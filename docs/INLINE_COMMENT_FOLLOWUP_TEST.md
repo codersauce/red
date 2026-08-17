@@ -15,9 +15,9 @@ cd /Users/felipe.coury/code/red.codex-inline-outcome-smoke
    > URLs. Leave two or three inline comments on the relevant branches. Do not
    > change the code.
 
-2. Open one specific annotation with `Space v` or by clicking its text. If
+2. Open one specific annotation with `Space v`, or click its text and press Enter. If
    comments overlap, click the `‹ 2/2 ›` arrows on the card, use `[ i` / `] i`
-   in Normal mode, or use `[` / `]` in the full view. Cycling and reopening the
+   in Normal mode, click the counter for a chooser, or use `h` / `l` in the full view. Cycling and reopening the
    same comment should place its viewer consistently, inside the source pane,
    with an intact border.
 3. Press `i` (**ask inline**). The new dialog should identify the selected

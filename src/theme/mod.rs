@@ -156,6 +156,31 @@ impl Theme {
         style
     }
 
+    pub(crate) fn current_inline_comment_style(&self) -> Style {
+        let mut style = self.inline_comment_style();
+        if let (Some(foreground), Some(background)) = (style.fg, style.bg) {
+            let (Color::Rgb { r, g, b } | Color::Rgba { r, g, b, .. }) = foreground;
+            let background = self
+                .colors
+                .get("red.inlineCommentActiveBackground")
+                .copied()
+                .unwrap_or_else(|| blend_color(Color::Rgba { r, g, b, a: 24 }, background));
+            style.bg = Some(background);
+            style.fg = Some(ensure_minimum_contrast(foreground, background, 4.5));
+        }
+        style
+    }
+
+    pub(crate) fn current_inline_comment_guide_style(&self) -> Style {
+        let mut style = self.inline_comment_arrow_style();
+        style.fg = self
+            .colors
+            .get("red.inlineCommentActiveBorder")
+            .copied()
+            .or(style.fg);
+        style
+    }
+
     pub(crate) fn inline_comment_arrow_style(&self) -> Style {
         let mut style = self.inline_comment_style();
         let background = self.style.bg.unwrap_or_default();

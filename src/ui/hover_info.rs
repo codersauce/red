@@ -33,6 +33,7 @@ pub struct HoverInfo {
     label: String,
     close_action: Action,
     inline_navigation: Option<uuid::Uuid>,
+    inline_card: Option<uuid::Uuid>,
     source_inline_comment: Option<uuid::Uuid>,
     overlay_layout: Option<OverlayLayout>,
     shortcuts: Vec<(char, String, Action)>,
@@ -105,6 +106,7 @@ impl HoverInfo {
             label: "Hover".to_string(),
             close_action: Action::CloseDialog,
             inline_navigation: None,
+            inline_card: None,
             source_inline_comment: None,
             overlay_layout: None,
             shortcuts: Vec::new(),
@@ -181,6 +183,12 @@ impl HoverInfo {
         self
     }
 
+    pub(crate) fn with_inline_card(mut self, id: uuid::Uuid) -> Self {
+        self.inline_card = Some(id);
+        self.update_chrome();
+        self
+    }
+
     pub(crate) fn with_inline_source(mut self, id: uuid::Uuid, layout: OverlayLayout) -> Self {
         self.source_inline_comment = Some(id);
         self.update_overlay_layout(layout);
@@ -243,8 +251,14 @@ impl HoverInfo {
             );
         }
         if self.inline_navigation.is_some() {
-            actions.push(UiAction::new("previous-inline", "[", "previous inline"));
-            actions.push(UiAction::new("next-inline", "]", "next inline"));
+            actions.push(UiAction::new("previous-inline", "h", "previous inline"));
+            actions.push(UiAction::new("next-inline", "l", "next inline"));
+        }
+        if self.inline_card.is_some() {
+            actions.push(
+                UiAction::new("expand-inline", "Enter", "expand")
+                    .with_priority(ActionPriority::Essential),
+            );
         }
         if !self.actions.is_empty() {
             actions.push(
@@ -381,6 +395,11 @@ impl Component for HoverInfo {
     }
 
     fn handle_event(&mut self, event: &Event) -> Option<KeyAction> {
+        if let (Some(id), Event::Key(key)) = (self.inline_card, event) {
+            if key.code == KeyCode::Enter && key.modifiers.is_empty() {
+                return Some(KeyAction::Single(Action::OpenInlineComment(id)));
+            }
+        }
         if let Event::Key(key) = event {
             if key.modifiers.is_empty() && key.kind == crossterm::event::KeyEventKind::Press {
                 if let Some((_, _, action)) = self
@@ -393,14 +412,21 @@ impl Component for HoverInfo {
             }
         }
         if let (Some(id), Event::Key(key)) = (self.inline_navigation, event) {
-            if matches!(key.code, KeyCode::Char('[' | ']')) && key.modifiers.is_empty() {
-                return Some(KeyAction::Single(
+            if matches!(
+                key.code,
+                KeyCode::Left | KeyCode::Right | KeyCode::Char('h' | 'l' | '[' | ']')
+            ) && key.modifiers.is_empty()
+            {
+                let backwards = matches!(key.code, KeyCode::Left | KeyCode::Char('h' | '['));
+                return Some(KeyAction::Single(if self.inline_card.is_some() {
+                    Action::NavigateInlineCommentCard { id, backwards }
+                } else {
                     Action::NavigateOverlappingInlineComment {
                         id,
-                        backwards: key.code == KeyCode::Char('['),
+                        backwards,
                         open: true,
-                    },
-                ));
+                    }
+                }));
             }
         }
         let redraw = || Some(KeyAction::Single(Action::Refresh));
@@ -778,6 +804,7 @@ mod tests {
             },
             anchor: (60, 12),
             avoid_rows: Some((12, 17)),
+            protected_rows: None,
         };
         let mut info = HoverInfo::new(
             &editor,

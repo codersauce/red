@@ -1670,7 +1670,11 @@ impl Editor {
                     lane_x,
                     term_y,
                     guide,
-                    &self.theme.inline_comment_guide_style(),
+                    &if self.inline_comment_is_current_at(window, comment.line, false) {
+                        self.theme.current_inline_comment_guide_style()
+                    } else {
+                        self.theme.inline_comment_guide_style()
+                    },
                 );
             }
             return;
@@ -1729,7 +1733,12 @@ impl Editor {
                 .row(row)
                 .and_then(|segment| self.inline_comment_connector_for_segment(window, segment))
             {
-                self.render_inline_comment_connector(buffer, lane_x, term_y, lane_width, connector);
+                let current = layout.row(row).is_some_and(|segment| {
+                    self.inline_comment_is_current_at(window, segment.line, true)
+                });
+                self.render_inline_comment_connector(
+                    buffer, lane_x, term_y, lane_width, connector, current,
+                );
             }
         }
 
@@ -1757,6 +1766,7 @@ impl Editor {
         y: usize,
         lane_width: usize,
         connector: InlineCommentConnector,
+        current: bool,
     ) {
         use InlineCommentConnector::{End, Middle, Single, Start};
 
@@ -1776,7 +1786,12 @@ impl Editor {
             (true, false, Single | Start) => ">",
             (true, false, End) => "`",
         };
-        buffer.set_text(x, y, text, &self.theme.inline_comment_guide_style());
+        let guide = if current {
+            self.theme.current_inline_comment_guide_style()
+        } else {
+            self.theme.inline_comment_guide_style()
+        };
+        buffer.set_text(x, y, text, &guide);
         if matches!(connector, Single | Start) {
             buffer.set_text(
                 x + if full { 2 } else { 0 },
@@ -2457,7 +2472,11 @@ impl Editor {
         let term_x = self.window_to_terminal_x(window, content_start);
         let content_width = self.window_content_width(window);
         let editor_style = self.theme.style.clone();
-        let comment_style = self.theme.inline_comment_style();
+        let comment_style = if self.inline_comment_is_current_at(window, comment.line, false) {
+            self.theme.current_inline_comment_style()
+        } else {
+            self.theme.inline_comment_style()
+        };
         let block_width = comment.block_width.min(content_width);
         self.fill_line_in_window(buffer, term_x, term_y, content_width, &editor_style);
         let half_block = match comment.content {
@@ -3837,6 +3856,7 @@ mod tests {
             },
             anchor: (5, 0),
             avoid_rows: None,
+            protected_rows: None,
         };
         editor.current_dialog = Some(Box::new(
             crate::ui::HoverInfo::new(
@@ -3917,7 +3937,7 @@ mod tests {
         editor
             .render_main_content_rows_in_window(&mut frame, &window, &rows)
             .unwrap();
-        let background = editor.theme.inline_comment_style().bg;
+        let background = editor.theme.current_inline_comment_style().bg;
         let content_start = editor.gutter_width_for_window(&window) + 1;
         for comment in &layout.inline_comments {
             let y = editor.window_to_terminal_y(&window, comment.row);

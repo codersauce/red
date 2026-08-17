@@ -16,15 +16,17 @@ Run `cargo run --bin red -- path/to/file` in this worktree.
 | `Space H` / `:InlineHistory` | Open unified history with running jobs, ready results, completed discussions, and saved drafts. |
 | Working-popup `Esc` / `Ctrl-c` | Hide without cancelling / explicitly cancel the request. |
 | Activity marker click / `Space v` | Reopen the selected inline job at its source. |
-| Ready-popup `v` / Enter | Inspect an off-screen code edit / apply it if source is unchanged. Explanations appear automatically. |
+| Ready-popup `v` / Enter | Review a proposed code edit; `a` in the diff applies it if source is unchanged. Explanations appear automatically. |
 | Wider-edit popup Enter / `v` / `d` | Review the proposed same-file diff / review / decline. `a` in the full review applies it. |
 | History Enter / `g` / `p` | Reopen the item / jump to source / pin the selected turn's annotations. |
 | History `v` / source-link click | Cycle rich conversation/code/diff views / jump to the tracked source. |
 | Result-popup `p` | Pin retained annotations without reapplying a code edit. |
 | `Space ] c` / `Space [ c` | Select the next/previous annotation, including overlapping comments. |
 | `] i` / `[ i` | Select the next/previous item in the current overlapping group. |
-| Card `‹ 2/2 ›` | Click an arrow to select the previous/next overlapping item; click the counter to open it. |
-| Full-view `[` / `]` | Browse the overlapping items while reading their full text. |
+| Card `‹ 2/2 ›` | Click an arrow to select the previous/next overlapping item; click the counter for a local chooser. |
+| Card text / Enter / Esc | Focus the card / expand its full text / return to the editor. |
+| Focused-card or full-view `h` / `l`, Left / Right | Browse overlapping items; `[` / `]` remain aliases. |
+| Comment-view `i` / `A` / `r` / `x` / `d` | Ask inline / ask Agent / refine discussion / dismiss comment / resolve discussion. |
 | `Space v` | Read the full comment in a scrollable plain-text popup. |
 | `Space x` | Dismiss the selected comment. |
 | Normal-mode `Space C` | Add a random sample comment above the current line. Repeat to replace it with a different sample. |
@@ -52,8 +54,9 @@ dirty state stay unchanged.
 Mouse-wheel scrolling keeps the requested viewport and moves an offscreen cursor
 to the nearest visible source row, accounting for comment blocks and wrapping.
 Clicking an activity marker reopens its job; clicking ordinary comment text opens
-its full view. Splits show the same buffer's
-comments at their own widths.
+its focused action view. Splits show the same buffer's comments at their own
+widths and remember independent current items. The current card and its source
+connector are subtly highlighted; hovering does not select it.
 
 Questions, answers, and comments are retained in editor-session history. Edits above them move both range anchors;
 changes to their source mark them outdated. Overlapping comments remain stored

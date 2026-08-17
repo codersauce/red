@@ -198,6 +198,97 @@ async fn inline_draft_close_can_edit_save_or_delete_without_losing_prior_results
 }
 
 #[tokio::test]
+async fn inline_foreground_code_result_requires_request_bound_review() {
+    let mut editor = editor("alpha\nbeta\n");
+    start(&mut editor, "first", Some("one"), range(0, 1));
+    let (bridge, worker) = CodexBridge::channel(std::num::NonZeroUsize::new(2).unwrap());
+    editor.agent_manager.set_bridge(bridge);
+    worker
+        .send(CodexEvent::InlineResult {
+            request_id: "one".into(),
+            session_id: "provider-one".into(),
+            result: result(Some("ALPHA\n")),
+        })
+        .await
+        .unwrap();
+    editor
+        .service_background(
+            &mut RenderBuffer::new(100, 30, &Style::default()),
+            &mut Runtime::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(editor.current_buffer().contents(), "alpha\nbeta\n");
+    assert!(!editor.current_buffer().is_dirty());
+    assert_eq!(
+        popup(&editor),
+        InlineAssistPopupState::Ready { stale: false }
+    );
+    let key = |editor: &mut Editor, code| {
+        editor
+            .current_dialog
+            .as_mut()
+            .unwrap()
+            .handle_event(&Event::Key(KeyEvent::new(code, KeyModifiers::NONE)))
+    };
+    assert_eq!(
+        key(&mut editor, KeyCode::Enter),
+        Some(KeyAction::Single(Action::ViewInlineAssistAnswer))
+    );
+    action(&mut editor, Action::ViewInlineAssistAnswer).await;
+    assert_eq!(key(&mut editor, KeyCode::Enter), None);
+    assert_eq!(
+        key(&mut editor, KeyCode::Char('a')),
+        Some(KeyAction::Single(Action::ApplyReviewedInlineAssist(
+            "one".into()
+        )))
+    );
+    action(
+        &mut editor,
+        Action::ApplyReviewedInlineAssist("other".into()),
+    )
+    .await;
+    assert_eq!(editor.current_buffer().contents(), "alpha\nbeta\n");
+    action(&mut editor, Action::ApplyReviewedInlineAssist("one".into())).await;
+    assert_eq!(editor.current_buffer().contents(), "ALPHA\nbeta\n");
+    assert_eq!(
+        editor.inline_history.turn("one").unwrap().status(),
+        "applied"
+    );
+    action(&mut editor, Action::KeepInlineAssist).await;
+    assert!(editor.inline_assist.is_none());
+    assert!(editor.current_buffer().is_dirty());
+
+    start(&mut editor, "second", Some("two"), range(1, 2));
+    worker
+        .send(CodexEvent::InlineResult {
+            request_id: "two".into(),
+            session_id: "provider-two".into(),
+            result: result(Some("BETA\n")),
+        })
+        .await
+        .unwrap();
+    editor
+        .service_background(
+            &mut RenderBuffer::new(100, 30, &Style::default()),
+            &mut Runtime::new(),
+        )
+        .await
+        .unwrap();
+    action(&mut editor, Action::ViewInlineAssistAnswer).await;
+    assert_eq!(
+        key(&mut editor, KeyCode::Char('d')),
+        Some(KeyAction::Single(Action::RejectPendingInlineAssist))
+    );
+    action(&mut editor, Action::RejectPendingInlineAssist).await;
+    assert_eq!(editor.current_buffer().contents(), "ALPHA\nbeta\n");
+    assert_eq!(
+        editor.inline_history.turn("two").unwrap().status(),
+        "declined"
+    );
+}
+
+#[tokio::test]
 async fn inline_background_result_waits_for_explicit_apply_and_keeps_other_jobs() {
     let mut editor = editor("alpha\nbeta\n");
     start(&mut editor, "first", Some("one"), range(0, 1));
@@ -407,11 +498,11 @@ async fn inline_background_explanation_publishes_in_its_own_buffer_without_takin
         .unwrap();
     start(&mut editor, "second", Some("two"), range(0, 1));
     let cursor = editor.cursor_snapshot();
-    let selected = editor.active_inline_comment;
+    let selected = editor.active_inline_comment();
     editor.stage_background_inline_result("one", "provider-one", result(None));
     assert_eq!(editor.buffer_manager.active_index(), other);
     assert_eq!(editor.cursor_snapshot(), cursor);
-    assert_eq!(editor.active_inline_comment, selected);
+    assert_eq!(editor.active_inline_comment(), selected);
     assert_eq!(popup(&editor), InlineAssistPopupState::Working);
     assert_eq!(
         editor.inline_assist.as_ref().unwrap().request_id.as_deref(),
@@ -535,7 +626,7 @@ async fn inline_running_marker_animates_at_the_shared_interval_and_stops_on_comp
     let interval = Duration::from_millis(SPINNER_FRAME_INTERVAL_MS);
     let cursor = editor.cursor_snapshot();
     let history = editor.inline_history.clone();
-    let id = editor.active_inline_comment;
+    let id = editor.active_inline_comment();
     assert!(editor.inline_comments[0].message.starts_with("⠋ Working"));
     assert!(!editor.poll_inline_activity_animation(since + interval - Duration::from_millis(1)));
     assert!(editor.poll_inline_activity_animation(since + interval));
@@ -543,7 +634,7 @@ async fn inline_running_marker_animates_at_the_shared_interval_and_stops_on_comp
     assert!(!editor.poll_inline_activity_animation(since + interval));
     assert!(editor.poll_inline_activity_animation(since + interval * 2));
     assert!(editor.inline_comments[0].message.starts_with("⠹ Working"));
-    assert_eq!(editor.active_inline_comment, id);
+    assert_eq!(editor.active_inline_comment(), id);
     assert_eq!(editor.cursor_snapshot(), cursor);
     assert_eq!(editor.inline_history, history);
     assert!(!editor.current_buffer().is_dirty());
@@ -588,7 +679,7 @@ fn inline_spinner_does_not_request_repaints_for_offscreen_or_collapsed_markers()
     editor.park_inline_assist();
     let since = editor.inline_activity_animation.since;
     let interval = Duration::from_millis(SPINNER_FRAME_INTERVAL_MS);
-    let activity_id = editor.active_inline_comment;
+    let activity_id = editor.active_inline_comment();
     assert!(!editor.poll_inline_activity_animation(since + interval));
     editor.vtop = 60;
     editor.cy = 0;
@@ -600,11 +691,11 @@ fn inline_spinner_does_not_request_repaints_for_offscreen_or_collapsed_markers()
         "Selected answer".into(),
         InlineCommentOrigin::Sample,
     );
-    editor.active_inline_comment = Some(comment.id);
+    editor.set_active_inline_comment(Some(comment.id));
     editor.inline_comments.push(comment);
     editor.layout_cache.borrow_mut().clear();
     assert!(!editor.poll_inline_activity_animation(since + interval * 3));
-    editor.active_inline_comment = activity_id;
+    editor.set_active_inline_comment(activity_id);
     editor.layout_cache.borrow_mut().clear();
     assert!(editor.poll_inline_activity_animation(since + interval * 4));
 }

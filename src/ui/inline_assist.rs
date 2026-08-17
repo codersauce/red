@@ -80,6 +80,7 @@ impl InlineAssistPopup {
                 },
                 anchor,
                 avoid_rows: None,
+                protected_rows: None,
             },
         )
     }
@@ -107,6 +108,7 @@ impl InlineAssistPopup {
                 },
                 anchor,
                 avoid_rows,
+                protected_rows: None,
             },
         )
     }
@@ -725,11 +727,15 @@ impl Component for InlineAssistPopup {
             return self.handle_close_choice(event);
         }
         if let (Some((id, _, _)), Event::Key(key)) = (self.navigation, event) {
-            if matches!(key.code, KeyCode::Char('[' | ']')) && key.modifiers.is_empty() {
+            if matches!(
+                key.code,
+                KeyCode::Left | KeyCode::Right | KeyCode::Char('h' | 'l' | '[' | ']')
+            ) && key.modifiers.is_empty()
+            {
                 return Some(KeyAction::Single(
                     Action::NavigateOverlappingInlineComment {
                         id,
-                        backwards: key.code == KeyCode::Char('['),
+                        backwards: matches!(key.code, KeyCode::Left | KeyCode::Char('h' | '[')),
                         open: true,
                     },
                 ));
@@ -1264,6 +1270,7 @@ mod tests {
                 viewport,
                 anchor: (40, 7),
                 avoid_rows: Some(avoid_rows),
+                protected_rows: None,
             },
         );
         let initial_height = popup.dialog.height;
@@ -1317,6 +1324,7 @@ mod tests {
                 viewport,
                 anchor: (7, 3),
                 avoid_rows: None,
+                protected_rows: None,
             },
         )
     }
@@ -1332,6 +1340,18 @@ mod tests {
             row: y as u16,
             modifiers: KeyModifiers::NONE,
         }))
+    }
+
+    #[test]
+    fn inline_prompt_navigation_keys_remain_text_and_cursor_input() {
+        let mut popup = prompt_in_viewport("", 40);
+        for character in ['h', 'l', '[', ']'] {
+            prompt_key(&mut popup, KeyCode::Char(character));
+        }
+        prompt_key(&mut popup, KeyCode::Left);
+        prompt_key(&mut popup, KeyCode::Char('x'));
+        prompt_key(&mut popup, KeyCode::Right);
+        assert_eq!(popup.prompt.text(), "hl[x]");
     }
 
     #[test]
@@ -1485,6 +1505,7 @@ mod tests {
                 viewport,
                 anchor: (48, 4),
                 avoid_rows: Some((4, 4)),
+                protected_rows: None,
             },
         );
 
@@ -1508,6 +1529,7 @@ mod tests {
             viewport: resized_viewport,
             anchor: (28, 4),
             avoid_rows: Some((4, 4)),
+            protected_rows: None,
         }));
         assert!(popup.dialog.x >= resized_viewport.x);
         assert!(

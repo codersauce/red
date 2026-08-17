@@ -11,7 +11,7 @@ use crate::inline_history::{
 mod tests;
 
 impl Editor {
-    fn selected_comment_context(
+    pub(super) fn selected_comment_context(
         &self,
         id: uuid::Uuid,
     ) -> anyhow::Result<(Box<InlineCommentContext>, Option<TextRange>)> {

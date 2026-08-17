@@ -201,7 +201,7 @@ async fn inline_change_summary_can_be_hidden_restored_and_recovered() {
     let mut editor = editor(BEFORE);
     apply(&mut editor).await;
     action(&mut editor, Action::KeepInlineAssist).await;
-    editor.active_inline_comment = Some(summary(&editor).unwrap().id);
+    editor.set_active_inline_comment(Some(summary(&editor).unwrap().id));
     editor.dismiss_inline_comment();
     editor.sync_inline_change_summaries();
     assert!(summary(&editor).is_none());
@@ -275,7 +275,7 @@ async fn inline_change_summary_does_not_replace_the_current_explanation() {
         .await
         .unwrap();
     assert!(summary(&editor).is_some());
-    assert!(editor.inline_comments.iter().any(|comment| Some(comment.id) == editor.active_inline_comment
+    assert!(editor.inline_comments.iter().any(|comment| Some(comment.id) == editor.active_inline_comment()
         && matches!(&comment.origin, InlineCommentOrigin::Assist { request_id, .. } if request_id == "explanation")));
 }
 

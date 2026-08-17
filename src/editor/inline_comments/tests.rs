@@ -21,6 +21,8 @@ use crossterm::event::{
     Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 
+mod current;
+
 fn editor(text: &str, width: usize, height: usize, wrap: bool) -> Editor {
     let defaults: Config = toml::from_str(include_str!("../../../default_config.toml")).unwrap();
     let config = Config {
@@ -213,7 +215,7 @@ fn inline_comment_rendering_is_not_a_text_edit() {
             .collect::<String>(),
         "╭───"
     );
-    let comment_style = editor.theme.inline_comment_style();
+    let comment_style = editor.theme.current_inline_comment_style();
     assert_ne!(comment_style.bg, editor.theme.style.bg);
     for comment in &layout.inline_comments {
         let cells = &frame.cells[comment.row * 60..(comment.row + 1) * 60];
@@ -283,6 +285,7 @@ fn inline_comment_surfaces_and_faded_guides_follow_dark_and_light_themes() {
         editor.theme.style.bg = Some(background);
         editor.cy = 1;
         editor.set_inline_comment("This comment wraps onto several rows in a narrow editor.");
+        editor.set_active_inline_comment(None);
         let mut frame = RenderBuffer::new(40, 10, &Style::default());
         editor.render(&mut frame).unwrap();
         let window = editor.active_window_with_editor_view().unwrap();
@@ -367,7 +370,7 @@ fn inline_comment_half_height_edges_fall_back_to_solid_padding_in_ascii_mode() {
         );
         assert!(cells[x..x + comment.block_width]
             .iter()
-            .all(|cell| cell.style.bg == editor.theme.inline_comment_style().bg));
+            .all(|cell| cell.style.bg == editor.theme.current_inline_comment_style().bg));
         if !matches!(comment.content, InlineCommentContent::Text(_)) {
             assert!(cells[x..x + comment.block_width]
                 .iter()
@@ -896,13 +899,10 @@ async fn inline_overlap_navigation_has_stable_mouse_and_keyboard_targets() {
         )));
     assert_eq!(
         next,
-        Some(KeyAction::Single(
-            Action::NavigateOverlappingInlineComment {
-                id: ids[1],
-                backwards: false,
-                open: true
-            }
-        ))
+        Some(KeyAction::Single(Action::NavigateInlineCommentCard {
+            id: ids[1],
+            backwards: false,
+        }))
     );
     let Some(KeyAction::Single(next)) = next else {
         panic!("expected navigation")

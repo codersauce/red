@@ -15,6 +15,8 @@ pub struct OverlayLayout {
     pub(crate) viewport: ScreenRect,
     pub(crate) anchor: (usize, usize),
     pub(crate) avoid_rows: Option<(usize, usize)>,
+    /// The clicked card takes priority when its complete source range will not fit.
+    pub(crate) protected_rows: Option<(usize, usize)>,
 }
 
 impl OverlayLayout {
@@ -32,7 +34,7 @@ impl OverlayLayout {
                 .saturating_sub(viewport.y)
                 .min(viewport.height.saturating_sub(1)),
         );
-        let avoid_rows = self.avoid_rows.and_then(|(start, end)| {
+        let local_rows = |(start, end): (usize, usize)| {
             let viewport_end = viewport.y.saturating_add(viewport.height.saturating_sub(1));
             let start = start.max(viewport.y);
             let end = end.min(viewport_end);
@@ -40,7 +42,9 @@ impl OverlayLayout {
                 start.saturating_sub(viewport.y),
                 end.saturating_sub(viewport.y),
             ))
-        });
+        };
+        let avoid_rows = self.avoid_rows.and_then(local_rows);
+        let protected_rows = self.protected_rows.and_then(local_rows);
         let (x, y, available_height) = avoid_rows.map_or_else(
             || anchored_popup_geometry(anchor, viewport.width, viewport.height, width, height),
             |rows| {
@@ -55,7 +59,21 @@ impl OverlayLayout {
             },
         );
         let (x, y, height) = if available_height < height.min(2) {
-            anchored_popup_geometry(anchor, viewport.width, viewport.height, width, height)
+            let protected = protected_rows.map(|rows| {
+                anchored_popup_geometry_avoiding_rows(
+                    anchor,
+                    rows,
+                    viewport.width,
+                    viewport.height,
+                    width,
+                    height,
+                )
+            });
+            if let Some(geometry) = protected.filter(|(_, _, available)| *available > 0) {
+                geometry
+            } else {
+                anchored_popup_geometry(anchor, viewport.width, viewport.height, width, height)
+            }
         } else {
             (x, y, available_height)
         };
@@ -158,7 +176,9 @@ impl ScreenRect {
 
 #[cfg(test)]
 mod tests {
-    use super::{anchored_popup_geometry, anchored_popup_geometry_avoiding_rows, ScreenRect};
+    use super::{
+        anchored_popup_geometry, anchored_popup_geometry_avoiding_rows, OverlayLayout, ScreenRect,
+    };
 
     #[test]
     fn rectangle_uses_exclusive_saturating_edges() {
@@ -208,5 +228,24 @@ mod tests {
             anchored_popup_geometry_avoiding_rows((8, 10), (8, 11), 20, 14, 8, 2),
             (8, 4, 2)
         );
+    }
+
+    #[test]
+    fn clicked_card_has_priority_when_the_source_fills_the_viewport() {
+        let layout = OverlayLayout {
+            viewport: ScreenRect {
+                x: 40,
+                y: 3,
+                width: 60,
+                height: 18,
+            },
+            anchor: (45, 9),
+            avoid_rows: Some((3, 20)),
+            protected_rows: Some((6, 8)),
+        };
+        let (_, y, height) = layout.popup_geometry(50, 12);
+        assert!(height >= 2);
+        assert!(y > 8 || y + height + 2 <= 6);
+        assert!(y >= 3 && y + height + 2 <= 21);
     }
 }

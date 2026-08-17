@@ -91,7 +91,11 @@ verbatim indentation and readable wrapping in narrow windows.
 
 Before applying a response, Red verifies the active buffer identity, revision,
 range, and original text. A stale response fails without changing the buffer.
-Successful output is applied only after a completed turn and full validation.
+Every code-changing result waits for explicit review, including results that
+finish while their dialog is open. Enter opens the proposed diff; `a` applies
+that reviewed request, `d` declines it, and Esc returns or hides it. Enter in
+the diff does not apply it. Successful output is applied only after a completed
+turn and full validation.
 Code changes use one agent-attributed editor transaction and are deliberately
 not saved. Comment-only results do not alter dirty state or text undo history.
 After a code edit, Red retains an editor-generated **Applied** summary even when
@@ -121,7 +125,7 @@ to reopen. `Ctrl-c` opens the same draft choices or cancels a running
 request. Several requests can run independently. Explanations and comment-only
 results appear automatically when their source still matches, without changing
 source or focus. Proposed code edits completed while hidden are retained as
-**ready**; reopen, use `v` to inspect, and Enter to apply. Changed source disables application and offers a
+**ready**; reopen, use Enter or `v` to inspect, and `a` in the diff to apply. Changed source disables application and offers a
 fresh recheck or Agent handoff. Kept comments remain until hidden or resolved.
 
 `Space H` opens the unified bottom-docked InlineHistory panel. It includes
@@ -137,12 +141,20 @@ still opens the latest completion afterward. Existing errors and command input
 take precedence. Notifications never move focus or apply a proposed edit.
 
 Use `Space ] c` and `Space [ c` to navigate comments across the file,
-`Space v` (or click the card text) to read the full message, `Space x` to dismiss
+`Space v` to read the full message, `Space x` to dismiss
 one, and `Space X` to clear the current buffer. Overlapping annotations are
 retained and collapsed into a group. `‹ 2/4 ›` means the second of four
 overlapping items is current, not a progress count; `✓ Done` is that request's
 completion status. Click `‹` / `›`, or use `[ i` / `] i`, to cycle
-only that group. The full viewer and result popup also accept `[` / `]`.
+only that group. Click the count to choose from the group's titles. Clicking
+ordinary card text focuses a compact action view; Enter expands it and Esc
+returns to the editor. Left/Right or `h`/`l` cycle that location's items in the
+focused card, full viewer, or result popup; `[` / `]` remain aliases. These keys
+remain ordinary text/cursor input while composing a reply. `i` asks a new inline
+question about that exact comment, `A` asks Agent, `r` refines its discussion,
+`x` dismisses the comment, and `d` resolves its discussion. Each pane remembers
+its current item separately, highlights its card and connector, and advances
+to the next overlapping item after dismissal. Hovering does not change it.
 Opening an item from History makes its annotations current. Comments
 follow edits above them and are marked outdated when their referenced source
 changes. They are never written into source files. Hiding or clearing comments

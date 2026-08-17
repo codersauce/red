@@ -151,6 +151,79 @@ const SAMPLES: &[&str] = &[
 ];
 
 impl Editor {
+    pub(super) fn inline_comment_selection(
+        &self,
+        window: crate::window::WindowId,
+        buffer: BufferId,
+    ) -> Option<Uuid> {
+        self.inline_comment_selections
+            .get(&(window, buffer))
+            .copied()
+    }
+
+    pub(super) fn inline_comment_is_current_at(
+        &self,
+        window: &crate::window::Window,
+        line: usize,
+        include_range: bool,
+    ) -> bool {
+        let Some(buffer) = self.buffer_manager.get(window.buffer_index) else {
+            return false;
+        };
+        let Some(id) = self.inline_comment_selection(window.id, buffer.id()) else {
+            return false;
+        };
+        self.inline_comments
+            .iter()
+            .find(|comment| comment.id == id && self.inline_comment_visible(comment))
+            .is_some_and(|comment| {
+                let (start, end) = comment.lines(buffer);
+                start == line || (include_range && start <= line && line <= end)
+            })
+    }
+
+    pub(super) fn active_inline_comment(&self) -> Option<Uuid> {
+        self.inline_comment_selection(
+            self.window_manager.active_stable_window_id()?,
+            self.current_buffer().id(),
+        )
+    }
+
+    pub(super) fn set_active_inline_comment(&mut self, id: Option<Uuid>) {
+        if let Some(window) = self.window_manager.active_stable_window_id() {
+            self.set_inline_comment_selection(window, self.current_buffer().id(), id);
+        }
+    }
+
+    pub(super) fn set_inline_comment_selection(
+        &mut self,
+        window: crate::window::WindowId,
+        buffer: BufferId,
+        id: Option<Uuid>,
+    ) {
+        if let Some(id) = id {
+            self.inline_comment_selections.insert((window, buffer), id);
+        } else {
+            self.inline_comment_selections.remove(&(window, buffer));
+        }
+        self.layout_cache.borrow_mut().clear();
+    }
+
+    /// Retarget every pane reading a removed item, without changing other panes.
+    fn replace_inline_selection(&mut self, removed: Uuid, next: Option<Uuid>) {
+        self.inline_comment_selections.retain(|_, selected| {
+            if *selected != removed {
+                return true;
+            }
+            if let Some(next) = next {
+                *selected = next;
+                true
+            } else {
+                false
+            }
+        });
+    }
+
     /// Whole-target replacements must not send every covered annotation to the
     /// replacement's end. Preserve its relative source line as an approximate
     /// location; the fingerprint decides whether the annotation is still valid.
@@ -245,7 +318,7 @@ impl Editor {
         }
         let comment =
             self.make_inline_comment(start, end, message.to_string(), InlineCommentOrigin::Sample);
-        self.active_inline_comment = Some(comment.id);
+        self.set_active_inline_comment(Some(comment.id));
         self.inline_comments.push(comment);
         self.layout_cache.borrow_mut().clear();
     }
@@ -344,7 +417,7 @@ impl Editor {
             start_line,
             comments,
         ) {
-            self.active_inline_comment = Some(id);
+            self.set_active_inline_comment(Some(id));
         }
     }
 
@@ -377,6 +450,36 @@ impl Editor {
                 )
             })
             .collect::<Vec<_>>();
+        let previous = self
+            .inline_comments
+            .iter()
+            .filter_map(|comment| {
+                let index = match &comment.origin {
+                    InlineCommentOrigin::Assist {
+                        group_id: owner,
+                        comment_index,
+                        ..
+                    } if owner == group_id => *comment_index,
+                    InlineCommentOrigin::Activity { group_id: owner } if owner == group_id => {
+                        return Some((
+                            comment.id,
+                            Some(added.first().map_or(comment.id, |next| next.id)),
+                        ));
+                    }
+                    _ => return None,
+                };
+                Some((
+                    comment.id,
+                    added
+                        .get(index)
+                        .or_else(|| added.first())
+                        .map(|next| next.id),
+                ))
+            })
+            .collect::<Vec<_>>();
+        for (removed, next) in previous {
+            self.replace_inline_selection(removed, next);
+        }
         self.remove_inline_comment_group(group_id);
         let first = added.first().map(|comment| comment.id);
         self.inline_comments.extend(added);
@@ -392,8 +495,16 @@ impl Editor {
     }
 
     pub(super) fn remove_inline_comment_group(&mut self, group_id: &str) {
+        let removed = self
+            .inline_comments
+            .iter()
+            .filter(|comment| comment.belongs_to(group_id))
+            .map(|comment| comment.id)
+            .collect::<HashSet<_>>();
         self.inline_comments
             .retain(|comment| !comment.belongs_to(group_id));
+        self.inline_comment_selections
+            .retain(|_, id| !removed.contains(id));
         self.layout_cache.borrow_mut().clear();
     }
 
@@ -421,6 +532,29 @@ impl Editor {
     // Collapse connected overlap groups, retaining every annotation in storage.
     // Cycling selects which range and box the one available gutter lane shows.
     fn comment_projections(&self, buffer: &Buffer) -> Vec<CommentProjection> {
+        let selected = self
+            .window_manager
+            .active_stable_window_id()
+            .and_then(|window| self.inline_comment_selection(window, buffer.id()));
+        self.comment_projections_with_selection(buffer, selected)
+    }
+
+    fn comment_projections_for_window(
+        &self,
+        window: crate::window::WindowId,
+        buffer: &Buffer,
+    ) -> Vec<CommentProjection> {
+        self.comment_projections_with_selection(
+            buffer,
+            self.inline_comment_selection(window, buffer.id()),
+        )
+    }
+
+    fn comment_projections_with_selection(
+        &self,
+        buffer: &Buffer,
+        current: Option<Uuid>,
+    ) -> Vec<CommentProjection> {
         let mut indices = self
             .inline_comments
             .iter()
@@ -443,9 +577,7 @@ impl Editor {
             let group = &indices[offset..next];
             let selected = group
                 .iter()
-                .position(|&(index, _)| {
-                    Some(self.inline_comments[index].id) == self.active_inline_comment
-                })
+                .position(|&(index, _)| Some(self.inline_comments[index].id) == current)
                 .unwrap_or_else(|| {
                     group
                         .iter()
@@ -465,7 +597,23 @@ impl Editor {
     }
 
     pub(super) fn inline_comment_display_messages(&self, buffer: &Buffer) -> Vec<(usize, String)> {
-        self.comment_projections(buffer)
+        self.inline_comment_messages(self.comment_projections(buffer), buffer)
+    }
+
+    pub(super) fn inline_comment_display_messages_for_window(
+        &self,
+        window: crate::window::WindowId,
+        buffer: &Buffer,
+    ) -> Vec<(usize, String)> {
+        self.inline_comment_messages(self.comment_projections_for_window(window, buffer), buffer)
+    }
+
+    fn inline_comment_messages(
+        &self,
+        projections: Vec<CommentProjection>,
+        buffer: &Buffer,
+    ) -> Vec<(usize, String)> {
+        projections
             .into_iter()
             .map(|view| {
                 let comment = &self.inline_comments[view.index];
@@ -496,7 +644,7 @@ impl Editor {
             return false;
         };
         let lines = self
-            .comment_projections(buffer)
+            .comment_projections_for_window(window.id, buffer)
             .into_iter()
             .filter_map(|view| {
                 let comment = &self.inline_comments[view.index];
@@ -531,7 +679,9 @@ impl Editor {
         };
         self.inline_comments
             .iter()
-            .position(|comment| Some(comment.id) == self.active_inline_comment && at_line(comment))
+            .position(|comment| {
+                Some(comment.id) == self.active_inline_comment() && at_line(comment)
+            })
             .or_else(|| {
                 self.comment_projections(buffer)
                     .into_iter()
@@ -595,7 +745,7 @@ impl Editor {
             })
             .or_else(|| {
                 self.inline_comments.iter().find(|comment| {
-                    belongs(comment) && Some(comment.id) == self.active_inline_comment
+                    belongs(comment) && Some(comment.id) == self.active_inline_comment()
                 })
             })
             .or_else(|| {
@@ -607,7 +757,7 @@ impl Editor {
             .or_else(|| self.inline_comments.iter().find(|comment| belongs(comment)))
             .map(|comment| (comment.id, comment.lines(self.current_buffer()).0));
         if let Some((id, line)) = selected {
-            self.active_inline_comment = Some(id);
+            self.set_active_inline_comment(Some(id));
             self.layout_cache.borrow_mut().clear();
             self.move_to_text_position(TextPosition::new(line, 0));
             self.refresh_cursor_goal();
@@ -640,7 +790,7 @@ impl Editor {
         let comment = &self.inline_comments[view.members[next]];
         let id = comment.id;
         let line = comment.lines(self.current_buffer()).0;
-        self.active_inline_comment = Some(id);
+        self.set_active_inline_comment(Some(id));
         self.layout_cache.borrow_mut().clear();
         self.move_to_text_position(TextPosition::new(line, 0));
         self.refresh_cursor_goal();
@@ -682,8 +832,230 @@ impl Editor {
                     open: false,
                 });
             }
+            if column < display_width(&pager.text) {
+                return Some(Action::ChooseInlineComment(id));
+            }
         }
-        Some(Action::OpenInlineComment(id))
+        Some(Action::FocusInlineComment(id))
+    }
+
+    pub(super) fn select_inline_comment_by_id(&mut self, id: Uuid) -> bool {
+        let Some(line) = self
+            .inline_comments
+            .iter()
+            .find(|comment| {
+                comment.id == id
+                    && comment.anchor.buffer_id == self.current_buffer().id()
+                    && self.inline_comment_visible(comment)
+            })
+            .map(|comment| comment.lines(self.current_buffer()).0)
+        else {
+            self.set_legacy_message(Some("inline item is no longer visible".into()));
+            return false;
+        };
+        self.set_active_inline_comment(Some(id));
+        self.move_to_text_position(TextPosition::new(line, 0));
+        self.refresh_cursor_goal();
+        true
+    }
+
+    pub(super) async fn focus_inline_comment(
+        &mut self,
+        id: Uuid,
+        frame: &mut RenderBuffer,
+        runtime: &mut Runtime,
+    ) -> anyhow::Result<()> {
+        if self.inline_comments.iter().any(|comment| {
+            comment.id == id
+                && matches!(
+                    comment.origin,
+                    InlineCommentOrigin::Activity { .. }
+                        | InlineCommentOrigin::ChangeSummary { .. }
+                        | InlineCommentOrigin::AgentOutcome { .. }
+                )
+        }) {
+            return self.open_inline_comment_by_id(id, frame, runtime).await;
+        }
+        self.park_inline_assist();
+        if self.select_inline_comment_by_id(id) {
+            self.show_inline_comment_view(true);
+        }
+        self.render(frame)
+    }
+
+    pub(super) fn choose_inline_comment(&mut self, id: Uuid) {
+        use crate::ui::{Picker, PickerItem};
+        let Some(view) = self
+            .comment_projections(self.current_buffer())
+            .into_iter()
+            .find(|view| {
+                view.members
+                    .iter()
+                    .any(|index| self.inline_comments[*index].id == id)
+            })
+        else {
+            return;
+        };
+        let items = view
+            .members
+            .into_iter()
+            .map(|index| {
+                let comment = &self.inline_comments[index];
+                let (start, end) = comment.lines(self.current_buffer());
+                PickerItem {
+                    id: comment.id.to_string(),
+                    icon: None,
+                    label: comment
+                        .message
+                        .lines()
+                        .find(|line| !line.trim().is_empty())
+                        .unwrap_or("Inline item")
+                        .chars()
+                        .take(180)
+                        .collect(),
+                    kind: None,
+                    annotation: Some(format!("{}–{}", start + 1, end + 1)),
+                    detail: None,
+                    data: serde_json::Value::Null,
+                    matches: Vec::new(),
+                    detail_matches: Vec::new(),
+                    preview: None,
+                }
+            })
+            .collect();
+        let mut picker = Picker::builder()
+            .title("Inline items here")
+            .structured_items(items)
+            .content_sized(76, 8)
+            .placeholder("Find an inline item")
+            .select_action(|id| {
+                Uuid::parse_str(&id).map_or(Action::CloseDialog, Action::FocusInlineComment)
+            })
+            .build(self);
+        picker.select_dynamic_id(&id.to_string());
+        self.current_dialog = Some(Box::new(picker));
+    }
+
+    fn inline_comment_discussion(&self, id: Uuid) -> Option<(String, String)> {
+        let comment = self
+            .inline_comments
+            .iter()
+            .find(|comment| comment.id == id)?;
+        let request = match &comment.origin {
+            InlineCommentOrigin::Assist { request_id, .. }
+            | InlineCommentOrigin::HistoryPreview { request_id, .. } => request_id,
+            _ => return None,
+        };
+        self.inline_history
+            .conversations
+            .iter()
+            .find(|conversation| {
+                conversation
+                    .turns
+                    .iter()
+                    .any(|turn| &turn.request_id == request)
+            })
+            .map(|conversation| (conversation.id.clone(), request.clone()))
+    }
+
+    pub(super) async fn refine_inline_comment(
+        &mut self,
+        id: Uuid,
+        frame: &mut RenderBuffer,
+        runtime: &mut Runtime,
+    ) -> anyhow::Result<()> {
+        if let Some((group, request)) = self.inline_comment_discussion(id) {
+            let context = match self.selected_comment_context(id) {
+                Ok((context, _)) => context,
+                Err(error) => {
+                    self.set_legacy_message(Some(error.to_string()));
+                    return self.render(frame);
+                }
+            };
+            self.open_inline_history_request(&group, &request, frame, runtime)
+                .await?;
+            let reuse_existing = self.has_parked_inline_draft(&group)
+                || self
+                    .inline_history
+                    .conversations
+                    .iter()
+                    .find(|conversation| conversation.id == group)
+                    .and_then(|conversation| conversation.turns.last())
+                    .is_some_and(|turn| {
+                        matches!(
+                            turn.state,
+                            crate::inline_history::InlineTurnState::Pending
+                                | crate::inline_history::InlineTurnState::Ready
+                        )
+                    });
+            self.handle_inline_history_action(
+                &crate::inline_history::HistoryAction::Continue,
+                frame,
+                runtime,
+            )
+            .await?;
+            if !reuse_existing {
+                if let Some(session) = self.inline_assist.as_mut().filter(|session| {
+                    session.annotation_group_id == group && session.request_id.is_none()
+                }) {
+                    session.parent_comment = Some(context);
+                    let scope = session.scope.clone();
+                    self.current_dialog = Some(Box::new(self.inline_assist_popup(
+                        scope,
+                        crate::ui::InlineAssistPopupState::Prompt {
+                            initial: String::new(),
+                            refining: false,
+                        },
+                    )));
+                    self.render(frame)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) fn resolve_inline_comment(&mut self, id: Uuid) {
+        let Some((group, _)) = self.inline_comment_discussion(id) else {
+            return;
+        };
+        if !self.select_inline_comment_by_id(id) {
+            return;
+        }
+        let next = self
+            .comment_projections(self.current_buffer())
+            .into_iter()
+            .find(|view| {
+                view.members
+                    .iter()
+                    .any(|index| self.inline_comments[*index].id == id)
+            })
+            .and_then(|view| {
+                view.members
+                    .into_iter()
+                    .map(|index| &self.inline_comments[index])
+                    .find(|comment| !comment.belongs_to(&group))
+                    .map(|comment| comment.id)
+            });
+        if let Some(conversation) = self
+            .inline_history
+            .conversations
+            .iter_mut()
+            .find(|conversation| conversation.id == group)
+        {
+            conversation.resolved = true;
+        }
+        self.remove_inline_comment_group(&group);
+        self.restore_inline_history_comments();
+        self.sync_inline_activity();
+        self.set_active_inline_comment(next);
+        if let Some(next) = next {
+            self.select_inline_comment_by_id(next);
+        }
+        self.current_dialog = None;
+        self.mark_inline_history_dirty();
+        self.set_legacy_message(Some(
+            "inline discussion resolved · Space H to restore".into(),
+        ));
     }
 
     pub(super) async fn open_inline_comment_by_id(
@@ -693,6 +1065,9 @@ impl Editor {
         runtime: &mut Runtime,
     ) -> anyhow::Result<()> {
         self.park_inline_assist();
+        if !self.select_inline_comment_by_id(id) {
+            return self.render(frame);
+        }
         let Some(comment) = self.inline_comments.iter().find(|comment| {
             comment.id == id
                 && comment.anchor.buffer_id == self.current_buffer().id()
@@ -718,11 +1093,6 @@ impl Editor {
                     .await;
             }
         }
-        let line = comment.lines(self.current_buffer()).0;
-        self.active_inline_comment = Some(id);
-        self.layout_cache.borrow_mut().clear();
-        self.move_to_text_position(TextPosition::new(line, 0));
-        self.refresh_cursor_goal();
         self.show_inline_comment();
         self.render(frame)
     }
@@ -761,7 +1131,7 @@ impl Editor {
                 .unwrap_or(0),
         };
         let (index, line) = indices[position];
-        self.active_inline_comment = Some(self.inline_comments[index].id);
+        self.set_active_inline_comment(Some(self.inline_comments[index].id));
         self.layout_cache.borrow_mut().clear();
         self.move_to_text_position(TextPosition::new(line, 0));
         self.refresh_cursor_goal();
@@ -774,6 +1144,16 @@ impl Editor {
 
     pub(super) fn dismiss_inline_comment(&mut self) {
         if let Some(index) = self.current_inline_comment_index() {
+            let removed = self.inline_comments[index].id;
+            let next = self
+                .comment_projections(self.current_buffer())
+                .into_iter()
+                .find(|view| view.members.contains(&index))
+                .and_then(|view| {
+                    let position = view.members.iter().position(|member| *member == index)?;
+                    (view.count > 1)
+                        .then(|| self.inline_comments[view.members[(position + 1) % view.count]].id)
+                });
             if let InlineCommentOrigin::AgentOutcome { request_id, file } =
                 &self.inline_comments[index].origin
             {
@@ -818,7 +1198,16 @@ impl Editor {
                 }
             }
             self.inline_comments.remove(index);
-            self.active_inline_comment = None;
+            self.replace_inline_selection(removed, next);
+            // The cursor may have reached this card without an explicit selection.
+            self.set_active_inline_comment(next);
+            if let Some(line) = next
+                .and_then(|id| self.inline_comments.iter().find(|comment| comment.id == id))
+                .map(|comment| comment.lines(self.current_buffer()).0)
+            {
+                self.move_to_text_position(TextPosition::new(line, 0));
+                self.refresh_cursor_goal();
+            }
             self.layout_cache.borrow_mut().clear();
         } else {
             self.set_legacy_message(Some("no inline comment at the cursor".into()));
@@ -826,6 +1215,10 @@ impl Editor {
     }
 
     pub(super) fn show_inline_comment(&mut self) {
+        self.show_inline_comment_view(false);
+    }
+
+    fn show_inline_comment_view(&mut self, compact: bool) {
         // Source layout must be settled before deriving terminal coordinates.
         // An existing modal intentionally hides the terminal cursor, so it is
         // not a valid anchor when cycling between comments.
@@ -852,13 +1245,28 @@ impl Editor {
                 |turn| format!("You: {}", turn.prompt),
             ),
         };
+        let provenance = if compact && provenance.chars().count() > 120 {
+            format!("{}…", provenance.chars().take(120).collect::<String>())
+        } else {
+            provenance
+        };
+        let message = if compact {
+            let snippet = comment.message.chars().take(240).collect::<String>();
+            if snippet.len() < comment.message.len() {
+                format!("{snippet}…")
+            } else {
+                snippet
+            }
+        } else {
+            comment.message.clone()
+        };
         let text = format!(
             "Lines {}–{}{}\n{}\n\n{}",
             start + 1,
             end + 1,
             if comment.stale { " · outdated" } else { "" },
             provenance,
-            comment.message
+            message
         );
         let navigation = self.current_inline_navigation();
         let label = navigation.map_or_else(
@@ -870,6 +1278,14 @@ impl Editor {
         if let Some(layout) = self.inline_comment_overlay_layout(comment.id) {
             hover = hover.with_inline_source(comment.id, layout);
         }
+        if compact {
+            hover = hover.with_inline_card(comment.id).with_shortcut(
+                'v',
+                "full comment",
+                Action::OpenInlineComment(comment.id),
+            );
+        }
+        hover = hover.with_shortcut('x', "dismiss", Action::DismissInlineCommentById(comment.id));
         if matches!(
             comment.origin,
             InlineCommentOrigin::Assist { .. } | InlineCommentOrigin::HistoryPreview { .. }
@@ -890,10 +1306,24 @@ impl Editor {
                         id: comment.id,
                         in_agent: true,
                     },
+                )
+                .with_shortcut(
+                    'r',
+                    "refine discussion",
+                    Action::RefineInlineComment(comment.id),
+                )
+                .with_shortcut(
+                    'd',
+                    "resolve discussion",
+                    Action::ResolveInlineComment(comment.id),
                 );
         }
         if let Some((id, _, _)) = navigation {
-            hover = hover.with_inline_navigation(id);
+            hover = hover.with_inline_navigation(id).with_shortcut(
+                'c',
+                "choose inline",
+                Action::ChooseInlineComment(id),
+            );
         }
         self.current_dialog = Some(Box::new(hover));
     }
@@ -913,14 +1343,33 @@ impl Editor {
             return None;
         }
         let (start, end) = comment.lines(buffer);
-        self.text_range_overlay_layout(
+        let mut overlay = self.text_range_overlay_layout(
             window_id,
             buffer.id(),
             TextRange::new(
                 TextPosition::new(start, 0),
                 TextPosition::new(end.saturating_add(1), 0),
             ),
-        )
+        )?;
+        let layout = self.layout_for_window(window);
+        let mut card_rows = layout
+            .inline_comments
+            .iter()
+            .filter(|row| row.line == start);
+        if let Some(first) = card_rows.next() {
+            let last = card_rows.next_back().unwrap_or(first);
+            let card = (
+                self.window_to_terminal_y(window, first.row),
+                self.window_to_terminal_y(window, last.row),
+            );
+            overlay.protected_rows = Some(card);
+            overlay.avoid_rows = Some(
+                overlay
+                    .avoid_rows
+                    .map_or(card, |source| (card.0.min(source.0), card.1.max(source.1))),
+            );
+        }
+        Some(overlay)
     }
 
     pub(super) fn clear_inline_comments(&mut self) {
@@ -968,7 +1417,8 @@ impl Editor {
             comment.anchor.buffer_id != buffer_id
                 || matches!(comment.origin, InlineCommentOrigin::Activity { .. })
         });
-        self.active_inline_comment = None;
+        self.inline_comment_selections
+            .retain(|(_, buffer), _| *buffer != buffer_id);
         self.layout_cache.borrow_mut().clear();
     }
 
@@ -1035,7 +1485,7 @@ impl Editor {
     ) -> Option<InlineCommentConnector> {
         let buffer = self.buffer_manager.get(window.buffer_index)?;
         let (start, end) = self
-            .comment_projections(buffer)
+            .comment_projections_for_window(window.id, buffer)
             .into_iter()
             .find_map(|view| {
                 let comment = &self.inline_comments[view.index];

@@ -848,7 +848,7 @@ impl Picker {
             .and_then(|index| self.dynamic_items.as_ref()?.get(*index))
     }
 
-    fn select_dynamic_id(&mut self, id: &str) {
+    pub(crate) fn select_dynamic_id(&mut self, id: &str) {
         let Some(items) = self.dynamic_items.as_ref() else {
             return;
         };

@@ -90,7 +90,7 @@ fn fixture() -> (Editor, uuid::Uuid) {
     );
     let id = comment.id;
     editor.inline_comments.push(comment);
-    editor.active_inline_comment = Some(id);
+    editor.set_active_inline_comment(Some(id));
     editor.move_to_text_position(TextPosition::new(1, 0));
     (editor, id)
 }
@@ -112,6 +112,51 @@ fn draft(editor: &Editor) -> String {
         .and_then(|text| text.composer)
         .map(|composer| composer.text)
         .unwrap_or_default()
+}
+
+#[tokio::test]
+async fn selected_comment_refine_and_resolve_target_the_visible_discussion() {
+    let (mut editor, id) = fixture();
+    editor
+        .test_execute_production_action(Action::RefineInlineComment(id))
+        .await
+        .unwrap();
+    assert_eq!(
+        editor.inline_assist.as_ref().unwrap().annotation_group_id,
+        "parent-group"
+    );
+    assert_eq!(editor.inline_assist.as_ref().unwrap().range, range(1, 2));
+    assert_eq!(
+        editor
+            .inline_assist
+            .as_ref()
+            .unwrap()
+            .parent_comment
+            .as_ref()
+            .unwrap()
+            .request_id,
+        "parent"
+    );
+    editor
+        .test_execute_production_action(Action::HideInlineAssist)
+        .await
+        .unwrap();
+    editor
+        .test_execute_production_action(Action::ResolveInlineComment(id))
+        .await
+        .unwrap();
+    assert!(
+        editor
+            .inline_history
+            .conversations
+            .iter()
+            .find(|conversation| conversation.id == "parent-group")
+            .unwrap()
+            .resolved
+    );
+    assert_eq!(editor.inline_comment_group_count("parent-group"), 0);
+    assert_eq!(editor.current_buffer().contents(), "alpha\nbeta\ngamma\n");
+    assert!(!editor.current_buffer().is_dirty());
 }
 
 #[tokio::test]

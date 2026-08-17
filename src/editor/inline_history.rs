@@ -42,7 +42,7 @@ pub(super) struct HistoryRow {
 pub(super) struct HistoryBrowser {
     origin: JumpEntry,
     viewport: (usize, usize, usize),
-    active_comment: Option<uuid::Uuid>,
+    active_comments: HashMap<(WindowId, BufferId), uuid::Uuid>,
     file: Option<String>,
     workspace: bool,
     query: String,
@@ -306,7 +306,7 @@ impl Editor {
             self.inline_history_browser = Some(HistoryBrowser {
                 origin: self.current_jump_entry(),
                 viewport: (self.vtop, self.vleft, self.skipcol),
-                active_comment: self.active_inline_comment,
+                active_comments: self.inline_comment_selections.clone(),
                 file: self.current_buffer().file.clone(),
                 workspace: true,
                 query: String::new(),
@@ -457,7 +457,7 @@ impl Editor {
                                 Some(value)
                             })
                             .collect::<Vec<_>>();
-                        self.active_inline_comment = comments.first().map(|comment| comment.id);
+                        self.set_active_inline_comment(comments.first().map(|comment| comment.id));
                         self.inline_comments.extend(comments);
                     }
                 }
@@ -576,7 +576,7 @@ impl Editor {
         };
         self.clear_history_preview();
         self.current_dialog = None;
-        self.active_inline_comment = browser.active_comment;
+        self.inline_comment_selections = browser.active_comments;
         if jump {
             self.save_to_history(browser.origin);
         } else {
@@ -1221,9 +1221,19 @@ impl Editor {
         }
         self.remove_inline_comment_group(&group);
         self.inline_comments.extend(annotations);
-        self.active_inline_comment = selected;
+        self.set_active_inline_comment(selected);
+        let selection_key = self
+            .window_manager
+            .active_stable_window_id()
+            .map(|window| (window, self.current_buffer().id()));
         if let Some(browser) = &mut self.inline_history_browser {
-            browser.active_comment = selected;
+            if let Some(key) = selection_key {
+                if let Some(selected) = selected {
+                    browser.active_comments.insert(key, selected);
+                } else {
+                    browser.active_comments.remove(&key);
+                }
+            }
         }
         self.sync_inline_activity();
         self.set_legacy_message(Some(format!(

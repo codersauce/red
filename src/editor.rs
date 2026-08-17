@@ -2164,6 +2164,21 @@ pub enum Action {
     PreviousOverlappingInlineComment,
     #[serde(skip)]
     OpenInlineComment(uuid::Uuid),
+    #[serde(skip)]
+    FocusInlineComment(uuid::Uuid),
+    #[serde(skip)]
+    ChooseInlineComment(uuid::Uuid),
+    #[serde(skip)]
+    NavigateInlineCommentCard {
+        id: uuid::Uuid,
+        backwards: bool,
+    },
+    #[serde(skip)]
+    RefineInlineComment(uuid::Uuid),
+    #[serde(skip)]
+    ResolveInlineComment(uuid::Uuid),
+    #[serde(skip)]
+    DismissInlineCommentById(uuid::Uuid),
     /// Starts a new discussion about the exact opened annotation.
     #[serde(skip)]
     AskInlineComment {
@@ -2190,7 +2205,7 @@ pub enum Action {
     OpenLatestInlineCompletion,
     OpenInlineCompletion(String),
     ApplyPendingInlineAssist,
-    /// Approval emitted only by a request-bound wider-edit review.
+    /// Approval emitted only by a request-bound code-edit review.
     #[serde(skip)]
     ApplyReviewedInlineAssist(String),
     #[serde(skip)]
@@ -2734,6 +2749,7 @@ struct ViewportHighlightEntry {
 /// calls share one computation.
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 struct LayoutCacheKey {
+    inline_selection: Option<uuid::Uuid>,
     buffer_index: usize,
     buffer_id: BufferId,
     revision: u64,
@@ -2964,7 +2980,7 @@ pub struct Editor {
 
     /// Session-local annotations; never serialized into source or text undo history.
     inline_comments: Vec<inline_comments::InlineComment>,
-    active_inline_comment: Option<uuid::Uuid>,
+    inline_comment_selections: HashMap<(WindowId, BufferId), uuid::Uuid>,
     inline_history: InlineHistory,
     inline_history_browser: Option<inline_history::HistoryBrowser>,
 
@@ -4431,7 +4447,7 @@ impl Editor {
             inline_completion: inline_notifications::InlineCompletionState::default(),
             staged_inline_agent_handoff: None,
             inline_comments: Vec::new(),
-            active_inline_comment: None,
+            inline_comment_selections: HashMap::new(),
             inline_history: InlineHistory::default(),
             inline_history_browser: None,
             lsp,
@@ -5379,8 +5395,32 @@ impl Editor {
     ) -> bool {
         self.clear_pane_zoom();
         self.sync_to_window();
+        let previous_windows = self
+            .window_manager
+            .windows()
+            .into_iter()
+            .map(|window| window.id)
+            .collect::<HashSet<_>>();
+        let previous_buffer = self.current_buffer().id();
+        let previous_inline = self.active_inline_comment();
         if update(&mut self.window_manager).is_some() {
             self.sync_with_window();
+            self.inline_comment_selections
+                .retain(|(window, buffer), _| {
+                    self.window_manager.window(*window).is_some()
+                        && self
+                            .buffer_manager
+                            .iter()
+                            .any(|candidate| candidate.id() == *buffer)
+                });
+            if self.current_buffer().id() == previous_buffer
+                && self
+                    .window_manager
+                    .active_stable_window_id()
+                    .is_some_and(|window| !previous_windows.contains(&window))
+            {
+                self.set_active_inline_comment(previous_inline);
+            }
             true
         } else {
             false
@@ -5759,6 +5799,7 @@ impl Editor {
             .visible_inline_suggestion()
             .filter(|suggestion| window.active && suggestion.snapshot.buffer_id == buffer.id());
         let key = LayoutCacheKey {
+            inline_selection: self.inline_comment_selection(window.id, buffer.id()),
             buffer_index: window.buffer_index,
             buffer_id: buffer.id(),
             revision: buffer.revision(),
@@ -5786,7 +5827,7 @@ impl Editor {
             .filter_map(|line| buffer.get(line))
             .collect::<Vec<_>>();
 
-        let comment_messages = self.inline_comment_display_messages(buffer);
+        let comment_messages = self.inline_comment_display_messages_for_window(window.id, buffer);
         let comments = comment_messages
             .iter()
             .map(|(line, message)| (*line, message.as_str()))
@@ -7672,6 +7713,7 @@ impl Editor {
             viewport,
             anchor,
             avoid_rows,
+            protected_rows: None,
         })
     }
 
@@ -8936,7 +8978,11 @@ impl Editor {
                             .as_ref()
                             .and_then(|dialog| dialog.inline_assist_state())
                             .is_some();
-                        if result.expanded_scope.is_some() {
+                        let changes_text = self
+                            .inline_history
+                            .turn(&request_id)
+                            .is_some_and(|turn| result.changes_text(&turn.before));
+                        if result.expanded_scope.is_some() || changes_text {
                             self.stage_background_inline_result(&request_id, &session_id, result);
                             if foreground {
                                 if let Some(scope) = self
@@ -17141,6 +17187,38 @@ impl Editor {
                 add_to_history = false;
                 self.open_inline_comment_by_id(*id, buffer, runtime).await?;
             }
+            Action::FocusInlineComment(id) => {
+                add_to_history = false;
+                self.focus_inline_comment(*id, buffer, runtime).await?;
+            }
+            Action::ChooseInlineComment(id) => {
+                add_to_history = false;
+                self.choose_inline_comment(*id);
+                self.render(buffer)?;
+            }
+            Action::NavigateInlineCommentCard { id, backwards } => {
+                add_to_history = false;
+                if let Some(next) = self.cycle_overlapping_inline_comment(*id, *backwards) {
+                    self.focus_inline_comment(next, buffer, runtime).await?;
+                }
+            }
+            Action::RefineInlineComment(id) => {
+                add_to_history = false;
+                self.refine_inline_comment(*id, buffer, runtime).await?;
+            }
+            Action::ResolveInlineComment(id) => {
+                add_to_history = false;
+                self.resolve_inline_comment(*id);
+                self.render(buffer)?;
+            }
+            Action::DismissInlineCommentById(id) => {
+                add_to_history = false;
+                if self.select_inline_comment_by_id(*id) {
+                    self.dismiss_inline_comment();
+                    self.current_dialog = None;
+                }
+                self.render(buffer)?;
+            }
             Action::NavigateOverlappingInlineComment {
                 id,
                 backwards,
@@ -17392,9 +17470,9 @@ impl Editor {
                     });
                 if let Some((request, session, result)) = pending {
                     if let Action::ApplyReviewedInlineAssist(reviewed) = action {
-                        if reviewed != &request || result.expanded_scope.is_none() {
+                        if reviewed != &request {
                             self.set_legacy_message(Some(
-                                "wider edit review is no longer current".into(),
+                                "inline edit review is no longer current".into(),
                             ));
                             self.render(buffer)?;
                             return Ok(false);
@@ -17712,7 +17790,7 @@ impl Editor {
                             hover = hover.with_shortcut(
                                 'a',
                                 "apply edit",
-                                Action::ApplyPendingInlineAssist,
+                                Action::ApplyReviewedInlineAssist(turn.request_id.clone()),
                             );
                         }
                     } else if let Some((id, ordinal, count)) = self.current_inline_navigation() {

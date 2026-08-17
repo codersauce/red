@@ -377,10 +377,7 @@ impl Editor {
                     return;
                 }
                 location = Self::history_location_in_buffer(buffer, range);
-                let select_answer = self.active_inline_comment.is_none() || self.inline_comments.iter().any(|comment|
-                    Some(comment.id) == self.active_inline_comment && matches!(&comment.origin,
-                        InlineCommentOrigin::Activity { group_id } | InlineCommentOrigin::Assist { group_id, .. } if group_id == &group));
-                let first = self.replace_inline_comment_group_in_buffer(
+                self.replace_inline_comment_group_in_buffer(
                     index,
                     &group,
                     provider,
@@ -388,9 +385,6 @@ impl Editor {
                     range.start.line,
                     &result.comments,
                 );
-                if select_answer {
-                    self.active_inline_comment = first;
-                }
             } else if !result.comments.is_empty() {
                 // Retain the original result and anchors for a later exact
                 // reattachment; never silently bind comments to changed text.
@@ -670,12 +664,13 @@ impl Editor {
                 detached: false,
                 expected_fingerprint: None,
             });
-            if self
+            if let Some(window_id) = self
                 .inline_assist
                 .as_ref()
-                .is_some_and(|session| session.annotation_group_id == group)
+                .filter(|session| session.annotation_group_id == group)
+                .map(|session| session.window_id)
             {
-                self.active_inline_comment = Some(id);
+                self.set_inline_comment_selection(window_id, buffer_id, Some(id));
             }
         }
         self.inline_activity_animation.running = running;
