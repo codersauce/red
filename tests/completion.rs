@@ -22,7 +22,7 @@ fn recording_editor(buffer: Buffer) -> (Editor, Arc<Mutex<Vec<LspEvent>>>) {
     let lsp = Box::new(lsp) as Box<dyn LspClient + Send>;
     let config = Config::default();
     let theme = Theme::default();
-    let mut editor = Editor::with_size(lsp, 80, 24, config, theme, vec![buffer]).unwrap();
+    let mut editor = Editor::test_with_size(lsp, 80, 24, config, theme, vec![buffer]).unwrap();
     editor.test_disable_terminal_output();
     (editor, events)
 }

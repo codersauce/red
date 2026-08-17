@@ -46,7 +46,7 @@ async fn language_reload_opens_previously_tracked_buffers_that_gain_a_route() {
     fs::write(&config_path, "").unwrap();
     let lsp = RecordingLsp::default();
     let events = lsp.events();
-    let mut editor = Editor::with_size(
+    let mut editor = Editor::test_with_size(
         Box::new(lsp),
         /*width*/ 80,
         /*height*/ 24,
@@ -99,7 +99,7 @@ command = "mock-lsp"
     let lsp = RecordingLsp::failing_next_did_open();
     let events = lsp.events();
     let reconfigurations = lsp.reconfigurations();
-    let mut editor = Editor::with_size(
+    let mut editor = Editor::test_with_size(
         Box::new(lsp),
         /*width*/ 80,
         /*height*/ 24,
@@ -1511,7 +1511,7 @@ async fn format_on_save_restores_save_as_identity_and_insert_transaction_after_s
     let lsp = RecordingLsp::failing_next_did_open();
     let events = lsp.events();
     let config = Config::default();
-    let mut editor = Editor::with_size(
+    let mut editor = Editor::test_with_size(
         Box::new(lsp),
         /*width*/ 80,
         /*height*/ 24,
@@ -1587,7 +1587,7 @@ async fn crash_recovery_keeps_transcript_in_memory_when_preferences_are_unsafe()
     snapshot.agent_session_resumable = true;
     let restored_buffers = Editor::buffers_from_session_snapshot(&snapshot);
     let preferences = PreferencesStore::load(&preferences_path);
-    let mut editor = Editor::with_size_and_preferences(
+    let mut editor = Editor::test_with_size_and_preferences(
         Box::new(MockLsp),
         /*width*/ 80,
         /*height*/ 24,
@@ -2431,7 +2431,7 @@ async fn submitted_commands_are_persisted_to_preferences() {
     let lsp = Box::new(MockLsp) as Box<dyn LspClient>;
     let config = Config::default();
     let buffer = Buffer::new(None, String::new());
-    let mut editor = Editor::with_size_and_preferences(
+    let mut editor = Editor::test_with_size_and_preferences(
         lsp,
         80,
         24,
@@ -4803,7 +4803,8 @@ async fn test_visual_block_insert_coalesces_replayed_change_notifications() {
     let config = Config::default();
     let theme = Theme::default();
     let buffer = Buffer::new(Some(path.clone()), "impl\nfn\nColor\n}\n}".to_string());
-    let mut editor = Editor::with_size(Box::new(lsp), 80, 24, config, theme, vec![buffer]).unwrap();
+    let mut editor =
+        Editor::test_with_size(Box::new(lsp), 80, 24, config, theme, vec![buffer]).unwrap();
     editor.test_disable_terminal_output();
     let mut harness = EditorHarness { editor };
 
@@ -5172,7 +5173,7 @@ async fn visual_paste_emits_one_change_notification() {
     let lsp = RecordingLsp::default();
     let events = lsp.events();
     let buffer = Buffer::new(Some(path.clone()), "one\ntwo\nthree".to_string());
-    let mut editor = Editor::with_size(
+    let mut editor = Editor::test_with_size(
         Box::new(lsp),
         80,
         24,
@@ -5210,7 +5211,7 @@ async fn bracketed_paste_inserts_multiline_text_once() {
     let lsp = RecordingLsp::default();
     let events = lsp.events();
     let buffer = Buffer::new(Some(path.clone()), "\n".to_string());
-    let mut editor = Editor::with_size(
+    let mut editor = Editor::test_with_size(
         Box::new(lsp),
         80,
         24,
@@ -5259,7 +5260,7 @@ async fn disabled_lsp_skips_document_change_notifications() {
     let mut config = default_key_config();
     config.lsp.enabled = false;
     let buffer = Buffer::new(Some(path.clone()), "text".to_string());
-    let mut editor = Editor::with_size(
+    let mut editor = Editor::test_with_size(
         Box::new(lsp),
         80,
         24,
@@ -5403,7 +5404,7 @@ async fn test_undo_history_is_per_buffer() {
         Buffer::new(None, "one".to_string()),
         Buffer::new(None, "two".to_string()),
     ];
-    let mut editor = Editor::with_size(lsp, 80, 24, config, theme, buffers).unwrap();
+    let mut editor = Editor::test_with_size(lsp, 80, 24, config, theme, buffers).unwrap();
     editor.test_disable_terminal_output();
     let mut harness = EditorHarness { editor };
 
@@ -5435,7 +5436,7 @@ async fn test_buffer_delete_removes_current_buffer_from_list() {
         Buffer::new(Some("two.rs".to_string()), "two".to_string()),
         Buffer::new(Some("three.rs".to_string()), "three".to_string()),
     ];
-    let mut editor = Editor::with_size(lsp, 80, 24, config, theme, buffers).unwrap();
+    let mut editor = Editor::test_with_size(lsp, 80, 24, config, theme, buffers).unwrap();
     editor.test_disable_terminal_output();
     let mut harness = EditorHarness { editor };
 
@@ -5459,7 +5460,7 @@ async fn test_buffer_delete_requires_force_for_dirty_buffer() {
         Buffer::new(Some("one.rs".to_string()), "one".to_string()),
         Buffer::new(Some("two.rs".to_string()), "two".to_string()),
     ];
-    let mut editor = Editor::with_size(lsp, 80, 24, config, theme, buffers).unwrap();
+    let mut editor = Editor::test_with_size(lsp, 80, 24, config, theme, buffers).unwrap();
     editor.test_disable_terminal_output();
     let mut harness = EditorHarness { editor };
 
@@ -8108,7 +8109,7 @@ async fn test_dirty_isolated_per_buffer() {
         Buffer::new(None, "one".to_string()),
         Buffer::new(None, "two".to_string()),
     ];
-    let mut editor = Editor::with_size(lsp, 80, 24, config, theme, buffers).unwrap();
+    let mut editor = Editor::test_with_size(lsp, 80, 24, config, theme, buffers).unwrap();
     editor.test_disable_terminal_output();
     let mut harness = EditorHarness { editor };
 

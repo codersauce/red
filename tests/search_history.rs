@@ -4,7 +4,6 @@ use common::{EditorHarness, MockLsp};
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 use red::{
     buffer::Buffer,
-    clipboard::DisabledClipboardProvider,
     config::Config,
     editor::{Action, Editor, Mode},
     preferences::PreferencesStore,
@@ -20,7 +19,7 @@ fn with_preferences(
     config: Config,
     preferences: PreferencesStore,
 ) -> EditorHarness {
-    let mut editor = Editor::with_size_and_preferences(
+    let mut editor = Editor::test_with_size_and_preferences(
         Box::new(MockLsp),
         /*width*/ 80,
         /*height*/ 24,
@@ -31,7 +30,6 @@ fn with_preferences(
     )
     .unwrap();
     editor.test_disable_terminal_output();
-    editor.test_set_clipboard(Box::new(DisabledClipboardProvider));
     EditorHarness { editor }
 }
 

@@ -21,7 +21,7 @@ fn recording_editor(buffers: Vec<Buffer>) -> (Editor, Arc<Mutex<Vec<LspEvent>>>)
     let lsp = Box::new(lsp) as Box<dyn LspClient + Send>;
     let config = Config::default();
     let theme = Theme::default();
-    let mut editor = Editor::with_size(lsp, 80, 24, config, theme, buffers).unwrap();
+    let mut editor = Editor::test_with_size(lsp, 80, 24, config, theme, buffers).unwrap();
     editor.test_disable_terminal_output();
     (editor, events)
 }
@@ -44,7 +44,8 @@ fn recording_workspace_editor_with_config(
     let lsp = RecordingLsp::with_workspace_root(root);
     let events = lsp.events();
     let lsp = Box::new(lsp) as Box<dyn LspClient + Send>;
-    let mut editor = Editor::with_size(lsp, 80, 24, config, Theme::default(), buffers).unwrap();
+    let mut editor =
+        Editor::test_with_size(lsp, 80, 24, config, Theme::default(), buffers).unwrap();
     editor.test_disable_terminal_output();
     (editor, events)
 }

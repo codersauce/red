@@ -4361,7 +4361,8 @@ impl Editor {
     }
 
     fn clipboard_provider_for_config(config: &Config) -> Box<dyn ClipboardProvider> {
-        if !config.clipboard.enabled {
+        // Unit tests must never read or overwrite the user's real clipboard.
+        if cfg!(test) || !config.clipboard.enabled {
             return Box::new(DisabledClipboardProvider);
         }
 
@@ -4420,6 +4421,70 @@ impl Editor {
         buffers: Vec<Buffer>,
         preferences: PreferencesStore,
     ) -> anyhow::Result<Self> {
+        let clipboard = Self::clipboard_provider_for_config(&config);
+        Self::with_clipboard(
+            lsp,
+            (width, height),
+            config,
+            theme,
+            buffers,
+            preferences,
+            clipboard,
+        )
+    }
+
+    /// Constructs an integration-test editor without accessing the system clipboard.
+    #[doc(hidden)]
+    pub fn test_with_size(
+        lsp: Box<dyn LspClient>,
+        width: usize,
+        height: usize,
+        config: Config,
+        theme: Theme,
+        buffers: Vec<Buffer>,
+    ) -> anyhow::Result<Self> {
+        Self::test_with_size_and_preferences(
+            lsp,
+            width,
+            height,
+            config,
+            theme,
+            buffers,
+            PreferencesStore::in_memory(),
+        )
+    }
+
+    /// Preserves clipboard configuration so tests can inject an in-memory provider.
+    #[doc(hidden)]
+    pub fn test_with_size_and_preferences(
+        lsp: Box<dyn LspClient>,
+        width: usize,
+        height: usize,
+        config: Config,
+        theme: Theme,
+        buffers: Vec<Buffer>,
+        preferences: PreferencesStore,
+    ) -> anyhow::Result<Self> {
+        Self::with_clipboard(
+            lsp,
+            (width, height),
+            config,
+            theme,
+            buffers,
+            preferences,
+            Box::new(DisabledClipboardProvider),
+        )
+    }
+
+    fn with_clipboard(
+        lsp: Box<dyn LspClient>,
+        (width, height): (usize, usize),
+        config: Config,
+        theme: Theme,
+        buffers: Vec<Buffer>,
+        preferences: PreferencesStore,
+        clipboard: Box<dyn ClipboardProvider>,
+    ) -> anyhow::Result<Self> {
         // Buffer terminal output so a full-screen repaint is one write
         // syscall instead of one per ~1KB of escape sequences.
         #[cfg(not(test))]
@@ -4444,7 +4509,7 @@ impl Editor {
             crate::syntax_indent::SyntaxIndentation::new(Arc::clone(&registry));
         let syntax_textobjects = SyntaxTextObjectService::new(registry);
 
-        let mut plugin_registry = PluginRegistry::new();
+        let plugin_registry = PluginRegistry::new();
         let indentation = Self::configured_indentation(&config);
 
         let mut window_manager = WindowManager::new(0, (width, height));
@@ -4452,8 +4517,6 @@ impl Editor {
         for window in window_manager.windows_mut() {
             window.wrap = wrap;
         }
-        let clipboard = Self::clipboard_provider_for_config(&config);
-
         let lsp_coordinator = lsp_coordinator::LspCoordinator::with_buffers(&buffers);
         let buffer_manager = buffer_manager::BufferManager::with_buffers(buffers);
         let session_manager = session_manager::SessionManager::new();
@@ -27555,6 +27618,44 @@ mod test {
     use crate::lsp::DiagnosticSeverity;
     use std::path::PathBuf;
 
+    #[test]
+    fn unit_test_editors_disable_system_clipboard() {
+        let mut editor = test_editor(80, 24);
+        assert!(editor.config.clipboard.enabled);
+        assert!(!editor.clipboard.is_available());
+
+        editor.set_default_register(Content::charwise("o\nt\nt\nf\n".to_string()));
+
+        assert_eq!(editor.clipboard.get_text().unwrap(), None);
+        assert_eq!(
+            editor.registers.get(&DEFAULT_REGISTER).unwrap().text,
+            "o\nt\nt\nf\n"
+        );
+    }
+
+    #[test]
+    fn test_constructor_preserves_injected_clipboard_behavior() {
+        let config = Config::default();
+        let mut editor = Editor::test_with_size(
+            Box::new(crate::lsp::LspManager::new(config.lsp.clone())),
+            80,
+            24,
+            config,
+            Theme::default(),
+            vec![Buffer::new(None, "hello".to_string())],
+        )
+        .unwrap();
+        assert!(editor.config.clipboard.enabled);
+        assert!(!editor.clipboard.is_available());
+
+        let clipboard = crate::clipboard::MemoryClipboardProvider::default();
+        let copied = clipboard.shared_text();
+        editor.test_set_clipboard(Box::new(clipboard));
+        editor.set_default_register(Content::charwise("o\nt\nt\nf\n".to_string()));
+
+        assert_eq!(copied.lock().unwrap().as_deref(), Some("o\nt\nt\nf\n"));
+    }
+
     #[tokio::test]
     async fn learn_red_restores_the_original_workspace_and_protects_files() {
         let mut editor = test_editor(120, 32);
@@ -30830,6 +30931,7 @@ builtin = "rust"
             ('c', "Xne\nXwo\nXhree\nXour"),
         ] {
             let mut harness = RenderedCursorHarness::new("one\ntwo\nthree\nfour", (0, 0));
+            assert!(!harness.editor.clipboard.is_available());
 
             harness
                 .press(
@@ -30846,6 +30948,17 @@ builtin = "rust"
             harness.escape().await;
 
             assert_eq!(harness.editor.current_buffer().contents(), expected);
+            if operation == 'c' {
+                assert_eq!(
+                    harness
+                        .editor
+                        .registers
+                        .get(&DEFAULT_REGISTER)
+                        .unwrap()
+                        .text,
+                    "o\nt\nt\nf\n"
+                );
+            }
             harness.assert_cursor((0, 0), &format!("completing visual block {operation:?}"));
             assert_eq!(
                 harness

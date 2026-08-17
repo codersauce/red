@@ -99,7 +99,7 @@ async fn running_codex_process_survives_disconnect_and_reattach() {
         pid_file.display().to_string(),
     );
     let lsp = Box::new(LspManager::new(config.lsp.clone()));
-    let editor = Editor::with_size(
+    let editor = Editor::test_with_size(
         lsp,
         80,
         24,

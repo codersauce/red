@@ -18,7 +18,7 @@ fn editor(root: &Path, path: &Path, text: &str) -> (Editor, Arc<Mutex<Vec<SavedD
     let saves = lsp.saves();
     let mut config = Config::default();
     config.formatting.on_save = false;
-    let mut editor = Editor::with_size(
+    let mut editor = Editor::test_with_size(
         Box::new(lsp),
         80,
         24,
