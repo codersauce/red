@@ -31,6 +31,7 @@ pub struct FilePicker {
     receiver: Receiver<FilePickerLoad>,
     sender: mpsc::Sender<FilePickerLoad>,
     root_path: PathBuf,
+    scoped: bool,
     visibility: FilePickerVisibility,
     load_generation: u64,
 }
@@ -65,6 +66,16 @@ impl FilePicker {
         Ok(picker)
     }
 
+    /// Browse an explicit directory without storing practice queries in the
+    /// user's file-picker history. Selections are absolute, not cwd-relative.
+    pub(crate) fn new_scoped(editor: &Editor, root_path: PathBuf) -> anyhow::Result<Self> {
+        let root_path = root_path.canonicalize()?;
+        let (sender, receiver) = mpsc::channel();
+        let mut picker = Self::loading_with_options(editor, root_path, sender, receiver, true);
+        picker.start_load();
+        Ok(picker)
+    }
+
     #[cfg(test)]
     fn loading(editor: &Editor) -> Self {
         let (sender, receiver) = mpsc::channel();
@@ -77,9 +88,20 @@ impl FilePicker {
         sender: mpsc::Sender<FilePickerLoad>,
         receiver: Receiver<FilePickerLoad>,
     ) -> Self {
+        Self::loading_with_options(editor, root_path, sender, receiver, false)
+    }
+
+    fn loading_with_options(
+        editor: &Editor,
+        root_path: PathBuf,
+        sender: mpsc::Sender<FilePickerLoad>,
+        receiver: Receiver<FilePickerLoad>,
+        scoped: bool,
+    ) -> Self {
         let score_matcher = SkimMatcherV2::default();
         let highlight_matcher = SkimMatcherV2::default();
-        let mut picker = Picker::builder()
+        let selection_root = scoped.then(|| root_path.clone());
+        let mut builder = Picker::builder()
             .title("Find Files")
             .items(vec![])
             .filter_action(move |item, query| file_match_score(&score_matcher, item, query))
@@ -87,9 +109,16 @@ impl FilePicker {
             .filter_highlight_action(move |item, query| {
                 file_match_highlights(&highlight_matcher, item, query)
             })
-            .history_key("find_files")
-            .select_action(Action::OpenFile)
-            .build(editor);
+            .select_action(move |path| {
+                Action::OpenFile(match &selection_root {
+                    Some(root) => root.join(path).to_string_lossy().into_owned(),
+                    None => path,
+                })
+            });
+        if !scoped {
+            builder = builder.history_key("find_files");
+        }
+        let mut picker = builder.build(editor);
         picker.set_empty_message(Some("Loading files...".to_string()));
 
         FilePicker {
@@ -97,6 +126,7 @@ impl FilePicker {
             receiver,
             sender,
             root_path,
+            scoped,
             visibility: FilePickerVisibility::default(),
             load_generation: 0,
         }
@@ -106,6 +136,7 @@ impl FilePicker {
         self.load_generation = self.load_generation.wrapping_add(1);
         let generation = self.load_generation;
         let root_path = self.root_path.clone();
+        let scoped = self.scoped;
         let visibility = self.visibility;
         let sender = self.sender.clone();
         self.picker
@@ -113,8 +144,12 @@ impl FilePicker {
         self.picker.set_status(visibility.status());
 
         std::thread::spawn(move || {
-            let result =
-                load_file_picker_items(&root_path, visibility).map_err(|err| err.to_string());
+            let result = if scoped {
+                load_file_picker_items_with_scope(&root_path, visibility, true)
+            } else {
+                load_file_picker_items(&root_path, visibility)
+            }
+            .map_err(|err| err.to_string());
             _ = sender.send(FilePickerLoad { generation, result });
         });
     }
@@ -373,14 +408,23 @@ fn load_file_picker_items(
     root_path: &Path,
     visibility: FilePickerVisibility,
 ) -> anyhow::Result<Vec<String>> {
+    load_file_picker_items_with_scope(root_path, visibility, false)
+}
+
+fn load_file_picker_items_with_scope(
+    root_path: &Path,
+    visibility: FilePickerVisibility,
+    scoped: bool,
+) -> anyhow::Result<Vec<String>> {
     let honor_ignores = !visibility.ignored;
     let mut builder = WalkBuilder::new(root_path);
     builder
         .hidden(!visibility.hidden)
         .ignore(honor_ignores)
         .git_ignore(honor_ignores)
-        .git_global(honor_ignores)
+        .git_global(honor_ignores && !scoped)
         .git_exclude(honor_ignores)
+        .parents(!scoped)
         .follow_links(false)
         .filter_entry(not_vcs_metadata);
 
@@ -508,6 +552,34 @@ mod tests {
                 _ => None,
             })
             .expect("file picker selection should open a file")
+    }
+
+    #[test]
+    fn learn_scoped_file_picker_returns_absolute_paths_without_recording_history() {
+        let directory = TestDir::new("learn-scoped");
+        let root = directory.path().join("project");
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(directory.path().join(".ignore"), "*.hk\n").unwrap();
+        fs::write(root.join("src/score.hk"), "source\n").unwrap();
+        let editor = test_editor();
+        let mut picker = FilePicker::new_scoped(&editor, root.clone()).unwrap();
+        wait_for_load(&mut picker);
+        for c in "src/score".chars() {
+            picker.handle_event(&key(KeyCode::Char(c)));
+        }
+        let Some(KeyAction::Multiple(actions)) = picker.handle_event(&key(KeyCode::Enter)) else {
+            panic!("expected selection");
+        };
+        assert!(actions.contains(&Action::OpenFile(
+            root.canonicalize()
+                .unwrap()
+                .join("src/score.hk")
+                .to_string_lossy()
+                .into_owned()
+        )));
+        assert!(!actions
+            .iter()
+            .any(|action| matches!(action, Action::RecordPickerHistory { .. })));
     }
 
     fn picker_item(path: &str) -> PickerItem {

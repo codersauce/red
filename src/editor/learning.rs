@@ -10,6 +10,7 @@ mod agent;
 mod committing;
 mod git;
 mod language;
+mod navigation;
 mod staging;
 mod symbols;
 
@@ -147,6 +148,7 @@ impl Editor {
         let workspace = if matches!(lesson, Lesson::SaveAPracticeFile | Lesson::ContinueInAgent)
             || lesson.is_lsp_practice()
             || lesson.is_git_practice()
+            || lesson.is_navigation_practice()
         {
             Some(PracticeWorkspace::new()?)
         } else {
@@ -156,6 +158,14 @@ impl Editor {
             let workspace = workspace.as_ref().expect("file lesson owns a workspace");
             workspace.write_fixture("score.rs", lesson.contents())?;
             workspace.write_fixture("example.rs", crate::learn::AGENT_EXAMPLE)?;
+        }
+        if lesson.is_navigation_practice() {
+            let workspace = workspace
+                .as_ref()
+                .expect("navigation lesson owns a workspace");
+            for &(name, contents) in crate::learn::navigation::FILES {
+                workspace.write_fixture(name, contents)?;
+            }
         }
         if lesson.is_lsp_practice() {
             workspace
@@ -215,7 +225,9 @@ impl Editor {
         self.pending_semantic_change = None;
         let file = workspace.as_ref().map(|workspace| {
             workspace
-                .path(if lesson.is_lsp_practice() {
+                .path(if lesson.is_navigation_practice() {
+                    "README.md"
+                } else if lesson.is_lsp_practice() {
                     "main.hk"
                 } else if lesson == Lesson::ContinueInAgent || lesson.is_git_practice() {
                     "score.rs"
@@ -432,6 +444,9 @@ impl Editor {
             return Ok(true);
         }
         let location_allowed = match action {
+            Action::OpenFile(path) if session.lesson.is_navigation_practice() => {
+                self.learn_navigation_path(path).is_some()
+            }
             Action::OpenLocation(location, target) if session.lesson.is_lsp_practice() => {
                 *target == plugin::OpenLocationTarget::Current
                     && session
@@ -451,6 +466,17 @@ impl Editor {
             self.render(buffer)?;
             return Ok(true);
         }
+        if session.lesson.is_navigation_practice()
+            && self
+                .intercept_learn_navigation_action(action, buffer, runtime)
+                .await?
+        {
+            return Ok(true);
+        }
+        let session = self
+            .learn_session
+            .as_ref()
+            .expect("active lesson was checked");
         if matches!(action, Action::Save) && session.workspace.is_some() {
             let permitted = self.current_buffer().file.as_deref().is_some_and(|file| {
                 session
@@ -568,6 +594,13 @@ impl Editor {
                 .flatten()
                 .and_then(|uri| self.diagnostics.get(&uri))
                 .is_some_and(Vec::is_empty),
+            files_picker_open: self
+                .current_dialog
+                .as_ref()
+                .is_some_and(|dialog| dialog.shortcut_context() == "Files"),
+            navigation_source_visible: self.learn_navigation_file_is("src/score.hk"),
+            navigation_tests_visible: self.learn_navigation_file_is("tests/score.hk"),
+            navigation_guide_visible: self.learn_navigation_file_is("README.md"),
             symbol_definition_received: session
                 .symbols
                 .as_ref()

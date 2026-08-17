@@ -1000,10 +1000,17 @@ mod tests {
     }
 
     #[test]
-    fn planned_tracks_cannot_start_a_fake_lesson() {
+    fn hub_starts_only_available_lessons() {
         let mut hub = panel(120, 32);
-        hub.selected = 3;
-        assert_eq!(hub.open_selected(), KeyAction::Single(Action::Refresh));
+        for track in 1..TRACKS.len() {
+            hub.selected = track;
+            let expected = Lesson::for_track(track)
+                .next()
+                .map_or(Action::Refresh, |lesson| {
+                    Action::StartLearnLessonAt(lesson.id().into())
+                });
+            assert_eq!(hub.open_selected(), KeyAction::Single(expected));
+        }
     }
 
     #[test]
