@@ -398,7 +398,7 @@ fn open_conversation() {
     if !was_created {
         render_conversation();
     }
-    red::execute("FocusPanel", "agent-conversation");
+    red::execute("FocusTextPanelComposer", "agent-conversation");
 }
 
 fn ensure_conversation_panel() {
@@ -509,7 +509,7 @@ fn stage_pending_prompt(text: String) {
     render_conversation();
     if state().focus_panel_on_first_prompt {
         red::state_patch(AgentState { focus_panel_on_first_prompt: false });
-        red::execute("FocusPanel", "agent-conversation");
+        red::execute("FocusTextPanelComposer", "agent-conversation");
     }
     set_phase("waiting", "Starting agent…");
     red::execute("Refresh");
@@ -583,7 +583,7 @@ fn dispatch_prompt_block(text: String, block_id: String) {
     append_transcript_block("You", text, block_id);
     if focus_conversation {
         red::state_patch(AgentState { focus_panel_on_first_prompt: false });
-        red::execute("FocusPanel", "agent-conversation");
+        red::execute("FocusTextPanelComposer", "agent-conversation");
     }
     set_phase("waiting", "Waiting for agent…");
     red::execute("Refresh");

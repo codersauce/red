@@ -4360,7 +4360,7 @@ mod tests {
                     );
                     rendered = true;
                 }
-                PluginRequest::FocusPanel { id } => {
+                PluginRequest::FocusTextPanelComposer { id } => {
                     assert_eq!(id, "agent-conversation");
                     focused = true;
                 }
@@ -6735,7 +6735,7 @@ mod tests {
         ));
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
-            PluginRequest::FocusPanel { id } if id == "agent-conversation"
+            PluginRequest::FocusTextPanelComposer { id } if id == "agent-conversation"
         ));
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
@@ -7263,7 +7263,7 @@ mod tests {
                     rendered |= id == "agent-conversation"
                         && blocks.iter().any(|block| block.text == "first prompt");
                 }
-                PluginRequest::FocusPanel { id } => {
+                PluginRequest::FocusTextPanelComposer { id } => {
                     focused |= id == "agent-conversation";
                 }
                 PluginRequest::SetTextPanelStatus {
@@ -7541,7 +7541,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bundled_agent_open_creates_and_focuses_panel_without_starting_a_session() {
+    async fn bundled_agent_open_creates_and_focuses_composer_without_starting_a_session() {
         drain_requests();
         let mut runtime = Runtime::new();
         runtime
@@ -7563,14 +7563,14 @@ mod tests {
         ));
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
-            PluginRequest::FocusPanel { id } if id == "agent-conversation"
+            PluginRequest::FocusTextPanelComposer { id } if id == "agent-conversation"
         ));
         assert!(ACTION_DISPATCHER.try_recv_request().is_none());
 
         runtime.execute_command("AgentOpen").await.unwrap();
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
-            PluginRequest::FocusPanel { id } if id == "agent-conversation"
+            PluginRequest::FocusTextPanelComposer { id } if id == "agent-conversation"
         ));
         assert!(ACTION_DISPATCHER.try_recv_request().is_none());
     }
@@ -7657,7 +7657,7 @@ mod tests {
         ));
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
-            PluginRequest::FocusPanel { id } if id == "agent-conversation"
+            PluginRequest::FocusTextPanelComposer { id } if id == "agent-conversation"
         ));
         assert!(ACTION_DISPATCHER.try_recv_request().is_none());
 
