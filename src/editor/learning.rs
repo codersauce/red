@@ -9,6 +9,7 @@ use crate::ui::{draw_learn_coach, draw_learn_panel_coach, CoachLayout, LearnHub}
 mod agent;
 mod git;
 mod language;
+mod staging;
 mod symbols;
 
 pub(super) struct LearnSession {
@@ -138,10 +139,9 @@ impl Editor {
         }
         // Create owned storage before changing any editor state, so a failed
         // setup leaves the user's current workspace untouched.
-        let workspace = if matches!(
-            lesson,
-            Lesson::SaveAPracticeFile | Lesson::ContinueInAgent | Lesson::ReviewWhatChanged
-        ) || lesson.is_lsp_practice()
+        let workspace = if matches!(lesson, Lesson::SaveAPracticeFile | Lesson::ContinueInAgent)
+            || lesson.is_lsp_practice()
+            || lesson.is_git_practice()
         {
             Some(PracticeWorkspace::new()?)
         } else {
@@ -160,9 +160,9 @@ impl Editor {
         }
         let (language_config, language_client) =
             language::practice_language_services(lesson, workspace.as_ref())?;
-        let git = if lesson == Lesson::ReviewWhatChanged {
+        let git = if lesson.is_git_practice() {
             let workspace = workspace.as_ref().expect("Git lesson owns a workspace");
-            match git::LearnGitState::prepare(workspace, runtime).await {
+            match git::LearnGitState::prepare(workspace, runtime, lesson).await {
                 Ok(state) => Some(state),
                 Err(error) => {
                     self.set_notification_message(
@@ -212,7 +212,7 @@ impl Editor {
             workspace
                 .path(if lesson.is_lsp_practice() {
                     "main.hk"
-                } else if matches!(lesson, Lesson::ContinueInAgent | Lesson::ReviewWhatChanged) {
+                } else if lesson == Lesson::ContinueInAgent || lesson.is_git_practice() {
                     "score.rs"
                 } else {
                     "practice.txt"

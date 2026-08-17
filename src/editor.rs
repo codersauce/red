@@ -16365,7 +16365,11 @@ impl Editor {
         {
             return Ok(false);
         }
-        if self.intercept_learn_git_action(action, buffer)? {
+        if self.learn_session.is_some()
+            && self
+                .intercept_learn_git_action(action, buffer, runtime)
+                .await?
+        {
             return Ok(false);
         }
         if self.learn_session.is_some()

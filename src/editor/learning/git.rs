@@ -12,13 +12,23 @@ pub(super) struct LearnGitState {
     documents: Vec<WorkspaceDocument>,
     selected: String,
     inspected: HashSet<String>,
+    pub(super) staging: Option<staging::LearnStageState>,
 }
 
 impl LearnGitState {
     pub async fn prepare(
         workspace: &PracticeWorkspace,
         runtime: &mut Runtime,
+        lesson: Lesson,
     ) -> anyhow::Result<Self> {
+        if lesson == Lesson::StageTheRightHunk {
+            return Ok(Self {
+                documents: Vec::new(),
+                selected: String::new(),
+                inspected: HashSet::new(),
+                staging: Some(staging::LearnStageState::prepare(workspace, runtime).await?),
+            });
+        }
         workspace
             .init_git(&[("score.rs", AI_CONTENTS), ("example.rs", AGENT_EXAMPLE)])
             .await?;
@@ -38,10 +48,14 @@ impl LearnGitState {
             documents,
             selected: "score.rs".into(),
             inspected: HashSet::new(),
+            staging: None,
         })
     }
 
     fn model(&self) -> WorkspaceModel {
+        if let Some(staging) = &self.staging {
+            return staging.model();
+        }
         WorkspaceModel {
             header: vec![segment(
                 "Read-only practice  ·  2 unstaged files  ·  no remote",
@@ -134,7 +148,7 @@ impl Editor {
         true
     }
 
-    fn refresh_learn_git_workspace(&mut self) {
+    pub(super) fn refresh_learn_git_workspace(&mut self) {
         if let Some(git) = self
             .learn_session
             .as_ref()
@@ -150,7 +164,29 @@ impl Editor {
         }
     }
 
-    pub(in crate::editor) fn intercept_learn_git_action(
+    #[inline(never)]
+    pub(in crate::editor) fn intercept_learn_git_action<'a>(
+        &'a mut self,
+        action: &'a Action,
+        buffer: &'a mut RenderBuffer,
+        runtime: &'a mut Runtime,
+    ) -> BoxFuture<'a, anyhow::Result<bool>> {
+        Box::pin(async move {
+            if self
+                .learn_session
+                .as_ref()
+                .and_then(|session| session.git.as_ref())
+                .is_some_and(|git| git.staging.is_some())
+            {
+                self.intercept_learn_staging_action(action, buffer, runtime)
+                    .await
+            } else {
+                self.intercept_learn_review_action(action, buffer)
+            }
+        })
+    }
+
+    fn intercept_learn_review_action(
         &mut self,
         action: &Action,
         buffer: &mut RenderBuffer,

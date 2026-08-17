@@ -3572,6 +3572,27 @@ impl Default for Runtime {
 }
 
 impl Runtime {
+    /// Select the same complete hunk used by the bundled Git dashboard.
+    pub(crate) fn git_dashboard_hunk(
+        &mut self,
+        patch: &str,
+        path: &str,
+        hunk_id: &str,
+    ) -> anyhow::Result<String> {
+        let value = self.inner.lock().unwrap().host.call_git_core(
+            "dashboard_hunk",
+            &[
+                Value::String(patch.into()),
+                Value::String(path.into()),
+                Value::String(hunk_id.into()),
+            ],
+        )?;
+        match value {
+            Value::String(patch) => Ok(patch),
+            _ => anyhow::bail!("invalid Git hunk response"),
+        }
+    }
+
     /// Reuse the bundled Git parser for editor-owned, local-only workspaces.
     pub(crate) fn git_detail_document(
         &mut self,

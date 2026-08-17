@@ -3,6 +3,7 @@
 use std::{path::Path, process::Stdio, time::Duration};
 
 use anyhow::{Context, Result};
+use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 
 use super::PracticeWorkspace;
@@ -35,6 +36,10 @@ impl PracticeWorkspace {
     /// Execute only editor-owned arguments, with every repository/config path
     /// pinned to this workspace. Never pass a prompt or arbitrary user command.
     pub async fn git(&self, args: &[&str]) -> Result<String> {
+        self.git_with_input(args, None).await
+    }
+
+    async fn git_with_input(&self, args: &[&str], input: Option<&str>) -> Result<String> {
         let git_dir = self.path(".git");
         match std::fs::symlink_metadata(&git_dir) {
             Ok(metadata) => anyhow::ensure!(
@@ -87,12 +92,29 @@ impl PracticeWorkspace {
                 "protocol.allow=never",
             ])
             .args(args)
-            .stdin(Stdio::null())
+            .stdin(if input.is_some() {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
             .kill_on_drop(true);
-        let output = tokio::time::timeout(Duration::from_secs(15), command.output())
-            .await
-            .context("practice Git command timed out")?
-            .context("could not run Git; install Git to use this lesson")?;
+        let output = tokio::time::timeout(Duration::from_secs(15), async {
+            let mut child = command.spawn()?;
+            if let Some(input) = input {
+                let mut stdin = child
+                    .stdin
+                    .take()
+                    .context("practice Git stdin is unavailable")?;
+                stdin.write_all(input.as_bytes()).await?;
+                stdin.shutdown().await?;
+            }
+            child.wait_with_output().await.map_err(anyhow::Error::from)
+        })
+        .await
+        .context("practice Git command timed out")?
+        .context("could not run Git; install Git to use this lesson")?;
         anyhow::ensure!(
             output.status.success(),
             "practice Git failed: {}",
@@ -102,19 +124,39 @@ impl PracticeWorkspace {
     }
 
     pub async fn unstaged_diff(&self, name: &str) -> Result<String> {
+        self.file_diff(name, false).await
+    }
+
+    pub async fn staged_diff(&self, name: &str) -> Result<String> {
+        self.file_diff(name, true).await
+    }
+
+    async fn file_diff(&self, name: &str, staged: bool) -> Result<String> {
         anyhow::ensure!(
             self.permits_file(&self.path(name)) && Path::new(name).components().count() == 1,
             "invalid practice diff path"
         );
-        self.git(&[
-            "diff",
-            "--no-ext-diff",
-            "--no-textconv",
-            "--no-color",
-            "--",
-            name,
-        ])
-        .await
+        let mut args = vec!["diff", "--no-ext-diff", "--no-textconv", "--no-color"];
+        if staged {
+            args.push("--cached");
+        }
+        args.extend(["--", name]);
+        self.git(&args).await
+    }
+
+    /// Apply a parser-selected patch only to this repository's index.
+    pub async fn apply_index_patch(&self, patch: &str, reverse: bool) -> Result<()> {
+        anyhow::ensure!(
+            !patch.is_empty() && patch.len() <= 65_536,
+            "invalid practice patch size"
+        );
+        let mut args = vec!["apply", "--cached", "--unidiff-zero"];
+        if reverse {
+            args.push("--reverse");
+        }
+        args.push("-");
+        self.git_with_input(&args, Some(patch)).await?;
+        Ok(())
     }
 }
 
