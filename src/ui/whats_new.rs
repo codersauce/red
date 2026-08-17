@@ -662,10 +662,22 @@ mod tests {
             .join("\n")
     }
 
+    fn test_release_notes() -> ReleaseNotes {
+        let version = env!("CARGO_PKG_VERSION");
+        ReleaseNotes {
+            version: version.to_string(),
+            markdown: format!(
+                "## [{version}](https://example.test/{version})\n\n### Features\n\n- Keep release highlights readable\n\n### Bug Fixes\n\n- Preserve release panel layout\n"
+            ),
+            release_url: format!("https://github.com/codersauce/red/releases/tag/v{version}"),
+            published_at: None,
+        }
+    }
+
     #[test]
     fn release_panel_renders_brand_version_and_markdown_highlights() {
         let editor = editor(100, 28);
-        let notes = ReleaseNotes::bundled(env!("CARGO_PKG_VERSION"), None);
+        let notes = test_release_notes();
         let panel = WhatsNewPanel::new(&editor, notes, None);
         let mut buffer = RenderBuffer::new(100, 28, &Style::default());
 
@@ -748,7 +760,7 @@ mod tests {
     #[test]
     fn spacious_layout_leaves_balanced_header_and_body_padding() {
         let editor = editor(180, 70);
-        let notes = ReleaseNotes::bundled(env!("CARGO_PKG_VERSION"), None);
+        let notes = test_release_notes();
         let panel = WhatsNewPanel::new(&editor, notes, None);
         let layout = panel.layout();
         let mut buffer = RenderBuffer::new(180, 70, &Style::default());
