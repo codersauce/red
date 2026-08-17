@@ -27,6 +27,15 @@ impl std::fmt::Debug for HistoryRenderCache {
 }
 
 impl HistoryRenderCache {
+    #[cfg(test)]
+    pub(crate) fn cached_lines(&self) -> Option<Arc<[RenderedTextLine]>> {
+        self.0
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .as_ref()
+            .map(|cached| Arc::clone(&cached.lines))
+    }
+
     pub(super) fn render(
         &self,
         detail: &HistoryDetail,

@@ -1,6 +1,8 @@
 use super::*;
 use crate::{inline_assist::InlineCommentInput, lsp::LspManager};
 
+mod performance;
+
 #[tokio::test]
 async fn word_backspace_updates_the_editor_owned_inline_history_query() {
     for modifiers in [KeyModifiers::ALT, KeyModifiers::CONTROL] {
