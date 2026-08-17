@@ -26,6 +26,8 @@ pub(crate) const AI_BONUS_CONTENTS: &str = "fn add_score(score: u32, points: u32
 pub(crate) const AGENT_EXAMPLE: &str = "// Practice usage example\nlet expected_score = 39;\n";
 pub(crate) const AGENT_EXAMPLE_FIXED: &str =
     "// Practice usage example: add_score(40, 2)\nlet expected_score = 42;\n";
+pub(crate) const HUSK_DIAGNOSTIC: &str = "expected `;` after let binding";
+pub(crate) const HUSK_CONTENTS: &str = "fn add_score(score: i32, points: i32) -> i32 {\n    score + points\n}\n\nfn main() {\n    let score = add_score(40, 2)\n    std::println(\"Score updated\");\n}\n";
 pub(crate) const LEARN_GIT_WORKSPACE: &str = "learn-git";
 pub(crate) const LEARN_AGENT_PANEL: &str = "learn-recorded-agent";
 
@@ -41,10 +43,11 @@ pub(crate) enum Lesson {
     ChooseWhatToKeep,
     ContinueInAgent,
     ReviewWhatChanged,
+    ReadTheDiagnostic,
 }
 
 impl Lesson {
-    pub const AVAILABLE: [Self; 9] = [
+    pub const AVAILABLE: [Self; 10] = [
         Self::FindYourFooting,
         Self::EditWithConfidence,
         Self::FindACommand,
@@ -54,6 +57,7 @@ impl Lesson {
         Self::ChooseWhatToKeep,
         Self::ContinueInAgent,
         Self::ReviewWhatChanged,
+        Self::ReadTheDiagnostic,
     ];
 
     pub fn from_id(id: &str) -> Option<Self> {
@@ -87,6 +91,7 @@ impl Lesson {
             Self::ChooseWhatToKeep => 6,
             Self::ContinueInAgent => 7,
             Self::ReviewWhatChanged => 8,
+            Self::ReadTheDiagnostic => 9,
         }
     }
 
@@ -97,6 +102,7 @@ impl Lesson {
             | Self::ChooseWhatToKeep
             | Self::ContinueInAgent
             | Self::ReviewWhatChanged => 1,
+            Self::ReadTheDiagnostic => 2,
             _ => 0,
         }
     }
@@ -105,6 +111,10 @@ impl Lesson {
         Self::for_track(self.track_index())
             .position(|lesson| lesson == self)
             .unwrap_or(0)
+    }
+
+    pub const fn is_lsp_practice(self) -> bool {
+        matches!(self, Self::ReadTheDiagnostic)
     }
 
     pub const fn is_ai_practice(self) -> bool {
@@ -128,6 +138,7 @@ impl Lesson {
             Self::ChooseWhatToKeep => "ai.choose-what-to-keep.v1",
             Self::ContinueInAgent => "ai.continue-in-agent.v1",
             Self::ReviewWhatChanged => "ai.review-what-changed.v1",
+            Self::ReadTheDiagnostic => "ship.read-the-diagnostic.v1",
         }
     }
 
@@ -146,6 +157,7 @@ impl Lesson {
             | Self::ChooseWhatToKeep
             | Self::ContinueInAgent => AI_CONTENTS,
             Self::ReviewWhatChanged => AI_FIXED_CONTENTS,
+            Self::ReadTheDiagnostic => HUSK_CONTENTS,
         }
     }
 
@@ -160,6 +172,7 @@ impl Lesson {
             Self::ChooseWhatToKeep => PracticeStep::AiChoiceSelect,
             Self::ContinueInAgent => PracticeStep::AgentSelect,
             Self::ReviewWhatChanged => PracticeStep::GitOpen,
+            Self::ReadTheDiagnostic => PracticeStep::DiagnosticOpen,
         }
     }
 
@@ -210,6 +223,12 @@ impl Lesson {
                 "Undo the unwanted change",
                 "Request and refine a suggestion",
                 "Keep only the corrected result",
+            ],
+            Self::ReadTheDiagnostic => &[
+                "Open the diagnostics picker",
+                "Jump to the reported problem",
+                "Read the line diagnostic",
+                "Return to the source",
             ],
             Self::ReviewWhatChanged => &[
                 "Open the practice Git review",
@@ -371,12 +390,19 @@ pub(crate) enum PracticeStep {
     GitScore,
     GitExample,
     GitReturn,
+    DiagnosticOpen,
+    DiagnosticJump,
+    DiagnosticRead,
+    DiagnosticReturn,
     Complete,
 }
 
 impl PracticeStep {
     pub fn suggested_action(self) -> Option<Action> {
         match self {
+            Self::DiagnosticOpen => Some(Action::OpenDiagnosticsPicker),
+            Self::DiagnosticRead => Some(Action::ShowLineDiagnostics),
+            Self::DiagnosticJump | Self::DiagnosticReturn => None,
             Self::GitOpen => Some(Action::PluginCommand("GitDashboard".into())),
             Self::GitScore | Self::GitExample | Self::GitReturn => None,
             Self::Insert => Some(Action::EnterMode(Mode::Insert)),
@@ -471,6 +497,10 @@ impl PracticeStep {
             Self::GitScore => "Select score.rs, press Tab to focus its diff, then move with j/k onto a red or green changed line. Check that subtraction became addition. Reopen with :GitDashboard if needed.".into(),
             Self::GitExample => "Tab back to Files, select example.rs, then Tab into its diff. Move onto a changed line and inspect the expected value 42. Reopen with :GitDashboard if needed.".into(),
             Self::GitReturn => "Both changes are reviewed. Press q or Esc to return to code. Nothing has been staged or committed.".into(),
+            Self::DiagnosticOpen => format!("The bundled Husk server checks this disposable file offline. When the error marker appears, press {} to open Diagnostics. If the picker is empty, close it and try again in a moment.", shortcut.unwrap_or("Space d")),
+            Self::DiagnosticJump => "Choose the missing-semicolon error and press Enter. The editor will take you to the reported location. Reopen Diagnostics if you closed the picker.".into(),
+            Self::DiagnosticRead => format!("Press {} to read the diagnostic on this line. The parser points at the next token; the incomplete statement is just above it.", shortcut.unwrap_or("D")),
+            Self::DiagnosticReturn => "Read the message and diagnostic code, then press Esc to return to the source. You will repair the defect in a later lesson.".into(),
             Self::Complete => match lesson {
                 Lesson::FindYourFooting => "Your original text is restored. Nicely done.",
                 Lesson::EditWithConfidence => {
@@ -481,6 +511,7 @@ impl PracticeStep {
                 Lesson::UnderstandSelectedCode => "You explained selected code without editing it. Recorded practice complete; real inline assist sends your selected context only when you submit a prompt.",
                 Lesson::MakeAFocusedChange => "The fix is kept in the buffer, still unsaved. Inline edits use normal undo history; keeping one is not the same as writing a file.",
                 Lesson::ChooseWhatToKeep => "You rejected an unwanted change, refined a suggestion, and kept the corrected result. The final edit is unsaved and remains undoable.",
+                Lesson::ReadTheDiagnostic => "You found a real language-server error and read it at its source. The file is unchanged. Your original language servers and diagnostics return when you leave.",
                 Lesson::ReviewWhatChanged => "You reviewed the real diff for both files. Build with AI complete! These changes are still unstaged; your own repository was never touched.",
                 Lesson::ContinueInAgent => "Both practice files are saved. Unlike Keep in inline assist, Agent file-edit tools can write to disk. Your real workspace and Agent draft are untouched.",
             }
@@ -501,7 +532,8 @@ impl PracticeStep {
             | Self::AgentSelect
             | Self::AgentInlineOpen
             | Self::AgentInlineSubmit
-            | Self::GitOpen => 0,
+            | Self::GitOpen
+            | Self::DiagnosticOpen => 0,
             Self::Type
             | Self::EditDelete
             | Self::CommandRun
@@ -510,7 +542,8 @@ impl PracticeStep {
             | Self::AiChangeOpen
             | Self::AiChoiceUndo
             | Self::AgentEscalate
-            | Self::GitScore => 1,
+            | Self::GitScore
+            | Self::DiagnosticJump => 1,
             Self::Normal
             | Self::EditUndo
             | Self::CommandHelp
@@ -521,7 +554,8 @@ impl PracticeStep {
             | Self::AiChoiceAgain
             | Self::AiChoiceRefine
             | Self::AgentPrompt
-            | Self::GitExample => 2,
+            | Self::GitExample
+            | Self::DiagnosticRead => 2,
             Self::Undo
             | Self::EditRedo
             | Self::CommandReturn
@@ -530,7 +564,8 @@ impl PracticeStep {
             | Self::AiChangeKeep
             | Self::AiChoiceKeep
             | Self::AgentInspect
-            | Self::GitReturn => 3,
+            | Self::GitReturn
+            | Self::DiagnosticReturn => 3,
             Self::Complete => 4,
         }
     }
@@ -595,6 +630,23 @@ impl PracticeStep {
     /// Observes UI state that can change through either a key or an action.
     pub fn observe_view(&mut self, action: &Action, view: PracticeView) -> bool {
         let next = match (*self, action) {
+            (
+                Self::DiagnosticOpen,
+                Action::OpenDiagnosticsPicker | Action::OpenErrorDiagnosticsPicker,
+            ) if view.diagnostic_present && view.diagnostics_picker_open => Self::DiagnosticJump,
+            (Self::DiagnosticJump, Action::OpenLocation(_, _)) if view.diagnostic_under_cursor => {
+                Self::DiagnosticRead
+            }
+            (Self::DiagnosticRead, Action::ShowLineDiagnostics)
+                if view.diagnostic_under_cursor && view.diagnostic_popup_open =>
+            {
+                Self::DiagnosticReturn
+            }
+            (Self::DiagnosticReturn, Action::CloseDialog)
+                if !view.diagnostic_popup_open && view.diagnostic_present && view.original_text =>
+            {
+                Self::Complete
+            }
             (Self::CommandOpen, Action::CommandPalette) if view.command_palette_open => {
                 Self::CommandRun
             }
@@ -674,7 +726,7 @@ impl PracticeStep {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Default, Clone, Copy)]
 pub(crate) struct PracticeView {
     pub command_palette_open: bool,
     pub wrapping: bool,
@@ -692,13 +744,32 @@ pub(crate) struct PracticeView {
     pub agent_pane_open: bool,
     pub agent_files_saved: bool,
     pub agent_example_visible: bool,
+    pub diagnostic_present: bool,
+    pub diagnostics_picker_open: bool,
+    pub diagnostic_under_cursor: bool,
+    pub diagnostic_popup_open: bool,
 }
 
 /// Scratch lessons permit only edits to their isolated practice buffer.
 pub(crate) fn practice_action_allowed(lesson: Lesson, action: &Action) -> bool {
-    (lesson == Lesson::ReviewWhatChanged
-        && (matches!(action, Action::PluginCommand(name) if name == "GitDashboard")
-            || matches!(action, Action::NotifyPlugins(method, _) if method == &format!("workspace:event:{LEARN_GIT_WORKSPACE}"))))
+    (lesson.is_lsp_practice()
+        && matches!(
+            action,
+            Action::OpenDiagnosticsPicker
+                | Action::OpenErrorDiagnosticsPicker
+                | Action::ShowLineDiagnostics
+                | Action::NextDiagnostic
+                | Action::PreviousDiagnostic
+                | Action::RefreshDiagnostics
+                | Action::OpenLocation(_, _)
+                | Action::MoveTo(_, _)
+                | Action::ShowDialog
+                | Action::CommandPalette
+                | Action::KeyboardShortcuts
+        ))
+        || (lesson == Lesson::ReviewWhatChanged
+            && (matches!(action, Action::PluginCommand(name) if name == "GitDashboard")
+                || matches!(action, Action::NotifyPlugins(method, _) if method == &format!("workspace:event:{LEARN_GIT_WORKSPACE}"))))
         || (lesson == Lesson::ContinueInAgent
             && (matches!(
                 action,
@@ -780,6 +851,40 @@ pub(crate) fn practice_action_allowed(lesson: Lesson, action: &Action) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn diagnostic_lesson_requires_real_picker_location_and_popup_effects() {
+        let mut step = Lesson::ReadTheDiagnostic.first_step();
+        let mut view = PracticeView {
+            original_text: true,
+            ..PracticeView::default()
+        };
+        let open = Action::OpenDiagnosticsPicker;
+        assert!(!step.observe_view(&open, view));
+        view.diagnostic_present = true;
+        assert!(!step.observe_view(&open, view));
+        view.diagnostics_picker_open = true;
+        assert!(step.observe_view(&open, view));
+        let jump = Action::OpenLocation(
+            crate::plugin::PluginLocation {
+                path: "main.hk".into(),
+                line: 6,
+                column: 4,
+                column_encoding: crate::plugin::LocationColumnEncoding::Utf16,
+            },
+            crate::plugin::OpenLocationTarget::Current,
+        );
+        assert!(!step.observe_view(&jump, view));
+        view.diagnostic_under_cursor = true;
+        assert!(step.observe_view(&jump, view));
+        assert!(!step.observe_view(&Action::ShowLineDiagnostics, view));
+        view.diagnostic_popup_open = true;
+        assert!(step.observe_view(&Action::ShowLineDiagnostics, view));
+        assert!(!step.observe_view(&Action::CloseDialog, view));
+        view.diagnostic_popup_open = false;
+        assert!(step.observe_view(&Action::CloseDialog, view));
+        assert_eq!(step, PracticeStep::Complete);
+    }
 
     fn observe_first(step: &mut PracticeStep, action: &Action, mode: Mode, original: bool) -> bool {
         step.observe(
@@ -916,6 +1021,10 @@ mod tests {
             agent_pane_open: false,
             agent_files_saved: false,
             agent_example_visible: false,
+            diagnostic_present: false,
+            diagnostics_picker_open: false,
+            diagnostic_under_cursor: false,
+            diagnostic_popup_open: false,
         };
         assert!(!step.observe_view(&Action::CommandPalette, view));
         view.command_palette_open = true;

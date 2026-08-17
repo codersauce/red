@@ -16349,7 +16349,9 @@ impl Editor {
     ) -> anyhow::Result<bool> {
         // log!("Action: {action:?}");
         self.set_legacy_message(None);
-        if self.intercept_learn_action(action, buffer, runtime)? {
+        if self.learn_session.is_some()
+            && self.intercept_learn_action(action, buffer, runtime).await?
+        {
             return Ok(false);
         }
         if self
@@ -19596,7 +19598,7 @@ impl Editor {
                 }
             }
             Action::OpenLearn => {
-                self.finish_learn_lesson(buffer, runtime)?;
+                self.finish_learn_lesson(buffer, runtime).await?;
                 self.open_learn_hub(runtime);
                 self.render(buffer)?;
             }
@@ -19619,7 +19621,7 @@ impl Editor {
                 self.continue_learn_lesson(buffer, runtime).await?;
             }
             Action::ExitLearnLesson => {
-                self.finish_learn_lesson(buffer, runtime)?;
+                self.finish_learn_lesson(buffer, runtime).await?;
             }
             Action::OpenStatuslineManager => {
                 self.release_current_dialog_callbacks(runtime);
@@ -27688,6 +27690,67 @@ mod test {
     use super::*;
     use crate::lsp::DiagnosticSeverity;
     use std::path::PathBuf;
+
+    #[tokio::test]
+    async fn learn_red_suspends_and_restores_language_service_state() {
+        let mut editor = test_editor(140, 38);
+        let mut buffer = RenderBuffer::new(140, 38, &Style::default());
+        let mut runtime = Runtime::new();
+        let client = (&*editor.lsp as *const dyn LspClient).cast::<()>();
+        let config = editor.config.lsp.clone();
+        let disable_ai = editor.config.disable_ai;
+        let show_diagnostics = editor.config.show_diagnostics;
+        let original_id = editor.current_buffer().id();
+        let uri = "file:///original.hk".to_string();
+        editor.lsp_coordinator.mark_document_opened(uri.clone());
+        editor.diagnostics.insert(
+            uri.clone(),
+            vec![diagnostic_at(
+                0,
+                Some(DiagnosticSeverity::Error),
+                "original diagnostic",
+            )],
+        );
+        editor.pending_lsp_edit_requests.insert(
+            918,
+            PendingLspEdit {
+                buffer_id: original_id,
+                revision: 3,
+                uri: uri.clone(),
+            },
+        );
+        editor
+            .execute(
+                &Action::StartLearnLessonAt(crate::learn::Lesson::SaveAPracticeFile.id().into()),
+                &mut buffer,
+                &mut runtime,
+            )
+            .await
+            .unwrap();
+        assert!(!editor.config.lsp.enabled);
+        assert!(editor.config.lsp.servers.is_empty());
+        assert!(editor.config.disable_ai);
+        assert!(editor.diagnostics.is_empty());
+        assert!(editor.pending_lsp_edit_requests.is_empty());
+        assert!(!editor.lsp_coordinator.is_document_opened(&uri));
+        assert!(editor.lsp.server_name_for_file("/original.hk").is_none());
+        editor
+            .execute(&Action::ExitLearnLesson, &mut buffer, &mut runtime)
+            .await
+            .unwrap();
+        assert_eq!((&*editor.lsp as *const dyn LspClient).cast::<()>(), client);
+        assert_eq!(editor.config.lsp.enabled, config.enabled);
+        assert_eq!(editor.config.lsp.format_on_save, config.format_on_save);
+        assert_eq!(editor.config.lsp.servers, config.servers);
+        assert_eq!(editor.config.disable_ai, disable_ai);
+        assert_eq!(editor.config.show_diagnostics, show_diagnostics);
+        assert!(editor.lsp_coordinator.is_document_opened(&uri));
+        assert_eq!(editor.diagnostics[&uri][0].message, "original diagnostic");
+        assert_eq!(
+            editor.pending_lsp_edit_requests[&918].buffer_id,
+            original_id
+        );
+    }
 
     #[tokio::test]
     async fn learn_red_git_review_requires_real_diff_navigation_and_restores_workspace() {

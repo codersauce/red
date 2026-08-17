@@ -1002,7 +1002,7 @@ mod tests {
     #[test]
     fn planned_tracks_cannot_start_a_fake_lesson() {
         let mut hub = panel(120, 32);
-        hub.selected = 2;
+        hub.selected = 3;
         assert_eq!(hub.open_selected(), KeyAction::Single(Action::Refresh));
     }
 

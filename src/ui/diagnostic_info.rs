@@ -138,6 +138,10 @@ impl DiagnosticInfo {
 }
 
 impl Component for DiagnosticInfo {
+    fn shortcut_context(&self) -> &str {
+        "Line diagnostics"
+    }
+
     fn draw(&self, buffer: &mut RenderBuffer) -> anyhow::Result<()> {
         self.dialog.draw(buffer)?;
         for (row, line) in self

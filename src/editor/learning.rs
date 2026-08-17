@@ -8,6 +8,7 @@ use crate::ui::{draw_learn_coach, draw_learn_panel_coach, CoachLayout, LearnHub}
 
 mod agent;
 mod git;
+mod language;
 
 pub(super) struct LearnSession {
     lesson: Lesson,
@@ -26,6 +27,7 @@ pub(super) struct LearnSession {
     agent: Option<agent::LearnAgentState>,
     git: Option<git::LearnGitState>,
     original_workspaces: Option<plugin::WorkspaceManager>,
+    original_language: language::SavedLanguageState,
 }
 
 impl LearnSession {
@@ -88,7 +90,7 @@ impl Editor {
                 return self.start_learn_lesson(next, buffer, runtime).await;
             }
         }
-        self.finish_learn_lesson(buffer, runtime)?;
+        self.finish_learn_lesson(buffer, runtime).await?;
         self.open_learn_hub(runtime);
         self.render(buffer)
     }
@@ -124,7 +126,7 @@ impl Editor {
         runtime: &mut Runtime,
     ) -> anyhow::Result<()> {
         if self.learn_session.is_some() {
-            self.finish_learn_lesson(buffer, runtime)?;
+            self.finish_learn_lesson(buffer, runtime).await?;
         }
         if self.size.0 < 32 || self.size.1 < 12 {
             self.set_legacy_message(Some(
@@ -136,7 +138,10 @@ impl Editor {
         // setup leaves the user's current workspace untouched.
         let workspace = if matches!(
             lesson,
-            Lesson::SaveAPracticeFile | Lesson::ContinueInAgent | Lesson::ReviewWhatChanged
+            Lesson::SaveAPracticeFile
+                | Lesson::ContinueInAgent
+                | Lesson::ReviewWhatChanged
+                | Lesson::ReadTheDiagnostic
         ) {
             Some(PracticeWorkspace::new()?)
         } else {
@@ -147,6 +152,14 @@ impl Editor {
             workspace.write_fixture("score.rs", lesson.contents())?;
             workspace.write_fixture("example.rs", crate::learn::AGENT_EXAMPLE)?;
         }
+        if lesson.is_lsp_practice() {
+            workspace
+                .as_ref()
+                .expect("LSP lesson owns a workspace")
+                .write_fixture("main.hk", lesson.contents())?;
+        }
+        let (language_config, language_client) =
+            language::practice_language_services(lesson, workspace.as_ref())?;
         let git = if lesson == Lesson::ReviewWhatChanged {
             let workspace = workspace.as_ref().expect("Git lesson owns a workspace");
             match git::LearnGitState::prepare(workspace, runtime).await {
@@ -178,6 +191,8 @@ impl Editor {
         // The temporary lesson must never replace the user's recovery layout.
         self.persist_session_snapshot(true);
         let original_buffer_id = self.current_buffer().id();
+        let original_language =
+            language::SavedLanguageState::install(self, language_config, language_client);
         let original_panel_focus = self.panel_manager.focused_panel_id().map(str::to_string);
         let original_panels =
             (lesson == Lesson::ContinueInAgent).then(|| std::mem::take(&mut self.panel_manager));
@@ -195,13 +210,13 @@ impl Editor {
         self.pending_semantic_change = None;
         let file = workspace.as_ref().map(|workspace| {
             workspace
-                .path(
-                    if matches!(lesson, Lesson::ContinueInAgent | Lesson::ReviewWhatChanged) {
-                        "score.rs"
-                    } else {
-                        "practice.txt"
-                    },
-                )
+                .path(if lesson.is_lsp_practice() {
+                    "main.hk"
+                } else if matches!(lesson, Lesson::ContinueInAgent | Lesson::ReviewWhatChanged) {
+                    "score.rs"
+                } else {
+                    "practice.txt"
+                })
                 .to_string_lossy()
                 .into_owned()
         });
@@ -233,6 +248,7 @@ impl Editor {
             agent: (lesson == Lesson::ContinueInAgent).then(agent::LearnAgentState::default),
             git,
             original_workspaces,
+            original_language,
         });
         self.mode = Mode::Normal;
         if lesson == Lesson::FindACommand {
@@ -240,10 +256,27 @@ impl Editor {
         }
         self.splash_dismissed = true;
         self.force_full_redraw = true;
-        self.set_current_buffer(buffer, practice_index).await
+        if let Err(error) = self.set_current_buffer(buffer, practice_index).await {
+            self.finish_learn_lesson(buffer, runtime).await?;
+            self.set_notification_message(
+                Severity::Error,
+                Some(format!("could not start lesson: {error:#}")),
+            );
+            return self.render(buffer);
+        }
+        Ok(())
     }
 
-    pub(super) fn finish_learn_lesson(
+    #[inline(never)]
+    pub(super) fn finish_learn_lesson<'a>(
+        &'a mut self,
+        buffer: &'a mut RenderBuffer,
+        runtime: &'a mut Runtime,
+    ) -> BoxFuture<'a, anyhow::Result<()>> {
+        Box::pin(self.finish_learn_lesson_impl(buffer, runtime))
+    }
+
+    async fn finish_learn_lesson_impl(
         &mut self,
         buffer: &mut RenderBuffer,
         runtime: &mut Runtime,
@@ -318,6 +351,7 @@ impl Editor {
         }
         self.highlight_cache.clear();
         self.layout_cache.borrow_mut().clear();
+        session.original_language.restore(self).await;
         // Finish deleting owned files before showing the restored workspace.
         drop(session.workspace);
         self.force_full_redraw = true;
@@ -327,7 +361,17 @@ impl Editor {
     }
 
     /// Returns true when a practice action was handled or safely refused.
-    pub(super) fn intercept_learn_action(
+    #[inline(never)]
+    pub(super) fn intercept_learn_action<'a>(
+        &'a mut self,
+        action: &'a Action,
+        buffer: &'a mut RenderBuffer,
+        runtime: &'a mut Runtime,
+    ) -> BoxFuture<'a, anyhow::Result<bool>> {
+        Box::pin(self.intercept_learn_action_impl(action, buffer, runtime))
+    }
+
+    async fn intercept_learn_action_impl(
         &mut self,
         action: &Action,
         buffer: &mut RenderBuffer,
@@ -337,18 +381,28 @@ impl Editor {
             return Ok(false);
         };
         if matches!(action, Action::Quit(_)) {
-            self.finish_learn_lesson(buffer, runtime)?;
+            self.finish_learn_lesson(buffer, runtime).await?;
             return Ok(true);
         }
         if !session.owns_buffer(self.current_buffer()) {
-            self.finish_learn_lesson(buffer, runtime)?;
+            self.finish_learn_lesson(buffer, runtime).await?;
             self.set_legacy_message(Some(
                 "lesson paused because the active buffer changed".into(),
             ));
             self.render(buffer)?;
             return Ok(true);
         }
-        if !practice_action_allowed(session.lesson, action) {
+        let location_allowed = match action {
+            Action::OpenLocation(location, target) if session.lesson.is_lsp_practice() => {
+                *target == plugin::OpenLocationTarget::Current
+                    && session
+                        .workspace
+                        .as_ref()
+                        .is_some_and(|workspace| workspace.permits_file(Path::new(&location.path)))
+            }
+            _ => true,
+        };
+        if !location_allowed || !practice_action_allowed(session.lesson, action) {
             self.set_legacy_message(Some(
                 "this practice step only edits tutorial text; use :tutorial quit to return".into(),
             ));
@@ -451,6 +505,15 @@ impl Editor {
             agent_pane_open: self.learn_agent_pane_open(),
             agent_files_saved: self.learn_agent_files_saved(),
             agent_example_visible: contents == crate::learn::AGENT_EXAMPLE_FIXED,
+            diagnostic_present: self.learn_diagnostic_present(),
+            diagnostics_picker_open: self.current_dialog.as_ref().is_some_and(|dialog| {
+                matches!(dialog.shortcut_context(), "Diagnostics" | "Errors")
+            }),
+            diagnostic_under_cursor: self.learn_diagnostic_under_cursor(),
+            diagnostic_popup_open: self
+                .current_dialog
+                .as_ref()
+                .is_some_and(|dialog| dialog.shortcut_context() == "Line diagnostics"),
         };
         let session = self
             .learn_session

@@ -64,6 +64,7 @@ where
 /// Lazily starts and routes documents across configured language servers.
 pub struct LspManager {
     config: LspConfig,
+    workspace_scope: Option<PathBuf>,
     document_selectors: HashMap<String, DocumentSelector>,
     filename_selectors: HashMap<String, DocumentSelector>,
     clients: HashMap<String, RealLspClient>,
@@ -106,6 +107,7 @@ impl LspManager {
 
         Self {
             config,
+            workspace_scope: None,
             document_selectors,
             filename_selectors,
             clients: HashMap::new(),
@@ -115,6 +117,14 @@ impl LspManager {
             document_clients: HashMap::new(),
             next_client_poll: 0,
         }
+    }
+
+    /// Restricts all document routing to an existing, editor-owned workspace.
+    /// The canonical root also replaces marker-based root discovery.
+    pub(crate) fn for_workspace(config: LspConfig, root: &Path) -> std::io::Result<Self> {
+        let mut manager = Self::new(config);
+        manager.workspace_scope = Some(root.canonicalize()?);
+        Ok(manager)
     }
 
     /// Resolves a file to its configured server, language, URI, and workspace.
@@ -136,8 +146,16 @@ impl LspManager {
         let server = self.config.servers.get(&selector.server_name)?;
 
         let path = Path::new(file);
-        let path = path.absolutize().ok()?.to_path_buf();
-        let workspace_root = find_workspace_root(&path, server);
+        let mut path = path.absolutize().ok()?.to_path_buf();
+        let workspace_root = if let Some(root) = &self.workspace_scope {
+            path = path.canonicalize().ok()?;
+            if !path.starts_with(root) || !path.is_file() {
+                return None;
+            }
+            root.clone()
+        } else {
+            find_workspace_root(&path, server)
+        };
         let uri = file_uri(&path).ok()?;
 
         Some(DocumentInfo {
@@ -200,6 +218,9 @@ impl LspManager {
         &mut self,
         file: &str,
     ) -> Result<Option<&mut RealLspClient>, LspError> {
+        if self.workspace_scope.is_some() && self.resolve_document(file).is_none() {
+            return Ok(None);
+        }
         if let Some(key) = self.document_clients.get(file) {
             if self.clients.contains_key(key) {
                 return Ok(self.clients.get_mut(key));
@@ -213,6 +234,9 @@ impl LspManager {
 
     fn client_for_uri_mut(&mut self, uri: &str) -> Option<&mut RealLspClient> {
         let file = file_path(uri).ok()?;
+        if self.workspace_scope.is_some() && self.resolve_document(&file).is_none() {
+            return None;
+        }
         if let Some(key) = self.document_clients.get(&file) {
             if self.clients.contains_key(key) {
                 return self.clients.get_mut(key);
@@ -274,7 +298,10 @@ fn find_workspace_root(path: &Path, server: &LanguageServerConfig) -> PathBuf {
 #[async_trait::async_trait]
 impl LspClient for LspManager {
     async fn reconfigure(&mut self, config: LspConfig) -> Result<Vec<String>, LspError> {
-        let replacement = Self::new(config);
+        let mut replacement = Self::new(config);
+        replacement
+            .workspace_scope
+            .clone_from(&self.workspace_scope);
         let changed = self
             .config
             .servers
@@ -353,6 +380,9 @@ impl LspClient for LspManager {
     }
 
     async fn did_open(&mut self, file: &str, contents: &str) -> Result<(), LspError> {
+        if self.workspace_scope.is_some() && self.resolve_document(file).is_none() {
+            return Ok(());
+        }
         if self.document_clients.contains_key(file) {
             return Ok(());
         }
@@ -379,6 +409,9 @@ impl LspClient for LspManager {
     }
 
     async fn did_change(&mut self, file: &str, contents: String) -> Result<(), LspError> {
+        if self.workspace_scope.is_some() && self.resolve_document(file).is_none() {
+            return Ok(());
+        }
         if let Some(key) = self.document_clients.get(file) {
             if let Some(client) = self.clients.get_mut(key) {
                 return client.did_change(file, contents).await;
@@ -820,6 +853,47 @@ mod tests {
     };
 
     use super::*;
+
+    #[tokio::test]
+    async fn learn_workspace_scope_pins_roots_and_refuses_outside_documents() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let inside = root.path().join("main.hk");
+        let other = outside.path().join("outside.hk");
+        std::fs::write(&inside, "fn main() {}").unwrap();
+        std::fs::write(&other, "fn outside() {}").unwrap();
+        let config = LspConfig {
+            enabled: true,
+            format_on_save: false,
+            servers: HashMap::from([("husk".into(), server("husk", &["hk"]))]),
+        };
+        let mut manager = LspManager::for_workspace(config.clone(), root.path()).unwrap();
+        assert_eq!(
+            manager
+                .resolve_document(inside.to_str().unwrap())
+                .unwrap()
+                .workspace_root,
+            root.path().canonicalize().unwrap()
+        );
+        assert!(manager.resolve_document(other.to_str().unwrap()).is_none());
+        manager
+            .did_open(other.to_str().unwrap(), "outside")
+            .await
+            .unwrap();
+        manager
+            .did_change(other.to_str().unwrap(), "outside".into())
+            .await
+            .unwrap();
+        assert!(manager.clients.is_empty());
+        manager.reconfigure(config).await.unwrap();
+        assert!(manager.resolve_document(other.to_str().unwrap()).is_none());
+        #[cfg(unix)]
+        {
+            let link = root.path().join("escaped.hk");
+            std::os::unix::fs::symlink(&other, &link).unwrap();
+            assert!(manager.resolve_document(link.to_str().unwrap()).is_none());
+        }
+    }
 
     fn server(language_id: &str, extensions: &[&str]) -> LanguageServerConfig {
         LanguageServerConfig {
