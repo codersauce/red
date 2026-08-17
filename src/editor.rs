@@ -26573,6 +26573,17 @@ fn directory_listing(path: &str) -> Value {
         let kind = match entry.file_type() {
             Some(file_type) if file_type.is_dir() => "directory",
             Some(file_type) if file_type.is_file() => "file",
+            Some(file_type) if file_type.is_symlink() => {
+                // Present links as their targets without replacing the lexical path.
+                // Unresolved links remain visible as files; only directory expansion
+                // follows a link, so a listing never recursively walks a cycle.
+                match std::fs::metadata(entry.path()) {
+                    Ok(metadata) if metadata.is_dir() => "directory",
+                    Ok(metadata) if metadata.is_file() => "file",
+                    Ok(_) => "other",
+                    Err(_) => "file",
+                }
+            }
             _ => "other",
         };
         if kind == "other" {
@@ -38493,6 +38504,93 @@ while True:
         assert_eq!(entries[1]["name"], "README.md");
 
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn directory_listing_presents_symlinks_as_targets_and_sorts_by_alias() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("Zulu")).unwrap();
+        std::fs::write(root.path().join("z-file.txt"), "file").unwrap();
+        std::fs::write(outside.path().join("child.txt"), "external file").unwrap();
+        symlink(outside.path(), root.path().join("alpha")).unwrap();
+        symlink("Zulu", root.path().join("Beta")).unwrap();
+        symlink("z-file.txt", root.path().join("a-file.txt")).unwrap();
+        symlink("missing", root.path().join("broken")).unwrap();
+        symlink("loop", root.path().join("loop")).unwrap();
+        let _socket = std::os::unix::net::UnixListener::bind(root.path().join("socket")).unwrap();
+        symlink("socket", root.path().join("socket-link")).unwrap();
+
+        let listing = directory_listing(&root.path().to_string_lossy());
+        let entries = listing["entries"].as_array().unwrap();
+        let names_and_kinds = entries
+            .iter()
+            .map(|entry| {
+                (
+                    entry["name"].as_str().unwrap(),
+                    entry["kind"].as_str().unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names_and_kinds,
+            [
+                ("alpha", "directory"),
+                ("Beta", "directory"),
+                ("Zulu", "directory"),
+                ("a-file.txt", "file"),
+                ("broken", "file"),
+                ("loop", "file"),
+                ("z-file.txt", "file"),
+            ]
+        );
+        for entry in entries {
+            let expected = root.path().join(entry["name"].as_str().unwrap());
+            assert_eq!(entry["path"].as_str().unwrap(), expected.to_str().unwrap());
+        }
+        assert_eq!(listing["truncated"], false);
+        assert!(listing["error"].is_null());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn directory_listing_expands_linked_directories_without_resolving_aliases() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("child.txt"), "external file").unwrap();
+        symlink(root.path(), outside.path().join("back")).unwrap();
+        let alias = root.path().join("linked");
+        symlink(outside.path(), &alias).unwrap();
+
+        let listing = directory_listing(&alias.to_string_lossy());
+        assert_eq!(
+            listing,
+            json!({
+                "path": alias,
+                "entries": [
+                    { "name": "back", "path": alias.join("back"), "kind": "directory" },
+                    { "name": "child.txt", "path": alias.join("child.txt"), "kind": "file" },
+                ],
+                "truncated": false,
+                "error": null,
+            })
+        );
+        assert_eq!(
+            std::fs::read_to_string(alias.join("child.txt")).unwrap(),
+            "external file"
+        );
+
+        let back = alias.join("back");
+        let listing = directory_listing(&back.to_string_lossy());
+        assert_eq!(
+            listing["entries"],
+            json!([{ "name": "linked", "path": back.join("linked"), "kind": "directory" }])
+        );
     }
 
     #[test]
