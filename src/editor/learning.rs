@@ -1,7 +1,7 @@
 //! Lifecycle for Learn Red's protected practice-buffer lessons.
 
 use super::*;
-use crate::learn::{practice_action_allowed, Lesson, PracticeStep};
+use crate::learn::{practice_action_allowed, Lesson, PracticeStep, PracticeView};
 use crate::ui::{draw_learn_coach, CoachLayout, LearnHub};
 
 pub(super) struct LearnSession {
@@ -149,6 +149,9 @@ impl Editor {
             original_registers,
         });
         self.mode = Mode::Normal;
+        if lesson == Lesson::FindACommand {
+            self.wrap = true;
+        }
         self.splash_dismissed = true;
         self.force_full_redraw = true;
         self.set_current_buffer(buffer, practice_index).await
@@ -228,7 +231,7 @@ impl Editor {
             self.render(buffer)?;
             return Ok(true);
         }
-        if !practice_action_allowed(action) {
+        if !practice_action_allowed(session.lesson, action) {
             self.set_legacy_message(Some(
                 "this practice step only edits tutorial text; use :tutorial quit to return".into(),
             ));
@@ -262,6 +265,14 @@ impl Editor {
         let position = self.cursor_text_position();
         let cursor = (position.character, position.line);
         let mode = self.mode;
+        let view = PracticeView {
+            command_palette_open: self
+                .current_dialog
+                .as_ref()
+                .is_some_and(|dialog| dialog.shortcut_context() == "Commands"),
+            wrapping: self.wrap,
+            shortcuts_open: self.keyboard_shortcuts.is_some(),
+        };
         let session = self
             .learn_session
             .as_mut()
@@ -269,6 +280,7 @@ impl Editor {
         if session
             .step
             .observe(session.lesson, action, mode, &contents, cursor)
+            || session.step.observe_view(action, view)
         {
             if session.step == PracticeStep::Complete {
                 if let Err(error) = self.preferences.complete_learn_lesson(session.lesson.id()) {

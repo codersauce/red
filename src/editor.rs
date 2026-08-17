@@ -27744,6 +27744,18 @@ mod test {
             .execute(&Action::FinishLearnLesson, &mut buffer, &mut runtime)
             .await
             .unwrap();
+        assert_eq!(
+            editor.current_buffer().contents(),
+            crate::learn::COMMAND_CONTENTS
+        );
+        assert_eq!(
+            editor.learn_session.as_ref().unwrap().step,
+            PracticeStep::CommandOpen
+        );
+        editor
+            .execute(&Action::ExitLearnLesson, &mut buffer, &mut runtime)
+            .await
+            .unwrap();
         assert!(editor.learn_session.is_none());
         assert_eq!(editor.current_buffer().contents(), "hello");
     }

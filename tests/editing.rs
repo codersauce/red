@@ -35,6 +35,67 @@ use std::{
 static COMMAND_COMPLETION_CWD_LOCK: Mutex<()> = Mutex::new(());
 
 #[tokio::test]
+async fn learn_red_command_lesson_uses_the_picker_and_restores_wrap() {
+    let mut harness = EditorHarness::with_config_and_size(
+        Buffer::new(None, "original workspace\n".into()),
+        default_key_config(),
+        120,
+        32,
+    );
+    harness
+        .execute_action(Action::SetWrap(false))
+        .await
+        .unwrap();
+    harness
+        .execute_action(Action::Command("tutorial essentials 3".into()))
+        .await
+        .unwrap();
+    let practice = harness.buffer_contents();
+    assert!(harness.editor.test_wrap());
+    harness
+        .execute_action(Action::CommandPalette)
+        .await
+        .unwrap();
+    for character in "Toggle line wrapping".chars() {
+        harness
+            .execute_event(Event::Key(KeyEvent::new(
+                KeyCode::Char(character),
+                KeyModifiers::NONE,
+            )))
+            .await
+            .unwrap();
+    }
+    harness
+        .execute_event(Event::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )))
+        .await
+        .unwrap();
+    assert!(!harness.editor.test_wrap());
+    harness
+        .execute_action(Action::KeyboardShortcuts)
+        .await
+        .unwrap();
+    harness
+        .execute_event(Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)))
+        .await
+        .unwrap();
+    assert_eq!(harness.buffer_contents(), practice);
+    let rows = (0..32)
+        .map(|row| harness.render_row(row).unwrap())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(rows.contains("CHECKPOINT  ·  4/4"));
+    harness
+        .execute_action(Action::Command("tutorial quit".into()))
+        .await
+        .unwrap();
+    assert!(!harness.editor.test_wrap());
+    harness.assert_buffer_contents("original workspace\n");
+}
+
+#[tokio::test]
 async fn learn_red_edit_lesson_uses_real_keys_and_restores_the_workspace() {
     let mut harness = EditorHarness::with_config(
         Buffer::new(None, "original workspace\n".into()),

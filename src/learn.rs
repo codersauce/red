@@ -8,16 +8,22 @@ pub(crate) const EDIT_CONTENTS: &str =
     "let score = 41;;\n\n// Remove the extra semicolon on the first line.\n";
 pub(crate) const EDIT_RESULT: &str =
     "let score = 41;\n\n// Remove the extra semicolon on the first line.\n";
+pub(crate) const COMMAND_CONTENTS: &str = "// This deliberately long line makes wrapping visible: use the command palette to change how it is displayed, without changing a single character of the practice text.\n\nlet score = 42;\n";
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Lesson {
     #[default]
     FindYourFooting,
     EditWithConfidence,
+    FindACommand,
 }
 
 impl Lesson {
-    pub const AVAILABLE: [Self; 2] = [Self::FindYourFooting, Self::EditWithConfidence];
+    pub const AVAILABLE: [Self; 3] = [
+        Self::FindYourFooting,
+        Self::EditWithConfidence,
+        Self::FindACommand,
+    ];
 
     pub fn from_id(id: &str) -> Option<Self> {
         Self::AVAILABLE.into_iter().find(|lesson| lesson.id() == id)
@@ -34,6 +40,7 @@ impl Lesson {
         match self {
             Self::FindYourFooting => 0,
             Self::EditWithConfidence => 1,
+            Self::FindACommand => 2,
         }
     }
 
@@ -41,6 +48,7 @@ impl Lesson {
         match self {
             Self::FindYourFooting => FIRST_LESSON_ID,
             Self::EditWithConfidence => "essentials.edit-with-confidence.v1",
+            Self::FindACommand => "essentials.find-a-command.v1",
         }
     }
 
@@ -52,6 +60,7 @@ impl Lesson {
         match self {
             Self::FindYourFooting => PRACTICE_CONTENTS,
             Self::EditWithConfidence => EDIT_CONTENTS,
+            Self::FindACommand => COMMAND_CONTENTS,
         }
     }
 
@@ -59,6 +68,7 @@ impl Lesson {
         match self {
             Self::FindYourFooting => PracticeStep::Insert,
             Self::EditWithConfidence => PracticeStep::EditMove,
+            Self::FindACommand => PracticeStep::CommandOpen,
         }
     }
 
@@ -79,6 +89,12 @@ impl Lesson {
                 "Delete one character",
                 "Undo the change",
                 "Redo to keep the fix",
+            ],
+            Self::FindACommand => &[
+                "Open the command palette",
+                "Turn line wrapping off",
+                "Open keyboard shortcuts",
+                "Return to the practice buffer",
             ],
         }
     }
@@ -195,6 +211,10 @@ pub(crate) enum PracticeStep {
     EditDelete,
     EditUndo,
     EditRedo,
+    CommandOpen,
+    CommandRun,
+    CommandHelp,
+    CommandReturn,
     Complete,
 }
 
@@ -207,7 +227,9 @@ impl PracticeStep {
             Self::EditMove => Some(Action::MoveToLineEnd),
             Self::EditDelete => Some(Action::DeleteCharAtCursorPos),
             Self::EditRedo => Some(Action::Redo),
-            Self::Type | Self::Complete => None,
+            Self::CommandOpen => Some(Action::CommandPalette),
+            Self::CommandHelp => Some(Action::KeyboardShortcuts),
+            Self::Type | Self::CommandRun | Self::CommandReturn | Self::Complete => None,
         }
     }
 
@@ -239,11 +261,16 @@ impl PracticeStep {
                 "Press {} to redo the change and keep the fix.",
                 shortcut.unwrap_or("Ctrl-r")
             ),
+            Self::CommandOpen => format!("Open the command palette with {} (or :commands). Search for Toggle line wrapping, then press Enter.", shortcut.unwrap_or("Alt-x")),
+            Self::CommandRun => "Search for Toggle line wrapping and press Enter. The long line should stop wrapping. If you closed the picker, reopen :commands.".into(),
+            Self::CommandHelp => format!("The text is unchanged. Press {} to explore the shortcuts available here.", shortcut.unwrap_or("F1")),
+            Self::CommandReturn => "Close keyboard shortcuts with Esc to return to the practice buffer.".into(),
             Self::Complete => match lesson {
                 Lesson::FindYourFooting => "Your original text is restored. Nicely done.",
                 Lesson::EditWithConfidence => {
                     "The extra semicolon is gone. You can edit, undo, and redo with confidence."
                 }
+                Lesson::FindACommand => "You found a command and its shortcuts. The practice text is unchanged, and your original view will return when you leave.",
             }
             .into(),
         }
@@ -251,10 +278,10 @@ impl PracticeStep {
 
     pub const fn completed_steps(self) -> usize {
         match self {
-            Self::Insert | Self::EditMove => 0,
-            Self::Type | Self::EditDelete => 1,
-            Self::Normal | Self::EditUndo => 2,
-            Self::Undo | Self::EditRedo => 3,
+            Self::Insert | Self::EditMove | Self::CommandOpen => 0,
+            Self::Type | Self::EditDelete | Self::CommandRun => 1,
+            Self::Normal | Self::EditUndo | Self::CommandHelp => 2,
+            Self::Undo | Self::EditRedo | Self::CommandReturn => 3,
             Self::Complete => 4,
         }
     }
@@ -291,54 +318,81 @@ impl PracticeStep {
         *self = next;
         true
     }
+
+    /// Observes UI state that can change through either a key or an action.
+    pub fn observe_view(&mut self, action: &Action, view: PracticeView) -> bool {
+        let next = match (*self, action) {
+            (Self::CommandOpen, Action::CommandPalette) if view.command_palette_open => {
+                Self::CommandRun
+            }
+            (Self::CommandRun, Action::ToggleWrap) if !view.wrapping => Self::CommandHelp,
+            (Self::CommandHelp, _) if view.shortcuts_open => Self::CommandReturn,
+            (Self::CommandReturn, _) if !view.shortcuts_open => Self::Complete,
+            _ => return false,
+        };
+        *self = next;
+        true
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PracticeView {
+    pub command_palette_open: bool,
+    pub wrapping: bool,
+    pub shortcuts_open: bool,
 }
 
 /// Scratch lessons permit only edits to their isolated practice buffer.
-pub(crate) fn practice_action_allowed(action: &Action) -> bool {
-    matches!(
-        action,
-        Action::OpenLearn
-            | Action::StartLearnLesson
-            | Action::StartLearnLessonAt(_)
-            | Action::ExitLearnLesson
-            | Action::RestartLearnLesson
-            | Action::FinishLearnLesson
-            | Action::Quit(_)
-            | Action::Command(_)
-            | Action::Print(_)
-            | Action::EnterMode(Mode::Normal | Mode::Insert | Mode::Command)
-            | Action::SetWaitingKey(_)
-            | Action::Refresh
-            | Action::CloseDialog
-            | Action::InsertCharAtCursorPos(_)
-            | Action::InsertString(_)
-            | Action::InsertPastedText(_)
-            | Action::InsertNewLine
-            | Action::InsertTab
-            | Action::InsertLineBelowCursor
-            | Action::InsertLineAtCursor
-            | Action::DeletePreviousChar
-            | Action::DeleteCharAtCursorPos
-            | Action::Undo
-            | Action::Redo
-            | Action::MoveUp
-            | Action::MoveDown
-            | Action::MoveLeft
-            | Action::MoveRight
-            | Action::MoveToLineEnd
-            | Action::MoveToLineStart
-            | Action::MoveToFirstLineChar
-            | Action::MoveToNextWord
-            | Action::MoveToPreviousWord
-            | Action::MoveToNextWordEnd
-            | Action::MoveToTop
-            | Action::MoveToBottom
-            | Action::GoToLine(_)
-            | Action::PageDown
-            | Action::PageUp
-            | Action::HalfPageDown(_)
-            | Action::HalfPageUp(_)
-    )
+pub(crate) fn practice_action_allowed(lesson: Lesson, action: &Action) -> bool {
+    (lesson == Lesson::FindACommand
+        && matches!(
+            action,
+            Action::CommandPalette | Action::KeyboardShortcuts | Action::ToggleWrap
+        ))
+        || matches!(
+            action,
+            Action::OpenLearn
+                | Action::StartLearnLesson
+                | Action::StartLearnLessonAt(_)
+                | Action::ExitLearnLesson
+                | Action::RestartLearnLesson
+                | Action::FinishLearnLesson
+                | Action::Quit(_)
+                | Action::Command(_)
+                | Action::Print(_)
+                | Action::EnterMode(Mode::Normal | Mode::Insert | Mode::Command)
+                | Action::SetWaitingKey(_)
+                | Action::Refresh
+                | Action::CloseDialog
+                | Action::InsertCharAtCursorPos(_)
+                | Action::InsertString(_)
+                | Action::InsertPastedText(_)
+                | Action::InsertNewLine
+                | Action::InsertTab
+                | Action::InsertLineBelowCursor
+                | Action::InsertLineAtCursor
+                | Action::DeletePreviousChar
+                | Action::DeleteCharAtCursorPos
+                | Action::Undo
+                | Action::Redo
+                | Action::MoveUp
+                | Action::MoveDown
+                | Action::MoveLeft
+                | Action::MoveRight
+                | Action::MoveToLineEnd
+                | Action::MoveToLineStart
+                | Action::MoveToFirstLineChar
+                | Action::MoveToNextWord
+                | Action::MoveToPreviousWord
+                | Action::MoveToNextWordEnd
+                | Action::MoveToTop
+                | Action::MoveToBottom
+                | Action::GoToLine(_)
+                | Action::PageDown
+                | Action::PageUp
+                | Action::HalfPageDown(_)
+                | Action::HalfPageUp(_)
+        )
 }
 
 #[cfg(test)]
@@ -452,10 +506,46 @@ mod tests {
             Action::PluginCommand("Agent".into()),
             Action::InlineAssist,
         ] {
-            assert!(!practice_action_allowed(&action));
+            assert!(!practice_action_allowed(Lesson::FindYourFooting, &action));
         }
-        assert!(practice_action_allowed(&Action::Command(
-            "tutorial quit".into()
-        )));
+        assert!(practice_action_allowed(
+            Lesson::FindYourFooting,
+            &Action::Command("tutorial quit".into())
+        ));
+    }
+
+    #[test]
+    fn command_lesson_requires_visible_ui_effects() {
+        let mut step = Lesson::FindACommand.first_step();
+        let mut view = PracticeView {
+            command_palette_open: false,
+            wrapping: true,
+            shortcuts_open: false,
+        };
+        assert!(!step.observe_view(&Action::CommandPalette, view));
+        view.command_palette_open = true;
+        assert!(step.observe_view(&Action::CommandPalette, view));
+        assert!(!step.observe_view(&Action::ToggleWrap, view));
+        view.wrapping = false;
+        assert!(step.observe_view(&Action::ToggleWrap, view));
+        assert!(!step.observe_view(&Action::Refresh, view));
+        view.shortcuts_open = true;
+        assert!(step.observe_view(&Action::Refresh, view));
+        assert!(!step.observe_view(&Action::Refresh, view));
+        view.shortcuts_open = false;
+        assert!(step.observe_view(&Action::Refresh, view));
+        assert_eq!(step, PracticeStep::Complete);
+        assert!(practice_action_allowed(
+            Lesson::FindACommand,
+            &Action::CommandPalette
+        ));
+        assert!(!practice_action_allowed(
+            Lesson::EditWithConfidence,
+            &Action::ToggleWrap
+        ));
+        assert!(!practice_action_allowed(
+            Lesson::FindACommand,
+            &Action::Save
+        ));
     }
 }
