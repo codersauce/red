@@ -7,6 +7,7 @@ use crate::learn::{
 use crate::ui::{draw_learn_coach, draw_learn_panel_coach, CoachLayout, LearnHub};
 
 mod agent;
+mod git;
 
 pub(super) struct LearnSession {
     lesson: Lesson,
@@ -23,6 +24,8 @@ pub(super) struct LearnSession {
     original_active_inline_comment: Option<uuid::Uuid>,
     original_panels: Option<plugin::panel::PanelManager>,
     agent: Option<agent::LearnAgentState>,
+    git: Option<git::LearnGitState>,
+    original_workspaces: Option<plugin::WorkspaceManager>,
 }
 
 impl LearnSession {
@@ -131,7 +134,10 @@ impl Editor {
         }
         // Create owned storage before changing any editor state, so a failed
         // setup leaves the user's current workspace untouched.
-        let workspace = if matches!(lesson, Lesson::SaveAPracticeFile | Lesson::ContinueInAgent) {
+        let workspace = if matches!(
+            lesson,
+            Lesson::SaveAPracticeFile | Lesson::ContinueInAgent | Lesson::ReviewWhatChanged
+        ) {
             Some(PracticeWorkspace::new()?)
         } else {
             None
@@ -141,6 +147,21 @@ impl Editor {
             workspace.write_fixture("score.rs", lesson.contents())?;
             workspace.write_fixture("example.rs", crate::learn::AGENT_EXAMPLE)?;
         }
+        let git = if lesson == Lesson::ReviewWhatChanged {
+            let workspace = workspace.as_ref().expect("Git lesson owns a workspace");
+            match git::LearnGitState::prepare(workspace, runtime).await {
+                Ok(state) => Some(state),
+                Err(error) => {
+                    self.set_notification_message(
+                        Severity::Error,
+                        Some(format!("could not start Git practice: {error:#}")),
+                    );
+                    return self.render(buffer);
+                }
+            }
+        } else {
+            None
+        };
         if self.inline_assist.is_some()
             || self.workspace_manager.is_active()
             || self.agent_manager.has_active_sessions()
@@ -160,6 +181,9 @@ impl Editor {
         let original_panel_focus = self.panel_manager.focused_panel_id().map(str::to_string);
         let original_panels =
             (lesson == Lesson::ContinueInAgent).then(|| std::mem::take(&mut self.panel_manager));
+        let original_workspaces = git
+            .as_ref()
+            .map(|_| std::mem::take(&mut self.workspace_manager));
         self.panel_manager.focus_editor();
         let original_zoom = self.zoomed_pane.take();
         let original_repeat = self.last_semantic_change.take();
@@ -171,11 +195,13 @@ impl Editor {
         self.pending_semantic_change = None;
         let file = workspace.as_ref().map(|workspace| {
             workspace
-                .path(if lesson == Lesson::ContinueInAgent {
-                    "score.rs"
-                } else {
-                    "practice.txt"
-                })
+                .path(
+                    if matches!(lesson, Lesson::ContinueInAgent | Lesson::ReviewWhatChanged) {
+                        "score.rs"
+                    } else {
+                        "practice.txt"
+                    },
+                )
                 .to_string_lossy()
                 .into_owned()
         });
@@ -205,6 +231,8 @@ impl Editor {
             original_active_inline_comment,
             original_panels,
             agent: (lesson == Lesson::ContinueInAgent).then(agent::LearnAgentState::default),
+            git,
+            original_workspaces,
         });
         self.mode = Mode::Normal;
         if lesson == Lesson::FindACommand {
@@ -249,6 +277,9 @@ impl Editor {
             self.last_visual_selections.remove(&id);
             self.forget_jumps_for_buffer(id);
         }
+        if let Some(workspaces) = session.original_workspaces {
+            self.workspace_manager = workspaces;
+        }
         let restored_panels = session.original_panels.is_some();
         if let Some(panels) = session.original_panels {
             self.panel_manager = panels;
@@ -287,6 +318,8 @@ impl Editor {
         }
         self.highlight_cache.clear();
         self.layout_cache.borrow_mut().clear();
+        // Finish deleting owned files before showing the restored workspace.
+        drop(session.workspace);
         self.force_full_redraw = true;
         self.render(buffer)?;
         self.persist_session_snapshot(true);
@@ -503,6 +536,14 @@ impl Editor {
         if self.learn_session.is_none() {
             return false;
         }
+        if self.learn_git_workspace_open() {
+            self.sync_to_window();
+            self.window_manager
+                .set_presentation(WindowPresentation::Hidden);
+            self.panel_manager
+                .set_presentation(plugin::panel::PanelPresentation::Hidden);
+            return true;
+        }
         if self.learn_agent_pane_open() {
             let layout = CoachLayout::for_panel(size.1);
             self.sync_to_window();
@@ -543,7 +584,7 @@ impl Editor {
                 .into_iter()
                 .next()
         });
-        let draw = if self.learn_agent_pane_open() {
+        let draw = if self.learn_agent_pane_open() || self.learn_git_workspace_open() {
             draw_learn_panel_coach
         } else {
             draw_learn_coach

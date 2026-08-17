@@ -3572,6 +3572,24 @@ impl Default for Runtime {
 }
 
 impl Runtime {
+    /// Reuse the bundled Git parser for editor-owned, local-only workspaces.
+    pub(crate) fn git_detail_document(
+        &mut self,
+        patch: &str,
+        path: &str,
+        section: &str,
+    ) -> anyhow::Result<super::WorkspaceDocument> {
+        let value = self.inner.lock().unwrap().host.call_git_core(
+            "detail_document",
+            &[
+                Value::String(patch.into()),
+                Value::String(path.into()),
+                Value::String(section.into()),
+            ],
+        )?;
+        Ok(serde_json::from_value(value_to_json(&value))?)
+    }
+
     pub fn new() -> Self {
         Self::try_new().expect("failed to initialize plugin runtime")
     }

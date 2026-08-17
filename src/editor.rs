@@ -12755,7 +12755,11 @@ impl Editor {
     }
 
     fn handle_workspace_event(&mut self, ev: &event::Event) -> Option<KeyAction> {
+        let height = self.learn_workspace_height(usize::from(self.size.1));
         let event = if let Event::Mouse(event) = ev {
+            if usize::from(event.row) >= height {
+                return None;
+            }
             let horizontal = event.modifiers.contains(KeyModifiers::SHIFT);
             let action = match event.kind {
                 MouseEventKind::ScrollUp if horizontal => "mouse_left",
@@ -12771,7 +12775,7 @@ impl Editor {
                 action,
                 event.column as usize,
                 event.row as usize,
-                self.size.1 as usize,
+                height,
                 self.size.0 as usize,
             )?
         } else if let Event::Paste(text) = ev {
@@ -12780,7 +12784,7 @@ impl Editor {
             }
             self.workspace_manager.handle_action(
                 format!("filter_text:{}", text.lines().next().unwrap_or_default()),
-                self.size.1 as usize,
+                height,
                 self.size.0 as usize,
             )?
         } else if let Event::Key(event) = ev {
@@ -12817,11 +12821,8 @@ impl Editor {
                     _ => return None,
                 }
             };
-            self.workspace_manager.handle_action(
-                action,
-                self.size.1 as usize,
-                self.size.0 as usize,
-            )?
+            self.workspace_manager
+                .handle_action(action, height, self.size.0 as usize)?
         } else {
             return None;
         };
@@ -16355,6 +16356,9 @@ impl Editor {
             .intercept_learn_agent_action(action, buffer, runtime)
             .await?
         {
+            return Ok(false);
+        }
+        if self.intercept_learn_git_action(action, buffer)? {
             return Ok(false);
         }
         let sensitive_action = matches!(action, Action::NotifyPlugin(_, _, _))
@@ -27684,6 +27688,106 @@ mod test {
     use super::*;
     use crate::lsp::DiagnosticSeverity;
     use std::path::PathBuf;
+
+    #[tokio::test]
+    async fn learn_red_git_review_requires_real_diff_navigation_and_restores_workspace() {
+        use crate::learn::{Lesson, PracticeStep};
+        async fn key(
+            editor: &mut Editor,
+            buffer: &mut RenderBuffer,
+            runtime: &mut Runtime,
+            code: KeyCode,
+        ) {
+            let event = Event::Key(KeyEvent::new(code, KeyModifiers::NONE));
+            let action = editor.handle_workspace_event(&event).unwrap();
+            editor
+                .handle_key_action(&event, &action, buffer, runtime)
+                .await
+                .unwrap();
+        }
+        let mut editor = test_editor(140, 38);
+        let mut buffer = RenderBuffer::new(140, 38, &Style::default());
+        let mut runtime = Runtime::new();
+        let original_id = editor.current_buffer().id();
+        editor
+            .execute(
+                &Action::StartLearnLessonAt(Lesson::ReviewWhatChanged.id().into()),
+                &mut buffer,
+                &mut runtime,
+            )
+            .await
+            .unwrap();
+        let root = PathBuf::from(editor.current_buffer().file.as_ref().unwrap())
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        let baseline = std::fs::read(root.join(".git/refs/heads/practice")).unwrap();
+        let index = std::fs::read(root.join(".git/index")).unwrap();
+        let open = Action::PluginCommand("GitDashboard".into());
+        editor
+            .execute(&open, &mut buffer, &mut runtime)
+            .await
+            .unwrap();
+        assert_eq!(editor.learn_workspace_height(38), 30);
+        assert_eq!(
+            editor.learn_session.as_ref().unwrap().step,
+            PracticeStep::GitScore
+        );
+        // Just opening or leaving is not a review.
+        key(&mut editor, &mut buffer, &mut runtime, KeyCode::Char('q')).await;
+        assert_eq!(
+            editor.learn_session.as_ref().unwrap().step,
+            PracticeStep::GitScore
+        );
+        editor
+            .execute(&open, &mut buffer, &mut runtime)
+            .await
+            .unwrap();
+        for code in [
+            KeyCode::Char('s'),
+            KeyCode::Char('c'),
+            KeyCode::Tab,
+            KeyCode::Char('j'),
+        ] {
+            key(&mut editor, &mut buffer, &mut runtime, code).await;
+        }
+        assert_eq!(
+            editor.learn_session.as_ref().unwrap().step,
+            PracticeStep::GitExample
+        );
+        for code in [
+            KeyCode::Tab,
+            KeyCode::Char('j'),
+            KeyCode::Tab,
+            KeyCode::Char('j'),
+        ] {
+            key(&mut editor, &mut buffer, &mut runtime, code).await;
+        }
+        assert_eq!(
+            editor.learn_session.as_ref().unwrap().step,
+            PracticeStep::GitReturn
+        );
+        key(&mut editor, &mut buffer, &mut runtime, KeyCode::Char('q')).await;
+        assert_eq!(
+            editor.learn_session.as_ref().unwrap().step,
+            PracticeStep::Complete
+        );
+        assert_eq!(
+            std::fs::read(root.join(".git/refs/heads/practice")).unwrap(),
+            baseline
+        );
+        assert_eq!(std::fs::read(root.join(".git/index")).unwrap(), index);
+        assert!(editor
+            .preferences
+            .learn_lesson_completed(Lesson::ReviewWhatChanged.id()));
+        editor
+            .execute(&Action::ExitLearnLesson, &mut buffer, &mut runtime)
+            .await
+            .unwrap();
+        assert!(!root.exists());
+        assert!(!editor.workspace_manager.is_active());
+        assert_eq!(editor.current_buffer().id(), original_id);
+    }
 
     #[tokio::test]
     async fn learn_red_agent_saves_owned_files_and_restores_the_real_composer() {

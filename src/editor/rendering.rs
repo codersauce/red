@@ -1303,8 +1303,10 @@ impl Editor {
         if self.workspace_manager.is_active() {
             buffer.shortcut_help_regions.clear();
         }
-        self.workspace_manager
-            .render(buffer, &self.theme, self.picker_icons());
+        if !self.render_learn_git_workspace(buffer) {
+            self.workspace_manager
+                .render(buffer, &self.theme, self.picker_icons());
+        }
         if self.workspace_manager.is_active() {
             let (context, _) = self.workspace_manager.shortcut_actions();
             for help in &mut buffer.shortcut_help_regions {

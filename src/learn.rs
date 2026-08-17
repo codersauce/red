@@ -2,6 +2,7 @@
 
 use crate::editor::{Action, Mode};
 
+mod git;
 mod workspace;
 pub(crate) use workspace::PracticeWorkspace;
 
@@ -25,6 +26,7 @@ pub(crate) const AI_BONUS_CONTENTS: &str = "fn add_score(score: u32, points: u32
 pub(crate) const AGENT_EXAMPLE: &str = "// Practice usage example\nlet expected_score = 39;\n";
 pub(crate) const AGENT_EXAMPLE_FIXED: &str =
     "// Practice usage example: add_score(40, 2)\nlet expected_score = 42;\n";
+pub(crate) const LEARN_GIT_WORKSPACE: &str = "learn-git";
 pub(crate) const LEARN_AGENT_PANEL: &str = "learn-recorded-agent";
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -38,10 +40,11 @@ pub(crate) enum Lesson {
     MakeAFocusedChange,
     ChooseWhatToKeep,
     ContinueInAgent,
+    ReviewWhatChanged,
 }
 
 impl Lesson {
-    pub const AVAILABLE: [Self; 8] = [
+    pub const AVAILABLE: [Self; 9] = [
         Self::FindYourFooting,
         Self::EditWithConfidence,
         Self::FindACommand,
@@ -50,6 +53,7 @@ impl Lesson {
         Self::MakeAFocusedChange,
         Self::ChooseWhatToKeep,
         Self::ContinueInAgent,
+        Self::ReviewWhatChanged,
     ];
 
     pub fn from_id(id: &str) -> Option<Self> {
@@ -82,6 +86,7 @@ impl Lesson {
             Self::MakeAFocusedChange => 5,
             Self::ChooseWhatToKeep => 6,
             Self::ContinueInAgent => 7,
+            Self::ReviewWhatChanged => 8,
         }
     }
 
@@ -90,7 +95,8 @@ impl Lesson {
             Self::UnderstandSelectedCode
             | Self::MakeAFocusedChange
             | Self::ChooseWhatToKeep
-            | Self::ContinueInAgent => 1,
+            | Self::ContinueInAgent
+            | Self::ReviewWhatChanged => 1,
             _ => 0,
         }
     }
@@ -121,6 +127,7 @@ impl Lesson {
             Self::MakeAFocusedChange => "ai.make-a-focused-change.v1",
             Self::ChooseWhatToKeep => "ai.choose-what-to-keep.v1",
             Self::ContinueInAgent => "ai.continue-in-agent.v1",
+            Self::ReviewWhatChanged => "ai.review-what-changed.v1",
         }
     }
 
@@ -138,6 +145,7 @@ impl Lesson {
             | Self::MakeAFocusedChange
             | Self::ChooseWhatToKeep
             | Self::ContinueInAgent => AI_CONTENTS,
+            Self::ReviewWhatChanged => AI_FIXED_CONTENTS,
         }
     }
 
@@ -151,6 +159,7 @@ impl Lesson {
             Self::MakeAFocusedChange => PracticeStep::AiChangeSelect,
             Self::ChooseWhatToKeep => PracticeStep::AiChoiceSelect,
             Self::ContinueInAgent => PracticeStep::AgentSelect,
+            Self::ReviewWhatChanged => PracticeStep::GitOpen,
         }
     }
 
@@ -201,6 +210,12 @@ impl Lesson {
                 "Undo the unwanted change",
                 "Request and refine a suggestion",
                 "Keep only the corrected result",
+            ],
+            Self::ReviewWhatChanged => &[
+                "Open the practice Git review",
+                "Inspect the score.rs change",
+                "Inspect the example.rs change",
+                "Return to code",
             ],
             Self::ContinueInAgent => &[
                 "Make an unsaved inline fix",
@@ -352,12 +367,18 @@ pub(crate) enum PracticeStep {
     AgentEscalate,
     AgentPrompt,
     AgentInspect,
+    GitOpen,
+    GitScore,
+    GitExample,
+    GitReturn,
     Complete,
 }
 
 impl PracticeStep {
     pub fn suggested_action(self) -> Option<Action> {
         match self {
+            Self::GitOpen => Some(Action::PluginCommand("GitDashboard".into())),
+            Self::GitScore | Self::GitExample | Self::GitReturn => None,
             Self::Insert => Some(Action::EnterMode(Mode::Insert)),
             Self::Normal => Some(Action::EnterMode(Mode::Normal)),
             Self::Undo | Self::EditUndo => Some(Action::Undo),
@@ -446,6 +467,10 @@ impl PracticeStep {
             Self::AgentEscalate => "The inline fix is unsaved. Press A in its result controls to continue in the recorded Agent workspace.".into(),
             Self::AgentPrompt => "Ask Agent to save the fix and update the usage example. Press Enter to submit. This recorded turn uses real editor file tools, not a live model.".into(),
             Self::AgentInspect => "The recorded Agent saved both files. Choose Back to code (or q), then use :bn to open example.rs and inspect the saved value 42.".into(),
+            Self::GitOpen => format!("The recorded task changed two saved files. Open Git review with {} (or :GitDashboard). This repository is disposable and has no remote.", shortcut.unwrap_or("Space g g")),
+            Self::GitScore => "Select score.rs, press Tab to focus its diff, then move with j/k onto a red or green changed line. Check that subtraction became addition. Reopen with :GitDashboard if needed.".into(),
+            Self::GitExample => "Tab back to Files, select example.rs, then Tab into its diff. Move onto a changed line and inspect the expected value 42. Reopen with :GitDashboard if needed.".into(),
+            Self::GitReturn => "Both changes are reviewed. Press q or Esc to return to code. Nothing has been staged or committed.".into(),
             Self::Complete => match lesson {
                 Lesson::FindYourFooting => "Your original text is restored. Nicely done.",
                 Lesson::EditWithConfidence => {
@@ -456,6 +481,7 @@ impl PracticeStep {
                 Lesson::UnderstandSelectedCode => "You explained selected code without editing it. Recorded practice complete; real inline assist sends your selected context only when you submit a prompt.",
                 Lesson::MakeAFocusedChange => "The fix is kept in the buffer, still unsaved. Inline edits use normal undo history; keeping one is not the same as writing a file.",
                 Lesson::ChooseWhatToKeep => "You rejected an unwanted change, refined a suggestion, and kept the corrected result. The final edit is unsaved and remains undoable.",
+                Lesson::ReviewWhatChanged => "You reviewed the real diff for both files. Build with AI complete! These changes are still unstaged; your own repository was never touched.",
                 Lesson::ContinueInAgent => "Both practice files are saved. Unlike Keep in inline assist, Agent file-edit tools can write to disk. Your real workspace and Agent draft are untouched.",
             }
             .into(),
@@ -474,7 +500,8 @@ impl PracticeStep {
             | Self::AiChoiceRequest
             | Self::AgentSelect
             | Self::AgentInlineOpen
-            | Self::AgentInlineSubmit => 0,
+            | Self::AgentInlineSubmit
+            | Self::GitOpen => 0,
             Self::Type
             | Self::EditDelete
             | Self::CommandRun
@@ -482,7 +509,8 @@ impl PracticeStep {
             | Self::AiOpen
             | Self::AiChangeOpen
             | Self::AiChoiceUndo
-            | Self::AgentEscalate => 1,
+            | Self::AgentEscalate
+            | Self::GitScore => 1,
             Self::Normal
             | Self::EditUndo
             | Self::CommandHelp
@@ -492,7 +520,8 @@ impl PracticeStep {
             | Self::AiChoiceAgainSelect
             | Self::AiChoiceAgain
             | Self::AiChoiceRefine
-            | Self::AgentPrompt => 2,
+            | Self::AgentPrompt
+            | Self::GitExample => 2,
             Self::Undo
             | Self::EditRedo
             | Self::CommandReturn
@@ -500,7 +529,8 @@ impl PracticeStep {
             | Self::AiRead
             | Self::AiChangeKeep
             | Self::AiChoiceKeep
-            | Self::AgentInspect => 3,
+            | Self::AgentInspect
+            | Self::GitReturn => 3,
             Self::Complete => 4,
         }
     }
@@ -666,16 +696,19 @@ pub(crate) struct PracticeView {
 
 /// Scratch lessons permit only edits to their isolated practice buffer.
 pub(crate) fn practice_action_allowed(lesson: Lesson, action: &Action) -> bool {
-    (lesson == Lesson::ContinueInAgent
-        && (matches!(
-            action,
-            Action::EscalateInlineAssist
-                | Action::OpenTextPanelTurnActions
-                | Action::NextBuffer
-                | Action::PreviousBuffer
-        ) || matches!(action, Action::CopyTextPanelTurn { panel_id, .. } | Action::ReuseTextPanelPrompt { panel_id, .. } if panel_id == LEARN_AGENT_PANEL)
-            || matches!(action, Action::PluginCommand(name) if matches!(name.as_str(), "Agent" | "AgentOpen" | "AgentToggle"))
-            || matches!(action, Action::NotifyPlugins(method, _) if method == &format!("panel:event:{LEARN_AGENT_PANEL}"))))
+    (lesson == Lesson::ReviewWhatChanged
+        && (matches!(action, Action::PluginCommand(name) if name == "GitDashboard")
+            || matches!(action, Action::NotifyPlugins(method, _) if method == &format!("workspace:event:{LEARN_GIT_WORKSPACE}"))))
+        || (lesson == Lesson::ContinueInAgent
+            && (matches!(
+                action,
+                Action::EscalateInlineAssist
+                    | Action::OpenTextPanelTurnActions
+                    | Action::NextBuffer
+                    | Action::PreviousBuffer
+            ) || matches!(action, Action::CopyTextPanelTurn { panel_id, .. } | Action::ReuseTextPanelPrompt { panel_id, .. } if panel_id == LEARN_AGENT_PANEL)
+                || matches!(action, Action::PluginCommand(name) if matches!(name.as_str(), "Agent" | "AgentOpen" | "AgentToggle"))
+                || matches!(action, Action::NotifyPlugins(method, _) if method == &format!("panel:event:{LEARN_AGENT_PANEL}"))))
         || (lesson.is_ai_practice()
             && matches!(
                 action,
