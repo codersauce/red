@@ -31,6 +31,7 @@ mod prompt_buffer;
 mod rich_text;
 mod selection;
 mod shortcut_catalog;
+pub(crate) mod signature_help;
 mod spinner;
 mod statusline_layout;
 mod whats_new;
@@ -211,6 +212,11 @@ pub trait Component: Send {
 
     fn allows_event_passthrough(&self) -> bool {
         false
+    }
+
+    /// Absolute bounds of an interactive completion popup, including its border.
+    fn completion_popup_bounds(&self) -> Option<(usize, usize, usize, usize)> {
+        None
     }
 
     fn is_sensitive_input(&self) -> bool {

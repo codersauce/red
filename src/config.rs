@@ -255,6 +255,9 @@ pub struct Config {
     /// Insert-mode completion sources and automatic triggering.
     #[serde(default)]
     pub completion: CompletionConfig,
+    /// Non-modal callable signatures shown near the Insert-mode cursor.
+    #[serde(default)]
+    pub signature_help: SignatureHelpConfig,
     /// Opt-in AI inline completion, independent of ordinary language servers.
     #[serde(default)]
     pub copilot: crate::copilot::CopilotConfig,
@@ -783,6 +786,25 @@ impl Default for CompletionConfig {
 
 fn default_completion_min_prefix_length() -> usize {
     1
+}
+
+/// Automatic signature-help presentation; explicit invocation remains available.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct SignatureHelpConfig {
+    pub auto_trigger: bool,
+    pub debounce_ms: u64,
+    pub show_documentation: bool,
+}
+
+impl Default for SignatureHelpConfig {
+    fn default() -> Self {
+        Self {
+            auto_trigger: true,
+            debounce_ms: 120,
+            show_documentation: true,
+        }
+    }
 }
 
 fn default_completion_debounce_ms() -> u64 {

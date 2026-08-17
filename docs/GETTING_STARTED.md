@@ -102,13 +102,23 @@ Patterns use Rust regular-expression syntax. `incsearch`, `hlsearch`,
 | `K` | Hover documentation |
 | `gd` | Go to definition |
 | `Ctrl-Space` | Trigger completion in Insert mode |
-| `Ctrl-k` | Show signature help in Insert mode |
+| `Ctrl-k` | Show signature help in Insert mode; cycle available overloads |
 | `Ctrl-t` | Find document symbols |
 | `Space w` | Find workspace symbols |
 | `Space k` | Find references |
 | `Space f` | Format the current document |
 | `Space .` | Show code actions and quick fixes |
 | `Space r` | Rename the current symbol |
+
+When a language server supports signature help, Red shows a small popup while
+you enter call arguments. The current parameter is highlighted, and typing,
+completion, and cursor movement continue normally. `Ctrl-k` reopens the popup
+or cycles through overloads. Leaving Insert mode closes it.
+
+Use `[signature_help]` in `config.toml` to set `auto_trigger = false`, adjust
+`debounce_ms` (120 by default), or hide the extra documentation line with
+`show_documentation = false`. Manual `Ctrl-k` remains available when automatic
+help is disabled.
 
 Husk's first-party server is included and starts for `.hk` and `.husk` files.
 Built-in defaults also cover Rust, TypeScript/JavaScript, Markdown, JSON, TOML,

@@ -1591,7 +1591,17 @@ impl LspClient for RealLspClient {
     }
 
     async fn signature_help(&mut self, file: &str, x: usize, y: usize) -> Result<i64, LspError> {
-        let params = json!({
+        self.signature_help_with_context(file, x, y, None).await
+    }
+
+    async fn signature_help_with_context(
+        &mut self,
+        file: &str,
+        x: usize,
+        y: usize,
+        context: Option<super::SignatureHelpContext>,
+    ) -> Result<i64, LspError> {
+        let mut params = json!({
             "textDocument": {
                 "uri": file_uri(file)?,
             },
@@ -1601,6 +1611,9 @@ impl LspClient for RealLspClient {
             }
         });
 
+        if let Some(context) = context {
+            params["context"] = serde_json::to_value(context)?;
+        }
         self.send_request("textDocument/signatureHelp", params, false)
             .await
     }

@@ -582,6 +582,11 @@ impl CompletionUI {
 }
 
 impl Component for CompletionUI {
+    fn completion_popup_bounds(&self) -> Option<(usize, usize, usize, usize)> {
+        self.has_shortcut_context()
+            .then_some((self.x, self.y, self.width, self.visible_rows + 2))
+    }
+
     fn has_shortcut_context(&self) -> bool {
         self.visible && !self.items.is_empty() && self.width >= 2 && self.visible_rows > 0
     }
