@@ -2379,6 +2379,7 @@ pub enum Action {
     FinishLearnLesson,
     SnapshotLearnRecovery,
     RestoreLearnRecovery,
+    CheckLearnLiveAi,
     OpenStatuslineManager,
     OpenDiagnosticsPicker,
     OpenErrorDiagnosticsPicker,
@@ -7578,6 +7579,7 @@ impl Editor {
         self.current_dialog = Some(Box::new(
             self.inline_assist_popup(scope, self.inline_assist_result_state()),
         ));
+        self.observe_learn_live_result(render_buffer)?;
         self.render(render_buffer)?;
         Ok(())
     }
@@ -13732,6 +13734,12 @@ impl Editor {
             "tutorial next" => return vec![Action::FinishLearnLesson],
             "tutorial snapshot" => return vec![Action::SnapshotLearnRecovery],
             "tutorial recover" => return vec![Action::RestoreLearnRecovery],
+            "tutorial ai-check" => return vec![Action::CheckLearnLiveAi],
+            "tutorial ai live" => {
+                return vec![Action::StartLearnLessonAt(
+                    crate::learn::Lesson::TryLiveAi.id().into(),
+                )]
+            }
             _ => {}
         }
         if let Some(number) = cmd.strip_prefix("tutorial essentials ") {
@@ -16783,6 +16791,8 @@ impl Editor {
                     Ok((range, scope)) => {
                         let scope = if self.is_learn_inline_practice() {
                             format!("recorded practice · {scope}")
+                        } else if self.is_learn_live_practice() {
+                            format!("LIVE practice · sends to Codex · {scope}")
                         } else {
                             scope
                         };
@@ -16861,8 +16871,8 @@ impl Editor {
                     self.render(buffer)?;
                     return Ok(false);
                 }
-                let cwd = get_workspace_path();
-                if let Err(error) = self.ensure_agent_bridge(&cwd) {
+                let cwd = self.inline_assist_workspace();
+                if let Err(error) = self.ensure_inline_assist_bridge(&cwd) {
                     self.inline_history.finish(
                         &request_id,
                         InlineTurnState::Failed,
@@ -19634,7 +19644,8 @@ impl Editor {
             | Action::FinishLearnLesson
             | Action::ExitLearnLesson
             | Action::SnapshotLearnRecovery
-            | Action::RestoreLearnRecovery => {
+            | Action::RestoreLearnRecovery
+            | Action::CheckLearnLiveAi => {
                 self.execute_learn_control(action, buffer, runtime).await?;
             }
             Action::OpenStatuslineManager => {

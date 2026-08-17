@@ -121,12 +121,12 @@ impl LearnHub {
 
     fn next_lesson(&self) -> Option<Lesson> {
         Lesson::for_track(self.selected)
-            .find(|lesson| !self.completed[lesson.index()])
+            .find(|lesson| !lesson.is_optional() && !self.completed[lesson.index()])
             .or_else(|| Lesson::for_track(self.selected).next())
     }
 
     fn track_progress(&self) -> (usize, usize) {
-        let available = Lesson::for_track(self.selected);
+        let available = Lesson::for_track(self.selected).filter(|lesson| !lesson.is_optional());
         let total = available.clone().count();
         (
             available
@@ -151,7 +151,7 @@ impl LearnHub {
         } else {
             "Track planned"
         };
-        vec![
+        let mut actions = vec![
             UiAction::new("open", "Enter", open).with_priority(ActionPriority::Essential),
             UiAction::new(
                 "close",
@@ -164,7 +164,11 @@ impl LearnHub {
             )
             .with_priority(ActionPriority::Essential),
             UiAction::new("next", "j/k", "Choose track").with_trigger("j"),
-        ]
+        ];
+        if self.selected == 1 {
+            actions.push(UiAction::new("live", "l", "Try live AI"));
+        }
+        actions
     }
 
     fn open_selected(&mut self) -> KeyAction {
@@ -508,6 +512,9 @@ impl Component for LearnHub {
                         }
                     }
                     KeyCode::Enter => Some(self.open_selected()),
+                    KeyCode::Char('l') if self.selected == 1 => Some(KeyAction::Single(
+                        Action::StartLearnLessonAt(Lesson::TryLiveAi.id().into()),
+                    )),
                     KeyCode::Down | KeyCode::Char('j') => {
                         self.move_selection(1);
                         Some(KeyAction::Single(Action::Refresh))
@@ -657,7 +664,9 @@ fn draw_coach(
                 track.title,
                 if lesson == Lesson::SaveAPracticeFile {
                     "Disposable practice file"
-                } else if lesson.is_ai_practice() {
+                } else if lesson == Lesson::TryLiveAi {
+                    "Optional live AI · sends on submit"
+                } else if lesson.is_recorded_ai_practice() {
                     "Offline recorded practice"
                 } else {
                     "Practice buffer"

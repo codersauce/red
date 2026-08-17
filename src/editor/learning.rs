@@ -13,6 +13,7 @@ mod git;
 mod keymap;
 mod language;
 mod language_support;
+mod live;
 mod navigation;
 mod outline;
 mod recovery;
@@ -45,6 +46,7 @@ pub(super) struct LearnSession {
     theme: Option<customization::LearnThemeState>,
     keymap: Option<keymap::LearnKeymapState>,
     recovery: Option<recovery::LearnRecoveryState>,
+    live: Option<Box<live::LearnLiveAiState>>,
 }
 
 impl LearnSession {
@@ -101,6 +103,12 @@ impl Editor {
                 Action::ExitLearnLesson => {
                     self.finish_learn_lesson(buffer, runtime).await?;
                 }
+                Action::CheckLearnLiveAi => {
+                    self.set_quiet_message(Some(
+                        "open :tutorial ai live for the optional live exercise".into(),
+                    ));
+                    self.render(buffer)?;
+                }
                 Action::SnapshotLearnRecovery | Action::RestoreLearnRecovery => {
                     self.set_quiet_message(Some(
                         "start :tutorial custom 4 to try isolated recovery".into(),
@@ -140,7 +148,9 @@ impl Editor {
 
     pub(super) fn next_learn_lesson_for_track(&self, track: usize) -> Option<Lesson> {
         Lesson::for_track(track)
-            .find(|lesson| !self.preferences.learn_lesson_completed(lesson.id()))
+            .find(|lesson| {
+                !lesson.is_optional() && !self.preferences.learn_lesson_completed(lesson.id())
+            })
             .or_else(|| Lesson::for_track(track).next())
     }
 
@@ -218,6 +228,7 @@ impl Editor {
                 | Lesson::ContinueInAgent
                 | Lesson::DiscoverYourKeymap
                 | Lesson::KeepYourPlace
+                | Lesson::TryLiveAi
         ) || lesson.is_lsp_practice()
             || lesson.is_git_practice()
             || lesson.is_navigation_practice()
@@ -226,6 +237,12 @@ impl Editor {
         } else {
             None
         };
+        if lesson == Lesson::TryLiveAi {
+            workspace
+                .as_ref()
+                .expect("live lesson owns a workspace")
+                .write_fixture("score.rs", lesson.contents())?;
+        }
         if lesson == Lesson::ContinueInAgent {
             let workspace = workspace.as_ref().expect("file lesson owns a workspace");
             workspace.write_fixture("score.rs", lesson.contents())?;
@@ -296,13 +313,22 @@ impl Editor {
         let original_panel_focus = self.panel_manager.focused_panel_id().map(str::to_string);
         let original_panels = matches!(
             lesson,
-            Lesson::ContinueInAgent | Lesson::ArrangeYourWorkspace
+            Lesson::ContinueInAgent | Lesson::ArrangeYourWorkspace | Lesson::TryLiveAi
         )
         .then(|| std::mem::take(&mut self.panel_manager));
         let original_workspaces = git
             .as_ref()
             .map(|_| std::mem::take(&mut self.workspace_manager));
         self.panel_manager.focus_editor();
+        let live = (lesson == Lesson::TryLiveAi).then(|| {
+            live::LearnLiveAiState::install(
+                self,
+                workspace
+                    .as_ref()
+                    .expect("live lesson owns a workspace")
+                    .root(),
+            )
+        });
         let original_zoom = self.zoomed_pane.take();
         let original_repeat = self.last_semantic_change.take();
         let input = search::LearnInputState::install(self);
@@ -322,7 +348,9 @@ impl Editor {
                     "README.md"
                 } else if lesson.is_lsp_practice() {
                     "main.hk"
-                } else if lesson == Lesson::ContinueInAgent || lesson.is_git_practice() {
+                } else if matches!(lesson, Lesson::ContinueInAgent | Lesson::TryLiveAi)
+                    || lesson.is_git_practice()
+                {
                     "score.rs"
                 } else {
                     "practice.txt"
@@ -374,6 +402,7 @@ impl Editor {
             keymap: (lesson == Lesson::DiscoverYourKeymap)
                 .then(|| keymap::LearnKeymapState::new(self)),
             recovery: (lesson == Lesson::KeepYourPlace).then(recovery::LearnRecoveryState::default),
+            live,
         }));
         self.mode = Mode::Normal;
         if matches!(lesson, Lesson::FindACommand | Lesson::DiscoverYourKeymap) {
@@ -406,15 +435,20 @@ impl Editor {
         buffer: &mut RenderBuffer,
         runtime: &mut Runtime,
     ) -> anyhow::Result<()> {
-        let Some(session) = self.learn_session.take() else {
+        let Some(mut session) = self.learn_session.take() else {
             return Ok(());
         };
         if session.lesson.is_ai_practice() {
             // Recorded sessions never belong to a live agent bridge.
-            if let Some(assist) = self.inline_assist.as_mut() {
-                assist.session_id = None;
+            if session.lesson.is_recorded_ai_practice() {
+                if let Some(assist) = self.inline_assist.as_mut() {
+                    assist.session_id = None;
+                }
             }
             self.close_inline_assist_session();
+        }
+        if let Some(live) = session.live.take() {
+            live.restore(self);
         }
         self.release_current_dialog_callbacks(runtime);
         self.current_dialog = None;
@@ -583,6 +617,9 @@ impl Editor {
             self.render(buffer)?;
             return Ok(true);
         }
+        if self.intercept_learn_live_action(action, buffer).await? {
+            return Ok(true);
+        }
         if self.intercept_learn_recovery_action(action, buffer)? {
             return Ok(true);
         }
@@ -730,6 +767,12 @@ impl Editor {
                 .flatten()
                 .and_then(|uri| self.diagnostics.get(&uri))
                 .is_some_and(Vec::is_empty),
+            live_readiness_open: self
+                .current_dialog
+                .as_ref()
+                .is_some_and(|dialog| dialog.shortcut_context() == "Live AI readiness"),
+            live_ready: session.live.as_ref().is_some_and(|state| state.ready),
+            live_result_received: session.live.as_ref().is_some_and(|state| state.received),
             recovery_snapshot_saved: session.recovery.as_ref().is_some_and(|state| state.saved),
             recovery_restored: session
                 .recovery
@@ -838,7 +881,7 @@ impl Editor {
     pub(super) fn is_learn_inline_practice(&self) -> bool {
         self.learn_session
             .as_ref()
-            .is_some_and(|session| session.lesson.is_ai_practice())
+            .is_some_and(|session| session.lesson.is_recorded_ai_practice())
     }
 
     /// Exercise the production result path without starting a model or sending

@@ -52,6 +52,10 @@ pub(super) fn practice_language_services(
 }
 
 impl SavedLanguageState {
+    pub(super) fn original_ai_disabled(&self) -> bool {
+        self.disable_ai
+    }
+
     pub(super) fn original_config(&self) -> &LspConfig {
         &self.config
     }

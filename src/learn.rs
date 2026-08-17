@@ -21,6 +21,7 @@ pub(crate) const SAVE_CONTENTS: &str = "Today I learned:\n";
 pub(crate) const AI_LINE: &str =
     "fn add_score(score: u32, points: u32) -> u32 { score - points }\n";
 pub(crate) const AI_CONTENTS: &str = "fn add_score(score: u32, points: u32) -> u32 { score - points }\n\n// Offline practice: no prompt or code is sent to an AI service.\n";
+pub(crate) const LIVE_AI_CONTENTS: &str = "fn add_score(score: u32, points: u32) -> u32 { score - points }\n\n// Optional live practice: submitting sends this fixture and your prompt to Codex.\n";
 pub(crate) const AI_FIXED_LINE: &str =
     "fn add_score(score: u32, points: u32) -> u32 { score + points }\n";
 pub(crate) const AI_FIXED_CONTENTS: &str = "fn add_score(score: u32, points: u32) -> u32 { score + points }\n\n// Offline practice: no prompt or code is sent to an AI service.\n";
@@ -66,10 +67,11 @@ pub(crate) enum Lesson {
     DiscoverYourKeymap,
     CheckLanguageSupport,
     KeepYourPlace,
+    TryLiveAi,
 }
 
 impl Lesson {
-    pub const AVAILABLE: [Self; 26] = [
+    pub const AVAILABLE: [Self; 27] = [
         Self::FindYourFooting,
         Self::EditWithConfidence,
         Self::FindACommand,
@@ -96,6 +98,7 @@ impl Lesson {
         Self::DiscoverYourKeymap,
         Self::CheckLanguageSupport,
         Self::KeepYourPlace,
+        Self::TryLiveAi,
     ];
 
     pub fn from_id(id: &str) -> Option<Self> {
@@ -146,6 +149,7 @@ impl Lesson {
             Self::DiscoverYourKeymap => 23,
             Self::CheckLanguageSupport => 24,
             Self::KeepYourPlace => 25,
+            Self::TryLiveAi => 26,
         }
     }
 
@@ -155,7 +159,8 @@ impl Lesson {
             | Self::MakeAFocusedChange
             | Self::ChooseWhatToKeep
             | Self::ContinueInAgent
-            | Self::ReviewWhatChanged => 1,
+            | Self::ReviewWhatChanged
+            | Self::TryLiveAi => 1,
             Self::ReadTheDiagnostic
             | Self::FollowTheSymbol
             | Self::RepairTheCode
@@ -208,7 +213,11 @@ impl Lesson {
         )
     }
 
-    pub const fn is_ai_practice(self) -> bool {
+    pub const fn is_optional(self) -> bool {
+        matches!(self, Self::TryLiveAi)
+    }
+
+    pub const fn is_recorded_ai_practice(self) -> bool {
         matches!(
             self,
             Self::UnderstandSelectedCode
@@ -216,6 +225,10 @@ impl Lesson {
                 | Self::ChooseWhatToKeep
                 | Self::ContinueInAgent
         )
+    }
+
+    pub const fn is_ai_practice(self) -> bool {
+        self.is_recorded_ai_practice() || matches!(self, Self::TryLiveAi)
     }
 
     pub const fn id(self) -> &'static str {
@@ -246,6 +259,7 @@ impl Lesson {
             Self::DiscoverYourKeymap => "custom.discover-your-keymap.v1",
             Self::CheckLanguageSupport => "custom.check-language-support.v1",
             Self::KeepYourPlace => "custom.keep-your-place.v1",
+            Self::TryLiveAi => "ai.try-live-ai.v1",
         }
     }
 
@@ -261,6 +275,7 @@ impl Lesson {
             Self::FindAndReplace => precision::REPLACE_CONTENTS,
             Self::DiscoverYourKeymap => personalization::KEYMAP_CONTENTS,
             Self::KeepYourPlace => personalization::RECOVERY_CONTENTS,
+            Self::TryLiveAi => LIVE_AI_CONTENTS,
             Self::FindYourFooting | Self::ChooseATheme => PRACTICE_CONTENTS,
             Self::EditWithConfidence => EDIT_CONTENTS,
             Self::FindACommand => COMMAND_CONTENTS,
@@ -309,11 +324,14 @@ impl Lesson {
             Self::DiscoverYourKeymap => PracticeStep::KeymapOpen,
             Self::CheckLanguageSupport => PracticeStep::SupportSyntax,
             Self::KeepYourPlace => PracticeStep::RecoveryEdit,
+            Self::TryLiveAi => PracticeStep::LiveCheck,
         }
     }
 
     pub fn next(self) -> Option<Self> {
-        Self::for_track(self.track_index()).nth(self.lesson_index() + 1)
+        Self::for_track(self.track_index())
+            .skip(self.lesson_index() + 1)
+            .find(|lesson| !lesson.is_optional())
     }
 
     pub const fn checkpoints(self) -> &'static [&'static str] {
@@ -359,6 +377,12 @@ impl Lesson {
                 "Undo the unwanted change",
                 "Request and refine a suggestion",
                 "Keep only the corrected result",
+            ],
+            Self::TryLiveAi => &[
+                "Check local Codex readiness",
+                "Select the owned practice code",
+                "Submit and receive a live result",
+                "Inspect and choose what to keep",
             ],
             Self::KeepYourPlace => &[
                 "Make an unsaved change",
@@ -517,6 +541,7 @@ pub(crate) const TRACKS: [Track; 6] = [
             "Choose what to keep",
             "Continue in Agent",
             "Review what changed",
+            "Try live AI (optional)",
         ],
     },
     Track {
@@ -695,12 +720,21 @@ pub(crate) enum PracticeStep {
     RecoveryRestore,
     RecoveryUndo,
     RecoveryRedo,
+    LiveCheck,
+    LiveReadiness,
+    LiveSelect,
+    LiveOpen,
+    LiveRequest,
+    LiveReview,
     Complete,
 }
 
 impl PracticeStep {
     pub fn suggested_action(self) -> Option<Action> {
         match self {
+            Self::LiveCheck => Some(Action::CheckLearnLiveAi),
+            Self::LiveReadiness | Self::LiveSelect | Self::LiveRequest | Self::LiveReview => None,
+            Self::LiveOpen => Some(Action::InlineAssist),
             Self::RecoveryEdit => None,
             Self::RecoverySnapshot => Some(Action::SnapshotLearnRecovery),
             Self::RecoveryRestore => Some(Action::RestoreLearnRecovery),
@@ -865,6 +899,12 @@ impl PracticeStep {
             Self::DiagnosticJump => "Choose the missing-semicolon error and press Enter. The editor will take you to the reported location. Reopen Diagnostics if you closed the picker.".into(),
             Self::DiagnosticRead => format!("Press {} to read the diagnostic on this line. The parser points at the next token; the incomplete statement is just above it.", shortcut.unwrap_or("D")),
             Self::DiagnosticReturn => "Read the message and diagnostic code, then press Esc to return to the source. You will repair the defect in a later lesson.".into(),
+            Self::LiveCheck => "Optional live exercise. Run :tutorial ai-check for an offline Codex executable/version check. This does not sign in or send a prompt. The five recorded AI lessons work without a service.".into(),
+            Self::LiveReadiness => "Read the readiness report, then press Esc. A ready executable is not proof of authentication; the first submitted request verifies your account. If not ready, leave with :tutorial quit or fix setup and rerun :tutorial ai-check.".into(),
+            Self::LiveSelect => "Select the first function line with V. This file belongs to the disposable lesson, not your project. No request has been sent yet.".into(),
+            Self::LiveOpen => format!("Press {} to open LIVE inline assist. Submitting sends your prompt and this owned code context to your configured Codex service; normal account usage may apply.", shortcut.unwrap_or("Space i")),
+            Self::LiveRequest => "Ask what the function does, then submit only if you want a real Codex request. This is not a recorded response. If authentication or the service fails, you can retry, cancel, or leave the lesson.".into(),
+            Self::LiveReview => "Inspect the actual result, then choose Keep or Undo in the inline popup. An explanation may leave the file unchanged; any inline edit is still unsaved and undoable.".into(),
             Self::RecoveryEdit => "Change TODO to DONE without saving. Try :%s/TODO/DONE/. Red normally snapshots unsaved buffers automatically; this lesson gives you an explicit, isolated recovery checkpoint.".into(),
             Self::RecoverySnapshot => "Run :tutorial snapshot. This writes a real recovery snapshot in the disposable lesson directory, then closes and reopens only this practice buffer from disk. Your actual recovery store is protected.".into(),
             Self::RecoveryRestore => "The file on disk still says TODO. Run :tutorial recover to load the unsaved DONE text, cursor, and undo history from the lesson snapshot. This uses the same snapshot format and buffer recovery as red --resume.".into(),
@@ -944,6 +984,7 @@ impl PracticeStep {
                 Lesson::UnderstandSelectedCode => "You explained selected code without editing it. Recorded practice complete; real inline assist sends your selected context only when you submit a prompt.",
                 Lesson::MakeAFocusedChange => "The fix is kept in the buffer, still unsaved. Inline edits use normal undo history; keeping one is not the same as writing a file.",
                 Lesson::ChooseWhatToKeep => "You rejected an unwanted change, refined a suggestion, and kept the corrected result. The final edit is unsaved and remains undoable.",
+                Lesson::TryLiveAi => "You checked readiness, submitted a real request, and reviewed its result. Only the owned practice context was supplied by Red. Any accepted edit remains unsaved; exiting restores your original workspace and Agent session.",
                 Lesson::KeepYourPlace => "You recovered an unsaved edit and its undo history from a real, isolated snapshot. In your own workspace, red --resume recovers the latest session; red --detach=NAME and red --attach NAME keep a live session available. Your original recovery data is untouched.",
                 Lesson::CheckLanguageSupport => "You checked syntax, observed a real language-server diagnostic, and inspected local language support. Your configuration and installed packs are unchanged.",
                 Lesson::DiscoverYourKeymap => "You edited a real keymap fragment, tried its temporary binding, and found it in keyboard help. Copy an intentional override into your own config later if you want to keep it.",
@@ -1001,7 +1042,9 @@ impl PracticeStep {
             | Self::KeymapReturn
             | Self::SupportSyntax
             | Self::SupportChooseSyntax
-            | Self::RecoveryEdit => 0,
+            | Self::RecoveryEdit
+            | Self::LiveCheck
+            | Self::LiveReadiness => 0,
             Self::Type
             | Self::EditDelete
             | Self::CommandRun
@@ -1027,7 +1070,9 @@ impl PracticeStep {
             | Self::ThemePreview
             | Self::KeymapEdit
             | Self::SupportDiagnostic
-            | Self::RecoverySnapshot => 1,
+            | Self::RecoverySnapshot
+            | Self::LiveSelect
+            | Self::LiveOpen => 1,
             Self::Normal
             | Self::EditUndo
             | Self::CommandHelp
@@ -1055,7 +1100,8 @@ impl PracticeStep {
             | Self::ThemeCancel
             | Self::KeymapTry
             | Self::SupportInventory
-            | Self::RecoveryRestore => 2,
+            | Self::RecoveryRestore
+            | Self::LiveRequest => 2,
             Self::Undo
             | Self::EditRedo
             | Self::CommandReturn
@@ -1083,7 +1129,8 @@ impl PracticeStep {
             | Self::KeymapClose
             | Self::SupportReturn
             | Self::RecoveryUndo
-            | Self::RecoveryRedo => 3,
+            | Self::RecoveryRedo
+            | Self::LiveReview => 3,
             Self::Complete => 4,
         }
     }
@@ -1099,6 +1146,9 @@ impl PracticeStep {
     ) -> bool {
         let original_text = contents == lesson.contents();
         let next = match (*self, action) {
+            (Self::LiveSelect, _) if original_text && mode == Mode::VisualLine && cursor.1 == 0 => {
+                Self::LiveOpen
+            }
             (Self::RecoveryEdit, _)
                 if mode == Mode::Normal && contents == personalization::RECOVERY_RESULT =>
             {
@@ -1214,6 +1264,25 @@ impl PracticeStep {
     /// Observes UI state that can change through either a key or an action.
     pub fn observe_view(&mut self, action: &Action, view: PracticeView) -> bool {
         let next = match (*self, action) {
+            (Self::LiveCheck, Action::CheckLearnLiveAi) if view.live_readiness_open => {
+                Self::LiveReadiness
+            }
+            (Self::LiveReadiness, Action::CloseDialog)
+                if !view.live_readiness_open && view.live_ready =>
+            {
+                Self::LiveSelect
+            }
+            (Self::LiveOpen, Action::InlineAssist)
+                if view.inline_target_selected && view.live_ready =>
+            {
+                Self::LiveRequest
+            }
+            (Self::LiveRequest, _) if view.live_result_received => Self::LiveReview,
+            (Self::LiveReview, Action::KeepInlineAssist | Action::UndoInlineAssist)
+                if view.live_result_received && view.inline_closed =>
+            {
+                Self::Complete
+            }
             (Self::RecoverySnapshot, Action::SnapshotLearnRecovery)
                 if view.recovery_snapshot_saved && view.original_text && !view.dirty =>
             {
@@ -1515,6 +1584,9 @@ pub(crate) struct PracticeView {
     pub code_actions_open: bool,
     pub husk_fixed_text: bool,
     pub diagnostics_clean: bool,
+    pub live_readiness_open: bool,
+    pub live_ready: bool,
+    pub live_result_received: bool,
     pub recovery_snapshot_saved: bool,
     pub recovery_restored: bool,
     pub syntax_picker_open: bool,
@@ -1552,14 +1624,15 @@ pub(crate) struct PracticeView {
 
 /// Scratch lessons permit only edits to their isolated practice buffer.
 pub(crate) fn practice_action_allowed(lesson: Lesson, action: &Action) -> bool {
-    (lesson == Lesson::KeepYourPlace
-        && matches!(
-            action,
-            Action::SnapshotLearnRecovery
-                | Action::RestoreLearnRecovery
-                | Action::Substitute(_)
-                | Action::ConfirmSubstitute(_)
-        ))
+    (lesson == Lesson::TryLiveAi && matches!(action, Action::CheckLearnLiveAi))
+        || (lesson == Lesson::KeepYourPlace
+            && matches!(
+                action,
+                Action::SnapshotLearnRecovery
+                    | Action::RestoreLearnRecovery
+                    | Action::Substitute(_)
+                    | Action::ConfirmSubstitute(_)
+            ))
         || (lesson == Lesson::CheckLanguageSupport
             && matches!(
                 action,
