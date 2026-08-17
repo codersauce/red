@@ -6,6 +6,9 @@ sources:
   - id: editor
     type: file
     path: src/editor.rs
+  - id: edit-batch
+    type: file
+    path: src/editor/edit_batch.rs
   - id: buffer
     type: file
     path: src/buffer.rs
@@ -29,13 +32,13 @@ The coordinate rule matters because surrounding systems use different units. The
 
 `begin_transaction` and `begin_transaction_with_origin` capture the current cursor snapshot and open a buffer-local undo transaction, optionally with an attributed origin such as user, plugin, agent, or LSP [@editor]. `replace_range` first reads the old text, returns early for no-op replacements, asserts that a transaction is active, computes the absolute character range, applies `Buffer::replace_range_raw`, updates marks, writes the special `.` mark, and records the old and new text in undo history [@editor]. `commit_transaction` delegates to `UndoHistory::commit_transaction` and refreshes the buffer dirty flag from history state [@editor].
 
-`UndoHistory` makes this a logical edit boundary rather than a raw diff list. A transaction stores ordered replacements, cursor state before and after, attribution, and revisions; commit advances the history revision once for the complete logical change and preserves sibling branches when editing after an undo [@undo]. Empty transactions are discarded, and equal old/new replacement records are ignored [@undo]. The user-facing model is covered by [Undo Tree](../../concepts/editor/undo-tree).
+`UndoHistory` makes this a logical edit boundary rather than a raw diff list. A transaction stores ordered replacements, cursor state before and after, attribution, and revisions; commit advances the history revision once for the complete logical change and preserves sibling branches when editing after an undo [@undo]. Empty transactions are discarded, equal old/new replacement records are ignored, and provably adjacent insertions within one active transaction are compacted without changing undo boundaries [@undo]. The user-facing model is covered by [Undo Tree](../../concepts/editor/undo-tree).
 
 ## Subsystems Updated By A Change
 
 The boundary updates more than text. Anchor maintenance transforms local, global, and special marks across the replacement, then recomputes fallback line/character positions from the buffer after the edit [@editor]. Dirty state is derived from undo history revisions, not from a separate ad hoc flag once the transaction commits [@editor]. Undo and redo temporarily take ownership of the buffer's undo history, replay raw replacements, refresh dirty state, update anchors, restore cursor snapshots, notify change consumers, and render [@editor].
 
-Notification is explicit. `notify_change` opens the current file in LSP if needed, sends `did_change` with full current buffer contents when LSP is enabled, emits a `buffer:changed` plugin notification with buffer identity, file path, revision, line count, and cursor coordinates, and records the delivered revision in `LspCoordinator` [@editor]. `flush_change_notification` skips duplicate notifications when the current buffer revision has already been delivered [@editor].
+Notification is explicit. `notify_change` queues delivery during a local edit batch; publication opens the file in LSP if needed, sends ordered canonical edits or a full-text fallback, emits a `buffer:changed` plugin notification with buffer identity, file path, revision, line count, and cursor coordinates, and records the delivered revision in `LspCoordinator` [@editor]. `flush_change_notification` skips duplicate notifications when the current buffer revision has already been delivered [@editor]. Batching delays only derived notifications and rendering: text, anchors, marks, revisions, modes, and undo state still change synchronously. External actions are publication barriers, and long synthetic replays use bounded checkpoints with Ctrl-C cancellation [@edit-batch].
 
 ## Entry Points
 

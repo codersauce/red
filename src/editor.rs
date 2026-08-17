@@ -20,6 +20,7 @@ mod buffer_manager;
 mod diagnostics;
 mod diagnostics_picker;
 mod display_layout;
+mod edit_batch;
 mod inline_actions;
 mod inline_agent_outcomes;
 mod inline_changes;
@@ -3118,6 +3119,9 @@ pub struct Editor {
     /// Suppresses per-step repainting while queued repeated motions are drained.
     defer_motion_render: bool,
 
+    /// Nested synthetic/local edit publication boundary.
+    edit_batch: edit_batch::EditBatch,
+
     /// Repaint scope accumulated by deferred navigation.
     deferred_motion_render: MotionRender,
 
@@ -4518,6 +4522,7 @@ impl Editor {
             last_rendered_bracket_rows: Vec::new(),
             last_rendered_cursor_surface: None,
             defer_motion_render: false,
+            edit_batch: edit_batch::EditBatch::default(),
             deferred_motion_render: MotionRender::None,
             deferred_plugin_event: None,
             block_replay_depth: 0,
@@ -4806,7 +4811,7 @@ impl Editor {
         self.sync_to_window();
         let viewport_changed = self.last_rendered_viewport != self.rendered_viewport();
 
-        if self.defer_motion_render {
+        if self.render_is_deferred() {
             self.request_motion_render(if viewport_changed {
                 MotionRender::Window
             } else {
@@ -7213,6 +7218,9 @@ impl Editor {
     }
 
     async fn flush_deferred_plugin_event(&mut self, runtime: &mut Runtime) -> anyhow::Result<()> {
+        if self.edit_batch.is_active() || self.block_replay_depth > 0 {
+            return Ok(());
+        }
         let Some((before, cause)) = self.deferred_plugin_event.take() else {
             return Ok(());
         };
@@ -8603,6 +8611,7 @@ impl Editor {
         let mut last_terminal_size_reconciliation = Instant::now();
 
         'editor_loop: loop {
+            pending_events.extend(self.edit_batch.pending_input.drain(..));
             // Wait for input, but at most 10ms so LSP messages, timers, and
             // plugin requests are still serviced on a steady tick. Unlike an
             // unconditional sleep, this wakes the moment a key arrives.
@@ -8638,6 +8647,7 @@ impl Editor {
                         EventRenderMode::CoalescedNavigation,
                     )
                     .await?;
+                pending_events.extend(self.edit_batch.pending_input.drain(..));
                 if processed.quit {
                     break 'editor_loop;
                 }
@@ -11306,6 +11316,9 @@ impl Editor {
     }
 
     fn flush_deferred_motion_render(&mut self, buffer: &mut RenderBuffer) -> anyhow::Result<()> {
+        if self.edit_batch.is_active() || self.block_replay_depth > 0 {
+            return Ok(());
+        }
         self.defer_motion_render = false;
         match std::mem::take(&mut self.deferred_motion_render) {
             MotionRender::None => return Ok(()),
@@ -11697,7 +11710,7 @@ impl Editor {
     }
 
     #[async_recursion::async_recursion]
-    async fn handle_key_action(
+    async fn handle_key_action_inner(
         &mut self,
         ev: &event::Event,
         action: &KeyAction,
@@ -11712,6 +11725,9 @@ impl Editor {
                 for action in actions {
                     if self.execute(action, buffer, runtime).await? {
                         quit = true;
+                        break;
+                    }
+                    if self.replay_is_cancelled() {
                         break;
                     }
                 }
@@ -11739,6 +11755,9 @@ impl Editor {
                 for _ in 0..*times as usize {
                     if self.handle_key_action(ev, action, buffer, runtime).await? {
                         quit = true;
+                        break;
+                    }
+                    if self.replay_checkpoint(buffer, runtime).await? {
                         break;
                     }
                 }
@@ -11770,6 +11789,9 @@ impl Editor {
                     {
                         anyhow::bail!("repeated change attempted to quit the editor");
                     }
+                }
+                if self.replay_checkpoint(buffer, runtime).await? {
+                    break;
                 }
             }
             Ok(())
@@ -11843,6 +11865,9 @@ impl Editor {
                     {
                         anyhow::bail!("macro attempted to quit the editor");
                     }
+                }
+                if self.replay_checkpoint(buffer, runtime).await? {
+                    break;
                 }
             }
             Ok(())
@@ -16842,7 +16867,7 @@ impl Editor {
     }
 
     #[async_recursion::async_recursion]
-    async fn execute_with_tracking(
+    async fn execute_action_inner(
         &mut self,
         action: &Action,
         buffer: &mut RenderBuffer,
@@ -17311,6 +17336,7 @@ impl Editor {
                     }
                 }
 
+                self.flush_edit_batch_events(runtime).await?;
                 self.mode = *new_mode;
 
                 if matches!(
@@ -17325,6 +17351,7 @@ impl Editor {
                 }
 
                 if !matches!(old_mode, Mode::Normal) && matches!(new_mode, Mode::Normal) {
+                    self.flush_edit_batch_changes(runtime).await?;
                     self.request_diagnostics().await?;
                 }
 
@@ -20358,10 +20385,20 @@ impl Editor {
         // Navigation repaints its active window; other actions may affect shared
         // buffers, layout, focus, or chrome in any editor window.
         if self.window_manager.window_count() > 1 && !Self::action_is_navigation(action) {
-            self.render(buffer)?;
+            if self.current_buffer().id() == action_buffer_id
+                && self.current_buffer().revision() != action_buffer_revision
+                && Self::action_is_batch_local(action)
+            {
+                self.render_editor_windows_frame(buffer)?;
+            } else {
+                self.render(buffer)?;
+            }
         }
 
-        if self.defer_motion_render {
+        if self.edit_batch.is_active() && event_snapshot_before_action.mode != self.mode {
+            self.notify_editor_event_changes(event_snapshot_before_action, runtime, &action_cause)
+                .await?;
+        } else if self.render_is_deferred() {
             if let Some((_, cause)) = &mut self.deferred_plugin_event {
                 *cause = action_cause;
             } else {
@@ -20779,6 +20816,7 @@ impl Editor {
         };
 
         let primary_cursor = self.cursor_snapshot();
+        let committed_deferred_render = self.deferred_motion_render;
         let committed_terminal_frame = self.previous_render_buffer.clone();
         let committed_render_generation = self.render_generation;
         let committed_viewport = self.last_rendered_viewport;
@@ -20803,8 +20841,16 @@ impl Editor {
                     replay_result = Err(error);
                     break;
                 }
+                match self.replay_checkpoint(&mut scratch_buffer, runtime).await {
+                    Ok(false) => {}
+                    Ok(true) => break,
+                    Err(error) => {
+                        replay_result = Err(error);
+                        break;
+                    }
+                }
             }
-            if replay_result.is_err() {
+            if replay_result.is_err() || self.replay_is_cancelled() {
                 break;
             }
         }
@@ -20814,6 +20860,7 @@ impl Editor {
         // Replay renders into a scratch frame with terminal output suppressed. Keep
         // terminal-derived caches tied to the last frame that was actually written,
         // then return to the primary edit so Escape finishes at the block's first row.
+        self.deferred_motion_render = committed_deferred_render;
         self.previous_render_buffer = committed_terminal_frame;
         self.render_generation = committed_render_generation;
         self.last_rendered_viewport = committed_viewport;
@@ -20823,19 +20870,16 @@ impl Editor {
         self.force_full_redraw = committed_force_full_redraw;
         self.restore_cursor_snapshot(primary_cursor);
 
-        if let Err(error) = replay_result {
-            if self.block_replay_depth == 0 {
-                self.block_replay_change_deferred = false;
-            }
-            return Err(error);
-        }
-
-        if self.block_replay_depth == 0 && self.block_replay_change_deferred {
-            self.block_replay_change_deferred = false;
-            self.notify_change(runtime).await?;
-        }
-
-        Ok(())
+        // A failed replay may already have changed earlier rows. Publish those
+        // edits as well, while preserving the original replay error.
+        let notification_result = if self.block_replay_depth == 0
+            && std::mem::take(&mut self.block_replay_change_deferred)
+        {
+            self.notify_change(runtime).await
+        } else {
+            Ok(())
+        };
+        replay_result.and(notification_result)
     }
 
     fn yank(&mut self, register: char) -> bool {
@@ -21352,41 +21396,64 @@ impl Editor {
             self.block_replay_change_deferred = true;
             return Ok(());
         }
+        if self.edit_batch.is_active() {
+            let id = self.current_buffer().id();
+            self.edit_batch.record_change(id);
+            perf::increment("edit:notifications_deferred", 1);
+            return Ok(());
+        }
+        self.notify_buffer_change(self.buffer_manager.active_index(), runtime)
+            .await
+    }
+
+    /// Publish one buffer without changing the active window or cursor.
+    async fn notify_buffer_change(
+        &mut self,
+        index: usize,
+        runtime: &mut Runtime,
+    ) -> anyhow::Result<()> {
+        let id = self.buffer_manager[index].id();
+        let revision = self.buffer_manager[index].revision();
         self.sync_inline_change_summaries();
-
-        self.schedule_inline_completion();
-        let file = self.current_buffer().file.clone();
-
-        // Notify LSP if enabled and the buffer has a file.
+        perf::increment("edit:change_notifications", 1);
+        #[cfg(test)]
+        {
+            self.edit_batch.published_changes += 1;
+        }
+        if index == self.buffer_manager.active_index() {
+            self.schedule_inline_completion();
+        }
+        let file = self.buffer_manager[index].file.clone();
         if self.config.lsp.enabled {
             if let Some(file) = &file {
-                self.ensure_current_buffer_lsp_opened().await?;
-                self.lsp
-                    .did_change(file, self.current_buffer().contents())
-                    .await?;
+                self.ensure_buffer_lsp_opened(index).await?;
+                let snapshot = self.buffer_manager[index].contents_snapshot();
+                if let Some(change) = self.lsp_coordinator.pending_change(id, revision, snapshot) {
+                    self.lsp.did_change_edits(file, change).await?;
+                } else {
+                    let contents = self.buffer_manager[index].contents();
+                    self.lsp.did_change(file, contents).await?;
+                }
             }
         }
-
-        // Notify plugins about buffer change
+        let source = &self.buffer_manager[index];
+        let (column, line) = if index == self.buffer_manager.active_index() {
+            (self.cx, self.cy + self.vtop)
+        } else {
+            (source.pos.0, source.pos.1 + source.vtop)
+        };
         let buffer_info = serde_json::json!({
-            "buffer_id": self.buffer_manager.active_index(),
-            "buffer_name": self.current_buffer().name(),
+            "buffer_id": index,
+            "buffer_name": source.name(),
             "file_path": file,
-            "revision": self.current_buffer().revision(),
-            "line_count": self.current_buffer().len(),
-            "cursor": {
-                "line": self.cy + self.vtop,
-                "column": self.cx
-            }
+            "revision": revision,
+            "line_count": source.len(),
+            "cursor": { "line": line, "column": column }
         });
-
         self.plugin_registry
             .notify(runtime, "buffer:changed", buffer_info)
             .await?;
-
-        self.lsp_coordinator
-            .record_notified_revision(self.current_buffer().id(), self.current_buffer().revision());
-
+        self.lsp_coordinator.record_notified_revision(id, revision);
         Ok(())
     }
 
@@ -22706,11 +22773,35 @@ impl Editor {
     }
 
     fn replace_range(&mut self, range: TextRange, new_text: &str) {
+        let pending =
+            (self.config.lsp.enabled && self.current_buffer().file.is_some()).then(|| {
+                let source = self.current_buffer();
+                (
+                    source.id(),
+                    source.revision(),
+                    source.contents_snapshot(),
+                    crate::lsp::Range {
+                        start: source.position_to_lsp(range.start),
+                        end: source.position_to_lsp(range.end),
+                    },
+                )
+            });
         let Some(edit) =
             apply_transactional_replacement(self.current_buffer_mut(), range, new_text)
         else {
             return;
         };
+        if let Some((id, revision, before, lsp_range)) = pending {
+            self.lsp_coordinator.record_edit(
+                id,
+                revision,
+                self.current_buffer().revision(),
+                before,
+                lsp_range,
+                new_text,
+            );
+        }
+        perf::increment("edit:replacements", 1);
         self.update_anchors_for_edit(edit);
         self.set_special_mark_at_char('.', edit.start_char, AnchorAffinity::Left);
     }

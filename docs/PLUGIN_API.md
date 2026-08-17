@@ -380,6 +380,17 @@ streaming lines to 256 KiB, and pending process events to 16 (at most roughly 32
 of payload); oversized output is
 reported without letting an untrusted process grow editor memory indefinitely.
 
+## Edit notification boundaries
+
+`buffer:changed`, `cursor:moved`, and `viewport:changed` describe the latest
+editor state. Dot-repeat, macros, counted edits, and visual-block replay may
+coalesce these notifications within a bounded group of source-local actions.
+Do not use their delivery count as an edit log; use the buffer revision and
+read the current document instead. Mode transitions remain observable in order.
+Explicit plugin commands, LSP requests, saves, and document switches flush
+pending changes before they execute. A long replay publishes intermediate
+states and can be interrupted with Ctrl-C without dropping other queued keys.
+
 ## Dynamic JSON boundary
 
 Event listeners and request callbacks decode host payloads according to their declared
