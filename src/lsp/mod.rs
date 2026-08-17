@@ -355,6 +355,16 @@ pub trait LspClient: std::any::Any + Send {
     ) -> Result<i64, LspError>;
     /// Requests callable signature help at an editor position.
     async fn signature_help(&mut self, file: &str, x: usize, y: usize) -> Result<i64, LspError>;
+    /// Requests signature help with automatic-trigger and retrigger context.
+    async fn signature_help_with_context(
+        &mut self,
+        file: &str,
+        x: usize,
+        y: usize,
+        _context: Option<SignatureHelpContext>,
+    ) -> Result<i64, LspError> {
+        self.signature_help(file, x, y).await
+    }
     /// Requests a workspace rename from an editor position.
     async fn rename(
         &mut self,

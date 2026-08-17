@@ -43,6 +43,7 @@ pub mod rendering;
 #[cfg(test)]
 mod resize_tests;
 mod session_manager;
+mod signature_help;
 mod snippet;
 
 use std::{
@@ -145,7 +146,7 @@ use crate::{
     ui::{
         AgentComposer, CompletionUI, Component, Confirmation, CopilotSignInDialog,
         CopilotSignInModel, CopilotSignInPhase, DiagnosticInfo, FilePicker, HoverInfo,
-        HoverInfoFormat, Info, InlineAssistPopup, InlineAssistPopupState, InputPrompt,
+        HoverInfoFormat, InlineAssistPopup, InlineAssistPopupState, InputPrompt,
         LegacyPickerOptions, OverlayLayout, Picker, PickerItem, PickerOptions, PickerPreview,
         PickerUpdate, ScreenRect, StatuslineLayoutPanel, WhatsNewPanel,
     },
@@ -3294,6 +3295,7 @@ pub struct Editor {
 
     /// Active dialog/popup component
     current_dialog: Option<Box<dyn Component>>,
+    signature_help: signature_help::SignatureHelpState,
     keyboard_shortcuts: Option<crate::ui::KeyboardShortcuts>,
     shortcut_help_regions: Vec<crate::ui::ShortcutHelpRegion>,
 
@@ -4580,6 +4582,7 @@ impl Editor {
             persistent_notification_messages: [None, None],
             last_error: None,
             current_dialog: None,
+            signature_help: signature_help::SignatureHelpState::default(),
             keyboard_shortcuts: None,
             shortcut_help_regions: Vec::new(),
             repeater: None,
@@ -9282,6 +9285,7 @@ impl Editor {
 
         self.refresh_live_inline_history(buffer, runtime).await?;
 
+        let signature_help_changed = self.service_signature_help().await?;
         let inline_completion_changed = self.service_inline_completion();
         let completion_changed = if self
             .scheduled_completion
@@ -9329,7 +9333,8 @@ impl Editor {
         let overlay_animation_changed = self.overlay_manager.poll_animation();
         let inline_activity_changed = self.poll_inline_activity_animation(Instant::now());
         let inline_notice_changed = self.poll_inline_completion_notice(Instant::now());
-        let full_animation_changed = inline_notice_changed
+        let full_animation_changed = signature_help_changed
+            || inline_notice_changed
             || completion_changed
             || startup_release_changed
             || dialog_changed
@@ -12377,30 +12382,6 @@ impl Editor {
         Some(Action::ShowDialog)
     }
 
-    fn signature_help_action(&mut self, response: &ResponseMessage) -> Option<Action> {
-        let signatures = response.result.get("signatures")?.as_array()?;
-        let active = response
-            .result
-            .get("activeSignature")
-            .and_then(Value::as_u64)
-            .unwrap_or(0) as usize;
-        let signature = signatures.get(active).or_else(|| signatures.first())?;
-        let label = signature.get("label")?.as_str()?;
-        let documentation = signature.get("documentation").and_then(|documentation| {
-            documentation
-                .as_str()
-                .or_else(|| documentation.get("value").and_then(Value::as_str))
-        });
-        let text = match documentation {
-            Some(documentation) if !documentation.is_empty() => {
-                format!("{label}\n\n{documentation}")
-            }
-            _ => label.to_string(),
-        };
-        self.current_dialog = Some(Box::new(Info::new(self, text)));
-        Some(Action::ShowDialog)
-    }
-
     fn hover_action(&mut self, value: &Value) -> Option<Action> {
         let value = match value {
             Value::Array(values) => values.first()?,
@@ -12882,6 +12863,9 @@ impl Editor {
             InboundMessage::Error(error_msg) => {
                 log!("got an error: {error_msg:?}");
                 let id = error_msg.id?;
+                if method.as_deref() == Some("textDocument/signatureHelp") {
+                    return self.signature_help_error(id);
+                }
                 if let Some(request_id) = self.take_pending_plugin_request(method.as_deref()?, id) {
                     return Some(Action::ResolvePluginRequest(
                         request_id.get(),
@@ -12951,6 +12935,9 @@ impl Editor {
                 None
             }
             InboundMessage::RequestError { id, error } => {
+                if method.as_deref() == Some("textDocument/signatureHelp") {
+                    return self.signature_help_error(*id);
+                }
                 if let Some(request_id) = method
                     .as_deref()
                     .and_then(|method| self.take_pending_plugin_request(method, *id))
@@ -16859,6 +16846,7 @@ impl Editor {
             self.render(buffer)?;
         }
         let action_buffer_id = self.current_buffer().id();
+        let signature_snapshot = self.signature_snapshot();
         let action_buffer_revision = self.current_buffer().revision();
         self.lsp_coordinator
             .ensure_notified_revision(action_buffer_id, action_buffer_revision);
@@ -18462,12 +18450,8 @@ impl Editor {
                 }
             }
             Action::SignatureHelp => {
-                if let Some(file) = self.current_buffer().file.clone() {
-                    let position = self.cursor_lsp_position();
-                    self.ensure_current_buffer_lsp_opened().await?;
-                    self.lsp
-                        .signature_help(&file, position.character, position.line)
-                        .await?;
+                if self.invoke_signature_help().await? {
+                    self.render(buffer)?;
                 }
             }
             Action::StartRename => {
@@ -20259,6 +20243,10 @@ impl Editor {
             && self.current_buffer().revision() != action_buffer_revision
         {
             self.flush_change_notification(runtime).await?;
+        }
+
+        if self.observe_signature_help_action(action, signature_snapshot) {
+            self.render(buffer)?;
         }
 
         // Sync editor state back to the active window after executing actions
@@ -35007,7 +34995,7 @@ builtin = "rust"
     }
 
     #[test]
-    fn signature_help_response_opens_documentation_dialog() {
+    fn unsolicited_signature_help_response_does_not_open_a_dialog() {
         let mut editor = lsp_test_editor(vec![Buffer::new(None, "call(".to_string())]);
         let message = InboundMessage::Message(ResponseMessage {
             id: 44,
@@ -35027,8 +35015,8 @@ builtin = "rust"
         let action =
             editor.handle_lsp_message(&message, Some("textDocument/signatureHelp".to_string()));
 
-        assert!(matches!(action, Some(Action::ShowDialog)));
-        assert!(editor.current_dialog.is_some());
+        assert!(action.is_none());
+        assert!(editor.current_dialog.is_none());
     }
 
     #[tokio::test]
