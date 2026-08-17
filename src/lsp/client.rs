@@ -2801,7 +2801,9 @@ mod test {
 
     const DIAGNOSTIC_URI: &str = "file:///tmp/diagnostics.rs";
 
-    fn diagnostic_test_client() -> (
+    fn diagnostic_test_client(
+        uri: &str,
+    ) -> (
         RealLspClient,
         mpsc::Receiver<OutboundMessage>,
         mpsc::Sender<InboundMessage>,
@@ -2824,7 +2826,7 @@ mod test {
             }))
             .unwrap(),
         );
-        client.files_versions.insert(DIAGNOSTIC_URI.to_string(), 1);
+        client.files_versions.insert(uri.to_string(), 1);
         (client, request_rx, response_tx)
     }
 
@@ -2845,7 +2847,7 @@ mod test {
             (-32802, Some(json!({}))),
             (-32801, None),
         ] {
-            let (mut client, mut requests, responses) = diagnostic_test_client();
+            let (mut client, mut requests, responses) = diagnostic_test_client(DIAGNOSTIC_URI);
             let id = client
                 .request_diagnostics(DIAGNOSTIC_URI)
                 .await
@@ -2904,7 +2906,7 @@ mod test {
             (-32802, Some(json!({ "retriggerRequest": false }))),
             (-32800, None),
         ] {
-            let (mut client, mut requests, responses) = diagnostic_test_client();
+            let (mut client, mut requests, responses) = diagnostic_test_client(DIAGNOSTIC_URI);
             let id = client
                 .request_diagnostics(DIAGNOSTIC_URI)
                 .await
@@ -2926,7 +2928,7 @@ mod test {
     #[tokio::test]
     async fn diagnostic_cancellation_preserves_a_later_document_refresh() {
         for retrigger in [true, false] {
-            let (mut client, mut requests, responses) = diagnostic_test_client();
+            let (mut client, mut requests, responses) = diagnostic_test_client(DIAGNOSTIC_URI);
             let id = client
                 .request_diagnostics(DIAGNOSTIC_URI)
                 .await
@@ -2956,7 +2958,7 @@ mod test {
 
     #[tokio::test]
     async fn diagnostic_requests_coalesce_per_document_while_in_flight() {
-        let (mut client, mut requests, responses) = diagnostic_test_client();
+        let (mut client, mut requests, responses) = diagnostic_test_client(DIAGNOSTIC_URI);
         let id = client
             .request_diagnostics(DIAGNOSTIC_URI)
             .await
@@ -3009,16 +3011,15 @@ mod test {
 
     #[tokio::test]
     async fn diagnostic_cancellation_does_not_resurrect_closed_documents() {
+        let path = std::env::temp_dir().join("diagnostics.rs");
+        let path = path.to_str().unwrap();
+        let uri = file_uri(path).unwrap();
         for close_before_response in [true, false] {
-            let (mut client, mut requests, responses) = diagnostic_test_client();
-            let id = client
-                .request_diagnostics(DIAGNOSTIC_URI)
-                .await
-                .unwrap()
-                .unwrap();
+            let (mut client, mut requests, responses) = diagnostic_test_client(&uri);
+            let id = client.request_diagnostics(&uri).await.unwrap().unwrap();
             requests.recv().await.unwrap();
             if close_before_response {
-                client.did_close("/tmp/diagnostics.rs").await.unwrap();
+                client.did_close(path).await.unwrap();
                 requests.recv().await.unwrap();
             }
             responses
@@ -3027,11 +3028,12 @@ mod test {
                 .unwrap();
             assert!(client.recv_response().await.unwrap().is_none());
             if !close_before_response {
-                assert!(client.pending_diagnostics.contains_key(DIAGNOSTIC_URI));
-                client.did_close("/tmp/diagnostics.rs").await.unwrap();
+                assert!(client.pending_diagnostics.contains_key(&uri));
+                client.did_close(path).await.unwrap();
                 requests.recv().await.unwrap();
             }
 
+            assert!(!client.files_versions.contains_key(&uri));
             assert!(client.pending_responses.is_empty());
             assert!(client.pending_diagnostics.is_empty());
             assert!(requests.try_recv().is_err());
@@ -3047,7 +3049,7 @@ mod test {
             ("workspace/symbol", -32802),
             ("textDocument/inlayHint", -32801),
         ] {
-            let (mut client, mut requests, responses) = diagnostic_test_client();
+            let (mut client, mut requests, responses) = diagnostic_test_client(DIAGNOSTIC_URI);
             let id = client
                 .send_request(
                     method,
