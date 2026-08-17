@@ -22,12 +22,12 @@ use super::markdown::{
 use super::text_link::{TextPanelLink, TextPanelLinkTarget};
 use crate::{
     buffer::BufferId,
-    color::{blend_color, ensure_minimum_contrast, Color},
+    color::{blend_color, Color},
     editor::{render_buffer::RenderBuffer, Point},
     text_layout::{LayoutOptions, TextLayout},
     theme::{
-        SelectionForegroundPriority, Style, SurfacePalette, Theme, ThemeStyleSpec,
-        MINIMUM_SELECTION_TEXT_CONTRAST,
+        SelectionForegroundPriority, Style, SurfaceCardColors, SurfaceCardPalette, SurfacePalette,
+        Theme, ThemeStyleSpec,
     },
     ui::{
         first_prompt_line, normalize_prompt_newlines, ActionBar, ActionPriority,
@@ -298,74 +298,22 @@ fn text_panel_palette(theme: &Theme, config: &PanelConfig) -> TextPanelPalette {
     SurfacePalette::new(theme, &panel_style(theme, config.surface.as_ref()))
 }
 
-/// Prompt surfaces remain theme-derived, while the half-block caps blend back into
-/// the surrounding pane. The explicit color keys make this exploration tunable.
-struct TextPanelPromptPalette {
-    content: TextPanelPalette,
-    edge: Style,
-    cap: Style,
-}
-
-impl TextPanelPromptPalette {
-    fn new(theme: &Theme, panel: &TextPanelPalette, selected: bool) -> Self {
-        let surface = blend_color(
-            panel.surface.bg.unwrap_or_default(),
-            Color::Rgb { r: 0, g: 0, b: 0 },
-        );
-        let light = surface.is_light();
-        let neutral = if light {
-            Color::Rgb { r: 0, g: 0, b: 0 }
-        } else {
-            Color::Rgb {
-                r: 255,
-                g: 255,
-                b: 255,
-            }
-        };
-        let background = theme_color(theme, &["red.agentPromptBackground"])
-            .map(|color| blend_color(color, surface))
-            .unwrap_or_else(|| tint_color(neutral, surface, if light { 12 } else { 17 }));
-        let accent = panel.accent.fg.unwrap_or(neutral);
-        let background = if selected {
-            theme_color(theme, &["red.agentPromptSelectedBackground"])
-                .map(|color| blend_color(color, surface))
-                .unwrap_or_else(|| tint_color(accent, background, if light { 22 } else { 32 }))
-        } else {
-            background
-        };
-        let edge_color = if selected {
-            theme_color(theme, &["red.agentPromptSelectedBorder"]).unwrap_or(accent)
-        } else {
-            theme_color(theme, &["red.agentPromptBorder"])
-                .or(panel.muted.fg)
-                .unwrap_or(accent)
-        };
-        let edge = Style {
-            fg: Some(ensure_minimum_contrast(
-                edge_color,
-                background,
-                MINIMUM_SELECTION_TEXT_CONTRAST,
-            )),
-            bg: Some(background),
-            bold: selected,
-            ..Style::default()
-        };
-        let mut content = panel.on_background(background);
-        content.accent = edge.clone();
-        Self {
-            content,
-            edge: Style {
-                bg: panel.surface.bg,
-                bold: false,
-                ..edge
-            },
-            cap: Style {
-                fg: Some(background),
-                bg: panel.surface.bg,
-                ..Style::default()
-            },
-        }
-    }
+/// Agent-specific overrides retain the shared surface card's contrast and geometry.
+fn text_panel_prompt_palette(
+    theme: &Theme,
+    panel: &TextPanelPalette,
+    selected: bool,
+) -> SurfaceCardPalette {
+    SurfaceCardPalette::new(
+        panel,
+        selected,
+        SurfaceCardColors {
+            background: theme_color(theme, &["red.agentPromptBackground"]),
+            selected_background: theme_color(theme, &["red.agentPromptSelectedBackground"]),
+            border: theme_color(theme, &["red.agentPromptBorder"]),
+            selected_border: theme_color(theme, &["red.agentPromptSelectedBorder"]),
+        },
+    )
 }
 
 fn tint_color(color: Color, background: Color, alpha: u8) -> Color {
@@ -4565,8 +4513,8 @@ fn render_text_panel(
         )
     });
     let selected_prompt = panel.selected_prompt(&layout);
-    let normal_prompt = TextPanelPromptPalette::new(theme, &palette, false);
-    let active_prompt = TextPanelPromptPalette::new(theme, &palette, true);
+    let normal_prompt = text_panel_prompt_palette(theme, &palette, false);
+    let active_prompt = text_panel_prompt_palette(theme, &palette, true);
     for (offset, line) in layout
         .rendered
         .iter()
@@ -7727,7 +7675,7 @@ mod tests {
             border: None,
         };
         let palette = text_panel_palette(&theme, &config);
-        let prompt_palette = TextPanelPromptPalette::new(&theme, &palette, true);
+        let prompt_palette = text_panel_prompt_palette(&theme, &palette, true);
         let assert_surfaces = |buffer: &RenderBuffer| {
             let label_y = text_position(buffer, "You").unwrap().y;
             let body_y = text_position(buffer, "question").unwrap().y;

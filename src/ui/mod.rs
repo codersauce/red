@@ -23,6 +23,7 @@ mod inline_history;
 mod input_prompt;
 mod keyboard_shortcuts;
 mod keymap_hints;
+mod learn;
 mod list;
 mod messages;
 mod picker;
@@ -60,6 +61,7 @@ pub(crate) use keyboard_shortcuts::{
     ShortcutHelpRegion, ShortcutTarget,
 };
 pub(crate) use keymap_hints::draw_keymap_hints;
+pub(crate) use learn::{draw_learn_coach, CoachLayout, LearnHub};
 use list::List;
 pub(crate) use messages::{MessageRow, MessagesPanel, MessagesView};
 pub(crate) use picker::MAX_UNFOCUSED_PREVIEW_BYTES;
@@ -91,6 +93,11 @@ use crate::{
 
 pub trait Component: Send {
     fn draw(&self, buffer: &mut RenderBuffer) -> anyhow::Result<()>;
+
+    /// Uses the whole terminal's editor area rather than the active split.
+    fn uses_full_editor_viewport(&self) -> bool {
+        false
+    }
 
     fn is_message_history(&self) -> bool {
         false

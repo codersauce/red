@@ -37,6 +37,8 @@ pub struct Preferences {
     panel_layouts: HashMap<String, HashMap<String, PanelLayoutPreference>>,
     #[serde(default)]
     copilot_setup_hint_seen: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    learn_completed_lessons: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -80,6 +82,23 @@ impl PreferencesStore {
     #[must_use]
     pub fn is_persistent(&self) -> bool {
         self.path.is_some()
+    }
+
+    /// Whether a stable, versioned Learn Red lesson has been completed.
+    pub(crate) fn learn_lesson_completed(&self, id: &str) -> bool {
+        self.preferences
+            .learn_completed_lessons
+            .iter()
+            .any(|lesson| lesson == id)
+    }
+
+    /// Records completion without changing any project or editor buffer.
+    pub(crate) fn complete_learn_lesson(&mut self, id: &str) -> anyhow::Result<()> {
+        if self.learn_lesson_completed(id) {
+            return Ok(());
+        }
+        self.preferences.learn_completed_lessons.push(id.to_owned());
+        self.save()
     }
 
     /// Loads preferences, falling back to empty state on any read or parse error.

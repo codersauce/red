@@ -39,6 +39,7 @@ pub mod inline_assist;
 pub mod inline_history;
 pub mod keyboard;
 pub mod language;
+mod learn;
 pub mod logger;
 pub mod lsp;
 pub mod matchit;

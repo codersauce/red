@@ -58,6 +58,9 @@ const SPECIAL_BUILTIN_COLON_COMMANDS: &[&str] = &[
     "keyboard-shortcuts",
     "whats-new",
     "changelog",
+    "learn",
+    "tutorial",
+    "welcome",
     "db",
     "dh",
     "di",
@@ -466,6 +469,15 @@ fn builtin_commands() -> Vec<BuiltinCommand> {
             Some(":whats-new"),
             &[":changelog", "release notes", "what's new", "updates"],
             Action::OpenWhatsNew,
+        ),
+        builtin(
+            "editor.learn",
+            "Learn Red",
+            "Editor",
+            "Choose a learning track and practice safely",
+            Some(":learn"),
+            &[":tutorial", ":welcome", "getting started", "onboarding"],
+            Action::OpenLearn,
         ),
         builtin(
             "editor.statusline_manager",
@@ -1222,7 +1234,7 @@ pub(crate) fn shortcut_entries(
     output
 }
 
-fn shortcuts_for_action(keys: &Keys, target: &Action) -> Vec<String> {
+pub(crate) fn shortcuts_for_action(keys: &Keys, target: &Action) -> Vec<String> {
     let tables = [
         ("Normal", &keys.normal),
         ("Insert", &keys.insert),

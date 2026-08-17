@@ -8,7 +8,7 @@
 
 mod surface;
 mod vscode;
-pub(crate) use surface::{DiffPalette, SurfacePalette};
+pub(crate) use surface::{DiffPalette, SurfaceCardColors, SurfaceCardPalette, SurfacePalette};
 
 use std::collections::BTreeMap;
 

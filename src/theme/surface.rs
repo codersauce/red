@@ -90,6 +90,86 @@ impl SurfacePalette {
     }
 }
 
+/// Optional overrides for a surface card. Unspecified colors use theme-derived tints.
+#[derive(Default)]
+pub(crate) struct SurfaceCardColors {
+    pub background: Option<Color>,
+    pub selected_background: Option<Color>,
+    pub border: Option<Color>,
+    pub selected_border: Option<Color>,
+}
+
+/// A softly tinted card with contrast-safe content, rails, and half-block caps.
+pub(crate) struct SurfaceCardPalette {
+    pub content: SurfacePalette,
+    pub edge: Style,
+    pub cap: Style,
+}
+
+impl SurfaceCardPalette {
+    pub fn new(panel: &SurfacePalette, selected: bool, colors: SurfaceCardColors) -> Self {
+        let surface = blend_color(
+            panel.surface.bg.unwrap_or_default(),
+            Color::Rgb { r: 0, g: 0, b: 0 },
+        );
+        let light = surface.is_light();
+        let neutral = if light {
+            Color::Rgb { r: 0, g: 0, b: 0 }
+        } else {
+            Color::Rgb {
+                r: 255,
+                g: 255,
+                b: 255,
+            }
+        };
+        let background = colors
+            .background
+            .map(|color| blend_color(color, surface))
+            .unwrap_or_else(|| blend_color(tint(neutral, if light { 12 } else { 17 }), surface));
+        let accent = panel.accent.fg.unwrap_or(neutral);
+        let background = if selected {
+            colors
+                .selected_background
+                .map(|color| blend_color(color, surface))
+                .unwrap_or_else(|| {
+                    blend_color(tint(accent, if light { 22 } else { 32 }), background)
+                })
+        } else {
+            background
+        };
+        let edge_color = if selected {
+            colors.selected_border.unwrap_or(accent)
+        } else {
+            colors.border.or(panel.muted.fg).unwrap_or(accent)
+        };
+        let edge = Style {
+            fg: Some(ensure_minimum_contrast(
+                edge_color,
+                background,
+                MINIMUM_SELECTION_TEXT_CONTRAST,
+            )),
+            bg: Some(background),
+            bold: selected,
+            ..Style::default()
+        };
+        let mut content = panel.on_background(background);
+        content.accent = edge.clone();
+        Self {
+            content,
+            edge: Style {
+                bg: panel.surface.bg,
+                bold: false,
+                ..edge
+            },
+            cap: Style {
+                fg: Some(background),
+                bg: panel.surface.bg,
+                ..Style::default()
+            },
+        }
+    }
+}
+
 /// Resolved, opaque diff colors. Text colors never carry another surface's background.
 pub(crate) struct DiffPalette {
     pub added: Style,
@@ -214,6 +294,48 @@ fn tint(color: Color, alpha: u8) -> Color {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::color::contrast_ratio;
+
+    #[test]
+    fn surface_cards_keep_overrides_and_text_contrast() {
+        for path in ["themes/kanso.json", "themes/night-owl-light.json"] {
+            let theme = crate::theme::parse_vscode_theme(path).unwrap();
+            let panel = SurfacePalette::new(&theme, &theme.ui_style.dialog);
+            let override_color = Color::Rgba {
+                r: 90,
+                g: 110,
+                b: 130,
+                a: 80,
+            };
+            for selected in [false, true] {
+                let card = SurfaceCardPalette::new(
+                    &panel,
+                    selected,
+                    SurfaceCardColors {
+                        background: Some(override_color),
+                        selected_background: Some(override_color),
+                        ..SurfaceCardColors::default()
+                    },
+                );
+                let background = blend_color(override_color, panel.surface.bg.unwrap());
+                assert_eq!(card.content.surface.bg, Some(background));
+                assert_eq!(card.cap.fg, Some(background));
+                assert_eq!(card.cap.bg, panel.surface.bg);
+                assert_eq!(card.edge.bg, panel.surface.bg);
+                for style in [
+                    &card.content.primary,
+                    &card.content.secondary,
+                    &card.content.accent,
+                ] {
+                    assert_eq!(style.bg, Some(background));
+                    assert!(
+                        contrast_ratio(style.fg.unwrap(), background) >= 4.5,
+                        "{path}"
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn one_dark_has_distinct_opaque_diff_surfaces() {
