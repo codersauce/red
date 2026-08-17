@@ -57,6 +57,7 @@ fn editor(text: &str) -> Editor {
 
 fn begin(editor: &mut Editor, group: &str, request: &str, range: TextRange, prompt: &str) {
     editor.inline_assist = Some(InlineAssistSession {
+        parent_comment: None,
         allow_expansion: false,
         buffer_id: editor.current_buffer().id(),
         window_id: editor.window_manager.active_stable_window_id().unwrap(),
@@ -233,6 +234,7 @@ async fn inline_handoff_reveals_an_existing_hidden_pane_and_clears_editor_zoom()
     editor
         .execute(
             &Action::StageInlineAssistHandoff {
+                comment_followup: None,
                 request_id: None,
                 prompt: "reviewable handoff".into(),
                 expected_draft: None,
@@ -1399,7 +1401,7 @@ async fn inline_history_restores_dismissed_annotations_without_reapplying_the_ed
     assert!(editor.inline_history_browser.is_none());
     assert_eq!(
         editor.inline_comment_display_messages(editor.current_buffer()),
-        vec![(0, "[<] [>] Inline 2 of 2 · Space v\nRenamed value".into())]
+        vec![(0, "‹ 2/2 › · Space v\nRenamed value".into())]
     );
     assert_eq!(editor.current_buffer().contents(), "renamed\nbeta\n");
     assert_eq!(editor.current_buffer().revision(), revision);

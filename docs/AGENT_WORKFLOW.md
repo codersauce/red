@@ -139,9 +139,9 @@ take precedence. Notifications never move focus or apply a proposed edit.
 Use `Space ] c` and `Space [ c` to navigate comments across the file,
 `Space v` (or click the card text) to read the full message, `Space x` to dismiss
 one, and `Space X` to clear the current buffer. Overlapping annotations are
-retained and collapsed into a group. `Inline 2 of 4` means the second of four
+retained and collapsed into a group. `‹ 2/4 ›` means the second of four
 overlapping items is current, not a progress count; `✓ Done` is that request's
-completion status. Click `[<]` / `[>]`, or use `Space [ i` / `Space ] i`, to cycle
+completion status. Click `‹` / `›`, or use `[ i` / `] i`, to cycle
 only that group. The full viewer and result popup also accept `[` / `]`.
 Opening an item from History makes its annotations current. Comments
 follow edits above them and are marked outdated when their referenced source

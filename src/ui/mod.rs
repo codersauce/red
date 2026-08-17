@@ -135,6 +135,11 @@ pub trait Component: Send {
         false
     }
 
+    /// Stable source annotation owning a full-comment viewer, if any.
+    fn inline_comment_id(&self) -> Option<uuid::Uuid> {
+        None
+    }
+
     fn scroll_inline_history(&mut self, _delta: isize) -> Option<usize> {
         None
     }

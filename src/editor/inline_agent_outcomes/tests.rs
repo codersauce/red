@@ -22,6 +22,7 @@ fn fixture(root: &Path) -> Editor {
     editor.agent_manager.set_root(Some(root.to_owned()));
     let range = TextRange::new(TextPosition::new(0, 0), TextPosition::new(1, 0));
     editor.inline_assist = Some(InlineAssistSession {
+        parent_comment: None,
         allow_expansion: true,
         buffer_id: editor.current_buffer().id(),
         window_id: editor.window_manager.active_stable_window_id().unwrap(),
@@ -52,6 +53,7 @@ fn fixture(root: &Path) -> Editor {
 
 fn start(editor: &mut Editor, session: &str, turn: &str) {
     editor.staged_inline_agent_handoff = Some(StagedHandoff {
+        comment_followup: None,
         request_id: "inline-request".into(),
     });
     let prompt = format!(
@@ -227,6 +229,7 @@ fn inline_agent_outcome_requires_the_staged_reference_and_bounds_storage() {
     let root = tempfile::tempdir().unwrap();
     let mut editor = fixture(root.path());
     editor.staged_inline_agent_handoff = Some(StagedHandoff {
+        comment_followup: None,
         request_id: "inline-request".into(),
     });
     editor

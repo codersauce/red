@@ -1262,6 +1262,16 @@ impl Editor {
         self.fix_cursor_pos();
         self.check_bounds();
         self.sync_to_window();
+        if let Some(layout) = self
+            .current_dialog
+            .as_ref()
+            .and_then(|dialog| dialog.inline_comment_id())
+            .and_then(|id| self.inline_comment_overlay_layout(id))
+        {
+            if let Some(dialog) = &mut self.current_dialog {
+                dialog.update_overlay_layout(layout);
+            }
+        }
         drop(prepare_span);
         // Render all windows
         let windows_span = super::perf::PerfSpan::start("render:windows");
@@ -1320,9 +1330,6 @@ impl Editor {
                 help.context.clone_from(&context);
             }
         }
-        self.render_learn_coach(buffer);
-        self.render_dialog(buffer)?;
-
         // Render all plugins
         self.render_from_plugins(buffer)?;
         drop(chrome_span);
@@ -1330,6 +1337,10 @@ impl Editor {
         // Update overlay positions and render them
         let overlays_span = super::perf::PerfSpan::start("render:overlays+cursor");
         self.update_and_render_overlays(buffer)?;
+        self.render_learn_coach(buffer);
+        // Modal content and its action menu must be above plugin paint commands
+        // and floating overlays, which may otherwise erase text or borders.
+        self.render_dialog(buffer)?;
         // The final row belongs to the editor, including inside modal workspaces.
         self.draw_commandline(buffer);
 
@@ -1454,9 +1465,9 @@ impl Editor {
             self.render_window(buffer, self.window_manager.active_window_id())?;
         }
         self.render_ui_chrome(buffer)?;
+        self.update_and_render_overlays(buffer)?;
         self.render_learn_coach(buffer);
         self.render_dialog(buffer)?;
-        self.update_and_render_overlays(buffer)?;
         self.update_terminal_cursor_surface(buffer);
         self.render_cursor_cell(buffer);
         self.last_rendered_cursor_position = self.render_cursor_position();
@@ -3812,6 +3823,78 @@ mod tests {
             Editor::with_size(lsp, 60, 12, config, Theme::default(), vec![source]).unwrap();
         editor.test_disable_terminal_output();
         editor
+    }
+
+    #[test]
+    fn modal_dialogs_cover_plugin_text_and_floating_overlays() {
+        let mut editor = rendering_test_editor(Buffer::new(None, "source\n".into()));
+        let layout = crate::ui::OverlayLayout {
+            viewport: crate::ui::ScreenRect {
+                x: 0,
+                y: 0,
+                width: 60,
+                height: 10,
+            },
+            anchor: (5, 0),
+            avoid_rows: None,
+        };
+        editor.current_dialog = Some(Box::new(
+            crate::ui::HoverInfo::new(
+                &editor,
+                "Modal text must stay readable".into(),
+                crate::ui::HoverInfoFormat::Plaintext,
+                Vec::new(),
+            )
+            .with_inline_source(uuid::Uuid::new_v4(), layout),
+        ));
+        let mut expected = RenderBuffer::new(60, 12, &editor.theme.style);
+        editor
+            .current_dialog
+            .as_ref()
+            .unwrap()
+            .draw(&mut expected)
+            .unwrap();
+        let first = expected
+            .cells
+            .iter()
+            .position(|cell| cell.c == '┌')
+            .unwrap();
+        let (left, top) = (first % 60, first / 60);
+        let right = left
+            + expected.cells[first..(top + 1) * 60]
+                .iter()
+                .position(|cell| cell.c == '┐')
+                .unwrap();
+        let bottom = (top..10)
+            .find(|row| expected.cells[row * 60 + left].c == '└')
+            .unwrap();
+        editor.render_commands.push_back(RenderCommand::BufferText {
+            x: 0,
+            y: top + 1,
+            text: "X".repeat(60),
+            style: Style::default(),
+        });
+        editor
+            .overlay_manager
+            .create_overlay(
+                "over-dialog".into(),
+                crate::plugin::OverlayConfig {
+                    align: crate::plugin::OverlayAlignment::Top,
+                    x_padding: 0,
+                    y_padding: top + 2,
+                    relative: "editor".into(),
+                },
+            )
+            .update_content(vec![("Z".repeat(60), Style::default())]);
+        let mut actual = RenderBuffer::new(60, 12, &editor.theme.style);
+        editor.render(&mut actual).unwrap();
+        for row in top..=bottom {
+            assert_eq!(
+                &actual.cells[row * 60 + left..=row * 60 + right],
+                &expected.cells[row * 60 + left..=row * 60 + right],
+                "modal row {row} was overwritten"
+            );
+        }
     }
 
     #[test]

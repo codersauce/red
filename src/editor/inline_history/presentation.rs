@@ -92,6 +92,19 @@ impl Editor {
         let mut blocks = Vec::new();
         match view {
             HistoryView::Conversation => {
+                if let Some(parent) = &turn.parent_comment {
+                    blocks.push(HistoryBlock::Plain(format!(
+                        "Follow-up to comment {} at {}{}\n{}",
+                        parent.comment_index + 1,
+                        history_location_label(&parent.location),
+                        if parent.outdated {
+                            " · historical source changed"
+                        } else {
+                            ""
+                        },
+                        parent.message,
+                    )));
+                }
                 blocks.push(HistoryBlock::Request(turn.prompt.clone()));
                 if has_change {
                     let count = turn.change_summary.as_ref().map_or_else(

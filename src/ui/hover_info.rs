@@ -17,7 +17,7 @@ use crate::{
 use super::{
     dialog::{BorderStyle, Dialog, SurfaceRole},
     geometry::anchored_popup_geometry,
-    paint_rich_text, ActionPriority, Component, UiAction,
+    paint_rich_text, ActionPriority, Component, OverlayLayout, UiAction,
 };
 
 const MAX_PROSE_HOVER_WIDTH: usize = 80;
@@ -33,6 +33,8 @@ pub struct HoverInfo {
     label: String,
     close_action: Action,
     inline_navigation: Option<uuid::Uuid>,
+    source_inline_comment: Option<uuid::Uuid>,
+    overlay_layout: Option<OverlayLayout>,
     shortcuts: Vec<(char, String, Action)>,
     source: String,
     diff: Option<HoverDiff>,
@@ -103,6 +105,8 @@ impl HoverInfo {
             label: "Hover".to_string(),
             close_action: Action::CloseDialog,
             inline_navigation: None,
+            source_inline_comment: None,
+            overlay_layout: None,
             shortcuts: Vec::new(),
             source,
             diff: None,
@@ -174,6 +178,12 @@ impl HoverInfo {
     pub(crate) fn with_inline_navigation(mut self, id: uuid::Uuid) -> Self {
         self.inline_navigation = Some(id);
         self.update_chrome();
+        self
+    }
+
+    pub(crate) fn with_inline_source(mut self, id: uuid::Uuid, layout: OverlayLayout) -> Self {
+        self.source_inline_comment = Some(id);
+        self.update_overlay_layout(layout);
         self
     }
 
@@ -263,12 +273,18 @@ impl HoverInfo {
             &self.registry,
             &self.actions,
         );
-        let (x, y, height) = anchored_popup_geometry(
-            self.anchor,
-            viewport_width,
-            viewport_height,
-            width,
-            lines.len().saturating_add(1),
+        let desired_height = lines.len().saturating_add(1);
+        let (x, y, height) = self.overlay_layout.map_or_else(
+            || {
+                anchored_popup_geometry(
+                    self.anchor,
+                    viewport_width,
+                    viewport_height,
+                    width,
+                    desired_height,
+                )
+            },
+            |layout| layout.popup_geometry(width, desired_height),
         );
         self.viewport_width = viewport_width;
         self.viewport_height = viewport_height;
@@ -328,6 +344,9 @@ impl HoverInfo {
 }
 
 impl Component for HoverInfo {
+    fn inline_comment_id(&self) -> Option<uuid::Uuid> {
+        self.source_inline_comment
+    }
     fn surface_actions(&self) -> Vec<UiAction> {
         self.dialog.actions()
     }
@@ -466,7 +485,20 @@ impl Component for HoverInfo {
     }
 
     fn resize(&mut self, viewport_width: usize, viewport_height: usize) -> bool {
+        if let Some(layout) = &mut self.overlay_layout {
+            layout.viewport.width = viewport_width;
+            layout.viewport.height = viewport_height;
+        }
         self.reflow(viewport_width, viewport_height);
+        true
+    }
+
+    fn update_overlay_layout(&mut self, layout: OverlayLayout) -> bool {
+        if self.overlay_layout != Some(layout) {
+            self.overlay_layout = Some(layout);
+            self.viewport_y_offset = 0;
+            self.reflow(layout.viewport.width, layout.viewport.height);
+        }
         true
     }
 
@@ -731,6 +763,40 @@ mod tests {
             vec![Buffer::new(None, String::new())],
         )
         .unwrap()
+    }
+
+    #[test]
+    fn inline_comment_hover_stays_inside_its_source_window_and_reanchors_on_resize() {
+        let editor = test_editor(Theme::default(), 130, 50);
+        let id = uuid::Uuid::new_v4();
+        let mut layout = OverlayLayout {
+            viewport: super::super::ScreenRect {
+                x: 47,
+                y: 5,
+                width: 48,
+                height: 35,
+            },
+            anchor: (60, 12),
+            avoid_rows: Some((12, 17)),
+        };
+        let mut info = HoverInfo::new(
+            &editor,
+            "A full comment. ".repeat(12),
+            HoverInfoFormat::Plaintext,
+            Vec::new(),
+        )
+        .with_inline_source(id, layout);
+        assert_eq!(info.inline_comment_id(), Some(id));
+        assert!(info.x >= 47 && info.x + info.width + 2 <= 95);
+        assert!(info.y > 17 || info.y + info.height + 2 <= 12);
+        layout.viewport.x = 20;
+        layout.viewport.width = 30;
+        layout.anchor.0 = 25;
+        assert!(info.update_overlay_layout(layout));
+        assert!(info.x >= 20 && info.x + info.width + 2 <= 50);
+        let position = (info.x, info.y, info.width, info.height);
+        assert!(info.update_overlay_layout(layout));
+        assert_eq!(position, (info.x, info.y, info.width, info.height));
     }
 
     #[test]

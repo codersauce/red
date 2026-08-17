@@ -22,8 +22,8 @@ Run `cargo run --bin red -- path/to/file` in this worktree.
 | History `v` / source-link click | Cycle rich conversation/code/diff views / jump to the tracked source. |
 | Result-popup `p` | Pin retained annotations without reapplying a code edit. |
 | `Space ] c` / `Space [ c` | Select the next/previous annotation, including overlapping comments. |
-| `Space ] i` / `Space [ i` | Select the next/previous item in the current overlapping group. |
-| Card `[<]` / `[>]` | Select the previous/next overlapping item with the mouse. |
+| `] i` / `[ i` | Select the next/previous item in the current overlapping group. |
+| Card `‹ 2/2 ›` | Click an arrow to select the previous/next overlapping item; click the counter to open it. |
 | Full-view `[` / `]` | Browse the overlapping items while reading their full text. |
 | `Space v` | Read the full comment in a scrollable plain-text popup. |
 | `Space x` | Dismiss the selected comment. |

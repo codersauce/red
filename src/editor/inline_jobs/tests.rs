@@ -23,6 +23,7 @@ fn range(start: usize, end: usize) -> TextRange {
 fn start(editor: &mut Editor, group: &str, request: Option<&str>, target: TextRange) {
     editor.park_inline_assist();
     editor.inline_assist = Some(InlineAssistSession {
+        parent_comment: None,
         allow_expansion: false,
         buffer_id: editor.current_buffer().id(),
         window_id: editor.window_manager.active_stable_window_id().unwrap(),

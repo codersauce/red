@@ -25,6 +25,7 @@ fn target() -> TextRange {
 fn begin(editor: &mut Editor, allow_expansion: bool) {
     let range = target();
     editor.inline_assist = Some(InlineAssistSession {
+        parent_comment: None,
         allow_expansion,
         buffer_id: editor.current_buffer().id(),
         window_id: editor.window_manager.active_stable_window_id().unwrap(),

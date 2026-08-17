@@ -27,6 +27,7 @@ async fn inline_context_dispatch_is_request_bound_and_does_not_move_focus() {
     editor.test_disable_terminal_output();
     let range = TextRange::new(TextPosition::new(0, 0), TextPosition::new(1, 0));
     editor.inline_assist = Some(InlineAssistSession {
+        parent_comment: None,
         allow_expansion: false,
         buffer_id: editor.current_buffer().id(),
         window_id: editor.window_manager.active_stable_window_id().unwrap(),

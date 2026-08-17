@@ -12,6 +12,7 @@ mod tests;
 
 pub(super) struct StagedHandoff {
     pub request_id: String,
+    pub comment_followup: Option<Box<crate::inline_history::InlineCommentContext>>,
 }
 
 pub(super) fn handoff_marker(request: &str) -> String {
@@ -176,20 +177,25 @@ impl Editor {
         {
             return Ok(());
         }
-        let same_workspace = self
-            .inline_history
-            .conversations
-            .iter()
-            .any(|conversation| {
-                conversation
-                    .turns
-                    .iter()
-                    .any(|turn| turn.request_id == staged.request_id)
-                    && self
-                        .agent_manager
-                        .root()
-                        .is_some_and(|root| same_file_path(Path::new(&conversation.cwd), root))
-            });
+        let same_workspace = if let Some(context) = &staged.comment_followup {
+            self.agent_manager
+                .root()
+                .is_some_and(|root| same_file_path(Path::new(&context.cwd), root))
+        } else {
+            self.inline_history
+                .conversations
+                .iter()
+                .any(|conversation| {
+                    conversation
+                        .turns
+                        .iter()
+                        .any(|turn| turn.request_id == staged.request_id)
+                        && self
+                            .agent_manager
+                            .root()
+                            .is_some_and(|root| same_file_path(Path::new(&conversation.cwd), root))
+                })
+        };
         if !same_workspace {
             return Ok(());
         }
@@ -200,6 +206,40 @@ impl Editor {
                 < MAX_HISTORY_BYTES,
             "inline history is full; export or forget old conversations before continuing in Agent"
         );
+        if let Some(context) = staged.comment_followup {
+            context.validate()?;
+            self.inline_history
+                .check_capacity(prompt, &context.source)?;
+            anyhow::ensure!(
+                self.inline_history.turn(&staged.request_id).is_none(),
+                "inline follow-up already exists"
+            );
+            let mut location = context.location.clone();
+            // The composer may have remained open across edits. Only an exact,
+            // contextual source relocation can reattach this historical record.
+            location.detached = true;
+            let before = if context.source_truncated {
+                String::new()
+            } else {
+                context.source.clone()
+            };
+            let cwd = context.cwd.clone();
+            let mut turn =
+                InlineHistoryTurn::new(staged.request_id.clone(), prompt.into(), before, location);
+            turn.parent_comment = Some(context);
+            turn.state = InlineTurnState::Completed;
+            turn.answer = "Continued in Agent.".into();
+            self.inline_history
+                .conversations
+                .push(crate::inline_history::InlineConversation {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    cwd,
+                    file: turn.location.file.clone(),
+                    turns: vec![turn],
+                    resolved: false,
+                    visible_request: Some(staged.request_id.clone()),
+                });
+        }
         if let Some(turn) = self.inline_history.turn_mut(&staged.request_id) {
             turn.agent_outcomes
                 .push(InlineAgentOutcome::new(session.into(), agent_turn.into()));

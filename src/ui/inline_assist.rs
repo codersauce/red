@@ -15,10 +15,8 @@ use crate::{
 
 use super::{
     dialog::{BorderStyle, Dialog, SurfaceRole},
-    first_prompt_line,
-    geometry::{anchored_popup_geometry, anchored_popup_geometry_avoiding_rows},
-    spinner_frame, wrap_text, ActionBar, ActionPriority, Component, OverlayLayout, PromptBuffer,
-    ScreenRect, UiAction, SPINNER_FRAME_INTERVAL_MS,
+    first_prompt_line, spinner_frame, wrap_text, ActionBar, ActionPriority, Component,
+    OverlayLayout, PromptBuffer, ScreenRect, UiAction, SPINNER_FRAME_INTERVAL_MS,
 };
 
 const MAX_WIDTH: usize = 72;
@@ -43,6 +41,7 @@ pub struct InlineAssistPopup {
     state: InlineAssistPopupState,
     prompt: PromptBuffer,
     title: String,
+    context_label: Option<String>,
     close_choice: Option<usize>,
     navigation: Option<(uuid::Uuid, usize, usize)>,
     layout: OverlayLayout,
@@ -128,7 +127,11 @@ impl InlineAssistPopup {
             .then(|| editor.current_inline_navigation())
             .flatten();
         let width = Self::content_width(layout.viewport.width);
-        let desired_height = Self::content_height(&state, &prompt, width);
+        let context_label = matches!(state, InlineAssistPopupState::Prompt { .. })
+            .then(|| editor.inline_comment_context_label())
+            .flatten();
+        let desired_height =
+            Self::content_height(&state, &prompt, width) + usize::from(context_label.is_some());
         let (x, y, height) = Self::geometry(layout, width, desired_height);
         let style = editor.theme.ui_style.dialog.clone();
         let title = navigation.map_or_else(
@@ -150,6 +153,7 @@ impl InlineAssistPopup {
             state,
             prompt,
             title,
+            context_label,
             close_choice: None,
             navigation,
             layout,
@@ -207,53 +211,7 @@ impl InlineAssistPopup {
     }
 
     fn geometry(layout: OverlayLayout, width: usize, height: usize) -> (usize, usize, usize) {
-        let viewport = layout.viewport;
-        let anchor = (
-            layout
-                .anchor
-                .0
-                .saturating_sub(viewport.x)
-                .min(viewport.width.saturating_sub(1)),
-            layout
-                .anchor
-                .1
-                .saturating_sub(viewport.y)
-                .min(viewport.height.saturating_sub(1)),
-        );
-        let avoid_rows = layout.avoid_rows.and_then(|(start, end)| {
-            let viewport_end = viewport.y.saturating_add(viewport.height.saturating_sub(1));
-            let start = start.max(viewport.y);
-            let end = end.min(viewport_end);
-            (start <= end).then_some((
-                start.saturating_sub(viewport.y),
-                end.saturating_sub(viewport.y),
-            ))
-        });
-        let (x, y, available_height) = avoid_rows.map_or_else(
-            || anchored_popup_geometry(anchor, viewport.width, viewport.height, width, height),
-            |avoid_rows| {
-                anchored_popup_geometry_avoiding_rows(
-                    anchor,
-                    avoid_rows,
-                    viewport.width,
-                    viewport.height,
-                    width,
-                    height,
-                )
-            },
-        );
-        // A whole function may fill the viewport. Keep the popup usable even
-        // when it is impossible to avoid every line in the edit scope.
-        let (x, y, height) = if available_height < height.min(2) {
-            anchored_popup_geometry(anchor, viewport.width, viewport.height, width, height)
-        } else {
-            (x, y, available_height)
-        };
-        (
-            viewport.x.saturating_add(x),
-            viewport.y.saturating_add(y),
-            height,
-        )
+        layout.popup_geometry(width, height)
     }
 
     fn insert(&mut self, text: &str) {
@@ -270,6 +228,7 @@ impl InlineAssistPopup {
             5
         } else {
             Self::content_height(&self.state, &self.prompt, width)
+                + usize::from(self.context_label.is_some())
         };
         let (x, y, height) = Self::geometry(self.layout, width, desired_height);
         self.dialog.x = x;
@@ -392,6 +351,11 @@ impl InlineAssistPopup {
         self.dialog
             .height
             .saturating_sub(usize::from(self.dialog.height > 1))
+            .saturating_sub(self.context_rows())
+    }
+
+    fn context_rows(&self) -> usize {
+        usize::from(self.context_label.is_some() && self.dialog.height >= 3)
     }
 
     fn prompt_scroll(&self, layout: &TextLayout) -> usize {
@@ -403,7 +367,7 @@ impl InlineAssistPopup {
 
     fn place_prompt_cursor(&mut self, column: usize, row: usize) -> Option<KeyAction> {
         let left = self.dialog.x + 1;
-        let top = self.dialog.y + 1;
+        let top = self.dialog.y + 1 + self.context_rows();
         if !(left..left + self.dialog.width).contains(&column)
             || !(top..top + self.prompt_body_height()).contains(&row)
         {
@@ -585,6 +549,18 @@ impl Component for InlineAssistPopup {
             InlineAssistPopupState::Prompt { .. } => {
                 let show_help = self.dialog.height > 1;
                 let body_height = self.prompt_body_height();
+                if self.context_rows() > 0 {
+                    buffer.set_text(
+                        x,
+                        y,
+                        &truncate_display_width(
+                            self.context_label.as_deref().unwrap_or_default(),
+                            width,
+                        ),
+                        &self.style,
+                    );
+                }
+                let prompt_y = y + self.context_rows();
                 if body_height > 0 {
                     let layout = self.prompt_layout();
                     let scroll = self.prompt_scroll(&layout);
@@ -602,11 +578,16 @@ impl Component for InlineAssistPopup {
                             "│"
                         };
                         if inset > 0 {
-                            buffer.set_text(x, y.saturating_add(offset), marker, &self.style);
+                            buffer.set_text(
+                                x,
+                                prompt_y.saturating_add(offset),
+                                marker,
+                                &self.style,
+                            );
                         }
                         buffer.set_text(
                             x.saturating_add(inset),
-                            y.saturating_add(offset),
+                            prompt_y.saturating_add(offset),
                             &row.text,
                             &self.style,
                         );
@@ -956,7 +937,7 @@ impl Component for InlineAssistPopup {
                 ),
             self.dialog
                 .y
-                .saturating_add(1)
+                .saturating_add(1 + self.context_rows())
                 .saturating_add(position.row.saturating_sub(scroll))
                 .min(
                     self.layout
@@ -1351,6 +1332,31 @@ mod tests {
             row: y as u16,
             modifiers: KeyModifiers::NONE,
         }))
+    }
+
+    #[test]
+    fn selected_comment_preview_does_not_shift_prompt_hit_testing_or_create_a_draft() {
+        let mut popup = prompt_in_viewport("", 24);
+        popup.context_label = Some("About comment: selected note".into());
+        popup.reflow();
+        assert_eq!(popup.context_rows(), 1);
+        assert_eq!(popup.cursor_position().unwrap().1, popup.dialog.y + 2);
+        let x = popup.dialog.x + 3;
+        let y = popup.dialog.y + 2;
+        assert_eq!(prompt_click(&mut popup, x, y - 1), None);
+        assert_eq!(
+            prompt_click(&mut popup, x, y),
+            Some(KeyAction::Single(Action::Refresh))
+        );
+        assert_eq!(
+            popup.request_inline_assist_close(),
+            Some(Action::DiscardInlineAssistDraft)
+        );
+        // One source row, two borders, and one editable row still fit.
+        popup.layout.viewport.height = 5;
+        popup.reflow();
+        assert_eq!(popup.context_rows(), 0);
+        assert!(popup.prompt_body_height() > 0);
     }
 
     #[test]

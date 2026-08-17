@@ -21,6 +21,7 @@ mod diagnostics_picker;
 mod display_layout;
 mod inline_agent_outcomes;
 mod inline_changes;
+mod inline_comment_followup;
 mod inline_comments;
 mod inline_completion;
 mod inline_context;
@@ -2163,6 +2164,12 @@ pub enum Action {
     PreviousOverlappingInlineComment,
     #[serde(skip)]
     OpenInlineComment(uuid::Uuid),
+    /// Starts a new discussion about the exact opened annotation.
+    #[serde(skip)]
+    AskInlineComment {
+        id: uuid::Uuid,
+        in_agent: bool,
+    },
     #[serde(skip)]
     NavigateOverlappingInlineComment {
         id: uuid::Uuid,
@@ -2210,6 +2217,8 @@ pub enum Action {
     EscalateInlineAssist,
     StageInlineAssistHandoff {
         request_id: Option<String>,
+        #[serde(default)]
+        comment_followup: Option<Box<crate::inline_history::InlineCommentContext>>,
         prompt: String,
         expected_draft: Option<plugin::panel::TextPanelDraftRevision>,
     },
@@ -2743,6 +2752,7 @@ struct LayoutCacheKey {
 
 #[derive(Debug)]
 struct InlineAssistSession {
+    parent_comment: Option<Box<crate::inline_history::InlineCommentContext>>,
     allow_expansion: bool,
     buffer_id: BufferId,
     window_id: WindowId,
@@ -5504,7 +5514,12 @@ impl Editor {
         } else {
             self.vheight()
         };
-        let overlay_layout = self.inline_assist_overlay_layout();
+        let overlay_layout = self
+            .current_dialog
+            .as_ref()
+            .and_then(|dialog| dialog.inline_comment_id())
+            .and_then(|id| self.inline_comment_overlay_layout(id))
+            .or_else(|| self.inline_assist_overlay_layout());
         let dialog_resized = if let Some(dialog) = &mut self.current_dialog {
             match overlay_layout {
                 Some(layout) => dialog.update_overlay_layout(layout),
@@ -7558,6 +7573,13 @@ impl Editor {
         {
             context.push_str(&discussion);
         }
+        if let Some(parent) = self
+            .inline_assist
+            .as_ref()
+            .and_then(|assist| assist.parent_comment.as_ref())
+        {
+            context.push_str(&parent.prompt_context());
+        }
         Ok(context)
     }
 
@@ -7606,9 +7628,18 @@ impl Editor {
 
     fn inline_assist_overlay_layout(&self) -> Option<OverlayLayout> {
         let assist = self.inline_assist.as_ref()?;
-        let window = self.window_manager.window(assist.window_id)?;
+        self.text_range_overlay_layout(assist.window_id, assist.buffer_id, assist.range)
+    }
+
+    fn text_range_overlay_layout(
+        &self,
+        window_id: WindowId,
+        buffer_id: BufferId,
+        range: TextRange,
+    ) -> Option<OverlayLayout> {
+        let window = self.window_manager.window(window_id)?;
         let buffer = self.buffer_manager.get(window.buffer_index)?;
-        if buffer.id() != assist.buffer_id {
+        if buffer.id() != buffer_id {
             return None;
         }
         let viewport = ScreenRect {
@@ -7620,13 +7651,12 @@ impl Editor {
             width: window.inner_width(),
             height: self.window_content_height(window),
         };
-        let avoid_rows = self.render_text_range_rows_in_window(assist.window_id, assist.range);
+        let avoid_rows = self.render_text_range_rows_in_window(window_id, range);
         let anchor = buffer
-            .get(assist.range.start.line)
+            .get(range.start.line)
             .and_then(|line| {
-                let grapheme =
-                    char_to_grapheme(line.trim_end_matches('\n'), assist.range.start.character);
-                self.buffer_to_window_coords(window, grapheme, assist.range.start.line)
+                let grapheme = char_to_grapheme(line.trim_end_matches('\n'), range.start.character);
+                self.buffer_to_window_coords(window, grapheme, range.start.line)
             })
             .map(|(x, y)| {
                 (
@@ -17129,6 +17159,11 @@ impl Editor {
                     }
                 }
             }
+            Action::AskInlineComment { id, in_agent } => {
+                add_to_history = false;
+                self.ask_inline_comment(*id, *in_agent, buffer, runtime)
+                    .await?;
+            }
             Action::InlineAssist => {
                 add_to_history = false;
                 match self.inline_assist_target() {
@@ -17143,6 +17178,7 @@ impl Editor {
                         let expected_text = self.current_buffer().text_in_range(range);
                         self.park_inline_assist();
                         self.inline_assist = Some(InlineAssistSession {
+                            parent_comment: None,
                             allow_expansion: !matches!(
                                 self.mode,
                                 Mode::Visual | Mode::VisualLine | Mode::VisualBlock
@@ -17727,12 +17763,14 @@ impl Editor {
                 // only after those requests have been processed.
                 runtime.send_request(PluginRequest::Action(Action::StageInlineAssistHandoff {
                     request_id,
+                    comment_followup: None,
                     prompt,
                     expected_draft: None,
                 }));
             }
             Action::StageInlineAssistHandoff {
                 request_id,
+                comment_followup,
                 prompt,
                 expected_draft,
             } => {
@@ -17755,9 +17793,13 @@ impl Editor {
                     Ok(plugin::panel::TextPanelReuseOutcome::Loaded) => {
                         self.staged_inline_agent_handoff = request_id
                             .as_ref()
-                            .filter(|request| self.inline_history.turn(request).is_some())
+                            .filter(|request| {
+                                comment_followup.is_some()
+                                    || self.inline_history.turn(request).is_some()
+                            })
                             .map(|request| inline_agent_outcomes::StagedHandoff {
                                 request_id: request.clone(),
+                                comment_followup: comment_followup.clone(),
                             });
                         self.set_legacy_message(Some(
                             "inline discussion loaded in Agent; review and send when ready".into(),
@@ -17769,7 +17811,7 @@ impl Editor {
                             "Replace unsent Agent draft?",
                             "The inline discussion will replace the draft as one undoable edit. Nothing will be sent.",
                             "Load discussion", "Keep draft",
-                            Action::StageInlineAssistHandoff { request_id: request_id.clone(), prompt: prompt.clone(), expected_draft: Some(revision) },
+                            Action::StageInlineAssistHandoff { request_id: request_id.clone(), comment_followup: comment_followup.clone(), prompt: prompt.clone(), expected_draft: Some(revision) },
                             Action::Print("current draft kept; inline discussion remains in history".into()),
                         )));
                     }
@@ -28740,6 +28782,7 @@ mod test {
         let right_window = editor.window_manager.active_window().unwrap().clone();
         let range = TextRange::new(TextPosition::new(0, 0), TextPosition::new(1, 0));
         editor.inline_assist = Some(InlineAssistSession {
+            parent_comment: None,
             allow_expansion: false,
             buffer_id: editor.current_buffer().id(),
             window_id: right_window.id,
@@ -28771,6 +28814,7 @@ mod test {
         let range = TextRange::new(TextPosition::new(0, 0), TextPosition::new(1, 0));
         let window_id = editor.window_manager.active_stable_window_id().unwrap();
         editor.inline_assist = Some(InlineAssistSession {
+            parent_comment: None,
             allow_expansion: false,
             buffer_id: editor.current_buffer().id(),
             window_id,
@@ -28835,6 +28879,7 @@ mod test {
         let revision = editor.current_buffer().revision();
         let window_id = editor.window_manager.active_stable_window_id().unwrap();
         editor.inline_assist = Some(InlineAssistSession {
+            parent_comment: None,
             allow_expansion: false,
             buffer_id: editor.current_buffer().id(),
             window_id,

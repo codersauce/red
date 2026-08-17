@@ -7,8 +7,10 @@ use serde::{Deserialize, Serialize};
 use crate::{buffer::BufferId, inline_assist::InlineAssistResult, undo::TextRange};
 
 mod agent_outcome;
+pub(crate) mod comment_context;
 pub(crate) use agent_outcome::MAX_IMAGE_BYTES as MAX_AGENT_IMAGE_BYTES;
 pub use agent_outcome::{InlineAgentEdit, InlineAgentFile, InlineAgentOutcome, InlineAgentState};
+pub use comment_context::InlineCommentContext;
 
 pub const MAX_HISTORY_BYTES: usize = 32 * 1024 * 1024;
 pub const MAX_ANSWER_BYTES: usize = 64 * 1024;
@@ -178,6 +180,9 @@ impl InlineChangeSummary {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct InlineHistoryTurn {
+    /// Immutable provenance for a new discussion started from one annotation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_comment: Option<Box<InlineCommentContext>>,
     /// False for explicit selections and records created before scope expansion.
     #[serde(default)]
     pub allow_expansion: bool,
@@ -223,6 +228,45 @@ pub struct InlineHistoryTurn {
 }
 
 impl InlineHistoryTurn {
+    pub(crate) fn new(
+        request_id: String,
+        prompt: String,
+        before: String,
+        location: InlineLocation,
+    ) -> Self {
+        Self {
+            parent_comment: None,
+            allow_expansion: false,
+            request_id,
+            created_at_ms: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis()
+                .try_into()
+                .unwrap_or(u64::MAX),
+            prompt,
+            answer: String::new(),
+            answer_truncated: false,
+            context_reads: Vec::new(),
+            agent_outcomes: Vec::new(),
+            before,
+            original_range: location.range,
+            location,
+            expanded_location: None,
+            state: InlineTurnState::Pending,
+            disposition: InlineDisposition::Kept,
+            result: None,
+            error: None,
+            transaction_id: None,
+            change_summary: None,
+            session_id: None,
+            hidden_comments: Vec::new(),
+            comment_fingerprints: Vec::new(),
+            comment_locations: Vec::new(),
+            comment_source_ids: Vec::new(),
+        }
+    }
+
     pub fn has_code_change(&self) -> bool {
         self.state == InlineTurnState::Completed
             && self.transaction_id.is_some()
@@ -522,6 +566,9 @@ impl InlineHistory {
                 "invalid visible inline history request"
             );
             for turn in &conversation.turns {
+                if let Some(context) = &turn.parent_comment {
+                    context.validate()?;
+                }
                 for outcome in &turn.agent_outcomes {
                     outcome.validate()?;
                 }

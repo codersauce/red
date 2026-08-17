@@ -17,6 +17,56 @@ pub struct OverlayLayout {
     pub(crate) avoid_rows: Option<(usize, usize)>,
 }
 
+impl OverlayLayout {
+    /// Fit a source-anchored popup inside its owning window. Prefer avoiding the
+    /// complete source range, but retain usable controls when the range fills it.
+    pub(crate) fn popup_geometry(self, width: usize, height: usize) -> (usize, usize, usize) {
+        let viewport = self.viewport;
+        let anchor = (
+            self.anchor
+                .0
+                .saturating_sub(viewport.x)
+                .min(viewport.width.saturating_sub(1)),
+            self.anchor
+                .1
+                .saturating_sub(viewport.y)
+                .min(viewport.height.saturating_sub(1)),
+        );
+        let avoid_rows = self.avoid_rows.and_then(|(start, end)| {
+            let viewport_end = viewport.y.saturating_add(viewport.height.saturating_sub(1));
+            let start = start.max(viewport.y);
+            let end = end.min(viewport_end);
+            (start <= end).then_some((
+                start.saturating_sub(viewport.y),
+                end.saturating_sub(viewport.y),
+            ))
+        });
+        let (x, y, available_height) = avoid_rows.map_or_else(
+            || anchored_popup_geometry(anchor, viewport.width, viewport.height, width, height),
+            |rows| {
+                anchored_popup_geometry_avoiding_rows(
+                    anchor,
+                    rows,
+                    viewport.width,
+                    viewport.height,
+                    width,
+                    height,
+                )
+            },
+        );
+        let (x, y, height) = if available_height < height.min(2) {
+            anchored_popup_geometry(anchor, viewport.width, viewport.height, width, height)
+        } else {
+            (x, y, available_height)
+        };
+        (
+            viewport.x.saturating_add(x),
+            viewport.y.saturating_add(y),
+            height,
+        )
+    }
+}
+
 /// Fits a cursor-anchored popup inside the editor viewport.
 ///
 /// The popup prefers the side of the cursor with the most vertical room and

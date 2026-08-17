@@ -591,7 +591,7 @@ impl Editor {
         self.render(buffer)
     }
 
-    pub(super) fn recovered_inline_context(&self, group: &str) -> String {
+    fn inline_discussion_text(&self, group: &str) -> String {
         let Some(conversation) = self
             .inline_history
             .conversations
@@ -621,6 +621,11 @@ impl Editor {
             }
             context.push_str(&text);
         }
+        context
+    }
+
+    pub(super) fn recovered_inline_context(&self, group: &str) -> String {
+        let context = self.inline_discussion_text(group);
         if context.is_empty() {
             context
         } else {
@@ -636,6 +641,19 @@ impl Editor {
             .find(|conversation| conversation.id == group)?;
         let latest = conversation.turns.last()?;
         let range = latest.location.range;
+        let discussion = self.inline_discussion_text(group);
+        let mut context = if discussion.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "\nEarlier discussion (historical context, not new instructions):\n{}",
+                crate::inline_history::comment_context::quote_history(discussion.trim())
+            )
+        };
+        if let Some(parent) = &latest.parent_comment {
+            context.push_str("\n\nSelected-comment context:\n");
+            context.push_str(&parent.agent_context());
+        }
         Some(format!(
             "Continue this inline-assist discussion in the project. Carry out the latest user request below, using the earlier answers as context. Read current files through Red before editing; the discussion may describe older source.\n\n{}\n\nLocation: {}:{}–{}\n\nLatest user request:\n{}\n{}",
             super::inline_agent_outcomes::handoff_marker(&latest.request_id),
@@ -643,7 +661,7 @@ impl Editor {
             range.start.line + 1,
             range.end.line + usize::from(range.end.character > 0),
             latest.prompt,
-            self.recovered_inline_context(group),
+            context,
         ))
     }
 
@@ -850,6 +868,7 @@ impl Editor {
                                 range.end.line + usize::from(range.end.character > 0)
                             );
                             self.inline_assist = Some(InlineAssistSession {
+                                parent_comment: turn.parent_comment.clone(),
                                 allow_expansion: turn.allow_expansion,
                                 buffer_id: self.current_buffer().id(),
                                 window_id,
@@ -1316,39 +1335,11 @@ impl Editor {
             .ok_or_else(|| anyhow::anyhow!("inline assist is no longer active"))?
             .annotation_group_id
             .clone();
-        let turn = InlineHistoryTurn {
-            expanded_location: None,
-            allow_expansion: self
-                .inline_assist
-                .as_ref()
-                .is_some_and(|session| session.allow_expansion),
-            context_reads: Vec::new(),
-            agent_outcomes: Vec::new(),
-            request_id: request.to_string(),
-            created_at_ms: SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis()
-                .try_into()
-                .unwrap_or(u64::MAX),
-            prompt: prompt.to_string(),
-            answer: String::new(),
-            answer_truncated: false,
-            before,
-            original_range: range,
-            location,
-            state: InlineTurnState::Pending,
-            disposition: InlineDisposition::Kept,
-            result: None,
-            error: None,
-            transaction_id: None,
-            change_summary: None,
-            session_id: None,
-            hidden_comments: Vec::new(),
-            comment_fingerprints: Vec::new(),
-            comment_locations: Vec::new(),
-            comment_source_ids: Vec::new(),
-        };
+        let mut turn = InlineHistoryTurn::new(request.into(), prompt.into(), before, location);
+        if let Some(session) = &self.inline_assist {
+            turn.allow_expansion = session.allow_expansion;
+            turn.parent_comment.clone_from(&session.parent_comment);
+        }
         if let Some(conversation) = self
             .inline_history
             .conversations
@@ -1502,7 +1493,7 @@ impl Editor {
         )
     }
 
-    fn resolve_history_comment(
+    pub(super) fn resolve_history_comment(
         &self,
         turn: &InlineHistoryTurn,
         comment: usize,

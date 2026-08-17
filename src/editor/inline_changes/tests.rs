@@ -37,6 +37,7 @@ async fn apply(editor: &mut Editor) {
 async fn apply_replacement(editor: &mut Editor, replacement: &str) {
     let range = TextRange::new(TextPosition::new(0, 0), TextPosition::new(5, 0));
     editor.inline_assist = Some(InlineAssistSession {
+        parent_comment: None,
         allow_expansion: false,
         buffer_id: editor.current_buffer().id(),
         window_id: editor.window_manager.active_stable_window_id().unwrap(),

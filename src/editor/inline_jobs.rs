@@ -832,6 +832,7 @@ impl Editor {
                 && self.current_buffer().text_in_range(range) == expected_text;
             (
                 InlineAssistSession {
+                    parent_comment: turn.parent_comment.clone(),
                     allow_expansion: turn.allow_expansion,
                     buffer_id: self.current_buffer().id(),
                     window_id,

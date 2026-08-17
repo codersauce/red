@@ -12,7 +12,7 @@ use crate::{
     buffer::{Buffer, BufferId},
     inline_assist::InlineCommentInput,
     ui::{HoverInfo, HoverInfoFormat},
-    undo::{AppliedTextEdit, TextPosition},
+    undo::{AppliedTextEdit, TextPosition, TextRange},
     unicode_utils::{display_width, display_width_with_tabs, trim_line_ending},
 };
 
@@ -105,6 +105,33 @@ struct CommentProjection {
     ordinal: usize,
     count: usize,
     members: Vec<usize>,
+}
+
+/// The same pager text supplies both painting and terminal-column hit targets.
+struct InlinePager {
+    text: String,
+    next_start: usize,
+}
+
+impl InlinePager {
+    fn new(ordinal: usize, count: usize, ascii: bool) -> Self {
+        let (previous, next) = if ascii { ('<', '>') } else { ('‹', '›') };
+        let text = format!("{previous} {ordinal}/{count} {next}");
+        let next_start = display_width(&text).saturating_sub(2);
+        Self { text, next_start }
+    }
+
+    fn direction_at(&self, text: &str, column: usize) -> Option<bool> {
+        if column < 2 && text.starts_with(self.text.chars().next()?) {
+            Some(true)
+        } else if text.starts_with(&self.text)
+            && (self.next_start..self.next_start + 3).contains(&column)
+        {
+            Some(false)
+        } else {
+            None
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -444,10 +471,12 @@ impl Editor {
                 let comment = &self.inline_comments[view.index];
                 let mut message = String::new();
                 if view.count > 1 {
-                    message.push_str(&format!(
-                        "[<] [>] Inline {} of {} · Space v\n",
-                        view.ordinal, view.count
-                    ));
+                    let pager = InlinePager::new(
+                        view.ordinal,
+                        view.count,
+                        self.config.window_borders_ascii,
+                    );
+                    message.push_str(&format!("{} · Space v\n", pager.text));
                 }
                 if comment.stale {
                     message.push_str("[outdated] ");
@@ -616,7 +645,7 @@ impl Editor {
         self.move_to_text_position(TextPosition::new(line, 0));
         self.refresh_cursor_goal();
         self.set_legacy_message(Some(format!(
-            "inline {} of {} here · Space [/] i cycle · Space v open",
+            "inline {} of {} here · [i previous · ]i next · Space v open",
             next + 1,
             view.count
         )));
@@ -644,17 +673,12 @@ impl Editor {
             })?;
         let id = self.inline_comments[view.index].id;
         if row.starts_connection && view.count > 1 {
-            if column < 3 && text.starts_with("[<]") {
+            let pager =
+                InlinePager::new(view.ordinal, view.count, self.config.window_borders_ascii);
+            if let Some(backwards) = pager.direction_at(text, column) {
                 return Some(Action::NavigateOverlappingInlineComment {
                     id,
-                    backwards: true,
-                    open: false,
-                });
-            }
-            if (4..7).contains(&column) && text.starts_with("[<] [>]") {
-                return Some(Action::NavigateOverlappingInlineComment {
-                    id,
-                    backwards: false,
+                    backwards,
                     open: false,
                 });
             }
@@ -802,6 +826,11 @@ impl Editor {
     }
 
     pub(super) fn show_inline_comment(&mut self) {
+        // Source layout must be settled before deriving terminal coordinates.
+        // An existing modal intentionally hides the terminal cursor, so it is
+        // not a valid anchor when cycling between comments.
+        self.check_bounds();
+        self.sync_to_window();
         let Some(index) = self.current_inline_comment_index() else {
             self.set_legacy_message(Some("no inline comment at the cursor".into()));
             return;
@@ -838,10 +867,60 @@ impl Editor {
         );
         let mut hover =
             HoverInfo::new(self, text, HoverInfoFormat::Plaintext, Vec::new()).with_label(label);
+        if let Some(layout) = self.inline_comment_overlay_layout(comment.id) {
+            hover = hover.with_inline_source(comment.id, layout);
+        }
+        if matches!(
+            comment.origin,
+            InlineCommentOrigin::Assist { .. } | InlineCommentOrigin::HistoryPreview { .. }
+        ) {
+            hover = hover
+                .with_shortcut(
+                    'i',
+                    "ask inline",
+                    Action::AskInlineComment {
+                        id: comment.id,
+                        in_agent: false,
+                    },
+                )
+                .with_shortcut(
+                    'A',
+                    "ask Agent",
+                    Action::AskInlineComment {
+                        id: comment.id,
+                        in_agent: true,
+                    },
+                );
+        }
         if let Some((id, _, _)) = navigation {
             hover = hover.with_inline_navigation(id);
         }
         self.current_dialog = Some(Box::new(hover));
+    }
+
+    pub(super) fn inline_comment_overlay_layout(
+        &self,
+        id: Uuid,
+    ) -> Option<crate::ui::OverlayLayout> {
+        let comment = self
+            .inline_comments
+            .iter()
+            .find(|comment| comment.id == id)?;
+        let window_id = self.window_manager.active_stable_window_id()?;
+        let window = self.window_manager.window(window_id)?;
+        let buffer = self.buffer_manager.get(window.buffer_index)?;
+        if buffer.id() != comment.anchor.buffer_id || comment.detached {
+            return None;
+        }
+        let (start, end) = comment.lines(buffer);
+        self.text_range_overlay_layout(
+            window_id,
+            buffer.id(),
+            TextRange::new(
+                TextPosition::new(start, 0),
+                TextPosition::new(end.saturating_add(1), 0),
+            ),
+        )
     }
 
     pub(super) fn clear_inline_comments(&mut self) {

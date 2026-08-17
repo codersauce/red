@@ -23,6 +23,7 @@ fn start(editor: &mut Editor, group: &str, request: &str, line: usize) {
     editor.park_inline_assist();
     let range = TextRange::new(TextPosition::new(line, 0), TextPosition::new(line + 1, 0));
     editor.inline_assist = Some(InlineAssistSession {
+        parent_comment: None,
         allow_expansion: false,
         buffer_id: editor.current_buffer().id(),
         window_id: editor.window_manager.active_stable_window_id().unwrap(),
