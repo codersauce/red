@@ -2740,12 +2740,23 @@ impl Editor {
             return;
         }
 
-        buffer.apply_selection_for_points(
-            points,
-            &self.theme.editor_bracket_match_style(),
-            &self.theme,
-            SelectionForegroundPriority::Content,
-        );
+        // A software block cursor replaces its cell's background. Decorating
+        // that cell first would make cursor contrast depend on a hidden fill.
+        let block_cursor = self
+            .uses_synthetic_block_cursor()
+            .then(|| self.render_cursor_position())
+            .flatten();
+        for point in points {
+            if block_cursor == Some((point.x, point.y))
+                || point.x >= buffer.width
+                || point.y >= buffer.height
+            {
+                continue;
+            }
+            if let Some(cell) = buffer.cells.get_mut(point.y * buffer.width + point.x) {
+                cell.style = self.theme.matched_bracket_style(&cell.style);
+            }
+        }
     }
 
     fn render_search_highlights_in_window(
