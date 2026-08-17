@@ -52,6 +52,10 @@ pub(super) fn practice_language_services(
 }
 
 impl SavedLanguageState {
+    pub(super) fn original_config(&self) -> &LspConfig {
+        &self.config
+    }
+
     pub fn install(editor: &mut Editor, config: LspConfig, client: Box<dyn LspClient>) -> Self {
         let show_diagnostics = config.enabled;
         let saved = Self {

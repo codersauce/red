@@ -246,6 +246,9 @@ impl HoverInfo {
 }
 
 impl Component for HoverInfo {
+    fn shortcut_context(&self) -> &str {
+        &self.label
+    }
     fn surface_actions(&self) -> Vec<UiAction> {
         self.dialog.actions()
     }

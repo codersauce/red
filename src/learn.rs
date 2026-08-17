@@ -64,10 +64,11 @@ pub(crate) enum Lesson {
     FindAndReplace,
     ChooseATheme,
     DiscoverYourKeymap,
+    CheckLanguageSupport,
 }
 
 impl Lesson {
-    pub const AVAILABLE: [Self; 24] = [
+    pub const AVAILABLE: [Self; 25] = [
         Self::FindYourFooting,
         Self::EditWithConfidence,
         Self::FindACommand,
@@ -92,6 +93,7 @@ impl Lesson {
         Self::FindAndReplace,
         Self::ChooseATheme,
         Self::DiscoverYourKeymap,
+        Self::CheckLanguageSupport,
     ];
 
     pub fn from_id(id: &str) -> Option<Self> {
@@ -140,6 +142,7 @@ impl Lesson {
             Self::FindAndReplace => 21,
             Self::ChooseATheme => 22,
             Self::DiscoverYourKeymap => 23,
+            Self::CheckLanguageSupport => 24,
         }
     }
 
@@ -163,7 +166,7 @@ impl Lesson {
             | Self::ChangeATextObject
             | Self::RepeatAndRecover
             | Self::FindAndReplace => 4,
-            Self::ChooseATheme | Self::DiscoverYourKeymap => 5,
+            Self::ChooseATheme | Self::DiscoverYourKeymap | Self::CheckLanguageSupport => 5,
             _ => 0,
         }
     }
@@ -195,6 +198,7 @@ impl Lesson {
                 | Self::FollowTheSymbol
                 | Self::RepairTheCode
                 | Self::FollowSymbols
+                | Self::CheckLanguageSupport
         )
     }
 
@@ -234,6 +238,7 @@ impl Lesson {
             Self::FindAndReplace => "precision.find-and-replace.v1",
             Self::ChooseATheme => "custom.choose-a-theme.v1",
             Self::DiscoverYourKeymap => "custom.discover-your-keymap.v1",
+            Self::CheckLanguageSupport => "custom.check-language-support.v1",
         }
     }
 
@@ -257,7 +262,9 @@ impl Lesson {
             | Self::ChooseWhatToKeep
             | Self::ContinueInAgent => AI_CONTENTS,
             Self::ReviewWhatChanged => AI_FIXED_CONTENTS,
-            Self::ReadTheDiagnostic | Self::RepairTheCode => HUSK_CONTENTS,
+            Self::ReadTheDiagnostic | Self::RepairTheCode | Self::CheckLanguageSupport => {
+                HUSK_CONTENTS
+            }
             Self::FollowTheSymbol | Self::FollowSymbols => HUSK_SYMBOL_CONTENTS,
             Self::StageTheRightHunk | Self::MakeALocalCommit => staging::WORKTREE,
             Self::OpenAFileByName | Self::SearchTheProject | Self::ArrangeYourWorkspace => {
@@ -292,6 +299,7 @@ impl Lesson {
             Self::FindAndReplace => PracticeStep::ReplaceSearch,
             Self::ChooseATheme => PracticeStep::ThemeOpen,
             Self::DiscoverYourKeymap => PracticeStep::KeymapOpen,
+            Self::CheckLanguageSupport => PracticeStep::SupportSyntax,
         }
     }
 
@@ -342,6 +350,12 @@ impl Lesson {
                 "Undo the unwanted change",
                 "Request and refine a suggestion",
                 "Keep only the corrected result",
+            ],
+            Self::CheckLanguageSupport => &[
+                "Choose the buffer syntax",
+                "Confirm a working language server",
+                "Inspect installed language support",
+                "Return without changing your setup",
             ],
             Self::DiscoverYourKeymap => &[
                 "Inspect your current shortcuts",
@@ -656,12 +670,21 @@ pub(crate) enum PracticeStep {
     KeymapTry,
     KeymapInspect,
     KeymapClose,
+    SupportSyntax,
+    SupportChooseSyntax,
+    SupportDiagnostic,
+    SupportInventory,
+    SupportReturn,
     Complete,
 }
 
 impl PracticeStep {
     pub fn suggested_action(self) -> Option<Action> {
         match self {
+            Self::SupportSyntax => Some(Action::OpenSyntaxPicker),
+            Self::SupportChooseSyntax | Self::SupportReturn => None,
+            Self::SupportDiagnostic => Some(Action::OpenDiagnosticsPicker),
+            Self::SupportInventory => Some(Action::ListPlugins),
             Self::KeymapOpen | Self::KeymapInspect => Some(Action::KeyboardShortcuts),
             Self::KeymapReturn | Self::KeymapClose => None,
             Self::KeymapEdit => Some(Action::Save),
@@ -817,6 +840,11 @@ impl PracticeStep {
             Self::DiagnosticJump => "Choose the missing-semicolon error and press Enter. The editor will take you to the reported location. Reopen Diagnostics if you closed the picker.".into(),
             Self::DiagnosticRead => format!("Press {} to read the diagnostic on this line. The parser points at the next token; the incomplete statement is just above it.", shortcut.unwrap_or("D")),
             Self::DiagnosticReturn => "Read the message and diagnostic code, then press Esc to return to the source. You will repair the defect in a later lesson.".into(),
+            Self::SupportSyntax => "Run :syntax to see the language definitions available in this Red installation. Syntax highlighting and language-server features are separate capabilities.".into(),
+            Self::SupportChooseSyntax => "Choose husk in the syntax picker. This is a buffer-local choice; it does not change file associations or install anything. Reopen :syntax if needed.".into(),
+            Self::SupportDiagnostic => format!("Press {} and open the missing-semicolon diagnostic. This real response from the bundled Husk server proves more than syntax colors alone.", shortcut.unwrap_or("Space d")),
+            Self::SupportInventory => "Run :plugins to inspect a read-only support report for this lesson. It shows the working practice server, your configured server commands, and installed language packs. Nothing is downloaded or started for your own project.".into(),
+            Self::SupportReturn => "Scroll through the report. A command found on PATH is not the same as a running server. Outside this lesson, :plugins opens the language-pack manager; installs and native-grammar approvals are explicit. Press Esc to return.".into(),
             Self::KeymapOpen => format!("Press {} to inspect your effective shortcuts. Keyboard help includes your own overrides, not just Red's defaults.", shortcut.unwrap_or("F1")),
             Self::KeymapReturn => "Try / to search by action or binding, and Tab to switch scope. Press Esc to clear a search, then Esc again to return to the practice config.".into(),
             Self::KeymapEdit => format!("Change MoveRight to ToggleWrap in this owned TOML file, then press {}. You can use :%s/MoveRight/ToggleWrap/ followed by :w. Only the practice F6 binding is applied; your real config is untouched.", shortcut.unwrap_or(":w")),
@@ -886,6 +914,7 @@ impl PracticeStep {
                 Lesson::UnderstandSelectedCode => "You explained selected code without editing it. Recorded practice complete; real inline assist sends your selected context only when you submit a prompt.",
                 Lesson::MakeAFocusedChange => "The fix is kept in the buffer, still unsaved. Inline edits use normal undo history; keeping one is not the same as writing a file.",
                 Lesson::ChooseWhatToKeep => "You rejected an unwanted change, refined a suggestion, and kept the corrected result. The final edit is unsaved and remains undoable.",
+                Lesson::CheckLanguageSupport => "You checked syntax, observed a real language-server diagnostic, and inspected local language support. Your configuration and installed packs are unchanged.",
                 Lesson::DiscoverYourKeymap => "You edited a real keymap fragment, tried its temporary binding, and found it in keyboard help. Copy an intentional override into your own config later if you want to keep it.",
                 Lesson::ChooseATheme => "You previewed a theme, tested cancellation, and made an explicit choice. Your saved theme remains in effect after the lesson.",
                 Lesson::FindAndReplace => "You searched, repeated the search, replaced both matches, and undid the substitution in one step. Edit with precision complete! The original practice text is restored.",
@@ -938,7 +967,9 @@ impl PracticeStep {
             | Self::ReplaceSearch
             | Self::ThemeOpen
             | Self::KeymapOpen
-            | Self::KeymapReturn => 0,
+            | Self::KeymapReturn
+            | Self::SupportSyntax
+            | Self::SupportChooseSyntax => 0,
             Self::Type
             | Self::EditDelete
             | Self::CommandRun
@@ -962,7 +993,8 @@ impl PracticeStep {
             | Self::RepeatNext
             | Self::ReplaceNext
             | Self::ThemePreview
-            | Self::KeymapEdit => 1,
+            | Self::KeymapEdit
+            | Self::SupportDiagnostic => 1,
             Self::Normal
             | Self::EditUndo
             | Self::CommandHelp
@@ -988,7 +1020,8 @@ impl PracticeStep {
             | Self::RepeatUndo
             | Self::ReplaceAll
             | Self::ThemeCancel
-            | Self::KeymapTry => 2,
+            | Self::KeymapTry
+            | Self::SupportInventory => 2,
             Self::Undo
             | Self::EditRedo
             | Self::CommandReturn
@@ -1013,7 +1046,8 @@ impl PracticeStep {
             | Self::ReplaceUndo
             | Self::ThemeChoose
             | Self::KeymapInspect
-            | Self::KeymapClose => 3,
+            | Self::KeymapClose
+            | Self::SupportReturn => 3,
             Self::Complete => 4,
         }
     }
@@ -1135,6 +1169,27 @@ impl PracticeStep {
     /// Observes UI state that can change through either a key or an action.
     pub fn observe_view(&mut self, action: &Action, view: PracticeView) -> bool {
         let next = match (*self, action) {
+            (Self::SupportSyntax, Action::OpenSyntaxPicker) if view.syntax_picker_open => {
+                Self::SupportChooseSyntax
+            }
+            (Self::SupportChooseSyntax, Action::SetSyntax(_)) if view.explicit_husk_syntax => {
+                Self::SupportDiagnostic
+            }
+            (Self::SupportDiagnostic, Action::OpenLocation(_, _))
+                if view.diagnostic_present
+                    && view.diagnostic_under_cursor
+                    && view.language_server_ready =>
+            {
+                Self::SupportInventory
+            }
+            (Self::SupportInventory, Action::ListPlugins)
+                if view.language_support_open && view.language_server_ready =>
+            {
+                Self::SupportReturn
+            }
+            (Self::SupportReturn, Action::CloseDialog) if !view.language_support_open => {
+                Self::Complete
+            }
             (Self::KeymapOpen, _) if view.shortcuts_open => Self::KeymapReturn,
             (Self::KeymapReturn, _) if !view.shortcuts_open => Self::KeymapEdit,
             (Self::KeymapEdit, Action::Save) if view.keymap_installed => Self::KeymapTry,
@@ -1405,6 +1460,10 @@ pub(crate) struct PracticeView {
     pub code_actions_open: bool,
     pub husk_fixed_text: bool,
     pub diagnostics_clean: bool,
+    pub syntax_picker_open: bool,
+    pub explicit_husk_syntax: bool,
+    pub language_server_ready: bool,
+    pub language_support_open: bool,
     pub keymap_installed: bool,
     pub keymap_binding_visible: bool,
     pub theme_picker_open: bool,
@@ -1436,19 +1495,24 @@ pub(crate) struct PracticeView {
 
 /// Scratch lessons permit only edits to their isolated practice buffer.
 pub(crate) fn practice_action_allowed(lesson: Lesson, action: &Action) -> bool {
-    (lesson == Lesson::DiscoverYourKeymap
+    (lesson == Lesson::CheckLanguageSupport
         && matches!(
             action,
-            Action::KeyboardShortcuts
-                | Action::CommandPalette
-                | Action::Save
-                | Action::ToggleWrap
-                | Action::Substitute(_)
-                | Action::ConfirmSubstitute(_)
-                | Action::ChangeTextRange(_)
-                | Action::DeleteTextRange(_)
-                | Action::DeleteWord
+            Action::OpenSyntaxPicker | Action::SetSyntax(_) | Action::ListPlugins
         ))
+        || (lesson == Lesson::DiscoverYourKeymap
+            && matches!(
+                action,
+                Action::KeyboardShortcuts
+                    | Action::CommandPalette
+                    | Action::Save
+                    | Action::ToggleWrap
+                    | Action::Substitute(_)
+                    | Action::ConfirmSubstitute(_)
+                    | Action::ChangeTextRange(_)
+                    | Action::DeleteTextRange(_)
+                    | Action::DeleteWord
+            ))
         || (lesson == Lesson::ChooseATheme
             && (matches!(
                 action,

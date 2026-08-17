@@ -12,6 +12,7 @@ mod customization;
 mod git;
 mod keymap;
 mod language;
+mod language_support;
 mod navigation;
 mod outline;
 mod search;
@@ -479,7 +480,7 @@ impl Editor {
         }
         if matches!(
             session.lesson,
-            Lesson::ReadTheDiagnostic | Lesson::RepairTheCode
+            Lesson::ReadTheDiagnostic | Lesson::RepairTheCode | Lesson::CheckLanguageSupport
         ) && matches!(
             action,
             Action::OpenDiagnosticsPicker | Action::OpenErrorDiagnosticsPicker
@@ -518,6 +519,9 @@ impl Editor {
                 "this practice step only edits tutorial text; use :tutorial quit to return".into(),
             ));
             self.render(buffer)?;
+            return Ok(true);
+        }
+        if self.intercept_learn_language_support(action, buffer, runtime)? {
             return Ok(true);
         }
         if self.intercept_learn_keymap_action(action, buffer).await? {
@@ -661,6 +665,24 @@ impl Editor {
                 .flatten()
                 .and_then(|uri| self.diagnostics.get(&uri))
                 .is_some_and(Vec::is_empty),
+            syntax_picker_open: self
+                .current_dialog
+                .as_ref()
+                .is_some_and(|dialog| dialog.shortcut_context() == "Syntax"),
+            explicit_husk_syntax: matches!(self.current_buffer().syntax_selection(), SyntaxSelection::Language(name) if name == "husk")
+                && self
+                    .highlight_language_id_for_buffer_index(self.buffer_manager.active_index())
+                    .as_deref()
+                    == Some("husk"),
+            language_server_ready: self
+                .current_buffer()
+                .file
+                .as_deref()
+                .is_some_and(|file| self.lsp.server_capabilities_for_file(file).is_some()),
+            language_support_open: self
+                .current_dialog
+                .as_ref()
+                .is_some_and(|dialog| dialog.shortcut_context() == "Language support"),
             keymap_installed: self.learn_keymap_installed(),
             keymap_binding_visible: self.learn_keymap_installed()
                 && self
