@@ -43,6 +43,7 @@ pub mod rendering;
 #[cfg(test)]
 mod resize_tests;
 mod session_manager;
+mod snippet;
 
 use std::{
     cell::RefCell,
@@ -2582,6 +2583,15 @@ pub enum Action {
         item: Box<CompletionResponseItem>,
         commit_character: Option<char>,
     },
+    /// Advances to the next editable language-server snippet placeholder.
+    #[serde(skip)]
+    NextSnippetPlaceholder,
+    /// Returns to the preceding editable language-server snippet placeholder.
+    #[serde(skip)]
+    PreviousSnippetPlaceholder,
+    /// Removes the currently selected snippet placeholder without leaving insert mode.
+    #[serde(skip)]
+    DeleteSnippetPlaceholder,
     ShowProgress(ProgressParams),
     NotifyPlugins(String, Value),
     NotifyPlugin(String, String, Value),
@@ -3341,6 +3351,8 @@ pub struct Editor {
     scheduled_completion: Option<ScheduledCompletion>,
     inline_completion: inline_completion::InlineCompletionState,
     completion_snapshot: Option<CompletionSnapshot>,
+    /// Insert-mode placeholder anchors belonging to the most recently expanded snippet.
+    snippet_session: Option<snippet::SnippetSession>,
 }
 
 /// Terminal-independent owner used by the local detach protocol. It keeps the real
@@ -4597,6 +4609,7 @@ impl Editor {
             scheduled_completion: None,
             inline_completion: inline_completion::InlineCompletionState::default(),
             completion_snapshot: None,
+            snippet_session: None,
         })
     }
 
@@ -13041,6 +13054,9 @@ impl Editor {
         if let Some(action) = self.handle_keyboard_shortcuts_event(ev, runtime) {
             return Ok(Some(action));
         }
+        if let Some(action) = self.handle_snippet_event(ev) {
+            return Ok(Some(action));
+        }
         if let Some(action) = self.handle_inline_completion_event(ev) {
             return Ok(Some(action));
         }
@@ -17175,6 +17191,9 @@ impl Editor {
             Action::EnterMode(new_mode) => {
                 add_to_history = false;
                 let old_mode = self.mode;
+                if !matches!(new_mode, Mode::Insert) {
+                    self.snippet_session = None;
+                }
                 if matches!(
                     old_mode,
                     Mode::Visual | Mode::VisualLine | Mode::VisualBlock
@@ -17271,10 +17290,10 @@ impl Editor {
                 let char_cx = self.grapheme_to_char_on_line(cx, line);
                 self.generated_indent = None;
 
-                self.replace_range(
-                    TextRange::insertion(TextPosition::new(line, char_cx)),
-                    &c.to_string(),
-                );
+                let range = self
+                    .take_selected_snippet_range()
+                    .unwrap_or_else(|| TextRange::insertion(TextPosition::new(line, char_cx)));
+                self.replace_range(range, &c.to_string());
                 drop(replace_span);
 
                 // Move cursor by one character position (not display width)
@@ -17766,9 +17785,11 @@ impl Editor {
                 self.render(buffer)?;
             }
             Action::Undo => {
+                self.snippet_session = None;
                 self.undo_transaction(buffer, runtime).await?;
             }
             Action::Redo => {
+                self.snippet_session = None;
                 self.redo_transaction(buffer, runtime).await?;
             }
             Action::SelectPreviousUndoBranch => {
@@ -19739,7 +19760,10 @@ impl Editor {
                 if started_transaction {
                     self.begin_transaction("insert string");
                 }
-                self.replace_range(TextRange::insertion(TextPosition::new(line, char_cx)), text);
+                let range = self
+                    .take_selected_snippet_range()
+                    .unwrap_or_else(|| TextRange::insertion(TextPosition::new(line, char_cx)));
+                self.replace_range(range, text);
                 self.notify_change(runtime).await?;
                 self.cx += grapheme_len(text);
                 if started_transaction {
@@ -19756,7 +19780,10 @@ impl Editor {
                 if started_transaction {
                     self.begin_transaction("paste");
                 }
-                self.replace_range(TextRange::insertion(start), text);
+                let range = self
+                    .take_selected_snippet_range()
+                    .unwrap_or_else(|| TextRange::insertion(start));
+                self.replace_range(range, text);
                 self.move_to_insert_text_position(end);
                 if started_transaction {
                     self.commit_transaction(self.cursor_snapshot());
@@ -19832,6 +19859,29 @@ impl Editor {
                 self.apply_completion(item, *commit_character, runtime)
                     .await?;
                 self.render(buffer)?;
+            }
+            Action::NextSnippetPlaceholder | Action::PreviousSnippetPlaceholder => {
+                add_to_history = false;
+                self.navigate_snippet_placeholder(matches!(
+                    action,
+                    Action::PreviousSnippetPlaceholder
+                ));
+                self.render(buffer)?;
+            }
+            Action::DeleteSnippetPlaceholder => {
+                if let Some(range) = self.take_selected_snippet_range() {
+                    let started_transaction = !self.transaction_active();
+                    if started_transaction {
+                        self.begin_transaction("delete snippet placeholder");
+                    }
+                    self.replace_range(range, "");
+                    self.move_to_insert_text_position(range.start);
+                    if started_transaction {
+                        self.commit_transaction(self.cursor_snapshot());
+                    }
+                    self.notify_change(runtime).await?;
+                    self.render(buffer)?;
+                }
             }
             Action::ShowProgress(progress) => {
                 add_to_history = false;
@@ -20198,6 +20248,8 @@ impl Editor {
             self.update_selection();
             self.render(buffer)?;
         }
+
+        self.finish_snippet_after_action(action);
 
         if add_to_history && Self::records_jump(action) {
             self.save_to_history(jump_entry_before_action);
@@ -22438,6 +22490,7 @@ impl Editor {
 
     fn update_anchors_for_edit(&mut self, edit: AppliedTextEdit) {
         self.transform_inline_history_for_edit(edit);
+        self.transform_snippet_anchors(edit);
         let buffer_id = self.current_buffer().id();
         let buffer = &self.buffer_manager[self.buffer_manager.active_index()];
         for comment in &mut self.inline_comments {
@@ -24801,6 +24854,9 @@ impl Editor {
             self.replace_range(edit.range, &edit.new_text);
 
             if edit.is_main {
+                if let Some(snippet) = &edit.snippet {
+                    self.activate_snippet_session(edit.range.start, snippet);
+                }
                 let cursor_offset = edit
                     .cursor_offset
                     .unwrap_or_else(|| edit.new_text.chars().count());
@@ -24822,6 +24878,12 @@ impl Editor {
         self.move_to_text_position(cursor_position);
 
         if let Some(c) = commit_character {
+            if let Some(final_position) = self
+                .snippet_final_cursor_position()
+                .filter(|_| self.selected_snippet_range().is_some())
+            {
+                self.move_to_insert_text_position(final_position);
+            }
             let line = self.buffer_line();
             let character = self.grapheme_to_char_on_line(self.cx, line);
             self.replace_range(
@@ -24829,6 +24891,9 @@ impl Editor {
                 &c.to_string(),
             );
             self.move_to_text_position(TextPosition::new(line, character + 1));
+            if let Some(range) = self.selected_snippet_range() {
+                self.move_to_insert_text_position(range.start);
+            }
         }
 
         self.notify_change(runtime).await?;
@@ -25952,6 +26017,7 @@ struct CompletionEdit {
     range: TextRange,
     new_text: String,
     cursor_offset: Option<usize>,
+    snippet: Option<snippet::ParsedSnippet>,
     is_main: bool,
 }
 
@@ -26044,17 +26110,24 @@ fn completion_edit(
     insert_text_format: Option<&InsertTextFormat>,
     is_main: bool,
 ) -> CompletionEdit {
-    let (new_text, cursor_offset) = if matches!(insert_text_format, Some(InsertTextFormat::Snippet))
-    {
-        snippet_to_plain_text(text)
-    } else {
-        (text.to_string(), None)
-    };
+    let snippet = matches!(insert_text_format, Some(InsertTextFormat::Snippet))
+        .then(|| snippet::parse_snippet(text));
+    let new_text = snippet
+        .as_ref()
+        .map_or_else(|| text.to_string(), |snippet| snippet.text.clone());
+    let cursor_offset = snippet.as_ref().and_then(|snippet| {
+        snippet
+            .placeholders
+            .first()
+            .map(|placeholder| placeholder.start)
+            .or(snippet.final_cursor)
+    });
 
     CompletionEdit {
         range,
         new_text,
         cursor_offset,
+        snippet,
         is_main,
     }
 }
@@ -26257,95 +26330,6 @@ fn transform_text_position_after_edit(
 
 fn compare_text_positions(a: TextPosition, b: TextPosition) -> Ordering {
     a.line.cmp(&b.line).then(a.character.cmp(&b.character))
-}
-
-fn snippet_to_plain_text(snippet: &str) -> (String, Option<usize>) {
-    let chars = snippet.chars().collect::<Vec<_>>();
-    let mut output = String::new();
-    let mut first_placeholder = None;
-    let mut final_cursor = None;
-    let mut i = 0;
-
-    while i < chars.len() {
-        if chars[i] != '$' {
-            output.push(chars[i]);
-            i += 1;
-            continue;
-        }
-
-        if i + 1 >= chars.len() {
-            output.push(chars[i]);
-            i += 1;
-            continue;
-        }
-
-        match chars[i + 1] {
-            '$' => {
-                output.push('$');
-                i += 2;
-            }
-            '0' => {
-                final_cursor = Some(output.chars().count());
-                i += 2;
-            }
-            c if c.is_ascii_digit() => {
-                first_placeholder.get_or_insert(output.chars().count());
-                i += 2;
-            }
-            '{' => {
-                if let Some((next, index, default_text)) = parse_snippet_placeholder(&chars, i + 2)
-                {
-                    let cursor = output.chars().count();
-                    if index == 0 {
-                        final_cursor = Some(cursor);
-                    } else {
-                        first_placeholder.get_or_insert(cursor);
-                    }
-                    output.push_str(&default_text);
-                    i = next;
-                } else {
-                    output.push(chars[i]);
-                    i += 1;
-                }
-            }
-            _ => {
-                output.push(chars[i]);
-                i += 1;
-            }
-        }
-    }
-
-    let cursor = first_placeholder.or(final_cursor);
-    (output, cursor)
-}
-
-fn parse_snippet_placeholder(chars: &[char], start: usize) -> Option<(usize, usize, String)> {
-    let mut i = start;
-    let mut index = String::new();
-    while i < chars.len() && chars[i].is_ascii_digit() {
-        index.push(chars[i]);
-        i += 1;
-    }
-
-    if index.is_empty() {
-        return None;
-    }
-
-    let index = index.parse::<usize>().ok()?;
-    let mut default_text = String::new();
-
-    match chars.get(i) {
-        Some('}') => Some((i + 1, index, default_text)),
-        Some(':') => {
-            i += 1;
-            while i < chars.len() && chars[i] != '}' {
-                default_text.push(chars[i]);
-                i += 1;
-            }
-            (i < chars.len()).then_some((i + 1, index, default_text))
-        }
-        _ => None,
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

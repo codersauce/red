@@ -2630,6 +2630,40 @@ impl Editor {
         self.render_search_highlights_in_window(buffer, window)?;
         self.render_matching_brackets_in_window(buffer, window, None);
 
+        if let Some(range) = self.selected_snippet_range() {
+            let selection_style = self.theme.editor_selection_style();
+            for line_index in range.start.line..=range.end.line {
+                let Some(line) = self.buffer_manager[window.buffer_index].get(line_index) else {
+                    continue;
+                };
+                let line = trim_line_ending(&line);
+                let start = if line_index == range.start.line {
+                    range.start.character
+                } else {
+                    0
+                };
+                let end = if line_index == range.end.line {
+                    range.end.character
+                } else {
+                    line.chars().count()
+                };
+                if end <= start {
+                    continue;
+                }
+                let tab_width = self.tab_width_for_buffer_index(window.buffer_index);
+                let start_col = display_width_with_tabs(char_prefix(line, start), tab_width);
+                let end_col = display_width_with_tabs(char_prefix(line, end), tab_width);
+                let points =
+                    self.display_col_range_points_in_window(window, line_index, start_col, end_col);
+                buffer.apply_selection_for_points(
+                    points,
+                    &selection_style,
+                    &self.theme,
+                    SelectionForegroundPriority::Selection,
+                );
+            }
+        }
+
         // Render selection last so its contrast guarantee is not overwritten by search highlights.
         if self.is_visual() && window.active {
             self.update_selection();

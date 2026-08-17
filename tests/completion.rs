@@ -3,9 +3,10 @@ mod common;
 use std::sync::{Arc, Mutex};
 
 use common::{LspEvent, RecordingLsp};
+use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 use red::{
     buffer::Buffer,
-    config::Config,
+    config::{Config, KeyAction},
     editor::{Action, Editor, Mode},
     lsp::{
         Command, CompletionResponseItem, InsertTextFormat, LspClient, Position, Range, TextEdit,
@@ -269,7 +270,7 @@ async fn invalid_and_overlapping_completion_edits_leave_the_buffer_unchanged() {
 }
 
 #[tokio::test]
-async fn apply_completion_strips_basic_snippet_markers() {
+async fn apply_completion_selects_the_first_snippet_placeholder() {
     let (mut editor, _) = recording_editor(Buffer::new(None, "call".to_string()));
     let mut completion = item("println");
     completion.insert_text = Some("println!(\"${1:value}\");$0".to_string());
@@ -289,6 +290,390 @@ async fn apply_completion_strips_basic_snippet_markers() {
 
     assert_eq!(editor.test_buffer_contents(), "println!(\"value\");call");
     assert_eq!(editor.test_cursor_position(), (10, 0));
+    let (cursor_x, cursor_y) = editor.test_render_cursor_position().unwrap();
+    let selected_background = editor.test_render_cell_bg(cursor_x, cursor_y).unwrap();
+    let following_background = editor.test_render_cell_bg(cursor_x + 5, cursor_y).unwrap();
+    assert_ne!(selected_background, following_background);
+    assert!(editor.test_is_insert());
+
+    editor
+        .test_execute_action(Action::InsertCharAtCursorPos('x'))
+        .await
+        .unwrap();
+    assert_eq!(editor.test_buffer_contents(), "println!(\"x\");call");
+
+    editor
+        .test_execute_event(Event::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)))
+        .await
+        .unwrap();
+    assert_eq!(editor.test_cursor_position(), (14, 0));
+    assert!(editor.test_is_insert());
+}
+
+#[tokio::test]
+async fn snippet_arguments_support_replacement_forward_and_backward_navigation() {
+    let (mut editor, _) = recording_editor(Buffer::new(None, String::new()));
+    let mut completion = item("spawn_asteroid");
+    completion.insert_text = Some("self.spawn_asteroid(${1:d}, ${2:pos}, ${3:size})$0".to_string());
+    completion.insert_text_format = Some(InsertTextFormat::Snippet);
+
+    editor
+        .test_execute_action(Action::EnterMode(Mode::Insert))
+        .await
+        .unwrap();
+    editor
+        .test_execute_action(Action::ApplyCompletion {
+            item: Box::new(completion),
+            commit_character: None,
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(
+        editor.test_buffer_contents().trim_end_matches('\n'),
+        "self.spawn_asteroid(d, pos, size)"
+    );
+    assert_eq!(editor.test_cursor_position(), (20, 0));
+
+    editor.test_type_text("drawer").await.unwrap();
+    assert_eq!(
+        editor.test_buffer_contents().trim_end_matches('\n'),
+        "self.spawn_asteroid(drawer, pos, size)"
+    );
+
+    editor
+        .test_execute_event(Event::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)))
+        .await
+        .unwrap();
+    assert_eq!(editor.test_cursor_position(), (28, 0));
+
+    editor
+        .test_execute_event(Event::Paste("origin_point".to_string()))
+        .await
+        .unwrap();
+    assert_eq!(
+        editor.test_buffer_contents().trim_end_matches('\n'),
+        "self.spawn_asteroid(drawer, origin_point, size)"
+    );
+
+    editor
+        .test_execute_event(Event::Key(KeyEvent::new(
+            KeyCode::BackTab,
+            KeyModifiers::SHIFT,
+        )))
+        .await
+        .unwrap();
+    assert_eq!(editor.test_cursor_position(), (20, 0));
+    editor
+        .test_execute_action(Action::InsertCharAtCursorPos('d'))
+        .await
+        .unwrap();
+
+    editor
+        .test_execute_event(Event::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)))
+        .await
+        .unwrap();
+    assert_eq!(editor.test_cursor_position(), (23, 0));
+    editor
+        .test_execute_event(Event::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)))
+        .await
+        .unwrap();
+    editor
+        .test_execute_action(Action::InsertString("AsteroidSize::Large".to_string()))
+        .await
+        .unwrap();
+    assert_eq!(
+        editor.test_buffer_contents().trim_end_matches('\n'),
+        "self.spawn_asteroid(d, origin_point, AsteroidSize::Large)"
+    );
+
+    editor
+        .test_execute_event(Event::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)))
+        .await
+        .unwrap();
+    assert_eq!(
+        editor.test_cursor_position(),
+        (
+            editor
+                .test_buffer_contents()
+                .trim_end_matches('\n')
+                .chars()
+                .count(),
+            0
+        )
+    );
+    assert!(editor.test_is_insert());
+}
+
+#[tokio::test]
+async fn snippet_placeholders_follow_unicode_and_additional_import_edits() {
+    let (mut editor, _) = recording_editor(Buffer::new(None, "😀\nspawn".to_string()));
+    let mut completion = item("spawn");
+    completion.text_edit = Some(text_edit(range(1, 0, 1, 5), "spawn(${2:位置}, ${1:🚀})$0"));
+    completion.additional_text_edits = Some(vec![text_edit(range(0, 0, 0, 0), "use game;\n")]);
+    completion.insert_text_format = Some(InsertTextFormat::Snippet);
+
+    editor
+        .test_execute_action(Action::EnterMode(Mode::Insert))
+        .await
+        .unwrap();
+    editor
+        .test_execute_action(Action::ApplyCompletion {
+            item: Box::new(completion),
+            commit_character: None,
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(
+        editor.test_buffer_contents(),
+        "use game;\n😀\nspawn(位置, 🚀)"
+    );
+    assert_eq!(editor.test_cursor_position(), (10, 2));
+    editor
+        .test_execute_action(Action::InsertCharAtCursorPos('x'))
+        .await
+        .unwrap();
+    assert_eq!(
+        editor.test_buffer_contents(),
+        "use game;\n😀\nspawn(位置, x)"
+    );
+
+    editor
+        .test_execute_event(Event::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)))
+        .await
+        .unwrap();
+    assert_eq!(editor.test_cursor_position(), (6, 2));
+    editor
+        .test_execute_action(Action::InsertString("position".to_string()))
+        .await
+        .unwrap();
+    assert_eq!(
+        editor.test_buffer_contents(),
+        "use game;\n😀\nspawn(position, x)"
+    );
+}
+
+#[tokio::test]
+async fn backspace_removes_selected_placeholder_and_escape_ends_navigation() {
+    let (mut editor, _) = recording_editor(Buffer::new(None, String::new()));
+    let mut completion = item("call");
+    completion.insert_text = Some("call(${1:value}, ${2:next})$0".to_string());
+    completion.insert_text_format = Some(InsertTextFormat::Snippet);
+
+    editor
+        .test_execute_action(Action::EnterMode(Mode::Insert))
+        .await
+        .unwrap();
+    editor
+        .test_execute_action(Action::ApplyCompletion {
+            item: Box::new(completion),
+            commit_character: None,
+        })
+        .await
+        .unwrap();
+    editor
+        .test_execute_event(Event::Key(KeyEvent::new(
+            KeyCode::Backspace,
+            KeyModifiers::NONE,
+        )))
+        .await
+        .unwrap();
+    assert_eq!(
+        editor.test_buffer_contents().trim_end_matches('\n'),
+        "call(, next)"
+    );
+
+    editor
+        .test_execute_event(Event::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)))
+        .await
+        .unwrap();
+    assert_eq!(editor.test_cursor_position(), (7, 0));
+    editor
+        .test_execute_action(Action::EnterMode(Mode::Normal))
+        .await
+        .unwrap();
+    editor
+        .test_execute_action(Action::EnterMode(Mode::Insert))
+        .await
+        .unwrap();
+    editor
+        .test_execute_action(Action::InsertCharAtCursorPos('x'))
+        .await
+        .unwrap();
+    assert!(editor.test_buffer_contents().contains("next"));
+    assert!(editor.test_buffer_contents().contains('x'));
+}
+
+#[tokio::test]
+async fn snippet_commit_character_follows_call_without_replacing_first_argument() {
+    let (mut editor, _) = recording_editor(Buffer::new(None, String::new()));
+    let mut completion = item("call");
+    completion.insert_text = Some("call(${1:value})$0".to_string());
+    completion.insert_text_format = Some(InsertTextFormat::Snippet);
+
+    editor
+        .test_execute_action(Action::EnterMode(Mode::Insert))
+        .await
+        .unwrap();
+    editor
+        .test_execute_action(Action::ApplyCompletion {
+            item: Box::new(completion),
+            commit_character: Some(';'),
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(
+        editor.test_buffer_contents().trim_end_matches('\n'),
+        "call(value);"
+    );
+    assert_eq!(editor.test_cursor_position(), (5, 0));
+    editor
+        .test_execute_action(Action::InsertCharAtCursorPos('x'))
+        .await
+        .unwrap();
+    assert_eq!(
+        editor.test_buffer_contents().trim_end_matches('\n'),
+        "call(x);"
+    );
+}
+
+#[tokio::test]
+async fn snippet_final_cursor_without_placeholders_does_not_capture_tab() {
+    let (mut editor, _) = recording_editor(Buffer::new(None, String::new()));
+    let mut completion = item("call");
+    completion.insert_text = Some("call($0)".to_string());
+    completion.insert_text_format = Some(InsertTextFormat::Snippet);
+
+    editor
+        .test_execute_action(Action::EnterMode(Mode::Insert))
+        .await
+        .unwrap();
+    editor
+        .test_execute_action(Action::ApplyCompletion {
+            item: Box::new(completion),
+            commit_character: None,
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(
+        editor.test_buffer_contents().trim_end_matches('\n'),
+        "call()"
+    );
+    assert_eq!(editor.test_cursor_position(), (5, 0));
+    let event = Event::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+    assert!(!matches!(
+        editor.test_handle_event(event).unwrap(),
+        Some(KeyAction::Single(Action::NextSnippetPlaceholder))
+    ));
+    let before_tab = editor.test_buffer_contents();
+    editor.test_execute_action(Action::InsertTab).await.unwrap();
+    assert_ne!(editor.test_buffer_contents(), before_tab);
+    assert!(editor.test_buffer_contents().starts_with("call("));
+}
+
+#[tokio::test]
+async fn undoing_snippet_completion_clears_placeholder_navigation() {
+    let (mut editor, _) = recording_editor(Buffer::new(None, "before".to_string()));
+    let mut completion = item("call");
+    completion.text_edit = Some(text_edit(range(0, 0, 0, 6), "call(${1:value})$0"));
+    completion.insert_text_format = Some(InsertTextFormat::Snippet);
+
+    editor
+        .test_execute_action(Action::EnterMode(Mode::Insert))
+        .await
+        .unwrap();
+    editor
+        .test_execute_action(Action::ApplyCompletion {
+            item: Box::new(completion),
+            commit_character: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(editor.test_buffer_contents(), "call(value)");
+
+    editor.test_execute_action(Action::Undo).await.unwrap();
+    assert_eq!(editor.test_buffer_contents(), "before");
+    editor
+        .test_execute_action(Action::InsertCharAtCursorPos('x'))
+        .await
+        .unwrap();
+    assert!(editor.test_buffer_contents().contains("before"));
+}
+
+#[tokio::test]
+async fn an_open_completion_menu_accepts_before_snippet_navigation() {
+    let (mut editor, _) = recording_editor(Buffer::new(None, "alpha\nseed".to_string()));
+    let mut completion = item("call");
+    completion.text_edit = Some(text_edit(
+        range(1, 0, 1, 4),
+        "call(${1:value}, ${2:next})$0",
+    ));
+    completion.insert_text_format = Some(InsertTextFormat::Snippet);
+
+    editor
+        .test_execute_action(Action::EnterMode(Mode::Insert))
+        .await
+        .unwrap();
+    editor
+        .test_execute_action(Action::ApplyCompletion {
+            item: Box::new(completion),
+            commit_character: None,
+        })
+        .await
+        .unwrap();
+    editor
+        .test_execute_action(Action::InsertCharAtCursorPos('a'))
+        .await
+        .unwrap();
+    editor
+        .test_execute_action(Action::RequestCompletion)
+        .await
+        .unwrap();
+
+    editor
+        .test_execute_event(Event::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)))
+        .await
+        .unwrap();
+    assert_eq!(editor.test_buffer_contents(), "alpha\ncall(alpha, next)");
+
+    editor
+        .test_execute_event(Event::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)))
+        .await
+        .unwrap();
+    assert_eq!(editor.test_cursor_position(), (12, 1));
+}
+
+#[tokio::test]
+async fn moving_outside_snippet_cancels_selected_argument_replacement() {
+    let (mut editor, _) = recording_editor(Buffer::new(None, "prefix seed".to_string()));
+    let mut completion = item("call");
+    completion.text_edit = Some(text_edit(range(0, 7, 0, 11), "call(${1:value})$0"));
+    completion.insert_text_format = Some(InsertTextFormat::Snippet);
+
+    editor
+        .test_execute_action(Action::EnterMode(Mode::Insert))
+        .await
+        .unwrap();
+    editor
+        .test_execute_action(Action::ApplyCompletion {
+            item: Box::new(completion),
+            commit_character: None,
+        })
+        .await
+        .unwrap();
+    editor
+        .test_execute_action(Action::SetCursor(0, 0))
+        .await
+        .unwrap();
+    editor
+        .test_execute_action(Action::InsertCharAtCursorPos('x'))
+        .await
+        .unwrap();
+
+    assert_eq!(editor.test_buffer_contents(), "xprefix call(value)");
 }
 
 #[tokio::test]
