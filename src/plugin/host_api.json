@@ -1,5 +1,5 @@
 {
-  "version": "0.12.0",
+  "version": "0.13.0",
   "calls": [
     { "name": "Print", "kind": "execute", "signature": "(message: String)", "introduced": "0.1.0" },
     { "name": "FilePicker", "kind": "execute", "signature": "()", "introduced": "0.1.0" },
@@ -96,7 +96,7 @@
     { "name": "GetEditorState", "kind": "request", "signature": "(callback: fn(Json))", "introduced": "0.1.0" },
     { "name": "RestoreEditorState", "kind": "request", "signature": "(callback: fn(Json), snapshot: Json)", "introduced": "0.1.0" },
     { "name": "GetWindows", "kind": "request", "signature": "(callback: fn(Json))", "introduced": "0.1.0" },
-    { "name": "DocumentSymbols", "kind": "request", "signature": "(callback: fn(Json), buffer_id?: i32)", "introduced": "0.1.0" },
+    { "name": "DocumentSymbols", "kind": "request", "signature": "(callback: fn(Json), buffer_index?: i32)", "introduced": "0.1.0" },
     { "name": "WorkspaceSymbols", "kind": "request", "signature": "(callback: fn(Json), query: String)", "introduced": "0.1.0" },
     { "name": "References", "kind": "request", "signature": "(callback: fn(Json), include_declaration?: bool)", "introduced": "0.1.0" },
     { "name": "ResolveThemeStyle", "kind": "request", "signature": "(callback: fn(Json), style: Json)", "introduced": "0.1.0" },

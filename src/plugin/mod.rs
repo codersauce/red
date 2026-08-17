@@ -15,6 +15,7 @@ pub mod catalog;
 pub mod companion;
 pub mod decoration;
 pub mod document;
+mod document_symbols;
 pub(crate) mod filesystem;
 pub mod gutter;
 pub mod location;

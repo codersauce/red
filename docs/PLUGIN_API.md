@@ -1,6 +1,6 @@
 # Husk plugin compatibility
 
-Red host API version `0.12.0` is defined by
+Red host API version `0.13.0` is defined by
 [`src/plugin/host_api.json`](../src/plugin/host_api.json). That file is the canonical,
 machine-readable list of execute actions, request actions, signatures, and introduction
 versions. Runtime dispatch and the bundled-plugin corpus are checked against it in tests.
@@ -24,9 +24,27 @@ required/optional arity (`HUSK-A0002`) and obvious literal argument types
 annotations use `HUSK-A0004`. `--no-typecheck` is an unsupported development
 escape hatch; compatibility guarantees do not apply while it is enabled.
 
-Red `0.12.0` retains the complete `0.4.0`, `0.6.0`, `0.7.0`, `0.8.0`, `0.9.0`,
-`0.10.0`, and `0.11.0` contracts, so existing packages that declare those minors continue to
-load. New packages should target `"red_api_version": "^0.12.0"`.
+Red `0.13.0` retains the complete `0.4.0`, `0.6.0`, `0.7.0`, `0.8.0`, `0.9.0`,
+`0.10.0`, `0.11.0`, and `0.12.0` contracts, so existing packages that declare those
+minors continue to load. New packages should target `"red_api_version": "^0.13.0"`.
+
+## Document-symbol breadcrumbs
+
+Host API `0.13.0` adds `document_id` to `GetWindows` entries and successful
+`DocumentSymbols` results, and to `file:saved` events. This identifies one live
+buffer and survives buffer-index changes. Cache symbols by this ID and `revision`, not by the display or navigation
+path. The optional argument to `DocumentSymbols` remains a buffer index. Responses
+for closed, renamed, or changed documents return an error.
+
+`GetWindows.breadcrumb_components` contains display-only path labels: relative to
+the working directory when possible, otherwise home-abbreviated with `~`, otherwise
+absolute. Native roots, drive letters, and UNC shares are preserved. Never use these
+labels for file access or LSP requests.
+
+`red::document_symbol_chain(symbols, position, file)` returns the containing symbol
+ancestry from normalized document symbols. `position` uses zero-based UTF-16 LSP
+coordinates; `file` is the response's navigation path. The native lookup preserves
+the original records and works beyond the bundled plugin's former 512-symbol limit.
 
 ## Language-pack indentation
 

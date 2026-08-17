@@ -6,7 +6,7 @@
 
 use std::{
     env,
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
 };
 
 use path_absolutize::Absolutize;
@@ -68,6 +68,72 @@ fn home_dir() -> Option<PathBuf> {
         .or_else(|| env::var_os("USERPROFILE").map(PathBuf::from))
 }
 
+/// Formats a file path as breadcrumb labels without changing its identity.
+/// Working-directory-relative paths take precedence over home abbreviation.
+/// This is lexical: missing files and symlink spellings are preserved.
+pub(crate) fn breadcrumb_path_components(
+    path: &Path,
+    cwd: &Path,
+    home: Option<&Path>,
+) -> Vec<String> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        cwd.join(path)
+    };
+    if cwd.is_absolute() {
+        if let Some(relative) = strip_display_prefix(&absolute, cwd) {
+            return display_components(relative);
+        }
+    }
+    if let Some(relative) = home
+        .filter(|home| home.is_absolute())
+        .and_then(|home| strip_display_prefix(&absolute, home))
+    {
+        let mut parts = vec!["~".to_string()];
+        parts.extend(display_components(relative));
+        return parts;
+    }
+    display_components(&absolute)
+}
+
+fn strip_display_prefix<'a>(path: &'a Path, base: &Path) -> Option<&'a Path> {
+    let mut components = path.components();
+    for expected in base.components() {
+        let actual = components.next()?;
+        #[cfg(windows)]
+        let matches = actual
+            .as_os_str()
+            .as_encoded_bytes()
+            .eq_ignore_ascii_case(expected.as_os_str().as_encoded_bytes());
+        #[cfg(not(windows))]
+        let matches = actual == expected;
+        if !matches {
+            return None;
+        }
+    }
+    Some(components.as_path())
+}
+
+fn display_components(path: &Path) -> Vec<String> {
+    let mut parts: Vec<String> = Vec::new();
+    let mut has_prefix = false;
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::Prefix(prefix) => {
+                parts.push(prefix.as_os_str().to_string_lossy().into_owned());
+                has_prefix = true;
+            }
+            Component::RootDir if has_prefix => {
+                parts.last_mut().unwrap().push(std::path::MAIN_SEPARATOR);
+            }
+            component => parts.push(component.as_os_str().to_string_lossy().into_owned()),
+        }
+    }
+    parts
+}
+
 /// Get the current working directory
 pub fn get_workspace_path() -> PathBuf {
     env::current_dir()
@@ -84,6 +150,58 @@ pub fn get_workspace_uri() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn breadcrumbs_prefer_cwd_then_home_and_match_whole_components() {
+        let root = std::env::temp_dir();
+        let home = root.join("breadcrumb-home");
+        let cwd = home.join("project");
+        let format = |path: &Path| breadcrumb_path_components(path, &cwd, Some(&home));
+        assert_eq!(format(&cwd.join("src/main.rs")), ["src", "main.rs"]);
+        assert_eq!(format(Path::new("src/main.rs")), ["src", "main.rs"]);
+        assert_eq!(
+            format(&home.join("other/main.rs")),
+            ["~", "other", "main.rs"]
+        );
+        assert_eq!(format(&home), ["~"]);
+        assert_ne!(format(&root.join("breadcrumb-home-other/main.rs"))[0], "~");
+        assert_eq!(
+            breadcrumb_path_components(&home.join("main.rs"), &cwd, None),
+            display_components(&home.join("main.rs"))
+        );
+        assert_eq!(
+            format(&home.join("missing/日本語.rs")),
+            ["~", "missing", "日本語.rs"]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn breadcrumbs_preserve_unix_roots_and_backslashes_in_names() {
+        assert_eq!(
+            breadcrumb_path_components(Path::new("/var/data/a\\b.rs"), Path::new("/work"), None),
+            ["/", "var", "data", "a\\b.rs"]
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn breadcrumbs_handle_windows_drives_unc_and_home_case() {
+        let cwd = Path::new(r"C:\Users\Alice\project");
+        let home = Some(Path::new(r"C:\Users\Alice"));
+        assert_eq!(
+            breadcrumb_path_components(Path::new(r"c:\users\ALICE\other\main.rs"), cwd, home),
+            ["~", "other", "main.rs"]
+        );
+        assert_eq!(
+            breadcrumb_path_components(Path::new(r"D:\src\main.rs"), cwd, home),
+            ["D:\\", "src", "main.rs"]
+        );
+        assert_eq!(
+            breadcrumb_path_components(Path::new(r"\\server\share\src\main.rs"), cwd, home),
+            ["\\\\server\\share\\", "src", "main.rs"]
+        );
+    }
 
     #[test]
     fn expands_bare_tilde_to_home() {

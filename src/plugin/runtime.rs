@@ -287,6 +287,7 @@ extern "red" {
         fn char() -> String;
         fn null() -> JsValue;
         fn parse_json() -> JsValue;
+        fn document_symbol_chain() -> JsValue;
         fn git_core() -> JsValue;
         fn neotree_core() -> JsValue;
     }
@@ -2610,6 +2611,16 @@ impl RedHost {
                     return schema.named_record(record, &value_to_json(&value));
                 }
                 Ok(value)
+            }
+            "red::document_symbol_chain" => {
+                let symbols = red_required_value_array(args, 0, path)?;
+                let cursor = args
+                    .get(1)
+                    .ok_or_else(|| anyhow::anyhow!("`{path}` requires a position"))?;
+                let file = red_required_string(args, 2, path)?;
+                Ok(Value::Array(Arc::new(super::document_symbols::chain(
+                    &symbols, cursor, file,
+                ))))
             }
             "red::neotree_core" => {
                 let operation = red_required_string(args, 0, path)?;
@@ -10663,18 +10674,22 @@ mod tests {
                     {
                         "window_id": 7,
                         "buffer_index": 2,
+                        "document_id": 42,
                         "buffer_path": "/repo/plugins/example.rs",
+                        "breadcrumb_components": ["plugins", "example.rs"],
                         "revision": 4,
-                        "cursor": { "x": 1, "y": 6 },
-                        "lsp_position": { "line": 6, "character": 1 },
+                        "cursor": { "x": 1, "y": 906 },
+                        "lsp_position": { "line": 906, "character": 1 },
                     },
                     {
                         "window_id": 8,
                         "buffer_index": 2,
+                        "document_id": 42,
                         "buffer_path": "/repo/plugins/example.rs",
+                        "breadcrumb_components": ["plugins", "example.rs"],
                         "revision": 4,
-                        "cursor": { "x": 1, "y": 6 },
-                        "lsp_position": { "line": 6, "character": 1 },
+                        "cursor": { "x": 1, "y": 905 },
+                        "lsp_position": { "line": 905, "character": 1 },
                     }
                 ]
             }),
@@ -10731,18 +10746,22 @@ mod tests {
                         {
                             "window_id": 7,
                             "buffer_index": 2,
+                            "document_id": 42,
                             "buffer_path": "/repo/plugins/example.rs",
+                            "breadcrumb_components": ["plugins", "example.rs"],
                             "revision": 4,
-                            "cursor": { "x": 1, "y": 6 },
-                            "lsp_position": { "line": 6, "character": 1 },
+                            "cursor": { "x": 1, "y": 906 },
+                            "lsp_position": { "line": 906, "character": 1 },
                         },
                         {
                             "window_id": 8,
                             "buffer_index": 2,
+                            "document_id": 42,
                             "buffer_path": "/repo/plugins/example.rs",
+                            "breadcrumb_components": ["plugins", "example.rs"],
                             "revision": 4,
-                            "cursor": { "x": 1, "y": 6 },
-                            "lsp_position": { "line": 6, "character": 1 },
+                            "cursor": { "x": 1, "y": 905 },
+                            "lsp_position": { "line": 905, "character": 1 },
                         }
                     ]
                 }),
@@ -10767,23 +10786,23 @@ mod tests {
 
         let symbols = (0..1_000)
             .map(|index| {
-                let (id, name, parent_id, depth, start_line, end_line) = if index == 5 {
+                let (id, name, parent_id, depth, start_line, end_line) = if index == 905 {
                     (
-                        "outer".to_string(),
+                        "root:905:outer".to_string(),
                         "outer".to_string(),
                         serde_json::Value::Null,
                         0,
-                        5,
-                        8,
+                        905,
+                        908,
                     )
-                } else if index == 6 {
+                } else if index == 906 {
                     (
+                        "root:905:outer:0:inner".to_string(),
                         "inner".to_string(),
-                        "inner".to_string(),
-                        serde_json::json!("outer"),
+                        serde_json::json!("root:905:outer"),
                         1,
-                        6,
-                        7,
+                        906,
+                        907,
                     )
                 } else {
                     (
@@ -10800,7 +10819,7 @@ mod tests {
                     "parent_id": parent_id,
                     "name": name,
                     "kind_name": "Function",
-                    "file": "/repo/plugins/example.rs",
+                    "file": "plugins/example.rs",
                     "depth": depth,
                     "range": {
                         "start": { "line": start_line, "character": 0 },
@@ -10818,8 +10837,9 @@ mod tests {
                 symbol_request_id,
                 serde_json::json!({
                     "ok": true,
-                    "file": "/repo/plugins/example.rs",
+                    "file": "plugins/example.rs",
                     "buffer_index": 2,
+                    "document_id": 42,
                     "revision": 4,
                     "symbols": symbols,
                 }),
@@ -10830,9 +10850,21 @@ mod tests {
         let mut saw_outer = false;
         let mut saw_inner = false;
         while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
-            if let PluginRequest::UpdateWindowBar { segments, .. } = request {
-                saw_outer |= segments.iter().any(|segment| segment.text == "󰊕 outer");
-                saw_inner |= segments.iter().any(|segment| segment.text == "󰊕 inner");
+            if let PluginRequest::UpdateWindowBar {
+                window_id,
+                segments,
+                ..
+            } = request
+            {
+                let outer = segments.iter().any(|segment| segment.text == "󰊕 outer");
+                let inner = segments.iter().any(|segment| segment.text == "󰊕 inner");
+                if window_id == 7 {
+                    assert!(outer && inner);
+                    saw_inner = true;
+                } else if window_id == 8 {
+                    assert!(outer && !inner);
+                    saw_outer = true;
+                }
             }
         }
         assert!(saw_outer && saw_inner);
@@ -10840,14 +10872,14 @@ mod tests {
         runtime
             .notify(
                 "window_bar:action:barbecue",
-                serde_json::json!({ "action": "jump:2:inner" }),
+                serde_json::json!({ "action": "jump:42:root:905:outer:0:inner" }),
             )
             .await
             .unwrap();
         match ACTION_DISPATCHER.recv_request() {
             PluginRequest::OpenLocation { location, .. } => {
-                assert_eq!(location.path, "/repo/plugins/example.rs");
-                assert_eq!(location.line, 6);
+                assert_eq!(location.path, "plugins/example.rs");
+                assert_eq!(location.line, 906);
                 assert_eq!(location.column, 0);
                 assert_eq!(
                     location.column_encoding,
@@ -10866,7 +10898,9 @@ mod tests {
             "windows": [{
                 "window_id": 7,
                 "buffer_index": 2,
+                "document_id": 42,
                 "buffer_path": "/repo/src/main.rs",
+                "breadcrumb_components": ["src", "main.rs"],
                 "revision": 4,
                 "cursor": { "x": 1, "y": 48 },
                 "lsp_position": { "line": 48, "character": 1 },
@@ -10968,6 +11002,7 @@ mod tests {
                     "ok": true,
                     "file": "/repo/src/main.rs",
                     "buffer_index": 2,
+                    "document_id": 42,
                     "revision": 4,
                     "symbols": symbols.clone(),
                 }),
@@ -11041,7 +11076,9 @@ mod tests {
                     "windows": [{
                         "window_id": 7,
                         "buffer_index": 2,
+                        "document_id": 42,
                         "buffer_path": "/repo/src/main.rs",
+                        "breadcrumb_components": ["src", "main.rs"],
                         "revision": 5,
                         "cursor": { "x": 8, "y": 97 },
                         "lsp_position": { "line": 97, "character": 8 },
@@ -11078,6 +11115,7 @@ mod tests {
                     "ok": true,
                     "file": "/repo/src/main.rs",
                     "buffer_index": 2,
+                    "document_id": 42,
                     "revision": 5,
                     "symbols": [],
                 }),
@@ -11092,6 +11130,7 @@ mod tests {
                 serde_json::json!({
                     "file": "/repo/src/main.rs",
                     "buffer_index": 2,
+                    "document_id": 42,
                 }),
             )
             .await
@@ -11107,7 +11146,9 @@ mod tests {
                     "windows": [{
                         "window_id": 7,
                         "buffer_index": 2,
+                        "document_id": 42,
                         "buffer_path": "/repo/src/main.rs",
+                        "breadcrumb_components": ["src", "main.rs"],
                         "revision": 5,
                         "cursor": { "x": 8, "y": 98 },
                         "lsp_position": { "line": 98, "character": 8 },
@@ -11127,6 +11168,7 @@ mod tests {
                     "ok": true,
                     "file": "/repo/src/main.rs",
                     "buffer_index": 2,
+                    "document_id": 42,
                     "revision": 5,
                     "symbols": [],
                 }),

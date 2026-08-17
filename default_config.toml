@@ -502,6 +502,7 @@ theme_browser = "theme_browser.hk"
 
 # Breadcrumb text uses theme colors; file icons use nvim-web-devicons' light/dark palette.
 # Set nerd_font to false for a plain Unicode presentation.
+# Paths are relative to cwd when possible, otherwise the home prefix becomes ~.
 [plugin_config.barbecue]
 enabled = true
 separator = ""
