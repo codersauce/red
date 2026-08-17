@@ -249,6 +249,9 @@ impl Editor {
         if matches!(lesson, Lesson::FollowTheSymbol | Lesson::FollowSymbols) {
             practice.pos = (16, 5);
         }
+        if lesson == Lesson::RepeatAndRecover {
+            practice.pos = (12, 0);
+        }
         let practice_buffer_id = practice.id();
         let practice_index = self.buffer_manager.len();
         self.buffer_manager.push_buffer(practice);

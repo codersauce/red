@@ -1,5 +1,9 @@
 //! Small, exact fixtures for modal editing lessons.
 
+pub(crate) const REPEAT_CONTENTS: &str = "let first = unused 40;\nlet next = unused 2;\n";
+pub(crate) const REPEAT_FIRST: &str = "let first = 40;\nlet next = unused 2;\n";
+pub(crate) const REPEAT_RESULT: &str = "let first = 40;\nlet next = 2;\n";
+
 pub(crate) const OBJECT_CONTENTS: &str = "let title = \"Old scoreboard\";\nlet score = 42;\n";
 pub(crate) const OBJECT_EMPTY: &str = "let title = \"\";\nlet score = 42;\n";
 pub(crate) const OBJECT_RESULT: &str = "let title = \"Scoreboard\";\nlet score = 42;\n";
@@ -14,6 +18,50 @@ mod tests {
         editor::{Action, Mode},
         learn::{Lesson, PracticeStep},
     };
+
+    #[test]
+    fn repeat_lesson_requires_dot_and_independent_undo() {
+        let lesson = Lesson::RepeatAndRecover;
+        let mut step = lesson.first_step();
+        assert!(!step.observe(
+            lesson,
+            &Action::RepeatLastChange,
+            Mode::Normal,
+            REPEAT_CONTENTS,
+            (12, 0)
+        ));
+        assert!(step.observe(
+            lesson,
+            &Action::DeleteWord,
+            Mode::Normal,
+            REPEAT_FIRST,
+            (12, 0)
+        ));
+        assert!(!step.observe(
+            lesson,
+            &Action::DeleteWord,
+            Mode::Normal,
+            REPEAT_RESULT,
+            (11, 1)
+        ));
+        assert!(step.observe(
+            lesson,
+            &Action::RepeatLastChange,
+            Mode::Normal,
+            REPEAT_RESULT,
+            (11, 1)
+        ));
+        assert!(!step.observe(
+            lesson,
+            &Action::Undo,
+            Mode::Normal,
+            REPEAT_CONTENTS,
+            (11, 1)
+        ));
+        assert!(step.observe(lesson, &Action::Undo, Mode::Normal, REPEAT_FIRST, (11, 1)));
+        assert!(step.observe(lesson, &Action::Redo, Mode::Normal, REPEAT_RESULT, (11, 1)));
+        assert_eq!(step, PracticeStep::Complete);
+    }
 
     #[test]
     fn object_lesson_requires_preserved_quotes_and_finished_insert() {
