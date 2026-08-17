@@ -1972,6 +1972,34 @@ async fn test_percent_matches_nested_bracket_under_cursor() {
 }
 
 #[tokio::test]
+async fn test_percent_matches_rust_method_with_lifetime() {
+    let contents = "impl Game {\n    fn update(&mut self, d: &mut DrawHandle<'_>) {\n        let values = [1, 2];\n    }\n}";
+    let opening_column = contents.lines().nth(1).unwrap().len() - 1;
+
+    for file in ["game.rs", "game.txt"] {
+        let buffer = Buffer::new(Some(file.to_string()), contents.to_string());
+        let mut harness = EditorHarness::with_config(buffer, default_key_config());
+        if file.ends_with(".txt") {
+            harness
+                .execute_action(Action::Command("syntax rust".to_string()))
+                .await
+                .unwrap();
+        }
+
+        harness
+            .execute_action(Action::MoveTo(opening_column, 2))
+            .await
+            .unwrap();
+        type_normal_keys(&mut harness, "%").await;
+        harness.assert_cursor_at(4, 3);
+        type_normal_keys(&mut harness, "%").await;
+        harness.assert_cursor_at(opening_column, 1);
+        type_normal_keys(&mut harness, "g%").await;
+        harness.assert_cursor_at(4, 3);
+    }
+}
+
+#[tokio::test]
 async fn test_counted_percent_jumps_to_file_percentage() {
     let content = (1..=100)
         .map(|line| format!("Line {line:03}"))
