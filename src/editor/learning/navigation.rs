@@ -43,13 +43,17 @@ impl Editor {
     }
 
     pub(super) fn learn_navigation_file_is(&self, name: &str) -> bool {
+        self.learn_navigation_buffer_is(self.current_buffer(), name)
+    }
+
+    fn learn_navigation_buffer_is(&self, candidate: &Buffer, name: &str) -> bool {
         let Some(expected) = fixture::FILES
             .iter()
             .find_map(|(path, text)| (*path == name).then_some(*text))
         else {
             return false;
         };
-        self.current_buffer()
+        candidate
             .file
             .as_deref()
             .and_then(|path| self.learn_navigation_path(path))
@@ -59,7 +63,24 @@ impl Editor {
                     .and_then(|session| session.workspace.as_ref())
                     .is_some_and(|workspace| same_file_path(&path, &workspace.path(name)))
             })
-            && self.current_buffer().contents() == expected
+            && candidate.contents() == expected
+    }
+
+    pub(super) fn learn_workspace_pair_visible(&self) -> bool {
+        if self
+            .learn_session
+            .as_ref()
+            .is_none_or(|session| session.lesson != Lesson::ArrangeYourWorkspace)
+            || self.window_manager.window_count() != 2
+        {
+            return false;
+        }
+        let windows = self.window_manager.windows();
+        ["README.md", "src/score.hk"].into_iter().all(|name| {
+            windows.iter().any(|window| {
+                self.learn_navigation_buffer_is(&self.buffer_manager[window.buffer_index], name)
+            })
+        })
     }
 
     #[inline(never)]
@@ -72,6 +93,34 @@ impl Editor {
         Box::pin(async move {
             let before = self.event_snapshot();
             match action {
+                Action::NextBuffer | Action::PreviousBuffer => {
+                    // The real buffer manager also contains the suspended user
+                    // buffers. Cycle only the owned, already-open fixture files.
+                    let indices = self
+                        .buffer_manager
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, candidate)| {
+                            candidate
+                                .file
+                                .as_deref()
+                                .is_some_and(|path| self.learn_navigation_path(path).is_some())
+                        })
+                        .map(|(index, _)| index)
+                        .collect::<Vec<_>>();
+                    let Some(position) = indices
+                        .iter()
+                        .position(|index| *index == self.buffer_manager.active_index())
+                    else {
+                        return Ok(true);
+                    };
+                    let next = if matches!(action, Action::NextBuffer) {
+                        (position + 1) % indices.len()
+                    } else {
+                        (position + indices.len() - 1) % indices.len()
+                    };
+                    self.set_current_buffer(buffer, indices[next]).await?;
+                }
                 Action::PluginCommand(name) if name == "ProjectSearch" => {
                     let root = self
                         .learn_session
@@ -168,6 +217,126 @@ impl Editor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn learn_workspace_confines_buffers_and_restores_zoom_and_panels() {
+        let config = Config::default();
+        let client = Box::new(crate::lsp::LspManager::new(config.lsp.clone()));
+        let mut editor = Editor::with_size(
+            client,
+            140,
+            38,
+            config,
+            Theme::default(),
+            vec![
+                Buffer::new(None, "original one".into()),
+                Buffer::new(None, "original two".into()),
+            ],
+        )
+        .unwrap();
+        editor.test_disable_terminal_output();
+        let mut buffer = RenderBuffer::new(140, 38, &Style::default());
+        let mut runtime = Runtime::new();
+        editor.window_manager.split_vertical(1).unwrap();
+        editor.sync_with_window();
+        let original_windows = editor
+            .window_manager
+            .windows()
+            .iter()
+            .map(|window| window.id)
+            .collect::<Vec<_>>();
+        editor.test_create_panel("original-pane", plugin::PanelConfig::default());
+        assert!(editor.test_focus_panel("original-pane"));
+        editor.toggle_pane_zoom();
+        assert!(
+            matches!(&editor.zoomed_pane, Some(FocusTarget::Panel(id)) if id == "original-pane")
+        );
+        editor
+            .start_learn_lesson(Lesson::ArrangeYourWorkspace, &mut buffer, &mut runtime)
+            .await
+            .unwrap();
+        assert!(!editor.panel_manager.is_visible("original-pane"));
+        editor
+            .execute(&Action::NextBuffer, &mut buffer, &mut runtime)
+            .await
+            .unwrap();
+        assert!(editor.learn_navigation_file_is("README.md"));
+        editor
+            .execute(&Action::SplitVertical, &mut buffer, &mut runtime)
+            .await
+            .unwrap();
+        editor
+            .execute(
+                &Action::OpenFile("src/score.hk".into()),
+                &mut buffer,
+                &mut runtime,
+            )
+            .await
+            .unwrap();
+        assert!(editor.learn_workspace_pair_visible());
+        assert_eq!(
+            editor.learn_session.as_ref().unwrap().step,
+            PracticeStep::WorkspaceFocus
+        );
+        editor
+            .execute(&Action::NextWindow, &mut buffer, &mut runtime)
+            .await
+            .unwrap();
+        assert!(editor.learn_navigation_file_is("README.md"));
+        editor
+            .execute(&Action::TogglePaneZoom, &mut buffer, &mut runtime)
+            .await
+            .unwrap();
+        assert_eq!(
+            editor
+                .window_manager
+                .windows()
+                .iter()
+                .filter(|window| editor.window_manager.is_presented(window.id))
+                .count(),
+            1
+        );
+        assert_eq!(
+            editor.learn_session.as_ref().unwrap().step,
+            PracticeStep::WorkspaceRestore
+        );
+        editor
+            .execute(&Action::TogglePaneZoom, &mut buffer, &mut runtime)
+            .await
+            .unwrap();
+        assert_eq!(
+            editor.learn_session.as_ref().unwrap().step,
+            PracticeStep::Complete
+        );
+        assert_eq!(
+            editor
+                .window_manager
+                .windows()
+                .iter()
+                .filter(|window| editor.window_manager.is_presented(window.id))
+                .count(),
+            2
+        );
+        editor
+            .finish_learn_lesson(&mut buffer, &mut runtime)
+            .await
+            .unwrap();
+        assert_eq!(
+            editor
+                .window_manager
+                .windows()
+                .iter()
+                .map(|window| window.id)
+                .collect::<Vec<_>>(),
+            original_windows
+        );
+        assert_eq!(editor.buffer_manager.len(), 2);
+        assert_eq!(editor.current_buffer().contents(), "original two");
+        assert_eq!(editor.test_focused_panel_id(), Some("original-pane"));
+        assert!(
+            matches!(&editor.zoomed_pane, Some(FocusTarget::Panel(id)) if id == "original-pane")
+        );
+    }
 
     #[tokio::test]
     async fn learn_search_missing_fixture_is_recoverable() {

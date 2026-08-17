@@ -55,10 +55,11 @@ pub(crate) enum Lesson {
     OpenAFileByName,
     SearchTheProject,
     FollowSymbols,
+    ArrangeYourWorkspace,
 }
 
 impl Lesson {
-    pub const AVAILABLE: [Self; 17] = [
+    pub const AVAILABLE: [Self; 18] = [
         Self::FindYourFooting,
         Self::EditWithConfidence,
         Self::FindACommand,
@@ -76,6 +77,7 @@ impl Lesson {
         Self::OpenAFileByName,
         Self::SearchTheProject,
         Self::FollowSymbols,
+        Self::ArrangeYourWorkspace,
     ];
 
     pub fn from_id(id: &str) -> Option<Self> {
@@ -117,6 +119,7 @@ impl Lesson {
             Self::OpenAFileByName => 14,
             Self::SearchTheProject => 15,
             Self::FollowSymbols => 16,
+            Self::ArrangeYourWorkspace => 17,
         }
     }
 
@@ -132,7 +135,10 @@ impl Lesson {
             | Self::RepairTheCode
             | Self::StageTheRightHunk
             | Self::MakeALocalCommit => 2,
-            Self::OpenAFileByName | Self::SearchTheProject | Self::FollowSymbols => 3,
+            Self::OpenAFileByName
+            | Self::SearchTheProject
+            | Self::FollowSymbols
+            | Self::ArrangeYourWorkspace => 3,
             _ => 0,
         }
     }
@@ -144,7 +150,10 @@ impl Lesson {
     }
 
     pub const fn is_navigation_practice(self) -> bool {
-        matches!(self, Self::OpenAFileByName | Self::SearchTheProject)
+        matches!(
+            self,
+            Self::OpenAFileByName | Self::SearchTheProject | Self::ArrangeYourWorkspace
+        )
     }
 
     pub const fn is_git_practice(self) -> bool {
@@ -193,6 +202,7 @@ impl Lesson {
             Self::OpenAFileByName => "navigation.open-a-file-by-name.v1",
             Self::SearchTheProject => "navigation.search-the-project.v1",
             Self::FollowSymbols => "navigation.follow-symbols.v1",
+            Self::ArrangeYourWorkspace => "navigation.arrange-your-workspace.v1",
         }
     }
 
@@ -214,7 +224,9 @@ impl Lesson {
             Self::ReadTheDiagnostic | Self::RepairTheCode => HUSK_CONTENTS,
             Self::FollowTheSymbol | Self::FollowSymbols => HUSK_SYMBOL_CONTENTS,
             Self::StageTheRightHunk | Self::MakeALocalCommit => staging::WORKTREE,
-            Self::OpenAFileByName | Self::SearchTheProject => navigation::GUIDE,
+            Self::OpenAFileByName | Self::SearchTheProject | Self::ArrangeYourWorkspace => {
+                navigation::GUIDE
+            }
         }
     }
 
@@ -237,6 +249,7 @@ impl Lesson {
             Self::OpenAFileByName => PracticeStep::FilesOpen,
             Self::SearchTheProject => PracticeStep::SearchOpen,
             Self::FollowSymbols => PracticeStep::OutlineOpen,
+            Self::ArrangeYourWorkspace => PracticeStep::WorkspaceSplit,
         }
     }
 
@@ -287,6 +300,12 @@ impl Lesson {
                 "Undo the unwanted change",
                 "Request and refine a suggestion",
                 "Keep only the corrected result",
+            ],
+            Self::ArrangeYourWorkspace => &[
+                "Open the source in a second view",
+                "Focus the project guide",
+                "Zoom the focused view",
+                "Restore the split layout",
             ],
             Self::FollowSymbols => &[
                 "Open document symbols",
@@ -528,12 +547,21 @@ pub(crate) enum PracticeStep {
     OutlineChoose,
     OutlineBack,
     OutlineForward,
+    WorkspaceSplit,
+    WorkspaceOpen,
+    WorkspaceFocus,
+    WorkspaceZoom,
+    WorkspaceRestore,
     Complete,
 }
 
 impl PracticeStep {
     pub fn suggested_action(self) -> Option<Action> {
         match self {
+            Self::WorkspaceSplit => Some(Action::SplitVertical),
+            Self::WorkspaceOpen => Some(Action::FilePicker),
+            Self::WorkspaceFocus => Some(Action::NextWindow),
+            Self::WorkspaceZoom | Self::WorkspaceRestore => Some(Action::TogglePaneZoom),
             Self::OutlineOpen => Some(Action::PluginCommand("LspDocumentSymbols".into())),
             Self::OutlineChoose => None,
             Self::OutlineBack => Some(Action::JumpBack),
@@ -659,6 +687,11 @@ impl PracticeStep {
             Self::DiagnosticJump => "Choose the missing-semicolon error and press Enter. The editor will take you to the reported location. Reopen Diagnostics if you closed the picker.".into(),
             Self::DiagnosticRead => format!("Press {} to read the diagnostic on this line. The parser points at the next token; the incomplete statement is just above it.", shortcut.unwrap_or("D")),
             Self::DiagnosticReturn => "Read the message and diagnostic code, then press Esc to return to the source. You will repair the defect in a later lesson.".into(),
+            Self::WorkspaceSplit => format!("Press {} to split this view side by side. A window is a view onto a buffer; splitting does not copy or change the file.", shortcut.unwrap_or("Ctrl-w v")),
+            Self::WorkspaceOpen => format!("Press {}, find src/score, and open it in the focused view. Keep README visible in the other view. If you closed the split, make another one first.", shortcut.unwrap_or("Ctrl-p")),
+            Self::WorkspaceFocus => format!("Press {} to focus the README view. Both buffers stay open; focus only changes which view receives your keys.", shortcut.unwrap_or("Ctrl-w w")),
+            Self::WorkspaceZoom => format!("Press {} to zoom the focused README view. The other view stays in the layout and will return when you unzoom.", shortcut.unwrap_or("Ctrl-w z")),
+            Self::WorkspaceRestore => format!("Press {} again to restore both views. Unlike keeping only one window, zoom is reversible.", shortcut.unwrap_or("Ctrl-w z")),
             Self::OutlineOpen => format!("Press {} (or :LspDocumentSymbols) to see the functions in this file. The bundled Husk server supplies the real outline.", shortcut.unwrap_or("Ctrl-t")),
             Self::OutlineChoose => "Filter for add_score and press Enter to open its definition. If you closed the picker, reopen :LspDocumentSymbols. The outline is useful when you know a symbol's name but not its line.".into(),
             Self::OutlineBack => format!("Press {} to return to the call where you started. A symbol jump records your previous position; ordinary cursor motions do not replace it.", shortcut.unwrap_or("Ctrl-o")),
@@ -697,6 +730,7 @@ impl PracticeStep {
                 Lesson::UnderstandSelectedCode => "You explained selected code without editing it. Recorded practice complete; real inline assist sends your selected context only when you submit a prompt.",
                 Lesson::MakeAFocusedChange => "The fix is kept in the buffer, still unsaved. Inline edits use normal undo history; keeping one is not the same as writing a file.",
                 Lesson::ChooseWhatToKeep => "You rejected an unwanted change, refined a suggestion, and kept the corrected result. The final edit is unsaved and remains undoable.",
+                Lesson::ArrangeYourWorkspace => "You opened two buffers in separate views, moved focus, and restored a zoomed layout. Find your way complete! Your original layout returns when you leave.",
                 Lesson::FollowSymbols => "You used a real symbol outline and traveled backward and forward through the jump list. No source was changed.",
                 Lesson::SearchTheProject => "You searched real file contents, inspected matching lines, and opened two results at their exact positions. The practice project is unchanged.",
                 Lesson::OpenAFileByName => "You found two files with the same name, used their paths to choose the right one, and returned to the guide. No project files were changed.",
@@ -733,7 +767,9 @@ impl PracticeStep {
             | Self::CommitOpen
             | Self::FilesOpen
             | Self::SearchOpen
-            | Self::OutlineOpen => 0,
+            | Self::OutlineOpen
+            | Self::WorkspaceSplit
+            | Self::WorkspaceOpen => 0,
             Self::Type
             | Self::EditDelete
             | Self::CommandRun
@@ -750,7 +786,8 @@ impl PracticeStep {
             | Self::CommitWrite
             | Self::FilesSource
             | Self::SearchCall
-            | Self::OutlineChoose => 1,
+            | Self::OutlineChoose
+            | Self::WorkspaceFocus => 1,
             Self::Normal
             | Self::EditUndo
             | Self::CommandHelp
@@ -769,7 +806,8 @@ impl PracticeStep {
             | Self::CommitInspect
             | Self::FilesTests
             | Self::SearchExpectation
-            | Self::OutlineBack => 2,
+            | Self::OutlineBack
+            | Self::WorkspaceZoom => 2,
             Self::Undo
             | Self::EditRedo
             | Self::CommandReturn
@@ -786,7 +824,8 @@ impl PracticeStep {
             | Self::CommitReturn
             | Self::FilesReturn
             | Self::SearchReturn
-            | Self::OutlineForward => 3,
+            | Self::OutlineForward
+            | Self::WorkspaceRestore => 3,
             Self::Complete => 4,
         }
     }
@@ -851,6 +890,39 @@ impl PracticeStep {
     /// Observes UI state that can change through either a key or an action.
     pub fn observe_view(&mut self, action: &Action, view: PracticeView) -> bool {
         let next = match (*self, action) {
+            (Self::WorkspaceSplit, Action::SplitVertical | Action::SplitHorizontal)
+                if view.workspace_two_views =>
+            {
+                Self::WorkspaceOpen
+            }
+            (Self::WorkspaceOpen, Action::OpenFile(_))
+                if view.workspace_pair_visible && view.navigation_source_visible =>
+            {
+                Self::WorkspaceFocus
+            }
+            (
+                Self::WorkspaceFocus,
+                Action::NextWindow
+                | Action::PreviousWindow
+                | Action::MoveWindowLeft
+                | Action::MoveWindowRight
+                | Action::MoveWindowUp
+                | Action::MoveWindowDown,
+            ) if view.workspace_pair_visible && view.navigation_guide_visible => {
+                Self::WorkspaceZoom
+            }
+            (Self::WorkspaceZoom, Action::TogglePaneZoom)
+                if view.workspace_pair_visible && view.workspace_guide_zoomed =>
+            {
+                Self::WorkspaceRestore
+            }
+            (Self::WorkspaceRestore, Action::TogglePaneZoom)
+                if view.workspace_pair_visible
+                    && view.navigation_guide_visible
+                    && !view.workspace_zoomed =>
+            {
+                Self::Complete
+            }
             (Self::OutlineOpen, Action::ShowDialog)
                 if view.outline_received && view.outline_picker_open =>
             {
@@ -1053,6 +1125,10 @@ pub(crate) struct PracticeView {
     pub code_actions_open: bool,
     pub husk_fixed_text: bool,
     pub diagnostics_clean: bool,
+    pub workspace_two_views: bool,
+    pub workspace_pair_visible: bool,
+    pub workspace_guide_zoomed: bool,
+    pub workspace_zoomed: bool,
     pub outline_received: bool,
     pub outline_picker_open: bool,
     pub project_search_open: bool,
@@ -1072,9 +1148,25 @@ pub(crate) struct PracticeView {
 
 /// Scratch lessons permit only edits to their isolated practice buffer.
 pub(crate) fn practice_action_allowed(lesson: Lesson, action: &Action) -> bool {
-    (lesson == Lesson::FollowSymbols
-        && (matches!(action, Action::JumpBack | Action::JumpForward)
-            || matches!(action, Action::PluginCommand(name) if name == "LspDocumentSymbols")))
+    (lesson == Lesson::ArrangeYourWorkspace
+        && matches!(
+            action,
+            Action::SplitVertical
+                | Action::SplitHorizontal
+                | Action::CloseWindow
+                | Action::NextWindow
+                | Action::PreviousWindow
+                | Action::MoveWindowLeft
+                | Action::MoveWindowRight
+                | Action::MoveWindowUp
+                | Action::MoveWindowDown
+                | Action::TogglePaneZoom
+                | Action::NextBuffer
+                | Action::PreviousBuffer
+        ))
+        || (lesson == Lesson::FollowSymbols
+            && (matches!(action, Action::JumpBack | Action::JumpForward)
+                || matches!(action, Action::PluginCommand(name) if name == "LspDocumentSymbols")))
         || (lesson == Lesson::SearchTheProject
             && (matches!(action, Action::OpenLocation(_, _))
                 || matches!(action,Action::PluginCommand(name) if name == "ProjectSearch")))

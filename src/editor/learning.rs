@@ -211,8 +211,11 @@ impl Editor {
         let original_language =
             language::SavedLanguageState::install(self, language_config, language_client);
         let original_panel_focus = self.panel_manager.focused_panel_id().map(str::to_string);
-        let original_panels =
-            (lesson == Lesson::ContinueInAgent).then(|| std::mem::take(&mut self.panel_manager));
+        let original_panels = matches!(
+            lesson,
+            Lesson::ContinueInAgent | Lesson::ArrangeYourWorkspace
+        )
+        .then(|| std::mem::take(&mut self.panel_manager));
         let original_workspaces = git
             .as_ref()
             .map(|_| std::mem::take(&mut self.workspace_manager));
@@ -602,6 +605,11 @@ impl Editor {
                 .flatten()
                 .and_then(|uri| self.diagnostics.get(&uri))
                 .is_some_and(Vec::is_empty),
+            workspace_two_views: self.window_manager.window_count() == 2,
+            workspace_pair_visible: self.learn_workspace_pair_visible(),
+            workspace_zoomed: self.zoomed_pane.is_some(),
+            workspace_guide_zoomed: self.learn_navigation_file_is("README.md")
+                && matches!(self.zoomed_pane, Some(FocusTarget::Window(id)) if self.window_manager.active_window().is_some_and(|window| window.id == id)),
             outline_received: session
                 .outline
                 .as_ref()
@@ -748,8 +756,7 @@ impl Editor {
         }
         let layout = CoachLayout::new(size.0, size.1);
         self.sync_to_window();
-        self.window_manager
-            .set_presentation(WindowPresentation::All);
+        self.configure_pane_presentation(size);
         self.panel_manager
             .set_presentation(plugin::panel::PanelPresentation::Hidden);
         self.window_manager.resize_with_origin(
