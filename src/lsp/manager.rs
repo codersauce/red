@@ -495,6 +495,21 @@ impl LspClient for LspManager {
         Ok(0)
     }
 
+    async fn signature_help_with_context(
+        &mut self,
+        file: &str,
+        x: usize,
+        y: usize,
+        context: Option<super::SignatureHelpContext>,
+    ) -> Result<i64, LspError> {
+        if let Some(client) = self.client_for_file(file).await? {
+            return client
+                .signature_help_with_context(file, x, y, context)
+                .await;
+        }
+        Ok(0)
+    }
+
     async fn rename(
         &mut self,
         file: &str,

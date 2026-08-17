@@ -1435,6 +1435,7 @@ impl Editor {
 
     fn can_reuse_editor_surfaces(&self) -> bool {
         self.previous_render_buffer.is_some()
+            && !self.signature_help.is_visible()
             && self.learn_session.is_none()
             && !self.force_full_redraw
             && self.last_rendered_window == self.window_manager.active_stable_window_id()
@@ -3134,6 +3135,7 @@ impl Editor {
     }
 
     fn render_dialog(&mut self, buffer: &mut RenderBuffer) -> anyhow::Result<()> {
+        self.render_signature_help(buffer)?;
         if let Some(current_dialog) = &self.current_dialog {
             if current_dialog.has_shortcut_context() {
                 buffer.shortcut_help_regions.clear();

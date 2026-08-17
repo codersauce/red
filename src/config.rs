@@ -255,6 +255,9 @@ pub struct Config {
     /// Insert-mode completion sources and automatic triggering.
     #[serde(default)]
     pub completion: CompletionConfig,
+    /// Non-modal callable signatures shown near the Insert-mode cursor.
+    #[serde(default)]
+    pub signature_help: SignatureHelpConfig,
     /// Opt-in AI inline completion, independent of ordinary language servers.
     #[serde(default)]
     pub copilot: crate::copilot::CopilotConfig,
@@ -783,6 +786,25 @@ impl Default for CompletionConfig {
 
 fn default_completion_min_prefix_length() -> usize {
     1
+}
+
+/// Automatic signature-help presentation; explicit invocation remains available.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct SignatureHelpConfig {
+    pub auto_trigger: bool,
+    pub debounce_ms: u64,
+    pub show_documentation: bool,
+}
+
+impl Default for SignatureHelpConfig {
+    fn default() -> Self {
+        Self {
+            auto_trigger: true,
+            debounce_ms: 120,
+            show_documentation: true,
+        }
+    }
 }
 
 fn default_completion_debounce_ms() -> u64 {
@@ -1842,6 +1864,7 @@ fn known_top_level_field(field: &str) -> bool {
             | "persist_inline_history"
             | "search"
             | "completion"
+            | "signature_help"
             | "copilot"
             | "picker"
             | "statusline"
@@ -2003,6 +2026,12 @@ fn known_schema_path(path: &[String]) -> bool {
                 | "buffer_words"
                 | "max_buffer_words"
         ),
+        ["signature_help", field] => {
+            matches!(
+                *field,
+                "auto_trigger" | "debounce_ms" | "show_documentation"
+            )
+        }
         ["copilot", field] => matches!(
             *field,
             "enabled" | "command" | "args" | "debounce_ms" | "max_file_bytes" | "excluded_patterns"
@@ -4014,6 +4043,20 @@ max_buffer_words = 20
         assert_eq!(config.completion.debounce_ms, 250);
         assert!(!config.completion.buffer_words);
         assert_eq!(config.completion.max_buffer_words, 20);
+    }
+
+    #[test]
+    fn signature_help_configuration_accepts_user_settings_and_overrides() {
+        let defaults = Config::from_user_toml_with_overrides("", &[]).unwrap();
+        assert_eq!(defaults.signature_help, SignatureHelpConfig::default());
+        let config = Config::from_user_toml_with_overrides(
+            "[signature_help]\nauto_trigger = false\ndebounce_ms = 350\nshow_documentation = false\n",
+            &["signature_help.debounce_ms = 75".to_owned()],
+        ).unwrap();
+        assert!(!config.signature_help.auto_trigger);
+        assert!(!config.signature_help.show_documentation);
+        assert_eq!(config.signature_help.debounce_ms, 75);
+        assert!(known_top_level_field("signature_help"));
     }
 
     #[test]
