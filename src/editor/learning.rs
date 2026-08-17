@@ -12,6 +12,7 @@ mod git;
 mod language;
 mod navigation;
 mod outline;
+mod search;
 mod staging;
 mod symbols;
 
@@ -27,6 +28,7 @@ pub(super) struct LearnSession {
     original_repeat: Option<SemanticChange>,
     original_registers: HashMap<char, Content>,
     original_clipboard_enabled: bool,
+    input: search::LearnInputState,
     original_inline_history: Option<InlineHistory>,
     original_active_inline_comment: Option<uuid::Uuid>,
     original_panels: Option<plugin::panel::PanelManager>,
@@ -146,6 +148,12 @@ impl Editor {
             ));
             return self.render(buffer);
         }
+        if self.active_search.is_some() || self.substitute_confirmation.is_some() {
+            self.set_quiet_message(Some(
+                "finish the current search or substitution before starting a lesson".into(),
+            ));
+            return self.render(buffer);
+        }
         // Create owned storage before changing any editor state, so a failed
         // setup leaves the user's current workspace untouched.
         let workspace = if matches!(lesson, Lesson::SaveAPracticeFile | Lesson::ContinueInAgent)
@@ -223,6 +231,7 @@ impl Editor {
         self.panel_manager.focus_editor();
         let original_zoom = self.zoomed_pane.take();
         let original_repeat = self.last_semantic_change.take();
+        let input = search::LearnInputState::install(self);
         let original_registers = std::mem::take(&mut self.registers);
         let original_clipboard_enabled =
             std::mem::replace(&mut self.config.clipboard.enabled, false);
@@ -274,6 +283,7 @@ impl Editor {
             original_repeat,
             original_registers,
             original_clipboard_enabled,
+            input,
             original_inline_history,
             original_active_inline_comment,
             original_panels,
@@ -365,6 +375,7 @@ impl Editor {
         self.pending_semantic_change = None;
         self.registers = session.original_registers;
         self.config.clipboard.enabled = session.original_clipboard_enabled;
+        session.input.restore(self);
         if let Some(history) = session.original_inline_history {
             self.inline_history = history;
         }
@@ -613,6 +624,12 @@ impl Editor {
                 .flatten()
                 .and_then(|uri| self.diagnostics.get(&uri))
                 .is_some_and(Vec::is_empty),
+            replace_first_match: self.search_term == "old"
+                && contents == crate::learn::precision::REPLACE_CONTENTS
+                && cursor == (13, 0),
+            replace_second_match: self.search_term == "old"
+                && contents == crate::learn::precision::REPLACE_CONTENTS
+                && cursor == (13, 1),
             workspace_two_views: self.window_manager.window_count() == 2,
             workspace_pair_visible: self.learn_workspace_pair_visible(),
             workspace_zoomed: self.zoomed_pane.is_some(),

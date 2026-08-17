@@ -14400,6 +14400,9 @@ impl Editor {
     }
 
     fn navigate_command_history(&mut self, direction: PromptHistoryDirection) {
+        if self.navigate_learn_command_history(direction) {
+            return;
+        }
         PromptHistoryNavigation::navigate(
             self.preferences.command_history(),
             &mut self.command_history_navigation,
@@ -14409,6 +14412,9 @@ impl Editor {
     }
 
     fn navigate_search_history(&mut self, direction: PromptHistoryDirection) {
+        if self.navigate_learn_search_history(direction) {
+            return;
+        }
         let Some(session) = &mut self.active_search else {
             return;
         };
@@ -14446,12 +14452,18 @@ impl Editor {
     }
 
     fn record_command_history(&mut self, command: &str) {
+        if self.record_learn_command(command) {
+            return;
+        }
         if let Err(error) = self.preferences.record_command(command) {
             log!("failed to save command history: {error}");
         }
     }
 
     fn record_search_history(&mut self, pattern: &str) {
+        if self.record_learn_search(pattern) {
+            return;
+        }
         if let Err(error) = self.preferences.record_search(pattern) {
             log!("failed to save search history: {error}");
         }

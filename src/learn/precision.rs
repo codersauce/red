@@ -1,5 +1,9 @@
 //! Small, exact fixtures for modal editing lessons.
 
+pub(crate) const REPLACE_CONTENTS: &str =
+    "let title = \"old score\";\nlet label = \"old score\";\n";
+pub(crate) const REPLACE_RESULT: &str = "let title = \"new score\";\nlet label = \"new score\";\n";
+
 pub(crate) const REPEAT_CONTENTS: &str = "let first = unused 40;\nlet next = unused 2;\n";
 pub(crate) const REPEAT_FIRST: &str = "let first = 40;\nlet next = unused 2;\n";
 pub(crate) const REPEAT_RESULT: &str = "let first = 40;\nlet next = 2;\n";
@@ -18,6 +22,31 @@ mod tests {
         editor::{Action, Mode},
         learn::{Lesson, PracticeStep},
     };
+
+    #[test]
+    fn replace_lesson_requires_both_matches_and_full_substitution() {
+        let lesson = Lesson::FindAndReplace;
+        let mut step = lesson.first_step();
+        let mut view = crate::learn::PracticeView::default();
+        assert!(!step.observe_view(&Action::CommitSearch, view));
+        view.replace_first_match = true;
+        assert!(step.observe_view(&Action::CommitSearch, view));
+        assert!(!step.observe_view(&Action::RepeatSearch, view));
+        view.replace_second_match = true;
+        assert!(step.observe_view(&Action::RepeatSearch, view));
+        let substitute = Action::ConfirmSubstitute(crate::editor::SubstituteDecision::All);
+        assert!(!step.observe(lesson, &substitute, Mode::Normal, REPLACE_CONTENTS, (13, 1)));
+        assert!(step.observe(lesson, &substitute, Mode::Normal, REPLACE_RESULT, (13, 1)));
+        assert!(!step.observe(lesson, &Action::Undo, Mode::Normal, REPLACE_RESULT, (13, 1)));
+        assert!(step.observe(
+            lesson,
+            &Action::Undo,
+            Mode::Normal,
+            REPLACE_CONTENTS,
+            (13, 1)
+        ));
+        assert_eq!(step, PracticeStep::Complete);
+    }
 
     #[test]
     fn repeat_lesson_requires_dot_and_independent_undo() {

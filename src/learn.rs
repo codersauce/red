@@ -1,6 +1,6 @@
 //! Curriculum metadata and editor-native Learn Red exercises.
 
-use crate::editor::{Action, Mode};
+use crate::editor::{Action, Mode, SearchDirection};
 
 mod git;
 pub(crate) mod navigation;
@@ -60,10 +60,11 @@ pub(crate) enum Lesson {
     MoveWithIntent,
     ChangeATextObject,
     RepeatAndRecover,
+    FindAndReplace,
 }
 
 impl Lesson {
-    pub const AVAILABLE: [Self; 21] = [
+    pub const AVAILABLE: [Self; 22] = [
         Self::FindYourFooting,
         Self::EditWithConfidence,
         Self::FindACommand,
@@ -85,6 +86,7 @@ impl Lesson {
         Self::MoveWithIntent,
         Self::ChangeATextObject,
         Self::RepeatAndRecover,
+        Self::FindAndReplace,
     ];
 
     pub fn from_id(id: &str) -> Option<Self> {
@@ -130,6 +132,7 @@ impl Lesson {
             Self::MoveWithIntent => 18,
             Self::ChangeATextObject => 19,
             Self::RepeatAndRecover => 20,
+            Self::FindAndReplace => 21,
         }
     }
 
@@ -149,7 +152,10 @@ impl Lesson {
             | Self::SearchTheProject
             | Self::FollowSymbols
             | Self::ArrangeYourWorkspace => 3,
-            Self::MoveWithIntent | Self::ChangeATextObject | Self::RepeatAndRecover => 4,
+            Self::MoveWithIntent
+            | Self::ChangeATextObject
+            | Self::RepeatAndRecover
+            | Self::FindAndReplace => 4,
             _ => 0,
         }
     }
@@ -217,6 +223,7 @@ impl Lesson {
             Self::MoveWithIntent => "precision.move-with-intent.v1",
             Self::ChangeATextObject => "precision.change-a-text-object.v1",
             Self::RepeatAndRecover => "precision.repeat-and-recover.v1",
+            Self::FindAndReplace => "precision.find-and-replace.v1",
         }
     }
 
@@ -229,6 +236,7 @@ impl Lesson {
             Self::MoveWithIntent => precision::MOTION_CONTENTS,
             Self::ChangeATextObject => precision::OBJECT_CONTENTS,
             Self::RepeatAndRecover => precision::REPEAT_CONTENTS,
+            Self::FindAndReplace => precision::REPLACE_CONTENTS,
             Self::FindYourFooting => PRACTICE_CONTENTS,
             Self::EditWithConfidence => EDIT_CONTENTS,
             Self::FindACommand => COMMAND_CONTENTS,
@@ -270,6 +278,7 @@ impl Lesson {
             Self::MoveWithIntent => PracticeStep::MotionFind,
             Self::ChangeATextObject => PracticeStep::ObjectFind,
             Self::RepeatAndRecover => PracticeStep::RepeatEdit,
+            Self::FindAndReplace => PracticeStep::ReplaceSearch,
         }
     }
 
@@ -320,6 +329,12 @@ impl Lesson {
                 "Undo the unwanted change",
                 "Request and refine a suggestion",
                 "Keep only the corrected result",
+            ],
+            Self::FindAndReplace => &[
+                "Search for old",
+                "Visit the next match",
+                "Replace both occurrences",
+                "Undo the substitution",
             ],
             Self::RepeatAndRecover => &[
                 "Make the first word deletion",
@@ -602,12 +617,20 @@ pub(crate) enum PracticeStep {
     RepeatNext,
     RepeatUndo,
     RepeatRedo,
+    ReplaceSearch,
+    ReplaceNext,
+    ReplaceAll,
+    ReplaceUndo,
     Complete,
 }
 
 impl PracticeStep {
     pub fn suggested_action(self) -> Option<Action> {
         match self {
+            Self::ReplaceSearch => Some(Action::EnterSearch(SearchDirection::Forward)),
+            Self::ReplaceNext => Some(Action::RepeatSearch),
+            Self::ReplaceAll => None,
+            Self::ReplaceUndo => Some(Action::Undo),
             Self::RepeatEdit => None,
             Self::RepeatNext => Some(Action::RepeatLastChange),
             Self::RepeatUndo => Some(Action::Undo),
@@ -751,6 +774,10 @@ impl PracticeStep {
             Self::DiagnosticJump => "Choose the missing-semicolon error and press Enter. The editor will take you to the reported location. Reopen Diagnostics if you closed the picker.".into(),
             Self::DiagnosticRead => format!("Press {} to read the diagnostic on this line. The parser points at the next token; the incomplete statement is just above it.", shortcut.unwrap_or("D")),
             Self::DiagnosticReturn => "Read the message and diagnostic code, then press Esc to return to the source. You will repair the defect in a later lesson.".into(),
+            Self::ReplaceSearch => format!("Press {}, type old, and press Enter. Search previews matching text before you commit the jump. This exercise keeps its search history separate from yours.", shortcut.unwrap_or("/")),
+            Self::ReplaceNext => format!("Press {} to visit the next match on the second line. The same search can be repeated without typing it again.", shortcut.unwrap_or("n")),
+            Self::ReplaceAll => "Run :%s/old/new/g. The % selects the whole buffer; g replaces every occurrence on each selected line. Red uses Rust regular-expression syntax.".into(),
+            Self::ReplaceUndo => format!("Press {} once to undo the whole substitution. Both original words should return together.", shortcut.unwrap_or("u")),
             Self::RepeatEdit => "The cursor starts on the first unused word. Type dw to remove it. This completed change becomes the recipe for dot-repeat.".into(),
             Self::RepeatNext => format!("Move to unused on the second line (j0 then 3w with the default keys). Press {} to repeat the previous word deletion at this new position.", shortcut.unwrap_or(".")),
             Self::RepeatUndo => format!("Press {} once. Only the repeated edit should return; the first correction stays in place.", shortcut.unwrap_or("u")),
@@ -806,6 +833,7 @@ impl PracticeStep {
                 Lesson::UnderstandSelectedCode => "You explained selected code without editing it. Recorded practice complete; real inline assist sends your selected context only when you submit a prompt.",
                 Lesson::MakeAFocusedChange => "The fix is kept in the buffer, still unsaved. Inline edits use normal undo history; keeping one is not the same as writing a file.",
                 Lesson::ChooseWhatToKeep => "You rejected an unwanted change, refined a suggestion, and kept the corrected result. The final edit is unsaved and remains undoable.",
+                Lesson::FindAndReplace => "You searched, repeated the search, replaced both matches, and undid the substitution in one step. Edit with precision complete! The original practice text is restored.",
                 Lesson::RepeatAndRecover => "Both unwanted words are gone. You repeated a completed change and recovered the second edit independently. The practice text is still unsaved.",
                 Lesson::ChangeATextObject => "The title is now Scoreboard, with both quotes preserved. You changed an entire text object in one unsaved, undoable edit.",
                 Lesson::MoveWithIntent => "You combined a word motion with the delete operator, then undid and redid the whole change. The corrected practice text is still unsaved.",
@@ -851,7 +879,8 @@ impl PracticeStep {
             | Self::WorkspaceOpen
             | Self::MotionFind
             | Self::ObjectFind
-            | Self::RepeatEdit => 0,
+            | Self::RepeatEdit
+            | Self::ReplaceSearch => 0,
             Self::Type
             | Self::EditDelete
             | Self::CommandRun
@@ -872,7 +901,8 @@ impl PracticeStep {
             | Self::WorkspaceFocus
             | Self::MotionDelete
             | Self::ObjectChange
-            | Self::RepeatNext => 1,
+            | Self::RepeatNext
+            | Self::ReplaceNext => 1,
             Self::Normal
             | Self::EditUndo
             | Self::CommandHelp
@@ -895,7 +925,8 @@ impl PracticeStep {
             | Self::WorkspaceZoom
             | Self::MotionUndo
             | Self::ObjectType
-            | Self::RepeatUndo => 2,
+            | Self::RepeatUndo
+            | Self::ReplaceAll => 2,
             Self::Undo
             | Self::EditRedo
             | Self::CommandReturn
@@ -916,7 +947,8 @@ impl PracticeStep {
             | Self::WorkspaceRestore
             | Self::MotionRedo
             | Self::ObjectNormal
-            | Self::RepeatRedo => 3,
+            | Self::RepeatRedo
+            | Self::ReplaceUndo => 3,
             Self::Complete => 4,
         }
     }
@@ -932,6 +964,12 @@ impl PracticeStep {
     ) -> bool {
         let original_text = contents == lesson.contents();
         let next = match (*self, action) {
+            (Self::ReplaceAll, Action::Substitute(_) | Action::ConfirmSubstitute(_))
+                if contents == precision::REPLACE_RESULT =>
+            {
+                Self::ReplaceUndo
+            }
+            (Self::ReplaceUndo, Action::Undo) if original_text => Self::Complete,
             (Self::RepeatEdit, Action::DeleteTextRange(_) | Action::DeleteWord)
                 if contents == precision::REPEAT_FIRST =>
             {
@@ -1032,6 +1070,14 @@ impl PracticeStep {
     /// Observes UI state that can change through either a key or an action.
     pub fn observe_view(&mut self, action: &Action, view: PracticeView) -> bool {
         let next = match (*self, action) {
+            (Self::ReplaceSearch, Action::CommitSearch) if view.replace_first_match => {
+                Self::ReplaceNext
+            }
+            (Self::ReplaceNext, Action::RepeatSearch | Action::FindNext)
+                if view.replace_second_match =>
+            {
+                Self::ReplaceAll
+            }
             (Self::WorkspaceSplit, Action::SplitVertical | Action::SplitHorizontal)
                 if view.workspace_two_views =>
             {
@@ -1267,6 +1313,8 @@ pub(crate) struct PracticeView {
     pub code_actions_open: bool,
     pub husk_fixed_text: bool,
     pub diagnostics_clean: bool,
+    pub replace_first_match: bool,
+    pub replace_second_match: bool,
     pub workspace_two_views: bool,
     pub workspace_pair_visible: bool,
     pub workspace_guide_zoomed: bool,
@@ -1290,11 +1338,26 @@ pub(crate) struct PracticeView {
 
 /// Scratch lessons permit only edits to their isolated practice buffer.
 pub(crate) fn practice_action_allowed(lesson: Lesson, action: &Action) -> bool {
-    (lesson == Lesson::RepeatAndRecover
+    (lesson == Lesson::FindAndReplace
         && matches!(
             action,
-            Action::DeleteTextRange(_) | Action::DeleteWord | Action::RepeatLastChange
+            Action::EnterSearch(_)
+                | Action::EnterMode(Mode::Search)
+                | Action::CommitSearch
+                | Action::CancelSearch
+                | Action::FindNext
+                | Action::FindPrevious
+                | Action::RepeatSearch
+                | Action::RepeatSearchOpposite
+                | Action::ClearSearchHighlight
+                | Action::Substitute(_)
+                | Action::ConfirmSubstitute(_)
         ))
+        || (lesson == Lesson::RepeatAndRecover
+            && matches!(
+                action,
+                Action::DeleteTextRange(_) | Action::DeleteWord | Action::RepeatLastChange
+            ))
         || (lesson == Lesson::ChangeATextObject
             && matches!(
                 action,
