@@ -81,6 +81,10 @@ All notable changes to Red are documented in this file.
 - **editor:** Coalesce scrolling and reuse unchanged surfaces ([#234](https://github.com/codersauce/red/issues/234)) ([bd15fea](https://github.com/codersauce/red/commit/bd15feac54a1517648db00b7ed9ea776a84d9bd4))
 - **ci:** Speed up test and validation workflows ([#232](https://github.com/codersauce/red/issues/232)) ([0477a6e](https://github.com/codersauce/red/commit/0477a6eba85043a2d3e7c923ba403747e9ea5ad9))
 
+### Testing
+
+- **whats-new:** Use stable release notes fixtures ([06e95db](https://github.com/codersauce/red/commit/06e95dbfe7d94e7ae84b6448a24d68428a82d6bc))
+
 ### Continuous Integration
 
 - Streamline pull request validation ([#223](https://github.com/codersauce/red/issues/223)) ([661032f](https://github.com/codersauce/red/commit/661032f505b641209d6b414a1b3af4f02b31a62c))
