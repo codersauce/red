@@ -3047,9 +3047,12 @@ impl Editor {
 
     fn render_dialog(&mut self, buffer: &mut RenderBuffer) -> anyhow::Result<()> {
         if let Some(current_dialog) = &self.current_dialog {
-            buffer.shortcut_help_regions.clear();
+            if current_dialog.has_shortcut_context() {
+                buffer.shortcut_help_regions.clear();
+            }
+            let first_region = buffer.shortcut_help_regions.len();
             current_dialog.draw(buffer)?;
-            for help in &mut buffer.shortcut_help_regions {
+            for help in &mut buffer.shortcut_help_regions[first_region..] {
                 help.context = current_dialog.shortcut_context().to_owned();
             }
         }

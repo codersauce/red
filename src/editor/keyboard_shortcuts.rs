@@ -27,7 +27,11 @@ impl Editor {
         let (context, current) = if let Some(region) = clicked {
             let entries = ShortcutEntry::from_actions(&region.context, &region.actions);
             (region.context, entries)
-        } else if let Some(dialog) = &self.current_dialog {
+        } else if let Some(dialog) = self
+            .current_dialog
+            .as_ref()
+            .filter(|dialog| dialog.has_shortcut_context())
+        {
             let context = dialog.shortcut_context().to_owned();
             let actions = dialog.surface_actions();
             let mut entries = ShortcutEntry::from_actions(&context, &actions);
@@ -97,19 +101,21 @@ impl Editor {
                     self.keyboard_shortcuts = None;
                     return Some(match target {
                         ShortcutTarget::Editor(action) => action,
-                        ShortcutTarget::Surface(id) => {
-                            if let Some(dialog) = &mut self.current_dialog {
-                                dialog.activate_surface_action(&id)
-                            } else {
-                                self.panel_manager
-                                    .surface_actions()
-                                    .iter()
-                                    .find(|action| action.id == id && action.enabled)
-                                    .and_then(crate::ui::UiAction::event)
-                                    .and_then(|event| self.handle_panel_event(&event, runtime))
-                            }
-                            .unwrap_or(KeyAction::Single(Action::Refresh))
+                        ShortcutTarget::Surface(id) => if let Some(dialog) = self
+                            .current_dialog
+                            .as_mut()
+                            .filter(|dialog| dialog.has_shortcut_context())
+                        {
+                            dialog.activate_surface_action(&id)
+                        } else {
+                            self.panel_manager
+                                .surface_actions()
+                                .iter()
+                                .find(|action| action.id == id && action.enabled)
+                                .and_then(crate::ui::UiAction::event)
+                                .and_then(|event| self.handle_panel_event(&event, runtime))
                         }
+                        .unwrap_or(KeyAction::Single(Action::Refresh)),
                         ShortcutTarget::Workspace(id) => self
                             .workspace_shortcut_action(id)
                             .unwrap_or(KeyAction::Single(Action::Refresh)),
@@ -142,12 +148,16 @@ impl Editor {
             }
         }
 
-        let local_help = self.current_dialog.is_some()
+        let dialog_help = self
+            .current_dialog
+            .as_ref()
+            .is_some_and(|dialog| dialog.has_shortcut_context());
+        let local_help = dialog_help
             || self.workspace_manager.is_active()
             || self.panel_manager.has_focused_panel();
         let f1 = matches!(event, Event::Key(key) if key.code == KeyCode::F(1) && key.modifiers.is_empty());
         let alternate_help = crate::ui::is_keyboard_shortcuts_alias(event);
-        let workspace_help = self.current_dialog.is_none()
+        let workspace_help = !dialog_help
             && self.workspace_manager.is_active()
             && !self.workspace_manager.is_filtering()
             && matches!(event, Event::Key(key) if key.code == KeyCode::Char('?') && !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT));
@@ -287,6 +297,56 @@ mod tests {
             .collect::<String>()
             .contains("Keyboard shortcuts"));
         assert_eq!(editor.render_cursor_position(), None);
+    }
+
+    fn completion_editor(filter: &str) -> Editor {
+        let mut editor = editor();
+        editor.mode = Mode::Insert;
+        let item = serde_json::from_value(serde_json::json!({ "label": "hello" })).unwrap();
+        let mut completion = crate::ui::CompletionUI::new();
+        completion.show(vec![item], 0, 0);
+        completion.set_filter(filter);
+        editor.current_dialog = Some(Box::new(completion));
+        editor
+    }
+
+    #[test]
+    fn shortcut_help_ignores_an_invisible_completion_popup() {
+        let mut editor = completion_editor("no match");
+        editor.handle_event(&key(KeyCode::F(1))).unwrap();
+        let mut buffer = RenderBuffer::new(80, 24, &Style::default());
+        editor.render(&mut buffer).unwrap();
+        let text = buffer.cells.iter().map(|cell| cell.c).collect::<String>();
+        assert!(text.contains("Editor · Insert"));
+        assert!(editor.current_dialog.is_some());
+    }
+
+    #[test]
+    fn shortcut_help_describes_visible_completions() {
+        let mut editor = completion_editor("he");
+        editor.handle_event(&key(KeyCode::F(1))).unwrap();
+        let mut buffer = RenderBuffer::new(80, 24, &Style::default());
+        editor.render(&mut buffer).unwrap();
+        let text = buffer.cells.iter().map(|cell| cell.c).collect::<String>();
+        assert!(text.contains("Completions"));
+        assert!(text.contains("Accept selected completion"));
+        assert!(editor.current_dialog.is_some());
+    }
+
+    #[test]
+    fn invisible_completion_preserves_the_alternate_shortcut_override() {
+        let mut editor = completion_editor("no match");
+        editor
+            .config
+            .keys
+            .insert
+            .insert("Alt-/".into(), KeyAction::Single(Action::Save));
+        let alternate = Event::Key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::ALT));
+        assert_eq!(
+            editor.handle_event(&alternate).unwrap(),
+            Some(KeyAction::Single(Action::Save))
+        );
+        assert!(editor.keyboard_shortcuts.is_none());
     }
 
     #[test]

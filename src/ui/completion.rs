@@ -582,6 +582,18 @@ impl CompletionUI {
 }
 
 impl Component for CompletionUI {
+    fn has_shortcut_context(&self) -> bool {
+        self.visible && !self.items.is_empty() && self.width >= 2 && self.visible_rows > 0
+    }
+
+    fn shortcut_context(&self) -> &str {
+        "Completions"
+    }
+
+    fn surface_actions(&self) -> Vec<super::UiAction> {
+        super::shortcut_catalog::completion_reference_actions()
+    }
+
     fn set_theme(&mut self, theme: &Theme) {
         CompletionUI::set_theme(self, theme);
     }

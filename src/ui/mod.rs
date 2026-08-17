@@ -96,6 +96,12 @@ pub trait Component: Send {
         false
     }
 
+    /// Whether this component currently owns a visible keyboard-help context.
+    /// Hidden, pass-through popups can leave help with the underlying editor.
+    fn has_shortcut_context(&self) -> bool {
+        true
+    }
+
     /// User-facing name used by contextual keyboard help.
     fn shortcut_context(&self) -> &str {
         "Dialog"

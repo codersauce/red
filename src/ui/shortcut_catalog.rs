@@ -202,11 +202,48 @@ pub(crate) fn picker_reference_actions() -> Vec<UiAction> {
     ])
 }
 
+pub(crate) fn completion_reference_actions() -> Vec<UiAction> {
+    reference_actions(&[
+        (
+            "Navigation",
+            "↑ / ↓ / Ctrl+p / Ctrl+n",
+            "Previous / next completion",
+        ),
+        (
+            "Navigation",
+            "PageUp / PageDown",
+            "Previous / next completion page",
+        ),
+        ("Completion", "Tab", "Accept selected completion"),
+        (
+            "Completion",
+            "Enter",
+            "Close completions and insert a new line",
+        ),
+        ("Completion", "Ctrl+e", "Close completions"),
+        (
+            "Completion",
+            "Esc",
+            "Close completions and enter Normal mode",
+        ),
+        (
+            "Search",
+            "Type / Backspace",
+            "Edit text and filter completions",
+        ),
+    ])
+}
+
 pub(crate) fn common_shortcut_entries() -> Vec<ShortcutEntry> {
     let mut entries = ShortcutEntry::from_actions("Picker", &picker_reference_actions())
         .into_iter()
         .map(|entry| entry.in_context("Picker"))
         .collect::<Vec<_>>();
+    entries.extend(
+        ShortcutEntry::from_actions("Completions", &completion_reference_actions())
+            .into_iter()
+            .map(|entry| entry.in_context("Completions")),
+    );
     for mode in [
         crate::editor::Mode::Insert,
         crate::editor::Mode::Normal,
