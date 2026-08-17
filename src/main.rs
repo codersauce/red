@@ -1599,7 +1599,7 @@ mod tests {
     }
 
     #[test]
-    fn detached_row_preserves_underlined_links_and_resets_the_next_span() {
+    fn detached_row_preserves_underlined_links_and_clears_the_next_span() {
         let row = red::headless::LinePatch {
             row: 0,
             text: "link plain".into(),
@@ -1622,7 +1622,8 @@ mod tests {
         let output = String::from_utf8(output).unwrap();
         assert!(output.contains("\x1b[4mlink"));
         let suffix = output.split_once("link").unwrap().1;
-        assert!(suffix.contains("\x1b[0m"));
+        assert!(suffix.starts_with("\x1b[24m plain"));
+        assert!(!suffix.contains("\x1b[0m"));
         assert!(!suffix.contains("\x1b[4m"));
     }
 
