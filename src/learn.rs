@@ -13,6 +13,9 @@ pub(crate) const EDIT_RESULT: &str =
     "let score = 41;\n\n// Remove the extra semicolon on the first line.\n";
 pub(crate) const COMMAND_CONTENTS: &str = "// This deliberately long line makes wrapping visible: use the command palette to change how it is displayed, without changing a single character of the practice text.\n\nlet score = 42;\n";
 pub(crate) const SAVE_CONTENTS: &str = "Today I learned:\n";
+pub(crate) const AI_LINE: &str =
+    "fn add_score(score: u32, points: u32) -> u32 { score - points }\n";
+pub(crate) const AI_CONTENTS: &str = "fn add_score(score: u32, points: u32) -> u32 { score - points }\n\n// Offline practice: no prompt or code is sent to an AI service.\n";
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Lesson {
@@ -21,14 +24,16 @@ pub(crate) enum Lesson {
     EditWithConfidence,
     FindACommand,
     SaveAPracticeFile,
+    UnderstandSelectedCode,
 }
 
 impl Lesson {
-    pub const AVAILABLE: [Self; 4] = [
+    pub const AVAILABLE: [Self; 5] = [
         Self::FindYourFooting,
         Self::EditWithConfidence,
         Self::FindACommand,
         Self::SaveAPracticeFile,
+        Self::UnderstandSelectedCode,
     ];
 
     pub fn from_id(id: &str) -> Option<Self> {
@@ -36,10 +41,19 @@ impl Lesson {
     }
 
     pub fn from_number(number: usize) -> Option<Self> {
+        Self::from_track_number(0, number)
+    }
+
+    pub fn for_track(track: usize) -> impl Iterator<Item = Self> + Clone {
+        Self::AVAILABLE
+            .into_iter()
+            .filter(move |lesson| lesson.track_index() == track)
+    }
+
+    pub fn from_track_number(track: usize, number: usize) -> Option<Self> {
         number
             .checked_sub(1)
-            .and_then(|index| Self::AVAILABLE.get(index))
-            .copied()
+            .and_then(|index| Self::for_track(track).nth(index))
     }
 
     pub const fn index(self) -> usize {
@@ -48,7 +62,25 @@ impl Lesson {
             Self::EditWithConfidence => 1,
             Self::FindACommand => 2,
             Self::SaveAPracticeFile => 3,
+            Self::UnderstandSelectedCode => 4,
         }
+    }
+
+    pub const fn track_index(self) -> usize {
+        match self {
+            Self::UnderstandSelectedCode => 1,
+            _ => 0,
+        }
+    }
+
+    pub fn lesson_index(self) -> usize {
+        Self::for_track(self.track_index())
+            .position(|lesson| lesson == self)
+            .unwrap_or(0)
+    }
+
+    pub const fn is_ai_practice(self) -> bool {
+        matches!(self, Self::UnderstandSelectedCode)
     }
 
     pub const fn id(self) -> &'static str {
@@ -57,11 +89,12 @@ impl Lesson {
             Self::EditWithConfidence => "essentials.edit-with-confidence.v1",
             Self::FindACommand => "essentials.find-a-command.v1",
             Self::SaveAPracticeFile => "essentials.save-a-practice-file.v1",
+            Self::UnderstandSelectedCode => "ai.understand-selected-code.v1",
         }
     }
 
     pub fn title(self) -> &'static str {
-        TRACKS[0].lessons[self.index()]
+        TRACKS[self.track_index()].lessons[self.lesson_index()]
     }
 
     pub const fn contents(self) -> &'static str {
@@ -70,6 +103,7 @@ impl Lesson {
             Self::EditWithConfidence => EDIT_CONTENTS,
             Self::FindACommand => COMMAND_CONTENTS,
             Self::SaveAPracticeFile => SAVE_CONTENTS,
+            Self::UnderstandSelectedCode => AI_CONTENTS,
         }
     }
 
@@ -79,11 +113,12 @@ impl Lesson {
             Self::EditWithConfidence => PracticeStep::EditMove,
             Self::FindACommand => PracticeStep::CommandOpen,
             Self::SaveAPracticeFile => PracticeStep::SaveEdit,
+            Self::UnderstandSelectedCode => PracticeStep::AiSelect,
         }
     }
 
     pub fn next(self) -> Option<Self> {
-        Self::AVAILABLE.get(self.index() + 1).copied()
+        Self::for_track(self.track_index()).nth(self.lesson_index() + 1)
     }
 
     pub const fn checkpoints(self) -> &'static [&'static str] {
@@ -111,6 +146,12 @@ impl Lesson {
                 "Write the file to disk",
                 "Make an unsaved change",
                 "Save the latest version",
+            ],
+            Self::UnderstandSelectedCode => &[
+                "Select the function",
+                "Open inline assist",
+                "Ask for an explanation",
+                "Read the inline comment",
             ],
         }
     }
@@ -235,6 +276,10 @@ pub(crate) enum PracticeStep {
     SaveWrite,
     SaveEditAgain,
     SaveWriteAgain,
+    AiSelect,
+    AiOpen,
+    AiSubmit,
+    AiRead,
     Complete,
 }
 
@@ -251,6 +296,10 @@ impl PracticeStep {
             Self::CommandHelp => Some(Action::KeyboardShortcuts),
             Self::SaveWrite | Self::SaveWriteAgain => Some(Action::Save),
             Self::SaveEdit | Self::SaveEditAgain => Some(Action::EnterMode(Mode::Insert)),
+            Self::AiSelect => Some(Action::EnterMode(Mode::VisualLine)),
+            Self::AiOpen => Some(Action::InlineAssist),
+            Self::AiRead => Some(Action::ShowInlineComment),
+            Self::AiSubmit => None,
             Self::Type | Self::CommandRun | Self::CommandReturn | Self::Complete => None,
         }
     }
@@ -291,6 +340,10 @@ impl PracticeStep {
             Self::SaveWrite => "Return to Normal mode with Esc, then use :w to write practice.txt. Watch the unsaved marker disappear.".into(),
             Self::SaveEditAgain => "The first version is on disk. Enter Insert mode and change the note again. Notice the unsaved marker return.".into(),
             Self::SaveWriteAgain => "Return to Normal mode and use :w again. The file on disk should now match your latest text.".into(),
+            Self::AiSelect => format!("Offline practice. Press {} on the first line to select the function. No code or prompt will leave Red.", shortcut.unwrap_or("V")),
+            Self::AiOpen => format!("Press {} to open inline assist for the selected function.", shortcut.unwrap_or("Space i")),
+            Self::AiSubmit => "Ask what this function does, then press Enter. This lesson supplies a labeled recorded response.".into(),
+            Self::AiRead => format!("Press Enter to keep the explanation, then {} to read its inline comment. The source text has not changed.", shortcut.unwrap_or("Space v")),
             Self::Complete => match lesson {
                 Lesson::FindYourFooting => "Your original text is restored. Nicely done.",
                 Lesson::EditWithConfidence => {
@@ -298,6 +351,7 @@ impl PracticeStep {
                 }
                 Lesson::FindACommand => "You found a command and its shortcuts. The practice text is unchanged, and your original view will return when you leave.",
                 Lesson::SaveAPracticeFile => "Your latest text is saved. Essentials complete! This disposable file is removed when you leave; your own work is untouched.",
+                Lesson::UnderstandSelectedCode => "You explained selected code without editing it. Recorded practice complete; real inline assist sends your selected context only when you submit a prompt.",
             }
             .into(),
         }
@@ -305,10 +359,20 @@ impl PracticeStep {
 
     pub const fn completed_steps(self) -> usize {
         match self {
-            Self::Insert | Self::EditMove | Self::CommandOpen | Self::SaveEdit => 0,
-            Self::Type | Self::EditDelete | Self::CommandRun | Self::SaveWrite => 1,
-            Self::Normal | Self::EditUndo | Self::CommandHelp | Self::SaveEditAgain => 2,
-            Self::Undo | Self::EditRedo | Self::CommandReturn | Self::SaveWriteAgain => 3,
+            Self::Insert | Self::EditMove | Self::CommandOpen | Self::SaveEdit | Self::AiSelect => {
+                0
+            }
+            Self::Type | Self::EditDelete | Self::CommandRun | Self::SaveWrite | Self::AiOpen => 1,
+            Self::Normal
+            | Self::EditUndo
+            | Self::CommandHelp
+            | Self::SaveEditAgain
+            | Self::AiSubmit => 2,
+            Self::Undo
+            | Self::EditRedo
+            | Self::CommandReturn
+            | Self::SaveWriteAgain
+            | Self::AiRead => 3,
             Self::Complete => 4,
         }
     }
@@ -341,6 +405,9 @@ impl PracticeStep {
             (Self::EditUndo, Action::Undo) if original_text => Self::EditRedo,
             (Self::EditRedo, Action::Redo) if contents == EDIT_RESULT => Self::Complete,
             (Self::SaveEdit, _) if !original_text => Self::SaveWrite,
+            (Self::AiSelect, _) if original_text && mode == Mode::VisualLine && cursor.1 == 0 => {
+                Self::AiOpen
+            }
             _ => return false,
         };
         *self = next;
@@ -359,6 +426,11 @@ impl PracticeStep {
             (Self::SaveWrite, Action::Save) if view.file_matches_buffer => Self::SaveEditAgain,
             (Self::SaveEditAgain, _) if view.dirty => Self::SaveWriteAgain,
             (Self::SaveWriteAgain, Action::Save) if view.file_matches_buffer => Self::Complete,
+            (Self::AiOpen, Action::InlineAssist) if view.inline_target_selected => Self::AiSubmit,
+            (Self::AiSubmit, Action::SubmitInlineAssist(_)) if view.inline_explanation_received => {
+                Self::AiRead
+            }
+            (Self::AiRead, Action::ShowInlineComment) if view.inline_comment_open => Self::Complete,
             _ => return false,
         };
         *self = next;
@@ -373,11 +445,30 @@ pub(crate) struct PracticeView {
     pub shortcuts_open: bool,
     pub file_matches_buffer: bool,
     pub dirty: bool,
+    pub inline_target_selected: bool,
+    pub inline_explanation_received: bool,
+    pub inline_comment_open: bool,
 }
 
 /// Scratch lessons permit only edits to their isolated practice buffer.
 pub(crate) fn practice_action_allowed(lesson: Lesson, action: &Action) -> bool {
-    (lesson == Lesson::SaveAPracticeFile && matches!(action, Action::Save))
+    (lesson.is_ai_practice()
+        && matches!(
+            action,
+            Action::EnterMode(Mode::Visual | Mode::VisualLine)
+                | Action::InlineAssist
+                | Action::SubmitInlineAssist(_)
+                | Action::CancelInlineAssist
+                | Action::CancelInlineAssistRefine
+                | Action::KeepInlineAssist
+                | Action::UndoInlineAssist
+                | Action::RefineInlineAssist
+                | Action::ShowInlineComment
+                | Action::DismissInlineComment
+                | Action::NextInlineComment
+                | Action::PreviousInlineComment
+        ))
+        || (lesson == Lesson::SaveAPracticeFile && matches!(action, Action::Save))
         || (lesson == Lesson::FindACommand
             && matches!(
                 action,
@@ -557,6 +648,9 @@ mod tests {
             shortcuts_open: false,
             file_matches_buffer: false,
             dirty: false,
+            inline_target_selected: false,
+            inline_explanation_received: false,
+            inline_comment_open: false,
         };
         assert!(!step.observe_view(&Action::CommandPalette, view));
         view.command_palette_open = true;

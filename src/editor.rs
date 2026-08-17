@@ -7365,6 +7365,7 @@ impl Editor {
             .inline_assist
             .as_ref()
             .and_then(|assist| assist.session_id.clone())
+            .filter(|session| !session.starts_with("learn-practice:"))
         {
             if let Some(bridge) = self.agent_manager.bridge() {
                 let _ = bridge.try_send(CodexCommand::CloseSession { session_id });
@@ -13706,6 +13707,27 @@ impl Editor {
             self.set_legacy_message(Some("that Essentials lesson is not available yet".into()));
             return Vec::new();
         }
+        if let Some(arguments) = cmd.strip_prefix("tutorial ") {
+            let mut parts = arguments.split_whitespace();
+            if let Some(track) = parts
+                .next()
+                .and_then(|id| crate::learn::TRACKS.iter().position(|track| track.id == id))
+            {
+                let lesson = match (parts.next(), parts.next()) {
+                    (None, None) => self.next_learn_lesson_for_track(track),
+                    (Some(number), None) => number
+                        .parse()
+                        .ok()
+                        .and_then(|number| crate::learn::Lesson::from_track_number(track, number)),
+                    _ => None,
+                };
+                if let Some(lesson) = lesson {
+                    return vec![Action::StartLearnLessonAt(lesson.id().into())];
+                }
+                self.set_legacy_message(Some("that lesson is not available yet".into()));
+                return Vec::new();
+            }
+        }
         if cmd == "config-diagnostics" {
             return vec![Action::ConfigDiagnostics];
         }
@@ -16689,6 +16711,11 @@ impl Editor {
                 add_to_history = false;
                 match self.inline_assist_target() {
                     Ok((range, scope)) => {
+                        let scope = if self.is_learn_inline_practice() {
+                            format!("recorded practice · {scope}")
+                        } else {
+                            scope
+                        };
                         let Some(window_id) = self.window_manager.active_stable_window_id() else {
                             self.set_legacy_message(Some(
                                 "inline assist requires an active editor window".to_string(),
@@ -16729,6 +16756,10 @@ impl Editor {
             }
             Action::SubmitInlineAssist(prompt) => {
                 add_to_history = false;
+                if self.is_learn_inline_practice() {
+                    self.submit_learn_inline(prompt, buffer, runtime).await?;
+                    return Ok(false);
+                }
                 let Some((range, scope, existing_session)) =
                     self.inline_assist.as_ref().map(|assist| {
                         (
@@ -27619,6 +27650,70 @@ mod test {
     use super::*;
     use crate::lsp::DiagnosticSeverity;
     use std::path::PathBuf;
+
+    #[tokio::test]
+    async fn learn_red_recorded_explanation_never_starts_a_bridge_or_leaks_history() {
+        use crate::learn::{Lesson, PracticeStep, AI_CONTENTS};
+        let mut editor = test_editor(140, 38);
+        let mut buffer = RenderBuffer::new(140, 38, &Style::default());
+        let mut runtime = Runtime::new();
+        editor
+            .inline_history
+            .conversations
+            .push(crate::inline_history::InlineConversation {
+                id: "original".into(),
+                cwd: "/original".into(),
+                file: "original.rs".into(),
+                turns: Vec::new(),
+                resolved: false,
+            });
+        let history = editor.inline_history.clone();
+        let original_id = editor.current_buffer().id();
+        for action in [
+            Action::StartLearnLessonAt(Lesson::UnderstandSelectedCode.id().into()),
+            Action::EnterMode(Mode::VisualLine),
+            Action::InlineAssist,
+            Action::SubmitInlineAssist("What does this do?".into()),
+        ] {
+            editor
+                .execute(&action, &mut buffer, &mut runtime)
+                .await
+                .unwrap();
+        }
+        assert_eq!(editor.current_buffer().contents(), AI_CONTENTS);
+        assert!(!editor.current_buffer().is_dirty());
+        assert!(editor.agent_manager.bridge().is_none());
+        assert_eq!(
+            editor.learn_session.as_ref().unwrap().step,
+            PracticeStep::AiRead
+        );
+        assert_eq!(editor.inline_history.conversations.len(), 1);
+        assert!(editor
+            .inline_comments
+            .iter()
+            .any(|comment| comment.message.starts_with("Recorded practice response:")));
+        for action in [Action::KeepInlineAssist, Action::ShowInlineComment] {
+            editor
+                .execute(&action, &mut buffer, &mut runtime)
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            editor.learn_session.as_ref().unwrap().step,
+            PracticeStep::Complete
+        );
+        assert!(editor
+            .preferences
+            .learn_lesson_completed(Lesson::UnderstandSelectedCode.id()));
+        editor
+            .execute(&Action::ExitLearnLesson, &mut buffer, &mut runtime)
+            .await
+            .unwrap();
+        assert_eq!(editor.current_buffer().id(), original_id);
+        assert_eq!(editor.inline_history, history);
+        assert!(editor.inline_comments.is_empty());
+        assert!(editor.inline_assist.is_none());
+    }
 
     #[tokio::test]
     async fn learn_red_restores_the_original_workspace_and_protects_files() {

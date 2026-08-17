@@ -17,6 +17,8 @@ pub(super) struct LearnSession {
     original_panel_focus: Option<String>,
     original_repeat: Option<SemanticChange>,
     original_registers: HashMap<char, Content>,
+    original_inline_history: Option<InlineHistory>,
+    original_active_inline_comment: Option<uuid::Uuid>,
 }
 
 impl Editor {
@@ -42,10 +44,13 @@ impl Editor {
     }
 
     pub(super) fn next_learn_lesson(&self) -> Lesson {
-        Lesson::AVAILABLE
-            .into_iter()
+        self.next_learn_lesson_for_track(0).unwrap_or_default()
+    }
+
+    pub(super) fn next_learn_lesson_for_track(&self, track: usize) -> Option<Lesson> {
+        Lesson::for_track(track)
             .find(|lesson| !self.preferences.learn_lesson_completed(lesson.id()))
-            .unwrap_or_default()
+            .or_else(|| Lesson::for_track(track).next())
     }
 
     pub(super) async fn continue_learn_lesson(
@@ -118,6 +123,7 @@ impl Editor {
         if self.inline_assist.is_some()
             || self.workspace_manager.is_active()
             || self.agent_manager.has_active_sessions()
+            || self.inline_history_browser.is_some()
         {
             self.set_legacy_message(Some(
                 "finish the current agent turn, inline assist, or workspace before starting a lesson".into(),
@@ -135,6 +141,10 @@ impl Editor {
         let original_zoom = self.zoomed_pane.take();
         let original_repeat = self.last_semantic_change.take();
         let original_registers = self.registers.clone();
+        let original_inline_history = lesson
+            .is_ai_practice()
+            .then(|| std::mem::take(&mut self.inline_history));
+        let original_active_inline_comment = self.active_inline_comment;
         self.pending_semantic_change = None;
         let file = workspace.as_ref().map(|workspace| {
             workspace
@@ -164,6 +174,8 @@ impl Editor {
             original_panel_focus,
             original_repeat,
             original_registers,
+            original_inline_history,
+            original_active_inline_comment,
         });
         self.mode = Mode::Normal;
         if lesson == Lesson::FindACommand {
@@ -182,6 +194,13 @@ impl Editor {
         let Some(session) = self.learn_session.take() else {
             return Ok(());
         };
+        if session.lesson.is_ai_practice() {
+            // Recorded sessions never belong to a live agent bridge.
+            if let Some(assist) = self.inline_assist.as_mut() {
+                assist.session_id = None;
+            }
+            self.close_inline_assist_session();
+        }
         self.release_current_dialog_callbacks(runtime);
         self.current_dialog = None;
         self.completion_snapshot = None;
@@ -206,6 +225,12 @@ impl Editor {
         self.last_semantic_change = session.original_repeat;
         self.pending_semantic_change = None;
         self.registers = session.original_registers;
+        if let Some(history) = session.original_inline_history {
+            self.inline_history = history;
+        }
+        self.inline_comments
+            .retain(|comment| comment.anchor.buffer_id != session.practice_buffer_id);
+        self.active_inline_comment = session.original_active_inline_comment;
         self.local_marks.remove(&session.practice_buffer_id);
         self.special_marks
             .retain(|(id, _), _| *id != session.practice_buffer_id);
@@ -213,6 +238,11 @@ impl Editor {
             .remove(&session.practice_buffer_id);
         self.sync_with_window();
         self.mode = Mode::Normal;
+        self.selection = None;
+        self.selection_start = None;
+        self.pending_visual_text_object_scope = None;
+        self.pending_operator = None;
+        self.pending_character_motion = None;
         self.waiting_key_action = None;
         self.command.clear();
         if let Some(panel) = session.original_panel_focus {
@@ -325,6 +355,21 @@ impl Editor {
                 })
             }),
             dirty: self.current_buffer().is_dirty(),
+            inline_target_selected: self.inline_assist.as_ref().is_some_and(|assist| {
+                assist.expected_text == crate::learn::AI_LINE && assist.scope.contains("selection")
+            }),
+            inline_explanation_received: self.inline_assist.as_ref().is_some_and(|assist| {
+                assist.has_result
+                    && assist.transaction_id.is_none()
+                    && self.inline_comment_group_count(&assist.annotation_group_id) > 0
+            }) && contents == crate::learn::AI_CONTENTS,
+            inline_comment_open: self.inline_assist.is_none()
+                && self.current_dialog.is_some()
+                && self
+                    .inline_comments
+                    .iter()
+                    .any(|comment| comment.anchor.buffer_id == session.practice_buffer_id)
+                && contents == crate::learn::AI_CONTENTS,
         };
         let session = self
             .learn_session
@@ -343,6 +388,51 @@ impl Editor {
             self.render(buffer)?;
         }
         Ok(())
+    }
+
+    pub(super) fn is_learn_inline_practice(&self) -> bool {
+        self.learn_session
+            .as_ref()
+            .is_some_and(|session| session.lesson.is_ai_practice())
+    }
+
+    /// Exercise the production result path without starting a model or sending
+    /// the user's prompt anywhere. History is isolated for the whole lesson.
+    #[inline(never)]
+    pub(super) fn submit_learn_inline<'a>(
+        &'a mut self,
+        prompt: &'a str,
+        buffer: &'a mut RenderBuffer,
+        runtime: &'a mut Runtime,
+    ) -> BoxFuture<'a, anyhow::Result<()>> {
+        Box::pin(async move {
+            let Some(assist) = self.inline_assist.as_ref() else {
+                return Ok(());
+            };
+            let range = assist.range;
+            let scope = assist.scope.clone();
+            if assist.expected_text != crate::learn::AI_LINE || prompt.trim().is_empty() {
+                self.current_dialog = Some(Box::new(self.inline_assist_popup(scope,
+                    InlineAssistPopupState::Failed("Recorded practice needs the first function line selected and a nonempty question. Esc, then select it with V and try again.".into()))));
+                return self.render(buffer);
+            }
+            let request = format!("learn-practice:{}", uuid::Uuid::new_v4());
+            self.begin_inline_history_turn(&request, prompt, range)?;
+            if let Some(assist) = self.inline_assist.as_mut() {
+                assist.request_id = Some(request.clone());
+            }
+            let result = InlineAssistResult {
+                replacement: None,
+                comments: vec![crate::inline_assist::InlineCommentInput {
+                    start_line: 1,
+                    end_line: None,
+                    message: "Recorded practice response: this function subtracts points from score. Its name suggests adding points instead. This explanation did not change the source.".into(),
+                }],
+            };
+            self.apply_inline_result(&request, "learn-practice:offline", &result, buffer, runtime)
+                .await?;
+            self.observe_learn_action(&Action::SubmitInlineAssist(prompt.into()), buffer)
+        })
     }
 
     pub(super) fn resize_learn_layout(&mut self, size: (usize, usize)) -> bool {

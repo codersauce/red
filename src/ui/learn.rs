@@ -119,20 +119,31 @@ impl LearnHub {
         self.layout().wide
     }
 
-    fn next_lesson(&self) -> Lesson {
-        Lesson::AVAILABLE
-            .into_iter()
+    fn next_lesson(&self) -> Option<Lesson> {
+        Lesson::for_track(self.selected)
             .find(|lesson| !self.completed[lesson.index()])
-            .unwrap_or_default()
+            .or_else(|| Lesson::for_track(self.selected).next())
+    }
+
+    fn track_progress(&self) -> (usize, usize) {
+        let available = Lesson::for_track(self.selected);
+        let total = available.clone().count();
+        (
+            available
+                .filter(|lesson| self.completed[lesson.index()])
+                .count(),
+            total,
+        )
     }
 
     fn actions(&self) -> Vec<UiAction> {
         let open = if !self.wide() && !self.details {
             "View track"
-        } else if self.selected == 0 {
-            if self.completed.iter().all(|completed| *completed) {
+        } else if self.next_lesson().is_some() {
+            let (completed, total) = self.track_progress();
+            if completed == total {
                 "Replay lesson"
-            } else if self.completed.iter().any(|completed| *completed) {
+            } else if completed > 0 {
                 "Continue lesson"
             } else {
                 "Start lesson"
@@ -162,6 +173,8 @@ impl LearnHub {
             KeyAction::Single(Action::Refresh)
         } else if TRACKS[self.selected].id == "essentials" {
             KeyAction::Single(Action::StartLearnLesson)
+        } else if let Some(lesson) = self.next_lesson() {
+            KeyAction::Single(Action::StartLearnLessonAt(lesson.id().into()))
         } else {
             KeyAction::Single(Action::Refresh)
         }
@@ -273,7 +286,9 @@ impl LearnHub {
                 if y >= bottom.saturating_sub(2) {
                     break;
                 }
-                let mark = if self.selected == 0 && self.completed.get(index) == Some(&true) {
+                let done = Lesson::from_track_number(self.selected, index + 1)
+                    .is_some_and(|lesson| self.completed[lesson.index()]);
+                let mark = if done {
                     "✓ ".to_string()
                 } else {
                     format!("{:02}", index + 1)
@@ -290,11 +305,12 @@ impl LearnHub {
             }
         }
         if y + 1 < bottom {
-            let status = if self.selected == 0 {
-                if self.completed.iter().all(|completed| *completed) {
+            let status = if let Some(next) = self.next_lesson() {
+                let (completed, total) = self.track_progress();
+                if completed == total {
                     "✓ Available lessons complete · Enter to replay".to_string()
-                } else if self.completed.iter().any(|completed| *completed) {
-                    format!("Enter  Continue: {} →", self.next_lesson().title())
+                } else if completed > 0 {
+                    format!("Enter  Continue: {} →", next.title())
                 } else {
                     "Enter  Start the first lesson →".to_string()
                 }
@@ -311,7 +327,7 @@ impl LearnHub {
                 y + 1,
                 width,
                 &status,
-                if self.selected == 0 {
+                if self.next_lesson().is_some() {
                     &palette.accent
                 } else {
                     &palette.secondary
@@ -597,6 +613,7 @@ pub(crate) fn draw_learn_coach(
     shortcut: Option<&str>,
 ) {
     let layout = CoachLayout::new(buffer.width, buffer.height);
+    let track = &TRACKS[lesson.track_index()];
     let palette = SurfacePalette::new(theme, &theme.ui_style.dialog);
     if layout.top > 0 {
         buffer.fill_rect(0, 0, buffer.width, layout.top, ' ', &palette.surface, theme);
@@ -605,11 +622,17 @@ pub(crate) fn draw_learn_coach(
             2,
             0,
             buffer.width.saturating_sub(4),
-            if lesson == Lesson::SaveAPracticeFile {
-                "red ●   Learn / Essentials   ·   Disposable practice file"
-            } else {
-                "red ●   Learn / Essentials   ·   Practice buffer"
-            },
+            &format!(
+                "red ●   Learn / {}   ·   {}",
+                track.title,
+                if lesson == Lesson::SaveAPracticeFile {
+                    "Disposable practice file"
+                } else if lesson.is_ai_practice() {
+                    "Offline recorded practice"
+                } else {
+                    "Practice buffer"
+                }
+            ),
             &palette.primary,
         );
         if layout.top > 1 {
@@ -648,7 +671,7 @@ pub(crate) fn draw_learn_coach(
     let exit = if step == PracticeStep::Complete {
         lesson.next().map_or_else(
             || ":tutorial next  →  All tracks".to_string(),
-            |next| format!(":tutorial next  →  Lesson {}", next.index() + 1),
+            |next| format!(":tutorial next  →  Lesson {}", next.lesson_index() + 1),
         )
     } else {
         ":tutorial quit  ·  :tutorial restart".to_string()
@@ -682,7 +705,7 @@ pub(crate) fn draw_learn_coach(
             left,
             area.y + 1,
             text_width,
-            &format!("ESSENTIALS  ·  {}", lesson.title()),
+            &format!("{}  ·  {}", track.title.to_uppercase(), lesson.title()),
             &palette.accent,
         );
         wrapped(
@@ -710,9 +733,10 @@ pub(crate) fn draw_learn_coach(
         area.y + 1,
         text_width,
         &format!(
-            "{:02} / {:02}  ·  ESSENTIALS",
-            lesson.index() + 1,
-            TRACKS[0].lessons.len()
+            "{:02} / {:02}  ·  {}",
+            lesson.lesson_index() + 1,
+            track.lessons.len(),
+            track.title.to_uppercase()
         ),
         &palette.accent,
     );
@@ -948,7 +972,7 @@ mod tests {
     #[test]
     fn planned_tracks_cannot_start_a_fake_lesson() {
         let mut hub = panel(120, 32);
-        hub.selected = 1;
+        hub.selected = 2;
         assert_eq!(hub.open_selected(), KeyAction::Single(Action::Refresh));
     }
 
