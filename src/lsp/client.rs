@@ -57,6 +57,22 @@ const PROCESS_EXIT_GRACE: Duration = Duration::from_secs(5);
 /// diagnostics for each is wasted server work.
 const DIAGNOSTICS_DEBOUNCE: Duration = Duration::from_millis(250);
 
+/// Apply the negotiated save options, including to saves queued before initialize.
+fn prepare_did_save(params: &mut Value, capabilities: Option<&ServerCapabilities>) -> bool {
+    let Some(include_text) = capabilities
+        .and_then(|caps| caps.text_document_sync.as_ref())
+        .and_then(TextDocumentSyncCapability::save_include_text)
+    else {
+        return false;
+    };
+    if !include_text {
+        if let Some(params) = params.as_object_mut() {
+            params.remove("text");
+        }
+    }
+    true
+}
+
 fn bytecount_newlines(text: &str) -> usize {
     text.as_bytes().iter().filter(|&&b| b == b'\n').count()
 }
@@ -1046,6 +1062,16 @@ impl LspClient for RealLspClient {
                                     self.pending_messages.len()
                                 );
                                 for mut msg in self.pending_messages.drain(..) {
+                                    if let OutboundMessage::Notification(notification) = &mut msg {
+                                        if notification.method == "textDocument/didSave"
+                                            && !prepare_did_save(
+                                                &mut notification.params,
+                                                self.server_capabilities.as_ref(),
+                                            )
+                                        {
+                                            continue;
+                                        }
+                                    }
                                     if let OutboundMessage::Request(request) = &mut msg {
                                         request.timestamp = Instant::now();
                                         self.pending_responses.insert(request.id, request.clone());
@@ -1286,6 +1312,19 @@ impl LspClient for RealLspClient {
             .await?;
 
         Ok(())
+    }
+
+    async fn did_save(&mut self, file: &str, contents: &str) -> Result<(), LspError> {
+        let uri = file_uri(file)?;
+        self.pending_diagnostics
+            .insert(uri.clone(), Instant::now() + DIAGNOSTICS_DEBOUNCE);
+        // Keep the saved snapshot until initialization tells us whether text is needed.
+        let mut params = json!({ "textDocument": { "uri": uri }, "text": contents });
+        if self.initialized && !prepare_did_save(&mut params, self.server_capabilities.as_ref()) {
+            return Ok(());
+        }
+        self.send_notification("textDocument/didSave", params, false)
+            .await
     }
 
     async fn did_close(&mut self, file: &str) -> Result<(), LspError> {
@@ -2705,6 +2744,87 @@ mod test {
         assert_eq!(id, 801);
         assert_eq!(method.as_deref(), Some("textDocument/formatting"));
         assert!(error.to_string().contains("invalid stdout frame"));
+    }
+
+    #[tokio::test]
+    async fn did_save_honors_negotiated_options_and_queued_initialization() {
+        for (sync, expected_text) in [
+            (json!({ "save": true }), Some(false)),
+            (json!({ "save": { "includeText": true } }), Some(true)),
+            (json!({ "save": {} }), Some(false)),
+            (json!({ "save": false }), None),
+            (json!({ "change": 2 }), None),
+            (json!(2), Some(false)),
+            (json!(0), None),
+        ] {
+            for queued in [false, true] {
+                let (request_tx, mut requests) = mpsc::channel(8);
+                let (responses, response_rx) = mpsc::channel(8);
+                let config = default_language_servers().remove("rust").unwrap();
+                let mut client = RealLspClient::with_test_channels(
+                    request_tx,
+                    response_rx,
+                    config,
+                    std::env::current_dir().unwrap(),
+                );
+                let capabilities = json!({ "textDocumentSync": sync });
+                client.initialized = !queued;
+                client.server_capabilities = if queued {
+                    None
+                } else {
+                    Some(serde_json::from_value(capabilities.clone()).unwrap())
+                };
+                if queued {
+                    client.initialize().await.unwrap();
+                    requests.recv().await.unwrap();
+                }
+                client.did_open("/tmp/saved.rs", "before").await.unwrap();
+                client
+                    .did_change("/tmp/saved.rs", "saved".to_string())
+                    .await
+                    .unwrap();
+                client.did_save("/tmp/saved.rs", "saved").await.unwrap();
+                if queued {
+                    assert!(requests.try_recv().is_err());
+                    responses
+                        .send(InboundMessage::Message(ResponseMessage {
+                            id: client.initialize_id.unwrap(),
+                            result: json!({ "capabilities": capabilities }),
+                            request: None,
+                        }))
+                        .await
+                        .unwrap();
+                    client.recv_response().await.unwrap();
+                }
+                let mut methods = Vec::new();
+                let mut saved = None;
+                while let Ok(message) = requests.try_recv() {
+                    if let OutboundMessage::Notification(notification) = message {
+                        methods.push(notification.method.clone());
+                        if notification.method == "textDocument/didSave" {
+                            saved = Some(notification.params);
+                        }
+                    }
+                }
+                let mut expected = Vec::new();
+                if queued {
+                    expected.push("initialized");
+                }
+                expected.extend(["textDocument/didOpen", "textDocument/didChange"]);
+                if let Some(include_text) = expected_text {
+                    expected.push("textDocument/didSave");
+                    let mut params =
+                        json!({ "textDocument": { "uri": file_uri("/tmp/saved.rs").unwrap() } });
+                    if include_text {
+                        params["text"] = json!("saved");
+                    }
+                    assert_eq!(saved, Some(params));
+                } else {
+                    assert!(saved.is_none());
+                }
+                assert_eq!(methods, expected);
+            }
+        }
     }
 
     #[tokio::test]

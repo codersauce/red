@@ -17,6 +17,7 @@
 
 mod agent_manager;
 mod buffer_manager;
+mod diagnostics;
 mod diagnostics_picker;
 mod display_layout;
 mod inline_actions;
@@ -3314,6 +3315,7 @@ pub struct Editor {
 
     /// Map of diagnostics per file uri
     diagnostics: HashMap<String, Vec<Diagnostic>>,
+    diagnostic_reports: diagnostics::DiagnosticReports,
 
     /// Indentation rules per file type
     indentation: HashMap<String, Indentation>,
@@ -4239,6 +4241,7 @@ impl Editor {
             if route_changed {
                 self.lsp_coordinator.mark_document_closed(&uri);
                 self.diagnostics.remove(&uri);
+                self.diagnostic_reports.remove(&uri);
             }
             self.lsp_coordinator.mark_document_opened(uri);
         }
@@ -4588,6 +4591,7 @@ impl Editor {
             registers: HashMap::new(),
             clipboard,
             diagnostics: HashMap::new(),
+            diagnostic_reports: diagnostics::DiagnosticReports::default(),
             indentation,
             render_commands: VecDeque::new(),
             overlay_manager: plugin::OverlayManager::new(),
@@ -8011,6 +8015,21 @@ impl Editor {
         Ok((self.buffer_manager.len() - 1, true, normalized))
     }
 
+    /// A failed LSP notification must not turn a successful disk write into a failed save.
+    async fn notify_lsp_saved(&mut self) {
+        let Some(file) = self.current_buffer().file.clone() else {
+            return;
+        };
+        let contents = self.current_buffer().contents();
+        if let Err(error) = self.lsp.did_save(&file, &contents).await {
+            log!("[lsp] saved {file}, but didSave failed: {error}");
+            self.set_notification_message(
+                Severity::Warning,
+                Some(format!("file saved, but LSP notification failed: {error}")),
+            );
+        }
+    }
+
     async fn save_current_agent_buffer(
         &mut self,
         root: &Path,
@@ -8039,6 +8058,7 @@ impl Editor {
         };
         match result {
             Ok(message) => {
+                self.notify_lsp_saved().await;
                 self.sync_inline_change_summaries();
                 if let Some(file) = self.current_buffer().file.clone() {
                     let _ = self
@@ -11971,6 +11991,15 @@ impl Editor {
     }
 
     fn add_diagnostics(&mut self, uri: Option<&str>, diagnostics: &[Diagnostic]) -> Option<Action> {
+        self.update_diagnostics(uri, diagnostics, diagnostics::DiagnosticReportKind::Push)
+    }
+
+    fn update_diagnostics(
+        &mut self,
+        uri: Option<&str>,
+        diagnostics: &[Diagnostic],
+        kind: diagnostics::DiagnosticReportKind,
+    ) -> Option<Action> {
         let Some(uri) = uri else {
             log!("WARN: no uri provided for diagnostics - {diagnostics:?}");
             return None;
@@ -11981,7 +12010,8 @@ impl Editor {
             .and_then(|path| crate::lsp::file_uri(path).ok())
             .unwrap_or_else(|| uri.to_string());
         log!("Adding diagnostics for {uri}: {diagnostics:#?}");
-        self.diagnostics.insert(uri, diagnostics.to_vec());
+        let merged = self.diagnostic_reports.update(&uri, kind, diagnostics);
+        self.diagnostics.insert(uri, merged);
         self.sync_diagnostic_gutter_signs();
 
         Some(Action::Refresh)
@@ -12694,7 +12724,11 @@ impl Editor {
 
                     if method == "textDocument/diagnostic" && self.config.show_diagnostics {
                         if let Some((uri, diagnostics)) = parse_diagnostics(msg) {
-                            return self.add_diagnostics(Some(&uri), &diagnostics);
+                            return self.update_diagnostics(
+                                Some(&uri),
+                                &diagnostics,
+                                diagnostics::DiagnosticReportKind::Pull,
+                            );
                         }
                     }
 
@@ -21384,6 +21418,7 @@ impl Editor {
                     self.lsp.did_close(&file).await?;
                 }
                 self.diagnostics.remove(uri);
+                self.diagnostic_reports.remove(uri);
             }
         }
         self.lsp_coordinator.forget_buffer(removed_id);
@@ -21510,6 +21545,8 @@ impl Editor {
                     self.lsp.did_close(&file).await?;
                 }
             }
+            self.diagnostic_reports
+                .rename(previous_uri, current_uri.as_deref());
             if let Some(diagnostics) = self.diagnostics.remove(previous_uri) {
                 if let Some(current_uri) = current_uri.as_ref() {
                     self.diagnostics.insert(current_uri.clone(), diagnostics);
@@ -25160,6 +25197,7 @@ impl Editor {
             self.lsp_coordinator.mark_document_closed(uri);
             let new_uri = crate::lsp::file_uri(file).ok();
             if let Some(new_uri) = &new_uri {
+                self.diagnostic_reports.rename(uri, Some(new_uri));
                 if let Some(diagnostics) = self.diagnostics.remove(uri) {
                     self.diagnostics.insert(new_uri.clone(), diagnostics);
                 }
@@ -25289,6 +25327,7 @@ impl Editor {
                 );
                 self.sync_lsp_document_identity(previous_uri.as_deref(), index)
                     .await?;
+                self.notify_lsp_saved().await;
                 let file = self.current_buffer().file.clone();
                 self.plugin_registry
                     .notify(
@@ -25452,6 +25491,7 @@ impl Editor {
                 };
                 self.set_notification_message(severity, Some(format_warning.unwrap_or(msg)));
 
+                self.notify_lsp_saved().await;
                 // Notify plugins about file save
                 if let Some(file) = &self.current_buffer().file {
                     let save_info = serde_json::json!({
@@ -25599,6 +25639,7 @@ impl Editor {
                         "format-on-save unavailable; saved unformatted: {error}"
                     )));
                 }
+                self.notify_lsp_saved().await;
                 let saved_file = self
                     .current_buffer()
                     .file

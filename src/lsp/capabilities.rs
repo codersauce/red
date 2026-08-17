@@ -28,7 +28,7 @@ pub fn get_client_capabilities_with_options(
                 .dynamic_registration(false)
                 .will_save(false)
                 .will_save_wait_until(false)
-                .did_save(false)
+                .did_save(true)
                 .build(),
         )
         .completion(
@@ -591,7 +591,7 @@ mod tests {
         assert!(flags.into_iter().all(|flag| !flag));
         assert_eq!(synchronization["willSave"], json!(false));
         assert_eq!(synchronization["willSaveWaitUntil"], json!(false));
-        assert_eq!(synchronization["didSave"], json!(false));
+        assert_eq!(synchronization["didSave"], json!(true));
         assert_eq!(
             capabilities["textDocument"]["completion"]["completionItem"]["insertReplaceSupport"],
             json!(false)

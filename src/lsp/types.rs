@@ -26,7 +26,7 @@ pub struct TextDocumentPublishDiagnostics {
     pub diagnostics: Vec<Diagnostic>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Diagnostic {
     pub range: Range,
@@ -206,7 +206,7 @@ macro_rules! impl_numeric_lsp_enum {
     };
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(try_from = "i32", into = "i32")]
 pub enum DiagnosticSeverity {
     Error = 1,
@@ -228,7 +228,7 @@ impl_numeric_lsp_enum!(DiagnosticSeverity {
     4 => Hint,
 });
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum DiagnosticCode {
     Int(usize),
@@ -250,7 +250,7 @@ pub struct DiagnosticCodeDescription {
     pub href: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DiagnosticRelatedInformation {
     pub location: Location,
@@ -264,7 +264,7 @@ pub struct Location {
     pub range: Range,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(try_from = "i32", into = "i32")]
 pub enum DiagnosticTag {
     Unnecessary = 1,
@@ -407,6 +407,21 @@ pub enum TextDocumentSyncCapability {
 }
 
 impl TextDocumentSyncCapability {
+    /// Whether saves are supported, and whether the notification must include text.
+    pub fn save_include_text(&self) -> Option<bool> {
+        match self {
+            Self::Kind(TextDocumentSyncKind::None) => None,
+            Self::Kind(_) => Some(false),
+            Self::Options(options) => match options.save.as_ref()? {
+                TextDocumentSyncSaveOptions::Supported(true) => Some(false),
+                TextDocumentSyncSaveOptions::Supported(false) => None,
+                TextDocumentSyncSaveOptions::Options(options) => {
+                    Some(options.include_text.unwrap_or(false))
+                }
+            },
+        }
+    }
+
     pub fn change_kind(&self) -> Option<TextDocumentSyncKind> {
         match self {
             TextDocumentSyncCapability::Kind(kind) => Some(kind.clone()),
