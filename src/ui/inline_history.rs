@@ -686,7 +686,12 @@ mod tests {
             assert_eq!(
                 panel.detail_link_at(x + column, y + row - panel.scroll),
                 InlineHistoryPanel::action(HistoryAction::FollowFile {
-                    path: "/workspace/src/other.rs".into(),
+                    path: panel
+                        .detail
+                        .cwd
+                        .join("src/other.rs")
+                        .to_string_lossy()
+                        .into_owned(),
                     line: Some(7),
                     column: Some(2)
                 })
