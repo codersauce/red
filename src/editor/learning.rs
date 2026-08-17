@@ -396,6 +396,21 @@ impl Editor {
             self.render(buffer)?;
             return Ok(true);
         }
+        if matches!(
+            session.lesson,
+            Lesson::ReadTheDiagnostic | Lesson::RepairTheCode
+        ) && matches!(
+            action,
+            Action::OpenDiagnosticsPicker | Action::OpenErrorDiagnosticsPicker
+        ) && self.current_buffer().contents() == crate::learn::HUSK_CONTENTS
+            && !self.learn_diagnostic_present()
+        {
+            self.set_quiet_message(Some(
+                "Husk is still preparing the practice diagnostic; try again in a moment".into(),
+            ));
+            self.render(buffer)?;
+            return Ok(true);
+        }
         let location_allowed = match action {
             Action::OpenLocation(location, target) if session.lesson.is_lsp_practice() => {
                 *target == plugin::OpenLocationTarget::Current
@@ -406,7 +421,10 @@ impl Editor {
             }
             _ => true,
         };
-        if !location_allowed || !practice_action_allowed(session.lesson, action) {
+        if !location_allowed
+            || !self.learn_repair_edit_allowed(action)
+            || !practice_action_allowed(session.lesson, action)
+        {
             self.set_legacy_message(Some(
                 "this practice step only edits tutorial text; use :tutorial quit to return".into(),
             ));
@@ -518,6 +536,18 @@ impl Editor {
                 .current_dialog
                 .as_ref()
                 .is_some_and(|dialog| dialog.shortcut_context() == "Line diagnostics"),
+            code_actions_open: self
+                .current_dialog
+                .as_ref()
+                .is_some_and(|dialog| dialog.shortcut_context() == "Code actions"),
+            husk_fixed_text: contents == crate::learn::HUSK_FIXED_CONTENTS,
+            diagnostics_clean: self
+                .current_buffer()
+                .uri()
+                .ok()
+                .flatten()
+                .and_then(|uri| self.diagnostics.get(&uri))
+                .is_some_and(Vec::is_empty),
             symbol_definition_received: session
                 .symbols
                 .as_ref()

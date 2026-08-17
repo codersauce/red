@@ -28,6 +28,7 @@ pub(crate) const AGENT_EXAMPLE_FIXED: &str =
     "// Practice usage example: add_score(40, 2)\nlet expected_score = 42;\n";
 pub(crate) const HUSK_DIAGNOSTIC: &str = "expected `;` after let binding";
 pub(crate) const HUSK_CONTENTS: &str = "fn add_score(score: i32, points: i32) -> i32 {\n    score + points\n}\n\nfn main() {\n    let score = add_score(40, 2)\n    let next = 45;\n}\n";
+pub(crate) const HUSK_FIXED_CONTENTS: &str = "fn add_score(score: i32, points: i32) -> i32 {\n    score + points\n}\n\nfn main() {\n    let score = add_score(40, 2);\n    let next = 45;\n}\n";
 pub(crate) const HUSK_SYMBOL_CONTENTS: &str = "fn add_score(score: i32, points: i32) -> i32 {\n    score + points\n}\n\nfn main() {\n    let score = add_score(40, 2);\n    let next = add_score(score, 3);\n}\n";
 pub(crate) const LEARN_GIT_WORKSPACE: &str = "learn-git";
 pub(crate) const LEARN_AGENT_PANEL: &str = "learn-recorded-agent";
@@ -46,10 +47,11 @@ pub(crate) enum Lesson {
     ReviewWhatChanged,
     ReadTheDiagnostic,
     FollowTheSymbol,
+    RepairTheCode,
 }
 
 impl Lesson {
-    pub const AVAILABLE: [Self; 11] = [
+    pub const AVAILABLE: [Self; 12] = [
         Self::FindYourFooting,
         Self::EditWithConfidence,
         Self::FindACommand,
@@ -61,6 +63,7 @@ impl Lesson {
         Self::ReviewWhatChanged,
         Self::ReadTheDiagnostic,
         Self::FollowTheSymbol,
+        Self::RepairTheCode,
     ];
 
     pub fn from_id(id: &str) -> Option<Self> {
@@ -96,6 +99,7 @@ impl Lesson {
             Self::ReviewWhatChanged => 8,
             Self::ReadTheDiagnostic => 9,
             Self::FollowTheSymbol => 10,
+            Self::RepairTheCode => 11,
         }
     }
 
@@ -106,7 +110,7 @@ impl Lesson {
             | Self::ChooseWhatToKeep
             | Self::ContinueInAgent
             | Self::ReviewWhatChanged => 1,
-            Self::ReadTheDiagnostic | Self::FollowTheSymbol => 2,
+            Self::ReadTheDiagnostic | Self::FollowTheSymbol | Self::RepairTheCode => 2,
             _ => 0,
         }
     }
@@ -118,7 +122,10 @@ impl Lesson {
     }
 
     pub const fn is_lsp_practice(self) -> bool {
-        matches!(self, Self::ReadTheDiagnostic | Self::FollowTheSymbol)
+        matches!(
+            self,
+            Self::ReadTheDiagnostic | Self::FollowTheSymbol | Self::RepairTheCode
+        )
     }
 
     pub const fn is_ai_practice(self) -> bool {
@@ -144,6 +151,7 @@ impl Lesson {
             Self::ReviewWhatChanged => "ai.review-what-changed.v1",
             Self::ReadTheDiagnostic => "ship.read-the-diagnostic.v1",
             Self::FollowTheSymbol => "ship.follow-the-symbol.v1",
+            Self::RepairTheCode => "ship.repair-the-code.v1",
         }
     }
 
@@ -162,7 +170,7 @@ impl Lesson {
             | Self::ChooseWhatToKeep
             | Self::ContinueInAgent => AI_CONTENTS,
             Self::ReviewWhatChanged => AI_FIXED_CONTENTS,
-            Self::ReadTheDiagnostic => HUSK_CONTENTS,
+            Self::ReadTheDiagnostic | Self::RepairTheCode => HUSK_CONTENTS,
             Self::FollowTheSymbol => HUSK_SYMBOL_CONTENTS,
         }
     }
@@ -180,6 +188,7 @@ impl Lesson {
             Self::ReviewWhatChanged => PracticeStep::GitOpen,
             Self::ReadTheDiagnostic => PracticeStep::DiagnosticOpen,
             Self::FollowTheSymbol => PracticeStep::SymbolDefinition,
+            Self::RepairTheCode => PracticeStep::RepairLocate,
         }
     }
 
@@ -230,6 +239,12 @@ impl Lesson {
                 "Undo the unwanted change",
                 "Request and refine a suggestion",
                 "Keep only the corrected result",
+            ],
+            Self::RepairTheCode => &[
+                "Jump to the diagnostic",
+                "Open the real code actions",
+                "Apply the unsaved quick fix",
+                "Save a clean practice file",
             ],
             Self::FollowTheSymbol => &[
                 "Go to the symbol definition",
@@ -411,12 +426,20 @@ pub(crate) enum PracticeStep {
     SymbolReferences,
     SymbolChoose,
     SymbolReturn,
+    RepairLocate,
+    RepairActions,
+    RepairApply,
+    RepairSave,
     Complete,
 }
 
 impl PracticeStep {
     pub fn suggested_action(self) -> Option<Action> {
         match self {
+            Self::RepairLocate => Some(Action::OpenDiagnosticsPicker),
+            Self::RepairActions => Some(Action::CodeAction),
+            Self::RepairApply => None,
+            Self::RepairSave => Some(Action::Save),
             Self::SymbolDefinition => Some(Action::GoToDefinition),
             Self::SymbolReferences => Some(Action::PluginCommand("LspReferences".into())),
             Self::SymbolChoose => None,
@@ -522,6 +545,10 @@ impl PracticeStep {
             Self::DiagnosticJump => "Choose the missing-semicolon error and press Enter. The editor will take you to the reported location. Reopen Diagnostics if you closed the picker.".into(),
             Self::DiagnosticRead => format!("Press {} to read the diagnostic on this line. The parser points at the next token; the incomplete statement is just above it.", shortcut.unwrap_or("D")),
             Self::DiagnosticReturn => "Read the message and diagnostic code, then press Esc to return to the source. You will repair the defect in a later lesson.".into(),
+            Self::RepairLocate => format!("Open Diagnostics with {} and choose the missing-semicolon error. This is an owned practice file with a real Husk diagnostic.", shortcut.unwrap_or("Space d")),
+            Self::RepairActions => format!("Press {} to ask the bundled Husk server for a code action at this diagnostic.", shortcut.unwrap_or("Space .")),
+            Self::RepairApply => "Choose Insert missing semicolon and press Enter. The quick fix uses the same undo history as an ordinary edit. If you closed the picker, open code actions again at the error.".into(),
+            Self::RepairSave => "The semicolon is fixed in the buffer, but not yet on disk. You can undo with u and redo with Ctrl-r. Use :w to save, then wait for the diagnostic to clear.".into(),
             Self::SymbolDefinition => format!("The cursor starts on the first add_score call. Press {} to follow it to its definition. This uses the real bundled Husk server. If you moved, use :6, then ^3w.", shortcut.unwrap_or("g d")),
             Self::SymbolReferences => format!("You are at the function definition. Press {} (or :LspReferences) to find the places that call it.", shortcut.unwrap_or("Space k")),
             Self::SymbolChoose => "Choose the second call, let next = add_score(score, 3), and press Enter. If you closed the picker, find references again from the definition.".into(),
@@ -536,6 +563,7 @@ impl PracticeStep {
                 Lesson::UnderstandSelectedCode => "You explained selected code without editing it. Recorded practice complete; real inline assist sends your selected context only when you submit a prompt.",
                 Lesson::MakeAFocusedChange => "The fix is kept in the buffer, still unsaved. Inline edits use normal undo history; keeping one is not the same as writing a file.",
                 Lesson::ChooseWhatToKeep => "You rejected an unwanted change, refined a suggestion, and kept the corrected result. The final edit is unsaved and remains undoable.",
+                Lesson::RepairTheCode => "You applied a real language-server quick fix and saved the corrected file. The diagnostic is gone; your own project was never touched.",
                 Lesson::FollowTheSymbol => "You followed a real definition, inspected its references, and returned through the jump list. No source was changed.",
                 Lesson::ReadTheDiagnostic => "You found a real language-server error and read it at its source. The file is unchanged. Your original language servers and diagnostics return when you leave.",
                 Lesson::ReviewWhatChanged => "You reviewed the real diff for both files. Build with AI complete! These changes are still unstaged; your own repository was never touched.",
@@ -560,7 +588,8 @@ impl PracticeStep {
             | Self::AgentInlineSubmit
             | Self::GitOpen
             | Self::DiagnosticOpen
-            | Self::SymbolDefinition => 0,
+            | Self::SymbolDefinition
+            | Self::RepairLocate => 0,
             Self::Type
             | Self::EditDelete
             | Self::CommandRun
@@ -571,7 +600,8 @@ impl PracticeStep {
             | Self::AgentEscalate
             | Self::GitScore
             | Self::DiagnosticJump
-            | Self::SymbolReferences => 1,
+            | Self::SymbolReferences
+            | Self::RepairActions => 1,
             Self::Normal
             | Self::EditUndo
             | Self::CommandHelp
@@ -584,7 +614,8 @@ impl PracticeStep {
             | Self::AgentPrompt
             | Self::GitExample
             | Self::DiagnosticRead
-            | Self::SymbolChoose => 2,
+            | Self::SymbolChoose
+            | Self::RepairApply => 2,
             Self::Undo
             | Self::EditRedo
             | Self::CommandReturn
@@ -595,7 +626,8 @@ impl PracticeStep {
             | Self::AgentInspect
             | Self::GitReturn
             | Self::DiagnosticReturn
-            | Self::SymbolReturn => 3,
+            | Self::SymbolReturn
+            | Self::RepairSave => 3,
             Self::Complete => 4,
         }
     }
@@ -660,6 +692,24 @@ impl PracticeStep {
     /// Observes UI state that can change through either a key or an action.
     pub fn observe_view(&mut self, action: &Action, view: PracticeView) -> bool {
         let next = match (*self, action) {
+            (Self::RepairLocate, Action::OpenLocation(_, _))
+                if view.diagnostic_under_cursor && view.original_text =>
+            {
+                Self::RepairActions
+            }
+            (Self::RepairActions, Action::ShowDialog) if view.code_actions_open => {
+                Self::RepairApply
+            }
+            (Self::RepairApply, Action::ApplyLspWorkspaceEdit { .. })
+                if view.husk_fixed_text && view.dirty =>
+            {
+                Self::RepairSave
+            }
+            (Self::RepairSave, _)
+                if view.husk_fixed_text && view.file_matches_buffer && view.diagnostics_clean =>
+            {
+                Self::Complete
+            }
             (Self::SymbolDefinition, Action::OpenLocation(_, _))
                 if view.symbol_definition_received && view.symbol_at_definition =>
             {
@@ -799,6 +849,9 @@ pub(crate) struct PracticeView {
     pub diagnostics_picker_open: bool,
     pub diagnostic_under_cursor: bool,
     pub diagnostic_popup_open: bool,
+    pub code_actions_open: bool,
+    pub husk_fixed_text: bool,
+    pub diagnostics_clean: bool,
     pub symbol_definition_received: bool,
     pub symbol_references_received: bool,
     pub references_picker_open: bool,
@@ -809,11 +862,16 @@ pub(crate) struct PracticeView {
 
 /// Scratch lessons permit only edits to their isolated practice buffer.
 pub(crate) fn practice_action_allowed(lesson: Lesson, action: &Action) -> bool {
-    (lesson == Lesson::FollowTheSymbol
-        && (matches!(
+    (lesson == Lesson::RepairTheCode
+        && matches!(
             action,
-            Action::GoToDefinition | Action::JumpBack | Action::JumpForward
-        ) || matches!(action, Action::PluginCommand(name) if name == "LspReferences")))
+            Action::CodeAction | Action::ApplyLspWorkspaceEdit { .. } | Action::Save
+        ))
+        || (lesson == Lesson::FollowTheSymbol
+            && (matches!(
+                action,
+                Action::GoToDefinition | Action::JumpBack | Action::JumpForward
+            ) || matches!(action, Action::PluginCommand(name) if name == "LspReferences")))
         || (lesson.is_lsp_practice()
             && matches!(
                 action,
