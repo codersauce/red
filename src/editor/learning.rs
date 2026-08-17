@@ -78,7 +78,19 @@ impl Editor {
         self.start_learn_lesson(lesson, buffer, runtime).await
     }
 
-    pub(super) async fn start_learn_lesson(
+    // Lesson startup owns a saved window layout across an await. Keep that
+    // future out of the editor dispatcher's nested motion/replay stack frames.
+    #[inline(never)]
+    pub(super) fn start_learn_lesson<'a>(
+        &'a mut self,
+        lesson: Lesson,
+        buffer: &'a mut RenderBuffer,
+        runtime: &'a mut Runtime,
+    ) -> BoxFuture<'a, anyhow::Result<()>> {
+        Box::pin(self.start_learn_lesson_impl(lesson, buffer, runtime))
+    }
+
+    async fn start_learn_lesson_impl(
         &mut self,
         lesson: Lesson,
         buffer: &mut RenderBuffer,
