@@ -652,6 +652,21 @@ impl Buffer {
         line_start + position.character.min(line_len)
     }
 
+    /// Converts a canonical position to an LSP UTF-16 position without flattening
+    /// the document. Canonical ranges cannot split a Unicode scalar or CRLF.
+    pub(crate) fn position_to_lsp(&self, position: TextPosition) -> crate::lsp::Position {
+        let index = self.position_to_char_idx(position);
+        let line = self.content.char_to_line(index);
+        let start = self.content.line_to_char(line);
+        let character = self
+            .content
+            .slice(start..index)
+            .chars()
+            .map(char::len_utf16)
+            .sum();
+        crate::lsp::Position { line, character }
+    }
+
     /// Converts a canonical line and scalar position to its UTF-8 byte offset.
     pub(crate) fn position_to_byte_idx(&self, position: TextPosition) -> usize {
         self.content

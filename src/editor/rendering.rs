@@ -1238,7 +1238,7 @@ impl Editor {
     /// Renders the entire editor state to the terminal
     /// This is the main entry point for all rendering operations
     pub fn render(&mut self, buffer: &mut RenderBuffer) -> anyhow::Result<()> {
-        if self.defer_motion_render {
+        if self.render_is_deferred() {
             self.request_motion_render(super::MotionRender::Full);
             return Ok(());
         }
@@ -1406,7 +1406,7 @@ impl Editor {
     }
 
     pub(crate) fn render_motion_frame(&mut self, buffer: &mut RenderBuffer) -> anyhow::Result<()> {
-        if self.defer_motion_render {
+        if self.render_is_deferred() {
             self.request_motion_render(super::MotionRender::Window);
             return Ok(());
         }
@@ -1422,7 +1422,7 @@ impl Editor {
         &mut self,
         buffer: &mut RenderBuffer,
     ) -> anyhow::Result<()> {
-        if self.defer_motion_render {
+        if self.render_is_deferred() {
             self.request_motion_render(super::MotionRender::EditorWindows);
             return Ok(());
         }
@@ -1515,6 +1515,10 @@ impl Editor {
         &mut self,
         buffer: &mut RenderBuffer,
     ) -> anyhow::Result<()> {
+        if self.render_is_deferred() {
+            self.request_motion_render(super::MotionRender::Cursor);
+            return Ok(());
+        }
         let _span = super::perf::PerfSpan::start("render:motion_delta");
         self.update_gutter_width();
         self.fix_cursor_pos();
@@ -1579,12 +1583,14 @@ impl Editor {
         Ok(())
     }
 
-    /// Flushes one complete, document-aware frame after an edit.
+    /// Repaint document-aware editor windows while reusing unchanged docked
+    /// surfaces. The shared frame path falls back to a full render when an
+    /// overlay, layout invalidation, or other surface makes reuse unsafe.
     pub(super) fn render_edited_window_rows(
         &mut self,
         buffer: &mut RenderBuffer,
     ) -> anyhow::Result<()> {
-        self.render(buffer)
+        self.render_editor_windows_frame(buffer)
     }
 
     fn render_window_rows(
@@ -3722,6 +3728,10 @@ impl Editor {
         self.fix_cursor_pos();
         self.sync_to_window();
 
+        if self.render_is_deferred() {
+            self.request_motion_render(super::MotionRender::Cursor);
+            return Ok(());
+        }
         if !self.terminal_output_enabled {
             return Ok(());
         }

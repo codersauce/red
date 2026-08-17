@@ -20,6 +20,27 @@ path instead.
 
 Detached owners expose a separate lightweight render audit. `detach:idle_tick` counts background polls that correctly skipped serialization, `detach:rendered_tick` counts polls that produced a frame, `detach:serialize_frame` measures row/span serialization, and `detach:changed_rows` reports the maximum number of rows sent in one delta. These metrics complement, rather than replace, the native motion-frame gate above.
 
+## Repeated editing
+
+Run `python3 scripts/edit_replay_bench.py --binary target/release/red` for dot,
+macros, counted deletion, visual-block insertion, paste, substitute, indentation,
+and undo. Each case uses a real PTY and verifies the saved result. Add `--plugins`
+and `--split` to include bundled callbacks and shared-buffer windows. Compare
+exact-base and feature binaries on the same machine; the script reports complete
+input-event time, frame counts, highlight misses, and change notifications.
+Use `--lsp incremental` or `--lsp full` to launch a local protocol fixture that
+reconstructs the document and reports notification/payload counts. `--unicode`
+and `--crlf` exercise UTF-16 coordinates and Windows line endings without an
+installed language server.
+
+`cargo run --locked --release --example textarea_replay_bench` separately measures
+large embedded text areas. Neither benchmark imposes a wall-clock CI threshold.
+The deterministic replay tests instead assert publication counts, final frames,
+notification ordering, cancellation, and undo correctness. `RED_PERF=summary`
+also reports `edit:replacements`, `edit:change_notifications`,
+`edit:notifications_deferred`, `edit:replay_slices`, `edit:inline_summary_refreshes`,
+and full/incremental LSP byte counters.
+
 ## Deterministic CI gate
 
 CI runs:

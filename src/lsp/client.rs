@@ -621,7 +621,7 @@ pub struct RealLspClient {
     request_tx: mpsc::Sender<OutboundMessage>,
     response_rx: mpsc::Receiver<InboundMessage>,
     files_versions: HashMap<String, usize>,
-    files_content: HashMap<String, String>,
+    files_content: HashMap<String, ropey::Rope>,
     pending_responses: HashMap<i64, Request>,
     initialize_id: Option<i64>,
     initialized: bool,
@@ -866,7 +866,8 @@ impl RealLspClient {
         let params = did_open_params(file, contents, language_id)?;
 
         let uri = file_uri(file)?;
-        self.files_content.insert(uri.clone(), contents.to_string());
+        self.files_content
+            .insert(uri.clone(), ropey::Rope::from_str(contents));
         self.files_versions.insert(uri, 1);
         <Self as LspClient>::send_notification(self, "textDocument/didOpen", params, false).await?;
 
@@ -1291,6 +1292,7 @@ impl LspClient for RealLspClient {
     }
 
     async fn did_change(&mut self, file: &str, contents: String) -> Result<(), LspError> {
+        crate::editor::perf::increment("edit:lsp_full_text_bytes", contents.len() as u64);
         let uri = file_uri(file)?;
         // Diagnostics are debounced: typing produces a didChange per
         // keystroke, and requesting diagnostics for every one of them floods
@@ -1326,7 +1328,8 @@ impl LspClient for RealLspClient {
                     contents
                 } else {
                     let text = contents.clone();
-                    self.files_content.insert(uri.clone(), contents);
+                    self.files_content
+                        .insert(uri.clone(), ropey::Rope::from_str(&contents));
                     text
                 };
                 vec![TextDocumentContentChangeEvent {
@@ -1340,12 +1343,13 @@ impl LspClient for RealLspClient {
                 let old_content = self
                     .files_content
                     .get(&uri)
-                    .map(String::as_str)
-                    .unwrap_or("");
+                    .map(ToString::to_string)
+                    .unwrap_or_default();
 
-                // Calculate actual changes
-                let changes = Self::calculate_changes(old_content, &contents);
-                self.files_content.insert(uri.clone(), contents);
+                // Legacy callers do not supply canonical edit ranges.
+                let changes = Self::calculate_changes(&old_content, &contents);
+                self.files_content
+                    .insert(uri.clone(), ropey::Rope::from_str(&contents));
                 changes
             }
             _ => return Ok(()),
@@ -1365,6 +1369,47 @@ impl LspClient for RealLspClient {
             .await?;
 
         Ok(())
+    }
+
+    async fn did_change_edits(
+        &mut self,
+        file: &str,
+        change: super::DocumentChange,
+    ) -> Result<(), LspError> {
+        let uri = file_uri(file)?;
+        let incremental = matches!(
+            self.server_capabilities
+                .as_ref()
+                .and_then(|caps| caps.text_document_sync.as_ref())
+                .and_then(|sync| sync.change_kind()),
+            Some(TextDocumentSyncKind::Incremental)
+        );
+        let matches_before = self.files_content.get(&uri).is_some_and(|previous| {
+            previous.is_instance(&change.before) || previous == &change.before
+        });
+        if !incremental || !matches_before || change.changes.is_empty() {
+            return self.did_change(file, change.after.to_string()).await;
+        }
+        self.schedule_diagnostics(&uri);
+        let version = self.files_versions.entry(uri.clone()).or_insert(0);
+        *version += 1;
+        let version = *version;
+        crate::editor::perf::increment("edit:lsp_incremental_changes", change.changes.len() as u64);
+        crate::editor::perf::increment(
+            "edit:lsp_incremental_bytes",
+            change
+                .changes
+                .iter()
+                .map(|edit| edit.text.len() as u64)
+                .sum(),
+        );
+        self.files_content.insert(uri.clone(), change.after);
+        self.send_notification(
+            "textDocument/didChange",
+            did_change_params(&uri, version, change.changes),
+            false,
+        )
+        .await
     }
 
     async fn did_save(&mut self, file: &str, contents: &str) -> Result<(), LspError> {
@@ -3307,6 +3352,95 @@ mod test {
     }
 
     #[tokio::test]
+    async fn canonical_edits_use_incremental_sync_and_keep_shared_snapshots() {
+        let (request_tx, mut request_rx) = mpsc::channel(8);
+        let (_response_tx, response_rx) = mpsc::channel(1);
+        let config = default_language_servers().remove("rust").unwrap();
+        let mut client = RealLspClient::with_test_channels(
+            request_tx,
+            response_rx,
+            config,
+            std::env::current_dir().unwrap(),
+        );
+        client.server_capabilities =
+            Some(serde_json::from_value(json!({ "textDocumentSync": 2 })).unwrap());
+        let file = "/tmp/canonical-sync.rs";
+        let before = ropey::Rope::from_str("a😀b\r\nnext\n");
+        let mut after = before.clone();
+        after.remove(1..2);
+        after.insert(1, "λ");
+        client.did_open(file, &before.to_string()).await.unwrap();
+        request_rx.recv().await.unwrap();
+        client
+            .did_change_edits(
+                file,
+                crate::lsp::DocumentChange {
+                    before,
+                    after: after.clone(),
+                    changes: vec![TextDocumentContentChangeEvent {
+                        range: Some(Range {
+                            start: Position {
+                                line: 0,
+                                character: 1,
+                            },
+                            end: Position {
+                                line: 0,
+                                character: 3,
+                            },
+                        }),
+                        range_length: None,
+                        text: "λ".into(),
+                    }],
+                },
+            )
+            .await
+            .unwrap();
+        let Some(OutboundMessage::Notification(notification)) = request_rx.recv().await else {
+            panic!("expected didChange");
+        };
+        assert_eq!(
+            notification.params["contentChanges"],
+            json!([{ "range": { "start": { "line": 0, "character": 1 }, "end": { "line": 0, "character": 3 } }, "text": "λ" }])
+        );
+        assert_eq!(notification.params["textDocument"]["version"], 2);
+        assert!(client.files_content[&file_uri(file).unwrap()].is_instance(&after));
+
+        // A stale or newly opened preimage must not receive obsolete ranges.
+        client
+            .did_change_edits(
+                file,
+                crate::lsp::DocumentChange {
+                    before: ropey::Rope::from_str("stale"),
+                    after: ropey::Rope::from_str("latest"),
+                    changes: vec![TextDocumentContentChangeEvent {
+                        range: Some(Range {
+                            start: Position {
+                                line: 0,
+                                character: 99,
+                            },
+                            end: Position {
+                                line: 0,
+                                character: 99,
+                            },
+                        }),
+                        range_length: None,
+                        text: "wrong".into(),
+                    }],
+                },
+            )
+            .await
+            .unwrap();
+        let Some(OutboundMessage::Notification(notification)) = request_rx.recv().await else {
+            panic!("expected fallback didChange");
+        };
+        assert_eq!(notification.params["contentChanges"][0]["text"], "latest");
+        assert_eq!(
+            client.files_content[&file_uri(file).unwrap()].to_string(),
+            "latest"
+        );
+    }
+
+    #[tokio::test]
     async fn full_sync_moves_contents_into_notification_and_releases_cached_copy() {
         let (request_tx, mut request_rx) = mpsc::channel(4);
         let (_response_tx, response_rx) = mpsc::channel(1);
@@ -3324,7 +3458,7 @@ mod test {
         let file = "/tmp/full-sync.rs";
         let uri = file_uri(file).unwrap();
         client.did_open(file, "old").await.unwrap();
-        assert_eq!(client.files_content[&uri], "old");
+        assert_eq!(client.files_content[&uri].to_string(), "old");
 
         let contents = "updated 👋".repeat(64);
         let contents_ptr = contents.as_ptr();
@@ -3367,7 +3501,7 @@ mod test {
 
         client.did_change(file, "latest".to_string()).await.unwrap();
 
-        assert_eq!(client.files_content[&uri], "latest");
+        assert_eq!(client.files_content[&uri].to_string(), "latest");
         assert!(matches!(
             request_rx.recv().await,
             Some(OutboundMessage::Notification(notification))

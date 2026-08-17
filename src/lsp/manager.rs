@@ -407,6 +407,20 @@ impl LspClient for LspManager {
         result
     }
 
+    async fn did_change_edits(
+        &mut self,
+        file: &str,
+        change: super::DocumentChange,
+    ) -> Result<(), LspError> {
+        if let Some(key) = self.document_clients.get(file) {
+            if let Some(client) = self.clients.get_mut(key) {
+                return client.did_change_edits(file, change).await;
+            }
+        }
+        // Lazy routing may open the latest image. Do not apply older ranges to it.
+        self.did_change(file, change.after.to_string()).await
+    }
+
     async fn did_save(&mut self, file: &str, contents: &str) -> Result<(), LspError> {
         self.did_open(file, contents).await?;
         if let Some(key) = self.document_clients.get(file) {

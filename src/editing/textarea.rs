@@ -1553,14 +1553,49 @@ impl TextArea {
     }
 
     fn replay_keys(&mut self, recipe: &[char], layout: LayoutOptions) {
-        for character in recipe.iter().take(MAX_MACRO_EVENTS) {
-            let code = if *character == '\u{1b}' {
-                KeyCode::Esc
-            } else {
-                KeyCode::Char(*character)
-            };
-            self.handle_key(KeyEvent::new(code, KeyModifiers::NONE), layout);
+        let recipe = &recipe[..recipe.len().min(MAX_MACRO_EVENTS)];
+        let mut index = 0;
+        while index < recipe.len() {
+            if self.state.mode == Mode::Insert && matches!(recipe[index], ' '..='~') {
+                let end = index
+                    + recipe[index..]
+                        .iter()
+                        .take_while(|ch| matches!(**ch, ' '..='~'))
+                        .count();
+                let contents = self.text();
+                let byte = grapheme_to_byte(&contents, self.state.cursor);
+                // Printable ASCII cannot join another ASCII grapheme. A
+                // non-ASCII suffix may begin with a combining mark, so keep
+                // the original per-key semantics at that boundary.
+                if contents
+                    .as_bytes()
+                    .get(byte)
+                    .is_none_or(|next| next.is_ascii())
+                {
+                    let text = recipe[index..end].iter().collect::<String>();
+                    for &ch in &recipe[index..end] {
+                        self.record_insert_character(ch);
+                    }
+                    let accepted = text
+                        .len()
+                        .min(self.max_bytes.saturating_sub(contents.len()));
+                    self.insert(&text[..accepted]);
+                    index = end;
+                    continue;
+                }
+            }
+            self.replay_key(recipe[index], layout);
+            index += 1;
         }
+    }
+
+    fn replay_key(&mut self, character: char, layout: LayoutOptions) {
+        let code = if character == '\u{1b}' {
+            KeyCode::Esc
+        } else {
+            KeyCode::Char(character)
+        };
+        self.handle_key(KeyEvent::new(code, KeyModifiers::NONE), layout);
     }
 
     fn repeat_motion(&mut self, count: u16, mut motion: impl FnMut(&mut Self)) {
@@ -1891,6 +1926,54 @@ mod tests {
         area.set_cursor(0);
         area.set_mode(Mode::Normal);
         area
+    }
+
+    #[test]
+    fn batched_insert_replay_matches_per_key_unicode_and_capacity_behavior() {
+        for text in [
+            "plain text",
+            "λ😀tail",
+            "\u{301}tail",
+            "a\u{301}b",
+            "\u{600}a",
+            "👩\u{200d}💻 tail",
+            "first\nlast",
+        ] {
+            for cursor in [0, 1, crate::unicode_utils::grapheme_len(text)] {
+                for capacity in [text.len() + 5, 4096] {
+                    for recipe in [
+                        "iHello world\u{1b}",
+                        "iλx\u{301}y\u{1b}",
+                        "ihello\nworld\u{1b}",
+                    ] {
+                        let mut fast = TextArea::with_max_bytes(text, capacity);
+                        let mut slow = TextArea::with_max_bytes(text, capacity);
+                        for area in [&mut fast, &mut slow] {
+                            area.set_cursor(cursor);
+                            area.set_mode(Mode::Normal);
+                            area.replaying = true;
+                        }
+                        let recipe = recipe.chars().collect::<Vec<_>>();
+                        let layout = crate::text_layout::LayoutOptions::grapheme(80);
+                        fast.replay_keys(&recipe, layout);
+                        for &ch in &recipe {
+                            slow.replay_key(ch, layout);
+                        }
+                        assert_eq!(
+                            (fast.text(), fast.cursor(), fast.mode()),
+                            (slow.text(), slow.cursor(), slow.mode()),
+                            "text={text:?}, cursor={cursor}, capacity={capacity}"
+                        );
+                        fast.undo();
+                        slow.undo();
+                        assert_eq!((fast.text(), fast.cursor()), (slow.text(), slow.cursor()));
+                        fast.redo();
+                        slow.redo();
+                        assert_eq!((fast.text(), fast.cursor()), (slow.text(), slow.cursor()));
+                    }
+                }
+            }
+        }
     }
 
     #[test]

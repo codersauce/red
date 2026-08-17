@@ -9,16 +9,22 @@ sources:
   - id: editor
     type: file
     path: src/editor.rs
+  - id: edit-batch
+    type: file
+    path: src/editor/edit_batch.rs
+  - id: client
+    type: file
+    path: src/lsp/client.rs
   - id: lazy-tests
     type: file
     path: tests/lsp_lazy.rs
 ---
 
-LSP document sync in Red is owned by the editor, not by the LSP manager. The manager routes requests to server processes, while `LspCoordinator` records which document URIs the editor has told servers are open and which buffer revisions have already been delivered [@coordinator]. The editor opens a file buffer only when an LSP operation needs it, sends full-content change notifications after the editor mutation boundary, stores diagnostics by normalized URI, and closes or reopens documents when buffer identity changes [@editor]. This layer connects user actions from the [event loop](event-loop) to the process routing described by [LSP Client Lifecycle And Routing](../lsp/client-lifecycle-and-routing).
+LSP document sync in Red is owned by the editor, not by the LSP manager. The manager routes requests to server processes, while `LspCoordinator` records which document URIs the editor has told servers are open and which buffer revisions have already been delivered [@coordinator]. The editor opens a file buffer only when an LSP operation needs it, publishes canonical edits or a full-content fallback after the editor mutation boundary, stores diagnostics by normalized URI, and closes or reopens documents when buffer identity changes [@editor]. This layer connects user actions from the [event loop](event-loop) to the process routing described by [LSP Client Lifecycle And Routing](../lsp/client-lifecycle-and-routing).
 
 ## Coordinator State
 
-`LspCoordinator` has two pieces of state: `opened_documents`, a set of URI strings currently reported as open to LSP servers, and `notified_revisions`, a map from `BufferId` to the latest buffer revision delivered to external consumers [@coordinator]. `with_buffers` seeds revision state from existing buffers but starts with no opened documents, so constructing an editor does not imply `didOpen` [@coordinator].
+`LspCoordinator` tracks opened URI strings, the latest delivered revision per `BufferId`, and ordered pending canonical edits with their pre-edit Rope snapshot and revision chain. It also caches whether a revision uses line endings supported by the direct UTF-16 conversion [@coordinator]. `with_buffers` seeds revision state from existing buffers but starts with no opened documents, so constructing an editor does not imply `didOpen` [@coordinator].
 
 The coordinator is deliberately small. It can mark a URI opened or closed, clear all opened documents, record or seed a notified revision, test whether a revision is already notified, and forget a closed buffer [@coordinator]. That gives the editor enough memory to suppress duplicate opens, skip redundant flushes, and discard per-buffer revision state when a buffer is deleted [@coordinator].
 
@@ -30,7 +36,9 @@ Most LSP-facing actions call the lazy-open helper before issuing their request. 
 
 ## Change Delivery
 
-`notify_change` is the editor-side sync point after a content mutation. If block replay is active, it defers the notification; otherwise, when LSP is enabled and the current buffer has a file, it ensures the buffer is open and sends `did_change` with the full current buffer contents [@editor]. The same method then notifies plugins of `buffer:changed` and records the current buffer revision as notified [@editor].
+`notify_change` is the editor-side sync point after a content mutation. Local edit batches queue changed buffers by stable identity; nested dot, macro, counted, and block replay share the outer publication boundary. Unknown or external actions flush first, and mode transitions remain observable to plugins [@edit-batch]. Publication ensures the target buffer is open, sends its document change, emits `buffer:changed`, and records the delivered revision without switching the active window [@editor].
+
+Canonical replacements retain ordered UTF-16 ranges and cheap before/after Rope snapshots. Adjacent same-line insertions can merge. An incremental server receives those ranges only when its cached preimage matches exactly; full-sync servers, revision gaps such as undo, lazy-open mismatches, and unsupported line separators retain the full-text fallback [@coordinator] [@client]. Document versions and debounced diagnostics still advance through the client [@client].
 
 `flush_change_notification` reads the active buffer revision and returns early if the coordinator already recorded that exact revision [@editor]. Otherwise it calls `notify_change`, which keeps delayed or grouped changes from leaving the LSP and plugin observers behind the current buffer state [@editor]. This follows the same canonical mutation boundary described by [Text Mutation Boundary](text-mutation-boundary): direct buffer helpers can change text, but production actions must pass through the editor path that opens transactions and notifies observers.
 

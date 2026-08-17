@@ -254,6 +254,8 @@ pub struct UndoHistory {
     current: Option<usize>,
     branch_selection: HashMap<usize, usize>,
     active_transaction: Option<EditTransaction>,
+    #[serde(skip)]
+    active_insert_end: Option<usize>,
     current_revision: u64,
     saved_revision: u64,
     next_revision: u64,
@@ -270,6 +272,7 @@ impl Default for UndoHistory {
             current: None,
             branch_selection: HashMap::new(),
             active_transaction: None,
+            active_insert_end: None,
             current_revision: 0,
             saved_revision: 0,
             next_revision: 1,
@@ -311,6 +314,7 @@ impl UndoHistory {
         origin: EditOrigin,
     ) {
         if self.active_transaction.is_none() {
+            self.active_insert_end = None;
             self.active_transaction = Some(EditTransaction::new(
                 label,
                 before_cursor,
@@ -365,6 +369,23 @@ impl UndoHistory {
         }
 
         if let Some(transaction) = &mut self.active_transaction {
+            let insertion = old_text.is_empty() && range.start == range.end;
+            let insertion_end = insertion.then(|| start_char + new_text.chars().count());
+            if insertion && self.active_insert_end == Some(start_char) {
+                if let Some(TextEdit::Replace {
+                    old_text: previous_old,
+                    new_text: previous_new,
+                    ..
+                }) = transaction.edits.last_mut()
+                {
+                    if previous_old.is_empty() {
+                        previous_new.push_str(&new_text);
+                        self.active_insert_end = insertion_end;
+                        return;
+                    }
+                }
+            }
+            self.active_insert_end = insertion_end;
             transaction.edits.push(TextEdit::Replace {
                 range,
                 start_char,
@@ -379,6 +400,7 @@ impl UndoHistory {
     /// Returns `true` only when history advanced. Empty transactions are discarded and
     /// sibling branches remain available.
     pub fn commit_transaction(&mut self, after_cursor: CursorSnapshot) -> bool {
+        self.active_insert_end = None;
         let Some(mut transaction) = self.active_transaction.take() else {
             return false;
         };
@@ -466,6 +488,7 @@ impl UndoHistory {
             .is_some_and(EditTransaction::is_empty)
         {
             self.active_transaction = None;
+            self.active_insert_end = None;
         }
     }
 
