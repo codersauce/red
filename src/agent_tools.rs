@@ -15,6 +15,29 @@ use crate::codex::CodexToolHost;
 /// Maximum number of edits accepted in one atomic editor operation.
 pub const MAX_EDITOR_EDITS: usize = 128;
 
+/// Maximum annotations accepted in one Agent tool call.
+pub const MAX_AGENT_ANNOTATIONS_PER_CALL: usize = crate::inline_assist::MAX_COMMENTS;
+
+/// One zero-based, inclusive source-line range rendered as an inline annotation.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct EditorAnnotationInput {
+    /// Inclusive zero-based start line in the file.
+    pub start_line: usize,
+    /// Inclusive zero-based end line; defaults to `start_line`.
+    #[serde(default)]
+    pub end_line: Option<usize>,
+    /// Plain-text annotation body.
+    pub message: String,
+}
+
+impl EditorAnnotationInput {
+    #[must_use]
+    pub fn last_line(&self) -> usize {
+        self.end_line.unwrap_or(self.start_line)
+    }
+}
+
 /// A zero-based UTF-16 position, compatible with LSP coordinates.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -70,6 +93,14 @@ pub enum EditorActionName {
     NextBuffer,
     /// Activate the previous buffer.
     PreviousBuffer,
+    /// Select the next source annotation in the active buffer.
+    NextAnnotation,
+    /// Select the previous source annotation in the active buffer.
+    PreviousAnnotation,
+    /// Select the next annotation overlapping the current source location.
+    NextOverlappingAnnotation,
+    /// Select the previous annotation overlapping the current source location.
+    PreviousOverlappingAnnotation,
 }
 
 /// Semantic operation executed by Red's editor owner task.
@@ -100,6 +131,20 @@ pub enum EditorToolCall {
     CreateDirectory {
         /// Workspace-relative or accepted absolute path. Missing parents are created.
         path: String,
+    },
+    /// Add source-linked annotations without changing file contents.
+    AddAnnotations {
+        /// Existing workspace file to annotate.
+        path: String,
+        /// Visible buffer revision returned by the preceding read.
+        expected_revision: u64,
+        /// Bounded, zero-based inclusive line ranges and messages.
+        annotations: Vec<EditorAnnotationInput>,
+    },
+    /// Hide existing source annotations by their stable identifiers.
+    DismissAnnotations {
+        /// Annotation UUIDs returned by add or editor-state tools.
+        annotation_ids: Vec<String>,
     },
     /// Read a bounded snapshot of active editor state.
     GetEditorState {},
@@ -174,6 +219,12 @@ impl EditorToolCall {
             Self::ReadFile { path } => format!("Reading {path}"),
             Self::WriteFile { path, .. } => format!("Writing {path}"),
             Self::CreateDirectory { path } => format!("Creating {path}/"),
+            Self::AddAnnotations {
+                path, annotations, ..
+            } => format!("Annotating {path} ({} comment(s))", annotations.len()),
+            Self::DismissAnnotations { annotation_ids } => {
+                format!("Dismissing {} annotation(s)", annotation_ids.len())
+            }
             Self::GetEditorState {} => "Inspecting editor state".to_string(),
             Self::OpenFile { path, .. } => format!("Opening {path}"),
             Self::SelectText { path, .. } => format!("Selecting text in {path}"),
@@ -389,7 +440,9 @@ pub fn editor_tool_schemas(schema_key: &str) -> Vec<Value> {
                         "type": "string",
                         "enum": [
                             "go_to_definition", "hover", "refresh_diagnostics", "signature_help",
-                            "jump_back", "jump_forward", "next_buffer", "previous_buffer"
+                            "jump_back", "jump_forward", "next_buffer", "previous_buffer",
+                            "next_annotation", "previous_annotation",
+                            "next_overlapping_annotation", "previous_overlapping_annotation"
                         ]
                     }
                 },
@@ -401,6 +454,51 @@ pub fn editor_tool_schemas(schema_key: &str) -> Vec<Value> {
             "create_directory",
             "Create a directory and missing parents inside the workspace. Existing directories are accepted. Does not open or change a buffer.",
             json!({"type": "object", "properties": {"path": {"type": "string", "minLength": 1}}, "required": ["path"], "additionalProperties": false}),
+        ),
+        (
+            "add_annotations",
+            "Add source-linked annotation cards without changing file contents. Read the file first and use its current revision. Lines are zero-based and inclusive. Each returned annotation includes a stable ID and canonical href for linking to the card from Agent Markdown.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "expected_revision": {"type": "integer", "minimum": 0},
+                    "annotations": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": MAX_AGENT_ANNOTATIONS_PER_CALL,
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "start_line": {"type": "integer", "minimum": 0},
+                                "end_line": {"type": "integer", "minimum": 0, "description": "Inclusive end; omit for one line."},
+                                "message": {"type": "string", "minLength": 1, "maxLength": crate::inline_assist::MAX_COMMENT_BYTES}
+                            },
+                            "required": ["start_line", "message"],
+                            "additionalProperties": false
+                        }
+                    }
+                },
+                "required": ["path", "expected_revision", "annotations"],
+                "additionalProperties": false
+            }),
+        ),
+        (
+            "dismiss_annotations",
+            "Hide source annotation cards by stable ID. This never edits source or deletes retained conversations.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "annotation_ids": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": MAX_AGENT_ANNOTATIONS_PER_CALL,
+                        "items": {"type": "string", "format": "uuid"}
+                    }
+                },
+                "required": ["annotation_ids"],
+                "additionalProperties": false
+            }),
         ),
     ];
     definitions
@@ -497,11 +595,19 @@ mod tests {
     fn tool_schemas_are_strict_and_bounded() {
         for schema_key in ["parameters", "inputSchema"] {
             let tools = editor_tool_schemas(schema_key);
-            assert_eq!(tools.len(), 6);
+            assert_eq!(tools.len(), 8);
             assert!(tools
                 .iter()
                 .all(|tool| tool[schema_key]["additionalProperties"] == false));
             assert_eq!(tools[3][schema_key]["properties"]["edits"]["maxItems"], 128);
+            assert_eq!(
+                tools[6][schema_key]["properties"]["annotations"]["maxItems"],
+                MAX_AGENT_ANNOTATIONS_PER_CALL
+            );
+            assert_eq!(
+                tools[7][schema_key]["properties"]["annotation_ids"]["maxItems"],
+                MAX_AGENT_ANNOTATIONS_PER_CALL
+            );
             assert_eq!(
                 tools[1][schema_key]["required"],
                 json!(["path", "line", "character", "target"])
@@ -530,6 +636,31 @@ mod tests {
         assert!(
             EditorToolCall::parse("open_file", json!({"path": "main.rs", "tool": "quit"})).is_err()
         );
+        assert_eq!(
+            EditorToolCall::parse(
+                "add_annotations",
+                json!({
+                    "path": "main.rs",
+                    "expected_revision": 3,
+                    "annotations": [{"start_line": 1, "message": "Review this."}]
+                })
+            )
+            .unwrap(),
+            EditorToolCall::AddAnnotations {
+                path: "main.rs".to_string(),
+                expected_revision: 3,
+                annotations: vec![EditorAnnotationInput {
+                    start_line: 1,
+                    end_line: None,
+                    message: "Review this.".to_string(),
+                }],
+            }
+        );
+        assert!(EditorToolCall::parse(
+            "dismiss_annotations",
+            json!({"annotation_ids": ["id"], "delete_history": true})
+        )
+        .is_err());
     }
 
     #[test]

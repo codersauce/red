@@ -1672,7 +1672,8 @@ impl Editor {
                     InlineCommentOrigin::Sample
                     | InlineCommentOrigin::Activity { .. }
                     | InlineCommentOrigin::ChangeSummary { .. }
-                    | InlineCommentOrigin::AgentOutcome { .. } => return None,
+                    | InlineCommentOrigin::AgentOutcome { .. }
+                    | InlineCommentOrigin::AgentAnnotation { .. } => return None,
                 };
                 let turn = self.inline_history.turn(request)?;
                 let resolved = self.resolve_history_comment(turn, index);

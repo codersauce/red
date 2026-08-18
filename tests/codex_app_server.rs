@@ -80,7 +80,8 @@ for line in sys.stdin:
         expected_tools = {
             "list_files", "search_files", "read_file", "write_file",
             "get_editor_state", "open_file", "select_text", "apply_edits",
-            "run_editor_action", "create_directory",
+            "run_editor_action", "create_directory", "add_annotations",
+            "dismiss_annotations",
         }
         tool_names = [tool["name"] for tool in message["params"]["dynamicTools"]]
         assert len(tool_names) == len(expected_tools) and set(tool_names) == expected_tools, tool_names

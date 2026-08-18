@@ -53,7 +53,9 @@ pub use runtime::{
 pub(crate) fn husk_lsp_declarations() -> &'static str {
     runtime::RED_HOST_DECLARATIONS
 }
-pub(crate) use text_link::TextPanelLinkTarget;
+#[cfg(test)]
+pub(crate) use text_link::markdown_link_target;
+pub(crate) use text_link::{annotation_link_destination, TextPanelLinkTarget};
 pub(crate) use text_link::{TextPanelFileLocation, TextPanelLink};
 pub use window_bar::{
     RenderedWindowBar, WindowBarConfig, WindowBarEdge, WindowBarHitRegion, WindowBarManager,

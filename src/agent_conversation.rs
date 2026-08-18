@@ -7,6 +7,9 @@ const MAX_TRANSCRIPT_ITEMS: usize = 512;
 const MAX_TRANSCRIPT_CHARS: usize = 1_048_576;
 const EDITOR_CONTEXT_MARKER: &str = "\n\nActive editor context from ";
 
+/// Maximum source annotations retained with one Agent conversation.
+pub const MAX_AGENT_ANNOTATIONS: usize = 512;
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentTranscriptRole {
@@ -23,6 +26,21 @@ pub struct AgentTranscriptItem {
     pub text: String,
 }
 
+/// Recoverable source annotation created by the full Agent workflow.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AgentAnnotationRecord {
+    pub id: String,
+    #[serde(default)]
+    pub session_id: String,
+    pub turn_id: String,
+    pub path: String,
+    pub start_line: usize,
+    pub end_line: usize,
+    pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_fingerprint: Option<[u8; 32]>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AgentConversationSnapshot {
     pub thread_id: String,
@@ -31,6 +49,8 @@ pub struct AgentConversationSnapshot {
     pub model_info: Option<crate::codex::AgentModelInfo>,
     #[serde(default)]
     pub items: Vec<AgentTranscriptItem>,
+    #[serde(default)]
+    pub annotations: Vec<AgentAnnotationRecord>,
 }
 
 impl AgentConversationSnapshot {
@@ -76,6 +96,7 @@ impl AgentConversationSnapshot {
             cwd: cwd.into(),
             model_info: None,
             items: Vec::new(),
+            annotations: Vec::new(),
         }
     }
 

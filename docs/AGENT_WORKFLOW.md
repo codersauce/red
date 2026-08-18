@@ -346,7 +346,7 @@ Every Codex thread is started with:
 Native command, file-change, and permission escalation requests are denied.
 Red never asks Codex to edit the workspace directly.
 
-Codex receives ten dynamic tools:
+Codex receives twelve dynamic tools:
 
 | Tool | Behavior |
 | --- | --- |
@@ -355,11 +355,32 @@ Codex receives ten dynamic tools:
 | `read_file` | Reveals and reads the authoritative Red buffer, returning its revision. |
 | `write_file` | Replaces revision-checked contents through Red, creates missing parent directories, and saves the buffer. |
 | `create_directory` | Creates a workspace directory and missing parents; an existing directory is a successful no-op. |
-| `get_editor_state` | Returns bounded active-file, cursor, selection, window, and diagnostic state. |
+| `get_editor_state` | Returns bounded active-file, cursor, selection, window, diagnostic, and current-annotation state. |
 | `open_file` | Opens a safe workspace file in the requested split. |
 | `select_text` | Creates a UTF-16-addressed editor selection. |
 | `apply_edits` | Applies atomic, revision-checked UTF-16 edits, creates missing parent directories, and saves the buffer. |
-| `run_editor_action` | Runs an allow-listed navigation or LSP action. |
+| `add_annotations` | Adds up to 16 revision-checked source annotation cards without editing or saving the file. |
+| `dismiss_annotations` | Hides visible annotation cards by stable ID without deleting source or conversation history. |
+| `run_editor_action` | Runs an allow-listed navigation or LSP action, including annotation traversal and overlap cycling. |
+
+Agent annotations use zero-based, inclusive file line ranges. They share inline
+assist's source anchors, overlap projection, stale-source indicator, cards, and
+keyboard controls. The first added annotation becomes current. The
+`annotations` object returned by `get_editor_state` reports the visible count
+and the current card's stable ID, line range, message, provenance, and stale
+state. `next_annotation` and `previous_annotation` walk the active file;
+`next_overlapping_annotation` and `previous_overlapping_annotation` cycle the
+cards at the current source location. Agent-created cards survive normal session
+recovery with their IDs and tracked locations. They do not change buffer dirty
+state, text revision, undo history, or files on disk.
+
+Each item returned by `add_annotations` includes a canonical
+`red://annotation/<uuid>` `href`. Agent responses can use that exact value as a
+Markdown destination to connect explanatory prose to a particular card. Link
+activation is resolved as a typed internal target: Red switches to the card's
+live buffer, moves to its tracked source anchor, and opens the card. Dismissed
+or otherwise unavailable annotations report a quiet status message and never
+fall through to file-path or external-URL handling.
 
 Tool paths must remain below the physical workspace root. Reads and writes
 reject parent traversal, symlink components, special files, unsafe roots,
