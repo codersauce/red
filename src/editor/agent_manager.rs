@@ -7,7 +7,7 @@ use std::{
 };
 
 use crate::{
-    agent_conversation::AgentConversationSnapshot,
+    agent_conversation::{AgentAnnotationRecord, AgentConversationSnapshot},
     agent_tools::{PendingEditorTool, PendingEditorToolResponse},
     codex::CodexBridge,
 };
@@ -293,6 +293,12 @@ impl AgentManager {
 
     pub fn conversation_snapshot(&self) -> Option<AgentConversationSnapshot> {
         self.conversation.clone()
+    }
+
+    pub fn replace_annotation_records(&mut self, annotations: Vec<AgentAnnotationRecord>) {
+        if let Some(conversation) = self.conversation.as_mut() {
+            conversation.annotations = annotations;
+        }
     }
 
     pub fn forget_conversation(&mut self, session_id: &str) {

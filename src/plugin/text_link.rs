@@ -1,7 +1,14 @@
 //! Link targets recognized in source-backed text panels.
 
+use uuid::Uuid;
+
+const ANNOTATION_LINK_PREFIX: &str = "red://annotation/";
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum TextPanelLinkTarget {
+    Annotation {
+        id: Uuid,
+    },
     File {
         path: String,
         location: Option<TextPanelFileLocation>,
@@ -12,6 +19,10 @@ pub(crate) enum TextPanelLinkTarget {
         panel_id: String,
         block_id: String,
     },
+}
+
+pub(crate) fn annotation_link_destination(id: Uuid) -> String {
+    format!("{ANNOTATION_LINK_PREFIX}{id}")
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -30,6 +41,13 @@ pub(crate) struct TextPanelLink {
 
 pub(crate) fn markdown_link_target(destination: &str) -> Option<TextPanelLinkTarget> {
     let destination = destination.trim();
+    if let Some(id) = destination.strip_prefix(ANNOTATION_LINK_PREFIX) {
+        let id = Uuid::parse_str(id).ok()?;
+        if id.hyphenated().to_string() != destination[ANNOTATION_LINK_PREFIX.len()..] {
+            return None;
+        }
+        return Some(TextPanelLinkTarget::Annotation { id });
+    }
     let lowercase = destination.to_ascii_lowercase();
     if lowercase.starts_with("https://") || lowercase.starts_with("http://") {
         return Some(TextPanelLinkTarget::ExternalUrl(destination.to_string()));
@@ -419,6 +437,15 @@ mod tests {
 
     #[test]
     fn classifies_markdown_destinations() {
+        let annotation_id = Uuid::parse_str("12345678-1234-5678-9abc-1234567890ab").unwrap();
+        assert_eq!(
+            annotation_link_destination(annotation_id),
+            "red://annotation/12345678-1234-5678-9abc-1234567890ab"
+        );
+        assert_eq!(
+            markdown_link_target("red://annotation/12345678-1234-5678-9abc-1234567890ab"),
+            Some(TextPanelLinkTarget::Annotation { id: annotation_id })
+        );
         assert_eq!(
             markdown_link_target("https://example.com/docs"),
             Some(TextPanelLinkTarget::ExternalUrl(
@@ -443,5 +470,14 @@ mod tests {
             })
         );
         assert_eq!(markdown_link_target("#section"), None);
+        assert_eq!(markdown_link_target("red://annotation/not-a-uuid"), None);
+        assert_eq!(
+            markdown_link_target("red://annotation/12345678-1234-5678-9ABC-1234567890AB"),
+            None
+        );
+        assert_eq!(
+            markdown_link_target("red://annotation/12345678-1234-5678-9abc-1234567890ab?open=true"),
+            None
+        );
     }
 }

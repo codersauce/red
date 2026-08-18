@@ -17,21 +17,29 @@ sources:
     path: docs/AGENT_WORKFLOW.md
 ---
 
-Dynamic tools and editor tools are Red's app-server capability layer for Codex. The Codex worker publishes four workspace dynamic tools directly, extends them with five strict editor-tool schemas, and routes editor-aware reads, writes, selections, and safe actions through the editor owner task [@codex] [@tools]. This layer is where the [Codex App-Server Workflow](codex-app-server-workflow) becomes editor-aware: Codex can list, search, read, open, select, run allow-listed editor actions, and request edits, but each operation is bounded, schema-checked, session-scoped, and mediated by Red [@workflow] [@editor].
+Dynamic tools and editor tools are Red's app-server capability layer for Codex. The Codex worker publishes four workspace dynamic tools directly, extends them with eight strict editor-tool schemas, and routes editor-aware reads, writes, annotations, selections, and safe actions through the editor owner task [@codex] [@tools]. This layer is where the [Codex App-Server Workflow](codex-app-server-workflow) becomes editor-aware: Codex can list, search, read, open, select, annotate, run allow-listed editor actions, and request edits, but each operation is bounded, schema-checked, session-scoped, and mediated by Red [@workflow] [@editor].
 
 ## Tool Surface
 
-The app-server worker publishes `list_files`, `search_files`, `read_file`, and `write_file` itself, then appends editor schemas for `get_editor_state`, `open_file`, `select_text`, `apply_edits`, and `run_editor_action` [@codex] [@tools]. `list_files` walks the workspace without following links, respects ignore files, sorts results, and stops at Red's file, entry, and time bounds [@codex]. On Unix, `search_files` reads through descriptor-relative, no-follow, nonblocking filesystem operations; the workflow states that content search is unavailable on platforms without that safe read boundary, so Codex must use `read_file` instead [@codex] [@workflow].
+The app-server worker publishes `list_files`, `search_files`, `read_file`, and `write_file` itself, then appends editor schemas for `get_editor_state`, `open_file`, `select_text`, `apply_edits`, `run_editor_action`, `create_directory`, `add_annotations`, and `dismiss_annotations` [@codex] [@tools]. `list_files` walks the workspace without following links, respects ignore files, sorts results, and stops at Red's file, entry, and time bounds [@codex]. On Unix, `search_files` reads through descriptor-relative, no-follow, nonblocking filesystem operations; the workflow states that content search is unavailable on platforms without that safe read boundary, so Codex must use `read_file` instead [@codex] [@workflow].
 
 `read_file` and `write_file` are editor-tool-host operations. `read_file` opens the safe workspace file through Red when needed and returns editor-visible contents, the current revision, and whether the file exists [@editor]. `write_file` requires that revision, replaces the complete buffer through an agent-origin editor transaction, and saves through Red [@tools] [@editor].
 
-The workflow documentation describes the same nine-tool contract and its expected behavior, including bounded file listing, bounded search, Red-mediated reads, revision-checked writes, editor state snapshots, file opening, UTF-16 selections, revision-checked edits, and allow-listed navigation or LSP actions [@workflow].
+The workflow documentation describes the same twelve-tool contract and its expected behavior, including bounded file listing, bounded search, Red-mediated reads, revision-checked writes, directory creation, editor state snapshots, file opening, UTF-16 selections, revision-checked edits, source annotations, and allow-listed navigation or LSP actions [@workflow].
 
 ## Strict Editor Schemas
 
 Editor tools use strongly parsed Rust enums and JSON schemas with `additionalProperties: false` [@tools]. `EditorToolCall::parse` rejects non-object arguments, rejects attempts to override the tool name, and deserializes with `deny_unknown_fields`, so unknown fields and unregistered action names fail before they reach editor logic [@tools]. Tests assert that schemas are strict, `apply_edits` is capped at 128 edits, and actions such as `quit` are rejected [@tools].
 
-The editor-tool set is intentionally narrow. `get_editor_state` returns a bounded active-editor snapshot; `open_file` opens a workspace file at a UTF-16 line and character in the current, horizontal, or vertical target; `select_text` opens a workspace file and creates a character, line, or block selection; `apply_edits` applies up to 128 atomic revision-checked UTF-16 replacements and saves the file; and `run_editor_action` maps only to safe navigation or LSP actions such as go to definition, hover, diagnostics refresh, signature help, jump history, and buffer switching [@tools] [@editor]. It cannot invoke arbitrary commands, shell, quit, or unrelated text mutations [@tools].
+The editor-tool set is intentionally narrow. `get_editor_state` returns a bounded active-editor snapshot, including the current source annotation; `open_file` opens a workspace file at a UTF-16 line and character in the current, horizontal, or vertical target; `select_text` opens a workspace file and creates a character, line, or block selection; `apply_edits` applies up to 128 atomic revision-checked UTF-16 replacements and saves the file; `add_annotations` adds up to 16 revision-checked line-anchored cards without changing source; `dismiss_annotations` hides cards by stable ID; and `run_editor_action` maps only to safe navigation or LSP actions such as go to definition, hover, diagnostics refresh, signature help, jump history, buffer switching, and annotation traversal [@tools] [@editor]. It cannot invoke arbitrary commands, shell, quit, or unrelated text mutations [@tools].
+
+`add_annotations` returns a canonical `red://annotation/<uuid>` destination for
+each card. Markdown rendered in an Agent transcript recognizes that destination
+as a typed internal link rather than a file or URL. Activating it resolves only
+a visible Agent-owned annotation, switches to the owning buffer, selects the
+tracked source anchor, and opens the shared inline-comment card. Missing or
+dismissed IDs produce a quiet unavailable message without any fallback to
+filesystem or external-link behavior [@editor].
 
 ## UTF-16 Editor Boundary
 

@@ -16,7 +16,7 @@ use crate::{
     unicode_utils::{display_width, display_width_with_tabs, trim_line_ending},
 };
 
-const MAX_BUFFER_COMMENTS: usize = 256;
+pub(super) const MAX_BUFFER_COMMENTS: usize = 256;
 const MAX_FINGERPRINT_BYTES: usize = 256 * 1024;
 
 #[derive(Debug, Clone)]
@@ -31,6 +31,10 @@ pub(super) enum InlineCommentOrigin {
     AgentOutcome {
         request_id: String,
         file: String,
+    },
+    AgentAnnotation {
+        session_id: String,
+        turn_id: String,
     },
     HistoryPreview {
         request_id: String,
@@ -86,6 +90,14 @@ impl InlineComment {
         let (start, end) = self.lines(buffer);
         self.stale = self.expected_fingerprint.is_none()
             || fingerprint(buffer, start, end) != self.expected_fingerprint;
+    }
+
+    pub(super) fn expected_fingerprint(&self) -> Option<[u8; 32]> {
+        self.expected_fingerprint
+    }
+
+    pub(super) fn set_expected_fingerprint(&mut self, fingerprint: Option<[u8; 32]>) {
+        self.expected_fingerprint = fingerprint;
     }
 }
 
@@ -1235,6 +1247,9 @@ impl Editor {
             InlineCommentOrigin::Activity { .. } => "inline activity".to_string(),
             InlineCommentOrigin::ChangeSummary { .. } => "inline changes".to_string(),
             InlineCommentOrigin::AgentOutcome { .. } => "Agent changes".to_string(),
+            InlineCommentOrigin::AgentAnnotation { turn_id, .. } => {
+                format!("Agent annotation · turn {turn_id}")
+            }
             InlineCommentOrigin::HistoryPreview { .. } => "history preview".to_string(),
             InlineCommentOrigin::Assist {
                 session_id,
@@ -1428,7 +1443,7 @@ impl Editor {
         })
     }
 
-    fn inline_comment_visible(&self, comment: &InlineComment) -> bool {
+    pub(super) fn inline_comment_visible(&self, comment: &InlineComment) -> bool {
         !comment.detached
             && matches!(comment.origin, InlineCommentOrigin::HistoryPreview { .. })
                 == self.inline_history_browser.is_some()

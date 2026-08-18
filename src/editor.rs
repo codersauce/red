@@ -15,6 +15,7 @@
 //! `display_layout` and `rendering`, while `render_buffer` owns the terminal-cell
 //! model.
 
+mod agent_annotations;
 mod agent_manager;
 mod agent_models;
 mod buffer_manager;
@@ -2208,6 +2209,9 @@ pub enum Action {
     PreviousInlineComment,
     NextOverlappingInlineComment,
     PreviousOverlappingInlineComment,
+    /// Opens a live Agent-owned source annotation selected from transcript prose.
+    #[serde(skip)]
+    OpenAgentAnnotation(uuid::Uuid),
     #[serde(skip)]
     OpenInlineComment(uuid::Uuid),
     #[serde(skip)]
@@ -8356,6 +8360,11 @@ impl Editor {
             "selection": selection,
             "context": context,
             "windows": windows,
+            "annotations": if included {
+                self.agent_annotation_state()
+            } else {
+                json!({"visible_count": 0, "current": null})
+            },
         })
     }
 
@@ -8627,6 +8636,38 @@ impl Editor {
                     "created": created,
                 }))
             }
+            EditorToolCall::AddAnnotations {
+                path,
+                expected_revision,
+                annotations,
+            } => {
+                let path = resolve_path(&path)?;
+                anyhow::ensure!(
+                    self.open_agent_buffer(&path, /*create*/ false, render_buffer)
+                        .await?
+                        .is_some(),
+                    "annotation file does not exist: {}",
+                    path.display()
+                );
+                let turn_id = self
+                    .agent_manager
+                    .turn_id(&request.session_id)
+                    .ok_or_else(|| anyhow::anyhow!("Agent annotation has no active turn"))?
+                    .to_string();
+                let result = self.add_agent_annotations(
+                    &request.session_id,
+                    &turn_id,
+                    &path.to_string_lossy(),
+                    expected_revision,
+                    annotations,
+                )?;
+                self.render(render_buffer)?;
+                Ok(result)
+            }
+            EditorToolCall::DismissAnnotations { annotation_ids } => {
+                self.dismiss_agent_requested_annotations(&root, annotation_ids, render_buffer)
+                    .await
+            }
             EditorToolCall::GetEditorState {} => Ok(self.agent_editor_state()),
             EditorToolCall::OpenFile {
                 path,
@@ -8766,6 +8807,14 @@ impl Editor {
                     EditorActionName::JumpForward => Action::JumpForward,
                     EditorActionName::NextBuffer => Action::NextBuffer,
                     EditorActionName::PreviousBuffer => Action::PreviousBuffer,
+                    EditorActionName::NextAnnotation => Action::NextInlineComment,
+                    EditorActionName::PreviousAnnotation => Action::PreviousInlineComment,
+                    EditorActionName::NextOverlappingAnnotation => {
+                        Action::NextOverlappingInlineComment
+                    }
+                    EditorActionName::PreviousOverlappingAnnotation => {
+                        Action::PreviousOverlappingInlineComment
+                    }
                 };
                 self.execute(&action, render_buffer, runtime).await?;
                 Ok(self.agent_editor_state())
@@ -8783,9 +8832,9 @@ impl Editor {
             anyhow::bail!("no agent workspace is active");
         };
         let (path, position, create, delay) = match &request.call {
-            EditorToolCall::InlineContext { .. } | EditorToolCall::CreateDirectory { .. } => {
-                return Ok(Duration::ZERO)
-            }
+            EditorToolCall::InlineContext { .. }
+            | EditorToolCall::CreateDirectory { .. }
+            | EditorToolCall::DismissAnnotations { .. } => return Ok(Duration::ZERO),
             EditorToolCall::ReadFile { path } => {
                 (Some(path.as_str()), None, false, Duration::from_millis(300))
             }
@@ -8797,6 +8846,19 @@ impl Editor {
                 edits.first().map(|edit| edit.start),
                 true,
                 Duration::from_millis(700),
+            ),
+            EditorToolCall::AddAnnotations {
+                path, annotations, ..
+            } => (
+                Some(path.as_str()),
+                annotations
+                    .first()
+                    .map(|annotation| crate::agent_tools::EditorPosition {
+                        line: annotation.start_line,
+                        character: 0,
+                    }),
+                false,
+                Duration::from_millis(300),
             ),
             EditorToolCall::OpenFile {
                 path,
@@ -14279,6 +14341,9 @@ impl Editor {
 
     fn follow_text_panel_link(&mut self, target: plugin::TextPanelLinkTarget) -> KeyAction {
         match target {
+            plugin::TextPanelLinkTarget::Annotation { id } => {
+                KeyAction::Single(Action::OpenAgentAnnotation(id))
+            }
             plugin::TextPanelLinkTarget::File { path, location } => {
                 let path = match self.resolve_text_panel_file_path(&path) {
                     Ok(path) => path,
@@ -17905,6 +17970,10 @@ impl Editor {
                     return Ok(quit);
                 }
             }
+            Action::OpenAgentAnnotation(id) => {
+                self.open_linked_agent_annotation(*id, buffer, runtime)
+                    .await?;
+            }
             Action::EnterMode(new_mode) => {
                 add_to_history = false;
                 let old_mode = self.mode;
@@ -21265,6 +21334,7 @@ impl Editor {
                 | Action::JumpToMark { .. }
                 | Action::OpenLocation(_, _)
                 | Action::OpenFile(_)
+                | Action::OpenAgentAnnotation(_)
                 | Action::SplitHorizontalWithFile(_)
                 | Action::SplitVerticalWithFile(_)
                 | Action::NextBuffer
@@ -24387,6 +24457,7 @@ impl Editor {
             self.inline_history.recover();
             self.restore_inline_history_comments();
         }
+        self.restore_agent_annotations();
         if let Err(error) = self
             .preferences
             .merge_plugin_storage_snapshot(&snapshot.plugin_extensions)
@@ -24555,6 +24626,7 @@ impl Editor {
         include_disk_contents: bool,
     ) -> (SessionSnapshot, Vec<Option<SessionDiskFingerprint>>) {
         self.refresh_inline_history_paths();
+        self.sync_agent_annotation_records();
         self.sync_to_window();
         let cwd = std::env::current_dir()
             .ok()
