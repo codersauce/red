@@ -3102,6 +3102,9 @@ pub struct Editor {
     /// Keyboard mode owned by this interactive terminal, never by the detached core.
     keyboard_protocol: crate::keyboard::KeyboardProtocol,
 
+    /// Whether this editor still owns terminal modes that need restoring.
+    terminal_active: bool,
+
     /// Whether render operations should write terminal escape sequences
     terminal_output_enabled: bool,
 
@@ -4628,6 +4631,7 @@ impl Editor {
             window_manager,
             stdout,
             keyboard_protocol: crate::keyboard::KeyboardProtocol::default(),
+            terminal_active: false,
             terminal_output_enabled: true,
             #[cfg(test)]
             pending_terminal_cursor: None,
@@ -8923,8 +8927,18 @@ impl Editor {
     /// A Result indicating success or failure of the editor session
     pub async fn run(&mut self) -> anyhow::Result<()> {
         let _perf_session = perf::PerfSession::start();
+        let mut runtime =
+            Runtime::try_new_with_permissions(self.config.plugin_permissions.clone())?;
+        runtime.set_typecheck_enabled(!self.config.disable_plugin_typecheck);
+        let result = self.run_interactive(&mut runtime).await;
+        self.finish_interactive(&mut runtime).await?;
+        result
+    }
+
+    async fn run_interactive(&mut self, runtime: &mut Runtime) -> anyhow::Result<()> {
         let interactive_startup = perf::PerfSpan::start("startup:interactive");
         terminal::enable_raw_mode()?;
+        self.terminal_active = true;
         self.stdout
             .execute(event::EnableMouseCapture)?
             .execute(event::EnableFocusChange)?
@@ -8942,22 +8956,19 @@ impl Editor {
         // initialization are not lost.
         event::poll(Duration::from_millis(0))?;
 
-        let mut runtime;
         {
             let plugin_startup = perf::PerfSpan::start("startup:plugins");
-            runtime = Runtime::try_new_with_permissions(self.config.plugin_permissions.clone())?;
-            runtime.set_typecheck_enabled(!self.config.disable_plugin_typecheck);
-            self.refresh_plugin_snapshots(&mut runtime, true, true, true)?;
+            self.refresh_plugin_snapshots(runtime, true, true, true)?;
             for (name, path) in &self.config.plugins {
                 let path = Config::resolve_plugin_path(path);
                 self.plugin_registry.add(name, path.as_str());
             }
-            self.plugin_registry.initialize(&mut runtime).await?;
+            self.plugin_registry.initialize(runtime).await?;
             self.plugin_registry
-                .notify(&mut runtime, "editor:ready", json!({}))
+                .notify(runtime, "editor:ready", json!({}))
                 .await?;
-            self.restore_agent_plugin_state(&mut runtime).await?;
-            self.notify_pane_restore_intents(&mut runtime).await?;
+            self.restore_agent_plugin_state(runtime).await?;
+            self.notify_pane_restore_intents(runtime).await?;
             drop(plugin_startup);
         }
 
@@ -8998,7 +9009,7 @@ impl Editor {
                 if self.can_batch_scroll(&ev) {
                     let events = Self::read_scroll_batch(ev, &mut pending_events)?;
                     if self
-                        .process_scroll_batch(events, &mut buffer, &mut runtime)
+                        .process_scroll_batch(events, &mut buffer, runtime)
                         .await?
                     {
                         break 'editor_loop;
@@ -9010,7 +9021,7 @@ impl Editor {
                     .process_editor_event(
                         ev,
                         &mut buffer,
-                        &mut runtime,
+                        runtime,
                         EventRenderMode::CoalescedNavigation,
                     )
                     .await?;
@@ -9030,15 +9041,14 @@ impl Editor {
                                 signature,
                                 &mut pending_events,
                                 &mut buffer,
-                                &mut runtime,
+                                runtime,
                             )
                             .await?
                         {
                             break 'editor_loop;
                         }
                     } else {
-                        self.finish_navigation_batch(&mut buffer, &mut runtime)
-                            .await?;
+                        self.finish_navigation_batch(&mut buffer, runtime).await?;
                     }
                     serviced_background = true;
                     break;
@@ -9052,44 +9062,49 @@ impl Editor {
             if last_terminal_size_reconciliation.elapsed() >= TERMINAL_SIZE_RECONCILE_INTERVAL {
                 last_terminal_size_reconciliation = Instant::now();
                 let observed_size = terminal::size()?;
-                self.reconcile_observed_terminal_size(observed_size, &mut buffer, &mut runtime)
+                self.reconcile_observed_terminal_size(observed_size, &mut buffer, runtime)
                     .await?;
             }
 
             if !serviced_background {
-                self.service_background(&mut buffer, &mut runtime).await?;
+                self.service_background(&mut buffer, runtime).await?;
             }
             if self.persist_session_snapshot(/*force*/ false) {
                 self.render(&mut buffer)?;
             }
         }
 
-        self.shutdown_services(&mut runtime).await;
-
         Ok(())
     }
 
-    async fn shutdown_services(&mut self, runtime: &mut Runtime) {
-        drop(self.agent_manager.take_bridge());
-        if let Some(task) = self.agent_manager.take_task() {
-            match task.await {
-                Ok(Ok(())) => {}
-                Ok(Err(error)) => log!("Codex app-server shutdown failed: {error}"),
-                Err(error) => log!("Codex app-server task failed: {error}"),
-            }
-        }
+    async fn finish_interactive(&mut self, runtime: &mut Runtime) -> anyhow::Result<()> {
+        // Quit has been accepted (or the event loop failed). Give the terminal
+        // back before durable writes and external-process shutdown can block.
+        // A restoration error must not skip the final recovery snapshot.
+        let cleanup_result = self.cleanup();
+        self.shutdown_services(runtime).await;
+        cleanup_result
+    }
 
+    async fn shutdown_services(&mut self, runtime: &mut Runtime) {
+        let _shutdown = perf::PerfSpan::start("shutdown:services");
+        // Closing the command channel starts agent shutdown immediately. Its
+        // process can exit while we persist state and deactivate plugins.
+        drop(self.agent_manager.take_bridge());
+        let agent_task = self.agent_manager.take_task();
+        let before_exit = perf::PerfSpan::start("shutdown:before_exit");
         let snapshot = self.editor_state_snapshot();
         if let Err(err) = self.plugin_registry.before_exit(runtime, snapshot).await {
             log!("Plugin beforeExit failed: {}", err);
         }
+        drop(before_exit);
+        let storage = perf::PerfSpan::start("shutdown:plugin_storage");
+        let mut storage_updates = Vec::new();
         while let Some(request) = runtime.try_recv_request() {
             match request {
                 PluginRequest::SetPluginStorage { plugin, key, value } => {
                     let key = scoped_plugin_storage_key(&plugin, &key);
-                    if let Err(err) = self.preferences.set_plugin_storage(&plugin, &key, value) {
-                        log!("Plugin storage flush failed: {}", err);
-                    }
+                    storage_updates.push((plugin, key, value));
                 }
                 request => {
                     log!(
@@ -9099,11 +9114,29 @@ impl Editor {
                 }
             }
         }
+        if let Err(err) = self.preferences.flush_plugin_storage(storage_updates) {
+            log!("Plugin storage flush failed: {}", err);
+        }
+        drop(storage);
+        let snapshot = perf::PerfSpan::start("shutdown:session_snapshot");
         self.persist_session_snapshot(/*force*/ true);
+        drop(snapshot);
+        let deactivate = perf::PerfSpan::start("shutdown:deactivate_plugins");
         if let Err(err) = self.plugin_registry.deactivate_all(runtime).await {
             log!("Plugin deactivate failed: {}", err);
         }
+        drop(deactivate);
+        let companions = perf::PerfSpan::start("shutdown:companions");
         self.companion_manager.lock().await.shutdown().await;
+        drop(companions);
+        let _agent = perf::PerfSpan::start("shutdown:agent_wait");
+        if let Some(task) = agent_task {
+            match task.await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => log!("Codex app-server shutdown failed: {error}"),
+                Err(error) => log!("Codex app-server task failed: {error}"),
+            }
+        }
     }
 
     fn abort_agent_bridge(&mut self) {
@@ -15431,7 +15464,15 @@ impl Editor {
     }
 
     fn record_command_history(&mut self, command: &str) {
+        let _history = perf::PerfSpan::start("command:history");
         if let Err(error) = self.preferences.record_command(command) {
+            log!("failed to save command history: {error}");
+        }
+    }
+
+    fn flush_command_history(&self) {
+        let _history = perf::PerfSpan::start("command:history_flush");
+        if let Err(error) = self.preferences.save() {
             log!("failed to save command history: {error}");
         }
     }
@@ -17101,12 +17142,17 @@ impl Editor {
     }
 
     pub fn cleanup(&mut self) -> anyhow::Result<()> {
+        if !self.terminal_active {
+            return Ok(());
+        }
+        let _restore = perf::PerfSpan::start("shutdown:restore_terminal");
         let keyboard_result = std::mem::take(&mut self.keyboard_protocol).stop(&mut self.stdout);
         let output_result = Self::restore_terminal_output(&mut self.stdout);
         let raw_mode_result = terminal::disable_raw_mode();
         keyboard_result?;
         output_result?;
         raw_mode_result?;
+        self.terminal_active = false;
         Ok(())
     }
 
@@ -18973,13 +19019,34 @@ impl Editor {
             }
             Action::Command(cmd) => {
                 log!("Handling command: {cmd}");
-                self.record_command_history(cmd);
-
-                for action in self.handle_command(cmd, runtime) {
-                    self.set_legacy_message(None);
-                    if self.execute(&action, buffer, runtime).await? {
-                        return Ok(true);
+                let actions = self.handle_command(cmd, runtime);
+                // Even a small preferences write can stall on the filesystem.
+                // An accepted quit flushes this history with exit-hook storage,
+                // after terminal restoration. Rejected/failed quits flush here.
+                let deferred_history = if actions
+                    .iter()
+                    .any(|action| matches!(action, Action::Quit(_)))
+                {
+                    self.preferences.record_command_deferred(cmd)
+                } else {
+                    self.record_command_history(cmd);
+                    false
+                };
+                let result: anyhow::Result<bool> = async {
+                    for action in actions {
+                        self.set_legacy_message(None);
+                        if self.execute(&action, buffer, runtime).await? {
+                            return Ok(true);
+                        }
                     }
+                    Ok(false)
+                }
+                .await;
+                if deferred_history && !matches!(result, Ok(true)) {
+                    self.flush_command_history();
+                }
+                if result? {
+                    return Ok(true);
                 }
                 self.render(buffer)?;
             }
@@ -20376,6 +20443,7 @@ impl Editor {
                     let pid = Pid::from_raw(/*raw*/ 0);
                     signal::kill(pid, Signal::SIGSTOP)?;
                     terminal::enable_raw_mode()?;
+                    self.terminal_active = true;
                     self.stdout
                         .execute(event::EnableMouseCapture)?
                         .execute(event::EnableFocusChange)?
@@ -32395,6 +32463,131 @@ builtin = "rust"
         assert!(output
             .windows(restore_sequence.len())
             .any(|window| window == restore_sequence));
+    }
+
+    #[cfg(unix)]
+    #[derive(Clone, Default)]
+    struct ShutdownOutput {
+        bytes: Arc<std::sync::Mutex<Vec<u8>>>,
+        fail: bool,
+    }
+
+    #[cfg(unix)]
+    impl std::io::Write for ShutdownOutput {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if self.fail {
+                return Err(std::io::Error::other("terminal unavailable"));
+            }
+            self.bytes.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn interactive_shutdown_restores_and_persists_before_waiting_for_agent() {
+        let mut editor = test_editor(80, 24);
+        let output = ShutdownOutput::default();
+        editor.stdout = std::io::BufWriter::new(Box::new(output.clone()));
+        editor.terminal_active = true;
+        let directory = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(directory.path().join("session"));
+        let latest = store.latest_path();
+        editor.set_session_store(store);
+        let (release, wait) = tokio::sync::oneshot::channel();
+        editor.agent_manager.set_task(tokio::spawn(async move {
+            wait.await?;
+            Ok(())
+        }));
+        let mut runtime = Runtime::new();
+
+        let (result, ()) = tokio::join!(editor.finish_interactive(&mut runtime), async {
+            let bytes = output.bytes.lock().unwrap();
+            assert!(bytes.windows(8).any(|window| window == b"\x1b[?1049l"));
+            assert!(latest.is_file(), "recovery must not wait for the agent");
+            release.send(()).unwrap();
+        });
+        result.unwrap();
+        assert!(!editor.terminal_active);
+        let restored = output.bytes.lock().unwrap().clone();
+        editor.cleanup().unwrap();
+        assert_eq!(*output.bytes.lock().unwrap(), restored);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn interactive_shutdown_persists_even_when_terminal_restore_fails() {
+        let mut editor = test_editor(80, 24);
+        editor.stdout = std::io::BufWriter::new(Box::new(ShutdownOutput {
+            fail: true,
+            ..ShutdownOutput::default()
+        }));
+        editor.terminal_active = true;
+        let directory = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(directory.path().join("session"));
+        let latest = store.latest_path();
+        editor.set_session_store(store);
+
+        let error = editor
+            .finish_interactive(&mut Runtime::new())
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("terminal unavailable"));
+        assert!(latest.is_file());
+        assert!(editor.terminal_active, "failed restoration can be retried");
+    }
+
+    #[tokio::test]
+    async fn accepted_quit_defers_history_until_shutdown() {
+        let mut editor = test_editor(80, 24);
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("preferences.json");
+        editor.preferences = PreferencesStore::load(&path);
+        let mut frame = RenderBuffer::new(80, 24, &Style::default());
+        let mut runtime = Runtime::new();
+
+        assert!(editor
+            .execute(&Action::Command("q".into()), &mut frame, &mut runtime)
+            .await
+            .unwrap());
+        assert_eq!(editor.preferences.command_history(), ["q"]);
+        assert!(
+            !path.exists(),
+            "accepted quit must not wait for preferences I/O"
+        );
+
+        editor.finish_interactive(&mut runtime).await.unwrap();
+        assert_eq!(PreferencesStore::load(&path).command_history(), ["q"]);
+    }
+
+    #[tokio::test]
+    async fn rejected_quit_flushes_history_before_returning_to_editor() {
+        let mut editor = test_editor(80, 24);
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("preferences.json");
+        editor.preferences = PreferencesStore::load(&path);
+        editor.current_buffer_mut().insert_str(0, 0, "changed");
+        let mut frame = RenderBuffer::new(80, 24, &Style::default());
+        let mut runtime = Runtime::new();
+
+        assert!(!editor
+            .execute(&Action::Command("q".into()), &mut frame, &mut runtime)
+            .await
+            .unwrap());
+        assert_eq!(PreferencesStore::load(&path).command_history(), ["q"]);
+        assert!(editor
+            .execute(&Action::Command("q!".into()), &mut frame, &mut runtime)
+            .await
+            .unwrap());
+        assert_eq!(PreferencesStore::load(&path).command_history(), ["q"]);
+
+        editor.finish_interactive(&mut runtime).await.unwrap();
+        assert_eq!(PreferencesStore::load(&path).command_history(), ["q", "q!"]);
     }
 
     #[test]
