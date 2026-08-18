@@ -27,6 +27,8 @@ pub struct AgentTranscriptItem {
 pub struct AgentConversationSnapshot {
     pub thread_id: String,
     pub cwd: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_info: Option<crate::codex::AgentModelInfo>,
     #[serde(default)]
     pub items: Vec<AgentTranscriptItem>,
 }
@@ -72,6 +74,7 @@ impl AgentConversationSnapshot {
         Self {
             thread_id: thread_id.into(),
             cwd: cwd.into(),
+            model_info: None,
             items: Vec::new(),
         }
     }

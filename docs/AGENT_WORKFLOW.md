@@ -384,8 +384,24 @@ protocol is unavailable; it does not fall back to `codex exec` or native edits.
 | `Space i` | Edit the current line or visual selection in a bounded popup. |
 | `:Agent` / `:AgentPrompt` | Open the prompt composer. |
 | `:AgentOpen` | Show and focus the conversation pane without opening a prompt. |
+| `:AgentModel` / `Alt+m` in the Agent pane | Choose this conversation’s model and reasoning effort. |
 | `:AgentCancel` | Interrupt the active Codex turn. |
 | `:AgentClear` | Clear visible conversation while retaining current context. |
 | `:AgentNew` | Close the current thread and start a new one. |
 | `:AgentClose` | Hide the conversation panel without discarding state. |
 | `:AgentHistory` | Inspect attributed agent transactions. |
+
+### Choosing a model
+
+Opening the Agent pane reads the workspace's configured Codex model without
+starting a conversation. Once a thread starts or resumes, its confirmed model
+and reasoning effort replace that preview. Click the model, press `Alt+m` from the pane's composer or transcript, or run
+`:AgentModel` from anywhere. Model names take priority over descriptions when
+space is limited, and a checkmark identifies the current choice. Search the
+model list, select with Enter, then choose a supported reasoning effort. Red
+preloads the catalog when the pane opens; if it is still loading, the picker
+shows a spinner and preserves anything you type while waiting. Escape leaves the previous settings and
+draft intact. Changes affect only this conversation; a running turn finishes
+with its existing model, and the header shows the accepted next-message choice.
+New conversations use Codex's default unless a model was explicitly selected
+before their first message. Red never changes global Codex configuration.

@@ -59,6 +59,7 @@ struct AgentConversationItem {
 struct AgentConversationEvent {
     thread_id: String,
     cwd: String,
+    model_info: Json,
     items: [AgentConversationItem],
 }
 
@@ -196,6 +197,20 @@ struct AgentPermissionEvent {
 }
 
 struct AgentState {
+    default_model_info: Json,
+    default_model_loading: bool,
+    model_info: Json,
+    turn_model_info: Json,
+    accepted_model: Json,
+    model_catalog: [Json],
+    model_catalog_loaded: bool,
+    model_catalog_request: i32,
+    model_picker: Option<i32>,
+    model_picker_session: String,
+    model_picker_loading: bool,
+    model_selection: Json,
+    model_header_text: String,
+    model_header_secondary: String,
     session_id: String,
     panel_created: bool,
     panel_open: bool,
@@ -231,6 +246,20 @@ struct AgentState {
 #[red::state]
 fn initial_state() -> AgentState {
     return AgentState {
+        default_model_info: Json {},
+        default_model_loading: false,
+        model_info: Json {},
+        turn_model_info: Json {},
+        accepted_model: Json {},
+        model_catalog: [],
+        model_catalog_loaded: false,
+        model_catalog_request: -1,
+        model_picker: None,
+        model_picker_session: "",
+        model_picker_loading: false,
+        model_selection: Json {},
+        model_header_text: "",
+        model_header_secondary: "",
         session_id: "",
         panel_created: false,
         panel_open: false,
@@ -267,6 +296,286 @@ fn initial_state() -> AgentState {
     };
 }
 
+struct AgentModelChangedEvent {
+    session_id: String,
+    model_info: Json,
+}
+
+struct AgentModelReroutedEvent {
+    session_id: String,
+    model: String,
+}
+
+#[red::on("agent:model_rerouted")]
+fn model_rerouted(event: AgentModelReroutedEvent) {
+    if event.session_id == "" || event.session_id != state().session_id { return; }
+    red::state_patch(AgentState { turn_model_info: Json { model: event.model } });
+    refresh_model_header();
+}
+
+struct AgentModelsResult {
+    models: [Json],
+    error: String,
+}
+
+struct AgentDefaultModelResult {
+    model_info: Json,
+    error: String,
+}
+
+// Preview only: opening a pane must not create a conversation or change settings.
+fn load_default_model() {
+    if state().session_id != "" || state().default_model_loading
+        || state().pending_prompt != "" || state().restoring { return; }
+    red::state_patch(AgentState { default_model_loading: true });
+    red::request("AgentReadDefaultModel", default_model_loaded);
+}
+
+fn default_model_loaded(result: AgentDefaultModelResult) {
+    red::state_patch(AgentState { default_model_loading: false });
+    if red::string(result.error, "") != "" { return; }
+    red::state_patch(AgentState { default_model_info: result.model_info });
+    refresh_model_header();
+}
+
+fn next_model_info() -> Json {
+    if model_name(state().accepted_model) != "" { return state().accepted_model; }
+    if model_name(state().model_info) != "" { return state().model_info; }
+    if state().session_id == "" { return state().default_model_info; }
+    return Json {};
+}
+
+struct AgentModelSetResult {
+    accepted: bool,
+    model_info: Json,
+    error: String,
+}
+
+fn model_name(info: Json) -> String {
+    if info == red::null() { return ""; }
+    return red::string(info.model, "");
+}
+
+fn model_effort(info: Json) -> String {
+    if info == red::null() { return ""; }
+    return red::string(info.effort, "");
+}
+
+fn model_description(info: Json) -> String {
+    let name = model_name(info);
+    let effort = model_effort(info);
+    if name != "" && effort != "" { return name + " · " + effort; }
+    return name;
+}
+
+fn same_model(left: Json, right: Json) -> bool {
+    return model_name(left) == model_name(right) && model_effort(left) == model_effort(right);
+}
+
+fn reset_model_state() {
+    red::state_patch(AgentState { model_info: Json {}, turn_model_info: Json {}, accepted_model: Json {} });
+    refresh_model_header();
+}
+
+fn refresh_model_header() {
+    if !state().panel_created { return; }
+    let current = state().model_info;
+    if model_name(current) == "" { current = next_model_info(); }
+    let running = state().turn_model_info;
+    let accepted = state().accepted_model;
+    let text = model_name(current);
+    let secondary = model_effort(current);
+    let next = Json {};
+    if model_name(running) != "" {
+        text = model_name(running);
+        secondary = model_effort(running);
+        if model_name(current) != "" && !same_model(running, current) {
+            next = current;
+        }
+    }
+    if model_name(accepted) != "" && !same_model(accepted, current) {
+        next = accepted;
+    }
+    if text == "" { text = "Codex"; }
+    let compact = "";
+    if model_name(next) != "" {
+        secondary = "Next: " + model_description(next);
+        compact = text + " → " + model_name(next);
+    }
+    if state().restoring { secondary = "restoring…"; compact = ""; }
+    if text == state().model_header_text && secondary == state().model_header_secondary { return; }
+    red::state_patch(AgentState { model_header_text: text, model_header_secondary: secondary });
+    red::execute("SetTextPanelHeaderDetail", "agent-conversation", Json {
+        text: text, secondary: secondary, compact_text: compact, action: "model", shortcut: "Alt-m",
+    });
+}
+
+#[red::on("agent:model_changed")]
+fn model_changed(event: AgentModelChangedEvent) {
+    if event.session_id == "" || event.session_id != state().session_id { return; }
+    if state().turn_active && model_name(state().turn_model_info) == "" {
+        red::state_patch(AgentState { turn_model_info: event.model_info });
+    }
+    red::state_patch(AgentState { model_info: event.model_info, accepted_model: Json {} });
+    refresh_model_header();
+}
+
+#[red::command(
+    name = "AgentModel",
+    title = "Change agent model",
+    category = "Agent",
+    description = "Choose the model and reasoning effort for this conversation",
+    aliases = ["change model", "reasoning effort"],
+    scope = "global",
+)]
+fn choose_model() {
+    if state().restoring {
+        red::execute("Print", "Wait for the agent session to finish restoring");
+        return;
+    }
+    if state().model_picker_loading { return; }
+    red::state_patch(AgentState { model_picker_session: state().session_id });
+    let loading = !state().model_catalog_loaded;
+    let status = "This conversation only";
+    if loading { status = "Loading models…"; }
+    let handle = red::execute("OpenPicker", "Agent model", model_items(), PickerOptions {
+        placeholder: "Search models…", initial_selection: current_catalog_model(),
+        status: status, busy: loading, presentation: "compact", item_layout: "label_first",
+    }, PickerHandlers { selected: model_selected, cancelled: model_picker_cancelled });
+    red::state_patch(AgentState { model_picker: Some(handle) });
+    prefetch_models();
+}
+
+fn prefetch_models() {
+    if state().model_catalog_loaded || state().model_catalog_request != -1 { return; }
+    let request = red::request("AgentListModels", models_loaded);
+    red::state_patch(AgentState { model_catalog_request: request });
+}
+
+fn invalidate_model_catalog() {
+    red::state_patch(AgentState {
+        model_catalog: [], model_catalog_loaded: false, model_catalog_request: -1,
+    });
+}
+
+fn current_catalog_model() -> String {
+    let current = model_name(next_model_info());
+    if current != "" { return current; }
+    for model in state().model_catalog {
+        if red::bool(model.isDefault, false) { return red::string(model.model, ""); }
+    }
+    return "";
+}
+
+fn model_picker_is_current() -> bool {
+    if state().model_picker_session != state().session_id {
+        red::execute("Print", "The agent conversation changed; choose its model again");
+        return false;
+    }
+    return true;
+}
+
+fn models_loaded(result: AgentModelsResult, request_id: i32) {
+    if request_id != state().model_catalog_request { return; }
+    red::state_patch(AgentState { model_catalog_request: -1 });
+    let error = red::string(result.error, "");
+    if error == "" && red::len(result.models) == 0 {
+        error = "Codex did not return any available models";
+    }
+    if error == "" {
+        red::state_patch(AgentState { model_catalog: result.models, model_catalog_loaded: true });
+    }
+    let Some(handle) = state().model_picker else { return; };
+    if state().model_picker_session != state().session_id {
+        red::state_patch(AgentState { model_picker: None });
+        red::execute("ClosePicker", handle);
+        return;
+    }
+    red::execute("UpdatePickerBusy", handle, false);
+    if error != "" {
+        red::execute("UpdatePickerStatus", handle, "Could not load models: " + error);
+        return;
+    }
+    red::execute("UpdatePickerItems", handle, model_items());
+    red::execute("UpdatePickerSelection", handle, current_catalog_model());
+    red::execute("UpdatePickerStatus", handle, "This conversation only");
+}
+
+fn model_items() -> [PickerItem] {
+    let current = current_catalog_model();
+    let items = [];
+    for model in state().model_catalog {
+        let id = red::string(model.model, "");
+        let icon = "";
+        if id == current { icon = "✓"; }
+        items = red::push(items, PickerItem {
+            id: id, icon: icon,
+            label: red::string(model.displayName, id),
+            detail: red::string(model.description, ""), data: model,
+        });
+    }
+    return items;
+}
+
+fn model_selected(item: PickerItem) {
+    red::state_patch(AgentState { model_picker: None });
+    if !model_picker_is_current() { return; }
+    let model = item.data;
+    let effort = model_effort(next_model_info());
+    let selected_effort = red::string(model.defaultReasoningEffort, "");
+    let items = [];
+    for option in model.supportedReasoningEfforts {
+        let id = red::string(option.reasoningEffort, "");
+        if id == effort { selected_effort = id; }
+        items = red::push(items, PickerItem {
+            id: id, label: id, detail: red::string(option.description, ""),
+            data: Json { model: model.model, effort: id },
+        });
+    }
+    red::state_patch(AgentState { model_selection: Json { model: model.model } });
+    if red::len(items) == 0 {
+        apply_model_selection();
+        return;
+    }
+    red::execute("OpenPicker", "Reasoning effort", items, PickerOptions {
+        placeholder: "Choose reasoning effort…", initial_selection: selected_effort,
+        status: red::string(model.displayName, model.model), presentation: "compact", item_layout: "label_first",
+    }, PickerHandlers { selected: model_effort_selected, cancelled: model_picker_cancelled });
+}
+
+fn model_effort_selected(item: PickerItem) {
+    red::state_patch(AgentState { model_selection: item.data });
+    apply_model_selection();
+}
+
+fn apply_model_selection() {
+    if !model_picker_is_current() { return; }
+    red::state_patch(AgentState { model_picker_loading: true });
+    red::request("AgentSetModel", model_set, state().model_picker_session, state().model_selection);
+}
+
+fn model_set(result: AgentModelSetResult) {
+    red::state_patch(AgentState { model_picker_loading: false });
+    if !model_picker_is_current() { return; }
+    let error = red::string(result.error, "");
+    if error != "" {
+        invalidate_model_catalog();
+        red::execute("Print", "Could not change Codex model: " + error);
+        return;
+    }
+    if model_name(result.model_info) != "" {
+        red::state_patch(AgentState { model_info: result.model_info, accepted_model: Json {} });
+    } else if !same_model(state().model_selection, state().model_info) {
+        red::state_patch(AgentState { accepted_model: state().model_selection });
+    }
+    refresh_model_header();
+    red::execute("Print", "Agent model selected: " + model_description(state().model_selection));
+}
+
+fn model_picker_cancelled(event: PickerCancelled) {
+    red::state_patch(AgentState { model_picker: None });
+}
+
 fn state() -> AgentState {
     return red::state();
 }
@@ -299,13 +608,14 @@ fn session_created(event: AgentSessionEvent) {
         red::state_patch(AgentState { turn_active: false });
     }
     if previous_session_id != event.session_id {
-        red::state_patch(AgentState { cancelled_session_id: "" });
+        red::state_patch(AgentState { cancelled_session_id: "", model_info: Json {}, turn_model_info: Json {} });
     }
     if previous_session_id != "" && previous_session_id != event.session_id {
         red::execute("AgentCloseSession", previous_session_id);
     }
     ensure_conversation_panel();
     render_conversation();
+    refresh_model_header();
     red::execute("Print", "Agent session started");
     if pending != "" {
         red::state_patch(AgentState { pending_prompt: "" });
@@ -398,6 +708,7 @@ fn open_conversation() {
         ensure_conversation_panel();
         render_conversation();
     }
+    if was_created && !state().panel_open { load_default_model(); prefetch_models(); }
     // An explicit open wins over a recovered hidden-pane preference.
     red::execute("SetPanelVisible", "agent-conversation", true);
     red::state_patch(AgentState { panel_open: true });
@@ -418,6 +729,10 @@ fn ensure_conversation_panel() {
             ],
         });
         red::state_patch(AgentState { panel_created: true });
+        red::state_patch(AgentState { model_header_text: "", model_header_secondary: "" });
+        prefetch_models();
+        refresh_model_header();
+        load_default_model();
         red::state_patch(AgentState { panel_open: true });
         red::state_patch(AgentState { focus_panel_on_first_prompt: true });
         return;
@@ -425,6 +740,8 @@ fn ensure_conversation_panel() {
     if !state().panel_open {
         red::execute("SetPanelVisible", "agent-conversation", true);
         red::state_patch(AgentState { panel_open: true });
+        load_default_model();
+        prefetch_models();
     }
 }
 
@@ -609,6 +926,10 @@ fn remove_queued_prompt_block(block_id: String) {
 
 #[red::on("agent:turn_started")]
 fn turn_started(event: AgentSessionEvent) {
+    if is_current_session(event.session_id) {
+        red::state_patch(AgentState { turn_model_info: state().model_info });
+        refresh_model_header();
+    }
     if !is_current_session(event.session_id) {
         return;
     }
@@ -619,6 +940,10 @@ fn turn_started(event: AgentSessionEvent) {
 fn set_phase(phase: String, label: String) {
     red::state_patch(AgentState { ui_phase: phase });
     red::state_patch(AgentState { ui_label: label });
+    if phase == "idle" && !state().turn_active {
+        red::state_patch(AgentState { turn_model_info: Json {} });
+        refresh_model_header();
+    }
     render_status();
 }
 
@@ -876,6 +1201,8 @@ fn panel_event(event: AgentPanelEvent) {
         red::execute("FocusTextPanelComposer", "agent-conversation");
     } else if event.action == "interrupt" {
         cancel();
+    } else if event.action == "model" {
+        choose_model();
     } else if event.action == "clear" {
         clear_conversation();
     } else if event.action == "new" {
@@ -948,9 +1275,10 @@ fn new_conversation() {
         if !state().restoring {
             red::execute("AgentCloseSession", session_id);
         }
-        red::execute("AgentForgetSession", session_id);
     }
+    red::execute("AgentForgetSession", session_id);
     red::state_patch(AgentState { session_id: "" });
+    reset_model_state();
     red::state_patch(AgentState { restoring: false });
     red::state_patch(AgentState { cancelled_session_id: "" });
     red::state_patch(AgentState { turn_active: false });
@@ -964,6 +1292,7 @@ fn new_conversation() {
     red::state_patch(AgentState { transcript: "" });
     red::execute("SetStorage", "transcript", "");
     red::execute("ClearTextPanelComposer", "agent-conversation");
+    if state().panel_created { load_default_model(); }
     prompt();
 }
 
@@ -1105,6 +1434,7 @@ fn completed(event: AgentCompletedEvent) {
     if session_id != "" && (stop_reason == "cancelled" || session_id == red::string(state().cancelled_session_id, "")) {
         red::execute("AgentCloseSession", session_id);
         red::state_patch(AgentState { session_id: "" });
+        reset_model_state();
         red::state_patch(AgentState { cancelled_session_id: "" });
         red::state_patch(AgentState { recap_pending: true });
     }
@@ -1156,6 +1486,7 @@ fn cancelled(event: AgentSessionEvent) {
     if !state().turn_active && session_id != "" {
         red::execute("AgentCloseSession", session_id);
         red::state_patch(AgentState { session_id: "" });
+        reset_model_state();
         red::state_patch(AgentState { cancelled_session_id: "" });
         red::state_patch(AgentState { recap_pending: true });
     }
@@ -1181,6 +1512,7 @@ fn failed(event: AgentErrorEvent) {
     if session_id != "" && session_id == red::string(state().cancelled_session_id, "") {
         red::execute("AgentCloseSession", session_id);
         red::state_patch(AgentState { session_id: "" });
+        reset_model_state();
         red::state_patch(AgentState { cancelled_session_id: "" });
         red::state_patch(AgentState { recap_pending: true });
     }
@@ -1238,6 +1570,7 @@ fn session_lost(event: AgentSessionLostEvent) {
     if !is_current_session(red::string(event.session_id, "")) && (session_id != "" || attempted == "") {
         return;
     }
+    invalidate_model_catalog();
     red::state_patch(AgentState { turn_active: false });
     collapse_activity(red::null());
     set_phase("idle", "");
@@ -1246,6 +1579,7 @@ fn session_lost(event: AgentSessionLostEvent) {
         red::state_patch(AgentState { recap_pending: true });
     }
     red::state_patch(AgentState { session_id: "" });
+    reset_model_state();
     red::state_patch(AgentState { cancelled_session_id: "" });
     if attempted != "" {
         red::state_patch(AgentState { pending_prompt: attempted });
@@ -1273,12 +1607,16 @@ fn setup_cancelled(event: PickerCancelled) {
 #[red::on("agent:credential_ready")]
 #[red::on("agent:backend_ready")]
 fn setup_ready(event: EmptyEvent) {
+    invalidate_model_catalog();
+    if state().panel_created { prefetch_models(); }
     if red::string(state().pending_prompt, "") != "" {
         start();
     }
 }
 
 fn finish_agent_turn() {
+    red::state_patch(AgentState { turn_model_info: Json {} });
+    refresh_model_header();
     if !state().streaming {
         return;
     }
@@ -1385,6 +1723,7 @@ fn transcript_restored(event: AgentTranscriptEvent) {
 
 #[red::on("agent:conversation_restore_pending")]
 fn conversation_restore_pending(event: AgentConversationEvent) {
+    red::state_patch(AgentState { model_info: event.model_info, accepted_model: Json {}, turn_model_info: Json {} });
     load_conversation(event);
     red::state_patch(AgentState { session_id: event.thread_id });
     red::state_patch(AgentState { restoring: true });
@@ -1393,6 +1732,7 @@ fn conversation_restore_pending(event: AgentConversationEvent) {
     red::state_patch(AgentState { activity_rows: [] });
     red::state_patch(AgentState { thought: "" });
     ensure_conversation_panel();
+    refresh_model_header();
     set_phase("restoring", "Restoring session…");
     red::execute("SetTextPanelComposerState", "agent-conversation", false, "Restoring agent session…");
     red::execute("AgentResumeSession", event.cwd, event.thread_id);
@@ -1400,12 +1740,14 @@ fn conversation_restore_pending(event: AgentConversationEvent) {
 
 #[red::on("agent:session_restored")]
 fn session_restored(event: AgentConversationEvent) {
+    red::state_patch(AgentState { model_info: event.model_info, accepted_model: Json {}, turn_model_info: Json {} });
     load_conversation(event);
     red::state_patch(AgentState { session_id: event.thread_id });
     red::state_patch(AgentState { restoring: false });
     red::state_patch(AgentState { recap_pending: false });
     set_phase("idle", "");
     red::execute("SetTextPanelComposerState", "agent-conversation", true, "");
+    refresh_model_header();
     red::execute("Print", "Agent session restored");
 }
 
@@ -1417,6 +1759,7 @@ struct AgentSessionRestoreFailedEvent {
 #[red::on("agent:session_restore_failed")]
 fn session_restore_failed(event: AgentSessionRestoreFailedEvent) {
     red::state_patch(AgentState { session_id: "" });
+    reset_model_state();
     red::state_patch(AgentState { restoring: false });
     red::state_patch(AgentState { recap_pending: red::trim(red::string(state().transcript, "")) != "" });
     red::execute("AgentForgetSession", event.session_id);
@@ -1757,6 +2100,7 @@ fn deactivate() {
     }
     red::execute("SetTextPanelStatus", "agent-conversation");
     red::state_patch(AgentState { session_id: "" });
+    reset_model_state();
     red::state_patch(AgentState { cancelled_session_id: "" });
     red::state_patch(AgentState { permission_request_id: "" });
     let timer = red::string(state().stream_timer, "");

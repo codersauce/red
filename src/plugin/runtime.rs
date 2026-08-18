@@ -1498,6 +1498,12 @@ impl RedHost {
                 let query = args.get(1).map(value_to_string).unwrap_or_default();
                 self.send_request(PluginRequest::UpdatePickerQuery { id, query });
             }
+            "UpdatePickerSelection" => {
+                let id = args.first().and_then(value_to_i32).unwrap_or(1);
+                self.ensure_picker_owner(plugin, id, "UpdatePickerSelection")?;
+                let selection = args.get(1).map(value_to_string).unwrap_or_default();
+                self.send_request(PluginRequest::UpdatePickerSelection { id, selection });
+            }
             "UpdatePickerStatus" => {
                 let id = args.first().and_then(value_to_i32).unwrap_or(1);
                 self.ensure_picker_owner(plugin, id, "UpdatePickerStatus")?;
@@ -1782,6 +1788,18 @@ impl RedHost {
                     status,
                 });
             }
+            "SetTextPanelHeaderDetail" => {
+                let id = args
+                    .first()
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("SetTextPanelHeaderDetail requires a panel id"))?
+                    .to_string();
+                let detail = match args.get(1).map(value_to_json) {
+                    None | Some(serde_json::Value::Null) => None,
+                    Some(value) => Some(serde_json::from_value(value)?),
+                };
+                self.send_request(PluginRequest::SetTextPanelHeaderDetail { id, detail });
+            }
             "SetTextPanelStatus" => {
                 let id = args
                     .first()
@@ -1955,6 +1973,34 @@ impl RedHost {
             }
             "GetEditorInfo" => PluginRequest::EditorInfo(request_id),
             "EditHistory" => PluginRequest::EditHistory { request_id },
+            "AgentReadDefaultModel" => PluginRequest::AgentModelRequest {
+                request_id,
+                request: crate::codex::ModelRequest::ReadDefault {
+                    cwd: crate::utils::get_workspace_path(),
+                },
+            },
+            "AgentListModels" => PluginRequest::AgentModelRequest {
+                request_id,
+                request: crate::codex::ModelRequest::List,
+            },
+            "AgentSetModel" => {
+                let session_id = args
+                    .first()
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                let selection = args
+                    .get(1)
+                    .map(value_to_json)
+                    .ok_or_else(|| anyhow::anyhow!("AgentSetModel requires a model selection"))?;
+                PluginRequest::AgentModelRequest {
+                    request_id,
+                    request: crate::codex::ModelRequest::Set {
+                        session_id,
+                        selection: serde_json::from_value(selection)?,
+                    },
+                }
+            }
             "GenerateCommitMessage" => {
                 let cwd = args
                     .first()
@@ -4338,6 +4384,24 @@ mod tests {
         }
     }
 
+    fn expect_agent_model_header() -> RequestId {
+        let catalog_request = expect_model_catalog_request();
+        match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::SetTextPanelHeaderDetail {
+                id,
+                detail: Some(detail),
+            } => {
+                assert_eq!(id, "agent-conversation");
+                assert_eq!(detail.text, "Codex");
+                assert!(detail.secondary.is_empty());
+                assert_eq!(detail.action.as_deref(), Some("model"));
+                assert_eq!(detail.shortcut.as_deref(), Some("Alt-m"));
+            }
+            _ => panic!("expected initial Agent model header"),
+        }
+        catalog_request
+    }
+
     fn recv_optimistic_agent_start(
         prompt: &str,
         expected_history: serde_json::Value,
@@ -4356,6 +4420,19 @@ mod tests {
                     assert_eq!(id, "agent-conversation");
                     created = true;
                 }
+                PluginRequest::SetTextPanelHeaderDetail {
+                    id,
+                    detail: Some(detail),
+                } => {
+                    assert_eq!(id, "agent-conversation");
+                    assert_eq!(detail.text, "Codex");
+                }
+                PluginRequest::AgentModelRequest {
+                    request:
+                        crate::codex::ModelRequest::ReadDefault { .. }
+                        | crate::codex::ModelRequest::List,
+                    ..
+                } => {}
                 PluginRequest::UpdateTextPanel { id, blocks } => {
                     assert_eq!(id, "agent-conversation");
                     assert_eq!(
@@ -6704,6 +6781,7 @@ mod tests {
                     && config.title.as_deref() == Some("Agent")
                     && config.header_actions.iter().map(|action| action.id.as_str()).eq(["clear", "new", "close"])
         ));
+        expect_agent_model_header();
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
             PluginRequest::UpdateTextPanel { id, blocks }
@@ -7565,6 +7643,8 @@ mod tests {
             ACTION_DISPATCHER.recv_request(),
             PluginRequest::CreateTextPanel { id, .. } if id == "agent-conversation"
         ));
+        expect_agent_model_header();
+        let _ = expect_default_model_request();
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
             PluginRequest::UpdateTextPanel { id, blocks }
@@ -7608,6 +7688,8 @@ mod tests {
             ACTION_DISPATCHER.recv_request(),
             PluginRequest::CreateTextPanel { id, .. } if id == "agent-conversation"
         ));
+        expect_agent_model_header();
+        let _ = expect_default_model_request();
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
             PluginRequest::UpdateTextPanel { id, .. } if id == "agent-conversation"
@@ -8882,6 +8964,8 @@ mod tests {
             ACTION_DISPATCHER.recv_request(),
             PluginRequest::CreateTextPanel { id, .. } if id == "agent-conversation"
         ));
+        expect_agent_model_header();
+        let _ = expect_default_model_request();
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
             PluginRequest::SetTextPanelStatus { id, status: None }
@@ -8990,6 +9074,8 @@ mod tests {
             ACTION_DISPATCHER.recv_request(),
             PluginRequest::CreateTextPanel { id, .. } if id == "agent-conversation"
         ));
+        expect_agent_model_header();
+        let _ = expect_default_model_request();
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
             PluginRequest::UpdateTextPanel { id, .. } if id == "agent-conversation"
@@ -9089,6 +9175,8 @@ mod tests {
             ACTION_DISPATCHER.recv_request(),
             PluginRequest::CreateTextPanel { id, .. } if id == "agent-conversation"
         ));
+        expect_agent_model_header();
+        let _ = expect_default_model_request();
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
             PluginRequest::UpdateTextPanel { id, blocks }
@@ -9183,6 +9271,560 @@ mod tests {
             }
         }
         assert!(saw_enabled_composer);
+    }
+
+    fn expect_default_model_request() -> RequestId {
+        match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::AgentModelRequest {
+                request_id,
+                request: crate::codex::ModelRequest::ReadDefault { cwd },
+            } => {
+                assert_eq!(cwd, crate::utils::get_workspace_path());
+                request_id
+            }
+            _ => panic!("expected read-only default model request"),
+        }
+    }
+
+    async fn open_for_default_model(runtime: &mut Runtime) -> RequestId {
+        runtime.execute_command("AgentOpen").await.unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::CreateTextPanel { .. }
+        ));
+        let catalog_request = expect_agent_model_header();
+        let request_id = expect_default_model_request();
+        while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
+            assert!(matches!(
+                request,
+                PluginRequest::UpdateTextPanel { .. }
+                    | PluginRequest::SetPanelVisible { .. }
+                    | PluginRequest::FocusTextPanelComposer { .. }
+            ));
+        }
+        runtime
+            .resolve_request(catalog_request, test_model_catalog())
+            .await
+            .unwrap();
+        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
+        request_id
+    }
+
+    #[tokio::test]
+    async fn bundled_agent_default_model_preview_is_read_only_and_thread_settings_win() {
+        drain_requests();
+        let mut runtime = Runtime::new();
+        runtime
+            .load_plugin("agent", include_str!("../../plugins/agent.hk"))
+            .await
+            .unwrap();
+        let request_id = open_for_default_model(&mut runtime).await;
+        runtime
+            .resolve_request(
+                request_id,
+                serde_json::json!({"error":"","model_info":{"model":"configured","effort":"high"}}),
+            )
+            .await
+            .unwrap();
+        match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::SetTextPanelHeaderDetail {
+                detail: Some(detail),
+                ..
+            } => {
+                assert_eq!(
+                    (detail.text.as_str(), detail.secondary.as_str()),
+                    ("configured", "high")
+                );
+            }
+            _ => panic!("preview must only update the header"),
+        }
+        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
+        runtime.execute_command("AgentClose").await.unwrap();
+        drain_requests();
+        runtime.execute_command("AgentOpen").await.unwrap();
+        let late = expect_default_model_request();
+        drain_requests();
+        runtime
+            .notify(
+                "agent:session_created",
+                serde_json::json!({"session_id":"thread"}),
+            )
+            .await
+            .unwrap();
+        runtime.notify("agent:model_changed", serde_json::json!({"session_id":"thread","model_info":{"model":"confirmed","effort":"low"}})).await.unwrap();
+        assert_eq!(take_model_header().unwrap().text, "confirmed");
+        runtime.resolve_request(late, serde_json::json!({"error":"","model_info":{"model":"stale-default","effort":"high"}})).await.unwrap();
+        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
+    }
+
+    #[tokio::test]
+    async fn bundled_agent_default_model_preview_does_not_replace_an_explicit_choice() {
+        drain_requests();
+        let mut runtime = Runtime::new();
+        runtime
+            .load_plugin("agent", include_str!("../../plugins/agent.hk"))
+            .await
+            .unwrap();
+        let default_request = open_for_default_model(&mut runtime).await;
+        let (picker, items, _) = open_test_model_picker(&mut runtime).await;
+        runtime
+            .notify_picker(picker, PickerCallback::Selected(items[1].clone()))
+            .unwrap();
+        let (effort_picker, efforts, _) = recv_model_picker();
+        runtime
+            .notify_picker(effort_picker, PickerCallback::Selected(efforts[0].clone()))
+            .unwrap();
+        let request_id = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::AgentModelRequest {
+                request_id,
+                request: crate::codex::ModelRequest::Set { session_id, .. },
+            } => {
+                assert!(session_id.is_empty());
+                request_id
+            }
+            _ => panic!("expected pre-session selection"),
+        };
+        runtime
+            .resolve_request(request_id, serde_json::json!({"accepted":true,"error":""}))
+            .await
+            .unwrap();
+        let header = take_model_header().unwrap();
+        assert_eq!(
+            (header.text.as_str(), header.secondary.as_str()),
+            ("second", "low")
+        );
+        runtime
+            .resolve_request(
+                default_request,
+                serde_json::json!({"error":"","model_info":{"model":"first","effort":"high"}}),
+            )
+            .await
+            .unwrap();
+        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
+    }
+
+    #[tokio::test]
+    async fn bundled_agent_default_model_lookup_failure_is_quiet_and_retries_on_reopen() {
+        drain_requests();
+        let mut runtime = Runtime::new();
+        runtime
+            .load_plugin("agent", include_str!("../../plugins/agent.hk"))
+            .await
+            .unwrap();
+        let request_id = open_for_default_model(&mut runtime).await;
+        runtime
+            .resolve_request(request_id, serde_json::json!({"error":"unavailable"}))
+            .await
+            .unwrap();
+        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
+        runtime.execute_command("AgentClose").await.unwrap();
+        drain_requests();
+        runtime.execute_command("AgentOpen").await.unwrap();
+        let retry = expect_default_model_request();
+        drain_requests();
+        runtime
+            .resolve_request(
+                retry,
+                serde_json::json!({"error":"","model_info":{"model":"recovered"}}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(take_model_header().unwrap().text, "recovered");
+    }
+
+    fn recv_model_picker() -> (PickerHandle, Vec<PickerItem>, crate::ui::PickerOptions) {
+        loop {
+            match ACTION_DISPATCHER.recv_request() {
+                PluginRequest::OpenCallbackPicker {
+                    handle,
+                    items,
+                    options,
+                    ..
+                } => return (handle, items, options),
+                PluginRequest::Action(Action::Print(_)) => {}
+                _ => panic!("expected model picker"),
+            }
+        }
+    }
+
+    fn take_model_header() -> Option<crate::plugin::TextPanelHeaderDetail> {
+        let mut latest = None;
+        while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
+            if let PluginRequest::SetTextPanelHeaderDetail { detail, .. } = request {
+                latest = detail;
+            }
+        }
+        latest
+    }
+
+    fn expect_model_catalog_request() -> RequestId {
+        match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::AgentModelRequest {
+                request_id,
+                request: crate::codex::ModelRequest::List,
+            } => request_id,
+            _ => panic!("expected model catalog request"),
+        }
+    }
+
+    fn test_model_catalog() -> serde_json::Value {
+        serde_json::json!({"error":"", "models":[
+            {"model":"first","displayName":"First","isDefault":true,"defaultReasoningEffort":"high","supportedReasoningEfforts":[{"reasoningEffort":"high","description":"More reasoning"}]},
+            {"model":"second","displayName":"Second","defaultReasoningEffort":"low","supportedReasoningEfforts":[{"reasoningEffort":"low","description":"Less reasoning"}]}
+        ]})
+    }
+
+    fn recv_loaded_model_picker(handle: PickerHandle) -> (Vec<PickerItem>, String) {
+        assert!(matches!(ACTION_DISPATCHER.recv_request(),
+            PluginRequest::UpdatePickerBusy { id, busy: false } if id == handle.get()));
+        let items = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::UpdatePickerItems { id, items } if id == handle.get() => items,
+            _ => panic!("expected in-place model catalog update"),
+        };
+        let selection = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::UpdatePickerSelection { id, selection } if id == handle.get() => {
+                selection
+            }
+            _ => panic!("expected current model selection"),
+        };
+        assert!(matches!(ACTION_DISPATCHER.recv_request(),
+            PluginRequest::UpdatePickerStatus { id, status: Some(status) }
+                if id == handle.get() && status == "This conversation only"));
+        (items, selection)
+    }
+
+    async fn open_test_model_picker(
+        runtime: &mut Runtime,
+    ) -> (PickerHandle, Vec<PickerItem>, crate::ui::PickerOptions) {
+        runtime.execute_command("AgentModel").await.unwrap();
+        let (handle, items, mut options) = recv_model_picker();
+        if !options.busy {
+            return (handle, items, options);
+        }
+        assert!(items.is_empty());
+        let request_id = expect_model_catalog_request();
+        runtime
+            .resolve_request(request_id, test_model_catalog())
+            .await
+            .unwrap();
+        let (items, selection) = recv_loaded_model_picker(handle);
+        options.busy = false;
+        options.initial_selection = Some(selection);
+        (handle, items, options)
+    }
+
+    async fn open_unprimed_agent(runtime: &mut Runtime) -> RequestId {
+        runtime.execute_command("AgentOpen").await.unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::CreateTextPanel { .. }
+        ));
+        let catalog = expect_agent_model_header();
+        let _ = expect_default_model_request();
+        while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
+            assert!(matches!(
+                request,
+                PluginRequest::UpdateTextPanel { .. }
+                    | PluginRequest::SetPanelVisible { .. }
+                    | PluginRequest::FocusTextPanelComposer { .. }
+            ));
+        }
+        catalog
+    }
+
+    #[tokio::test]
+    async fn bundled_agent_model_catalog_prefetch_populates_the_open_spinner_once() {
+        drain_requests();
+        let mut runtime = Runtime::new();
+        runtime
+            .load_plugin("agent", include_str!("../../plugins/agent.hk"))
+            .await
+            .unwrap();
+        let catalog = open_unprimed_agent(&mut runtime).await;
+        runtime.execute_command("AgentModel").await.unwrap();
+        let (handle, items, options) = recv_model_picker();
+        assert!(items.is_empty());
+        assert!(options.busy);
+        assert_eq!(options.status.as_deref(), Some("Loading models…"));
+        assert!(
+            ACTION_DISPATCHER.try_recv_request().is_none(),
+            "reuse the in-flight preload"
+        );
+        runtime
+            .resolve_request(catalog, test_model_catalog())
+            .await
+            .unwrap();
+        let (items, selection) = recv_loaded_model_picker(handle);
+        assert_eq!(selection, "first");
+        assert_eq!(items.len(), 2);
+        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
+        runtime
+            .notify_picker(handle, PickerCallback::Cancelled)
+            .unwrap();
+        let (_, cached, options) = open_test_model_picker(&mut runtime).await;
+        assert!(!options.busy);
+        assert_eq!(cached, items);
+        assert!(
+            ACTION_DISPATCHER.try_recv_request().is_none(),
+            "cached opens must not fetch again"
+        );
+    }
+
+    #[tokio::test]
+    async fn bundled_agent_model_catalog_failure_retries_and_cancelled_load_stays_closed() {
+        drain_requests();
+        let mut runtime = Runtime::new();
+        runtime
+            .load_plugin("agent", include_str!("../../plugins/agent.hk"))
+            .await
+            .unwrap();
+        let catalog = open_unprimed_agent(&mut runtime).await;
+        runtime
+            .resolve_request(catalog, serde_json::json!({"error":"offline"}))
+            .await
+            .unwrap();
+        assert!(
+            ACTION_DISPATCHER.try_recv_request().is_none(),
+            "preload errors are quiet"
+        );
+        runtime.execute_command("AgentModel").await.unwrap();
+        let (handle, _, options) = recv_model_picker();
+        assert!(options.busy);
+        let retry = expect_model_catalog_request();
+        runtime
+            .resolve_request(retry, serde_json::json!({"error":"still offline"}))
+            .await
+            .unwrap();
+        assert!(
+            matches!(ACTION_DISPATCHER.recv_request(), PluginRequest::UpdatePickerBusy { id, busy: false } if id == handle.get())
+        );
+        assert!(
+            matches!(ACTION_DISPATCHER.recv_request(), PluginRequest::UpdatePickerStatus { id, status: Some(status) } if id == handle.get() && status.contains("still offline"))
+        );
+        runtime
+            .notify_picker(handle, PickerCallback::Cancelled)
+            .unwrap();
+        runtime.execute_command("AgentModel").await.unwrap();
+        let (cancelled, _, options) = recv_model_picker();
+        assert!(options.busy);
+        let retry = expect_model_catalog_request();
+        runtime
+            .notify_picker(cancelled, PickerCallback::Cancelled)
+            .unwrap();
+        runtime
+            .resolve_request(retry, test_model_catalog())
+            .await
+            .unwrap();
+        assert!(
+            ACTION_DISPATCHER.try_recv_request().is_none(),
+            "late results must not reopen a cancelled picker"
+        );
+        let (_, items, options) = open_test_model_picker(&mut runtime).await;
+        assert_eq!(items.len(), 2);
+        assert!(!options.busy);
+        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
+    }
+
+    #[tokio::test]
+    async fn bundled_agent_model_catalog_ignores_invalidated_and_foreign_session_results() {
+        drain_requests();
+        let mut runtime = Runtime::new();
+        runtime
+            .load_plugin("agent", include_str!("../../plugins/agent.hk"))
+            .await
+            .unwrap();
+        let old = open_unprimed_agent(&mut runtime).await;
+        runtime
+            .notify("agent:backend_ready", serde_json::json!({}))
+            .await
+            .unwrap();
+        let fresh = expect_model_catalog_request();
+        runtime
+            .resolve_request(old, test_model_catalog())
+            .await
+            .unwrap();
+        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
+        runtime.execute_command("AgentModel").await.unwrap();
+        let (handle, items, options) = recv_model_picker();
+        assert!(items.is_empty() && options.busy);
+        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
+        runtime
+            .notify(
+                "agent:session_created",
+                serde_json::json!({"session_id":"new-thread"}),
+            )
+            .await
+            .unwrap();
+        drain_requests();
+        runtime
+            .resolve_request(fresh, test_model_catalog())
+            .await
+            .unwrap();
+        assert!(
+            matches!(ACTION_DISPATCHER.recv_request(), PluginRequest::ClosePicker { id } if id == handle.get())
+        );
+        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
+        let (_, items, options) = open_test_model_picker(&mut runtime).await;
+        assert_eq!(items.len(), 2);
+        assert!(!options.busy);
+        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
+    }
+
+    #[tokio::test]
+    async fn bundled_agent_model_picker_preserves_running_model_and_waits_for_acceptance() {
+        drain_requests();
+        let mut runtime = Runtime::new();
+        runtime
+            .load_plugin("agent", include_str!("../../plugins/agent.hk"))
+            .await
+            .unwrap();
+        let _ = open_for_default_model(&mut runtime).await;
+        runtime
+            .notify(
+                "agent:session_created",
+                serde_json::json!({"session_id":"thread-1"}),
+            )
+            .await
+            .unwrap();
+        drain_requests();
+        runtime.notify("agent:model_changed", serde_json::json!({"session_id":"thread-1","model_info":{"model":"first","effort":"high"}})).await.unwrap();
+        assert_eq!(take_model_header().unwrap().text, "first");
+        runtime
+            .notify(
+                "agent:turn_started",
+                serde_json::json!({"session_id":"thread-1"}),
+            )
+            .await
+            .unwrap();
+        drain_requests();
+
+        let (picker, items, options) = open_test_model_picker(&mut runtime).await;
+        assert_eq!(options.initial_selection.as_deref(), Some("first"));
+        assert_eq!(options.item_layout, crate::ui::PickerItemLayout::LabelFirst);
+        assert_eq!(items[0].icon, Some(crate::ui::PickerIcon::Text("✓".into())));
+        assert_eq!(
+            items[1].icon,
+            Some(crate::ui::PickerIcon::Text(String::new()))
+        );
+        assert!(items.iter().all(|item| item.annotation.is_none()));
+        runtime
+            .notify_picker(picker, PickerCallback::Selected(items[1].clone()))
+            .unwrap();
+        let (effort_picker, efforts, options) = recv_model_picker();
+        assert_eq!(options.initial_selection.as_deref(), Some("low"));
+        assert_eq!(options.item_layout, crate::ui::PickerItemLayout::LabelFirst);
+        runtime
+            .notify_picker(effort_picker, PickerCallback::Cancelled)
+            .unwrap();
+        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
+
+        let (picker, items, _) = open_test_model_picker(&mut runtime).await;
+        runtime
+            .notify_picker(picker, PickerCallback::Selected(items[1].clone()))
+            .unwrap();
+        let (effort_picker, _, _) = recv_model_picker();
+        runtime
+            .notify_picker(effort_picker, PickerCallback::Selected(efforts[0].clone()))
+            .unwrap();
+        let request_id = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::AgentModelRequest {
+                request_id,
+                request:
+                    crate::codex::ModelRequest::Set {
+                        session_id,
+                        selection,
+                    },
+            } => {
+                assert_eq!(session_id, "thread-1");
+                assert_eq!(selection.model, "second");
+                assert_eq!(selection.effort.as_deref(), Some("low"));
+                request_id
+            }
+            _ => panic!("expected conversation-scoped model selection"),
+        };
+        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
+        runtime
+            .resolve_request(request_id, serde_json::json!({"accepted":true,"error":""}))
+            .await
+            .unwrap();
+        let pending = take_model_header().unwrap();
+        assert_eq!(pending.text, "first");
+        assert_eq!(pending.secondary, "Next: second · low");
+        runtime
+            .notify(
+                "agent:model_changed",
+                serde_json::json!({"session_id":"foreign","model_info":{"model":"wrong"}}),
+            )
+            .await
+            .unwrap();
+        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
+        runtime.notify("agent:model_changed", serde_json::json!({"session_id":"thread-1","model_info":{"model":"second","effort":"low"}})).await.unwrap();
+        assert!(
+            take_model_header().is_none(),
+            "running header already describes the same next model"
+        );
+        runtime
+            .notify(
+                "agent:completed",
+                serde_json::json!({"session_id":"thread-1","stop_reason":"completed"}),
+            )
+            .await
+            .unwrap();
+        let finished = take_model_header().unwrap();
+        assert_eq!(
+            (finished.text.as_str(), finished.secondary.as_str()),
+            ("second", "low")
+        );
+    }
+
+    #[tokio::test]
+    async fn bundled_agent_model_picker_rejects_stale_results_and_keeps_failed_selection() {
+        drain_requests();
+        let mut runtime = Runtime::new();
+        runtime
+            .load_plugin("agent", include_str!("../../plugins/agent.hk"))
+            .await
+            .unwrap();
+        let _ = open_for_default_model(&mut runtime).await;
+        let (picker, items, _) = open_test_model_picker(&mut runtime).await;
+        runtime
+            .notify_picker(picker, PickerCallback::Selected(items[0].clone()))
+            .unwrap();
+        let (effort_picker, efforts, _) = recv_model_picker();
+        runtime
+            .notify_picker(effort_picker, PickerCallback::Selected(efforts[0].clone()))
+            .unwrap();
+        let request_id = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::AgentModelRequest {
+                request_id,
+                request: crate::codex::ModelRequest::Set { session_id, .. },
+            } => {
+                assert!(session_id.is_empty());
+                request_id
+            }
+            _ => panic!("expected pre-session selection"),
+        };
+        runtime
+            .resolve_request(request_id, serde_json::json!({"error":"not allowed"}))
+            .await
+            .unwrap();
+        assert!(take_model_header().is_none());
+        let (picker, items, _) = open_test_model_picker(&mut runtime).await;
+        runtime
+            .notify(
+                "agent:session_created",
+                serde_json::json!({"session_id":"new-thread"}),
+            )
+            .await
+            .unwrap();
+        drain_requests();
+        runtime
+            .notify_picker(picker, PickerCallback::Selected(items[0].clone()))
+            .unwrap();
+        assert!(
+            matches!(ACTION_DISPATCHER.recv_request(), PluginRequest::Action(Action::Print(message)) if message.contains("conversation changed"))
+        );
+        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
     }
 
     #[tokio::test]

@@ -654,3 +654,280 @@ async fn direct_app_server_reports_live_startup_failure_and_stderr_availability(
         "{error}"
     );
 }
+
+fn mock_model_codex(directory: &std::path::Path) -> std::path::PathBuf {
+    let path = directory.join("codex-models");
+    std::fs::write(&path, r#"#!/usr/bin/env python3
+import json, sys
+def send(value):
+    print(json.dumps(value), flush=True)
+def info(model, effort):
+    return {"model": model, "modelProvider": "test-provider", "reasoningEffort": effort}
+for line in sys.stdin:
+    message = json.loads(line)
+    method, ident = message.get("method"), message.get("id")
+    params = message.get("params", {})
+    if method == "initialize":
+        send({"id": ident, "result": {"userAgent": "mock"}})
+    elif method == "account/read":
+        send({"id": ident, "result": {"account": {"type": "chatgpt"}}})
+    elif method == "config/read":
+        send({"id": ident, "result": {"config": {"mcp_servers": {}}}})
+    elif method == "configRequirements/read":
+        send({"id": ident, "result": {"requirements": None}})
+    elif method == "model/list":
+        assert params["includeHidden"] is False
+        if params.get("cursor") is None:
+            send({"id": ident, "result": {"data": [{"model":"first","displayName":"First"},{"model":"secret","hidden":True}],"nextCursor":"page-2"}})
+        else:
+            assert params["cursor"] == "page-2"
+            send({"id": ident, "result": {"data": [{"model":"first"},{"model":"second","displayName":"Second"}],"nextCursor":None}})
+    elif method == "thread/start":
+        assert params["model"] == "first"
+        assert params["config"]["model_reasoning_effort"] == "high"
+        assert params["sandbox"] == "read-only"
+        send({"id": ident, "result": dict(info("first", "high"), thread={"id":"model-thread"})})
+    elif method == "turn/start":
+        assert params["threadId"] == "model-thread"
+        assert "model" not in params
+        send({"id": ident, "result": {"turn":{"id":"running-turn"}}})
+    elif method == "thread/settings/update":
+        assert set(params) == {"threadId","model","effort"}
+        assert params["threadId"] == "model-thread"
+        if params["model"] == "rejected":
+            send({"id": ident, "error":{"code":-32602,"message":"model unavailable"}})
+            continue
+        assert params["model"] == "second" and params["effort"] == "low"
+        send({"method":"thread/settings/updated","params":{"threadId":"foreign-thread","threadSettings":{"model":"wrong","effort":"max"}}})
+        send({"method":"thread/settings/updated","params":{"threadId":"model-thread","threadSettings":{"model":"second","modelProvider":"test-provider","effort":"low"}}})
+        send({"id":ident,"result":{}})
+        send({"method":"turn/completed","params":{"threadId":"model-thread","turn":{"id":"running-turn","status":"completed"}}})
+    elif method == "thread/resume":
+        send({"id":ident,"result":dict(info("second","low"),thread={"id":"model-thread","turns":[]})})
+    elif method == "turn/interrupt":
+        raise AssertionError("changing the model must not interrupt the running turn")
+"#).unwrap();
+    let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&path, permissions).unwrap();
+    path
+}
+
+#[tokio::test]
+async fn direct_app_server_lists_and_changes_conversation_models() {
+    use red::codex::{AgentModelSelection, ModelRequest};
+    let _serial = MOCK_CODEX_TEST_LOCK.lock().await;
+    let directory = tempfile::tempdir().unwrap();
+    let host = RecordingHost {
+        writes: Arc::new(Mutex::new(Vec::new())),
+    };
+    let (mut bridge, mut task) = start_codex(
+        CodexProcessSpec::new(mock_model_codex(directory.path()), directory.path()),
+        host,
+        NonZeroUsize::new(32).unwrap(),
+    )
+    .unwrap();
+    bridge
+        .send(CodexCommand::ModelRequest {
+            request_id: 1,
+            request: ModelRequest::List,
+        })
+        .await
+        .unwrap();
+    match next_event(&mut bridge, &mut task).await {
+        CodexEvent::ModelRequestCompleted {
+            request_id: 1,
+            result: Ok(result),
+        } => {
+            assert_eq!(
+                result["models"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|model| model["model"].as_str().unwrap())
+                    .collect::<Vec<_>>(),
+                ["first", "second"]
+            );
+        }
+        event => panic!("unexpected catalog result: {event:?}"),
+    }
+    bridge
+        .send(CodexCommand::NewSessionWithModel {
+            cwd: directory.path().to_path_buf(),
+            selection: AgentModelSelection {
+                model: "first".into(),
+                effort: Some("high".into()),
+            },
+        })
+        .await
+        .unwrap();
+    assert!(
+        matches!(next_event(&mut bridge, &mut task).await, CodexEvent::SessionCreated { session_id } if session_id == "model-thread")
+    );
+    assert!(
+        matches!(next_event(&mut bridge, &mut task).await, CodexEvent::SessionModelChanged { model_info, .. } if model_info.model == "first" && model_info.effort.as_deref() == Some("high"))
+    );
+    bridge
+        .send(CodexCommand::Prompt {
+            session_id: "model-thread".into(),
+            text: "keep working".into(),
+        })
+        .await
+        .unwrap();
+    bridge
+        .send(CodexCommand::ModelRequest {
+            request_id: 2,
+            request: ModelRequest::Set {
+                session_id: "model-thread".into(),
+                selection: AgentModelSelection {
+                    model: "second".into(),
+                    effort: Some("low".into()),
+                },
+            },
+        })
+        .await
+        .unwrap();
+    assert!(
+        matches!(next_event(&mut bridge, &mut task).await, CodexEvent::SessionModelChanged { session_id, model_info } if session_id == "model-thread" && model_info.model == "second" && model_info.provider.as_deref() == Some("test-provider") && model_info.effort.as_deref() == Some("low"))
+    );
+    assert!(matches!(
+        next_event(&mut bridge, &mut task).await,
+        CodexEvent::ModelRequestCompleted {
+            request_id: 2,
+            result: Ok(_)
+        }
+    ));
+    assert!(
+        matches!(next_event(&mut bridge, &mut task).await, CodexEvent::Completed { session_id, .. } if session_id == "model-thread")
+    );
+    bridge
+        .send(CodexCommand::ModelRequest {
+            request_id: 3,
+            request: ModelRequest::Set {
+                session_id: "model-thread".into(),
+                selection: AgentModelSelection {
+                    model: "rejected".into(),
+                    effort: Some("low".into()),
+                },
+            },
+        })
+        .await
+        .unwrap();
+    assert!(
+        matches!(next_event(&mut bridge, &mut task).await, CodexEvent::ModelRequestCompleted { request_id: 3, result: Err(error) } if error == "model unavailable")
+    );
+    bridge
+        .send(CodexCommand::ResumeSession {
+            cwd: directory.path().to_path_buf(),
+            session_id: "model-thread".into(),
+        })
+        .await
+        .unwrap();
+    assert!(matches!(
+        next_event(&mut bridge, &mut task).await,
+        CodexEvent::SessionRestored { .. }
+    ));
+    assert!(
+        matches!(next_event(&mut bridge, &mut task).await, CodexEvent::SessionModelChanged { model_info, .. } if model_info.model == "second")
+    );
+    drop(bridge);
+    task.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn direct_app_server_previews_workspace_model_without_creating_a_thread() {
+    use red::codex::ModelRequest;
+    let _serial = MOCK_CODEX_TEST_LOCK.lock().await;
+    let directory = tempfile::tempdir().unwrap();
+    let executable = directory.path().join("codex-default-model");
+    std::fs::write(&executable, r#"#!/usr/bin/env python3
+import json, os, sys
+mode = None
+def send(ident, result):
+    print(json.dumps({"id":ident,"result":result}), flush=True)
+for line in sys.stdin:
+    msg=json.loads(line)
+    method, ident, params=msg.get("method"),msg.get("id"),msg.get("params",{})
+    if method == "initialize": send(ident,{"userAgent":"mock"})
+    elif method == "initialized": pass
+    elif method == "account/read": send(ident,{"account":{"type":"chatgpt"}})
+    elif method == "config/read":
+        assert params["includeLayers"] is False
+        mode=os.path.basename(params["cwd"])
+        config={"model_provider":"configured-provider"}
+        if mode == "configured": config.update(model="configured-model",model_reasoning_effort="high")
+        if mode == "effort": config["model_reasoning_effort"]="low"
+        if mode == "invalid": send(ident,{})
+        else: send(ident,{"config":config})
+    elif method == "model/list":
+        assert mode in ["fallback","effort","missing"], "explicit model must not need the catalog"
+        assert params["includeHidden"] is False
+        if params.get("cursor") is None:
+            send(ident,{"data":[{"model":"hidden","isDefault":True,"hidden":True},{"model":"other"}],"nextCursor":"page-2"})
+        else:
+            assert params["cursor"] == "page-2"
+            send(ident,{"data":[{"model":"catalog-default","isDefault":mode!="missing","defaultReasoningEffort":"medium"}],"nextCursor":None})
+    else: raise AssertionError("preview must be read-only: "+str(method))
+"#).unwrap();
+    std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let (mut bridge, mut task) = start_codex(
+        CodexProcessSpec::new(executable, directory.path()),
+        RecordingHost {
+            writes: Arc::new(Mutex::new(Vec::new())),
+        },
+        NonZeroUsize::new(8).unwrap(),
+    )
+    .unwrap();
+    for (index, (mode, model, effort)) in [
+        ("configured", "configured-model", "high"),
+        ("fallback", "catalog-default", "medium"),
+        ("effort", "catalog-default", "low"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let request_id = index as i64;
+        bridge
+            .send(CodexCommand::ModelRequest {
+                request_id,
+                request: ModelRequest::ReadDefault {
+                    cwd: directory.path().join(mode),
+                },
+            })
+            .await
+            .unwrap();
+        match next_event(&mut bridge, &mut task).await {
+            CodexEvent::ModelRequestCompleted {
+                request_id: actual,
+                result: Ok(result),
+            } => {
+                assert_eq!(actual, request_id);
+                assert_eq!(
+                    result["model_info"],
+                    json!({"model":model,"provider":"configured-provider","effort":effort})
+                );
+            }
+            event => panic!("unexpected preview result: {event:?}"),
+        }
+    }
+    for mode in ["invalid", "missing"] {
+        bridge
+            .send(CodexCommand::ModelRequest {
+                request_id: 4,
+                request: ModelRequest::ReadDefault {
+                    cwd: directory.path().join(mode),
+                },
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            next_event(&mut bridge, &mut task).await,
+            CodexEvent::ModelRequestCompleted {
+                request_id: 4,
+                result: Err(_)
+            }
+        ));
+    }
+    drop(bridge);
+    task.await.unwrap().unwrap();
+}

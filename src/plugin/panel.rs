@@ -198,6 +198,23 @@ pub struct TextPanelComposerConfig {
     pub rows: usize,
 }
 
+/// Optional metadata beside a stable text-panel title. Updating it does not
+/// replace the panel, its draft, or its focus and scroll state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TextPanelHeaderDetail {
+    pub text: String,
+    #[serde(default)]
+    pub secondary: String,
+    /// A shorter complete label for important state, such as a pending model switch.
+    #[serde(default)]
+    pub compact_text: String,
+    #[serde(default)]
+    pub action: Option<String>,
+    #[serde(default)]
+    pub shortcut: Option<String>,
+}
+
 /// One clickable action rendered in a text-panel header.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -380,6 +397,7 @@ pub struct TextPanel {
     viewport: FollowTailViewport,
     composer: Option<TextPanelComposer>,
     status: Option<TextPanelStatus>,
+    header_detail: Option<TextPanelHeaderDetail>,
     busy_since: Option<Instant>,
     selected_link: Option<u64>,
     scrollback: TextPanelScrollback,
@@ -872,6 +890,7 @@ impl TextPanel {
             viewport: FollowTailViewport::default(),
             composer,
             status: None,
+            header_detail: None,
             busy_since: None,
             selected_link: None,
             scrollback: TextPanelScrollback::default(),
@@ -2777,6 +2796,21 @@ impl PanelManager {
         }
     }
 
+    pub fn set_text_panel_header_detail(
+        &mut self,
+        id: &str,
+        detail: Option<TextPanelHeaderDetail>,
+    ) -> bool {
+        let Some(panel) = self.text_panels.get_mut(id) else {
+            return false;
+        };
+        if panel.header_detail == detail {
+            return false;
+        }
+        panel.header_detail = detail;
+        true
+    }
+
     pub fn update_text_panel(
         &mut self,
         id: &str,
@@ -3063,13 +3097,23 @@ impl PanelManager {
         else {
             return Vec::new();
         };
-        panel
+        let mut actions = panel
             .composer
             .as_ref()
             .map(|composer| {
                 text_panel_actions(composer, &panel.scrollback, TextPanelOverflow::None).1
             })
-            .unwrap_or_else(|| crate::ui::surface_reference_actions("SCROLLBACK NORMAL"))
+            .unwrap_or_else(|| crate::ui::surface_reference_actions("SCROLLBACK NORMAL"));
+        if let Some(detail) = &panel.header_detail {
+            if let (Some(action), Some(shortcut)) = (&detail.action, &detail.shortcut) {
+                actions.push(
+                    UiAction::new(action, shortcut, "model")
+                        .with_group("Conversation")
+                        .with_description("Change the agent model"),
+                );
+            }
+        }
+        actions
     }
 
     pub fn focused_row_panel(&self) -> bool {
@@ -3138,6 +3182,21 @@ impl PanelManager {
             .filter(|config| config.side == PanelSide::Bottom)
             .map(|config| config.width.saturating_add(1))
             .sum()
+    }
+
+    pub(crate) fn header_shortcut_event(&self, key: &str) -> Option<PanelEvent> {
+        let panel = self.text_panels.get(self.focused.as_deref()?)?;
+        let detail = panel.header_detail.as_ref()?;
+        if detail.shortcut.as_deref() != Some(key) {
+            return None;
+        }
+        Some(PanelEvent {
+            panel_id: panel.id.clone(),
+            action: detail.action.clone()?,
+            selected_index: panel.scroll,
+            row: None,
+            text: None,
+        })
     }
 
     pub fn handle_focused_key(
@@ -4017,8 +4076,26 @@ impl PanelManager {
         if let Some(panel) = self.text_panels.get_mut(&placement.id) {
             let metrics = TextPanelContentMetrics::new(placement.width);
             if y == placement.y && metrics.contains_x(placement.x, x) {
+                let column = metrics.column(placement.x, x);
+                if let Some((start, text)) = text_panel_header_detail_layout(panel, metrics.width) {
+                    if column >= start + 3 && column < start + display_width(&text) {
+                        if let Some(action) = panel
+                            .header_detail
+                            .as_ref()
+                            .and_then(|detail| detail.action.as_ref())
+                        {
+                            return Some(PanelEvent {
+                                panel_id: panel.id.clone(),
+                                action: action.clone(),
+                                selected_index: panel.scroll,
+                                row: None,
+                                text: None,
+                            });
+                        }
+                    }
+                }
                 if let Some(action) = text_panel_header_action_at(
-                    &panel.config,
+                    panel,
                     metrics.width,
                     metrics.column(placement.x, x),
                 ) {
@@ -4593,7 +4670,7 @@ fn render_text_panel(
         );
     }
 
-    let header_actions = text_panel_header_actions(&panel.config, metrics.width);
+    let header_actions = text_panel_header_actions_for_panel(panel, metrics.width);
     let title_rows = text_panel_header_rows(&panel.config);
     let title_width = header_actions
         .first()
@@ -4608,6 +4685,14 @@ fn render_text_panel(
             position.y,
             &fit_display_width(title, title_width),
             &title_style,
+        );
+    }
+    if let Some((start, text)) = text_panel_header_detail_layout(panel, metrics.width) {
+        buffer.set_text(
+            content_position.x + start,
+            position.y,
+            &text,
+            &palette.secondary,
         );
     }
     for (start, _, label) in header_actions {
@@ -5316,7 +5401,36 @@ fn render_text_panel_status(
 }
 
 fn text_panel_header_actions(config: &PanelConfig, width: usize) -> Vec<(usize, &str, &str)> {
-    let title_width = config.title.as_deref().map_or(0, display_width).min(5);
+    text_panel_header_actions_with_title_width(
+        config,
+        width,
+        config.title.as_deref().map_or(0, display_width).min(5),
+    )
+}
+
+fn text_panel_header_actions_for_panel(
+    panel: &TextPanel,
+    width: usize,
+) -> Vec<(usize, &str, &str)> {
+    let Some(detail) = &panel.header_detail else {
+        return text_panel_header_actions(&panel.config, width);
+    };
+    let title_width = panel.config.title.as_deref().map_or(0, display_width)
+        + 3
+        + display_width(&detail.text)
+        + if detail.secondary.is_empty() {
+            0
+        } else {
+            3 + display_width(&detail.secondary)
+        };
+    text_panel_header_actions_with_title_width(&panel.config, width, title_width)
+}
+
+fn text_panel_header_actions_with_title_width(
+    config: &PanelConfig,
+    width: usize,
+    title_width: usize,
+) -> Vec<(usize, &str, &str)> {
     let full_width = config
         .header_actions
         .iter()
@@ -5359,8 +5473,43 @@ fn text_panel_header_actions(config: &PanelConfig, width: usize) -> Vec<(usize, 
         .collect()
 }
 
-fn text_panel_header_action_at(config: &PanelConfig, width: usize, x: usize) -> Option<&str> {
-    text_panel_header_actions(config, width)
+/// Returns exactly the metadata cells painted in the header, also used for hit testing.
+fn text_panel_header_detail_layout(panel: &TextPanel, width: usize) -> Option<(usize, String)> {
+    let detail = panel.header_detail.as_ref()?;
+    let title = panel.config.title.as_deref().unwrap_or_default();
+    let end = text_panel_header_actions_for_panel(panel, width)
+        .first()
+        .map_or(width, |(start, _, _)| start.saturating_sub(1));
+    let start = display_width(title);
+    let available = end.saturating_sub(start);
+    if available < 5 || detail.text.is_empty() {
+        return None;
+    }
+    let text_width = available - 3;
+    let full = if detail.secondary.is_empty() {
+        detail.text.clone()
+    } else {
+        format!("{} · {}", detail.text, detail.secondary)
+    };
+    let text = if display_width(&full) <= text_width {
+        full
+    } else {
+        crate::unicode_utils::truncate_display_width_with_marker(
+            if detail.compact_text.is_empty() {
+                &detail.text
+            } else {
+                &detail.compact_text
+            },
+            text_width,
+            "…",
+            crate::unicode_utils::TruncationSide::Right,
+        )
+    };
+    Some((start, format!(" · {text}")))
+}
+
+fn text_panel_header_action_at(panel: &TextPanel, width: usize, x: usize) -> Option<&str> {
+    text_panel_header_actions_for_panel(panel, width)
         .into_iter()
         .find(|(start, _, label)| {
             x >= *start && x < start.saturating_add(display_width(label).saturating_add(2))
@@ -7316,6 +7465,130 @@ mod tests {
         manager.render(&mut buffer, &theme);
         assert!((1..6).any(|row| row_text(&buffer, row).contains("LATEST")));
         assert!((6..10).any(|row| row_text(&buffer, row).contains("Ask")));
+    }
+
+    #[test]
+    fn text_panel_model_header_preserves_state_and_uses_painted_hit_region() {
+        let mut manager = PanelManager::default();
+        manager.create_text_panel(
+            "agent-conversation".into(),
+            PanelConfig {
+                side: PanelSide::Right,
+                width: 62,
+                title: Some("Agent".into()),
+                composer: Some(TextPanelComposerConfig {
+                    placeholder: "Ask".into(),
+                    rows: 3,
+                }),
+                header_actions: vec![TextPanelHeaderAction {
+                    id: "close".into(),
+                    label: "×".into(),
+                    compact_label: None,
+                }],
+                ..PanelConfig::default()
+            },
+        );
+        manager.focus_text_panel_composer("agent-conversation");
+        let panel = manager.text_panels.get_mut("agent-conversation").unwrap();
+        panel
+            .composer
+            .as_mut()
+            .unwrap()
+            .prompt
+            .replace_draft("unfinished draft");
+        let detail = TextPanelHeaderDetail {
+            text: "model-with-a-long-name".into(),
+            secondary: "high".into(),
+            compact_text: String::new(),
+            action: Some("model".into()),
+            shortcut: Some("Alt-m".into()),
+        };
+        assert!(manager.set_text_panel_header_detail("agent-conversation", Some(detail.clone())));
+        assert!(!manager.set_text_panel_header_detail("agent-conversation", Some(detail)));
+        assert_eq!(
+            manager.text_panels["agent-conversation"]
+                .composer
+                .as_ref()
+                .unwrap()
+                .prompt
+                .text(),
+            "unfinished draft"
+        );
+        assert!(manager.focused_text_input_active());
+        let theme = Theme::default();
+        let mut wide = RenderBuffer::new(100, 20, &theme.style);
+        manager.render(&mut wide, &theme);
+        let header = row_text(&wide, 0);
+        assert!(header.contains("Agent · model-with-a-long-name · high"));
+        let x = display_width(&header[..header.find("model-with").unwrap()]);
+        assert_eq!(
+            manager
+                .focus_panel_at_position(x, 0, 100, 20)
+                .unwrap()
+                .action,
+            "model"
+        );
+        assert!(manager.focused_text_input_active());
+        let panel = &manager.text_panels["agent-conversation"];
+        for width in 0..70 {
+            if let Some((start, text)) = text_panel_header_detail_layout(panel, width) {
+                let action_start = text_panel_header_actions_for_panel(panel, width)
+                    .first()
+                    .map_or(width, |(start, _, _)| *start);
+                assert!(start + display_width(&text) < action_start);
+            }
+        }
+        let (_, narrow) = text_panel_header_detail_layout(panel, 24).unwrap();
+        assert!(narrow.ends_with('…'));
+        assert!(!narrow.contains("high"));
+    }
+
+    #[test]
+    fn pending_model_header_compacts_buttons_before_hiding_the_change() {
+        let mut panel = TextPanel::new(
+            "agent".into(),
+            PanelConfig {
+                title: Some("Agent".into()),
+                header_actions: [
+                    ("clear", "Clear", "C"),
+                    ("new", "New", "N"),
+                    ("close", "×", "×"),
+                ]
+                .into_iter()
+                .map(|(id, label, compact)| TextPanelHeaderAction {
+                    id: id.into(),
+                    label: label.into(),
+                    compact_label: Some(compact.into()),
+                })
+                .collect(),
+                ..Default::default()
+            },
+        );
+        panel.header_detail = Some(TextPanelHeaderDetail {
+            text: "smoke-deep".into(),
+            secondary: "Next: smoke-fast · medium".into(),
+            compact_text: "smoke-deep → smoke-fast".into(),
+            action: Some("model".into()),
+            shortcut: Some("Alt-m".into()),
+        });
+        assert!(text_panel_header_detail_layout(&panel, 60)
+            .unwrap()
+            .1
+            .contains("Next: smoke-fast"));
+        assert_eq!(
+            text_panel_header_actions_for_panel(&panel, 60)
+                .iter()
+                .map(|(_, _, label)| *label)
+                .collect::<Vec<_>>(),
+            ["C", "N", "×"]
+        );
+        assert!(text_panel_header_detail_layout(&panel, 42)
+            .unwrap()
+            .1
+            .contains('→'));
+        for (start, action, _) in text_panel_header_actions_for_panel(&panel, 60) {
+            assert_eq!(text_panel_header_action_at(&panel, 60, start), Some(action));
+        }
     }
 
     #[test]

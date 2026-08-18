@@ -189,6 +189,9 @@ pub struct PickerOptions {
     pub actions: Vec<PickerKeyAction>,
     #[serde(default)]
     pub preview: Option<PickerPreview>,
+    /// Reserve full labels before allocating aligned secondary columns.
+    #[serde(default)]
+    pub item_layout: PickerItemLayout,
     #[serde(default)]
     pub presentation: PickerPresentation,
 }
@@ -200,6 +203,14 @@ pub struct LegacyPickerOptions {
     pub initial_selection: Option<String>,
     #[serde(default)]
     pub presentation: PickerPresentation,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PickerItemLayout {
+    #[default]
+    Default,
+    LabelFirst,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -353,6 +364,7 @@ pub struct Picker {
     history_navigation: Option<PickerHistoryNavigation>,
     input_position: PickerInputPosition,
     icons: PickerIconsConfig,
+    item_layout: PickerItemLayout,
     presentation: PickerPresentation,
     viewport_width: usize,
     viewport_height: usize,
@@ -402,6 +414,13 @@ struct CommandColumns {
     title: usize,
     shortcut: usize,
     colon: usize,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct LabelFirstColumns {
+    label: usize,
+    annotation: usize,
+    detail: usize,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -522,6 +541,7 @@ impl Picker {
             history_navigation: None,
             input_position: editor.picker_input_position(),
             icons: editor.picker_icons(),
+            item_layout: PickerItemLayout::Default,
             presentation,
             viewport_width: editor.vwidth(),
             viewport_height: editor.vheight(),
@@ -667,6 +687,7 @@ impl Picker {
         picker.set_busy(options.busy);
         picker.key_actions = options.actions;
         picker.preview = options.preview;
+        picker.item_layout = options.item_layout;
         picker.search = options.initial_query;
         picker.set_presentation_for_viewport(
             options.presentation,
@@ -1652,6 +1673,8 @@ impl Picker {
         };
         let content_width = rect.width.saturating_sub(PICKER_ITEM_PREFIX_WIDTH);
         let command_columns = self.command_columns(items, content_width);
+        let label_first_columns = (self.item_layout == PickerItemLayout::LabelFirst)
+            .then(|| self.label_first_columns(items, content_width));
         let selected = self.list.selected_index();
         let top = self.list.top_index();
         for (offset, index) in self
@@ -1744,6 +1767,60 @@ impl Picker {
                         command_columns.colon,
                         &content_style,
                         &detail_match_style,
+                        &item.detail_matches,
+                    );
+                }
+                continue;
+            }
+
+            if let Some(columns) = label_first_columns {
+                let label_style = self.result_label_style(&row_style);
+                let label_match_style = if derived_label_matches.is_some() {
+                    self.result_filter_match_style(&label_style)
+                } else {
+                    self.result_match_style(&label_style)
+                };
+                self.draw_text_with_matches(
+                    buffer,
+                    x,
+                    y,
+                    &item.label,
+                    columns.label,
+                    &label_style,
+                    &label_match_style,
+                    label_matches,
+                );
+                let mut column_x = x + columns.label;
+                if columns.annotation > 0 {
+                    column_x += INTRINSIC_COLUMN_GAP;
+                    let style = self.result_annotation_style(&row_style, is_selected);
+                    let matches = filter_highlights
+                        .as_ref()
+                        .map(|highlights| highlights.annotation.as_slice())
+                        .unwrap_or_default();
+                    self.draw_text_with_matches(
+                        buffer,
+                        column_x,
+                        y,
+                        item.annotation.as_deref().unwrap_or_default(),
+                        columns.annotation,
+                        &style,
+                        &self.result_filter_match_style(&style),
+                        matches,
+                    );
+                    column_x += columns.annotation;
+                }
+                if columns.detail > 0 {
+                    column_x += INTRINSIC_COLUMN_GAP;
+                    let style = self.result_content_style(&row_style, is_selected);
+                    self.draw_text_with_matches(
+                        buffer,
+                        column_x,
+                        y,
+                        item.detail.as_deref().unwrap_or_default(),
+                        columns.detail,
+                        &style,
+                        &self.result_match_style(&style),
                         &item.detail_matches,
                     );
                 }
@@ -1895,6 +1972,36 @@ impl Picker {
                 );
             }
         }
+    }
+
+    /// Use every filtered row, not just the current page, so scrolling does not
+    /// move the columns. Labels take priority over status and descriptions.
+    fn label_first_columns(&self, items: &[PickerItem], content_width: usize) -> LabelFirstColumns {
+        let mut columns = LabelFirstColumns::default();
+        for index in &self.visible_dynamic_items {
+            let item = &items[*index];
+            columns.label = columns.label.max(display_width(&item.label));
+            columns.annotation = columns
+                .annotation
+                .max(item.annotation.as_deref().map_or(0, display_width));
+            columns.detail = columns
+                .detail
+                .max(item.detail.as_deref().map_or(0, display_width));
+        }
+        columns.label = columns.label.min(content_width);
+        let mut remaining = content_width.saturating_sub(columns.label);
+        if columns.annotation > 0 && columns.annotation + INTRINSIC_COLUMN_GAP <= remaining {
+            remaining -= columns.annotation + INTRINSIC_COLUMN_GAP;
+        } else {
+            columns.annotation = 0;
+        }
+        let available_detail = remaining.saturating_sub(INTRINSIC_COLUMN_GAP);
+        if available_detail < columns.detail.min(8) {
+            columns.detail = 0;
+        } else {
+            columns.detail = columns.detail.min(available_detail);
+        }
+        columns
     }
 
     fn command_columns(&self, items: &[PickerItem], content_width: usize) -> CommandColumns {
@@ -4482,6 +4589,196 @@ mod tests {
         assert!(contrast_ratio(selected_bg, surface_bg) >= 3.0);
         assert_ne!(selected_bg, selection_color);
         assert_eq!(buffer.cells[detail_start + 4].style.bg, Some(match_color));
+    }
+
+    #[test]
+    fn label_first_picker_keeps_model_names_and_aligns_secondary_columns() {
+        let editor = test_editor_with_theme_and_size(Theme::default(), 120, 30);
+        let labels = ["GPT-5.6-Sol-OAI", "GPT-5.6-Sol", "漢字 model"];
+        let items = labels
+            .iter()
+            .enumerate()
+            .map(|(index, label)| {
+                let mut item = dynamic_item(&index.to_string(), label);
+                item.annotation = (index == 1).then(|| "Current".to_string());
+                item.detail = Some(format!(
+                    "Description {index} that should yield to the full model name"
+                ));
+                item
+            })
+            .collect();
+        let mut picker = Picker::new_dynamic(
+            Some("Agent model".into()),
+            &editor,
+            items,
+            24,
+            PickerOptions {
+                item_layout: super::PickerItemLayout::LabelFirst,
+                presentation: PickerPresentation::Compact,
+                ..PickerOptions::default()
+            },
+        );
+        let mut buffer = RenderBuffer::new(120, 30, &Style::default());
+        picker.draw(&mut buffer).unwrap();
+        let rows = (0..labels.len())
+            .map(|index| render_row(&buffer, picker.layout().results.y + index))
+            .collect::<Vec<_>>();
+        let assert_label = |buffer: &RenderBuffer, x: usize, y: usize, label: &str| {
+            let mut column = x;
+            for character in label.chars() {
+                assert_eq!(buffer.cells[y * buffer.width + column].c, character);
+                column += display_width(&character.to_string());
+            }
+        };
+        // RenderBuffer stores a continuation cell for each wide character.
+        // Compare cell positions, not the display width of that debug string.
+        let description_column = |row: &str| {
+            row.find("Description")
+                .map(|index| row[..index].chars().count())
+        };
+        for (index, (row, label)) in rows.iter().zip(labels).enumerate() {
+            assert_label(
+                &buffer,
+                picker.layout().results.x + super::PICKER_ITEM_PREFIX_WIDTH,
+                picker.layout().results.y + index,
+                label,
+            );
+            assert_eq!(description_column(row), description_column(&rows[0]));
+        }
+        assert!(rows[1].contains("Current"));
+        assert!(picker.resize(40, 30));
+        let mut narrow = RenderBuffer::new(40, 30, &Style::default());
+        picker.draw(&mut narrow).unwrap();
+        for (index, label) in labels.into_iter().enumerate() {
+            let row = render_row(&narrow, picker.layout().results.y + index);
+            assert_label(
+                &narrow,
+                picker.layout().results.x + super::PICKER_ITEM_PREFIX_WIDTH,
+                picker.layout().results.y + index,
+                label,
+            );
+            assert!(!row.contains("Description"), "{row:?}");
+        }
+        assert!(picker.resize(22, 30));
+        let mut tiny = RenderBuffer::new(22, 30, &Style::default());
+        picker.draw(&mut tiny).unwrap();
+        let row = render_row(&tiny, picker.layout().results.y);
+        assert!(row.contains(labels[0]), "{row:?}");
+        assert!(!row.contains("Current"));
+        assert!(row.ends_with('│'), "{row:?}");
+    }
+
+    #[test]
+    fn loading_picker_updates_keep_the_query_and_visible_selection() {
+        let editor = test_editor();
+        let mut picker = Picker::new_dynamic(
+            Some("Agent model".into()),
+            &editor,
+            vec![],
+            27,
+            PickerOptions {
+                busy: true,
+                status: Some("Loading models…".into()),
+                item_layout: super::PickerItemLayout::LabelFirst,
+                ..PickerOptions::default()
+            },
+        );
+        assert!(picker.apply_update(27, PickerUpdate::Query("second".into())));
+        assert!(picker.apply_update(
+            27,
+            PickerUpdate::Items(vec![
+                dynamic_item("first", "First"),
+                dynamic_item("second", "Second")
+            ])
+        ));
+        assert!(picker.apply_update(27, PickerUpdate::Selection("first".into())));
+        assert!(picker.apply_update(27, PickerUpdate::Busy(false)));
+        assert_eq!(picker.search, "second");
+        assert_eq!(picker.selected_dynamic_item().unwrap().id, "second");
+        assert!(picker.busy_since.is_none());
+    }
+
+    #[test]
+    fn label_first_picker_checkmark_uses_existing_prefix_space() {
+        let editor = test_editor_with_theme_and_size(Theme::default(), 120, 30);
+        let mut first = dynamic_item("first", "GPT-5.6-Sol-OAI");
+        first.detail = Some("Description one".into());
+        let mut current = dynamic_item("current", "GPT-5.6-Sol");
+        current.icon = Some(PickerIcon::Text("✓".into()));
+        current.detail = Some("Description two".into());
+        let picker = Picker::new_dynamic(
+            Some("Agent model".into()),
+            &editor,
+            vec![first, current],
+            26,
+            PickerOptions {
+                item_layout: super::PickerItemLayout::LabelFirst,
+                presentation: PickerPresentation::Compact,
+                ..PickerOptions::default()
+            },
+        );
+        let mut buffer = RenderBuffer::new(120, 30, &Style::default());
+        picker.draw(&mut buffer).unwrap();
+        let rect = picker.layout().results;
+        let first = render_row(&buffer, rect.y);
+        let current = render_row(&buffer, rect.y + 1);
+        assert_eq!(buffer.cells[rect.y * buffer.width + rect.x].c, '›');
+        assert_eq!(
+            buffer.cells[(rect.y + 1) * buffer.width + rect.x + 2].c,
+            '✓'
+        );
+        let description_x = rect.x
+            + super::PICKER_ITEM_PREFIX_WIDTH
+            + display_width("GPT-5.6-Sol-OAI")
+            + super::INTRINSIC_COLUMN_GAP;
+        assert_eq!(display_column(&first, "Description"), Some(description_x));
+        assert_eq!(display_column(&current, "Description"), Some(description_x));
+        assert!(!current.contains("Current"));
+    }
+
+    #[test]
+    fn label_first_picker_columns_stay_aligned_across_pages() {
+        let editor = test_editor_with_theme_and_size(Theme::default(), 120, 18);
+        let mut items = (0..24)
+            .map(|index| {
+                let mut item = dynamic_item(&index.to_string(), &format!("Model {index}"));
+                item.detail = Some("Description".into());
+                item
+            })
+            .collect::<Vec<_>>();
+        items[20].label = "Longest model on the next page".into();
+        let mut picker = Picker::new_dynamic(
+            None,
+            &editor,
+            items,
+            25,
+            PickerOptions {
+                item_layout: super::PickerItemLayout::LabelFirst,
+                ..PickerOptions::default()
+            },
+        );
+        let width = picker
+            .layout()
+            .results
+            .width
+            .saturating_sub(super::PICKER_ITEM_PREFIX_WIDTH);
+        let columns = picker.label_first_columns(picker.dynamic_items.as_ref().unwrap(), width);
+        picker.list.set_selected_index(20);
+        assert_eq!(
+            columns,
+            picker.label_first_columns(picker.dynamic_items.as_ref().unwrap(), width)
+        );
+        assert_eq!(
+            columns.label,
+            display_width("Longest model on the next page")
+        );
+        picker.filter("Model 1");
+        assert!(
+            picker
+                .label_first_columns(picker.dynamic_items.as_ref().unwrap(), width)
+                .label
+                < columns.label
+        );
     }
 
     #[test]

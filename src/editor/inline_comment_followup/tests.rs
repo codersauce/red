@@ -353,6 +353,9 @@ async fn changed_source_is_disclosed_and_detached_source_offers_agent() {
 #[tokio::test]
 async fn ask_agent_opens_the_composer_without_sending_or_creating_history() {
     let (mut editor, id) = fixture();
+    let (bridge, mut worker) =
+        crate::codex::CodexBridge::channel(std::num::NonZeroUsize::new(2).unwrap());
+    editor.agent_manager.set_bridge(bridge);
     let mut runtime = Runtime::new();
     runtime
         .load_plugin("agent", include_str!("../../../plugins/agent.hk"))
@@ -378,7 +381,27 @@ async fn ask_agent_opens_the_composer_without_sending_or_creating_history() {
     let staged = editor.staged_inline_agent_handoff.as_ref().unwrap();
     assert!(editor.inline_history.turn(&staged.request_id).is_none());
     assert_eq!(editor.inline_history.conversations.len(), 1);
-    assert!(!editor.agent_manager.has_bridge());
+    assert!(matches!(
+        worker.recv().await,
+        Some(crate::codex::CodexCommand::ModelRequest {
+            request: crate::codex::ModelRequest::List,
+            ..
+        })
+    ));
+    assert!(matches!(
+        worker.recv().await,
+        Some(crate::codex::CodexCommand::ModelRequest {
+            request: crate::codex::ModelRequest::ReadDefault { .. },
+            ..
+        })
+    ));
+    assert!(editor.agent_manager.conversation_snapshot().is_none());
+    assert!(!editor.agent_manager.has_active_sessions());
+    drop(editor.agent_manager.take_bridge());
+    assert!(
+        worker.recv().await.is_none(),
+        "opening the composer must not start a thread or turn"
+    );
 }
 
 #[tokio::test]
