@@ -3063,6 +3063,41 @@ impl PanelManager {
             .is_some_and(|composer| composer.focused && composer.enabled)
     }
 
+    /// The navigation keymap eligible to open the editor command line.
+    /// Local text entry and incomplete Vim commands retain their next key.
+    pub(crate) fn command_mode_keymap(&self) -> Option<crate::editor::Mode> {
+        use crate::editor::Mode;
+
+        let id = self.focused.as_deref()?;
+        let Some(panel) = self.text_panels.get(id) else {
+            return Some(Mode::Normal);
+        };
+        if panel.scrollback.focused {
+            if panel.search.active.is_some()
+                || panel.scrollback.pending_find.is_some()
+                || panel.scrollback.pending_jump.is_some()
+            {
+                return None;
+            }
+        } else if let Some(composer) = panel
+            .composer
+            .as_ref()
+            .filter(|composer| composer.focused && composer.enabled)
+        {
+            if composer.prompt.has_pending_input() {
+                return None;
+            }
+        }
+        let mode = self
+            .focused_text_panel_cursor_mode()
+            .unwrap_or(Mode::Normal);
+        matches!(
+            mode,
+            Mode::Normal | Mode::Visual | Mode::VisualLine | Mode::VisualBlock
+        )
+        .then_some(mode)
+    }
+
     pub fn focused_text_panel_has_composer(&self) -> bool {
         self.focused
             .as_deref()
