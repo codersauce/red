@@ -18,9 +18,28 @@ Set an explicit workspace root with `-r`:
 red -r path/to/project src/main.rs
 ```
 
-On the first interactive run, Red offers to create a starter configuration at
-`~/.config/red/config.toml`. The file is optional; Red starts with its embedded
-configuration, themes, and plugins when it is absent.
+The first interactive launch opens a keyboard-first welcome screen inside the
+editor. Start its guided tour, press `i` for a shorter tour, view release
+highlights, or press `Esc` to begin editing immediately. Use `:welcome` to
+reopen it later.
+
+The guided tour uses an unnamed practice buffer and simulated Git and agent
+previews; it never saves the practice buffer, changes your repository, or
+starts Codex. The full tour covers modal editing, command discovery, fuzzy
+navigation, completion, Git, reviewable agent proposals, and themes. Start or
+control it at any time:
+
+```text
+:tutorial          # start the full guided tour
+:tutorial quick    # start the shorter experienced-user tour
+:tutorial resume   # continue an unfinished tour
+:tutorial next     # skip the current lesson
+:tutorial quit     # exit and restore your original editor layout
+```
+
+A starter configuration at `~/.config/red/config.toml` remains optional. Press
+`c` on the welcome screen to create one without overwriting existing settings.
+Embedded configuration, themes, and plugins work when the file is absent.
 
 ## Editor model
 

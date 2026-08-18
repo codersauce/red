@@ -474,6 +474,24 @@ fn builtin_commands() -> Vec<BuiltinCommand> {
             Action::CommandPalette,
         ),
         builtin(
+            "editor.welcome",
+            "Welcome to Red",
+            "Editor",
+            "Open the first-run welcome, guided tour, and release highlights",
+            Some(":welcome"),
+            &["first launch", "onboarding", "what's new"],
+            Action::OpenWelcome,
+        ),
+        builtin(
+            "editor.tutorial",
+            "Take the guided Red tour",
+            "Editor",
+            "Practice editing, navigation, Git, and reviewable agent changes",
+            Some(":tutorial"),
+            &["tour", "walkthrough", "learn red", "onboarding"],
+            Action::StartTutorial(crate::tutorial::TutorialTrack::Guided),
+        ),
+        builtin(
             "editor.config_diagnostics",
             "Configuration diagnostics",
             "Editor",
@@ -1357,6 +1375,8 @@ fn action_label(action: &Action) -> String {
         Action::OpenInlineActivity | Action::OpenInlineHistory => {
             "Inline assist history".to_string()
         }
+        Action::OpenWelcome => "Welcome to Red".to_string(),
+        Action::StartTutorial(_) => "Take the guided Red tour".to_string(),
         Action::ConfigDiagnostics => "Configuration diagnostics".to_string(),
         Action::OpenWhatsNew => "What’s new in Red".to_string(),
         Action::OpenDiagnosticsPicker => "Diagnostics".to_string(),
@@ -1573,6 +1593,18 @@ mod tests {
             .unwrap();
         assert_eq!(zoom.action, Action::TogglePaneZoom);
         assert!(zoom.shortcuts.iter().any(|shortcut| shortcut == "Ctrl-w z"));
+
+        let welcome = entries
+            .iter()
+            .find(|entry| entry.id == "editor.welcome")
+            .unwrap();
+        assert_eq!(welcome.colon.as_deref(), Some(":welcome"));
+
+        let tutorial = entries
+            .iter()
+            .find(|entry| entry.id == "editor.tutorial")
+            .unwrap();
+        assert_eq!(tutorial.colon.as_deref(), Some(":tutorial"));
     }
 
     #[test]

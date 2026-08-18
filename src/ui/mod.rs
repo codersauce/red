@@ -34,6 +34,7 @@ mod shortcut_catalog;
 pub(crate) mod signature_help;
 mod spinner;
 mod statusline_layout;
+mod welcome;
 mod whats_new;
 
 pub(crate) use action_bar::ActionMenu;
@@ -85,6 +86,8 @@ pub(crate) use shortcut_catalog::{
 };
 pub(crate) use spinner::{spinner_frame, SPINNER_FRAME_INTERVAL_MS};
 pub use statusline_layout::StatuslineLayoutPanel;
+pub(crate) use welcome::draw_tutorial_coach;
+pub use welcome::{TutorialDemoKind, TutorialDemoPanel, WelcomePanel};
 pub use whats_new::WhatsNewPanel;
 
 use crate::{

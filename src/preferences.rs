@@ -14,7 +14,7 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
-use crate::{plugin::PanelSide, LOGGER};
+use crate::{plugin::PanelSide, tutorial::TutorialProgress, LOGGER};
 
 const COMMAND_HISTORY_LIMIT: usize = 100;
 const SEARCH_HISTORY_LIMIT: usize = 100;
@@ -39,6 +39,10 @@ pub struct Preferences {
     copilot_setup_hint_seen: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     learn_completed_lessons: Vec<String>,
+    #[serde(default)]
+    welcome_completed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tutorial_progress: Option<TutorialProgress>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -171,6 +175,36 @@ impl PreferencesStore {
             return Ok(());
         }
         self.preferences.copilot_setup_hint_seen = true;
+        self.save()
+    }
+
+    /// Whether the first-run welcome has already received an explicit decision.
+    #[must_use]
+    pub const fn welcome_completed(&self) -> bool {
+        self.preferences.welcome_completed
+    }
+
+    /// Persists dismissal or acceptance without requiring a starter config file.
+    pub fn complete_welcome(&mut self) -> anyhow::Result<()> {
+        if self.preferences.welcome_completed {
+            return Ok(());
+        }
+        self.preferences.welcome_completed = true;
+        self.save()
+    }
+
+    /// Returns the last explicitly persisted guided-tour position.
+    #[must_use]
+    pub fn tutorial_progress(&self) -> Option<&TutorialProgress> {
+        self.preferences.tutorial_progress.as_ref()
+    }
+
+    /// Saves a resumable lesson or completed track without touching editor files.
+    pub fn set_tutorial_progress(&mut self, progress: TutorialProgress) -> anyhow::Result<()> {
+        if self.preferences.tutorial_progress.as_ref() == Some(&progress) {
+            return Ok(());
+        }
+        self.preferences.tutorial_progress = Some(progress);
         self.save()
     }
 
@@ -552,6 +586,8 @@ mod tests {
         assert!(store.command_history().is_empty());
         assert!(store.search_history().is_empty());
         assert_eq!(store.last_seen_version(), None);
+        assert!(!store.welcome_completed());
+        assert!(store.tutorial_progress().is_none());
     }
 
     #[test]
@@ -564,6 +600,24 @@ mod tests {
 
         let reloaded = PreferencesStore::load(&path);
         assert_eq!(reloaded.last_seen_version(), Some("0.5.0"));
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn welcome_decision_and_tutorial_progress_survive_reload() {
+        let dir = unique_temp_dir("welcome-progress");
+        let path = dir.join("preferences.json");
+        let mut store = PreferencesStore::load(&path);
+        let mut progress = TutorialProgress::new(crate::tutorial::TutorialTrack::Quick);
+        progress.lesson_index = 1;
+        progress.phase = 1;
+
+        store.complete_welcome().unwrap();
+        store.set_tutorial_progress(progress.clone()).unwrap();
+
+        let reloaded = PreferencesStore::load(&path);
+        assert!(reloaded.welcome_completed());
+        assert_eq!(reloaded.tutorial_progress(), Some(&progress));
         fs::remove_dir_all(dir).ok();
     }
 
@@ -593,6 +647,8 @@ mod tests {
         assert_eq!(store.command_history(), ["write"]);
         assert!(store.search_history().is_empty());
         assert_eq!(store.last_seen_version(), None);
+        assert!(!store.welcome_completed());
+        assert!(store.tutorial_progress().is_none());
         fs::remove_dir_all(dir).ok();
     }
 

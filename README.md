@@ -101,8 +101,11 @@ Open a file:
 red path/to/file
 ```
 
-Red offers to create a starter config on the first interactive run. Declining
-is fine: the embedded defaults, plugins, and themes are enough to start editing.
+The first interactive launch offers a guided tour, release highlights, and an
+immediate exit into the editor. The tour uses a disposable practice buffer and
+safe Git/agent demonstrations; reopen it with `:welcome` or `:tutorial`.
+Starter configuration remains optional: embedded defaults, plugins, and themes
+are enough to begin editing.
 
 | Key | Action |
 | --- | --- |

@@ -829,6 +829,7 @@ async fn serve_editor_connection(
         core.clear_pending_paste();
         core.resize(columns, rows).await?;
         core.focus(focused).await?;
+        core.prepare_startup_welcome()?;
         core.prepare_startup_whats_new()?
     };
     let render = core.lock().await.snapshot(last_revision);
