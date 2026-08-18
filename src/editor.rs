@@ -16,6 +16,7 @@
 //! model.
 
 mod agent_manager;
+mod agent_models;
 mod buffer_manager;
 mod diagnostics;
 mod diagnostics_picker;
@@ -1265,6 +1266,20 @@ fn agent_event_payload(event: CodexEvent) -> (&'static str, Value) {
             "inline_assist:error",
             json!({ "request_id": request_id, "session_id": session_id, "message": message }),
         ),
+        CodexEvent::ModelRequestCompleted { .. } => {
+            unreachable!("model results use private callbacks")
+        }
+        CodexEvent::SessionModelRerouted { session_id, model } => (
+            "agent:model_rerouted",
+            json!({"session_id": session_id, "model": model}),
+        ),
+        CodexEvent::SessionModelChanged {
+            session_id,
+            model_info,
+        } => (
+            "agent:model_changed",
+            json!({ "session_id": session_id, "model_info": model_info }),
+        ),
         CodexEvent::SessionCreated { session_id } => (
             "agent:session_created",
             json!({ "session_id": session_id.to_string() }),
@@ -1529,6 +1544,14 @@ fn snake_case_key(key: &str) -> String {
 /// windows, UI resources, agent state, LSP state, or the filesystem.
 pub enum PluginRequest {
     Action(Action),
+    AgentModelRequest {
+        request_id: RequestId,
+        request: crate::codex::ModelRequest,
+    },
+    SetTextPanelHeaderDetail {
+        id: String,
+        detail: Option<plugin::TextPanelHeaderDetail>,
+    },
     AgentNewSession {
         cwd: PathBuf,
     },
@@ -1626,6 +1649,10 @@ pub enum PluginRequest {
     UpdatePickerQuery {
         id: i32,
         query: String,
+    },
+    UpdatePickerSelection {
+        id: i32,
+        selection: String,
     },
     UpdatePickerStatus {
         id: i32,
@@ -1925,6 +1952,8 @@ impl PluginRequest {
     fn label(&self) -> &'static str {
         match self {
             Self::Action(_) => "Action",
+            Self::AgentModelRequest { .. } => "AgentModelRequest",
+            Self::SetTextPanelHeaderDetail { .. } => "SetTextPanelHeaderDetail",
             Self::AgentNewSession { .. } => "AgentNewSession",
             Self::AgentResumeSession { .. } => "AgentResumeSession",
             Self::AgentPrompt { .. } => "AgentPrompt",
@@ -1948,6 +1977,7 @@ impl PluginRequest {
             Self::OpenCallbackConfirmation { .. } => "OpenCallbackConfirmation",
             Self::UpdatePickerItems { .. } => "UpdatePickerItems",
             Self::UpdatePickerQuery { .. } => "UpdatePickerQuery",
+            Self::UpdatePickerSelection { .. } => "UpdatePickerSelection",
             Self::UpdatePickerStatus { .. } => "UpdatePickerStatus",
             Self::UpdatePickerBusy { .. } => "UpdatePickerBusy",
             Self::UpdatePickerPreview { .. } => "UpdatePickerPreview",
@@ -8531,8 +8561,11 @@ impl Editor {
     ) -> anyhow::Result<bool> {
         if self.agent_manager.is_task_finished() {
             let message = self
-                .finish_agent_bridge("Codex app-server stopped before the prompt was sent")
-                .await;
+                .finish_agent_bridge(
+                    runtime,
+                    "Codex app-server stopped before the prompt was sent",
+                )
+                .await?;
             self.plugin_registry
                 .notify(
                     runtime,
@@ -8599,8 +8632,8 @@ impl Editor {
         );
         if bridge.send(command).await.is_err() {
             let message = self
-                .finish_agent_bridge("Codex app-server stopped while sending the prompt")
-                .await;
+                .finish_agent_bridge(runtime, "Codex app-server stopped while sending the prompt")
+                .await?;
             self.plugin_registry
                 .notify(
                     runtime,
@@ -8912,7 +8945,11 @@ impl Editor {
             .await
     }
 
-    async fn finish_agent_bridge(&mut self, fallback: &str) -> String {
+    async fn finish_agent_bridge(
+        &mut self,
+        runtime: &mut Runtime,
+        fallback: &str,
+    ) -> anyhow::Result<String> {
         let result = match self.agent_manager.take_task() {
             Some(task) => Some(task.await),
             None => None,
@@ -8938,7 +8975,18 @@ impl Editor {
         };
         let message = bounded_agent_failure_message(&message);
         self.fail_running_inline_jobs(&message);
-        message
+        // Every shutdown path must resolve metadata callbacks, including a
+        // request that replaces a failed bridge before the background tick.
+        for request_id in self.agent_manager.take_pending_model_requests() {
+            self.plugin_registry
+                .resolve_request(
+                    runtime,
+                    RequestId::from_raw(request_id),
+                    json!({"error": message.clone()}),
+                )
+                .await?;
+        }
+        Ok(message)
     }
 
     async fn service_background(
@@ -9028,6 +9076,17 @@ impl Editor {
             else {
                 break;
             };
+            if let CodexEvent::ModelRequestCompleted { request_id, result } = &event {
+                self.agent_manager.finish_model_request(*request_id);
+                self.plugin_registry
+                    .resolve_request(
+                        runtime,
+                        RequestId::from_raw(*request_id),
+                        agent_models::model_result_payload(result),
+                    )
+                    .await?;
+                continue;
+            }
             if let CodexEvent::CommitMessageGenerated { request_id, result } = &event {
                 self.agent_manager.finish_commit_message(*request_id);
                 let payload = match result {
@@ -9210,7 +9269,15 @@ impl Editor {
                     event => event,
                 };
             match &event {
+                CodexEvent::SessionModelChanged {
+                    session_id,
+                    model_info,
+                } => {
+                    self.agent_manager
+                        .set_conversation_model(session_id, model_info.clone());
+                }
                 CodexEvent::SessionCreated { session_id } => {
+                    self.agent_manager.take_next_model();
                     let root = self
                         .agent_manager
                         .root()
@@ -9339,6 +9406,7 @@ impl Editor {
                 .is_none_or(|bridge| !bridge.has_pending_events())
         {
             let pending_commit_messages = self.agent_manager.take_pending_commit_messages();
+            let model_only_bridge = self.agent_manager.is_model_only_bridge();
             let inline_scope = self
                 .current_dialog
                 .as_ref()
@@ -9349,8 +9417,8 @@ impl Editor {
                         .map(|assist| assist.scope.clone())
                 });
             let message = self
-                .finish_agent_bridge("Codex app-server stopped unexpectedly")
-                .await;
+                .finish_agent_bridge(runtime, "Codex app-server stopped unexpectedly")
+                .await?;
             for request_id in pending_commit_messages {
                 self.plugin_registry
                     .resolve_request(
@@ -9382,7 +9450,7 @@ impl Editor {
                 self.set_legacy_message(Some(format!(
                     "{message}; restoring the persisted agent session"
                 )));
-            } else {
+            } else if !model_only_bridge {
                 self.plugin_registry
                     .notify(runtime, "agent:session_lost", json!({ "message": message }))
                     .await?;
@@ -9521,15 +9589,33 @@ impl Editor {
                     needs_render = true;
                     // self.redraw(runtime, &current_buffer, buffer).await?;
                 }
+                PluginRequest::AgentModelRequest {
+                    request_id,
+                    request,
+                } => {
+                    self.handle_agent_model_request(runtime, request_id, request)
+                        .await?;
+                }
+                PluginRequest::SetTextPanelHeaderDetail { id, detail } => {
+                    needs_render |= self.panel_manager.set_text_panel_header_detail(&id, detail);
+                }
                 PluginRequest::AgentNewSession { cwd } => {
                     if self.agent_manager.is_task_finished() {
+                        let model_only_bridge = self.agent_manager.is_model_only_bridge();
                         let message = self
-                            .finish_agent_bridge("Codex app-server stopped unexpectedly")
-                            .await;
-                        self.plugin_registry
-                            .notify(runtime, "agent:session_lost", json!({ "message": message }))
+                            .finish_agent_bridge(runtime, "Codex app-server stopped unexpectedly")
                             .await?;
+                        if !model_only_bridge {
+                            self.plugin_registry
+                                .notify(
+                                    runtime,
+                                    "agent:session_lost",
+                                    json!({ "message": message }),
+                                )
+                                .await?;
+                        }
                     }
+                    self.agent_manager.mark_conversation_requested();
                     if let Err(error) = self.ensure_agent_bridge(&cwd) {
                         self.plugin_registry
                             .notify(
@@ -9543,22 +9629,34 @@ impl Editor {
                     let Some(bridge) = self.agent_manager.bridge() else {
                         continue;
                     };
-                    if bridge.send(CodexCommand::NewSession { cwd }).await.is_err() {
+                    let command = self.agent_manager.next_model().cloned().map_or_else(
+                        || CodexCommand::NewSession { cwd: cwd.clone() },
+                        |selection| CodexCommand::NewSessionWithModel {
+                            cwd: cwd.clone(),
+                            selection,
+                        },
+                    );
+                    if bridge.send(command).await.is_err() {
                         let message = self
                             .finish_agent_bridge(
+                                runtime,
                                 "Codex app-server stopped while starting the session",
                             )
-                            .await;
+                            .await?;
                         self.plugin_registry
                             .notify(runtime, "agent:session_lost", json!({ "message": message }))
                             .await?;
                     }
                 }
                 PluginRequest::AgentResumeSession { cwd, session_id } => {
+                    self.agent_manager.mark_conversation_requested();
                     if self.agent_manager.is_task_finished() {
                         let _ = self
-                            .finish_agent_bridge("Codex app-server stopped before restoration")
-                            .await;
+                            .finish_agent_bridge(
+                                runtime,
+                                "Codex app-server stopped before restoration",
+                            )
+                            .await?;
                     }
                     if let Err(error) = self.ensure_agent_bridge(&cwd) {
                         self.plugin_registry
@@ -9586,9 +9684,10 @@ impl Editor {
                     {
                         let message = self
                             .finish_agent_bridge(
+                                runtime,
                                 "Codex app-server stopped while restoring the session",
                             )
-                            .await;
+                            .await?;
                         self.plugin_registry
                             .notify(
                                 runtime,
@@ -9691,8 +9790,11 @@ impl Editor {
                         Ok(prompt) => {
                             if self.agent_manager.is_task_finished() {
                                 let _ = self
-                                    .finish_agent_bridge("Codex app-server stopped unexpectedly")
-                                    .await;
+                                    .finish_agent_bridge(
+                                        runtime,
+                                        "Codex app-server stopped unexpectedly",
+                                    )
+                                    .await?;
                             }
                             self.ensure_agent_bridge(&get_workspace_path())
                                 .and_then(|()| {
@@ -9924,6 +10026,12 @@ impl Editor {
                 PluginRequest::UpdatePickerQuery { id, query } => {
                     if let Some(dialog) = &mut self.current_dialog {
                         dialog.update_picker(id, PickerUpdate::Query(query));
+                    }
+                    needs_render = true;
+                }
+                PluginRequest::UpdatePickerSelection { id, selection } => {
+                    if let Some(dialog) = &mut self.current_dialog {
+                        dialog.update_picker(id, PickerUpdate::Selection(selection));
                     }
                     needs_render = true;
                 }
@@ -13522,6 +13630,11 @@ impl Editor {
         ev: &event::Event,
         runtime: Option<&Runtime>,
     ) -> Option<KeyAction> {
+        if let Some(event) = Self::key_string_for_event(ev)
+            .and_then(|key| self.panel_manager.header_shortcut_event(&key))
+        {
+            return Self::panel_event_key_action(event);
+        }
         if matches!(ev, Event::Key(key) if matches!(key.code, KeyCode::Tab | KeyCode::BackTab))
             && self
                 .panel_manager

@@ -34,6 +34,9 @@ use tokio::{
     time::timeout,
 };
 
+mod models;
+pub use models::{AgentModelInfo, AgentModelSelection, ModelRequest};
+
 use crate::agent_tools::{editor_tool_schemas, EditorToolCall, EditorToolRequest};
 use crate::inline_assist::InlineAssistResult;
 use crate::inline_context::InlineContextCall;
@@ -93,6 +96,16 @@ impl CodexProcessSpec {
 /// Commands sent from the editor owner to the Codex worker.
 #[derive(Debug, Clone)]
 pub enum CodexCommand {
+    /// Queries the model catalog or updates one conversation's next-turn settings.
+    ModelRequest {
+        request_id: i64,
+        request: ModelRequest,
+    },
+    /// Starts a conversation with an explicitly selected model.
+    NewSessionWithModel {
+        cwd: PathBuf,
+        selection: AgentModelSelection,
+    },
     /// Starts an isolated, ephemeral inline-edit thread and immediately submits a request.
     InlineAssist {
         /// Editor-generated identifier used to reject stale responses.
@@ -176,6 +189,18 @@ pub enum CodexCommand {
 /// Events delivered from the Codex worker to the editor owner.
 #[derive(Debug, Clone)]
 pub enum CodexEvent {
+    /// Result for a private plugin model request.
+    ModelRequestCompleted {
+        request_id: i64,
+        result: std::result::Result<Value, String>,
+    },
+    /// A running turn was routed to a different model without changing its next-turn settings.
+    SessionModelRerouted { session_id: String, model: String },
+    /// Authoritative next-turn settings for a user-visible conversation.
+    SessionModelChanged {
+        session_id: String,
+        model_info: AgentModelInfo,
+    },
     /// User-visible prose from an inline turn, retained separately from its result.
     InlineAnswerDelta { request_id: String, text: String },
     /// Provenance of a successful read-only inline context request.
@@ -375,6 +400,7 @@ pub trait CodexToolHost: Send + 'static {
 
 #[derive(Debug)]
 struct Session {
+    model_info: Option<AgentModelInfo>,
     cwd: PathBuf,
     active_turn: Option<String>,
     cancelled: Arc<AtomicBool>,
@@ -400,6 +426,7 @@ enum SessionKind {
 #[derive(Debug)]
 enum ThreadRequest {
     Agent {
+        selection: Option<AgentModelSelection>,
         cwd: PathBuf,
         launch: SessionLaunch,
     },
@@ -439,6 +466,7 @@ enum SessionLaunch {
 }
 
 enum Pending {
+    Model(models::PendingModelRequest),
     Config {
         request: ThreadRequest,
     },
@@ -759,6 +787,28 @@ async fn handle_command(
     next_id: &mut u64,
 ) -> Result<()> {
     match command {
+        CodexCommand::ModelRequest {
+            request_id,
+            request,
+        } => {
+            models::handle_command(
+                request_id, request, input, events, pending, sessions, next_id,
+            )
+            .await?;
+        }
+        CodexCommand::NewSessionWithModel { cwd, selection } => {
+            start_thread_request(
+                ThreadRequest::Agent {
+                    cwd,
+                    selection: Some(selection),
+                    launch: SessionLaunch::New,
+                },
+                input,
+                pending,
+                next_id,
+            )
+            .await?;
+        }
         CodexCommand::InlineAssist {
             request_id,
             cwd,
@@ -768,6 +818,7 @@ async fn handle_command(
             start_thread_request(
                 ThreadRequest::Agent {
                     cwd,
+                    selection: None,
                     launch: SessionLaunch::Inline {
                         request_id,
                         prompt,
@@ -832,6 +883,7 @@ async fn handle_command(
             start_thread_request(
                 ThreadRequest::Agent {
                     cwd,
+                    selection: None,
                     launch: SessionLaunch::New,
                 },
                 input,
@@ -861,6 +913,7 @@ async fn handle_command(
             start_thread_request(
                 ThreadRequest::Agent {
                     cwd,
+                    selection: None,
                     launch: SessionLaunch::Resume { session_id },
                 },
                 input,
@@ -1103,6 +1156,12 @@ async fn handle_message<H: CodexToolHost>(
         .and_then(Value::as_str)
         .unwrap_or_default();
     match method {
+        "thread/settings/updated" => {
+            models::settings_updated(&message["params"], events, sessions).await;
+        }
+        "model/rerouted" => {
+            models::model_rerouted(&message["params"], events, sessions).await;
+        }
         "item/agentMessage/delta" => {
             let params = &message["params"];
             let session_id = params["threadId"].as_str().unwrap_or_default();
@@ -1272,6 +1331,12 @@ async fn handle_response(
     let Some(request) = pending.remove(&key) else {
         return Ok(());
     };
+    if let Pending::Model(request) = request {
+        return models::handle_response(
+            request, message, input, events, pending, sessions, next_id,
+        )
+        .await;
+    }
     if let Some(error) = message.get("error") {
         let message = error["message"]
             .as_str()
@@ -1324,7 +1389,7 @@ async fn handle_response(
             config["features"]["hooks"] = json!(hooks_enabled);
             let id = rpc_id(next_id);
             let cwd = request.cwd().to_path_buf();
-            let rpc_request = match &request {
+            let mut rpc_request = match &request {
                 ThreadRequest::Agent {
                     launch: SessionLaunch::New,
                     ..
@@ -1392,6 +1457,16 @@ async fn handle_response(
                     }
                 }),
             };
+            if let ThreadRequest::Agent {
+                selection: Some(selection),
+                ..
+            } = &request
+            {
+                rpc_request["params"]["model"] = json!(selection.model);
+                if let Some(effort) = &selection.effort {
+                    rpc_request["params"]["config"]["model_reasoning_effort"] = json!(effort);
+                }
+            }
             pending.insert(id, Pending::Start { request });
             write_message(input, &rpc_request).await?;
         }
@@ -1457,6 +1532,7 @@ async fn handle_response(
                 sessions.insert(
                     session_id.clone(),
                     Session {
+                        model_info: AgentModelInfo::from_response(&message["result"]),
                         cwd,
                         active_turn: None,
                         cancelled: Arc::new(AtomicBool::new(false)),
@@ -1464,6 +1540,14 @@ async fn handle_response(
                         kind,
                     },
                 );
+                let model_event = sessions
+                    .get(&session_id)
+                    .filter(|session| matches!(session.kind, SessionKind::Agent))
+                    .and_then(|session| session.model_info.clone())
+                    .map(|model_info| CodexEvent::SessionModelChanged {
+                        session_id: session_id.clone(),
+                        model_info,
+                    });
                 match launch {
                     Some(SessionLaunch::New) => {
                         events
@@ -1515,8 +1599,12 @@ async fn handle_response(
                         .await?;
                     }
                 }
+                if let Some(event) = model_event {
+                    events.send(event).await.ok();
+                }
             }
         }
+        Pending::Model(_) => unreachable!("model responses are handled separately"),
         Pending::Turn { session_id } => {
             let turn_id = message
                 .pointer("/result/turn/id")
@@ -1585,7 +1673,7 @@ async fn send_pending_failure(
         Pending::Config { request }
         | Pending::Requirements { request, .. }
         | Pending::Start { request } => Some(request),
-        Pending::Turn { .. } | Pending::Interrupt { .. } => None,
+        Pending::Model(_) | Pending::Turn { .. } | Pending::Interrupt { .. } => None,
     };
     if let Some(request) = early_request {
         send_thread_failure(request, message, events).await;
@@ -1593,7 +1681,10 @@ async fn send_pending_failure(
     }
     let session_id = match request {
         Pending::Turn { session_id } | Pending::Interrupt { session_id, .. } => session_id,
-        Pending::Config { .. } | Pending::Requirements { .. } | Pending::Start { .. } => {
+        Pending::Model(_)
+        | Pending::Config { .. }
+        | Pending::Requirements { .. }
+        | Pending::Start { .. } => {
             unreachable!("early requests returned above")
         }
     };
@@ -2325,6 +2416,7 @@ mod tests {
         let mut sessions = HashMap::from([(
             "inline".into(),
             Session {
+                model_info: None,
                 cwd: PathBuf::from("/workspace"),
                 active_turn: Some("turn".into()),
                 cancelled: Arc::new(AtomicBool::new(false)),
@@ -2579,6 +2671,7 @@ mod tests {
         let mut sessions = HashMap::from([(
             "hidden-thread".to_string(),
             Session {
+                model_info: None,
                 cwd: PathBuf::from("/workspace"),
                 active_turn: None,
                 cancelled: Arc::new(AtomicBool::new(false)),

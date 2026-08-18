@@ -70,8 +70,8 @@ use list::List;
 pub(crate) use messages::{MessageRow, MessagesPanel, MessagesView};
 pub(crate) use picker::MAX_UNFOCUSED_PREVIEW_BYTES;
 pub use picker::{
-    LegacyPickerOptions, Picker, PickerIcon, PickerItem, PickerOptions, PickerPresentation,
-    PickerPreview, PickerUpdate,
+    LegacyPickerOptions, Picker, PickerIcon, PickerItem, PickerItemLayout, PickerOptions,
+    PickerPresentation, PickerPreview, PickerUpdate,
 };
 pub(crate) use prompt_buffer::{
     first_prompt_line, normalize_prompt_newlines, PromptBuffer, PromptInput, PromptKeyPolicy,

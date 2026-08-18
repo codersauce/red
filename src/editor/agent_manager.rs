@@ -27,6 +27,9 @@ pub struct AgentManager {
     active_turn_ids: HashMap<String, String>,
     turn_started_at: HashMap<String, Instant>,
     pending_commit_messages: HashSet<i64>,
+    pending_model_requests: HashSet<i64>,
+    model_only_bridge: bool,
+    next_model: Option<crate::codex::AgentModelSelection>,
     conversation: Option<AgentConversationSnapshot>,
     forgotten_conversations: HashSet<String>,
 }
@@ -51,6 +54,7 @@ impl AgentManager {
     }
 
     pub fn set_bridge(&mut self, bridge: CodexBridge) {
+        self.model_only_bridge = false;
         self.bridge = Some(bridge);
     }
 
@@ -208,6 +212,56 @@ impl AgentManager {
         self.pending_commit_messages.drain().collect()
     }
 
+    pub fn mark_model_request_pending(&mut self, request_id: i64) {
+        self.pending_model_requests.insert(request_id);
+    }
+
+    pub fn finish_model_request(&mut self, request_id: i64) {
+        self.pending_model_requests.remove(&request_id);
+    }
+
+    pub fn take_pending_model_requests(&mut self) -> Vec<i64> {
+        self.pending_model_requests.drain().collect()
+    }
+
+    pub fn mark_model_only_bridge(&mut self) {
+        self.model_only_bridge = true;
+    }
+
+    pub fn mark_conversation_requested(&mut self) {
+        self.model_only_bridge = false;
+    }
+
+    pub fn is_model_only_bridge(&self) -> bool {
+        self.model_only_bridge
+    }
+
+    pub fn set_next_model(&mut self, selection: crate::codex::AgentModelSelection) {
+        self.next_model = Some(selection);
+    }
+
+    pub fn next_model(&self) -> Option<&crate::codex::AgentModelSelection> {
+        self.next_model.as_ref()
+    }
+
+    pub fn take_next_model(&mut self) -> Option<crate::codex::AgentModelSelection> {
+        self.next_model.take()
+    }
+
+    pub fn set_conversation_model(
+        &mut self,
+        session_id: &str,
+        model_info: crate::codex::AgentModelInfo,
+    ) {
+        if let Some(conversation) = self
+            .conversation
+            .as_mut()
+            .filter(|conversation| conversation.thread_id == session_id)
+        {
+            conversation.model_info = Some(model_info);
+        }
+    }
+
     pub fn begin_conversation(&mut self, thread_id: impl Into<String>, cwd: &Path) {
         let thread_id = thread_id.into();
         self.forgotten_conversations.remove(&thread_id);
@@ -242,6 +296,7 @@ impl AgentManager {
     }
 
     pub fn forget_conversation(&mut self, session_id: &str) {
+        self.next_model = None;
         self.forgotten_conversations.insert(session_id.to_string());
         if self
             .conversation

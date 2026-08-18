@@ -1,6 +1,6 @@
 # Husk plugin compatibility
 
-Red host API version `0.13.0` is defined by
+Red host API version `0.14.0` is defined by
 [`src/plugin/host_api.json`](../src/plugin/host_api.json). That file is the canonical,
 machine-readable list of execute actions, request actions, signatures, and introduction
 versions. Runtime dispatch and the bundled-plugin corpus are checked against it in tests.
@@ -24,9 +24,9 @@ required/optional arity (`HUSK-A0002`) and obvious literal argument types
 annotations use `HUSK-A0004`. `--no-typecheck` is an unsupported development
 escape hatch; compatibility guarantees do not apply while it is enabled.
 
-Red `0.13.0` retains the complete `0.4.0`, `0.6.0`, `0.7.0`, `0.8.0`, `0.9.0`,
-`0.10.0`, `0.11.0`, and `0.12.0` contracts, so existing packages that declare those
-minors continue to load. New packages should target `"red_api_version": "^0.13.0"`.
+Red `0.14.0` retains the complete `0.4.0`, `0.6.0`, `0.7.0`, `0.8.0`, `0.9.0`,
+`0.10.0`, `0.11.0`, `0.12.0`, and `0.13.0` contracts, so existing packages that declare those
+minors continue to load. New packages should target `"red_api_version": "^0.14.0"`.
 
 ## Document-symbol breadcrumbs
 
@@ -305,7 +305,7 @@ process-specific and filesystem-watch-specific event names.
 New pickers should use
 `OpenPicker(title: String, items: [PickerItem], options: PickerOptions, handlers: PickerHandlers)`.
 The host returns an opaque integer handle that may be passed to `UpdatePickerItems`,
-`UpdatePickerQuery`, `UpdatePickerStatus`, and `ClosePicker`. Plugins
+`UpdatePickerQuery`, `UpdatePickerSelection`, `UpdatePickerStatus`, and `ClosePicker`. Plugins
 must not assign or interpret this handle.
 
 ```husk
@@ -476,3 +476,34 @@ in the complete reference but not in the compact action strip. Disabled actions
 are omitted. The strip and its clickable `F1 shortcuts` affordance use the same
 records, including the current mode and enabled state. `F1` opens help above the
 active surface; closing help does not replace that surface or its draft.
+
+## Agent model selection
+
+Host API `0.14.0` adds `AgentReadDefaultModel(callback)`, which returns
+`{ model_info, error }` for the current workspace without creating a thread.
+It reads Codex's effective configuration, falling back to the catalog default
+when no model is configured. This is a preview; thread settings remain authoritative.
+
+`AgentListModels(callback)` and
+`AgentSetModel(callback, session_id, selection)`. The catalog callback returns
+`{ models, error }`; model entries use Codex's `model/list` shape. Selection is
+`{ model: String, effort?: String }`. An empty session ID stores the choice for
+the next conversation; an existing ID updates only that conversation's next-turn
+settings. The callback reports `{ accepted, error }`. No global configuration is
+written. `agent:model_changed` carries `{ session_id, model_info }`, where
+`model_info` contains the effective `model`, optional `provider`, and optional
+`effort`. Treat that event as authoritative, and ignore foreign session IDs.
+`agent:model_rerouted` reports `{ session_id, model }` for the running turn only.
+
+For name-oriented lists, `PickerOptions.item_layout: "label_first"` reserves the
+longest filtered label, then aligns annotations and descriptions in shared columns.
+Secondary fields disappear before labels are shortened; the default layout is unchanged.
+`UpdatePickerSelection(handle, item_id)` selects a currently visible item without
+resetting the query. This is useful after populating a loading picker in place.
+
+`SetTextPanelHeaderDetail(id, detail?)` updates header metadata in place. Detail
+is `{ text: String, secondary?: String, compact_text?: String, action?: String, shortcut?: String }`.
+The header compacts its buttons before dropping secondary text. An optional
+`compact_text` preserves essential state in the shortened label. Clicking the visible
+detail emits the configured panel action; the shortcut works while the panel is focused and is included in contextual
+help. Omitting detail clears it. Draft, focus, scroll, and panel layout survive.
