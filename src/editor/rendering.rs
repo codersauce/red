@@ -1330,6 +1330,10 @@ impl Editor {
                 help.context.clone_from(&context);
             }
         }
+        if let Some(tutorial) = &self.tutorial_controller {
+            let shortcut = self.tutorial_shortcut();
+            crate::ui::draw_tutorial_coach(buffer, &self.theme, tutorial, shortcut.as_deref());
+        }
         // Render all plugins
         self.render_from_plugins(buffer)?;
         drop(chrome_span);

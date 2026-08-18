@@ -58,6 +58,7 @@ pub mod terminal_output;
 pub mod text_layout;
 mod textobjects;
 pub mod theme;
+pub mod tutorial;
 pub mod ui;
 pub mod undo;
 pub mod unicode_utils;

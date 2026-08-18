@@ -7,7 +7,7 @@
 
 use std::fs;
 use std::io::{self, IsTerminal, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::assets;
 
@@ -67,6 +67,17 @@ fn write_default_assets(config_dir: &Path) -> anyhow::Result<()> {
     fs::create_dir_all(config_dir)?;
     fs::write(config_dir.join("config.toml"), assets::starter_config())?;
     Ok(())
+}
+
+/// Writes an optional starter config without overwriting an existing user file.
+///
+/// The editor-native welcome invokes this only after an explicit user request.
+pub fn create_starter_config(config_dir: &Path) -> anyhow::Result<PathBuf> {
+    let config_path = config_dir.join("config.toml");
+    if !config_path.exists() {
+        write_default_assets(config_dir)?;
+    }
+    Ok(config_path)
 }
 
 /// Print the prompt caret and read a `[Y/n]` answer from stdin.
@@ -215,6 +226,21 @@ mod tests {
         let parsed = crate::config::Config::from_user_toml_with_overrides(&contents, &[]);
         assert!(parsed.is_ok(), "starter config should parse: {parsed:?}");
 
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn explicit_starter_config_creation_never_overwrites_existing_settings() {
+        let dir = unique_temp_dir("onboarding-explicit");
+        fs::create_dir_all(&dir).unwrap();
+        let config_path = dir.join("config.toml");
+        fs::write(&config_path, "theme = \"mine.json\"\n").unwrap();
+
+        assert_eq!(create_starter_config(&dir).unwrap(), config_path);
+        assert_eq!(
+            fs::read_to_string(dir.join("config.toml")).unwrap(),
+            "theme = \"mine.json\"\n"
+        );
         fs::remove_dir_all(&dir).ok();
     }
 

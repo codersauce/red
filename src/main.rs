@@ -40,7 +40,6 @@ use red::headless::{
 use red::language::GrammarTrustStore;
 use red::logger::Logger;
 use red::lsp::{LspClient, LspManager};
-use red::onboarding;
 use red::preferences::PreferencesStore;
 use red::session::SessionStore;
 use red::theme::{parse_vscode_theme, parse_vscode_theme_contents, Theme};
@@ -190,12 +189,8 @@ async fn run() -> anyhow::Result<()> {
     }
 
     let config_file = Config::path("config.toml");
-    if !config_file.exists() {
-        let config_dir = config_file
-            .parent()
-            .expect("config path always has a parent directory");
-        onboarding::run(config_dir)?;
-    }
+    let preferences_file = Config::path("preferences.json");
+    let first_launch = !config_file.exists() && !preferences_file.exists();
 
     let (mut loaded, theme, logger) = finalize_runtime_config(Config::load_user_file(
         &config_file,
@@ -203,7 +198,7 @@ async fn run() -> anyhow::Result<()> {
     )?)?;
     loaded.config.disable_plugin_typecheck = args.no_typecheck;
     LOGGER.get_or_init(|| logger);
-    let preferences = PreferencesStore::load(Config::path("preferences.json"));
+    let preferences = PreferencesStore::load(preferences_file);
 
     loaded.config.startup_file_count = args.files.len();
     loaded.config.startup_session_resumed = args.resume;
@@ -249,6 +244,7 @@ async fn run() -> anyhow::Result<()> {
     let diagnostics = std::mem::take(&mut loaded.diagnostics);
     let recovery = loaded.recovery;
     let mut editor = Editor::new_with_preferences(lsp, loaded.config, theme, buffers, preferences)?;
+    editor.enable_first_launch_welcome(first_launch && resumed_session.is_none());
     editor.set_language_reload_source(config_file, args.config_overrides.clone());
     editor.set_config_diagnostics(diagnostics, recovery);
     if let Some(snapshot) = &resumed_session {

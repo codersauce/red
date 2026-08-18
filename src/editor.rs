@@ -147,12 +147,17 @@ use crate::{
     },
     textobjects::{ResolvedTextObject, SyntaxObjectKind, SyntaxTextObjectService},
     theme::{parse_vscode_theme, parse_vscode_theme_contents, Style, Theme},
+    tutorial::{
+        TutorialController, TutorialLesson, TutorialObservation, TutorialProgress, TutorialTrack,
+        PRACTICE_CONTENTS,
+    },
     ui::{
         AgentComposer, CompletionUI, Component, Confirmation, CopilotSignInDialog,
         CopilotSignInModel, CopilotSignInPhase, DiagnosticInfo, FilePicker, HoverInfo,
         HoverInfoFormat, InlineAssistPopup, InlineAssistPopupState, InputPrompt,
         LegacyPickerOptions, OverlayLayout, Picker, PickerItem, PickerOptions, PickerPreview,
-        PickerUpdate, ScreenRect, StatuslineLayoutPanel, WhatsNewPanel,
+        PickerUpdate, ScreenRect, StatuslineLayoutPanel, TutorialDemoKind, TutorialDemoPanel,
+        WelcomePanel, WhatsNewPanel,
     },
     undo::{AppliedTextEdit, CursorSnapshot, EditOrigin, RevertEdit, TextPosition, TextRange},
     utils::{expand_user_path, get_workspace_path, normalized_file_path, same_file_path},
@@ -2492,6 +2497,16 @@ pub enum Action {
     ExitLearnLesson,
     RestartLearnLesson,
     FinishLearnLesson,
+    OpenWelcome,
+    DismissWelcome,
+    StartTutorial(TutorialTrack),
+    ResumeTutorial,
+    AdvanceTutorial,
+    ExitTutorial,
+    DismissTutorialDemo,
+    AcceptTutorialProposal,
+    RejectTutorialProposal,
+    CreateStarterConfig,
     OpenStatuslineManager,
     OpenDiagnosticsPicker,
     OpenErrorDiagnosticsPicker,
@@ -3293,6 +3308,12 @@ pub struct Editor {
     /// The announcement was prepared and still needs a successful rendered-frame claim.
     whats_new_needs_persistence: bool,
 
+    /// First launch is presented only after a visible, usable editor is ready.
+    welcome_startup_pending: bool,
+
+    /// Owns the unnamed practice buffer while a nonmodal guided tour is active.
+    tutorial_controller: Option<TutorialController>,
+
     /// Active command-history navigation state.
     command_history_navigation: Option<PromptHistoryNavigation>,
 
@@ -3608,6 +3629,16 @@ impl DetachedEditorCore {
     /// Prepares a pending release modal only after a client authenticates.
     pub fn prepare_startup_whats_new(&mut self) -> anyhow::Result<bool> {
         if !self.editor.prepare_startup_whats_new() {
+            return Ok(false);
+        }
+        self.editor.render(&mut self.render_buffer)?;
+        self.finish_render()?;
+        Ok(true)
+    }
+
+    /// Opens fresh-install onboarding only after a detached client authenticates.
+    pub fn prepare_startup_welcome(&mut self) -> anyhow::Result<bool> {
+        if !self.editor.prepare_startup_welcome() {
             return Ok(false);
         }
         self.editor.render(&mut self.render_buffer)?;
@@ -4670,6 +4701,8 @@ impl Editor {
             learn_session: None,
             whats_new_auto_presentation_enabled: false,
             whats_new_needs_persistence: false,
+            welcome_startup_pending: false,
+            tutorial_controller: None,
             command_history_navigation: None,
             command_completion: None,
             search_term: String::new(),
@@ -4812,6 +4845,232 @@ impl Editor {
         {
             log!("could not persist the displayed release version: {error}");
         }
+    }
+
+    /// Requests the editor-native welcome for a genuinely fresh installation.
+    ///
+    /// Detached owners retain the request until an authenticated client attaches.
+    pub fn enable_first_launch_welcome(&mut self, first_launch: bool) {
+        self.welcome_startup_pending = first_launch && !self.preferences.welcome_completed();
+        if self.welcome_startup_pending {
+            self.whats_new_startup_pending = false;
+        }
+    }
+
+    fn open_welcome_panel(&mut self) -> bool {
+        if !WelcomePanel::fits(self.vwidth(), self.vheight()) {
+            return false;
+        }
+        let can_resume = self
+            .preferences
+            .tutorial_progress()
+            .is_some_and(|progress| !progress.completed);
+        self.current_dialog = Some(Box::new(WelcomePanel::new(self, can_resume)));
+        self.welcome_startup_pending = false;
+        true
+    }
+
+    fn prepare_startup_welcome(&mut self) -> bool {
+        self.welcome_startup_pending && self.current_dialog.is_none() && self.open_welcome_panel()
+    }
+
+    fn finish_welcome(&mut self) {
+        self.welcome_startup_pending = false;
+        if let Err(error) = self.preferences.complete_welcome() {
+            log!("could not persist first-run welcome decision: {error}");
+        }
+    }
+
+    async fn start_tutorial(
+        &mut self,
+        progress: TutorialProgress,
+        buffer: &mut RenderBuffer,
+        runtime: &mut Runtime,
+    ) -> anyhow::Result<()> {
+        if self.tutorial_controller.is_some() {
+            self.finish_tutorial(/*completed*/ false, buffer, runtime)
+                .await?;
+        }
+
+        self.finish_welcome();
+        self.release_current_dialog_callbacks(runtime);
+        self.current_dialog = None;
+        self.sync_to_window();
+        let original_window_layout = self.window_manager.snapshot();
+        let original_buffer_index = self.buffer_manager.active_index();
+        let practice = Buffer::new(/*file*/ None, PRACTICE_CONTENTS.to_string());
+        let practice_buffer_id = practice.id();
+        self.buffer_manager.push_buffer(practice);
+        let practice_index = self.buffer_manager.len() - 1;
+        self.tutorial_controller = Some(TutorialController::new(
+            progress,
+            practice_buffer_id,
+            original_buffer_index,
+            original_window_layout,
+        ));
+        self.mode = Mode::Normal;
+        self.splash_dismissed = true;
+        if let Some(window) = self.window_manager.active_window_mut() {
+            window.buffer_index = practice_index;
+        }
+        self.set_current_buffer(buffer, practice_index).await?;
+        self.persist_tutorial_progress();
+        self.render(buffer)
+    }
+
+    async fn finish_tutorial(
+        &mut self,
+        completed: bool,
+        buffer: &mut RenderBuffer,
+        runtime: &mut Runtime,
+    ) -> anyhow::Result<()> {
+        let Some(mut tutorial) = self.tutorial_controller.take() else {
+            return Ok(());
+        };
+        if completed {
+            while !tutorial.progress().completed {
+                tutorial.advance();
+            }
+        }
+        if let Err(error) = self
+            .preferences
+            .set_tutorial_progress(tutorial.progress().clone())
+        {
+            log!("could not persist guided-tour progress: {error}");
+        }
+
+        self.release_current_dialog_callbacks(runtime);
+        self.current_dialog = None;
+        if let Some(index) = self
+            .buffer_manager
+            .iter()
+            .position(|candidate| candidate.id() == tutorial.practice_buffer_id)
+        {
+            self.buffer_manager.remove_buffer(index);
+        }
+
+        let buffer_map = (0..self.buffer_manager.len())
+            .map(|index| (index, index))
+            .collect::<HashMap<_, _>>();
+        if let Some(restored) = WindowManager::from_snapshot(
+            &tutorial.original_window_layout,
+            (self.size.0 as usize, self.size.1 as usize),
+            &buffer_map,
+        ) {
+            self.window_manager = restored;
+        }
+        self.buffer_manager
+            .set_active_index(tutorial.original_buffer_index);
+        self.sync_with_window();
+        self.mode = Mode::Normal;
+        self.highlight_cache.clear();
+        self.layout_cache.borrow_mut().clear();
+        self.force_full_redraw = true;
+        if completed {
+            self.last_error = Some("Red tour complete — your project was never modified".into());
+        }
+        self.render(buffer)
+    }
+
+    fn persist_tutorial_progress(&mut self) {
+        let Some(progress) = self
+            .tutorial_controller
+            .as_ref()
+            .map(|tutorial| tutorial.progress().clone())
+        else {
+            return;
+        };
+        if let Err(error) = self.preferences.set_tutorial_progress(progress) {
+            log!("could not persist guided-tour progress: {error}");
+        }
+    }
+
+    fn tutorial_shortcut(&self) -> Option<String> {
+        let tutorial = self.tutorial_controller.as_ref()?;
+        let action = tutorial
+            .lesson()?
+            .suggested_action(tutorial.progress().phase)?;
+        command_palette::shortcuts_for_action(&self.config.keys, &action)
+            .into_iter()
+            .next()
+    }
+
+    async fn observe_tutorial_action(
+        &mut self,
+        action: &Action,
+        buffer: &mut RenderBuffer,
+        runtime: &mut Runtime,
+    ) -> anyhow::Result<()> {
+        if matches!(
+            action,
+            Action::StartTutorial(_)
+                | Action::ResumeTutorial
+                | Action::AdvanceTutorial
+                | Action::ExitTutorial
+        ) {
+            return Ok(());
+        }
+        let Some(tutorial) = &mut self.tutorial_controller else {
+            return Ok(());
+        };
+        let observation = tutorial.observe(action);
+        if observation == TutorialObservation::Unchanged {
+            return Ok(());
+        }
+        self.persist_tutorial_progress();
+        if observation == TutorialObservation::Completed {
+            self.finish_tutorial(/*completed*/ true, buffer, runtime)
+                .await?;
+        } else {
+            self.render(buffer)?;
+        }
+        Ok(())
+    }
+
+    async fn accept_tutorial_proposal(
+        &mut self,
+        buffer: &mut RenderBuffer,
+        runtime: &mut Runtime,
+    ) -> anyhow::Result<()> {
+        let Some(practice_id) = self
+            .tutorial_controller
+            .as_ref()
+            .map(|tutorial| tutorial.practice_buffer_id)
+        else {
+            return Ok(());
+        };
+        let Some(index) = self
+            .buffer_manager
+            .iter()
+            .position(|candidate| candidate.id() == practice_id)
+        else {
+            return Ok(());
+        };
+        if index != self.buffer_manager.active_index() {
+            if let Some(window) = self.window_manager.active_window_mut() {
+                window.buffer_index = index;
+            }
+            self.set_current_buffer(buffer, index).await?;
+        }
+        let contents = self.current_buffer().contents();
+        let old = "prices.iter().sum()";
+        if let Some((line, text)) = contents
+            .lines()
+            .enumerate()
+            .find(|(_, line)| line.contains(old))
+        {
+            let character = text
+                .find(old)
+                .map(|byte| text[..byte].chars().count())
+                .unwrap_or_default();
+            let start = TextPosition::new(line, character);
+            let end = TextPosition::new(line, character + old.chars().count());
+            self.begin_transaction("accept tutorial practice proposal");
+            self.replace_range(TextRange::new(start, end), "prices.iter().copied().sum()");
+            self.commit_transaction(self.cursor_snapshot());
+            self.notify_change(runtime).await?;
+        }
+        Ok(())
     }
 
     /// Synchronizes the editor's state with the active window
@@ -8708,6 +8967,7 @@ impl Editor {
         self.ensure_current_buffer_lsp_opened().await?;
         let (columns, rows) = terminal::size()?;
         self.resize_terminal_surface(columns, rows, &mut buffer);
+        self.prepare_startup_welcome();
         self.prepare_startup_whats_new();
         self.render(&mut buffer)?;
         self.mark_whats_new_presented();
@@ -14450,15 +14710,34 @@ impl Editor {
         if matches!(cmd, "whats-new" | "changelog") {
             return vec![Action::OpenWhatsNew];
         }
-        if matches!(cmd, "learn" | "tutorial" | "welcome") {
+        if cmd == "learn" {
             return vec![Action::OpenLearn];
         }
-        match cmd {
-            "tutorial essentials" => return vec![Action::StartLearnLesson],
-            "tutorial quit" => return vec![Action::ExitLearnLesson],
-            "tutorial restart" => return vec![Action::RestartLearnLesson],
-            "tutorial next" => return vec![Action::FinishLearnLesson],
-            _ => {}
+        if cmd == "welcome" {
+            return vec![Action::OpenWelcome];
+        }
+        if let Some(arguments) = cmd.strip_prefix("tutorial") {
+            if arguments.is_empty() || arguments.starts_with(' ') {
+                return match arguments.trim() {
+                    "" => vec![Action::StartTutorial(TutorialTrack::Guided)],
+                    "essentials" => vec![Action::StartLearnLesson],
+                    "restart" if self.learn_session.is_some() => vec![Action::RestartLearnLesson],
+                    "restart" => vec![Action::StartTutorial(TutorialTrack::Guided)],
+                    "quick" => vec![Action::StartTutorial(TutorialTrack::Quick)],
+                    "resume" => vec![Action::ResumeTutorial],
+                    "next" if self.learn_session.is_some() => vec![Action::FinishLearnLesson],
+                    "next" | "skip" => vec![Action::AdvanceTutorial],
+                    "quit" if self.learn_session.is_some() => vec![Action::ExitLearnLesson],
+                    "quit" | "exit" => vec![Action::ExitTutorial],
+                    _ => {
+                        self.last_error = Some(
+                            "usage: tutorial [quick|resume|restart|essentials|next|quit]"
+                                .to_string(),
+                        );
+                        Vec::new()
+                    }
+                };
+            }
         }
         if cmd == "config-diagnostics" {
             return vec![Action::ConfigDiagnostics];
@@ -17089,6 +17368,16 @@ impl Editor {
         if self.intercept_learn_action(action, buffer, runtime)? {
             return Ok(false);
         }
+        if matches!(action, Action::Save | Action::SaveAs(_))
+            && self
+                .tutorial_controller
+                .as_ref()
+                .is_some_and(|tutorial| tutorial.practice_buffer_id == self.current_buffer().id())
+        {
+            self.last_error = Some("the Red tutorial practice buffer cannot be saved".to_string());
+            self.render(buffer)?;
+            return Ok(false);
+        }
         let sensitive_action = matches!(action, Action::NotifyPlugin(_, _, _))
             || matches!(
                 action,
@@ -18693,7 +18982,25 @@ impl Editor {
                 self.render(buffer)?;
             }
             Action::PluginCommand(cmd) => {
-                self.plugin_registry.execute(runtime, cmd).await?;
+                let demo = match (
+                    self.tutorial_controller
+                        .as_ref()
+                        .and_then(TutorialController::lesson),
+                    cmd.as_str(),
+                ) {
+                    (Some(TutorialLesson::Git), "GitDashboard") => Some(TutorialDemoKind::Git),
+                    (Some(TutorialLesson::Agent), "Agent" | "AgentOpen") => {
+                        Some(TutorialDemoKind::Agent)
+                    }
+                    _ => None,
+                };
+                if let Some(kind) = demo {
+                    self.release_current_dialog_callbacks(runtime);
+                    self.current_dialog = Some(Box::new(TutorialDemoPanel::new(self, kind)));
+                    self.render(buffer)?;
+                } else {
+                    self.plugin_registry.execute(runtime, cmd).await?;
+                }
             }
             Action::GoToLine(line) => {
                 self.go_to_line(*line, buffer, runtime, GoToLinePosition::Center)
@@ -19586,6 +19893,13 @@ impl Editor {
                 self.render(buffer)?;
             }
             Action::OpenWhatsNew => {
+                if self
+                    .current_dialog
+                    .as_ref()
+                    .is_some_and(|dialog| dialog.shortcut_context() == "Welcome to Red")
+                {
+                    self.finish_welcome();
+                }
                 self.release_current_dialog_callbacks(runtime);
                 if self.open_whats_new_panel() {
                     self.render(buffer)?;
@@ -19598,11 +19912,19 @@ impl Editor {
                 }
             }
             Action::OpenLearn | Action::FinishLearnLesson => {
+                if self.tutorial_controller.is_some() {
+                    self.finish_tutorial(/*completed*/ false, buffer, runtime)
+                        .await?;
+                }
                 self.finish_learn_lesson(buffer, runtime)?;
                 self.open_learn_hub(runtime);
                 self.render(buffer)?;
             }
             Action::StartLearnLesson | Action::RestartLearnLesson => {
+                if self.tutorial_controller.is_some() {
+                    self.finish_tutorial(/*completed*/ false, buffer, runtime)
+                        .await?;
+                }
                 self.start_learn_lesson(buffer, runtime).await?;
             }
             Action::ExitLearnLesson => {
@@ -19611,6 +19933,72 @@ impl Editor {
             Action::OpenStatuslineManager => {
                 self.release_current_dialog_callbacks(runtime);
                 self.current_dialog = Some(Box::new(StatuslineLayoutPanel::new(self)));
+                self.render(buffer)?;
+            }
+            Action::OpenWelcome => {
+                self.release_current_dialog_callbacks(runtime);
+                if !self.open_welcome_panel() {
+                    self.last_error = Some("terminal is too small for the welcome screen".into());
+                }
+                self.render(buffer)?;
+            }
+            Action::DismissWelcome => {
+                self.finish_welcome();
+                self.release_current_dialog_callbacks(runtime);
+                self.current_dialog = None;
+                self.render(buffer)?;
+            }
+            Action::StartTutorial(track) => {
+                self.start_tutorial(TutorialProgress::new(*track), buffer, runtime)
+                    .await?;
+            }
+            Action::ResumeTutorial => {
+                let progress = self
+                    .preferences
+                    .tutorial_progress()
+                    .cloned()
+                    .filter(|progress| !progress.completed)
+                    .unwrap_or_else(|| TutorialProgress::new(TutorialTrack::Guided));
+                self.start_tutorial(progress, buffer, runtime).await?;
+            }
+            Action::AdvanceTutorial => {
+                if let Some(tutorial) = &mut self.tutorial_controller {
+                    let completed = tutorial.advance() == TutorialObservation::Completed;
+                    self.persist_tutorial_progress();
+                    if completed {
+                        self.finish_tutorial(/*completed*/ true, buffer, runtime)
+                            .await?;
+                    } else {
+                        self.current_dialog = None;
+                        self.mode = Mode::Normal;
+                        self.render(buffer)?;
+                    }
+                }
+            }
+            Action::ExitTutorial => {
+                self.finish_tutorial(/*completed*/ false, buffer, runtime)
+                    .await?;
+            }
+            Action::DismissTutorialDemo | Action::RejectTutorialProposal => {
+                self.release_current_dialog_callbacks(runtime);
+                self.current_dialog = None;
+                self.render(buffer)?;
+            }
+            Action::AcceptTutorialProposal => {
+                self.release_current_dialog_callbacks(runtime);
+                self.current_dialog = None;
+                self.accept_tutorial_proposal(buffer, runtime).await?;
+                self.render(buffer)?;
+            }
+            Action::CreateStarterConfig => {
+                match crate::onboarding::create_starter_config(&Config::config_dir()) {
+                    Ok(path) => {
+                        self.last_error = Some(format!("starter config: {}", path.display()))
+                    }
+                    Err(error) => {
+                        self.last_error = Some(format!("could not create config: {error}"))
+                    }
+                }
                 self.render(buffer)?;
             }
             Action::OpenDiagnosticsPicker => {
@@ -20621,6 +21009,9 @@ impl Editor {
         }
 
         self.observe_learn_action(action, buffer)?;
+        self.observe_tutorial_action(action, buffer, runtime)
+            .await?;
+
         Ok(false)
     }
 
@@ -27889,16 +28280,43 @@ mod test {
     fn learn_red_commands_are_explicit_and_discoverable() {
         let mut editor = test_editor(80, 24);
         let runtime = Runtime::new();
-        for command in ["learn", "tutorial", "welcome"] {
-            assert_eq!(
-                editor.handle_command(command, &runtime),
-                vec![Action::OpenLearn]
-            );
-        }
+        assert_eq!(
+            editor.handle_command("learn", &runtime),
+            vec![Action::OpenLearn]
+        );
+        assert_eq!(
+            editor.handle_command("tutorial", &runtime),
+            vec![Action::StartTutorial(TutorialTrack::Guided)]
+        );
+        assert_eq!(
+            editor.handle_command("welcome", &runtime),
+            vec![Action::OpenWelcome]
+        );
         assert_eq!(
             editor.handle_command("tutorial essentials", &runtime),
             vec![Action::StartLearnLesson]
         );
+        assert_eq!(
+            editor.handle_command("tutorial quit", &runtime),
+            vec![Action::ExitTutorial]
+        );
+        assert_eq!(
+            editor.handle_command("tutorial restart", &runtime),
+            vec![Action::StartTutorial(TutorialTrack::Guided)]
+        );
+    }
+
+    #[tokio::test]
+    async fn active_learn_lesson_retains_contextual_tutorial_controls() {
+        let mut editor = test_editor(100, 24);
+        let mut buffer = RenderBuffer::new(100, 24, &Style::default());
+        let mut runtime = Runtime::new();
+
+        editor
+            .execute(&Action::StartLearnLesson, &mut buffer, &mut runtime)
+            .await
+            .unwrap();
+
         assert_eq!(
             editor.handle_command("tutorial quit", &runtime),
             vec![Action::ExitLearnLesson]
@@ -27906,6 +28324,10 @@ mod test {
         assert_eq!(
             editor.handle_command("tutorial restart", &runtime),
             vec![Action::RestartLearnLesson]
+        );
+        assert_eq!(
+            editor.handle_command("tutorial next", &runtime),
+            vec![Action::FinishLearnLesson]
         );
     }
 
@@ -28204,6 +28626,296 @@ mod test {
 
         assert!(error.to_string().contains("buffer changed"));
         assert_eq!(editor.current_buffer().contents(), "newer\n");
+    }
+
+    #[tokio::test]
+    async fn fresh_install_welcome_waits_for_an_explicit_user_decision() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("preferences.json");
+        let preferences = PreferencesStore::load(&path);
+        let config = Config::default();
+        let lsp = Box::new(crate::lsp::LspManager::new(config.lsp.clone()));
+        let mut editor = Editor::with_size_and_preferences(
+            lsp,
+            /*width*/ 100,
+            /*height*/ 28,
+            config,
+            Theme::default(),
+            vec![Buffer::new(/*file*/ None, String::new())],
+            preferences,
+        )
+        .unwrap();
+        editor.test_disable_terminal_output();
+        let mut buffer =
+            RenderBuffer::new(/*width*/ 100, /*height*/ 28, &Style::default());
+        let mut runtime = Runtime::new();
+
+        editor.enable_first_launch_welcome(/*first_launch*/ true);
+        assert!(editor.prepare_startup_welcome());
+        assert!(editor.current_dialog.is_some());
+        assert!(!editor.whats_new_startup_pending);
+        assert!(!path.exists(), "showing the screen is not a user decision");
+
+        editor
+            .execute(&Action::DismissWelcome, &mut buffer, &mut runtime)
+            .await
+            .unwrap();
+
+        assert!(editor.current_dialog.is_none());
+        assert!(PreferencesStore::load(&path).welcome_completed());
+    }
+
+    #[tokio::test]
+    async fn first_run_release_preview_opens_the_existing_whats_new_panel() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("preferences.json");
+        let preferences = PreferencesStore::load(&path);
+        let config = Config {
+            fetch_release_notes: Some(false),
+            ..Config::default()
+        };
+        let lsp = Box::new(crate::lsp::LspManager::new(config.lsp.clone()));
+        let mut editor = Editor::with_size_and_preferences(
+            lsp,
+            /*width*/ 100,
+            /*height*/ 28,
+            config,
+            Theme::default(),
+            vec![Buffer::new(/*file*/ None, String::new())],
+            preferences,
+        )
+        .unwrap();
+        editor.test_disable_terminal_output();
+        let mut buffer =
+            RenderBuffer::new(/*width*/ 100, /*height*/ 28, &Style::default());
+        let mut runtime = Runtime::new();
+
+        editor.enable_first_launch_welcome(/*first_launch*/ true);
+        assert!(editor.prepare_startup_welcome());
+        editor
+            .execute(&Action::OpenWhatsNew, &mut buffer, &mut runtime)
+            .await
+            .unwrap();
+
+        assert!(render_text_rows(&buffer)
+            .join("\n")
+            .contains("RELEASE NOTES"));
+        let preferences = PreferencesStore::load(&path);
+        assert!(preferences.welcome_completed());
+        assert_eq!(
+            preferences.last_seen_version(),
+            Some(env!("CARGO_PKG_VERSION"))
+        );
+    }
+
+    #[tokio::test]
+    async fn tutorial_practice_buffer_cannot_write_and_exit_restores_original_buffer() {
+        let mut editor = test_editor(/*width*/ 100, /*height*/ 24);
+        let original_id = editor.current_buffer().id();
+        let original_contents = editor.current_buffer().contents();
+        let directory = tempfile::tempdir().unwrap();
+        let forbidden = directory.path().join("tutorial-should-not-exist.rs");
+        let mut buffer =
+            RenderBuffer::new(/*width*/ 100, /*height*/ 24, &Style::default());
+        let mut runtime = Runtime::new();
+
+        editor
+            .execute(
+                &Action::StartTutorial(TutorialTrack::Guided),
+                &mut buffer,
+                &mut runtime,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(editor.buffer_manager.len(), 2);
+        assert_ne!(editor.current_buffer().id(), original_id);
+        assert!(editor.current_buffer().file.is_none());
+
+        editor
+            .execute(
+                &Action::SaveAs(forbidden.to_string_lossy().into_owned()),
+                &mut buffer,
+                &mut runtime,
+            )
+            .await
+            .unwrap();
+
+        assert!(!forbidden.exists());
+        assert!(editor
+            .last_error
+            .as_deref()
+            .unwrap()
+            .contains("cannot be saved"));
+
+        editor
+            .execute(&Action::ExitTutorial, &mut buffer, &mut runtime)
+            .await
+            .unwrap();
+
+        assert_eq!(editor.buffer_manager.len(), 1);
+        assert_eq!(editor.current_buffer().id(), original_id);
+        assert_eq!(editor.current_buffer().contents(), original_contents);
+        assert!(editor.tutorial_controller.is_none());
+    }
+
+    #[tokio::test]
+    async fn editing_lesson_advances_only_after_real_mode_edit_and_undo_actions() {
+        let mut editor = test_editor(/*width*/ 100, /*height*/ 24);
+        let mut buffer =
+            RenderBuffer::new(/*width*/ 100, /*height*/ 24, &Style::default());
+        let mut runtime = Runtime::new();
+        editor
+            .execute(
+                &Action::StartTutorial(TutorialTrack::Guided),
+                &mut buffer,
+                &mut runtime,
+            )
+            .await
+            .unwrap();
+
+        for action in [
+            Action::EnterMode(Mode::Insert),
+            Action::InsertCharAtCursorPos('x'),
+            Action::EnterMode(Mode::Normal),
+            Action::Undo,
+        ] {
+            editor
+                .execute(&action, &mut buffer, &mut runtime)
+                .await
+                .unwrap();
+        }
+
+        let tutorial = editor.tutorial_controller.as_ref().unwrap();
+        assert_eq!(tutorial.lesson(), Some(TutorialLesson::Discovery));
+        assert_eq!(tutorial.progress().lesson_index, 1);
+    }
+
+    #[tokio::test]
+    async fn git_lesson_opens_a_simulated_workspace_without_a_git_plugin() {
+        let mut editor = test_editor(/*width*/ 100, /*height*/ 24);
+        let mut buffer =
+            RenderBuffer::new(/*width*/ 100, /*height*/ 24, &Style::default());
+        let mut runtime = Runtime::new();
+        editor
+            .execute(
+                &Action::StartTutorial(TutorialTrack::Guided),
+                &mut buffer,
+                &mut runtime,
+            )
+            .await
+            .unwrap();
+        for _ in 0..4 {
+            editor
+                .execute(&Action::AdvanceTutorial, &mut buffer, &mut runtime)
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            editor.tutorial_controller.as_ref().unwrap().lesson(),
+            Some(TutorialLesson::Git)
+        );
+
+        editor
+            .execute(
+                &Action::PluginCommand("GitDashboard".to_string()),
+                &mut buffer,
+                &mut runtime,
+            )
+            .await
+            .unwrap();
+
+        assert!(editor.current_dialog.is_some());
+        assert!(render_text_rows(&buffer)
+            .join("\n")
+            .contains("SAFE PRACTICE DIFF"));
+
+        editor
+            .execute(&Action::DismissTutorialDemo, &mut buffer, &mut runtime)
+            .await
+            .unwrap();
+        assert_eq!(
+            editor.tutorial_controller.as_ref().unwrap().lesson(),
+            Some(TutorialLesson::Agent)
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_lesson_accepts_only_a_local_simulated_proposal() {
+        let mut editor = test_editor(/*width*/ 100, /*height*/ 24);
+        let original_contents = editor.current_buffer().contents();
+        let mut buffer =
+            RenderBuffer::new(/*width*/ 100, /*height*/ 24, &Style::default());
+        let mut runtime = Runtime::new();
+        editor
+            .execute(
+                &Action::StartTutorial(TutorialTrack::Quick),
+                &mut buffer,
+                &mut runtime,
+            )
+            .await
+            .unwrap();
+        editor
+            .execute(&Action::AdvanceTutorial, &mut buffer, &mut runtime)
+            .await
+            .unwrap();
+        editor
+            .execute(&Action::AdvanceTutorial, &mut buffer, &mut runtime)
+            .await
+            .unwrap();
+
+        editor
+            .execute(
+                &Action::PluginCommand("Agent".to_string()),
+                &mut buffer,
+                &mut runtime,
+            )
+            .await
+            .unwrap();
+        assert!(render_text_rows(&buffer).join("\n").contains("NOT APPLIED"));
+
+        editor
+            .execute(&Action::AcceptTutorialProposal, &mut buffer, &mut runtime)
+            .await
+            .unwrap();
+
+        assert!(editor.tutorial_controller.is_none());
+        assert_eq!(editor.current_buffer().contents(), original_contents);
+        assert!(editor
+            .preferences
+            .tutorial_progress()
+            .is_some_and(|progress| progress.completed));
+    }
+
+    #[test]
+    fn tutorial_colon_commands_cover_start_resume_skip_and_exit() {
+        let mut editor = test_editor(/*width*/ 80, /*height*/ 16);
+        let runtime = Runtime::new();
+
+        assert_eq!(
+            editor.handle_command("welcome", &runtime),
+            vec![Action::OpenWelcome]
+        );
+        assert_eq!(
+            editor.handle_command("tutorial", &runtime),
+            vec![Action::StartTutorial(TutorialTrack::Guided)]
+        );
+        assert_eq!(
+            editor.handle_command("tutorial quick", &runtime),
+            vec![Action::StartTutorial(TutorialTrack::Quick)]
+        );
+        assert_eq!(
+            editor.handle_command("tutorial resume", &runtime),
+            vec![Action::ResumeTutorial]
+        );
+        assert_eq!(
+            editor.handle_command("tutorial next", &runtime),
+            vec![Action::AdvanceTutorial]
+        );
+        assert_eq!(
+            editor.handle_command("tutorial quit", &runtime),
+            vec![Action::ExitTutorial]
+        );
     }
 
     fn catalog_test_package() -> plugin::catalog::CatalogPackage {
