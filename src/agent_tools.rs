@@ -96,6 +96,11 @@ pub enum EditorToolCall {
         /// Complete replacement contents.
         content: String,
     },
+    /// Create workspace directories without changing an editor buffer.
+    CreateDirectory {
+        /// Workspace-relative or accepted absolute path. Missing parents are created.
+        path: String,
+    },
     /// Read a bounded snapshot of active editor state.
     GetEditorState {},
     /// Open a workspace file and reveal a UTF-16 position.
@@ -168,6 +173,7 @@ impl EditorToolCall {
             Self::InlineContext { .. } => "Inspecting inline context".to_string(),
             Self::ReadFile { path } => format!("Reading {path}"),
             Self::WriteFile { path, .. } => format!("Writing {path}"),
+            Self::CreateDirectory { path } => format!("Creating {path}/"),
             Self::GetEditorState {} => "Inspecting editor state".to_string(),
             Self::OpenFile { path, .. } => format!("Opening {path}"),
             Self::SelectText { path, .. } => format!("Selecting text in {path}"),
@@ -347,7 +353,7 @@ pub fn editor_tool_schemas(schema_key: &str) -> Vec<Value> {
         ),
         (
             "apply_edits",
-            "Atomically apply up to 128 non-overlapping, half-open UTF-16 text edits through Red and save the file.",
+            "Atomically apply up to 128 non-overlapping, half-open UTF-16 text edits through Red and save the file, creating missing parent directories.",
             json!({
                 "type": "object",
                 "properties": {
@@ -390,6 +396,11 @@ pub fn editor_tool_schemas(schema_key: &str) -> Vec<Value> {
                 "required": ["action"],
                 "additionalProperties": false
             }),
+        ),
+        (
+            "create_directory",
+            "Create a directory and missing parents inside the workspace. Existing directories are accepted. Does not open or change a buffer.",
+            json!({"type": "object", "properties": {"path": {"type": "string", "minLength": 1}}, "required": ["path"], "additionalProperties": false}),
         ),
     ];
     definitions
@@ -486,7 +497,7 @@ mod tests {
     fn tool_schemas_are_strict_and_bounded() {
         for schema_key in ["parameters", "inputSchema"] {
             let tools = editor_tool_schemas(schema_key);
-            assert_eq!(tools.len(), 5);
+            assert_eq!(tools.len(), 6);
             assert!(tools
                 .iter()
                 .all(|tool| tool[schema_key]["additionalProperties"] == false));
@@ -504,6 +515,16 @@ mod tests {
 
     #[test]
     fn tool_parser_rejects_unknown_actions_and_fields() {
+        assert_eq!(
+            EditorToolCall::parse("create_directory", json!({"path":"go/examples"})).unwrap(),
+            EditorToolCall::CreateDirectory {
+                path: "go/examples".to_string()
+            }
+        );
+        assert!(
+            EditorToolCall::parse("create_directory", json!({"path":"go", "recursive":true}))
+                .is_err()
+        );
         assert!(EditorToolCall::parse("run_editor_action", json!({"action": "quit"})).is_err());
         assert!(EditorToolCall::parse("get_editor_state", json!({"extra": true})).is_err());
         assert!(

@@ -278,6 +278,22 @@ to that turn's prompt; repeating it visits earlier prompts. Jumps reveal the
 prompt card, update its accent, and pause automatic scrolling without changing
 the composer draft. `G` returns to the latest output and resumes following it.
 
+While a turn runs, the status row names the current operation and shows elapsed
+time, with a blank row separating it from the transcript. Assistant messages
+stream without repeated role headings. Tool calls are grouped into one compact
+`Activity · N actions · N issues` disclosure per turn. On completion, that
+summary stays above the final answer and shows an issue count instead of full
+tool errors. A quiet `Worked for …` footer appears below the answer. Errors that
+stop the request still appear separately. Click a summary (or move to it with
+`[l` / `]l` and press Enter) to expand that turn's five most recent actions.
+Select **View all details** to inspect full paths and bounded error text.
+**Activity** in the pane header and `:AgentActivity` toggle the latest turn.
+**New** starts a fresh Codex session and focuses the pane composer directly,
+without opening another ask popup. Details are
+bounded and retained for the current conversation view; restored conversations
+may contain only their saved summaries. Raw file contents are not shown in the
+activity log. Scrolling back continues to pause automatic tail-following.
+
 `/` searches forward through visible prompt and answer text; `?` searches
 backward. Search is literal and case-sensitive, previews matches as you type,
 and shows a result count. Enter keeps the result, while Escape cancels an
@@ -330,24 +346,33 @@ Every Codex thread is started with:
 Native command, file-change, and permission escalation requests are denied.
 Red never asks Codex to edit the workspace directly.
 
-Codex receives nine dynamic tools:
+Codex receives ten dynamic tools:
 
 | Tool | Behavior |
 | --- | --- |
 | `list_files` | Lists at most 4,096 workspace files while respecting ignore files. |
 | `search_files` | Searches bounded text content and returns at most 200 matches. |
 | `read_file` | Reveals and reads the authoritative Red buffer, returning its revision. |
-| `write_file` | Replaces revision-checked contents through Red and saves the buffer. |
+| `write_file` | Replaces revision-checked contents through Red, creates missing parent directories, and saves the buffer. |
+| `create_directory` | Creates a workspace directory and missing parents; an existing directory is a successful no-op. |
 | `get_editor_state` | Returns bounded active-file, cursor, selection, window, and diagnostic state. |
 | `open_file` | Opens a safe workspace file in the requested split. |
 | `select_text` | Creates a UTF-16-addressed editor selection. |
-| `apply_edits` | Applies atomic, revision-checked UTF-16 edits and saves the buffer. |
+| `apply_edits` | Applies atomic, revision-checked UTF-16 edits, creates missing parent directories, and saves the buffer. |
 | `run_editor_action` | Runs an allow-listed navigation or LSP action. |
 
 Tool paths must remain below the physical workspace root. Reads and writes
 reject parent traversal, symlink components, special files, unsafe roots,
 oversized content, stale revisions, and overlapping edits. Reads always see the
 latest visible editor contents, including unsaved user changes.
+
+Directory creation is confined to the same workspace and rejects ignored,
+protected, symlinked, and non-directory paths. It creates at most 64 path
+components, leaves existing directories untouched, and does not switch buffers.
+On Unix, creation uses directory-relative, no-follow operations. Platforms
+without that secure boundary return an explicit unsupported-operation error
+when new directories are needed. Directory creation does not grant shell access,
+and directories are not removed automatically if a later file save fails.
 
 On Unix, content search uses descriptor-relative, nonblocking, no-follow reads
 from the physical workspace root. It fails closed on symlinks and special files.

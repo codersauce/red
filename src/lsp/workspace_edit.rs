@@ -28,7 +28,7 @@ use {
     nix::{
         errno::Errno,
         fcntl::{open, openat, renameat, AtFlags, OFlag},
-        sys::stat::{fstatat, Mode, SFlag},
+        sys::stat::{fstatat, mkdirat, Mode, SFlag},
         unistd::{unlinkat, UnlinkatFlags},
     },
     std::os::fd::{AsRawFd, FromRawFd},
@@ -39,6 +39,8 @@ use super::{apply_text_edits, file_path, file_uri, LspError, WorkspaceEditOperat
 const MAX_WORKSPACE_EDIT_OPERATIONS: usize = 1024;
 #[cfg(unix)]
 const MAX_WORKSPACE_FILE_BYTES: u64 = 16 * 1024 * 1024;
+#[cfg(unix)]
+const MAX_WORKSPACE_DIRECTORY_DEPTH: usize = 64;
 pub const MAX_WORKSPACE_EDIT_TOTAL_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Debug, Clone)]
@@ -1055,8 +1057,92 @@ fn atomic_write_with_permissions(
     result
 }
 
-/// Writes one workspace file through the same pinned, no-follow boundary used
-/// by filesystem-bearing LSP edits.
+/// Create missing directories below a pinned workspace without following links.
+/// Existing directories are accepted; the returned paths are workspace-relative
+/// and contain only directories created by this operation.
+pub(crate) fn secure_create_workspace_directory(
+    root: &Path,
+    path: &Path,
+) -> Result<Vec<PathBuf>, LspError> {
+    #[cfg(unix)]
+    {
+        let root = pin_workspace_root(root)?;
+        secure_create_directories(&root, path)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = root;
+        Err(protocol_error(format!(
+            "workspace directory creation requires no-follow filesystem support: {}",
+            path.display()
+        )))
+    }
+}
+
+#[cfg(unix)]
+fn secure_create_directories(
+    root: &PinnedWorkspaceRoot,
+    path: &Path,
+) -> Result<Vec<PathBuf>, LspError> {
+    ensure_safe_path(&root.path, path)?;
+    // Validate the entire request before creating even its first component.
+    let relative = path
+        .strip_prefix(&root.path)
+        .map_err(|error| protocol_error(error.to_string()))?;
+    let components = relative
+        .components()
+        .map(|component| match component {
+            Component::Normal(name) => Ok(name),
+            _ => Err(protocol_error(format!(
+                "invalid workspace directory: {}",
+                path.display()
+            ))),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if components.len() > MAX_WORKSPACE_DIRECTORY_DEPTH {
+        return Err(protocol_error(format!(
+            "workspace directory exceeds {MAX_WORKSPACE_DIRECTORY_DEPTH} components"
+        )));
+    }
+    verify_logical_workspace_root(root)?;
+    let flags = OFlag::O_RDONLY
+        | OFlag::O_DIRECTORY
+        | OFlag::O_NOFOLLOW
+        | OFlag::O_NONBLOCK
+        | OFlag::O_CLOEXEC;
+    let mut directory = root.directory.try_clone()?;
+    let mut relative_path = PathBuf::new();
+    let mut created = Vec::new();
+    for component in components {
+        relative_path.push(component);
+        let raw = match openat(Some(directory.as_raw_fd()), component, flags, Mode::empty()) {
+            Ok(raw) => raw,
+            Err(Errno::ENOENT) => {
+                verify_logical_workspace_root(root)?;
+                match mkdirat(
+                    Some(directory.as_raw_fd()),
+                    component,
+                    Mode::from_bits_truncate(0o777),
+                ) {
+                    Ok(()) => created.push(relative_path.clone()),
+                    // Another creator may have won. The no-follow open below
+                    // still requires the resulting entry to be a directory.
+                    Err(Errno::EEXIST) => {}
+                    Err(error) => return Err(error.into()),
+                }
+                openat(Some(directory.as_raw_fd()), component, flags, Mode::empty())?
+            }
+            Err(error) => return Err(error.into()),
+        };
+        // SAFETY: `openat` returned a new, owned directory descriptor.
+        directory = unsafe { fs::File::from_raw_fd(raw) };
+    }
+    verify_logical_workspace_root(root)?;
+    Ok(created)
+}
+
+/// Writes one workspace file, creating missing parents through the same pinned,
+/// no-follow boundary used by filesystem-bearing LSP edits.
 #[cfg(unix)]
 pub(crate) fn secure_write_workspace_file(
     root: &Path,
@@ -1070,6 +1156,11 @@ pub(crate) fn secure_write_workspace_file(
         )));
     }
     let root = pin_workspace_root(root)?;
+    ensure_safe_path(&root.path, path)?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| protocol_error("workspace file has no parent".to_string()))?;
+    secure_create_directories(&root, parent)?;
     verify_logical_workspace_root(&root)?;
     let snapshot = secure_snapshot_file(&root, path)?;
     atomic_write_with_permissions(&root, path, contents, snapshot.permissions.as_ref())
@@ -1222,6 +1313,15 @@ fn ensure_safe_path(root: &Path, path: &Path) -> Result<(), LspError> {
     let relative = path
         .strip_prefix(root)
         .map_err(|error| protocol_error(error.to_string()))?;
+    if relative
+        .components()
+        .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        return Err(protocol_error(format!(
+            "LSP workspace path contains an invalid component: {}",
+            path.display()
+        )));
+    }
     let components = relative
         .components()
         .filter_map(|component| match component {
@@ -1312,6 +1412,111 @@ mod tests {
 
     fn uri(path: &Path) -> String {
         file_uri(path).unwrap()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn agent_directories_are_recursive_idempotent_and_enable_nested_writes() {
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join("go/examples");
+        assert_eq!(
+            secure_create_workspace_directory(root.path(), &directory).unwrap(),
+            [PathBuf::from("go"), PathBuf::from("go/examples")]
+        );
+        assert!(secure_create_workspace_directory(root.path(), &directory)
+            .unwrap()
+            .is_empty());
+        assert!(secure_create_workspace_directory(root.path(), root.path())
+            .unwrap()
+            .is_empty());
+        let path = root.path().join("samples/go/main.go");
+        secure_write_workspace_file(root.path(), &path, b"package main\n").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"package main\n");
+        secure_write_workspace_file(root.path(), &path, b"package sample\n").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"package sample\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn agent_directories_reject_unsafe_paths_before_creating_parents() {
+        use std::os::unix::fs::symlink;
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        fs::write(root.path().join("file"), "untouched").unwrap();
+        symlink(outside.path(), root.path().join("linked")).unwrap();
+        symlink(outside.path().join("absent"), root.path().join("dangling")).unwrap();
+        for path in [
+            outside.path().join("escape"),
+            root.path().join("new/../escape"),
+            root.path().join("new/.git/hooks"),
+            root.path().join("new/.ssh/keys"),
+            root.path().join("new/.red/plugins"),
+            root.path().join("new/.env.local"),
+            root.path().join("file"),
+            root.path().join("file/child"),
+            root.path().join("linked/child"),
+            root.path().join("dangling/child"),
+        ] {
+            assert!(
+                secure_create_workspace_directory(root.path(), &path).is_err(),
+                "{}",
+                path.display()
+            );
+        }
+        let deep = root
+            .path()
+            .join(vec!["deep"; MAX_WORKSPACE_DIRECTORY_DEPTH + 1].join("/"));
+        assert!(secure_create_workspace_directory(root.path(), &deep).is_err());
+        assert!(!root.path().join("deep").exists());
+        assert!(!root.path().join("new").exists());
+        assert!(!outside.path().join("child").exists());
+        assert!(!outside.path().join("absent").exists());
+        assert_eq!(
+            fs::read_to_string(root.path().join("file")).unwrap(),
+            "untouched"
+        );
+
+        assert!(secure_write_workspace_file(
+            root.path(),
+            &root.path().join("new/.git/config"),
+            b"bad"
+        )
+        .is_err());
+        assert!(secure_write_workspace_file(
+            root.path(),
+            &root.path().join("linked/main.go"),
+            b"bad"
+        )
+        .is_err());
+        assert!(!root.path().join("new").exists());
+        assert!(!outside.path().join("main.go").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn agent_directory_creation_rejects_a_replaced_pinned_root() {
+        let parent = tempfile::tempdir().unwrap();
+        let root = parent.path().join("workspace");
+        fs::create_dir(&root).unwrap();
+        let pinned = pin_workspace_root(&root).unwrap();
+        let moved = parent.path().join("moved");
+        fs::rename(&root, &moved).unwrap();
+        fs::create_dir(&root).unwrap();
+        assert!(secure_create_directories(&pinned, &root.join("go")).is_err());
+        assert!(!root.join("go").exists());
+        assert!(!moved.join("go").exists());
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    fn agent_directory_creation_fails_closed_without_no_follow_support() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("go");
+        assert!(secure_create_workspace_directory(root.path(), &path)
+            .unwrap_err()
+            .to_string()
+            .contains("no-follow"));
+        assert!(!path.exists());
     }
 
     #[cfg(unix)]

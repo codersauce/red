@@ -1432,7 +1432,7 @@ pub(crate) fn agent_context_path_is_sensitive(path: &Path) -> bool {
         )
 }
 
-fn agent_context_path_is_ignored(path: &Path, root: &Path) -> bool {
+fn agent_context_path_is_ignored(path: &Path, root: &Path, is_dir: bool) -> bool {
     let mut ignored = false;
     let mut directories = path
         .parent()
@@ -1444,7 +1444,7 @@ fn agent_context_path_is_ignored(path: &Path, root: &Path) -> bool {
     for directory in directories {
         for name in [".gitignore", ".ignore"] {
             let (matcher, _) = ignore::gitignore::Gitignore::new(directory.join(name));
-            match matcher.matched_path_or_any_parents(path, /*is_dir*/ false) {
+            match matcher.matched_path_or_any_parents(path, is_dir) {
                 ignore::Match::Ignore(_) => ignored = true,
                 ignore::Match::Whitelist(_) => ignored = false,
                 ignore::Match::None => {}
@@ -1454,7 +1454,7 @@ fn agent_context_path_is_ignored(path: &Path, root: &Path) -> bool {
     let mut builder = ignore::gitignore::GitignoreBuilder::new(root);
     builder.add(root.join(".git/info/exclude"));
     if let Ok(exclude) = builder.build() {
-        match exclude.matched_path_or_any_parents(path, /*is_dir*/ false) {
+        match exclude.matched_path_or_any_parents(path, is_dir) {
             ignore::Match::Ignore(_) => ignored = true,
             ignore::Match::Whitelist(_) => ignored = false,
             ignore::Match::None => {}
@@ -1464,6 +1464,10 @@ fn agent_context_path_is_ignored(path: &Path, root: &Path) -> bool {
 }
 
 pub(crate) fn resolve_agent_tool_path(root: &Path, path: &str) -> anyhow::Result<PathBuf> {
+    resolve_agent_tool_path_kind(root, path, /*is_dir*/ false)
+}
+
+fn resolve_agent_tool_path_kind(root: &Path, path: &str, is_dir: bool) -> anyhow::Result<PathBuf> {
     anyhow::ensure!(!path.is_empty(), "editor tool path cannot be empty");
     let path = Path::new(path);
     let path = if path.is_absolute() {
@@ -1509,7 +1513,7 @@ pub(crate) fn resolve_agent_tool_path(root: &Path, path: &str) -> anyhow::Result
         "editor tool path is a sensitive file"
     );
     anyhow::ensure!(
-        !agent_context_path_is_ignored(&normalized, root),
+        !agent_context_path_is_ignored(&normalized, root, is_dir),
         "editor tool path is ignored by the workspace"
     );
     Ok(normalized)
@@ -7738,7 +7742,7 @@ impl Editor {
                 Some("outside the workspace")
             } else if agent_context_path_is_sensitive(path) {
                 Some("a sensitive file")
-            } else if agent_context_path_is_ignored(path, &root) {
+            } else if agent_context_path_is_ignored(path, &root, /*is_dir*/ false) {
                 Some("an ignored file")
             } else {
                 None
@@ -8435,8 +8439,15 @@ impl Editor {
         };
         #[cfg(not(unix))]
         let result = {
-            let _ = (root, path);
-            self.current_buffer_mut().save()
+            let parent = path
+                .parent()
+                .ok_or_else(|| anyhow::anyhow!("workspace file has no parent"));
+            parent.and_then(|parent| {
+                if !parent.is_dir() {
+                    crate::lsp::workspace_edit::secure_create_workspace_directory(root, parent)?;
+                }
+                self.current_buffer_mut().save()
+            })
         };
         match result {
             Ok(message) => {
@@ -8604,6 +8615,17 @@ impl Editor {
                 )
                 .await
             }
+            EditorToolCall::CreateDirectory { path } => {
+                let path = resolve_agent_tool_path_kind(&root, &path, /*is_dir*/ true)?;
+                let created =
+                    crate::lsp::workspace_edit::secure_create_workspace_directory(&root, &path)?;
+                Ok(json!({
+                    "ok": true,
+                    "path": path.strip_prefix(&root)?,
+                    "already_exists": created.is_empty(),
+                    "created": created,
+                }))
+            }
             EditorToolCall::GetEditorState {} => Ok(self.agent_editor_state()),
             EditorToolCall::OpenFile {
                 path,
@@ -8760,7 +8782,9 @@ impl Editor {
             anyhow::bail!("no agent workspace is active");
         };
         let (path, position, create, delay) = match &request.call {
-            EditorToolCall::InlineContext { .. } => return Ok(Duration::ZERO),
+            EditorToolCall::InlineContext { .. } | EditorToolCall::CreateDirectory { .. } => {
+                return Ok(Duration::ZERO)
+            }
             EditorToolCall::ReadFile { path } => {
                 (Some(path.as_str()), None, false, Duration::from_millis(300))
             }
@@ -14185,6 +14209,12 @@ impl Editor {
 
         match event.kind {
             MouseEventKind::Down(MouseButton::Left) => {
+                if let Some(target) = self
+                    .panel_manager
+                    .text_action_at_position(x, y, width, height)
+                {
+                    return Some(self.follow_text_panel_link(target));
+                }
                 if event
                     .modifiers
                     .intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER)
@@ -14265,6 +14295,15 @@ impl Editor {
             }
             plugin::TextPanelLinkTarget::ExternalUrl(url) => {
                 KeyAction::Single(Action::OpenExternalUrl(url))
+            }
+            plugin::TextPanelLinkTarget::PanelAction { panel_id, block_id } => {
+                KeyAction::Multiple(vec![
+                    Action::NotifyPlugins(
+                        format!("panel:event:{panel_id}"),
+                        serde_json::json!({"panel_id":panel_id,"action":"activate_block","text":block_id}),
+                    ),
+                    Action::Refresh,
+                ])
             }
         }
     }
@@ -29520,6 +29559,151 @@ mod test {
                 .unwrap()
                 .contains("linked outside contents"));
         }
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn agent_directory_tools_create_folders_without_switching_buffers() {
+        let root = tempfile::tempdir().unwrap();
+        let mut editor = test_editor(/*width*/ 80, /*height*/ 24);
+        editor.test_set_agent_root(root.path());
+        let buffer_id = editor.current_buffer().id();
+        let before = editor.current_buffer().contents();
+        let request = EditorToolRequest {
+            session_id: "directories".to_string(),
+            call: EditorToolCall::CreateDirectory {
+                path: "go/examples".to_string(),
+            },
+        };
+        let mut render_buffer = RenderBuffer::new(80, 24, &Style::default());
+        let mut runtime = Runtime::new();
+        assert_eq!(
+            editor
+                .prepare_agent_follow_step(&request, &mut render_buffer, &mut runtime)
+                .await
+                .unwrap(),
+            Duration::ZERO
+        );
+        assert!(editor
+            .dispatch_agent_editor_tool(request.clone(), &mut render_buffer, &mut runtime)
+            .await
+            .is_err());
+        assert!(!root.path().join("go").exists());
+        let result = editor
+            .test_run_agent_editor_tool(request.clone())
+            .await
+            .unwrap();
+        assert_eq!(result["created"], json!(["go", "go/examples"]));
+        assert_eq!(result["already_exists"], false);
+        let result = editor.test_run_agent_editor_tool(request).await.unwrap();
+        assert_eq!(result["created"], json!([]));
+        assert_eq!(result["already_exists"], true);
+        assert_eq!(editor.current_buffer().id(), buffer_id);
+        assert_eq!(editor.current_buffer().contents(), before);
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn agent_directory_tools_reject_ignored_protected_and_outside_paths() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        fs::write(root.path().join(".gitignore"), "ignored/\n").unwrap();
+        std::os::unix::fs::symlink(outside.path(), root.path().join("linked")).unwrap();
+        let mut editor = test_editor(/*width*/ 80, /*height*/ 24);
+        editor.test_set_agent_root(root.path());
+        for path in [
+            "ignored",
+            "ignored/child",
+            "new/.git/hooks",
+            "linked/child",
+            "../outside",
+        ] {
+            let result = editor
+                .test_run_agent_editor_tool(EditorToolRequest {
+                    session_id: "directories".to_string(),
+                    call: EditorToolCall::CreateDirectory {
+                        path: path.to_string(),
+                    },
+                })
+                .await;
+            assert!(result.is_err(), "{path}");
+        }
+        assert!(!root.path().join("ignored").exists());
+        assert!(!root.path().join("new").exists());
+        assert!(!outside.path().join("child").exists());
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn agent_file_writes_create_parents_only_after_revision_validation() {
+        let root = tempfile::tempdir().unwrap();
+        let mut editor = test_editor(/*width*/ 80, /*height*/ 24);
+        editor.test_set_agent_root(root.path());
+        let request = |call| EditorToolRequest {
+            session_id: "directories".to_string(),
+            call,
+        };
+        let read = editor
+            .test_run_agent_editor_tool(request(EditorToolCall::ReadFile {
+                path: "go/main.go".to_string(),
+            }))
+            .await
+            .unwrap();
+        assert_eq!(read["exists"], false);
+        assert!(!root.path().join("go").exists());
+        let revision = read["revision"].as_u64().unwrap();
+        let content = "package main\n\nfunc main() {}\n";
+        let error = editor
+            .test_run_agent_editor_tool(request(EditorToolCall::WriteFile {
+                path: "go/main.go".to_string(),
+                expected_revision: revision + 1,
+                content: content.to_string(),
+            }))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("stale editor revision"));
+        assert!(!root.path().join("go").exists());
+        let result = editor
+            .test_run_agent_editor_tool(request(EditorToolCall::WriteFile {
+                path: "go/main.go".to_string(),
+                expected_revision: revision,
+                content: content.to_string(),
+            }))
+            .await
+            .unwrap();
+        assert_eq!(result["saved"], true, "{result}");
+        assert_eq!(
+            fs::read_to_string(root.path().join("go/main.go")).unwrap(),
+            content
+        );
+        assert_eq!(editor.current_buffer().contents(), content);
+        assert!(
+            matches!(editor.test_last_transaction_origin(), Some(EditOrigin::Agent { session_id, .. }) if session_id == "directories")
+        );
+
+        let result = editor
+            .test_run_agent_editor_tool(request(EditorToolCall::ApplyEdits {
+                path: "other/nested/main.go".to_string(),
+                expected_revision: 0,
+                edits: vec![crate::agent_tools::EditorTextEdit {
+                    start: crate::agent_tools::EditorPosition {
+                        line: 0,
+                        character: 0,
+                    },
+                    end: crate::agent_tools::EditorPosition {
+                        line: 0,
+                        character: 0,
+                    },
+                    new_text: "package main".to_string(),
+                }],
+            }))
+            .await
+            .unwrap();
+        assert_eq!(result["saved"], true, "{result}");
+        assert_eq!(
+            fs::read_to_string(root.path().join("other/nested/main.go")).unwrap(),
+            "package main\n"
+        );
     }
 
     #[tokio::test]

@@ -7,6 +7,11 @@ pub(crate) enum TextPanelLinkTarget {
         location: Option<TextPanelFileLocation>,
     },
     ExternalUrl(String),
+    /// Trusted plugin-authored block action, never parsed from Markdown.
+    PanelAction {
+        panel_id: String,
+        block_id: String,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

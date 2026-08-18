@@ -302,7 +302,7 @@ impl WhatsNewPanel {
             TextPanelLinkTarget::ExternalUrl(url) => {
                 Some(KeyAction::Single(Action::OpenExternalUrl(url.to_string())))
             }
-            TextPanelLinkTarget::File { .. } => None,
+            TextPanelLinkTarget::File { .. } | TextPanelLinkTarget::PanelAction { .. } => None,
         }
     }
 

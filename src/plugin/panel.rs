@@ -274,6 +274,8 @@ pub enum TextPanelBlockKind {
     Error,
     /// Muted tool/progress timeline emitted while an agent turn runs.
     Activity,
+    /// Muted, plugin-authored disclosure or other inline action.
+    Action,
     #[default]
     Text,
 }
@@ -904,13 +906,7 @@ impl TextPanel {
     fn set_status(&mut self, status: Option<TextPanelStatus>) {
         let stream_changed = self.status.as_ref().is_some_and(|status| status.stream)
             != status.as_ref().is_some_and(|status| status.stream);
-        let busy_spacer_changed = self
-            .blocks
-            .last()
-            .is_some_and(|block| block.kind == TextPanelBlockKind::User)
-            && self.status.as_ref().is_some_and(|status| status.busy)
-                != status.as_ref().is_some_and(|status| status.busy);
-        if stream_changed || busy_spacer_changed {
+        if stream_changed {
             self.invalidate_layout();
         }
         self.busy_since = if status.as_ref().is_some_and(|status| status.busy) {
@@ -922,7 +918,9 @@ impl TextPanel {
     }
 
     fn status_height(&self) -> usize {
-        usize::from(self.status.is_some())
+        self.status
+            .as_ref()
+            .map_or(0, |status| 1 + usize::from(status.busy))
     }
 
     fn search_bar_row(&self, height: usize) -> Option<usize> {
@@ -1222,12 +1220,41 @@ impl TextPanel {
                 }
 
                 let style = block_style(&block.kind);
-                let mut block_lines = match block.format {
-                    TextPanelBlockFormat::Plain => wrap_plain_text(&block.text, width, style),
-                    TextPanelBlockFormat::Markdown => render_markdown_lines(&block.text, width),
+                let mut block_lines = if block.kind == TextPanelBlockKind::Action {
+                    block
+                        .text
+                        .lines()
+                        .map(|line| {
+                            RenderedTextLine::plain(
+                                crate::unicode_utils::truncate_display_width_with_marker(
+                                    line,
+                                    width,
+                                    "…",
+                                    crate::unicode_utils::TruncationSide::Right,
+                                ),
+                                style,
+                            )
+                        })
+                        .collect()
+                } else {
+                    match block.format {
+                        TextPanelBlockFormat::Plain => wrap_plain_text(&block.text, width, style),
+                        TextPanelBlockFormat::Markdown => render_markdown_lines(&block.text, width),
+                    }
                 };
                 if block_lines.is_empty() {
                     block_lines.push(RenderedTextLine::plain(String::new(), style));
+                }
+                if block.kind == TextPanelBlockKind::Action {
+                    for span in block_lines.iter_mut().flat_map(|line| &mut line.spans) {
+                        span.link = Some(TextPanelLink {
+                            id: 1,
+                            target: TextPanelLinkTarget::PanelAction {
+                                panel_id: self.id.clone(),
+                                block_id: block.id.clone(),
+                            },
+                        });
+                    }
                 }
                 namespace_block_links(&mut block_lines, block_index);
                 lines.extend(block_lines);
@@ -1238,19 +1265,19 @@ impl TextPanel {
             ) {
                 searchable_rows.push(block_start..lines.len());
             }
-            lines.push(RenderedTextLine::plain(
-                String::new(),
-                TextPanelSpanStyle::Text,
-            ));
+            let continues_action = block.kind == TextPanelBlockKind::Action
+                && self
+                    .blocks
+                    .get(block_index + 1)
+                    .is_some_and(|next| next.kind == TextPanelBlockKind::Action);
+            if !continues_action {
+                lines.push(RenderedTextLine::plain(
+                    String::new(),
+                    TextPanelSpanStyle::Text,
+                ));
+            }
         }
-        let separate_user_prompt_from_busy_status = self
-            .blocks
-            .last()
-            .is_some_and(|block| block.kind == TextPanelBlockKind::User)
-            && self.status.as_ref().is_some_and(|status| status.busy);
-        if lines.last().is_some_and(RenderedTextLine::is_empty)
-            && !separate_user_prompt_from_busy_status
-        {
+        if lines.last().is_some_and(RenderedTextLine::is_empty) {
             lines.pop();
         }
         if self.status.as_ref().is_some_and(|status| status.stream) {
@@ -3668,6 +3695,27 @@ impl PanelManager {
         terminal_width: usize,
         terminal_height: usize,
     ) -> Option<TextPanelLinkTarget> {
+        self.text_link_at_position_impl(x, y, terminal_width, terminal_height, false)
+    }
+
+    pub(crate) fn text_action_at_position(
+        &mut self,
+        x: usize,
+        y: usize,
+        terminal_width: usize,
+        terminal_height: usize,
+    ) -> Option<TextPanelLinkTarget> {
+        self.text_link_at_position_impl(x, y, terminal_width, terminal_height, true)
+    }
+
+    fn text_link_at_position_impl(
+        &mut self,
+        x: usize,
+        y: usize,
+        terminal_width: usize,
+        terminal_height: usize,
+        action_only: bool,
+    ) -> Option<TextPanelLinkTarget> {
         let placement = self.panel_at_position(x, y, terminal_width, terminal_height)?;
         let panel = self.text_panels.get_mut(&placement.id)?;
         let title_rows = text_panel_header_rows(&panel.config);
@@ -3700,6 +3748,9 @@ impl PanelManager {
             let end = used.saturating_add(display_width(&span.text));
             if column >= used && column < end {
                 let link = span.link.as_ref()?;
+                if action_only && !matches!(link.target, TextPanelLinkTarget::PanelAction { .. }) {
+                    return None;
+                }
                 self.focused = Some(placement.id);
                 panel.selected_link = Some(link.id);
                 if let Some(composer) = panel.composer.as_mut() {
@@ -4871,7 +4922,7 @@ fn render_text_panel(
             status,
             content_position,
             metrics.width,
-            content_height,
+            content_height + status_height.saturating_sub(1),
             &palette,
         );
     }
@@ -5715,9 +5766,11 @@ fn block_label(kind: &TextPanelBlockKind) -> Option<(&'static str, TextPanelSpan
     match kind {
         // User blocks render their own prompt card and label.
         TextPanelBlockKind::User => None,
-        TextPanelBlockKind::Agent => Some(("◆ Agent", TextPanelSpanStyle::Agent)),
+        TextPanelBlockKind::Agent => None,
         TextPanelBlockKind::Error => Some(("⚠ Error", TextPanelSpanStyle::Error)),
-        TextPanelBlockKind::Activity | TextPanelBlockKind::Text => None,
+        TextPanelBlockKind::Activity | TextPanelBlockKind::Action | TextPanelBlockKind::Text => {
+            None
+        }
     }
 }
 
@@ -5726,7 +5779,7 @@ fn block_style(kind: &TextPanelBlockKind) -> TextPanelSpanStyle {
         TextPanelBlockKind::User => TextPanelSpanStyle::User,
         TextPanelBlockKind::Agent => TextPanelSpanStyle::Agent,
         TextPanelBlockKind::Error => TextPanelSpanStyle::Error,
-        TextPanelBlockKind::Activity => TextPanelSpanStyle::Muted,
+        TextPanelBlockKind::Activity | TextPanelBlockKind::Action => TextPanelSpanStyle::Muted,
         TextPanelBlockKind::Text => TextPanelSpanStyle::Text,
     }
 }
@@ -7753,13 +7806,17 @@ mod tests {
 
         let placement = manager.panel_at_position(40, 0, 80, 20).unwrap();
         assert_eq!(
-            manager.text_link_at_position(placement.x + 1, 3, 80, 20),
+            manager.text_action_at_position(placement.x + 1, 2, 80, 20),
+            None
+        );
+        assert_eq!(
+            manager.text_link_at_position(placement.x + 1, 2, 80, 20),
             Some(TextPanelLinkTarget::ExternalUrl(
                 "https://example.com".to_string()
             ))
         );
         assert_eq!(
-            manager.text_link_at_position(placement.x + 11, 3, 80, 20),
+            manager.text_link_at_position(placement.x + 11, 2, 80, 20),
             Some(TextPanelLinkTarget::File {
                 path: "src/main.rs".to_string(),
                 location: None,
@@ -8159,6 +8216,9 @@ mod tests {
 
         let status_row = row_text(&buffer, 8);
         assert!(status_row.contains("⠋ Reading demo.txt · 0s"));
+        assert!(buffer.cells[7 * 100 + 30..8 * 100]
+            .iter()
+            .all(|cell| cell.text.trim().is_empty()));
         assert!(row_text(&buffer, 9).contains("────"));
         assert!((1..8).any(|row| row_text(&buffer, row).contains("partial answer▌")));
 
@@ -8168,6 +8228,117 @@ mod tests {
         assert!(!row_text(&buffer, 8).contains("Reading demo.txt"));
         assert!((1..9).any(|row| row_text(&buffer, row).contains("partial answer")));
         assert!(!(1..9).any(|row| row_text(&buffer, row).contains("partial answer▌")));
+    }
+
+    #[test]
+    fn action_blocks_support_plain_click_and_keyboard_activation() {
+        let mut manager = PanelManager::default();
+        manager.create_text_panel(
+            "agent".to_string(),
+            PanelConfig {
+                side: PanelSide::Right,
+                width: 40,
+                title: Some("Agent".to_string()),
+                ..PanelConfig::default()
+            },
+        );
+        manager.update_text_panel(
+            "agent",
+            vec![TextPanelBlock {
+                id: "activity:1".to_string(),
+                kind: TextPanelBlockKind::Action,
+                format: TextPanelBlockFormat::Plain,
+                text: "▸ Activity · 1 action".to_string(),
+            }],
+            18,
+            80,
+        );
+        let placement = manager.panel_at_position(40, 0, 80, 20).unwrap();
+        let expected = Some(TextPanelLinkTarget::PanelAction {
+            panel_id: "agent".to_string(),
+            block_id: "activity:1".to_string(),
+        });
+        assert_eq!(
+            manager.text_action_at_position(placement.x + 1, 2, 80, 20),
+            expected
+        );
+        assert!(manager.focus_panel("agent"));
+        assert_eq!(manager.focused_text_link_target(80), expected);
+    }
+
+    #[test]
+    fn action_blocks_are_truncated_trusted_links_without_extra_chrome() {
+        let mut panel = TextPanel::new("agent".to_string(), PanelConfig::default());
+        panel.blocks = vec![
+            TextPanelBlock {
+                id: "summary".to_string(),
+                kind: TextPanelBlockKind::Action,
+                format: TextPanelBlockFormat::Plain,
+                text: "▸ Activity · 8 actions".to_string(),
+            },
+            TextPanelBlock {
+                id: "details".to_string(),
+                kind: TextPanelBlockKind::Action,
+                format: TextPanelBlockFormat::Plain,
+                text: "  ✓ Read a very long filename\n  View all details…".to_string(),
+            },
+            TextPanelBlock {
+                id: "answer".to_string(),
+                kind: TextPanelBlockKind::Agent,
+                format: TextPanelBlockFormat::Markdown,
+                text: "Answer".to_string(),
+            },
+        ];
+        let rendered = panel.build_rendered_lines(18);
+        assert_eq!(rendered.lines.len(), 5);
+        assert!(rendered.lines[3].is_empty());
+        for line in &rendered.lines[..3] {
+            assert!(
+                line.spans
+                    .iter()
+                    .map(|s| display_width(&s.text))
+                    .sum::<usize>()
+                    <= 18
+            );
+            assert!(line
+                .spans
+                .iter()
+                .all(|s| matches!(s.link.as_ref().map(|l| &l.target),
+                Some(TextPanelLinkTarget::PanelAction { panel_id, .. }) if panel_id == "agent")));
+        }
+        assert!(rendered.lines[4].spans.iter().any(|s| s.text == "Answer"));
+        assert_eq!(panel.links(18).len(), 2);
+    }
+
+    #[test]
+    fn busy_status_reserves_spacing_after_every_block_kind() {
+        for kind in [
+            TextPanelBlockKind::Agent,
+            TextPanelBlockKind::Activity,
+            TextPanelBlockKind::Action,
+            TextPanelBlockKind::Error,
+        ] {
+            let mut panel = TextPanel::new("agent".to_string(), PanelConfig::default());
+            panel.blocks = vec![TextPanelBlock {
+                id: "tail".to_string(),
+                kind,
+                format: TextPanelBlockFormat::Plain,
+                text: "one\ntwo\nthree\nfour\nfive\nsix\nseven\neight".to_string(),
+            }];
+            panel.set_status(Some(TextPanelStatus {
+                busy: true,
+                label: "Working".to_string(),
+                stream: false,
+            }));
+            panel.scroll_to_bottom(8, 40);
+            let theme = Theme::default();
+            let mut buffer = RenderBuffer::new(40, 8, &theme.style);
+            render_text_panel(&mut buffer, &panel, Point::new(0, 0), 40, 8, &theme);
+            assert!(row_text(&buffer, 5).contains("eight"));
+            assert!(row_text(&buffer, 6).trim().is_empty());
+            assert!(row_text(&buffer, 7).contains("Working"));
+            assert!(!panel.layout(40).rendered.last().unwrap().is_empty());
+        }
     }
 
     #[test]
@@ -8205,7 +8376,7 @@ mod tests {
             label: "Waiting for agent…".to_string(),
             stream: false,
         }));
-        assert!(panel
+        assert!(!panel
             .layout(40)
             .rendered
             .last()
@@ -8459,8 +8630,8 @@ mod tests {
 
         assert_eq!(text_position(&buffer, "Agent"), Some(Point::new(1, 0)));
         assert!(buffer.cells[40..80].iter().all(|cell| cell.text == "─"));
-        assert_eq!(text_position(&buffer, "◆ Agent"), Some(Point::new(1, 2)));
-        assert_eq!(text_position(&buffer, "body"), Some(Point::new(1, 3)));
+        assert_eq!(text_position(&buffer, "◆ Agent"), None);
+        assert_eq!(text_position(&buffer, "body"), Some(Point::new(1, 2)));
         let composer_divider = (12 - panel.composer_height(12, 40)) * 40;
         assert!(buffer.cells[composer_divider..composer_divider + 40]
             .iter()

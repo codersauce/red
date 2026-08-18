@@ -77,7 +77,13 @@ for line in sys.stdin:
         assert message["params"]["sandbox"] == "read-only"
         assert message["params"]["approvalPolicy"] == "never"
         assert message["params"]["ephemeral"] is False
-        assert len(message["params"]["dynamicTools"]) == 9
+        expected_tools = {
+            "list_files", "search_files", "read_file", "write_file",
+            "get_editor_state", "open_file", "select_text", "apply_edits",
+            "run_editor_action", "create_directory",
+        }
+        tool_names = [tool["name"] for tool in message["params"]["dynamicTools"]]
+        assert len(tool_names) == len(expected_tools) and set(tool_names) == expected_tools, tool_names
         expected_hooks = os.environ.get("RED_MOCK_EXPECT_HOOKS") == "true"
         assert message["params"]["config"]["features"]["hooks"] is expected_hooks
         assert "codex_hooks" not in message["params"]["config"]["features"]
