@@ -1746,8 +1746,13 @@ fn cancelled(event: AgentSessionEvent) {
         reset_model_state();
         red::state_patch(AgentState { cancelled_session_id: "" });
         red::state_patch(AgentState { recap_pending: true });
+        red::execute("Print", "Agent cancellation requested");
+        set_phase("idle", "");
+        return;
     }
     red::execute("Print", "Agent cancellation requested");
+    // Restart elapsed time so the status measures cancellation latency, not turn age.
+    red::execute("SetTextPanelStatus", "agent-conversation");
     set_phase("stopping", "Stopping…");
 }
 
