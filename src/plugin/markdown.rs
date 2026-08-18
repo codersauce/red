@@ -385,7 +385,10 @@ impl<'a> MarkdownRenderer<'a> {
         match tag {
             TagEnd::Paragraph => {
                 self.flush_current();
-                if self.items.is_empty() && self.quote_depth == 0 {
+                // pulldown-cmark omits paragraph events in tight lists. Keeping
+                // explicit paragraph spacing therefore preserves loose lists
+                // without adding gaps to ordinary compact lists.
+                if self.quote_depth == 0 {
                     self.blank_line();
                 }
             }
@@ -1835,6 +1838,69 @@ mod tests {
                 path: "README.md".to_string(),
                 location: Some(TextPanelFileLocation { line: 8, column: 1 }),
             }
+        );
+    }
+
+    #[test]
+    fn loose_ordered_steps_keep_spacing_after_prose_and_code() {
+        let markdown = "1. Check Go:\n\n   ```sh\n   go version\n   ```\n\n   Install it if needed.\n\n2. Create the project:\n\n   ```sh\n   mkdir myapp\n   ```\n\n   Choose a module path.\n\n3. Save main.go:\n\n   ```go\n   package main\n   ```\n\n4. Run it:\n\n   ```sh\n   go run .\n   ```\n\nTo build, run `go build .`.";
+        for width in [24, 80] {
+            let lines = render_markdown_lines(markdown, width);
+            let output = plain(&lines);
+            for marker in ["2. ", "3. ", "4. "] {
+                let index = output
+                    .iter()
+                    .position(|line| line.starts_with(marker))
+                    .unwrap();
+                assert_eq!(
+                    output[index - 1],
+                    "",
+                    "missing gap before {marker} at width {width}: {output:?}"
+                );
+                assert!(
+                    !output[index - 2].is_empty(),
+                    "duplicate gap before {marker}"
+                );
+            }
+            assert!(output
+                .iter()
+                .any(|line| line.contains("Install it if needed.")));
+            assert!(output
+                .iter()
+                .any(|line| line.contains("Choose a module path.")));
+            assert_fits(&lines, width);
+        }
+    }
+
+    #[test]
+    fn tight_lists_stay_compact_and_loose_paragraphs_stay_separate() {
+        assert_eq!(
+            plain(&render_markdown_lines("1. one\n2. two\n3. three", 40)),
+            ["1. one", "2. two", "3. three"]
+        );
+        assert_eq!(
+            plain(&render_markdown_lines("- one\n- two", 40)),
+            ["• one", "• two"]
+        );
+        assert_eq!(
+            plain(&render_markdown_lines(
+                "1. first paragraph\n\n   second paragraph\n\n2. next item",
+                40
+            )),
+            [
+                "1. first paragraph",
+                "",
+                "   second paragraph",
+                "",
+                "2. next item"
+            ]
+        );
+        assert_eq!(
+            plain(&render_markdown_lines(
+                "- outer\n  - nested one\n  - nested two\n- next",
+                40
+            )),
+            ["• outer", "  • nested one", "  • nested two", "• next"]
         );
     }
 

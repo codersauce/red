@@ -278,6 +278,17 @@ to that turn's prompt; repeating it visits earlier prompts. Jumps reveal the
 prompt card, update its accent, and pause automatic scrolling without changing
 the composer draft. `G` returns to the latest output and resumes following it.
 
+While a turn runs, the status row names the current operation and shows elapsed
+time. Assistant messages stream into separate blocks. Repeated reads, searches,
+and edits are grouped into a compact activity summary. On completion, that
+summary stays above the final answer and shows an issue count instead of full
+tool errors. Errors that stop the request still appear separately. Click
+**Activity** in the pane header (or run
+`:AgentActivity`) to expand or collapse the retained tool details. Details are
+bounded and retained for the current conversation view; restored conversations
+may contain only their saved summaries. Raw file contents are not shown in the
+activity log. Scrolling back continues to pause automatic tail-following.
+
 `/` searches forward through visible prompt and answer text; `?` searches
 backward. Search is literal and case-sensitive, previews matches as you type,
 and shows a result count. Enter keeps the result, while Escape cancels an

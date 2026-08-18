@@ -81,6 +81,13 @@ struct AgentActivityRow {
     id: String,
     title: String,
     status: String,
+    kind: String,
+    detail: String,
+}
+
+struct AgentActivityHistory {
+    id: String,
+    details: String,
 }
 
 struct AgentThoughtContent {
@@ -96,12 +103,15 @@ struct AgentToolCall {
     kind: Option<String>,
     tool_call_id: Option<String>,
     status: Option<String>,
+    detail: Option<String>,
 }
 
 struct AgentToolCallUpdate {
     tool_call_id: Option<String>,
     status: Option<String>,
     title: Option<String>,
+    kind: Option<String>,
+    detail: Option<String>,
 }
 
 enum AgentActivityUpdate {
@@ -239,6 +249,8 @@ struct AgentState {
     ui_phase: String,
     ui_label: String,
     activity_rows: [AgentActivityRow],
+    activity_history: [AgentActivityHistory],
+    activity_expanded: bool,
     activity_block_id: String,
     thought: String,
 }
@@ -291,6 +303,8 @@ fn initial_state() -> AgentState {
         ui_phase: "idle",
         ui_label: "",
         activity_rows: [],
+        activity_history: [],
+        activity_expanded: false,
         activity_block_id: "",
         thought: "",
     };
@@ -723,6 +737,7 @@ fn ensure_conversation_panel() {
             title: "Agent",
             composer: TextPanelComposerConfig { placeholder: "Ask a follow-up…", rows: 3 },
             header_actions: [
+                TextPanelHeaderAction { id: "activity", label: "Activity", compact_label: "A" },
                 TextPanelHeaderAction { id: "clear", label: "Clear", compact_label: "C" },
                 TextPanelHeaderAction { id: "new", label: "New", compact_label: "N" },
                 TextPanelHeaderAction { id: "close", label: "×", compact_label: "×" },
@@ -1011,39 +1026,49 @@ fn tool_activity(update: AgentToolCall) {
     if title == "" {
         title = optional_text(update.kind, "Tool");
     }
-    let rows = state().activity_rows;
-    if red::len(rows) < 100 {
-        rows = red::push(rows, AgentActivityRow {
-            id: optional_text(update.tool_call_id, ""),
-            title: title,
-            status: optional_text(update.status, "in_progress"),
-        });
-    }
-    red::state_patch(AgentState { activity_rows: rows });
-    render_activity();
-    set_phase("tool", title);
+    update_tool_activity(AgentToolCallUpdate {
+        tool_call_id: update.tool_call_id,
+        title: Some(title),
+        status: Some(optional_text(update.status, "in_progress")),
+        kind: update.kind,
+        detail: update.detail,
+    });
 }
 
 fn update_tool_activity(update: AgentToolCallUpdate) {
     let target = optional_text(update.tool_call_id, "");
     let status = optional_text(update.status, "");
     let title = optional_text(update.title, "");
+    let kind = optional_text(update.kind, "tool");
+    let detail = optional_text(update.detail, "");
     let rows = state().activity_rows;
     let updated = [];
     let active = "";
+    let found = false;
     for row in rows {
         if row.id == target && row.id != "" {
+            found = true;
             if status != "" {
                 row.status = status;
             }
             if title != "" {
                 row.title = title;
             }
+            if detail != "" { row.detail = detail; }
         }
         if row.status == "in_progress" || row.status == "pending" {
             active = row.title;
         }
         updated = red::push(updated, row);
+    }
+    // A completed item can arrive without its start, for example after reconnecting.
+    if !found && title != "" && red::len(updated) < 100 {
+        let row_status = status;
+        if row_status == "" { row_status = "in_progress"; }
+        updated = red::push(updated, AgentActivityRow {
+            id: target, title: title, status: row_status, kind: kind, detail: detail,
+        });
+        if row_status == "in_progress" || row_status == "pending" { active = title; }
     }
     red::state_patch(AgentState { activity_rows: updated });
     render_activity();
@@ -1084,23 +1109,87 @@ fn activity_glyph(status: String) -> String {
     if status == "failed" {
         return "✗";
     }
+    if status == "cancelled" { return "−"; }
     return "→";
 }
 
-/// Re-render the in-conversation timeline: latest thought plus one line per tool.
-fn render_activity() {
-    let block_id = ensure_activity_block();
+fn activity_details(rows: [AgentActivityRow]) -> String {
     let text = "";
-    let thought = red::trim(red::string(state().thought, ""));
-    if thought != "" {
-        text = "Thinking: " + thought;
+    for row in rows {
+        if text != "" { text = text + "\n"; }
+        text = text + activity_glyph(row.status) + " " + row.title;
+        if row.detail != "" { text = text + " · " + row.detail; }
     }
-    for row in state().activity_rows {
-        if text != "" {
-            text = text + "\n";
+    return text;
+}
+
+fn add_activity_count(text: String, count: i32, singular: String, plural: String) -> String {
+    if count == 0 { return text; }
+    if text != "" { text = text + " · "; }
+    if count == 1 { return text + "1 " + singular; }
+    return text + count + " " + plural;
+}
+
+/// Summarize successful actions by kind and retain a compact issue count.
+fn activity_summary(rows: [AgentActivityRow]) -> String {
+    let reads = 0;
+    let searches = 0;
+    let edits = 0;
+    let other = 0;
+    let failed = 0;
+    let stopped = 0;
+    for row in rows {
+        if row.status == "failed" { failed = failed + 1; }
+        else if row.status == "cancelled" { stopped = stopped + 1; }
+        else if row.status == "completed" {
+            if row.kind == "read" { reads = reads + 1; }
+            else if row.kind == "search" { searches = searches + 1; }
+            else if row.kind == "edit" { edits = edits + 1; }
+            else { other = other + 1; }
         }
-        text = text + activity_glyph(red::string(row.status, "")) + " " + red::string(row.title, "");
     }
+    let text = add_activity_count("", reads, "file read", "file reads");
+    text = add_activity_count(text, searches, "search", "searches");
+    text = add_activity_count(text, edits, "edit", "edits");
+    text = add_activity_count(text, other, "action", "actions");
+    text = add_activity_count(text, failed, "tool issue", "tool issues");
+    text = add_activity_count(text, stopped, "stopped", "stopped");
+    if text == "" { return "Actions in progress"; }
+    return text;
+}
+
+fn activity_failures(rows: [AgentActivityRow]) -> String {
+    let failures = [];
+    for row in rows {
+        if row.status == "failed" || row.status == "cancelled" {
+            failures = red::push(failures, row);
+        }
+    }
+    return activity_details(failures);
+}
+
+fn remember_activity(block_id: String, rows: [AgentActivityRow]) {
+    let history = [];
+    let skip = red::len(state().activity_history) >= 100;
+    for entry in state().activity_history {
+        if entry.id != block_id {
+            if skip { skip = false; }
+            else { history = red::push(history, entry); }
+        }
+    }
+    history = red::push(history, AgentActivityHistory { id: block_id, details: activity_details(rows) });
+    red::state_patch(AgentState { activity_history: history });
+}
+
+/// Keep the live transcript bounded; the dedicated status row names the current tool.
+fn render_activity() {
+    let rows = state().activity_rows;
+    if red::len(rows) == 0 { return; }
+    let block_id = ensure_activity_block();
+    let text = "▸ " + activity_summary(rows);
+    let failures = activity_failures(rows);
+    if failures != "" { text = text + "\n" + failures; }
+    remember_activity(block_id, rows);
     let blocks = state().transcript_blocks;
     let updated = [];
     for block in blocks {
@@ -1113,11 +1202,17 @@ fn render_activity() {
     render_conversation();
 }
 
-/// Collapse the finished turn's timeline into one trailing summary (or drop it).
+/// Collapse completed activity in place, keeping the final answer below it.
 fn collapse_activity(elapsed_ms: i64) {
     let block_id = red::string(state().activity_block_id, "");
+    let blocks = state().transcript_blocks;
+    let previous_visible = flat_transcript(blocks);
     red::state_patch(AgentState { activity_block_id: "" });
-    let rows = state().activity_rows;
+    let rows = [];
+    for row in state().activity_rows {
+        if row.status == "in_progress" || row.status == "pending" { row.status = "cancelled"; }
+        rows = red::push(rows, row);
+    }
     red::state_patch(AgentState { activity_rows: [] });
     red::state_patch(AgentState { thought: "" });
     let elapsed = format_turn_elapsed(elapsed_ms);
@@ -1125,47 +1220,57 @@ fn collapse_activity(elapsed_ms: i64) {
     if block_id == "" && count == 0 && elapsed == "" {
         return;
     }
-    let blocks = state().transcript_blocks;
-    let updated = [];
-    for block in blocks {
-        if block.id != block_id || block_id == "" {
-            updated = red::push(updated, block);
-        }
-    }
     let summary = "";
-    if count > 0 {
-        summary = "✓ " + count + " steps";
-        if count == 1 {
-            summary = "✓ 1 step";
-        }
-    }
     if elapsed != "" {
-        if summary != "" {
-            summary = summary + " · ";
-        }
-        summary = summary + "Worked for " + elapsed;
+        summary = "Worked for " + elapsed;
     }
-    if summary != "" {
+    if count > 0 {
+        if summary != "" { summary = summary + " · "; }
+        summary = "▸ " + summary + activity_summary(rows);
+    }
+    if summary == "" { return; }
+
+    let summary_id = block_id;
+    if summary_id == "" {
         let generation = red::int(state().block_generation, 0) + 1;
         red::state_patch(AgentState { block_generation: generation });
-        updated = red::push(updated, AgentTextBlock {
-            id: "activity:" + generation,
-            kind: "activity",
-            format: "plain",
-            text: summary,
-        });
-        let transcript = state().transcript;
-        if transcript != "" && !red::ends_with(transcript, "\n") {
-            transcript = transcript + "\n";
-        }
-        transcript = transcript + "Activity: " + summary + "\n";
-        red::state_patch(AgentState { transcript: transcript });
+        summary_id = "activity:" + generation;
     }
+    if count > 0 { remember_activity(summary_id, rows); }
+    let summary_block = AgentTextBlock {
+        id: summary_id, kind: "activity", format: "plain", text: summary,
+    };
+
+    // Usually the live block already precedes the answer. A timing-only summary,
+    // or a late first tool event, needs an anchor before the last agent message.
+    let anchor = block_id;
+    let activity_index = -1;
+    let answer_index = -1;
+    let answer_id = "";
+    let index = 0;
+    for block in blocks {
+        if block.kind == "user" { answer_index = -1; answer_id = ""; }
+        if block.kind == "agent" { answer_index = index; answer_id = block.id; }
+        if block.id == block_id && block_id != "" { activity_index = index; }
+        index = index + 1;
+    }
+    if answer_index >= 0 && (activity_index < 0 || activity_index > answer_index) {
+        anchor = answer_id;
+    }
+    let updated = [];
+    let inserted = false;
+    for block in blocks {
+        if !inserted && anchor != "" && block.id == anchor {
+            updated = red::push(updated, summary_block);
+            inserted = true;
+        }
+        if block_id == "" || block.id != block_id { updated = red::push(updated, block); }
+    }
+    if !inserted { updated = red::push(updated, summary_block); }
+    red::state_patch(AgentState { transcript: replace_visible_transcript(previous_visible, flat_transcript(updated)) });
     red::state_patch(AgentState { transcript_blocks: updated });
     render_conversation();
-    if summary != "" {
-        red::execute("SetStorage", "transcript", state().transcript);
-    }
+    red::execute("SetStorage", "transcript", state().transcript);
 }
 
 fn format_turn_elapsed(elapsed_ms: i64) -> String {
@@ -1203,6 +1308,8 @@ fn panel_event(event: AgentPanelEvent) {
         cancel();
     } else if event.action == "model" {
         choose_model();
+    } else if event.action == "activity" {
+        toggle_activity();
     } else if event.action == "clear" {
         clear_conversation();
     } else if event.action == "new" {
@@ -1212,6 +1319,18 @@ fn panel_event(event: AgentPanelEvent) {
     } else if event.action == "close" {
         close_conversation();
     }
+}
+
+#[red::command(
+    name = "AgentActivity",
+    title = "Toggle agent activity details",
+    category = "Agent",
+    description = "Expand or collapse tool activity in the conversation",
+    scope = "global",
+)]
+fn toggle_activity() {
+    red::state_patch(AgentState { activity_expanded: !state().activity_expanded });
+    render_conversation();
 }
 
 #[red::command(
@@ -1228,6 +1347,7 @@ fn clear_conversation() {
     red::state_patch(AgentState { queued_prompt_blocks: [] });
     red::state_patch(AgentState { activity_block_id: "" });
     red::state_patch(AgentState { activity_rows: [] });
+    red::state_patch(AgentState { activity_history: [] });
     red::state_patch(AgentState { thought: "" });
     red::execute("UpdateTextPanel", "agent-conversation", []);
     red::execute("SetTextPanelComposerState", "agent-conversation", true, "Conversation view cleared · context preserved");
@@ -1364,10 +1484,9 @@ fn update(event: AgentTextEvent) {
     red::state_patch(AgentState { stream_delta: red::string(state().stream_delta, "") + delta });
 
     let timer = red::string(state().stream_timer, "");
-    if timer != "" {
-        red::execute("CancelTimeout", timer);
+    if timer == "" {
+        red::state_patch(AgentState { stream_timer: red::execute("SetTimeout", 50) });
     }
-    red::state_patch(AgentState { stream_timer: red::execute("SetTimeout", 50) });
 }
 
 #[red::on("agent:message_completed")]
@@ -1378,10 +1497,10 @@ fn message_completed(event: AgentTextEvent) {
     let text = red::string(event.text, "");
     if !state().streaming {
         update(event);
-        return;
     }
     let block_id = red::string(state().stream_block_id, "");
     let blocks = state().transcript_blocks;
+    let previous_visible = flat_transcript(blocks);
     let updated = [];
     for block in blocks {
         if block.id == block_id {
@@ -1390,15 +1509,30 @@ fn message_completed(event: AgentTextEvent) {
         updated = red::push(updated, block);
     }
     red::state_patch(AgentState { transcript_blocks: updated });
-    red::state_patch(AgentState { transcript: flat_transcript(updated) });
+    red::state_patch(AgentState { transcript: replace_visible_transcript(previous_visible, flat_transcript(updated)) });
     red::state_patch(AgentState { stream_delta: "" });
     red::state_patch(AgentState { stream_trimmed: false });
     render_conversation();
+    finish_agent_message();
+    set_phase("working", "Working…");
+}
+
+/// Replace the visible suffix without discarding context hidden by AgentClear.
+fn replace_visible_transcript(previous: String, updated: String) -> String {
+    let transcript = state().transcript;
+    if transcript != "" && !red::ends_with(transcript, "\n") { transcript = transcript + "\n"; }
+    if previous == "" { return transcript + updated; }
+    if red::ends_with(transcript, previous) {
+        return red::slice(transcript, 0, red::len(transcript) - red::len(previous)) + updated;
+    }
+    return updated;
 }
 
 fn flat_transcript(blocks: [AgentTextBlock]) -> String {
     let transcript = "";
     for block in blocks {
+        // Live progress is presentation-only; collapse_activity saves one final summary.
+        if block.id != "" && block.id == state().activity_block_id { continue; }
         let text = red::string(block.text, "");
         if text == "" {
             continue;
@@ -1617,6 +1751,11 @@ fn setup_ready(event: EmptyEvent) {
 fn finish_agent_turn() {
     red::state_patch(AgentState { turn_model_info: Json {} });
     refresh_model_header();
+    finish_agent_message();
+}
+
+/// Each app-server message is a separate block, even within the same turn.
+fn finish_agent_message() {
     if !state().streaming {
         return;
     }
@@ -1707,6 +1846,7 @@ fn flush_stream(block_id: String) {
 
 #[red::on("agent:transcript_restored")]
 fn transcript_restored(event: AgentTranscriptEvent) {
+    red::state_patch(AgentState { activity_history: [] });
     let transcript = red::string(event.transcript, "");
     let blocks = legacy_transcript_blocks(transcript);
     let generation = red::len(blocks);
@@ -1770,6 +1910,7 @@ fn session_restore_failed(event: AgentSessionRestoreFailedEvent) {
 }
 
 fn load_conversation(event: AgentConversationEvent) {
+    red::state_patch(AgentState { activity_history: [] });
     let transcript = "";
     let blocks = [];
     let generation = 0;
@@ -1803,6 +1944,22 @@ fn load_conversation(event: AgentConversationEvent) {
 fn render_conversation() {
     let blocks = normalize_transcript_blocks(state().transcript_blocks);
     red::state_patch(AgentState { transcript_blocks: blocks });
+    if state().activity_expanded {
+        let presented = [];
+        for block in blocks {
+            if block.kind == "activity" {
+                for entry in state().activity_history {
+                    if entry.id == block.id && entry.details != "" {
+                        // The first line is the summary; details already include failures.
+                        let summary = red::split(block.text, "\n")[0];
+                        block.text = "▾ " + red::slice(summary, 2) + "\n" + entry.details;
+                    }
+                }
+            }
+            presented = red::push(presented, block);
+        }
+        blocks = presented;
+    }
     for block in state().queued_prompt_blocks {
         blocks = red::push(blocks, block);
     }
@@ -1815,6 +1972,8 @@ fn render_conversation() {
         }];
     }
     red::execute("UpdateTextPanel", "agent-conversation", blocks);
+    // Full replacement already contains pending deltas; never append them twice.
+    red::state_patch(AgentState { stream_delta: "", stream_trimmed: false });
 }
 
 /// Normalize blocks from live, migrated, and restored state before they reach the panel.

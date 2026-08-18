@@ -6450,6 +6450,382 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bundled_agent_progress_keeps_one_flush_deadline_and_separate_messages() {
+        drain_requests();
+        let mut runtime = Runtime::new();
+        runtime
+            .load_plugin("agent", include_str!("../../plugins/agent.hk"))
+            .await
+            .unwrap();
+        runtime
+            .notify(
+                "agent:session_created",
+                serde_json::json!({"session_id":"progress"}),
+            )
+            .await
+            .unwrap();
+        drain_requests();
+        let state = |runtime: &Runtime| {
+            let inner = runtime.inner.lock().unwrap();
+            value_to_json(inner.host.policy().typed_states.get("agent").unwrap())
+        };
+        runtime
+            .notify(
+                "agent:update",
+                serde_json::json!({"session_id":"progress","text":"first"}),
+            )
+            .await
+            .unwrap();
+        let timer = state(&runtime)["stream_timer"].clone();
+        assert_ne!(timer, "");
+        drain_requests();
+        for text in [" second", " third"] {
+            runtime
+                .notify(
+                    "agent:update",
+                    serde_json::json!({"session_id":"progress","text":text}),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                state(&runtime)["stream_timer"],
+                timer,
+                "a busy stream must not postpone its flush"
+            );
+        }
+        runtime
+            .notify("timeout:callback", serde_json::json!({"timer_id":timer}))
+            .await
+            .unwrap();
+        let mut appended = String::new();
+        while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
+            if let PluginRequest::AppendTextPanel { delta, .. } = request {
+                appended.push_str(&delta);
+            }
+        }
+        assert_eq!(appended, "first second third");
+
+        runtime
+            .notify(
+                "agent:update",
+                serde_json::json!({"session_id":"progress","text":" fourth"}),
+            )
+            .await
+            .unwrap();
+        let timer = state(&runtime)["stream_timer"].clone();
+        runtime
+            .notify(
+                "panel:event:agent-conversation",
+                serde_json::json!({"action":"activity"}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(state(&runtime)["stream_delta"], "");
+        drain_requests();
+        runtime
+            .notify("timeout:callback", serde_json::json!({"timer_id":timer}))
+            .await
+            .unwrap();
+        while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
+            assert!(
+                !matches!(request, PluginRequest::AppendTextPanel { .. }),
+                "full render already contains pending text"
+            );
+        }
+        runtime
+            .notify(
+                "agent:message_completed",
+                serde_json::json!({"session_id":"progress","text":"First message."}),
+            )
+            .await
+            .unwrap();
+        runtime
+            .notify(
+                "agent:update",
+                serde_json::json!({"session_id":"progress","text":"Final"}),
+            )
+            .await
+            .unwrap();
+        runtime
+            .notify(
+                "agent:message_completed",
+                serde_json::json!({"session_id":"progress","text":"Final answer."}),
+            )
+            .await
+            .unwrap();
+        let current = state(&runtime);
+        let messages: Vec<_> = current["transcript_blocks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|block| block["kind"] == "agent")
+            .map(|block| block["text"].as_str().unwrap())
+            .collect();
+        assert_eq!(messages, ["First message.", "Final answer."]);
+        assert_eq!(current["streaming"], false);
+        drain_requests();
+    }
+
+    #[tokio::test]
+    async fn bundled_agent_progress_groups_actions_and_retains_failure_details() {
+        drain_requests();
+        let mut runtime = Runtime::new();
+        runtime
+            .load_plugin("agent", include_str!("../../plugins/agent.hk"))
+            .await
+            .unwrap();
+        runtime
+            .notify(
+                "agent:session_created",
+                serde_json::json!({"session_id":"progress"}),
+            )
+            .await
+            .unwrap();
+        drain_requests();
+        let state = |runtime: &Runtime| {
+            let inner = runtime.inner.lock().unwrap();
+            value_to_json(inner.host.policy().typed_states.get("agent").unwrap())
+        };
+        for (id, title, status, detail) in [
+            ("a", "Reading first.rs", "completed", "2 ms"),
+            ("b", "Reading second.rs", "completed", "3 ms"),
+            ("c", "Reading missing.rs", "failed", "File not found"),
+        ] {
+            // Exercise completion without start as well as bounded output details.
+            runtime
+                .notify(
+                    "agent:activity",
+                    serde_json::json!({"session_id":"progress","update":{
+                        "session_update":"tool_call_update","tool_call_id":id,"title":title,
+                        "kind":"read","status":status,"detail":detail
+                    }}),
+                )
+                .await
+                .unwrap();
+        }
+        let current = state(&runtime);
+        let compact = current["transcript_blocks"][0]["text"].as_str().unwrap();
+        assert!(compact.contains("2 file reads · 1 tool issue"));
+        assert!(compact.contains("File not found"));
+        assert!(!compact.contains("first.rs"));
+        let activity_id = current["transcript_blocks"][0]["id"].clone();
+        drain_requests();
+        runtime
+            .notify(
+                "panel:event:agent-conversation",
+                serde_json::json!({"action":"activity"}),
+            )
+            .await
+            .unwrap();
+        let mut expanded = false;
+        while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
+            if let PluginRequest::UpdateTextPanel { blocks, .. } = request {
+                expanded |= blocks.iter().any(|block| {
+                    block.text.starts_with("▾ 2 file reads")
+                        && block.text.contains("Reading first.rs · 2 ms")
+                });
+            }
+        }
+        assert!(expanded);
+        runtime.execute_command("AgentActivity").await.unwrap();
+        runtime
+            .notify(
+                "agent:message_completed",
+                serde_json::json!({"session_id":"progress","text":"Done."}),
+            )
+            .await
+            .unwrap();
+        runtime.notify("agent:completed", serde_json::json!({"session_id":"progress","stop_reason":"completed","elapsed_ms":1200})).await.unwrap();
+        let current = state(&runtime);
+        assert_eq!(current["activity_rows"], serde_json::json!([]));
+        assert_eq!(current["activity_history"].as_array().unwrap().len(), 1);
+        assert_eq!(current["transcript_blocks"][0]["id"], activity_id);
+        assert_eq!(
+            current["transcript_blocks"][0]["text"],
+            "▸ Worked for 1s · 2 file reads · 1 tool issue"
+        );
+        assert_eq!(current["transcript_blocks"][1]["text"], "Done.");
+        assert!(current["activity_history"][0]["details"]
+            .as_str()
+            .unwrap()
+            .contains("File not found"));
+        assert!(!current["transcript"]
+            .as_str()
+            .unwrap()
+            .contains("File not found"));
+        assert!(!current["transcript"]
+            .as_str()
+            .unwrap()
+            .contains("Reading first.rs"));
+        assert_eq!(
+            current["transcript"]
+                .as_str()
+                .unwrap()
+                .matches("Activity:")
+                .count(),
+            1
+        );
+        assert!(current["transcript"]
+            .as_str()
+            .unwrap()
+            .ends_with("Agent: Done.\n"));
+        drain_requests();
+        runtime.execute_command("AgentActivity").await.unwrap();
+        let mut reopened = false;
+        while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
+            if let PluginRequest::UpdateTextPanel { blocks, .. } = request {
+                reopened |= blocks.len() == 2
+                    && blocks[0].text.contains("File not found")
+                    && blocks[1].text == "Done.";
+            }
+        }
+        assert!(
+            reopened,
+            "completed errors remain available above the answer"
+        );
+        drain_requests();
+    }
+
+    #[tokio::test]
+    async fn bundled_agent_completion_places_late_activity_before_answer_and_preserves_terminal_errors(
+    ) {
+        drain_requests();
+        let mut runtime = Runtime::new();
+        runtime
+            .load_plugin("agent", include_str!("../../plugins/agent.hk"))
+            .await
+            .unwrap();
+        runtime
+            .notify(
+                "agent:session_created",
+                serde_json::json!({"session_id":"late"}),
+            )
+            .await
+            .unwrap();
+        let state = |runtime: &Runtime| {
+            let inner = runtime.inner.lock().unwrap();
+            value_to_json(inner.host.policy().typed_states.get("agent").unwrap())
+        };
+        drain_requests();
+        submit_agent_prompt(&mut runtime, "explain it").await;
+        runtime
+            .notify(
+                "agent:message_completed",
+                serde_json::json!({"session_id":"late","text":"The useful answer."}),
+            )
+            .await
+            .unwrap();
+        runtime
+            .notify(
+                "agent:activity",
+                serde_json::json!({"session_id":"late","update":{
+                    "session_update":"tool_call_update","tool_call_id":"late-read","kind":"read",
+                    "title":"Reading optional file","status":"failed","detail":"outside workspace"
+                }}),
+            )
+            .await
+            .unwrap();
+        runtime.notify("agent:completed", serde_json::json!({"session_id":"late","stop_reason":"completed","elapsed_ms":19000})).await.unwrap();
+        let current = state(&runtime);
+        assert_eq!(
+            current["transcript_blocks"][1]["text"],
+            "▸ Worked for 19s · 1 tool issue"
+        );
+        assert_eq!(
+            current["transcript_blocks"][2]["text"],
+            "The useful answer."
+        );
+        assert!(!current["transcript"]
+            .as_str()
+            .unwrap()
+            .contains("outside workspace"));
+
+        drain_requests();
+        submit_agent_prompt(&mut runtime, "try another request").await;
+        runtime
+            .notify(
+                "agent:activity",
+                serde_json::json!({"session_id":"late","update":{
+                    "session_update":"tool_call","tool_call_id":"pending-read","kind":"read",
+                    "title":"Reading source","status":"in_progress"
+                }}),
+            )
+            .await
+            .unwrap();
+        runtime
+            .notify(
+                "agent:error",
+                serde_json::json!({"session_id":"late","message":"Connection lost"}),
+            )
+            .await
+            .unwrap();
+        let current = state(&runtime);
+        let last = current["transcript_blocks"]
+            .as_array()
+            .unwrap()
+            .last()
+            .unwrap();
+        assert_eq!(last["kind"], "error");
+        assert_eq!(last["text"], "Connection lost");
+        assert!(current["transcript"]
+            .as_str()
+            .unwrap()
+            .ends_with("Error: Connection lost\n"));
+        drain_requests();
+    }
+
+    #[tokio::test]
+    async fn bundled_agent_completion_preserves_context_hidden_by_clear() {
+        drain_requests();
+        let mut runtime = Runtime::new();
+        runtime
+            .load_plugin("agent", include_str!("../../plugins/agent.hk"))
+            .await
+            .unwrap();
+        runtime
+            .notify(
+                "agent:session_created",
+                serde_json::json!({"session_id":"clear-progress"}),
+            )
+            .await
+            .unwrap();
+        drain_requests();
+        submit_agent_prompt(&mut runtime, "earlier question").await;
+        runtime
+            .notify(
+                "agent:message_completed",
+                serde_json::json!({"session_id":"clear-progress","text":"Earlier answer."}),
+            )
+            .await
+            .unwrap();
+        runtime
+            .notify(
+                "agent:completed",
+                serde_json::json!({"session_id":"clear-progress","stop_reason":"completed"}),
+            )
+            .await
+            .unwrap();
+        runtime.execute_command("AgentClear").await.unwrap();
+        drain_requests();
+        submit_agent_prompt(&mut runtime, "new question").await;
+        runtime
+            .notify(
+                "agent:message_completed",
+                serde_json::json!({"session_id":"clear-progress","text":"New answer."}),
+            )
+            .await
+            .unwrap();
+        runtime.notify("agent:completed", serde_json::json!({"session_id":"clear-progress","stop_reason":"completed","elapsed_ms":2000})).await.unwrap();
+        let current = {
+            let inner = runtime.inner.lock().unwrap();
+            value_to_json(inner.host.policy().typed_states.get("agent").unwrap())
+        };
+        assert_eq!(current["transcript"], "You: earlier question\nAgent: Earlier answer.\nYou: new question\nActivity: Worked for 2s\nAgent: New answer.\n");
+        assert_eq!(current["transcript_blocks"].as_array().unwrap().len(), 3);
+        drain_requests();
+    }
+
+    #[tokio::test]
     async fn bundled_agent_activity_decodes_typed_updates_and_ignores_future_variants() {
         drain_requests();
         let mut runtime = Runtime::new();
@@ -6570,7 +6946,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bundled_agent_completion_moves_muted_summary_after_markdown_response_and_persists_it()
+    async fn bundled_agent_completion_keeps_muted_summary_before_markdown_response_and_persists_it()
     {
         drain_requests();
         let mut runtime = Runtime::new();
@@ -6634,17 +7010,17 @@ mod tests {
                 PluginRequest::UpdateTextPanel { id, blocks } => {
                     saw_final_blocks |= id == "agent-conversation"
                         && blocks.len() == 3
-                        && blocks[1].kind == crate::plugin::TextPanelBlockKind::Agent
-                        && blocks[1].format == crate::plugin::TextPanelBlockFormat::Markdown
-                        && blocks[1].text == "### Result\n\n**Done.**"
-                        && blocks[2].kind == crate::plugin::TextPanelBlockKind::Activity
-                        && blocks[2].text == "✓ 1 step · Worked for 13s";
+                        && blocks[1].kind == crate::plugin::TextPanelBlockKind::Activity
+                        && blocks[1].text == "▸ Worked for 13s · 1 action"
+                        && blocks[2].kind == crate::plugin::TextPanelBlockKind::Agent
+                        && blocks[2].format == crate::plugin::TextPanelBlockFormat::Markdown
+                        && blocks[2].text == "### Result\n\n**Done.**";
                 }
                 PluginRequest::SetPluginStorage { plugin, key, value } => {
                     saw_persisted_summary |= plugin == "agent"
                         && key == "transcript"
                         && value.as_str().is_some_and(|text| {
-                            text.ends_with("Activity: ✓ 1 step · Worked for 13s\n")
+                            text.ends_with("Activity: ▸ Worked for 13s · 1 action\nAgent: ### Result\n\n**Done.**\n")
                         });
                 }
                 _ => {}
@@ -6652,7 +7028,7 @@ mod tests {
         }
         assert!(
             saw_final_blocks,
-            "completion summary must trail the response"
+            "completion summary must precede the response"
         );
         assert!(
             saw_persisted_summary,
@@ -6779,7 +7155,7 @@ mod tests {
                     && config.side == crate::plugin::PanelSide::Right
                     && config.width == 62
                     && config.title.as_deref() == Some("Agent")
-                    && config.header_actions.iter().map(|action| action.id.as_str()).eq(["clear", "new", "close"])
+                    && config.header_actions.iter().map(|action| action.id.as_str()).eq(["activity", "clear", "new", "close"])
         ));
         expect_agent_model_header();
         assert!(matches!(
@@ -7019,10 +7395,11 @@ mod tests {
             ACTION_DISPATCHER.recv_request(),
             PluginRequest::UpdateTextPanel { id, blocks }
                 if id == "agent-conversation"
-                    && blocks.last().is_some_and(|block| {
+                    && blocks.get(1).is_some_and(|block| {
                         block.kind == crate::plugin::TextPanelBlockKind::Activity
                             && block.text == "Worked for 1h 2m 3s"
                     })
+                    && blocks.last().is_some_and(|block| block.kind == crate::plugin::TextPanelBlockKind::Agent)
         ));
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
@@ -7030,7 +7407,8 @@ mod tests {
                 if plugin == "agent"
                     && key == "transcript"
                     && value.as_str().is_some_and(|text| {
-                        text.ends_with("Activity: Worked for 1h 2m 3s\n")
+                        text.contains("Activity: Worked for 1h 2m 3s\nAgent: ")
+                            && text.ends_with(&format!("{large_delta}\n"))
                     })
         ));
         assert!(matches!(

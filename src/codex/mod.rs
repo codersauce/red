@@ -34,6 +34,7 @@ use tokio::{
     time::timeout,
 };
 
+mod activity;
 mod models;
 pub use models::{AgentModelInfo, AgentModelSelection, ModelRequest};
 
@@ -1155,6 +1156,29 @@ async fn handle_message<H: CodexToolHost>(
         .get("method")
         .and_then(Value::as_str)
         .unwrap_or_default();
+    // Activity belongs only to the currently active, visible agent turn.
+    // Inline and commit-message sessions have their own progress surfaces.
+    if matches!(method, "item/started" | "item/completed") {
+        let params = &message["params"];
+        let session_id = params["threadId"].as_str().unwrap_or_default();
+        let turn_id = params["turnId"].as_str().unwrap_or_default();
+        if sessions.get(session_id).is_some_and(|session| {
+            session.active_turn.as_deref() == Some(turn_id)
+                && !session.cancelled.load(Ordering::Relaxed)
+                && matches!(session.kind, SessionKind::Agent)
+        }) {
+            if let Some(update) = activity::item_update(&params["item"], method == "item/completed")
+            {
+                events
+                    .send(CodexEvent::Activity {
+                        session_id: session_id.to_string(),
+                        update,
+                    })
+                    .await
+                    .ok();
+            }
+        }
+    }
     match method {
         "thread/settings/updated" => {
             models::settings_updated(&message["params"], events, sessions).await;
@@ -2407,6 +2431,57 @@ mod tests {
             self.0.lock().unwrap().push(request);
             Ok(json!({"path":"main.c","source":"editor","revision":9,"content":"unsaved"}))
         }
+    }
+
+    #[tokio::test]
+    async fn agent_activity_is_scoped_to_the_active_visible_turn() {
+        let host = Arc::new(Mutex::new(InlineReadHost(Arc::new(StdMutex::new(
+            Vec::new(),
+        )))));
+        let mut sessions = HashMap::from([(
+            "agent".into(),
+            Session {
+                model_info: None,
+                cwd: PathBuf::from("/workspace"),
+                active_turn: Some("turn".into()),
+                cancelled: Arc::new(AtomicBool::new(false)),
+                tool_calls: 0,
+                kind: SessionKind::Agent,
+            },
+        )]);
+        let (events, mut received) = mpsc::channel(8);
+        let (internal, _) = mpsc::channel(8);
+        let mut pending = HashMap::new();
+        let mut output = Vec::new();
+        let mut next_id = 0;
+        for (turn, method) in [
+            ("stale", "item/started"),
+            ("turn", "item/started"),
+            ("turn", "item/completed"),
+        ] {
+            handle_message(
+                json!({"method":method,"params":{"threadId":"agent","turnId":turn,
+                "item":{"id":"call","type":"dynamicToolCall","tool":"read_file",
+                "arguments":{"path":"main.rs"},"status":"completed","success":true}}}),
+                &mut output,
+                &events,
+                &mut pending,
+                &mut sessions,
+                &mut next_id,
+                Arc::clone(&host),
+                internal.clone(),
+            )
+            .await
+            .unwrap();
+        }
+        for expected in ["in_progress", "completed"] {
+            let CodexEvent::Activity { session_id, update } = received.try_recv().unwrap() else {
+                panic!("expected activity")
+            };
+            assert_eq!(session_id, "agent");
+            assert_eq!(update["status"], expected);
+        }
+        assert!(received.try_recv().is_err());
     }
 
     #[tokio::test]
