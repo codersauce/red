@@ -573,6 +573,15 @@ fn builtin_commands() -> Vec<BuiltinCommand> {
             Action::FilePicker,
         ),
         builtin(
+            "buffer.alternate",
+            "Alternate buffer",
+            "Buffer",
+            "Switch to the most recently used buffer",
+            None,
+            &["recent buffer", "last buffer", "toggle buffer"],
+            Action::AlternateBuffer,
+        ),
+        builtin(
             "buffer.next",
             "Next buffer",
             "Buffer",
@@ -1382,6 +1391,7 @@ fn action_label(action: &Action) -> String {
         Action::SwapPreviousParameter => "Swap with previous parameter".to_string(),
         Action::SwapNextFunction => "Swap with next function".to_string(),
         Action::SwapPreviousFunction => "Swap with previous function".to_string(),
+        Action::AlternateBuffer => "Alternate buffer".to_string(),
         Action::NextBuffer => "Next buffer".to_string(),
         Action::PreviousBuffer => "Previous buffer".to_string(),
         Action::FilePicker => "Find file".to_string(),
@@ -1504,6 +1514,20 @@ mod tests {
         let config: crate::config::Config =
             toml::from_str(include_str!("../default_config.toml")).unwrap();
         config.keys
+    }
+
+    #[test]
+    fn palette_distinguishes_alternate_and_sequential_buffer_shortcuts() {
+        let entries = entries(&default_keys(), &[]);
+        for (id, action, shortcut) in [
+            ("buffer.alternate", Action::AlternateBuffer, "Space Space"),
+            ("buffer.next", Action::NextBuffer, "Space n"),
+            ("buffer.previous", Action::PreviousBuffer, "Space p"),
+        ] {
+            let entry = entries.iter().find(|entry| entry.id == id).unwrap();
+            assert_eq!(entry.action, action);
+            assert_eq!(entry.shortcuts, vec![shortcut]);
+        }
     }
 
     #[test]

@@ -236,6 +236,7 @@ mod tests {
             Action::SaveAs("outside.rs".into()),
             Action::OpenFile("outside.rs".into()),
             Action::NextBuffer,
+            Action::AlternateBuffer,
             Action::PluginCommand("Agent".into()),
             Action::InlineAssist,
         ] {
