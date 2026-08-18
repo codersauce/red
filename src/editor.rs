@@ -3419,7 +3419,8 @@ pub struct Editor {
     pending_lsp_revision_snapshots: HashMap<i64, Vec<(String, u64)>>,
     pending_completions: HashMap<i64, PendingCompletion>,
     scheduled_completion: Option<ScheduledCompletion>,
-    inline_completion: inline_completion::InlineCompletionState,
+    // Keep optional AI state out of Editor values and the startup futures that own them.
+    inline_completion: Box<inline_completion::InlineCompletionState>,
     completion_snapshot: Option<CompletionSnapshot>,
     /// Insert-mode placeholder anchors belonging to the most recently expanded snippet.
     snippet_session: Option<snippet::SnippetSession>,
@@ -3936,7 +3937,7 @@ struct PendingLspEdit {
     uri: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 struct CompletionSnapshot {
     buffer_id: BufferId,
     initial_revision: u64,
@@ -4762,7 +4763,7 @@ impl Editor {
             pending_lsp_revision_snapshots: HashMap::new(),
             pending_completions: HashMap::new(),
             scheduled_completion: None,
-            inline_completion: inline_completion::InlineCompletionState::default(),
+            inline_completion: Box::default(),
             completion_snapshot: None,
             snippet_session: None,
         })
@@ -12704,7 +12705,7 @@ impl Editor {
         &self,
         pending: &PendingCompletion,
     ) -> Option<CompletionSnapshot> {
-        if pending.superseded {
+        if !self.config.completion.enabled || pending.superseded {
             return None;
         }
         if pending.displayed_immediately {
@@ -25282,7 +25283,8 @@ impl Editor {
             self.scheduled_completion = None;
             return;
         };
-        if !self.config.completion.auto_trigger
+        if !self.config.completion.enabled
+            || !self.config.completion.auto_trigger
             || prefix.chars().count() < self.config.completion.min_prefix_length
         {
             self.scheduled_completion = None;
@@ -25297,6 +25299,9 @@ impl Editor {
     }
 
     fn is_completion_trigger_char(&self, c: char) -> bool {
+        if !self.config.completion.enabled {
+            return false;
+        }
         let Some(file) = self.current_buffer().file.as_deref() else {
             return false;
         };
@@ -25520,7 +25525,10 @@ impl Editor {
         items: Vec<CompletionResponseItem>,
         snapshot: CompletionSnapshot,
     ) -> bool {
-        if items.is_empty() || !self.is_insert() || !self.completion_snapshot_is_current(&snapshot)
+        if !self.config.completion.enabled
+            || items.is_empty()
+            || !self.is_insert()
+            || !self.completion_snapshot_is_current(&snapshot)
         {
             return false;
         }
@@ -25588,7 +25596,7 @@ impl Editor {
         &mut self,
         trigger_character: Option<char>,
     ) -> anyhow::Result<bool> {
-        if !self.is_insert() {
+        if !self.config.completion.enabled || !self.is_insert() {
             return Ok(false);
         }
 
@@ -25655,12 +25663,37 @@ impl Editor {
         Ok(displayed_immediately)
     }
 
+    /// Resolve the exact main edit used by both ordinary and coordinated completion.
+    fn completion_main_edit(
+        &self,
+        item: &CompletionResponseItem,
+        snapshot: Option<&CompletionSnapshot>,
+    ) -> Option<LspTextEdit> {
+        match &item.text_edit {
+            Some(edit) => rebase_completion_edit(edit, snapshot, true),
+            None => Some(LspTextEdit {
+                range: snapshot
+                    .and_then(|snapshot| snapshot.current_range.clone())
+                    .unwrap_or_else(|| self.completion_default_range()),
+                new_text: item
+                    .insert_text
+                    .as_deref()
+                    .unwrap_or(&item.label)
+                    .to_owned(),
+            }),
+        }
+    }
+
     async fn apply_completion(
         &mut self,
         item: &CompletionResponseItem,
         commit_character: Option<char>,
         runtime: &mut Runtime,
     ) -> anyhow::Result<()> {
+        if !self.config.completion.enabled {
+            return Ok(());
+        }
+        let continuation = self.coordinated_completion_continuation(item, commit_character);
         let snapshot = self.completion_snapshot.take();
         if snapshot
             .as_ref()
@@ -25671,40 +25704,15 @@ impl Editor {
         }
 
         let contents = self.current_buffer().contents();
-        let session_ranges = snapshot.as_ref().and_then(|snapshot| {
-            Some((
-                snapshot.original_range.as_ref()?,
-                snapshot.current_range.as_ref()?,
-            ))
-        });
-        let session_changed = snapshot
-            .as_ref()
-            .is_some_and(|snapshot| snapshot.initial_revision != snapshot.revision);
-        let rebase_edit = |edit: &LspTextEdit, is_main: bool| {
-            if !session_changed {
-                return Some(edit.clone());
-            }
-            let (original, current) = session_ranges?;
-            Some(LspTextEdit {
-                range: rebase_completion_range(&edit.range, original, current, is_main)?,
-                new_text: edit.new_text.clone(),
-            })
-        };
-        let main_text_edit = match item.text_edit.as_ref() {
-            Some(edit) => match rebase_edit(edit, true) {
-                Some(edit) => Some(edit),
-                None => {
-                    self.set_legacy_message(Some(
-                        "completion edit could not be rebased after typing".to_string(),
-                    ));
-                    return Ok(());
-                }
-            },
-            None => None,
+        let Some(main_text_edit) = self.completion_main_edit(item, snapshot.as_ref()) else {
+            self.set_legacy_message(Some(
+                "completion edit could not be rebased after typing".to_string(),
+            ));
+            return Ok(());
         };
         let mut additional_text_edits = Vec::new();
         for edit in item.additional_text_edits.iter().flatten() {
-            let Some(edit) = rebase_edit(edit, false) else {
+            let Some(edit) = rebase_completion_edit(edit, snapshot.as_ref(), false) else {
                 self.set_legacy_message(Some(
                     "additional completion edit could not be rebased after typing".to_string(),
                 ));
@@ -25712,8 +25720,7 @@ impl Editor {
             };
             additional_text_edits.push(edit);
         }
-        let validation_edits = main_text_edit
-            .iter()
+        let validation_edits = std::iter::once(&main_text_edit)
             .chain(additional_text_edits.iter())
             .cloned()
             .collect::<Vec<_>>();
@@ -25728,30 +25735,12 @@ impl Editor {
 
         self.begin_transaction("apply completion");
 
-        let mut edits = Vec::new();
-        if let Some(text_edit) = &main_text_edit {
-            edits.push(completion_edit_from_lsp(
-                &contents,
-                text_edit,
-                item.insert_text_format.as_ref(),
-                true,
-            )?);
-        } else {
-            let text = item.insert_text.as_deref().unwrap_or(&item.label);
-            let range = snapshot
-                .as_ref()
-                .and_then(|snapshot| snapshot.current_range.clone())
-                .unwrap_or_else(|| self.completion_default_range());
-            edits.push(completion_edit_from_lsp(
-                &contents,
-                &LspTextEdit {
-                    range,
-                    new_text: text.to_string(),
-                },
-                item.insert_text_format.as_ref(),
-                true,
-            )?);
-        }
+        let mut edits = vec![completion_edit_from_lsp(
+            &contents,
+            &main_text_edit,
+            item.insert_text_format.as_ref(),
+            true,
+        )?];
         for text_edit in &additional_text_edits {
             edits.push(completion_edit_from_lsp(&contents, text_edit, None, false)?);
         }
@@ -25814,6 +25803,10 @@ impl Editor {
 
         if let Some(command) = &item.command {
             self.execute_lsp_command(command, None).await?;
+        }
+
+        if let Some(continuation) = continuation {
+            self.restore_coordinated_completion(continuation);
         }
 
         Ok(())
@@ -26960,6 +26953,25 @@ fn shift_lsp_position_after_prefix_change(
     Some(LspPosition {
         line: position.line,
         character,
+    })
+}
+
+fn rebase_completion_edit(
+    edit: &LspTextEdit,
+    snapshot: Option<&CompletionSnapshot>,
+    is_main: bool,
+) -> Option<LspTextEdit> {
+    let Some(snapshot) = snapshot.filter(|s| s.initial_revision != s.revision) else {
+        return Some(edit.clone());
+    };
+    Some(LspTextEdit {
+        range: rebase_completion_range(
+            &edit.range,
+            snapshot.original_range.as_ref()?,
+            snapshot.current_range.as_ref()?,
+            is_main,
+        )?,
+        new_text: edit.new_text.clone(),
     })
 }
 

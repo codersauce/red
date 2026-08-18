@@ -751,10 +751,25 @@ impl Default for SearchConfig {
     }
 }
 
+/// How the completion menu shares the editor with inline AI suggestions.
+#[derive(Debug, Default, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum InlineCompletionMode {
+    #[default]
+    PopupFirst,
+    Coordinated,
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 /// Insert-mode completion behavior shared by buffer and language-server sources.
 pub struct CompletionConfig {
+    /// Enable ordinary completion, including explicit requests. Independent of Copilot.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Whether compatible inline suggestions may extend the selected menu item.
+    #[serde(default)]
+    pub inline_mode: InlineCompletionMode,
     /// Request completion after an identifier prefix is typed.
     #[serde(default = "default_true")]
     pub auto_trigger: bool,
@@ -775,6 +790,8 @@ pub struct CompletionConfig {
 impl Default for CompletionConfig {
     fn default() -> Self {
         Self {
+            enabled: true,
+            inline_mode: InlineCompletionMode::default(),
             auto_trigger: true,
             min_prefix_length: default_completion_min_prefix_length(),
             debounce_ms: default_completion_debounce_ms(),
@@ -2057,7 +2074,9 @@ fn known_schema_path(path: &[String]) -> bool {
         ),
         ["completion", field] => matches!(
             *field,
-            "auto_trigger"
+            "enabled"
+                | "inline_mode"
+                | "auto_trigger"
                 | "min_prefix_length"
                 | "debounce_ms"
                 | "buffer_words"
@@ -2827,6 +2846,31 @@ mod test {
     use super::*;
 
     const LEGACY_CONFIG: &str = include_str!("../tests/fixtures/legacy_config.toml");
+
+    #[test]
+    fn completion_modes_preserve_defaults_and_allow_copilot_only() {
+        let defaults = Config::from_user_toml_with_overrides("", &[]).unwrap();
+        assert!(defaults.completion.enabled);
+        assert_eq!(
+            defaults.completion.inline_mode,
+            InlineCompletionMode::PopupFirst
+        );
+        let config = Config::from_user_toml_with_overrides(
+            "[completion]\nenabled = false\ninline_mode = 'coordinated'\n[copilot]\nenabled = true\n",
+            &[],
+        ).unwrap();
+        assert!(!config.completion.enabled);
+        assert!(config.completion.auto_trigger);
+        assert!(config.copilot.enabled);
+        assert_eq!(
+            config.completion.inline_mode,
+            InlineCompletionMode::Coordinated
+        );
+        assert!(toml::from_str::<CompletionConfig>("inline_mode = 'unknown'").is_err());
+        let legacy: CompletionConfig = toml::from_str("auto_trigger = false").unwrap();
+        assert!(legacy.enabled);
+        assert_eq!(legacy.inline_mode, InlineCompletionMode::PopupFirst);
+    }
 
     #[test]
     fn legacy_config_recovers_key_actions_and_reports_ignored_settings() {

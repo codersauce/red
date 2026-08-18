@@ -3,8 +3,10 @@
 use super::*;
 use crate::{
     agent_tools::EditorPosition,
+    config::InlineCompletionMode,
     copilot::{
-        Bridge, CompletionItem, CompletionRequest, Control, Event as CopilotEvent, Snapshot,
+        Bridge, CompletionItem, CompletionRequest, Control, Event as CopilotEvent,
+        SelectedCompletionInfo, Snapshot,
     },
 };
 use std::{
@@ -20,6 +22,8 @@ pub(super) struct InlineCompletionState {
     generation: u64,
     scheduled: Option<(Instant, Snapshot)>,
     requested: Option<Snapshot>,
+    observed_selection: Option<ObservedCompletion>,
+    selected_completion: Option<CoordinatedCompletion>,
     pub(super) suggestion: Option<Suggestion>,
     status: String,
     failed: bool,
@@ -31,6 +35,28 @@ pub(super) struct InlineCompletionState {
 pub(super) struct Suggestion {
     pub snapshot: Snapshot,
     pub insertion: String,
+    item: CompletionItem,
+    shown: bool,
+}
+
+#[derive(Clone, PartialEq)]
+struct ObservedCompletion {
+    item: CompletionResponseItem,
+    snapshot: CompletionSnapshot,
+}
+
+#[derive(Clone, PartialEq)]
+struct CoordinatedCompletion {
+    item: CompletionResponseItem,
+    info: SelectedCompletionInfo,
+    insertion: String,
+}
+
+pub(super) struct CoordinatedContinuation {
+    buffer_id: BufferId,
+    contents: String,
+    cursor: TextPosition,
+    insertion: String,
     item: CompletionItem,
     shown: bool,
 }
@@ -123,6 +149,18 @@ impl Editor {
             return None;
         }
         self.visible_inline_suggestion()?;
+        // The menu owns navigation, Tab, Enter, and dismissal. Only the explicit
+        // AI binding accepts the combined preview while the menu is open.
+        if self.visible_completion_menu() {
+            return matches!(
+                mapping,
+                Some(KeyAction::Single(
+                    Action::AcceptInlineCompletion | Action::DismissInlineCompletion
+                ))
+            )
+            .then_some(mapping)
+            .flatten();
+        }
         if matches!(
             mapping,
             Some(KeyAction::Single(
@@ -189,12 +227,18 @@ impl Editor {
             revision: self.current_buffer().revision(),
             cursor: self.cursor_text_position(),
             uri: self.current_buffer().uri().ok()??,
+            selected_completion_info: self
+                .inline_completion
+                .selected_completion
+                .as_ref()
+                .map(|selected| selected.info.clone()),
         })
     }
 
     fn inline_snapshot_current(&self, snapshot: &Snapshot) -> bool {
         self.is_insert()
             && self.copilot_enabled()
+            && self.completion_selection_is_observed()
             && self.inline_snapshot().as_ref() == Some(snapshot)
     }
 
@@ -204,11 +248,131 @@ impl Editor {
             && !self.panel_manager.has_focused_panel()
     }
 
+    fn visible_completion_menu(&self) -> bool {
+        self.current_dialog.as_ref().is_some_and(|dialog| {
+            dialog.allows_event_passthrough() && dialog.has_shortcut_context()
+        })
+    }
+
+    fn completion_selection(&self) -> Option<(&CompletionResponseItem, &CompletionSnapshot)> {
+        if !self.copilot_enabled()
+            || !self.config.completion.enabled
+            || self.config.completion.inline_mode != InlineCompletionMode::Coordinated
+            || !self.visible_completion_menu()
+        {
+            return None;
+        }
+        let item = self.current_dialog.as_ref()?.selected_completion()?;
+        let snapshot = self.completion_snapshot.as_ref()?;
+        self.completion_snapshot_is_current(snapshot)
+            .then_some((item, snapshot))
+    }
+
+    fn completion_selection_is_observed(&self) -> bool {
+        match (
+            self.completion_selection(),
+            &self.inline_completion.observed_selection,
+        ) {
+            (None, None) => true,
+            (Some((item, snapshot)), Some(observed)) => {
+                item == &observed.item && snapshot == &observed.snapshot
+            }
+            _ => false,
+        }
+    }
+
+    /// This cheap check also hides stale previews before the next service tick.
+    fn coordinated_completion(&self) -> Option<&CoordinatedCompletion> {
+        self.inline_completion
+            .selected_completion
+            .as_ref()
+            .filter(|_| self.completion_selection_is_observed())
+    }
+
+    /// Only insertion-equivalent, side-effect-free items can share a preview.
+    /// Resolve against source text once per selection/document change, not per frame.
+    fn prepare_coordinated_completion(
+        &self,
+        observed: &ObservedCompletion,
+    ) -> Option<CoordinatedCompletion> {
+        let item = &observed.item;
+        let snapshot = &observed.snapshot;
+        if !self.copilot_file_allowed()
+            || item.insert_text_format == Some(InsertTextFormat::Snippet)
+            || item.command.is_some()
+            || item
+                .additional_text_edits
+                .as_ref()
+                .is_some_and(|edits| !edits.is_empty())
+        {
+            return None;
+        }
+        let edit = self.completion_main_edit(item, Some(snapshot))?;
+        if edit.range.end != self.cursor_lsp_position() {
+            return None;
+        }
+        let contents = self.current_buffer().contents();
+        let candidate = CompletionItem {
+            insert_text: edit.new_text.clone(),
+            range: Some(edit.range.clone()),
+            command: None,
+            extra: Default::default(),
+        };
+        let insertion =
+            insertion_for_edit(&contents, self.cursor_lsp_position(), &candidate, true)?;
+        // Ordinary completion does not normalize newlines. Require the preview
+        // projection and the actual ordinary edit to produce identical bytes.
+        let actual = crate::lsp::apply_text_edits(&contents, std::slice::from_ref(&edit)).ok()?;
+        let insertion_edit = LspTextEdit {
+            range: Range {
+                start: edit.range.end,
+                end: edit.range.end,
+            },
+            new_text: insertion.clone(),
+        };
+        if actual != crate::lsp::apply_text_edits(&contents, &[insertion_edit]).ok()? {
+            return None;
+        }
+        Some(CoordinatedCompletion {
+            item: item.clone(),
+            info: SelectedCompletionInfo {
+                range: edit.range,
+                text: edit.new_text,
+            },
+            insertion,
+        })
+    }
+
+    /// Selection changes do not change the buffer revision, so they need their
+    /// own generation and cancellation boundary.
+    fn refresh_coordinated_completion(&mut self) -> bool {
+        if self.completion_selection_is_observed() {
+            return false;
+        }
+        let observed = self
+            .completion_selection()
+            .map(|(item, snapshot)| ObservedCompletion {
+                item: item.clone(),
+                snapshot: snapshot.clone(),
+            });
+        let selected = observed
+            .as_ref()
+            .and_then(|observed| self.prepare_coordinated_completion(observed));
+        let changed = selected.is_some() || self.inline_completion.selected_completion.is_some();
+        self.inline_completion.observed_selection = observed;
+        self.inline_completion.selected_completion = selected;
+        if changed {
+            self.schedule_inline_completion();
+        }
+        changed
+    }
+
     /// An installed completion component may have no visible matches.
     /// Only an interactive popup (or another dialog) takes priority over ghost text.
     fn inline_completion_obscured(&self) -> bool {
         self.current_dialog.as_ref().is_some_and(|dialog| {
-            !dialog.allows_event_passthrough() || dialog.has_shortcut_context()
+            !dialog.allows_event_passthrough()
+                || (dialog.has_shortcut_context() && self.coordinated_completion().is_none())
         })
     }
 
@@ -487,6 +651,8 @@ impl Editor {
                 self.current_dialog = None;
                 self.completion_snapshot = None;
             }
+            self.inline_completion.observed_selection = None;
+            self.inline_completion.selected_completion = None;
         }
         let Some(snapshot) = self.inline_snapshot() else {
             return;
@@ -523,6 +689,22 @@ impl Editor {
 
     pub(super) fn service_inline_completion(&mut self) -> bool {
         let mut changed = false;
+        if !self.config.completion.enabled {
+            self.scheduled_completion = None;
+            for pending in self.pending_completions.values_mut() {
+                pending.superseded = true;
+            }
+            if self
+                .current_dialog
+                .as_ref()
+                .is_some_and(|dialog| dialog.allows_event_passthrough())
+            {
+                self.current_dialog = None;
+                self.completion_snapshot = None;
+                changed = true;
+            }
+        }
+        changed |= self.refresh_coordinated_completion();
         if !self.inline_completion.setup_hint_checked
             && !self.config.disable_ai
             && !self.config.copilot.enabled
@@ -621,6 +803,16 @@ impl Editor {
                     let contents = self.current_buffer().contents();
                     let position = self.cursor_lsp_position();
                     if let Some((item, insertion)) = items.into_iter().find_map(|item| {
+                        if let Some(selected) = &snapshot.selected_completion_info {
+                            if item.range.as_ref() != Some(&selected.range)
+                                || item
+                                    .insert_text
+                                    .strip_prefix(&selected.text)
+                                    .is_none_or(|suffix| suffix.is_empty())
+                            {
+                                return None;
+                            }
+                        }
                         insertion_for_item(&contents, position, &item)
                             .map(|insertion| (item, insertion))
                     }) {
@@ -690,7 +882,7 @@ impl Editor {
         &mut self,
         runtime: &mut Runtime,
     ) -> anyhow::Result<()> {
-        if !self.inline_editor_focused() || self.inline_completion_obscured() {
+        if self.visible_inline_suggestion().is_none() {
             return Ok(());
         }
         let Some(suggestion) = self.inline_completion.suggestion.take() else {
@@ -705,6 +897,8 @@ impl Editor {
             self.current_dialog = None;
             self.completion_snapshot = None;
         }
+        self.inline_completion.observed_selection = None;
+        self.inline_completion.selected_completion = None;
         let resume_insert = self.transaction_active();
         if resume_insert {
             self.commit_transaction(self.cursor_snapshot());
@@ -725,12 +919,89 @@ impl Editor {
         self.copilot_control(Control::Accepted(suggestion.item));
         Ok(())
     }
+
+    /// Capture the suffix before ordinary completion invalidates the snapshot.
+    pub(super) fn coordinated_completion_continuation(
+        &self,
+        item: &CompletionResponseItem,
+        commit_character: Option<char>,
+    ) -> Option<CoordinatedContinuation> {
+        if commit_character.is_some() {
+            return None;
+        }
+        let suggestion = self.visible_inline_suggestion()?;
+        let selected = self.coordinated_completion()?;
+        if &selected.item != item {
+            return None;
+        }
+        let insertion = suggestion.insertion.strip_prefix(&selected.insertion)?;
+        if insertion.is_empty() {
+            return None;
+        }
+        let contents = self.current_buffer().contents();
+        let edit = LspTextEdit {
+            range: selected.info.range.clone(),
+            new_text: selected.info.text.clone(),
+        };
+        let prepared = completion_edit_from_lsp(&contents, &edit, None, true).ok()?;
+        Some(CoordinatedContinuation {
+            buffer_id: self.current_buffer().id(),
+            contents: crate::lsp::apply_text_edits(&contents, &[edit]).ok()?,
+            cursor: offset_text_position(
+                prepared.range.start,
+                &prepared.new_text,
+                prepared.new_text.chars().count(),
+            ),
+            insertion: insertion.to_owned(),
+            item: suggestion.item.clone(),
+            shown: suggestion.shown,
+        })
+    }
+
+    pub(super) fn restore_coordinated_completion(&mut self, continuation: CoordinatedContinuation) {
+        if self.current_buffer().id() != continuation.buffer_id
+            || self.current_buffer().contents() != continuation.contents
+            || self.cursor_text_position() != continuation.cursor
+            || !self.inline_editor_focused()
+            || !self.copilot_enabled()
+        {
+            return;
+        }
+        self.current_dialog = None;
+        self.completion_snapshot = None;
+        self.scheduled_completion = None;
+        for pending in self.pending_completions.values_mut() {
+            pending.superseded = true;
+        }
+        self.inline_completion.observed_selection = None;
+        self.inline_completion.selected_completion = None;
+        self.dismiss_inline_completion();
+        if let Some(snapshot) = self.inline_snapshot() {
+            self.inline_completion.suggestion = Some(Suggestion {
+                snapshot,
+                insertion: continuation.insertion,
+                item: continuation.item,
+                shown: continuation.shown,
+            });
+            self.layout_cache.borrow_mut().clear();
+            self.force_full_redraw = true;
+        }
+    }
 }
 
 fn insertion_for_item(
     contents: &str,
     cursor: LspPosition,
     item: &CompletionItem,
+) -> Option<String> {
+    insertion_for_edit(contents, cursor, item, false)
+}
+
+fn insertion_for_edit(
+    contents: &str,
+    cursor: LspPosition,
+    item: &CompletionItem,
+    allow_empty: bool,
 ) -> Option<String> {
     let offset = |position: LspPosition| {
         utf16_byte_offset(
@@ -754,7 +1025,7 @@ fn insertion_for_item(
     let before = contents.get(start..cursor)?;
     let after = contents.get(cursor..end)?;
     let inserted = item.insert_text.strip_prefix(before)?.strip_suffix(after)?;
-    if inserted.is_empty()
+    if (!allow_empty && inserted.is_empty())
         || inserted
             .chars()
             .any(|ch| ch.is_control() && !matches!(ch, '\n' | '\r' | '\t'))
@@ -878,6 +1149,436 @@ mod tests {
             command: None,
             extra: Default::default(),
         }
+    }
+
+    fn ordinary(label: &str) -> CompletionResponseItem {
+        serde_json::from_value(json!({"label": label})).unwrap()
+    }
+
+    async fn coordinated_editor(
+        text: &str,
+        cursor: usize,
+        items: Vec<CompletionResponseItem>,
+    ) -> (
+        Editor,
+        tokio::sync::watch::Receiver<Option<CompletionRequest>>,
+        tokio::sync::mpsc::Receiver<Control>,
+        tokio::sync::mpsc::Sender<CopilotEvent>,
+    ) {
+        let mut editor = editor(text);
+        editor.config.completion.inline_mode = InlineCompletionMode::Coordinated;
+        show(&mut editor, "", cursor).await;
+        editor.dismiss_inline_completion();
+        let (bridge, requests, controls, events) = Bridge::test_channels();
+        editor.inline_completion.bridge = Some(bridge);
+        editor.inline_completion.failed = false;
+        assert!(editor.show_completion_items(items, editor.completion_snapshot()));
+        editor.service_inline_completion();
+        if editor.coordinated_completion().is_some() {
+            expire_inline_schedule(&mut editor);
+            editor.service_inline_completion();
+        }
+        (editor, requests, controls, events)
+    }
+
+    async fn respond(
+        editor: &mut Editor,
+        events: &tokio::sync::mpsc::Sender<CopilotEvent>,
+        snapshot: Snapshot,
+        items: Vec<CompletionItem>,
+    ) {
+        events
+            .send(CopilotEvent::Completion { snapshot, items })
+            .await
+            .unwrap();
+        editor.service_inline_completion();
+    }
+
+    async fn execute_key(editor: &mut Editor, code: KeyCode, modifiers: KeyModifiers) {
+        match editor
+            .handle_event(&Event::Key(KeyEvent::new(code, modifiers)))
+            .unwrap()
+        {
+            Some(KeyAction::Single(action)) => editor.test_execute_action(action).await.unwrap(),
+            Some(KeyAction::Multiple(actions)) => {
+                for action in actions {
+                    editor.test_execute_action(action).await.unwrap();
+                }
+            }
+            Some(KeyAction::None) | None => {}
+            action => panic!("unexpected action: {action:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn coordinated_preview_extends_selected_item_and_accepts_in_two_steps() {
+        for accept in [KeyCode::Tab, KeyCode::Enter] {
+            let (mut editor, requests, mut controls, events) =
+                coordinated_editor("foo()", 3, vec![ordinary("foobar")]).await;
+            let request = requests.borrow().clone().unwrap();
+            assert_eq!(request.contents, "foo()");
+            assert_eq!(
+                request
+                    .snapshot
+                    .selected_completion_info
+                    .as_ref()
+                    .unwrap()
+                    .text,
+                "foobar"
+            );
+            let ai = item("foobar_extra", 0, 3);
+            respond(&mut editor, &events, request.snapshot, vec![ai.clone()]).await;
+            assert!(editor.visible_completion_menu());
+            assert_eq!(
+                editor.visible_inline_suggestion().unwrap().insertion,
+                "bar_extra"
+            );
+            assert!(rendered_rows(&mut editor)
+                .iter()
+                .any(|row| row.contains("foobar_extra()")));
+            assert_eq!(editor.current_buffer().contents(), "foo()");
+            assert!(matches!(controls.try_recv(), Ok(Control::Shown(_))));
+
+            execute_key(&mut editor, accept, KeyModifiers::NONE).await;
+            assert_eq!(editor.current_buffer().contents(), "foobar()");
+            assert!(editor.current_dialog.is_none());
+            assert_eq!(
+                editor.visible_inline_suggestion().unwrap().insertion,
+                "_extra"
+            );
+            assert!(controls.try_recv().is_err());
+            editor.service_inline_completion();
+            assert!(controls.try_recv().is_err());
+            execute_key(&mut editor, KeyCode::Tab, KeyModifiers::NONE).await;
+            assert_eq!(editor.current_buffer().contents(), "foobar_extra()");
+            assert!(
+                matches!(controls.try_recv(), Ok(Control::Accepted(accepted)) if accepted == ai)
+            );
+            editor
+                .test_execute_action(Action::EnterMode(Mode::Normal))
+                .await
+                .unwrap();
+            editor.test_execute_action(Action::Undo).await.unwrap();
+            assert_eq!(editor.current_buffer().contents(), "foobar()");
+            editor.test_execute_action(Action::Undo).await.unwrap();
+            assert_eq!(editor.current_buffer().contents(), "foo()");
+        }
+    }
+
+    #[tokio::test]
+    async fn coordinated_ctrl_l_accepts_the_whole_edit_in_one_undo_step() {
+        let (mut editor, requests, mut controls, events) =
+            coordinated_editor("foo()", 3, vec![ordinary("foobar")]).await;
+        let snapshot = requests.borrow().as_ref().unwrap().snapshot.clone();
+        let ai = item("foobar\nnext", 0, 3);
+        respond(&mut editor, &events, snapshot, vec![ai.clone()]).await;
+        assert!(matches!(controls.try_recv(), Ok(Control::Shown(_))));
+        execute_key(&mut editor, KeyCode::Char('l'), KeyModifiers::CONTROL).await;
+        assert_eq!(editor.current_buffer().contents(), "foobar\nnext()");
+        assert!(editor.current_dialog.is_none());
+        assert!(matches!(controls.try_recv(), Ok(Control::Accepted(accepted)) if accepted == ai));
+        editor
+            .test_execute_action(Action::EnterMode(Mode::Normal))
+            .await
+            .unwrap();
+        editor.test_execute_action(Action::Undo).await.unwrap();
+        assert_eq!(editor.current_buffer().contents(), "foo()");
+    }
+
+    #[tokio::test]
+    async fn coordinated_selection_change_rejects_old_results_without_a_text_edit() {
+        let (mut editor, requests, _controls, events) =
+            coordinated_editor("foo", 3, vec![ordinary("foobar"), ordinary("foobaz")]).await;
+        let first = requests.borrow().as_ref().unwrap().snapshot.clone();
+        let selected = first
+            .selected_completion_info
+            .as_ref()
+            .unwrap()
+            .text
+            .clone();
+        respond(
+            &mut editor,
+            &events,
+            first.clone(),
+            vec![item(&format!("{selected}_old"), 0, 3)],
+        )
+        .await;
+        assert!(editor.visible_inline_suggestion().is_some());
+        execute_key(&mut editor, KeyCode::Down, KeyModifiers::NONE).await;
+        assert!(editor.visible_inline_suggestion().is_none());
+        editor
+            .test_execute_action(Action::AcceptInlineCompletion)
+            .await
+            .unwrap();
+        assert_eq!(editor.current_buffer().contents(), "foo");
+        editor.service_inline_completion();
+        expire_inline_schedule(&mut editor);
+        editor.service_inline_completion();
+        let second = requests.borrow().as_ref().unwrap().snapshot.clone();
+        assert_eq!(first.revision, second.revision);
+        assert_ne!(first.generation, second.generation);
+        assert_ne!(
+            first.selected_completion_info,
+            second.selected_completion_info
+        );
+        respond(
+            &mut editor,
+            &events,
+            first,
+            vec![item(&format!("{selected}_late"), 0, 3)],
+        )
+        .await;
+        assert!(editor.visible_inline_suggestion().is_none());
+        let selected = second
+            .selected_completion_info
+            .as_ref()
+            .unwrap()
+            .text
+            .clone();
+        respond(
+            &mut editor,
+            &events,
+            second,
+            vec![item(&format!("{selected}_new"), 0, 3)],
+        )
+        .await;
+        assert!(editor
+            .visible_inline_suggestion()
+            .unwrap()
+            .insertion
+            .ends_with("_new"));
+    }
+
+    #[tokio::test]
+    async fn coordinated_rejects_incompatible_results_and_unsafe_ordinary_items() {
+        let (mut editor, requests, _controls, events) =
+            coordinated_editor("foo", 3, vec![ordinary("foobar")]).await;
+        let snapshot = requests.borrow().as_ref().unwrap().snapshot.clone();
+        respond(
+            &mut editor,
+            &events,
+            snapshot,
+            vec![
+                item("foobaz_extra", 0, 3),
+                item("foobar", 0, 3),
+                item("foobar_extra", 1, 3),
+            ],
+        )
+        .await;
+        assert!(editor.visible_inline_suggestion().is_none());
+        assert!(editor.visible_completion_menu());
+
+        for value in [
+            json!({"label":"foobar", "insertTextFormat":2}),
+            json!({"label":"foobar", "command":{"title":"run","command":"run"}}),
+            json!({"label":"foobar", "additionalTextEdits":[{"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":0}},"newText":"import\n"}]}),
+            json!({"label":"foobar", "textEdit":{"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":4}},"newText":"foobar"}}),
+            json!({"label":"foobar", "insertText":"different"}),
+        ] {
+            let ordinary = serde_json::from_value(value).unwrap();
+            let (editor, requests, _controls, _events) =
+                coordinated_editor("foo()", 3, vec![ordinary]).await;
+            assert!(editor.coordinated_completion().is_none());
+            assert!(editor.inline_completion_obscured());
+            assert!(requests.borrow().is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn coordinated_identity_includes_payload_and_explicit_request_is_standalone() {
+        let (mut editor, requests, _controls, events) =
+            coordinated_editor("foo", 3, vec![ordinary("foobar")]).await;
+        let first = requests.borrow().as_ref().unwrap().snapshot.clone();
+        respond(
+            &mut editor,
+            &events,
+            first.clone(),
+            vec![item("foobar_extra", 0, 3)],
+        )
+        .await;
+        let mut changed = ordinary("foobar");
+        changed.data = Some(json!({"identity":2}));
+        assert!(editor.show_completion_items(vec![changed], editor.completion_snapshot()));
+        assert!(editor.visible_inline_suggestion().is_none());
+        editor.service_inline_completion();
+        expire_inline_schedule(&mut editor);
+        editor.service_inline_completion();
+        let second = requests.borrow().as_ref().unwrap().snapshot.clone();
+        assert_eq!(
+            first.selected_completion_info,
+            second.selected_completion_info
+        );
+        assert_ne!(first.generation, second.generation);
+        execute_key(&mut editor, KeyCode::Char('\\'), KeyModifiers::ALT).await;
+        assert!(editor.current_dialog.is_none());
+        let request = requests.borrow().clone().unwrap();
+        assert!(!request.automatic);
+        assert!(request.snapshot.selected_completion_info.is_none());
+        assert_eq!(request.contents, "foo");
+    }
+
+    #[tokio::test]
+    async fn coordinated_plain_text_edits_use_rebased_utf16_ranges() {
+        let ordinary = serde_json::from_value(json!({
+            "label":"foobar",
+            "textEdit":{"range":{"start":{"line":0,"character":2},"end":{"line":0,"character":5}},"newText":"foobar"}
+        })).unwrap();
+        let (mut editor, requests, _controls, events) =
+            coordinated_editor("😀foo", 4, vec![ordinary]).await;
+        execute_key(&mut editor, KeyCode::Char('b'), KeyModifiers::NONE).await;
+        editor.service_inline_completion();
+        expire_inline_schedule(&mut editor);
+        editor.service_inline_completion();
+        let request = requests.borrow().clone().unwrap();
+        let selected = request.snapshot.selected_completion_info.as_ref().unwrap();
+        assert_eq!(selected.range.start.character, 2);
+        assert_eq!(selected.range.end.character, 6);
+        respond(
+            &mut editor,
+            &events,
+            request.snapshot,
+            vec![item("foobar_extra", 2, 6)],
+        )
+        .await;
+        execute_key(&mut editor, KeyCode::Tab, KeyModifiers::NONE).await;
+        assert_eq!(editor.current_buffer().contents(), "😀foobar");
+        assert_eq!(
+            editor.visible_inline_suggestion().unwrap().insertion,
+            "_extra"
+        );
+    }
+
+    #[tokio::test]
+    async fn completion_can_be_disabled_without_disabling_copilot() {
+        let mut editor = editor("foo foobar");
+        show(&mut editor, "_ai", 3).await;
+        show_popup(&mut editor, "foobar");
+        editor.config.completion.enabled = false;
+        editor.service_inline_completion();
+        assert!(editor.current_dialog.is_none());
+        assert!(editor.copilot_enabled());
+        editor.schedule_automatic_completion();
+        assert!(editor.scheduled_completion.is_none());
+        assert!(!editor.request_completion(None).await.unwrap());
+        assert!(
+            !editor.show_completion_items(vec![ordinary("foobar")], editor.completion_snapshot())
+        );
+        assert_eq!(editor.visible_inline_suggestion().unwrap().insertion, "_ai");
+        execute_key(&mut editor, KeyCode::Tab, KeyModifiers::NONE).await;
+        assert_eq!(editor.current_buffer().contents(), "foo_ai foobar");
+
+        editor.config.completion.enabled = true;
+        editor.config.completion.auto_trigger = false;
+        editor.schedule_automatic_completion();
+        assert!(editor.scheduled_completion.is_none());
+        editor
+            .test_execute_action(Action::SetCursor(3, 0))
+            .await
+            .unwrap();
+        assert!(editor.request_completion(None).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn coordinated_dismissal_returns_to_standalone_and_commit_drops_suffix() {
+        let (mut editor, requests, _controls, events) =
+            coordinated_editor("foo", 3, vec![ordinary("foobar")]).await;
+        let old = requests.borrow().as_ref().unwrap().snapshot.clone();
+        respond(
+            &mut editor,
+            &events,
+            old.clone(),
+            vec![item("foobar_extra", 0, 3)],
+        )
+        .await;
+        execute_key(&mut editor, KeyCode::Char('e'), KeyModifiers::CONTROL).await;
+        assert!(editor.current_dialog.is_none());
+        assert!(editor.visible_inline_suggestion().is_none());
+        editor.service_inline_completion();
+        expire_inline_schedule(&mut editor);
+        editor.service_inline_completion();
+        let standalone = requests.borrow().as_ref().unwrap().snapshot.clone();
+        assert!(standalone.selected_completion_info.is_none());
+        respond(&mut editor, &events, old, vec![item("foobar_late", 0, 3)]).await;
+        assert!(editor.visible_inline_suggestion().is_none());
+        respond(
+            &mut editor,
+            &events,
+            standalone,
+            vec![item("foo_standalone", 0, 3)],
+        )
+        .await;
+        assert_eq!(
+            editor.visible_inline_suggestion().unwrap().insertion,
+            "_standalone"
+        );
+
+        let mut ordinary = ordinary("foobar");
+        ordinary.commit_characters = Some(vec![".".into()]);
+        let (mut editor, requests, _controls, events) =
+            coordinated_editor("foo", 3, vec![ordinary]).await;
+        let snapshot = requests.borrow().as_ref().unwrap().snapshot.clone();
+        respond(
+            &mut editor,
+            &events,
+            snapshot,
+            vec![item("foobar_extra", 0, 3)],
+        )
+        .await;
+        execute_key(&mut editor, KeyCode::Char('.'), KeyModifiers::NONE).await;
+        assert_eq!(editor.current_buffer().contents(), "foobar.");
+        assert!(editor.visible_inline_suggestion().is_none());
+    }
+
+    #[tokio::test]
+    async fn coordinated_already_typed_item_preserves_a_crlf_suffix() {
+        let (mut editor, requests, _controls, events) =
+            coordinated_editor("foo\r\n", 3, vec![ordinary("foo")]).await;
+        let snapshot = requests.borrow().as_ref().unwrap().snapshot.clone();
+        respond(
+            &mut editor,
+            &events,
+            snapshot,
+            vec![item("foo\nnext", 0, 3)],
+        )
+        .await;
+        assert_eq!(
+            editor.visible_inline_suggestion().unwrap().insertion,
+            "\r\nnext"
+        );
+        execute_key(&mut editor, KeyCode::Tab, KeyModifiers::NONE).await;
+        assert_eq!(editor.current_buffer().contents(), "foo\r\n");
+        assert_eq!(
+            editor.visible_inline_suggestion().unwrap().insertion,
+            "\r\nnext"
+        );
+        execute_key(&mut editor, KeyCode::Tab, KeyModifiers::NONE).await;
+        assert_eq!(editor.current_buffer().contents(), "foo\r\nnext\r\n");
+    }
+
+    #[tokio::test]
+    async fn disabled_completion_rejects_late_lsp_responses() {
+        let mut editor = editor("foo");
+        show(&mut editor, "_ai", 3).await;
+        editor.pending_completions.insert(
+            71,
+            PendingCompletion {
+                buffer_items: vec![ordinary("foobar")],
+                snapshot: editor.completion_snapshot(),
+                displayed_immediately: false,
+                superseded: false,
+            },
+        );
+        editor.config.completion.enabled = false;
+        let response = InboundMessage::Message(ResponseMessage {
+            id: 71,
+            result: json!([{"label":"foobar"}]),
+            request: None,
+        });
+        assert!(editor
+            .handle_lsp_message(&response, Some("textDocument/completion".into()))
+            .is_none());
+        assert!(editor.current_dialog.is_none());
+        assert_eq!(editor.visible_inline_suggestion().unwrap().insertion, "_ai");
     }
     #[test]
     fn only_insertion_equivalent_edits_are_accepted() {

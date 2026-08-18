@@ -1,16 +1,49 @@
-use std::process::Command;
+use std::{
+    path::Path,
+    process::{Command, Output},
+};
+
+fn self_check_command(config: &Path) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_red"));
+    configure_self_check(&mut command, config);
+    command
+}
+
+fn configure_self_check(command: &mut Command, config: &Path) {
+    command
+        .arg("--self-check")
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .env("NO_COLOR", "1")
+        .env("XDG_CONFIG_HOME", config);
+}
 
 #[test]
 fn self_check_reports_every_bundled_plugin_and_finishes_with_success() {
     let config = tempfile::tempdir().unwrap();
-    let output = Command::new(env!("CARGO_BIN_EXE_red"))
-        .arg("--self-check")
-        .current_dir(env!("CARGO_MANIFEST_DIR"))
-        .env("NO_COLOR", "1")
-        .env("XDG_CONFIG_HOME", config.path())
-        .output()
-        .unwrap();
+    assert_self_check_report(self_check_command(config.path()).output().unwrap());
+}
 
+#[cfg(unix)]
+#[test]
+fn self_check_succeeds_with_a_small_main_stack() {
+    let config = tempfile::tempdir().unwrap();
+    // Exercise the executable's main stack, not the larger Rust test-thread
+    // stack. Windows already runs the ordinary self-check with its native
+    // executable stack limit. Use a fresh shell's main thread: changing
+    // RLIMIT_STACK in a test worker's pre_exec hook can fail on macOS.
+    let mut command = Command::new("/bin/sh");
+    command
+        .args([
+            "-c",
+            "ulimit -s 1024 && exec \"$@\"",
+            "red-self-check-stack",
+        ])
+        .arg(env!("CARGO_BIN_EXE_red"));
+    configure_self_check(&mut command, config.path());
+    assert_self_check_report(command.output().unwrap());
+}
+
+fn assert_self_check_report(output: Output) {
     let stdout = String::from_utf8(output.stdout).unwrap();
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(

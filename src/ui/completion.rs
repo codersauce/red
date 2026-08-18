@@ -582,6 +582,10 @@ impl CompletionUI {
 }
 
 impl Component for CompletionUI {
+    fn selected_completion(&self) -> Option<&CompletionResponseItem> {
+        self.selected_item()
+    }
+
     fn is_empty_completion(&self) -> bool {
         self.selected_item().is_none()
     }

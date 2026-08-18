@@ -129,6 +129,27 @@ Patterns use Rust regular-expression syntax. `incsearch`, `hlsearch`,
 | `Space .` | Show code actions and quick fixes |
 | `Space r` | Rename the current symbol |
 
+Ordinary completion and Copilot can be enabled independently. The default
+completion menu takes priority over Copilot ghost text. To try coordinated
+previews instead, add:
+
+```toml
+[completion]
+inline_mode = "coordinated"
+```
+
+When Copilot can extend the selected plain-text completion, both stay visible.
+Up/Down changes the selected item, Tab or Enter accepts that item first, and a
+second Tab accepts the remaining AI text. Ctrl-l accepts the whole AI suggestion
+at once. Snippets and completions with additional edits keep the default
+popup-first behavior. Ctrl-e closes the menu; Alt-\ requests Copilot on its own.
+Set `inline_mode = "popup_first"` to restore the default.
+
+For Copilot only, set `enabled = false` under `[completion]`. This also disables
+Ctrl-Space and language-server trigger characters. To stop only identifier-prefix
+popups, use `auto_trigger = false` instead; Ctrl-Space and language-server trigger
+characters remain available. Neither setting enables or disables Copilot.
+
 Supported documents are formatted on save by default. Red prefers an installed
 language-pack formatter and otherwise uses LSP. To disable automatic formatting,
 add this to `~/.config/red/config.toml`:

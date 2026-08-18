@@ -86,6 +86,11 @@ ignorecase = false
 smartcase = false
 
 [completion]
+# Disable ordinary completion entirely (including Ctrl-Space), independently of Copilot.
+enabled = true
+# "coordinated" lets compatible Copilot suggestions extend the selected menu item.
+# Tab/Enter accepts the menu item first; Ctrl-l accepts the whole AI suggestion.
+inline_mode = "popup_first"
 # Request completion after an identifier prefix is typed. Increase debounce_ms
 # if the language server should wait for a quiet period before each request.
 auto_trigger = true

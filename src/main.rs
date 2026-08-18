@@ -188,6 +188,17 @@ async fn run() -> anyhow::Result<()> {
         return Ok(());
     }
 
+    run_editor(args).await
+}
+
+// Keep constructing the large interactive future out of utility-command stack
+// frames, including --self-check on Windows' smaller executable stack.
+#[inline(never)]
+fn run_editor(args: Args) -> impl std::future::Future<Output = anyhow::Result<()>> {
+    Box::pin(run_editor_inner(args))
+}
+
+async fn run_editor_inner(args: Args) -> anyhow::Result<()> {
     let config_file = Config::path("config.toml");
     let preferences_file = Config::path("preferences.json");
     let first_launch = !config_file.exists() && !preferences_file.exists();
@@ -1200,6 +1211,15 @@ async fn load_startup_buffers(files: &[String]) -> anyhow::Result<Vec<Buffer>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn startup_dispatch_future_stays_small() {
+        let bytes = std::mem::size_of_val(&run());
+        assert!(
+            bytes <= 32 * 1024,
+            "startup dispatch future is {bytes} bytes"
+        );
+    }
 
     #[test]
     fn plugin_default_keymaps_install_shared_leader_siblings() {
