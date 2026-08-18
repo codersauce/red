@@ -87,7 +87,8 @@ fn tool_title(tool: &str, arguments: &Value, path: &str) -> (&'static str, Strin
 fn compact_path(path: &str, cwd: &Path) -> String {
     let path = Path::new(path);
     let display = path.strip_prefix(cwd).unwrap_or_else(|_| {
-        if path.is_absolute() {
+        // Rooted paths need shortening even without a Windows drive prefix.
+        if path.has_root() {
             path.file_name().map(Path::new).unwrap_or(path)
         } else {
             path
@@ -165,6 +166,24 @@ mod tests {
             let update = item_update(&item, false, cwd).unwrap();
             assert_eq!(update["title"], expected);
             assert_eq!(update["full_title"], format!("Reading {path}"));
+        }
+        assert_eq!(compact_path("src/main.rs", cwd), "src/main.rs");
+        assert_eq!(compact_path("/outside/main.rs", cwd), "main.rs");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_activity_paths_keep_native_relative_paths_and_shorten_other_roots() {
+        let cwd = Path::new(r"C:\workspace\project");
+        for (path, expected) in [
+            (r"C:\workspace\project\src\main.rs", r"src\main.rs"),
+            (r"D:\other\main.rs", "main.rs"),
+            (r"\other\main.rs", "main.rs"),
+            (r"\\server\share\main.rs", "main.rs"),
+            (r"src\main.rs", r"src\main.rs"),
+            (r"C:main.rs", "C:main.rs"),
+        ] {
+            assert_eq!(compact_path(path, cwd), expected, "{path}");
         }
     }
 
