@@ -39,6 +39,7 @@ use crate::{
     unicode_utils::{
         char_prefix, display_width, display_width_with_tabs, fit_display_width,
         grapheme_to_column_with_tabs, trim_line_ending, truncate_display_width,
+        truncate_display_width_with_marker, TruncationSide,
     },
     utils::{expand_user_path, get_workspace_path},
     window::WindowId,
@@ -150,8 +151,13 @@ fn diagnostics_by_visible_line(
     by_line
 }
 
-fn statusline_file_name(name: &str) -> &str {
-    name.strip_prefix("./").unwrap_or(name)
+fn statusline_file_name(name: &str, current_folder: &Path) -> String {
+    let name = name.strip_prefix("./").unwrap_or(name);
+    Path::new(name)
+        .strip_prefix(current_folder)
+        .unwrap_or_else(|_| Path::new(name))
+        .to_string_lossy()
+        .into_owned()
 }
 
 #[derive(Clone)]
@@ -159,6 +165,7 @@ struct StatuslineSegment {
     text: String,
     style: Style,
     accents: Vec<StatuslineAccent>,
+    truncation_side: TruncationSide,
 }
 
 #[derive(Clone)]
@@ -205,6 +212,10 @@ fn statusline_segment(
     icon_style: PickerIconStyle,
     color_icons: bool,
 ) -> Option<StatuslineSegment> {
+    let truncation_side = match section {
+        StatuslineSection::Filename | StatuslineSection::RelativePath => TruncationSide::Left,
+        _ => TruncationSide::Right,
+    };
     let (text, accents) = match section {
         StatuslineSection::Mode => (format!(" {} ", context.mode), Vec::new()),
         StatuslineSection::GitBranch => {
@@ -405,6 +416,7 @@ fn statusline_segment(
         text,
         style: Style::default(),
         accents,
+        truncation_side,
     })
 }
 
@@ -631,7 +643,7 @@ fn draw_statusline_left(
         let desired_width = text_width + if has_separator { separator_width } else { 0 };
         let remaining = limit - x;
         if desired_width > remaining {
-            let text = truncate_display_width(&segment.text, remaining);
+            let text = truncate_statusline_segment(segment, remaining);
             let visible_width = display_width(&text);
             draw_statusline_segment(buffer, x, y, &text, visible_width, segment);
             break;
@@ -674,7 +686,7 @@ fn draw_statusline_right(
         };
         let available_text = width.saturating_sub(leading_width);
         if display_width(&segment.text) > available_text {
-            segment.text = truncate_display_width(&segment.text, available_text);
+            segment.text = truncate_statusline_segment(segment, available_text);
         }
     }
 
@@ -698,6 +710,15 @@ fn draw_statusline_right(
         previous_style = &segment.style;
     }
     start
+}
+
+fn truncate_statusline_segment(segment: &StatuslineSegment, width: usize) -> String {
+    match segment.truncation_side {
+        TruncationSide::Left => {
+            truncate_display_width_with_marker(&segment.text, width, "…", TruncationSide::Left)
+        }
+        TruncationSide::Right => truncate_display_width(&segment.text, width),
+    }
 }
 
 fn statusline_right_width(
@@ -3255,7 +3276,7 @@ impl Editor {
                     " ".to_string()
                 };
             (
-                statusline_file_name(window_buffer.name()).to_string(),
+                window_buffer.name().to_string(),
                 window_buffer.file.clone(),
                 dirty,
                 format!(
@@ -3279,7 +3300,7 @@ impl Editor {
         } else {
             let current = self.current_buffer();
             (
-                statusline_file_name(current.name()).to_string(),
+                current.name().to_string(),
                 current.file.clone(),
                 current.is_dirty(),
                 format!(" {}:{} ", self.vtop + self.cy + 1, self.cx + 1),
@@ -3309,6 +3330,7 @@ impl Editor {
                 configured(StatuslineSection::GitChanges),
             );
         }
+        let current_folder = get_workspace_path();
         let workspace_root = self
             .statusline_git_cache
             .repository_root
@@ -3318,7 +3340,8 @@ impl Editor {
                     .as_deref()
                     .and_then(|file| self.lsp.workspace_root_for_file(file))
             })
-            .unwrap_or_else(get_workspace_path);
+            .unwrap_or_else(|| current_folder.clone());
+        let filename = statusline_file_name(&filename, &current_folder);
         let diagnostics = configured(StatuslineSection::Diagnostics)
             .then(|| self.statusline_diagnostic_counts(buffer_index))
             .flatten();
@@ -4448,17 +4471,107 @@ mod tests {
 
     #[test]
     fn statusline_file_name_omits_dot_slash_prefix() {
-        assert_eq!(statusline_file_name("./src/color.rs"), "src/color.rs");
+        assert_eq!(
+            statusline_file_name("./src/color.rs", Path::new("workspace")),
+            "src/color.rs"
+        );
     }
 
     #[test]
-    fn statusline_file_name_preserves_other_paths() {
-        assert_eq!(statusline_file_name("src/color.rs"), "src/color.rs");
+    fn statusline_file_name_omits_current_folder_prefix() {
+        let current_folder = Path::new("workspace");
+        let file = current_folder.join("src").join("color.rs");
+
         assert_eq!(
-            statusline_file_name("/Users/fcoury/code/red/src/color.rs"),
-            "/Users/fcoury/code/red/src/color.rs"
+            statusline_file_name(&file.to_string_lossy(), current_folder),
+            Path::new("src")
+                .join("color.rs")
+                .to_string_lossy()
+                .into_owned()
         );
-        assert_eq!(statusline_file_name("[No Name]"), "[No Name]");
+    }
+
+    #[test]
+    fn statusline_file_name_preserves_paths_outside_current_folder() {
+        let current_folder = Path::new("workspace");
+        let outside = Path::new("workspace-other").join("src").join("color.rs");
+
+        assert_eq!(
+            statusline_file_name(&outside.to_string_lossy(), current_folder),
+            outside.to_string_lossy()
+        );
+        assert_eq!(
+            statusline_file_name("[No Name]", current_folder),
+            "[No Name]"
+        );
+    }
+
+    #[test]
+    fn statusline_file_paths_elide_from_the_left() {
+        let segment = StatuslineSegment {
+            text: " src/deeply/nested/app_server_session.rs ".to_string(),
+            style: Style::default(),
+            accents: Vec::new(),
+            truncation_side: TruncationSide::Left,
+        };
+
+        let truncated = truncate_statusline_segment(&segment, 18);
+
+        assert_eq!(display_width(&truncated), 18);
+        assert!(truncated.starts_with('…'));
+        assert!(truncated.ends_with("session.rs "));
+    }
+
+    #[test]
+    fn rendered_statusline_uses_a_current_folder_relative_filename() {
+        const WIDTH: usize = 100;
+        const HEIGHT: usize = 5;
+
+        let current_folder = get_workspace_path();
+        let relative = Path::new("src").join("editor").join("rendering.rs");
+        let source = Buffer::new(
+            Some(
+                current_folder
+                    .join(&relative)
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+            String::new(),
+        );
+        let mut config = Config::default();
+        config.statusline.left = vec![StatuslineSection::Filename];
+        config.statusline.right.clear();
+        let lsp = Box::new(LspManager::new(config.lsp.clone()));
+        let mut editor =
+            Editor::with_size(lsp, WIDTH, HEIGHT, config, Theme::default(), vec![source]).unwrap();
+
+        let row = editor.test_statusline_row();
+
+        assert!(row.contains(&relative.to_string_lossy().into_owned()));
+        assert!(!row.contains(&current_folder.to_string_lossy().into_owned()));
+    }
+
+    #[test]
+    fn rendered_statusline_preserves_the_end_of_a_long_filename() {
+        const WIDTH: usize = 20;
+        const HEIGHT: usize = 5;
+
+        let source = Buffer::new(
+            Some("src/deeply/nested/app_server_session.rs".to_string()),
+            String::new(),
+        );
+        let mut config = Config::default();
+        config.statusline.left = vec![StatuslineSection::Filename];
+        config.statusline.right.clear();
+        let lsp = Box::new(LspManager::new(config.lsp.clone()));
+        let mut editor =
+            Editor::with_size(lsp, WIDTH, HEIGHT, config, Theme::default(), vec![source]).unwrap();
+
+        let row = editor.test_statusline_row();
+
+        assert_eq!(display_width(&row), WIDTH);
+        assert!(row.starts_with('…'));
+        assert!(row.ends_with("session.rs "));
     }
 
     #[test]
@@ -4601,6 +4714,7 @@ mod tests {
             text: text.clone(),
             style: statusline_slot_style(&theme, 1),
             accents,
+            truncation_side: TruncationSide::Right,
         };
         let truncated = truncate_display_width(&text, 5);
         let mut buffer = RenderBuffer::new(5, 1, &Style::default());
