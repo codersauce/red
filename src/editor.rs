@@ -3419,7 +3419,8 @@ pub struct Editor {
     pending_lsp_revision_snapshots: HashMap<i64, Vec<(String, u64)>>,
     pending_completions: HashMap<i64, PendingCompletion>,
     scheduled_completion: Option<ScheduledCompletion>,
-    inline_completion: inline_completion::InlineCompletionState,
+    // Keep optional AI state out of Editor values and the startup futures that own them.
+    inline_completion: Box<inline_completion::InlineCompletionState>,
     completion_snapshot: Option<CompletionSnapshot>,
     /// Insert-mode placeholder anchors belonging to the most recently expanded snippet.
     snippet_session: Option<snippet::SnippetSession>,
@@ -4762,7 +4763,7 @@ impl Editor {
             pending_lsp_revision_snapshots: HashMap::new(),
             pending_completions: HashMap::new(),
             scheduled_completion: None,
-            inline_completion: inline_completion::InlineCompletionState::default(),
+            inline_completion: Box::default(),
             completion_snapshot: None,
             snippet_session: None,
         })
