@@ -174,6 +174,11 @@ pub trait Component: Send {
         false
     }
 
+    /// Selected ordinary completion, if this component owns a completion menu.
+    fn selected_completion(&self) -> Option<&CompletionResponseItem> {
+        None
+    }
+
     fn picker_id(&self) -> Option<i32> {
         None
     }

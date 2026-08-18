@@ -172,6 +172,13 @@ fn normalized_document_path(path: &Path) -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
+/// The real edit represented by the selected ordinary completion item.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(crate) struct SelectedCompletionInfo {
+    pub range: Range,
+    pub text: String,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Snapshot {
     pub generation: u64,
@@ -179,6 +186,7 @@ pub(crate) struct Snapshot {
     pub revision: u64,
     pub cursor: TextPosition,
     pub uri: String,
+    pub selected_completion_info: Option<SelectedCompletionInfo>,
 }
 
 #[derive(Debug, Clone)]
@@ -423,9 +431,13 @@ impl<W: AsyncWrite + Unpin> Protocol<W> {
             .as_ref()
             .expect("document was synchronized")
             .version;
+        let mut context = json!({"triggerKind":if request.automatic {2} else {1}});
+        if let Some(selected) = &request.snapshot.selected_completion_info {
+            context["selectedCompletionInfo"] = serde_json::to_value(selected)?;
+        }
         let id = self.request("textDocument/inlineCompletion", json!({
             "textDocument":{"uri":uri,"version":version},"position":request.position,
-            "context":{"triggerKind":if request.automatic {2} else {1}},
+            "context":context,
             "formattingOptions":{"tabSize":request.tab_size,"insertSpaces":request.insert_spaces}
         }), Pending::Completion(request.snapshot)).await?;
         self.completion = Some((id, tokio::time::Instant::now() + REQUEST_TIMEOUT));
@@ -827,6 +839,7 @@ mod tests {
                 revision: generation,
                 cursor: TextPosition::new(0, 0),
                 uri: uri.into(),
+                selected_completion_info: None,
             },
             language_id: "rust".into(),
             contents: text.into(),
@@ -868,6 +881,9 @@ mod tests {
         let first = read(&mut reader).await;
         assert_eq!(first["method"], "textDocument/inlineCompletion");
         assert_eq!(first["params"]["textDocument"]["version"], 1);
+        assert!(first["params"]["context"]
+            .get("selectedCompletionInfo")
+            .is_none());
         protocol
             .complete(request(2, "file:///workspace/a.rs", "😀x"))
             .await
@@ -899,6 +915,63 @@ mod tests {
             1
         );
         assert_eq!(protocol.pending.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn selected_completion_context_never_changes_the_synchronized_document() {
+        let (writer, reader) = tokio::io::duplex(8192);
+        let mut reader = BufReader::new(reader);
+        let mut protocol = Protocol {
+            writer,
+            next_id: 0,
+            pending: HashMap::new(),
+            completion: None,
+            document: None,
+        };
+        let mut request = request(1, "file:///workspace/a.rs", "foo");
+        request.snapshot.selected_completion_info = Some(SelectedCompletionInfo {
+            range: Range {
+                start: Position {
+                    line: 0,
+                    character: 0,
+                },
+                end: Position {
+                    line: 0,
+                    character: 3,
+                },
+            },
+            text: "foobar".into(),
+        });
+        protocol.complete(request.clone()).await.unwrap();
+        let open = read(&mut reader).await;
+        assert_eq!(open["params"]["textDocument"]["text"], "foo");
+        assert_eq!(read(&mut reader).await["method"], "textDocument/didFocus");
+        let first = read(&mut reader).await;
+        assert_eq!(
+            first["params"]["context"]["selectedCompletionInfo"]["text"],
+            "foobar"
+        );
+        assert_eq!(
+            first["params"]["context"]["selectedCompletionInfo"]["range"]["end"]["character"],
+            3
+        );
+        request.snapshot.generation += 1;
+        request
+            .snapshot
+            .selected_completion_info
+            .as_mut()
+            .unwrap()
+            .text = "foobaz".into();
+        protocol.complete(request).await.unwrap();
+        assert_eq!(read(&mut reader).await["method"], "$/cancelRequest");
+        assert_eq!(read(&mut reader).await["method"], "textDocument/didFocus");
+        let second = read(&mut reader).await;
+        assert_eq!(second["params"]["textDocument"]["version"], 1);
+        assert_eq!(
+            second["params"]["context"]["selectedCompletionInfo"]["text"],
+            "foobaz"
+        );
+        assert_eq!(protocol.document.as_ref().unwrap().contents, "foo");
     }
 
     #[tokio::test]
