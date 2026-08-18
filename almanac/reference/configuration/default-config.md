@@ -64,7 +64,7 @@ The default Space and `Ctrl-w` prefixes are dense command neighborhoods. Space o
 
 ## Plugins, Plugin Config, And Permissions
 
-The default `[plugins]` table enables bundled Husk plugins: `agent`, `barbecue`, `buffer_picker`, `cool_search`, `fidget`, `git`, `indent_guides`, `inlay_hints`, `lsp_symbols`, `neotree`, `project_search`, and `theme_browser` [@defaults]. Relative plugin paths are resolved through the runtime asset system or the config directory's `plugins` folder; absolute plugin paths are kept absolute [@config].
+The default `[plugins]` table enables bundled Husk plugins: `agent`, `barbecue`, `buffer_picker`, `cool_search`, `fidget`, `git`, `indent_guides`, `inlay_hints`, `lsp_symbols`, `neotree`, `project_search`, `session_restore`, and `theme_browser` [@defaults]. Relative plugin paths are resolved through the runtime asset system or the config directory's `plugins` folder; absolute plugin paths are kept absolute [@config].
 
 `[plugin_permissions.<plugin>]` currently grants process execution allowlists. The default config allows `project_search` to launch `rg` and `git` to launch `git` [@defaults] [@config]. The process API matches allowed commands exactly and does not invoke a shell [@config].
 

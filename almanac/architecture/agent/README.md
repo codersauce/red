@@ -21,6 +21,9 @@ sources:
   - id: agent-plugin
     type: file
     path: plugins/agent.hk
+  - id: copilot-guide
+    type: file
+    path: almanac/guides/agent/copilot-completion.md
 ---
 
 # Agent Architecture
@@ -37,7 +40,7 @@ Use [Followed Editing](followed-editing) for the full-agent write path: Red reve
 
 [Agent-Attributed Edits](../../concepts/agent-attributed-edits) is the safety model behind the architecture. Read it before changing whether Codex can inspect state, edit text, or cross the editor transaction boundary [@workflow] [@editor].
 
-For task-oriented operation, use [Inspect Agent History](../../guides/agent/inspect-agent-history). For prerequisites and offline readiness checks, use [Agent Check](../../reference/agent/agent-check). For the accepted integration decision, use [Direct Codex App-Server](../../decisions/agent/direct-codex-app-server).
+For task-oriented operation, use [Inspect Agent History](../../guides/agent/inspect-agent-history). For inline AI suggestions that run beside language-server completion rather than through Codex turns, use [Copilot Inline Completion](../../guides/agent/copilot-completion) [@copilot-guide]. For prerequisites and offline readiness checks, use [Agent Check](../../reference/agent/agent-check). For the accepted integration decision, use [Direct Codex App-Server](../../decisions/agent/direct-codex-app-server).
 
 ## Boundaries To Preserve
 
