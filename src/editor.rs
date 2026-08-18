@@ -14227,6 +14227,12 @@ impl Editor {
                         return Some(self.follow_text_panel_link(target));
                     }
                 }
+                if let Some(target) = self
+                    .panel_manager
+                    .double_clicked_text_link_at_position(x, y, width, height)
+                {
+                    return Some(self.follow_text_panel_link(target));
+                }
                 self.panel_manager
                     .focus_panel_at_position(x, y, width, height)
                     .and_then(Self::panel_event_key_action)
@@ -14274,10 +14280,13 @@ impl Editor {
     fn follow_text_panel_link(&mut self, target: plugin::TextPanelLinkTarget) -> KeyAction {
         match target {
             plugin::TextPanelLinkTarget::File { path, location } => {
-                if let Err(error) = validate_text_panel_file(&path) {
-                    self.set_legacy_message(Some(format!("Unable to open link: {error}")));
-                    return KeyAction::Single(Action::Refresh);
-                }
+                let path = match self.resolve_text_panel_file_path(&path) {
+                    Ok(path) => path,
+                    Err(error) => {
+                        self.set_legacy_message(Some(format!("Unable to open link: {error}")));
+                        return KeyAction::Single(Action::Refresh);
+                    }
+                };
                 self.panel_manager.focus_editor();
                 if let Some(location) = location {
                     KeyAction::Single(Action::OpenLocation(
@@ -14290,7 +14299,6 @@ impl Editor {
                         plugin::OpenLocationTarget::Current,
                     ))
                 } else {
-                    let path = self.open_buffer_name_for_path(&path).unwrap_or(path);
                     KeyAction::Single(Action::OpenFile(path))
                 }
             }
@@ -14307,6 +14315,48 @@ impl Editor {
                 ])
             }
         }
+    }
+
+    fn resolve_text_panel_file_path(&self, path: &str) -> anyhow::Result<String> {
+        let direct_error = match validate_text_panel_file(path) {
+            Ok(()) => {
+                return Ok(self
+                    .open_buffer_name_for_path(path)
+                    .unwrap_or_else(|| path.to_string()));
+            }
+            Err(error) => error,
+        };
+
+        let relative = Path::new(path);
+        if relative.is_absolute() || path.starts_with('~') {
+            return Err(direct_error);
+        }
+
+        let matches = |buffer_path: &str| {
+            Path::new(buffer_path).ends_with(relative)
+                && validate_text_panel_file(buffer_path).is_ok()
+        };
+        if let Some(current) = self
+            .current_buffer()
+            .file
+            .as_deref()
+            .filter(|path| matches(path))
+        {
+            return Ok(current.to_string());
+        }
+
+        let mut open_matches = self
+            .buffer_manager
+            .iter()
+            .filter_map(|buffer| buffer.file.as_deref())
+            .filter(|buffer_path| matches(buffer_path));
+        let Some(first) = open_matches.next() else {
+            return Err(direct_error);
+        };
+        if open_matches.next().is_some() {
+            anyhow::bail!("Link target matches multiple open files: {path}");
+        }
+        Ok(first.to_string())
     }
 
     fn open_buffer_name_for_path(&self, path: &str) -> Option<String> {
@@ -39008,6 +39058,59 @@ while True:
         );
     }
 
+    #[test]
+    fn relative_text_panel_links_resolve_unique_open_buffer_suffixes() {
+        let directory = tempfile::tempdir().unwrap();
+        let file = directory
+            .path()
+            .join("codex-worktree/codex-rs/tui/src/app_server_session.rs");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, "fn start_thread() {}\n").unwrap();
+
+        let mut editor = test_editor(40, 10);
+        editor.buffer_manager.push_buffer(Buffer::new(
+            Some(file.to_string_lossy().into_owned()),
+            "fn start_thread() {}\n".to_string(),
+        ));
+
+        let expected = file.to_string_lossy().into_owned();
+        assert_eq!(
+            editor
+                .resolve_text_panel_file_path("codex-rs/tui/src/app_server_session.rs")
+                .unwrap(),
+            expected
+        );
+        assert_eq!(
+            editor
+                .resolve_text_panel_file_path("app_server_session.rs")
+                .unwrap(),
+            expected
+        );
+
+        let duplicate = directory
+            .path()
+            .join("other-worktree/app_server_session.rs");
+        std::fs::create_dir_all(duplicate.parent().unwrap()).unwrap();
+        std::fs::write(&duplicate, "fn other() {}\n").unwrap();
+        editor.buffer_manager.push_buffer(Buffer::new(
+            Some(duplicate.to_string_lossy().into_owned()),
+            "fn other() {}\n".to_string(),
+        ));
+        assert!(editor
+            .resolve_text_panel_file_path("app_server_session.rs")
+            .unwrap_err()
+            .to_string()
+            .contains("multiple open files"));
+
+        editor.buffer_manager.set_active_index(1);
+        assert_eq!(
+            editor
+                .resolve_text_panel_file_path("app_server_session.rs")
+                .unwrap(),
+            expected
+        );
+    }
+
     #[tokio::test]
     async fn locationless_text_panel_links_preserve_existing_buffer_positions() {
         let directory = tempfile::tempdir().unwrap();
@@ -39368,6 +39471,74 @@ while True:
             editor.panel_manager.focused_text_panel_cursor_mode(),
             Some(Mode::Insert)
         );
+    }
+
+    #[test]
+    fn text_panel_links_open_on_enter_and_double_click() {
+        let setup = || {
+            let mut editor = test_editor(80, 24);
+            editor.test_create_text_panel(
+                "agent-conversation",
+                plugin::PanelConfig {
+                    side: plugin::PanelSide::Right,
+                    width: 40,
+                    ..plugin::PanelConfig::default()
+                },
+            );
+            editor.test_update_text_panel(
+                "agent-conversation",
+                vec![plugin::TextPanelBlock {
+                    id: "answer".into(),
+                    kind: plugin::TextPanelBlockKind::Agent,
+                    format: plugin::TextPanelBlockFormat::Markdown,
+                    text: "[docs](https://example.com)".into(),
+                }],
+            );
+            editor
+        };
+        let click = |editor: &mut Editor| {
+            for row in 0..24 {
+                for column in 0..80 {
+                    if editor
+                        .panel_manager
+                        .text_link_at_position(column, row, 80, 24)
+                        .is_some()
+                    {
+                        return MouseEvent {
+                            kind: MouseEventKind::Down(MouseButton::Left),
+                            column: u16::try_from(column).unwrap(),
+                            row: u16::try_from(row).unwrap(),
+                            modifiers: KeyModifiers::NONE,
+                        };
+                    }
+                }
+            }
+            panic!("rendered text link should have a hit target");
+        };
+        let is_docs_link = |action| {
+            matches!(
+                action,
+                Some(KeyAction::Single(Action::OpenExternalUrl(url)))
+                    if url == "https://example.com"
+            )
+        };
+
+        let mut double_click_editor = setup();
+        let mouse = click(&mut double_click_editor);
+        assert!(!is_docs_link(
+            double_click_editor.handle_panel_mouse_event(&mouse)
+        ));
+        assert!(is_docs_link(
+            double_click_editor.handle_panel_mouse_event(&mouse)
+        ));
+
+        let mut enter_editor = setup();
+        let mouse = click(&mut enter_editor);
+        assert!(!is_docs_link(enter_editor.handle_panel_mouse_event(&mouse)));
+        assert!(is_docs_link(enter_editor.handle_panel_event(
+            &Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            None,
+        )));
     }
 
     #[test]

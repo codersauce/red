@@ -60,14 +60,19 @@ pub(crate) fn linkify_source_locations(text: &str) -> Vec<(&str, Option<TextPane
     let mut cursor = 0;
 
     for (token_start, token) in whitespace_tokens(text) {
-        let leading = token
-            .char_indices()
-            .take_while(|(_, character)| {
-                matches!(character, '(' | '[' | '{' | '<' | '\'' | '"' | '`')
-            })
-            .map(|(index, character)| index + character.len_utf8())
-            .last()
-            .unwrap_or(0);
+        // Inline code can quote Markdown source verbatim, for example
+        // `[label](src/main.rs:12)`. Start after the label/destination boundary
+        // so the label is not accidentally folded into the file path.
+        let destination_start = token.rfind("](").map_or(0, |index| index + 2);
+        let leading = destination_start
+            + token[destination_start..]
+                .char_indices()
+                .take_while(|(_, character)| {
+                    matches!(character, '(' | '[' | '{' | '<' | '\'' | '"' | '`')
+                })
+                .map(|(index, character)| index + character.len_utf8())
+                .last()
+                .unwrap_or(0);
         let candidate = &token[leading..];
         let candidate_len = candidate
             .trim_end_matches(|character: char| {
@@ -320,6 +325,27 @@ mod tests {
                     },
                 ),
             ]
+        );
+    }
+
+    #[test]
+    fn linkifies_source_locations_inside_literal_markdown_links() {
+        let fragments = linkify_source_locations("`[startup](app_server_session.rs:1661-1697)`");
+
+        assert_eq!(
+            fragments
+                .iter()
+                .find_map(|(fragment, target)| target.as_ref().map(|target| (*fragment, target))),
+            Some((
+                "app_server_session.rs:1661-1697",
+                &TextPanelLinkTarget::File {
+                    path: "app_server_session.rs".to_string(),
+                    location: Some(TextPanelFileLocation {
+                        line: 1661,
+                        column: 1,
+                    }),
+                }
+            ))
         );
     }
 
