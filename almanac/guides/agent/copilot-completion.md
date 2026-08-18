@@ -41,7 +41,12 @@ max_file_bytes = 262144
 excluded_patterns = [".env", ".env.*", "*.pem", "*.key", "**/.git/**"]
 ```
 
-Alternatively, use `:Copilot enable` to opt in for the current editor session.
+Alternatively, use `:Copilot enable` to opt in. Red saves `enabled = true` in
+your user configuration so the choice survives restarts. Confirming “Enable
+and sign in” through `:Copilot signin` saves the same choice before starting
+authentication. `:Copilot disable` saves `enabled = false`; `:Copilot signout`
+signs out without changing the enablement setting. If the configuration cannot
+be saved, Red applies the choice only to the current session and shows a warning.
 Type `:Copilot ` and press `Tab` to cycle through subcommands, or complete a
 prefix such as `:Copilot en`. `Shift-Tab` cycles backward. Completion does not
 enable Copilot or start authentication.
@@ -71,10 +76,10 @@ configured `copilot-language-server` can be found [@editor] [@preferences].
 Displaying the hint records `copilot_setup_hint_seen` in preferences before the
 bridge starts. Running `:Copilot signin`, `:Copilot enable`, or
 `:Copilot disable` also records the hint as seen [@editor] [@preferences].
-This means the hint is onboarding state, not Copilot enablement state. A user
-can acknowledge the setup flow, reopen Red, and still have Copilot disabled if
-they only used session-level enablement rather than changing `[copilot].enabled`
-in configuration [@defaults] [@editor].
+The hint is onboarding state, not consent or authentication state. Detecting
+an installed server never enables it. Explicit enablement is remembered in
+`[copilot].enabled`, independently of whether authentication succeeds. Red
+leaves credential management to the language server [@defaults] [@editor].
 
 The sign-in flow keeps the device-code dialog open after Red sends
 `github.copilot.finishDeviceFlow` to the language server. Red copies the code to

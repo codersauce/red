@@ -265,7 +265,7 @@ impl Editor {
         self.current_dialog = Some(Box::new(Confirmation::new_actions(
             self,
             "Enable GitHub Copilot?",
-            "Eligible source files may be sent to GitHub for inline suggestions. Copilot will be enabled for this session.",
+            "Eligible source files may be sent to GitHub for inline suggestions. Red will remember that Copilot is enabled.",
             "Enable and sign in",
             "Cancel",
             Action::CopilotEnableAndSignIn,
@@ -274,11 +274,40 @@ impl Editor {
     }
 
     pub(super) fn enable_and_sign_in_copilot(&mut self) {
-        self.inline_completion.enabled_override = Some(true);
+        if self.config.disable_ai {
+            self.set_legacy_message(Some("Copilot is disabled by disable_ai = true".into()));
+            return;
+        }
+        let saved = self.set_copilot_enabled(true);
         self.inline_completion.failed = false;
         if self.ensure_copilot() {
             self.set_legacy_message(Some("Contacting GitHub Copilot...".into()));
             self.copilot_control(Control::SignIn);
+        }
+        self.report_copilot_save_error(true, saved);
+    }
+
+    fn set_copilot_enabled(&mut self, enabled: bool) -> anyhow::Result<()> {
+        self.mark_copilot_setup_hint_seen();
+        self.inline_completion.enabled_override = Some(enabled);
+        anyhow::ensure!(
+            self.preferences.is_persistent(),
+            "no persistent user configuration"
+        );
+        Config::persist_copilot_enabled(&self.language_config_path, enabled)?;
+        self.config.copilot.enabled = enabled;
+        Ok(())
+    }
+
+    fn report_copilot_save_error(&mut self, enabled: bool, saved: anyhow::Result<()>) {
+        if let Err(error) = saved {
+            let state = if enabled { "enabled" } else { "disabled" };
+            self.set_notification_message(
+                Severity::Warning,
+                Some(format!(
+                    "Copilot {state} for this session only; couldn't save configuration: {error:#}"
+                )),
+            );
         }
     }
 
@@ -306,33 +335,30 @@ impl Editor {
                     ));
                     return;
                 }
-                self.mark_copilot_setup_hint_seen();
-                self.inline_completion.enabled_override = Some(true);
+                let saved = self.set_copilot_enabled(true);
                 self.inline_completion.failed = false;
                 self.ensure_copilot();
                 self.set_legacy_message(Some(
-                    "Copilot enabled for this session; eligible source files may be sent to GitHub"
-                        .into(),
+                    "Copilot enabled; eligible source files may be sent to GitHub".into(),
                 ));
+                self.report_copilot_save_error(true, saved);
             }
             Some(CopilotCommand::Disable) => {
-                self.mark_copilot_setup_hint_seen();
+                let saved = self.set_copilot_enabled(false);
                 self.dismiss_inline_completion();
                 if self.inline_completion.sign_in.take().is_some() {
                     self.current_dialog = None;
                 }
-                self.inline_completion.enabled_override = Some(false);
                 self.inline_completion.bridge = None;
                 self.inline_completion.prompts.clear();
                 self.inline_completion.status = "Disabled".into();
                 self.set_legacy_message(Some("Copilot disabled".into()));
+                self.report_copilot_save_error(false, saved);
             }
             Some(CopilotCommand::SignIn) => {
                 self.inline_completion.failed = false;
                 if self.copilot_enabled() {
-                    if self.ensure_copilot() {
-                        self.copilot_control(Control::SignIn);
-                    }
+                    self.enable_and_sign_in_copilot();
                 } else {
                     self.confirm_copilot_sign_in();
                 }
@@ -736,8 +762,12 @@ mod tests {
 
     fn editor(text: &str) -> Editor {
         let mut config = Config::from_user_toml_with_overrides("", &[]).unwrap();
-        config.lsp.enabled = false;
         config.copilot.enabled = true;
+        editor_with_config(text, config)
+    }
+
+    fn editor_with_config(text: &str, mut config: Config) -> Editor {
+        config.lsp.enabled = false;
         let lsp = Box::new(crate::lsp::LspManager::new(config.lsp.clone()));
         let file = get_workspace_path()
             .join("src/main.rs")
@@ -755,6 +785,18 @@ mod tests {
         editor.test_disable_terminal_output();
         editor.inline_completion.failed = true;
         editor
+    }
+
+    fn use_temporary_config(editor: &mut Editor, directory: &Path, contents: &str) -> PathBuf {
+        let path = directory.join("config.toml");
+        std::fs::write(&path, contents).unwrap();
+        editor.preferences = PreferencesStore::load(directory.join("preferences.json"));
+        editor.set_language_reload_source(path.clone(), Vec::new());
+        path
+    }
+
+    fn reopen_with_config(path: &Path) -> Editor {
+        editor_with_config("foo", Config::load_user_file(path, &[]).unwrap().config)
     }
 
     async fn show(editor: &mut Editor, text: &str, cursor: usize) {
@@ -927,6 +969,12 @@ mod tests {
     #[tokio::test]
     async fn signin_confirms_consent_then_enables_and_starts_authentication() {
         let mut editor = editor("foo");
+        let directory = tempfile::tempdir().unwrap();
+        let path = use_temporary_config(
+            &mut editor,
+            directory.path(),
+            "[copilot]\nenabled = false\n",
+        );
         editor.config.copilot.enabled = false;
         editor.config.copilot.command = std::env::current_exe()
             .unwrap()
@@ -937,6 +985,7 @@ mod tests {
         editor.handle_copilot_command("signin");
 
         assert!(!editor.copilot_enabled());
+        assert!(!reopen_with_config(&path).copilot_enabled());
         assert!(editor.inline_completion.bridge.is_none());
         assert!(editor.preferences.copilot_setup_hint_seen());
         let dialog = editor.current_dialog.as_mut().unwrap();
@@ -955,7 +1004,7 @@ mod tests {
             ]))
         );
 
-        let (bridge, _requests, mut controls, _events) = Bridge::test_channels();
+        let (bridge, _requests, mut controls, events) = Bridge::test_channels();
         editor.inline_completion.bridge = Some(bridge);
         editor
             .test_execute_action(Action::CopilotEnableAndSignIn)
@@ -968,6 +1017,118 @@ mod tests {
             Some("Contacting GitHub Copilot...")
         );
         assert!(matches!(controls.recv().await, Some(Control::SignIn)));
+        assert!(reopen_with_config(&path).copilot_enabled());
+
+        events
+            .send(CopilotEvent::SignInFinished {
+                error: Some("not authorized".into()),
+            })
+            .await
+            .unwrap();
+        editor.service_inline_completion();
+        assert!(reopen_with_config(&path).copilot_enabled());
+    }
+
+    #[tokio::test]
+    async fn copilot_enable_and_disable_survive_restart() {
+        let mut editor = editor("foo");
+        let directory = tempfile::tempdir().unwrap();
+        let path = use_temporary_config(&mut editor, directory.path(), "# keep me\n");
+        editor.config.copilot.enabled = false;
+        let (bridge, _requests, _controls, _events) = Bridge::test_channels();
+        editor.inline_completion.bridge = Some(bridge);
+
+        editor.handle_copilot_command("enable");
+        assert!(editor.copilot_enabled());
+        assert!(reopen_with_config(&path).copilot_enabled());
+        assert!(std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("# keep me"));
+
+        editor.handle_copilot_command("disable");
+        assert!(!editor.copilot_enabled());
+        assert!(editor.inline_completion.bridge.is_none());
+        assert!(!reopen_with_config(&path).copilot_enabled());
+    }
+
+    #[tokio::test]
+    async fn signin_persists_existing_session_enablement_and_signout_keeps_it() {
+        let mut editor = editor("foo");
+        let directory = tempfile::tempdir().unwrap();
+        let path = use_temporary_config(
+            &mut editor,
+            directory.path(),
+            "[copilot]\nenabled = false\n",
+        );
+        let (bridge, _requests, mut controls, _events) = Bridge::test_channels();
+        editor.inline_completion.bridge = Some(bridge);
+
+        editor.handle_copilot_command("signin");
+        assert!(matches!(controls.recv().await, Some(Control::SignIn)));
+        assert!(reopen_with_config(&path).copilot_enabled());
+        let contents = std::fs::read_to_string(&path).unwrap();
+
+        editor.handle_copilot_command("signout");
+        assert!(matches!(controls.recv().await, Some(Control::SignOut)));
+        assert!(editor.copilot_enabled());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), contents);
+    }
+
+    #[tokio::test]
+    async fn failed_copilot_saves_keep_session_choice_and_warn() {
+        let mut editor = editor("foo");
+        let directory = tempfile::tempdir().unwrap();
+        let contents = "[copilot\n";
+        let path = use_temporary_config(&mut editor, directory.path(), contents);
+        editor.config.copilot.enabled = false;
+        let (bridge, _requests, mut controls, _events) = Bridge::test_channels();
+        editor.inline_completion.bridge = Some(bridge);
+
+        editor.enable_and_sign_in_copilot();
+        assert!(editor.copilot_enabled());
+        assert!(matches!(controls.recv().await, Some(Control::SignIn)));
+        assert!(editor
+            .last_error
+            .as_deref()
+            .unwrap()
+            .starts_with("Copilot enabled for this session only; couldn't save configuration:"));
+        assert!(editor
+            .notifications
+            .records()
+            .any(|notice| notice.severity == Severity::Warning
+                && notice
+                    .content
+                    .summary
+                    .contains("couldn't save configuration")));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), contents);
+
+        editor.handle_copilot_command("disable");
+        assert!(!editor.copilot_enabled());
+        assert!(editor.inline_completion.bridge.is_none());
+        assert!(editor
+            .last_error
+            .as_deref()
+            .unwrap()
+            .starts_with("Copilot disabled for this session only; couldn't save configuration:"));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), contents);
+    }
+
+    #[test]
+    fn global_ai_disable_prevents_persisting_copilot_consent() {
+        let mut editor = editor("foo");
+        let directory = tempfile::tempdir().unwrap();
+        let contents = "disable_ai = true\n[copilot]\nenabled = false\n";
+        let path = use_temporary_config(&mut editor, directory.path(), contents);
+        editor.config.disable_ai = true;
+        editor.config.copilot.enabled = false;
+        for command in ["enable", "signin"] {
+            editor.handle_copilot_command(command);
+            assert!(!editor.copilot_enabled());
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), contents);
+        }
+        editor.enable_and_sign_in_copilot();
+        assert!(!editor.copilot_enabled());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), contents);
     }
 
     #[test]
