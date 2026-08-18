@@ -8508,13 +8508,28 @@ mod tests {
             .unwrap();
 
         let mut closed = false;
+        let mut idle = false;
+        let mut stopping = false;
         while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
-            closed |= matches!(
-                request,
-                PluginRequest::AgentCloseSession { session_id } if session_id == "session-1"
-            );
+            match request {
+                PluginRequest::AgentCloseSession { session_id } => {
+                    closed |= session_id == "session-1";
+                }
+                PluginRequest::SetTextPanelStatus { id, status: None } => {
+                    idle |= id == "agent-conversation";
+                }
+                PluginRequest::SetTextPanelStatus {
+                    id,
+                    status: Some(status),
+                } => {
+                    stopping |= id == "agent-conversation" && status.label == "Stopping…";
+                }
+                _ => {}
+            }
         }
         assert!(closed, "late cancellation must close the unusable session");
+        assert!(idle, "late cancellation must leave the completed turn idle");
+        assert!(!stopping, "late cancellation must not restart busy status");
 
         submit_agent_prompt(&mut runtime, "next prompt").await;
         let mut config_request = None;
@@ -8589,12 +8604,30 @@ mod tests {
             )
             .await
             .unwrap();
+        let mut reset_status = false;
+        let mut stopping_status = false;
         while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
-            assert!(
-                !matches!(request, PluginRequest::AgentCloseSession { .. }),
-                "cancellation must not close an active stream before completion"
-            );
+            match request {
+                PluginRequest::SetTextPanelStatus { id, status: None } => {
+                    reset_status |= id == "agent-conversation";
+                }
+                PluginRequest::SetTextPanelStatus {
+                    id,
+                    status: Some(status),
+                } => {
+                    if id == "agent-conversation" && status.label == "Stopping…" {
+                        assert!(reset_status, "stopping must restart the elapsed timer");
+                        stopping_status = status.busy;
+                    }
+                }
+                PluginRequest::AgentCloseSession { .. } => {
+                    panic!("cancellation must not close an active stream before completion")
+                }
+                _ => {}
+            }
         }
+        assert!(reset_status);
+        assert!(stopping_status);
         runtime
             .notify(
                 "agent:completed",

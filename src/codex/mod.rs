@@ -288,7 +288,7 @@ pub enum CodexEvent {
         /// App-server stop reason.
         stop_reason: String,
     },
-    /// Active turn was interrupted.
+    /// Active turn cancellation was requested.
     Cancelled {
         /// Owning session.
         session_id: String,
@@ -404,6 +404,7 @@ struct Session {
     model_info: Option<AgentModelInfo>,
     cwd: PathBuf,
     active_turn: Option<String>,
+    pending_interrupt_turn_id: Option<String>,
     cancelled: Arc<AtomicBool>,
     tool_calls: usize,
     kind: SessionKind,
@@ -483,7 +484,6 @@ enum Pending {
     },
     Interrupt {
         session_id: String,
-        notify_cancelled: bool,
     },
 }
 
@@ -1013,6 +1013,7 @@ async fn start_turn(
         return Ok(());
     }
     session.cancelled.store(false, Ordering::Relaxed);
+    session.pending_interrupt_turn_id = None;
     session.tool_calls = 0;
     if let SessionKind::Inline { result, .. } = &mut session.kind {
         *result = None;
@@ -1055,29 +1056,11 @@ async fn stop_session(
     let notify_cancelled = sessions
         .get(&session_id)
         .is_none_or(|session| matches!(session.kind, SessionKind::Agent));
-    let turn_id = sessions.get_mut(&session_id).and_then(|session| {
-        session.cancelled.store(true, Ordering::Relaxed);
-        session.active_turn.take()
-    });
-    if let Some(turn_id) = turn_id {
-        let id = rpc_id(next_id);
-        pending.insert(
-            id.clone(),
-            Pending::Interrupt {
-                session_id: session_id.clone(),
-                notify_cancelled,
-            },
-        );
-        write_message(
-            input,
-            &json!({
-                "id": id,
-                "method": "turn/interrupt",
-                "params": {"threadId": session_id, "turnId": turn_id}
-            }),
-        )
-        .await?;
-    } else if notify_cancelled {
+    let newly_cancelled = sessions
+        .get_mut(&session_id)
+        .is_none_or(|session| !session.cancelled.swap(true, Ordering::Relaxed));
+    interrupt_active_turn(&session_id, input, pending, sessions, next_id).await?;
+    if notify_cancelled && newly_cancelled {
         events
             .send(CodexEvent::Cancelled {
                 session_id: session_id.clone(),
@@ -1089,6 +1072,44 @@ async fn stop_session(
         sessions.remove(&session_id);
     }
     Ok(())
+}
+
+async fn interrupt_active_turn(
+    session_id: &str,
+    input: &mut (impl AsyncWrite + Unpin),
+    pending: &mut HashMap<String, Pending>,
+    sessions: &mut HashMap<String, Session>,
+    next_id: &mut u64,
+) -> Result<()> {
+    let turn_id = {
+        let Some(session) = sessions.get_mut(session_id) else {
+            return Ok(());
+        };
+        let Some(turn_id) = session.active_turn.clone() else {
+            return Ok(());
+        };
+        if session.pending_interrupt_turn_id.as_deref() == Some(turn_id.as_str()) {
+            return Ok(());
+        }
+        session.pending_interrupt_turn_id = Some(turn_id.clone());
+        turn_id
+    };
+    let id = rpc_id(next_id);
+    pending.insert(
+        id.clone(),
+        Pending::Interrupt {
+            session_id: session_id.to_string(),
+        },
+    );
+    write_message(
+        input,
+        &json!({
+            "id": id,
+            "method": "turn/interrupt",
+            "params": {"threadId": session_id, "turnId": turn_id}
+        }),
+    )
+    .await
 }
 
 async fn expire_commit_messages(
@@ -1268,6 +1289,7 @@ async fn handle_message<H: CodexToolHost>(
             if let Some(session) = sessions.get_mut(&session_id) {
                 if session.active_turn.as_deref() == Some(turn_id) {
                     session.active_turn = None;
+                    session.pending_interrupt_turn_id = None;
                     completed_event = Some(match &mut session.kind {
                         SessionKind::Agent => CodexEvent::Completed {
                             session_id: session_id.clone(),
@@ -1560,6 +1582,7 @@ async fn handle_response(
                         model_info: AgentModelInfo::from_response(&message["result"]),
                         cwd,
                         active_turn: None,
+                        pending_interrupt_turn_id: None,
                         cancelled: Arc::new(AtomicBool::new(false)),
                         tool_calls: 0,
                         kind,
@@ -1636,18 +1659,17 @@ async fn handle_response(
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_string();
-            if let Some(session) = sessions.get_mut(&session_id) {
+            let cancelled = if let Some(session) = sessions.get_mut(&session_id) {
                 session.active_turn = Some(turn_id);
+                session.cancelled.load(Ordering::Relaxed)
+            } else {
+                false
+            };
+            if cancelled {
+                interrupt_active_turn(&session_id, input, pending, sessions, next_id).await?;
             }
         }
-        Pending::Interrupt {
-            session_id,
-            notify_cancelled,
-        } => {
-            if notify_cancelled {
-                events.send(CodexEvent::Cancelled { session_id }).await.ok();
-            }
-        }
+        Pending::Interrupt { .. } => {}
     }
     Ok(())
 }
@@ -2451,6 +2473,7 @@ mod tests {
                 model_info: None,
                 cwd: PathBuf::from("/workspace"),
                 active_turn: Some("turn".into()),
+                pending_interrupt_turn_id: None,
                 cancelled: Arc::new(AtomicBool::new(false)),
                 tool_calls: 0,
                 kind: SessionKind::Agent,
@@ -2492,6 +2515,170 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn interrupt_keeps_active_turn_until_terminal_notification() {
+        let host = Arc::new(Mutex::new(InlineReadHost(Arc::new(StdMutex::new(
+            Vec::new(),
+        )))));
+        let mut sessions = HashMap::from([(
+            "agent".into(),
+            Session {
+                model_info: None,
+                cwd: PathBuf::from("/workspace"),
+                active_turn: Some("turn".into()),
+                pending_interrupt_turn_id: None,
+                cancelled: Arc::new(AtomicBool::new(false)),
+                tool_calls: 0,
+                kind: SessionKind::Agent,
+            },
+        )]);
+        let (events, mut received) = mpsc::channel(4);
+        let mut pending = HashMap::new();
+        let mut output = Vec::new();
+        let mut next_id = 0;
+
+        stop_session(
+            "agent".into(),
+            false,
+            &mut output,
+            &events,
+            &mut pending,
+            &mut sessions,
+            &mut next_id,
+        )
+        .await
+        .unwrap();
+
+        let request: Value = serde_json::from_slice(&output).unwrap();
+        assert_eq!(request["method"], "turn/interrupt");
+        assert_eq!(request["params"]["turnId"], "turn");
+        assert_eq!(sessions["agent"].active_turn.as_deref(), Some("turn"));
+        assert_eq!(
+            sessions["agent"].pending_interrupt_turn_id.as_deref(),
+            Some("turn")
+        );
+        assert!(sessions["agent"].cancelled.load(Ordering::Relaxed));
+        assert!(matches!(
+            received.try_recv(),
+            Ok(CodexEvent::Cancelled { session_id }) if session_id == "agent"
+        ));
+
+        let output_len = output.len();
+        stop_session(
+            "agent".into(),
+            false,
+            &mut output,
+            &events,
+            &mut pending,
+            &mut sessions,
+            &mut next_id,
+        )
+        .await
+        .unwrap();
+        assert_eq!(output.len(), output_len);
+        assert!(received.try_recv().is_err());
+
+        handle_response(
+            json!({"id": request["id"], "result": {}}),
+            &mut output,
+            &events,
+            &mut pending,
+            &mut sessions,
+            &mut next_id,
+        )
+        .await
+        .unwrap();
+        assert!(received.try_recv().is_err());
+
+        let (internal, _) = mpsc::channel(1);
+        handle_message(
+            json!({"method":"turn/completed","params":{"threadId":"agent",
+                "turn":{"id":"turn","status":"interrupted"}}}),
+            &mut output,
+            &events,
+            &mut pending,
+            &mut sessions,
+            &mut next_id,
+            host,
+            internal,
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            received.try_recv(),
+            Ok(CodexEvent::Completed { session_id, stop_reason })
+                if session_id == "agent" && stop_reason == "interrupted"
+        ));
+        assert_eq!(sessions["agent"].active_turn, None);
+        assert_eq!(sessions["agent"].pending_interrupt_turn_id, None);
+    }
+
+    #[tokio::test]
+    async fn cancellation_before_turn_start_response_interrupts_returned_turn() {
+        let mut sessions = HashMap::from([(
+            "agent".into(),
+            Session {
+                model_info: None,
+                cwd: PathBuf::from("/workspace"),
+                active_turn: None,
+                pending_interrupt_turn_id: None,
+                cancelled: Arc::new(AtomicBool::new(false)),
+                tool_calls: 0,
+                kind: SessionKind::Agent,
+            },
+        )]);
+        let (events, mut received) = mpsc::channel(2);
+        let mut pending = HashMap::from([(
+            "turn-start".to_string(),
+            Pending::Turn {
+                session_id: "agent".to_string(),
+            },
+        )]);
+        let mut output = Vec::new();
+        let mut next_id = 0;
+
+        stop_session(
+            "agent".into(),
+            false,
+            &mut output,
+            &events,
+            &mut pending,
+            &mut sessions,
+            &mut next_id,
+        )
+        .await
+        .unwrap();
+        assert!(output.is_empty());
+        assert!(matches!(
+            received.try_recv(),
+            Ok(CodexEvent::Cancelled { session_id }) if session_id == "agent"
+        ));
+
+        handle_response(
+            json!({"id":"turn-start","result":{"turn":{"id":"returned-turn"}}}),
+            &mut output,
+            &events,
+            &mut pending,
+            &mut sessions,
+            &mut next_id,
+        )
+        .await
+        .unwrap();
+
+        let request: Value = serde_json::from_slice(&output).unwrap();
+        assert_eq!(request["method"], "turn/interrupt");
+        assert_eq!(request["params"]["turnId"], "returned-turn");
+        assert_eq!(
+            sessions["agent"].active_turn.as_deref(),
+            Some("returned-turn")
+        );
+        assert_eq!(
+            sessions["agent"].pending_interrupt_turn_id.as_deref(),
+            Some("returned-turn")
+        );
+    }
+
+    #[tokio::test]
     async fn inline_context_worker_allows_reads_but_never_editor_writes_or_extra_results() {
         let calls = Arc::new(StdMutex::new(Vec::new()));
         let host = Arc::new(Mutex::new(InlineReadHost(Arc::clone(&calls))));
@@ -2501,6 +2688,7 @@ mod tests {
                 model_info: None,
                 cwd: PathBuf::from("/workspace"),
                 active_turn: Some("turn".into()),
+                pending_interrupt_turn_id: None,
                 cancelled: Arc::new(AtomicBool::new(false)),
                 tool_calls: 0,
                 kind: SessionKind::Inline {
@@ -2668,6 +2856,7 @@ mod tests {
                 model_info: None,
                 cwd: PathBuf::from("/workspace"),
                 active_turn: Some("turn".into()),
+                pending_interrupt_turn_id: None,
                 cancelled: Arc::new(AtomicBool::new(false)),
                 tool_calls: 0,
                 kind: SessionKind::Agent,
@@ -2836,6 +3025,7 @@ mod tests {
                 model_info: None,
                 cwd: PathBuf::from("/workspace"),
                 active_turn: None,
+                pending_interrupt_turn_id: None,
                 cancelled: Arc::new(AtomicBool::new(false)),
                 tool_calls: 0,
                 kind: SessionKind::CommitMessage {
