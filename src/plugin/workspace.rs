@@ -1434,6 +1434,14 @@ impl WorkspaceManager {
         }
     }
 
+    pub(crate) fn accepts_command_mode(&self) -> bool {
+        self.active.as_ref().is_some_and(|workspace| {
+            !workspace.filtering
+                && workspace.key_prefix.is_none()
+                && !workspace.action_menu.is_open()
+        })
+    }
+
     pub fn is_filtering(&self) -> bool {
         self.active
             .as_ref()

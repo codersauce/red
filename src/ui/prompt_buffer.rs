@@ -104,6 +104,11 @@ impl PromptBuffer {
         self.area.mode()
     }
 
+    /// Whether a local Vim count or command still owns the next key.
+    pub(crate) fn has_pending_input(&self) -> bool {
+        self.area.state().has_pending_input()
+    }
+
     /// Changes the local prompt mode without mutating the global editor.
     pub(crate) fn set_mode(&mut self, mode: Mode) {
         self.area.set_mode(mode);

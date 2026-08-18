@@ -348,6 +348,17 @@ of actions, define a nested chord, or invoke a plugin command:
 "Ctrl-j" = { PluginCommand = "BufferPicker" }
 ```
 
+Bindings to `EnterMode = "Command"` also work in panel navigation and modal
+workspaces. Normal-mode command bindings are inherited by visual modes; an
+explicit visual-mode binding takes precedence. Text input, searches, and
+unfinished Vim commands keep their characters. For example, this makes `;`
+an alternative to `:` without changing what it types in insert mode:
+
+```toml
+[keys.normal]
+";" = { EnterMode = "Command" }
+```
+
 The prefix guide can be configured independently:
 
 ```toml

@@ -17,6 +17,7 @@
 
 mod agent_manager;
 mod buffer_manager;
+mod command_mode;
 mod diagnostics;
 mod diagnostics_picker;
 mod display_layout;
@@ -11719,13 +11720,18 @@ impl Editor {
         )
     }
 
-    fn selection_motion_subset(action: &KeyAction) -> Option<KeyAction> {
+    fn action_is_visual_inherited(action: &Action) -> bool {
+        Self::action_is_selection_motion(action)
+            || matches!(action, Action::EnterMode(Mode::Command))
+    }
+
+    fn visual_inherited_subset(action: &KeyAction) -> Option<KeyAction> {
         match action {
-            KeyAction::Single(action) if Self::action_is_selection_motion(action) => {
+            KeyAction::Single(action) if Self::action_is_visual_inherited(action) => {
                 Some(KeyAction::Single(action.clone()))
             }
             KeyAction::Multiple(actions)
-                if !actions.is_empty() && actions.iter().all(Self::action_is_selection_motion) =>
+                if !actions.is_empty() && actions.iter().all(Self::action_is_visual_inherited) =>
             {
                 Some(KeyAction::Multiple(actions.clone()))
             }
@@ -11733,12 +11739,12 @@ impl Editor {
                 let mappings = mappings
                     .iter()
                     .filter_map(|(key, action)| {
-                        Self::selection_motion_subset(action).map(|action| (key.clone(), action))
+                        Self::visual_inherited_subset(action).map(|action| (key.clone(), action))
                     })
                     .collect::<HashMap<_, _>>();
                 (!mappings.is_empty()).then_some(KeyAction::Nested(mappings))
             }
-            KeyAction::Repeating(times, action) => Self::selection_motion_subset(action)
+            KeyAction::Repeating(times, action) => Self::visual_inherited_subset(action)
                 .map(|action| KeyAction::Repeating(*times, Box::new(action))),
             KeyAction::None | KeyAction::Single(_) | KeyAction::Multiple(_) => None,
         }
@@ -11760,18 +11766,22 @@ impl Editor {
     }
 
     fn visual_key_mappings(&self) -> HashMap<String, KeyAction> {
+        self.visual_key_mappings_for_mode(self.mode)
+    }
+
+    fn visual_key_mappings_for_mode(&self, mode: Mode) -> HashMap<String, KeyAction> {
         let mut mappings = self
             .config
             .keys
             .normal
             .iter()
             .filter_map(|(key, action)| {
-                Self::selection_motion_subset(action).map(|action| (key.clone(), action))
+                Self::visual_inherited_subset(action).map(|action| (key.clone(), action))
             })
             .collect::<HashMap<_, _>>();
 
         Self::merge_key_mappings(&mut mappings, &self.config.keys.visual);
-        match self.mode {
+        match mode {
             Mode::VisualLine => {
                 Self::merge_key_mappings(&mut mappings, &self.config.keys.visual_line)
             }
@@ -13289,12 +13299,17 @@ impl Editor {
             }
         }
 
-        if self.workspace_manager.is_active() {
-            return Ok(self.handle_workspace_event(ev));
-        }
-
         if self.is_command() {
             return Ok(self.handle_command_event(ev, runtime));
+        }
+
+        if self.workspace_manager.is_active() {
+            if self.workspace_manager.accepts_command_mode() {
+                if let Some(action) = self.command_mode_key_action(ev, Mode::Normal) {
+                    return Ok(Some(action));
+                }
+            }
+            return Ok(self.handle_workspace_event(ev));
         }
 
         if self.is_search() {
@@ -13308,6 +13323,9 @@ impl Editor {
         }
 
         if self.panel_manager.focused_panel_id().is_some() {
+            if let Some(action) = self.panel_command_mode_key_action(ev) {
+                return Ok(Some(action));
+            }
             if !self.panel_manager.focused_text_input_active() && self.handle_repeater(ev) {
                 return Ok(None);
             }
@@ -13711,7 +13729,7 @@ impl Editor {
                 | KeyModifiers::SUPER
                 | KeyModifiers::HYPER
                 | KeyModifiers::META,
-        ) && matches!(event.code, KeyCode::Char(c) if !matches!(c, ':' | ';'))
+        ) && matches!(event.code, KeyCode::Char(_))
     }
 
     fn handle_divider_mouse_event(&mut self, event: &MouseEvent) -> Option<KeyAction> {
@@ -13873,6 +13891,11 @@ impl Editor {
                 _ => None,
             })?;
 
+        // Direct command entries were resolved before the panel consumed input.
+        // Do not resurrect a normal-mode binding that a local mode overrode.
+        if Self::is_command_mode_entry(action) {
+            return None;
+        }
         self.key_action_for_panel(action, runtime)
     }
 
