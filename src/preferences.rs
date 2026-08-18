@@ -178,8 +178,17 @@ impl PreferencesStore {
     ///
     /// History is bounded and a filesystem-backed store saves immediately.
     pub fn record_command(&mut self, command: &str) -> anyhow::Result<()> {
+        if self.record_command_deferred(command) {
+            self.save()?;
+        }
+        Ok(())
+    }
+
+    /// Records a possible quit command without blocking terminal restoration.
+    /// The caller must flush preferences after the command is accepted or rejected.
+    pub(crate) fn record_command_deferred(&mut self, command: &str) -> bool {
         if command.trim().is_empty() {
-            return Ok(());
+            return false;
         }
 
         if self
@@ -188,7 +197,7 @@ impl PreferencesStore {
             .last()
             .is_some_and(|last| last == command)
         {
-            return Ok(());
+            return false;
         }
 
         self.preferences.command_history.push(command.to_string());
@@ -201,7 +210,7 @@ impl PreferencesStore {
             self.preferences.command_history.drain(0..overflow);
         }
 
-        self.save()
+        true
     }
 
     /// Appends a non-empty search pattern unless it duplicates the newest entry.
@@ -330,6 +339,19 @@ impl PreferencesStore {
         self.preferences
             .plugin_storage
             .insert(plugin_storage_key(plugin, key), value);
+        self.save()
+    }
+
+    /// Flushes deferred preferences and ordered exit-hook values in one write.
+    pub(crate) fn flush_plugin_storage(
+        &mut self,
+        updates: Vec<(String, String, serde_json::Value)>,
+    ) -> anyhow::Result<()> {
+        for (plugin, key, value) in updates {
+            self.preferences
+                .plugin_storage
+                .insert(plugin_storage_key(&plugin, &key), value);
+        }
         self.save()
     }
 
@@ -839,6 +861,43 @@ mod tests {
         assert_eq!(
             store.plugin_storage("other", "history"),
             Some(&serde_json::json!(["other"]))
+        );
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn plugin_storage_batch_preserves_order_and_unrelated_values() {
+        let dir = unique_temp_dir("plugin-storage-batch");
+        let path = dir.join("preferences.json");
+        let mut store = PreferencesStore::load(&path);
+        assert!(store.record_command_deferred("q"));
+        assert!(!store.record_command_deferred("q"));
+        assert!(!store.record_command_deferred("  "));
+        assert!(!path.exists());
+        store.flush_plugin_storage(Vec::new()).unwrap();
+        assert_eq!(PreferencesStore::load(&path).command_history(), ["q"]);
+        store
+            .set_plugin_storage("other", "keep", serde_json::json!(1))
+            .unwrap();
+        store
+            .flush_plugin_storage(vec![
+                ("test".into(), "key".into(), serde_json::json!(2)),
+                ("test".into(), "key".into(), serde_json::json!(3)),
+                ("test".into(), "second".into(), serde_json::json!(4)),
+            ])
+            .unwrap();
+        let reloaded = PreferencesStore::load(&path);
+        assert_eq!(
+            reloaded.plugin_storage("other", "keep"),
+            Some(&serde_json::json!(1))
+        );
+        assert_eq!(
+            reloaded.plugin_storage("test", "key"),
+            Some(&serde_json::json!(3))
+        );
+        assert_eq!(
+            reloaded.plugin_storage("test", "second"),
+            Some(&serde_json::json!(4))
         );
         fs::remove_dir_all(dir).ok();
     }
