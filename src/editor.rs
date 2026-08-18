@@ -25243,8 +25243,7 @@ impl Editor {
             self.scheduled_completion = None;
             return;
         };
-        if self.prefers_inline_completion()
-            || !self.config.completion.auto_trigger
+        if !self.config.completion.auto_trigger
             || prefix.chars().count() < self.config.completion.min_prefix_length
         {
             self.scheduled_completion = None;
@@ -25554,7 +25553,6 @@ impl Editor {
             return Ok(false);
         }
 
-        self.dismiss_inline_completion();
         self.scheduled_completion = None;
         let buffer_items = self.buffer_completion_items();
         let snapshot = self.completion_snapshot();

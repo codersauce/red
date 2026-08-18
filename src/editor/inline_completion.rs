@@ -117,6 +117,11 @@ impl Editor {
         {
             return Some(KeyAction::Single(Action::RequestInlineCompletion));
         }
+        // Opening ordinary completion must only hide a current AI suggestion,
+        // not cancel it before the popup has a chance to take priority.
+        if mapping == Some(KeyAction::Single(Action::RequestCompletion)) {
+            return None;
+        }
         self.visible_inline_suggestion()?;
         if matches!(
             mapping,
@@ -162,10 +167,6 @@ impl Editor {
                 .unwrap_or(self.config.copilot.enabled)
     }
 
-    pub(super) fn prefers_inline_completion(&self) -> bool {
-        self.copilot_enabled() && !self.inline_completion.failed && self.copilot_file_allowed()
-    }
-
     fn copilot_file_allowed(&self) -> bool {
         self.current_buffer()
             .uri()
@@ -203,13 +204,21 @@ impl Editor {
             && !self.panel_manager.has_focused_panel()
     }
 
+    /// An installed completion component may have no visible matches.
+    /// Only an interactive popup (or another dialog) takes priority over ghost text.
+    fn inline_completion_obscured(&self) -> bool {
+        self.current_dialog.as_ref().is_some_and(|dialog| {
+            !dialog.allows_event_passthrough() || dialog.has_shortcut_context()
+        })
+    }
+
     pub(super) fn visible_inline_suggestion(&self) -> Option<&Suggestion> {
         self.inline_completion
             .suggestion
             .as_ref()
             .filter(|suggestion| {
                 self.inline_editor_focused()
-                    && self.current_dialog.is_none()
+                    && !self.inline_completion_obscured()
                     && self.inline_snapshot_current(&suggestion.snapshot)
             })
     }
@@ -552,11 +561,11 @@ impl Editor {
             changed = true;
         }
         if let Some((deadline, snapshot)) = self.inline_completion.scheduled.clone() {
-            if Instant::now() >= deadline {
+            if !self.inline_snapshot_current(&snapshot) {
                 self.inline_completion.scheduled = None;
-                if self.inline_snapshot_current(&snapshot) {
-                    self.request_inline_completion(true);
-                }
+            } else if Instant::now() >= deadline && !self.inline_completion_obscured() {
+                self.inline_completion.scheduled = None;
+                self.request_inline_completion(true);
             }
         }
         for _ in 0..32 {
@@ -681,12 +690,20 @@ impl Editor {
         &mut self,
         runtime: &mut Runtime,
     ) -> anyhow::Result<()> {
+        if !self.inline_editor_focused() || self.inline_completion_obscured() {
+            return Ok(());
+        }
         let Some(suggestion) = self.inline_completion.suggestion.take() else {
             return Ok(());
         };
         if !self.inline_snapshot_current(&suggestion.snapshot) {
             self.dismiss_inline_completion();
             return Ok(());
+        }
+        // A filtered-out completion popup must not survive the accepted edit.
+        if self.current_dialog.is_some() {
+            self.current_dialog = None;
+            self.completion_snapshot = None;
         }
         let resume_insert = self.transaction_active();
         if resume_insert {
@@ -797,6 +814,15 @@ mod tests {
 
     fn reopen_with_config(path: &Path) -> Editor {
         editor_with_config("foo", Config::load_user_file(path, &[]).unwrap().config)
+    }
+
+    fn show_popup(editor: &mut Editor, label: &str) {
+        let item = serde_json::from_value(json!({"label": label})).unwrap();
+        assert!(editor.show_completion_items(vec![item], editor.completion_snapshot()));
+    }
+
+    fn expire_inline_schedule(editor: &mut Editor) {
+        editor.inline_completion.scheduled.as_mut().unwrap().0 = Instant::now();
     }
 
     async fn show(editor: &mut Editor, text: &str, cursor: usize) {
@@ -1426,6 +1452,7 @@ mod tests {
                 superseded: false,
             },
         );
+        show_popup(&mut editor, "foobar");
         editor.request_inline_completion(false);
         let response = InboundMessage::Message(ResponseMessage {
             id: 41,
@@ -1442,12 +1469,14 @@ mod tests {
             .await
             .unwrap();
         assert!(editor.current_dialog.is_some());
-        assert!(editor.inline_completion.requested.is_none());
+        assert!(editor.inline_completion.requested.is_some());
     }
 
     #[tokio::test]
-    async fn ordinary_completion_remains_explicitly_available() {
+    async fn ordinary_completion_remains_automatically_available() {
         let mut editor = editor("foo foobar");
+        let (bridge, requests, _controls, _events) = Bridge::test_channels();
+        editor.inline_completion.bridge = Some(bridge);
         editor.inline_completion.failed = false;
         editor
             .test_execute_action(Action::EnterMode(Mode::Insert))
@@ -1457,12 +1486,212 @@ mod tests {
             .test_execute_action(Action::SetCursor(3, 0))
             .await
             .unwrap();
+        editor.schedule_inline_completion();
+        editor.inline_completion.scheduled.as_mut().unwrap().0 =
+            Instant::now() + Duration::from_secs(60);
         editor.schedule_automatic_completion();
-        assert!(editor.scheduled_completion.is_none());
+        assert!(editor.scheduled_completion.is_some());
+        editor.scheduled_completion.as_mut().unwrap().deadline = Instant::now();
+        let mut output = RenderBuffer::new(60, 16, &editor.theme.style);
+        let mut runtime = Runtime::new();
+        editor
+            .service_background(&mut output, &mut runtime)
+            .await
+            .unwrap();
+        assert!(editor.current_dialog.is_some());
+        assert!(requests.borrow().is_none());
+        assert!(editor.inline_completion.scheduled.is_some());
+    }
+
+    #[tokio::test]
+    async fn completion_popup_hides_ghost_text_and_owns_acceptance() {
+        let mut editor = editor("foo foobar");
+        show(&mut editor, "_ai", 3).await;
+        let request = editor
+            .handle_event(&Event::Key(KeyEvent::new(
+                KeyCode::Char(' '),
+                KeyModifiers::CONTROL,
+            )))
+            .unwrap();
+        assert_eq!(request, Some(KeyAction::Single(Action::RequestCompletion)));
+        assert!(editor.inline_completion.suggestion.is_some());
         editor
             .test_execute_action(Action::RequestCompletion)
             .await
             .unwrap();
-        assert!(editor.current_dialog.is_some());
+        assert!(editor.visible_inline_suggestion().is_none());
+        assert!(editor.inline_completion.suggestion.is_some());
+
+        let tab = Event::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        let action = editor.handle_event(&tab).unwrap().unwrap();
+        assert!(matches!(action, KeyAction::Multiple(ref actions)
+            if matches!(actions.first(), Some(Action::ApplyCompletion { item, .. }) if item.label == "foobar")));
+        editor
+            .test_execute_action(Action::AcceptInlineCompletion)
+            .await
+            .unwrap();
+        assert_eq!(editor.current_buffer().contents(), "foo foobar");
+        assert!(editor.inline_completion.suggestion.is_some());
+
+        let close = editor
+            .handle_event(&Event::Key(KeyEvent::new(
+                KeyCode::Char('e'),
+                KeyModifiers::CONTROL,
+            )))
+            .unwrap();
+        assert_eq!(close, Some(KeyAction::Single(Action::CloseDialog)));
+        editor
+            .test_execute_action(Action::CloseDialog)
+            .await
+            .unwrap();
+        assert_eq!(editor.visible_inline_suggestion().unwrap().insertion, "_ai");
+        assert_eq!(
+            editor.handle_event(&tab).unwrap(),
+            Some(KeyAction::Single(Action::AcceptInlineCompletion))
+        );
+        editor
+            .test_execute_action(Action::AcceptInlineCompletion)
+            .await
+            .unwrap();
+        assert_eq!(editor.current_buffer().contents(), "foo_ai foobar");
+    }
+
+    #[tokio::test]
+    async fn completion_popup_defers_copilot_until_it_closes() {
+        let mut editor = editor("foo foobar");
+        let (bridge, requests, _controls, _events) = Bridge::test_channels();
+        editor.inline_completion.bridge = Some(bridge);
+        editor.inline_completion.failed = false;
+        editor
+            .test_execute_action(Action::EnterMode(Mode::Insert))
+            .await
+            .unwrap();
+        editor
+            .test_execute_action(Action::SetCursor(3, 0))
+            .await
+            .unwrap();
+        editor.schedule_inline_completion();
+        expire_inline_schedule(&mut editor);
+        assert!(editor.request_completion(None).await.unwrap());
+
+        editor.service_inline_completion();
+        assert!(requests.borrow().is_none());
+        assert!(editor.inline_completion.scheduled.is_some());
+        let key = Event::Key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE));
+        assert_eq!(
+            editor.handle_event(&key).unwrap(),
+            Some(KeyAction::Single(Action::InsertCharAtCursorPos('b')))
+        );
+        editor
+            .test_execute_action(Action::InsertCharAtCursorPos('b'))
+            .await
+            .unwrap();
+        expire_inline_schedule(&mut editor);
+        editor.service_inline_completion();
+        assert!(requests.borrow().is_none());
+
+        editor
+            .test_execute_action(Action::CloseDialog)
+            .await
+            .unwrap();
+        editor.service_inline_completion();
+        let request = requests.borrow().clone().unwrap();
+        assert!(request.automatic);
+        assert_eq!(request.contents, "foob foobar");
+        assert_eq!(request.snapshot, editor.inline_snapshot().unwrap());
+        assert!(editor.inline_completion.scheduled.is_none());
+    }
+
+    #[tokio::test]
+    async fn inflight_copilot_result_waits_for_completion_popup() {
+        let mut editor = editor("foo foobar");
+        let (bridge, requests, mut controls, events) = Bridge::test_channels();
+        editor.inline_completion.bridge = Some(bridge);
+        editor.inline_completion.failed = false;
+        editor
+            .test_execute_action(Action::EnterMode(Mode::Insert))
+            .await
+            .unwrap();
+        editor
+            .test_execute_action(Action::SetCursor(3, 0))
+            .await
+            .unwrap();
+        editor.request_inline_completion(false);
+        let snapshot = requests.borrow().as_ref().unwrap().snapshot.clone();
+        assert!(editor.request_completion(None).await.unwrap());
+        assert_eq!(editor.inline_completion.requested.as_ref(), Some(&snapshot));
+
+        events
+            .send(CopilotEvent::Completion {
+                snapshot,
+                items: vec![item("foo_ai", 0, 3)],
+            })
+            .await
+            .unwrap();
+        editor.service_inline_completion();
+        assert!(editor.inline_completion.suggestion.is_some());
+        assert!(editor.visible_inline_suggestion().is_none());
+        assert!(controls.try_recv().is_err());
+
+        editor
+            .test_execute_action(Action::CloseDialog)
+            .await
+            .unwrap();
+        editor.service_inline_completion();
+        assert_eq!(editor.visible_inline_suggestion().unwrap().insertion, "_ai");
+        assert!(matches!(controls.try_recv(), Ok(Control::Shown(_))));
+    }
+
+    #[tokio::test]
+    async fn empty_completion_popup_does_not_block_copilot() {
+        let mut editor = editor("foo");
+        let (bridge, requests, _controls, _events) = Bridge::test_channels();
+        editor.inline_completion.bridge = Some(bridge);
+        editor.inline_completion.failed = false;
+        show(&mut editor, "_ai", 3).await;
+        show_popup(&mut editor, "unrelated");
+        assert!(editor
+            .current_dialog
+            .as_ref()
+            .unwrap()
+            .is_empty_completion());
+        assert!(editor.visible_inline_suggestion().is_some());
+
+        editor.schedule_inline_completion();
+        expire_inline_schedule(&mut editor);
+        editor.service_inline_completion();
+        assert!(requests.borrow().is_some());
+        show(&mut editor, "_ai", 3).await;
+        editor
+            .test_execute_action(Action::AcceptInlineCompletion)
+            .await
+            .unwrap();
+        assert_eq!(editor.current_buffer().contents(), "foo_ai");
+        assert!(editor.current_dialog.is_none());
+        assert!(editor.completion_snapshot.is_none());
+    }
+
+    #[tokio::test]
+    async fn empty_ordinary_completion_does_not_cancel_copilot() {
+        let mut editor = editor("foo");
+        let (bridge, requests, _controls, _events) = Bridge::test_channels();
+        editor.inline_completion.bridge = Some(bridge);
+        editor.inline_completion.failed = false;
+        editor.config.completion.buffer_words = false;
+        editor
+            .test_execute_action(Action::EnterMode(Mode::Insert))
+            .await
+            .unwrap();
+        editor
+            .test_execute_action(Action::SetCursor(3, 0))
+            .await
+            .unwrap();
+        editor.schedule_inline_completion();
+        expire_inline_schedule(&mut editor);
+        assert!(!editor.request_completion(None).await.unwrap());
+        assert!(editor.inline_completion.scheduled.is_some());
+        editor.service_inline_completion();
+        assert!(requests.borrow().is_some());
+        assert!(editor.current_dialog.is_none());
     }
 }

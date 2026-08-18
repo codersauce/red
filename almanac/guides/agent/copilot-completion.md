@@ -98,11 +98,13 @@ cursor, or changing buffers invalidates stale suggestions. `Alt-\` requests a
 suggestion explicitly; `:Copilot complete` enters Insert mode and requests one
 at the current cursor [@editor].
 
-With Copilot enabled, idle identifier typing prefers ghost text over the
-automatic word-completion popup. `Ctrl-Space` still opens ordinary completion,
-and language-server trigger characters still work. An open completion popup
-takes priority over AI suggestions; `Alt-\` switches from that popup to an
-explicit AI request [@editor].
+Copilot and ordinary autocomplete remain enabled together. A visible completion
+popup takes priority and hides ghost text; `Tab` and `Enter` keep accepting the
+selected popup item. When the popup closes or has no matching items, a current
+Copilot suggestion can reappear and deferred suggestions can run. `Ctrl-Space`
+opens ordinary completion, while `Alt-\` switches from that popup to an
+explicit AI request. `Ctrl-e` closes the completion popup without leaving Insert
+mode [@editor].
 
 This first integration supports single-line and multiline insertions at the
 cursor. Suggestions that would rewrite existing code are not accepted. Copilot
