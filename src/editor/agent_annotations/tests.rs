@@ -216,6 +216,33 @@ async fn agent_annotation_guards_revisions_ranges_messages_and_duplicate_dismiss
 }
 
 #[tokio::test]
+async fn excluded_agent_context_redacts_annotation_messages() {
+    let root = tempfile::tempdir().unwrap();
+    let mut editor = fixture(root.path());
+    let revision = editor.current_buffer().revision();
+    editor
+        .test_run_agent_editor_tool(request(EditorToolCall::AddAnnotations {
+            path: "main.rs".into(),
+            expected_revision: revision,
+            annotations: annotations(&[(1, None, "private annotation text")]),
+        }))
+        .await
+        .unwrap();
+
+    let sensitive = root.path().join(".env");
+    editor
+        .current_buffer_mut()
+        .save_as(&sensitive.to_string_lossy())
+        .unwrap();
+    let state = editor.agent_editor_state();
+
+    assert_eq!(state["context"]["included"], false);
+    assert_eq!(state["annotations"]["visible_count"], 0);
+    assert_eq!(state["annotations"]["current"], Value::Null);
+    assert!(!state.to_string().contains("private annotation text"));
+}
+
+#[tokio::test]
 async fn overlapping_agent_annotations_cycle_with_the_shared_annotation_controls() {
     let root = tempfile::tempdir().unwrap();
     let mut editor = fixture(root.path());
@@ -292,6 +319,67 @@ async fn agent_annotations_recover_with_stable_ids_and_moved_anchors() {
     assert_eq!(comment.lines(restored.current_buffer()), (2, 2));
     assert!(!comment.stale);
     assert_eq!(comment.message, "Track one");
+}
+
+#[tokio::test]
+async fn agent_annotations_follow_save_as_for_dismissal_and_recovery() {
+    let root = tempfile::tempdir().unwrap();
+    let mut editor = fixture(root.path());
+    let revision = editor.current_buffer().revision();
+    let added = editor
+        .test_run_agent_editor_tool(request(EditorToolCall::AddAnnotations {
+            path: "main.rs".into(),
+            expected_revision: revision,
+            annotations: annotations(&[(0, None, "Dismiss me"), (2, None, "Recover me")]),
+        }))
+        .await
+        .unwrap();
+    let dismissed_id = added["annotations"][0]["id"].as_str().unwrap().to_string();
+    let recovered_id = added["annotations"][1]["id"].as_str().unwrap().to_string();
+    let renamed = root.path().join("renamed.rs");
+
+    editor
+        .current_buffer_mut()
+        .save_as(&renamed.to_string_lossy())
+        .unwrap();
+    let snapshot = editor.test_session_snapshot();
+    assert!(snapshot
+        .agent_conversation
+        .as_ref()
+        .unwrap()
+        .annotations
+        .iter()
+        .all(|annotation| annotation.path == renamed.to_string_lossy()));
+
+    editor
+        .test_run_agent_editor_tool(request(EditorToolCall::DismissAnnotations {
+            annotation_ids: vec![dismissed_id],
+        }))
+        .await
+        .unwrap();
+    let snapshot = editor.test_session_snapshot();
+    assert_eq!(
+        snapshot.agent_conversation.as_ref().unwrap().annotations[0].id,
+        recovered_id
+    );
+
+    let config = Config::default();
+    let buffers = Editor::buffers_from_session_snapshot(&snapshot);
+    let mut restored = Editor::with_size(
+        Box::new(LspManager::new(config.lsp.clone())),
+        100,
+        30,
+        config,
+        Theme::default(),
+        buffers,
+    )
+    .unwrap();
+    restored.test_disable_terminal_output();
+    restored.restore_session_snapshot(&snapshot).unwrap();
+    assert!(restored
+        .inline_comments
+        .iter()
+        .any(|comment| comment.id.to_string() == recovered_id));
 }
 
 #[tokio::test]

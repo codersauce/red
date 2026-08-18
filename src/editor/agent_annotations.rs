@@ -241,26 +241,30 @@ impl Editor {
                 Ok(parsed)
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
-        let targets =
-            ids.iter()
-                .map(|id| {
-                    let comment = self
-                        .inline_comments
-                        .iter()
-                        .find(|comment| comment.id == *id && self.inline_comment_visible(comment))
-                        .ok_or_else(|| anyhow::anyhow!("annotation is not visible: {id}"))?;
-                    anyhow::ensure!(
-                        !matches!(comment.origin, InlineCommentOrigin::Activity { .. }),
-                        "running activity annotations cannot be dismissed"
-                    );
-                    let path =
-                        comment.anchor.file.as_deref().ok_or_else(|| {
-                            anyhow::anyhow!("annotation has no workspace file: {id}")
-                        })?;
-                    let path = super::resolve_agent_tool_path(root, path)?;
-                    Ok((*id, path))
-                })
-                .collect::<anyhow::Result<Vec<_>>>()?;
+        let targets = ids
+            .iter()
+            .map(|id| {
+                let comment = self
+                    .inline_comments
+                    .iter()
+                    .find(|comment| comment.id == *id && self.inline_comment_visible(comment))
+                    .ok_or_else(|| anyhow::anyhow!("annotation is not visible: {id}"))?;
+                anyhow::ensure!(
+                    !matches!(comment.origin, InlineCommentOrigin::Activity { .. }),
+                    "running activity annotations cannot be dismissed"
+                );
+                let path = self
+                    .buffer_manager
+                    .iter()
+                    .find(|buffer| buffer.id() == comment.anchor.buffer_id)
+                    .and_then(|buffer| buffer.file.as_deref())
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("annotation buffer has no workspace file: {id}")
+                    })?;
+                let path = super::resolve_agent_tool_path(root, path)?;
+                Ok((*id, path))
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
 
         for (_, path) in &targets {
             anyhow::ensure!(
@@ -304,7 +308,7 @@ impl Editor {
                     .buffer_manager
                     .iter()
                     .find(|buffer| buffer.id() == comment.anchor.buffer_id)?;
-                let path = comment.anchor.file.clone()?;
+                let path = buffer.file.clone()?;
                 let (start_line, end_line) = comment.lines(buffer);
                 Some(AgentAnnotationRecord {
                     id: comment.id.to_string(),

@@ -8360,7 +8360,11 @@ impl Editor {
             "selection": selection,
             "context": context,
             "windows": windows,
-            "annotations": self.agent_annotation_state(),
+            "annotations": if included {
+                self.agent_annotation_state()
+            } else {
+                json!({"visible_count": 0, "current": null})
+            },
         })
     }
 
