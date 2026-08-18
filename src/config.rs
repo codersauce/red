@@ -1743,6 +1743,40 @@ impl Config {
         Ok(())
     }
 
+    /// Saves Copilot consent without replacing unrelated settings or a config symlink.
+    pub(crate) fn persist_copilot_enabled(path: &Path, enabled: bool) -> anyhow::Result<()> {
+        use std::io::Write;
+
+        let target = match fs::symlink_metadata(path) {
+            Ok(_) => fs::canonicalize(path)?,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => path.to_path_buf(),
+            Err(error) => return Err(error.into()),
+        };
+        let contents = match fs::read_to_string(&target) {
+            Ok(contents) => contents,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => String::new(),
+            Err(error) => return Err(error.into()),
+        };
+        let updated = update_copilot_config_contents(&contents, enabled)?;
+        if updated == contents {
+            return Ok(());
+        }
+        let parent = target
+            .parent()
+            .filter(|path| !path.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        fs::create_dir_all(parent)?;
+        let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
+        if let Ok(metadata) = fs::metadata(&target) {
+            temporary
+                .as_file()
+                .set_permissions(metadata.permissions())?;
+        }
+        temporary.write_all(updated.as_bytes())?;
+        temporary.persist(&target)?;
+        Ok(())
+    }
+
     /// Resolves a plugin path or bundled-plugin specifier for runtime loading.
     pub fn resolve_plugin_path(configured_path: &str) -> String {
         let configured = PathBuf::from(configured_path);
@@ -2696,6 +2730,32 @@ fn update_statusline_config_contents(
     Ok(document.to_string())
 }
 
+fn update_copilot_config_contents(contents: &str, enabled: bool) -> anyhow::Result<String> {
+    use anyhow::Context;
+    use toml_edit::{DocumentMut, Item, Table, Value};
+
+    let mut document = contents
+        .parse::<DocumentMut>()
+        .context("could not update config.toml")?;
+    if !document.contains_key("copilot") {
+        document["copilot"] = Item::Table(Table::new());
+    }
+    let table = document["copilot"]
+        .as_table_like_mut()
+        .context("could not update config.toml: copilot is not a table")?;
+    if let Some(item) = table.get_mut("enabled") {
+        let value = item
+            .as_value_mut()
+            .context("could not update config.toml: copilot.enabled is not a value")?;
+        let mut replacement = Value::from(enabled);
+        *replacement.decor_mut() = value.decor().clone();
+        *value = replacement;
+    } else {
+        table.insert("enabled", toml_edit::value(enabled));
+    }
+    Ok(document.to_string())
+}
+
 fn is_theme_assignment(line: &str) -> bool {
     let line = line.trim_start();
     if line.starts_with('#') {
@@ -3176,6 +3236,103 @@ color = false
                 .unwrap_err();
 
         assert!(error.to_string().contains("could not update config.toml"));
+    }
+
+    #[test]
+    fn update_copilot_config_preserves_other_settings_and_comments() {
+        let contents = "# user settings\ntheme = 'mocha.json'\n\n[copilot] # provider\n# consent\nenabled = false # remembered\ncommand = 'custom-copilot'\nargs = ['--stdio']\n\n[keys.normal]\n'x' = 'DeleteChar'\n";
+        let updated = update_copilot_config_contents(contents, true).unwrap();
+        assert_eq!(
+            updated,
+            contents.replacen("enabled = false", "enabled = true", 1)
+        );
+        assert_eq!(
+            update_copilot_config_contents(&updated, false).unwrap(),
+            contents
+        );
+    }
+
+    #[test]
+    fn update_copilot_config_supports_missing_inline_and_dotted_tables() {
+        for contents in [
+            "",
+            "theme = 'mocha.json'\n",
+            "[copilot]\ncommand = 'custom-copilot'\n",
+            "copilot = { enabled = false, command = 'custom-copilot' }\n",
+            "copilot.enabled = false\ncopilot.command = 'custom-copilot'\n",
+        ] {
+            let updated = update_copilot_config_contents(contents, true).unwrap();
+            let config = Config::from_user_toml_with_overrides(&updated, &[]).unwrap();
+            assert!(config.copilot.enabled, "{updated}");
+            if contents.contains("custom-copilot") {
+                assert_eq!(config.copilot.command, "custom-copilot");
+            }
+            assert_eq!(
+                update_copilot_config_contents(&updated, true).unwrap(),
+                updated
+            );
+        }
+    }
+
+    #[test]
+    fn persist_copilot_config_creates_and_reloads_user_setting() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("red/config.toml");
+        for enabled in [true, false] {
+            Config::persist_copilot_enabled(&path, enabled).unwrap();
+            assert_eq!(
+                Config::load_user_file(&path, &[])
+                    .unwrap()
+                    .config
+                    .copilot
+                    .enabled,
+                enabled
+            );
+        }
+    }
+
+    #[test]
+    fn persist_copilot_config_leaves_invalid_files_untouched() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        for contents in [
+            "[copilot\n",
+            "copilot = 42\n",
+            "[copilot.enabled]\nvalue = true\n",
+        ] {
+            fs::write(&path, contents).unwrap();
+            assert!(Config::persist_copilot_enabled(&path, true).is_err());
+            assert_eq!(fs::read_to_string(&path).unwrap(), contents);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn persist_copilot_config_preserves_symlinks_and_permissions() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("dotfiles.toml");
+        let path = directory.path().join("config.toml");
+        fs::write(&target, "[copilot]\nenabled = false\n").unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o640)).unwrap();
+        symlink(&target, &path).unwrap();
+        Config::persist_copilot_enabled(&path, true).unwrap();
+        assert!(fs::symlink_metadata(&path)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert!(
+            Config::load_user_file(&target, &[])
+                .unwrap()
+                .config
+                .copilot
+                .enabled
+        );
+        assert_eq!(
+            fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
     }
 
     #[test]

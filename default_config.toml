@@ -105,6 +105,7 @@ show_documentation = true
 [copilot]
 # Opt in before any source code is sent to GitHub Copilot. Install the official
 # @github/copilot-language-server separately, then use :Copilot signin.
+# :Copilot enable, disable, and confirmed sign-in save this setting.
 enabled = false
 command = "copilot-language-server"
 args = ["--stdio"]
