@@ -410,7 +410,7 @@ Esc = { EnterMode = "Normal" }
 "X" = "ClearInlineComments"
 "v" = "ShowInlineComment"
 "x" = "DismissInlineComment"
-" " = "NextBuffer"
+" " = "AlternateBuffer"
 "a" = [ "MoveToTop", { EnterMode = "VisualLine" }, "MoveToBottom" ]
 "A" = { PluginCommand = "Agent" }
 "i" = "InlineAssist"

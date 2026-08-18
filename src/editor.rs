@@ -2484,6 +2484,8 @@ pub enum Action {
 
     NextBuffer,
     PreviousBuffer,
+    /// Switches to the most recently used other buffer.
+    AlternateBuffer,
     DeleteBuffer(bool),
     FilePicker,
     CommandPalette,
@@ -19749,6 +19751,11 @@ impl Editor {
                 };
                 self.set_current_buffer(buffer, new_index).await?;
             }
+            Action::AlternateBuffer => {
+                if let Some(index) = self.buffer_manager.alternate_index() {
+                    self.set_current_buffer(buffer, index).await?;
+                }
+            }
             Action::OpenBuffer(name) => {
                 if let Some(index) = self.buffer_manager.iter().position(|b| b.name() == *name) {
                     self.set_current_buffer(buffer, index).await?;
@@ -21104,6 +21111,7 @@ impl Editor {
                 | Action::SplitVerticalWithFile(_)
                 | Action::NextBuffer
                 | Action::PreviousBuffer
+                | Action::AlternateBuffer
         )
     }
 
@@ -22148,8 +22156,8 @@ impl Editor {
         self.lsp_coordinator.forget_buffer(removed_id);
 
         if self.buffer_manager.len() == 1 {
-            self.buffer_manager[0] = Buffer::new(None, String::new());
-            self.buffer_manager.set_active_index(0);
+            self.buffer_manager
+                .replace_buffers(vec![Buffer::new(None, String::new())]);
             self.cx = 0;
             self.cy = 0;
             self.vtop = 0;
@@ -26035,7 +26043,7 @@ impl Editor {
         let previous = self.buffer_manager.active_index();
         self.buffer_manager[previous].pos = (self.cx, self.cy);
         self.buffer_manager[previous].vtop = self.vtop;
-        self.buffer_manager.set_active_index(index);
+        self.buffer_manager.set_active_index_without_history(index);
         (self.cx, self.cy) = self.buffer_manager[index].pos;
         self.vtop = self.buffer_manager[index].vtop;
         self.vleft = 0;
@@ -28205,6 +28213,119 @@ mod test {
         editor.set_default_register(Content::charwise("o\nt\nt\nf\n".to_string()));
 
         assert_eq!(copied.lock().unwrap().as_deref(), Some("o\nt\nt\nf\n"));
+    }
+
+    #[tokio::test]
+    async fn space_space_toggles_recent_buffers_without_changing_sequential_navigation() {
+        let mut editor = test_editor(80, 24);
+        editor.config.keys = toml::from_str::<Config>(include_str!("../default_config.toml"))
+            .unwrap()
+            .keys;
+        editor.buffer_manager.push_buffer(Buffer::new(
+            Some("second".to_string()),
+            "second".to_string(),
+        ));
+        editor
+            .buffer_manager
+            .push_buffer(Buffer::new(Some("third".to_string()), "third".to_string()));
+        let mut buffer = RenderBuffer::new(80, 24, &Style::default());
+        let mut runtime = Runtime::new();
+
+        for (chord, expected) in [
+            ("  ", 0), // No previous visit yet.
+            (" n", 1),
+            (" n", 2),
+            ("  ", 1),
+            ("  ", 2),
+            ("  ", 1),
+            (" p", 0),
+            ("  ", 1),
+            ("  ", 0),
+        ] {
+            for key in chord.chars() {
+                editor
+                    .process_editor_event(
+                        Event::Key(KeyEvent::new(KeyCode::Char(key), KeyModifiers::NONE)),
+                        &mut buffer,
+                        &mut runtime,
+                        EventRenderMode::Immediate,
+                    )
+                    .await
+                    .unwrap();
+            }
+            assert_eq!(
+                editor.buffer_manager.active_index(),
+                expected,
+                "chord {chord:?}"
+            );
+        }
+
+        editor
+            .execute(
+                &Action::OpenBuffer("third".to_string()),
+                &mut buffer,
+                &mut runtime,
+            )
+            .await
+            .unwrap();
+        editor
+            .execute(&Action::AlternateBuffer, &mut buffer, &mut runtime)
+            .await
+            .unwrap();
+        assert_eq!(editor.buffer_manager.active_index(), 0);
+
+        editor.select_buffer_for_lsp_edit(1);
+        editor.select_buffer_for_lsp_edit(0);
+        editor
+            .execute(&Action::AlternateBuffer, &mut buffer, &mut runtime)
+            .await
+            .unwrap();
+        assert_eq!(editor.buffer_manager.active_index(), 2);
+
+        editor
+            .execute(&Action::DeleteBuffer(false), &mut buffer, &mut runtime)
+            .await
+            .unwrap();
+        assert_eq!(editor.buffer_manager.active_index(), 1);
+        editor
+            .execute(&Action::AlternateBuffer, &mut buffer, &mut runtime)
+            .await
+            .unwrap();
+        assert_eq!(editor.buffer_manager.active_index(), 0);
+    }
+
+    #[tokio::test]
+    async fn alternate_buffer_tracks_window_focus() {
+        let mut editor = test_editor(80, 24);
+        editor.buffer_manager.push_buffer(Buffer::new(
+            Some("second".to_string()),
+            "second".to_string(),
+        ));
+        editor
+            .buffer_manager
+            .push_buffer(Buffer::new(Some("third".to_string()), "third".to_string()));
+        let mut buffer = RenderBuffer::new(80, 24, &Style::default());
+        let mut runtime = Runtime::new();
+        let first_window = editor.window_manager.active_window_id();
+        editor
+            .execute(&Action::SplitVertical, &mut buffer, &mut runtime)
+            .await
+            .unwrap();
+        editor.set_current_buffer(&mut buffer, 1).await.unwrap();
+        editor.set_current_buffer(&mut buffer, 2).await.unwrap();
+
+        assert!(editor.set_active_window(first_window));
+        assert_eq!(editor.buffer_manager.active_index(), 0);
+        editor
+            .execute(&Action::AlternateBuffer, &mut buffer, &mut runtime)
+            .await
+            .unwrap();
+        assert_eq!(editor.buffer_manager.active_index(), 2);
+        editor
+            .execute(&Action::AlternateBuffer, &mut buffer, &mut runtime)
+            .await
+            .unwrap();
+        assert_eq!(editor.buffer_manager.active_index(), 0);
     }
 
     #[tokio::test]
