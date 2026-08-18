@@ -2484,6 +2484,12 @@ struct RowClick {
     at: Instant,
 }
 
+struct TextLinkClick {
+    panel_id: String,
+    link_id: u64,
+    at: Instant,
+}
+
 #[derive(Default)]
 pub struct PanelManager {
     presentation: PanelPresentation,
@@ -2497,6 +2503,7 @@ pub struct PanelManager {
     pending_restore: HashMap<String, PendingPanelRestore>,
     pending_focused: Option<String>,
     last_row_click: Option<RowClick>,
+    last_text_link_click: Option<TextLinkClick>,
 }
 
 impl PanelManager {
@@ -3696,6 +3703,38 @@ impl PanelManager {
         terminal_height: usize,
     ) -> Option<TextPanelLinkTarget> {
         self.text_link_at_position_impl(x, y, terminal_width, terminal_height, false)
+            .map(|(_, link)| link.target)
+    }
+
+    pub(crate) fn double_clicked_text_link_at_position(
+        &mut self,
+        x: usize,
+        y: usize,
+        terminal_width: usize,
+        terminal_height: usize,
+    ) -> Option<TextPanelLinkTarget> {
+        let clicked = self.text_link_at_position_impl(x, y, terminal_width, terminal_height, false);
+        let Some((panel_id, link)) = clicked else {
+            self.last_text_link_click = None;
+            return None;
+        };
+
+        let now = Instant::now();
+        let is_double_click = self.last_text_link_click.take().is_some_and(|click| {
+            click.panel_id == panel_id
+                && click.link_id == link.id
+                && now.duration_since(click.at) <= ROW_DOUBLE_CLICK_INTERVAL
+        });
+        if is_double_click {
+            Some(link.target)
+        } else {
+            self.last_text_link_click = Some(TextLinkClick {
+                panel_id,
+                link_id: link.id,
+                at: now,
+            });
+            None
+        }
     }
 
     pub(crate) fn text_action_at_position(
@@ -3706,6 +3745,7 @@ impl PanelManager {
         terminal_height: usize,
     ) -> Option<TextPanelLinkTarget> {
         self.text_link_at_position_impl(x, y, terminal_width, terminal_height, true)
+            .map(|(_, link)| link.target)
     }
 
     fn text_link_at_position_impl(
@@ -3715,7 +3755,7 @@ impl PanelManager {
         terminal_width: usize,
         terminal_height: usize,
         action_only: bool,
-    ) -> Option<TextPanelLinkTarget> {
+    ) -> Option<(String, TextPanelLink)> {
         let placement = self.panel_at_position(x, y, terminal_width, terminal_height)?;
         let panel = self.text_panels.get_mut(&placement.id)?;
         let title_rows = text_panel_header_rows(&panel.config);
@@ -3751,12 +3791,12 @@ impl PanelManager {
                 if action_only && !matches!(link.target, TextPanelLinkTarget::PanelAction { .. }) {
                     return None;
                 }
-                self.focused = Some(placement.id);
+                self.focused = Some(placement.id.clone());
                 panel.selected_link = Some(link.id);
                 if let Some(composer) = panel.composer.as_mut() {
                     composer.focused = false;
                 }
-                return Some(link.target.clone());
+                return Some((placement.id, link.clone()));
             }
             used = end;
         }
@@ -7821,6 +7861,36 @@ mod tests {
                 path: "src/main.rs".to_string(),
                 location: None,
             })
+        );
+
+        assert_eq!(
+            manager.double_clicked_text_link_at_position(placement.x + 1, 2, 80, 20),
+            None
+        );
+        assert_eq!(
+            manager.double_clicked_text_link_at_position(placement.x + 11, 2, 80, 20),
+            None
+        );
+        assert_eq!(
+            manager.double_clicked_text_link_at_position(placement.x + 1, 2, 80, 20),
+            None
+        );
+        assert_eq!(
+            manager.double_clicked_text_link_at_position(placement.x + 1, 2, 80, 20),
+            Some(TextPanelLinkTarget::ExternalUrl(
+                "https://example.com".to_string()
+            ))
+        );
+
+        assert_eq!(
+            manager.double_clicked_text_link_at_position(placement.x + 1, 2, 80, 20),
+            None
+        );
+        manager.last_text_link_click.as_mut().unwrap().at -=
+            ROW_DOUBLE_CLICK_INTERVAL + Duration::from_millis(1);
+        assert_eq!(
+            manager.double_clicked_text_link_at_position(placement.x + 1, 2, 80, 20),
+            None
         );
     }
 
