@@ -13890,6 +13890,12 @@ impl Editor {
 
         match event.kind {
             MouseEventKind::Down(MouseButton::Left) => {
+                if let Some(target) = self
+                    .panel_manager
+                    .text_action_at_position(x, y, width, height)
+                {
+                    return Some(self.follow_text_panel_link(target));
+                }
                 if event
                     .modifiers
                     .intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER)
@@ -13970,6 +13976,15 @@ impl Editor {
             }
             plugin::TextPanelLinkTarget::ExternalUrl(url) => {
                 KeyAction::Single(Action::OpenExternalUrl(url))
+            }
+            plugin::TextPanelLinkTarget::PanelAction { panel_id, block_id } => {
+                KeyAction::Multiple(vec![
+                    Action::NotifyPlugins(
+                        format!("panel:event:{panel_id}"),
+                        serde_json::json!({"panel_id":panel_id,"action":"activate_block","text":block_id}),
+                    ),
+                    Action::Refresh,
+                ])
             }
         }
     }

@@ -6605,8 +6605,8 @@ mod tests {
         }
         let current = state(&runtime);
         let compact = current["transcript_blocks"][0]["text"].as_str().unwrap();
-        assert!(compact.contains("2 file reads · 1 tool issue"));
-        assert!(compact.contains("File not found"));
+        assert_eq!(compact, "▸ Activity · 3 actions · 1 issue");
+        assert!(!compact.contains("File not found"));
         assert!(!compact.contains("first.rs"));
         let activity_id = current["transcript_blocks"][0]["id"].clone();
         drain_requests();
@@ -6621,8 +6621,8 @@ mod tests {
         while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
             if let PluginRequest::UpdateTextPanel { blocks, .. } = request {
                 expanded |= blocks.iter().any(|block| {
-                    block.text.starts_with("▾ 2 file reads")
-                        && block.text.contains("Reading first.rs · 2 ms")
+                    block.text.contains("✓ Read first.rs")
+                        && block.text.contains("View all details…")
                 });
             }
         }
@@ -6642,9 +6642,10 @@ mod tests {
         assert_eq!(current["transcript_blocks"][0]["id"], activity_id);
         assert_eq!(
             current["transcript_blocks"][0]["text"],
-            "▸ Worked for 1s · 2 file reads · 1 tool issue"
+            "▸ Activity · 3 actions · 1 issue"
         );
         assert_eq!(current["transcript_blocks"][1]["text"], "Done.");
+        assert_eq!(current["transcript_blocks"][2]["text"], "Worked for 1s");
         assert!(current["activity_history"][0]["details"]
             .as_str()
             .unwrap()
@@ -6663,26 +6664,128 @@ mod tests {
                 .unwrap()
                 .matches("Activity:")
                 .count(),
-            1
+            2
         );
         assert!(current["transcript"]
             .as_str()
             .unwrap()
-            .ends_with("Agent: Done.\n"));
+            .ends_with("Agent: Done.\nActivity: Worked for 1s\n"));
         drain_requests();
         runtime.execute_command("AgentActivity").await.unwrap();
         let mut reopened = false;
         while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
             if let PluginRequest::UpdateTextPanel { blocks, .. } = request {
-                reopened |= blocks.len() == 2
-                    && blocks[0].text.contains("File not found")
-                    && blocks[1].text == "Done.";
+                reopened |= blocks.len() == 4
+                    && blocks[1].text.contains("missing.rs — not found")
+                    && blocks[2].text == "Done."
+                    && blocks[3].text == "Worked for 1s";
             }
         }
         assert!(
             reopened,
             "completed errors remain available above the answer"
         );
+        drain_requests();
+    }
+
+    #[tokio::test]
+    async fn bundled_agent_activity_disclosures_are_per_turn_and_details_are_on_demand() {
+        drain_requests();
+        let mut runtime = Runtime::new();
+        runtime
+            .load_plugin("agent", include_str!("../../plugins/agent.hk"))
+            .await
+            .unwrap();
+        runtime
+            .notify(
+                "agent:session_created",
+                serde_json::json!({"session_id":"activity"}),
+            )
+            .await
+            .unwrap();
+        let state = |runtime: &Runtime| {
+            let inner = runtime.inner.lock().unwrap();
+            value_to_json(inner.host.policy().typed_states.get("agent").unwrap())
+        };
+        for turn in 0..2 {
+            drain_requests();
+            submit_agent_prompt(&mut runtime, &format!("turn {turn}")).await;
+            for index in 0..8 {
+                runtime.notify("agent:activity", serde_json::json!({"session_id":"activity","update":{
+                    "session_update":"tool_call_update","tool_call_id":format!("{turn}:{index}"),
+                    "title":format!("Reading file{index}.rs"),"full_title":format!("Reading /workspace/src/file{index}.rs"),
+                    "kind":"read","status":"failed","detail":"full diagnostic outside workspace"
+                }})).await.unwrap();
+            }
+            runtime
+                .notify(
+                    "agent:message_completed",
+                    serde_json::json!({"session_id":"activity","text":"Answer"}),
+                )
+                .await
+                .unwrap();
+            runtime.notify("agent:completed", serde_json::json!({"session_id":"activity","stop_reason":"completed","elapsed_ms":2000})).await.unwrap();
+        }
+        let current = state(&runtime);
+        let first_id = current["activity_history"][0]["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let second_id = current["activity_history"][1]["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        drain_requests();
+        runtime
+            .notify(
+                "panel:event:agent-conversation",
+                serde_json::json!({"action":"activate_block","text":first_id}),
+            )
+            .await
+            .unwrap();
+        let mut found_preview = false;
+        while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
+            if let PluginRequest::UpdateTextPanel { blocks, .. } = request {
+                assert!(blocks
+                    .iter()
+                    .any(|b| b.id == second_id && b.text.starts_with("▸")));
+                let preview = blocks
+                    .iter()
+                    .find(|b| b.id == format!("activity-details:{first_id}"))
+                    .unwrap();
+                assert_eq!(preview.text.lines().count(), 6);
+                assert!(!preview.text.contains("/workspace"));
+                assert!(!preview.text.contains("full diagnostic"));
+                found_preview = true;
+            }
+        }
+        assert!(found_preview);
+        runtime.notify("panel:event:agent-conversation", serde_json::json!({"action":"activate_block","text":format!("activity-details:{first_id}")})).await.unwrap();
+        let mut opened = false;
+        let mut inspected = false;
+        while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
+            match request {
+                PluginRequest::OpenWorkspace { id, .. } => opened |= id == "agent-activity",
+                PluginRequest::UpdateWorkspace { id, model } if id == "agent-activity" => {
+                    assert_eq!(model.rows.len(), 8);
+                    let detail = model
+                        .detail
+                        .iter()
+                        .flatten()
+                        .map(|s| s.text.as_str())
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    inspected |= detail.contains("/workspace/src/file0.rs")
+                        && detail.contains("full diagnostic");
+                }
+                _ => {}
+            }
+        }
+        assert!(opened && inspected);
+        assert!(!state(&runtime)["transcript"]
+            .as_str()
+            .unwrap()
+            .contains("full diagnostic"));
         drain_requests();
     }
 
@@ -6729,12 +6832,13 @@ mod tests {
         let current = state(&runtime);
         assert_eq!(
             current["transcript_blocks"][1]["text"],
-            "▸ Worked for 19s · 1 tool issue"
+            "▸ Activity · 1 action · 1 issue"
         );
         assert_eq!(
             current["transcript_blocks"][2]["text"],
             "The useful answer."
         );
+        assert_eq!(current["transcript_blocks"][3]["text"], "Worked for 19s");
         assert!(!current["transcript"]
             .as_str()
             .unwrap()
@@ -6820,7 +6924,7 @@ mod tests {
             let inner = runtime.inner.lock().unwrap();
             value_to_json(inner.host.policy().typed_states.get("agent").unwrap())
         };
-        assert_eq!(current["transcript"], "You: earlier question\nAgent: Earlier answer.\nYou: new question\nActivity: Worked for 2s\nAgent: New answer.\n");
+        assert_eq!(current["transcript"], "You: earlier question\nAgent: Earlier answer.\nYou: new question\nAgent: New answer.\nActivity: Worked for 2s\n");
         assert_eq!(current["transcript_blocks"].as_array().unwrap().len(), 3);
         drain_requests();
     }
@@ -6946,8 +7050,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bundled_agent_completion_keeps_muted_summary_before_markdown_response_and_persists_it()
-    {
+    async fn bundled_agent_completion_splits_tool_summary_from_elapsed_footer_and_persists_both() {
         drain_requests();
         let mut runtime = Runtime::new();
         runtime
@@ -7009,18 +7112,20 @@ mod tests {
             match request {
                 PluginRequest::UpdateTextPanel { id, blocks } => {
                     saw_final_blocks |= id == "agent-conversation"
-                        && blocks.len() == 3
-                        && blocks[1].kind == crate::plugin::TextPanelBlockKind::Activity
-                        && blocks[1].text == "▸ Worked for 13s · 1 action"
+                        && blocks.len() == 4
+                        && blocks[1].kind == crate::plugin::TextPanelBlockKind::Action
+                        && blocks[1].text == "▸ Activity · 1 action"
                         && blocks[2].kind == crate::plugin::TextPanelBlockKind::Agent
                         && blocks[2].format == crate::plugin::TextPanelBlockFormat::Markdown
-                        && blocks[2].text == "### Result\n\n**Done.**";
+                        && blocks[2].text == "### Result\n\n**Done.**"
+                        && blocks[3].kind == crate::plugin::TextPanelBlockKind::Activity
+                        && blocks[3].text == "Worked for 13s";
                 }
                 PluginRequest::SetPluginStorage { plugin, key, value } => {
                     saw_persisted_summary |= plugin == "agent"
                         && key == "transcript"
                         && value.as_str().is_some_and(|text| {
-                            text.ends_with("Activity: ▸ Worked for 13s · 1 action\nAgent: ### Result\n\n**Done.**\n")
+                            text.ends_with("Activity: ▸ Activity · 1 action\nAgent: ### Result\n\n**Done.**\nActivity: Worked for 13s\n")
                         });
                 }
                 _ => {}
@@ -7028,11 +7133,11 @@ mod tests {
         }
         assert!(
             saw_final_blocks,
-            "completion summary must precede the response"
+            "tool summary must precede the response and elapsed time must follow it"
         );
         assert!(
             saw_persisted_summary,
-            "completion summary must survive transcript restoration"
+            "tool summary and elapsed footer must survive transcript restoration"
         );
     }
 
@@ -7395,11 +7500,11 @@ mod tests {
             ACTION_DISPATCHER.recv_request(),
             PluginRequest::UpdateTextPanel { id, blocks }
                 if id == "agent-conversation"
-                    && blocks.get(1).is_some_and(|block| {
+                    && blocks.last().is_some_and(|block| {
                         block.kind == crate::plugin::TextPanelBlockKind::Activity
                             && block.text == "Worked for 1h 2m 3s"
                     })
-                    && blocks.last().is_some_and(|block| block.kind == crate::plugin::TextPanelBlockKind::Agent)
+                    && blocks.get(1).is_some_and(|block| block.kind == crate::plugin::TextPanelBlockKind::Agent)
         ));
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
@@ -7407,8 +7512,7 @@ mod tests {
                 if plugin == "agent"
                     && key == "transcript"
                     && value.as_str().is_some_and(|text| {
-                        text.contains("Activity: Worked for 1h 2m 3s\nAgent: ")
-                            && text.ends_with(&format!("{large_delta}\n"))
+                        text.ends_with(&format!("{large_delta}\nActivity: Worked for 1h 2m 3s\n"))
                     })
         ));
         assert!(matches!(
@@ -8167,7 +8271,8 @@ mod tests {
         let mut cleared = false;
         let mut reset_storage = false;
         let mut reset_draft = false;
-        let mut requested_history = false;
+        let mut requested_cwd = None;
+        let mut focused_composer = false;
         while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
             match request {
                 PluginRequest::AgentCloseSession { session_id } => {
@@ -8183,8 +8288,16 @@ mod tests {
                 PluginRequest::ClearTextPanelComposer { id } => {
                     reset_draft |= id == "agent-conversation";
                 }
-                PluginRequest::GetPluginStorage { plugin, key, .. } => {
-                    requested_history |= plugin == "agent" && key == "prompt_history";
+                PluginRequest::GetConfig {
+                    key, request_id, ..
+                } if key.as_deref() == Some("cwd") => {
+                    requested_cwd = Some(request_id);
+                }
+                PluginRequest::FocusTextPanelComposer { id } => {
+                    focused_composer |= id == "agent-conversation";
+                }
+                PluginRequest::GetPluginStorage { key, .. } if key == "prompt_history" => {
+                    panic!("New must not open the floating ask popup");
                 }
                 PluginRequest::CreateTextPanel { .. } => {
                     panic!("new must reuse the existing conversation panel")
@@ -8196,7 +8309,48 @@ mod tests {
         assert!(cleared);
         assert!(reset_storage);
         assert!(reset_draft);
-        assert!(requested_history);
+        assert!(focused_composer);
+        let request_id = requested_cwd.expect("New starts a session immediately");
+        runtime
+            .resolve_request(request_id, serde_json::json!({"value":"/workspace"}))
+            .await
+            .unwrap();
+        assert!(
+            matches!(ACTION_DISPATCHER.recv_request(), PluginRequest::AgentNewSession { cwd } if cwd == Path::new("/workspace"))
+        );
+        drain_requests();
+
+        // A prompt submitted before thread/start finishes must use that same start.
+        runtime
+            .notify(
+                "panel:event:agent-conversation",
+                serde_json::json!({"action":"submit","text":"hello"}),
+            )
+            .await
+            .unwrap();
+        while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
+            assert!(!matches!(
+                request,
+                PluginRequest::AgentNewSession { .. } | PluginRequest::GetConfig { .. }
+            ));
+        }
+        runtime
+            .notify(
+                "agent:session_created",
+                serde_json::json!({"session_id":"session-2"}),
+            )
+            .await
+            .unwrap();
+        let mut submitted = false;
+        while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
+            if let PluginRequest::AgentPrompt {
+                session_id, text, ..
+            } = request
+            {
+                submitted |= session_id == "session-2" && text == "hello";
+            }
+        }
+        assert!(submitted);
 
         runtime
             .notify(

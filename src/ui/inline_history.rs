@@ -175,6 +175,7 @@ impl InlineHistoryPanel {
                     TextPanelLinkTarget::ExternalUrl(url) => {
                         Some(KeyAction::Single(Action::OpenExternalUrl(url.clone())))
                     }
+                    TextPanelLinkTarget::PanelAction { .. } => None,
                 };
             }
             start = end;

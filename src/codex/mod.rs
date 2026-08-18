@@ -1162,12 +1162,13 @@ async fn handle_message<H: CodexToolHost>(
         let params = &message["params"];
         let session_id = params["threadId"].as_str().unwrap_or_default();
         let turn_id = params["turnId"].as_str().unwrap_or_default();
-        if sessions.get(session_id).is_some_and(|session| {
+        if let Some(session) = sessions.get(session_id).filter(|session| {
             session.active_turn.as_deref() == Some(turn_id)
                 && !session.cancelled.load(Ordering::Relaxed)
                 && matches!(session.kind, SessionKind::Agent)
         }) {
-            if let Some(update) = activity::item_update(&params["item"], method == "item/completed")
+            if let Some(update) =
+                activity::item_update(&params["item"], method == "item/completed", &session.cwd)
             {
                 events
                     .send(CodexEvent::Activity {

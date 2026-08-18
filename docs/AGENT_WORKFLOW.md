@@ -279,12 +279,17 @@ prompt card, update its accent, and pause automatic scrolling without changing
 the composer draft. `G` returns to the latest output and resumes following it.
 
 While a turn runs, the status row names the current operation and shows elapsed
-time. Assistant messages stream into separate blocks. Repeated reads, searches,
-and edits are grouped into a compact activity summary. On completion, that
+time, with a blank row separating it from the transcript. Assistant messages
+stream without repeated role headings. Tool calls are grouped into one compact
+`Activity · N actions · N issues` disclosure per turn. On completion, that
 summary stays above the final answer and shows an issue count instead of full
-tool errors. Errors that stop the request still appear separately. Click
-**Activity** in the pane header (or run
-`:AgentActivity`) to expand or collapse the retained tool details. Details are
+tool errors. A quiet `Worked for …` footer appears below the answer. Errors that
+stop the request still appear separately. Click a summary (or move to it with
+`[l` / `]l` and press Enter) to expand that turn's five most recent actions.
+Select **View all details** to inspect full paths and bounded error text.
+**Activity** in the pane header and `:AgentActivity` toggle the latest turn.
+**New** starts a fresh Codex session and focuses the pane composer directly,
+without opening another ask popup. Details are
 bounded and retained for the current conversation view; restored conversations
 may contain only their saved summaries. Raw file contents are not shown in the
 activity log. Scrolling back continues to pause automatic tail-following.
