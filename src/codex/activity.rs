@@ -66,6 +66,10 @@ fn tool_title(tool: &str, arguments: &Value, path: &str) -> (&'static str, Strin
         ),
         "read_file" => ("read", format!("Reading {path}")),
         "write_file" | "apply_edits" => ("edit", format!("Editing {path}")),
+        "create_directory" => (
+            "create",
+            format!("Creating {}/", path.trim_end_matches('/')),
+        ),
         "get_editor_state" => ("inspect", "Inspecting editor state".to_string()),
         "open_file" => ("inspect", format!("Opening {path}")),
         "select_text" => ("inspect", format!("Selecting text in {path}")),
@@ -162,5 +166,15 @@ mod tests {
             assert_eq!(update["title"], expected);
             assert_eq!(update["full_title"], format!("Reading {path}"));
         }
+    }
+
+    #[test]
+    fn directory_creation_has_a_compact_activity_label() {
+        let item = json!({"id":"mkdir", "type":"dynamicToolCall", "tool":"create_directory",
+            "arguments":{"path":"/workspace/go/"}});
+        let update = item_update(&item, false, Path::new("/workspace")).unwrap();
+        assert_eq!(update["title"], "Creating go/");
+        assert_eq!(update["kind"], "create");
+        assert_eq!(update["full_title"], "Creating /workspace/go/");
     }
 }

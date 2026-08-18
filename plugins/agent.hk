@@ -1170,6 +1170,7 @@ fn short_activity_row(row: AgentActivityRow) -> String {
     if row.status == "completed" {
         if red::starts_with(title, "Reading ") { title = "Read " + red::slice(title, 8); }
         else if red::starts_with(title, "Editing ") { title = "Edited " + red::slice(title, 8); }
+        else if red::starts_with(title, "Creating ") { title = "Created " + red::slice(title, 9); }
         else if red::starts_with(title, "Searching for ") { title = "Searched for " + red::slice(title, 14); }
     }
     let reason = "";

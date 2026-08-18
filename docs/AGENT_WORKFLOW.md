@@ -346,24 +346,33 @@ Every Codex thread is started with:
 Native command, file-change, and permission escalation requests are denied.
 Red never asks Codex to edit the workspace directly.
 
-Codex receives nine dynamic tools:
+Codex receives ten dynamic tools:
 
 | Tool | Behavior |
 | --- | --- |
 | `list_files` | Lists at most 4,096 workspace files while respecting ignore files. |
 | `search_files` | Searches bounded text content and returns at most 200 matches. |
 | `read_file` | Reveals and reads the authoritative Red buffer, returning its revision. |
-| `write_file` | Replaces revision-checked contents through Red and saves the buffer. |
+| `write_file` | Replaces revision-checked contents through Red, creates missing parent directories, and saves the buffer. |
+| `create_directory` | Creates a workspace directory and missing parents; an existing directory is a successful no-op. |
 | `get_editor_state` | Returns bounded active-file, cursor, selection, window, and diagnostic state. |
 | `open_file` | Opens a safe workspace file in the requested split. |
 | `select_text` | Creates a UTF-16-addressed editor selection. |
-| `apply_edits` | Applies atomic, revision-checked UTF-16 edits and saves the buffer. |
+| `apply_edits` | Applies atomic, revision-checked UTF-16 edits, creates missing parent directories, and saves the buffer. |
 | `run_editor_action` | Runs an allow-listed navigation or LSP action. |
 
 Tool paths must remain below the physical workspace root. Reads and writes
 reject parent traversal, symlink components, special files, unsafe roots,
 oversized content, stale revisions, and overlapping edits. Reads always see the
 latest visible editor contents, including unsaved user changes.
+
+Directory creation is confined to the same workspace and rejects ignored,
+protected, symlinked, and non-directory paths. It creates at most 64 path
+components, leaves existing directories untouched, and does not switch buffers.
+On Unix, creation uses directory-relative, no-follow operations. Platforms
+without that secure boundary return an explicit unsupported-operation error
+when new directories are needed. Directory creation does not grant shell access,
+and directories are not removed automatically if a later file save fails.
 
 On Unix, content search uses descriptor-relative, nonblocking, no-follow reads
 from the physical workspace root. It fails closed on symlinks and special files.
