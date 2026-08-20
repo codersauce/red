@@ -551,6 +551,8 @@ async fn run<H: CodexToolHost>(
     let mut child = Command::new(&spec.command)
         .arg("app-server")
         .arg("--stdio")
+        .arg("--session-source")
+        .arg("app-server")
         .args(&spec.args)
         .arg("-c")
         .arg("features.apps=false")

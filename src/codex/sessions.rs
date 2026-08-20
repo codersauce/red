@@ -2,11 +2,16 @@
 
 use super::*;
 use serde::{Deserialize, Serialize};
-use std::{collections::HashSet, time::SystemTime};
+use std::{
+    collections::HashSet,
+    io::{BufRead as _, BufReader},
+    time::SystemTime,
+};
 
 const PAGE_LIMIT: usize = 100;
 const MAX_SESSIONS: usize = 4096;
 const MAX_PAGES: usize = 100;
+const MAX_SESSION_METADATA_BYTES: u64 = 64 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -62,7 +67,7 @@ async fn complete(
 
 fn interactive_source_kinds(scope: AgentSessionScope) -> Value {
     match scope {
-        AgentSessionScope::Red => json!(["appServer"]),
+        AgentSessionScope::Red => json!(["appServer", "vscode"]),
         AgentSessionScope::Workspace | AgentSessionScope::All => {
             json!(["cli", "vscode", "appServer", "unknown"])
         }
@@ -247,7 +252,7 @@ fn summarize(
         return None;
     }
     let cwd = thread["cwd"].as_str().unwrap_or_default().to_string();
-    let is_red = thread["threadSource"].as_str() == Some("red");
+    let is_red = is_red_thread(thread);
     if request.scope == AgentSessionScope::Red && !is_red {
         return None;
     }
@@ -277,6 +282,38 @@ fn summarize(
         is_red,
         updated_at,
     })
+}
+
+fn is_red_thread(thread: &Value) -> bool {
+    if thread["threadSource"].as_str() == Some("red") {
+        return true;
+    }
+    if thread["source"].as_str() != Some("vscode") {
+        return false;
+    }
+
+    let Some(path) = thread["path"].as_str() else {
+        return false;
+    };
+    let Ok(file) = std::fs::File::open(path) else {
+        return false;
+    };
+    let mut line = String::new();
+    if BufReader::new(std::io::Read::take(file, MAX_SESSION_METADATA_BYTES))
+        .read_line(&mut line)
+        .is_err()
+    {
+        return false;
+    }
+    let Ok(metadata) = serde_json::from_str::<Value>(&line) else {
+        return false;
+    };
+    metadata["type"].as_str() == Some("session_meta")
+        && metadata.pointer("/payload/id").and_then(Value::as_str) == thread["id"].as_str()
+        && metadata
+            .pointer("/payload/originator")
+            .and_then(Value::as_str)
+            == Some("red")
 }
 
 fn nonempty(value: &Value) -> Option<String> {
@@ -382,6 +419,46 @@ mod tests {
             "preview": "Different root",
             "updatedAt": 1,
         });
+        assert!(summarize(&request, &thread, String::new()).is_none());
+    }
+
+    #[test]
+    fn red_scope_recovers_legacy_vscode_sessions_from_rollout_metadata() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("rollout.jsonl");
+        std::fs::write(
+            &path,
+            format!(
+                "{}\n",
+                json!({
+                    "type": "session_meta",
+                    "payload": {"id": "legacy-red", "originator": "red"}
+                })
+            ),
+        )
+        .unwrap();
+        let request = AgentSessionListRequest {
+            cwd: PathBuf::from("/work/red"),
+            scope: AgentSessionScope::Red,
+            query: String::new(),
+            exclude_session_id: None,
+        };
+        let mut thread = json!({
+            "id": "legacy-red",
+            "cwd": "/work/red",
+            "ephemeral": false,
+            "threadSource": null,
+            "source": "vscode",
+            "path": path,
+            "preview": "Earlier Red session",
+            "updatedAt": 1
+        });
+
+        let session = summarize(&request, &thread, String::new()).unwrap();
+        assert!(session.is_red);
+        assert_eq!(session.source, "Red");
+
+        thread["id"] = json!("different-session");
         assert!(summarize(&request, &thread, String::new()).is_none());
     }
 }

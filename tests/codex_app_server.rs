@@ -54,6 +54,7 @@ import json, os, sys
 
 assert "features.hooks=false" not in sys.argv
 assert "features.codex_hooks=false" not in sys.argv
+assert sys.argv[sys.argv.index("--session-source") + 1] == "app-server"
 
 def send(value):
     print(json.dumps(value), flush=True)
@@ -146,9 +147,22 @@ for line in sys.stdin:
 fn mock_session_codex(directory: &std::path::Path) -> std::path::PathBuf {
     let path = directory.join("codex-sessions");
     std::fs::write(
+        directory.join("red-legacy.jsonl"),
+        format!(
+            "{}\n",
+            json!({
+                "type": "session_meta",
+                "payload": {"id": "red-legacy", "originator": "red"}
+            })
+        ),
+    )
+    .unwrap();
+    std::fs::write(
         &path,
         r#"#!/usr/bin/env python3
-import json, sys
+import json, os, sys
+
+assert sys.argv[sys.argv.index("--session-source") + 1] == "app-server"
 
 def send(value):
     print(json.dumps(value), flush=True)
@@ -171,12 +185,13 @@ for line in sys.stdin:
     elif method == "thread/list":
         assert params["sortKey"] == "updated_at"
         assert params["sortDirection"] == "desc"
-        assert params["sourceKinds"] == ["appServer"]
+        assert params["sourceKinds"] == ["appServer", "vscode"]
         assert params["modelProviders"] == []
         if params.get("cursor") is None:
             send({"id": ident, "result": {"data": [
                 {"id":"current", "cwd":"/workspace", "ephemeral":False, "threadSource":"red", "source":"appServer", "name":"Current", "preview":"", "updatedAt":40},
                 {"id":"foreign", "cwd":"/workspace", "ephemeral":False, "threadSource":"user", "source":"appServer", "name":"Foreign", "preview":"", "updatedAt":30},
+                {"id":"red-legacy", "cwd":"/workspace", "ephemeral":False, "threadSource":None, "source":"vscode", "path":os.path.join(os.path.dirname(sys.argv[0]), "red-legacy.jsonl"), "name":"Legacy Red", "preview":"", "updatedAt":25},
                 {"id":"red-old", "cwd":"/workspace", "ephemeral":False, "threadSource":"red", "source":"appServer", "name":None, "preview":"Older Red", "updatedAt":10},
                 {"id":"ephemeral", "cwd":"/workspace", "ephemeral":True, "threadSource":"red", "source":"appServer", "name":"Hidden", "preview":"", "updatedAt":50}
             ], "nextCursor":"page-2"}})
@@ -261,9 +276,11 @@ async fn direct_app_server_lists_searches_and_continues_sessions_for_red() {
             request_id: 41,
             result: Ok(result),
         } => {
-            assert_eq!(result["sessions"].as_array().unwrap().len(), 2);
-            assert_eq!(result["sessions"][0]["id"], "red-new");
-            assert_eq!(result["sessions"][1]["id"], "red-old");
+            assert_eq!(result["sessions"].as_array().unwrap().len(), 3);
+            assert_eq!(result["sessions"][0]["id"], "red-legacy");
+            assert_eq!(result["sessions"][0]["source"], "Red");
+            assert_eq!(result["sessions"][1]["id"], "red-new");
+            assert_eq!(result["sessions"][2]["id"], "red-old");
         }
         event => panic!("unexpected Red session list: {event:?}"),
     }
