@@ -8249,12 +8249,7 @@ mod tests {
             ACTION_DISPATCHER.recv_request(),
             PluginRequest::UpdateTextPanel { id, blocks }
                 if id == "agent-conversation"
-                    && blocks.iter().any(|block| block.id == "session-browser:back")
                     && blocks.iter().any(|block| block.id == "session-browser:loading")
-        ));
-        assert!(matches!(
-            ACTION_DISPATCHER.recv_request(),
-            PluginRequest::FocusTextPanelComposer { id } if id == "agent-conversation"
         ));
         let cwd_request = match ACTION_DISPATCHER.recv_request() {
             PluginRequest::GetConfig { request_id, key } if key.as_deref() == Some("cwd") => {

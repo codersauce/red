@@ -380,11 +380,13 @@ contrasted. Plugins do not need to configure a border to make resizing visible.
 
 `EnterTextPanelContext(id, placeholder)` gives a plugin a temporary in-pane
 surface while retaining the panel's blocks, scroll position, search state,
-status, composer draft, and composer focus. The temporary composer is one row
-and emits `filter_input`, `filter_submit`, and `filter_cancel` panel events;
-input and submit events include the complete filter text. Call
-`ExitTextPanelContext(id)` to restore the retained conversation exactly. A
-second enter is ignored until the current context exits.
+status, composer draft, and composer focus. The conversation composer is hidden
+and replaced by a search field at the top of an embedded picker. Action blocks
+become selectable rows; arrows and `Ctrl-j` / `Ctrl-k` move between them, `Enter`
+emits `activate_block` for the selected row, and `Esc` or `Ctrl-c` emits
+`filter_cancel`. Editing the search field emits `filter_input` with its complete
+contents. Call `ExitTextPanelContext(id)` to restore the retained conversation
+exactly. A second enter is ignored until the current context exits.
 
 A focused footer is a host-owned modal text area, not an editor file buffer. It supports Unicode-safe editing, wrapping, click-to-position cursor movement, counts, Vim word and character motions, `d`/`c`/`y` operators, inner/around text objects, Visual/Visual-line/Visual-block selections, transactional undo/redo, local yank/paste registers, dot-repeat, local macro recording, and prompt-local `/` or `?` searches. Its mode, pending operator, selection, undo tree, register, and search never alter the main editor. File writes, Ex commands, window operations, LSP requests, and plugin callbacks cannot be invoked through textarea keys.
 

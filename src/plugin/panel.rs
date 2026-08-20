@@ -421,6 +421,7 @@ struct TextPanelContext {
     scrollback: TextPanelScrollback,
     search: TextPanelSearch,
     last_focused_region: TextPanelFocusRegion,
+    selected_action: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -821,6 +822,7 @@ fn format_elapsed(seconds: u64) -> String {
 const MAX_COMPOSER_BYTES: usize = PROMPT_MAX_BYTES;
 const COMPOSER_MAX_HEIGHT_PERCENT: usize = 70;
 const COMPOSER_CHROME_ROWS: usize = 2;
+const EMBEDDED_PICKER_CHROME_ROWS: usize = 3;
 
 struct ComposerLayoutCache {
     buffer_id: BufferId,
@@ -989,6 +991,7 @@ impl TextPanel {
             scrollback: std::mem::take(&mut self.scrollback),
             search: std::mem::take(&mut self.search),
             last_focused_region: self.last_focused_region,
+            selected_action: None,
         });
         self.viewport = FollowTailViewport::default();
         self.viewport.scroll_to_top();
@@ -1045,6 +1048,91 @@ impl TextPanel {
             .map_or(0, |status| 1 + usize::from(status.busy))
     }
 
+    fn picker_header_rows(&self, panel_height: usize) -> usize {
+        if self.temporary_context.is_none() {
+            return 0;
+        }
+        panel_height
+            .saturating_sub(text_panel_header_rows(&self.config))
+            .saturating_sub(self.status_height())
+            .saturating_sub(1)
+            .min(EMBEDDED_PICKER_CHROME_ROWS)
+    }
+
+    fn selected_picker_action(&self) -> Option<&str> {
+        self.temporary_context.as_ref()?.selected_action.as_deref()
+    }
+
+    fn sync_picker_selection(&mut self, panel_height: usize, panel_width: usize) {
+        let Some(context) = self.temporary_context.as_mut() else {
+            return;
+        };
+        if !context.selected_action.as_deref().is_some_and(|selected| {
+            self.blocks
+                .iter()
+                .any(|block| block.kind == TextPanelBlockKind::Action && block.id == selected)
+        }) {
+            context.selected_action = self
+                .blocks
+                .iter()
+                .find(|block| block.kind == TextPanelBlockKind::Action)
+                .map(|block| block.id.clone());
+        }
+        let Some(selected) = context.selected_action.clone() else {
+            self.selected_link = None;
+            return;
+        };
+        let layout = self.layout(panel_width);
+        let selected_rows = layout
+            .rendered
+            .iter()
+            .enumerate()
+            .filter_map(|(row, line)| {
+                line.spans.iter().find_map(|span| {
+                    let link = span.link.as_ref()?;
+                    matches!(&link.target, TextPanelLinkTarget::PanelAction { block_id, .. } if block_id == &selected)
+                        .then_some((row, link.id))
+                })
+            })
+            .collect::<Vec<_>>();
+        self.selected_link = selected_rows.first().map(|(_, link)| *link);
+        let (Some((first, _)), Some((last, _))) = (selected_rows.first(), selected_rows.last())
+        else {
+            return;
+        };
+        let visible = self.visible_rows(panel_height, panel_width);
+        if *first < self.scroll {
+            self.scroll = *first;
+        } else if *last >= self.scroll.saturating_add(visible) {
+            self.scroll = last.saturating_add(1).saturating_sub(visible);
+        }
+        self.follow_tail = false;
+        self.viewport.restore(self.scroll, false);
+    }
+
+    fn move_picker_selection(&mut self, delta: isize, panel_height: usize, panel_width: usize) {
+        let actions = self
+            .blocks
+            .iter()
+            .filter(|block| block.kind == TextPanelBlockKind::Action)
+            .map(|block| block.id.clone())
+            .collect::<Vec<_>>();
+        if actions.is_empty() {
+            return;
+        }
+        let current = self
+            .selected_picker_action()
+            .and_then(|selected| actions.iter().position(|action| action == selected))
+            .unwrap_or_default();
+        let next = current
+            .saturating_add_signed(delta)
+            .min(actions.len().saturating_sub(1));
+        if let Some(context) = self.temporary_context.as_mut() {
+            context.selected_action = Some(actions[next].clone());
+        }
+        self.sync_picker_selection(panel_height, panel_width);
+    }
+
     fn search_bar_row(&self, height: usize) -> Option<usize> {
         if self.composer.is_some() {
             height.checked_sub(1)
@@ -1066,6 +1154,10 @@ impl TextPanel {
         }
         self.blocks = blocks;
         self.invalidate_layout();
+        if self.temporary_context.is_some() {
+            self.follow_tail = false;
+            self.viewport.restore(self.scroll, false);
+        }
         if self.follow_tail {
             self.scroll_to_bottom(panel_height, panel_width);
         } else {
@@ -1076,6 +1168,7 @@ impl TextPanel {
         if layout.len == 0 {
             self.scrollback.initialized = false;
         }
+        self.sync_picker_selection(panel_height, panel_width);
     }
 
     fn append_delta(
@@ -1155,12 +1248,16 @@ impl TextPanel {
     fn visible_rows(&self, panel_height: usize, panel_width: usize) -> usize {
         panel_height
             .saturating_sub(text_panel_header_rows(&self.config))
+            .saturating_sub(self.picker_header_rows(panel_height))
             .saturating_sub(self.composer_height(panel_height, panel_width))
             .saturating_sub(self.status_height())
             .max(1)
     }
 
     fn composer_height(&self, panel_height: usize, panel_width: usize) -> usize {
+        if self.temporary_context.is_some() {
+            return 0;
+        }
         let Some(composer) = &self.composer else {
             return 0;
         };
@@ -3280,6 +3377,12 @@ impl PanelManager {
         else {
             return "Panel".to_owned();
         };
+        if panel.temporary_context.is_some() {
+            return format!(
+                "{} · Session picker",
+                panel.config.title.as_deref().unwrap_or("Text panel")
+            );
+        }
         let mode = panel
             .composer
             .as_ref()
@@ -3299,19 +3402,36 @@ impl PanelManager {
         else {
             return Vec::new();
         };
-        let mut actions = panel
-            .composer
-            .as_ref()
-            .map(|composer| {
-                text_panel_actions(composer, &panel.scrollback, TextPanelOverflow::None).1
-            })
-            .unwrap_or_else(|| crate::ui::surface_reference_actions("SCROLLBACK NORMAL"));
+        let mut actions = if panel.temporary_context.is_some() {
+            vec![
+                UiAction::new("picker_select", "Enter", "resume session")
+                    .with_group("Session picker"),
+                UiAction::new("picker_previous", "Up", "previous session")
+                    .with_group("Session picker"),
+                UiAction::new("picker_next", "Down", "next session").with_group("Session picker"),
+                UiAction::new("picker_cancel", "Esc", "back to conversation")
+                    .with_group("Session picker"),
+            ]
+        } else {
+            panel
+                .composer
+                .as_ref()
+                .map(|composer| {
+                    text_panel_actions(composer, &panel.scrollback, TextPanelOverflow::None).1
+                })
+                .unwrap_or_else(|| crate::ui::surface_reference_actions("SCROLLBACK NORMAL"))
+        };
         if let Some(detail) = &panel.header_detail {
             if let (Some(action), Some(shortcut)) = (&detail.action, &detail.shortcut) {
+                let (label, description) = if action == "session_scope" {
+                    ("scope", "Change which sessions are shown")
+                } else {
+                    ("model", "Change the agent model")
+                };
                 actions.push(
-                    UiAction::new(action, shortcut, "model")
+                    UiAction::new(action, shortcut, label)
                         .with_group("Conversation")
-                        .with_description("Change the agent model"),
+                        .with_description(description),
                 );
             }
         }
@@ -3417,6 +3537,12 @@ impl PanelManager {
                 .presentation
                 .height(&panel.id, &panel.config, panel_height);
             match action {
+                "up" if panel.temporary_context.is_some() => {
+                    panel.move_picker_selection(-1, panel_height, width);
+                }
+                "down" if panel.temporary_context.is_some() => {
+                    panel.move_picker_selection(1, panel_height, width);
+                }
                 "up" => panel.move_scroll(-1, panel_height, width),
                 "down" => panel.move_scroll(1, panel_height, width),
                 "page_up" => {
@@ -3788,6 +3914,9 @@ impl PanelManager {
         let Some(panel) = self.text_panels.get(&focused) else {
             return false;
         };
+        if panel.temporary_context.is_some() {
+            return false;
+        }
         if panel
             .composer
             .as_ref()
@@ -3891,7 +4020,8 @@ impl PanelManager {
     ) -> Option<(String, TextPanelLink)> {
         let placement = self.panel_at_position(x, y, terminal_width, terminal_height)?;
         let panel = self.text_panels.get_mut(&placement.id)?;
-        let title_rows = text_panel_header_rows(&panel.config);
+        let title_rows = text_panel_header_rows(&panel.config)
+            .saturating_add(panel.picker_header_rows(placement.height));
         let metrics = TextPanelContentMetrics::new(placement.width);
         let content_height = placement
             .height
@@ -4168,6 +4298,52 @@ impl PanelManager {
         if !composer.focused || !composer.enabled {
             return None;
         }
+        let temporary_context = composer.temporary_context.is_some();
+        if temporary_context {
+            if matches!(
+                event,
+                Event::Key(key)
+                    if key.code == KeyCode::Esc
+                        || (matches!(key.code, KeyCode::Char('c' | 'C'))
+                            && key.modifiers.contains(KeyModifiers::CONTROL))
+            ) {
+                return Some(PanelEvent {
+                    panel_id: panel.id.clone(),
+                    action: "filter_cancel".to_string(),
+                    selected_index: panel.scroll,
+                    row: None,
+                    text: None,
+                });
+            }
+            if matches!(
+                event,
+                Event::Key(key)
+                    if matches!(key.code, KeyCode::Up | KeyCode::Down)
+                        || (key.modifiers.contains(KeyModifiers::CONTROL)
+                            && matches!(key.code, KeyCode::Char('j' | 'k')))
+            ) {
+                return None;
+            }
+            if matches!(event, Event::Key(key) if key.code == KeyCode::Enter && key.modifiers.is_empty())
+            {
+                let selected = panel
+                    .temporary_context
+                    .as_ref()
+                    .and_then(|context| context.selected_action.clone());
+                return Some(PanelEvent {
+                    panel_id: panel.id.clone(),
+                    action: if selected.is_some() {
+                        "activate_block"
+                    } else {
+                        "filter_submit"
+                    }
+                    .to_string(),
+                    selected_index: panel.scroll,
+                    row: None,
+                    text: Some(selected.unwrap_or_else(|| composer.prompt.text())),
+                });
+            }
+        }
         if matches!(
             event,
             Event::Key(key)
@@ -4177,28 +4353,6 @@ impl PanelManager {
             // Ctrl-C is a pane-level interrupt. Let the editor route it without
             // changing the focused composer's mode, draft, or cursor.
             return None;
-        }
-        let temporary_context = composer.temporary_context.is_some();
-        if temporary_context {
-            if matches!(event, Event::Key(key) if key.code == KeyCode::Esc) {
-                return Some(PanelEvent {
-                    panel_id: panel.id.clone(),
-                    action: "filter_cancel".to_string(),
-                    selected_index: panel.scroll,
-                    row: None,
-                    text: None,
-                });
-            }
-            if matches!(event, Event::Key(key) if key.code == KeyCode::Enter && key.modifiers.is_empty())
-            {
-                return Some(PanelEvent {
-                    panel_id: panel.id.clone(),
-                    action: "filter_submit".to_string(),
-                    selected_index: panel.scroll,
-                    row: None,
-                    text: Some(composer.prompt.text()),
-                });
-            }
         }
         let delegates_to_panel_navigation = matches!(
             event,
@@ -4358,6 +4512,20 @@ impl PanelManager {
             return None;
         }
         let metrics = TextPanelContentMetrics::new(placement.width);
+        if panel.temporary_context.is_some() {
+            let text = composer.prompt.text();
+            let byte = grapheme_to_byte(&text, composer.prompt.cursor());
+            let column = display_width(&text[..byte]);
+            return Some((
+                metrics
+                    .x(placement.x)
+                    .saturating_add(2)
+                    .saturating_add(column.min(metrics.width.saturating_sub(3))),
+                placement
+                    .y
+                    .saturating_add(text_panel_header_rows(&panel.config)),
+            ));
+        }
         let wrapped = composer.layout(metrics.width);
         let position = wrapped
             .position(composer.prompt.cursor())
@@ -4430,6 +4598,26 @@ impl PanelManager {
                 }
             }
 
+            if panel.temporary_context.is_some()
+                && y == placement
+                    .y
+                    .saturating_add(text_panel_header_rows(&panel.config))
+            {
+                if let Some(composer) = panel.composer.as_mut() {
+                    composer.focused = true;
+                    let column = x.saturating_sub(metrics.x(placement.x).saturating_add(2));
+                    composer.prompt.set_cursor(column);
+                }
+                panel.blur_scrollback();
+                return Some(PanelEvent {
+                    panel_id: panel.id.clone(),
+                    action: "composer_focus".to_string(),
+                    selected_index: panel.scroll,
+                    row: None,
+                    text: None,
+                });
+            }
+
             let composer_height = panel.composer_height(placement.height, placement.width);
             let composer_top = placement
                 .y
@@ -4459,7 +4647,8 @@ impl PanelManager {
                 "composer_focus"
             } else {
                 panel.focus_scrollback(placement.width);
-                let title_rows = text_panel_header_rows(&panel.config);
+                let title_rows = text_panel_header_rows(&panel.config)
+                    .saturating_add(panel.picker_header_rows(placement.height));
                 let content_height = placement
                     .height
                     .saturating_sub(composer_height)
@@ -5039,10 +5228,24 @@ fn render_text_panel(
 
     let composer_height = panel.composer_height(height, width);
     let status_height = panel.status_height();
+    let picker_header_rows = panel.picker_header_rows(height);
     let content_height = height
         .saturating_sub(composer_height)
         .saturating_sub(status_height);
-    let visible_rows = content_height.saturating_sub(title_rows);
+    let visible_rows = content_height
+        .saturating_sub(title_rows)
+        .saturating_sub(picker_header_rows);
+    if picker_header_rows > 0 {
+        render_text_panel_picker_header(
+            buffer,
+            panel,
+            content_position,
+            metrics.width,
+            title_rows,
+            picker_header_rows,
+            &palette,
+        );
+    }
     let layout = panel.layout(width);
     let max_scroll = layout.lines.len().saturating_sub(visible_rows);
     let scroll = panel.viewport.visible_offset(max_scroll);
@@ -5072,7 +5275,23 @@ fn render_text_panel(
         .enumerate()
     {
         let line_index = scroll.saturating_add(offset);
-        let y = position.y.saturating_add(title_rows + offset);
+        let y = position
+            .y
+            .saturating_add(title_rows + picker_header_rows + offset);
+        if panel.temporary_context.is_some()
+            && line.spans.iter().any(|span| {
+                span.link
+                    .as_ref()
+                    .is_some_and(|link| Some(link.id) == panel.selected_link)
+            })
+        {
+            let selected = theme.selected_style(
+                &palette.surface,
+                &theme.list_selection_style(),
+                SelectionForegroundPriority::Content,
+            );
+            buffer.set_text(content_position.x, y, &" ".repeat(metrics.width), &selected);
+        }
         let prompt_card = layout
             .prompt_cards
             .iter()
@@ -5220,6 +5439,53 @@ fn render_text_panel(
                 &palette,
             );
         }
+    }
+}
+
+fn render_text_panel_picker_header(
+    buffer: &mut RenderBuffer,
+    panel: &TextPanel,
+    position: Point,
+    width: usize,
+    title_rows: usize,
+    rows: usize,
+    palette: &TextPanelPalette,
+) {
+    let Some(composer) = panel.composer.as_ref() else {
+        return;
+    };
+    let y = position.y.saturating_add(title_rows);
+    let prefix = "› ";
+    if width >= display_width(prefix) {
+        buffer.set_text(position.x, y, prefix, &palette.accent);
+        let query = composer.prompt.text();
+        let (text, style) = if query.is_empty() {
+            (composer.config.placeholder.as_str(), &palette.muted)
+        } else {
+            (query.as_str(), &palette.primary)
+        };
+        buffer.set_text(
+            position.x.saturating_add(display_width(prefix)),
+            y,
+            &fit_display_width(text, width.saturating_sub(display_width(prefix))),
+            style,
+        );
+    }
+    if rows > 1 {
+        buffer.set_text(
+            position.x,
+            y.saturating_add(1),
+            &fit_display_width("↑↓ select · Enter resume · Esc back · Alt-S scope", width),
+            &palette.muted,
+        );
+    }
+    if rows > 2 {
+        buffer.set_text(
+            position.x,
+            y.saturating_add(2),
+            &"─".repeat(width),
+            &palette.divider,
+        );
     }
 }
 
@@ -6942,6 +7208,7 @@ mod tests {
         manager.create_text_panel(
             "agent".to_string(),
             PanelConfig {
+                title: Some("Agent".to_string()),
                 composer: Some(TextPanelComposerConfig {
                     placeholder: "Ask a follow-up…".to_string(),
                     rows: 3,
@@ -6966,12 +7233,20 @@ mod tests {
         assert!(manager.enter_text_panel_context("agent", "Search previous sessions…".to_string()));
         manager.update_text_panel(
             "agent",
-            vec![TextPanelBlock {
-                id: "session:one".to_string(),
-                kind: TextPanelBlockKind::Action,
-                format: TextPanelBlockFormat::Plain,
-                text: "Previous session".to_string(),
-            }],
+            vec![
+                TextPanelBlock {
+                    id: "session:one".to_string(),
+                    kind: TextPanelBlockKind::Action,
+                    format: TextPanelBlockFormat::Plain,
+                    text: "Previous session\n1h ago".to_string(),
+                },
+                TextPanelBlock {
+                    id: "session:two".to_string(),
+                    kind: TextPanelBlockKind::Action,
+                    format: TextPanelBlockFormat::Plain,
+                    text: "Older session\n2h ago".to_string(),
+                },
+            ],
             20,
             80,
         );
@@ -6981,6 +7256,24 @@ mod tests {
         assert_eq!(composer.prompt.text(), "");
         assert_eq!(manager.text_panels["agent"].scroll, 0);
         assert!(!manager.text_panels["agent"].follow_tail);
+        assert_eq!(manager.text_panels["agent"].composer_height(20, 30), 0);
+        assert_eq!(
+            manager.text_panels["agent"].selected_picker_action(),
+            Some("session:one")
+        );
+        assert_eq!(
+            manager
+                .focused_text_panel_cursor_position(80, 20)
+                .unwrap()
+                .1,
+            2
+        );
+        let theme = Theme::default();
+        let mut frame = RenderBuffer::new(80, 20, &theme.style);
+        manager.render(&mut frame, &theme);
+        assert!(row_text(&frame, 2).contains("Search previous sessions"));
+        assert!(row_text(&frame, 3).contains("select"));
+        assert!(!(0..20).any(|row| row_text(&frame, row).contains("unsent follow-up")));
         let snapshot = manager.snapshot(80);
         let saved = snapshot
             .panels
@@ -6996,6 +7289,19 @@ mod tests {
             .unwrap();
         assert_eq!(input.action, "filter_input");
         assert_eq!(input.text.as_deref(), Some("needle"));
+        for event in [
+            crossterm::event::KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+            crossterm::event::KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL),
+        ] {
+            assert!(manager
+                .handle_focused_text_input(&Event::Key(event), 80)
+                .is_none());
+            manager.handle_focused_key("down", 20, 80, 0).unwrap();
+        }
+        assert_eq!(
+            manager.text_panels["agent"].selected_picker_action(),
+            Some("session:two")
+        );
         let submit = manager
             .handle_focused_text_input(
                 &Event::Key(crossterm::event::KeyEvent::new(
@@ -7005,8 +7311,19 @@ mod tests {
                 80,
             )
             .unwrap();
-        assert_eq!(submit.action, "filter_submit");
-        assert_eq!(submit.text.as_deref(), Some("needle"));
+        assert_eq!(submit.action, "activate_block");
+        assert_eq!(submit.text.as_deref(), Some("session:two"));
+        let cancel = manager
+            .handle_focused_text_input(
+                &Event::Key(crossterm::event::KeyEvent::new(
+                    KeyCode::Char('c'),
+                    KeyModifiers::CONTROL,
+                )),
+                80,
+            )
+            .unwrap();
+        assert_eq!(cancel.action, "filter_cancel");
+        assert!(!manager.toggle_focused_text_region(80));
 
         assert!(manager.exit_text_panel_context("agent"));
         let panel = &manager.text_panels["agent"];

@@ -662,7 +662,6 @@ fn choose_session() {
     red::execute("EnterTextPanelContext", "agent-conversation", "Search previous sessions…");
     refresh_session_browser_header();
     render_session_browser([], "", true);
-    red::execute("FocusTextPanelComposer", "agent-conversation");
     red::request("GetConfig", session_browser_cwd_loaded, "cwd");
 }
 
@@ -725,16 +724,7 @@ fn sessions_loaded(result: AgentSessionsResult, request_id: i32) {
 
 fn render_session_browser(sessions: [Json], error: String, loading: bool) {
     if !state().session_browser_open { return; }
-    let blocks = [
-        AgentTextBlock {
-            id: "session-browser:heading", kind: "text", format: "plain",
-            text: "Previous sessions · newest first\nType to search · Alt-S changes scope · Esc returns to the conversation",
-        },
-        AgentTextBlock {
-            id: "session-browser:back", kind: "action", format: "plain",
-            text: "← Back to conversation",
-        },
-    ];
+    let blocks = [];
     if loading {
         blocks = red::push(blocks, AgentTextBlock {
             id: "session-browser:loading", kind: "text", format: "plain", text: "Loading sessions…",
