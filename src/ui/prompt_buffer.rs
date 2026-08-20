@@ -11,7 +11,7 @@ use crate::{
     editing::{TextArea, TextAreaOutcome},
     editor::Mode,
     text_layout::{LayoutOptions, TextLayout},
-    unicode_utils::grapheme_len,
+    unicode_utils::{byte_to_grapheme, grapheme_len, grapheme_to_byte},
 };
 
 /// Largest prompt accepted by the direct Codex app-server integration.
@@ -50,6 +50,7 @@ impl PromptKeyPolicy {
 }
 
 const PROMPT_HISTORY_LIMIT: usize = 50;
+const PROMPT_HISTORY_SEARCH_LABEL: &str = "Search prompts: ";
 
 #[derive(Debug)]
 struct PromptHistoryDraft {
@@ -60,6 +61,7 @@ struct PromptHistoryDraft {
 #[derive(Debug, Default)]
 struct PromptHistorySearch {
     query: String,
+    cursor: usize,
     current: Option<usize>,
 }
 
@@ -110,15 +112,26 @@ impl PromptBuffer {
         self.area.text()
     }
 
-    /// Returns the draft or the non-destructive reverse-search preview.
+    /// Returns the draft or a focused history-search field and separate match preview.
     #[must_use]
     pub(crate) fn display_text(&self) -> String {
-        self.history_search
-            .as_ref()
-            .and_then(|search| search.current)
+        let Some(search) = self.history_search.as_ref() else {
+            return self.text();
+        };
+        let mut text = format!("{PROMPT_HISTORY_SEARCH_LABEL}{}", search.query);
+        let matched = search
+            .current
             .and_then(|index| self.history.get(index))
-            .cloned()
-            .unwrap_or_else(|| self.text())
+            .map(String::as_str);
+        if let Some(matched) = matched {
+            let preview = matched
+                .lines()
+                .find(|line| line.contains(&search.query))
+                .unwrap_or(matched);
+            text.push_str("\n↳ ");
+            text.push_str(preview);
+        }
+        text
     }
 
     /// Projects the current draft without modifying its logical representation.
@@ -132,13 +145,23 @@ impl PromptBuffer {
         self.area.cursor()
     }
 
-    /// Returns the cursor for the draft or reverse-search preview.
+    /// Returns the draft cursor or the cursor within the focused history-search field.
     #[must_use]
     pub(crate) fn display_cursor(&self) -> usize {
-        if self.history_search.is_some() {
-            grapheme_len(&self.display_text())
+        self.history_search.as_ref().map_or_else(
+            || self.cursor(),
+            |search| grapheme_len(PROMPT_HISTORY_SEARCH_LABEL) + search.cursor,
+        )
+    }
+
+    /// Moves the draft cursor or the focused history-query cursor.
+    pub(crate) fn set_display_cursor(&mut self, cursor: usize) {
+        if let Some(search) = self.history_search.as_mut() {
+            search.cursor = cursor
+                .saturating_sub(grapheme_len(PROMPT_HISTORY_SEARCH_LABEL))
+                .min(grapheme_len(&search.query));
         } else {
-            self.cursor()
+            self.set_cursor(cursor);
         }
     }
 
@@ -341,14 +364,17 @@ impl PromptBuffer {
         event: &Event,
         layout: LayoutOptions,
     ) -> PromptInput {
+        if self.history_search.is_some() {
+            if matches!(event, Event::Key(key) if key.kind == KeyEventKind::Release) {
+                return PromptInput::Changed;
+            }
+            return self.handle_history_search_event(event);
+        }
         let Event::Key(key) = event else {
             return self.apply_area_event(event, layout);
         };
         if key.kind == KeyEventKind::Release {
             return PromptInput::Changed;
-        }
-        if self.history_search.is_some() {
-            return self.handle_history_search_event(event, layout);
         }
         if self.key_policy.shell_history() {
             if let Some(outcome) = self.handle_shell_history_key(*key, layout) {
@@ -502,20 +528,15 @@ impl PromptBuffer {
     }
 
     fn begin_history_search(&mut self) {
-        let current = (!self.history.is_empty()).then_some(0);
-        self.history_search = Some(PromptHistorySearch {
-            query: String::new(),
-            current,
-        });
+        self.history_search = Some(PromptHistorySearch::default());
     }
 
-    fn handle_history_search_event(&mut self, event: &Event, layout: LayoutOptions) -> PromptInput {
+    fn handle_history_search_event(&mut self, event: &Event) -> PromptInput {
         match event {
             Event::Paste(text) => {
-                if let Some(search) = self.history_search.as_mut() {
-                    search.query.push_str(&normalize_prompt_newlines(text));
-                }
-                self.select_first_history_match();
+                self.insert_history_search_query(
+                    &normalize_prompt_newlines(text).replace('\n', " "),
+                );
             }
             Event::Key(key) => match key.code {
                 KeyCode::Esc | KeyCode::Char('g' | 'G')
@@ -528,10 +549,10 @@ impl PromptBuffer {
                     self.accept_history_search();
                 }
                 KeyCode::Backspace => {
-                    if let Some(search) = self.history_search.as_mut() {
-                        search.query.pop();
-                    }
-                    self.select_first_history_match();
+                    self.delete_history_search_query(true);
+                }
+                KeyCode::Delete => {
+                    self.delete_history_search_query(false);
                 }
                 KeyCode::Char('r' | 'R') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     self.select_older_history_match();
@@ -542,11 +563,24 @@ impl PromptBuffer {
                 KeyCode::Down if key.modifiers.is_empty() => {
                     self.select_newer_history_match();
                 }
-                KeyCode::Left | KeyCode::Right | KeyCode::Home | KeyCode::End
-                    if key.modifiers.is_empty() =>
-                {
-                    if self.accept_history_search() {
-                        return self.apply_area_event(event, layout);
+                KeyCode::Left if key.modifiers.is_empty() => {
+                    if let Some(search) = self.history_search.as_mut() {
+                        search.cursor = search.cursor.saturating_sub(1);
+                    }
+                }
+                KeyCode::Right if key.modifiers.is_empty() => {
+                    if let Some(search) = self.history_search.as_mut() {
+                        search.cursor = (search.cursor + 1).min(grapheme_len(&search.query));
+                    }
+                }
+                KeyCode::Home if key.modifiers.is_empty() => {
+                    if let Some(search) = self.history_search.as_mut() {
+                        search.cursor = 0;
+                    }
+                }
+                KeyCode::End if key.modifiers.is_empty() => {
+                    if let Some(search) = self.history_search.as_mut() {
+                        search.cursor = grapheme_len(&search.query);
                     }
                 }
                 KeyCode::Char(character)
@@ -554,16 +588,49 @@ impl PromptBuffer {
                         .modifiers
                         .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
                 {
-                    if let Some(search) = self.history_search.as_mut() {
-                        search.query.push(character);
-                    }
-                    self.select_first_history_match();
+                    self.insert_history_search_query(&character.to_string());
                 }
                 _ => {}
             },
             _ => {}
         }
         PromptInput::Changed
+    }
+
+    fn insert_history_search_query(&mut self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        let Some(search) = self.history_search.as_mut() else {
+            return;
+        };
+        if text.len() > PROMPT_MAX_BYTES.saturating_sub(search.query.len()) {
+            return;
+        }
+        let offset = grapheme_to_byte(&search.query, search.cursor);
+        search.query.insert_str(offset, text);
+        search.cursor = byte_to_grapheme(&search.query, offset + text.len());
+        self.select_first_history_match();
+    }
+
+    fn delete_history_search_query(&mut self, backward: bool) {
+        let Some(search) = self.history_search.as_mut() else {
+            return;
+        };
+        let len = grapheme_len(&search.query);
+        if (backward && search.cursor == 0) || (!backward && search.cursor == len) {
+            return;
+        }
+        let start = if backward {
+            search.cursor - 1
+        } else {
+            search.cursor
+        };
+        let start_byte = grapheme_to_byte(&search.query, start);
+        let end_byte = grapheme_to_byte(&search.query, start + 1);
+        search.query.replace_range(start_byte..end_byte, "");
+        search.cursor = start;
+        self.select_first_history_match();
     }
 
     fn history_matches(&self, query: &str) -> Vec<usize> {
@@ -582,7 +649,9 @@ impl PromptBuffer {
         else {
             return;
         };
-        let current = self.history_matches(&query).first().copied();
+        let current = (!query.is_empty())
+            .then(|| self.history_matches(&query).first().copied())
+            .flatten();
         if let Some(search) = self.history_search.as_mut() {
             search.current = current;
         }
@@ -710,7 +779,7 @@ mod tests {
         first_prompt_line, normalize_prompt_newlines, Mode, PromptBuffer, PromptInput,
         PromptKeyPolicy, PROMPT_MAX_BYTES,
     };
-    use crate::text_layout::LayoutOptions;
+    use crate::{text_layout::LayoutOptions, unicode_utils::grapheme_len};
 
     #[test]
     fn single_line_paste_shares_crlf_normalization_without_accepting_a_newline() {
@@ -1641,16 +1710,39 @@ mod tests {
         prompt.set_cursor(4);
 
         prompt.handle_event(&key(KeyCode::Char('r'), KeyModifiers::CONTROL), 40);
+        assert_eq!(prompt.display_text(), "Search prompts: ");
+        assert_eq!(prompt.display_cursor(), grapheme_len("Search prompts: "));
+        assert_eq!(prompt.history_search_match_position(), None);
+        assert_eq!(prompt.text(), "keep this draft");
         for character in ['d', 'e', 'p'] {
             prompt.handle_event(&key(KeyCode::Char(character), KeyModifiers::NONE), 40);
         }
         assert!(prompt.history_search_active());
         assert_eq!(prompt.text(), "keep this draft");
-        assert_eq!(prompt.display_text(), "deploy production");
+        assert_eq!(
+            prompt.display_text(),
+            "Search prompts: dep\n↳ deploy production"
+        );
+        assert_eq!(prompt.display_cursor(), grapheme_len("Search prompts: dep"));
         assert_eq!(prompt.history_search_match_position(), Some((1, 2)));
 
+        prompt.handle_event(&key(KeyCode::Left, KeyModifiers::NONE), 40);
+        assert_eq!(prompt.display_cursor(), grapheme_len("Search prompts: de"));
+        prompt.handle_event(&key(KeyCode::Backspace, KeyModifiers::NONE), 40);
+        assert_eq!(prompt.display_text(), "Search prompts: dp");
+        assert_eq!(prompt.history_search_match_position(), None);
+        prompt.handle_event(&key(KeyCode::Char('e'), KeyModifiers::NONE), 40);
+        assert_eq!(
+            prompt.display_text(),
+            "Search prompts: dep\n↳ deploy production"
+        );
+        prompt.handle_event(&key(KeyCode::End, KeyModifiers::NONE), 40);
+
         prompt.handle_event(&key(KeyCode::Char('r'), KeyModifiers::CONTROL), 40);
-        assert_eq!(prompt.display_text(), "deploy staging");
+        assert_eq!(
+            prompt.display_text(),
+            "Search prompts: dep\n↳ deploy staging"
+        );
         assert_eq!(prompt.history_search_match_position(), Some((2, 2)));
         assert_eq!(
             prompt.handle_event(&key(KeyCode::Enter, KeyModifiers::NONE), 40),
@@ -1668,10 +1760,20 @@ mod tests {
         prompt.handle_event(&key(KeyCode::Char('r'), KeyModifiers::CONTROL), 40);
         prompt.handle_event(&key(KeyCode::Char('x'), KeyModifiers::NONE), 40);
         assert_eq!(prompt.history_search_match_position(), None);
+        assert_eq!(prompt.display_text(), "Search prompts: x");
         prompt.handle_event(&key(KeyCode::Esc, KeyModifiers::NONE), 40);
         assert_eq!(prompt.text(), "another draft");
         assert_eq!(prompt.cursor(), 3);
         assert!(!prompt.history_search_active());
+
+        prompt.handle_event(&key(KeyCode::Char('r'), KeyModifiers::CONTROL), 40);
+        prompt.handle_event(&Event::Paste("deploy\r\nstaging".to_string()), 40);
+        assert_eq!(
+            prompt.display_text(),
+            "Search prompts: deploy staging\n↳ deploy staging"
+        );
+        assert_eq!(prompt.text(), "another draft");
+        assert_eq!(prompt.cursor(), 3);
     }
 
     #[test]

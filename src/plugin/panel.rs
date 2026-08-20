@@ -4269,7 +4269,6 @@ impl PanelManager {
             {
                 if let Some(composer) = panel.composer.as_mut() {
                     composer.focused = true;
-                    composer.prompt.accept_history_search();
                     let wrapped = composer.layout(metrics.width);
                     let cursor_row = wrapped
                         .position(composer.prompt.display_cursor())
@@ -4279,7 +4278,7 @@ impl PanelManager {
                     let row = first.saturating_add(y.saturating_sub(composer_top + 1));
                     let column = x.saturating_sub(metrics.x(placement.x).saturating_add(2));
                     if let Some(index) = wrapped.nearest_offset_on_row(row, column) {
-                        composer.prompt.set_cursor(index);
+                        composer.prompt.set_display_cursor(index);
                     }
                 }
                 panel.blur_scrollback();
@@ -5437,9 +5436,11 @@ fn render_text_panel_composer_footer(
     let (mode, actions) = text_panel_actions(composer, scrollback, overflow);
     let history_search_status = composer.prompt.history_search_query().map(|query| {
         if let Some((position, total)) = composer.prompt.history_search_match_position() {
-            format!("`{query}` · {position}/{total}")
+            format!("{position}/{total} matches")
+        } else if query.is_empty() {
+            "type to search".to_string()
         } else {
-            format!("`{query}` · no match")
+            "no match".to_string()
         }
     });
     ActionBar::new(&actions)
@@ -7275,6 +7276,22 @@ mod tests {
             &Event::Key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL)),
             80,
         );
+        let composer = manager.text_panels["agent"].composer.as_ref().unwrap();
+        assert_eq!(composer.prompt.text(), "draft");
+        assert_eq!(composer.prompt.display_text(), "Search prompts: ");
+        assert_eq!(composer.prompt.history_search_match_position(), None);
+
+        let theme = Theme::default();
+        let mut buffer = RenderBuffer::new(80, 20, &theme.style);
+        manager.render(&mut buffer, &theme);
+        let initial = (0..20)
+            .map(|row| row_text(&buffer, row))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(initial.contains("Search prompts:"), "{initial}");
+        assert!(initial.contains("type to search"), "{initial}");
+        assert!(!initial.contains("deploy production"), "{initial}");
+
         for character in ['d', 'e', 'p'] {
             manager.handle_focused_text_input(
                 &Event::Key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE)),
@@ -7287,13 +7304,15 @@ mod tests {
         );
         let composer = manager.text_panels["agent"].composer.as_ref().unwrap();
         assert_eq!(composer.prompt.text(), "draft");
-        assert_eq!(composer.prompt.display_text(), "deploy staging");
+        assert_eq!(
+            composer.prompt.display_text(),
+            "Search prompts: dep\n↳ deploy staging"
+        );
         assert_eq!(
             composer.prompt.history(),
             ["deploy production", "show status", "deploy staging"]
         );
 
-        let theme = Theme::default();
         let mut buffer = RenderBuffer::new(80, 20, &theme.style);
         manager.render(&mut buffer, &theme);
         let rendered = (0..20)
@@ -7301,8 +7320,18 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(rendered.contains("^R/↑/↓ matches"), "{rendered}");
-        assert!(rendered.contains("`dep` · 2/2"), "{rendered}");
-        assert!(rendered.contains("deploy staging"), "{rendered}");
+        assert!(rendered.contains("2/2 matches"), "{rendered}");
+        assert!(rendered.contains("Search prompts: dep"), "{rendered}");
+        assert!(rendered.contains("↳ deploy staging"), "{rendered}");
+        let (cursor_x, cursor_y) = manager
+            .focused_text_panel_cursor_position(80, 20)
+            .expect("history query owns the visible cursor");
+        let cursor_row = row_text(&buffer, cursor_y);
+        let query_end = cursor_row
+            .find("Search prompts: dep")
+            .expect("cursor remains on the search field")
+            + "Search prompts: dep".len();
+        assert_eq!(cursor_x, display_width(&cursor_row[..query_end]));
 
         let accepted = manager
             .handle_focused_text_input(
