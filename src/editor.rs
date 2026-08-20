@@ -13652,6 +13652,9 @@ impl Editor {
             InboundMessage::ProcessingError(error_msg) => {
                 Some(Action::Print(error_msg.to_string()))
             }
+            InboundMessage::ServerStderr(message) => {
+                Some(Action::Print(format!("LSP server error: {message}")))
+            }
         }
     }
 
@@ -22456,10 +22459,32 @@ impl Editor {
 
     async fn request_diagnostics(&mut self) -> anyhow::Result<()> {
         if let Some(uri) = self.current_buffer().uri()? {
-            self.ensure_current_buffer_lsp_opened().await?;
-            self.lsp.request_diagnostics(&uri).await?;
+            if let Err(error) = self.ensure_current_buffer_lsp_opened().await {
+                self.report_diagnostics_lsp_failure("open document", &error);
+                return Ok(());
+            }
+            if let Err(error) = self.lsp.request_diagnostics(&uri).await {
+                self.report_diagnostics_lsp_failure("request diagnostics", &error);
+            }
         }
         Ok(())
+    }
+
+    fn report_diagnostics_lsp_failure(&mut self, operation: &str, error: &dyn std::fmt::Display) {
+        log!(
+            "{}",
+            json!({
+                "event": "lsp_diagnostics_unavailable",
+                "level": "warn",
+                "service": "red",
+                "operation": operation,
+                "error": error.to_string(),
+            })
+        );
+        self.set_notification_message(
+            Severity::Warning,
+            Some(format!("Language server unavailable: {error}")),
+        );
     }
 
     async fn ensure_current_buffer_lsp_opened(&mut self) -> anyhow::Result<()> {
@@ -35936,6 +35961,21 @@ builtin = "rust"
         assert!(matches!(
             action,
             Some(Action::Print(message)) if message.contains("husk lsp exited")
+        ));
+    }
+
+    #[test]
+    fn lsp_server_stderr_is_visible_without_becoming_a_processing_error() {
+        let mut editor = test_editor(40, 10);
+        let message =
+            InboundMessage::ServerStderr("thread 'main' panicked in a cargo child".to_string());
+
+        let action = editor.handle_lsp_message(&message, None);
+
+        assert!(matches!(
+            action,
+            Some(Action::Print(message))
+                if message.contains("LSP server error") && message.contains("cargo child")
         ));
     }
 

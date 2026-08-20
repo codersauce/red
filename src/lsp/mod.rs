@@ -275,6 +275,8 @@ pub enum InboundMessage {
     Error(ResponseError),
     /// Error paired with a known Red request ID.
     RequestError { id: i64, error: LspError },
+    /// Important server stderr that should be visible without failing the transport.
+    ServerStderr(String),
     /// Transport or parsing failure not tied to one request.
     ProcessingError(LspError),
 }

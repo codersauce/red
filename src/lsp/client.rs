@@ -357,12 +357,7 @@ impl RealLspClient {
                 }
 
                 if should_surface_server_stderr(&message) {
-                    match rtx
-                        .send(InboundMessage::ProcessingError(LspError::ServerError(
-                            message,
-                        )))
-                        .await
-                    {
+                    match rtx.send(InboundMessage::ServerStderr(message)).await {
                         Ok(_) => (),
                         Err(err) => {
                             log!("[lsp] error sending stderr to editor: {}", err);
@@ -1060,7 +1055,10 @@ impl LspClient for RealLspClient {
 
         match self.response_rx.try_recv() {
             Ok(mut msg) => {
-                if matches!(msg, InboundMessage::ProcessingError(_)) {
+                if matches!(
+                    msg,
+                    InboundMessage::ProcessingError(_) | InboundMessage::ServerStderr(_)
+                ) {
                     if let Some(error) = self.poll_process_failure() {
                         msg = InboundMessage::ProcessingError(error);
                     }
@@ -2092,6 +2090,54 @@ mod test {
 
         client.did_close("/tmp/unavailable.hk").await.unwrap();
         client.shutdown().await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn panic_shaped_stderr_does_not_fail_a_running_server() {
+        let config = LanguageServerConfig {
+            command: "/bin/sh".to_string(),
+            args: vec![
+                "-c".to_string(),
+                "printf \"thread 'main' panicked in a cargo child\\n\" >&2; exec sleep 10"
+                    .to_string(),
+            ],
+            language_id: "rust".to_string(),
+            file_extensions: vec!["rs".to_string()],
+            filenames: Vec::new(),
+            documents: Vec::new(),
+            root_markers: Vec::new(),
+            env: HashMap::new(),
+            initialization_options: None,
+            settings: None,
+            workspace_name: None,
+        };
+        let mut client = RealLspClient::start(config, std::env::current_dir().unwrap())
+            .await
+            .unwrap();
+
+        let (message, method) = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(message) = client.recv_response().await.unwrap() {
+                    break message;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("panic-shaped stderr should be surfaced while the server is running");
+
+        assert!(matches!(
+            message,
+            InboundMessage::ServerStderr(ref message)
+                if message.contains("panicked in a cargo child")
+        ));
+        assert!(method.is_none());
+        assert!(!client.initialize_failed);
+        assert!(client.child.as_mut().unwrap().try_wait().unwrap().is_none());
+
+        client.child.as_mut().unwrap().start_kill().unwrap();
+        client.child.as_mut().unwrap().wait().await.unwrap();
     }
 
     #[tokio::test]
