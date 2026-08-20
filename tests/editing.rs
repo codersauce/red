@@ -1256,6 +1256,38 @@ async fn global_mark_reopens_a_closed_file_buffer() {
 }
 
 #[tokio::test]
+async fn opening_file_survives_an_lsp_did_open_failure() {
+    let path = temp_file_path("open-with-failed-lsp");
+    fs::write(&path, "fn main() {}\n").unwrap();
+    let lsp = RecordingLsp::failing_next_did_open();
+    let mut editor = Editor::test_with_size(
+        Box::new(lsp),
+        80,
+        24,
+        Config::default(),
+        Theme::default(),
+        vec![Buffer::new(None, String::new())],
+    )
+    .unwrap();
+    editor.test_disable_terminal_output();
+
+    editor
+        .test_execute_production_action(Action::OpenFile(path.clone()))
+        .await
+        .expect("an unavailable language server should not abort file navigation");
+
+    assert_eq!(
+        editor.test_current_buffer().file.as_deref(),
+        Some(path.as_str())
+    );
+    assert!(editor.test_last_error().is_some_and(|error| {
+        error.contains("Language server unavailable") && error.contains("injected didOpen failure")
+    }));
+
+    fs::remove_file(path).unwrap();
+}
+
+#[tokio::test]
 async fn jumplist_switches_buffers_but_forgets_a_deleted_buffer() {
     let first_path = temp_file_path("jumplist-first");
     let second_path = temp_file_path("jumplist-second");
