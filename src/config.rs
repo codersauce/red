@@ -4344,6 +4344,27 @@ max_buffer_words = 20
     }
 
     #[test]
+    fn default_config_maps_every_agent_header_action_to_a_shortcut() {
+        let config: Config = toml::from_str(include_str!("../default_config.toml")).unwrap();
+
+        for (shortcut, command) in [
+            ("Alt-c", "AgentClear"),
+            ("Alt-m", "AgentModel"),
+            ("Alt-n", "AgentNew"),
+            ("Alt-s", "AgentSessions"),
+            ("Alt-w", "AgentClose"),
+        ] {
+            assert_eq!(
+                config.keys.normal.get(shortcut),
+                Some(&KeyAction::Single(Action::PluginCommand(
+                    command.to_string()
+                ))),
+                "missing default keymap for {command}"
+            );
+        }
+    }
+
+    #[test]
     fn default_config_enables_project_search() {
         let config: Config = toml::from_str(include_str!("../default_config.toml")).unwrap();
         let Some(KeyAction::Nested(leader)) = config.keys.normal.get(" ") else {

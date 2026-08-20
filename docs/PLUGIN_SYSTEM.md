@@ -153,8 +153,8 @@ red::execute("CreateTextPanel", "assistant", PanelConfig {
     title: "Assistant",
     composer: Json { placeholder: "Ask a follow-up…", rows: 3 },
     header_actions: [
-        Json { id: "clear", label: "Clear", compact_label: "C" },
-        Json { id: "close", label: "×", compact_label: "×" },
+        Json { id: "clear", label: "Clear", compact_label: "C", shortcut: "Alt-c" },
+        Json { id: "close", label: "×", compact_label: "×", shortcut: "Alt-w" },
     ],
 });
 red::execute("UpdateTextPanel", "assistant", [

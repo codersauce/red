@@ -152,6 +152,7 @@ struct TextPanelHeaderAction {
     id: String,
     label: String,
     compact_label: String,
+    shortcut: String,
 }
 
 struct AgentEdit {
@@ -993,11 +994,10 @@ fn ensure_conversation_panel() {
             title: "Agent",
             composer: TextPanelComposerConfig { placeholder: "Ask a follow-up…", rows: 3 },
             header_actions: [
-                TextPanelHeaderAction { id: "sessions", label: "Sessions", compact_label: "S" },
-                TextPanelHeaderAction { id: "activity", label: "Activity", compact_label: "A" },
-                TextPanelHeaderAction { id: "clear", label: "Clear", compact_label: "C" },
-                TextPanelHeaderAction { id: "new", label: "New", compact_label: "N" },
-                TextPanelHeaderAction { id: "close", label: "×", compact_label: "×" },
+                TextPanelHeaderAction { id: "sessions", label: "Sessions", compact_label: "S", shortcut: "Alt-s" },
+                TextPanelHeaderAction { id: "new", label: "New", compact_label: "N", shortcut: "Alt-n" },
+                TextPanelHeaderAction { id: "clear", label: "Clear", compact_label: "C", shortcut: "Alt-c" },
+                TextPanelHeaderAction { id: "close", label: "×", compact_label: "×", shortcut: "Alt-w" },
             ],
         });
         red::state_patch(AgentState { panel_created: true });

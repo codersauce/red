@@ -339,6 +339,11 @@ Esc = { EnterMode = "Normal" }
 "Ctrl-p" = "FilePicker"
 "Ctrl-Shift-p" = "CommandPalette"
 "Alt-a" = { PluginCommand = "AgentToggle" }
+"Alt-c" = { PluginCommand = "AgentClear" }
+"Alt-m" = { PluginCommand = "AgentModel" }
+"Alt-n" = { PluginCommand = "AgentNew" }
+"Alt-s" = { PluginCommand = "AgentSessions" }
+"Alt-w" = { PluginCommand = "AgentClose" }
 "Alt-x" = "CommandPalette"
 "F1" = "KeyboardShortcuts"
 "Ctrl-j" = { PluginCommand = "BufferPicker" }

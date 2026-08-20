@@ -259,12 +259,12 @@ space. It shrinks again when text is removed or sent, and short panes always
 retain room for the conversation.
 
 Open a workspace, press `Space A` (or run `:Agent`), type a request, and press
-Enter. Red lazily starts `codex app-server --stdio`, initializes the connection,
-checks the account, starts a persisted thread, and submits turns with
-`turn/start`. Follow-up text and the busy indicator render before dispatch;
-follow-ups submitted during an active turn appear immediately and remain queued
-in FIFO order. Assistant deltas stream into the conversation footer. `Ctrl-c`
-interrupts the active turn with `turn/interrupt`.
+Enter. Red lazily starts `codex app-server --stdio --session-source app-server`,
+initializes the connection, checks the account, starts a persisted thread, and
+submits turns with `turn/start`. Follow-up text and the busy indicator render
+before dispatch; follow-ups submitted during an active turn appear immediately
+and remain queued in FIFO order. Assistant deltas stream into the conversation
+footer. `Ctrl-c` interrupts the active turn with `turn/interrupt`.
 
 `Tab` or `Shift-Tab` switches between the composer and transcript, preserving
 the draft, composer editing mode, and transcript reading position. Switching
@@ -272,13 +272,13 @@ away from an unfinished transcript search cancels it and restores its starting
 position. In transcript Normal mode, `]l` jumps to the next link and `[l` to the
 previous one, wrapping at the ends. Enter opens the link under the cursor.
 
-The Agent pane's `Sessions` header action replaces the conversation with an
-in-pane browser; `:AgentSessions` opens the same view. Sessions are newest
-first. Type in the temporary footer to search conversation content, press
-`Alt-s` to cycle between `Red`, `This workspace`, and `All Codex`, and click or
-open a session row to continue it. `Esc`, the back row, or the `Sessions` action
-returns to the conversation with its transcript position and unsent draft
-restored.
+The Agent pane's **Sessions** header action, `Alt-s`, and `:AgentSessions` open
+a picker inside the same pane. Its search field replaces the conversation
+composer, and matching sessions appear newest first. Move between sessions with
+the arrow keys or `Ctrl-j` / `Ctrl-k`, press `Enter` to continue the selected
+conversation, and use `Alt-s` to cycle between **Red**, **This workspace**,
+and **All Codex**. `Esc` or `Ctrl-c` returns to the conversation with its
+transcript position and unsent draft restored.
 
 In the conversation transcript's Normal mode, `[p` jumps backward to a user
 prompt and `]p` jumps forward. From an answer, the first backward jump returns
@@ -295,7 +295,7 @@ tool errors. A quiet `Worked for …` footer appears below the answer. Errors th
 stop the request still appear separately. Click a summary (or move to it with
 `[l` / `]l` and press Enter) to expand that turn's five most recent actions.
 Select **View all details** to inspect full paths and bounded error text.
-**Activity** in the pane header and `:AgentActivity` toggle the latest turn.
+`:AgentActivity` toggles the latest turn.
 **New** starts a fresh Codex session and focuses the pane composer directly,
 without opening another ask popup. Details are
 bounded and retained for the current conversation view; restored conversations
@@ -437,12 +437,15 @@ protocol is unavailable; it does not fall back to `codex exec` or native edits.
 | --- | --- |
 | `Space i` | Edit the current line or visual selection in a bounded popup. |
 | `:Agent` / `:AgentPrompt` | Open the prompt composer. |
+| `:AgentToggle` / `Alt+a` | Show or hide the Agent pane. |
 | `:AgentOpen` | Show and focus the conversation pane without opening a prompt. |
-| `:AgentModel` / `Alt+m` in the Agent pane | Choose this conversation’s model and reasoning effort. |
+| `:AgentSessions` / `Alt+s` | Search and resume previous sessions inside the Agent pane. |
+| `:AgentModel` / `Alt+m` | Choose this conversation’s model and reasoning effort. |
 | `:AgentCancel` | Interrupt the active Codex turn. |
-| `:AgentClear` | Clear visible conversation while retaining current context. |
-| `:AgentNew` | Close the current thread and start a new one. |
-| `:AgentClose` | Hide the conversation panel without discarding state. |
+| `:AgentClear` / `Alt+c` | Clear visible conversation while retaining current context. |
+| `:AgentNew` / `Alt+n` | Close the current thread and start a new one. |
+| `:AgentClose` / `Alt+w` | Hide the conversation panel without discarding state. |
+| `:AgentActivity` | Expand or collapse the latest activity summary. |
 | `:AgentHistory` | Inspect attributed agent transactions. |
 
 ### Choosing a model

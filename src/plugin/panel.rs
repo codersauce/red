@@ -223,6 +223,8 @@ pub struct TextPanelHeaderAction {
     pub label: String,
     #[serde(default)]
     pub compact_label: Option<String>,
+    #[serde(default)]
+    pub shortcut: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -3435,6 +3437,27 @@ impl PanelManager {
                 );
             }
         }
+        actions.extend(panel.config.header_actions.iter().filter_map(|action| {
+            let shortcut = action.shortcut.as_ref()?;
+            if panel
+                .header_detail
+                .as_ref()
+                .and_then(|detail| detail.shortcut.as_ref())
+                .is_some_and(|detail_shortcut| detail_shortcut == shortcut)
+            {
+                return None;
+            }
+            let label = if action.id == "close" && action.label == "×" {
+                "Close"
+            } else {
+                action.label.as_str()
+            };
+            Some(
+                UiAction::new(&action.id, shortcut, label)
+                    .with_group("Conversation")
+                    .with_description(format!("{label} in the Agent pane")),
+            )
+        }));
         actions
     }
 
@@ -3508,13 +3531,22 @@ impl PanelManager {
 
     pub(crate) fn header_shortcut_event(&self, key: &str) -> Option<PanelEvent> {
         let panel = self.text_panels.get(self.focused.as_deref()?)?;
-        let detail = panel.header_detail.as_ref()?;
-        if detail.shortcut.as_deref() != Some(key) {
-            return None;
-        }
+        let action = panel
+            .header_detail
+            .as_ref()
+            .filter(|detail| detail.shortcut.as_deref() == Some(key))
+            .and_then(|detail| detail.action.as_ref())
+            .or_else(|| {
+                panel
+                    .config
+                    .header_actions
+                    .iter()
+                    .find(|action| action.shortcut.as_deref() == Some(key))
+                    .map(|action| &action.id)
+            })?;
         Some(PanelEvent {
             panel_id: panel.id.clone(),
-            action: detail.action.clone()?,
+            action: action.clone(),
             selected_index: panel.scroll,
             row: None,
             text: None,
@@ -5206,14 +5238,11 @@ fn render_text_panel(
         );
     }
     for (start, _, label) in header_actions {
-        let x = content_position.x + start;
-        buffer.set_text(x, position.y, "[", &palette.divider);
-        buffer.set_text(x + 1, position.y, label, &palette.accent);
         buffer.set_text(
-            x + 1 + display_width(label),
+            content_position.x + start,
             position.y,
-            "]",
-            &palette.divider,
+            label,
+            &palette.accent,
         );
     }
     if title_rows > 0 {
@@ -6018,12 +6047,19 @@ fn text_panel_header_actions_with_title_width(
     width: usize,
     title_width: usize,
 ) -> Vec<(usize, &str, &str)> {
+    const HEADER_ACTION_GAP: usize = 2;
     let full_width = config
         .header_actions
         .iter()
-        .map(|action| display_width(&action.label).saturating_add(2))
+        .map(|action| display_width(&action.label))
         .sum::<usize>()
-        .saturating_add(config.header_actions.len().saturating_sub(1));
+        .saturating_add(
+            config
+                .header_actions
+                .len()
+                .saturating_sub(1)
+                .saturating_mul(HEADER_ACTION_GAP),
+        );
     let compact = full_width.saturating_add(title_width).saturating_add(1) > width;
     let mut labels = config
         .header_actions
@@ -6039,14 +6075,19 @@ fn text_panel_header_actions_with_title_width(
         .collect::<Vec<_>>();
     let mut used = labels
         .iter()
-        .map(|(_, label)| display_width(label).saturating_add(2))
+        .map(|(_, label)| display_width(label))
         .sum::<usize>()
-        .saturating_add(labels.len().saturating_sub(1));
+        .saturating_add(
+            labels
+                .len()
+                .saturating_sub(1)
+                .saturating_mul(HEADER_ACTION_GAP),
+        );
     while used > width && !labels.is_empty() {
         let (_, label) = labels.remove(0);
-        used = used.saturating_sub(display_width(label).saturating_add(2));
+        used = used.saturating_sub(display_width(label));
         if !labels.is_empty() {
-            used = used.saturating_sub(1);
+            used = used.saturating_sub(HEADER_ACTION_GAP);
         }
     }
     let mut start = width.saturating_sub(used);
@@ -6054,7 +6095,7 @@ fn text_panel_header_actions_with_title_width(
         .into_iter()
         .map(|(action, label)| {
             let current = start;
-            start = start.saturating_add(display_width(label).saturating_add(3));
+            start = start.saturating_add(display_width(label).saturating_add(HEADER_ACTION_GAP));
             (current, action, label)
         })
         .collect()
@@ -6098,9 +6139,7 @@ fn text_panel_header_detail_layout(panel: &TextPanel, width: usize) -> Option<(u
 fn text_panel_header_action_at(panel: &TextPanel, width: usize, x: usize) -> Option<&str> {
     text_panel_header_actions_for_panel(panel, width)
         .into_iter()
-        .find(|(start, _, label)| {
-            x >= *start && x < start.saturating_add(display_width(label).saturating_add(2))
-        })
+        .find(|(start, _, label)| x >= *start && x < start.saturating_add(display_width(label)))
         .map(|(_, action, _)| action)
 }
 
@@ -8207,6 +8246,7 @@ mod tests {
                     id: "close".into(),
                     label: "×".into(),
                     compact_label: None,
+                    shortcut: None,
                 }],
                 ..PanelConfig::default()
             },
@@ -8282,6 +8322,7 @@ mod tests {
                     id: id.into(),
                     label: label.into(),
                     compact_label: Some(compact.into()),
+                    shortcut: None,
                 })
                 .collect(),
                 ..Default::default()
@@ -8294,12 +8335,12 @@ mod tests {
             action: Some("model".into()),
             shortcut: Some("Alt-m".into()),
         });
-        assert!(text_panel_header_detail_layout(&panel, 60)
+        assert!(text_panel_header_detail_layout(&panel, 59)
             .unwrap()
             .1
             .contains("Next: smoke-fast"));
         assert_eq!(
-            text_panel_header_actions_for_panel(&panel, 60)
+            text_panel_header_actions_for_panel(&panel, 59)
                 .iter()
                 .map(|(_, _, label)| *label)
                 .collect::<Vec<_>>(),
@@ -8309,8 +8350,8 @@ mod tests {
             .unwrap()
             .1
             .contains('→'));
-        for (start, action, _) in text_panel_header_actions_for_panel(&panel, 60) {
-            assert_eq!(text_panel_header_action_at(&panel, 60, start), Some(action));
+        for (start, action, _) in text_panel_header_actions_for_panel(&panel, 59) {
+            assert_eq!(text_panel_header_action_at(&panel, 59, start), Some(action));
         }
     }
 
@@ -8334,16 +8375,19 @@ mod tests {
                         id: "clear".to_string(),
                         label: "Clear".to_string(),
                         compact_label: Some("C".to_string()),
+                        shortcut: Some("Alt-c".to_string()),
                     },
                     TextPanelHeaderAction {
                         id: "new".to_string(),
                         label: "New".to_string(),
                         compact_label: Some("N".to_string()),
+                        shortcut: Some("Alt-n".to_string()),
                     },
                     TextPanelHeaderAction {
                         id: "close".to_string(),
                         label: "×".to_string(),
                         compact_label: Some("×".to_string()),
+                        shortcut: Some("Alt-w".to_string()),
                     },
                 ],
             },
@@ -8353,22 +8397,34 @@ mod tests {
         manager.render(&mut wide, &theme);
         let wide_header = row_text(&wide, 0);
         assert!(wide_header.contains("Agent"));
-        assert!(wide_header.contains("[Clear] [New] [×]"));
+        assert!(wide_header.contains("Clear  New  ×"));
+        assert!(!wide_header.contains('['));
 
-        for (label, expected) in [("[Clear]", "clear"), ("[New]", "new"), ("[×]", "close")] {
+        for (label, expected) in [("Clear", "clear"), ("New", "new"), ("×", "close")] {
             let start = wide_header.find(label).unwrap();
-            let column = display_width(&wide_header[..start]) + 1;
+            let column = display_width(&wide_header[..start]);
             let event = manager.focus_panel_at_position(column, 0, 80, 20).unwrap();
             assert_eq!(event.action, expected);
+        }
+        for (shortcut, action) in [("Alt-c", "clear"), ("Alt-n", "new"), ("Alt-w", "close")] {
+            assert_eq!(
+                manager.header_shortcut_event(shortcut).unwrap().action,
+                action
+            );
+            assert!(manager
+                .surface_actions()
+                .iter()
+                .any(|candidate| candidate.id == action && candidate.key == shortcut));
         }
 
         let mut narrow = RenderBuffer::new(30, 12, &theme.style);
         manager.render(&mut narrow, &theme);
-        assert!(row_text(&narrow, 0).contains("[C] [N] [×]"));
+        assert!(row_text(&narrow, 0).contains("C  N  ×"));
 
         let actions = text_panel_header_actions(&manager.text_panels["agent"].config, 4);
-        assert_eq!(actions.len(), 1);
-        assert_eq!(actions[0].1, "close");
+        assert_eq!(actions.len(), 2);
+        assert_eq!(actions[0].1, "new");
+        assert_eq!(actions[1].1, "close");
     }
 
     #[test]
@@ -9278,6 +9334,7 @@ mod tests {
                 id: "close".to_string(),
                 label: "×".to_string(),
                 compact_label: Some("×".to_string()),
+                shortcut: None,
             }],
             ..PanelConfig::default()
         };

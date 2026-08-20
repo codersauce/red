@@ -7325,7 +7325,16 @@ mod tests {
                     && config.side == crate::plugin::PanelSide::Right
                     && config.width == 62
                     && config.title.as_deref() == Some("Agent")
-                && config.header_actions.iter().map(|action| action.id.as_str()).eq(["sessions", "activity", "clear", "new", "close"])
+                && config
+                    .header_actions
+                    .iter()
+                    .map(|action| (action.id.as_str(), action.shortcut.as_deref()))
+                    .eq([
+                        ("sessions", Some("Alt-s")),
+                        ("new", Some("Alt-n")),
+                        ("clear", Some("Alt-c")),
+                        ("close", Some("Alt-w")),
+                    ])
         ));
         expect_agent_model_header();
         assert!(matches!(
