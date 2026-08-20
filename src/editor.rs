@@ -1861,6 +1861,10 @@ pub enum PluginRequest {
         enabled: bool,
         status: Option<String>,
     },
+    SetTextPanelComposerHistory {
+        id: String,
+        history: Vec<String>,
+    },
     SetTextPanelStatus {
         id: String,
         status: Option<plugin::TextPanelStatus>,
@@ -2042,6 +2046,7 @@ impl PluginRequest {
             Self::AppendTextPanel { .. } => "AppendTextPanel",
             Self::FocusTextPanelComposer { .. } => "FocusTextPanelComposer",
             Self::SetTextPanelComposerState { .. } => "SetTextPanelComposerState",
+            Self::SetTextPanelComposerHistory { .. } => "SetTextPanelComposerHistory",
             Self::SetTextPanelStatus { .. } => "SetTextPanelStatus",
             Self::ClearTextPanelComposer { .. } => "ClearTextPanelComposer",
             Self::SelectPanelRow { .. } => "SelectPanelRow",
@@ -11201,6 +11206,14 @@ impl Editor {
                     if self
                         .panel_manager
                         .set_text_panel_composer_state(&id, enabled, status)
+                    {
+                        needs_render = true;
+                    }
+                }
+                PluginRequest::SetTextPanelComposerHistory { id, history } => {
+                    if self
+                        .panel_manager
+                        .set_text_panel_composer_history(&id, history)
                     {
                         needs_render = true;
                     }

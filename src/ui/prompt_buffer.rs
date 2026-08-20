@@ -36,6 +36,31 @@ pub(crate) enum PromptKeyPolicy {
     #[default]
     Vim,
     EnterSends,
+    EnterSendsWithShellHistory,
+}
+
+impl PromptKeyPolicy {
+    const fn enter_sends(self) -> bool {
+        matches!(self, Self::EnterSends | Self::EnterSendsWithShellHistory)
+    }
+
+    const fn shell_history(self) -> bool {
+        matches!(self, Self::EnterSendsWithShellHistory)
+    }
+}
+
+const PROMPT_HISTORY_LIMIT: usize = 50;
+
+#[derive(Debug)]
+struct PromptHistoryDraft {
+    text: String,
+    cursor: usize,
+}
+
+#[derive(Debug, Default)]
+struct PromptHistorySearch {
+    query: String,
+    current: Option<usize>,
 }
 
 /// Fileless modal text area with thread-local prompt history and submission policy.
@@ -45,7 +70,8 @@ pub(crate) struct PromptBuffer {
     key_policy: PromptKeyPolicy,
     history: Vec<String>,
     history_position: Option<usize>,
-    history_draft: Option<String>,
+    history_draft: Option<PromptHistoryDraft>,
+    history_search: Option<PromptHistorySearch>,
 }
 
 impl PromptBuffer {
@@ -59,13 +85,10 @@ impl PromptBuffer {
         Self {
             area: TextArea::with_max_bytes(text, PROMPT_MAX_BYTES),
             key_policy: PromptKeyPolicy::default(),
-            history: history
-                .into_iter()
-                .filter(|entry| entry.len() <= PROMPT_MAX_BYTES)
-                .map(|entry| normalize_prompt_newlines(&entry))
-                .collect(),
+            history: normalized_prompt_history(history),
             history_position: None,
             history_draft: None,
+            history_search: None,
         }
     }
 
@@ -87,15 +110,36 @@ impl PromptBuffer {
         self.area.text()
     }
 
+    /// Returns the draft or the non-destructive reverse-search preview.
+    #[must_use]
+    pub(crate) fn display_text(&self) -> String {
+        self.history_search
+            .as_ref()
+            .and_then(|search| search.current)
+            .and_then(|index| self.history.get(index))
+            .cloned()
+            .unwrap_or_else(|| self.text())
+    }
+
     /// Projects the current draft without modifying its logical representation.
     pub(crate) fn layout(&self, options: LayoutOptions) -> TextLayout {
-        TextLayout::new(&self.text(), options)
+        TextLayout::new(&self.display_text(), options)
     }
 
     /// Returns the cursor as an absolute extended-grapheme index.
     #[must_use]
     pub(crate) const fn cursor(&self) -> usize {
         self.area.cursor()
+    }
+
+    /// Returns the cursor for the draft or reverse-search preview.
+    #[must_use]
+    pub(crate) fn display_cursor(&self) -> usize {
+        if self.history_search.is_some() {
+            grapheme_len(&self.display_text())
+        } else {
+            self.cursor()
+        }
     }
 
     /// Returns the prompt's independent editor mode.
@@ -111,6 +155,9 @@ impl PromptBuffer {
 
     /// Changes the local prompt mode without mutating the global editor.
     pub(crate) fn set_mode(&mut self, mode: Mode) {
+        if mode != Mode::Insert {
+            self.cancel_history_search();
+        }
         self.area.set_mode(mode);
     }
 
@@ -118,6 +165,35 @@ impl PromptBuffer {
     #[must_use]
     pub(crate) fn history(&self) -> &[String] {
         &self.history
+    }
+
+    /// Replaces surface-provided history without changing the current draft.
+    pub(crate) fn set_history(&mut self, history: Vec<String>) {
+        self.history = normalized_prompt_history(history);
+        self.history_position = None;
+        self.history_draft = None;
+        self.cancel_history_search();
+    }
+
+    #[must_use]
+    pub(crate) const fn history_search_active(&self) -> bool {
+        self.history_search.is_some()
+    }
+
+    #[must_use]
+    pub(crate) fn history_search_query(&self) -> Option<&str> {
+        self.history_search
+            .as_ref()
+            .map(|search| search.query.as_str())
+    }
+
+    #[must_use]
+    pub(crate) fn history_search_match_position(&self) -> Option<(usize, usize)> {
+        let search = self.history_search.as_ref()?;
+        let current = search.current?;
+        let matches = self.history_matches(&search.query);
+        let position = matches.iter().position(|index| *index == current)?;
+        Some((position + 1, matches.len()))
     }
 
     /// Moves the cursor to a bounded absolute grapheme position.
@@ -141,12 +217,14 @@ impl PromptBuffer {
         let changed = self.area.set_text(&text);
         self.history_position = None;
         self.history_draft = None;
+        self.history_search = None;
         self.area.set_mode(Mode::Insert);
         changed
     }
 
     /// Inserts normalized text as one undoable prompt transaction.
     pub(crate) fn insert(&mut self, text: &str) -> bool {
+        self.cancel_history_search();
         let changed = self.area.insert(text);
         self.detach_history_after_edit(changed);
         changed
@@ -154,6 +232,7 @@ impl PromptBuffer {
 
     /// Removes the previous complete extended grapheme.
     pub(crate) fn backspace(&mut self) -> bool {
+        self.cancel_history_search();
         let changed = self.area.backspace();
         self.detach_history_after_edit(changed);
         changed
@@ -161,6 +240,7 @@ impl PromptBuffer {
 
     /// Removes the complete extended grapheme under the cursor.
     pub(crate) fn delete(&mut self) -> bool {
+        self.cancel_history_search();
         let changed = self.area.delete();
         self.detach_history_after_edit(changed);
         changed
@@ -168,6 +248,7 @@ impl PromptBuffer {
 
     /// Removes whitespace and the word immediately preceding the cursor.
     pub(crate) fn delete_previous_word(&mut self) -> bool {
+        self.cancel_history_search();
         let changed = self.area.delete_previous_word();
         self.detach_history_after_edit(changed);
         changed
@@ -181,7 +262,10 @@ impl PromptBuffer {
         let index = match self.history_position {
             Some(index) => (index + 1).min(self.history.len() - 1),
             None => {
-                self.history_draft = Some(self.text());
+                self.history_draft = Some(PromptHistoryDraft {
+                    text: self.text(),
+                    cursor: self.cursor(),
+                });
                 0
             }
         };
@@ -195,14 +279,22 @@ impl PromptBuffer {
         let Some(index) = self.history_position else {
             return false;
         };
-        let next = if index == 0 {
+        let (next, cursor) = if index == 0 {
             self.history_position = None;
-            self.history_draft.take().unwrap_or_default()
+            let draft = self.history_draft.take().unwrap_or(PromptHistoryDraft {
+                text: String::new(),
+                cursor: 0,
+            });
+            (draft.text, Some(draft.cursor))
         } else {
             self.history_position = Some(index - 1);
-            self.history[index - 1].clone()
+            (self.history[index - 1].clone(), None)
         };
-        self.set_text(&next)
+        let changed = self.set_text(&next);
+        if let Some(cursor) = cursor {
+            self.set_cursor(cursor);
+        }
+        changed
     }
 
     /// Undoes one real, branch-preserving prompt edit.
@@ -220,6 +312,7 @@ impl PromptBuffer {
         self.area.clear();
         self.history_position = None;
         self.history_draft = None;
+        self.history_search = None;
     }
 
     /// Takes a nonblank draft and adds it to bounded, deduplicated history.
@@ -230,7 +323,7 @@ impl PromptBuffer {
         }
         self.history.retain(|entry| entry != &text);
         self.history.insert(0, text.clone());
-        self.history.truncate(50);
+        self.history.truncate(PROMPT_HISTORY_LIMIT);
         self.clear();
         self.set_mode(Mode::Insert);
         Some(text)
@@ -254,7 +347,15 @@ impl PromptBuffer {
         if key.kind == KeyEventKind::Release {
             return PromptInput::Changed;
         }
-        if self.key_policy == PromptKeyPolicy::EnterSends {
+        if self.history_search.is_some() {
+            return self.handle_history_search_event(event, layout);
+        }
+        if self.key_policy.shell_history() {
+            if let Some(outcome) = self.handle_shell_history_key(*key, layout) {
+                return outcome;
+            }
+        }
+        if self.key_policy.enter_sends() {
             if let Some(outcome) = self.handle_composer_key(*key, layout) {
                 return outcome;
             }
@@ -291,6 +392,14 @@ impl PromptBuffer {
                 if modifiers.contains(KeyModifiers::CONTROL) && self.mode() != Mode::Search =>
             {
                 self.delete_previous_word();
+                PromptInput::Changed
+            }
+            KeyCode::Char('r' | 'R')
+                if modifiers.contains(KeyModifiers::CONTROL)
+                    && self.key_policy.shell_history()
+                    && self.mode() == Mode::Insert =>
+            {
+                self.begin_history_search();
                 PromptInput::Changed
             }
             KeyCode::Char('r' | 'R') if modifiers.contains(KeyModifiers::CONTROL) => {
@@ -363,6 +472,186 @@ impl PromptBuffer {
         })
     }
 
+    fn handle_shell_history_key(
+        &mut self,
+        key: KeyEvent,
+        options: LayoutOptions,
+    ) -> Option<PromptInput> {
+        if self.mode() != Mode::Insert || !key.modifiers.is_empty() {
+            return None;
+        }
+        match key.code {
+            KeyCode::Up => {
+                let layout = TextLayout::new(&self.text(), options);
+                let first_row = layout
+                    .position(self.cursor())
+                    .is_none_or(|position| position.row == 0);
+                if self.history_position.is_some() || first_row {
+                    self.history_previous();
+                    Some(PromptInput::Changed)
+                } else {
+                    None
+                }
+            }
+            KeyCode::Down if self.history_position.is_some() => {
+                self.history_next();
+                Some(PromptInput::Changed)
+            }
+            _ => None,
+        }
+    }
+
+    fn begin_history_search(&mut self) {
+        let current = (!self.history.is_empty()).then_some(0);
+        self.history_search = Some(PromptHistorySearch {
+            query: String::new(),
+            current,
+        });
+    }
+
+    fn handle_history_search_event(&mut self, event: &Event, layout: LayoutOptions) -> PromptInput {
+        match event {
+            Event::Paste(text) => {
+                if let Some(search) = self.history_search.as_mut() {
+                    search.query.push_str(&normalize_prompt_newlines(text));
+                }
+                self.select_first_history_match();
+            }
+            Event::Key(key) => match key.code {
+                KeyCode::Esc | KeyCode::Char('g' | 'G')
+                    if key.code == KeyCode::Esc
+                        || key.modifiers.contains(KeyModifiers::CONTROL) =>
+                {
+                    self.cancel_history_search();
+                }
+                KeyCode::Enter | KeyCode::Char('\r') => {
+                    self.accept_history_search();
+                }
+                KeyCode::Backspace => {
+                    if let Some(search) = self.history_search.as_mut() {
+                        search.query.pop();
+                    }
+                    self.select_first_history_match();
+                }
+                KeyCode::Char('r' | 'R') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.select_older_history_match();
+                }
+                KeyCode::Up if key.modifiers.is_empty() => {
+                    self.select_older_history_match();
+                }
+                KeyCode::Down if key.modifiers.is_empty() => {
+                    self.select_newer_history_match();
+                }
+                KeyCode::Left | KeyCode::Right | KeyCode::Home | KeyCode::End
+                    if key.modifiers.is_empty() =>
+                {
+                    if self.accept_history_search() {
+                        return self.apply_area_event(event, layout);
+                    }
+                }
+                KeyCode::Char(character)
+                    if !key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                {
+                    if let Some(search) = self.history_search.as_mut() {
+                        search.query.push(character);
+                    }
+                    self.select_first_history_match();
+                }
+                _ => {}
+            },
+            _ => {}
+        }
+        PromptInput::Changed
+    }
+
+    fn history_matches(&self, query: &str) -> Vec<usize> {
+        self.history
+            .iter()
+            .enumerate()
+            .filter_map(|(index, entry)| entry.contains(query).then_some(index))
+            .collect()
+    }
+
+    fn select_first_history_match(&mut self) {
+        let Some(query) = self
+            .history_search
+            .as_ref()
+            .map(|search| search.query.clone())
+        else {
+            return;
+        };
+        let current = self.history_matches(&query).first().copied();
+        if let Some(search) = self.history_search.as_mut() {
+            search.current = current;
+        }
+    }
+
+    fn select_older_history_match(&mut self) {
+        let Some((query, current)) = self
+            .history_search
+            .as_ref()
+            .map(|search| (search.query.clone(), search.current))
+        else {
+            return;
+        };
+        let matches = self.history_matches(&query);
+        let next = current
+            .and_then(|current| matches.iter().position(|index| *index == current))
+            .and_then(|position| matches.get(position + 1))
+            .copied()
+            .or_else(|| {
+                current
+                    .is_none()
+                    .then(|| matches.first().copied())
+                    .flatten()
+            })
+            .or(current);
+        if let Some(search) = self.history_search.as_mut() {
+            search.current = next;
+        }
+    }
+
+    fn select_newer_history_match(&mut self) {
+        let Some((query, current)) = self
+            .history_search
+            .as_ref()
+            .map(|search| (search.query.clone(), search.current))
+        else {
+            return;
+        };
+        let matches = self.history_matches(&query);
+        let next = current
+            .and_then(|current| matches.iter().position(|index| *index == current))
+            .and_then(|position| position.checked_sub(1))
+            .and_then(|position| matches.get(position))
+            .copied()
+            .or(current);
+        if let Some(search) = self.history_search.as_mut() {
+            search.current = next;
+        }
+    }
+
+    pub(crate) fn accept_history_search(&mut self) -> bool {
+        let Some(current) = self
+            .history_search
+            .as_ref()
+            .and_then(|search| search.current)
+        else {
+            return false;
+        };
+        let Some(entry) = self.history.get(current).cloned() else {
+            return false;
+        };
+        self.history_search = None;
+        self.replace_draft(&entry)
+    }
+
+    pub(crate) fn cancel_history_search(&mut self) -> bool {
+        self.history_search.take().is_some()
+    }
+
     fn apply_area_event(&mut self, event: &Event, layout: LayoutOptions) -> PromptInput {
         let previous_revision = self.buffer().revision();
         let result = self.area.handle_event_with_layout_options(event, layout);
@@ -379,6 +668,22 @@ impl PromptBuffer {
             self.history_draft = None;
         }
     }
+}
+
+fn normalized_prompt_history(history: Vec<String>) -> Vec<String> {
+    let mut normalized = Vec::new();
+    for entry in history {
+        let entry = normalize_prompt_newlines(&entry);
+        if entry.trim().is_empty() || entry.len() > PROMPT_MAX_BYTES || normalized.contains(&entry)
+        {
+            continue;
+        }
+        normalized.push(entry);
+        if normalized.len() == PROMPT_HISTORY_LIMIT {
+            break;
+        }
+    }
+    normalized
 }
 
 /// Normalizes terminal and clipboard line endings before prompt editing.
@@ -1294,6 +1599,95 @@ mod tests {
         assert_eq!(prompt.text(), "newer\nentry");
         assert!(prompt.history_next());
         assert_eq!(prompt.text(), "unsent draft");
+    }
+
+    #[test]
+    fn shell_history_arrows_preserve_multiline_motion_and_restore_the_draft_cursor() {
+        let mut prompt = PromptBuffer::with_history(
+            "first line\nsecond line",
+            vec!["newest".to_string(), "older".to_string()],
+        )
+        .with_key_policy(PromptKeyPolicy::EnterSendsWithShellHistory);
+
+        assert_eq!(
+            prompt.handle_event(&key(KeyCode::Up, KeyModifiers::NONE), 40),
+            PromptInput::Changed
+        );
+        assert_eq!(prompt.text(), "first line\nsecond line");
+        let draft_cursor = prompt.cursor();
+
+        prompt.handle_event(&key(KeyCode::Up, KeyModifiers::NONE), 40);
+        assert_eq!(prompt.text(), "newest");
+        prompt.handle_event(&key(KeyCode::Up, KeyModifiers::NONE), 40);
+        assert_eq!(prompt.text(), "older");
+        prompt.handle_event(&key(KeyCode::Down, KeyModifiers::NONE), 40);
+        assert_eq!(prompt.text(), "newest");
+        prompt.handle_event(&key(KeyCode::Down, KeyModifiers::NONE), 40);
+        assert_eq!(prompt.text(), "first line\nsecond line");
+        assert_eq!(prompt.cursor(), draft_cursor);
+    }
+
+    #[test]
+    fn reverse_history_search_previews_cycles_accepts_and_cancels_without_submitting() {
+        let mut prompt = PromptBuffer::with_history(
+            "keep this draft",
+            vec![
+                "deploy production".to_string(),
+                "show status".to_string(),
+                "deploy staging".to_string(),
+            ],
+        )
+        .with_key_policy(PromptKeyPolicy::EnterSendsWithShellHistory);
+        prompt.set_cursor(4);
+
+        prompt.handle_event(&key(KeyCode::Char('r'), KeyModifiers::CONTROL), 40);
+        for character in ['d', 'e', 'p'] {
+            prompt.handle_event(&key(KeyCode::Char(character), KeyModifiers::NONE), 40);
+        }
+        assert!(prompt.history_search_active());
+        assert_eq!(prompt.text(), "keep this draft");
+        assert_eq!(prompt.display_text(), "deploy production");
+        assert_eq!(prompt.history_search_match_position(), Some((1, 2)));
+
+        prompt.handle_event(&key(KeyCode::Char('r'), KeyModifiers::CONTROL), 40);
+        assert_eq!(prompt.display_text(), "deploy staging");
+        assert_eq!(prompt.history_search_match_position(), Some((2, 2)));
+        assert_eq!(
+            prompt.handle_event(&key(KeyCode::Enter, KeyModifiers::NONE), 40),
+            PromptInput::Changed
+        );
+        assert_eq!(prompt.text(), "deploy staging");
+        assert!(!prompt.history_search_active());
+        assert_eq!(
+            prompt.handle_event(&key(KeyCode::Enter, KeyModifiers::NONE), 40),
+            PromptInput::Submit
+        );
+
+        prompt.replace_draft("another draft");
+        prompt.set_cursor(3);
+        prompt.handle_event(&key(KeyCode::Char('r'), KeyModifiers::CONTROL), 40);
+        prompt.handle_event(&key(KeyCode::Char('x'), KeyModifiers::NONE), 40);
+        assert_eq!(prompt.history_search_match_position(), None);
+        prompt.handle_event(&key(KeyCode::Esc, KeyModifiers::NONE), 40);
+        assert_eq!(prompt.text(), "another draft");
+        assert_eq!(prompt.cursor(), 3);
+        assert!(!prompt.history_search_active());
+    }
+
+    #[test]
+    fn shell_history_keeps_control_r_as_normal_mode_redo() {
+        let mut prompt =
+            PromptBuffer::new("first").with_key_policy(PromptKeyPolicy::EnterSendsWithShellHistory);
+        assert!(prompt.insert(" second"));
+        assert!(prompt.undo());
+        prompt.set_mode(Mode::Normal);
+
+        assert_eq!(
+            prompt.handle_event(&key(KeyCode::Char('r'), KeyModifiers::CONTROL), 40),
+            PromptInput::Changed
+        );
+        assert_eq!(prompt.text(), "first second");
+        assert!(!prompt.history_search_active());
     }
 
     #[test]

@@ -1,6 +1,12 @@
 {
-  "api_version": "0.14.0",
+  "api_version": "0.15.0",
   "changes": [
+    {
+      "version": "0.15.0",
+      "kind": "introduced",
+      "symbols": ["SetTextPanelComposerHistory"],
+      "migration_note": "docs/PLUGIN_API.md#text-panels"
+    },
     {
       "version": "0.14.0",
       "kind": "introduced",

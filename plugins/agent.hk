@@ -762,6 +762,11 @@ fn ensure_conversation_panel() {
             ],
         });
         red::state_patch(AgentState { panel_created: true });
+        if red::len(state().prompt_history) > 0 {
+            sync_text_panel_prompt_history();
+        } else {
+            red::request("GetStorage", docked_prompt_history_loaded, "prompt_history");
+        }
         red::state_patch(AgentState { model_header_text: "", model_header_secondary: "" });
         prefetch_models();
         refresh_model_header();
@@ -793,16 +798,9 @@ fn restore_conversation_pane(event: RestoredPanesEvent) {
 }
 
 fn prompt_history_loaded(result: AgentStoredValueEvent) {
-    let history = [];
-    if result.value != red::null() {
-        for entry in result.value {
-            let text = red::string(entry, "");
-            if red::trim(text) != "" && !red::contains(history, text) && red::len(history) < 50 {
-                history = red::push(history, text);
-            }
-        }
-    }
+    let history = merged_prompt_history(result);
     red::state_patch(AgentState { prompt_history: history });
+    sync_text_panel_prompt_history();
     red::execute(
         "OpenComposer",
         "Agent prompt",
@@ -813,6 +811,41 @@ fn prompt_history_loaded(result: AgentStoredValueEvent) {
             cancelled: prompt_cancelled,
         }
     );
+}
+
+fn docked_prompt_history_loaded(result: AgentStoredValueEvent) {
+    let history = merged_prompt_history(result);
+    red::state_patch(AgentState { prompt_history: history });
+    sync_text_panel_prompt_history();
+}
+
+fn merged_prompt_history(result: AgentStoredValueEvent) -> [String] {
+    let history = [];
+    for entry in state().prompt_history {
+        let text = red::string(entry, "");
+        if red::trim(text) != "" && !red::contains(history, text) && red::len(history) < 50 {
+            history = red::push(history, text);
+        }
+    }
+    if result.value != red::null() {
+        for entry in result.value {
+            let text = red::string(entry, "");
+            if red::trim(text) != "" && !red::contains(history, text) && red::len(history) < 50 {
+                history = red::push(history, text);
+            }
+        }
+    }
+    return history;
+}
+
+fn sync_text_panel_prompt_history() {
+    if state().panel_created {
+        red::execute(
+            "SetTextPanelComposerHistory",
+            "agent-conversation",
+            state().prompt_history
+        );
+    }
 }
 
 fn prompt_submitted(text: String) {
@@ -826,6 +859,7 @@ fn prompt_submitted(text: String) {
         }
     }
     red::state_patch(AgentState { prompt_history: history });
+    sync_text_panel_prompt_history();
     if state().session_id == "" {
         stage_pending_prompt(text);
         red::execute("SetStorage", "prompt_history", history);
