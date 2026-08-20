@@ -405,8 +405,22 @@ pub struct TextPanel {
     scrollback: TextPanelScrollback,
     search: TextPanelSearch,
     last_focused_region: TextPanelFocusRegion,
+    temporary_context: Option<TextPanelContext>,
     layout_cache: RefCell<Option<(usize, Arc<TextPanelLayout>)>>,
     search_cache: RefCell<Option<TextPanelSearchCache>>,
+}
+
+struct TextPanelContext {
+    blocks: Vec<TextPanelBlock>,
+    scroll: usize,
+    follow_tail: bool,
+    viewport: FollowTailViewport,
+    status: Option<TextPanelStatus>,
+    busy_since: Option<Instant>,
+    selected_link: Option<u64>,
+    scrollback: TextPanelScrollback,
+    search: TextPanelSearch,
+    last_focused_region: TextPanelFocusRegion,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -822,7 +836,17 @@ struct TextPanelComposer {
     enabled: bool,
     status: Option<String>,
     validation: Option<&'static str>,
+    temporary_context: Option<TextPanelComposerContext>,
     layout_cache: RefCell<Option<ComposerLayoutCache>>,
+}
+
+struct TextPanelComposerContext {
+    config: TextPanelComposerConfig,
+    prompt: PromptBuffer,
+    focused: bool,
+    enabled: bool,
+    status: Option<String>,
+    validation: Option<&'static str>,
 }
 
 impl TextPanelComposer {
@@ -866,8 +890,48 @@ impl TextPanelComposer {
             enabled: true,
             status: None,
             validation: None,
+            temporary_context: None,
             layout_cache: RefCell::new(None),
         }
+    }
+
+    fn enter_temporary_context(&mut self, placeholder: String) -> bool {
+        if self.temporary_context.is_some() {
+            return false;
+        }
+        let prompt = std::mem::replace(
+            &mut self.prompt,
+            PromptBuffer::new("").with_key_policy(PromptKeyPolicy::EnterSends),
+        );
+        self.temporary_context = Some(TextPanelComposerContext {
+            config: self.config.clone(),
+            prompt,
+            focused: self.focused,
+            enabled: self.enabled,
+            status: self.status.take(),
+            validation: self.validation.take(),
+        });
+        self.config.placeholder = placeholder;
+        self.config.rows = 1;
+        self.focused = true;
+        self.enabled = true;
+        self.validation = None;
+        *self.layout_cache.borrow_mut() = None;
+        true
+    }
+
+    fn exit_temporary_context(&mut self) -> bool {
+        let Some(context) = self.temporary_context.take() else {
+            return false;
+        };
+        self.config = context.config;
+        self.prompt = context.prompt;
+        self.focused = context.focused;
+        self.enabled = context.enabled;
+        self.status = context.status;
+        self.validation = context.validation;
+        *self.layout_cache.borrow_mut() = None;
+        true
     }
 
     fn take_submission(&mut self) -> Option<String> {
@@ -898,9 +962,67 @@ impl TextPanel {
             scrollback: TextPanelScrollback::default(),
             search: TextPanelSearch::default(),
             last_focused_region: TextPanelFocusRegion::default(),
+            temporary_context: None,
             layout_cache: RefCell::new(None),
             search_cache: RefCell::new(None),
         }
+    }
+
+    fn enter_temporary_context(&mut self, placeholder: String) -> bool {
+        if self.temporary_context.is_some() {
+            return false;
+        }
+        let Some(composer) = self.composer.as_mut() else {
+            return false;
+        };
+        if !composer.enter_temporary_context(placeholder) {
+            return false;
+        }
+        self.temporary_context = Some(TextPanelContext {
+            blocks: std::mem::take(&mut self.blocks),
+            scroll: self.scroll,
+            follow_tail: self.follow_tail,
+            viewport: self.viewport,
+            status: self.status.take(),
+            busy_since: self.busy_since.take(),
+            selected_link: self.selected_link.take(),
+            scrollback: std::mem::take(&mut self.scrollback),
+            search: std::mem::take(&mut self.search),
+            last_focused_region: self.last_focused_region,
+        });
+        self.viewport = FollowTailViewport::default();
+        self.viewport.scroll_to_top();
+        self.scroll = 0;
+        self.follow_tail = false;
+        self.last_focused_region = TextPanelFocusRegion::Composer;
+        self.invalidate_layout();
+        true
+    }
+
+    fn exit_temporary_context(&mut self) -> bool {
+        let Some(context) = self.temporary_context.take() else {
+            return false;
+        };
+        let Some(composer) = self.composer.as_mut() else {
+            self.temporary_context = Some(context);
+            return false;
+        };
+        if !composer.exit_temporary_context() {
+            self.temporary_context = Some(context);
+            return false;
+        }
+        self.blocks = context.blocks;
+        self.scroll = context.scroll;
+        self.follow_tail = context.follow_tail;
+        self.viewport = context.viewport;
+        self.status = context.status;
+        self.busy_since = context.busy_since;
+        self.selected_link = context.selected_link;
+        self.scrollback = context.scrollback;
+        self.search = context.search;
+        self.last_focused_region = context.last_focused_region;
+        self.invalidate_layout();
+        true
     }
 
     fn set_status(&mut self, status: Option<TextPanelStatus>) {
@@ -2595,23 +2717,34 @@ impl PanelManager {
                         .find_map(|row| layout.offset_at(row, 0))
                         .unwrap_or(0)
                 });
-                let focus = if panel
-                    .composer
+                let composer_focused = panel.composer.as_ref().is_some_and(|composer| {
+                    composer
+                        .temporary_context
+                        .as_ref()
+                        .map_or(composer.focused, |context| context.focused)
+                });
+                let last_focused_region = panel
+                    .temporary_context
                     .as_ref()
-                    .is_some_and(|composer| composer.focused)
-                    || panel.last_focused_region == TextPanelFocusRegion::Composer
-                {
-                    TextPanelSnapshotFocus::Composer
-                } else {
-                    TextPanelSnapshotFocus::Scrollback
-                };
-                let composer = panel
-                    .composer
-                    .as_ref()
-                    .map(|composer| TextPanelComposerSnapshot {
-                        text: composer.prompt.text(),
-                        cursor: composer.prompt.cursor(),
+                    .map_or(panel.last_focused_region, |context| {
+                        context.last_focused_region
                     });
+                let focus =
+                    if composer_focused || last_focused_region == TextPanelFocusRegion::Composer {
+                        TextPanelSnapshotFocus::Composer
+                    } else {
+                        TextPanelSnapshotFocus::Scrollback
+                    };
+                let composer = panel.composer.as_ref().map(|composer| {
+                    let prompt = composer
+                        .temporary_context
+                        .as_ref()
+                        .map_or(&composer.prompt, |context| &context.prompt);
+                    TextPanelComposerSnapshot {
+                        text: prompt.text(),
+                        cursor: prompt.cursor(),
+                    }
+                });
                 Some(PanelSessionSnapshot {
                     id,
                     kind: PanelSnapshotKind::Text,
@@ -3952,6 +4085,27 @@ impl PanelManager {
         true
     }
 
+    /// Temporarily replaces a text panel's contents and composer while retaining its UI state.
+    pub fn enter_text_panel_context(&mut self, id: &str, placeholder: String) -> bool {
+        let Some(panel) = self.text_panels.get_mut(id) else {
+            return false;
+        };
+        if !panel.enter_temporary_context(placeholder) {
+            return false;
+        }
+        panel.blur_scrollback();
+        self.focused = Some(id.to_string());
+        true
+    }
+
+    /// Restores the panel state retained by `enter_text_panel_context`.
+    pub fn exit_text_panel_context(&mut self, id: &str) -> bool {
+        let Some(panel) = self.text_panels.get_mut(id) else {
+            return false;
+        };
+        panel.exit_temporary_context()
+    }
+
     pub fn set_text_panel_status(&mut self, id: &str, status: Option<TextPanelStatus>) -> bool {
         let Some(panel) = self.text_panels.get_mut(id) else {
             return false;
@@ -4024,6 +4178,28 @@ impl PanelManager {
             // changing the focused composer's mode, draft, or cursor.
             return None;
         }
+        let temporary_context = composer.temporary_context.is_some();
+        if temporary_context {
+            if matches!(event, Event::Key(key) if key.code == KeyCode::Esc) {
+                return Some(PanelEvent {
+                    panel_id: panel.id.clone(),
+                    action: "filter_cancel".to_string(),
+                    selected_index: panel.scroll,
+                    row: None,
+                    text: None,
+                });
+            }
+            if matches!(event, Event::Key(key) if key.code == KeyCode::Enter && key.modifiers.is_empty())
+            {
+                return Some(PanelEvent {
+                    panel_id: panel.id.clone(),
+                    action: "filter_submit".to_string(),
+                    selected_index: panel.scroll,
+                    row: None,
+                    text: Some(composer.prompt.text()),
+                });
+            }
+        }
         let delegates_to_panel_navigation = matches!(
             event,
             Event::Key(key)
@@ -4059,7 +4235,12 @@ impl PanelManager {
             match composer.handle_event(event, TextPanelContentMetrics::new(panel_width).width) {
                 PromptInput::Changed => {
                     composer.validation = None;
-                    ("composer_input", None)
+                    let action = if temporary_context {
+                        "filter_input"
+                    } else {
+                        "composer_input"
+                    };
+                    (action, Some(composer.prompt.text()))
                 }
                 PromptInput::Submit => match composer.take_submission() {
                     Some(text) => {
@@ -4069,6 +4250,15 @@ impl PanelManager {
                     None => ("composer_input", None),
                 },
                 PromptInput::Cancel => {
+                    if temporary_context {
+                        return Some(PanelEvent {
+                            panel_id: panel.id.clone(),
+                            action: "filter_cancel".to_string(),
+                            selected_index: panel.scroll,
+                            row: None,
+                            text: None,
+                        });
+                    }
                     composer.focused = false;
                     panel.scrollback.focused = true;
                     panel.scrollback.mode = TextPanelScrollbackMode::Normal;
@@ -4081,7 +4271,12 @@ impl PanelManager {
                     if inserted_bytes > MAX_COMPOSER_BYTES.saturating_sub(previous_bytes) =>
                 {
                     composer.validation = Some("Prompt exceeds 128 KiB");
-                    ("composer_input", None)
+                    let action = if temporary_context {
+                        "filter_input"
+                    } else {
+                        "composer_input"
+                    };
+                    (action, Some(composer.prompt.text()))
                 }
                 PromptInput::Unhandled => return None,
             };
@@ -6739,6 +6934,89 @@ mod tests {
             assert!(composer.focused);
             assert_eq!(composer.prompt.text(), "keep this draft");
         }
+    }
+
+    #[test]
+    fn temporary_text_panel_context_restores_transcript_and_unsent_draft() {
+        let mut manager = PanelManager::default();
+        manager.create_text_panel(
+            "agent".to_string(),
+            PanelConfig {
+                composer: Some(TextPanelComposerConfig {
+                    placeholder: "Ask a follow-up…".to_string(),
+                    rows: 3,
+                }),
+                ..PanelConfig::default()
+            },
+        );
+        manager.update_text_panel(
+            "agent",
+            vec![TextPanelBlock {
+                id: "answer".to_string(),
+                kind: TextPanelBlockKind::Agent,
+                format: TextPanelBlockFormat::Markdown,
+                text: "Existing conversation".to_string(),
+            }],
+            20,
+            80,
+        );
+        assert!(manager.focus_text_panel_composer("agent"));
+        manager.handle_focused_text_input(&Event::Paste("unsent follow-up".to_string()), 80);
+
+        assert!(manager.enter_text_panel_context("agent", "Search previous sessions…".to_string()));
+        manager.update_text_panel(
+            "agent",
+            vec![TextPanelBlock {
+                id: "session:one".to_string(),
+                kind: TextPanelBlockKind::Action,
+                format: TextPanelBlockFormat::Plain,
+                text: "Previous session".to_string(),
+            }],
+            20,
+            80,
+        );
+        let composer = manager.text_panels["agent"].composer.as_ref().unwrap();
+        assert_eq!(composer.config.placeholder, "Search previous sessions…");
+        assert_eq!(composer.config.rows, 1);
+        assert_eq!(composer.prompt.text(), "");
+        assert_eq!(manager.text_panels["agent"].scroll, 0);
+        assert!(!manager.text_panels["agent"].follow_tail);
+        let snapshot = manager.snapshot(80);
+        let saved = snapshot
+            .panels
+            .iter()
+            .find(|panel| panel.id == "agent")
+            .and_then(|panel| panel.text.as_ref())
+            .and_then(|text| text.composer.as_ref())
+            .unwrap();
+        assert_eq!(saved.text, "unsent follow-up");
+
+        let input = manager
+            .handle_focused_text_input(&Event::Paste("needle".to_string()), 80)
+            .unwrap();
+        assert_eq!(input.action, "filter_input");
+        assert_eq!(input.text.as_deref(), Some("needle"));
+        let submit = manager
+            .handle_focused_text_input(
+                &Event::Key(crossterm::event::KeyEvent::new(
+                    KeyCode::Enter,
+                    KeyModifiers::NONE,
+                )),
+                80,
+            )
+            .unwrap();
+        assert_eq!(submit.action, "filter_submit");
+        assert_eq!(submit.text.as_deref(), Some("needle"));
+
+        assert!(manager.exit_text_panel_context("agent"));
+        let panel = &manager.text_panels["agent"];
+        assert_eq!(panel.blocks.len(), 1);
+        assert_eq!(panel.blocks[0].id, "answer");
+        let composer = panel.composer.as_ref().unwrap();
+        assert_eq!(composer.config.placeholder, "Ask a follow-up…");
+        assert_eq!(composer.config.rows, 3);
+        assert_eq!(composer.prompt.text(), "unsent follow-up");
+        assert!(composer.focused);
     }
 
     #[test]

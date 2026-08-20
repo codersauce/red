@@ -1805,6 +1805,27 @@ impl RedHost {
                     status,
                 });
             }
+            "EnterTextPanelContext" => {
+                let id = args
+                    .first()
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("EnterTextPanelContext requires a panel id"))?
+                    .to_string();
+                let placeholder = args
+                    .get(1)
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("EnterTextPanelContext requires a placeholder"))?
+                    .to_string();
+                self.send_request(PluginRequest::EnterTextPanelContext { id, placeholder });
+            }
+            "ExitTextPanelContext" => {
+                let id = args
+                    .first()
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("ExitTextPanelContext requires a panel id"))?
+                    .to_string();
+                self.send_request(PluginRequest::ExitTextPanelContext { id });
+            }
             "SetTextPanelHeaderDetail" => {
                 let id = args
                     .first()
@@ -8201,7 +8222,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bundled_agent_session_picker_cycles_scope_and_continues_in_the_same_pane() {
+    async fn bundled_agent_session_browser_cycles_scope_and_continues_in_the_same_pane() {
         drain_requests();
         let mut runtime = Runtime::new();
         runtime
@@ -8211,44 +8232,44 @@ mod tests {
 
         let _catalog = open_unprimed_agent(&mut runtime).await;
         runtime.execute_command("AgentSessions").await.unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::EnterTextPanelContext { id, placeholder }
+                if id == "agent-conversation" && placeholder == "Search previous sessions…"
+        ));
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::SetTextPanelHeaderDetail { id, detail: Some(detail) }
+                if id == "agent-conversation"
+                    && detail.text == "Previous sessions"
+                    && detail.secondary == "Red"
+                    && detail.shortcut.as_deref() == Some("Alt-s")
+        ));
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::UpdateTextPanel { id, blocks }
+                if id == "agent-conversation"
+                    && blocks.iter().any(|block| block.id == "session-browser:back")
+                    && blocks.iter().any(|block| block.id == "session-browser:loading")
+        ));
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::FocusTextPanelComposer { id } if id == "agent-conversation"
+        ));
         let cwd_request = match ACTION_DISPATCHER.recv_request() {
-            PluginRequest::GetConfig { request_id, key } => {
-                assert_eq!(key.as_deref(), Some("cwd"));
+            PluginRequest::GetConfig { request_id, key } if key.as_deref() == Some("cwd") => {
                 request_id
             }
-            _ => panic!("expected workspace request"),
+            _ => panic!("expected workspace request after entering the panel browser"),
         };
         runtime
             .resolve_request(cwd_request, serde_json::json!({"value": "/workspace"}))
             .await
             .unwrap();
-        let handle = match ACTION_DISPATCHER.recv_request() {
-            PluginRequest::OpenCallbackPicker {
-                owner,
-                handle,
-                title,
-                items,
-                options,
-            } => {
-                assert_eq!(owner, "agent");
-                assert_eq!(title.as_deref(), Some("Agent sessions"));
-                assert!(items.is_empty());
-                assert!(options.external_filter);
-                assert!(options
-                    .actions
-                    .iter()
-                    .any(|action| action.key == "Alt-s" && action.action == "cycle_scope"));
-                handle
-            }
-            _ => panic!("expected session picker"),
-        };
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
-            PluginRequest::UpdatePickerBusy { id, busy: true } if id == handle.get()
-        ));
-        assert!(matches!(
-            ACTION_DISPATCHER.recv_request(),
-            PluginRequest::UpdatePickerStatus { id, .. } if id == handle.get()
+            PluginRequest::SetTextPanelStatus { id, status: Some(status) }
+                if id == "agent-conversation" && status.busy
         ));
         let initial_request = match ACTION_DISPATCHER.recv_request() {
             PluginRequest::AgentSessionRequest {
@@ -8271,34 +8292,83 @@ mod tests {
             .unwrap();
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
-            PluginRequest::UpdatePickerBusy { id, busy: false } if id == handle.get()
+            PluginRequest::SetTextPanelStatus { id, status: None } if id == "agent-conversation"
         ));
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
-            PluginRequest::UpdatePickerItems { id, ref items } if id == handle.get() && items.is_empty()
-        ));
-        assert!(matches!(
-            ACTION_DISPATCHER.recv_request(),
-            PluginRequest::UpdatePickerStatus { id, .. } if id == handle.get()
+            PluginRequest::UpdateTextPanel { id, blocks }
+                if id == "agent-conversation"
+                    && blocks.iter().any(|block| block.id == "session-browser:empty")
         ));
 
         runtime
-            .notify_picker(
-                handle,
-                PickerCallback::Action {
-                    action: "cycle_scope".into(),
-                    item: None,
-                    query: String::new(),
-                },
+            .notify(
+                "panel:event:agent-conversation",
+                serde_json::json!({"action":"filter_input","text":"needle"}),
             )
+            .await
+            .unwrap();
+        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
+        tokio::time::sleep(Duration::from_millis(175)).await;
+        for callback in runtime.poll_timer_callbacks() {
+            if let PluginRequest::TimeoutCallback { timer_id } = callback {
+                runtime
+                    .notify("timeout:callback", serde_json::json!({"timer_id":timer_id}))
+                    .await
+                    .unwrap();
+            }
+        }
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::SetTextPanelStatus { status: Some(status), .. } if status.busy
+        ));
+        let search_request = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::AgentSessionRequest {
+                request_id,
+                request,
+            } => {
+                assert_eq!(request.scope, crate::codex::AgentSessionScope::Red);
+                assert_eq!(request.query, "needle");
+                request_id
+            }
+            _ => panic!("expected debounced in-pane session search"),
+        };
+        runtime
+            .resolve_request(
+                search_request,
+                serde_json::json!({"sessions": [], "error": ""}),
+            )
+            .await
             .unwrap();
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
-            PluginRequest::UpdatePickerBusy { id, busy: true } if id == handle.get()
+            PluginRequest::SetTextPanelStatus { status: None, .. }
         ));
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
-            PluginRequest::UpdatePickerStatus { id, .. } if id == handle.get()
+            PluginRequest::UpdateTextPanel { .. }
+        ));
+
+        runtime
+            .notify(
+                "panel:event:agent-conversation",
+                serde_json::json!({"action":"session_scope","text":""}),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::SetTextPanelHeaderDetail { detail: Some(detail), .. }
+                if detail.secondary == "This workspace"
+        ));
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::UpdateTextPanel { blocks, .. }
+                if blocks.iter().any(|block| block.id == "session-browser:loading")
+        ));
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::SetTextPanelStatus { status: Some(status), .. } if status.busy
         ));
         let workspace_request = match ACTION_DISPATCHER.recv_request() {
             PluginRequest::AgentSessionRequest {
@@ -8306,6 +8376,7 @@ mod tests {
                 request,
             } => {
                 assert_eq!(request.scope, crate::codex::AgentSessionScope::Workspace);
+                assert_eq!(request.query, "needle");
                 request_id
             }
             _ => panic!("expected workspace session request"),
@@ -8331,25 +8402,31 @@ mod tests {
             .unwrap();
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
-            PluginRequest::UpdatePickerBusy { id, busy: false } if id == handle.get()
+            PluginRequest::SetTextPanelStatus { status: None, .. }
         ));
-        let item = match ACTION_DISPATCHER.recv_request() {
-            PluginRequest::UpdatePickerItems { id, items } if id == handle.get() => {
-                assert_eq!(items.len(), 1);
-                items[0].clone()
+        let session_block_id = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::UpdateTextPanel { id, blocks } if id == "agent-conversation" => {
+                let session = blocks
+                    .iter()
+                    .find(|block| block.id.starts_with("session-browser:session:"))
+                    .expect("foreign session is rendered inside the Agent pane");
+                assert!(session.text.contains("Earlier conversation"));
+                assert!(session.text.contains("Continue in Red"));
+                session.id.clone()
             }
-            _ => panic!("expected session rows"),
+            _ => panic!("expected in-pane session blocks"),
         };
-        assert!(matches!(
-            ACTION_DISPATCHER.recv_request(),
-            PluginRequest::UpdatePickerStatus { id, .. } if id == handle.get()
-        ));
 
         runtime
-            .notify_picker(handle, PickerCallback::Selected(item))
+            .notify(
+                "panel:event:agent-conversation",
+                serde_json::json!({"action":"activate_block","text":session_block_id}),
+            )
+            .await
             .unwrap();
         let mut switched = false;
-        for _ in 0..4 {
+        let mut exited_context = false;
+        for _ in 0..8 {
             match ACTION_DISPATCHER.recv_request() {
                 PluginRequest::AgentSwitchSession {
                     cwd,
@@ -8362,13 +8439,19 @@ mod tests {
                     switched = true;
                     break;
                 }
+                PluginRequest::ExitTextPanelContext { id } => {
+                    assert_eq!(id, "agent-conversation");
+                    exited_context = true;
+                }
                 PluginRequest::SetTextPanelStatus { id, .. }
+                | PluginRequest::SetTextPanelHeaderDetail { id, .. }
                 | PluginRequest::SetTextPanelComposerState { id, .. } => {
                     assert_eq!(id, "agent-conversation");
                 }
                 _ => panic!("session switch opened another surface"),
             }
         }
+        assert!(exited_context);
         assert!(switched);
         assert!(ACTION_DISPATCHER.try_recv_request().is_none());
     }

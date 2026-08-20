@@ -1874,6 +1874,13 @@ pub enum PluginRequest {
         enabled: bool,
         status: Option<String>,
     },
+    EnterTextPanelContext {
+        id: String,
+        placeholder: String,
+    },
+    ExitTextPanelContext {
+        id: String,
+    },
     SetTextPanelStatus {
         id: String,
         status: Option<plugin::TextPanelStatus>,
@@ -2057,6 +2064,8 @@ impl PluginRequest {
             Self::AppendTextPanel { .. } => "AppendTextPanel",
             Self::FocusTextPanelComposer { .. } => "FocusTextPanelComposer",
             Self::SetTextPanelComposerState { .. } => "SetTextPanelComposerState",
+            Self::EnterTextPanelContext { .. } => "EnterTextPanelContext",
+            Self::ExitTextPanelContext { .. } => "ExitTextPanelContext",
             Self::SetTextPanelStatus { .. } => "SetTextPanelStatus",
             Self::ClearTextPanelComposer { .. } => "ClearTextPanelComposer",
             Self::SelectPanelRow { .. } => "SelectPanelRow",
@@ -11301,6 +11310,19 @@ impl Editor {
                         .panel_manager
                         .set_text_panel_composer_state(&id, enabled, status)
                     {
+                        needs_render = true;
+                    }
+                }
+                PluginRequest::EnterTextPanelContext { id, placeholder } => {
+                    if self
+                        .panel_manager
+                        .enter_text_panel_context(&id, placeholder)
+                    {
+                        needs_render = true;
+                    }
+                }
+                PluginRequest::ExitTextPanelContext { id } => {
+                    if self.panel_manager.exit_text_panel_context(&id) {
                         needs_render = true;
                     }
                 }

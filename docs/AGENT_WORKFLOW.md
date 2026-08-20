@@ -272,6 +272,14 @@ away from an unfinished transcript search cancels it and restores its starting
 position. In transcript Normal mode, `]l` jumps to the next link and `[l` to the
 previous one, wrapping at the ends. Enter opens the link under the cursor.
 
+The Agent pane's `Sessions` header action replaces the conversation with an
+in-pane browser; `:AgentSessions` opens the same view. Sessions are newest
+first. Type in the temporary footer to search conversation content, press
+`Alt-s` to cycle between `Red`, `This workspace`, and `All Codex`, and click or
+open a session row to continue it. `Esc`, the back row, or the `Sessions` action
+returns to the conversation with its transcript position and unsent draft
+restored.
+
 In the conversation transcript's Normal mode, `[p` jumps backward to a user
 prompt and `]p` jumps forward. From an answer, the first backward jump returns
 to that turn's prompt; repeating it visits earlier prompts. Jumps reveal the
