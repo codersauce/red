@@ -18,6 +18,7 @@
 mod agent_annotations;
 mod agent_manager;
 mod agent_models;
+mod agent_sessions;
 mod buffer_manager;
 mod command_mode;
 mod diagnostics;
@@ -1276,6 +1277,9 @@ fn agent_event_payload(event: CodexEvent) -> (&'static str, Value) {
         CodexEvent::ModelRequestCompleted { .. } => {
             unreachable!("model results use private callbacks")
         }
+        CodexEvent::SessionListCompleted { .. } => {
+            unreachable!("session-list results use private callbacks")
+        }
         CodexEvent::SessionModelRerouted { session_id, model } => (
             "agent:model_rerouted",
             json!({"session_id": session_id, "model": model}),
@@ -1559,6 +1563,10 @@ pub enum PluginRequest {
         request_id: RequestId,
         request: crate::codex::ModelRequest,
     },
+    AgentSessionRequest {
+        request_id: RequestId,
+        request: crate::codex::AgentSessionListRequest,
+    },
     SetTextPanelHeaderDetail {
         id: String,
         detail: Option<plugin::TextPanelHeaderDetail>,
@@ -1569,6 +1577,11 @@ pub enum PluginRequest {
     AgentResumeSession {
         cwd: PathBuf,
         session_id: String,
+    },
+    AgentSwitchSession {
+        cwd: PathBuf,
+        session_id: String,
+        resume: bool,
     },
     AgentPrompt {
         session_id: String,
@@ -1964,9 +1977,11 @@ impl PluginRequest {
         match self {
             Self::Action(_) => "Action",
             Self::AgentModelRequest { .. } => "AgentModelRequest",
+            Self::AgentSessionRequest { .. } => "AgentSessionRequest",
             Self::SetTextPanelHeaderDetail { .. } => "SetTextPanelHeaderDetail",
             Self::AgentNewSession { .. } => "AgentNewSession",
             Self::AgentResumeSession { .. } => "AgentResumeSession",
+            Self::AgentSwitchSession { .. } => "AgentSwitchSession",
             Self::AgentPrompt { .. } => "AgentPrompt",
             Self::AgentPromptWithContext { .. } => "AgentPromptWithContext",
             Self::AgentCancel { .. } => "AgentCancel",
@@ -9369,6 +9384,15 @@ impl Editor {
                 )
                 .await?;
         }
+        for request_id in self.agent_manager.take_pending_session_requests() {
+            self.plugin_registry
+                .resolve_request(
+                    runtime,
+                    RequestId::from_raw(request_id),
+                    json!({"sessions": [], "error": message.clone()}),
+                )
+                .await?;
+        }
         Ok(message)
     }
 
@@ -9466,6 +9490,17 @@ impl Editor {
                         runtime,
                         RequestId::from_raw(*request_id),
                         agent_models::model_result_payload(result),
+                    )
+                    .await?;
+                continue;
+            }
+            if let CodexEvent::SessionListCompleted { request_id, result } = &event {
+                self.agent_manager.finish_session_request(*request_id);
+                self.plugin_registry
+                    .resolve_request(
+                        runtime,
+                        RequestId::from_raw(*request_id),
+                        agent_sessions::session_result_payload(result),
                     )
                     .await?;
                 continue;
@@ -9979,6 +10014,13 @@ impl Editor {
                     self.handle_agent_model_request(runtime, request_id, request)
                         .await?;
                 }
+                PluginRequest::AgentSessionRequest {
+                    request_id,
+                    request,
+                } => {
+                    self.handle_agent_session_request(runtime, request_id, request)
+                        .await?;
+                }
                 PluginRequest::SetTextPanelHeaderDetail { id, detail } => {
                     needs_render |= self.panel_manager.set_text_panel_header_detail(&id, detail);
                 }
@@ -10069,6 +10111,63 @@ impl Editor {
                             .finish_agent_bridge(
                                 runtime,
                                 "Codex app-server stopped while restoring the session",
+                            )
+                            .await?;
+                        self.plugin_registry
+                            .notify(
+                                runtime,
+                                "agent:session_restore_failed",
+                                json!({ "session_id": session_id, "message": message }),
+                            )
+                            .await?;
+                    }
+                }
+                PluginRequest::AgentSwitchSession {
+                    cwd,
+                    session_id,
+                    resume,
+                } => {
+                    self.agent_manager.mark_conversation_requested();
+                    if self.agent_manager.is_task_finished() {
+                        let _ = self
+                            .finish_agent_bridge(
+                                runtime,
+                                "Codex app-server stopped before switching sessions",
+                            )
+                            .await?;
+                    }
+                    if let Err(error) = self.ensure_agent_bridge(&cwd) {
+                        self.plugin_registry
+                            .notify(
+                                runtime,
+                                "agent:session_restore_failed",
+                                json!({
+                                    "session_id": session_id,
+                                    "message": error.to_string()
+                                }),
+                            )
+                            .await?;
+                        continue;
+                    }
+                    let Some(bridge) = self.agent_manager.bridge() else {
+                        continue;
+                    };
+                    let command = if resume {
+                        CodexCommand::ResumeSession {
+                            cwd,
+                            session_id: session_id.clone(),
+                        }
+                    } else {
+                        CodexCommand::ContinueSession {
+                            cwd,
+                            session_id: session_id.clone(),
+                        }
+                    };
+                    if bridge.send(command).await.is_err() {
+                        let message = self
+                            .finish_agent_bridge(
+                                runtime,
+                                "Codex app-server stopped while switching sessions",
                             )
                             .await?;
                         self.plugin_registry

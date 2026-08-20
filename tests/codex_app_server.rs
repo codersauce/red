@@ -77,6 +77,7 @@ for line in sys.stdin:
         assert message["params"]["sandbox"] == "read-only"
         assert message["params"]["approvalPolicy"] == "never"
         assert message["params"]["ephemeral"] is False
+        assert message["params"]["threadSource"] == "red"
         expected_tools = {
             "list_files", "search_files", "read_file", "write_file",
             "get_editor_state", "open_file", "select_text", "apply_edits",
@@ -140,6 +141,170 @@ for line in sys.stdin:
     permissions.set_mode(0o755);
     std::fs::set_permissions(&path, permissions).unwrap();
     path
+}
+
+fn mock_session_codex(directory: &std::path::Path) -> std::path::PathBuf {
+    let path = directory.join("codex-sessions");
+    std::fs::write(
+        &path,
+        r#"#!/usr/bin/env python3
+import json, sys
+
+def send(value):
+    print(json.dumps(value), flush=True)
+
+for line in sys.stdin:
+    message = json.loads(line)
+    method = message.get("method")
+    ident = message.get("id")
+    params = message.get("params", {})
+    if method == "initialize":
+        send({"id": ident, "result": {"userAgent": "mock"}})
+    elif method == "initialized":
+        pass
+    elif method == "account/read":
+        send({"id": ident, "result": {"account": {"type": "chatgpt"}, "requiresOpenaiAuth": True}})
+    elif method == "config/read":
+        send({"id": ident, "result": {"config": {"mcp_servers": {}}, "origins": {}}})
+    elif method == "configRequirements/read":
+        send({"id": ident, "result": {"requirements": None}})
+    elif method == "thread/list":
+        assert params["sortKey"] == "updated_at"
+        assert params["sortDirection"] == "desc"
+        assert params["sourceKinds"] == ["appServer"]
+        assert params["modelProviders"] == []
+        if params.get("cursor") is None:
+            send({"id": ident, "result": {"data": [
+                {"id":"current", "cwd":"/workspace", "ephemeral":False, "threadSource":"red", "source":"appServer", "name":"Current", "preview":"", "updatedAt":40},
+                {"id":"foreign", "cwd":"/workspace", "ephemeral":False, "threadSource":"user", "source":"appServer", "name":"Foreign", "preview":"", "updatedAt":30},
+                {"id":"red-old", "cwd":"/workspace", "ephemeral":False, "threadSource":"red", "source":"appServer", "name":None, "preview":"Older Red", "updatedAt":10},
+                {"id":"ephemeral", "cwd":"/workspace", "ephemeral":True, "threadSource":"red", "source":"appServer", "name":"Hidden", "preview":"", "updatedAt":50}
+            ], "nextCursor":"page-2"}})
+        else:
+            assert params["cursor"] == "page-2"
+            send({"id": ident, "result": {"data": [
+                {"id":"red-new", "cwd":"/workspace", "ephemeral":False, "threadSource":"red", "source":"appServer", "name":"Newer Red", "preview":"", "updatedAt":20}
+            ], "nextCursor":None}})
+    elif method == "thread/search":
+        assert params["searchTerm"] == "needle"
+        assert params["sortKey"] == "updated_at"
+        assert params["sourceKinds"] == ["cli", "vscode", "appServer", "unknown"]
+        send({"id": ident, "result": {"data": [
+            {"thread":{"id":"workspace-hit", "cwd":"/workspace", "ephemeral":False, "threadSource":"user", "source":"cli", "name":"Hit", "preview":"", "updatedAt":25}, "snippet":"a matching needle"},
+            {"thread":{"id":"other-hit", "cwd":"/other", "ephemeral":False, "threadSource":"user", "source":"cli", "name":"Other", "preview":"", "updatedAt":35}, "snippet":"needle elsewhere"}
+        ], "nextCursor":None}})
+    elif method == "thread/read":
+        assert params["threadId"] == "foreign"
+        assert params["includeTurns"] is True
+        send({"id": ident, "result": {"thread": {
+            "id":"foreign", "cwd":"/elsewhere", "turns":[{"id":"old-turn", "items":[
+                {"id":"old-user", "type":"userMessage", "content":[{"type":"text", "text":"Earlier question"}]},
+                {"id":"old-agent", "type":"agentMessage", "text":"Earlier answer"}
+            ]}]
+        }}})
+    elif method == "thread/start":
+        assert params["cwd"].endswith("workspace")
+        assert params["sandbox"] == "read-only"
+        assert params["approvalPolicy"] == "never"
+        assert params["threadSource"] == "red"
+        assert params["serviceName"] == "red"
+        assert len(params["dynamicTools"]) == 12
+        send({"id": ident, "result": {"thread": {"id":"red-fork", "turns":[]}}})
+    elif method == "thread/inject_items":
+        assert params["threadId"] == "red-fork"
+        assert params["items"] == [
+            {"type":"message", "role":"user", "content":[{"type":"input_text", "text":"Earlier question"}]},
+            {"type":"message", "role":"assistant", "content":[{"type":"output_text", "text":"Earlier answer"}]}
+        ]
+        send({"id": ident, "result": {}})
+"#,
+    )
+    .unwrap();
+    let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&path, permissions).unwrap();
+    path
+}
+
+#[tokio::test]
+async fn direct_app_server_lists_searches_and_continues_sessions_for_red() {
+    use red::codex::{AgentSessionListRequest, AgentSessionScope};
+
+    let _serial = MOCK_CODEX_TEST_LOCK.lock().await;
+    let directory = tempfile::tempdir().unwrap();
+    let workspace = directory.path().join("workspace");
+    std::fs::create_dir(&workspace).unwrap();
+    let host = RecordingHost {
+        writes: Arc::new(Mutex::new(Vec::new())),
+    };
+    let (mut bridge, mut task) = start_codex(
+        CodexProcessSpec::new(mock_session_codex(directory.path()), &workspace),
+        host,
+        NonZeroUsize::new(32).unwrap(),
+    )
+    .unwrap();
+
+    bridge
+        .send(CodexCommand::SessionList {
+            request_id: 41,
+            request: AgentSessionListRequest {
+                cwd: std::path::PathBuf::from("/workspace"),
+                scope: AgentSessionScope::Red,
+                query: String::new(),
+                exclude_session_id: Some("current".into()),
+            },
+        })
+        .await
+        .unwrap();
+    match next_event(&mut bridge, &mut task).await {
+        CodexEvent::SessionListCompleted {
+            request_id: 41,
+            result: Ok(result),
+        } => {
+            assert_eq!(result["sessions"].as_array().unwrap().len(), 2);
+            assert_eq!(result["sessions"][0]["id"], "red-new");
+            assert_eq!(result["sessions"][1]["id"], "red-old");
+        }
+        event => panic!("unexpected Red session list: {event:?}"),
+    }
+
+    bridge
+        .send(CodexCommand::SessionList {
+            request_id: 42,
+            request: AgentSessionListRequest {
+                cwd: std::path::PathBuf::from("/workspace"),
+                scope: AgentSessionScope::Workspace,
+                query: "needle".into(),
+                exclude_session_id: None,
+            },
+        })
+        .await
+        .unwrap();
+    match next_event(&mut bridge, &mut task).await {
+        CodexEvent::SessionListCompleted {
+            request_id: 42,
+            result: Ok(result),
+        } => {
+            assert_eq!(result["sessions"].as_array().unwrap().len(), 1);
+            assert_eq!(result["sessions"][0]["id"], "workspace-hit");
+            assert_eq!(result["sessions"][0]["snippet"], "a matching needle");
+        }
+        event => panic!("unexpected workspace search: {event:?}"),
+    }
+
+    bridge
+        .send(CodexCommand::ContinueSession {
+            cwd: workspace,
+            session_id: "foreign".into(),
+        })
+        .await
+        .unwrap();
+    assert!(matches!(
+        next_event(&mut bridge, &mut task).await,
+        CodexEvent::SessionRestored { session_id, .. } if session_id == "red-fork"
+    ));
+    drop(bridge);
+    task.await.unwrap().unwrap();
 }
 
 fn mock_inline_codex(directory: &std::path::Path) -> std::path::PathBuf {

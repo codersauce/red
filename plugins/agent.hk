@@ -227,6 +227,14 @@ struct AgentState {
     model_picker_session: String,
     model_picker_loading: bool,
     model_selection: Json,
+    session_picker: Option<i32>,
+    session_picker_scope: String,
+    session_picker_query: String,
+    session_picker_cwd: String,
+    session_picker_request: i32,
+    session_picker_debounce: String,
+    session_switch_target: String,
+    session_switch_previous: String,
     model_header_text: String,
     model_header_secondary: String,
     session_id: String,
@@ -280,6 +288,14 @@ fn initial_state() -> AgentState {
         model_picker_session: "",
         model_picker_loading: false,
         model_selection: Json {},
+        session_picker: None,
+        session_picker_scope: "red",
+        session_picker_query: "",
+        session_picker_cwd: "",
+        session_picker_request: -1,
+        session_picker_debounce: "",
+        session_switch_target: "",
+        session_switch_previous: "",
         model_header_text: "",
         model_header_secondary: "",
         session_id: "",
@@ -342,6 +358,17 @@ fn model_rerouted(event: AgentModelReroutedEvent) {
 struct AgentModelsResult {
     models: [Json],
     error: String,
+}
+
+struct AgentSessionsResult {
+    sessions: [Json],
+    error: String,
+}
+
+struct PickerAction {
+    action: String,
+    key: String,
+    label: String,
 }
 
 struct AgentDefaultModelResult {
@@ -602,6 +629,166 @@ fn model_picker_cancelled(event: PickerCancelled) {
     red::state_patch(AgentState { model_picker: None });
 }
 
+#[red::command(
+    name = "AgentSessions",
+    title = "Resume agent session",
+    category = "Agent",
+    description = "Search and resume a previous Codex conversation in the Agent pane",
+    aliases = ["resume session", "switch session", "previous agent session"],
+    scope = "global",
+)]
+fn choose_session() {
+    if state().turn_active || state().session_starting || state().restoring {
+        red::execute("Print", "Wait for the current agent operation to finish");
+        return;
+    }
+    if state().session_picker != None { return; }
+    ensure_conversation_panel();
+    red::request("GetConfig", session_picker_cwd_loaded, "cwd");
+}
+
+fn session_picker_cwd_loaded(result: AgentStringValueEvent) {
+    let cwd = red::string(result.value, ".");
+    red::state_patch(AgentState {
+        session_picker_scope: "red",
+        session_picker_query: "",
+        session_picker_cwd: cwd,
+        session_picker_request: -1,
+    });
+    let handle = red::execute("OpenPicker", "Agent sessions", [], PickerOptions {
+        external_filter: true,
+        placeholder: "Search conversation content…",
+        status: session_picker_status(0, ""),
+        busy: true,
+        presentation: "compact",
+        item_layout: "label_first",
+        actions: [PickerAction {
+            action: "cycle_scope", key: "Alt-s", label: "Cycle session scope",
+        }],
+    }, PickerHandlers {
+        selected: session_selected,
+        cancelled: session_picker_cancelled,
+        query: session_picker_query_changed,
+        action: session_picker_action,
+    });
+    red::state_patch(AgentState { session_picker: Some(handle) });
+    request_sessions();
+}
+
+fn session_scope_label() -> String {
+    if state().session_picker_scope == "workspace" { return "This workspace"; }
+    if state().session_picker_scope == "all" { return "All Codex"; }
+    return "Red";
+}
+
+fn session_picker_status(count: i32, error: String) -> String {
+    let scope = session_scope_label();
+    if error != "" { return scope + " · " + error + " · Alt-S: change scope"; }
+    if count == 0 && red::trim(state().session_picker_query) != "" {
+        return scope + " · No matching sessions · Alt-S: change scope";
+    }
+    return scope + " · " + count + " sessions · Alt-S: change scope";
+}
+
+fn request_sessions() {
+    let Some(handle) = state().session_picker else { return; };
+    red::execute("UpdatePickerBusy", handle, true);
+    red::execute("UpdatePickerStatus", handle, session_scope_label() + " · Searching…");
+    let request = red::request(
+        "AgentListSessions",
+        sessions_loaded,
+        state().session_picker_cwd,
+        state().session_picker_scope,
+        state().session_picker_query,
+        state().session_id
+    );
+    red::state_patch(AgentState { session_picker_request: request });
+}
+
+fn sessions_loaded(result: AgentSessionsResult, request_id: i32) {
+    if request_id != state().session_picker_request { return; }
+    red::state_patch(AgentState { session_picker_request: -1 });
+    let Some(handle) = state().session_picker else { return; };
+    red::execute("UpdatePickerBusy", handle, false);
+    let error = red::string(result.error, "");
+    if error != "" {
+        red::execute("UpdatePickerItems", handle, []);
+        red::execute("UpdatePickerStatus", handle, session_picker_status(0, "Could not load sessions: " + error));
+        return;
+    }
+    let items = [];
+    for session in result.sessions {
+        let detail = red::string(session.detail, "");
+        let snippet = red::string(session.snippet, "");
+        if !red::bool(session.is_red, false) { detail = detail + " · Continue in Red"; }
+        if snippet != "" { detail = detail + " · " + snippet; }
+        items = red::push(items, PickerItem {
+            id: red::string(session.id, ""),
+            label: red::string(session.label, "Untitled session"),
+            detail: detail,
+            icon: "",
+            data: session,
+        });
+    }
+    red::execute("UpdatePickerItems", handle, items);
+    red::execute("UpdatePickerStatus", handle, session_picker_status(red::len(items), ""));
+}
+
+fn session_picker_query_changed(query: String) {
+    red::state_patch(AgentState { session_picker_query: query });
+    let previous = red::string(state().session_picker_debounce, "");
+    if previous != "" { red::execute("CancelTimeout", previous); }
+    let timer = red::execute("SetTimeout", 150);
+    red::state_patch(AgentState { session_picker_debounce: timer });
+}
+
+#[red::on("timeout:callback")]
+fn session_picker_timeout(event: TimerEvent) {
+    if event.timer_id != state().session_picker_debounce { return; }
+    red::state_patch(AgentState { session_picker_debounce: "" });
+    request_sessions();
+}
+
+fn session_picker_action(event: PickerActionEvent) {
+    if event.action != "cycle_scope" { return; }
+    let scope = "red";
+    if state().session_picker_scope == "red" { scope = "workspace"; }
+    else if state().session_picker_scope == "workspace" { scope = "all"; }
+    red::state_patch(AgentState { session_picker_scope: scope });
+    request_sessions();
+}
+
+fn session_picker_cancelled(event: PickerCancelled) {
+    let debounce = red::string(state().session_picker_debounce, "");
+    if debounce != "" { red::execute("CancelTimeout", debounce); }
+    red::state_patch(AgentState {
+        session_picker: None,
+        session_picker_request: -1,
+        session_picker_debounce: "",
+    });
+}
+
+fn session_selected(item: PickerItem) {
+    red::state_patch(AgentState { session_picker: None, session_picker_request: -1 });
+    if state().turn_active || state().session_starting || state().restoring {
+        red::execute("Print", "The Agent state changed; choose the session again");
+        return;
+    }
+    let target = red::string(item.data.id, "");
+    if target == "" { return; }
+    let resume = red::bool(item.data.is_red, false);
+    red::state_patch(AgentState {
+        session_switch_target: target,
+        session_switch_previous: state().session_id,
+        restoring: true,
+    });
+    let label = "Continuing in Red…";
+    if resume { label = "Resuming session…"; }
+    set_phase("restoring", label);
+    red::execute("SetTextPanelComposerState", "agent-conversation", false, label);
+    red::execute("AgentSwitchSession", state().session_picker_cwd, target, resume);
+}
+
 fn state() -> AgentState {
     return red::state();
 }
@@ -755,6 +942,7 @@ fn ensure_conversation_panel() {
             title: "Agent",
             composer: TextPanelComposerConfig { placeholder: "Ask a follow-up…", rows: 3 },
             header_actions: [
+                TextPanelHeaderAction { id: "sessions", label: "Sessions", compact_label: "S" },
                 TextPanelHeaderAction { id: "activity", label: "Activity", compact_label: "A" },
                 TextPanelHeaderAction { id: "clear", label: "Clear", compact_label: "C" },
                 TextPanelHeaderAction { id: "new", label: "New", compact_label: "N" },
@@ -1351,6 +1539,8 @@ fn panel_event(event: AgentPanelEvent) {
         cancel();
     } else if event.action == "model" {
         choose_model();
+    } else if event.action == "sessions" {
+        choose_session();
     } else if event.action == "activity" {
         toggle_activity();
     } else if event.action == "activate_block" {
@@ -2009,14 +2199,22 @@ fn conversation_restore_pending(event: AgentConversationEvent) {
 
 #[red::on("agent:session_restored")]
 fn session_restored(event: AgentConversationEvent) {
+    let previous_session_id = red::string(state().session_switch_previous, "");
     red::state_patch(AgentState { model_info: event.model_info, accepted_model: Json {}, turn_model_info: Json {} });
     load_conversation(event);
     red::state_patch(AgentState { session_id: event.thread_id });
-    red::state_patch(AgentState { restoring: false });
+    red::state_patch(AgentState {
+        restoring: false,
+        session_switch_target: "",
+        session_switch_previous: "",
+    });
     red::state_patch(AgentState { recap_pending: false });
     set_phase("idle", "");
     red::execute("SetTextPanelComposerState", "agent-conversation", true, "");
     refresh_model_header();
+    if previous_session_id != "" && previous_session_id != event.thread_id {
+        red::execute("AgentCloseSession", previous_session_id);
+    }
     red::execute("Print", "Agent session restored");
 }
 
@@ -2027,6 +2225,18 @@ struct AgentSessionRestoreFailedEvent {
 
 #[red::on("agent:session_restore_failed")]
 fn session_restore_failed(event: AgentSessionRestoreFailedEvent) {
+    if state().session_switch_target != "" && event.session_id == state().session_switch_target {
+        red::state_patch(AgentState {
+            restoring: false,
+            session_switch_target: "",
+            session_switch_previous: "",
+        });
+        set_phase("idle", "");
+        red::execute("SetTextPanelComposerState", "agent-conversation", true, "");
+        refresh_model_header();
+        red::execute("Print", "Could not switch Agent sessions: " + event.message);
+        return;
+    }
     red::state_patch(AgentState { session_id: "" });
     reset_model_state();
     red::state_patch(AgentState { restoring: false });

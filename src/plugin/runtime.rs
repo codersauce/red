@@ -1152,6 +1152,23 @@ impl RedHost {
                     .to_string();
                 self.send_request(PluginRequest::AgentResumeSession { cwd, session_id });
             }
+            "AgentSwitchSession" => {
+                let cwd = args
+                    .first()
+                    .and_then(Value::as_str)
+                    .map_or_else(|| PathBuf::from("."), PathBuf::from);
+                let session_id = args
+                    .get(1)
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("AgentSwitchSession requires a session id"))?
+                    .to_string();
+                let resume = args.get(2).and_then(red_value_to_bool).unwrap_or(false);
+                self.send_request(PluginRequest::AgentSwitchSession {
+                    cwd,
+                    session_id,
+                    resume,
+                });
+            }
             "AgentPrompt" => {
                 let session_id = args
                     .first()
@@ -1983,6 +2000,33 @@ impl RedHost {
                 request_id,
                 request: crate::codex::ModelRequest::List,
             },
+            "AgentListSessions" => {
+                let cwd = args
+                    .first()
+                    .and_then(Value::as_str)
+                    .map_or_else(|| PathBuf::from("."), PathBuf::from);
+                let scope = match args.get(1).and_then(Value::as_str).unwrap_or("red") {
+                    "red" => crate::codex::AgentSessionScope::Red,
+                    "workspace" => crate::codex::AgentSessionScope::Workspace,
+                    "all" => crate::codex::AgentSessionScope::All,
+                    value => anyhow::bail!("unknown Agent session scope `{value}`"),
+                };
+                let query = args.get(2).map(value_to_string).unwrap_or_default();
+                let exclude_session_id = args
+                    .get(3)
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string);
+                PluginRequest::AgentSessionRequest {
+                    request_id,
+                    request: crate::codex::AgentSessionListRequest {
+                        cwd,
+                        scope,
+                        query,
+                        exclude_session_id,
+                    },
+                }
+            }
             "AgentSetModel" => {
                 let session_id = args
                     .first()
@@ -7260,7 +7304,7 @@ mod tests {
                     && config.side == crate::plugin::PanelSide::Right
                     && config.width == 62
                     && config.title.as_deref() == Some("Agent")
-                    && config.header_actions.iter().map(|action| action.id.as_str()).eq(["activity", "clear", "new", "close"])
+                && config.header_actions.iter().map(|action| action.id.as_str()).eq(["sessions", "activity", "clear", "new", "close"])
         ));
         expect_agent_model_header();
         assert!(matches!(
@@ -8153,6 +8197,179 @@ mod tests {
             ACTION_DISPATCHER.recv_request(),
             PluginRequest::FocusTextPanelComposer { id } if id == "agent-conversation"
         ));
+        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
+    }
+
+    #[tokio::test]
+    async fn bundled_agent_session_picker_cycles_scope_and_continues_in_the_same_pane() {
+        drain_requests();
+        let mut runtime = Runtime::new();
+        runtime
+            .load_plugin("agent", include_str!("../../plugins/agent.hk"))
+            .await
+            .unwrap();
+
+        let _catalog = open_unprimed_agent(&mut runtime).await;
+        runtime.execute_command("AgentSessions").await.unwrap();
+        let cwd_request = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::GetConfig { request_id, key } => {
+                assert_eq!(key.as_deref(), Some("cwd"));
+                request_id
+            }
+            _ => panic!("expected workspace request"),
+        };
+        runtime
+            .resolve_request(cwd_request, serde_json::json!({"value": "/workspace"}))
+            .await
+            .unwrap();
+        let handle = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::OpenCallbackPicker {
+                owner,
+                handle,
+                title,
+                items,
+                options,
+            } => {
+                assert_eq!(owner, "agent");
+                assert_eq!(title.as_deref(), Some("Agent sessions"));
+                assert!(items.is_empty());
+                assert!(options.external_filter);
+                assert!(options
+                    .actions
+                    .iter()
+                    .any(|action| action.key == "Alt-s" && action.action == "cycle_scope"));
+                handle
+            }
+            _ => panic!("expected session picker"),
+        };
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::UpdatePickerBusy { id, busy: true } if id == handle.get()
+        ));
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::UpdatePickerStatus { id, .. } if id == handle.get()
+        ));
+        let initial_request = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::AgentSessionRequest {
+                request_id,
+                request,
+            } => {
+                assert_eq!(request.cwd, PathBuf::from("/workspace"));
+                assert_eq!(request.scope, crate::codex::AgentSessionScope::Red);
+                assert!(request.query.is_empty());
+                request_id
+            }
+            _ => panic!("expected Red session request"),
+        };
+        runtime
+            .resolve_request(
+                initial_request,
+                serde_json::json!({"sessions": [], "error": ""}),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::UpdatePickerBusy { id, busy: false } if id == handle.get()
+        ));
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::UpdatePickerItems { id, ref items } if id == handle.get() && items.is_empty()
+        ));
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::UpdatePickerStatus { id, .. } if id == handle.get()
+        ));
+
+        runtime
+            .notify_picker(
+                handle,
+                PickerCallback::Action {
+                    action: "cycle_scope".into(),
+                    item: None,
+                    query: String::new(),
+                },
+            )
+            .unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::UpdatePickerBusy { id, busy: true } if id == handle.get()
+        ));
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::UpdatePickerStatus { id, .. } if id == handle.get()
+        ));
+        let workspace_request = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::AgentSessionRequest {
+                request_id,
+                request,
+            } => {
+                assert_eq!(request.scope, crate::codex::AgentSessionScope::Workspace);
+                request_id
+            }
+            _ => panic!("expected workspace session request"),
+        };
+        runtime
+            .resolve_request(
+                workspace_request,
+                serde_json::json!({
+                    "sessions": [{
+                        "id": "foreign-thread",
+                        "cwd": "/workspace",
+                        "label": "Earlier conversation",
+                        "detail": "2h ago · Codex CLI · workspace",
+                        "snippet": "",
+                        "source": "Codex CLI",
+                        "is_red": false,
+                        "updated_at": 42
+                    }],
+                    "error": ""
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::UpdatePickerBusy { id, busy: false } if id == handle.get()
+        ));
+        let item = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::UpdatePickerItems { id, items } if id == handle.get() => {
+                assert_eq!(items.len(), 1);
+                items[0].clone()
+            }
+            _ => panic!("expected session rows"),
+        };
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::UpdatePickerStatus { id, .. } if id == handle.get()
+        ));
+
+        runtime
+            .notify_picker(handle, PickerCallback::Selected(item))
+            .unwrap();
+        let mut switched = false;
+        for _ in 0..4 {
+            match ACTION_DISPATCHER.recv_request() {
+                PluginRequest::AgentSwitchSession {
+                    cwd,
+                    session_id,
+                    resume,
+                } => {
+                    assert_eq!(cwd, PathBuf::from("/workspace"));
+                    assert_eq!(session_id, "foreign-thread");
+                    assert!(!resume);
+                    switched = true;
+                    break;
+                }
+                PluginRequest::SetTextPanelStatus { id, .. }
+                | PluginRequest::SetTextPanelComposerState { id, .. } => {
+                    assert_eq!(id, "agent-conversation");
+                }
+                _ => panic!("session switch opened another surface"),
+            }
+        }
+        assert!(switched);
         assert!(ACTION_DISPATCHER.try_recv_request().is_none());
     }
 
