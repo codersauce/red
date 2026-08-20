@@ -97,11 +97,13 @@ use crate::{
     agent_tools::{
         apply_text_edits, editor_tool_channel, utf16_byte_offset, EditorActionName,
         EditorOpenTarget, EditorSelectionKind, EditorToolCall, EditorToolHost, EditorToolRequest,
-        PendingEditorToolResponse,
+        PendingEditorToolResponse, MAX_AGENT_READ_BYTES,
     },
     buffer::{Buffer, BufferId, SearchMatch, SyntaxSelection},
     clipboard::{ClipboardProvider, DisabledClipboardProvider, NativeClipboardProvider},
-    codex::{start_codex, CodexBridge, CodexCommand, CodexEvent, CodexProcessSpec},
+    codex::{
+        start_codex, AgentRuntimePolicy, CodexBridge, CodexCommand, CodexEvent, CodexProcessSpec,
+    },
     color::Color,
     command,
     command_completion::{self, CommandCompletionState, CompletionDirection},
@@ -1375,6 +1377,48 @@ fn bounded_agent_failure_message(message: &str) -> String {
     bounded
 }
 
+struct AgentFilePage {
+    content: String,
+    start_line: usize,
+    end_line: usize,
+    truncated: bool,
+    line_truncated: bool,
+    next_line: Option<usize>,
+}
+
+fn agent_file_page(contents: &str, start_line: usize, line_count: usize) -> AgentFilePage {
+    let lines = contents.split_inclusive('\n').collect::<Vec<_>>();
+    let start = start_line.saturating_sub(1).min(lines.len());
+    let mut end = start;
+    let mut content = String::new();
+    let mut line_truncated = false;
+    for line in lines.iter().skip(start).take(line_count) {
+        if content.len().saturating_add(line.len()) > MAX_AGENT_READ_BYTES {
+            if content.is_empty() {
+                let mut byte_end = line.len().min(MAX_AGENT_READ_BYTES);
+                while !line.is_char_boundary(byte_end) {
+                    byte_end -= 1;
+                }
+                content.push_str(&line[..byte_end]);
+                end += 1;
+                line_truncated = byte_end < line.len();
+            }
+            break;
+        }
+        content.push_str(line);
+        end += 1;
+    }
+    let truncated = line_truncated || end < lines.len();
+    AgentFilePage {
+        content,
+        start_line: start + 1,
+        end_line: end,
+        truncated,
+        line_truncated,
+        next_line: (end < lines.len()).then_some(end + 1),
+    }
+}
+
 const COMMIT_MESSAGE_DIFF_BYTES: usize = 192 * 1024;
 const COMMIT_MESSAGE_HISTORY_BYTES: usize = 24 * 1024;
 const COMMIT_MESSAGE_BRANCH_BYTES: usize = 512;
@@ -1465,10 +1509,23 @@ fn agent_context_path_is_ignored(path: &Path, root: &Path, is_dir: bool) -> bool
 }
 
 pub(crate) fn resolve_agent_tool_path(root: &Path, path: &str) -> anyhow::Result<PathBuf> {
-    resolve_agent_tool_path_kind(root, path, /*is_dir*/ false)
+    resolve_agent_tool_path_with_policy(root, path, /*allow_sensitive_paths*/ false)
 }
 
-fn resolve_agent_tool_path_kind(root: &Path, path: &str, is_dir: bool) -> anyhow::Result<PathBuf> {
+pub(crate) fn resolve_agent_tool_path_with_policy(
+    root: &Path,
+    path: &str,
+    allow_sensitive_paths: bool,
+) -> anyhow::Result<PathBuf> {
+    resolve_agent_tool_path_kind(root, path, /*is_dir*/ false, allow_sensitive_paths)
+}
+
+fn resolve_agent_tool_path_kind(
+    root: &Path,
+    path: &str,
+    is_dir: bool,
+    allow_sensitive_paths: bool,
+) -> anyhow::Result<PathBuf> {
     anyhow::ensure!(!path.is_empty(), "editor tool path cannot be empty");
     let path = Path::new(path);
     let path = if path.is_absolute() {
@@ -1510,8 +1567,8 @@ fn resolve_agent_tool_path_kind(root: &Path, path: &str, is_dir: bool) -> anyhow
         }
     }
     anyhow::ensure!(
-        !agent_context_path_is_sensitive(&normalized),
-        "editor tool path is a sensitive file"
+        allow_sensitive_paths || !agent_context_path_is_sensitive(&normalized),
+        "editor tool path is a sensitive file; set [agent] allow_sensitive_paths = true to opt in"
     );
     anyhow::ensure!(
         !agent_context_path_is_ignored(&normalized, root, is_dir),
@@ -8582,14 +8639,20 @@ impl Editor {
             .ok_or_else(|| anyhow::anyhow!("no agent workspace is active"))?
             .to_path_buf();
 
-        let resolve_path =
-            |path: &str| -> anyhow::Result<PathBuf> { resolve_agent_tool_path(&root, path) };
+        let allow_sensitive_paths = self.config.agent.allow_sensitive_paths;
+        let resolve_path = |path: &str| -> anyhow::Result<PathBuf> {
+            resolve_agent_tool_path_with_policy(&root, path, allow_sensitive_paths)
+        };
 
         match request.call {
             EditorToolCall::InlineContext { .. } => {
                 anyhow::bail!("inline context must use its request-bound dispatcher")
             }
-            EditorToolCall::ReadFile { path } => {
+            EditorToolCall::ReadFile {
+                path,
+                start_line,
+                line_count,
+            } => {
                 let path = resolve_path(&path)?;
                 let exists = path.exists();
                 if self
@@ -8601,12 +8664,24 @@ impl Editor {
                         "content": "",
                         "revision": 0,
                         "exists": false,
+                        "start_line": 1,
+                        "end_line": 0,
+                        "truncated": false,
+                        "line_truncated": false,
+                        "next_line": null,
                     }));
                 }
+                let contents = self.current_buffer().contents();
+                let page = agent_file_page(&contents, start_line, line_count);
                 Ok(json!({
-                    "content": self.current_buffer().contents(),
+                    "content": page.content,
                     "revision": self.current_buffer().revision(),
                     "exists": exists,
+                    "start_line": page.start_line,
+                    "end_line": page.end_line,
+                    "truncated": page.truncated,
+                    "line_truncated": page.line_truncated,
+                    "next_line": page.next_line,
                 }))
             }
             EditorToolCall::WriteFile {
@@ -8626,7 +8701,12 @@ impl Editor {
                 .await
             }
             EditorToolCall::CreateDirectory { path } => {
-                let path = resolve_agent_tool_path_kind(&root, &path, /*is_dir*/ true)?;
+                let path = resolve_agent_tool_path_kind(
+                    &root,
+                    &path,
+                    /*is_dir*/ true,
+                    allow_sensitive_paths,
+                )?;
                 let created =
                     crate::lsp::workspace_edit::secure_create_workspace_directory(&root, &path)?;
                 Ok(json!({
@@ -8665,8 +8745,13 @@ impl Editor {
                 Ok(result)
             }
             EditorToolCall::DismissAnnotations { annotation_ids } => {
-                self.dismiss_agent_requested_annotations(&root, annotation_ids, render_buffer)
-                    .await
+                self.dismiss_agent_requested_annotations(
+                    &root,
+                    annotation_ids,
+                    allow_sensitive_paths,
+                    render_buffer,
+                )
+                .await
             }
             EditorToolCall::GetEditorState {} => Ok(self.agent_editor_state()),
             EditorToolCall::OpenFile {
@@ -8835,7 +8920,7 @@ impl Editor {
             EditorToolCall::InlineContext { .. }
             | EditorToolCall::CreateDirectory { .. }
             | EditorToolCall::DismissAnnotations { .. } => return Ok(Duration::ZERO),
-            EditorToolCall::ReadFile { path } => {
+            EditorToolCall::ReadFile { path, .. } => {
                 (Some(path.as_str()), None, false, Duration::from_millis(300))
             }
             EditorToolCall::WriteFile { path, .. } => {
@@ -8887,7 +8972,11 @@ impl Editor {
         let Some(path) = path else {
             return Ok(delay);
         };
-        let path = resolve_agent_tool_path(&root, path)?;
+        let path = resolve_agent_tool_path_with_policy(
+            &root,
+            path,
+            self.config.agent.allow_sensitive_paths,
+        )?;
         if self
             .open_agent_buffer(&path, create, render_buffer)
             .await?
@@ -9260,8 +9349,14 @@ impl Editor {
                 "Codex CLI was not found; install Codex, run `codex login`, and try again"
             )
         })?;
-        let mut spec =
-            CodexProcessSpec::new(command, cwd.clone()).args(self.config.agent.args.clone());
+        let policy = AgentRuntimePolicy::new(
+            self.config.agent.allow_sensitive_paths,
+            self.config.agent.enabled_mcp_servers.clone(),
+            self.config.agent.enabled_codex_features.clone(),
+        );
+        let mut spec = CodexProcessSpec::new(command, cwd.clone())
+            .args(self.config.agent.args.clone())
+            .policy(policy);
         spec.environment.extend(
             self.config
                 .agent
@@ -9387,7 +9482,7 @@ impl Editor {
             if let Some(pending) = self.agent_manager.try_recv_tool_request() {
                 if matches!(pending.request.call, EditorToolCall::InlineContext { .. }) {
                     self.dispatch_inline_context_request(pending);
-                } else {
+                } else if self.config.agent.follow_tool_calls {
                     match self
                         .prepare_agent_follow_step(&pending.request, buffer, runtime)
                         .await
@@ -9399,15 +9494,19 @@ impl Editor {
                             let _ = pending.response.send(Err(error.to_string()));
                         }
                     }
+                } else {
+                    self.agent_manager
+                        .stage_playback_tool(pending, Instant::now());
                 }
             }
         }
         if let Some(pending) = self.agent_manager.take_ready_playback_tool(Instant::now()) {
-            let post_delay = if pending.request.call.is_edit() {
-                Duration::from_millis(700)
-            } else {
-                Duration::ZERO
-            };
+            let post_delay =
+                if self.config.agent.follow_tool_calls && pending.request.call.is_edit() {
+                    Duration::from_millis(700)
+                } else {
+                    Duration::ZERO
+                };
             let result = self
                 .dispatch_agent_editor_tool(pending.request, buffer, runtime)
                 .await
@@ -9481,176 +9580,190 @@ impl Editor {
                     .await?;
                 continue;
             }
-            let event =
-                match event {
-                    CodexEvent::InlineContextRead {
-                        request_id,
-                        description,
-                    } => {
+            let event = match event {
+                CodexEvent::InlineContextRead {
+                    request_id,
+                    description,
+                } => {
+                    if let Some(turn) = self.inline_history.turn_mut(&request_id) {
+                        if turn.context_reads.len() < 12
+                            && !turn.context_reads.contains(&description)
+                        {
+                            turn.context_reads.push(description);
+                        }
+                    }
+                    self.mark_inline_history_dirty();
+                    continue;
+                }
+                CodexEvent::InlineAnswerDelta { request_id, text } => {
+                    self.inline_history.append_answer(&request_id, &text);
+                    self.mark_inline_history_dirty();
+                    continue;
+                }
+                CodexEvent::InlineSessionCreated {
+                    request_id,
+                    session_id,
+                } => {
+                    let pending = self
+                        .inline_history
+                        .turn(&request_id)
+                        .is_some_and(|turn| turn.state == InlineTurnState::Pending);
+                    if let Some(assist) = self
+                        .inline_request_session_mut(&request_id)
+                        .filter(|_| pending)
+                    {
+                        assist.session_id = Some(session_id.clone());
                         if let Some(turn) = self.inline_history.turn_mut(&request_id) {
-                            if turn.context_reads.len() < 12
-                                && !turn.context_reads.contains(&description)
-                            {
-                                turn.context_reads.push(description);
-                            }
+                            turn.session_id = Some(session_id);
                         }
-                        self.mark_inline_history_dirty();
+                    } else if let Some(bridge) = self.agent_manager.bridge() {
+                        let _ = bridge.try_send(CodexCommand::CloseSession { session_id });
+                    }
+                    continue;
+                }
+                CodexEvent::InlineResult {
+                    request_id,
+                    session_id,
+                    result,
+                } => {
+                    // A duplicate or late provider event must never apply a
+                    // result after its request has already finished.
+                    if !self
+                        .inline_history
+                        .turn(&request_id)
+                        .is_some_and(|turn| turn.state == InlineTurnState::Pending)
+                    {
                         continue;
                     }
-                    CodexEvent::InlineAnswerDelta { request_id, text } => {
-                        self.inline_history.append_answer(&request_id, &text);
-                        self.mark_inline_history_dirty();
-                        continue;
-                    }
-                    CodexEvent::InlineSessionCreated {
-                        request_id,
-                        session_id,
-                    } => {
-                        let pending = self
-                            .inline_history
-                            .turn(&request_id)
-                            .is_some_and(|turn| turn.state == InlineTurnState::Pending);
-                        if let Some(assist) = self
-                            .inline_request_session_mut(&request_id)
-                            .filter(|_| pending)
-                        {
-                            assist.session_id = Some(session_id.clone());
-                            if let Some(turn) = self.inline_history.turn_mut(&request_id) {
-                                turn.session_id = Some(session_id);
-                            }
-                        } else if let Some(bridge) = self.agent_manager.bridge() {
-                            let _ = bridge.try_send(CodexCommand::CloseSession { session_id });
-                        }
-                        continue;
-                    }
-                    CodexEvent::InlineResult {
-                        request_id,
-                        session_id,
-                        result,
-                    } => {
-                        // A duplicate or late provider event must never apply a
-                        // staged result without the user's explicit approval.
-                        if !self
-                            .inline_history
-                            .turn(&request_id)
-                            .is_some_and(|turn| turn.state == InlineTurnState::Pending)
-                        {
-                            continue;
-                        }
-                        let foreground = self.inline_assist.as_ref().is_some_and(|assist| {
+                    let foreground =
+                        self.inline_assist.as_ref().is_some_and(|assist| {
                             assist.request_id.as_deref() == Some(&request_id)
                         }) && self
                             .current_dialog
                             .as_ref()
                             .and_then(|dialog| dialog.inline_assist_state())
                             .is_some();
-                        let changes_text = self
-                            .inline_history
-                            .turn(&request_id)
-                            .is_some_and(|turn| result.changes_text(&turn.before));
-                        if result.expanded_scope.is_some() || changes_text {
-                            self.stage_background_inline_result(&request_id, &session_id, result);
-                            if foreground {
-                                if let Some(scope) = self
-                                    .inline_assist
-                                    .as_ref()
-                                    .map(|assist| assist.scope.clone())
-                                {
-                                    self.current_dialog = Some(Box::new(self.inline_assist_popup(
-                                        scope,
-                                        self.inline_assist_result_state(),
-                                    )));
-                                }
-                            }
-                            self.render(buffer)?;
-                            continue;
-                        }
-                        if !foreground {
-                            if self.inline_assist.as_ref().is_some_and(|assist| {
-                                assist.request_id.as_deref() == Some(&request_id)
-                            }) {
-                                self.park_inline_assist();
-                            }
-                            self.stage_background_inline_result(&request_id, &session_id, result);
-                            self.render(buffer)?;
-                            continue;
-                        }
-                        if let Err(error) = self
+                    let changes_text = self
+                        .inline_history
+                        .turn(&request_id)
+                        .is_some_and(|turn| result.changes_text(&turn.before));
+                    if foreground
+                        && changes_text
+                        && result.expanded_scope.is_none()
+                        && self.config.agent.auto_apply_inline_edits
+                        && self
                             .apply_inline_result(&request_id, &session_id, &result, buffer, runtime)
                             .await
-                        {
-                            if let Some(turn) =
-                                self.inline_history.turn_mut(&request_id).filter(|turn| {
-                                    matches!(
-                                        turn.state,
-                                        InlineTurnState::Pending | InlineTurnState::Ready
-                                    )
-                                })
-                            {
-                                turn.result = Some(result);
-                                turn.session_id = Some(session_id);
-                            }
-                            self.inline_history.finish(
-                                &request_id,
-                                InlineTurnState::Rejected,
-                                Some(error.to_string()),
-                            );
-                            self.sync_inline_activity();
-                            if let Some(scope) = self.inline_assist.as_ref().and_then(|assist| {
-                                (assist.request_id.as_deref() == Some(request_id.as_str()))
-                                    .then(|| assist.scope.clone())
-                            }) {
-                                self.current_dialog = Some(Box::new(self.inline_assist_popup(
-                                    scope,
-                                    InlineAssistPopupState::Failed(error.to_string()),
-                                )));
-                                self.render(buffer)?;
-                            }
-                        }
+                            .is_ok()
+                    {
                         continue;
                     }
-                    CodexEvent::InlineFailed {
-                        request_id,
-                        session_id,
-                        message,
-                    } => {
-                        let request_id = request_id.or_else(|| {
-                            session_id
-                                .as_deref()
-                                .and_then(|provider| self.inline_request_for_provider(provider))
-                        });
-                        if !request_id
-                            .as_deref()
-                            .and_then(|request| self.inline_history.turn(request))
-                            .is_some_and(|turn| turn.state == InlineTurnState::Pending)
+                    if result.expanded_scope.is_some() || changes_text {
+                        self.stage_background_inline_result(&request_id, &session_id, result);
+                        if foreground {
+                            if let Some(scope) = self
+                                .inline_assist
+                                .as_ref()
+                                .map(|assist| assist.scope.clone())
+                            {
+                                self.current_dialog = Some(Box::new(self.inline_assist_popup(
+                                    scope,
+                                    self.inline_assist_result_state(),
+                                )));
+                            }
+                        }
+                        self.render(buffer)?;
+                        continue;
+                    }
+                    if !foreground {
+                        if self
+                            .inline_assist
+                            .as_ref()
+                            .is_some_and(|assist| assist.request_id.as_deref() == Some(&request_id))
                         {
-                            continue;
+                            self.park_inline_assist();
                         }
-                        let scope = self.inline_assist.as_ref().and_then(|assist| {
-                            (assist.request_id == request_id
-                                && self
-                                    .current_dialog
-                                    .as_ref()
-                                    .and_then(|dialog| dialog.inline_assist_state())
-                                    .is_some())
-                            .then(|| assist.scope.clone())
-                        });
-                        if let Some(request) = request_id {
-                            self.record_inline_failure(&request, &message);
+                        self.stage_background_inline_result(&request_id, &session_id, result);
+                        self.render(buffer)?;
+                        continue;
+                    }
+                    if let Err(error) = self
+                        .apply_inline_result(&request_id, &session_id, &result, buffer, runtime)
+                        .await
+                    {
+                        if let Some(turn) =
+                            self.inline_history.turn_mut(&request_id).filter(|turn| {
+                                matches!(
+                                    turn.state,
+                                    InlineTurnState::Pending | InlineTurnState::Ready
+                                )
+                            })
+                        {
+                            turn.result = Some(result);
+                            turn.session_id = Some(session_id);
                         }
-                        if let Some(scope) = scope {
+                        self.inline_history.finish(
+                            &request_id,
+                            InlineTurnState::Rejected,
+                            Some(error.to_string()),
+                        );
+                        self.sync_inline_activity();
+                        if let Some(scope) = self.inline_assist.as_ref().and_then(|assist| {
+                            (assist.request_id.as_deref() == Some(request_id.as_str()))
+                                .then(|| assist.scope.clone())
+                        }) {
                             self.current_dialog = Some(Box::new(self.inline_assist_popup(
+                                scope,
+                                InlineAssistPopupState::Failed(error.to_string()),
+                            )));
+                            self.render(buffer)?;
+                        }
+                    }
+                    continue;
+                }
+                CodexEvent::InlineFailed {
+                    request_id,
+                    session_id,
+                    message,
+                } => {
+                    let request_id = request_id.or_else(|| {
+                        session_id
+                            .as_deref()
+                            .and_then(|provider| self.inline_request_for_provider(provider))
+                    });
+                    if !request_id
+                        .as_deref()
+                        .and_then(|request| self.inline_history.turn(request))
+                        .is_some_and(|turn| turn.state == InlineTurnState::Pending)
+                    {
+                        continue;
+                    }
+                    let scope = self.inline_assist.as_ref().and_then(|assist| {
+                        (assist.request_id == request_id
+                            && self
+                                .current_dialog
+                                .as_ref()
+                                .and_then(|dialog| dialog.inline_assist_state())
+                                .is_some())
+                        .then(|| assist.scope.clone())
+                    });
+                    if let Some(request) = request_id {
+                        self.record_inline_failure(&request, &message);
+                    }
+                    if let Some(scope) = scope {
+                        self.current_dialog =
+                            Some(Box::new(self.inline_assist_popup(
                                 scope,
                                 InlineAssistPopupState::Failed(message),
                             )));
-                            self.render(buffer)?;
-                        } else {
-                            self.render(buffer)?;
-                        }
-                        continue;
+                        self.render(buffer)?;
+                    } else {
+                        self.render(buffer)?;
                     }
-                    event => event,
-                };
+                    continue;
+                }
+                event => event,
+            };
             match &event {
                 CodexEvent::SessionModelChanged {
                     session_id,
@@ -29805,6 +29918,8 @@ mod test {
         let read = editor
             .test_run_agent_editor_tool(request(EditorToolCall::ReadFile {
                 path: "go/main.go".to_string(),
+                start_line: 1,
+                line_count: 400,
             }))
             .await
             .unwrap();
@@ -29863,6 +29978,46 @@ mod test {
             fs::read_to_string(root.path().join("other/nested/main.go")).unwrap(),
             "package main\n"
         );
+    }
+
+    #[tokio::test]
+    async fn agent_file_reads_return_explicit_pages_from_unsaved_buffers() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("main.rs");
+        fs::write(&path, "one\ntwo\nthree\nfour\nfive\n").unwrap();
+        let mut editor = test_editor(/*width*/ 80, /*height*/ 24);
+        editor.test_set_agent_root(root.path());
+        let request = |start_line, line_count| EditorToolRequest {
+            session_id: "paged-read".to_string(),
+            call: EditorToolCall::ReadFile {
+                path: "main.rs".to_string(),
+                start_line,
+                line_count,
+            },
+        };
+
+        let first = editor
+            .test_run_agent_editor_tool(request(/*start_line*/ 2, /*line_count*/ 2))
+            .await
+            .unwrap();
+        assert_eq!(first["content"], "two\nthree\n");
+        assert_eq!(first["start_line"], 2);
+        assert_eq!(first["end_line"], 3);
+        assert_eq!(first["truncated"], true);
+        assert_eq!(first["next_line"], 4);
+
+        editor.begin_transaction("unsaved edit");
+        editor.replace_range(TextRange::insertion(TextPosition::new(3, 0)), "unsaved ");
+        assert!(editor.commit_transaction(editor.cursor_snapshot()));
+        let second = editor
+            .test_run_agent_editor_tool(request(/*start_line*/ 4, /*line_count*/ 2))
+            .await
+            .unwrap();
+        assert_eq!(second["content"], "unsaved four\nfive\n");
+        assert_eq!(second["start_line"], 4);
+        assert_eq!(second["end_line"], 5);
+        assert_eq!(second["truncated"], false);
+        assert!(second["next_line"].is_null());
     }
 
     #[tokio::test]

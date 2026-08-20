@@ -5,6 +5,7 @@ fn snapshot(root: &Path) -> InlineContextSnapshot {
     InlineContextSnapshot {
         root: root.canonicalize().unwrap(),
         visible: BTreeMap::new(),
+        allow_sensitive_paths: false,
     }
 }
 
@@ -137,6 +138,28 @@ async fn inline_context_rejects_unsafe_ignored_binary_and_oversized_files() {
             "{forbidden}"
         );
     }
+}
+
+#[tokio::test]
+async fn inline_context_can_read_sensitive_workspace_files_after_explicit_consent() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join(".env"), "TOKEN=example\n").unwrap();
+    std::fs::create_dir(root.path().join(".git")).unwrap();
+    std::fs::write(root.path().join(".git/config"), "private\n").unwrap();
+    let consented = || {
+        let mut context = snapshot(root.path());
+        context.allow_sensitive_paths = true;
+        context
+    };
+
+    let value = consented().execute(read(".env")).await.unwrap();
+    assert_eq!(value["content"], "TOKEN=example\n");
+    let files = consented()
+        .execute(InlineContextCall::ListFiles {})
+        .await
+        .unwrap();
+    assert!(files["files"].as_array().unwrap().contains(&json!(".env")));
+    assert!(consented().execute(read(".git/config")).await.is_err());
 }
 
 #[tokio::test]

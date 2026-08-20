@@ -314,8 +314,34 @@ pub struct Config {
     pub startup_session_resumed: bool,
 }
 
-/// Direct Codex CLI launch configuration.
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Default)]
+/// Optional Codex extension categories that Red may expose to Agent sessions.
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentCodexFeature {
+    Apps,
+    Connectors,
+    Plugins,
+    RemotePlugin,
+    SkillMcpDependencyInstall,
+    OrchestratorMcp,
+}
+
+impl AgentCodexFeature {
+    /// Returns the matching Codex feature-config key when one exists.
+    pub(crate) const fn config_key(self) -> Option<&'static str> {
+        match self {
+            Self::Apps => Some("apps"),
+            Self::Connectors => Some("connectors"),
+            Self::Plugins => Some("plugins"),
+            Self::RemotePlugin => Some("remote_plugin"),
+            Self::SkillMcpDependencyInstall => Some("skill_mcp_dependency_install"),
+            Self::OrchestratorMcp => None,
+        }
+    }
+}
+
+/// Direct Codex CLI launch and Agent policy configuration.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct AgentConfig {
     /// Codex executable override. Red uses `codex` from PATH when absent.
@@ -326,6 +352,36 @@ pub struct AgentConfig {
     /// Environment additions supplied only to the Codex child process.
     #[serde(default)]
     pub env: HashMap<String, String>,
+    /// Show each file tool in the active editor with deliberate playback delays.
+    #[serde(default)]
+    pub follow_tool_calls: bool,
+    /// Apply exact-target inline edits immediately as unsaved, undoable transactions.
+    #[serde(default = "default_true")]
+    pub auto_apply_inline_edits: bool,
+    /// Permit Agent tools to inspect or change paths matching Red's secret-name heuristic.
+    #[serde(default)]
+    pub allow_sensitive_paths: bool,
+    /// Existing Codex MCP server names that Red may enable for Agent sessions.
+    #[serde(default)]
+    pub enabled_mcp_servers: Vec<String>,
+    /// Codex extension categories that Red may enable for Agent sessions.
+    #[serde(default)]
+    pub enabled_codex_features: Vec<AgentCodexFeature>,
+}
+
+impl Default for AgentConfig {
+    fn default() -> Self {
+        Self {
+            command: None,
+            args: Vec::new(),
+            env: HashMap::new(),
+            follow_tool_calls: false,
+            auto_apply_inline_edits: true,
+            allow_sensitive_paths: false,
+            enabled_mcp_servers: Vec::new(),
+            enabled_codex_features: Vec::new(),
+        }
+    }
 }
 
 /// Diagnostic presentation layered on top of the master `show_diagnostics` switch.
@@ -2054,7 +2110,18 @@ fn known_schema_path(path: &[String]) -> bool {
         ["keys", ..] | ["plugin_config", ..] => true,
         ["plugins", _] => true,
         ["plugin_permissions", _] | ["plugin_permissions", _, "process"] => true,
-        ["agent", field] => matches!(*field, "adapter" | "command" | "args" | "env"),
+        ["agent", field] => matches!(
+            *field,
+            "adapter"
+                | "command"
+                | "args"
+                | "env"
+                | "follow_tool_calls"
+                | "auto_apply_inline_edits"
+                | "allow_sensitive_paths"
+                | "enabled_mcp_servers"
+                | "enabled_codex_features"
+        ),
         ["agent", "env", _] => true,
         ["diagnostics", field] => matches!(*field, "gutter_signs" | "icon_style"),
         ["cursor", field] => matches!(
@@ -3574,6 +3641,40 @@ env = { NO_BROWSER = "1" }
         assert_eq!(
             config.agent.env.get("NO_BROWSER").map(String::as_str),
             Some("1")
+        );
+        assert!(!config.agent.follow_tool_calls);
+        assert!(config.agent.auto_apply_inline_edits);
+        assert!(!config.agent.allow_sensitive_paths);
+        assert!(config.agent.enabled_mcp_servers.is_empty());
+        assert!(config.agent.enabled_codex_features.is_empty());
+    }
+
+    #[test]
+    fn agent_runtime_policy_and_behavior_are_configurable() {
+        let config = Config::from_user_toml_with_overrides(
+            r#"
+[agent]
+follow_tool_calls = true
+auto_apply_inline_edits = false
+allow_sensitive_paths = true
+enabled_mcp_servers = ["github", "linear"]
+enabled_codex_features = ["apps", "plugins", "orchestrator_mcp"]
+"#,
+            &[],
+        )
+        .unwrap();
+
+        assert!(config.agent.follow_tool_calls);
+        assert!(!config.agent.auto_apply_inline_edits);
+        assert!(config.agent.allow_sensitive_paths);
+        assert_eq!(config.agent.enabled_mcp_servers, ["github", "linear"]);
+        assert_eq!(
+            config.agent.enabled_codex_features,
+            [
+                AgentCodexFeature::Apps,
+                AgentCodexFeature::Plugins,
+                AgentCodexFeature::OrchestratorMcp,
+            ]
         );
     }
 

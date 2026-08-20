@@ -3,7 +3,7 @@
 Red launches the installed Codex CLI as an app-server and speaks its JSONL
 protocol directly. There is no ACP client, adapter, or companion executable.
 The bundled Husk plugin owns the terminal UI; Rust core owns the Codex process,
-thread and turn lifecycle, dynamic tools, paced following, saving, and attributed
+thread and turn lifecycle, dynamic tools, optional followed playback, saving, and attributed
 application.
 
 ## Prerequisites
@@ -41,10 +41,12 @@ native tools, four bounded project-reading tools, and four submission tools.
 opening files or moving focus. Unsaved buffers take precedence over disk.
 `read_git_diff` compares one tracked file at `HEAD` with its current buffer,
 including unsaved changes. The response identifies the exact base commit.
-Reading more context does not expand the editable target. Inline requests have
-at most 12 context reads; file reads are limited to 200 lines and 32 KiB per
-response, and files larger than 512 KiB are omitted. Results report truncation.
-Sensitive, ignored, binary, symlinked, and out-of-workspace files are excluded.
+Reading more context does not expand the editable target. File reads are limited
+to 200 lines and 32 KiB per response, and files larger than 512 KiB are omitted.
+Results report truncation.
+Ignored, binary, symlinked, and out-of-workspace files are excluded. Secret-like
+filenames are excluded by default and can be included explicitly with
+`[agent] allow_sensitive_paths = true`.
 On platforms without the safe on-disk reader, open-buffer reads remain available
 and other disk reads fail closed.
 
@@ -58,7 +60,7 @@ supplied target or replacement, and cannot escape it. Codex cannot choose a
 file. Red supplies the immutable target plus at most 20 surrounding
 lines on either side and a bounded recap of the current Agent conversation
 when it belongs to the same workspace. Current buffer contents remain
-authoritative. Red rejects sensitive/ignored/out-of-workspace and binary
+authoritative. Red rejects disallowed sensitive, ignored, out-of-workspace, and binary
 contexts, and accepts at most a 128 KiB complete replacement, 16 comments per
 result, and 4 KiB of plain text per comment. An empty comment list is a valid
 no-findings result. Follow-up
@@ -91,11 +93,13 @@ verbatim indentation and readable wrapping in narrow windows.
 
 Before applying a response, Red verifies the active buffer identity, revision,
 range, and original text. A stale response fails without changing the buffer.
-Every code-changing result waits for explicit review, including results that
-finish while their dialog is open. Enter opens the proposed diff; `a` applies
-that reviewed request, `d` declines it, and Esc returns or hides it. Enter in
-the diff does not apply it. Successful output is applied only after a completed
-turn and full validation.
+By default, a code-changing result confined to the exact requested target
+applies immediately when its original popup is still in the foreground. Set
+`[agent] auto_apply_inline_edits = false` to require review for those results.
+Background, stale, and wider-scope results always wait for review. Enter opens a
+staged diff; `a` applies that reviewed request, `d` declines it, and Esc returns
+or hides it. Enter in the diff does not apply it. Successful output is applied
+only after a completed turn and full validation.
 Code changes use one agent-attributed editor transaction and are deliberately
 not saved. Comment-only results do not alter dirty state or text undo history.
 After a code edit, Red retains an editor-generated **Applied** summary even when
@@ -337,8 +341,10 @@ Every Codex thread is started with:
 - `sandbox = "read-only"`
 - `approvalPolicy = "never"`
 - no execution environments
-- configured MCP servers disabled
-- apps, connectors, plugins, orchestrator MCP, and notifications disabled
+- configured MCP servers disabled unless named in `agent.enabled_mcp_servers`
+- apps, connectors, plugins, remote plugins, skill MCP dependency installation,
+  and orchestrator MCP disabled unless named in `agent.enabled_codex_features`
+- notifications disabled
 - hooks disabled unless the managed Codex policy requires them; when required,
   Codex may also load trusted user, workspace, or plugin hooks
 - Red's bounded dynamic tools and live-edit instructions
@@ -350,9 +356,9 @@ Codex receives twelve dynamic tools:
 
 | Tool | Behavior |
 | --- | --- |
-| `list_files` | Lists at most 4,096 workspace files while respecting ignore files. |
-| `search_files` | Searches bounded text content and returns at most 200 matches. |
-| `read_file` | Reveals and reads the authoritative Red buffer, returning its revision. |
+| `list_files` | Lists sorted workspace files in pages of up to 4,096 while respecting ignore and sensitive-path policy; `next_offset` continues the walk result. |
+| `search_files` | Searches bounded text content, reports truncation, and returns at most 200 matches. |
+| `read_file` | Reads an authoritative Red-buffer page of up to 1,000 lines and 256 KiB, returning its revision and `next_line`. |
 | `write_file` | Replaces revision-checked contents through Red, creates missing parent directories, and saves the buffer. |
 | `create_directory` | Creates a workspace directory and missing parents; an existing directory is a successful no-op. |
 | `get_editor_state` | Returns bounded active-file, cursor, selection, window, diagnostic, and current-annotation state. |
@@ -384,8 +390,9 @@ fall through to file-path or external-URL handling.
 
 Tool paths must remain below the physical workspace root. Reads and writes
 reject parent traversal, symlink components, special files, unsafe roots,
-oversized content, stale revisions, and overlapping edits. Reads always see the
-latest visible editor contents, including unsaved user changes.
+oversized content, stale revisions, and overlapping edits. Secret-like paths
+also require `[agent] allow_sensitive_paths = true`. Reads always see the latest
+visible editor contents, including unsaved user changes.
 
 Directory creation is confined to the same workspace and rejects ignored,
 protected, symlinked, and non-directory paths. It creates at most 64 path
@@ -400,19 +407,21 @@ from the physical workspace root. It fails closed on symlinks and special files.
 Content search is unavailable on platforms without that safe read boundary;
 Codex must use `read_file` through Red instead.
 
-Following is mandatory in this first iteration. Before a file tool runs, Red
-opens the target, moves the cursor to the first affected range when available,
-renders it, and waits briefly. The operation then passes through the editor's
-transaction boundary with session/turn attribution and saves through the editor.
-Tool calls remain serialized, which provides a natural future boundary for
-pause, resume, and single-step controls.
+Tool calls remain serialized. By default they run without deliberate playback
+pauses. Set `[agent] follow_tool_calls = true` to reveal each file target, move
+to the first affected range when available, render it, and wait briefly before
+the operation. Mutations always pass through the editor's transaction boundary
+with session/turn attribution and save through the editor.
 
 ## Limits and failure behavior
 
-App-server frames are capped at 1 MiB and tool content at 960 KiB. Each turn is
-limited to 32 dynamic-tool calls. File listing, search results, search bytes,
-queues, and callback duration are bounded. Oversized or malformed frames stop
-the Codex runtime without being rendered into the terminal.
+App-server frames are capped at 1 MiB and tool content at 960 KiB. File-list
+pages, workspace-walk work, search results, search bytes, queues, and callback
+duration are bounded. File listings and reads expose continuation metadata;
+search reports when its bounded scan was truncated. There is no per-turn tool
+call count limit.
+Oversized or malformed frames stop the Codex runtime without being rendered into
+the terminal.
 
 App-server stderr is isolated from the TUI. Structured failures appear in the
 conversation and status line. A stopped process is restarted and the persisted
