@@ -134,6 +134,9 @@ impl AgentConversationSnapshot {
     /// is authoritative once it has returned at least one transcript item.
     #[must_use]
     pub fn reconciled_with_thread(mut self, thread: &Value) -> Self {
+        if let Some(annotations) = annotation_records_from_thread(&self, thread) {
+            self.annotations = annotations;
+        }
         let parsed = transcript_items_from_thread(thread);
         if parsed.is_empty() {
             return self;
@@ -174,6 +177,121 @@ impl AgentConversationSnapshot {
             self.items.remove(0);
         }
     }
+}
+
+fn annotation_records_from_thread(
+    conversation: &AgentConversationSnapshot,
+    thread: &Value,
+) -> Option<Vec<AgentAnnotationRecord>> {
+    let turns = thread.get("turns")?.as_array()?;
+    let mut records = Vec::<AgentAnnotationRecord>::new();
+    let mut has_annotation_history = false;
+
+    for turn in turns {
+        let turn_id = turn.get("id").and_then(Value::as_str).unwrap_or_default();
+        let Some(items) = turn.get("items").and_then(Value::as_array) else {
+            continue;
+        };
+        for item in items {
+            let Some(output) = successful_annotation_output(item) else {
+                continue;
+            };
+            match item.get("tool").and_then(Value::as_str) {
+                Some("add_annotations") => {
+                    has_annotation_history = true;
+                    let Some(path) = output
+                        .get("path")
+                        .and_then(Value::as_str)
+                        .or_else(|| item.pointer("/arguments/path").and_then(Value::as_str))
+                    else {
+                        continue;
+                    };
+                    let Some(annotations) = output.get("annotations").and_then(Value::as_array)
+                    else {
+                        continue;
+                    };
+                    for annotation in annotations {
+                        if records.len() >= MAX_AGENT_ANNOTATIONS {
+                            break;
+                        }
+                        let Some(id) = annotation.get("id").and_then(Value::as_str) else {
+                            continue;
+                        };
+                        if records.iter().any(|record| record.id == id) {
+                            continue;
+                        }
+                        if let Some(cached) = conversation
+                            .annotations
+                            .iter()
+                            .find(|record| record.id == id)
+                        {
+                            records.push(cached.clone());
+                            continue;
+                        }
+                        let Some(start_line) = annotation
+                            .get("start_line")
+                            .and_then(Value::as_u64)
+                            .and_then(|line| usize::try_from(line).ok())
+                        else {
+                            continue;
+                        };
+                        let end_line = annotation
+                            .get("end_line")
+                            .and_then(Value::as_u64)
+                            .and_then(|line| usize::try_from(line).ok())
+                            .unwrap_or(start_line);
+                        let Some(message) = annotation.get("message").and_then(Value::as_str)
+                        else {
+                            continue;
+                        };
+                        records.push(AgentAnnotationRecord {
+                            id: id.to_string(),
+                            session_id: conversation.thread_id.clone(),
+                            turn_id: turn_id.to_string(),
+                            path: path.to_string(),
+                            start_line,
+                            end_line,
+                            message: message.to_string(),
+                            expected_fingerprint: None,
+                        });
+                    }
+                }
+                Some("dismiss_annotations") => {
+                    has_annotation_history = true;
+                    let Some(dismissed) = output.get("dismissed").and_then(Value::as_array) else {
+                        continue;
+                    };
+                    records.retain(|record| {
+                        !dismissed
+                            .iter()
+                            .any(|id| id.as_str() == Some(record.id.as_str()))
+                    });
+                }
+                _ => {}
+            }
+        }
+    }
+
+    has_annotation_history.then_some(records)
+}
+
+fn successful_annotation_output(item: &Value) -> Option<Value> {
+    if item.get("type").and_then(Value::as_str) != Some("dynamicToolCall")
+        || item.get("status").and_then(Value::as_str) != Some("completed")
+        || item.get("success").and_then(Value::as_bool) != Some(true)
+        || !matches!(
+            item.get("tool").and_then(Value::as_str),
+            Some("add_annotations" | "dismiss_annotations")
+        )
+    {
+        return None;
+    }
+    item.get("contentItems")?
+        .as_array()?
+        .iter()
+        .filter_map(|content| content.get("text").and_then(Value::as_str))
+        .filter_map(|text| serde_json::from_str::<Value>(text).ok())
+        .find(|output| output.get("ok").and_then(Value::as_bool) == Some(true))
 }
 
 fn transcript_items_from_thread(thread: &Value) -> Vec<AgentTranscriptItem> {
@@ -250,6 +368,18 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    fn annotation_tool_item(tool: &str, arguments: Value, output: Value) -> Value {
+        json!({
+            "id": format!("call-{tool}"),
+            "type": "dynamicToolCall",
+            "tool": tool,
+            "arguments": arguments,
+            "status": "completed",
+            "success": true,
+            "contentItems": [{"type": "inputText", "text": output.to_string()}],
+        })
+    }
+
     #[test]
     fn inline_context_is_recent_bounded_and_workspace_scoped() {
         let workspace = tempfile::tempdir().unwrap();
@@ -317,5 +447,82 @@ mod tests {
             .reconciled_with_thread(&thread);
 
         assert_eq!(restored.items[1].text, "First\n\nSecond");
+    }
+
+    #[test]
+    fn replays_successful_annotation_additions_and_dismissals_from_thread_history() {
+        let first = "00000000-0000-4000-8000-000000000001";
+        let second = "00000000-0000-4000-8000-000000000002";
+        let add = annotation_tool_item(
+            "add_annotations",
+            json!({"path": "src/main.rs", "expected_revision": 3}),
+            json!({
+                "ok": true,
+                "path": "src/main.rs",
+                "annotations": [
+                    {"id": first, "start_line": 1, "end_line": 2, "message": "First note"},
+                    {"id": second, "start_line": 4, "end_line": 4, "message": "Second note"}
+                ]
+            }),
+        );
+        let dismiss = annotation_tool_item(
+            "dismiss_annotations",
+            json!({"annotation_ids": [first]}),
+            json!({"ok": true, "dismissed": [first]}),
+        );
+        let mut failed = annotation_tool_item(
+            "add_annotations",
+            json!({"path": "ignored.rs"}),
+            json!({"ok": true, "path": "ignored.rs", "annotations": []}),
+        );
+        failed["success"] = json!(false);
+        let thread = json!({"turns": [
+            {"id": "turn-1", "items": [add]},
+            {"id": "turn-2", "items": [dismiss, failed]}
+        ]});
+
+        let restored = AgentConversationSnapshot::new("thread-1", "/workspace")
+            .reconciled_with_thread(&thread);
+
+        assert_eq!(restored.annotations.len(), 1);
+        assert_eq!(restored.annotations[0].id, second);
+        assert_eq!(restored.annotations[0].session_id, "thread-1");
+        assert_eq!(restored.annotations[0].turn_id, "turn-1");
+        assert_eq!(restored.annotations[0].path, "src/main.rs");
+        assert_eq!(restored.annotations[0].start_line, 4);
+        assert_eq!(restored.annotations[0].message, "Second note");
+    }
+
+    #[test]
+    fn annotation_replay_preserves_cached_paths_anchors_and_fingerprints() {
+        let id = "00000000-0000-4000-8000-000000000001";
+        let mut cached = AgentConversationSnapshot::new("thread-1", "/workspace");
+        cached.annotations.push(AgentAnnotationRecord {
+            id: id.to_string(),
+            session_id: "thread-1".to_string(),
+            turn_id: "turn-1".to_string(),
+            path: "renamed.rs".to_string(),
+            start_line: 8,
+            end_line: 9,
+            message: "Preserved note".to_string(),
+            expected_fingerprint: Some([7; 32]),
+        });
+        let add = annotation_tool_item(
+            "add_annotations",
+            json!({"path": "original.rs"}),
+            json!({
+                "ok": true,
+                "path": "original.rs",
+                "annotations": [{"id": id, "start_line": 1, "end_line": 2, "message": "Preserved note"}]
+            }),
+        );
+        let thread = json!({"turns": [{"id": "turn-1", "items": [add]}]});
+
+        let restored = cached.reconciled_with_thread(&thread);
+
+        assert_eq!(restored.annotations[0].path, "renamed.rs");
+        assert_eq!(restored.annotations[0].start_line, 8);
+        assert_eq!(restored.annotations[0].end_line, 9);
+        assert_eq!(restored.annotations[0].expected_fingerprint, Some([7; 32]));
     }
 }

@@ -9731,6 +9731,7 @@ impl Editor {
                         .reconcile_conversation(session_id, &root, thread)
                         .cloned();
                     if let Some(conversation) = conversation {
+                        self.restore_agent_annotations();
                         self.plugin_registry
                             .notify(
                                 runtime,
