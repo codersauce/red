@@ -54,7 +54,7 @@ import json, os, sys
 
 assert "features.hooks=false" not in sys.argv
 assert "features.codex_hooks=false" not in sys.argv
-assert sys.argv[sys.argv.index("--session-source") + 1] == "app-server"
+assert "--session-source" not in sys.argv
 
 def send(value):
     print(json.dumps(value), flush=True)
@@ -162,7 +162,7 @@ fn mock_session_codex(directory: &std::path::Path) -> std::path::PathBuf {
         r#"#!/usr/bin/env python3
 import json, os, sys
 
-assert sys.argv[sys.argv.index("--session-source") + 1] == "app-server"
+assert "--session-source" not in sys.argv
 
 def send(value):
     print(json.dumps(value), flush=True)
@@ -189,7 +189,7 @@ for line in sys.stdin:
         assert params["modelProviders"] == []
         if params.get("cursor") is None:
             send({"id": ident, "result": {"data": [
-                {"id":"current", "cwd":"/workspace", "ephemeral":False, "threadSource":"red", "source":"appServer", "name":"Current", "preview":"", "updatedAt":40},
+                {"id":"current", "cwd":"/workspace", "ephemeral":False, "threadSource":"red", "source":"vscode", "name":"Current", "preview":"", "updatedAt":40},
                 {"id":"foreign", "cwd":"/workspace", "ephemeral":False, "threadSource":"user", "source":"appServer", "name":"Foreign", "preview":"", "updatedAt":30},
                 {"id":"red-legacy", "cwd":"/workspace", "ephemeral":False, "threadSource":None, "source":"vscode", "path":os.path.join(os.path.dirname(sys.argv[0]), "red-legacy.jsonl"), "name":"Legacy Red", "preview":"", "updatedAt":25},
                 {"id":"red-old", "cwd":"/workspace", "ephemeral":False, "threadSource":"red", "source":"appServer", "name":None, "preview":"Older Red", "updatedAt":10},
@@ -198,7 +198,7 @@ for line in sys.stdin:
         else:
             assert params["cursor"] == "page-2"
             send({"id": ident, "result": {"data": [
-                {"id":"red-new", "cwd":"/workspace", "ephemeral":False, "threadSource":"red", "source":"appServer", "name":"Newer Red", "preview":"", "updatedAt":20}
+                {"id":"red-new", "cwd":"/workspace", "ephemeral":False, "threadSource":"red", "source":"vscode", "name":"Newer Red", "preview":"", "updatedAt":20}
             ], "nextCursor":None}})
     elif method == "thread/search":
         assert params["searchTerm"] == "needle"
@@ -280,6 +280,7 @@ async fn direct_app_server_lists_searches_and_continues_sessions_for_red() {
             assert_eq!(result["sessions"][0]["id"], "red-legacy");
             assert_eq!(result["sessions"][0]["source"], "Red");
             assert_eq!(result["sessions"][1]["id"], "red-new");
+            assert_eq!(result["sessions"][1]["source"], "Red");
             assert_eq!(result["sessions"][2]["id"], "red-old");
         }
         event => panic!("unexpected Red session list: {event:?}"),

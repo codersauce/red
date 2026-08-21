@@ -259,12 +259,12 @@ space. It shrinks again when text is removed or sent, and short panes always
 retain room for the conversation.
 
 Open a workspace, press `Space A` (or run `:Agent`), type a request, and press
-Enter. Red lazily starts `codex app-server --stdio --session-source app-server`,
-initializes the connection, checks the account, starts a persisted thread, and
-submits turns with `turn/start`. Follow-up text and the busy indicator render
-before dispatch; follow-ups submitted during an active turn appear immediately
-and remain queued in FIFO order. Assistant deltas stream into the conversation
-footer. `Ctrl-c` interrupts the active turn with `turn/interrupt`.
+Enter. Red lazily starts `codex app-server --stdio`, initializes the connection,
+checks the account, starts a persisted thread, and submits turns with
+`turn/start`. Follow-up text and the busy indicator render before dispatch;
+follow-ups submitted during an active turn appear immediately and remain queued
+in FIFO order. Assistant deltas stream into the conversation footer. `Ctrl-c`
+interrupts the active turn with `turn/interrupt`.
 
 `Tab` or `Shift-Tab` switches between the composer and transcript, preserving
 the draft, composer editing mode, and transcript reading position. Switching
@@ -278,7 +278,9 @@ composer, and matching sessions appear newest first. Move between sessions with
 the arrow keys or `Ctrl-j` / `Ctrl-k`, press `Enter` to continue the selected
 conversation, and use `Alt-s` to cycle between **Red**, **This workspace**,
 and **All Codex**. `Esc` or `Ctrl-c` returns to the conversation with its
-transcript position and unsent draft restored.
+transcript position and unsent draft restored. Red identifies its conversations
+by their thread source or persisted originator, even when Codex's CLI labels the
+underlying app-server session as VS Code.
 
 In the conversation transcript's Normal mode, `[p` jumps backward to a user
 prompt and `]p` jumps forward. From an answer, the first backward jump returns

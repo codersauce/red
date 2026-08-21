@@ -386,7 +386,7 @@ mod tests {
             query: String::new(),
             exclude_session_id: Some("current".into()),
         };
-        let thread = json!({
+        let mut thread = json!({
             "id": "other",
             "cwd": cwd,
             "ephemeral": false,
@@ -400,6 +400,12 @@ mod tests {
         assert_eq!(summary.label, "Fix the picker");
         assert_eq!(summary.source, "Red");
         assert!(summary.is_red);
+
+        thread["source"] = json!("vscode");
+        let cli_summary = summarize(&request, &thread, String::new()).unwrap();
+        assert_eq!(cli_summary.label, "Fix the picker");
+        assert_eq!(cli_summary.source, "Red");
+        assert!(cli_summary.is_red);
     }
 
     #[test]
