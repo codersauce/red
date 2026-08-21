@@ -65,6 +65,90 @@ async fn vim_parity_default_big_word_motion_treats_punctuation_as_part_of_a_word
 }
 
 #[tokio::test]
+async fn vim_parity_paragraph_motions_land_on_empty_lines_and_honor_counts() {
+    for (contents, keys, expected_x, expected_y) in [
+        ("alpha\n\nbeta\n\n\ngamma", "}", 0, 1),
+        ("alpha\n\nbeta\n\n\ngamma", "2}", 0, 3),
+        ("alpha\n\nbeta\n\n\ngamma", "3}", 4, 5),
+        ("alpha\n\nbeta\n\n\ngamma", "j}", 0, 3),
+        ("alpha\n\nbeta\n\n\ngamma", "G{", 0, 4),
+        ("alpha\n\nbeta\n\n\ngamma", "G2{", 0, 1),
+        ("alpha\n   \nbeta\n\ngamma", "}", 0, 3),
+        ("alpha\nbeta", "}", 3, 1),
+    ] {
+        let mut harness = EditorHarness::with_config(
+            Buffer::new(None, contents.to_string()),
+            default_key_config(),
+        );
+
+        type_normal_keys(&mut harness, keys).await;
+
+        harness.assert_buffer_contents(contents);
+        harness.assert_cursor_at(expected_x, expected_y);
+        harness.assert_mode(Mode::Normal);
+    }
+}
+
+#[tokio::test]
+async fn vim_parity_sentence_motions_handle_closers_paragraphs_and_unicode() {
+    for (contents, keys, expected_x, expected_y) in [
+        ("One.  Two! Three? End", ")", 6, 0),
+        ("One.  Two! Three? End", "2)", 11, 0),
+        ("One.  Two! Three? End", "3)", 18, 0),
+        ("One.  Two! Three? End", "4)", 20, 0),
+        ("One.  Two! Three? End", "2)(", 6, 0),
+        ("One.)\"  Two! [Next]? End", ")", 8, 0),
+        ("One.)\"  Two! [Next]? End", "2)", 13, 0),
+        ("One.\nTwo\ncontinued!\n\nNext?\nFinal", "2)", 0, 3),
+        ("One.\nTwo\ncontinued!\n\nNext?\nFinal", "3)", 0, 4),
+        ("Olá! 👨‍👩‍👧 e\u{301}lan. Fim", ")", 5, 0),
+        ("Olá! 👨‍👩‍👧 e\u{301}lan. Fim", "2)", 13, 0),
+    ] {
+        let mut harness = EditorHarness::with_config(
+            Buffer::new(None, contents.to_string()),
+            default_key_config(),
+        );
+
+        type_normal_keys(&mut harness, keys).await;
+
+        harness.assert_buffer_contents(contents);
+        assert_eq!(
+            harness.cursor_position(),
+            (expected_x, expected_y),
+            "sentence keys {keys:?} on {contents:?}"
+        );
+        harness.assert_mode(Mode::Normal);
+    }
+}
+
+#[tokio::test]
+async fn paragraph_and_sentence_motions_are_visual_and_jump_aware() {
+    for (contents, keys, expected_x, expected_y) in [
+        ("alpha\n\nbeta", "v}", 0, 1),
+        ("One. Two! Last", "v)", 5, 0),
+        ("One. Two! Last", "v2)", 10, 0),
+    ] {
+        let mut harness = EditorHarness::with_config(
+            Buffer::new(None, contents.to_string()),
+            default_key_config(),
+        );
+
+        type_normal_keys(&mut harness, keys).await;
+
+        harness.assert_cursor_at(expected_x, expected_y);
+        harness.assert_mode(Mode::Visual);
+    }
+
+    let mut harness = EditorHarness::with_config(
+        Buffer::new(None, "alpha\n\nbeta".to_string()),
+        default_key_config(),
+    );
+    type_normal_keys(&mut harness, "}").await;
+    harness.execute_action(Action::JumpBack).await.unwrap();
+    harness.assert_cursor_at(0, 0);
+}
+
+#[tokio::test]
 async fn vim_parity_screen_motions_target_the_visible_top_middle_and_bottom() {
     for (keys, expected_y) in [("jjH", 0), ("M", 2), ("L", 4)] {
         let contents = "one\ntwo\nthree\nfour\nfive";

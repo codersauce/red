@@ -37,6 +37,8 @@ pub enum TextObjectKind {
     Word,
     /// A whitespace-delimited Vim WORD.
     BigWord,
+    /// A sentence, including its terminating punctuation and closing delimiters.
+    Sentence,
     /// A paragraph or blank-line group.
     Paragraph,
     /// The innermost surrounding delimiter pair.
@@ -55,6 +57,26 @@ enum TextUnitKind {
     Keyword,
     Punctuation,
     Symbol,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SentenceUnitKind {
+    Text,
+    Whitespace,
+    Paragraph,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SentenceUnit {
+    start: usize,
+    end: usize,
+    kind: SentenceUnitKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BoundaryMotion {
+    position: TextPosition,
+    ends_at_buffer: bool,
 }
 
 /// Resolve motions against a canonical scalar-coordinate cursor position.
@@ -258,6 +280,203 @@ impl<'buffer> MotionResolver<'buffer> {
         target.map(|index| self.buffer.char_idx_to_position(index))
     }
 
+    /// Resolves `{` or `}`, treating only genuinely empty lines as paragraph boundaries.
+    #[must_use]
+    pub fn paragraph_target(&self, count: u16, backward: bool) -> Option<TextPosition> {
+        self.paragraph_motion(count, backward)
+            .map(|motion| motion.position)
+    }
+
+    /// Resolves `(` or `)`, including paragraph boundaries and closing punctuation.
+    #[must_use]
+    pub fn sentence_target(&self, count: u16, backward: bool) -> Option<TextPosition> {
+        self.sentence_motion(count, backward)
+            .map(|motion| motion.position)
+    }
+
+    /// Resolves an exclusive paragraph operator motion and its effective register shape.
+    #[must_use]
+    pub fn paragraph_range(&self, count: u16, backward: bool) -> Option<(TextRange, bool)> {
+        self.boundary_motion_range(self.paragraph_motion(count, backward)?, backward)
+    }
+
+    /// Resolves an exclusive sentence operator motion and its effective register shape.
+    #[must_use]
+    pub fn sentence_range(&self, count: u16, backward: bool) -> Option<(TextRange, bool)> {
+        self.boundary_motion_range(self.sentence_motion(count, backward)?, backward)
+    }
+
+    fn paragraph_motion(&self, count: u16, backward: bool) -> Option<BoundaryMotion> {
+        if self.buffer.is_empty() {
+            return None;
+        }
+
+        let last_line = self.buffer.last_navigable_line();
+        let mut line = self.cursor.line.min(last_line);
+        let is_empty = |candidate: usize| {
+            self.buffer
+                .get(candidate)
+                .is_some_and(|contents| trim_line_ending(&contents).is_empty())
+        };
+
+        for _ in 0..count.max(1) {
+            if backward {
+                if line == 0 {
+                    return Some(BoundaryMotion {
+                        position: TextPosition::new(0, 0),
+                        ends_at_buffer: false,
+                    });
+                }
+
+                let mut candidate = line - 1;
+                if is_empty(line) {
+                    while candidate > 0 && is_empty(candidate) {
+                        candidate -= 1;
+                    }
+                }
+                while candidate > 0 && !is_empty(candidate) {
+                    candidate -= 1;
+                }
+                line = candidate;
+            } else {
+                let mut candidate = line + 1;
+                if is_empty(line) {
+                    while candidate <= last_line && is_empty(candidate) {
+                        candidate += 1;
+                    }
+                }
+                while candidate <= last_line && !is_empty(candidate) {
+                    candidate += 1;
+                }
+                if candidate > last_line {
+                    return Some(BoundaryMotion {
+                        position: self.last_cursor_position(),
+                        ends_at_buffer: true,
+                    });
+                }
+                line = candidate;
+            }
+        }
+
+        Some(BoundaryMotion {
+            position: TextPosition::new(line, 0),
+            ends_at_buffer: false,
+        })
+    }
+
+    fn sentence_motion(&self, count: u16, backward: bool) -> Option<BoundaryMotion> {
+        if self.buffer.is_empty() {
+            return None;
+        }
+
+        let starts = self
+            .sentence_units()
+            .into_iter()
+            .filter(|unit| unit.kind != SentenceUnitKind::Whitespace)
+            .map(|unit| unit.start)
+            .collect::<Vec<_>>();
+        let mut cursor = self.buffer.position_to_char_idx(self.cursor);
+
+        for _ in 0..count.max(1) {
+            if backward {
+                let Some(previous) = starts.iter().rev().find(|start| **start < cursor) else {
+                    return Some(BoundaryMotion {
+                        position: TextPosition::new(0, 0),
+                        ends_at_buffer: false,
+                    });
+                };
+                cursor = *previous;
+            } else {
+                let Some(next) = starts.iter().find(|start| **start > cursor) else {
+                    return Some(BoundaryMotion {
+                        position: self.last_cursor_position(),
+                        ends_at_buffer: true,
+                    });
+                };
+                cursor = *next;
+            }
+        }
+
+        Some(BoundaryMotion {
+            position: self.buffer.char_idx_to_position(cursor),
+            ends_at_buffer: false,
+        })
+    }
+
+    fn boundary_motion_range(
+        &self,
+        motion: BoundaryMotion,
+        backward: bool,
+    ) -> Option<(TextRange, bool)> {
+        let cursor = self.cursor;
+        let target = motion.position;
+        let first_non_blank = self
+            .buffer
+            .get(cursor.line)
+            .map(|line| {
+                trim_line_ending(&line)
+                    .chars()
+                    .position(|character| !character.is_whitespace())
+                    .unwrap_or_default()
+            })
+            .unwrap_or_default();
+
+        if backward {
+            if cursor == target {
+                return None;
+            }
+            let linewise = target.line < cursor.line
+                && target.character == 0
+                && cursor.character <= first_non_blank;
+            return Some((TextRange::new(target, cursor), linewise));
+        }
+
+        if motion.ends_at_buffer {
+            let end = self
+                .buffer
+                .char_idx_to_position(self.buffer.contents().chars().count());
+            if cursor == end {
+                return None;
+            }
+            let linewise = target.line > cursor.line && cursor.character <= first_non_blank;
+            let start = if linewise {
+                TextPosition::new(cursor.line, 0)
+            } else {
+                cursor
+            };
+            return Some((TextRange::new(start, end), linewise));
+        }
+
+        if cursor == target {
+            return None;
+        }
+        if target.line > cursor.line && target.character == 0 {
+            if cursor.character <= first_non_blank {
+                return Some((
+                    TextRange::new(TextPosition::new(cursor.line, 0), target),
+                    true,
+                ));
+            }
+            let previous_line = target.line - 1;
+            let end = TextPosition::new(previous_line, self.line_character_len(previous_line));
+            return (cursor != end).then(|| (TextRange::new(cursor, end), false));
+        }
+
+        Some((TextRange::new(cursor, target), false))
+    }
+
+    fn last_cursor_position(&self) -> TextPosition {
+        let line = self.buffer.last_navigable_line();
+        let Some(contents) = self.buffer.get(line) else {
+            return TextPosition::new(line, 0);
+        };
+        let contents = trim_line_ending(&contents);
+        let character = contents.graphemes(true).next_back().map_or(0, |grapheme| {
+            contents.chars().count() - grapheme.chars().count()
+        });
+        TextPosition::new(line, character)
+    }
+
     /// Finds the requested character on the current logical line.
     #[must_use]
     pub fn character_match(
@@ -293,9 +512,21 @@ impl<'buffer> MotionResolver<'buffer> {
     /// Resolves a supported Vim text object in canonical scalar coordinates.
     #[must_use]
     pub fn text_object(&self, scope: TextObjectScope, kind: TextObjectKind) -> Option<TextRange> {
+        self.text_object_with_count(scope, kind, 1)
+    }
+
+    /// Resolves a text object, honoring sentence-object counts without changing legacy objects.
+    #[must_use]
+    pub fn text_object_with_count(
+        &self,
+        scope: TextObjectScope,
+        kind: TextObjectKind,
+        count: u16,
+    ) -> Option<TextRange> {
         match kind {
             TextObjectKind::Word => self.word_text_object(scope, false),
             TextObjectKind::BigWord => self.word_text_object(scope, true),
+            TextObjectKind::Sentence => self.sentence_text_object(scope, count),
             TextObjectKind::Paragraph => self.paragraph_text_object(scope),
             TextObjectKind::Delimited { open, close } => {
                 self.delimited_text_object(scope, open, close)
@@ -360,6 +591,168 @@ impl<'buffer> MotionResolver<'buffer> {
             TextPosition::new(line_index, start),
             TextPosition::new(line_index, end),
         ))
+    }
+
+    fn sentence_text_object(&self, scope: TextObjectScope, count: u16) -> Option<TextRange> {
+        let units = self.sentence_units();
+        let cursor = self.buffer.position_to_char_idx(self.cursor);
+        let current = units
+            .iter()
+            .position(|unit| unit.start <= cursor && cursor < unit.end)?;
+        let mut first = current;
+        let mut last = current;
+
+        if scope == TextObjectScope::Inner {
+            for _ in 1..count.max(1) {
+                let Some(next) = units.get(last + 1) else {
+                    break;
+                };
+                if next.kind == SentenceUnitKind::Paragraph
+                    && units[current].kind != SentenceUnitKind::Paragraph
+                {
+                    break;
+                }
+                last += 1;
+            }
+        } else if units[current].kind == SentenceUnitKind::Whitespace {
+            for _ in 0..count.max(1) {
+                if units
+                    .get(last + 1)
+                    .is_some_and(|unit| unit.kind != SentenceUnitKind::Whitespace)
+                {
+                    last += 1;
+                }
+                if last + 1 < units.len() && count > 1 {
+                    last += 1;
+                }
+            }
+        } else {
+            for index in 0..count.max(1) {
+                if index > 0 {
+                    let Some(next) = units.get(last + 1) else {
+                        break;
+                    };
+                    if next.kind != SentenceUnitKind::Whitespace {
+                        last += 1;
+                    }
+                }
+                if units
+                    .get(last + 1)
+                    .is_some_and(|unit| unit.kind == SentenceUnitKind::Whitespace)
+                {
+                    last += 1;
+                }
+            }
+            if last + 1 == units.len()
+                && first > 0
+                && units[first - 1].kind == SentenceUnitKind::Whitespace
+            {
+                first -= 1;
+            }
+        }
+
+        Some(TextRange::new(
+            self.buffer.char_idx_to_position(units[first].start),
+            self.buffer.char_idx_to_position(units[last].end),
+        ))
+    }
+
+    fn sentence_units(&self) -> Vec<SentenceUnit> {
+        let contents = self.buffer.contents();
+        let characters = contents.chars().collect::<Vec<_>>();
+        if characters.is_empty() {
+            return Vec::new();
+        }
+
+        let paragraph_boundaries = (0..=self.buffer.last_navigable_line())
+            .filter(|line| {
+                self.buffer
+                    .get(*line)
+                    .is_some_and(|contents| trim_line_ending(&contents).is_empty())
+            })
+            .map(|line| self.buffer.position_to_char_idx(TextPosition::new(line, 0)))
+            .collect::<Vec<_>>();
+        let is_paragraph_boundary =
+            |index: usize| paragraph_boundaries.binary_search(&index).is_ok();
+        let mut units = Vec::new();
+        let mut start = 0;
+
+        while start < characters.len() {
+            if is_paragraph_boundary(start) {
+                let mut end = start;
+                while end < characters.len() && is_paragraph_boundary(end) {
+                    if characters[end] == '\r' {
+                        end += 1;
+                    }
+                    if characters.get(end) == Some(&'\n') {
+                        end += 1;
+                    } else {
+                        break;
+                    }
+                }
+                if end == start {
+                    break;
+                }
+                units.push(SentenceUnit {
+                    start,
+                    end,
+                    kind: SentenceUnitKind::Paragraph,
+                });
+                start = end;
+                continue;
+            }
+
+            let boundary = paragraph_boundaries
+                .iter()
+                .copied()
+                .find(|boundary| *boundary > start)
+                .unwrap_or(characters.len());
+            let mut end = boundary;
+            for index in start..boundary {
+                if !matches!(characters[index], '.' | '!' | '?') {
+                    continue;
+                }
+                let mut candidate = index + 1;
+                while matches!(characters.get(candidate), Some(')' | ']' | '"' | '\'')) {
+                    candidate += 1;
+                }
+                if candidate < characters.len()
+                    && !matches!(characters[candidate], ' ' | '\t' | '\r' | '\n')
+                {
+                    continue;
+                }
+                end = candidate;
+                if characters.get(end) == Some(&'\r') {
+                    end += 1;
+                }
+                if characters.get(end) == Some(&'\n') {
+                    end += 1;
+                }
+                break;
+            }
+
+            units.push(SentenceUnit {
+                start,
+                end,
+                kind: SentenceUnitKind::Text,
+            });
+            start = end;
+            while start < characters.len()
+                && characters[start].is_whitespace()
+                && !is_paragraph_boundary(start)
+            {
+                start += 1;
+            }
+            if start > end {
+                units.push(SentenceUnit {
+                    start: end,
+                    end: start,
+                    kind: SentenceUnitKind::Whitespace,
+                });
+            }
+        }
+
+        units
     }
 
     fn paragraph_text_object(&self, scope: TextObjectScope) -> Option<TextRange> {
@@ -500,6 +893,7 @@ pub(crate) fn text_object_kind_for_key(character: char) -> Option<TextObjectKind
     match character {
         'w' => Some(TextObjectKind::Word),
         'W' => Some(TextObjectKind::BigWord),
+        's' => Some(TextObjectKind::Sentence),
         'p' => Some(TextObjectKind::Paragraph),
         '(' | ')' | 'b' => Some(TextObjectKind::Delimited {
             open: '(',
@@ -570,6 +964,114 @@ mod tests {
             buffer.text_in_range(resolver.word_range(1, false, true).unwrap()),
             "e\u{301}cho,  "
         );
+    }
+
+    #[test]
+    fn paragraph_motions_stop_on_empty_lines_but_ignore_whitespace_only_lines() {
+        let buffer = Buffer::new(None, "alpha\n   \nbeta\n\ngamma\n\n\ndelta".to_string());
+        let resolver = MotionResolver::new(&buffer, TextPosition::new(0, 2));
+
+        assert_eq!(
+            resolver.paragraph_target(1, false),
+            Some(TextPosition::new(3, 0))
+        );
+        assert_eq!(
+            resolver.paragraph_target(2, false),
+            Some(TextPosition::new(5, 0))
+        );
+        assert_eq!(
+            resolver.paragraph_target(3, false),
+            Some(TextPosition::new(7, 4))
+        );
+
+        let resolver = MotionResolver::new(&buffer, TextPosition::new(7, 2));
+        assert_eq!(
+            resolver.paragraph_target(1, true),
+            Some(TextPosition::new(6, 0))
+        );
+        assert_eq!(
+            resolver.paragraph_target(2, true),
+            Some(TextPosition::new(3, 0))
+        );
+    }
+
+    #[test]
+    fn sentence_motions_include_closers_paragraph_boundaries_and_unicode() {
+        let buffer = Buffer::new(None, "Olá.)\"  👨‍👩‍👧 e\u{301}lan!\n\nNext? Final".to_string());
+        let resolver = MotionResolver::new(&buffer, TextPosition::new(0, 0));
+
+        assert_eq!(
+            resolver.sentence_target(1, false),
+            Some(TextPosition::new(0, 8))
+        );
+        assert_eq!(
+            resolver.sentence_target(2, false),
+            Some(TextPosition::new(1, 0))
+        );
+        assert_eq!(
+            resolver.sentence_target(3, false),
+            Some(TextPosition::new(2, 0))
+        );
+        assert_eq!(
+            resolver.sentence_target(4, false),
+            Some(TextPosition::new(2, 6))
+        );
+    }
+
+    #[test]
+    fn sentence_objects_distinguish_inner_text_around_whitespace_and_counts() {
+        let buffer = Buffer::new(None, "One.  Two! Three?".to_string());
+        let resolver = MotionResolver::new(&buffer, TextPosition::new(0, 0));
+
+        for (scope, count, expected) in [
+            (TextObjectScope::Inner, 1, "One."),
+            (TextObjectScope::Inner, 2, "One.  "),
+            (TextObjectScope::Inner, 3, "One.  Two!"),
+            (TextObjectScope::Around, 1, "One.  "),
+            (TextObjectScope::Around, 2, "One.  Two! "),
+        ] {
+            let range = resolver
+                .text_object_with_count(scope, TextObjectKind::Sentence, count)
+                .unwrap();
+            assert_eq!(buffer.text_in_range(range), expected);
+        }
+
+        let whitespace = MotionResolver::new(&buffer, TextPosition::new(0, 4));
+        assert_eq!(
+            buffer.text_in_range(
+                whitespace
+                    .text_object(TextObjectScope::Inner, TextObjectKind::Sentence)
+                    .unwrap()
+            ),
+            "  "
+        );
+        assert_eq!(
+            buffer.text_in_range(
+                whitespace
+                    .text_object(TextObjectScope::Around, TextObjectKind::Sentence)
+                    .unwrap()
+            ),
+            "  Two!"
+        );
+    }
+
+    #[test]
+    fn boundary_operator_motions_apply_exclusive_linewise_rules() {
+        let buffer = Buffer::new(None, "  alpha\n\nbeta".to_string());
+        let line_start = MotionResolver::new(&buffer, TextPosition::new(0, 2));
+        let (range, linewise) = line_start.paragraph_range(1, false).unwrap();
+        assert!(linewise);
+        assert_eq!(buffer.text_in_range(range), "  alpha\n");
+
+        let mid_line = MotionResolver::new(&buffer, TextPosition::new(0, 4));
+        let (range, linewise) = mid_line.paragraph_range(1, false).unwrap();
+        assert!(!linewise);
+        assert_eq!(buffer.text_in_range(range), "pha");
+
+        let at_end = MotionResolver::new(&buffer, TextPosition::new(2, 3));
+        let (range, linewise) = at_end.sentence_range(1, false).unwrap();
+        assert!(!linewise);
+        assert_eq!(buffer.text_in_range(range), "a");
     }
 
     #[test]

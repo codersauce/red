@@ -3975,6 +3975,23 @@ input_position = "left"
     }
 
     #[test]
+    fn default_config_maps_vim_paragraph_and_sentence_motions() {
+        let config: Config = toml::from_str(include_str!("../default_config.toml")).unwrap();
+
+        for (key, action) in [
+            ("{", Action::MoveToPreviousParagraph),
+            ("}", Action::MoveToNextParagraph),
+            ("(", Action::MoveToPreviousSentence),
+            (")", Action::MoveToNextSentence),
+        ] {
+            assert_eq!(
+                config.keys.normal.get(key),
+                Some(&KeyAction::Single(action))
+            );
+        }
+    }
+
+    #[test]
     fn default_config_preserves_wrap_toggle_under_gw() {
         let config: Config = toml::from_str(include_str!("../default_config.toml")).unwrap();
         let Some(KeyAction::Nested(g)) = config.keys.normal.get("g") else {

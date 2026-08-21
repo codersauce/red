@@ -49,6 +49,8 @@ pub(crate) fn surface_reference_actions(mode: &str) -> Vec<UiAction> {
                 "Move left / down / up / right",
             ),
             ("Navigation", "w / W / b / B / e / E", "Move by word"),
+            ("Navigation", "{ / }", "Previous / next paragraph"),
+            ("Navigation", "( / )", "Previous / next sentence"),
             (
                 "Navigation",
                 "0 / ^ / $",
