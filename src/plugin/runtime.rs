@@ -11220,9 +11220,39 @@ mod tests {
                 request_id,
                 serde_json::json!({
                     "buffers": [
-                        { "id": 41, "name": "src/main.rs", "path": "src/main.rs", "dirty": false },
-                        { "id": 42, "name": "[No Name]", "path": null, "dirty": true },
-                        { "id": 43, "name": "[No Name]", "path": null, "dirty": false },
+                        {
+                            "id": 41,
+                            "name": "/workspace/src/main.rs",
+                            "path": "/workspace/src/main.rs",
+                            "display_path": "src/main.rs",
+                            "dirty": false,
+                            "active": true,
+                            "alternate": false,
+                            "line": 4,
+                            "column": 8
+                        },
+                        {
+                            "id": 42,
+                            "name": "[No Name]",
+                            "path": null,
+                            "display_path": null,
+                            "dirty": true,
+                            "active": false,
+                            "alternate": true,
+                            "line": 0,
+                            "column": 0
+                        },
+                        {
+                            "id": 43,
+                            "name": "[No Name]",
+                            "path": null,
+                            "display_path": null,
+                            "dirty": false,
+                            "active": false,
+                            "alternate": false,
+                            "line": 0,
+                            "column": 0
+                        }
                     ],
                 }),
             )
@@ -11235,18 +11265,106 @@ mod tests {
                 handle,
                 title,
                 items,
-                ..
+                options,
             } => {
                 assert_eq!(owner, "buffer_picker");
                 assert_eq!(title.as_deref(), Some("Buffers"));
-                assert_eq!(items[0].label, "src/main.rs");
+                assert_eq!(items[0].id, "buffer:41");
+                assert_eq!(items[0].label, "main.rs");
+                assert_eq!(items[0].kind.as_deref(), Some("FilePath"));
+                assert_eq!(items[0].annotation.as_deref(), Some("src"));
+                assert_eq!(items[0].detail.as_deref(), Some("current"));
+                assert_eq!(
+                    items[0].preview,
+                    Some(crate::ui::PickerPreview::Location {
+                        path: "/workspace/src/main.rs".to_string(),
+                        line: Some(4),
+                        column: Some(8),
+                        matches: Vec::new(),
+                    })
+                );
+                assert_eq!(items[1].id, "buffer:42");
                 assert_eq!(items[1].label, "[No Name] #42");
+                assert_eq!(items[1].kind.as_deref(), Some("Buffer"));
+                assert_eq!(items[1].detail.as_deref(), Some("● modified"));
+                assert!(items[1].preview.is_none());
+                assert_eq!(items[2].id, "buffer:43");
                 assert_eq!(items[2].label, "[No Name] #43");
+                assert!(items[2].preview.is_none());
                 assert_ne!(items[1].id, items[2].id);
+                assert_eq!(options.initial_selection.as_deref(), Some("buffer:42"));
+                assert_eq!(options.status.as_deref(), Some("3 buffers · 1 modified"));
+                assert_eq!(options.item_layout, crate::ui::PickerItemLayout::LabelFirst);
+                assert_eq!(
+                    options
+                        .actions
+                        .iter()
+                        .map(|action| action.action.as_str())
+                        .collect::<Vec<_>>(),
+                    ["open_horizontal", "open_vertical", "toggle_preview"]
+                );
                 (handle, items)
             }
             _ => panic!("unexpected plugin request"),
         };
+
+        runtime
+            .notify_picker(
+                handle,
+                PickerCallback::Action {
+                    action: "toggle_preview".to_string(),
+                    item: Some(items[0].clone()),
+                    query: "main".to_string(),
+                },
+            )
+            .unwrap();
+
+        match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::UpdatePickerItems { id, items } => {
+                assert_eq!(id, handle.get());
+                assert!(items.iter().all(|item| item.preview.is_none()));
+            }
+            _ => panic!("preview toggle should update the existing picker"),
+        }
+
+        runtime
+            .notify_picker(
+                handle,
+                PickerCallback::Action {
+                    action: "toggle_preview".to_string(),
+                    item: Some(items[0].clone()),
+                    query: "main".to_string(),
+                },
+            )
+            .unwrap();
+
+        match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::UpdatePickerItems { id, items } => {
+                assert_eq!(id, handle.get());
+                assert!(items[0].preview.is_some());
+                assert!(items[1].preview.is_none());
+                assert!(items[2].preview.is_none());
+            }
+            _ => panic!("enabling previews should restore file-backed buffer previews"),
+        }
+
+        runtime
+            .notify_picker(
+                handle,
+                PickerCallback::Action {
+                    action: "open_vertical".to_string(),
+                    item: Some(items[1].clone()),
+                    query: String::new(),
+                },
+            )
+            .unwrap();
+
+        match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::Action(Action::Print(message)) => {
+                assert!(message.contains("unnamed buffer"));
+            }
+            _ => panic!("unnamed buffers must remain in the existing picker"),
+        }
 
         runtime
             .notify_picker(handle, PickerCallback::Selected(items[2].clone()))
@@ -11255,6 +11373,83 @@ mod tests {
         match ACTION_DISPATCHER.recv_request() {
             PluginRequest::Action(Action::OpenBufferById(id)) => assert_eq!(id, 43),
             _ => panic!("unexpected plugin request"),
+        }
+    }
+
+    #[tokio::test]
+    async fn buffer_picker_opens_file_splits_at_the_saved_utf8_cursor() {
+        drain_requests();
+
+        let mut runtime = Runtime::new();
+        runtime
+            .load_plugin(
+                "buffer_picker",
+                include_str!("../../plugins/buffer_picker.hk"),
+            )
+            .await
+            .unwrap();
+        runtime.execute_command("BufferPicker").await.unwrap();
+        let request_id = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::EditorInfo(request_id) => request_id,
+            _ => panic!("expected the open-buffer snapshot"),
+        };
+        runtime
+            .resolve_request(
+                request_id,
+                serde_json::json!({
+                    "buffers": [{
+                        "id": 12,
+                        "name": "/workspace/src/other.rs",
+                        "path": "/workspace/src/other.rs",
+                        "display_path": "src/other.rs",
+                        "dirty": true,
+                        "active": true,
+                        "alternate": false,
+                        "line": 7,
+                        "column": 11
+                    }]
+                }),
+            )
+            .await
+            .unwrap();
+        let (handle, item) = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::OpenCallbackPicker { handle, items, .. } => (handle, items[0].clone()),
+            _ => panic!("expected the modern buffer picker"),
+        };
+
+        runtime
+            .notify_picker(
+                handle,
+                PickerCallback::Action {
+                    action: "open_horizontal".to_string(),
+                    item: Some(item),
+                    query: String::new(),
+                },
+            )
+            .unwrap();
+
+        match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::ClosePicker { id } => assert_eq!(id, handle.get()),
+            PluginRequest::Action(Action::Print(message)) => {
+                panic!("split selection should close its picker, printed {message:?}")
+            }
+            _ => panic!("split selection should close its picker"),
+        }
+        match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::OpenLocation { location, target } => {
+                assert_eq!(location.path, "/workspace/src/other.rs");
+                assert_eq!(location.line, 7);
+                assert_eq!(location.column, 11);
+                assert_eq!(
+                    location.column_encoding,
+                    crate::plugin::LocationColumnEncoding::Utf8Byte
+                );
+                assert_eq!(target, crate::plugin::OpenLocationTarget::Horizontal);
+            }
+            PluginRequest::Action(Action::Print(message)) => {
+                panic!("split selection should preserve the saved cursor, printed {message:?}")
+            }
+            _ => panic!("split selection should preserve the saved cursor"),
         }
     }
 

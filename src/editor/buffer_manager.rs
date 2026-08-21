@@ -73,6 +73,11 @@ impl BufferManager {
         })
     }
 
+    /// Returns visited buffer identities from their oldest visit to their newest.
+    pub(crate) fn recent_buffer_ids(&self) -> impl DoubleEndedIterator<Item = BufferId> + '_ {
+        self.recent_buffers.iter().copied()
+    }
+
     fn record_active_buffer(&mut self) {
         let Some(id) = self.active_buffer().map(Buffer::id) else {
             return;
@@ -193,6 +198,30 @@ mod tests {
         manager.remove_buffer(1);
         assert_eq!(manager.active_buffer().unwrap().name(), "a");
         assert_eq!(manager.alternate_index(), None);
+    }
+
+    #[test]
+    fn recent_buffer_ids_keep_visit_order_without_duplicate_or_removed_entries() {
+        let mut manager = BufferManager::with_buffers(vec![buffer("a"), buffer("b"), buffer("c")]);
+        let first = manager[0].id();
+        let second = manager[1].id();
+        let third = manager[2].id();
+
+        manager.set_active_index(1);
+        manager.set_active_index(2);
+        manager.set_active_index(1);
+
+        assert_eq!(
+            manager.recent_buffer_ids().collect::<Vec<_>>(),
+            vec![first, third, second]
+        );
+
+        manager.remove_buffer(1);
+
+        assert_eq!(
+            manager.recent_buffer_ids().collect::<Vec<_>>(),
+            vec![first, third]
+        );
     }
 
     #[test]

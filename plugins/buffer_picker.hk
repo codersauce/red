@@ -1,11 +1,19 @@
-// Fuzzy picker for the editor's current buffer list.
+// Recent-buffer picker with file-aware rows, previews, and split navigation.
 //
-// The editor snapshot is authoritative for buffer identity and active state. Selection
-// requests a normal buffer switch and never mutates buffer contents.
+// The editor snapshot owns ordering, buffer identity, active state, and saved cursor
+// coordinates. File previews resolve through the editor's live buffer snapshots, while
+// split actions use explicit UTF-8 byte locations and never reopen unnamed buffers.
 
 struct BufferSummary {
     id: i32,
     name: String,
+    path: Option<String>,
+    display_path: Option<String>,
+    dirty: bool,
+    active: bool,
+    alternate: bool,
+    line: i32,
+    column: i32,
 }
 
 struct EditorInfo {
@@ -14,17 +22,45 @@ struct EditorInfo {
 
 struct BufferPickerData {
     id: i32,
+    path: Option<String>,
+    search_path: String,
+    dirty: bool,
+    active: bool,
+    line: i32,
+    column: i32,
 }
 
 struct BufferPickerItem {
     id: String,
     label: String,
     kind: String,
+    annotation: String,
+    detail: String,
     data: BufferPickerData,
+    preview: Json,
 }
 
 struct BufferPickerHandlers {
     selected: fn(BufferPickerItem),
+    cancelled: fn(PickerCancelled),
+    action: fn(PickerActionEvent),
+}
+
+struct BufferPickerState {
+    picker: Option<i32>,
+    preview: bool,
+}
+
+#[red::state]
+fn initial_state() -> BufferPickerState {
+    return BufferPickerState {
+        picker: None,
+        preview: true,
+    };
+}
+
+fn state() -> BufferPickerState {
+    return red::state();
 }
 
 #[red::command(
@@ -36,41 +72,187 @@ struct BufferPickerHandlers {
     scope = "global",
 )]
 fn buffer_picker() {
+    if let Some(handle) = state().picker {
+        red::execute("ClosePicker", handle);
+        red::state_patch(BufferPickerState { picker: None });
+    }
     red::request("GetEditorInfo", editor_info_loaded);
 }
 
 fn editor_info_loaded(info: EditorInfo) {
     let items: [BufferPickerItem] = [];
     let index = 0;
+    let dirty = 0;
+    let selected = "";
     while index < red::len(info.buffers) && index < 500 {
         let buffer = info.buffers[index];
-        let label = buffer.name;
-        if buffer.name == "[No Name]" {
-            label = buffer.name + " #" + buffer.id;
+        let item = buffer_item(buffer);
+        if buffer.dirty {
+            dirty = dirty + 1;
         }
-        items = red::push(items, BufferPickerItem {
-            id: "buffer:" + buffer.id,
-            label: label,
-            kind: "Buffer",
-            data: BufferPickerData {
-                id: buffer.id,
-            },
-        });
+        if buffer.alternate || (selected == "" && buffer.active) {
+            selected = item.id;
+        }
+        items = red::push(items, item);
         index = index + 1;
     }
 
-    let status = red::len(items) + " buffers";
+    let status = red::len(items) + " buffer";
+    if red::len(items) != 1 {
+        status = status + "s";
+    }
+    if dirty > 0 {
+        status = status + " · " + dirty + " modified";
+    }
     if index < red::len(info.buffers) {
         status = status + " (results truncated)";
     }
-    red::execute("OpenPicker", "Buffers", items, PickerOptions {
-        placeholder: "Filter buffers",
+    red::state_set("buffer_picker_items", items);
+    let handle = red::execute("OpenPicker", "Buffers", items, PickerOptions {
+        placeholder: "Search open buffers…",
         status: status,
+        initial_selection: selected,
+        item_layout: "label_first",
+        actions: [
+            PickerAction { action: "open_horizontal", key: "Ctrl-s", label: "Open horizontal split" },
+            PickerAction { action: "open_vertical", key: "Ctrl-v", label: "Open vertical split" },
+            PickerAction { action: "toggle_preview", key: "Alt-p", label: "Toggle preview" },
+        ],
     }, BufferPickerHandlers {
         selected: buffer_selected,
+        cancelled: buffer_cancelled,
+        action: buffer_action,
     });
+    red::state_patch(BufferPickerState { picker: Some(handle) });
+}
+
+fn buffer_item(buffer: BufferSummary) -> BufferPickerItem {
+    let display_path = buffer.name;
+    if let Some(path) = buffer.display_path {
+        display_path = path;
+    }
+    display_path = red::replace_all(display_path, "\\", "/");
+
+    let parts = red::split(display_path, "/");
+    let label = red::string(parts[red::len(parts) - 1], display_path);
+    if buffer.name == "[No Name]" {
+        label = buffer.name + " #" + buffer.id;
+    }
+    let annotation = "";
+    if red::len(parts) > 1 {
+        let parents = [];
+        let index = 0;
+        while index < red::len(parts) - 1 {
+            parents = red::push(parents, parts[index]);
+            index = index + 1;
+        }
+        annotation = red::join(parents, "/");
+    }
+
+    let kind = "Buffer";
+    let preview = red::null();
+    if let Some(path) = buffer.path {
+        kind = "FilePath";
+        if state().preview {
+            preview = Json { path: path, line: buffer.line, column: buffer.column };
+        }
+    }
+
+    let detail = "";
+    if buffer.dirty {
+        detail = "● modified";
+    }
+    if buffer.active {
+        if detail != "" {
+            detail = detail + " · ";
+        }
+        detail = detail + "current";
+    }
+
+    return BufferPickerItem {
+        id: "buffer:" + buffer.id,
+        label: label,
+        kind: kind,
+        annotation: annotation,
+        detail: detail,
+        data: BufferPickerData {
+            id: buffer.id,
+            path: buffer.path,
+            search_path: display_path,
+            dirty: buffer.dirty,
+            active: buffer.active,
+            line: buffer.line,
+            column: buffer.column,
+        },
+        preview: preview,
+    };
 }
 
 fn buffer_selected(item: BufferPickerItem) {
+    clear_picker();
     red::execute("OpenBufferById", item.data.id);
+}
+
+fn buffer_cancelled(event: PickerCancelled) {
+    clear_picker();
+}
+
+fn buffer_action(event: PickerActionEvent) {
+    if event.action == "toggle_preview" {
+        toggle_preview();
+    } else if event.action == "open_horizontal" {
+        open_buffer_split(event.item, "horizontal");
+    } else if event.action == "open_vertical" {
+        open_buffer_split(event.item, "vertical");
+    }
+}
+
+fn toggle_preview() {
+    let Some(handle) = state().picker else {
+        return;
+    };
+    let enabled = !state().preview;
+    red::state_patch(BufferPickerState { preview: enabled });
+
+    let items: [BufferPickerItem] = red::state("buffer_picker_items");
+    let updated: [BufferPickerItem] = [];
+    for item in items {
+        item.preview = red::null();
+        if enabled {
+            if let Some(path) = item.data.path {
+                item.preview = Json {
+                    path: path,
+                    line: item.data.line,
+                    column: item.data.column,
+                };
+            }
+        }
+        updated = red::push(updated, item);
+    }
+    red::state_set("buffer_picker_items", updated);
+    red::execute("UpdatePickerItems", handle, updated);
+}
+
+fn open_buffer_split(item: PickerItem, target: String) {
+    let path = red::string(item.data.path, "");
+    if path == "" {
+        red::execute("Print", "Save an unnamed buffer before opening it in a split");
+        return;
+    }
+    let Some(handle) = state().picker else {
+        return;
+    };
+    clear_picker();
+    red::execute("ClosePicker", handle);
+    red::execute("OpenLocation", Json {
+        path: path,
+        line: red::int(item.data.line, 0),
+        column: red::int(item.data.column, 0),
+        column_encoding: "utf8-byte",
+    }, target);
+}
+
+fn clear_picker() {
+    red::state_patch(BufferPickerState { picker: None });
+    red::state_set("buffer_picker_items", []);
 }
