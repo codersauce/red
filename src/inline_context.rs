@@ -142,14 +142,24 @@ pub(crate) struct VisibleText {
 pub(crate) struct InlineContextSnapshot {
     pub root: PathBuf,
     pub visible: BTreeMap<String, Option<VisibleText>>,
+    pub allow_sensitive_paths: bool,
 }
 
 pub(crate) fn resolve_path(root: &Path, path: &str) -> Result<(PathBuf, String)> {
+    resolve_path_with_policy(root, path, /*allow_sensitive_paths*/ false)
+}
+
+pub(crate) fn resolve_path_with_policy(
+    root: &Path,
+    path: &str,
+    allow_sensitive_paths: bool,
+) -> Result<(PathBuf, String)> {
     crate::codex::validate_workspace_root(root)?;
     let physical = crate::codex::physical_workspace_root(Path::new(path));
-    let full = crate::editor::resolve_agent_tool_path(
+    let full = crate::editor::resolve_agent_tool_path_with_policy(
         root,
         physical.to_str().context("file path is not UTF-8")?,
+        allow_sensitive_paths,
     )?;
     let relative = full.strip_prefix(root)?;
     ensure!(!relative.as_os_str().is_empty(), "expected a project file");
@@ -160,7 +170,7 @@ pub(crate) fn resolve_path(root: &Path, path: &str) -> Result<(PathBuf, String)>
                 .as_os_str()
                 .to_string_lossy()
                 .eq_ignore_ascii_case(".git")
-                && !crate::editor::agent_context_path_is_sensitive(name),
+                && (allow_sensitive_paths || !crate::editor::agent_context_path_is_sensitive(name)),
             "inline context path is restricted"
         );
     }
@@ -203,7 +213,7 @@ impl InlineContextSnapshot {
     }
 
     fn read(&self, path: &str) -> Result<(String, FileText)> {
-        let (_, relative) = resolve_path(&self.root, path)?;
+        let (_, relative) = resolve_path_with_policy(&self.root, path, self.allow_sensitive_paths)?;
         let text = match self.visible.get(&relative) {
             Some(Some(text)) => FileText {
                 content: text.content.clone(),
@@ -252,7 +262,9 @@ impl InlineContextSnapshot {
             let Ok(entry) = entry else { continue };
             if entry.file_type().is_some_and(|kind| kind.is_file()) {
                 if let Some(path) = entry.path().to_str() {
-                    if let Ok((_, relative)) = resolve_path(&self.root, path) {
+                    if let Ok((_, relative)) =
+                        resolve_path_with_policy(&self.root, path, self.allow_sensitive_paths)
+                    {
                         files.insert(relative);
                     }
                 }

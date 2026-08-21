@@ -198,8 +198,49 @@ async fn inline_draft_close_can_edit_save_or_delete_without_losing_prior_results
 }
 
 #[tokio::test]
-async fn inline_foreground_code_result_requires_request_bound_review() {
+async fn inline_foreground_exact_code_result_auto_applies_as_unsaved_transaction() {
     let mut editor = editor("alpha\nbeta\n");
+    start(&mut editor, "first", Some("one"), range(0, 1));
+    let (bridge, worker) = CodexBridge::channel(std::num::NonZeroUsize::new(2).unwrap());
+    editor.agent_manager.set_bridge(bridge);
+    worker
+        .send(CodexEvent::InlineResult {
+            request_id: "one".into(),
+            session_id: "provider-one".into(),
+            result: result(Some("ALPHA\n")),
+        })
+        .await
+        .unwrap();
+    editor
+        .service_background(
+            &mut RenderBuffer::new(100, 30, &Style::default()),
+            &mut Runtime::new(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(editor.current_buffer().contents(), "ALPHA\nbeta\n");
+    assert!(editor.current_buffer().is_dirty());
+    assert!(editor
+        .inline_assist
+        .as_ref()
+        .unwrap()
+        .transaction_id
+        .is_some());
+    assert_eq!(
+        editor.inline_history.turn("one").unwrap().state,
+        InlineTurnState::Completed
+    );
+    assert!(matches!(
+        popup(&editor),
+        InlineAssistPopupState::Applied { edited: true, .. }
+    ));
+}
+
+#[tokio::test]
+async fn inline_foreground_code_result_can_require_request_bound_review() {
+    let mut editor = editor("alpha\nbeta\n");
+    editor.config.agent.auto_apply_inline_edits = false;
     start(&mut editor, "first", Some("one"), range(0, 1));
     let (bridge, worker) = CodexBridge::channel(std::num::NonZeroUsize::new(2).unwrap());
     editor.agent_manager.set_bridge(bridge);

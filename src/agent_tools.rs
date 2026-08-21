@@ -15,6 +15,12 @@ use crate::codex::CodexToolHost;
 /// Maximum number of edits accepted in one atomic editor operation.
 pub const MAX_EDITOR_EDITS: usize = 128;
 
+/// Maximum number of source lines returned by one full-Agent file read.
+pub const MAX_AGENT_READ_LINES: usize = 1_000;
+
+/// Maximum source bytes returned by one full-Agent file read.
+pub const MAX_AGENT_READ_BYTES: usize = 256 * 1024;
+
 /// Maximum annotations accepted in one Agent tool call.
 pub const MAX_AGENT_ANNOTATIONS_PER_CALL: usize = crate::inline_assist::MAX_COMMENTS;
 
@@ -117,6 +123,10 @@ pub enum EditorToolCall {
     ReadFile {
         /// Workspace-relative or accepted absolute path.
         path: String,
+        /// One-based first source line to return.
+        start_line: usize,
+        /// Maximum number of source lines to return.
+        line_count: usize,
     },
     /// Replace a file with complete contents and persist it.
     WriteFile {
@@ -216,7 +226,7 @@ impl EditorToolCall {
     pub fn activity_title(&self) -> String {
         match self {
             Self::InlineContext { .. } => "Inspecting inline context".to_string(),
-            Self::ReadFile { path } => format!("Reading {path}"),
+            Self::ReadFile { path, .. } => format!("Reading {path}"),
             Self::WriteFile { path, .. } => format!("Writing {path}"),
             Self::CreateDirectory { path } => format!("Creating {path}/"),
             Self::AddAnnotations {
@@ -294,11 +304,19 @@ impl EditorToolHost {
 
 #[async_trait]
 impl CodexToolHost for EditorToolHost {
-    async fn read_file(&mut self, session_id: &str, path: &str) -> anyhow::Result<Value> {
+    async fn read_file(
+        &mut self,
+        session_id: &str,
+        path: &str,
+        start_line: usize,
+        line_count: usize,
+    ) -> anyhow::Result<Value> {
         self.request(EditorToolRequest {
             session_id: session_id.to_string(),
             call: EditorToolCall::ReadFile {
                 path: path.to_string(),
+                start_line,
+                line_count,
             },
         })
         .await

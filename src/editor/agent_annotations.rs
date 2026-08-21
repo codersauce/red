@@ -225,6 +225,7 @@ impl Editor {
         &mut self,
         root: &std::path::Path,
         annotation_ids: Vec<String>,
+        allow_sensitive_paths: bool,
         frame: &mut RenderBuffer,
     ) -> anyhow::Result<Value> {
         anyhow::ensure!(
@@ -261,7 +262,8 @@ impl Editor {
                     .ok_or_else(|| {
                         anyhow::anyhow!("annotation buffer has no workspace file: {id}")
                     })?;
-                let path = super::resolve_agent_tool_path(root, path)?;
+                let path =
+                    super::resolve_agent_tool_path_with_policy(root, path, allow_sensitive_paths)?;
                 Ok((*id, path))
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
@@ -350,9 +352,10 @@ impl Editor {
             {
                 continue;
             }
-            let Ok(resolved_path) = super::resolve_agent_tool_path(
+            let Ok(resolved_path) = super::resolve_agent_tool_path_with_policy(
                 std::path::Path::new(&conversation.cwd),
                 &record.path,
+                self.config.agent.allow_sensitive_paths,
             ) else {
                 continue;
             };

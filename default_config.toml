@@ -73,6 +73,19 @@ icon_style = "nerd_font"
 # Override `command` only when Codex is installed outside PATH.
 [agent]
 # command = "/path/to/codex"
+# Run file tools immediately by default. Set this to true to reveal each target
+# and retain the deliberate playback pauses used by followed editing.
+follow_tool_calls = false
+# Apply edits confined to the exact inline target immediately. These edits stay
+# unsaved and undoable. Wider same-file proposals always require review.
+auto_apply_inline_edits = true
+# Explicitly opt in before secret-like filenames can enter Agent context.
+allow_sensitive_paths = false
+# Opt in to configured Codex capabilities by exact server name or category.
+enabled_mcp_servers = []
+# Supported values: apps, connectors, plugins, remote_plugin,
+# skill_mcp_dependency_install, orchestrator_mcp.
+enabled_codex_features = []
 
 [search]
 # Preview the next match while typing / or ?.

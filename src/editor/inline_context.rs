@@ -4,8 +4,8 @@ use super::*;
 use crate::{
     agent_tools::PendingEditorTool,
     inline_context::{
-        resolve_path, InlineContextCall, InlineContextSnapshot, VisibleText, MAX_FILE_BYTES,
-        MAX_SNAPSHOT_BYTES,
+        resolve_path_with_policy, InlineContextCall, InlineContextSnapshot, VisibleText,
+        MAX_FILE_BYTES, MAX_SNAPSHOT_BYTES,
     },
 };
 
@@ -54,21 +54,24 @@ impl Editor {
             "inline context references an inactive request"
         );
         let root = PathBuf::from(&conversation.cwd).canonicalize()?;
+        let allow_sensitive_paths = self.config.agent.allow_sensitive_paths;
         let requested = call
             .path()
-            .map(|path| resolve_path(&root, path).map(|(_, relative)| relative))
+            .map(|path| {
+                resolve_path_with_policy(&root, path, allow_sensitive_paths)
+                    .map(|(_, relative)| relative)
+            })
             .transpose()?;
         let mut snapshot = InlineContextSnapshot {
             root,
             visible: BTreeMap::new(),
+            allow_sensitive_paths,
         };
         let mut remaining = MAX_SNAPSHOT_BYTES;
         for buffer in self.buffer_manager.iter() {
-            let Some((_, relative)) = buffer
-                .file
-                .as_deref()
-                .and_then(|path| resolve_path(&snapshot.root, path).ok())
-            else {
+            let Some((_, relative)) = buffer.file.as_deref().and_then(|path| {
+                resolve_path_with_policy(&snapshot.root, path, snapshot.allow_sensitive_paths).ok()
+            }) else {
                 continue;
             };
             if requested
