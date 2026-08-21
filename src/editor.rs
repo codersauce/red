@@ -20,6 +20,7 @@ mod agent_manager;
 mod agent_models;
 mod buffer_manager;
 mod command_mode;
+mod completion_resolve;
 mod diagnostics;
 mod diagnostics_picker;
 mod display_layout;
@@ -2713,6 +2714,12 @@ pub enum Action {
         item: Box<CompletionResponseItem>,
         commit_character: Option<char>,
     },
+    /// Applies a selected item after its deferred language-server fields arrive.
+    #[serde(skip)]
+    ApplyResolvedCompletion {
+        item: Box<CompletionResponseItem>,
+        commit_character: Option<char>,
+    },
     /// Advances to the next editable language-server snippet placeholder.
     #[serde(skip)]
     NextSnippetPlaceholder,
@@ -3493,6 +3500,7 @@ pub struct Editor {
     pending_lsp_format_saves: HashMap<i64, PendingLspFormatSave>,
     pending_lsp_revision_snapshots: HashMap<i64, Vec<(String, u64)>>,
     pending_completions: HashMap<i64, PendingCompletion>,
+    pending_completion_resolutions: HashMap<i64, completion_resolve::PendingCompletionResolution>,
     scheduled_completion: Option<ScheduledCompletion>,
     // Keep optional AI state out of Editor values and the startup futures that own them.
     inline_completion: Box<inline_completion::InlineCompletionState>,
@@ -4837,6 +4845,7 @@ impl Editor {
             pending_lsp_format_saves: HashMap::new(),
             pending_lsp_revision_snapshots: HashMap::new(),
             pending_completions: HashMap::new(),
+            pending_completion_resolutions: HashMap::new(),
             scheduled_completion: None,
             inline_completion: Box::default(),
             completion_snapshot: None,
@@ -13637,6 +13646,10 @@ impl Editor {
                         }
                     }
 
+                    if method == "completionItem/resolve" {
+                        return self.resolved_completion_action(msg);
+                    }
+
                     if method == "textDocument/definition" {
                         let result = match msg.result {
                             serde_json::Value::Array(ref arr) => {
@@ -13693,6 +13706,9 @@ impl Editor {
                 let id = error_msg.id?;
                 if method.as_deref() == Some("textDocument/signatureHelp") {
                     return self.signature_help_error(id);
+                }
+                if method.as_deref() == Some("completionItem/resolve") {
+                    return self.completion_resolution_failed(id, &error_msg.message);
                 }
                 if let Some(request_id) = self.take_pending_plugin_request(method.as_deref()?, id) {
                     return Some(Action::ResolvePluginRequest(
@@ -13765,6 +13781,9 @@ impl Editor {
             InboundMessage::RequestError { id, error } => {
                 if method.as_deref() == Some("textDocument/signatureHelp") {
                     return self.signature_help_error(*id);
+                }
+                if method.as_deref() == Some("completionItem/resolve") {
+                    return self.completion_resolution_failed(*id, &error.to_string());
                 }
                 if let Some(request_id) = method
                     .as_deref()
@@ -20996,6 +21015,19 @@ impl Editor {
                 }
             }
             Action::ApplyCompletion {
+                item,
+                commit_character,
+            } => {
+                if !self
+                    .resolve_completion_item(item, *commit_character)
+                    .await?
+                {
+                    self.apply_completion(item, *commit_character, runtime)
+                        .await?;
+                }
+                self.render(buffer)?;
+            }
+            Action::ApplyResolvedCompletion {
                 item,
                 commit_character,
             } => {

@@ -48,6 +48,12 @@ pub fn get_client_capabilities_with_options(
                                 .build(),
                         )
                         .insert_replace_support(false)
+                        // rust-analyzer withholds auto-import candidates without this capability.
+                        .resolve_support(
+                            CompletionItemResolveSupport::builder()
+                                .properties(vec!["additionalTextEdits".to_string()])
+                                .build(),
+                        )
                         .insert_text_mode_support(
                             InsertTextModeSupport::builder()
                                 .value_set(vec![
@@ -520,6 +526,17 @@ mod tests {
     }
 
     #[test]
+    fn advertises_deferred_completion_import_edits() {
+        let params = serde_json::to_value(get_client_capabilities("file:///tmp")).unwrap();
+
+        assert_eq!(
+            params["capabilities"]["textDocument"]["completion"]["completionItem"]
+                ["resolveSupport"]["properties"],
+            json!(["additionalTextEdits"])
+        );
+    }
+
+    #[test]
     fn advertises_only_supported_workspace_edit_capabilities() {
         let params = serde_json::to_value(get_client_capabilities("file:///tmp")).unwrap();
         let capabilities = &params["capabilities"];
@@ -599,9 +616,6 @@ mod tests {
             capabilities["textDocument"]["completion"]["completionItem"]["insertReplaceSupport"],
             json!(false)
         );
-        assert!(capabilities["textDocument"]["completion"]["completionItem"]
-            .get("resolveSupport")
-            .is_none());
         assert!(capabilities["textDocument"]["completion"]
             .get("completionList")
             .is_none());
