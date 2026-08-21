@@ -3072,7 +3072,10 @@ impl Editor {
             if line_width > segment.end_col {
                 continue;
             }
-            let content_end = gutter_width + 1 + line_width.saturating_sub(segment.start_col);
+            let content_end = gutter_width
+                + 1
+                + segment.visual_offset
+                + line_width.saturating_sub(segment.start_col);
             let indicator_x = content_end + 5; // Add some padding
 
             // Skip if diagnostic would be outside window
@@ -4294,6 +4297,88 @@ mod tests {
         let row = diagnostic_row(&diagnostics, 2).unwrap();
 
         assert_eq!(display_width(&row), 2);
+    }
+
+    #[test]
+    fn wrapped_diagnostic_does_not_overwrite_indented_continuation() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("wrapped-diagnostic.rs");
+        let line = format!("{}{}SOURCE_TAIL", " ".repeat(12), "x".repeat(50));
+        let source = Buffer::new(
+            Some(path.to_string_lossy().into_owned()),
+            format!("{line}\nfollowing source\n"),
+        );
+        let mut editor = rendering_test_editor(source);
+        let uri = editor.current_buffer().uri().unwrap().unwrap();
+        editor
+            .diagnostics
+            .insert(uri, vec![diagnostic("wrapped diagnostic")]);
+        let mut buffer = RenderBuffer::new(60, 12, &Style::default());
+
+        editor.render(&mut buffer).unwrap();
+
+        let window = editor.active_window_with_editor_view().unwrap();
+        let layout = editor.layout_for_window(&window);
+        let continuation = layout
+            .rows
+            .iter()
+            .rev()
+            .find(|segment| segment.line == 0)
+            .unwrap();
+        assert!(!continuation.first_segment);
+        assert!(continuation.visual_offset > 5);
+        let rows = rendered_rows(&buffer);
+        let row = &rows[continuation.row];
+        assert!(
+            row.contains("SOURCE_TAIL"),
+            "diagnostic overwrote source: {row}"
+        );
+        let source_end = row.find("SOURCE_TAIL").unwrap() + "SOURCE_TAIL".len();
+        let diagnostic_start = row.find('■').expect("diagnostic should remain visible");
+        assert!(
+            diagnostic_start > source_end,
+            "diagnostic overlaps source: {row}"
+        );
+    }
+
+    #[test]
+    fn wrapped_diagnostic_is_hidden_when_continuation_has_no_room() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("cramped-diagnostic.rs");
+        let line = format!("{}{}SOURCE_TAIL", " ".repeat(12), "x".repeat(75));
+        let source = Buffer::new(
+            Some(path.to_string_lossy().into_owned()),
+            format!("{line}\nfollowing source\n"),
+        );
+        let mut editor = rendering_test_editor(source);
+        let uri = editor.current_buffer().uri().unwrap().unwrap();
+        editor
+            .diagnostics
+            .insert(uri, vec![diagnostic("cramped diagnostic")]);
+        let mut buffer = RenderBuffer::new(60, 12, &Style::default());
+
+        editor.render(&mut buffer).unwrap();
+
+        let window = editor.active_window_with_editor_view().unwrap();
+        let layout = editor.layout_for_window(&window);
+        let continuation = layout
+            .rows
+            .iter()
+            .rev()
+            .find(|segment| segment.line == 0)
+            .unwrap();
+        assert!(!continuation.first_segment);
+        let rows = rendered_rows(&buffer);
+        let row = &rows[continuation.row];
+        assert!(
+            row.contains("SOURCE_TAIL"),
+            "diagnostic overwrote source: {row}"
+        );
+        assert!(
+            !row.contains('■'),
+            "cramped diagnostic should be hidden: {row}"
+        );
+        assert!(rows.iter().any(|line| line.contains("following source")));
     }
 
     #[test]
