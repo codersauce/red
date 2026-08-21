@@ -142,6 +142,29 @@ restore its workflow without Red understanding the payload.
 
 These calls were introduced in host API `0.6.0`.
 
+## Row-panel search and workspace path discovery
+
+Host API `0.15.0` supports an inline search prompt owned by an existing row
+panel. `OpenPanelSearch(id, initial, prefix)` focuses that prompt,
+`UpdatePanelSearch(id, status)` replaces its compact result indicator,
+`KeepPanelSearch(id)` preserves the query while returning focus to row
+navigation, and `ClosePanelSearch(id)` removes it.
+
+Input emits ordinary `panel:event:<id>` events with actions `search_query`,
+`search_move`, `search_submit`, `search_reveal`, `search_keep`, and
+`search_cancel`. The current query is provided in `text`, while `row` identifies
+the current selection. Up/Down and `Ctrl-p`/`Ctrl-n` move the selection; Enter
+submits, `Ctrl-Enter` requests reveal, `Shift-Enter` keeps the prompt, and
+Escape cancels.
+
+`SearchWorkspacePaths(callback, path, query, directories_only)` performs a
+bounded, asynchronous, ignore-aware recursive filesystem search. Its result
+contains the original `query`, `directories_only`, ranked `matches`, synthetic
+directory `children`, expanded ancestor paths, the total match count,
+`truncated`, and an optional `error`. Paths are normalized relative to the
+requested workspace root. `InvalidateWorkspacePaths(path)` drops its cached
+index after filesystem changes. Neither call grants subprocess permissions.
+
 ## Workspace file operations
 
 `FileOperation(callback: fn(Json), operation: Json)` applies a structured filesystem

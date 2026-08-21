@@ -205,7 +205,10 @@ logic, and Git argument construction live in the native, multi-file
 `plugins/git_core` Husk package. Neo-tree follows the same split: filesystem
 actions, confirmations, and panel events stay in `plugins/neotree.hk`, while
 normalized path handling, typed Git-status presentation, and bounded tree-row
-construction live in `plugins/neotree_core`. Red embeds those pure sources and
+construction live in `plugins/neotree_core`. The tree's inline search delegates
+recursive, ignore-aware discovery and bounded fuzzy ranking to a shared Rust
+workspace-path index; the pure core renders matching paths and their ancestors
+without granting the plugin subprocess permissions. Red embeds those pure sources and
 exposes small internal bridges to the compatibility shells, so installed
 builds do not depend on checkout-relative source paths. The bridges are
 bundled-plugin implementation detail, not public plugin APIs.

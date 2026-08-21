@@ -23,6 +23,11 @@ pub struct PathStatus {
     status: String,
 }
 
+pub struct PathMatch {
+    path: String,
+    ranges: [[i32]],
+}
+
 struct Ancestor {
     last: bool,
     visible: bool,
@@ -80,7 +85,34 @@ pub fn build_rows(
     status_root: String,
     statuses: [PathStatus]
 ) -> [PanelRow] {
+    build_rows_with_matches(cwd, children, expanded, selected, clipboard, status_root, statuses, [])
+}
+
+pub fn build_search_rows(
+    cwd: String,
+    children: [Children],
+    expanded: [String],
+    selected: [String],
+    clipboard: [ClipboardEntry],
+    status_root: String,
+    statuses: [PathStatus],
+    matches: [PathMatch]
+) -> [PanelRow] {
+    build_rows_with_matches(cwd, children, expanded, selected, clipboard, status_root, statuses, matches)
+}
+
+fn build_rows_with_matches(
+    cwd: String,
+    children: [Children],
+    expanded: [String],
+    selected: [String],
+    clipboard: [ClipboardEntry],
+    status_root: String,
+    statuses: [PathStatus],
+    matches: [PathMatch]
+) -> [PanelRow] {
     let root = ".";
+    let status_root = path::normalize(status_root);
     let root_status = status_for_path(root, status_root, statuses);
     let mut rows = [PanelRow {
         id: root,
@@ -96,7 +128,7 @@ pub fn build_rows(
     }];
 
     if expanded.contains(root) {
-        rows = append_rows(root, [], rows, children, expanded, selected, clipboard, status_root, statuses);
+        rows = append_rows(root, [], rows, children, expanded, selected, clipboard, status_root, statuses, matches);
     }
     if rows.len() >= 200 {
         rows.push(truncation_row("tree-limit", "… tree limited to 200 rows"));
@@ -113,7 +145,8 @@ fn append_rows(
     selected: [String],
     clipboard: [ClipboardEntry],
     status_root: String,
-    statuses: [PathStatus]
+    statuses: [PathStatus],
+    matches: [PathMatch]
 ) -> [PanelRow] {
     let entries = children_for(path, children);
     let mut visible: [DirectoryEntry] = [];
@@ -140,7 +173,9 @@ fn append_rows(
         let icon_style = entry_icon_style_keys(entry.name, status, directory);
         let name_style = status::entry_name_style_keys(status, directory);
         segments.push(segment(entry_icon(entry.name, directory, open) + " ", icon_style, false));
-        segments.push(segment(entry.name, name_style, false));
+        for part in matching_name_segments(entry.name, entry.path, name_style, matches) {
+            segments.push(part);
+        }
         rows.push(PanelRow {
             id: entry.path,
             path: Some(entry.path),
@@ -153,7 +188,7 @@ fn append_rows(
         if open {
             let mut next_ancestors = ancestors;
             next_ancestors.push(Ancestor { last: last, visible: !ancestors.is_empty() });
-            rows = append_rows(entry.path, next_ancestors, rows, children, expanded, selected, clipboard, status_root, statuses);
+            rows = append_rows(entry.path, next_ancestors, rows, children, expanded, selected, clipboard, status_root, statuses, matches);
         }
         index += 1;
     }
@@ -161,6 +196,33 @@ fn append_rows(
         rows.push(truncation_row("directory-limit:" + path, "… directory listing truncated"));
     }
     rows
+}
+
+fn matching_name_segments(name: String, path: String, style: [String], matches: [PathMatch]) -> [PanelSegment] {
+    for found in matches {
+        if found.path != path || found.ranges.is_empty() {
+            continue;
+        }
+        let mut segments: [PanelSegment] = [];
+        let mut cursor = 0;
+        for range in found.ranges {
+            if range.len() != 2 {
+                continue;
+            }
+            let start = range[0];
+            let end = range[1];
+            if start > cursor {
+                segments.push(segment(name.substring(cursor, start), style, false));
+            }
+            segments.push(segment(name.substring(start, end), ["list.highlightForeground", "editor.findMatchHighlightForeground", "editor.foreground"], true));
+            cursor = end;
+        }
+        if cursor < name.len() {
+            segments.push(segment(name.substring(cursor, name.len()), style, false));
+        }
+        return segments;
+    }
+    [segment(name, style, false)]
 }
 
 fn children_for(path: String, children: [Children]) -> [DirectoryEntry] {
@@ -182,7 +244,6 @@ fn children_truncated(path: String, children: [Children]) -> bool {
 }
 
 fn status_for_path(path: String, root: String, statuses: [PathStatus]) -> String {
-    let root = path::normalize(root);
     if root.is_empty() {
         return "";
     }
@@ -314,7 +375,7 @@ fn status_segments(value: String) -> [PanelSegment] {
 }
 
 fn visible_status_segments(value: String, directory: bool, expanded: bool) -> [PanelSegment] {
-    if directory && expanded {
+    if value.is_empty() || directory && expanded {
         return [];
     }
     status_segments(value)
@@ -379,6 +440,31 @@ fn renders_typed_rows_with_status_and_selection_markers() {
     assert(entry_icon_style_keys("Cargo.lock", "modified", false)[0] == "descriptionForeground");
     assert(entry_icon_style_keys("ignored.rs", "ignored", false)[0] == "gitDecoration.ignoredResourceForeground");
     assert(indent_style_keys()[1] == "editorIndentGuide.background");
+}
+
+#[test]
+fn highlights_search_matches_without_losing_filename_styles() {
+    let rows = build_search_rows(
+        "/repo",
+        [Children {
+            path: ".",
+            entries: [DirectoryEntry { name: "file_picker.rs", path: "./file_picker.rs", kind: "file" }],
+            truncated: false,
+        }],
+        ["."],
+        [],
+        [],
+        "",
+        [],
+        [PathMatch { path: "./file_picker.rs", ranges: [[5, 9]] }]
+    );
+
+    assert(rows.len() == 2);
+    assert(rows[1].segments[3].text == "file_");
+    assert(rows[1].segments[4].text == "pick");
+    assert(rows[1].segments[4].semantic.bold);
+    assert(rows[1].segments[4].semantic.foreground[0] == "list.highlightForeground");
+    assert(rows[1].segments[5].text == "er.rs");
 }
 
 #[test]

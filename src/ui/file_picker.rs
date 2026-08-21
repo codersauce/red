@@ -10,16 +10,15 @@ use std::{
     sync::mpsc::{self, Receiver, TryRecvError},
 };
 
-use anyhow::Context;
 use crossterm::event::{self};
 use fuzzy_matcher::{skim::SkimMatcherV2, FuzzyMatcher};
-use ignore::{DirEntry, WalkBuilder};
 
 use crate::{
     config::KeyAction,
     editor::{Action, Editor, RenderBuffer},
     log,
     theme::Theme,
+    workspace_paths::{discover_workspace_paths, WorkspacePathOptions},
 };
 
 use super::{picker::PickerFilterHighlights, Component, Picker, PickerItem, PickerPreview};
@@ -373,42 +372,16 @@ fn load_file_picker_items(
     root_path: &Path,
     visibility: FilePickerVisibility,
 ) -> anyhow::Result<Vec<String>> {
-    let honor_ignores = !visibility.ignored;
-    let mut builder = WalkBuilder::new(root_path);
-    builder
-        .hidden(!visibility.hidden)
-        .ignore(honor_ignores)
-        .git_ignore(honor_ignores)
-        .git_global(honor_ignores)
-        .git_exclude(honor_ignores)
-        .follow_links(false)
-        .filter_entry(not_vcs_metadata);
-
-    let mut files = Vec::new();
-    for result in builder.build() {
-        let entry = result.with_context(|| format!("failed to walk {}", root_path.display()))?;
-        if !entry
-            .file_type()
-            .is_some_and(|file_type| file_type.is_file())
-        {
-            continue;
-        }
-        let relative_path = entry.path().strip_prefix(root_path).with_context(|| {
-            format!(
-                "failed to make {} relative to {}",
-                entry.path().display(),
-                root_path.display()
-            )
-        })?;
-        files.push(relative_path.to_string_lossy().into_owned());
-    }
-    files.sort_unstable();
-
-    Ok(files)
-}
-
-fn not_vcs_metadata(entry: &DirEntry) -> bool {
-    entry.depth() == 0 || !matches!(entry.file_name().to_str(), Some(".git" | ".bare"))
+    let (entries, _) = discover_workspace_paths(
+        root_path,
+        WorkspacePathOptions {
+            hidden: visibility.hidden,
+            ignored: visibility.ignored,
+            directories: false,
+            max_entries: None,
+        },
+    )?;
+    Ok(entries.into_iter().map(|entry| entry.path).collect())
 }
 
 #[cfg(test)]

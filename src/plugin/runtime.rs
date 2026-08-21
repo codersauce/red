@@ -1718,6 +1718,33 @@ impl RedHost {
                     .unwrap_or_default();
                 self.send_request(PluginRequest::UpdatePanel { id, rows });
             }
+            "OpenPanelSearch" => {
+                let id = red_required_string(args, 0, "OpenPanelSearch")?.to_string();
+                let initial = red_required_string(args, 1, "OpenPanelSearch")?.to_string();
+                let prefix = red_required_string(args, 2, "OpenPanelSearch")?.to_string();
+                self.send_request(PluginRequest::OpenPanelSearch {
+                    id,
+                    initial,
+                    prefix,
+                });
+            }
+            "UpdatePanelSearch" => {
+                let id = red_required_string(args, 0, "UpdatePanelSearch")?.to_string();
+                let status = red_required_string(args, 1, "UpdatePanelSearch")?.to_string();
+                self.send_request(PluginRequest::UpdatePanelSearch { id, status });
+            }
+            "KeepPanelSearch" => {
+                let id = red_required_string(args, 0, "KeepPanelSearch")?.to_string();
+                self.send_request(PluginRequest::KeepPanelSearch { id });
+            }
+            "ClosePanelSearch" => {
+                let id = red_required_string(args, 0, "ClosePanelSearch")?.to_string();
+                self.send_request(PluginRequest::ClosePanelSearch { id });
+            }
+            "InvalidateWorkspacePaths" => {
+                let path = red_required_string(args, 0, "InvalidateWorkspacePaths")?.to_string();
+                self.send_request(PluginRequest::InvalidateWorkspacePaths { path });
+            }
             "CreateTextPanel" => {
                 let id = args
                     .first()
@@ -2161,6 +2188,12 @@ impl RedHost {
                     .and_then(Value::as_str)
                     .unwrap_or(".")
                     .to_string(),
+                request_id,
+            },
+            "SearchWorkspacePaths" => PluginRequest::SearchWorkspacePaths {
+                path: red_required_string(args, 0, "SearchWorkspacePaths")?.to_string(),
+                query: red_required_string(args, 1, "SearchWorkspacePaths")?.to_string(),
+                directories_only: args.get(2).and_then(Value::as_bool).unwrap_or(false),
                 request_id,
             },
             "GetGitStatus" => PluginRequest::GetGitStatus {
@@ -2770,6 +2803,7 @@ impl RedHost {
             "tree_path" => "path::tree_path",
             "reveal_parts" => "path::reveal_parts",
             "build_rows" => "tree::build_rows",
+            "build_search_rows" => "tree::build_search_rows",
             _ => anyhow::bail!("unknown Neo-tree core operation `{operation}`"),
         };
 
@@ -2785,8 +2819,12 @@ impl RedHost {
             .as_mut()
             .ok_or_else(|| anyhow::anyhow!("Neo-tree core VM did not initialize"))?;
         let mut host = NativeCoreHost;
-        let result = vm.call_export("red-neotree-core", function, args.to_vec(), &mut host)?;
-        Ok(normalize_native_core_value(result))
+        if matches!(operation, "build_rows" | "build_search_rows") {
+            vm.set_instruction_budget(PLUGIN_INSTRUCTION_BUDGET * 4);
+        }
+        let result = vm.call_export("red-neotree-core", function, args.to_vec(), &mut host);
+        vm.set_instruction_budget(PLUGIN_INSTRUCTION_BUDGET);
+        Ok(normalize_native_core_value(result?))
     }
 }
 
@@ -15331,6 +15369,180 @@ mod tests {
             PluginRequest::FocusEditor => {}
             _ => panic!("unexpected plugin request"),
         }
+    }
+
+    #[tokio::test]
+    async fn neotree_search_opens_inline_and_renders_collapsed_descendant_matches() {
+        drain_requests();
+        let mut runtime = Runtime::new();
+        runtime
+            .load_plugin("neotree", include_str!("../../plugins/neotree.hk"))
+            .await
+            .unwrap();
+        runtime.execute_command("NeoTree").await.unwrap();
+        drain_requests();
+
+        runtime
+            .notify(
+                "panel:event:neotree",
+                serde_json::json!({ "action": "/", "row": { "path": ".", "kind": "directory" } }),
+            )
+            .await
+            .unwrap();
+        match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::OpenPanelSearch {
+                id,
+                initial,
+                prefix,
+            } => {
+                assert_eq!(id, "neotree");
+                assert_eq!(initial, "");
+                assert_eq!(prefix, "/");
+            }
+            _ => panic!("expected inline Neo-tree search"),
+        }
+
+        runtime
+            .notify(
+                "panel:event:neotree",
+                serde_json::json!({ "action": "search_query", "text": "ui pick", "row": null }),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::UpdatePanelSearch { status, .. } if status == "…"
+        ));
+        std::thread::sleep(Duration::from_millis(75));
+        for callback in runtime.poll_timer_callbacks() {
+            if let PluginRequest::TimeoutCallback { timer_id } = callback {
+                runtime
+                    .notify(
+                        "timeout:callback",
+                        serde_json::json!({ "timer_id": timer_id }),
+                    )
+                    .await
+                    .unwrap();
+            }
+        }
+        let request_id = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::SearchWorkspacePaths {
+                path,
+                query,
+                directories_only,
+                request_id,
+            } => {
+                assert_eq!(path, ".");
+                assert_eq!(query, "ui pick");
+                assert!(!directories_only);
+                request_id
+            }
+            _ => panic!("expected native workspace search request"),
+        };
+
+        runtime
+            .resolve_request(request_id, serde_json::json!({
+                "query": "ui pick",
+                "directories_only": false,
+                "children": [
+                    { "path": ".", "entries": [{ "name": "src", "path": "./src", "kind": "directory" }], "truncated": false },
+                    { "path": "./src", "entries": [{ "name": "ui", "path": "./src/ui", "kind": "directory" }], "truncated": false },
+                    { "path": "./src/ui", "entries": [{ "name": "file_picker.rs", "path": "./src/ui/file_picker.rs", "kind": "file" }], "truncated": false }
+                ],
+                "expanded": [".", "./src", "./src/ui"],
+                "matches": [{ "path": "./src/ui/file_picker.rs", "ranges": [[5, 9]] }],
+                "total": 1,
+                "truncated": false,
+                "error": null
+            }))
+            .await
+            .unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::UpdatePanelSearch { status, .. } if status == "1"
+        ));
+        match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::UpdatePanel { rows, .. } => {
+                assert_eq!(rows.len(), 4);
+                assert_eq!(rows[3].id, "./src/ui/file_picker.rs");
+                assert!(rows[3]
+                    .segments
+                    .iter()
+                    .any(|segment| segment.text == "pick"));
+            }
+            _ => panic!("expected filtered Neo-tree projection"),
+        }
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::SelectPanelRow { row_id, .. }
+                if row_id == "./src/ui/file_picker.rs"
+        ));
+    }
+
+    #[tokio::test]
+    async fn neotree_directory_search_and_persistent_filter_have_distinct_modes() {
+        drain_requests();
+        let mut runtime = Runtime::new();
+        runtime
+            .load_plugin("neotree", include_str!("../../plugins/neotree.hk"))
+            .await
+            .unwrap();
+        runtime.execute_command("NeoTree").await.unwrap();
+        drain_requests();
+
+        runtime
+            .notify(
+                "panel:event:neotree",
+                serde_json::json!({ "action": "D", "row": null }),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::OpenPanelSearch { prefix, .. } if prefix == "D"
+        ));
+        runtime
+            .notify(
+                "panel:event:neotree",
+                serde_json::json!({ "action": "search_cancel", "row": null }),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::ClosePanelSearch { .. }
+        ));
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::UpdatePanel { .. }
+        ));
+
+        runtime
+            .notify(
+                "panel:event:neotree",
+                serde_json::json!({ "action": "f", "row": null }),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::OpenPanelSearch { prefix, .. } if prefix == "f"
+        ));
+        runtime
+            .notify(
+                "panel:event:neotree",
+                serde_json::json!({
+                    "action": "search_submit",
+                    "row": { "path": "./src", "kind": "directory" },
+                    "text": "src"
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::KeepPanelSearch { .. }
+        ));
     }
 
     #[tokio::test]

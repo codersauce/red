@@ -2274,6 +2274,14 @@ pub struct PluginPanel {
     pub rows: Vec<PanelRow>,
     pub selected: usize,
     pub scroll: usize,
+    search: Option<RowPanelSearch>,
+}
+
+struct RowPanelSearch {
+    input: PromptBuffer,
+    prefix: String,
+    status: String,
+    active: bool,
 }
 
 impl PluginPanel {
@@ -2284,6 +2292,7 @@ impl PluginPanel {
             rows: Vec::new(),
             selected: 0,
             scroll: 0,
+            search: None,
         }
     }
 
@@ -2394,7 +2403,10 @@ impl PluginPanel {
     }
 
     fn visible_rows(&self, panel_height: usize) -> usize {
-        panel_height.saturating_sub(self.rows_start()).max(1)
+        panel_height
+            .saturating_sub(self.rows_start())
+            .saturating_sub(usize::from(self.search.is_some()))
+            .max(1)
     }
 
     fn select_screen_row(&mut self, screen_y: usize) {
@@ -2893,6 +2905,126 @@ impl PanelManager {
         }
     }
 
+    pub fn open_panel_search(&mut self, id: &str, initial: &str, prefix: &str) -> bool {
+        let Some(panel) = self.panels.get_mut(id) else {
+            return false;
+        };
+        panel.search = Some(RowPanelSearch {
+            input: PromptBuffer::new(initial).with_key_policy(PromptKeyPolicy::EnterSends),
+            prefix: prefix.to_string(),
+            status: String::new(),
+            active: true,
+        });
+        self.focused = Some(id.to_string());
+        true
+    }
+
+    pub fn update_panel_search(&mut self, id: &str, status: String) -> bool {
+        let Some(search) = self
+            .panels
+            .get_mut(id)
+            .and_then(|panel| panel.search.as_mut())
+        else {
+            return false;
+        };
+        if search.status == status {
+            return false;
+        }
+        search.status = status;
+        true
+    }
+
+    pub fn keep_panel_search(&mut self, id: &str) -> bool {
+        let Some(search) = self
+            .panels
+            .get_mut(id)
+            .and_then(|panel| panel.search.as_mut())
+        else {
+            return false;
+        };
+        search.active = false;
+        true
+    }
+
+    pub fn close_panel_search(&mut self, id: &str) -> bool {
+        self.panels
+            .get_mut(id)
+            .is_some_and(|panel| panel.search.take().is_some())
+    }
+
+    pub(crate) fn focused_row_search_active(&self) -> bool {
+        self.focused
+            .as_deref()
+            .and_then(|id| self.panels.get(id))
+            .and_then(|panel| panel.search.as_ref())
+            .is_some_and(|search| search.active)
+    }
+
+    pub(crate) fn handle_focused_row_search(
+        &mut self,
+        event: &Event,
+        terminal_width: usize,
+        panel_height: usize,
+    ) -> Option<PanelEvent> {
+        let id = self.focused.clone()?;
+        let panel = self.panels.get_mut(&id)?;
+        let search = panel.search.as_mut().filter(|search| search.active)?;
+        let Event::Key(key) = event else {
+            if let Event::Paste(_) = event {
+                let outcome = search.input.handle_event_with_layout_options(
+                    event,
+                    LayoutOptions::grapheme(terminal_width.max(1)),
+                );
+                if outcome == PromptInput::Changed {
+                    let text = search.input.text();
+                    return Some(PanelEvent {
+                        panel_id: id,
+                        action: "search_query".to_string(),
+                        selected_index: panel.selected,
+                        row: panel.selected_row(),
+                        text: Some(text),
+                    });
+                }
+            }
+            return None;
+        };
+
+        let control = key.modifiers.contains(KeyModifiers::CONTROL);
+        let action = match key.code {
+            KeyCode::Esc => "search_cancel",
+            KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => "search_keep",
+            KeyCode::Enter if control => "search_reveal",
+            KeyCode::Up | KeyCode::Char('p') if key.code == KeyCode::Up || control => {
+                panel.move_selection(-1, panel_height);
+                "search_move"
+            }
+            KeyCode::Down | KeyCode::Char('n') if key.code == KeyCode::Down || control => {
+                panel.move_selection(1, panel_height);
+                "search_move"
+            }
+            _ => {
+                let outcome = search.input.handle_event_with_layout_options(
+                    event,
+                    LayoutOptions::grapheme(terminal_width.max(1)),
+                );
+                match outcome {
+                    PromptInput::Changed => "search_query",
+                    PromptInput::Submit => "search_submit",
+                    PromptInput::Cancel => "search_cancel",
+                    PromptInput::Unhandled => return None,
+                }
+            }
+        };
+        let text = panel.search.as_ref().map(|search| search.input.text());
+        Some(PanelEvent {
+            panel_id: id,
+            action: action.to_string(),
+            selected_index: panel.selected,
+            row: panel.selected_row(),
+            text,
+        })
+    }
+
     /// Moves or resizes a stable panel without replacing its contents or focus.
     pub fn update_panel_layout(&mut self, id: &str, side: PanelSide, width: usize) -> bool {
         let changed = if let Some(panel) = self.panels.get_mut(id) {
@@ -3110,7 +3242,7 @@ impl PanelManager {
 
         let id = self.focused.as_deref()?;
         let Some(panel) = self.text_panels.get(id) else {
-            return Some(Mode::Normal);
+            return (!self.focused_row_search_active()).then_some(Mode::Normal);
         };
         if panel.scrollback.focused {
             if panel.search.active.is_some()
@@ -4118,6 +4250,9 @@ impl PanelManager {
 
     /// Returns the prompt-local editor mode while the docked composer owns focus.
     pub(crate) fn focused_text_panel_cursor_mode(&self) -> Option<crate::editor::Mode> {
+        if self.focused_row_search_active() {
+            return Some(crate::editor::Mode::Search);
+        }
         let panel = self.text_panels.get(self.focused.as_deref()?)?;
         if panel.scrollback.focused {
             if panel.search.active.is_some() {
@@ -4139,11 +4274,26 @@ impl PanelManager {
         terminal_height: usize,
     ) -> Option<(usize, usize)> {
         let id = self.focused.as_deref()?;
-        let panel = self.text_panels.get(id)?;
         let placement = self
             .panel_placements(terminal_width, terminal_height)
             .into_iter()
             .find(|placement| placement.id == id)?;
+        if let Some(panel) = self.panels.get(id) {
+            let search = panel.search.as_ref().filter(|search| search.active)?;
+            let text = search.input.text();
+            let cursor_byte = grapheme_to_byte(&text, search.input.cursor());
+            let before = truncate_display_width_from_end(
+                &text[..cursor_byte],
+                placement.width.saturating_sub(2),
+            );
+            return Some((
+                placement.x.saturating_add(1 + display_width(&before)),
+                placement
+                    .y
+                    .saturating_add(placement.height.saturating_sub(1)),
+            ));
+        }
+        let panel = self.text_panels.get(id)?;
         if panel.scrollback.focused {
             let title_rows = text_panel_header_rows(&panel.config);
             let metrics = TextPanelContentMetrics::new(placement.width);
@@ -4766,7 +4916,9 @@ fn render_panel_at(
     }
 
     let rows_start = if panel.config.title.is_some() { 1 } else { 0 };
-    let visible_rows = height.saturating_sub(rows_start);
+    let visible_rows = height
+        .saturating_sub(rows_start)
+        .saturating_sub(usize::from(panel.search.is_some()));
     for (screen_row, row) in panel
         .rows
         .iter()
@@ -4790,6 +4942,33 @@ fn render_panel_at(
             &surface_style,
             selected,
         );
+    }
+    if let Some(search) = &panel.search {
+        let row = position.y.saturating_add(height.saturating_sub(1));
+        let prefix_width = display_width(&search.prefix);
+        let status_width = display_width(&search.status);
+        let show_status = width >= prefix_width + status_width + 4;
+        let available = width
+            .saturating_sub(prefix_width)
+            .saturating_sub(if show_status { status_width + 1 } else { 0 });
+        let text = search.input.text();
+        let cursor_byte = grapheme_to_byte(&text, search.input.cursor());
+        let before =
+            truncate_display_width_from_end(&text[..cursor_byte], available.saturating_sub(1));
+        let start = cursor_byte.saturating_sub(before.len());
+        let query = truncate_display_width(&text[start..], available);
+        let accent = theme.list_selection_style();
+        buffer.set_text(position.x, row, &" ".repeat(width), &surface_style);
+        buffer.set_text(position.x, row, &search.prefix, &accent);
+        buffer.set_text(position.x + prefix_width, row, &query, &surface_style);
+        if show_status {
+            buffer.set_text(
+                position.x + width - status_width,
+                row,
+                &search.status,
+                &surface_style,
+            );
+        }
     }
 }
 
@@ -9317,6 +9496,80 @@ mod tests {
         let event = manager.handle_focused_key("down", 10, 80, 0).unwrap();
         assert_eq!(event.selected_index, 1);
         assert_eq!(event.row.unwrap().id, "b");
+    }
+
+    #[test]
+    fn row_panel_search_edits_query_navigates_and_preserves_filter() {
+        use crossterm::event::KeyEvent;
+
+        let mut manager = PanelManager::default();
+        manager.create_panel("tree".to_string(), PanelConfig::default());
+        manager.update_panel("tree", vec![row("first"), row("second")]);
+        assert!(manager.open_panel_search("tree", "", "/"));
+        assert!(manager.focused_row_search_active());
+        assert_eq!(manager.command_mode_keymap(), None);
+
+        let typed = manager
+            .handle_focused_row_search(
+                &Event::Key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE)),
+                30,
+                12,
+            )
+            .unwrap();
+        assert_eq!(typed.action, "search_query");
+        assert_eq!(typed.text.as_deref(), Some("p"));
+
+        let moved = manager
+            .handle_focused_row_search(
+                &Event::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
+                30,
+                12,
+            )
+            .unwrap();
+        assert_eq!(moved.action, "search_move");
+        assert_eq!(moved.row.unwrap().id, "second");
+
+        let submitted = manager
+            .handle_focused_row_search(
+                &Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+                30,
+                12,
+            )
+            .unwrap();
+        assert_eq!(submitted.action, "search_submit");
+        assert_eq!(submitted.text.as_deref(), Some("p"));
+
+        assert!(manager.update_panel_search("tree", "1".to_string()));
+        assert!(manager.keep_panel_search("tree"));
+        assert!(!manager.focused_row_search_active());
+        assert_eq!(
+            manager.command_mode_keymap(),
+            Some(crate::editor::Mode::Normal)
+        );
+        assert!(manager.close_panel_search("tree"));
+    }
+
+    #[test]
+    fn row_panel_search_renders_at_bottom_and_reserves_a_content_row() {
+        let mut manager = PanelManager::default();
+        manager.create_panel("tree".to_string(), PanelConfig::default());
+        manager.update_panel("tree", vec![row("first"), row("second"), row("third")]);
+        assert!(manager.open_panel_search("tree", "pick", "/"));
+        assert!(manager.update_panel_search("tree", "3".to_string()));
+
+        let style = Style::default();
+        let theme = Theme {
+            style: style.clone(),
+            ..Theme::default()
+        };
+        let mut buffer = RenderBuffer::new(20, 5, &style);
+        manager.render(&mut buffer, &theme);
+
+        assert_eq!(row_text(&buffer, 0).trim(), "first");
+        assert_eq!(row_text(&buffer, 1).trim(), "second");
+        assert!(row_text(&buffer, 2).starts_with("/pick"));
+        assert!(row_text(&buffer, 2).trim_end().ends_with('3'));
+        assert!(manager.focused_text_panel_cursor_position(20, 5).is_some());
     }
 
     #[test]
