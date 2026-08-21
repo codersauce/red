@@ -360,7 +360,7 @@ pub fn get_client_capabilities_with_options(
                 .support(false)
                 .build(),
         )
-        .work_done_progress(false)
+        .work_done_progress(true)
         .build();
 
     let workspace = WorkspaceClientCapabilities::builder()
@@ -626,7 +626,6 @@ mod tests {
             capabilities["window"]["showDocument"]["support"],
             json!(false)
         );
-        assert_eq!(capabilities["window"]["workDoneProgress"], json!(false));
         assert!(capabilities["window"].get("showMessage").is_none());
         assert_eq!(
             capabilities["workspace"]["diagnostics"]["refreshSupport"],

@@ -1227,6 +1227,18 @@ impl LspClient for RealLspClient {
                         }
                     }
                     InboundMessage::ServerRequest(request)
+                        if request.method == "window/workDoneProgress/create" =>
+                    {
+                        self.request_tx
+                            .send(OutboundMessage::Response(ServerResponse {
+                                id: request.id.clone(),
+                                result: Some(Value::Null),
+                                error: None,
+                            }))
+                            .await?;
+                        return Ok(None);
+                    }
+                    InboundMessage::ServerRequest(request)
                         if request.method == "workspace/diagnostic/refresh" =>
                     {
                         self.schedule_workspace_diagnostics();
@@ -2419,6 +2431,96 @@ mod test {
         for body in invalid {
             assert!(process_lsp_message(&body, &response_tx).await.is_err());
         }
+    }
+
+    #[tokio::test]
+    async fn work_done_progress_is_negotiated_created_and_forwarded() {
+        let (request_tx, mut requests) = mpsc::channel(4);
+        let (responses, response_rx) = mpsc::channel(4);
+        let config = default_language_servers().remove("rust").unwrap();
+        let mut client = RealLspClient::with_test_channels(
+            request_tx,
+            response_rx,
+            config,
+            std::env::current_dir().unwrap(),
+        );
+        client.initialized = false;
+
+        client.initialize().await.unwrap();
+
+        let Some(OutboundMessage::Request(initialize)) = requests.recv().await else {
+            panic!("expected an LSP initialize request");
+        };
+        assert_eq!(initialize.method, "initialize");
+        assert_eq!(
+            initialize.params["capabilities"]["window"]["workDoneProgress"],
+            json!(true)
+        );
+
+        let initialization = serde_json::to_vec(&json!({
+            "jsonrpc": "2.0",
+            "id": initialize.id,
+            "result": { "capabilities": {} }
+        }))
+        .unwrap();
+        process_lsp_message(&initialization, &responses)
+            .await
+            .unwrap();
+        let Some((InboundMessage::Message(_), method)) = client.recv_response().await.unwrap()
+        else {
+            panic!("expected the LSP initialization response");
+        };
+        assert_eq!(method.as_deref(), Some("initialize"));
+
+        let Some(OutboundMessage::Notification(initialized)) = requests.recv().await else {
+            panic!("expected the initialized notification");
+        };
+        assert_eq!(initialized.method, "initialized");
+
+        for token in [json!("rustAnalyzer/Indexing"), json!(7)] {
+            let create = serde_json::to_vec(&json!({
+                "jsonrpc": "2.0",
+                "id": token.clone(),
+                "method": "window/workDoneProgress/create",
+                "params": { "token": token.clone() }
+            }))
+            .unwrap();
+            process_lsp_message(&create, &responses).await.unwrap();
+
+            assert!(client.recv_response().await.unwrap().is_none());
+            let Some(OutboundMessage::Response(created)) = requests.recv().await else {
+                panic!("expected progress-token creation to receive a response");
+            };
+            assert_eq!(created.id, token);
+            assert_eq!(created.result, Some(Value::Null));
+            assert!(created.error.is_none());
+
+            for kind in ["begin", "report", "end"] {
+                let progress = serde_json::to_vec(&json!({
+                    "jsonrpc": "2.0",
+                    "method": "$/progress",
+                    "params": {
+                        "token": token.clone(),
+                        "value": { "kind": kind, "title": "Indexing" }
+                    }
+                }))
+                .unwrap();
+                process_lsp_message(&progress, &responses).await.unwrap();
+
+                let Some((
+                    InboundMessage::Notification(ParsedNotification::Progress(progress)),
+                    method,
+                )) = client.recv_response().await.unwrap()
+                else {
+                    panic!("expected the {kind} progress notification");
+                };
+                assert!(method.is_none());
+                assert_eq!(serde_json::to_value(progress.token).unwrap(), token);
+                assert_eq!(progress.value["kind"], kind);
+            }
+        }
+
+        assert!(requests.try_recv().is_err());
     }
 
     #[tokio::test]
