@@ -1,6 +1,6 @@
 // Watched project tree panel with Neo-tree-style filesystem actions.
 //
-// Directory listings are authoritative snapshots supplied by Rust and may be truncated.
+// Directory listings are complete authoritative snapshots supplied by Rust.
 // Reveal walks one path segment at a time, watchers follow the displayed root, and row
 // IDs are normalized project-relative paths. All mutations are performed by Red's
 // workspace-confined filesystem host API.
@@ -1033,7 +1033,17 @@ fn render() {
     if !state().created {
         return;
     }
-    red::execute("UpdatePanel", "neotree", build_rows());
+    red::neotree_core(
+        "update_panel",
+        "neotree",
+        red::string(state().cwd, "."),
+        state().children,
+        state().expanded,
+        state().selected,
+        state().clipboard,
+        optional_text(state().status.root, ""),
+        state().status_entries
+    );
 }
 
 fn loading_rows() -> [TreePanelRow] {
@@ -1050,19 +1060,6 @@ fn loading_rows() -> [TreePanelRow] {
             right_segments: [],
         }
     ];
-}
-
-fn build_rows() -> [TreePanelRow] {
-    return red::neotree_core(
-        "build_rows",
-        red::string(state().cwd, "."),
-        state().children,
-        state().expanded,
-        state().selected,
-        state().clipboard,
-        optional_text(state().status.root, ""),
-        state().status_entries
-    );
 }
 
 fn segment(text: String, foreground: [String], bold: bool) -> TreePanelSegment {

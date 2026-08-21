@@ -1,5 +1,5 @@
-// Typed, bounded Neo-tree row construction. Host-provided strings are parsed
-// once at the boundary and all presentation work stays in this pure core.
+// Pure, typed compatibility row construction. Large production trees use the
+// Rust-owned virtual model so decoration is limited to the visible viewport.
 
 struct DirectoryEntry {
     name: String,
@@ -99,9 +99,6 @@ pub fn build_rows(
     if expanded.contains(root) {
         rows = append_rows(root, [], rows, children, expanded, selected, clipboard, status_root, statuses);
     }
-    if rows.len() >= 200 {
-        rows.push(truncation_row("tree-limit", "… tree limited to 200 rows"));
-    }
     rows
 }
 
@@ -128,7 +125,7 @@ fn append_rows(
 
     let mut rows = rows;
     let mut index = 0;
-    while index < visible.len() && rows.len() < 200 {
+    while index < visible.len() {
         let entry = visible[index];
         let directory = entry.kind == "directory";
         let open = directory && expanded.contains(entry.path);
@@ -158,7 +155,7 @@ fn append_rows(
         }
         index += 1;
     }
-    if children_truncated(path, children) && rows.len() < 200 {
+    if children_truncated(path, children) {
         rows.push(truncation_row("directory-limit:" + path, "… directory listing truncated"));
     }
     rows
@@ -382,14 +379,13 @@ fn renders_typed_rows_with_status_and_selection_markers() {
 }
 
 #[test]
-fn caps_pathological_visible_listings() {
+fn renders_visible_listings_without_a_global_row_cap() {
     let mut entries: [DirectoryEntry] = [];
-    for index in 0..1000 {
+    for index in 0..240 {
         entries.push(DirectoryEntry { name: "file-" + index + ".rs", path: "./file-" + index + ".rs", kind: "file" });
     }
-    let rows = build_rows("/repo", [Children { path: ".", entries: entries, truncated: true }], ["."], [], [], "", []);
+    let rows = build_rows("/repo", [Children { path: ".", entries: entries, truncated: false }], ["."], [], [], "", []);
 
-    assert(rows.len() == 201);
-    assert(rows[200].path == None);
-    assert(rows[200].segments[1].text == "… tree limited to 200 rows");
+    assert(rows.len() == 241);
+    assert(rows[240].id == "./file-239.rs");
 }

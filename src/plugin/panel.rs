@@ -26,6 +26,7 @@ use super::markdown::{
     RenderedTextSpan, TextPanelLineSelection, TextPanelSpanSelection, TextPanelSpanStyle,
 };
 use super::text_link::{TextPanelLink, TextPanelLinkTarget};
+use super::TreePanelModel;
 use crate::{
     buffer::BufferId,
     color::{blend_color, Color},
@@ -2272,6 +2273,7 @@ pub struct PluginPanel {
     pub id: String,
     pub config: PanelConfig,
     pub rows: Vec<PanelRow>,
+    tree: Option<TreePanelModel>,
     pub selected: usize,
     pub scroll: usize,
 }
@@ -2282,18 +2284,20 @@ impl PluginPanel {
             id,
             config,
             rows: Vec::new(),
+            tree: None,
             selected: 0,
             scroll: 0,
         }
     }
 
     pub fn update_rows(&mut self, rows: Vec<PanelRow>) {
+        self.tree = None;
         self.rows = rows;
-        if self.rows.is_empty() {
+        if self.row_count() == 0 {
             self.selected = 0;
             self.scroll = 0;
-        } else if self.selected >= self.rows.len() {
-            self.selected = self.rows.len() - 1;
+        } else if self.selected >= self.row_count() {
+            self.selected = self.row_count() - 1;
         }
 
         if self.scroll > self.selected {
@@ -2301,12 +2305,43 @@ impl PluginPanel {
         }
     }
 
+    fn update_tree(&mut self, model: TreePanelModel) {
+        let selected_id = self.selected_row().map(|row| row.id);
+        self.rows.clear();
+        self.tree = Some(model);
+        let count = self.row_count();
+        if count == 0 {
+            self.selected = 0;
+            self.scroll = 0;
+            return;
+        }
+        self.selected = selected_id
+            .as_deref()
+            .and_then(|id| self.tree.as_ref()?.position(id))
+            .unwrap_or_else(|| self.selected.min(count - 1));
+        if self.scroll > self.selected {
+            self.scroll = self.selected;
+        }
+    }
+
+    fn row_count(&self) -> usize {
+        self.tree
+            .as_ref()
+            .map_or(self.rows.len(), TreePanelModel::len)
+    }
+
+    fn row(&self, index: usize) -> Option<PanelRow> {
+        self.tree
+            .as_ref()
+            .map_or_else(|| self.rows.get(index).cloned(), |tree| tree.row(index))
+    }
+
     pub fn move_selection(&mut self, delta: isize, panel_height: usize) {
-        if self.rows.is_empty() {
+        if self.row_count() == 0 {
             return;
         }
 
-        let max_index = self.rows.len() - 1;
+        let max_index = self.row_count() - 1;
         self.selected = self.selected.saturating_add_signed(delta).min(max_index);
 
         if self.selected < self.scroll {
@@ -2320,14 +2355,14 @@ impl PluginPanel {
     }
 
     fn scroll_view(&mut self, delta: isize, panel_height: usize, scrolloff: usize) {
-        if self.rows.is_empty() {
+        if self.row_count() == 0 {
             self.selected = 0;
             self.scroll = 0;
             return;
         }
 
         let visible_rows = self.visible_rows(panel_height);
-        let max_scroll = self.rows.len().saturating_sub(visible_rows);
+        let max_scroll = self.row_count().saturating_sub(visible_rows);
         let previous_scroll = self.scroll;
         self.scroll = self.scroll.saturating_add_signed(delta).min(max_scroll);
         if self.scroll == previous_scroll {
@@ -2339,7 +2374,7 @@ impl PluginPanel {
         let last = self
             .scroll
             .saturating_add(visible_rows.saturating_sub(scrolloff).saturating_sub(1))
-            .min(self.rows.len() - 1);
+            .min(self.row_count() - 1);
         self.selected = self.selected.clamp(first, last);
     }
 
@@ -2355,20 +2390,23 @@ impl PluginPanel {
     }
 
     fn scroll_to_bottom(&mut self, panel_height: usize) {
-        if self.rows.is_empty() {
+        if self.row_count() == 0 {
             self.scroll_to_top();
             return;
         }
 
-        self.selected = self.rows.len() - 1;
+        self.selected = self.row_count() - 1;
         self.scroll = self
-            .rows
-            .len()
+            .row_count()
             .saturating_sub(self.visible_rows(panel_height));
     }
 
     pub fn select_row_by_id(&mut self, row_id: &str, panel_height: usize) -> bool {
-        let Some(index) = self.rows.iter().position(|row| row.id == row_id) else {
+        let index = self.tree.as_ref().map_or_else(
+            || self.rows.iter().position(|row| row.id == row_id),
+            |tree| tree.position(row_id),
+        );
+        let Some(index) = index else {
             return false;
         };
 
@@ -2386,7 +2424,7 @@ impl PluginPanel {
     }
 
     pub fn selected_row(&self) -> Option<PanelRow> {
-        self.rows.get(self.selected).cloned()
+        self.row(self.selected)
     }
 
     fn rows_start(&self) -> usize {
@@ -2399,12 +2437,12 @@ impl PluginPanel {
 
     fn select_screen_row(&mut self, screen_y: usize) {
         let rows_start = self.rows_start();
-        if screen_y < rows_start || self.rows.is_empty() {
+        if screen_y < rows_start || self.row_count() == 0 {
             return;
         }
 
         let row_index = self.scroll + screen_y - rows_start;
-        if row_index < self.rows.len() {
+        if row_index < self.row_count() {
             self.selected = row_index;
         }
     }
@@ -2890,6 +2928,13 @@ impl PanelManager {
     pub fn update_panel(&mut self, id: &str, rows: Vec<PanelRow>) {
         if let Some(panel) = self.panels.get_mut(id) {
             panel.update_rows(rows);
+        }
+    }
+
+    /// Replaces a row panel with a compact tree while preserving its stable selection.
+    pub fn update_tree_panel(&mut self, id: &str, model: TreePanelModel) {
+        if let Some(panel) = self.panels.get_mut(id) {
+            panel.update_tree(model);
         }
     }
 
@@ -4324,7 +4369,7 @@ impl PanelManager {
 
         let clicked_row = screen_row
             .checked_sub(panel.rows_start())
-            .and_then(|index| panel.rows.get(panel.scroll.saturating_add(index)));
+            .and_then(|index| panel.row(panel.scroll.saturating_add(index)));
         let action = if let Some(row) = clicked_row {
             let now = Instant::now();
             let is_double_click = previous_row_click.is_some_and(|click| {
@@ -4767,13 +4812,7 @@ fn render_panel_at(
 
     let rows_start = if panel.config.title.is_some() { 1 } else { 0 };
     let visible_rows = height.saturating_sub(rows_start);
-    for (screen_row, row) in panel
-        .rows
-        .iter()
-        .skip(panel.scroll)
-        .take(visible_rows)
-        .enumerate()
-    {
+    let mut paint_row = |screen_row: usize, row: &PanelRow| {
         let y = position.y.saturating_add(rows_start + screen_row);
         let index = panel.scroll + screen_row;
         let selected = index == panel.selected;
@@ -4790,6 +4829,23 @@ fn render_panel_at(
             &surface_style,
             selected,
         );
+    };
+    if let Some(tree) = panel.tree.as_ref() {
+        for (screen_row, index) in (panel.scroll..tree.len()).take(visible_rows).enumerate() {
+            if let Some(row) = tree.row(index) {
+                paint_row(screen_row, &row);
+            }
+        }
+    } else {
+        for (screen_row, row) in panel
+            .rows
+            .iter()
+            .skip(panel.scroll)
+            .take(visible_rows)
+            .enumerate()
+        {
+            paint_row(screen_row, row);
+        }
     }
 }
 
@@ -9395,6 +9451,52 @@ mod tests {
         let mut buffer = RenderBuffer::new(10, 5, &style);
         manager.render(&mut buffer, &theme);
         assert_eq!(row_text(&buffer, 2).trim(), "d");
+    }
+
+    #[test]
+    fn virtual_tree_rows_remain_selectable_and_render_only_the_viewport() {
+        let entries = (0..1_024)
+            .map(|index| {
+                serde_json::json!({
+                    "name": format!("file-{index:04}.rs"),
+                    "path": format!("./file-{index:04}.rs"),
+                    "kind": "file",
+                })
+            })
+            .collect::<Vec<_>>();
+        let model = TreePanelModel::from_husk_values(&[
+            husk_runtime::Value::String("/repo".to_string()),
+            husk_runtime::Value::from_json(serde_json::json!([{
+                "path": ".",
+                "entries": entries,
+            }])),
+            husk_runtime::Value::from_json(serde_json::json!(["."])),
+            husk_runtime::Value::from_json(serde_json::json!([])),
+            husk_runtime::Value::from_json(serde_json::json!([])),
+            husk_runtime::Value::String(String::new()),
+            husk_runtime::Value::from_json(serde_json::json!([])),
+        ])
+        .unwrap();
+        let mut manager = PanelManager::default();
+        manager.create_panel(
+            "tree".to_string(),
+            PanelConfig {
+                width: 24,
+                ..PanelConfig::default()
+            },
+        );
+        manager.update_tree_panel("tree", model);
+        assert!(manager.focus_panel("tree"));
+
+        let event = manager.handle_focused_key("bottom", 5, 40, 0).unwrap();
+        assert_eq!(event.selected_index, 1_024);
+        assert_eq!(event.row.unwrap().id, "./file-1023.rs");
+        assert!(manager.panels["tree"].rows.is_empty());
+
+        let theme = Theme::default();
+        let mut buffer = RenderBuffer::new(40, 7, &theme.style);
+        manager.render(&mut buffer, &theme);
+        assert!((0..5).any(|row| row_text(&buffer, row).contains("file-1023.rs")));
     }
 
     #[test]
