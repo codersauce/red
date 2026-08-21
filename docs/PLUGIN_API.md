@@ -388,6 +388,12 @@ emits `activate_block` for the selected row, and `Esc` or `Ctrl-c` emits
 contents. Passing `Json { key: String, query: String }` restores the initial
 query and the selection and scroll position previously remembered for that key;
 if the old selection disappears, the nearest remaining row is selected instead.
+`Alt-p` emits `session_preview`; plugins can display read-only latest-turn
+details with `SetTextPanelPreview(id, Json { session_id, prompt, response,
+loading?, error? })`, or hide them by omitting the second argument. The host
+places previews beside wide pickers and beneath narrow pickers. Request the
+contents with `AgentReadSessionPreview(callback, cwd, session_id)`, which reads
+persisted history without resuming the thread or changing conversation state.
 Call `ExitTextPanelContext(id)` to restore the retained conversation
 exactly. A second enter is ignored until the current context exits.
 

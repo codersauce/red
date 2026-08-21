@@ -1836,6 +1836,20 @@ impl RedHost {
                     .to_string();
                 self.send_request(PluginRequest::ExitTextPanelContext { id });
             }
+            "SetTextPanelPreview" => {
+                let id = args
+                    .first()
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("SetTextPanelPreview requires a panel id"))?
+                    .to_string();
+                let preview = match args.get(1).map(value_to_json) {
+                    None | Some(serde_json::Value::Null) => None,
+                    Some(value) => Some(serde_json::from_value::<crate::plugin::TextPanelPreview>(
+                        value,
+                    )?),
+                };
+                self.send_request(PluginRequest::SetTextPanelPreview { id, preview });
+            }
             "SetTextPanelHeaderDetail" => {
                 let id = args
                     .first()
@@ -2056,6 +2070,24 @@ impl RedHost {
                         query,
                         exclude_session_id,
                     },
+                }
+            }
+            "AgentReadSessionPreview" => {
+                let cwd = args
+                    .first()
+                    .and_then(Value::as_str)
+                    .map_or_else(|| PathBuf::from("."), PathBuf::from);
+                let session_id = args
+                    .get(1)
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.is_empty())
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("AgentReadSessionPreview requires a session id")
+                    })?
+                    .to_string();
+                PluginRequest::AgentSessionPreview {
+                    request_id,
+                    request: crate::codex::AgentSessionPreviewRequest { cwd, session_id },
                 }
             }
             "AgentSetModel" => {
@@ -8399,17 +8431,30 @@ mod tests {
             _ => panic!("expected workspace session request"),
         };
         let listed_sessions = serde_json::json!({
-            "sessions": [{
-                "id": "foreign-thread",
-                "cwd": "/workspace",
-                "label": "Earlier conversation",
-                "detail": "2h ago · Codex CLI · workspace",
-                "snippet": "",
-                "source": "Codex CLI",
-                "time_group": "Recent",
-                "is_red": false,
-                "updated_at": 42
-            }],
+            "sessions": [
+                {
+                    "id": "foreign-thread",
+                    "cwd": "/workspace",
+                    "label": "Earlier conversation",
+                    "detail": "2h ago · Codex CLI · workspace",
+                    "snippet": "",
+                    "source": "Codex CLI",
+                    "time_group": "Recent",
+                    "is_red": false,
+                    "updated_at": 42
+                },
+                {
+                    "id": "another-thread",
+                    "cwd": "/workspace",
+                    "label": "Another conversation",
+                    "detail": "3h ago · Red · workspace",
+                    "snippet": "",
+                    "source": "Red",
+                    "time_group": "Recent",
+                    "is_red": true,
+                    "updated_at": 41
+                }
+            ],
             "error": ""
         });
         runtime
@@ -8439,6 +8484,146 @@ mod tests {
         runtime
             .notify(
                 "panel:event:agent-conversation",
+                serde_json::json!({"action":"session_preview","text":session_block_id}),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::SetTextPanelPreview { id, preview: Some(preview) }
+                if id == "agent-conversation"
+                    && preview.session_id == "foreign-thread"
+                    && preview.loading
+        ));
+        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
+        tokio::time::sleep(Duration::from_millis(140)).await;
+        for callback in runtime.poll_timer_callbacks() {
+            if let PluginRequest::TimeoutCallback { timer_id } = callback {
+                runtime
+                    .notify("timeout:callback", serde_json::json!({"timer_id":timer_id}))
+                    .await
+                    .unwrap();
+            }
+        }
+        let first_preview_request = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::AgentSessionPreview {
+                request_id,
+                request,
+            } => {
+                assert_eq!(request.cwd, PathBuf::from("/workspace"));
+                assert_eq!(request.session_id, "foreign-thread");
+                request_id
+            }
+            _ => panic!("preview should load only after its debounce"),
+        };
+        runtime
+            .resolve_request(
+                first_preview_request,
+                serde_json::json!({
+                    "session_id":"foreign-thread",
+                    "prompt":"Why is startup failing?",
+                    "response":"The hook was unavailable.",
+                    "error":""
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::SetTextPanelPreview { preview: Some(preview), .. }
+                if preview.prompt == "Why is startup failing?"
+                    && preview.response == "The hook was unavailable."
+                    && !preview.loading
+        ));
+
+        runtime
+            .notify(
+                "panel:event:agent-conversation",
+                serde_json::json!({"action":"session_preview","text":session_block_id}),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::SetTextPanelPreview { preview: None, .. }
+        ));
+        runtime
+            .notify(
+                "panel:event:agent-conversation",
+                serde_json::json!({"action":"session_preview","text":session_block_id}),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::SetTextPanelPreview { preview: Some(preview), .. }
+                if preview.session_id == "foreign-thread"
+                    && preview.response == "The hook was unavailable."
+        ));
+        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
+
+        runtime
+            .notify(
+                "panel:event:agent-conversation",
+                serde_json::json!({
+                    "action":"down",
+                    "text":"session-browser:session:another-thread"
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::SetTextPanelPreview { preview: Some(preview), .. }
+                if preview.session_id == "another-thread" && preview.loading
+        ));
+        tokio::time::sleep(Duration::from_millis(140)).await;
+        for callback in runtime.poll_timer_callbacks() {
+            if let PluginRequest::TimeoutCallback { timer_id } = callback {
+                runtime
+                    .notify("timeout:callback", serde_json::json!({"timer_id":timer_id}))
+                    .await
+                    .unwrap();
+            }
+        }
+        let stale_preview_request = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::AgentSessionPreview {
+                request_id,
+                request,
+            } if request.session_id == "another-thread" => request_id,
+            _ => panic!("selection movement should load the newly focused session"),
+        };
+        runtime
+            .notify(
+                "panel:event:agent-conversation",
+                serde_json::json!({"action":"up","text":session_block_id}),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::SetTextPanelPreview { preview: Some(preview), .. }
+                if preview.session_id == "foreign-thread"
+                    && preview.response == "The hook was unavailable."
+        ));
+        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
+        runtime
+            .resolve_request(
+                stale_preview_request,
+                serde_json::json!({
+                    "session_id":"another-thread",
+                    "prompt":"Stale question",
+                    "response":"Stale answer",
+                    "error":""
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
+
+        runtime
+            .notify(
+                "panel:event:agent-conversation",
                 serde_json::json!({"action":"filter_cancel","text":""}),
             )
             .await
@@ -8451,6 +8636,68 @@ mod tests {
             }
         }
         assert!(exited_picker);
+
+        runtime.execute_command("AgentSessions").await.unwrap();
+        let other_cwd_request = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::GetConfig { request_id, key } if key.as_deref() == Some("cwd") => {
+                request_id
+            }
+            _ => panic!("expected workspace request for the other project"),
+        };
+        runtime
+            .resolve_request(other_cwd_request, serde_json::json!({"value":"/other"}))
+            .await
+            .unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::EnterTextPanelContext { options, .. }
+                if options.key == "/other" && options.query.is_empty()
+        ));
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::SetTextPanelHeaderDetail { detail: Some(detail), .. }
+                if detail.secondary == "Red"
+        ));
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::UpdateTextPanel { .. }
+        ));
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::SetTextPanelStatus { status: Some(status), .. } if status.busy
+        ));
+        let other_request = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::AgentSessionRequest {
+                request_id,
+                request,
+            } => {
+                assert_eq!(request.cwd, PathBuf::from("/other"));
+                assert_eq!(request.scope, crate::codex::AgentSessionScope::Red);
+                assert!(request.query.is_empty());
+                request_id
+            }
+            _ => panic!("another workspace must not inherit the previous picker state"),
+        };
+        runtime
+            .resolve_request(other_request, serde_json::json!({"sessions":[],"error":""}))
+            .await
+            .unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::SetTextPanelStatus { status: None, .. }
+        ));
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::UpdateTextPanel { .. }
+        ));
+        runtime
+            .notify(
+                "panel:event:agent-conversation",
+                serde_json::json!({"action":"filter_cancel","text":""}),
+            )
+            .await
+            .unwrap();
+        while ACTION_DISPATCHER.try_recv_request().is_some() {}
 
         runtime.execute_command("AgentSessions").await.unwrap();
         let reopened_cwd_request = match ACTION_DISPATCHER.recv_request() {
@@ -8485,6 +8732,11 @@ mod tests {
         ));
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
+            PluginRequest::SetTextPanelPreview { preview: Some(preview), .. }
+                if preview.session_id == "foreign-thread" && preview.loading
+        ));
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
             PluginRequest::SetTextPanelStatus { status: Some(status), .. } if status.busy
         ));
         let reopened_request = match ACTION_DISPATCHER.recv_request() {
@@ -8510,6 +8762,12 @@ mod tests {
             ACTION_DISPATCHER.recv_request(),
             PluginRequest::UpdateTextPanel { blocks, .. }
                 if blocks.iter().any(|block| block.id == session_block_id)
+        ));
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::SetTextPanelPreview { preview: Some(preview), .. }
+                if preview.session_id == "foreign-thread"
+                    && preview.response == "The hook was unavailable."
         ));
 
         runtime

@@ -12,6 +12,7 @@ const PAGE_LIMIT: usize = 100;
 const MAX_SESSIONS: usize = 4096;
 const MAX_PAGES: usize = 100;
 const MAX_SESSION_METADATA_BYTES: u64 = 64 * 1024;
+const MAX_SESSION_PREVIEW_CHARS: usize = 12 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -27,6 +28,12 @@ pub struct AgentSessionListRequest {
     pub scope: AgentSessionScope,
     pub query: String,
     pub exclude_session_id: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct AgentSessionPreviewRequest {
+    pub cwd: PathBuf,
+    pub session_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -64,6 +71,69 @@ async fn complete(
         .send(CodexEvent::SessionListCompleted { request_id, result })
         .await
         .ok();
+}
+
+pub(super) fn session_preview(session_id: &str, message: &Value) -> Result<Value, String> {
+    if let Some(error) = message.get("error") {
+        return Err(error["message"]
+            .as_str()
+            .unwrap_or("Codex could not load the session preview")
+            .to_string());
+    }
+    let thread = message
+        .pointer("/result/thread")
+        .filter(|thread| thread.is_object())
+        .ok_or_else(|| "Codex returned an invalid session preview".to_string())?;
+    if thread["id"].as_str() != Some(session_id) {
+        return Err("Codex returned a preview for a different session".to_string());
+    }
+    let turns = thread["turns"]
+        .as_array()
+        .ok_or_else(|| "Codex returned a session without conversation history".to_string())?;
+    for turn in turns.iter().rev() {
+        let Some(items) = turn["items"].as_array() else {
+            continue;
+        };
+        let prompt = items
+            .iter()
+            .rev()
+            .find(|item| item["type"].as_str() == Some("userMessage"))
+            .map(preview_item_text)
+            .unwrap_or_default();
+        let response = items
+            .iter()
+            .rev()
+            .find(|item| item["type"].as_str() == Some("agentMessage"))
+            .map(preview_item_text)
+            .unwrap_or_default();
+        if !prompt.is_empty() || !response.is_empty() {
+            return Ok(json!({
+                "session_id": session_id,
+                "prompt": prompt,
+                "response": response,
+            }));
+        }
+    }
+    Ok(json!({"session_id": session_id, "prompt": "", "response": ""}))
+}
+
+fn preview_item_text(item: &Value) -> String {
+    let text = item["text"]
+        .as_str()
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            item["content"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|part| part["text"].as_str())
+                .collect::<Vec<_>>()
+                .join("\n")
+        });
+    text.trim()
+        .chars()
+        .take(MAX_SESSION_PREVIEW_CHARS)
+        .collect()
 }
 
 fn interactive_source_kinds(scope: AgentSessionScope) -> Value {
@@ -433,6 +503,40 @@ mod tests {
         assert_eq!(session_time_group(604_800), "This month");
         assert_eq!(session_time_group(2_591_999), "This month");
         assert_eq!(session_time_group(2_592_000), "Earlier");
+    }
+
+    #[test]
+    fn preview_uses_the_latest_turn_without_opening_or_changing_a_thread() {
+        let response = json!({"result":{"thread":{
+            "id":"thread",
+            "turns":[
+                {"items":[
+                    {"type":"userMessage","content":[{"type":"text","text":"Old question"}]},
+                    {"type":"agentMessage","text":"Old answer"}
+                ]},
+                {"items":[
+                    {"type":"userMessage","content":[{"type":"text","text":"Latest question"}]},
+                    {"type":"agentMessage","text":"Latest answer"}
+                ]}
+            ]
+        }}});
+        let preview = session_preview("thread", &response).unwrap();
+        assert_eq!(preview["prompt"], "Latest question");
+        assert_eq!(preview["response"], "Latest answer");
+        assert!(session_preview("different", &response).is_err());
+    }
+
+    #[test]
+    fn preview_keeps_an_unanswered_latest_prompt() {
+        let response = json!({"result":{"thread":{
+            "id":"thread",
+            "turns":[{"items":[
+                {"type":"userMessage","content":[{"type":"text","text":"Still running"}]}
+            ]}]
+        }}});
+        let preview = session_preview("thread", &response).unwrap();
+        assert_eq!(preview["prompt"], "Still running");
+        assert_eq!(preview["response"], "");
     }
 
     #[test]

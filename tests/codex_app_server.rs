@@ -311,6 +311,25 @@ async fn direct_app_server_lists_searches_and_continues_sessions_for_red() {
     }
 
     bridge
+        .send(CodexCommand::SessionPreview {
+            request_id: 43,
+            session_id: "foreign".into(),
+        })
+        .await
+        .unwrap();
+    match next_event(&mut bridge, &mut task).await {
+        CodexEvent::SessionPreviewCompleted {
+            request_id: 43,
+            result: Ok(result),
+        } => {
+            assert_eq!(result["session_id"], "foreign");
+            assert_eq!(result["prompt"], "Earlier question");
+            assert_eq!(result["response"], "Earlier answer");
+        }
+        event => panic!("unexpected read-only session preview: {event:?}"),
+    }
+
+    bridge
         .send(CodexCommand::ContinueSession {
             cwd: workspace,
             session_id: "foreign".into(),

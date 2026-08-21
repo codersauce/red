@@ -38,7 +38,7 @@ mod activity;
 mod models;
 mod sessions;
 pub use models::{AgentModelInfo, AgentModelSelection, ModelRequest};
-pub use sessions::{AgentSessionListRequest, AgentSessionScope};
+pub use sessions::{AgentSessionListRequest, AgentSessionPreviewRequest, AgentSessionScope};
 
 use crate::agent_tools::{editor_tool_schemas, EditorToolCall, EditorToolRequest};
 use crate::inline_assist::InlineAssistResult;
@@ -109,6 +109,8 @@ pub enum CodexCommand {
         request_id: i64,
         request: AgentSessionListRequest,
     },
+    /// Reads the latest persisted exchange without resuming or mutating a thread.
+    SessionPreview { request_id: i64, session_id: String },
     /// Starts a conversation with an explicitly selected model.
     NewSessionWithModel {
         cwd: PathBuf,
@@ -211,6 +213,11 @@ pub enum CodexEvent {
     },
     /// Result for Red's private persisted-session picker request.
     SessionListCompleted {
+        request_id: i64,
+        result: std::result::Result<Value, String>,
+    },
+    /// Side-effect-free latest-exchange preview for the session picker.
+    SessionPreviewCompleted {
         request_id: i64,
         result: std::result::Result<Value, String>,
     },
@@ -493,6 +500,10 @@ enum SessionLaunch {
 enum Pending {
     Model(models::PendingModelRequest),
     Sessions(sessions::PendingSessionRequest),
+    SessionPreview {
+        request_id: i64,
+        session_id: String,
+    },
     ContinueRead {
         cwd: PathBuf,
         source_session_id: String,
@@ -836,6 +847,28 @@ async fn handle_command(
             request,
         } => {
             sessions::handle_command(request_id, request, input, pending, next_id).await?;
+        }
+        CodexCommand::SessionPreview {
+            request_id,
+            session_id,
+        } => {
+            let id = rpc_id(next_id);
+            pending.insert(
+                id.clone(),
+                Pending::SessionPreview {
+                    request_id,
+                    session_id: session_id.clone(),
+                },
+            );
+            write_message(
+                input,
+                &json!({
+                    "id": id,
+                    "method": "thread/read",
+                    "params": {"threadId": session_id, "includeTurns": true}
+                }),
+            )
+            .await?;
         }
         CodexCommand::NewSessionWithModel { cwd, selection } => {
             start_thread_request(
@@ -1446,6 +1479,18 @@ async fn handle_response(
     if let Pending::Sessions(request) = request {
         return sessions::handle_response(request, message, input, events, pending, next_id).await;
     }
+    if let Pending::SessionPreview {
+        request_id,
+        session_id,
+    } = request
+    {
+        let result = sessions::session_preview(&session_id, &message);
+        events
+            .send(CodexEvent::SessionPreviewCompleted { request_id, result })
+            .await
+            .ok();
+        return Ok(());
+    }
     if let Pending::ContinueRead {
         cwd,
         source_session_id,
@@ -1870,6 +1915,9 @@ async fn handle_response(
         }
         Pending::Model(_) => unreachable!("model responses are handled separately"),
         Pending::Sessions(_) => unreachable!("session-list responses are handled separately"),
+        Pending::SessionPreview { .. } => {
+            unreachable!("session-preview responses are handled separately")
+        }
         Pending::ContinueRead { .. } => {
             unreachable!("continuation reads are handled separately")
         }
@@ -1954,6 +2002,7 @@ async fn send_pending_failure(
         | Pending::Start { request } => Some(request),
         Pending::Model(_)
         | Pending::Sessions(_)
+        | Pending::SessionPreview { .. }
         | Pending::ContinueRead { .. }
         | Pending::ContinueInject { .. }
         | Pending::Turn { .. }
@@ -1967,6 +2016,7 @@ async fn send_pending_failure(
         Pending::Turn { session_id } | Pending::Interrupt { session_id, .. } => session_id,
         Pending::Model(_)
         | Pending::Sessions(_)
+        | Pending::SessionPreview { .. }
         | Pending::ContinueRead { .. }
         | Pending::ContinueInject { .. }
         | Pending::Config { .. }

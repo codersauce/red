@@ -327,6 +327,17 @@ pub struct TextPanelContextOptions {
     pub query: String,
 }
 
+/// Read-only conversation detail rendered inside an embedded session picker.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct TextPanelPreview {
+    pub session_id: String,
+    pub prompt: String,
+    pub response: String,
+    pub error: String,
+    pub loading: bool,
+}
+
 /// Foreground-first visual roles for a source-backed text panel.
 type TextPanelPalette = SurfacePalette;
 
@@ -436,6 +447,7 @@ struct TextPanelContext {
     selected_action: Option<String>,
     selected_index: usize,
     restore_scroll: Option<usize>,
+    preview: Option<TextPanelPreview>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -443,6 +455,17 @@ struct TextPanelPickerMemory {
     selected_action: Option<String>,
     selected_index: usize,
     scroll: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TextPanelPickerPreviewGeometry {
+    list_width: usize,
+    list_rows: usize,
+    preview_column: usize,
+    preview_row: usize,
+    preview_width: usize,
+    preview_rows: usize,
+    side_by_side: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -845,6 +868,8 @@ const COMPOSER_MAX_HEIGHT_PERCENT: usize = 70;
 const COMPOSER_CHROME_ROWS: usize = 2;
 const EMBEDDED_PICKER_CHROME_ROWS: usize = 3;
 const EMBEDDED_PICKER_ITEM_INSET: usize = 2;
+const EMBEDDED_PICKER_PREVIEW_MIN_COLUMNS: usize = 40;
+const EMBEDDED_PICKER_PREVIEW_MIN_ROWS: usize = 5;
 
 struct ComposerLayoutCache {
     buffer_id: BufferId,
@@ -1028,6 +1053,7 @@ impl TextPanel {
             selected_action: remembered.selected_action,
             selected_index: remembered.selected_index,
             restore_scroll: Some(remembered.scroll),
+            preview: None,
         });
         self.viewport = FollowTailViewport::default();
         self.viewport.scroll_to_top();
@@ -1308,12 +1334,56 @@ impl TextPanel {
     }
 
     fn visible_rows(&self, panel_height: usize, panel_width: usize) -> usize {
-        panel_height
+        let available = panel_height
             .saturating_sub(text_panel_header_rows(&self.config))
             .saturating_sub(self.picker_header_rows(panel_height))
             .saturating_sub(self.composer_height(panel_height, panel_width))
             .saturating_sub(self.status_height())
+            .max(1);
+        self.picker_preview_geometry(panel_height, panel_width)
+            .map_or(available, |geometry| geometry.list_rows)
             .max(1)
+    }
+
+    fn picker_preview_geometry(
+        &self,
+        panel_height: usize,
+        panel_width: usize,
+    ) -> Option<TextPanelPickerPreviewGeometry> {
+        self.temporary_context.as_ref()?.preview.as_ref()?;
+        let width = TextPanelContentMetrics::new(panel_width).width;
+        let rows = panel_height
+            .saturating_sub(text_panel_header_rows(&self.config))
+            .saturating_sub(self.picker_header_rows(panel_height))
+            .saturating_sub(self.status_height());
+        if width > EMBEDDED_PICKER_PREVIEW_MIN_COLUMNS * 2 {
+            let list_width = (width - 1) / 2;
+            return Some(TextPanelPickerPreviewGeometry {
+                list_width,
+                list_rows: rows,
+                preview_column: list_width + 1,
+                preview_row: 0,
+                preview_width: width.saturating_sub(list_width + 1),
+                preview_rows: rows,
+                side_by_side: true,
+            });
+        }
+        if rows < EMBEDDED_PICKER_PREVIEW_MIN_ROWS + 4 {
+            return None;
+        }
+        let preview_rows = (rows / 2)
+            .max(EMBEDDED_PICKER_PREVIEW_MIN_ROWS)
+            .min(rows.saturating_sub(4));
+        let list_rows = rows.saturating_sub(preview_rows + 1);
+        Some(TextPanelPickerPreviewGeometry {
+            list_width: width,
+            list_rows,
+            preview_column: 0,
+            preview_row: list_rows + 1,
+            preview_width: width,
+            preview_rows,
+            side_by_side: false,
+        })
     }
 
     fn composer_height(&self, panel_height: usize, panel_width: usize) -> usize {
@@ -1892,7 +1962,16 @@ impl TextPanel {
         }
 
         let _span = crate::editor::perf::PerfSpan::start("panel:text_layout_miss");
-        let content_width = TextPanelContentMetrics::new(width).width;
+        let mut content_width = TextPanelContentMetrics::new(width).width;
+        if self
+            .temporary_context
+            .as_ref()
+            .and_then(|context| context.preview.as_ref())
+            .is_some()
+            && content_width > EMBEDDED_PICKER_PREVIEW_MIN_COLUMNS * 2
+        {
+            content_width = (content_width - 1) / 2;
+        }
         let rendered = self.build_rendered_lines(content_width);
         let mut layout = TextPanelLayout::new(rendered.lines);
         layout.prompt_cards = rendered.prompt_cards;
@@ -3480,6 +3559,8 @@ impl PanelManager {
                 UiAction::new("picker_next", "Down", "next session").with_group("Session picker"),
                 UiAction::new("picker_cancel", "Esc", "back to conversation")
                     .with_group("Session picker"),
+                UiAction::new("session_preview", "Alt-p", "toggle session preview")
+                    .with_group("Session picker"),
             ]
         } else {
             panel
@@ -3598,6 +3679,15 @@ impl PanelManager {
 
     pub(crate) fn header_shortcut_event(&self, key: &str) -> Option<PanelEvent> {
         let panel = self.text_panels.get(self.focused.as_deref()?)?;
+        if panel.temporary_context.is_some() && key.eq_ignore_ascii_case("Alt-p") {
+            return Some(PanelEvent {
+                panel_id: panel.id.clone(),
+                action: "session_preview".to_string(),
+                selected_index: panel.scroll,
+                row: None,
+                text: panel.selected_picker_action().map(str::to_string),
+            });
+        }
         let action = panel
             .header_detail
             .as_ref()
@@ -3667,7 +3757,7 @@ impl PanelManager {
                 action: action.to_string(),
                 selected_index: panel.scroll,
                 row: None,
-                text: None,
+                text: panel.selected_picker_action().map(str::to_string),
             });
         }
         let panel = self.panels.get_mut(&focused)?;
@@ -4133,10 +4223,20 @@ impl PanelManager {
         {
             return None;
         }
+        let preview = panel.picker_preview_geometry(placement.height, placement.width);
+        if preview.is_some_and(|geometry| {
+            metrics.column(placement.x, x) >= geometry.list_width
+                || screen_row.saturating_sub(title_rows) >= geometry.list_rows
+        }) {
+            return None;
+        }
 
         let layout = panel.layout(placement.width);
         let lines = &layout.rendered;
-        let visible_rows = content_height.saturating_sub(title_rows);
+        let visible_rows = preview.map_or_else(
+            || content_height.saturating_sub(title_rows),
+            |geometry| geometry.list_rows,
+        );
         let max_scroll = lines.len().saturating_sub(visible_rows);
         let scroll = if panel.follow_tail {
             max_scroll
@@ -4161,6 +4261,17 @@ impl PanelManager {
                 }
                 self.focused = Some(placement.id.clone());
                 panel.selected_link = Some(link.id);
+                if let TextPanelLinkTarget::PanelAction { block_id, .. } = &link.target {
+                    if let Some(context) = panel.temporary_context.as_mut() {
+                        context.selected_action = Some(block_id.clone());
+                        context.selected_index = panel
+                            .blocks
+                            .iter()
+                            .filter(|block| block.kind == TextPanelBlockKind::Action)
+                            .position(|block| block.id == *block_id)
+                            .unwrap_or_default();
+                    }
+                }
                 if let Some(composer) = panel.composer.as_mut() {
                     composer.focused = false;
                 }
@@ -4353,6 +4464,35 @@ impl PanelManager {
             return false;
         };
         panel.exit_temporary_context()
+    }
+
+    /// Changes an embedded picker's read-only detail without replacing conversation blocks.
+    pub fn set_text_panel_preview(
+        &mut self,
+        id: &str,
+        preview: Option<TextPanelPreview>,
+        panel_height: usize,
+        terminal_width: usize,
+    ) -> bool {
+        let Some(panel) = self.text_panels.get_mut(id) else {
+            return false;
+        };
+        let Some(context) = panel.temporary_context.as_mut() else {
+            return false;
+        };
+        if context.preview == preview {
+            return false;
+        }
+        context.preview = preview;
+        panel.invalidate_layout();
+        let width = self
+            .presentation
+            .width(&panel.id, &panel.config, terminal_width);
+        let height = self
+            .presentation
+            .height(&panel.id, &panel.config, panel_height);
+        panel.sync_picker_selection(height, width);
+        true
     }
 
     pub fn set_text_panel_status(&mut self, id: &str, status: Option<TextPanelStatus>) -> bool {
@@ -5348,9 +5488,12 @@ fn render_text_panel(
     let content_height = height
         .saturating_sub(composer_height)
         .saturating_sub(status_height);
-    let visible_rows = content_height
+    let available_rows = content_height
         .saturating_sub(title_rows)
         .saturating_sub(picker_header_rows);
+    let preview_geometry = panel.picker_preview_geometry(height, width);
+    let visible_rows = preview_geometry.map_or(available_rows, |geometry| geometry.list_rows);
+    let list_width = preview_geometry.map_or(metrics.width, |geometry| geometry.list_width);
     if picker_header_rows > 0 {
         render_text_panel_picker_header(
             buffer,
@@ -5405,7 +5548,7 @@ fn render_text_panel(
                 render_text_panel_picker_item(
                     buffer,
                     Point::new(content_position.x, y),
-                    metrics.width,
+                    list_width,
                     line,
                     Some(link.id) == panel.selected_link,
                     title,
@@ -5416,7 +5559,7 @@ fn render_text_panel(
             if render_text_panel_picker_group(
                 buffer,
                 Point::new(content_position.x, y),
-                metrics.width,
+                list_width,
                 line,
                 &palette,
             ) {
@@ -5434,7 +5577,7 @@ fn render_text_panel(
                 &normal_prompt
             }
         });
-        let framed_prompt = prompt_palette.is_some() && metrics.width >= 7;
+        let framed_prompt = prompt_palette.is_some() && list_width >= 7;
         let edge_inset = usize::from(framed_prompt);
         if let (Some(card), Some(prompt)) = (prompt_card, prompt_palette) {
             let cap = if line_index == card.rows.start {
@@ -5448,14 +5591,14 @@ fn render_text_panel(
                 buffer.set_text(
                     content_position.x + edge_inset,
                     y,
-                    &cap.repeat(metrics.width.saturating_sub(edge_inset * 2)),
+                    &cap.repeat(list_width.saturating_sub(edge_inset * 2)),
                     &prompt.cap,
                 );
                 if framed_prompt {
                     render_prompt_rails(
                         buffer,
                         Point::new(content_position.x, y),
-                        metrics.width,
+                        list_width,
                         rail,
                         &prompt.edge,
                     );
@@ -5465,7 +5608,7 @@ fn render_text_panel(
             buffer.set_text(
                 content_position.x + edge_inset,
                 y,
-                &" ".repeat(metrics.width.saturating_sub(edge_inset * 2)),
+                &" ".repeat(list_width.saturating_sub(edge_inset * 2)),
                 &prompt.content.surface,
             );
         }
@@ -5473,7 +5616,7 @@ fn render_text_panel(
             buffer,
             content_position.x,
             y,
-            metrics.width.saturating_sub(usize::from(framed_prompt)),
+            list_width.saturating_sub(usize::from(framed_prompt)),
             line,
             layout.lines.get(line_index).map_or(0, |line| line.first),
             layout
@@ -5492,12 +5635,32 @@ fn render_text_panel(
                 render_prompt_rails(
                     buffer,
                     Point::new(content_position.x, y),
-                    metrics.width,
+                    list_width,
                     "│",
                     &prompt.edge,
                 );
             }
         }
+    }
+
+    if let (Some(geometry), Some(preview)) = (
+        preview_geometry,
+        panel
+            .temporary_context
+            .as_ref()
+            .and_then(|context| context.preview.as_ref()),
+    ) {
+        render_text_panel_preview(
+            buffer,
+            Point::new(
+                content_position.x,
+                position.y.saturating_add(title_rows + picker_header_rows),
+            ),
+            geometry,
+            preview,
+            theme,
+            &palette,
+        );
     }
 
     if let Some(status) = &panel.status {
@@ -5621,6 +5784,9 @@ fn render_text_panel_picker_header(
                 ("  ·  ", &palette.divider),
                 ("Esc", &palette.accent),
                 (" back", &palette.secondary),
+                ("  ·  ", &palette.divider),
+                ("Alt-P", &palette.accent),
+                (" peek", &palette.secondary),
                 ("  ·  ", &palette.divider),
                 ("Alt-S", &palette.accent),
                 (" scope", &palette.secondary),
@@ -5768,6 +5934,137 @@ fn render_picker_fragments(
         let text = truncate_display_width(text, width.saturating_sub(used));
         buffer.set_text(position.x.saturating_add(used), position.y, &text, style);
         used = used.saturating_add(display_width(&text));
+    }
+}
+
+fn render_text_panel_preview(
+    buffer: &mut RenderBuffer,
+    position: Point,
+    geometry: TextPanelPickerPreviewGeometry,
+    preview: &TextPanelPreview,
+    theme: &Theme,
+    palette: &TextPanelPalette,
+) {
+    if geometry.side_by_side {
+        for offset in 0..geometry.preview_rows {
+            buffer.set_text(
+                position.x.saturating_add(geometry.list_width),
+                position.y.saturating_add(offset),
+                "│",
+                &palette.divider,
+            );
+        }
+    } else {
+        buffer.set_text(
+            position.x,
+            position.y.saturating_add(geometry.list_rows),
+            &"─".repeat(geometry.list_width),
+            &palette.divider,
+        );
+    }
+
+    let inset = usize::from(geometry.preview_width > 2);
+    let x = position
+        .x
+        .saturating_add(geometry.preview_column)
+        .saturating_add(inset);
+    let y = position.y.saturating_add(geometry.preview_row);
+    let width = geometry.preview_width.saturating_sub(inset);
+    if width == 0 || geometry.preview_rows == 0 {
+        return;
+    }
+    buffer.set_text(
+        x,
+        y,
+        &fit_display_width("LAST EXCHANGE", width),
+        &palette.accent,
+    );
+    if geometry.preview_rows == 1 {
+        return;
+    }
+    if preview.loading || !preview.error.is_empty() {
+        let (text, style) = if preview.loading {
+            ("Loading preview…", &palette.secondary)
+        } else {
+            (preview.error.as_str(), &palette.error)
+        };
+        for (offset, line) in wrap_plain_text(text, width, TextPanelSpanStyle::Text)
+            .into_iter()
+            .take(geometry.preview_rows.saturating_sub(1))
+            .enumerate()
+        {
+            let text = line
+                .spans
+                .iter()
+                .map(|span| span.text.as_str())
+                .collect::<String>();
+            buffer.set_text(x, y.saturating_add(offset + 1), &text, style);
+        }
+        return;
+    }
+
+    let mut row = 1usize;
+    buffer.set_text(x, y + row, "YOU", &palette.secondary);
+    row += 1;
+    let prompt = if preview.prompt.is_empty() {
+        "No previous prompt"
+    } else {
+        preview.prompt.as_str()
+    };
+    let prompt_budget = geometry.preview_rows.saturating_sub(3).div_ceil(3).max(1);
+    for line in wrap_plain_text(prompt, width, TextPanelSpanStyle::Text)
+        .into_iter()
+        .take(prompt_budget)
+    {
+        if row + 2 >= geometry.preview_rows {
+            break;
+        }
+        render_text_spans(
+            buffer,
+            x,
+            y + row,
+            width,
+            &line,
+            0,
+            None,
+            None,
+            None,
+            theme,
+            palette,
+        );
+        row += 1;
+    }
+    if geometry.preview_rows.saturating_sub(row) > 3 {
+        row += 1;
+    }
+    if row >= geometry.preview_rows {
+        return;
+    }
+    buffer.set_text(x, y + row, "AGENT", &palette.accent);
+    row += 1;
+    let response = if preview.response.is_empty() {
+        "No response yet"
+    } else {
+        preview.response.as_str()
+    };
+    for line in render_markdown_lines(response, width) {
+        if row >= geometry.preview_rows {
+            break;
+        }
+        render_text_spans(
+            buffer,
+            x,
+            y + row,
+            width,
+            &line,
+            0,
+            None,
+            None,
+            None,
+            theme,
+            palette,
+        );
+        row += 1;
     }
 }
 
@@ -7642,6 +7939,10 @@ mod tests {
             manager.text_action_at_position(first_session.x, first_session.y, 80, 20),
             Some(TextPanelLinkTarget::PanelAction { block_id, .. }) if block_id == "session:one"
         ));
+        assert_eq!(
+            manager.text_panels["agent"].selected_picker_action(),
+            Some("session:one")
+        );
 
         assert!(manager.exit_text_panel_context("agent"));
         let panel = &manager.text_panels["agent"];
@@ -7756,6 +8057,75 @@ mod tests {
             manager.text_panels["agent"].selected_picker_action(),
             Some("one")
         );
+    }
+
+    #[test]
+    fn temporary_picker_preview_reflows_without_affecting_session_hit_testing() {
+        for (panel_width, side_by_side) in [(48, false), (100, true)] {
+            let mut manager = PanelManager::default();
+            manager.create_text_panel(
+                "agent".to_string(),
+                PanelConfig {
+                    title: Some("Agent".to_string()),
+                    width: panel_width,
+                    composer: Some(TextPanelComposerConfig {
+                        placeholder: "Ask".to_string(),
+                        rows: 2,
+                    }),
+                    ..PanelConfig::default()
+                },
+            );
+            assert!(manager.enter_text_panel_context("agent", "Search sessions".to_string()));
+            manager.update_text_panel(
+                "agent",
+                vec![TextPanelBlock {
+                    id: "session:one".to_string(),
+                    kind: TextPanelBlockKind::Action,
+                    format: TextPanelBlockFormat::Plain,
+                    text: "Selected conversation\n1h ago · Red".to_string(),
+                }],
+                24,
+                120,
+            );
+            assert!(manager.set_text_panel_preview(
+                "agent",
+                Some(TextPanelPreview {
+                    session_id: "one".to_string(),
+                    prompt: "Why is the server offline?".to_string(),
+                    response: "The **startup hook** failed.".to_string(),
+                    ..TextPanelPreview::default()
+                }),
+                24,
+                120,
+            ));
+            let theme = Theme::default();
+            let mut frame = RenderBuffer::new(120, 24, &theme.style);
+            manager.render(&mut frame, &theme);
+            let session = text_position(&frame, "Selected conversation").unwrap();
+            let preview = text_position(&frame, "LAST EXCHANGE").unwrap();
+            let prompt = text_position(&frame, "Why is the server offline?").unwrap();
+            assert!(text_position(&frame, "startup hook").is_some());
+            if side_by_side {
+                assert!(preview.x > session.x);
+                assert_eq!(preview.y, session.y);
+            } else {
+                assert!(preview.y > session.y);
+            }
+            assert!(matches!(
+                manager.text_action_at_position(session.x, session.y, 120, 24),
+                Some(TextPanelLinkTarget::PanelAction { block_id, .. }) if block_id == "session:one"
+            ));
+            assert!(manager
+                .text_action_at_position(prompt.x, prompt.y, 120, 24)
+                .is_none());
+            let shortcut = manager.header_shortcut_event("Alt-p").unwrap();
+            assert_eq!(shortcut.action, "session_preview");
+            assert_eq!(shortcut.text.as_deref(), Some("session:one"));
+            assert!(manager
+                .surface_actions()
+                .iter()
+                .any(|action| action.key == "Alt-p"));
+        }
     }
 
     #[test]

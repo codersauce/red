@@ -286,6 +286,30 @@ mod tests {
                 .count(),
             1
         );
+        assert!(editor.panel_manager.enter_text_panel_context(
+            "agent-conversation",
+            "Search previous sessions".to_string(),
+        ));
+        let preview_key = Event::Key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::ALT));
+        let preview = editor.handle_panel_event(&preview_key, None).unwrap();
+        assert!(matches!(
+            preview,
+            KeyAction::Multiple(actions)
+                if actions.iter().any(|action| matches!(
+                    action,
+                    Action::NotifyPlugins(name, payload)
+                        if name == "panel:event:agent-conversation"
+                            && payload["action"] == "session_preview"
+                ))
+        ));
+        assert!(editor
+            .panel_manager
+            .surface_actions()
+            .iter()
+            .any(|action| action.key == "Alt-p"));
+        assert!(editor
+            .panel_manager
+            .exit_text_panel_context("agent-conversation"));
         editor
             .panel_manager
             .create_text_panel("other".into(), plugin::PanelConfig::default());

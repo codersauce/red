@@ -1280,6 +1280,9 @@ fn agent_event_payload(event: CodexEvent) -> (&'static str, Value) {
         CodexEvent::SessionListCompleted { .. } => {
             unreachable!("session-list results use private callbacks")
         }
+        CodexEvent::SessionPreviewCompleted { .. } => {
+            unreachable!("session-preview results use private callbacks")
+        }
         CodexEvent::SessionModelRerouted { session_id, model } => (
             "agent:model_rerouted",
             json!({"session_id": session_id, "model": model}),
@@ -1566,6 +1569,10 @@ pub enum PluginRequest {
     AgentSessionRequest {
         request_id: RequestId,
         request: crate::codex::AgentSessionListRequest,
+    },
+    AgentSessionPreview {
+        request_id: RequestId,
+        request: crate::codex::AgentSessionPreviewRequest,
     },
     SetTextPanelHeaderDetail {
         id: String,
@@ -1882,6 +1889,10 @@ pub enum PluginRequest {
     ExitTextPanelContext {
         id: String,
     },
+    SetTextPanelPreview {
+        id: String,
+        preview: Option<plugin::TextPanelPreview>,
+    },
     SetTextPanelStatus {
         id: String,
         status: Option<plugin::TextPanelStatus>,
@@ -1986,6 +1997,7 @@ impl PluginRequest {
             Self::Action(_) => "Action",
             Self::AgentModelRequest { .. } => "AgentModelRequest",
             Self::AgentSessionRequest { .. } => "AgentSessionRequest",
+            Self::AgentSessionPreview { .. } => "AgentSessionPreview",
             Self::SetTextPanelHeaderDetail { .. } => "SetTextPanelHeaderDetail",
             Self::AgentNewSession { .. } => "AgentNewSession",
             Self::AgentResumeSession { .. } => "AgentResumeSession",
@@ -2067,6 +2079,7 @@ impl PluginRequest {
             Self::SetTextPanelComposerState { .. } => "SetTextPanelComposerState",
             Self::EnterTextPanelContext { .. } => "EnterTextPanelContext",
             Self::ExitTextPanelContext { .. } => "ExitTextPanelContext",
+            Self::SetTextPanelPreview { .. } => "SetTextPanelPreview",
             Self::SetTextPanelStatus { .. } => "SetTextPanelStatus",
             Self::ClearTextPanelComposer { .. } => "ClearTextPanelComposer",
             Self::SelectPanelRow { .. } => "SelectPanelRow",
@@ -9403,6 +9416,15 @@ impl Editor {
                 )
                 .await?;
         }
+        for request_id in self.agent_manager.take_pending_session_previews() {
+            self.plugin_registry
+                .resolve_request(
+                    runtime,
+                    RequestId::from_raw(request_id),
+                    agent_sessions::session_preview_payload(&Err(message.clone())),
+                )
+                .await?;
+        }
         Ok(message)
     }
 
@@ -9511,6 +9533,17 @@ impl Editor {
                         runtime,
                         RequestId::from_raw(*request_id),
                         agent_sessions::session_result_payload(result),
+                    )
+                    .await?;
+                continue;
+            }
+            if let CodexEvent::SessionPreviewCompleted { request_id, result } = &event {
+                self.agent_manager.finish_session_preview(*request_id);
+                self.plugin_registry
+                    .resolve_request(
+                        runtime,
+                        RequestId::from_raw(*request_id),
+                        agent_sessions::session_preview_payload(result),
                     )
                     .await?;
                 continue;
@@ -10030,6 +10063,13 @@ impl Editor {
                     request,
                 } => {
                     self.handle_agent_session_request(runtime, request_id, request)
+                        .await?;
+                }
+                PluginRequest::AgentSessionPreview {
+                    request_id,
+                    request,
+                } => {
+                    self.handle_agent_session_preview(runtime, request_id, request)
                         .await?;
                 }
                 PluginRequest::SetTextPanelHeaderDetail { id, detail } => {
@@ -11330,6 +11370,16 @@ impl Editor {
                 }
                 PluginRequest::ExitTextPanelContext { id } => {
                     if self.panel_manager.exit_text_panel_context(&id) {
+                        needs_render = true;
+                    }
+                }
+                PluginRequest::SetTextPanelPreview { id, preview } => {
+                    if self.panel_manager.set_text_panel_preview(
+                        &id,
+                        preview,
+                        usize::from(self.size.1.saturating_sub(2)),
+                        usize::from(self.size.0),
+                    ) {
                         needs_render = true;
                     }
                 }
