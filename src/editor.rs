@@ -230,6 +230,7 @@ const INPUT_BATCH_BUDGET: Duration = Duration::from_millis(8);
 const SCROLL_EVENTS_PER_BATCH: usize = 64;
 const KEY_EVENTS_PER_BATCH: usize = 64;
 const TERMINAL_SIZE_RECONCILE_INTERVAL: Duration = Duration::from_millis(100);
+const LSP_MESSAGES_PER_TICK: usize = 64;
 const PLUGIN_REQUESTS_PER_TICK: usize = 64;
 const AGENT_EVENTS_PER_TICK: usize = 64;
 const GUTTER_SIGN_COLUMN_WIDTH: usize = 2;
@@ -10088,33 +10089,35 @@ impl Editor {
         let mut needs_motion_render = false;
         let mut needs_editor_windows_render = inline_activity_changed && !full_animation_changed;
 
-        // Always pump LSP responses. `recv_response` completes the
-        // initialize handshake and flushes queued didOpen/change
-        // messages, so it must not depend on diagnostic display.
-        match self.lsp.recv_response().await {
-            Ok(Some((msg, method))) => {
-                if let Some(action) = self.handle_lsp_message(&msg, method) {
-                    // Numeric progress tokens (e.g. rust-analyzer indexing)
-                    // don't change anything the editor core draws; plugins
-                    // that visualize them request their own redraws.
+        // Always pump LSP responses: this completes initialization and flushes
+        // queued document updates even when diagnostics are hidden. A bounded
+        // batch also keeps progress bursts from holding later responses behind
+        // one 10 ms editor tick per message.
+        for _ in 0..LSP_MESSAGES_PER_TICK {
+            match self.lsp.recv_response().await {
+                Ok(Some((msg, method))) => {
+                    // Progress only changes the editor surface when one of its
+                    // listeners submits an actual overlay update below.
                     let progress_only = matches!(
-                        &action,
-                        Action::ShowProgress(progress)
-                            if matches!(progress.token, ProgressToken::Number(_))
+                        &msg,
+                        InboundMessage::Notification(ParsedNotification::Progress(_))
                     );
-                    // TODO: handle quit
-                    let generation_before = self.render_generation;
-                    self.execute(&action, buffer, runtime).await?;
-                    if !progress_only && self.render_generation == generation_before {
-                        needs_render = true;
+                    if let Some(action) = self.handle_lsp_message(&msg, method) {
+                        // TODO: handle quit
+                        let generation_before = self.render_generation;
+                        self.execute(&action, buffer, runtime).await?;
+                        if !progress_only && self.render_generation == generation_before {
+                            needs_render = true;
+                        }
                     }
                 }
-            }
-            Ok(None) => {}
-            Err(err) => {
-                log!("ERROR: Lsp error: {err}");
-                self.set_notification_message(Severity::Error, Some(err.to_string()));
-                needs_render = true;
+                Ok(None) => break,
+                Err(err) => {
+                    log!("ERROR: Lsp error: {err}");
+                    self.set_notification_message(Severity::Error, Some(err.to_string()));
+                    needs_render = true;
+                    break;
+                }
             }
         }
 
@@ -32190,6 +32193,192 @@ builtin = "rust"
         ACTION_DISPATCHER.send_request(PluginRequest::SetCursorDisplayColumn { column: 1, y: 3 });
         let column = core.tick().await.unwrap().expect("cursor-column render");
         assert_eq!(column.cursor.1, 3);
+        drain_plugin_requests();
+    }
+
+    fn lsp_progress_test_editor() -> (
+        Editor,
+        tokio::sync::mpsc::Sender<InboundMessage>,
+        tokio::sync::mpsc::Receiver<crate::lsp::OutboundMessage>,
+    ) {
+        let config = Config::default();
+        let server = crate::config::default_language_servers()
+            .remove("rust")
+            .expect("default Rust language server");
+        let (request_sender, requests) = tokio::sync::mpsc::channel(2);
+        let (responses, response_receiver) = tokio::sync::mpsc::channel(LSP_MESSAGES_PER_TICK + 2);
+        let lsp = crate::lsp::RealLspClient::with_test_channels(
+            request_sender,
+            response_receiver,
+            server,
+            std::env::current_dir().unwrap(),
+        );
+        let mut editor = Editor::with_size(
+            Box::new(lsp),
+            /*width*/ 80,
+            /*height*/ 24,
+            config,
+            Theme::default(),
+            vec![Buffer::new(None, "hello".to_string())],
+        )
+        .unwrap();
+        editor.test_disable_terminal_output();
+        (editor, responses, requests)
+    }
+
+    fn lsp_progress_notification(token: Value, index: usize) -> InboundMessage {
+        let kind = if index == 0 { "begin" } else { "report" };
+        let progress = serde_json::from_value(json!({
+            "token": token,
+            "value": {
+                "kind": kind,
+                "title": "Indexing",
+                "message": format!("Update {index}"),
+            },
+        }))
+        .unwrap();
+        InboundMessage::Notification(ParsedNotification::Progress(progress))
+    }
+
+    #[tokio::test]
+    async fn lsp_progress_burst_does_not_delay_a_queued_hover_response() {
+        drain_plugin_requests();
+        let (mut editor, responses, _requests) = lsp_progress_test_editor();
+        let mut buffer =
+            RenderBuffer::new(/*width*/ 80, /*height*/ 24, &Style::default());
+        let mut runtime = Runtime::new();
+        editor.render(&mut buffer).unwrap();
+        let full_renders = editor.full_render_count;
+        let request_id = editor
+            .lsp
+            .send_request("textDocument/hover", json!({}), /*force*/ true)
+            .await
+            .unwrap();
+
+        for index in 0..12 {
+            responses
+                .try_send(lsp_progress_notification(json!(7), index))
+                .unwrap();
+        }
+        responses
+            .try_send(InboundMessage::Message(ResponseMessage {
+                id: request_id,
+                result: json!({
+                    "contents": {
+                        "kind": "plaintext",
+                        "value": "Hover after progress",
+                    },
+                }),
+                request: None,
+            }))
+            .unwrap();
+
+        editor
+            .service_background(&mut buffer, &mut runtime)
+            .await
+            .unwrap();
+
+        assert!(editor.current_dialog.is_some());
+        assert_eq!(editor.full_render_count, full_renders + 1);
+        assert!(render_text_rows(&buffer)
+            .join("\n")
+            .contains("Hover after progress"));
+        assert!(editor.lsp.recv_response().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn lsp_progress_without_a_visual_listener_does_not_redraw() {
+        drain_plugin_requests();
+        let (mut editor, responses, _requests) = lsp_progress_test_editor();
+        let mut buffer =
+            RenderBuffer::new(/*width*/ 80, /*height*/ 24, &Style::default());
+        let mut runtime = Runtime::new();
+        editor.render(&mut buffer).unwrap();
+        let full_renders = editor.full_render_count;
+
+        for (index, token) in [json!(7), json!("rustAnalyzer/Indexing")]
+            .into_iter()
+            .enumerate()
+        {
+            responses
+                .try_send(lsp_progress_notification(token, index))
+                .unwrap();
+        }
+
+        editor
+            .service_background(&mut buffer, &mut runtime)
+            .await
+            .unwrap();
+
+        assert_eq!(editor.full_render_count, full_renders);
+        assert!(editor.lsp.recv_response().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn lsp_progress_drain_keeps_a_bounded_fairness_budget() {
+        drain_plugin_requests();
+        let (mut editor, responses, _requests) = lsp_progress_test_editor();
+        let mut buffer =
+            RenderBuffer::new(/*width*/ 80, /*height*/ 24, &Style::default());
+        let mut runtime = Runtime::new();
+        editor.render(&mut buffer).unwrap();
+        let full_renders = editor.full_render_count;
+
+        for index in 0..=LSP_MESSAGES_PER_TICK {
+            responses
+                .try_send(lsp_progress_notification(json!(7), index))
+                .unwrap();
+        }
+
+        editor
+            .service_background(&mut buffer, &mut runtime)
+            .await
+            .unwrap();
+
+        assert_eq!(editor.full_render_count, full_renders);
+        let Some((InboundMessage::Notification(ParsedNotification::Progress(progress)), None)) =
+            editor.lsp.recv_response().await.unwrap()
+        else {
+            panic!("the first message beyond the LSP tick budget must remain queued");
+        };
+        assert_eq!(
+            progress.value["message"],
+            format!("Update {LSP_MESSAGES_PER_TICK}")
+        );
+    }
+
+    #[tokio::test]
+    async fn fidget_progress_burst_coalesces_overlay_updates_into_one_redraw() {
+        drain_plugin_requests();
+        let (mut editor, responses, _requests) = lsp_progress_test_editor();
+        let mut buffer =
+            RenderBuffer::new(/*width*/ 80, /*height*/ 24, &Style::default());
+        let mut runtime = Runtime::new();
+        runtime
+            .load_plugin("fidget", include_str!("../plugins/fidget.hk"))
+            .await
+            .unwrap();
+        editor
+            .service_background(&mut buffer, &mut runtime)
+            .await
+            .unwrap();
+        editor.render(&mut buffer).unwrap();
+        let full_renders = editor.full_render_count;
+
+        for index in 0..8 {
+            responses
+                .try_send(lsp_progress_notification(json!(7), index))
+                .unwrap();
+        }
+
+        editor
+            .service_background(&mut buffer, &mut runtime)
+            .await
+            .unwrap();
+
+        assert_eq!(editor.full_render_count, full_renders + 1);
+        assert!(render_text_rows(&buffer).join("\n").contains("Update 7"));
+        runtime.deactivate_all().await.unwrap();
         drain_plugin_requests();
     }
 

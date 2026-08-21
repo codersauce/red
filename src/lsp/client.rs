@@ -232,7 +232,7 @@ fn lsp_command_display(config: &LanguageServerConfig) -> String {
 
 impl RealLspClient {
     #[cfg(test)]
-    pub(super) fn with_test_channels(
+    pub(crate) fn with_test_channels(
         request_tx: mpsc::Sender<OutboundMessage>,
         response_rx: mpsc::Receiver<InboundMessage>,
         config: LanguageServerConfig,
