@@ -15296,9 +15296,6 @@ impl Editor {
         if cmd == "config-diagnostics" {
             return vec![Action::ConfigDiagnostics];
         }
-        if cmd == "messages" {
-            return vec![Action::OpenMessages];
-        }
         if matches!(
             cmd,
             "InlineHistory" | "inline-history" | "InlineActivity" | "inline-activity"
@@ -15375,8 +15372,20 @@ impl Editor {
 
         let (name, arguments) = cmd.split_once(' ').unwrap_or((cmd, ""));
         let name = name.strip_suffix('!').unwrap_or(name);
+        let parsed = command::parse(command_palette::BUILTIN_COLON_COMMANDS, cmd);
+        let canonical_name = parsed
+            .as_ref()
+            .and_then(|parsed| match parsed.commands.as_slice() {
+                [command] => Some(command.as_str()),
+                _ => None,
+            })
+            .unwrap_or(name);
 
-        if matches!(name, "syntax" | "syn" | "ft") {
+        if canonical_name == "messages" && arguments.is_empty() {
+            return vec![Action::OpenMessages];
+        }
+
+        if matches!(canonical_name, "syntax" | "syn" | "ft") {
             let mut arguments = arguments.split_whitespace();
             let Some(syntax) = arguments.next() else {
                 return vec![Action::OpenSyntaxPicker];
@@ -15406,7 +15415,7 @@ impl Editor {
             };
         }
 
-        if name == "set" {
+        if canonical_name == "set" {
             let mut options = arguments.split_whitespace();
             let Some(option) = options.next() else {
                 self.set_legacy_message(Some(
@@ -15429,8 +15438,6 @@ impl Editor {
                 }
             };
         }
-
-        let parsed = command::parse(command_palette::BUILTIN_COLON_COMMANDS, cmd);
 
         let Some(parsed) = parsed else {
             if runtime.command_plugin(cmd).is_some() {
@@ -31267,6 +31274,10 @@ builtin = "rust"
         assert_eq!(
             editor.handle_command("set nornu", &runtime),
             vec![Action::SetRelativeLineNumbers(false)]
+        );
+        assert_eq!(
+            editor.handle_command("se rnu", &runtime),
+            vec![Action::SetRelativeLineNumbers(true)]
         );
     }
 
