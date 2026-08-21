@@ -12748,6 +12748,20 @@ impl Editor {
         self.update_diagnostics(uri, diagnostics, diagnostics::DiagnosticReportKind::Push)
     }
 
+    fn clear_current_buffer_diagnostics(&mut self) {
+        if self.diagnostics.is_empty() {
+            return;
+        }
+        let Ok(Some(uri)) = self.current_buffer().uri() else {
+            return;
+        };
+        if self.diagnostics.remove(&uri).is_none() {
+            return;
+        }
+        self.diagnostic_reports.remove(&uri);
+        self.sync_diagnostic_gutter_signs();
+    }
+
     fn update_diagnostics(
         &mut self,
         uri: Option<&str>,
@@ -23791,6 +23805,21 @@ impl Editor {
     }
 
     fn replace_range(&mut self, range: TextRange, new_text: &str) {
+        let diagnostic_edit = (!self.diagnostics.is_empty())
+            .then(|| self.current_buffer().uri().ok().flatten())
+            .flatten()
+            .and_then(|uri| {
+                self.diagnostics.contains_key(&uri).then(|| {
+                    let source = self.current_buffer();
+                    (
+                        uri,
+                        crate::lsp::Range {
+                            start: source.position_to_lsp(range.start),
+                            end: source.position_to_lsp(range.end),
+                        },
+                    )
+                })
+            });
         let pending =
             (self.config.lsp.enabled && self.current_buffer().file.is_some()).then(|| {
                 let source = self.current_buffer();
@@ -23818,6 +23847,12 @@ impl Editor {
                 lsp_range,
                 new_text,
             );
+        }
+        if let Some((uri, edit)) = diagnostic_edit {
+            if let Some(diagnostics) = self.diagnostic_reports.rebase(&uri, &edit, new_text) {
+                self.diagnostics.insert(uri, diagnostics);
+                self.sync_diagnostic_gutter_signs();
+            }
         }
         perf::increment("edit:replacements", 1);
         self.update_anchors_for_edit(edit);
@@ -24358,6 +24393,7 @@ impl Editor {
             self.draw_commandline(render_buffer);
             return Ok(());
         };
+        self.clear_current_buffer_diagnostics();
         if let Some(transaction) = transaction {
             self.set_inline_history_transaction_applied(&transaction, false);
         }
@@ -24389,6 +24425,7 @@ impl Editor {
             self.draw_commandline(render_buffer);
             return Ok(());
         };
+        self.clear_current_buffer_diagnostics();
         if let Some(transaction) = self
             .current_buffer()
             .undo_history

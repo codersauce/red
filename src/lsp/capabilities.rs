@@ -360,6 +360,9 @@ pub fn get_client_capabilities_with_options(
     let workspace = WorkspaceClientCapabilities::builder()
         .apply_edit(true)
         .configuration(true)
+        .did_change_watched_files(DynamicRegistrationCapability {
+            dynamic_registration: Some(false),
+        })
         .symbol(
             WorkspaceSymbolClientCapabilities::builder()
                 .dynamic_registration(false)
@@ -405,7 +408,7 @@ pub fn get_client_capabilities_with_options(
         )
         .diagnostics(
             DiagnosticWorkspaceClientCapabilities::builder()
-                .refresh_support(false)
+                .refresh_support(true)
                 .build(),
         )
         .build();
@@ -613,6 +616,10 @@ mod tests {
         assert!(capabilities["window"].get("showMessage").is_none());
         assert_eq!(
             capabilities["workspace"]["diagnostics"]["refreshSupport"],
+            json!(true)
+        );
+        assert_eq!(
+            capabilities["workspace"]["didChangeWatchedFiles"]["dynamicRegistration"],
             json!(false)
         );
     }

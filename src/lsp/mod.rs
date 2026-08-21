@@ -41,6 +41,7 @@ pub mod edit;
 pub mod manager;
 pub mod types;
 pub mod workspace_edit;
+mod workspace_watch;
 
 /// Ordered incremental edits and their cheap, exact document snapshots.
 /// Ranges use UTF-16 coordinates in the document produced by the preceding edit.

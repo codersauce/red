@@ -30,8 +30,9 @@ use tokio::{
 };
 
 use super::{
-    capabilities::get_client_capabilities_with_options, file_uri, InboundMessage, LspClient,
-    OutboundMessage, ResponseError, ServerRequest, ServerResponse,
+    capabilities::get_client_capabilities_with_options, file_uri,
+    workspace_watch::WorkspaceFileWatcher, InboundMessage, LspClient, OutboundMessage,
+    ResponseError, ServerRequest, ServerResponse,
 };
 use crate::config::LanguageServerConfig;
 use crate::lsp::{
@@ -200,6 +201,7 @@ struct LspProcessMonitor {
     stderr_closed: Arc<AtomicBool>,
     stderr_tail: Arc<Mutex<VecDeque<String>>>,
     failure_reported: bool,
+    workspace_watcher: Option<WorkspaceFileWatcher>,
 }
 
 impl LspProcessMonitor {
@@ -263,6 +265,16 @@ impl RealLspClient {
         workspace_root: PathBuf,
     ) -> Result<RealLspClient, LspError> {
         let mut child = spawn_lsp_process(&config).await?;
+        let workspace_watcher = match WorkspaceFileWatcher::new(&workspace_root, &config) {
+            Ok(watcher) => Some(watcher),
+            Err(error) => {
+                log!(
+                    "[lsp] could not watch workspace {}: {error}",
+                    workspace_root.display()
+                );
+                None
+            }
+        };
         let stdin = child.stdin.take().unwrap();
         let stdout = child.stdout.take().unwrap();
         let stderr = child.stderr.take().unwrap();
@@ -389,6 +401,7 @@ impl RealLspClient {
                 stderr_closed,
                 stderr_tail,
                 failure_reported: false,
+                workspace_watcher,
             }),
             config,
             workspace_root,
@@ -747,6 +760,42 @@ impl RealLspClient {
             .or_insert(next);
     }
 
+    fn schedule_workspace_diagnostics(&mut self) {
+        let documents = self.files_versions.keys().cloned().collect::<Vec<_>>();
+        for uri in documents {
+            self.schedule_diagnostics(&uri);
+        }
+    }
+
+    async fn publish_workspace_file_changes(&mut self) -> Result<(), LspError> {
+        let changes = self
+            .process_monitor
+            .as_mut()
+            .and_then(|monitor| monitor.workspace_watcher.as_mut())
+            .map(WorkspaceFileWatcher::take_changes)
+            .unwrap_or_default();
+        let mut watched_changes = Vec::with_capacity(changes.len());
+        for change in changes {
+            let uri = file_uri(&change.path)?;
+            // Open documents already have authoritative didChange/didSave streams.
+            // Replaying their disk writes as workspace changes can cancel flycheck.
+            if !self.files_versions.contains_key(&uri) {
+                watched_changes.push(json!({ "uri": uri, "type": change.kind }));
+            }
+        }
+        if watched_changes.is_empty() {
+            return Ok(());
+        }
+        self.send_notification(
+            "workspace/didChangeWatchedFiles",
+            json!({ "changes": watched_changes }),
+            false,
+        )
+        .await?;
+        self.schedule_workspace_diagnostics();
+        Ok(())
+    }
+
     /// Consume expected background diagnostic cancellations without hiding
     /// failures of user commands or leaving their request owners unresolved.
     fn handle_diagnostic_cancellation(&mut self, request: &Request, error: &ResponseError) -> bool {
@@ -861,6 +910,13 @@ impl RealLspClient {
         let params = did_open_params(file, contents, language_id)?;
 
         let uri = file_uri(file)?;
+        if let Some(watcher) = self
+            .process_monitor
+            .as_mut()
+            .and_then(|monitor| monitor.workspace_watcher.as_mut())
+        {
+            watcher.watch_document(std::path::Path::new(&super::file_path(&uri)?));
+        }
         self.files_content
             .insert(uri.clone(), ropey::Rope::from_str(contents));
         self.files_versions.insert(uri, 1);
@@ -1007,6 +1063,7 @@ impl LspClient for RealLspClient {
                 Some(method),
             )));
         }
+        self.publish_workspace_file_changes().await?;
         // Send the debounced diagnostics request once the document has been
         // quiet long enough. This is polled every editor tick.
         let now = Instant::now();
@@ -1168,6 +1225,19 @@ impl LspClient for RealLspClient {
                                 return Ok(Some((msg, Some(method))));
                             }
                         }
+                    }
+                    InboundMessage::ServerRequest(request)
+                        if request.method == "workspace/diagnostic/refresh" =>
+                    {
+                        self.schedule_workspace_diagnostics();
+                        self.request_tx
+                            .send(OutboundMessage::Response(ServerResponse {
+                                id: request.id.clone(),
+                                result: Some(Value::Null),
+                                error: None,
+                            }))
+                            .await?;
+                        return Ok(None);
                     }
                     InboundMessage::ServerRequest(request)
                         if request.method == "workspace/configuration" =>
@@ -3269,6 +3339,44 @@ mod test {
                 assert_eq!(methods, expected);
             }
         }
+    }
+
+    #[tokio::test]
+    async fn workspace_diagnostic_refresh_acknowledges_and_requeues_open_documents() {
+        let (request_tx, mut requests) = mpsc::channel(4);
+        let (responses, response_rx) = mpsc::channel(1);
+        let config = default_language_servers().remove("rust").unwrap();
+        let mut client = RealLspClient::with_test_channels(
+            request_tx,
+            response_rx,
+            config,
+            std::env::current_dir().unwrap(),
+        );
+        let first = "file:///workspace/src/lib.rs";
+        let second = "file:///workspace/src/recap.rs";
+        client.files_versions.insert(first.to_string(), 1);
+        client.files_versions.insert(second.to_string(), 1);
+
+        responses
+            .send(InboundMessage::ServerRequest(ServerRequest {
+                id: json!("refresh-1"),
+                method: "workspace/diagnostic/refresh".to_string(),
+                params: json!(null),
+                source: None,
+            }))
+            .await
+            .unwrap();
+
+        assert!(client.recv_response().await.unwrap().is_none());
+        let OutboundMessage::Response(response) = requests.recv().await.unwrap() else {
+            panic!("workspace diagnostic refresh must receive a JSON-RPC response");
+        };
+        assert_eq!(response.id, json!("refresh-1"));
+        assert_eq!(response.result, Some(Value::Null));
+        assert!(response.error.is_none());
+        assert_eq!(client.pending_diagnostics.len(), 2);
+        assert!(client.pending_diagnostics.contains_key(first));
+        assert!(client.pending_diagnostics.contains_key(second));
     }
 
     #[tokio::test]
