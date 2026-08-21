@@ -159,7 +159,7 @@ impl LspManager {
         }
 
         if !self.clients.contains_key(&key) {
-            let config = self
+            let mut config = self
                 .config
                 .servers
                 .get(&document.server_name)
@@ -170,6 +170,11 @@ impl LspManager {
                         document.server_name
                     ))
                 })?;
+            super::workspace_settings::apply_workspace_settings(
+                &mut config,
+                &document.workspace_root,
+                &document.language_id,
+            );
 
             let mut client =
                 match RealLspClient::start(config, document.workspace_root.clone()).await {
