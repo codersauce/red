@@ -1,7 +1,7 @@
 ---
 title: "Copilot Inline Completion"
 summary: "Enable, authenticate, and use optional GitHub Copilot ghost-text suggestions without replacing ordinary language-server completion."
-topics: [guides, agent, completion]
+topics: [guides, completion, configuration]
 sources:
   - id: defaults
     type: file

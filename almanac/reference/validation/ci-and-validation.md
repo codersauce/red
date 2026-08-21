@@ -110,3 +110,7 @@ remapping the workspace path to `/red` [@release].
 The smoke job downloads each archive, extracts it, runs `--self-check`, requires the final line to be `red self-check ok`, fails if plugin health output reports pending, disabled, quarantined, reload-rejected, or error states, and checks that the binary does not contain the GitHub workspace path [@release]. The publish job downloads archives, adds installer scripts, verifies the package version and committed changelog, regenerates the changelog with git-cliff, generates SHA-256 sums, writes release notes, and creates or updates a draft release before uploading artifacts [@release].
 
 When a GitHub release is published, the `homebrew` job requires `HOMEBREW_TAP_TOKEN`, downloads release assets and checksums, checks out `codersauce/homebrew-tap`, writes `Formula/red.rb`, and commits and pushes the formula if it changed [@release].
+
+## Related Pages
+
+Use [Build, Test, And Validate](../../guides/development/build-test-and-validate) for the local maintainer workflow, [Release Red](../../guides/releases/release-red) for release operations, [Performance Checks](../../guides/performance/performance-checks) for benchmark procedures, and [Self Check](../runtime/self-check) for the runtime diagnostic that CI and release smoke tests exercise.

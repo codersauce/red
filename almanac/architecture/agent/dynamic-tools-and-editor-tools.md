@@ -25,6 +25,8 @@ The app-server worker publishes `list_files`, `search_files`, `read_file`, and `
 
 `read_file` and `write_file` are editor-tool-host operations. `read_file` opens the safe workspace file through Red when needed and returns a bounded editor-visible page, current revision, existence, line range, and continuation metadata. Continuations must carry the first page's revision and fail if the buffer changes; an individual source line beyond the byte limit fails explicitly rather than returning an unrecoverable prefix [@codex] [@editor]. `write_file` requires the first page's revision, replaces the complete buffer through an agent-origin editor transaction, and saves through Red [@tools] [@editor].
 
+`create_directory` is the one editor tool that mutates the workspace without opening or changing an editor buffer. It creates a directory and missing parents inside the workspace, accepts an existing directory as success, and remains subject to the same workspace, ignore, protected-path, symlink, and platform support checks described by the workflow [@tools] [@workflow].
+
 The workflow documentation describes the same twelve-tool contract and its expected behavior, including bounded file listing, bounded search, Red-mediated reads, revision-checked writes, directory creation, editor state snapshots, file opening, UTF-16 selections, revision-checked edits, source annotations, and allow-listed navigation or LSP actions [@workflow].
 
 ## Strict Editor Schemas

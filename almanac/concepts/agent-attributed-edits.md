@@ -27,7 +27,7 @@ Red makes the work visible before it happens. For file tools, the editor opens t
 
 ## Full Agent Versus Inline Assist
 
-The full Agent workflow starts from `Space A` or `:Agent` and uses the nine-tool Codex surface documented in the workflow [@workflow]. Successful full-agent edits are revision-checked, applied as agent-origin transactions, and saved to disk through Red [@workflow] [@editor].
+The full Agent workflow starts from `Space A` or `:Agent` and uses the ten-tool Codex surface documented in the workflow [@workflow]. Successful full-agent edits are revision-checked, applied as agent-origin transactions, and saved to disk through Red, while directory creation is workspace-confined and does not change an editor buffer [@workflow] [@editor] [@tools].
 
 Inline assist starts from `Space i` and has a smaller contract. Codex receives one immutable target range plus bounded surrounding context and can only call `submit_replacement`; Red then verifies that the active buffer, window, revision, and original target text still match before applying the replacement [@workflow] [@codex] [@editor]. Inline replacements are agent-attributed but deliberately unsaved, giving the user local keep, undo, refine, and promote controls [@workflow] [@editor].
 

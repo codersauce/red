@@ -32,9 +32,9 @@ Red's agent architecture is a direct Codex app-server integration wrapped in edi
 
 ## Reading Order
 
-Start with [Codex App-Server Workflow](codex-app-server-workflow) for process launch, app-server initialization, account checks, turn dispatch, event polling, and fail-closed behavior. It is the runtime path that turns `Space A` or `:Agent` into a Codex thread and streamed assistant updates [@workflow] [@codex].
+Start with [Codex App-Server Workflow](codex-app-server-workflow) for process launch, app-server initialization, account checks, turn dispatch, conversation-scoped model selection, activity presentation, event polling, and fail-closed behavior. It is the runtime path that turns `Space A` or `:Agent` into a Codex thread and streamed assistant updates [@workflow] [@codex].
 
-Read [Dynamic Tools And Editor Tools](dynamic-tools-and-editor-tools) when work touches the tool surface Codex can call. That page covers the four workspace dynamic tools, the five strict editor-tool schemas, UTF-16 editor coordinates, allow-listed editor actions, and the bounded channel that routes editor tools back through Red [@codex] [@tools].
+Read [Dynamic Tools And Editor Tools](dynamic-tools-and-editor-tools) when work touches the tool surface Codex can call. That page covers the app-server tool definitions, the six strict editor-tool schemas, UTF-16 editor coordinates, directory creation, allow-listed editor actions, and the bounded channel that routes editor tools back through Red [@codex] [@tools].
 
 Use [Followed Editing](followed-editing) for the full-agent write path: Red reveals the target file, checks the visible revision, applies an agent-attributed editor transaction, and saves through the editor [@workflow] [@editor].
 

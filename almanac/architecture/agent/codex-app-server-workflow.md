@@ -6,9 +6,18 @@ sources:
   - id: codex
     type: file
     path: src/codex/mod.rs
+  - id: codex-models
+    type: file
+    path: src/codex/models.rs
+  - id: codex-activity
+    type: file
+    path: src/codex/activity.rs
   - id: editor
     type: file
     path: src/editor.rs
+  - id: editor-models
+    type: file
+    path: src/editor/agent_models.rs
   - id: manager
     type: file
     path: src/editor/agent_manager.rs
@@ -45,6 +54,14 @@ Prompt dispatch begins in the editor. Before sending a turn, `dispatch_agent_pro
 The worker keeps app-server reading, command handling, response correlation, and dynamic-tool results in one async loop [@codex]. It reads stdout frames on a separate task, uses a pending-request table keyed by JSON-RPC id, tracks sessions by Codex thread id, and drops tool results if the referenced turn is no longer active or has been cancelled [@codex]. Tool arguments, tool responses, app-server frames, tool runtime, file-list pages, workspace walks, search matches, and search bytes are bounded; there is no per-turn tool-call count ceiling [@codex] [@workflow].
 
 The editor polls both directions from `service_background`. It follows and executes pending editor-tool requests through the owner task, then drains Codex events; inactive-session updates are ignored, stale permission requests are denied, terminal events mark sessions inactive, and all user-facing Codex events are translated to plugin notifications such as `agent:update`, `agent:activity`, `agent:completed`, `agent:cancelled`, and `agent:error` [@editor].
+
+## Model Selection And Activity
+
+Agent model choice is conversation-scoped. The bundled agent plugin exposes `:AgentModel` and the Agent-pane model header, while `Editor::handle_agent_model_request` routes `AgentReadDefaultModel`, `AgentListModels`, and `AgentSetModel` callbacks through the Codex bridge without changing global Codex configuration [@workflow] [@agent-plugin] [@editor-models]. If the user chooses a model before a thread exists, the editor stores that selection as the next conversation model; otherwise the request must match the current conversation id before Red sends it to Codex [@editor-models] [@manager]. A metadata-only model request may start the app-server bridge, but bridge failure resolves the plugin callback instead of reporting a lost agent conversation [@editor-models].
+
+The Codex worker reads default model settings with `config/read`, pages the visible model catalog with `model/list`, and updates a running conversation with `thread/settings/update` using the selected model and optional reasoning effort [@codex-models]. Catalog reads filter hidden entries, deduplicate model ids, and stop if pagination exceeds Red's page or cursor bounds, so a malformed model catalog cannot keep the worker paginating forever [@codex-models]. Confirmed `thread/settings/updated` events update the session model, and `model/rerouted` is forwarded only when it names the active turn for an agent session [@codex-models]. Starting a new conversation with an explicit selection adds the selected model and optional `model_reasoning_effort` to the `thread/start` request without weakening the read-only tool and approval settings [@codex].
+
+Activity updates are presentation data, not raw app-server frames. The worker converts active-turn `item/started` and `item/completed` events into bounded labels for recognized dynamic tools and reasoning progress, dropping unrelated items and omitting raw arguments or file contents [@codex] [@codex-activity]. The agent plugin keeps live rows for the current turn, collapses them into a compact activity summary when the turn ends, and opens a separate activity workspace for full row details [@agent-plugin]. Live progress is therefore visible without making private reasoning text, full file contents, or stale inactive-turn tools part of the conversation transcript [@codex-activity] [@agent-plugin].
 
 ## Conversation UI State
 
