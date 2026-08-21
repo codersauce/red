@@ -27878,12 +27878,34 @@ fn directory_watch_snapshot(path: &str, recursive: bool) -> Value {
             (metadata.is_dir(), metadata.len(), modified)
         })
     };
+    #[cfg(windows)]
+    let directory = (signature(root), directory_entry_fingerprint(root));
+    #[cfg(not(windows))]
+    let directory = signature(root);
     json!({
         "path": path,
-        "directory": signature(root),
+        "directory": directory,
         "gitignore": signature(&root.join(".gitignore")),
         "ignore": signature(&root.join(".ignore")),
     })
+}
+
+#[cfg(any(test, windows))]
+fn directory_entry_fingerprint(path: &Path) -> Option<(usize, u64)> {
+    use std::{
+        collections::hash_map::DefaultHasher,
+        hash::{Hash, Hasher},
+    };
+
+    let mut count = 0;
+    let mut fingerprint = 0;
+    for entry in fs::read_dir(path).ok()?.flatten() {
+        let mut hasher = DefaultHasher::new();
+        entry.file_name().hash(&mut hasher);
+        fingerprint ^= hasher.finish();
+        count += 1;
+    }
+    Some((count, fingerprint))
 }
 
 fn directory_snapshot(path: &str, recursive: bool) -> Value {
@@ -41271,6 +41293,22 @@ while True:
         std::fs::write(root.path().join("new-file.rs"), "").unwrap();
         let changed = directory_watch_snapshot(&root.path().to_string_lossy(), false);
         assert_ne!(initial, changed);
+    }
+
+    #[test]
+    fn directory_entry_fingerprint_detects_renames_without_retaining_entries() {
+        let root = tempfile::tempdir().unwrap();
+        let original = root.path().join("original.rs");
+        let renamed = root.path().join("renamed.rs");
+        std::fs::write(&original, "").unwrap();
+
+        let initial = directory_entry_fingerprint(root.path()).unwrap();
+        std::fs::rename(original, renamed).unwrap();
+        let changed = directory_entry_fingerprint(root.path()).unwrap();
+
+        assert_eq!(initial.0, 1);
+        assert_eq!(changed.0, 1);
+        assert_ne!(initial.1, changed.1);
     }
 
     #[test]
