@@ -18,6 +18,7 @@
 mod agent_annotations;
 mod agent_manager;
 mod agent_models;
+mod buffer_actions;
 mod buffer_manager;
 mod command_mode;
 mod completion_resolve;
@@ -2561,12 +2562,20 @@ pub enum Action {
     PluginCommand(String),
     SetCursor(usize, usize),
     SetWaitingKey(Box<KeyAction>),
+    /// Opens an empty, unnamed buffer in the active editor window.
+    NewBuffer,
+    /// Switches to the existing buffer selected by its stable process-local identity.
+    OpenBufferById(u64),
     OpenBuffer(String),
+    /// Assigns a file path to the current buffer without writing it to disk.
+    SetBufferName(String),
     OpenFile(String),
     ReloadFile(bool),
 
     NextBuffer,
     PreviousBuffer,
+    /// Displays open buffers, stable numbers, active state, and unsaved markers.
+    ListBuffers,
     /// Switches to the most recently used other buffer.
     AlternateBuffer,
     DeleteBuffer(bool),
@@ -2771,6 +2780,10 @@ pub enum Action {
     // Window management actions
     SplitHorizontal,
     SplitVertical,
+    /// Creates a horizontal split containing a fresh unnamed buffer.
+    SplitHorizontalNewBuffer,
+    /// Creates a vertical split containing a fresh unnamed buffer.
+    SplitVerticalNewBuffer,
     SplitHorizontalWithFile(String),
     SplitVerticalWithFile(String),
     CloseWindow,
@@ -8482,6 +8495,60 @@ impl Editor {
                     .as_deref()
                     .is_some_and(|file| same_file_path(Path::new(file), path))
         })
+    }
+
+    fn named_buffer_index(&self, name: &str) -> Result<usize, String> {
+        if name == "#" {
+            return self
+                .buffer_manager
+                .alternate_index()
+                .ok_or_else(|| "No alternate buffer".to_string());
+        }
+
+        if let Ok(id) = name.parse::<u64>() {
+            return self
+                .buffer_manager
+                .iter()
+                .position(|buffer| buffer.id().as_u64() == id)
+                .ok_or_else(|| format!("No buffer matching {name:?}"));
+        }
+
+        let exact = self
+            .buffer_manager
+            .iter()
+            .enumerate()
+            .filter_map(|(index, buffer)| {
+                let basename = buffer
+                    .file
+                    .as_deref()
+                    .and_then(|file| Path::new(file).file_name())
+                    .and_then(|file| file.to_str());
+                (buffer.name() == name || basename == Some(name)).then_some(index)
+            })
+            .collect::<Vec<_>>();
+        match exact.as_slice() {
+            [index] => return Ok(*index),
+            [] => {}
+            _ => {
+                return Err(format!(
+                    "Multiple buffers match {name:?}; use the buffer number"
+                ))
+            }
+        }
+
+        let partial = self
+            .buffer_manager
+            .iter()
+            .enumerate()
+            .filter_map(|(index, buffer)| buffer.name().contains(name).then_some(index))
+            .collect::<Vec<_>>();
+        match partial.as_slice() {
+            [index] => Ok(*index),
+            [] => Err(format!("No buffer matching {name:?}")),
+            _ => Err(format!(
+                "Multiple buffers match {name:?}; use the buffer number"
+            )),
+        }
     }
 
     async fn load_or_reuse_file_buffer(
@@ -15364,16 +15431,76 @@ impl Editor {
                 }
             }
 
-            if cmd == "buffer-next" {
+            if cmd == "saveas" {
+                let Some(file) = parsed.file_argument() else {
+                    self.set_legacy_message(Some("usage: saveas <file>".to_string()));
+                    return Vec::new();
+                };
+                actions.push(Action::SaveAs(file));
+            }
+
+            if cmd == "file" {
+                if let Some(file) = parsed.file_argument() {
+                    actions.push(Action::SetBufferName(file));
+                } else {
+                    actions.push(Action::Print(self.current_buffer().name().to_string()));
+                }
+            }
+
+            if cmd == "buffer-next" || cmd == "bnext" {
                 actions.push(Action::NextBuffer);
             }
 
-            if cmd == "buffer-prev" {
+            if cmd == "buffer-prev" || cmd == "bprevious" {
                 actions.push(Action::PreviousBuffer);
+            }
+
+            if cmd == "b" || cmd == "buffer" {
+                if let Some(name) = parsed.file_argument() {
+                    actions.push(Action::OpenBuffer(name));
+                } else {
+                    actions.push(Action::ListBuffers);
+                }
+            }
+
+            if cmd == "b#" {
+                actions.push(Action::AlternateBuffer);
+            }
+
+            if cmd == "ls" || cmd == "buffers" || cmd == "files" {
+                if parsed.file_argument().is_some() {
+                    self.set_legacy_message(Some(format!("usage: {cmd}")));
+                    return Vec::new();
+                }
+                actions.push(Action::ListBuffers);
             }
 
             if cmd == "bd" || cmd == "bdelete" || cmd == "buffer-delete" {
                 actions.push(Action::DeleteBuffer(parsed.is_forced()));
+            }
+
+            if cmd == "enew" {
+                if parsed.file_argument().is_some() {
+                    self.set_legacy_message(Some("usage: enew".to_string()));
+                    return Vec::new();
+                }
+                actions.push(Action::NewBuffer);
+            }
+
+            if cmd == "new" {
+                if let Some(file) = parsed.file_argument() {
+                    actions.push(Action::SplitHorizontalWithFile(file));
+                } else {
+                    actions.push(Action::SplitHorizontalNewBuffer);
+                }
+            }
+
+            if cmd == "vnew" {
+                if let Some(file) = parsed.file_argument() {
+                    actions.push(Action::SplitVerticalWithFile(file));
+                } else {
+                    actions.push(Action::SplitVerticalNewBuffer);
+                }
             }
 
             if cmd == "edit" {
@@ -17879,6 +18006,8 @@ impl Editor {
             action,
             Action::SplitHorizontal
                 | Action::SplitVertical
+                | Action::SplitHorizontalNewBuffer
+                | Action::SplitVerticalNewBuffer
                 | Action::SplitHorizontalWithFile(_)
                 | Action::SplitVerticalWithFile(_)
                 | Action::CloseWindow
@@ -20268,9 +20397,18 @@ impl Editor {
                     self.set_current_buffer(buffer, index).await?;
                 }
             }
-            Action::OpenBuffer(name) => {
-                if let Some(index) = self.buffer_manager.iter().position(|b| b.name() == *name) {
-                    self.set_current_buffer(buffer, index).await?;
+            Action::ListBuffers
+            | Action::NewBuffer
+            | Action::OpenBufferById(_)
+            | Action::OpenBuffer(_)
+            | Action::SetBufferName(_)
+            | Action::SplitHorizontalNewBuffer
+            | Action::SplitVerticalNewBuffer => {
+                if matches!(action, Action::ListBuffers) {
+                    add_to_history = false;
+                }
+                if !self.execute_buffer_action(action, buffer).await? {
+                    return Ok(false);
                 }
             }
             Action::DeleteBuffer(force) => {
@@ -21640,6 +21778,8 @@ impl Editor {
                 | Action::JumpToMark { .. }
                 | Action::OpenLocation(_, _)
                 | Action::OpenFile(_)
+                | Action::OpenBuffer(_)
+                | Action::OpenBufferById(_)
                 | Action::OpenAgentAnnotation(_)
                 | Action::SplitHorizontalWithFile(_)
                 | Action::SplitVerticalWithFile(_)
@@ -27939,6 +28079,7 @@ pub struct EditorInfo {
 #[derive(Debug, Clone, Serialize)]
 /// Read-only buffer summary nested in [`EditorInfo`].
 pub struct BufferInfo {
+    id: BufferId,
     name: String,
     path: Option<String>,
     dirty: bool,
@@ -27966,6 +28107,7 @@ impl From<&Editor> for EditorInfo {
 impl From<&Buffer> for BufferInfo {
     fn from(buffer: &Buffer) -> Self {
         Self {
+            id: buffer.id(),
             name: buffer.name().to_string(),
             path: buffer.file.clone(),
             dirty: buffer.is_dirty(),

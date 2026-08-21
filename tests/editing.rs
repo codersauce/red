@@ -1999,6 +1999,403 @@ async fn whitespace_only_commands_are_not_saved_to_history() {
 }
 
 #[tokio::test]
+async fn enew_opens_an_unnamed_buffer_without_saving_the_previous_buffer() {
+    let path = temp_file_path("enew-dirty-buffer");
+    fs::write(&path, "saved contents\n").unwrap();
+    let buffer = Buffer::new(Some(path.clone()), "saved contents\n".to_string());
+    let mut harness = EditorHarness::with_buffer(buffer);
+    harness
+        .execute_action(Action::InsertCharAtCursorPos('x'))
+        .await
+        .unwrap();
+
+    harness
+        .execute_action(Action::Command("enew".to_string()))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        harness.buffer_names(),
+        vec![path.clone(), "[No Name]".into()]
+    );
+    assert_eq!(harness.current_buffer_index(), 1);
+    assert!(harness.editor.test_current_buffer().is_unnamed());
+    assert!(harness.editor.test_current_buffer().is_blank());
+    assert!(!harness.is_dirty());
+    assert_eq!(fs::read_to_string(&path).unwrap(), "saved contents\n");
+
+    harness
+        .execute_action(Action::PreviousBuffer)
+        .await
+        .unwrap();
+    assert_eq!(harness.buffer_contents(), "xsaved contents\n");
+    assert!(harness.is_dirty());
+    fs::remove_file(path).unwrap();
+}
+
+#[tokio::test]
+async fn enew_reuses_a_clean_unnamed_empty_buffer() {
+    let mut harness = EditorHarness::new();
+    let original_id = harness.editor.test_current_buffer().id();
+
+    for command in ["enew", "enew!"] {
+        harness
+            .execute_action(Action::Command(command.to_string()))
+            .await
+            .unwrap();
+
+        assert_eq!(harness.buffer_names(), vec!["[No Name]"]);
+        assert_eq!(harness.editor.test_current_buffer().id(), original_id);
+    }
+}
+
+#[tokio::test]
+async fn enew_changes_only_the_active_split() {
+    let mut harness = EditorHarness::with_content("original contents\n");
+    harness.execute_action(Action::SplitVertical).await.unwrap();
+
+    harness
+        .execute_action(Action::Command("enew".to_string()))
+        .await
+        .unwrap();
+
+    assert_eq!(harness.window_count(), 2);
+    assert_eq!(harness.current_buffer_index(), 1);
+    assert!(harness.editor.test_current_buffer().is_blank());
+
+    harness.execute_action(Action::NextWindow).await.unwrap();
+
+    assert_eq!(harness.current_buffer_index(), 0);
+    assert_eq!(harness.buffer_contents(), "original contents\n");
+}
+
+#[tokio::test]
+async fn enew_rejects_file_arguments_without_changing_buffers() {
+    let mut harness = EditorHarness::with_content("original contents\n");
+
+    harness
+        .execute_action(Action::Command("enew unexpected.txt".to_string()))
+        .await
+        .unwrap();
+
+    assert_eq!(harness.buffer_names(), vec!["[No Name]"]);
+    assert_eq!(harness.buffer_contents(), "original contents\n");
+    assert_eq!(harness.last_error(), Some("usage: enew"));
+}
+
+#[tokio::test]
+async fn new_and_vnew_create_fresh_unnamed_buffers_in_new_splits() {
+    for command in ["new", "vnew"] {
+        let mut harness = EditorHarness::new();
+        let original_id = harness.editor.test_current_buffer().id();
+
+        harness
+            .execute_action(Action::Command(command.to_string()))
+            .await
+            .unwrap();
+
+        assert_eq!(harness.window_count(), 2, "{command}");
+        assert_eq!(harness.buffer_names(), vec!["[No Name]", "[No Name]"]);
+        assert_eq!(harness.current_buffer_index(), 1);
+        assert_ne!(harness.editor.test_current_buffer().id(), original_id);
+        assert!(harness.editor.test_current_buffer().is_blank());
+
+        harness.execute_action(Action::NextWindow).await.unwrap();
+        assert_eq!(harness.editor.test_current_buffer().id(), original_id);
+    }
+}
+
+#[tokio::test]
+async fn new_and_vnew_accept_paths_without_writing_missing_files() {
+    let directory = tempfile::tempdir().unwrap();
+
+    for (command, name) in [("new", "horizontal.rs"), ("vnew", "vertical.rs")] {
+        let path = directory.path().join(name);
+        let mut harness = EditorHarness::with_content("original contents\n");
+
+        harness
+            .execute_action(Action::Command(format!("{command} {}", path.display())))
+            .await
+            .unwrap();
+
+        assert_eq!(harness.window_count(), 2, "{command}");
+        assert_eq!(
+            harness.editor.test_current_buffer().file.as_deref(),
+            path.to_str()
+        );
+        assert!(!path.exists(), "{command} should not create a disk file");
+
+        harness.execute_action(Action::NextWindow).await.unwrap();
+        assert_eq!(harness.buffer_contents(), "original contents\n");
+    }
+}
+
+#[tokio::test]
+async fn buffer_commands_select_names_stable_numbers_and_the_alternate() {
+    let directory = tempfile::tempdir().unwrap();
+    let first = directory.path().join("one.rs");
+    let second = directory.path().join("two.rs");
+    let third = directory.path().join("three.rs");
+    let buffers = [(&first, "one\n"), (&second, "two\n"), (&third, "three\n")]
+        .into_iter()
+        .map(|(path, contents)| {
+            Buffer::new(
+                Some(path.to_string_lossy().into_owned()),
+                contents.to_string(),
+            )
+        })
+        .collect();
+    let mut editor = Editor::test_with_size(
+        Box::new(MockLsp),
+        /*width*/ 80,
+        /*height*/ 24,
+        Config::default(),
+        Theme::default(),
+        buffers,
+    )
+    .unwrap();
+    editor.test_disable_terminal_output();
+    let mut harness = EditorHarness { editor };
+
+    harness
+        .execute_action(Action::Command("b two.rs".to_string()))
+        .await
+        .unwrap();
+    assert_eq!(harness.current_buffer_index(), 1);
+    let second_id = harness.editor.test_current_buffer().id().as_u64();
+
+    harness
+        .execute_action(Action::Command("buffer #".to_string()))
+        .await
+        .unwrap();
+    assert_eq!(harness.current_buffer_index(), 0);
+
+    harness
+        .execute_action(Action::Command(format!("buffer {second_id}")))
+        .await
+        .unwrap();
+    assert_eq!(harness.current_buffer_index(), 1);
+
+    harness
+        .execute_action(Action::Command("b#".to_string()))
+        .await
+        .unwrap();
+    assert_eq!(harness.current_buffer_index(), 0);
+    assert_eq!(harness.buffer_names().len(), 3);
+
+    harness
+        .execute_action(Action::Command("b thre".to_string()))
+        .await
+        .unwrap();
+    assert_eq!(harness.current_buffer_index(), 2);
+}
+
+#[tokio::test]
+async fn buffer_selection_rejects_ambiguous_names_and_supports_stable_ids() {
+    let buffers = vec![
+        Buffer::new(/*file*/ None, "first\n".to_string()),
+        Buffer::new(/*file*/ None, "second\n".to_string()),
+    ];
+    let second_id = buffers[1].id().as_u64();
+    let mut editor = Editor::test_with_size(
+        Box::new(MockLsp),
+        /*width*/ 80,
+        /*height*/ 24,
+        Config::default(),
+        Theme::default(),
+        buffers,
+    )
+    .unwrap();
+    editor.test_disable_terminal_output();
+    let mut harness = EditorHarness { editor };
+
+    harness
+        .execute_action(Action::Command("b [No Name]".to_string()))
+        .await
+        .unwrap();
+    assert_eq!(harness.current_buffer_index(), 0);
+    assert!(harness
+        .last_error()
+        .is_some_and(|message| message.contains("Multiple buffers match")));
+
+    harness
+        .execute_action(Action::OpenBufferById(second_id))
+        .await
+        .unwrap();
+    assert_eq!(harness.current_buffer_index(), 1);
+    assert_eq!(harness.buffer_contents(), "second\n");
+}
+
+#[tokio::test]
+async fn buffer_listing_aliases_show_stable_numbers_without_opening_splits() {
+    for command in ["ls", "buffers", "files", "b", "buffer"] {
+        let mut harness = EditorHarness::with_content("contents\n");
+        harness
+            .execute_action(Action::InsertCharAtCursorPos('x'))
+            .await
+            .unwrap();
+        let id = harness.editor.test_current_buffer().id().as_u64();
+
+        harness
+            .execute_action(Action::Command(command.to_string()))
+            .await
+            .unwrap();
+
+        let listing = harness.last_error().unwrap();
+        assert!(listing.contains(&id.to_string()), "{command}: {listing}");
+        assert!(listing.contains("[No Name]"), "{command}: {listing}");
+        assert!(listing.contains("[+]"), "{command}: {listing}");
+        assert_eq!(harness.window_count(), 1, "{command}");
+    }
+}
+
+#[tokio::test]
+async fn standard_buffer_navigation_aliases_switch_existing_buffers() {
+    let mut harness = EditorHarness::with_content("first\n");
+    harness
+        .execute_action(Action::Command("enew".to_string()))
+        .await
+        .unwrap();
+
+    harness
+        .execute_action(Action::Command("bprevious".to_string()))
+        .await
+        .unwrap();
+    assert_eq!(harness.current_buffer_index(), 0);
+
+    harness
+        .execute_action(Action::Command("bnext".to_string()))
+        .await
+        .unwrap();
+    assert_eq!(harness.current_buffer_index(), 1);
+}
+
+#[tokio::test]
+async fn saveas_writes_the_current_buffer_to_its_new_file() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("saved notes.txt");
+    let mut harness = EditorHarness::with_content("draft contents\n");
+
+    harness
+        .execute_action(Action::Command(format!("saveas {}", path.display())))
+        .await
+        .unwrap();
+
+    assert_eq!(fs::read_to_string(&path).unwrap(), "draft contents\n");
+    assert_eq!(
+        harness.editor.test_current_buffer().file.as_deref(),
+        path.to_str()
+    );
+    assert!(!harness.is_dirty());
+}
+
+#[tokio::test]
+async fn file_assigns_a_buffer_name_without_writing_or_clearing_changes() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("unsaved notes.txt");
+    let mut harness = EditorHarness::with_content("draft contents\n");
+    harness
+        .execute_action(Action::InsertCharAtCursorPos('x'))
+        .await
+        .unwrap();
+
+    harness
+        .execute_action(Action::Command(format!("file {}", path.display())))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        harness.editor.test_current_buffer().file.as_deref(),
+        path.to_str()
+    );
+    assert_eq!(harness.buffer_contents(), "xdraft contents\n");
+    assert!(harness.is_dirty());
+    assert!(!path.exists());
+
+    harness
+        .execute_action(Action::Command("file".to_string()))
+        .await
+        .unwrap();
+    assert_eq!(harness.last_error(), path.to_str());
+}
+
+#[tokio::test]
+async fn file_rejects_paths_already_open_in_another_buffer() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("open.rs");
+    let buffers = vec![
+        Buffer::new(/*file*/ None, "draft\n".to_string()),
+        Buffer::new(
+            Some(path.to_string_lossy().into_owned()),
+            "existing\n".to_string(),
+        ),
+    ];
+    let mut editor = Editor::test_with_size(
+        Box::new(MockLsp),
+        /*width*/ 80,
+        /*height*/ 24,
+        Config::default(),
+        Theme::default(),
+        buffers,
+    )
+    .unwrap();
+    editor.test_disable_terminal_output();
+    let mut harness = EditorHarness { editor };
+
+    harness
+        .execute_action(Action::Command(format!("file {}", path.display())))
+        .await
+        .unwrap();
+
+    assert!(harness.editor.test_current_buffer().is_unnamed());
+    assert!(harness
+        .last_error()
+        .is_some_and(|message| message.contains("already exists")));
+    assert!(!path.exists());
+}
+
+#[tokio::test]
+async fn saveas_requires_a_file_argument() {
+    let mut harness = EditorHarness::with_content("draft contents\n");
+
+    harness
+        .execute_action(Action::Command("saveas".to_string()))
+        .await
+        .unwrap();
+
+    assert!(harness.editor.test_current_buffer().is_unnamed());
+    assert_eq!(harness.last_error(), Some("usage: saveas <file>"));
+}
+
+#[tokio::test]
+async fn unknown_command_does_not_expand_into_reload_write_or_split_actions() {
+    let path = temp_file_path("unknown-buffer-command");
+    fs::write(&path, "disk contents\n").unwrap();
+    let buffer = Buffer::new(Some(path.clone()), "disk contents\n".to_string());
+    let mut harness = EditorHarness::with_buffer(buffer);
+    harness
+        .execute_action(Action::InsertCharAtCursorPos('x'))
+        .await
+        .unwrap();
+
+    for command in ["eneww", "nwe", "lss"] {
+        harness
+            .execute_action(Action::Command(command.to_string()))
+            .await
+            .unwrap();
+
+        assert_eq!(harness.buffer_contents(), "xdisk contents\n");
+        assert_eq!(fs::read_to_string(&path).unwrap(), "disk contents\n");
+        assert_eq!(harness.window_count(), 1);
+        assert!(harness
+            .last_error()
+            .is_some_and(|message| message.contains("unknown command")));
+    }
+
+    fs::remove_file(path).unwrap();
+}
+
+#[tokio::test]
 async fn edit_without_file_argument_reloads_current_file() {
     let path = temp_file_path("edit-reload");
     fs::write(&path, "one\ntwo\nthree\n").unwrap();
@@ -2101,7 +2498,9 @@ async fn command_tab_opens_completed_paths_with_spaces() {
     let command_path = format!("{command_directory}/name  with spaces.txt!");
     fs::write(&path, "completed file contents\n").unwrap();
 
-    for command in ["e", "edit", "e!", "split", "sp", "vsplit", "vs"] {
+    for command in [
+        "e", "edit", "e!", "new", "vnew", "split", "sp", "vsplit", "vs",
+    ] {
         let mut harness = EditorHarness::with_content("");
         harness.set_commandline(
             Mode::Command,

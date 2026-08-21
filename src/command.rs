@@ -1,9 +1,9 @@
 //! Parsing of built-in colon-command abbreviations, arguments, and force flags.
 //!
 //! Parsing receives the authoritative command-name list from the caller. Exact names,
-//! conventional initial-based abbreviations, and command chains are resolved before
-//! arguments are returned; unknown input fails as a whole so a partially recognized
-//! chain cannot execute unintended commands.
+//! conventional initial-based abbreviations, and the explicit `wq` command chain are
+//! resolved before arguments are returned. Unknown names never decompose into unrelated
+//! commands, which prevents accidental buffer deletion, reloads, and writes.
 
 /// Accepted values for the first `:set` argument.
 pub(crate) const SET_OPTIONS: &[&str] = &["relativenumber", "rnu", "norelativenumber", "nornu"];
@@ -55,8 +55,8 @@ impl ParsedCommand {
 
 /// Resolves a command line against the supplied canonical command names.
 ///
-/// Returns `None` when any command in a chain is unknown. Arguments are split on spaces
-/// without shell quoting or expansion.
+/// Returns `None` for unknown command names. Only the intentional `wq` chain is
+/// recognized. Arguments are split on spaces without shell quoting or expansion.
 pub fn parse(commands: &[&str], input: &str) -> Option<ParsedCommand> {
     let mut parts = input.splitn(2, ' ');
     let (flags, input) = parse_flags(parts.next()?);
@@ -101,15 +101,11 @@ fn parse_commands(commands: &[&str], input: &str) -> Vec<String> {
         return vec![(*command).to_string()];
     }
 
-    let mut result = Vec::new();
-    for c in input.chars() {
-        let Some(command) = commands.iter().find(|cmd| cmd.starts_with(c)) else {
-            return Vec::new();
-        };
-        result.push(command.to_string());
+    if input == "wq" && commands.contains(&"write") && commands.contains(&"quit") {
+        return vec!["write".to_string(), "quit".to_string()];
     }
 
-    result
+    Vec::new()
 }
 
 #[cfg(test)]
@@ -203,6 +199,17 @@ mod test {
 
         assert_eq!(parse(&commands, "DefinitelyNotACommand"), None);
         assert_eq!(parse(&commands, "wzq"), None);
+    }
+
+    #[test]
+    fn unknown_names_never_expand_into_unrelated_command_chains() {
+        let commands = ["quit", "write", "edit", "noh", "languages", "split", "bd"];
+
+        for unknown in ["enew", "new", "vnew", "ls", "ew", "lss"] {
+            assert_eq!(parse(&commands, unknown), None, "{unknown}");
+        }
+
+        assert_eq!(parse(&commands, "wq!").unwrap().commands, ["write", "quit"]);
     }
 
     #[test]
