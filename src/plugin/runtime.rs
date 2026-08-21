@@ -47,7 +47,7 @@ use crate::{
 
 use super::{
     Decoration, GutterSign, OverlayConfig, PanelConfig, PanelRow, TextPanelBlock, TextPanelStatus,
-    WindowBarConfig, WindowBarSegment,
+    TreePanelModel, WindowBarConfig, WindowBarSegment,
 };
 use super::{WorkspaceConfig, WorkspaceModel};
 
@@ -2757,6 +2757,25 @@ impl RedHost {
     fn call_neotree_core(&mut self, operation: &str, args: &[Value]) -> anyhow::Result<Value> {
         if operation == "status_entries" {
             return neotree_status_entries(args.first());
+        }
+        if operation == "update_panel" {
+            const EAGER_TREE_ROWS: usize = 192;
+            let id = args
+                .first()
+                .and_then(Value::as_str)
+                .ok_or_else(|| anyhow::anyhow!("Neo-tree panel update requires an id"))?
+                .to_string();
+            let model = TreePanelModel::from_husk_values(&args[1..])?;
+            crate::editor::perf::gauge_max("neotree:total_rows", model.len() as u64);
+            if model.len() <= EAGER_TREE_ROWS {
+                let rows = (0..model.len())
+                    .filter_map(|index| model.row(index))
+                    .collect::<Vec<_>>();
+                self.send_request(PluginRequest::UpdatePanel { id, rows });
+            } else {
+                self.send_request(PluginRequest::UpdateTreePanel { id, model });
+            }
+            return Ok(Value::Unit);
         }
 
         let function = match operation {
@@ -15971,7 +15990,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn neotree_caps_a_pathological_visible_listing_within_the_instruction_budget() {
+    async fn neotree_virtualizes_large_visible_listings_within_the_instruction_budget() {
         drain_requests();
 
         let mut runtime = Runtime::new();
@@ -16006,7 +16025,7 @@ mod tests {
                 serde_json::json!({
                     "path": ".",
                     "entries": entries,
-                    "truncated": true,
+                    "truncated": false,
                     "error": null,
                 }),
             )
@@ -16017,19 +16036,15 @@ mod tests {
             PluginRequest::WatchDirectory { path, .. } => assert_eq!(path, "."),
             _ => panic!("expected neotree directory watch"),
         }
-        let rows = match ACTION_DISPATCHER.recv_request() {
-            PluginRequest::UpdatePanel { id, rows } => {
+        let model = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::UpdateTreePanel { id, model } => {
                 assert_eq!(id, "neotree");
-                rows
+                model
             }
-            _ => panic!("expected neotree panel update"),
+            _ => panic!("expected virtualized Neo-tree panel update"),
         };
-        assert_eq!(rows.len(), 201);
-        assert!(rows.last().unwrap().path.is_none());
-        assert_eq!(
-            rows.last().unwrap().segments[1].text,
-            "… tree limited to 200 rows"
-        );
+        assert_eq!(model.len(), 1_001);
+        assert_eq!(model.row(1_000).unwrap().id, "./file-0999.rlib");
     }
 
     #[tokio::test]

@@ -15,6 +15,9 @@ sources:
   - id: runtime
     type: file
     path: src/plugin/runtime.rs
+  - id: tree-model
+    type: file
+    path: src/plugin/tree.rs
 ---
 
 Bundled Husk plugins are the Husk feature layer that ships with Red itself. The repository embeds the `plugins/` tree into the binary as runtime assets, while `default_config.toml` selects the default configured plugin set by mapping plugin names to `.hk` files [@assets] [@default-config]. Most bundled behavior lives in single `.hk` compatibility shells, but Git and Neo-tree also call embedded pure Husk packages for typed parsing, path handling, row construction, and command argument construction [@plugins-dir] [@runtime]. This distinction matters when changing plugin behavior: the shell owns editor events and host calls, while the core package owns deterministic logic that can be compiled and tested as Husk code.
@@ -29,7 +32,7 @@ Default enablement is a separate configuration decision. The `[plugins]` table i
 
 Most bundled plugins are `.hk` shells that register commands, listen to events, request editor state, and update editor-owned UI resources through the Red host API [@plugins-dir]. Examples include buffer picking, theme browsing, search decoration, breadcrumbs, inlay hints, project search, LSP symbol pickers, agent UI, and Git or Neo-tree panels [@plugins-dir].
 
-Git and Neo-tree have an extra split. `plugins/git.hk` remains the editor-facing plugin, but `plugins/git_core/` contains a Husk package with separate modules for status parsing, patch modeling, and Git command arguments [@plugins-dir]. `plugins/neotree.hk` stays responsible for panel events and filesystem actions, while `plugins/neotree_core/` contains pure path, status, and tree-row modules [@plugins-dir]. The runtime embeds both package source sets with `ResolvedPackage::from_sources`, compiles them under the native semantic profile, caches their compiled programs, and exposes them only through internal `red::git_core` and `red::neotree_core` operations [@runtime].
+Git and Neo-tree have an extra split. `plugins/git.hk` remains the editor-facing plugin, but `plugins/git_core/` contains a Husk package with separate modules for status parsing, patch modeling, and Git command arguments [@plugins-dir]. `plugins/neotree.hk` stays responsible for panel events and filesystem actions, while `plugins/neotree_core/` contains pure path, status, and compatibility tree-row modules [@plugins-dir]. Large Neo-tree panels use a Rust-owned virtual model that shares Husk directory-entry arrays, indexes every expanded entry, and decorates only visible terminal rows [@tree-model]. The runtime embeds both package source sets with `ResolvedPackage::from_sources`, compiles them under the native semantic profile, caches their compiled programs, and exposes them only through internal `red::git_core` and `red::neotree_core` operations [@runtime].
 
 That split keeps public plugin compatibility small. A shell can continue to use Red events and UI calls, while pure package code can use typed data models without becoming a public host API. The user-facing host contract for plugin authors belongs in [Plugin host API](../../reference/plugins/host-api), not in the internal bridge operation names [@runtime].
 

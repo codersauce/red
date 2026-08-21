@@ -235,7 +235,6 @@ const DIAGNOSTIC_GUTTER_NAMESPACE: &str = "diagnostics";
 const MAX_HIGHLIGHT_SLICE_BYTES: usize = 512 * 1024;
 const MAX_PLUGIN_VIEWPORT_LINE_CHARS: usize = 64 * 1024;
 const MAX_AGENT_FAILURE_MESSAGE_CHARS: usize = 2048;
-const MAX_DIRECTORY_LISTING_ENTRIES: usize = 160;
 const AGENT_BRIDGE_CAPACITY: usize = 64;
 const PLUGIN_MANAGER_PICKER_ID: i32 = 9_101;
 const PLUGIN_MANAGER_ACTION_PICKER_ID: i32 = 9_102;
@@ -1897,6 +1896,10 @@ pub enum PluginRequest {
         id: String,
         rows: Vec<plugin::PanelRow>,
     },
+    UpdateTreePanel {
+        id: String,
+        model: plugin::TreePanelModel,
+    },
     CreateTextPanel {
         id: String,
         config: plugin::PanelConfig,
@@ -1974,6 +1977,10 @@ pub enum PluginRequest {
     ListDirectory {
         path: String,
         request_id: RequestId,
+    },
+    DirectoryListed {
+        request_id: RequestId,
+        payload: Value,
     },
     GetGitStatus {
         path: String,
@@ -2098,6 +2105,7 @@ impl PluginRequest {
             Self::RemoveOverlay { .. } => "RemoveOverlay",
             Self::CreatePanel { .. } => "CreatePanel",
             Self::UpdatePanel { .. } => "UpdatePanel",
+            Self::UpdateTreePanel { .. } => "UpdateTreePanel",
             Self::CreateTextPanel { .. } => "CreateTextPanel",
             Self::UpdateTextPanel { .. } => "UpdateTextPanel",
             Self::AppendTextPanel { .. } => "AppendTextPanel",
@@ -2119,6 +2127,7 @@ impl PluginRequest {
             Self::UpdateWindowBar { .. } => "UpdateWindowBar",
             Self::CloseWindowBar { .. } => "CloseWindowBar",
             Self::ListDirectory { .. } => "ListDirectory",
+            Self::DirectoryListed { .. } => "DirectoryListed",
             Self::GetGitStatus { .. } => "GetGitStatus",
             Self::FileOperation { .. } => "FileOperation",
             Self::WatchDirectory { .. } => "WatchDirectory",
@@ -11289,6 +11298,15 @@ impl Editor {
                     );
                     needs_render = true;
                 }
+                PluginRequest::UpdateTreePanel { id, model } => {
+                    self.panel_manager.update_tree_panel(&id, model);
+                    self.panel_manager.apply_pending_content_restore(
+                        &id,
+                        usize::from(self.size.1.saturating_sub(2)),
+                        usize::from(self.size.0),
+                    );
+                    needs_render = true;
+                }
                 PluginRequest::CreateTextPanel { id, config } => {
                     self.clear_replaced_panel_zoom(&id);
                     self.panel_manager.create_text_panel(id.clone(), config);
@@ -11447,7 +11465,20 @@ impl Editor {
                     }
                 }
                 PluginRequest::ListDirectory { path, request_id } => {
-                    let payload = directory_listing(&path);
+                    let callback_runtime = runtime.clone();
+                    tokio::task::spawn_blocking(move || {
+                        let _span = perf::PerfSpan::with_detail("neotree:directory_scan", &path);
+                        let payload = directory_listing(&path);
+                        callback_runtime.send_request(PluginRequest::DirectoryListed {
+                            request_id,
+                            payload,
+                        });
+                    });
+                }
+                PluginRequest::DirectoryListed {
+                    request_id,
+                    payload,
+                } => {
                     self.plugin_registry
                         .resolve_request(runtime, request_id, payload)
                         .await?;
@@ -11590,7 +11621,7 @@ impl Editor {
                     self.directory_watchers.insert(
                         watch_id,
                         DirectoryWatcher {
-                            snapshot: directory_snapshot(&path, recursive),
+                            snapshot: directory_watch_snapshot(&path, recursive),
                             path,
                             last_checked: Instant::now(),
                             recursive,
@@ -14789,10 +14820,15 @@ impl Editor {
             }
             watcher.last_checked = now;
 
-            let next_snapshot = directory_snapshot(&watcher.path, watcher.recursive);
+            let next_snapshot = directory_watch_snapshot(&watcher.path, watcher.recursive);
             if next_snapshot != watcher.snapshot {
                 watcher.snapshot = next_snapshot.clone();
-                changes.push((*watch_id, next_snapshot));
+                let payload = if watcher.recursive {
+                    next_snapshot
+                } else {
+                    directory_listing(&watcher.path)
+                };
+                changes.push((*watch_id, payload));
             }
         }
 
@@ -27736,6 +27772,14 @@ impl From<&Buffer> for BufferInfo {
     }
 }
 
+#[derive(Debug)]
+struct DirectoryListingEntry {
+    name: String,
+    path: String,
+    kind: &'static str,
+    sort_name: String,
+}
+
 fn directory_listing(path: &str) -> Value {
     match std::fs::metadata(path) {
         Ok(metadata) if metadata.is_dir() => {}
@@ -27771,7 +27815,6 @@ fn directory_listing(path: &str) -> Value {
         });
 
     let mut entries = Vec::new();
-    let mut truncated = false;
     for entry in builder.build().filter_map(Result::ok).skip(1) {
         let kind = match entry.file_type() {
             Some(file_type) if file_type.is_dir() => "directory",
@@ -27792,36 +27835,54 @@ fn directory_listing(path: &str) -> Value {
         if kind == "other" {
             continue;
         }
-        if entries.len() == MAX_DIRECTORY_LISTING_ENTRIES {
-            truncated = true;
-            break;
-        }
-        entries.push(json!({
-            "name": entry.file_name().to_string_lossy(),
-            "path": entry.path().to_string_lossy(),
-            "kind": kind,
-        }));
+        let name = entry.file_name().to_string_lossy().into_owned();
+        entries.push(DirectoryListingEntry {
+            sort_name: name.to_lowercase(),
+            name,
+            path: entry.path().to_string_lossy().into_owned(),
+            kind,
+        });
     }
 
     entries.sort_by(|a, b| {
-        let kind_rank = |value: &Value| match value.get("kind").and_then(Value::as_str) {
-            Some("directory") => 0,
-            Some("file") => 1,
-            _ => 2,
-        };
-        let a_name = a.get("name").and_then(Value::as_str).unwrap_or_default();
-        let b_name = b.get("name").and_then(Value::as_str).unwrap_or_default();
-
-        kind_rank(a)
-            .cmp(&kind_rank(b))
-            .then_with(|| a_name.to_lowercase().cmp(&b_name.to_lowercase()))
+        (a.kind != "directory")
+            .cmp(&(b.kind != "directory"))
+            .then_with(|| a.sort_name.cmp(&b.sort_name))
     });
 
     json!({
         "path": path,
-        "entries": entries,
-        "truncated": truncated,
+        "entries": entries.into_iter().map(|entry| json!({
+            "name": entry.name,
+            "path": entry.path,
+            "kind": entry.kind,
+        })).collect::<Vec<_>>(),
+        "truncated": false,
         "error": null,
+    })
+}
+
+fn directory_watch_snapshot(path: &str, recursive: bool) -> Value {
+    if recursive {
+        return directory_snapshot(path, true);
+    }
+
+    let root = Path::new(path);
+    let signature = |path: &Path| {
+        fs::metadata(path).ok().map(|metadata| {
+            let modified = metadata
+                .modified()
+                .ok()
+                .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+                .map(|duration| (duration.as_secs(), duration.subsec_nanos()));
+            (metadata.is_dir(), metadata.len(), modified)
+        })
+    };
+    json!({
+        "path": path,
+        "directory": signature(root),
+        "gitignore": signature(&root.join(".gitignore")),
+        "ignore": signature(&root.join(".ignore")),
     })
 }
 
@@ -41179,23 +41240,37 @@ while True:
     }
 
     #[test]
-    fn directory_listing_caps_pathological_directories() {
+    fn directory_listing_returns_every_entry_in_large_directories() {
         let root =
             std::env::temp_dir().join(format!("red-dir-listing-cap-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&root).unwrap();
-        for index in 0..MAX_DIRECTORY_LISTING_ENTRIES + 10 {
-            std::fs::write(root.join(format!("file-{index:03}.txt")), "fixture").unwrap();
+        for index in 0..1_024 {
+            std::fs::write(root.join(format!("file-{index:04}.txt")), "fixture").unwrap();
         }
 
         let listing = directory_listing(&root.to_string_lossy());
 
-        assert_eq!(
-            listing["entries"].as_array().unwrap().len(),
-            MAX_DIRECTORY_LISTING_ENTRIES
-        );
-        assert_eq!(listing["truncated"], true);
+        assert_eq!(listing["entries"].as_array().unwrap().len(), 1_024);
+        assert_eq!(listing["truncated"], false);
+        assert_eq!(listing["entries"][1_023]["name"], "file-1023.txt");
 
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn nonrecursive_directory_watch_snapshots_do_not_retain_directory_entries() {
+        let root = tempfile::tempdir().unwrap();
+        for index in 0..256 {
+            std::fs::write(root.path().join(format!("file-{index:03}.rs")), "").unwrap();
+        }
+
+        let initial = directory_watch_snapshot(&root.path().to_string_lossy(), false);
+        assert!(initial.get("entries").is_none());
+        assert!(initial.to_string().len() < 512);
+
+        std::fs::write(root.path().join("new-file.rs"), "").unwrap();
+        let changed = directory_watch_snapshot(&root.path().to_string_lossy(), false);
+        assert_ne!(initial, changed);
     }
 
     #[test]

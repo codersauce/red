@@ -29,6 +29,7 @@ mod registry;
 mod runtime;
 mod text_link;
 pub mod timer_stats;
+mod tree;
 pub mod window_bar;
 pub mod workspace;
 
@@ -49,6 +50,7 @@ pub use runtime::{
     CommandMetadata, CommandScope, ComposerHandle, PickerHandle, RegisteredPluginCommand,
     RequestId, Runtime,
 };
+pub use tree::TreePanelModel;
 
 pub(crate) fn husk_lsp_declarations() -> &'static str {
     runtime::RED_HOST_DECLARATIONS
