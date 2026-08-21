@@ -81,6 +81,7 @@ pub fn build_rows(
     statuses: [PathStatus]
 ) -> [PanelRow] {
     let root = ".";
+    let status_root = path::normalize(status_root);
     let root_status = status_for_path(root, status_root, statuses);
     let mut rows = [PanelRow {
         id: root,
@@ -182,7 +183,6 @@ fn children_truncated(path: String, children: [Children]) -> bool {
 }
 
 fn status_for_path(path: String, root: String, statuses: [PathStatus]) -> String {
-    let root = path::normalize(root);
     if root.is_empty() {
         return "";
     }
@@ -314,7 +314,7 @@ fn status_segments(value: String) -> [PanelSegment] {
 }
 
 fn visible_status_segments(value: String, directory: bool, expanded: bool) -> [PanelSegment] {
-    if directory && expanded {
+    if value.is_empty() || directory && expanded {
         return [];
     }
     status_segments(value)

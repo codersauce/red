@@ -2785,7 +2785,14 @@ impl RedHost {
             .as_mut()
             .ok_or_else(|| anyhow::anyhow!("Neo-tree core VM did not initialize"))?;
         let mut host = NativeCoreHost;
-        let result = vm.call_export("red-neotree-core", function, args.to_vec(), &mut host)?;
+        // A deep, decorated tree can emit several segments per row. Only this
+        // trusted core operation receives extra fuel; its output is capped at 200 rows.
+        if operation == "build_rows" {
+            vm.set_instruction_budget(PLUGIN_INSTRUCTION_BUDGET * 4);
+        }
+        let result = vm.call_export("red-neotree-core", function, args.to_vec(), &mut host);
+        vm.set_instruction_budget(PLUGIN_INSTRUCTION_BUDGET);
+        let result = result?;
         Ok(normalize_native_core_value(result))
     }
 }
@@ -5072,6 +5079,145 @@ mod tests {
                 .contains("unknown Neo-tree core operation"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn neotree_renders_deep_mostly_clean_workspaces_within_the_instruction_budget() {
+        let workspace = "/Users/developer/code/workspace-with-a-realistic-deep-monorepo";
+        let root_entries = std::iter::once(serde_json::json!({
+            "name": "codex-rs",
+            "path": "./codex-rs",
+            "kind": "directory",
+        }))
+        .chain((0..47).map(|index| {
+            serde_json::json!({
+                "name": format!("workspace-directory-{index:03}"),
+                "path": format!("./workspace-directory-{index:03}"),
+                "kind": "directory",
+            })
+        }))
+        .collect::<Vec<_>>();
+        let crate_entries = (0..118)
+            .map(|index| {
+                serde_json::json!({
+                    "name": format!("crate-{index:03}"),
+                    "path": format!("./codex-rs/crate-{index:03}"),
+                    "kind": "directory",
+                })
+            })
+            .chain(std::iter::once(serde_json::json!({
+                "name": "tui",
+                "path": "./codex-rs/tui",
+                "kind": "directory",
+            })))
+            .collect::<Vec<_>>();
+        let source_entries = std::iter::once(serde_json::json!({
+            "name": "tui",
+            "path": "./codex-rs/tui/src/tui",
+            "kind": "directory",
+        }))
+        .chain((0..149).map(|index| {
+            serde_json::json!({
+                "name": format!("source-file-{index:03}.rs"),
+                "path": format!("./codex-rs/tui/src/source-file-{index:03}.rs"),
+                "kind": "file",
+            })
+        }))
+        .collect::<Vec<_>>();
+        let tui_entries = std::iter::once(serde_json::json!({
+            "name": "screen_size.rs",
+            "path": "./codex-rs/tui/src/tui/screen_size.rs",
+            "kind": "file",
+        }))
+        .chain((0..14).map(|index| {
+            serde_json::json!({
+                "name": format!("tui-file-{index:03}.rs"),
+                "path": format!("./codex-rs/tui/src/tui/tui-file-{index:03}.rs"),
+                "kind": "file",
+            })
+        }))
+        .collect::<Vec<_>>();
+        let statuses = std::iter::once(serde_json::json!({
+            "path": "codex-rs/tui/src/tui/screen_size.rs",
+            "absolute_path": format!("{workspace}/codex-rs/tui/src/tui/screen_size.rs"),
+            "status": "modified",
+        }))
+        .chain((0..15).map(|index| {
+            serde_json::json!({
+                "path": format!("codex-rs/tui/src/source-file-{index:03}.rs"),
+                "absolute_path": format!(
+                    "{workspace}/codex-rs/tui/src/source-file-{index:03}.rs"
+                ),
+                "status": "modified",
+            })
+        }))
+        .collect::<Vec<_>>();
+        let mut host = RedHost::new(HashMap::new());
+        let status_entries = host
+            .call_neotree_core(
+                "status_entries",
+                &[Value::from_json(crate::editor::git_status_index(
+                    &statuses, workspace,
+                ))],
+            )
+            .unwrap();
+
+        let rows = host
+            .call_neotree_core(
+                "build_rows",
+                &[
+                    Value::String(workspace.to_string()),
+                    Value::from_json(serde_json::json!([
+                        { "path": ".", "entries": root_entries, "truncated": false },
+                        {
+                            "path": "./codex-rs",
+                            "entries": crate_entries,
+                            "truncated": false,
+                        },
+                        {
+                            "path": "./codex-rs/tui",
+                            "entries": [{
+                                "name": "src",
+                                "path": "./codex-rs/tui/src",
+                                "kind": "directory",
+                            }],
+                            "truncated": false,
+                        },
+                        {
+                            "path": "./codex-rs/tui/src",
+                            "entries": source_entries,
+                            "truncated": false,
+                        },
+                        {
+                            "path": "./codex-rs/tui/src/tui",
+                            "entries": tui_entries,
+                            "truncated": false,
+                        }
+                    ])),
+                    Value::from_json(serde_json::json!([
+                        ".",
+                        "./codex-rs",
+                        "./codex-rs/tui",
+                        "./codex-rs/tui/src",
+                        "./codex-rs/tui/src/tui",
+                    ])),
+                    Value::from_json(serde_json::json!([])),
+                    Value::from_json(serde_json::json!([])),
+                    Value::String(workspace.to_string()),
+                    status_entries,
+                ],
+            )
+            .expect("deep mostly-clean Neo-tree rendering must stay within its instruction budget")
+            .to_json();
+        let rows = rows.as_array().unwrap();
+
+        assert_eq!(rows.len(), 201);
+        assert!(rows.last().unwrap()["path"].is_null());
+        let modified_row = rows
+            .iter()
+            .find(|row| row["id"] == "./codex-rs/tui/src/tui/screen_size.rs")
+            .expect("the active file should remain visible while its ancestors are expanded");
+        assert_eq!(modified_row["right_segments"][0]["text"], "");
     }
 
     #[test]
