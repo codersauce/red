@@ -1999,6 +1999,91 @@ async fn whitespace_only_commands_are_not_saved_to_history() {
 }
 
 #[tokio::test]
+async fn enew_opens_an_unnamed_buffer_without_saving_the_previous_buffer() {
+    let path = temp_file_path("enew-dirty-buffer");
+    fs::write(&path, "saved contents\n").unwrap();
+    let buffer = Buffer::new(Some(path.clone()), "saved contents\n".to_string());
+    let mut harness = EditorHarness::with_buffer(buffer);
+    harness
+        .execute_action(Action::InsertCharAtCursorPos('x'))
+        .await
+        .unwrap();
+
+    harness
+        .execute_action(Action::Command("enew".to_string()))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        harness.buffer_names(),
+        vec![path.clone(), "[No Name]".into()]
+    );
+    assert_eq!(harness.current_buffer_index(), 1);
+    assert!(harness.editor.test_current_buffer().is_unnamed());
+    assert!(harness.editor.test_current_buffer().is_blank());
+    assert!(!harness.is_dirty());
+    assert_eq!(fs::read_to_string(&path).unwrap(), "saved contents\n");
+
+    harness
+        .execute_action(Action::PreviousBuffer)
+        .await
+        .unwrap();
+    assert_eq!(harness.buffer_contents(), "xsaved contents\n");
+    assert!(harness.is_dirty());
+    fs::remove_file(path).unwrap();
+}
+
+#[tokio::test]
+async fn enew_reuses_a_clean_unnamed_empty_buffer() {
+    let mut harness = EditorHarness::new();
+    let original_id = harness.editor.test_current_buffer().id();
+
+    for command in ["enew", "enew!"] {
+        harness
+            .execute_action(Action::Command(command.to_string()))
+            .await
+            .unwrap();
+
+        assert_eq!(harness.buffer_names(), vec!["[No Name]"]);
+        assert_eq!(harness.editor.test_current_buffer().id(), original_id);
+    }
+}
+
+#[tokio::test]
+async fn enew_changes_only_the_active_split() {
+    let mut harness = EditorHarness::with_content("original contents\n");
+    harness.execute_action(Action::SplitVertical).await.unwrap();
+
+    harness
+        .execute_action(Action::Command("enew".to_string()))
+        .await
+        .unwrap();
+
+    assert_eq!(harness.window_count(), 2);
+    assert_eq!(harness.current_buffer_index(), 1);
+    assert!(harness.editor.test_current_buffer().is_blank());
+
+    harness.execute_action(Action::NextWindow).await.unwrap();
+
+    assert_eq!(harness.current_buffer_index(), 0);
+    assert_eq!(harness.buffer_contents(), "original contents\n");
+}
+
+#[tokio::test]
+async fn enew_rejects_file_arguments_without_changing_buffers() {
+    let mut harness = EditorHarness::with_content("original contents\n");
+
+    harness
+        .execute_action(Action::Command("enew unexpected.txt".to_string()))
+        .await
+        .unwrap();
+
+    assert_eq!(harness.buffer_names(), vec!["[No Name]"]);
+    assert_eq!(harness.buffer_contents(), "original contents\n");
+    assert_eq!(harness.last_error(), Some("usage: enew"));
+}
+
+#[tokio::test]
 async fn edit_without_file_argument_reloads_current_file() {
     let path = temp_file_path("edit-reload");
     fs::write(&path, "one\ntwo\nthree\n").unwrap();

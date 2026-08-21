@@ -25,6 +25,7 @@ pub(crate) const BUILTIN_COLON_COMMANDS: &[&str] = &[
     "bdelete",
     "buffer-delete",
     "edit",
+    "enew",
     "split",
     "sp",
     "vsplit",
@@ -589,6 +590,15 @@ fn builtin_commands() -> Vec<BuiltinCommand> {
             None,
             &["file picker", "open file"],
             Action::FilePicker,
+        ),
+        builtin(
+            "buffer.new",
+            "New buffer",
+            "Buffer",
+            "Open an empty, unnamed buffer in the current window",
+            Some(":enew"),
+            &["new file", "unnamed buffer", "scratch buffer"],
+            Action::NewBuffer,
         ),
         builtin(
             "buffer.alternate",
@@ -1393,6 +1403,7 @@ fn action_label(action: &Action) -> String {
         Action::OpenStatuslineManager => "Configure status line".to_string(),
         Action::PluginCommand(name) => humanize_identifier(name),
         Action::Save => "Save file".to_string(),
+        Action::NewBuffer => "New buffer".to_string(),
         Action::Quit(_) => "Quit".to_string(),
         Action::Undo => "Undo".to_string(),
         Action::Redo => "Redo".to_string(),
@@ -1548,6 +1559,27 @@ mod tests {
             assert_eq!(entry.action, action);
             assert_eq!(entry.shortcuts, vec![shortcut]);
         }
+    }
+
+    #[test]
+    fn palette_exposes_the_unnamed_buffer_command() {
+        let entries = entries(&default_keys(), &[]);
+        let entry = entries
+            .iter()
+            .find(|entry| entry.id == "buffer.new")
+            .unwrap();
+
+        assert_eq!(entry.action, Action::NewBuffer);
+        assert_eq!(entry.colon.as_deref(), Some(":enew"));
+        assert!(colon_completion_names(&[])
+            .iter()
+            .any(|name| name == "enew"));
+        assert_eq!(
+            command::parse(BUILTIN_COLON_COMMANDS, "enew")
+                .unwrap()
+                .commands,
+            ["enew"]
+        );
     }
 
     #[test]

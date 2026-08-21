@@ -76,6 +76,7 @@ the corresponding integration tests.
 |---|---|---|
 | Unicode graphemes | **supported** | Cursoring, replacement, selection, paste, undo, and marks are tested with multi-codepoint graphemes. Rust-regex offsets are converted to character coordinates before editing. |
 | Empty buffers | **supported** | The synthetic editable line remains cursor-safe across insert, delete, render, and undo. |
+| Unnamed buffer creation | **supported** | `:enew` opens an empty unnamed buffer in the current window, preserves existing unsaved buffers, and reuses an already-empty unnamed buffer. |
 | Final line / trailing newline | **supported** | Both forms render and edit without exposing a phantom gutter line. |
 | Multi-window and docked panes | **supported** | Active-buffer cursor, viewport, wrapping, gutter width, and focus-cycle state are window-aware. `Ctrl-w h/j/k/l` moves between editor windows and panes; `Ctrl-w H/J/K/L` moves the focused editor window, row pane, or text pane to the corresponding outer edge without replacing its identity, content, or draft. |
 | Embedded plugin text areas | **supported** | Agent dialogs and text-panel composers reuse Unicode-aware word motions, character searches, ordinary text objects, and transactional replacement. Counts, operators, Visual selections, local registers, undo/redo, dot-repeat, macros, and prompt-local search remain isolated. Tree-sitter structural objects and swaps stay editor-owned and are unavailable in grammar-free composers. |

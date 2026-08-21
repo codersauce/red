@@ -2561,6 +2561,8 @@ pub enum Action {
     PluginCommand(String),
     SetCursor(usize, usize),
     SetWaitingKey(Box<KeyAction>),
+    /// Opens an empty, unnamed buffer in the active editor window.
+    NewBuffer,
     OpenBuffer(String),
     OpenFile(String),
     ReloadFile(bool),
@@ -15376,6 +15378,14 @@ impl Editor {
                 actions.push(Action::DeleteBuffer(parsed.is_forced()));
             }
 
+            if cmd == "enew" {
+                if parsed.file_argument().is_some() {
+                    self.set_legacy_message(Some("usage: enew".to_string()));
+                    return Vec::new();
+                }
+                actions.push(Action::NewBuffer);
+            }
+
             if cmd == "edit" {
                 if let Some(file) = parsed.file_argument() {
                     actions.push(Action::OpenFile(file));
@@ -20265,6 +20275,17 @@ impl Editor {
             }
             Action::AlternateBuffer => {
                 if let Some(index) = self.buffer_manager.alternate_index() {
+                    self.set_current_buffer(buffer, index).await?;
+                }
+            }
+            Action::NewBuffer => {
+                if !self.current_buffer().is_unnamed()
+                    || !self.current_buffer().is_blank()
+                    || self.current_buffer().is_dirty()
+                {
+                    self.buffer_manager
+                        .push_buffer(Buffer::new(/*file*/ None, String::new()));
+                    let index = self.buffer_manager.len() - 1;
                     self.set_current_buffer(buffer, index).await?;
                 }
             }
