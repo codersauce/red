@@ -833,6 +833,9 @@ impl TextPanelComposer {
 
     fn layout(&self, content_width: usize) -> Arc<TextLayout> {
         let options = Self::layout_options(content_width);
+        if self.prompt.history_search_active() {
+            return Arc::new(self.prompt.layout(options));
+        }
         let buffer = self.prompt.buffer();
         let mut cache = self.layout_cache.borrow_mut();
         if let Some(cached) = cache.as_ref() {
@@ -861,7 +864,8 @@ impl TextPanelComposer {
     fn new(config: TextPanelComposerConfig) -> Self {
         Self {
             config,
-            prompt: PromptBuffer::new("").with_key_policy(PromptKeyPolicy::EnterSends),
+            prompt: PromptBuffer::new("")
+                .with_key_policy(PromptKeyPolicy::EnterSendsWithShellHistory),
             focused: false,
             enabled: true,
             status: None,
@@ -1874,6 +1878,7 @@ impl TextPanel {
         self.cancel_transcript_search();
         if let Some(composer) = self.composer.as_mut() {
             composer.focused = false;
+            composer.prompt.cancel_history_search();
         }
         self.scrollback.focused = true;
         self.scrollback.mode = TextPanelScrollbackMode::Normal;
@@ -3078,6 +3083,7 @@ impl PanelManager {
                 panel.remember_focused_region();
                 if let Some(composer) = panel.composer.as_mut() {
                     composer.focused = false;
+                    composer.prompt.cancel_history_search();
                 }
                 panel.blur_scrollback();
             }
@@ -3948,7 +3954,20 @@ impl PanelManager {
         composer.status = status;
         if !enabled {
             composer.focused = false;
+            composer.prompt.cancel_history_search();
         }
+        true
+    }
+
+    pub fn set_text_panel_composer_history(&mut self, id: &str, history: Vec<String>) -> bool {
+        let Some(composer) = self
+            .text_panels
+            .get_mut(id)
+            .and_then(|panel| panel.composer.as_mut())
+        else {
+            return false;
+        };
+        composer.prompt.set_history(history);
         true
     }
 
@@ -4032,7 +4051,9 @@ impl PanelManager {
                     && matches!(key.code, KeyCode::Char('j' | 'k') | KeyCode::Up | KeyCode::Down))
                     || matches!(key.code, KeyCode::Tab | KeyCode::BackTab)
                     || (key.modifiers.contains(KeyModifiers::CONTROL)
-                        && matches!(key.code, KeyCode::Char('h' | 'k' | 'g' | 'G' | 'w')))
+                        && (matches!(key.code, KeyCode::Char('h' | 'k' | 'w'))
+                            || (matches!(key.code, KeyCode::Char('g' | 'G'))
+                                && !composer.prompt.history_search_active())))
         );
         if delegates_to_panel_navigation {
             // Let the panel-navigation layer scroll the conversation without
@@ -4165,7 +4186,7 @@ impl PanelManager {
         let metrics = TextPanelContentMetrics::new(placement.width);
         let wrapped = composer.layout(metrics.width);
         let position = wrapped
-            .position(composer.prompt.cursor())
+            .position(composer.prompt.display_cursor())
             .unwrap_or_default();
         let row = position.row;
         let column = position.column;
@@ -4250,14 +4271,14 @@ impl PanelManager {
                     composer.focused = true;
                     let wrapped = composer.layout(metrics.width);
                     let cursor_row = wrapped
-                        .position(composer.prompt.cursor())
+                        .position(composer.prompt.display_cursor())
                         .map_or(0, |position| position.row);
                     let rows = composer_height.saturating_sub(COMPOSER_CHROME_ROWS);
                     let first = cursor_row.saturating_sub(rows.saturating_sub(1));
                     let row = first.saturating_add(y.saturating_sub(composer_top + 1));
                     let column = x.saturating_sub(metrics.x(placement.x).saturating_add(2));
                     if let Some(index) = wrapped.nearest_offset_on_row(row, column) {
-                        composer.prompt.set_cursor(index);
+                        composer.prompt.set_display_cursor(index);
                     }
                 }
                 panel.blur_scrollback();
@@ -5169,6 +5190,20 @@ const COMPOSER_SEARCH_HINTS: &[TextPanelShortcutHint] = &[
         action: "cancel",
     },
 ];
+const COMPOSER_HISTORY_SEARCH_HINTS: &[TextPanelShortcutHint] = &[
+    TextPanelShortcutHint {
+        keys: "^R/↑/↓",
+        action: "matches",
+    },
+    TextPanelShortcutHint {
+        keys: "Enter",
+        action: "accept",
+    },
+    TextPanelShortcutHint {
+        keys: "Esc/^G",
+        action: "cancel",
+    },
+];
 const COMPOSER_INSERT_HINTS: &[TextPanelShortcutHint] = &[
     TextPanelShortcutHint {
         keys: "Enter",
@@ -5189,6 +5224,14 @@ const COMPOSER_INSERT_HINTS: &[TextPanelShortcutHint] = &[
     TextPanelShortcutHint {
         keys: "^K",
         action: "scroll",
+    },
+    TextPanelShortcutHint {
+        keys: "↑/↓",
+        action: "history",
+    },
+    TextPanelShortcutHint {
+        keys: "^R",
+        action: "history search",
     },
     TextPanelShortcutHint {
         keys: "^g/^G",
@@ -5252,6 +5295,9 @@ fn text_panel_composer_hints(
             }
         };
     }
+    if composer.prompt.history_search_active() {
+        return ("REVERSE SEARCH", COMPOSER_HISTORY_SEARCH_HINTS);
+    }
     match (composer.focused, composer.prompt.mode()) {
         (true, crate::editor::Mode::Normal) => ("NORMAL", COMPOSER_NORMAL_HINTS),
         (
@@ -5291,6 +5337,11 @@ fn text_panel_hint_action(_mode: &str, hint: &TextPanelShortcutHint, index: usiz
         ("Esc", "normal") => ("Mode", "Return to Normal mode"),
         ("Esc", "cancel") => ("Mode", "Cancel the selection or search"),
         ("Enter", "find") => ("Search", "Accept the search"),
+        ("Enter", "accept") => ("History", "Load the selected prompt"),
+        ("^R/↑/↓", "matches") => ("History", "Select an older / newer match"),
+        ("↑/↓", "history") => ("History", "Previous / next prompt"),
+        ("^R", "history search") => ("History", "Search previous prompts"),
+        ("Esc/^G", "cancel") => ("History", "Cancel history search"),
         _ => ("Actions", hint.action),
     };
     let action = UiAction::new(hint.keys, hint.keys, hint.action)
@@ -5319,6 +5370,7 @@ pub(crate) fn all_text_panel_shortcuts() -> Vec<crate::ui::ShortcutEntry> {
         ("NORMAL", COMPOSER_NORMAL_HINTS),
         ("VISUAL", COMPOSER_VISUAL_HINTS),
         ("SEARCH", COMPOSER_SEARCH_HINTS),
+        ("REVERSE SEARCH", COMPOSER_HISTORY_SEARCH_HINTS),
         ("INSERT", COMPOSER_INSERT_HINTS),
     ] {
         let mut actions = hints
@@ -5382,9 +5434,23 @@ fn render_text_panel_composer_footer(
     theme: &Theme,
 ) {
     let (mode, actions) = text_panel_actions(composer, scrollback, overflow);
+    let history_search_status = composer.prompt.history_search_query().map(|query| {
+        if let Some((position, total)) = composer.prompt.history_search_match_position() {
+            format!("{position}/{total} matches")
+        } else if query.is_empty() {
+            "type to search".to_string()
+        } else {
+            "no match".to_string()
+        }
+    });
     ActionBar::new(&actions)
         .with_context(mode)
-        .with_status(composer.validation.or(composer.status.as_deref()))
+        .with_status(
+            composer
+                .validation
+                .or(history_search_status.as_deref())
+                .or(composer.status.as_deref()),
+        )
         .render(buffer, position.x, y, width, theme, &palette.surface);
 }
 
@@ -5409,15 +5475,16 @@ fn render_text_panel_composer(
     let content_width = TextPanelComposer::layout_options(width).width;
     let wrapped = composer.layout(width);
     let cursor_row = wrapped
-        .position(composer.prompt.cursor())
+        .position(composer.prompt.display_cursor())
         .map_or(0, |position| position.row);
     let first = cursor_row.saturating_sub(rows.saturating_sub(1));
     let active_row = cursor_row.saturating_sub(first).min(rows.saturating_sub(1));
     for row in 0..rows {
         let y = top + 1 + row;
         let line = wrapped.rows().get(first + row).map(|row| row.text.as_str());
-        let placeholder =
-            line.is_some_and(str::is_empty) && composer.prompt.text().is_empty() && row == 0;
+        let placeholder = line.is_some_and(str::is_empty)
+            && composer.prompt.display_text().is_empty()
+            && row == 0;
         let text = if placeholder {
             composer.config.placeholder.as_str()
         } else {
@@ -7145,6 +7212,181 @@ mod tests {
         let restored = manager.text_panels["agent"].composer.as_ref().unwrap();
         assert_eq!(restored.prompt.text(), "draft");
         assert!(manager.focused_text_panel_cursor_position(80, 20).is_some());
+    }
+
+    #[test]
+    fn text_panel_composer_hydrates_arrow_and_reverse_search_history() {
+        use crossterm::event::KeyEvent;
+
+        let mut manager = PanelManager::default();
+        manager.create_text_panel(
+            "agent".to_string(),
+            PanelConfig {
+                side: PanelSide::Right,
+                width: 48,
+                title: Some("Agent".to_string()),
+                composer: Some(TextPanelComposerConfig {
+                    placeholder: "Ask a follow-up…".to_string(),
+                    rows: 3,
+                }),
+                ..PanelConfig::default()
+            },
+        );
+        assert!(manager.set_text_panel_composer_history(
+            "agent",
+            vec![
+                "deploy production".to_string(),
+                "show status".to_string(),
+                "deploy staging".to_string(),
+                "deploy production".to_string(),
+                "  ".to_string(),
+            ],
+        ));
+        assert!(manager.focus_text_panel_composer("agent"));
+        manager.handle_focused_text_input(&Event::Paste("draft".to_string()), 80);
+
+        manager.handle_focused_text_input(
+            &Event::Key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)),
+            80,
+        );
+        assert_eq!(
+            manager.text_panels["agent"]
+                .composer
+                .as_ref()
+                .unwrap()
+                .prompt
+                .text(),
+            "deploy production"
+        );
+        manager.handle_focused_text_input(
+            &Event::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
+            80,
+        );
+        assert_eq!(
+            manager.text_panels["agent"]
+                .composer
+                .as_ref()
+                .unwrap()
+                .prompt
+                .text(),
+            "draft"
+        );
+
+        manager.handle_focused_text_input(
+            &Event::Key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL)),
+            80,
+        );
+        let composer = manager.text_panels["agent"].composer.as_ref().unwrap();
+        assert_eq!(composer.prompt.text(), "draft");
+        assert_eq!(composer.prompt.display_text(), "Search prompts: ");
+        assert_eq!(composer.prompt.history_search_match_position(), None);
+
+        let theme = Theme::default();
+        let mut buffer = RenderBuffer::new(80, 20, &theme.style);
+        manager.render(&mut buffer, &theme);
+        let initial = (0..20)
+            .map(|row| row_text(&buffer, row))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(initial.contains("Search prompts:"), "{initial}");
+        assert!(initial.contains("type to search"), "{initial}");
+        assert!(!initial.contains("deploy production"), "{initial}");
+
+        for character in ['d', 'e', 'p'] {
+            manager.handle_focused_text_input(
+                &Event::Key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE)),
+                80,
+            );
+        }
+        manager.handle_focused_text_input(
+            &Event::Key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL)),
+            80,
+        );
+        let composer = manager.text_panels["agent"].composer.as_ref().unwrap();
+        assert_eq!(composer.prompt.text(), "draft");
+        assert_eq!(
+            composer.prompt.display_text(),
+            "Search prompts: dep\n↳ deploy staging"
+        );
+        assert_eq!(
+            composer.prompt.history(),
+            ["deploy production", "show status", "deploy staging"]
+        );
+
+        let mut buffer = RenderBuffer::new(80, 20, &theme.style);
+        manager.render(&mut buffer, &theme);
+        let rendered = (0..20)
+            .map(|row| row_text(&buffer, row))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains("^R/↑/↓ matches"), "{rendered}");
+        assert!(rendered.contains("2/2 matches"), "{rendered}");
+        assert!(rendered.contains("Search prompts: dep"), "{rendered}");
+        assert!(rendered.contains("↳ deploy staging"), "{rendered}");
+        let (cursor_x, cursor_y) = manager
+            .focused_text_panel_cursor_position(80, 20)
+            .expect("history query owns the visible cursor");
+        let cursor_row = row_text(&buffer, cursor_y);
+        let query_end = cursor_row
+            .find("Search prompts: dep")
+            .expect("cursor remains on the search field")
+            + "Search prompts: dep".len();
+        assert_eq!(cursor_x, display_width(&cursor_row[..query_end]));
+
+        let accepted = manager
+            .handle_focused_text_input(
+                &Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+                80,
+            )
+            .unwrap();
+        assert_eq!(accepted.action, "composer_input");
+        assert_eq!(accepted.text, None);
+        let submitted = manager
+            .handle_focused_text_input(
+                &Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+                80,
+            )
+            .unwrap();
+        assert_eq!(submitted.action, "submit");
+        assert_eq!(submitted.text.as_deref(), Some("deploy staging"));
+
+        manager.handle_focused_text_input(
+            &Event::Key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL)),
+            80,
+        );
+        assert!(manager.text_panels["agent"]
+            .composer
+            .as_ref()
+            .unwrap()
+            .prompt
+            .history_search_active());
+        manager.handle_focused_text_input(
+            &Event::Key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL)),
+            80,
+        );
+        assert!(!manager.text_panels["agent"]
+            .composer
+            .as_ref()
+            .unwrap()
+            .prompt
+            .history_search_active());
+        manager.handle_focused_text_input(
+            &Event::Key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL)),
+            80,
+        );
+        assert!(manager.text_panels["agent"]
+            .composer
+            .as_ref()
+            .unwrap()
+            .prompt
+            .history_search_active());
+        assert!(manager.focus_focused_text_scrollback(80));
+        assert!(!manager.text_panels["agent"]
+            .composer
+            .as_ref()
+            .unwrap()
+            .prompt
+            .history_search_active());
     }
 
     #[test]

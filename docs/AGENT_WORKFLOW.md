@@ -258,6 +258,17 @@ draft, up to roughly 70% of the Agent pane. Longer drafts scroll within that
 space. It shrinks again when text is removed or sent, and short panes always
 retain room for the conversation.
 
+In Insert mode, Up and Down continue to move through a multiline draft. Up on
+the first visual row recalls an older prompt; once history browsing starts,
+Up/Down step through the persisted prompt MRU and Down past the newest entry
+restores the exact unsent draft and cursor. `Ctrl-r` opens an empty, editable
+`Search prompts:` field for incremental substring search over the same history.
+Matching prompts appear separately below the query. Type to narrow, press
+`Ctrl-r` again for an older match, and press Enter to load the match for editing
+without sending it. Escape or `Ctrl-g` cancels and leaves the draft unchanged.
+Normal-mode `Ctrl-r` remains redo, while `/` and `?` keep searching only within
+the current prompt.
+
 Open a workspace, press `Space A` (or run `:Agent`), type a request, and press
 Enter. Red lazily starts `codex app-server --stdio`, initializes the connection,
 checks the account, starts a persisted thread, and submits turns with
