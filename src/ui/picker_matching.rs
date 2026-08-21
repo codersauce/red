@@ -47,6 +47,9 @@ pub(super) fn match_path(
     query: &str,
 ) -> Option<PathMatch> {
     if !fuzzy_subsequence_matches(candidate.filename, query) {
+        if !fuzzy_subsequence_matches(candidate.path, query) {
+            return None;
+        }
         return Some(PathMatch {
             score: matcher.fuzzy_match(candidate.path, query)?,
             filename_score: None,

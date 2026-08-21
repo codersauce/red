@@ -85,6 +85,7 @@ impl FilePicker {
             .title("Find Files")
             .items(vec![])
             .filter_action(move |item, query| file_match_score(&score_matcher, item, query))
+            .incremental_filter()
             .filter_tie_breaker(|item| item.id.len())
             .filter_highlight_action(move |item, query| {
                 file_match_highlights(&highlight_matcher, item, query)
@@ -314,7 +315,10 @@ fn not_vcs_metadata(entry: &DirEntry) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, thread, time::Duration};
+    use std::{
+        fs, thread,
+        time::{Duration, Instant},
+    };
 
     use super::*;
     use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
@@ -439,6 +443,119 @@ mod tests {
             }
         }
         panic!("{needle:?} was not rendered");
+    }
+
+    #[test]
+    #[ignore = "manual performance benchmark for large workspaces"]
+    fn file_picker_large_workspace_performance() {
+        const SAMPLES: usize = 5;
+        const QUERIES: [&str; 5] = [
+            "thread",
+            "agent",
+            "config",
+            "workspace",
+            "codex-rs/core/src",
+        ];
+
+        let editor = test_editor();
+        let benchmark_root = std::env::var_os("RED_FILE_PICKER_BENCH_ROOT")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("."));
+        let files = if std::env::var_os("RED_FILE_PICKER_BENCH_ROOT").is_some() {
+            let started = Instant::now();
+            let files = load_file_picker_items(&benchmark_root, FilePickerVisibility::default())
+                .expect("benchmark workspace should be readable");
+            eprintln!(
+                "file-picker benchmark discovery: files={} elapsed={:?} root={}",
+                files.len(),
+                started.elapsed(),
+                benchmark_root.display(),
+            );
+            files
+        } else {
+            const NAMES: [&str; 12] = [
+                "thread",
+                "agent",
+                "config",
+                "workspace",
+                "client",
+                "protocol",
+                "session",
+                "approval",
+                "terminal",
+                "message",
+                "history",
+                "review",
+            ];
+            (0..12_000)
+                .map(|index| {
+                    format!(
+                        "codex-rs/crate_{:02}/src/{}_{index:05}.rs",
+                        index % 96,
+                        NAMES[index % NAMES.len()],
+                    )
+                })
+                .collect()
+        };
+        assert!(files.len() >= 5_000, "benchmark requires a large workspace");
+
+        let mut installation_samples = Vec::with_capacity(SAMPLES);
+        let mut query_samples = vec![Vec::with_capacity(SAMPLES); QUERIES.len()];
+        let mut draw_samples = vec![Vec::with_capacity(SAMPLES); QUERIES.len()];
+        let mut slowest_keystrokes = Vec::with_capacity(SAMPLES);
+
+        for _ in 0..SAMPLES {
+            let (sender, receiver) = mpsc::channel();
+            let mut picker =
+                FilePicker::loading_with_root(&editor, benchmark_root.clone(), sender, receiver);
+            send_load(&picker, picker.load_generation, Ok(files.clone()));
+            let started = Instant::now();
+            assert!(picker.tick().expect("benchmark load should succeed"));
+            installation_samples.push(started.elapsed());
+            let mut buffer = RenderBuffer::new(80, 24, &Style::default());
+            let mut slowest_keystroke = Duration::ZERO;
+
+            for (query_index, query) in QUERIES.iter().enumerate() {
+                while !picker.picker.query().is_empty() {
+                    picker.handle_event(&key(KeyCode::Backspace));
+                }
+                let mut query_elapsed = Duration::ZERO;
+                let mut draw_elapsed = Duration::ZERO;
+                for character in query.chars() {
+                    let started = Instant::now();
+                    picker.handle_event(&key(KeyCode::Char(character)));
+                    let elapsed = started.elapsed();
+                    query_elapsed += elapsed;
+                    slowest_keystroke = slowest_keystroke.max(elapsed);
+                    let started = Instant::now();
+                    picker
+                        .draw(&mut buffer)
+                        .expect("benchmark draw should succeed");
+                    draw_elapsed += started.elapsed();
+                }
+                query_samples[query_index].push(query_elapsed);
+                draw_samples[query_index].push(draw_elapsed);
+            }
+            slowest_keystrokes.push(slowest_keystroke);
+        }
+
+        let median = |samples: &mut [Duration]| {
+            samples.sort_unstable();
+            samples[samples.len() / 2]
+        };
+        eprintln!(
+            "file-picker benchmark: files={} samples={SAMPLES} install={:?} slowest_key={:?}",
+            files.len(),
+            median(&mut installation_samples),
+            median(&mut slowest_keystrokes),
+        );
+        for (index, query) in QUERIES.iter().enumerate() {
+            eprintln!(
+                "file-picker benchmark query={query:?}: filtering={:?} drawing={:?}",
+                median(&mut query_samples[index]),
+                median(&mut draw_samples[index]),
+            );
+        }
     }
 
     #[test]

@@ -2344,6 +2344,7 @@ dependencies = [
  "once_cell",
  "path-absolutize",
  "pulldown-cmark",
+ "rayon",
  "regex",
  "reqwest",
  "ropey",
