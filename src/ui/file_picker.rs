@@ -12,7 +12,7 @@ use std::{
 
 use anyhow::Context;
 use crossterm::event::{self};
-use fuzzy_matcher::{skim::SkimMatcherV2, FuzzyMatcher};
+use fuzzy_matcher::skim::SkimMatcherV2;
 use ignore::{DirEntry, WalkBuilder};
 
 use crate::{
@@ -22,9 +22,11 @@ use crate::{
     theme::Theme,
 };
 
-use super::{picker::PickerFilterHighlights, Component, Picker, PickerItem, PickerPreview};
-
-const FILENAME_MATCH_BONUS: i64 = 1;
+use super::{
+    picker::PickerFilterHighlights,
+    picker_matching::{match_path, path_match_highlights, PathCandidate},
+    Component, Picker, PickerItem, PickerPreview,
+};
 
 pub struct FilePicker {
     picker: Picker,
@@ -248,25 +250,12 @@ impl Component for FilePicker {
 }
 
 fn file_match_score(matcher: &SkimMatcherV2, item: &PickerItem, query: &str) -> Option<i64> {
-    if !fuzzy_subsequence_matches(&item.label, query) {
-        return matcher.fuzzy_match(&item.id, query);
-    }
-
-    let filename_score = matcher
-        .fuzzy_match(&item.label, query)
-        .map(|score| score.saturating_add(FILENAME_MATCH_BONUS))?;
-    let query_matches_parent = item
-        .annotation
-        .as_deref()
-        .is_some_and(|parent| fuzzy_subsequence_matches(parent, query));
-
-    if query_matches_parent {
-        matcher
-            .fuzzy_match(&item.id, query)
-            .map(|path_score| path_score.max(filename_score))
-    } else {
-        Some(filename_score)
-    }
+    match_path(
+        matcher,
+        PathCandidate::new(&item.id, &item.label, item.annotation.as_deref()),
+        query,
+    )
+    .map(|matched| matched.score)
 }
 
 fn file_match_highlights(
@@ -274,99 +263,11 @@ fn file_match_highlights(
     item: &PickerItem,
     query: &str,
 ) -> PickerFilterHighlights {
-    let Some((filename_score, filename_indices)) = matcher.fuzzy_indices(&item.label, query) else {
-        return matcher
-            .fuzzy_indices(&item.id, query)
-            .map(|(_, indices)| path_match_highlights(item, indices))
-            .unwrap_or_default();
-    };
-    let filename_score = filename_score.saturating_add(FILENAME_MATCH_BONUS);
-    let query_matches_parent = item
-        .annotation
-        .as_deref()
-        .is_some_and(|parent| fuzzy_subsequence_matches(parent, query));
-
-    if query_matches_parent {
-        if let Some((path_score, path_indices)) = matcher.fuzzy_indices(&item.id, query) {
-            if path_score > filename_score {
-                return path_match_highlights(item, path_indices);
-            }
-        }
-    }
-
-    PickerFilterHighlights {
-        label: indices_to_ranges(filename_indices),
-        annotation: Vec::new(),
-    }
-}
-
-fn path_match_highlights(item: &PickerItem, indices: Vec<usize>) -> PickerFilterHighlights {
-    let label_start = item
-        .id
-        .chars()
-        .count()
-        .saturating_sub(item.label.chars().count());
-    let annotation_len = item
-        .annotation
-        .as_deref()
-        .map(|annotation| annotation.chars().count())
-        .unwrap_or_default();
-    let mut label_indices = Vec::new();
-    let mut annotation_indices = Vec::new();
-
-    for index in indices {
-        if index >= label_start {
-            label_indices.push(index - label_start);
-        } else if index < annotation_len {
-            annotation_indices.push(index);
-        }
-    }
-
-    PickerFilterHighlights {
-        label: indices_to_ranges(label_indices),
-        annotation: indices_to_ranges(annotation_indices),
-    }
-}
-
-fn indices_to_ranges(indices: Vec<usize>) -> Vec<[usize; 2]> {
-    let mut ranges: Vec<[usize; 2]> = Vec::new();
-    for index in indices {
-        if let Some(last) = ranges.last_mut() {
-            if last[1] == index {
-                last[1] += 1;
-                continue;
-            }
-        }
-        ranges.push([index, index + 1]);
-    }
-    ranges
-}
-
-fn fuzzy_subsequence_matches(candidate: &str, query: &str) -> bool {
-    let case_sensitive = query
-        .chars()
-        .any(|character| character.is_ascii_uppercase());
-    let mut query = query.chars();
-    let Some(mut expected) = query.next() else {
-        return true;
-    };
-
-    for character in candidate.chars() {
-        let matches = if case_sensitive {
-            character == expected
-        } else {
-            character.eq_ignore_ascii_case(&expected)
-        };
-        if !matches {
-            continue;
-        }
-        let Some(next) = query.next() else {
-            return true;
-        };
-        expected = next;
-    }
-
-    false
+    path_match_highlights(
+        matcher,
+        PathCandidate::new(&item.id, &item.label, item.annotation.as_deref()),
+        query,
+    )
 }
 
 fn load_file_picker_items(
@@ -665,6 +566,37 @@ mod tests {
 
         assert!(picker.tick().unwrap());
         assert_eq!(selected_file(&mut picker), "deep/src/main.rs");
+    }
+
+    #[test]
+    fn file_picker_prefers_filename_matches_over_shared_parent_matches() {
+        let editor = test_editor();
+        let mut picker = FilePicker::loading(&editor);
+        for character in "recap".chars() {
+            picker.handle_event(&key(KeyCode::Char(character)));
+        }
+        send_load(
+            &picker,
+            picker.load_generation,
+            Ok(vec![
+                "codex.fcoury-recap/src/lib.rs".to_string(),
+                "codex.fcoury-recap/src/thread_recap.rs".to_string(),
+                "codex.fcoury-recap/src/recap.rs".to_string(),
+            ]),
+        );
+
+        assert!(picker.tick().unwrap());
+        assert_eq!(
+            selected_file(&mut picker),
+            "codex.fcoury-recap/src/recap.rs"
+        );
+        picker.handle_event(&key(KeyCode::Down));
+        assert_eq!(
+            selected_file(&mut picker),
+            "codex.fcoury-recap/src/thread_recap.rs"
+        );
+        picker.handle_event(&key(KeyCode::Down));
+        assert_eq!(selected_file(&mut picker), "codex.fcoury-recap/src/lib.rs");
     }
 
     #[test]
