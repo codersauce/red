@@ -2038,7 +2038,7 @@ async fn enew_reuses_a_clean_unnamed_empty_buffer() {
     let mut harness = EditorHarness::new();
     let original_id = harness.editor.test_current_buffer().id();
 
-    for command in ["enew", "enew!"] {
+    for command in ["ene", "ene!", "enew", "enew!"] {
         harness
             .execute_action(Action::Command(command.to_string()))
             .await
@@ -2047,6 +2047,28 @@ async fn enew_reuses_a_clean_unnamed_empty_buffer() {
         assert_eq!(harness.buffer_names(), vec!["[No Name]"]);
         assert_eq!(harness.editor.test_current_buffer().id(), original_id);
     }
+}
+
+#[tokio::test]
+async fn enew_abbreviation_requires_its_vim_compatible_minimum_prefix() {
+    let mut harness = EditorHarness::with_content("original contents\n");
+
+    harness
+        .execute_action(Action::Command("en".to_string()))
+        .await
+        .unwrap();
+
+    assert_eq!(harness.buffer_names(), vec!["[No Name]"]);
+    assert_eq!(harness.buffer_contents(), "original contents\n");
+    assert_eq!(harness.last_error(), Some("unknown command \"en\""));
+
+    harness
+        .execute_action(Action::Command("ene".to_string()))
+        .await
+        .unwrap();
+
+    assert_eq!(harness.buffer_names(), vec!["[No Name]", "[No Name]"]);
+    assert!(harness.editor.test_current_buffer().is_blank());
 }
 
 #[tokio::test]
@@ -2499,7 +2521,7 @@ async fn command_tab_opens_completed_paths_with_spaces() {
     fs::write(&path, "completed file contents\n").unwrap();
 
     for command in [
-        "e", "edit", "e!", "new", "vnew", "split", "sp", "vsplit", "vs",
+        "e", "ed", "edit", "e!", "new", "vne", "vnew", "spl", "split", "sp", "vsp", "vsplit", "vs",
     ] {
         let mut harness = EditorHarness::with_content("");
         harness.set_commandline(
@@ -2529,7 +2551,7 @@ async fn command_tab_writes_completed_paths_with_spaces() {
     let command_directory = directory.path().to_string_lossy().replace('\\', "/");
     let command_path = format!("{command_directory}/name  with spaces.txt!");
 
-    for command in ["w", "write", "w!", "write!"] {
+    for command in ["w", "wr", "wri", "write", "w!", "write!"] {
         fs::write(&path, "old contents\n").unwrap();
         let mut harness = EditorHarness::with_content("saved contents\n");
         harness.set_commandline(
@@ -2806,6 +2828,15 @@ async fn syntax_commands_set_reset_and_disable_buffer_local_syntax() {
         &SyntaxSelection::Off
     );
     assert_eq!(harness.last_error(), Some("syntax: off"));
+
+    harness
+        .execute_action(Action::Command("sy rust".to_string()))
+        .await
+        .unwrap();
+    assert_eq!(
+        harness.editor.test_current_buffer().syntax_selection(),
+        &SyntaxSelection::Language("rust".to_string())
+    );
 
     harness
         .execute_action(Action::Command("syntax auto".to_string()))

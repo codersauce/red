@@ -170,10 +170,16 @@ pub(crate) fn complete(
         return;
     };
     let argument_source = source(&context, plugins);
-    // Retain the established bare :e<Tab> and :syntax<Tab> shortcuts. Other
-    // commands enter argument completion only after a separating space.
+    let command_name = context.command.trim_end_matches('!');
+    let accepts_bare_arguments = command_name.len() == 1
+        || command_palette::BUILTIN_COLON_COMMANDS
+            .iter()
+            .any(|command| command.name() == command_name);
+    // Preserve established bare-command argument shortcuts without letting a newly
+    // executable prefix, such as :wr, take over command-name completion.
     let (replacement, needs_leading_space, candidates) = if context.needs_leading_space
-        && !matches!(argument_source, Some(Source::Files | Source::Syntax))
+        && (!matches!(argument_source, Some(Source::Files | Source::Syntax))
+            || !accepts_bare_arguments)
     {
         let start = context.replacement.start - context.command.len();
         let names = command_palette::colon_completion_names(plugins)
@@ -330,8 +336,10 @@ mod tests {
             ("copilot en", "copilot en"),
             ("languages re", "languages reload"),
             ("set norn", "set nornu"),
+            ("se norn", "se nornu"),
             ("set rnu ", "set rnu "),
             ("syntax RU", "syntax rust"),
+            ("sy ru", "sy rust"),
             ("syn ru", "syn rust"),
             ("ft ", "ft auto"),
             ("syntax rust extra", "syntax rust extra"),
@@ -416,8 +424,8 @@ mod tests {
         fs::create_dir(directory.path().join("zdir")).unwrap();
         fs::write(directory.path().join("afile"), "").unwrap();
         for command in [
-            "e", "edit", "w", "write", "saveas", "file", "new", "vnew", "sp", "split", "vs",
-            "vsplit", "e!",
+            "e", "ed", "edit", "w", "wr", "wri", "write", "sav", "saveas", "fi", "file", "new",
+            "vne", "vnew", "sp", "spl", "split", "vs", "vsp", "vsplit", "e!",
         ] {
             let mut state = None;
             let mut line = format!("{command} {}/", directory.path().display());

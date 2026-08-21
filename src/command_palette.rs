@@ -6,7 +6,7 @@ use fuzzy_matcher::{skim::SkimMatcherV2, FuzzyMatcher};
 use serde_json::json;
 
 use crate::{
-    command,
+    command::{self, CommandSpec},
     config::{KeyAction, Keys},
     editor::{Action, Mode, SearchDirection},
     plugin::RegisteredPluginCommand,
@@ -14,50 +14,50 @@ use crate::{
     unicode_utils::{display_width, truncate_display_width},
 };
 
-/// Colon commands handled by the built-in command parser.
-pub(crate) const BUILTIN_COLON_COMMANDS: &[&str] = &[
-    "$",
-    "quit",
-    "write",
-    "buffer-next",
-    "bnext",
-    "buffer-prev",
-    "bprevious",
-    "buffer",
-    "b",
-    "b#",
-    "bd",
-    "bdelete",
-    "buffer-delete",
-    "edit",
-    "enew",
-    "new",
-    "vnew",
-    "saveas",
-    "file",
-    "ls",
-    "buffers",
-    "files",
-    "split",
-    "sp",
-    "vsplit",
-    "vs",
-    "close",
-    "only",
-    "panel-layout-reset",
-    "noh",
-    "nohlsearch",
-    "set",
-    "wrap",
-    "nowrap",
-    "syntax",
-    "syn",
-    "ft",
-    "languages",
-    "plugins",
-    "statusline",
-    "config-diagnostics",
-    "messages",
+/// Built-ins and their stable Vim-compatible minimum abbreviation lengths.
+pub(crate) const BUILTIN_COLON_COMMANDS: &[CommandSpec] = &[
+    CommandSpec::exact("$"),
+    CommandSpec::new("quit", 1),
+    CommandSpec::new("write", 1),
+    CommandSpec::exact("buffer-next"),
+    CommandSpec::new("bnext", 2),
+    CommandSpec::exact("buffer-prev"),
+    CommandSpec::new("bprevious", 2),
+    CommandSpec::new("buffer", 1),
+    CommandSpec::exact("b"),
+    CommandSpec::exact("b#"),
+    CommandSpec::exact("bd"),
+    CommandSpec::new("bdelete", 2),
+    CommandSpec::exact("buffer-delete"),
+    CommandSpec::new("edit", 1),
+    CommandSpec::new("enew", 3),
+    CommandSpec::new("new", 3),
+    CommandSpec::new("vnew", 3),
+    CommandSpec::new("saveas", 3),
+    CommandSpec::new("file", 1),
+    CommandSpec::exact("ls"),
+    CommandSpec::exact("buffers"),
+    CommandSpec::exact("files"),
+    CommandSpec::new("split", 2),
+    CommandSpec::exact("sp"),
+    CommandSpec::new("vsplit", 2),
+    CommandSpec::exact("vs"),
+    CommandSpec::new("close", 3),
+    CommandSpec::new("only", 2),
+    CommandSpec::exact("panel-layout-reset"),
+    CommandSpec::exact("noh"),
+    CommandSpec::new("nohlsearch", 3),
+    CommandSpec::new("set", 2),
+    CommandSpec::exact("wrap"),
+    CommandSpec::exact("nowrap"),
+    CommandSpec::new("syntax", 2),
+    CommandSpec::exact("syn"),
+    CommandSpec::exact("ft"),
+    CommandSpec::exact("languages"),
+    CommandSpec::exact("plugins"),
+    CommandSpec::exact("statusline"),
+    CommandSpec::exact("config-diagnostics"),
+    CommandSpec::new("messages", 3),
 ];
 
 const SPECIAL_BUILTIN_COLON_COMMANDS: &[&str] = &[
@@ -188,8 +188,9 @@ pub(crate) fn entries(
 pub(crate) fn colon_completion_names(plugin_commands: &[RegisteredPluginCommand]) -> Vec<String> {
     let mut names = BUILTIN_COLON_COMMANDS
         .iter()
-        .chain(SPECIAL_BUILTIN_COLON_COMMANDS)
-        .map(|name| (*name).to_string())
+        .map(CommandSpec::name)
+        .chain(SPECIAL_BUILTIN_COLON_COMMANDS.iter().copied())
+        .map(str::to_string)
         .collect::<Vec<_>>();
     names.extend(
         plugin_commands
@@ -1622,6 +1623,48 @@ mod tests {
                 .commands,
             ["enew"]
         );
+        assert_eq!(
+            command::parse(BUILTIN_COLON_COMMANDS, "ene")
+                .unwrap()
+                .commands,
+            ["enew"]
+        );
+        assert_eq!(command::parse(BUILTIN_COLON_COMMANDS, "en"), None);
+    }
+
+    #[test]
+    fn builtin_command_prefixes_do_not_conflict() {
+        for (index, command) in BUILTIN_COLON_COMMANDS.iter().enumerate() {
+            assert!(
+                !BUILTIN_COLON_COMMANDS[..index]
+                    .iter()
+                    .any(|other| other.name() == command.name()),
+                "duplicate built-in command {:?}",
+                command.name()
+            );
+
+            for length in 1..=command.name().len() {
+                let prefix = &command.name()[..length];
+                if !command.accepts_prefix(prefix)
+                    || BUILTIN_COLON_COMMANDS
+                        .iter()
+                        .any(|other| other.name() == prefix)
+                {
+                    continue;
+                }
+
+                let matches = BUILTIN_COLON_COMMANDS
+                    .iter()
+                    .filter(|other| other.accepts_prefix(prefix))
+                    .map(CommandSpec::name)
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    matches.len(),
+                    1,
+                    "built-in command prefix {prefix:?} matches {matches:?}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -1986,6 +2029,24 @@ mod tests {
             .unwrap();
 
         assert_eq!(custom.colon, None);
+    }
+
+    #[test]
+    fn vim_prefixes_shadow_plugin_names_only_after_their_minimum_length() {
+        for (name, expected) in [("ene", None), ("en", Some(":en"))] {
+            let plugin = RegisteredPluginCommand {
+                name: name.to_string(),
+                plugin: "custom".to_string(),
+                metadata: CommandMetadata::default(),
+            };
+            let entries = entries(&default_keys(), &[plugin]);
+            let custom = entries
+                .iter()
+                .find(|entry| entry.id == format!("plugin.custom.{name}"))
+                .unwrap();
+
+            assert_eq!(custom.colon.as_deref(), expected, "{name}");
+        }
     }
 
     #[test]
