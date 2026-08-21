@@ -9,6 +9,7 @@ mod embedding;
 mod stdlib;
 
 use std::{
+    borrow::Cow,
     collections::{BTreeMap, HashMap, HashSet},
     fmt,
     sync::Arc,
@@ -251,7 +252,7 @@ impl Value {
     /// Converts JSON into Husk's shared runtime representation.
     #[must_use]
     pub fn from_json(value: serde_json::Value) -> Self {
-        json_to_value(&value)
+        json_into_value(value)
     }
 
     /// Converts a runtime value into its JSON boundary representation.
@@ -750,10 +751,10 @@ impl CompiledProgram {
             )));
         }
 
-        let mut declarations = options.declarations.clone();
+        let mut declarations = Cow::Borrowed(options.declarations.as_slice());
         for module in &options.modules {
             module.validate()?;
-            declarations.push(module_declaration_ast(module)?);
+            declarations.to_mut().push(module_declaration_ast(module)?);
         }
 
         let semantic = if options.typecheck {
@@ -5561,9 +5562,9 @@ fn iterable_values(value: Value) -> anyhow::Result<Box<dyn Iterator<Item = Value
                 (0..length).map(move |index| values[index].clone()),
             ))
         }
-        Value::Json(serde_json::Value::Array(values)) => Ok(Box::new(
-            values.into_iter().map(|value| json_to_value(&value)),
-        )),
+        Value::Json(serde_json::Value::Array(values)) => {
+            Ok(Box::new(values.into_iter().map(json_into_value)))
+        }
         Value::String(value) => Ok(Box::new(
             value
                 .chars()
@@ -5601,6 +5602,33 @@ fn enum_constructor_path(path: &str) -> Option<(&str, &str)> {
     (is_type && is_case).then_some((type_name, case))
 }
 
+fn json_into_value(value: serde_json::Value) -> Value {
+    match value {
+        serde_json::Value::Null => Value::Null,
+        serde_json::Value::Bool(value) => Value::Bool(value),
+        serde_json::Value::Number(value) => {
+            if let Some(integer) = value.as_i64() {
+                Value::Int(integer)
+            } else if let Some(float) = value.as_f64() {
+                Value::Float(float)
+            } else {
+                Value::Json(serde_json::Value::Number(value))
+            }
+        }
+        serde_json::Value::String(value) => Value::String(value),
+        serde_json::Value::Array(values) => {
+            Value::Array(Arc::new(values.into_iter().map(json_into_value).collect()))
+        }
+        serde_json::Value::Object(values) => {
+            let mut object = BTreeMap::new();
+            for (key, value) in values {
+                object.insert(key, json_into_value(value));
+            }
+            Value::Object(Arc::new(object))
+        }
+    }
+}
+
 fn json_to_value(value: &serde_json::Value) -> Value {
     match value {
         serde_json::Value::Null => Value::Null,
@@ -5618,12 +5646,13 @@ fn json_to_value(value: &serde_json::Value) -> Value {
         serde_json::Value::Array(values) => {
             Value::Array(Arc::new(values.iter().map(json_to_value).collect()))
         }
-        serde_json::Value::Object(values) => Value::Object(Arc::new(
-            values
-                .iter()
-                .map(|(key, value)| (key.clone(), json_to_value(value)))
-                .collect(),
-        )),
+        serde_json::Value::Object(values) => {
+            let mut object = BTreeMap::new();
+            for (key, value) in values {
+                object.insert(key.clone(), json_to_value(value));
+            }
+            Value::Object(Arc::new(object))
+        }
     }
 }
 
@@ -6318,6 +6347,19 @@ mod tests {
 
     impl Host for TestHost {
         fn log(&mut self, _message: &str) {}
+    }
+
+    #[test]
+    fn owned_json_conversion_preserves_nested_values_and_unicode() {
+        let json = serde_json::json!({
+            "text": "héllo 🦀",
+            "values": [null, true, -42, 3.25, { "nested": "世界" }],
+        });
+
+        let runtime = Value::from_json(json.clone());
+
+        assert_eq!(runtime.to_json(), json);
+        assert!(matches!(runtime, Value::Object(_)));
     }
 
     #[test]

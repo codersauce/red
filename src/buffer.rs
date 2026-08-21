@@ -11,7 +11,7 @@
 //! transaction boundary instead; raw replacement exists for that boundary and for
 //! controlled undo/redo replay.
 
-use ropey::Rope;
+use ropey::{Rope, RopeSlice};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use regex::Regex;
@@ -536,6 +536,25 @@ impl Buffer {
         self.last_navigable_line() + 1
     }
 
+    /// Reports whether a logical line contains only its LF or CRLF terminator.
+    ///
+    /// Whitespace-only lines remain nonempty, matching Vim paragraph semantics.
+    pub(crate) fn line_is_empty(&self, line: usize) -> bool {
+        self.content
+            .get_line(line)
+            .is_some_and(Self::line_slice_is_empty)
+    }
+
+    /// Checks one borrowed rope line without allocating or flattening its text.
+    pub(crate) fn line_slice_is_empty(line: RopeSlice<'_>) -> bool {
+        match line.len_chars() {
+            0 => true,
+            1 => matches!(line.char(0), '\n' | '\r'),
+            2 => line.char(0) == '\r' && line.char(1) == '\n',
+            _ => false,
+        }
+    }
+
     /// Returns true if the buffer is empty
     pub fn is_empty(&self) -> bool {
         self.content.len_bytes() == 0
@@ -803,37 +822,34 @@ impl Buffer {
 
     /// Finds the end of the current word
     pub fn find_word_end(&self, (x, y): (usize, usize)) -> Option<(usize, usize)> {
-        let line = self.get(y)?;
-        let mut x = x;
-        let chars = line.chars().skip(x);
-        let line_len = line.chars().count();
-        for c in chars {
-            if x >= line_len {
-                return Some((x, y));
-            }
-            if !c.is_alphanumeric() && c != '_' {
-                return Some((x, y));
-            }
-            x += 1;
+        let line = self.content.get_line(y)?;
+        if x >= line.len_chars() {
+            return Some((x, y));
         }
-        Some((x, y))
+        let mut position = x;
+        for character in line.slice(x..).chars() {
+            if !character.is_alphanumeric() && character != '_' {
+                return Some((position, y));
+            }
+            position += 1;
+        }
+        Some((position, y))
     }
 
     /// Finds the next word from the current position
     pub fn find_next_word(&self, (mut x, mut y): (usize, usize)) -> Option<(usize, usize)> {
         // Get current line
-        let mut current_line = self.get(y)?;
-        let line = trim_line_ending(&current_line);
+        let mut current_line = self.line_without_ending(y)?;
 
         // Check if we're at the last character of the buffer
-        let line_len = Self::char_len(line);
+        let line_len = current_line.len_chars();
         if y >= self.len() && x >= line_len.saturating_sub(1) {
             return None;
         }
 
         // If we're on an empty line now, move to start of next line
         // without doing anything else
-        if line.is_empty() {
+        if line_len == 0 {
             y += 1;
             if y > self.len() {
                 return None;
@@ -848,43 +864,41 @@ impl Buffer {
                 return None;
             }
             x = 0;
-            current_line = self.get(y)?;
-            let next_line = trim_line_ending(&current_line);
-            if next_line.is_empty() {
+            current_line = self.line_without_ending(y)?;
+            if current_line.len_chars() == 0 {
                 return Some((0, y));
             }
             // Find first non-whitespace on next line
-            if let Some(i) = Self::first_non_whitespace_char(next_line) {
+            if let Some(i) = Self::first_non_whitespace_char(current_line) {
                 return Some((i, y));
             }
         }
 
-        let current_line = trim_line_ending(&current_line);
-        if current_line.is_empty() {
+        if current_line.len_chars() == 0 {
             return Some((0, y));
         }
 
-        let line_len = Self::char_len(current_line);
+        let line_len = current_line.len_chars();
         let last_char_position = line_len.checked_sub(1).map(|last_x| (last_x, y));
 
         if x < line_len {
-            let start_type = Self::char_type_at(current_line, x)?;
+            let start_type = Self::get_char_type(current_line.char(x));
             x += 1;
 
-            for (i, current_type) in Self::char_types(current_line).skip(x) {
+            for character in current_line.slice(x..).chars() {
                 if start_type == CharType::Whitespace {
                     break;
                 }
-                if current_type != start_type {
+                if Self::get_char_type(character) != start_type {
                     break;
                 }
-                x = i + 1;
+                x += 1;
             }
         }
 
-        for (i, current_type) in Self::char_types(current_line).skip(x) {
-            if current_type != CharType::Whitespace {
-                return Some((i, y));
+        for (offset, character) in current_line.slice(x..).chars().enumerate() {
+            if Self::get_char_type(character) != CharType::Whitespace {
+                return Some((x + offset, y));
             }
         }
 
@@ -894,8 +908,7 @@ impl Buffer {
         }
 
         // Find first non-whitespace on next line
-        let next_line = self.get(y)?;
-        let next_line = trim_line_ending(&next_line);
+        let next_line = self.line_without_ending(y)?;
         if let Some(i) = Self::first_non_whitespace_char(next_line) {
             return Some((i, y));
         }
@@ -906,15 +919,14 @@ impl Buffer {
     /// Finds the previous word from the current position
     pub fn find_prev_word(&self, (mut x, mut y): (usize, usize)) -> Option<(usize, usize)> {
         // Get current line
-        let line = self.get(y)?;
-        let line = trim_line_ending(&line);
+        let line = self.line_without_ending(y)?;
 
         // Check if we're at start of buffer
         if y == 0 && x == 0 {
             return None;
         }
 
-        let line_len = Self::char_len(line);
+        let line_len = line.len_chars();
 
         // If we're at the end of line, move back one
         if x >= line_len {
@@ -928,21 +940,19 @@ impl Buffer {
                 return None;
             }
             y -= 1;
-            let prev_line = self.get(y)?;
-            let prev_line = trim_line_ending(&prev_line);
-            if prev_line.is_empty() {
+            let prev_line = self.line_without_ending(y)?;
+            if prev_line.len_chars() == 0 {
                 return Some((0, y));
             }
-            x = Self::char_len(prev_line) - 1;
+            x = prev_line.len_chars() - 1;
         } else {
             x -= 1;
         }
 
-        let current_line = self.get(y)?;
-        let current_line = trim_line_ending(&current_line);
+        let current_line = self.line_without_ending(y)?;
 
         // Get the type of character we landed on
-        let start_type = Self::char_type_at(current_line, x)?;
+        let start_type = Self::get_char_type(current_line.get_char(x)?);
 
         // Skip whitespace backward
         if start_type == CharType::Whitespace {
@@ -953,47 +963,44 @@ impl Buffer {
                         return None;
                     }
                     y -= 1;
-                    let prev_line = self.get(y)?;
-                    let prev_line = trim_line_ending(&prev_line);
-                    if prev_line.is_empty() {
+                    let prev_line = self.line_without_ending(y)?;
+                    if prev_line.len_chars() == 0 {
                         return Some((0, y));
                     }
                     Self::last_non_whitespace_at_or_before(
                         prev_line,
-                        Self::char_len(prev_line).saturating_sub(1),
+                        prev_line.len_chars().saturating_sub(1),
                     )?
                 }
             };
 
             // If we hit start of line while skipping whitespace, go to previous line
-            if x == 0 && Self::char_type_at(current_line, 0)? == CharType::Whitespace {
+            if x == 0 && Self::get_char_type(current_line.get_char(0)?) == CharType::Whitespace {
                 if y == 0 {
                     return None;
                 }
                 y -= 1;
-                let prev_line = self.get(y)?;
-                let prev_line = trim_line_ending(&prev_line);
-                if prev_line.is_empty() {
+                let prev_line = self.line_without_ending(y)?;
+                if prev_line.len_chars() == 0 {
                     return Some((0, y));
                 }
                 x = Self::last_non_whitespace_at_or_before(
                     prev_line,
-                    Self::char_len(prev_line).saturating_sub(1),
+                    prev_line.len_chars().saturating_sub(1),
                 )?;
             }
         }
 
-        let current_line = self.get(y)?;
-        let current_line = trim_line_ending(&current_line);
-        let current_type = Self::char_type_at(current_line, x)?;
+        let current_line = self.line_without_ending(y)?;
+        let current_type = Self::get_char_type(current_line.get_char(x)?);
 
         // Move backward to start of current word/symbol
         x = Self::word_start_at_or_before(current_line, x, current_type);
 
         // If we're at start of line, check previous line
         if x == 0 && y > 0 {
-            let prev_line = self.get(y - 1)?;
-            if trim_line_ending(&prev_line).is_empty() {
+            let prev_line = self.line_without_ending(y - 1)?;
+            if prev_line.len_chars() == 0 {
                 return Some((0, y - 1));
             }
         }
@@ -1166,54 +1173,37 @@ impl Buffer {
         }
     }
 
-    fn char_len(line: &str) -> usize {
-        line.chars().count()
+    fn line_without_ending(&self, line: usize) -> Option<RopeSlice<'_>> {
+        let line = self.content.get_line(line)?;
+        let mut len = line.len_chars();
+        if len > 0 && line.char(len - 1) == '\n' {
+            len -= 1;
+        }
+        if len > 0 && line.char(len - 1) == '\r' {
+            len -= 1;
+        }
+        Some(line.slice(..len))
     }
 
-    fn char_types(line: &str) -> impl Iterator<Item = (usize, CharType)> + '_ {
+    fn first_non_whitespace_char(line: RopeSlice<'_>) -> Option<usize> {
         line.chars()
-            .enumerate()
-            .map(|(i, c)| (i, Self::get_char_type(c)))
+            .position(|character| Self::get_char_type(character) != CharType::Whitespace)
     }
 
-    fn char_type_at(line: &str, x: usize) -> Option<CharType> {
-        line.chars().nth(x).map(Self::get_char_type)
+    fn last_non_whitespace_at_or_before(line: RopeSlice<'_>, x: usize) -> Option<usize> {
+        line.chars_at(x + 1)
+            .reversed()
+            .position(|character| Self::get_char_type(character) != CharType::Whitespace)
+            .map(|offset| x - offset)
     }
 
-    fn first_non_whitespace_char(line: &str) -> Option<usize> {
-        Self::char_types(line)
-            .find(|(_, kind)| *kind != CharType::Whitespace)
-            .map(|(i, _)| i)
-    }
-
-    fn last_non_whitespace_at_or_before(line: &str, x: usize) -> Option<usize> {
-        let mut index = Self::char_len(line);
-        for c in line.chars().rev() {
-            index = index.saturating_sub(1);
-            if index > x {
-                continue;
-            }
-            if Self::get_char_type(c) != CharType::Whitespace {
-                return Some(index);
-            }
-        }
-        None
-    }
-
-    fn word_start_at_or_before(line: &str, x: usize, target_type: CharType) -> usize {
-        let mut start = x;
-        let mut index = Self::char_len(line);
-        for c in line.chars().rev() {
-            index = index.saturating_sub(1);
-            if index > x {
-                continue;
-            }
-            if Self::get_char_type(c) != target_type {
-                break;
-            }
-            start = index;
-        }
-        start
+    fn word_start_at_or_before(line: RopeSlice<'_>, x: usize, target_type: CharType) -> usize {
+        let matching = line
+            .chars_at(x + 1)
+            .reversed()
+            .take_while(|character| Self::get_char_type(*character) == target_type)
+            .count();
+        x + 1 - matching
     }
 }
 
@@ -1618,6 +1608,44 @@ mod test {
     }
 
     #[test]
+    fn word_navigation_preserves_unicode_crlf_and_long_rope_lines() {
+        let buffer = Buffer::new(None, "αβ_世界 :: 👋\r\n  終わり".to_string());
+
+        assert_eq!(buffer.find_next_word((0, 0)), Some((6, 0)));
+        assert_eq!(buffer.find_next_word((6, 0)), Some((9, 0)));
+        assert_eq!(buffer.find_next_word((9, 0)), Some((2, 1)));
+        assert_eq!(buffer.find_prev_word((9, 0)), Some((6, 0)));
+        assert_eq!(buffer.find_prev_word((6, 0)), Some((0, 0)));
+        assert_eq!(buffer.find_prev_word((2, 1)), Some((9, 0)));
+        assert_eq!(buffer.find_next_word((usize::MAX, 1)), None);
+        assert_eq!(buffer.find_prev_word((0, 9)), None);
+
+        let prefix = "ordinary_identifier ".repeat(512);
+        let offset = prefix.len();
+        let long_line = Buffer::new(None, format!("{prefix}target_identifier remaining"));
+        assert_eq!(
+            long_line.find_next_word((offset, 0)),
+            Some((offset + 18, 0))
+        );
+        assert_eq!(
+            long_line.find_prev_word((offset + 17, 0)),
+            Some((offset, 0))
+        );
+    }
+
+    #[test]
+    fn empty_line_checks_distinguish_crlf_from_whitespace_and_missing_lines() {
+        let buffer = Buffer::new(None, "alpha\r\n\r\n  \r\n\n終わり".to_string());
+
+        assert!(!buffer.line_is_empty(0));
+        assert!(buffer.line_is_empty(1));
+        assert!(!buffer.line_is_empty(2));
+        assert!(buffer.line_is_empty(3));
+        assert!(!buffer.line_is_empty(4));
+        assert!(!buffer.line_is_empty(5));
+    }
+
+    #[test]
     fn test_find_prev_word() {
         let buffer = Buffer::new(
             None,
@@ -1836,6 +1864,17 @@ mod test {
 
         let word_end = buffer.find_word_end((7, 0));
         assert_eq!(word_end.unwrap(), (7, 0));
+    }
+
+    #[test]
+    fn word_end_motion_preserves_unicode_scalars_and_out_of_range_positions() {
+        let buffer = Buffer::new(None, "prefix αβ_世界 👋\r\nsecond".to_string());
+
+        assert_eq!(buffer.find_word_end((7, 0)), Some((12, 0)));
+        assert_eq!(buffer.find_word_end((12, 0)), Some((12, 0)));
+        assert_eq!(buffer.find_word_end((13, 0)), Some((13, 0)));
+        assert_eq!(buffer.find_word_end((usize::MAX, 0)), Some((usize::MAX, 0)));
+        assert_eq!(buffer.find_word_end((0, 5)), None);
     }
 
     #[test]

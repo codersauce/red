@@ -160,18 +160,26 @@ impl AgentConversationSnapshot {
     }
 
     fn enforce_limits(&mut self) {
-        while self.items.len() > MAX_TRANSCRIPT_ITEMS
-            || self
-                .items
+        let mut removed = self.items.len().saturating_sub(MAX_TRANSCRIPT_ITEMS);
+        let retained = &self.items[removed..];
+        let bytes = retained.iter().map(|item| item.text.len()).sum::<usize>();
+
+        // A UTF-8 string never contains more characters than bytes. Most streamed
+        // conversations are comfortably below the byte ceiling, so avoid counting
+        // every character in the entire transcript after each incoming token.
+        if bytes > MAX_TRANSCRIPT_CHARS {
+            let mut characters = retained
                 .iter()
                 .map(|item| item.text.chars().count())
-                .sum::<usize>()
-                > MAX_TRANSCRIPT_CHARS
-        {
-            if self.items.is_empty() {
-                break;
+                .sum::<usize>();
+            while characters > MAX_TRANSCRIPT_CHARS && removed < self.items.len() {
+                characters -= self.items[removed].text.chars().count();
+                removed += 1;
             }
-            self.items.remove(0);
+        }
+
+        if removed > 0 {
+            self.items.drain(..removed);
         }
     }
 }
@@ -317,5 +325,46 @@ mod tests {
             .reconciled_with_thread(&thread);
 
         assert_eq!(restored.items[1].text, "First\n\nSecond");
+    }
+
+    #[test]
+    fn transcript_limits_count_characters_instead_of_utf8_bytes() {
+        let mut conversation = AgentConversationSnapshot::new("thread", "/workspace");
+        let unicode = "界".repeat(MAX_TRANSCRIPT_CHARS / 2);
+
+        conversation.append_user("unicode", unicode.clone());
+        conversation.append_agent_delta("answer", "Still within the character limit");
+
+        assert_eq!(conversation.items.len(), 2);
+        assert_eq!(conversation.items[0].text, unicode);
+    }
+
+    #[test]
+    fn transcript_limits_remove_oldest_items_once() {
+        let mut conversation = AgentConversationSnapshot::new("thread", "/workspace");
+        conversation.items = (0..MAX_TRANSCRIPT_ITEMS + 4)
+            .map(|index| AgentTranscriptItem {
+                id: index.to_string(),
+                turn_id: None,
+                role: AgentTranscriptRole::User,
+                text: "message".to_string(),
+            })
+            .collect();
+
+        conversation.enforce_limits();
+
+        assert_eq!(conversation.items.len(), MAX_TRANSCRIPT_ITEMS);
+        assert_eq!(conversation.items[0].id, "4");
+    }
+
+    #[test]
+    fn transcript_limits_remove_complete_messages_at_character_boundary() {
+        let mut conversation = AgentConversationSnapshot::new("thread", "/workspace");
+        conversation.append_user("full", "a".repeat(MAX_TRANSCRIPT_CHARS));
+
+        conversation.append_agent_delta("answer", "界");
+
+        assert_eq!(conversation.items.len(), 1);
+        assert_eq!(conversation.items[0].text, "界");
     }
 }

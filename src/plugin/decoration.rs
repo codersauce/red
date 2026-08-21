@@ -54,17 +54,20 @@ impl DecorationManager {
             return false;
         }
 
-        self.namespaces.insert(namespace, decorations);
-        self.rebuild_index();
+        let previous = self.namespaces.insert(namespace.clone(), decorations);
+        if let Some(previous) = previous {
+            Self::remove_indexed(&mut self.line_index, &previous);
+        }
+        Self::insert_indexed(&mut self.line_index, &self.namespaces[&namespace]);
         true
     }
 
     pub fn clear(&mut self, namespace: &str) -> bool {
-        if self.namespaces.remove(namespace).is_none() {
+        let Some(previous) = self.namespaces.remove(namespace) else {
             return false;
-        }
+        };
 
-        self.rebuild_index();
+        Self::remove_indexed(&mut self.line_index, &previous);
         true
     }
 
@@ -88,23 +91,41 @@ impl DecorationManager {
             .collect()
     }
 
-    fn rebuild_index(&mut self) {
-        self.line_index.clear();
-
-        for decorations in self.namespaces.values() {
-            for decoration in decorations {
-                let Some(buffer_index) = decoration.buffer_index else {
-                    continue;
-                };
-                self.line_index
-                    .entry((buffer_index, decoration.line))
-                    .or_default()
-                    .push(decoration.clone());
+    fn remove_indexed(
+        line_index: &mut HashMap<(usize, usize), Vec<Decoration>>,
+        decorations: &[Decoration],
+    ) {
+        for decoration in decorations {
+            let Some(buffer_index) = decoration.buffer_index else {
+                continue;
+            };
+            let key = (buffer_index, decoration.line);
+            let remove_line = line_index.get_mut(&key).is_some_and(|indexed| {
+                if let Some(position) = indexed.iter().position(|current| current == decoration) {
+                    indexed.remove(position);
+                }
+                indexed.is_empty()
+            });
+            if remove_line {
+                line_index.remove(&key);
             }
         }
+    }
 
-        for decorations in self.line_index.values_mut() {
-            decorations.sort_by_key(|decoration| decoration.priority);
+    fn insert_indexed(
+        line_index: &mut HashMap<(usize, usize), Vec<Decoration>>,
+        decorations: &[Decoration],
+    ) {
+        for decoration in decorations {
+            let Some(buffer_index) = decoration.buffer_index else {
+                continue;
+            };
+            let indexed = line_index
+                .entry((buffer_index, decoration.line))
+                .or_default();
+            let position =
+                indexed.partition_point(|current| current.priority <= decoration.priority);
+            indexed.insert(position, decoration.clone());
         }
     }
 }
@@ -189,5 +210,45 @@ mod tests {
         assert!(manager.clear("guides"));
         assert!(!manager.clear("guides"));
         assert_eq!(manager.decorations_for_line(0, 1).count(), 0);
+    }
+
+    #[test]
+    fn namespace_updates_preserve_other_namespaces_on_shared_lines() {
+        let mut manager = DecorationManager::default();
+        let shared = decoration(0, 3, 4, 10);
+        manager.set("first".to_string(), vec![shared.clone()]);
+        manager.set("second".to_string(), vec![shared.clone()]);
+        manager.set("third".to_string(), vec![decoration(0, 3, 8, 20)]);
+
+        manager.set("first".to_string(), vec![decoration(0, 7, 2, 5)]);
+
+        assert_eq!(
+            manager
+                .decorations_for_line(0, 3)
+                .map(|decoration| decoration.column)
+                .collect::<Vec<_>>(),
+            vec![4, 8]
+        );
+        assert_eq!(manager.decorations_for_line(0, 7).count(), 1);
+        assert!(manager.clear("second"));
+        assert_eq!(
+            manager
+                .decorations_for_line(0, 3)
+                .map(|decoration| decoration.column)
+                .collect::<Vec<_>>(),
+            vec![8]
+        );
+    }
+
+    #[test]
+    fn removing_unindexed_decorations_does_not_disturb_indexed_lines() {
+        let mut manager = DecorationManager::default();
+        let mut unindexed = decoration(0, 3, 4, 10);
+        unindexed.buffer_index = None;
+        manager.set("unindexed".to_string(), vec![unindexed]);
+        manager.set("indexed".to_string(), vec![decoration(0, 3, 8, 20)]);
+
+        assert!(manager.clear("unindexed"));
+        assert_eq!(manager.decorations_for_line(0, 3).count(), 1);
     }
 }

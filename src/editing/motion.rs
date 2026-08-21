@@ -97,9 +97,11 @@ impl<'buffer> MotionResolver<'buffer> {
     #[must_use]
     pub fn word_range(&self, count: u16, change_word: bool, big_word: bool) -> Option<TextRange> {
         let start = self.cursor;
-        let contents = self.buffer.contents();
+        let start_index = self.buffer.position_to_char_idx(start);
+        let snapshot = self.buffer.contents_snapshot();
+        let contents = snapshot.slice(start_index..).to_string();
         let characters = contents.chars().collect::<Vec<_>>();
-        let mut end = self.buffer.position_to_char_idx(start);
+        let mut end = 0;
         characters.get(end)?;
         let word_kind = |character: char| {
             if character.is_whitespace() {
@@ -181,7 +183,7 @@ impl<'buffer> MotionResolver<'buffer> {
             }
         }
 
-        let end = self.buffer.char_idx_to_position(end);
+        let end = self.buffer.char_idx_to_position(start_index + end);
         (start != end || change_word).then(|| TextRange::new(start, end))
     }
 
@@ -194,9 +196,9 @@ impl<'buffer> MotionResolver<'buffer> {
         end: bool,
         big_word: bool,
     ) -> Option<TextPosition> {
-        let contents = self.buffer.contents();
-        let characters = contents.chars().collect::<Vec<_>>();
-        if characters.is_empty() {
+        let characters = self.buffer.contents_snapshot();
+        let character_count = characters.len_chars();
+        if character_count == 0 {
             return None;
         }
 
@@ -212,14 +214,14 @@ impl<'buffer> MotionResolver<'buffer> {
         let mut cursor = self
             .buffer
             .position_to_char_idx(self.cursor)
-            .min(characters.len().saturating_sub(1));
+            .min(character_count.saturating_sub(1));
         let mut target = None;
 
         for _ in 0..count {
             if backward {
-                if end && !characters[cursor].is_whitespace() {
-                    let kind = word_kind(characters[cursor]);
-                    while cursor > 0 && word_kind(characters[cursor - 1]) == kind {
+                if end && !characters.char(cursor).is_whitespace() {
+                    let kind = word_kind(characters.char(cursor));
+                    while cursor > 0 && word_kind(characters.char(cursor - 1)) == kind {
                         cursor -= 1;
                     }
                 }
@@ -227,28 +229,28 @@ impl<'buffer> MotionResolver<'buffer> {
                     break;
                 }
                 cursor -= 1;
-                while cursor > 0 && characters[cursor].is_whitespace() {
+                while cursor > 0 && characters.char(cursor).is_whitespace() {
                     cursor -= 1;
                 }
-                if characters[cursor].is_whitespace() {
+                if characters.char(cursor).is_whitespace() {
                     break;
                 }
                 let found_end = cursor;
-                let kind = word_kind(characters[cursor]);
-                while cursor > 0 && word_kind(characters[cursor - 1]) == kind {
+                let kind = word_kind(characters.char(cursor));
+                while cursor > 0 && word_kind(characters.char(cursor - 1)) == kind {
                     cursor -= 1;
                 }
                 target = Some(if end { found_end } else { cursor });
             } else {
-                if characters[cursor].is_whitespace() {
-                    while cursor < characters.len() && characters[cursor].is_whitespace() {
+                if characters.char(cursor).is_whitespace() {
+                    while cursor < character_count && characters.char(cursor).is_whitespace() {
                         cursor += 1;
                     }
                 } else {
-                    let kind = word_kind(characters[cursor]);
+                    let kind = word_kind(characters.char(cursor));
                     let mut group_end = cursor;
-                    while group_end + 1 < characters.len()
-                        && word_kind(characters[group_end + 1]) == kind
+                    while group_end + 1 < character_count
+                        && word_kind(characters.char(group_end + 1)) == kind
                     {
                         group_end += 1;
                     }
@@ -258,17 +260,18 @@ impl<'buffer> MotionResolver<'buffer> {
                         continue;
                     }
                     cursor = group_end.saturating_add(1);
-                    while cursor < characters.len() && characters[cursor].is_whitespace() {
+                    while cursor < character_count && characters.char(cursor).is_whitespace() {
                         cursor += 1;
                     }
                 }
 
-                if cursor >= characters.len() {
+                if cursor >= character_count {
                     break;
                 }
                 if end {
-                    let kind = word_kind(characters[cursor]);
-                    while cursor + 1 < characters.len() && word_kind(characters[cursor + 1]) == kind
+                    let kind = word_kind(characters.char(cursor));
+                    while cursor + 1 < character_count
+                        && word_kind(characters.char(cursor + 1)) == kind
                     {
                         cursor += 1;
                     }
@@ -313,11 +316,8 @@ impl<'buffer> MotionResolver<'buffer> {
 
         let last_line = self.buffer.last_navigable_line();
         let mut line = self.cursor.line.min(last_line);
-        let is_empty = |candidate: usize| {
-            self.buffer
-                .get(candidate)
-                .is_some_and(|contents| trim_line_ending(&contents).is_empty())
-        };
+        let contents = self.buffer.contents_snapshot();
+        let is_empty = |candidate: usize| self.buffer.line_is_empty(candidate);
 
         for _ in 0..count.max(1) {
             if backward {
@@ -328,33 +328,46 @@ impl<'buffer> MotionResolver<'buffer> {
                     });
                 }
 
-                let mut candidate = line - 1;
-                if is_empty(line) {
-                    while candidate > 0 && is_empty(candidate) {
-                        candidate -= 1;
+                let mut skip_empty = is_empty(line);
+                let mut boundary = 0;
+                for (offset, candidate_line) in contents.lines_at(line).reversed().enumerate() {
+                    let candidate = line - offset - 1;
+                    let empty = Buffer::line_slice_is_empty(candidate_line);
+                    if skip_empty && empty && candidate > 0 {
+                        continue;
+                    }
+                    skip_empty = false;
+                    if empty || candidate == 0 {
+                        boundary = candidate;
+                        break;
                     }
                 }
-                while candidate > 0 && !is_empty(candidate) {
-                    candidate -= 1;
-                }
-                line = candidate;
+                line = boundary;
             } else {
-                let mut candidate = line + 1;
-                if is_empty(line) {
-                    while candidate <= last_line && is_empty(candidate) {
-                        candidate += 1;
+                let mut skip_empty = is_empty(line);
+                let mut boundary = None;
+                for (offset, candidate_line) in contents.lines_at(line + 1).enumerate() {
+                    let candidate = line + offset + 1;
+                    if candidate > last_line {
+                        break;
+                    }
+                    let empty = Buffer::line_slice_is_empty(candidate_line);
+                    if skip_empty && empty {
+                        continue;
+                    }
+                    skip_empty = false;
+                    if empty {
+                        boundary = Some(candidate);
+                        break;
                     }
                 }
-                while candidate <= last_line && !is_empty(candidate) {
-                    candidate += 1;
-                }
-                if candidate > last_line {
+                let Some(boundary) = boundary else {
                     return Some(BoundaryMotion {
                         position: self.last_cursor_position(),
                         ends_at_buffer: true,
                     });
-                }
-                line = candidate;
+                };
+                line = boundary;
             }
         }
 
@@ -369,31 +382,37 @@ impl<'buffer> MotionResolver<'buffer> {
             return None;
         }
 
-        let starts = self
-            .sentence_units()
-            .into_iter()
-            .filter(|unit| unit.kind != SentenceUnitKind::Whitespace)
-            .map(|unit| unit.start)
-            .collect::<Vec<_>>();
+        let units = self.sentence_units();
         let mut cursor = self.buffer.position_to_char_idx(self.cursor);
 
         for _ in 0..count.max(1) {
             if backward {
-                let Some(previous) = starts.iter().rev().find(|start| **start < cursor) else {
+                let mut index = units.partition_point(|unit| unit.start < cursor);
+                while index > 0 && units[index - 1].kind == SentenceUnitKind::Whitespace {
+                    index -= 1;
+                }
+                let Some(previous) = index.checked_sub(1).and_then(|index| units.get(index)) else {
                     return Some(BoundaryMotion {
                         position: TextPosition::new(0, 0),
                         ends_at_buffer: false,
                     });
                 };
-                cursor = *previous;
+                cursor = previous.start;
             } else {
-                let Some(next) = starts.iter().find(|start| **start > cursor) else {
+                let mut index = units.partition_point(|unit| unit.start <= cursor);
+                while units
+                    .get(index)
+                    .is_some_and(|unit| unit.kind == SentenceUnitKind::Whitespace)
+                {
+                    index += 1;
+                }
+                let Some(next) = units.get(index) else {
                     return Some(BoundaryMotion {
                         position: self.last_cursor_position(),
                         ends_at_buffer: true,
                     });
                 };
-                cursor = *next;
+                cursor = next.start;
             }
         }
 
@@ -658,34 +677,45 @@ impl<'buffer> MotionResolver<'buffer> {
     }
 
     fn sentence_units(&self) -> Vec<SentenceUnit> {
-        let contents = self.buffer.contents();
+        let snapshot = self.buffer.contents_snapshot();
+        let contents = snapshot.to_string();
         let characters = contents.chars().collect::<Vec<_>>();
         if characters.is_empty() {
             return Vec::new();
         }
 
-        let paragraph_boundaries = (0..=self.buffer.last_navigable_line())
-            .filter(|line| {
-                self.buffer
-                    .get(*line)
-                    .is_some_and(|contents| trim_line_ending(&contents).is_empty())
+        let mut char_index = 0;
+        let paragraph_boundaries = snapshot
+            .lines()
+            .take(self.buffer.last_navigable_line() + 1)
+            .filter_map(|line| {
+                let start = char_index;
+                char_index += line.len_chars();
+                Buffer::line_slice_is_empty(line).then_some(start)
             })
-            .map(|line| self.buffer.position_to_char_idx(TextPosition::new(line, 0)))
             .collect::<Vec<_>>();
-        let is_paragraph_boundary =
-            |index: usize| paragraph_boundaries.binary_search(&index).is_ok();
-        let mut units = Vec::new();
+        let mut units = Vec::with_capacity(paragraph_boundaries.len().saturating_mul(4));
         let mut start = 0;
+        let mut paragraph_index = 0;
 
         while start < characters.len() {
-            if is_paragraph_boundary(start) {
+            while paragraph_boundaries
+                .get(paragraph_index)
+                .is_some_and(|boundary| *boundary < start)
+            {
+                paragraph_index += 1;
+            }
+            if paragraph_boundaries.get(paragraph_index) == Some(&start) {
                 let mut end = start;
-                while end < characters.len() && is_paragraph_boundary(end) {
+                while end < characters.len()
+                    && paragraph_boundaries.get(paragraph_index) == Some(&end)
+                {
                     if characters[end] == '\r' {
                         end += 1;
                     }
                     if characters.get(end) == Some(&'\n') {
                         end += 1;
+                        paragraph_index += 1;
                     } else {
                         break;
                     }
@@ -703,9 +733,8 @@ impl<'buffer> MotionResolver<'buffer> {
             }
 
             let boundary = paragraph_boundaries
-                .iter()
+                .get(paragraph_index)
                 .copied()
-                .find(|boundary| *boundary > start)
                 .unwrap_or(characters.len());
             let mut end = boundary;
             for index in start..boundary {
@@ -739,7 +768,7 @@ impl<'buffer> MotionResolver<'buffer> {
             start = end;
             while start < characters.len()
                 && characters[start].is_whitespace()
-                && !is_paragraph_boundary(start)
+                && paragraph_boundaries.get(paragraph_index) != Some(&start)
             {
                 start += 1;
             }
@@ -963,6 +992,28 @@ mod tests {
         assert_eq!(
             buffer.text_in_range(resolver.word_range(1, false, true).unwrap()),
             "e\u{301}cho,  "
+        );
+    }
+
+    #[test]
+    fn shared_word_motions_preserve_large_unicode_rope_offsets() {
+        let prefix = "ordinary_identifier ".repeat(512);
+        let offset = prefix.len();
+        let buffer = Buffer::new(None, format!("{prefix}e\u{301}cho,  終わり"));
+        let resolver = MotionResolver::new(&buffer, TextPosition::new(0, offset));
+
+        assert_eq!(
+            buffer.text_in_range(resolver.word_range(1, true, false).unwrap()),
+            "e\u{301}cho"
+        );
+        assert_eq!(
+            resolver.word_target(1, false, false, true),
+            Some(TextPosition::new(0, offset + 8))
+        );
+        assert_eq!(
+            MotionResolver::new(&buffer, TextPosition::new(0, offset + 8))
+                .word_target(1, true, false, true),
+            Some(TextPosition::new(0, offset))
         );
     }
 

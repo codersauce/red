@@ -10,17 +10,21 @@
 //! callbacks, commands, and state active and records a reload error. Callers should
 //! inspect status rather than assuming a changed source file became live.
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
 use std::time::{Duration, Instant, SystemTime};
 
 use crate::editor::EditorStateSnapshot;
+use rayon::prelude::*;
 use semver::{Version, VersionReq};
 use serde::Serialize;
 
 use super::package::{PluginPackageManifest, PLUGIN_MANIFEST_FILE};
 use super::{PluginMetadata, RequestId, Runtime};
+
+const PARALLEL_PLUGIN_STARTUP_MIN: usize = 4;
 
 /// Lifecycle authority for configured Husk plugins.
 pub struct PluginRegistry {
@@ -153,6 +157,33 @@ impl PluginRegistry {
     pub async fn initialize(&mut self, runtime: &mut Runtime) -> anyhow::Result<()> {
         let mut pending = self.plugins.clone();
         pending.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
+        let mut precompiled = if pending.len() >= PARALLEL_PLUGIN_STARTUP_MIN {
+            let typecheck_enabled = runtime.typecheck_enabled();
+            pending
+                .par_iter()
+                .filter(|(name, path)| {
+                    !is_husk_package(path)
+                        && matches!(self.statuses.get(name), Some(PluginStatus::Pending))
+                        && self
+                            .metadata
+                            .get(name)
+                            .is_none_or(|metadata| !is_lazy(metadata))
+                })
+                .map(|(name, path)| {
+                    let source = plugin_source(path).and_then(|source| {
+                        super::runtime::compile_startup_plugin(
+                            name,
+                            &plugin_display_path(path),
+                            &source,
+                            typecheck_enabled,
+                        )
+                    });
+                    (name.clone(), source)
+                })
+                .collect::<HashMap<_, _>>()
+        } else {
+            HashMap::new()
+        };
         while !pending.is_empty() {
             let mut deferred = Vec::new();
             let mut progressed = false;
@@ -184,7 +215,12 @@ impl PluginRegistry {
                     progressed = true;
                     continue;
                 }
-                match load_plugin(runtime, &name, &plugin).await {
+                let result = if let Some(program) = precompiled.remove(&name) {
+                    program.and_then(|program| runtime.load_precompiled_plugin(&name, program))
+                } else {
+                    load_plugin(runtime, &name, &plugin).await
+                };
+                match result {
                     Ok(()) => {
                         self.statuses.insert(name, PluginStatus::Active);
                     }
@@ -971,14 +1007,14 @@ fn diagnostic_stage(error: &anyhow::Error) -> &'static str {
     }
 }
 
-fn plugin_source(plugin: &str) -> anyhow::Result<String> {
+fn plugin_source(plugin: &str) -> anyhow::Result<Cow<'static, str>> {
     if crate::assets::is_bundled_plugin_specifier(plugin) {
         return crate::assets::bundled_plugin_contents(plugin)
-            .map(str::to_string)
+            .map(Cow::Borrowed)
             .ok_or_else(|| anyhow::anyhow!("bundled plugin `{plugin}` was not found"));
     }
 
-    Ok(fs::read_to_string(plugin)?)
+    Ok(Cow::Owned(fs::read_to_string(plugin)?))
 }
 
 async fn load_plugin(runtime: &mut Runtime, name: &str, plugin: &str) -> anyhow::Result<()> {
@@ -1015,6 +1051,15 @@ mod tests {
 
     fn drain_requests() {
         while ACTION_DISPATCHER.try_recv_request().is_some() {}
+    }
+
+    #[test]
+    fn bundled_plugin_sources_borrow_immutable_embedded_assets() {
+        let specifier = crate::assets::bundled_plugin_specifier("agent.hk").unwrap();
+        let source = plugin_source(&specifier).unwrap();
+
+        assert!(matches!(source, Cow::Borrowed(_)));
+        assert!(!source.is_empty());
     }
 
     #[tokio::test]
@@ -1427,6 +1472,42 @@ mod tests {
             ACTION_DISPATCHER.recv_request(),
             PluginRequest::Action(Action::Print(message)) if message == "isolated"
         ));
+    }
+
+    #[tokio::test]
+    async fn parallel_startup_preserves_activation_order_and_quarantines_compile_failures() {
+        drain_requests();
+        let directory = tempfile_dir("parallel-startup-order");
+        let mut registry = PluginRegistry::new();
+        for name in ["zeta", "alpha", "broken", "middle", "omega"] {
+            let path = directory.join(format!("{name}.hk"));
+            let source = if name == "broken" {
+                "fn activate( {".to_string()
+            } else {
+                format!("pub fn activate() {{ red::execute(\"Print\", \"{name}\"); }}")
+            };
+            fs::write(&path, source).unwrap();
+            registry.add(name, path.to_str().unwrap());
+        }
+        let mut runtime = Runtime::new();
+
+        registry.initialize(&mut runtime).await.unwrap();
+
+        for expected in ["alpha", "middle", "omega", "zeta"] {
+            assert!(matches!(
+                ACTION_DISPATCHER.recv_request(),
+                PluginRequest::Action(Action::Print(message)) if message == expected
+            ));
+            assert_eq!(
+                registry.statuses().get(expected),
+                Some(&PluginStatus::Active)
+            );
+        }
+        assert!(matches!(
+            registry.statuses().get("broken"),
+            Some(PluginStatus::Quarantined { stage, .. }) if stage == "compile"
+        ));
+        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
     }
 
     #[tokio::test]

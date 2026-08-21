@@ -466,8 +466,15 @@ struct RawInjection {
     content_end: usize,
 }
 
+struct CachedHighlight {
+    language_id: String,
+    code: String,
+    styles: Vec<StyleInfo>,
+}
+
 pub struct Highlighter {
     highlighters: HashMap<String, LanguageHighlighter>,
+    cached_highlight: Option<CachedHighlight>,
     registry: Arc<LanguageRegistry>,
     theme: Theme,
     husk_styles: HuskStyles,
@@ -529,6 +536,8 @@ impl GitCommitStyles {
 }
 
 const MAX_INJECTION_DEPTH: usize = 3;
+const MAX_CACHED_HIGHLIGHT_BYTES: usize = 64 * 1024;
+const MAX_CACHED_HIGHLIGHT_SPANS: usize = 4_096;
 
 const LANGUAGE_NAMES: &[(&str, &str)] = &[
     ("rs", "rust"),
@@ -601,6 +610,7 @@ impl Highlighter {
     pub fn with_registry(theme: &Theme, registry: Arc<LanguageRegistry>) -> anyhow::Result<Self> {
         Ok(Self {
             highlighters: HashMap::new(),
+            cached_highlight: None,
             registry,
             theme: theme.clone(),
             husk_styles: HuskStyles::new(theme),
@@ -705,7 +715,25 @@ impl Highlighter {
     }
 
     pub fn highlight(&mut self, language_id: &str, code: &str) -> anyhow::Result<Vec<StyleInfo>> {
-        self.highlight_with_depth(language_id, code, 0)
+        if let Some(cached) = &self.cached_highlight {
+            if cached.language_id == language_id && cached.code == code {
+                return Ok(cached.styles.clone());
+            }
+        }
+
+        let styles = self.highlight_with_depth(language_id, code, 0)?;
+        self.cached_highlight = if code.len() <= MAX_CACHED_HIGHLIGHT_BYTES
+            && styles.len() <= MAX_CACHED_HIGHLIGHT_SPANS
+        {
+            Some(CachedHighlight {
+                language_id: language_id.to_string(),
+                code: code.to_string(),
+                styles: styles.clone(),
+            })
+        } else {
+            None
+        };
+        Ok(styles)
     }
 
     fn highlight_with_depth(
@@ -714,7 +742,8 @@ impl Highlighter {
         code: &str,
         depth: usize,
     ) -> anyhow::Result<Vec<StyleInfo>> {
-        let Some(definition) = self.registry.languages.get(language_id).cloned() else {
+        let registry = Arc::clone(&self.registry);
+        let Some(definition) = registry.languages.get(language_id) else {
             return Ok(Vec::new());
         };
         if let Some(specialized) = definition.specialized {
@@ -1534,6 +1563,78 @@ mod tests {
         let tree = parser.parse(code, None).unwrap();
         let query = Query::new(&language, query_source).unwrap();
         collect_injections(&query, tree.root_node(), code)
+    }
+
+    #[test]
+    fn repeated_highlighting_reuses_matching_language_and_source() {
+        let mut highlighter = highlighter();
+        let source = "fn greeting() { let value = 42; }";
+
+        let first = highlighter.highlight("rust", source).unwrap();
+        assert!(!first.is_empty());
+        let second = highlighter.highlight("rust", source).unwrap();
+
+        assert_eq!(first.len(), second.len());
+        for (original, repeated) in first.iter().zip(&second) {
+            assert_eq!(original.start, repeated.start);
+            assert_eq!(original.end, repeated.end);
+            assert_eq!(original.style, repeated.style);
+        }
+        assert_eq!(
+            highlighter
+                .cached_highlight
+                .as_ref()
+                .map(|cached| cached.code.as_str()),
+            Some(source)
+        );
+
+        let changed = "fn greeting() { return; }";
+        let updated = highlighter.highlight("rust", changed).unwrap();
+        assert_token_highlighted(&updated, changed, "return");
+        assert_eq!(
+            highlighter
+                .cached_highlight
+                .as_ref()
+                .map(|cached| cached.code.as_str()),
+            Some(changed)
+        );
+
+        let other_language = highlighter.highlight("javascript", "return true;").unwrap();
+        assert_token_highlighted(&other_language, "return true;", "true");
+        assert_eq!(
+            highlighter
+                .cached_highlight
+                .as_ref()
+                .map(|cached| cached.language_id.as_str()),
+            Some("javascript")
+        );
+    }
+
+    #[test]
+    fn repeated_markdown_highlighting_preserves_nested_language_offsets() {
+        let mut highlighter = highlighter();
+        let source = "# Example\n\n```rust\nfn greeting() {}\n```\n";
+
+        let first = highlighter.highlight("markdown", source).unwrap();
+        let second = highlighter.highlight("markdown", source).unwrap();
+        assert_eq!(first.len(), second.len());
+        assert_token_highlighted(&second, source, "fn");
+        for (original, repeated) in first.iter().zip(&second) {
+            assert_eq!(original.start, repeated.start);
+            assert_eq!(original.end, repeated.end);
+            assert_eq!(original.style, repeated.style);
+        }
+    }
+
+    #[test]
+    fn oversized_highlight_requests_do_not_retain_source_or_styles() {
+        let mut highlighter = highlighter();
+        highlighter.highlight("rust", "fn cached() {}").unwrap();
+        assert!(highlighter.cached_highlight.is_some());
+
+        let source = format!("// {}", "a".repeat(MAX_CACHED_HIGHLIGHT_BYTES));
+        highlighter.highlight("rust", &source).unwrap();
+        assert!(highlighter.cached_highlight.is_none());
     }
 
     #[test]

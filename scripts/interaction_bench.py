@@ -40,7 +40,8 @@ def send_keys(master, keys, delay):
 
 
 def run(args):
-    if not BIN.exists():
+    binary = Path(args.binary).resolve()
+    if not binary.is_file():
         raise SystemExit("build the release binary first: cargo build --locked --release")
 
     file_path = Path(args.file).resolve()
@@ -64,7 +65,7 @@ def run(args):
             struct.pack("HHHH", args.rows, args.cols, 0, 0),
         )
         argv = [
-            str(BIN),
+            str(binary),
             "--root",
             str(root),
             "--config-override",
@@ -200,6 +201,7 @@ def run(args):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--binary", default=str(BIN), help="editor binary to benchmark")
     parser.add_argument("scenario", choices=("typing", "search", "picker"))
     parser.add_argument("--file", default=str(ROOT / "src" / "editor.rs"))
     parser.add_argument("--root", default=str(ROOT))

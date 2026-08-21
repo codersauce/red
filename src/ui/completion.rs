@@ -55,6 +55,7 @@ pub struct CompletionUI {
     items: Vec<usize>,
     matched_label_indices: Vec<Vec<usize>>,
     filter: String,
+    last_filter: Option<String>,
     viewport: SelectionViewport,
     visible: bool,
     anchor_x: usize,
@@ -147,6 +148,7 @@ impl CompletionUI {
                 .then(a.label.cmp(&b.label))
         });
         self.all_items = items;
+        self.last_filter = None;
         self.refilter_items(selected);
     }
 
@@ -156,6 +158,7 @@ impl CompletionUI {
         self.items.clear();
         self.matched_label_indices.clear();
         self.filter.clear();
+        self.last_filter = None;
     }
 
     pub fn is_visible(&self) -> bool {
@@ -203,6 +206,7 @@ impl CompletionUI {
         matcher: &SkimMatcherV2,
         item: &CompletionResponseItem,
         filter: &str,
+        normalized_filter: &str,
     ) -> Option<(u8, i64, Vec<usize>)> {
         if filter.is_empty() {
             return Some((0, 0, Vec::new()));
@@ -210,20 +214,23 @@ impl CompletionUI {
 
         let display_name = Self::item_display_name(item);
         let candidate = item.filter_text.as_deref().unwrap_or(display_name);
-        let (score, _) = matcher.fuzzy_indices(candidate, filter)?;
+        let (score, candidate_indices) = matcher.fuzzy_indices(candidate, filter)?;
         let normalized_candidate = candidate.to_lowercase();
-        let normalized_filter = filter.to_lowercase();
         let match_class = if normalized_candidate == normalized_filter {
             3
-        } else if normalized_candidate.starts_with(&normalized_filter) {
+        } else if normalized_candidate.starts_with(normalized_filter) {
             2
         } else {
             1
         };
-        let label_indices = matcher
-            .fuzzy_indices(display_name, filter)
-            .map(|(_, indices)| indices)
-            .unwrap_or_default();
+        let label_indices = if display_name == candidate {
+            candidate_indices
+        } else {
+            matcher
+                .fuzzy_indices(display_name, filter)
+                .map(|(_, indices)| indices)
+                .unwrap_or_default()
+        };
         Some((match_class, score, label_indices))
     }
 
@@ -234,15 +241,31 @@ impl CompletionUI {
             self.items.extend(0..self.all_items.len());
             self.matched_label_indices = vec![Vec::new(); self.items.len()];
         } else {
-            let mut matches = self
-                .all_items
-                .iter()
-                .enumerate()
-                .filter_map(|(idx, item)| {
-                    Self::item_filter_match(&matcher, item, &self.filter)
-                        .map(|(class, score, indices)| (class, score, idx, indices))
-                })
-                .collect::<Vec<_>>();
+            let normalized_filter = self.filter.to_lowercase();
+            let matching_item = |index| {
+                Self::item_filter_match(
+                    &matcher,
+                    &self.all_items[index],
+                    &self.filter,
+                    &normalized_filter,
+                )
+                .map(|(class, score, indices)| (class, score, index, indices))
+            };
+            let refines_previous = self
+                .last_filter
+                .as_ref()
+                .is_some_and(|previous| !previous.is_empty() && self.filter.starts_with(previous));
+            let mut matches = if refines_previous {
+                self.items
+                    .iter()
+                    .copied()
+                    .filter_map(matching_item)
+                    .collect::<Vec<_>>()
+            } else {
+                (0..self.all_items.len())
+                    .filter_map(matching_item)
+                    .collect::<Vec<_>>()
+            };
             matches.sort_by(|a, b| {
                 b.0.cmp(&a.0)
                     .then_with(|| b.1.cmp(&a.1))
@@ -255,6 +278,7 @@ impl CompletionUI {
                 self.matched_label_indices.push(indices);
             }
         }
+        self.last_filter = Some(self.filter.clone());
 
         self.recalculate_layout();
         self.viewport = SelectionViewport::new(self.items.len(), self.visible_rows);
@@ -1341,6 +1365,37 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["exists", "add_extension", "ancestors"]
         );
+    }
+
+    #[test]
+    fn replacing_completion_items_invalidates_progressive_filter_candidates() {
+        let mut ui = CompletionUI::new();
+        ui.show(vec![item("needle_old", None), item("other", None)], 0, 0);
+        ui.set_filter("need");
+
+        ui.update_items(vec![item("needle_new", None), item("other", None)], "needl");
+
+        assert_eq!(ui.selected_item().unwrap().label, "needle_new");
+    }
+
+    #[test]
+    fn broadening_completion_filter_restores_previous_nonmatches() {
+        let mut ui = CompletionUI::new();
+        ui.show(
+            vec![
+                item("needle", None),
+                item("nearby", None),
+                item("other", None),
+            ],
+            0,
+            0,
+        );
+        ui.set_filter("need");
+        assert_eq!(ui.items.len(), 1);
+
+        ui.set_filter("ne");
+
+        assert_eq!(ui.items.len(), 2);
     }
 
     #[test]

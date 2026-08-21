@@ -51,12 +51,32 @@ pub static HOST_API: Lazy<HostApiSchema> = Lazy::new(|| {
     schema
 });
 
-static HOST_CALLS: Lazy<HashMap<(&'static str, &'static str), &'static HostCall>> =
+struct ValidatedHostCall {
+    call: &'static HostCall,
+    parameters: Vec<(&'static str, &'static str, bool)>,
+    required: usize,
+}
+
+static HOST_CALLS: Lazy<HashMap<(&'static str, &'static str), ValidatedHostCall>> =
     Lazy::new(|| {
         Lazy::force(&HOST_API)
             .calls
             .iter()
-            .map(|call| ((call.kind.as_str(), call.name.as_str()), call))
+            .map(|call| {
+                let parameters = signature_parameters(&call.signature);
+                let required = parameters
+                    .iter()
+                    .filter(|(_, _, optional)| !optional)
+                    .count();
+                (
+                    (call.kind.as_str(), call.name.as_str()),
+                    ValidatedHostCall {
+                        call,
+                        parameters,
+                        required,
+                    },
+                )
+            })
             .collect()
     });
 
@@ -868,7 +888,7 @@ pub(crate) fn validate_parsed_source(
         );
     }
     for site in host_call_sites(file) {
-        let Some(call) = HOST_CALLS.get(&(site.kind, site.action)).copied() else {
+        let Some(definition) = HOST_CALLS.get(&(site.kind, site.action)) else {
             diagnostics.push(
                 Diagnostic::new(
                     "HUSK-A0001",
@@ -889,11 +909,9 @@ pub(crate) fn validate_parsed_source(
             );
             continue;
         };
-        let parameters = signature_parameters(&call.signature);
-        let required = parameters
-            .iter()
-            .filter(|(_, _, optional)| !optional)
-            .count();
+        let call = definition.call;
+        let parameters = &definition.parameters;
+        let required = definition.required;
         if site.arguments.len() < required || site.arguments.len() > parameters.len() {
             diagnostics.push(
                 Diagnostic::new(
@@ -926,7 +944,7 @@ pub(crate) fn validate_parsed_source(
             );
             continue;
         }
-        for (argument, (parameter, expected, optional)) in site.arguments.iter().zip(&parameters) {
+        for (argument, (parameter, expected, optional)) in site.arguments.iter().zip(parameters) {
             let Some(actual) = literal_type(argument) else {
                 continue;
             };
@@ -1191,6 +1209,21 @@ fn literal_matches(expected: &str, actual: &str) -> bool {
 mod tests {
     use super::*;
     use regex::Regex;
+
+    #[test]
+    fn cached_host_signatures_preserve_optional_parameter_contracts() {
+        let definition = HOST_CALLS.get(&("request", "GetBufferText")).unwrap();
+
+        assert_eq!(definition.required, 1);
+        assert_eq!(
+            definition.parameters,
+            [
+                ("callback", "fn(Json)", false),
+                ("start_line", "i32", true),
+                ("end_line", "i32", true),
+            ]
+        );
+    }
 
     #[test]
     fn decodes_structured_command_and_event_annotations() {

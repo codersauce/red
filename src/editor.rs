@@ -2879,7 +2879,7 @@ pub enum Mode {
     VisualBlock,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 /// Concrete syntax style over a UTF-8 byte range.
 pub struct StyleInfo {
     /// Inclusive byte offset.
@@ -3258,8 +3258,8 @@ pub struct Editor {
     /// Incremented after full renders so event handling can avoid duplicate frames.
     render_generation: u64,
 
-    /// Picker callbacks may enqueue navigation that must commit before the next input event.
-    service_background_before_next_input: bool,
+    /// Rows changed by the most recent detached frame, reused for protocol deltas.
+    last_detached_changed_rows: Vec<usize>,
 
     /// Active window represented by the last committed frame.
     last_rendered_window: Option<WindowId>,
@@ -3568,6 +3568,8 @@ pub struct DetachedEditorCore {
     revision: u64,
     rows: Vec<String>,
     row_spans: Vec<Vec<crate::headless::StyledSpan>>,
+    serialized_render_generation: u64,
+    serialized_width: usize,
     cursor: (usize, usize),
     cursor_state: crate::terminal_output::CursorState,
     stopped: bool,
@@ -3610,6 +3612,8 @@ impl DetachedEditorCore {
             .render_cursor_position()
             .unwrap_or((editor.cx, editor.cy));
         let cursor_state = editor.terminal_cursor_state();
+        let serialized_render_generation = editor.render_generation;
+        let serialized_width = render_buffer.width;
         Ok(Self {
             editor,
             runtime,
@@ -3617,6 +3621,8 @@ impl DetachedEditorCore {
             revision: 0,
             rows,
             row_spans,
+            serialized_render_generation,
+            serialized_width,
             cursor,
             cursor_state,
             stopped: false,
@@ -3768,6 +3774,35 @@ impl DetachedEditorCore {
         self.pending_paste.clear();
     }
 
+    #[doc(hidden)]
+    pub fn benchmark_incremental_frame(
+        &mut self,
+        iteration: usize,
+    ) -> anyhow::Result<crate::headless::RenderDelta> {
+        let row = self.render_buffer.height / 2;
+        let text = if iteration.is_multiple_of(2) {
+            "a"
+        } else {
+            "b"
+        };
+        self.render_buffer.set_text(0, row, text, &Style::default());
+        let previous = self
+            .editor
+            .previous_render_buffer
+            .as_mut()
+            .expect("detached initialization commits an initial frame");
+        let changes = self.render_buffer.diff(previous);
+        previous.apply_changes(&changes);
+        self.editor.last_detached_changed_rows.clear();
+        for change in &changes {
+            if self.editor.last_detached_changed_rows.last() != Some(&change.y) {
+                self.editor.last_detached_changed_rows.push(change.y);
+            }
+        }
+        self.editor.render_generation = self.editor.render_generation.wrapping_add(1);
+        self.finish_render()
+    }
+
     /// Prepares a pending release modal only after a client authenticates.
     pub fn prepare_startup_whats_new(&mut self) -> anyhow::Result<bool> {
         if !self.editor.prepare_startup_whats_new() {
@@ -3814,21 +3849,68 @@ impl DetachedEditorCore {
 
     fn finish_render(&mut self) -> anyhow::Result<crate::headless::RenderDelta> {
         let _span = perf::PerfSpan::start("detach:serialize_frame");
-        let next_rows = render_text_rows(&self.render_buffer);
-        let next_row_spans = render_styled_rows(&self.render_buffer, &self.editor.theme.style);
         let next_cursor = self
             .editor
             .render_cursor_position()
             .unwrap_or((self.editor.cx, self.editor.cy));
         let next_cursor_state = self.editor.terminal_cursor_state();
-        let changed = next_rows != self.rows
-            || next_row_spans != self.row_spans
-            || next_cursor != self.cursor
-            || next_cursor_state != self.cursor_state;
-        if changed {
+        let generation_delta = self
+            .editor
+            .render_generation
+            .wrapping_sub(self.serialized_render_generation);
+        let dimensions_unchanged = self.render_buffer.width == self.serialized_width
+            && self.render_buffer.height == self.rows.len()
+            && self.row_spans.len() == self.rows.len();
+        let lines = if dimensions_unchanged && generation_delta <= 1 {
+            if generation_delta == 0 {
+                Vec::new()
+            } else {
+                self.serialize_changed_rows()
+            }
+        } else {
+            self.serialize_full_frame()
+        };
+        if !lines.is_empty() || next_cursor != self.cursor || next_cursor_state != self.cursor_state
+        {
             self.revision = self.revision.saturating_add(1);
         }
-        let lines: Vec<_> = next_rows
+        perf::gauge_max("detach:changed_rows", lines.len() as u64);
+        self.serialized_render_generation = self.editor.render_generation;
+        self.serialized_width = self.render_buffer.width;
+        self.cursor = next_cursor;
+        self.cursor_state = next_cursor_state;
+        Ok(crate::headless::RenderDelta {
+            revision: self.revision,
+            lines,
+            cursor: self.cursor,
+            cursor_state: Some(self.cursor_state),
+        })
+    }
+
+    fn serialize_changed_rows(&mut self) -> Vec<crate::headless::LinePatch> {
+        let mut lines = Vec::with_capacity(self.editor.last_detached_changed_rows.len());
+        for &row in &self.editor.last_detached_changed_rows {
+            let start = row.saturating_mul(self.render_buffer.width);
+            let end = start.saturating_add(self.render_buffer.width);
+            let Some(cells) = self.render_buffer.cells.get(start..end) else {
+                continue;
+            };
+            let text = render_text_row(cells);
+            let spans = render_styled_row(cells, &self.editor.theme.style);
+            if self.rows.get(row) == Some(&text) && self.row_spans.get(row) == Some(&spans) {
+                continue;
+            }
+            self.rows[row].clone_from(&text);
+            self.row_spans[row].clone_from(&spans);
+            lines.push(crate::headless::LinePatch { row, text, spans });
+        }
+        lines
+    }
+
+    fn serialize_full_frame(&mut self) -> Vec<crate::headless::LinePatch> {
+        let next_rows = render_text_rows(&self.render_buffer);
+        let next_row_spans = render_styled_rows(&self.render_buffer, &self.editor.theme.style);
+        let lines = next_rows
             .iter()
             .enumerate()
             .filter(|(row, text)| {
@@ -3841,17 +3923,9 @@ impl DetachedEditorCore {
                 spans: next_row_spans.get(row).cloned().unwrap_or_default(),
             })
             .collect();
-        perf::gauge_max("detach:changed_rows", lines.len() as u64);
         self.rows = next_rows;
         self.row_spans = next_row_spans;
-        self.cursor = next_cursor;
-        self.cursor_state = next_cursor_state;
-        Ok(crate::headless::RenderDelta {
-            revision: self.revision,
-            lines,
-            cursor: self.cursor,
-            cursor_state: Some(self.cursor_state),
-        })
+        lines
     }
 }
 
@@ -3859,16 +3933,18 @@ fn render_text_rows(buffer: &RenderBuffer) -> Vec<String> {
     buffer
         .cells
         .chunks(buffer.width.max(1))
-        .map(|row| {
-            let mut text = String::new();
-            let mut column = 0;
-            while let Some(cell) = row.get(column) {
-                text.push_str(&cell.text);
-                column += display_width(&cell.text).max(1);
-            }
-            text
-        })
+        .map(render_text_row)
         .collect()
+}
+
+fn render_text_row(row: &[render_buffer::Cell]) -> String {
+    let mut text = String::new();
+    let mut column = 0;
+    while let Some(cell) = row.get(column) {
+        text.push_str(&cell.text);
+        column += display_width(&cell.text).max(1);
+    }
+    text
 }
 
 fn render_styled_rows(
@@ -3878,31 +3954,36 @@ fn render_styled_rows(
     buffer
         .cells
         .chunks(buffer.width.max(1))
-        .map(|row| {
-            let mut spans: Vec<crate::headless::StyledSpan> = Vec::new();
-            let mut column = 0;
-            while let Some(cell) = row.get(column) {
-                let (fg, bg) = rendering::resolve_cell_colors(&cell.style, theme_style);
-                let style = Style {
-                    fg: Some(fg),
-                    bg: Some(bg),
-                    bold: cell.style.bold,
-                    italic: cell.style.italic,
-                    underline: cell.style.underline,
-                };
-                if let Some(span) = spans.last_mut().filter(|span| span.style == style) {
-                    span.text.push_str(&cell.text);
-                } else {
-                    spans.push(crate::headless::StyledSpan {
-                        text: cell.text.clone(),
-                        style,
-                    });
-                }
-                column += display_width(&cell.text).max(1);
-            }
-            spans
-        })
+        .map(|row| render_styled_row(row, theme_style))
         .collect()
+}
+
+fn render_styled_row(
+    row: &[render_buffer::Cell],
+    theme_style: &Style,
+) -> Vec<crate::headless::StyledSpan> {
+    let mut spans: Vec<crate::headless::StyledSpan> = Vec::new();
+    let mut column = 0;
+    while let Some(cell) = row.get(column) {
+        let (fg, bg) = rendering::resolve_cell_colors(&cell.style, theme_style);
+        let style = Style {
+            fg: Some(fg),
+            bg: Some(bg),
+            bold: cell.style.bold,
+            italic: cell.style.italic,
+            underline: cell.style.underline,
+        };
+        if let Some(span) = spans.last_mut().filter(|span| span.style == style) {
+            span.text.push_str(&cell.text);
+        } else {
+            spans.push(crate::headless::StyledSpan {
+                text: cell.text.clone(),
+                style,
+            });
+        }
+        column += display_width(&cell.text).max(1);
+    }
+    spans
 }
 
 fn detached_input_to_crossterm(event: crate::headless::InputEvent) -> Event {
@@ -4050,6 +4131,7 @@ struct EditorEventSnapshot {
     width: usize,
     height: usize,
     buffer_index: usize,
+    buffer_revision: u64,
     window_id: Option<WindowId>,
     windows: Vec<WindowLayoutEventSnapshot>,
 }
@@ -4785,7 +4867,7 @@ impl Editor {
             is_focused: true,
             suppress_reactivation_click: false,
             render_generation: 0,
-            service_background_before_next_input: false,
+            last_detached_changed_rows: Vec::new(),
             last_rendered_window: None,
             last_rendered_viewport: None,
             splash_shown: false,
@@ -7548,6 +7630,7 @@ impl Editor {
             width,
             height,
             buffer_index: self.buffer_manager.active_index(),
+            buffer_revision: self.current_buffer().revision(),
             window_id: self.window_manager.active_stable_window_id(),
             windows: self
                 .window_manager
@@ -7602,35 +7685,55 @@ impl Editor {
             || before.width != after.width
             || before.height != after.height;
         let windows_changed = layout_changed || before.buffer_index != after.buffer_index;
-        self.refresh_plugin_snapshots(
-            runtime,
-            cursor_changed || viewport_changed,
-            windows_changed,
-            false,
-        )?;
+        let updated_cursor_only = cursor_changed
+            && !viewport_changed
+            && !windows_changed
+            && before.buffer_revision == after.buffer_revision
+            && self.active_window_with_editor_view().is_some_and(|window| {
+                runtime.update_viewport_cursor(json!({
+                    "x": window.cx,
+                    "y": window.vtop + window.cy,
+                    "lsp_character": self.lsp_character_for_cursor(
+                        window.buffer_index,
+                        window.vtop + window.cy,
+                        window.cx,
+                    ),
+                    "screen_row": window.cy,
+                }))
+            });
+        if !updated_cursor_only {
+            self.refresh_plugin_snapshots(
+                runtime,
+                cursor_changed || viewport_changed,
+                windows_changed,
+                false,
+            )?;
+        }
 
-        let current_window_ids = after
-            .windows
-            .iter()
-            .map(|window| window.id)
-            .collect::<HashSet<_>>();
-        for window_id in before
-            .windows
-            .iter()
-            .map(|window| window.id)
-            .filter(|window_id| !current_window_ids.contains(window_id))
-        {
-            self.window_bar_manager.close_window(window_id);
-            self.plugin_registry
-                .notify(
-                    runtime,
-                    "window:closed",
-                    json!({
-                        "window_id": window_id.0,
-                        "cause": cause,
-                    }),
-                )
-                .await?;
+        if before.windows != after.windows {
+            let current_window_ids = after
+                .windows
+                .iter()
+                .map(|window| window.id)
+                .collect::<HashSet<_>>();
+            for window_id in before
+                .windows
+                .iter()
+                .map(|window| window.id)
+                .filter(|window_id| !current_window_ids.contains(window_id))
+            {
+                self.window_bar_manager.close_window(window_id);
+                self.plugin_registry
+                    .notify(
+                        runtime,
+                        "window:closed",
+                        json!({
+                            "window_id": window_id.0,
+                            "cause": cause,
+                        }),
+                    )
+                    .await?;
+            }
         }
 
         if before.window_id != after.window_id {
@@ -15875,24 +15978,24 @@ impl Editor {
         wrap: bool,
     ) -> Option<SearchMatch> {
         let origin_x = self.grapheme_to_char_on_line(origin.x, origin.y);
+        let origin = (origin.y, origin_x);
         match direction {
-            SearchDirection::Forward => matches
-                .iter()
-                .copied()
-                .find(|match_| {
-                    match_.start_y > origin.y
-                        || (match_.start_y == origin.y && match_.start_x > origin_x)
-                })
-                .or_else(|| wrap.then(|| matches.first().copied()).flatten()),
-            SearchDirection::Backward => matches
-                .iter()
-                .rev()
-                .copied()
-                .find(|match_| {
-                    match_.start_y < origin.y
-                        || (match_.start_y == origin.y && match_.start_x < origin_x)
-                })
-                .or_else(|| wrap.then(|| matches.last().copied()).flatten()),
+            SearchDirection::Forward => {
+                let index =
+                    matches.partition_point(|match_| (match_.start_y, match_.start_x) <= origin);
+                matches
+                    .get(index)
+                    .copied()
+                    .or_else(|| wrap.then(|| matches.first().copied()).flatten())
+            }
+            SearchDirection::Backward => {
+                let index =
+                    matches.partition_point(|match_| (match_.start_y, match_.start_x) < origin);
+                index
+                    .checked_sub(1)
+                    .and_then(|index| matches.get(index).copied())
+                    .or_else(|| wrap.then(|| matches.last().copied()).flatten())
+            }
         }
     }
 
@@ -29405,6 +29508,19 @@ impl Editor {
     }
 
     #[doc(hidden)]
+    pub fn test_search_match_from_origin(
+        &mut self,
+        pattern: &str,
+        x: usize,
+        y: usize,
+        direction: SearchDirection,
+        wrap: bool,
+    ) -> anyhow::Result<Option<SearchMatch>> {
+        let origin = HistoryEntry::new(self.current_buffer().file.clone(), x, y);
+        self.search_match_from_origin(pattern, &origin, direction, wrap)
+    }
+
+    #[doc(hidden)]
     pub async fn test_ensure_current_buffer_lsp_opened(&mut self) -> anyhow::Result<()> {
         self.ensure_current_buffer_lsp_opened().await
     }
@@ -32625,6 +32741,67 @@ builtin = "rust"
     }
 
     #[tokio::test]
+    async fn detached_incremental_frame_serializes_only_the_changed_row() {
+        drain_plugin_requests();
+        let mut core = DetachedEditorCore::new(test_editor(/*width*/ 80, /*height*/ 24))
+            .await
+            .unwrap();
+
+        let first = core.benchmark_incremental_frame(/*iteration*/ 0).unwrap();
+        assert_eq!(first.lines.len(), 1);
+        assert_eq!(first.lines[0].row, 12);
+        assert!(first.lines[0].text.starts_with('a'));
+        assert_eq!(
+            first.lines[0]
+                .spans
+                .iter()
+                .map(|span| span.text.as_str())
+                .collect::<String>(),
+            first.lines[0].text
+        );
+
+        let second = core.benchmark_incremental_frame(/*iteration*/ 1).unwrap();
+        assert_eq!(second.lines.len(), 1);
+        assert_eq!(second.lines[0].row, 12);
+        assert!(second.lines[0].text.starts_with('b'));
+        assert_eq!(
+            core.snapshot(/*last_revision*/ None).lines[12].text,
+            second.lines[0].text
+        );
+
+        let unchanged = core.finish_render().unwrap();
+        assert!(unchanged.lines.is_empty());
+        assert_eq!(unchanged.revision, second.revision);
+        drain_plugin_requests();
+    }
+
+    #[tokio::test]
+    async fn detached_multiple_pending_frames_reserialize_every_changed_row() {
+        drain_plugin_requests();
+        let mut core = DetachedEditorCore::new(test_editor(/*width*/ 80, /*height*/ 24))
+            .await
+            .unwrap();
+        core.render_buffer
+            .set_text(/*x*/ 0, /*y*/ 2, "first", &Style::default());
+        core.render_buffer
+            .set_text(/*x*/ 0, /*y*/ 4, "second", &Style::default());
+        core.editor.last_detached_changed_rows = vec![4];
+        core.editor.render_generation = core.editor.render_generation.wrapping_add(2);
+
+        let delta = core.finish_render().unwrap();
+
+        assert!(delta
+            .lines
+            .iter()
+            .any(|line| line.row == 2 && line.text.starts_with("first")));
+        assert!(delta
+            .lines
+            .iter()
+            .any(|line| line.row == 4 && line.text.starts_with("second")));
+        drain_plugin_requests();
+    }
+
+    #[tokio::test]
     async fn production_resize_event_accepts_zero_and_tiny_dimensions() {
         let mut editor = test_editor(80, 24);
         let mut buffer = RenderBuffer::new(80, 24, &Style::default());
@@ -34800,6 +34977,71 @@ builtin = "rust"
 
         assert!(!Arc::ptr_eq(&first, &second));
         assert_eq!(second.len(), 2);
+    }
+
+    #[test]
+    fn search_match_navigation_preserves_direction_boundaries_and_wrapping() {
+        let editor = test_editor(/*width*/ 80, /*height*/ 24);
+        let matches = [
+            SearchMatch {
+                start_x: 0,
+                start_y: 0,
+                end_x: 1,
+                end_y: 0,
+            },
+            SearchMatch {
+                start_x: 3,
+                start_y: 0,
+                end_x: 4,
+                end_y: 0,
+            },
+            SearchMatch {
+                start_x: 0,
+                start_y: 1,
+                end_x: 1,
+                end_y: 1,
+            },
+            SearchMatch {
+                start_x: 2,
+                start_y: 1,
+                end_x: 3,
+                end_y: 1,
+            },
+        ];
+
+        let origin = HistoryEntry::new(None, 3, 0);
+        assert_eq!(
+            editor.search_match_in_direction(&matches, &origin, SearchDirection::Forward, false),
+            Some(matches[2]),
+        );
+        assert_eq!(
+            editor.search_match_in_direction(&matches, &origin, SearchDirection::Backward, false),
+            Some(matches[0]),
+        );
+
+        let first = HistoryEntry::new(None, 0, 0);
+        assert_eq!(
+            editor.search_match_in_direction(&matches, &first, SearchDirection::Backward, false),
+            None,
+        );
+        assert_eq!(
+            editor.search_match_in_direction(&matches, &first, SearchDirection::Backward, true),
+            Some(matches[3]),
+        );
+
+        let last = HistoryEntry::new(None, 2, 1);
+        assert_eq!(
+            editor.search_match_in_direction(&matches, &last, SearchDirection::Forward, false),
+            None,
+        );
+        assert_eq!(
+            editor.search_match_in_direction(&matches, &last, SearchDirection::Forward, true),
+            Some(matches[0]),
+        );
+        assert_eq!(
+            editor.search_match_in_direction(&[], &first, SearchDirection::Forward, true),
+            None,
+        );
     }
 
     #[test]

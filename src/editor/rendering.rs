@@ -1245,6 +1245,14 @@ impl Editor {
     }
 
     fn commit_render_buffer_changes(&mut self, changes: &[Change<'_>]) {
+        if !self.terminal_output_enabled {
+            self.last_detached_changed_rows.clear();
+            for change in changes {
+                if self.last_detached_changed_rows.last() != Some(&change.y) {
+                    self.last_detached_changed_rows.push(change.y);
+                }
+            }
+        }
         self.previous_render_buffer
             .as_mut()
             .expect("render buffer diff requires a previous frame")

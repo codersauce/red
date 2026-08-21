@@ -10,7 +10,7 @@ use crate::{
     color::{blend_color, Color},
     log,
     theme::{SelectionForegroundPriority, Style, Theme},
-    unicode_utils::display_width,
+    unicode_utils::{display_width, is_printable_ascii},
 };
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -302,6 +302,19 @@ impl RenderBuffer {
             return;
         }
 
+        if is_printable_ascii(text) {
+            let length = text.len().min(self.width - x);
+            let start = y * self.width + x;
+            let Some(cells) = self.cells.get_mut(start..start + length) else {
+                log!("WARN: pos >= self.cells.len()");
+                return;
+            };
+            for (cell, byte) in cells.iter_mut().zip(text.bytes()) {
+                cell.set_char_in_place(char::from(byte), style);
+            }
+            return;
+        }
+
         let mut cell_x = x;
         for grapheme in text.graphemes(true) {
             if cell_x >= self.width {
@@ -543,6 +556,26 @@ mod tests {
 
         assert_eq!(changes.len(), 1);
         assert_eq!((changes[0].x, changes[0].y), (1, 0));
+    }
+
+    #[test]
+    fn printable_ascii_writes_clip_at_the_edge_and_reuse_cell_storage() {
+        let mut buffer = RenderBuffer::new(5, 1, &Style::default());
+        buffer.cells[3].text.reserve(32);
+        let capacity = buffer.cells[3].text.capacity();
+        let style = Style {
+            bold: true,
+            ..Style::default()
+        };
+
+        buffer.set_text(2, 0, "hello", &style);
+
+        assert_eq!(
+            buffer.cells.iter().map(|cell| cell.c).collect::<String>(),
+            "  hel"
+        );
+        assert_eq!(buffer.cells[3].text.capacity(), capacity);
+        assert!(buffer.cells[2..].iter().all(|cell| cell.style == style));
     }
 
     #[test]

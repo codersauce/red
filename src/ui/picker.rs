@@ -857,11 +857,11 @@ impl Picker {
                             (index, score, tie_breaker)
                         })
                 };
-                let can_reuse_matches = self.incremental_filter
+                let can_reuse_matches = (self.incremental_filter || self.filter_action.is_none())
                     && self
                         .filtered_query
                         .as_deref()
-                        .is_some_and(|previous| term.starts_with(previous));
+                        .is_some_and(|previous| !previous.is_empty() && term.starts_with(previous));
                 let mut matches = if self.incremental_filter
                     && (if can_reuse_matches {
                         self.visible_dynamic_items.len()
@@ -6710,6 +6710,76 @@ mod tests {
         assert_eq!(selected.id, "b");
         assert_eq!(selected.label.as_ptr(), original_label);
         assert!(picker.list.items().is_empty());
+    }
+
+    #[test]
+    fn structured_picker_refinement_restores_candidates_when_the_query_broadens() {
+        let editor = test_editor();
+        let mut picker = Picker::new_dynamic(
+            /*title*/ None,
+            &editor,
+            vec![
+                dynamic_item("needle", "needle"),
+                dynamic_item("nearby", "nearby"),
+                dynamic_item("other", "other"),
+            ],
+            /*id*/ 26,
+            PickerOptions::default(),
+        );
+
+        picker.filter("ne");
+        assert_eq!(visible_picker_labels(&picker), ["needle", "nearby"]);
+        picker.filter("need");
+        assert_eq!(visible_picker_labels(&picker), ["needle"]);
+        picker.filter("ne");
+        assert_eq!(visible_picker_labels(&picker), ["needle", "nearby"]);
+        picker.filter("");
+        assert_eq!(
+            visible_picker_labels(&picker),
+            ["needle", "nearby", "other"]
+        );
+    }
+
+    #[test]
+    fn custom_picker_filters_can_add_matches_when_a_query_is_extended() {
+        let editor = test_editor();
+        let mut picker = Picker::builder()
+            .structured_items(vec![
+                dynamic_item("first", "first"),
+                dynamic_item("second", "second"),
+            ])
+            .filter_action(|item, query| match (item.id.as_str(), query) {
+                ("first", "n") | ("second", "ne") => Some(10),
+                _ => None,
+            })
+            .build(&editor);
+
+        picker.filter("n");
+        assert_eq!(visible_picker_labels(&picker), ["first"]);
+        picker.filter("ne");
+        assert_eq!(visible_picker_labels(&picker), ["second"]);
+    }
+
+    #[test]
+    fn replacing_picker_items_invalidates_previous_refinement_candidates() {
+        let editor = test_editor();
+        let mut picker = Picker::new_dynamic(
+            /*title*/ None,
+            &editor,
+            vec![dynamic_item("old", "needle")],
+            /*id*/ 27,
+            PickerOptions::default(),
+        );
+
+        picker.filter("ne");
+        picker.filter("need");
+        picker.replace_structured_items(vec![
+            dynamic_item("other", "other"),
+            dynamic_item("new", "needlework"),
+        ]);
+        picker.filter("needle");
+
+        assert_eq!(visible_picker_labels(&picker), ["needlework"]);
     }
 
     fn visible_picker_labels(picker: &Picker) -> Vec<&str> {

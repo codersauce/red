@@ -185,8 +185,11 @@ impl Workspace {
     }
 
     pub fn set_cfg_flags(&mut self, flags: impl IntoIterator<Item = String>) {
-        self.cfg_flags = flags.into_iter().collect();
-        self.reanalyze();
+        let flags = flags.into_iter().collect();
+        if self.cfg_flags != flags {
+            self.cfg_flags = flags;
+            self.reanalyze();
+        }
     }
 
     /// Replace the external typed module surface visible to every document.
@@ -272,6 +275,18 @@ impl Workspace {
             text.len(),
             MAX_DOCUMENT_BYTES
         );
+        if self
+            .documents
+            .get(&path)
+            .is_some_and(|document| document.text.as_ref() == text.as_ref())
+        {
+            let document = self
+                .documents
+                .get_mut(&path)
+                .expect("unchanged document was present immediately above");
+            document.version = version;
+            return Ok(document);
+        }
         let module_path = self
             .documents
             .get(&path)
@@ -457,13 +472,19 @@ impl Workspace {
                     && seen.insert((symbol.name.clone(), symbol.kind, symbol.container.clone()))
             })
             .collect::<Vec<_>>();
+        let local_symbols = self
+            .document(path)
+            .map(|document| {
+                document
+                    .symbols
+                    .iter()
+                    .map(|symbol| &symbol.id)
+                    .collect::<HashSet<_>>()
+            })
+            .unwrap_or_default();
         symbols.sort_by(|left, right| {
-            let left_local = self
-                .document(path)
-                .is_some_and(|document| document.symbols.iter().any(|symbol| symbol.id == left.id));
-            let right_local = self.document(path).is_some_and(|document| {
-                document.symbols.iter().any(|symbol| symbol.id == right.id)
-            });
+            let left_local = local_symbols.contains(&left.id);
+            let right_local = local_symbols.contains(&right.id);
             right_local
                 .cmp(&left_local)
                 .then_with(|| left.name.cmp(&right.name))
@@ -750,6 +771,64 @@ mod tests {
             fs::read_to_string(&path).expect("read disk source"),
             "fn before() {}\n"
         );
+    }
+
+    #[test]
+    fn unchanged_source_revision_reuses_existing_analysis_and_updates_version() {
+        let root = tempfile::tempdir().expect("create fixture directory");
+        let path = root.path().join("main.hk");
+        let source = "fn unchanged() {}\n";
+        fs::write(&path, source).expect("write source fixture");
+        let mut workspace =
+            Workspace::open(root.path(), SemanticProfile::Native).expect("open workspace");
+        let original_symbols = workspace.document(&path).unwrap().symbols().as_ptr();
+
+        let document = workspace
+            .update(&path, 12, Arc::<str>::from(source))
+            .expect("advance unchanged revision");
+
+        assert_eq!(document.version(), 12);
+        assert_eq!(document.symbols().as_ptr(), original_symbols);
+    }
+
+    #[test]
+    fn unchanged_configuration_flags_do_not_reanalyze_documents() {
+        let root = tempfile::tempdir().expect("create fixture directory");
+        let path = root.path().join("main.hk");
+        fs::write(&path, "fn unchanged() {}\n").expect("write source fixture");
+        let mut workspace =
+            Workspace::open(root.path(), SemanticProfile::Native).expect("open workspace");
+        workspace.set_cfg_flags(["first".to_string(), "second".to_string()]);
+        let original_symbols = workspace.document(&path).unwrap().symbols().as_ptr();
+
+        workspace.set_cfg_flags(["second".to_string(), "first".to_string()]);
+
+        assert_eq!(
+            workspace.document(&path).unwrap().symbols().as_ptr(),
+            original_symbols
+        );
+    }
+
+    #[test]
+    fn completions_prioritize_local_symbols_and_preserve_name_order() {
+        let root = tempfile::tempdir().expect("create fixture directory");
+        let local = root.path().join("main.hk");
+        let other = root.path().join("other.hk");
+        fs::write(&local, "fn z_local() {}\nfn b_local() {}\n")
+            .expect("write local source fixture");
+        fs::write(&other, "fn a_workspace() {}\nfn y_workspace() {}\n")
+            .expect("write workspace source fixture");
+        let workspace =
+            Workspace::open(root.path(), SemanticProfile::Native).expect("open workspace");
+
+        let names = workspace
+            .completions(&local, "")
+            .into_iter()
+            .map(|symbol| symbol.name.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(names, ["b_local", "z_local", "a_workspace", "y_workspace"]);
+        assert_eq!(workspace.completions(&local, "z_")[0].name, "z_local");
     }
 
     #[test]
