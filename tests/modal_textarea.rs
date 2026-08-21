@@ -108,6 +108,36 @@ async fn embedded_textareas_match_file_editor_for_shared_vim_sequences() {
         ("end word", "one two three", "2e"),
         ("dot repeat", "one two three", "dw."),
         ("visual deletion", "one two three", "vwx"),
+        ("next paragraph", "one\n\ntwo\n\nthree", "}"),
+        ("counted paragraphs", "one\n\ntwo\n\nthree", "2}"),
+        ("previous paragraph", "one\n\ntwo\n\nthree", "G{"),
+        (
+            "whitespace-only lines do not split paragraphs",
+            "one\n   \ntwo\n\nthree",
+            "}",
+        ),
+        ("linewise paragraph deletion", "one\n\ntwo", "d}"),
+        ("characterwise paragraph deletion", "alpha\n\nbeta", "2ld}"),
+        ("counted paragraph deletion", "one\n\ntwo\n\nthree", "d2}"),
+        ("paragraph yank shape", "one\n\ntwo", "y}p"),
+        ("paragraph visual deletion", "one\n\ntwo", "v}x"),
+        ("next sentence", "One.  Two! Three?", ")"),
+        ("counted sentence", "One.  Two! Three?", "2)"),
+        ("previous sentence", "One.  Two! Three?", "2)("),
+        ("sentence deletion", "One.  Two! Three?", "d)"),
+        ("counted sentence deletion", "One.  Two! Three?", "d2)"),
+        ("inner sentence", "One.  Two! Three?", "dis"),
+        ("around sentence", "One.  Two! Three?", "das"),
+        ("counted inner sentence", "One.  Two! Three?", "d3is"),
+        ("counted around sentence", "One.  Two! Three?", "d2as"),
+        ("sentence whitespace object", "One.  Two! Three?", "4ldis"),
+        ("sentence around whitespace", "One.  Two! Three?", "4ldas"),
+        ("visual sentence", "One.  Two! Three?", "v)x"),
+        ("visual inner sentence", "One.  Two! Three?", "visx"),
+        ("counted visual sentence", "One.  Two! Three?", "v2isx"),
+        ("unicode sentence", "Olá! 👨‍👩‍👧 e\u{301}lan. Fim", "das"),
+        ("sentence dot repeat", "One.  Two! Three?", "das."),
+        ("sentence undo grouping", "One.  Two!", "cisnew\u{1b}u"),
     ];
 
     for (name, initial, raw_keys) in cases {
@@ -135,6 +165,29 @@ async fn embedded_textareas_match_file_editor_for_shared_vim_sequences() {
             editor.cursor_position(),
             "{name}: cursor"
         );
+    }
+}
+
+#[test]
+fn embedded_paragraph_operators_match_neovim_register_shapes() {
+    for (keys, expected_text, expected_register, expected_linewise) in [
+        ("d}", "\nbeta", "alpha\n", true),
+        ("2ld}", "al\n\nbeta", "pha", false),
+    ] {
+        let mut area = TextArea::new("alpha\n\nbeta");
+        area.set_cursor(0);
+        area.set_mode(Mode::Normal);
+
+        for character in keys.chars() {
+            assert_eq!(
+                area.handle_event(&event(character), 80),
+                TextAreaOutcome::Changed
+            );
+        }
+
+        assert_eq!(area.text(), expected_text);
+        assert_eq!(area.register().text, expected_register);
+        assert_eq!(area.register().linewise, expected_linewise);
     }
 }
 

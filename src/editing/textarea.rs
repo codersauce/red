@@ -568,6 +568,16 @@ impl TextArea {
             'w' | 'W' | 'b' | 'B' | 'e' | 'E' => {
                 self.move_word(character, count);
             }
+            '{' | '}' => {
+                if let Some(position) = self.resolver().paragraph_target(count, character == '{') {
+                    self.move_to_position(position);
+                }
+            }
+            '(' | ')' => {
+                if let Some(position) = self.resolver().sentence_target(count, character == '(') {
+                    self.move_to_position(position);
+                }
+            }
             'g' => {
                 self.state.pending = Some(PendingInput::GPrefix {
                     operator: None,
@@ -763,7 +773,8 @@ impl TextArea {
             } => {
                 keys.push(character);
                 if let Some(kind) = text_object_kind_for_key(character) {
-                    if let Some(range) = self.resolver().text_object(scope, kind) {
+                    if let Some(range) = self.resolver().text_object_with_count(scope, kind, count)
+                    {
                         if let Some(operator) = operator {
                             self.apply_operator(
                                 operator,
@@ -859,6 +870,8 @@ impl TextArea {
     ) -> Option<(TextRange, bool)> {
         let start = self.cursor_position();
         match motion {
+            '{' | '}' => self.resolver().paragraph_range(count, motion == '{'),
+            '(' | ')' => self.resolver().sentence_range(count, motion == '('),
             'w' | 'W' => self
                 .resolver()
                 .word_range(count, operator == Operator::Change, motion == 'W')
@@ -1257,9 +1270,20 @@ impl TextArea {
         } else {
             text
         };
-        let cursor = position
-            .saturating_add(grapheme_len(&inserted))
-            .saturating_sub(1);
+        let cursor = if self.register.linewise {
+            let first_non_blank = inserted
+                .lines()
+                .next()
+                .unwrap_or_default()
+                .graphemes(true)
+                .position(|grapheme| !grapheme.chars().all(char::is_whitespace))
+                .unwrap_or_default();
+            position.saturating_add(first_non_blank)
+        } else {
+            position
+                .saturating_add(grapheme_len(&inserted))
+                .saturating_sub(1)
+        };
         if self.replace_graphemes(position, position, &inserted, cursor, "paste") {
             self.record_change(keys);
             self.clamp_normal_cursor();

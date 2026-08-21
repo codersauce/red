@@ -2451,6 +2451,10 @@ pub enum Action {
     MoveToNextBigWordEnd,
     MoveToPreviousBigWord,
     MoveToPreviousBigWordEnd,
+    MoveToNextParagraph,
+    MoveToPreviousParagraph,
+    MoveToNextSentence,
+    MoveToPreviousSentence,
     MoveToNextCall,
     MoveToPreviousCall,
     MoveToNextFunction,
@@ -12394,6 +12398,10 @@ impl Editor {
                 | Action::MoveToNextBigWordEnd
                 | Action::MoveToPreviousBigWord
                 | Action::MoveToPreviousBigWordEnd
+                | Action::MoveToNextParagraph
+                | Action::MoveToPreviousParagraph
+                | Action::MoveToNextSentence
+                | Action::MoveToPreviousSentence
                 | Action::MoveToNextCall
                 | Action::MoveToPreviousCall
                 | Action::MoveToNextFunction
@@ -12448,6 +12456,10 @@ impl Editor {
                 | Action::MoveToNextBigWordEnd
                 | Action::MoveToPreviousBigWord
                 | Action::MoveToPreviousBigWordEnd
+                | Action::MoveToNextParagraph
+                | Action::MoveToPreviousParagraph
+                | Action::MoveToNextSentence
+                | Action::MoveToPreviousSentence
                 | Action::MoveToNextCall
                 | Action::MoveToPreviousCall
                 | Action::MoveToNextFunction
@@ -16286,7 +16298,8 @@ impl Editor {
                 return self.pending_visual_text_object_invalid();
             };
 
-            let Some(range) = self.text_object_range(scope, kind) else {
+            let count = self.repeater.take().unwrap_or(1);
+            let Some(range) = self.text_object_range_with_count(scope, kind, count) else {
                 self.set_legacy_message(Some("text object not found".to_string()));
                 return Some(KeyAction::None);
             };
@@ -16861,6 +16874,26 @@ impl Editor {
                     self.end_word_motion_range(pending.count(), true),
                     "no word under cursor",
                 ),
+                '{' | '}' => {
+                    let range =
+                        MotionResolver::new(self.current_buffer(), self.cursor_text_position())
+                            .paragraph_range(pending.count(), c == '{');
+                    self.operator_action_for_boundary_range(
+                        pending.operator,
+                        range,
+                        "no paragraph under cursor",
+                    )
+                }
+                '(' | ')' => {
+                    let range =
+                        MotionResolver::new(self.current_buffer(), self.cursor_text_position())
+                            .sentence_range(pending.count(), c == '(');
+                    self.operator_action_for_boundary_range(
+                        pending.operator,
+                        range,
+                        "no sentence under cursor",
+                    )
+                }
                 '$' => self.operator_action_for_range(
                     pending.operator,
                     Some(self.line_end_motion_range(pending.count())),
@@ -17064,7 +17097,7 @@ impl Editor {
                 };
                 self.operator_action_for_range(
                     pending.operator,
-                    self.text_object_range(scope, kind),
+                    self.text_object_range_with_count(scope, kind, pending.count()),
                     "text object not found",
                 )
             }
@@ -17147,6 +17180,21 @@ impl Editor {
         };
         self.repeater = None;
         Some(KeyAction::Single(action))
+    }
+
+    fn operator_action_for_boundary_range(
+        &mut self,
+        operator: EditOperator,
+        range: Option<(TextRange, bool)>,
+        error: &str,
+    ) -> Option<KeyAction> {
+        match range {
+            Some((range, true)) => {
+                self.operator_action_for_linewise_range(operator, Some(range), error)
+            }
+            Some((range, false)) => self.operator_action_for_range(operator, Some(range), error),
+            None => self.operator_action_for_range(operator, None, error),
+        }
     }
 
     fn cursor_text_position(&self) -> TextPosition {
@@ -17618,9 +17666,14 @@ impl Editor {
         self.commit_transaction(self.cursor_snapshot())
     }
 
-    fn text_object_range(&self, scope: TextObjectScope, kind: TextObjectKind) -> Option<TextRange> {
+    fn text_object_range_with_count(
+        &self,
+        scope: TextObjectScope,
+        kind: TextObjectKind,
+        count: u16,
+    ) -> Option<TextRange> {
         MotionResolver::new(self.current_buffer(), self.cursor_text_position())
-            .text_object(scope, kind)
+            .text_object_with_count(scope, kind, count)
     }
 
     fn word_under_cursor(&self) -> Option<String> {
@@ -20147,6 +20200,24 @@ impl Editor {
                     self.finish_cursor_motion(buffer, false)?;
                 }
             }
+            Action::MoveToNextParagraph
+            | Action::MoveToPreviousParagraph
+            | Action::MoveToNextSentence
+            | Action::MoveToPreviousSentence => {
+                let resolver =
+                    MotionResolver::new(self.current_buffer(), self.cursor_text_position());
+                let target = match action {
+                    Action::MoveToNextParagraph => resolver.paragraph_target(1, false),
+                    Action::MoveToPreviousParagraph => resolver.paragraph_target(1, true),
+                    Action::MoveToNextSentence => resolver.sentence_target(1, false),
+                    Action::MoveToPreviousSentence => resolver.sentence_target(1, true),
+                    _ => unreachable!(),
+                };
+                if let Some(target) = target {
+                    self.move_to_text_position(target);
+                    self.finish_cursor_motion(buffer, false)?;
+                }
+            }
             Action::MoveToNextCall
             | Action::MoveToPreviousCall
             | Action::MoveToNextFunction
@@ -21761,6 +21832,10 @@ impl Editor {
                 | Action::MatchitBackward
                 | Action::MatchitPreviousUnmatched
                 | Action::MatchitNextUnmatched
+                | Action::MoveToNextParagraph
+                | Action::MoveToPreviousParagraph
+                | Action::MoveToNextSentence
+                | Action::MoveToPreviousSentence
                 | Action::MoveToNextCall
                 | Action::MoveToPreviousCall
                 | Action::MoveToNextFunction
@@ -22301,27 +22376,9 @@ impl Editor {
                         }
                     }
                     Mode::Visual => {
-                        if y0 == y1 {
-                            let start = self.grapheme_to_char_on_line(x0, y0);
-                            let end = self.grapheme_to_char_on_line(x1 + 1, y0);
-                            self.replace_range(
-                                TextRange::new(
-                                    TextPosition::new(y0, start),
-                                    TextPosition::new(y0, end),
-                                ),
-                                "",
-                            );
-                        } else {
-                            let start = self.grapheme_to_char_on_line(x0, y0);
-                            let end = self.grapheme_to_char_on_line(x1 + 1, y1);
-                            self.replace_range(
-                                TextRange::new(
-                                    TextPosition::new(y0, start),
-                                    TextPosition::new(y1, end),
-                                ),
-                                "",
-                            );
-                        }
+                        let start = self.grapheme_to_char_on_line(x0, y0);
+                        let end = self.visual_selection_end_position(x1, y1);
+                        self.replace_range(TextRange::new(TextPosition::new(y0, start), end), "");
                     }
                     _ => {}
                 }
@@ -24511,7 +24568,7 @@ impl Editor {
             self.vtop = y;
         }
         self.cy = y.saturating_sub(self.vtop);
-        let char_x = position.character.min(self.length_for_line(y));
+        let char_x = position.character.min(self.line_character_len(y));
         self.cx = self.char_to_grapheme_on_line(char_x, y);
     }
 
@@ -24523,7 +24580,7 @@ impl Editor {
             self.vtop = y;
         }
         self.cy = y.saturating_sub(self.vtop);
-        let char_x = position.character.min(self.length_for_line(y));
+        let char_x = position.character.min(self.line_character_len(y));
         self.cx = self.char_to_grapheme_on_line(char_x, y);
     }
 
@@ -25766,6 +25823,17 @@ impl Editor {
         })
     }
 
+    fn visual_selection_end_position(&self, column: usize, line: usize) -> TextPosition {
+        let is_empty_line_with_ending = self.current_buffer().get(line).is_some_and(|contents| {
+            trim_line_ending(&contents).is_empty() && contents.ends_with('\n')
+        });
+        if is_empty_line_with_ending {
+            TextPosition::new(line + 1, 0)
+        } else {
+            TextPosition::new(line, self.grapheme_to_char_on_line(column + 1, line))
+        }
+    }
+
     fn selected_text(&self) -> Option<String> {
         let selection = self.selection?;
         let (x0, y0, x1, y1) = selection.into();
@@ -25799,25 +25867,12 @@ impl Editor {
                 Some(text)
             }
             Mode::Visual => {
-                let mut text = String::new();
-                for y in y0..=y1 {
-                    let line = self.current_buffer().get(y).unwrap();
-                    let start = if y == y0 {
-                        self.grapheme_to_char_on_line(x0, y)
-                    } else {
-                        0
-                    };
-                    let end = if y == y1 {
-                        self.grapheme_to_char_on_line(x1 + 1, y)
-                    } else {
-                        line.trim_end_matches('\n').chars().count()
-                    };
-                    text.push_str(char_slice(&line, start, end));
-                    if y != y1 {
-                        text.push('\n');
-                    }
-                }
-                Some(text)
+                let start = TextPosition::new(y0, self.grapheme_to_char_on_line(x0, y0));
+                let end = self.visual_selection_end_position(x1, y1);
+                Some(
+                    self.current_buffer()
+                        .text_in_range(TextRange::new(start, end)),
+                )
             }
             _ => None,
         }

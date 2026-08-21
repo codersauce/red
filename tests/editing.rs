@@ -8885,6 +8885,97 @@ async fn vim_parity_charwise_paste_places_the_cursor_on_the_last_inserted_graphe
 }
 
 #[tokio::test]
+async fn vim_parity_paragraph_operators_preserve_exclusive_and_linewise_ranges() {
+    for (contents, keys, expected, cursor) in [
+        ("alpha\n\nbeta", "d}", "\nbeta", (0, 0)),
+        ("alpha\n\nbeta", "2ld}", "al\n\nbeta", (1, 0)),
+        ("alpha\n\nbeta\n\ngamma", "d2}", "\ngamma", (0, 0)),
+        ("alpha\n\nbeta\n\ngamma", "2d}", "\ngamma", (0, 0)),
+        ("alpha\n   \nbeta\n\ngamma", "d}", "\ngamma", (0, 0)),
+        ("alpha\nbeta", "d}", "", (0, 0)),
+        ("alpha\n\nbeta", "y}p", "alpha\nalpha\n\nbeta", (0, 1)),
+        ("alpha\n\nbeta", "v}x", "beta", (0, 0)),
+        ("one\n\ntwo\n\nthree", "Gd{", "one\n\ntwo\nthree", (0, 3)),
+        ("one\n\ntwo\n\nthree", "d}.", "\nthree", (0, 0)),
+    ] {
+        let mut harness = EditorHarness::with_config(
+            Buffer::new(None, contents.to_string()),
+            default_key_config(),
+        );
+
+        type_normal_keys(&mut harness, keys).await;
+
+        harness.assert_buffer_contents(expected);
+        harness.assert_cursor_at(cursor.0, cursor.1);
+        harness.assert_mode(Mode::Normal);
+    }
+}
+
+#[tokio::test]
+async fn vim_parity_sentence_operators_and_objects_preserve_sentence_whitespace() {
+    for (contents, keys, expected, cursor) in [
+        ("One.  Two! Three? End", "d)", "Two! Three? End", (0, 0)),
+        ("One.  Two! Three? End", "d2)", "Three? End", (0, 0)),
+        ("One.  Two! Three? End", "2d)", "Three? End", (0, 0)),
+        ("One.  Two! Three? End", ")d(", "Two! Three? End", (0, 0)),
+        ("One.  Two! Three? End", "dis", "  Two! Three? End", (0, 0)),
+        ("One.  Two! Three? End", "das", "Two! Three? End", (0, 0)),
+        ("One.  Two! Three? End", "d2is", "Two! Three? End", (0, 0)),
+        ("One.  Two! Three? End", "d3is", " Three? End", (0, 0)),
+        ("One.  Two! Three? End", "d2as", "Three? End", (0, 0)),
+        (
+            "One.  Two! Three? End",
+            "4ldis",
+            "One.Two! Three? End",
+            (4, 0),
+        ),
+        ("One.  Two! Three? End", "4ldas", "One. Three? End", (4, 0)),
+        ("One.  Two! Three? End", "visx", "  Two! Three? End", (0, 0)),
+        ("One.  Two! Three? End", "vasx", "Two! Three? End", (0, 0)),
+        ("One.  Two! Three? End", "v2isx", "Two! Three? End", (0, 0)),
+        ("One. Two! Last", "v)x", "wo! Last", (0, 0)),
+        ("One.)\"  Two!", "dis", "  Two!", (0, 0)),
+        ("One.\nTwo", "dis", "Two", (0, 0)),
+        ("One.\n\nTwo", "d2as", "Two", (0, 0)),
+        (
+            "Olá! 👨‍👩‍👧 e\u{301}lan. Fim",
+            "das",
+            "👨‍👩‍👧 e\u{301}lan. Fim",
+            (0, 0),
+        ),
+        ("One.  Two! Three? End", "das.", "Three? End", (0, 0)),
+    ] {
+        let mut harness = EditorHarness::with_config(
+            Buffer::new(None, contents.to_string()),
+            default_key_config(),
+        );
+
+        type_normal_keys(&mut harness, keys).await;
+
+        harness.assert_buffer_contents(expected);
+        harness.assert_cursor_at(cursor.0, cursor.1);
+        harness.assert_mode(Mode::Normal);
+    }
+}
+
+#[tokio::test]
+async fn sentence_changes_remain_one_undoable_transaction() {
+    let contents = "One.  Two!";
+    let mut harness = EditorHarness::with_config(
+        Buffer::new(None, contents.to_string()),
+        default_key_config(),
+    );
+
+    type_normal_keys(&mut harness, "cisnew").await;
+    command_key(&mut harness, KeyCode::Esc).await;
+    harness.assert_buffer_contents("new  Two!");
+
+    type_normal_keys(&mut harness, "u").await;
+    harness.assert_buffer_contents(contents);
+    harness.assert_mode(Mode::Normal);
+}
+
+#[tokio::test]
 async fn vim_parity_paragraph_text_objects_preserve_inner_blank_line_semantics() {
     for (contents, keys, expected, cursor) in [
         (
