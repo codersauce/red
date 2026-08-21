@@ -358,7 +358,7 @@ Codex receives twelve dynamic tools:
 | --- | --- |
 | `list_files` | Lists sorted workspace files in pages of up to 4,096 while respecting ignore and sensitive-path policy; `next_offset` continues the walk result. |
 | `search_files` | Searches bounded text content, reports truncation, and returns at most 200 matches. |
-| `read_file` | Reads an authoritative Red-buffer page of up to 1,000 lines and 256 KiB, returning its revision and `next_line`. |
+| `read_file` | Reads an authoritative Red-buffer page of up to 1,000 lines and 256 KiB, returning its revision and `next_line`. Continuations must pass the first page's revision and restart if it changes; a single line over 256 KiB returns an explicit error rather than partial source. |
 | `write_file` | Replaces revision-checked contents through Red, creates missing parent directories, and saves the buffer. |
 | `create_directory` | Creates a workspace directory and missing parents; an existing directory is a successful no-op. |
 | `get_editor_state` | Returns bounded active-file, cursor, selection, window, diagnostic, and current-annotation state. |
@@ -408,10 +408,12 @@ Content search is unavailable on platforms without that safe read boundary;
 Codex must use `read_file` through Red instead.
 
 Tool calls remain serialized. By default they run without deliberate playback
-pauses. Set `[agent] follow_tool_calls = true` to reveal each file target, move
-to the first affected range when available, render it, and wait briefly before
-the operation. Mutations always pass through the editor's transaction boundary
-with session/turn attribution and save through the editor.
+pauses, and incidental file tools restore the user's active buffer after they
+finish. Explicit navigation tools still change the active location. Set
+`[agent] follow_tool_calls = true` to reveal each file target, move to the first
+affected range when available, render it, and wait briefly before the operation.
+Mutations always pass through the editor's transaction boundary with
+session/turn attribution and save through the editor.
 
 ## Limits and failure behavior
 

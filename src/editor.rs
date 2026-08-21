@@ -8673,6 +8673,10 @@ impl Editor {
                 }
                 let contents = self.current_buffer().contents();
                 let page = agent_file_page(&contents, start_line, line_count);
+                anyhow::ensure!(
+                    !page.line_truncated,
+                    "source line exceeds the 256 KiB read limit and cannot be paged"
+                );
                 Ok(json!({
                     "content": page.content,
                     "revision": self.current_buffer().revision(),
@@ -9507,10 +9511,25 @@ impl Editor {
                 } else {
                     Duration::ZERO
                 };
-            let result = self
+            let restore_buffer = (!self.config.agent.follow_tool_calls
+                && !matches!(
+                    &pending.request.call,
+                    EditorToolCall::OpenFile { .. }
+                        | EditorToolCall::SelectText { .. }
+                        | EditorToolCall::RunEditorAction { .. }
+                ))
+            .then(|| self.buffer_manager.active_index());
+            let mut result = self
                 .dispatch_agent_editor_tool(pending.request, buffer, runtime)
                 .await
                 .map_err(|error| error.to_string());
+            if let Some(index) =
+                restore_buffer.filter(|&index| index != self.buffer_manager.active_index())
+            {
+                if let Err(error) = self.set_current_buffer(buffer, index).await {
+                    result = Err(error.to_string());
+                }
+            }
             if post_delay.is_zero() {
                 let _ = pending.response.send(result);
             } else {
@@ -30018,6 +30037,104 @@ mod test {
         assert_eq!(second["end_line"], 5);
         assert_eq!(second["truncated"], false);
         assert!(second["next_line"].is_null());
+    }
+
+    #[tokio::test]
+    async fn unfollowed_agent_reads_restore_focus_but_explicit_navigation_does_not() {
+        let root = tempfile::tempdir().unwrap();
+        let first = root.path().join("first.rs");
+        let second = root.path().join("second.rs");
+        let long = root.path().join("long.rs");
+        fs::write(&first, "first\n").unwrap();
+        fs::write(&second, "second\n").unwrap();
+        fs::write(&long, "x".repeat(MAX_AGENT_READ_BYTES + 1)).unwrap();
+        let mut editor = test_editor(/*width*/ 80, /*height*/ 24);
+        editor.buffer_manager.replace_buffers(vec![Buffer::new(
+            Some(first.to_string_lossy().into_owned()),
+            "first\n".to_string(),
+        )]);
+        editor.test_set_agent_root(root.path());
+        editor.agent_manager.mark_session_active("session-1");
+        let first_id = editor.current_buffer().id();
+        let (sender, requests) = editor_tool_channel(/*capacity*/ 2);
+        editor.agent_manager.set_tool_requests(requests);
+        let mut render_buffer =
+            RenderBuffer::new(/*width*/ 80, /*height*/ 24, &Style::default());
+        let mut runtime = Runtime::new();
+
+        let (response, result) = tokio::sync::oneshot::channel();
+        sender
+            .send(crate::agent_tools::PendingEditorTool {
+                request: EditorToolRequest {
+                    session_id: "session-1".to_string(),
+                    call: EditorToolCall::ReadFile {
+                        path: "second.rs".to_string(),
+                        start_line: 1,
+                        line_count: 1,
+                    },
+                },
+                response,
+            })
+            .await
+            .unwrap();
+        editor
+            .service_background(&mut render_buffer, &mut runtime)
+            .await
+            .unwrap();
+        assert_eq!(result.await.unwrap().unwrap()["content"], "second\n");
+        assert_eq!(editor.current_buffer().id(), first_id);
+
+        let (response, result) = tokio::sync::oneshot::channel();
+        sender
+            .send(crate::agent_tools::PendingEditorTool {
+                request: EditorToolRequest {
+                    session_id: "session-1".to_string(),
+                    call: EditorToolCall::ReadFile {
+                        path: "long.rs".to_string(),
+                        start_line: 1,
+                        line_count: 1,
+                    },
+                },
+                response,
+            })
+            .await
+            .unwrap();
+        editor
+            .service_background(&mut render_buffer, &mut runtime)
+            .await
+            .unwrap();
+        assert!(result
+            .await
+            .unwrap()
+            .unwrap_err()
+            .contains("cannot be paged"));
+        assert_eq!(editor.current_buffer().id(), first_id);
+
+        let (response, result) = tokio::sync::oneshot::channel();
+        sender
+            .send(crate::agent_tools::PendingEditorTool {
+                request: EditorToolRequest {
+                    session_id: "session-1".to_string(),
+                    call: EditorToolCall::OpenFile {
+                        path: "second.rs".to_string(),
+                        line: 0,
+                        character: 0,
+                        target: EditorOpenTarget::Current,
+                    },
+                },
+                response,
+            })
+            .await
+            .unwrap();
+        editor
+            .service_background(&mut render_buffer, &mut runtime)
+            .await
+            .unwrap();
+        result.await.unwrap().unwrap();
+        assert_eq!(
+            editor.current_buffer().file.as_deref(),
+            Some(second.to_string_lossy().as_ref())
+        );
     }
 
     #[tokio::test]

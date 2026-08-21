@@ -21,13 +21,13 @@ Followed editing is Red's current safety boundary for full Codex agent writes. T
 
 ## Tool Entry Points
 
-The full agent receives `list_files`, `search_files`, `read_file`, `write_file`, `create_directory`, `get_editor_state`, `open_file`, `select_text`, `apply_edits`, `add_annotations`, `dismiss_annotations`, and `run_editor_action` [@workflow]. `list_files` and `read_file` are paged and report continuation or truncation metadata. `read_file` returns current editor-visible contents and revision, including unsaved buffer contents, and `write_file`, `apply_edits`, and `add_annotations` require that revision [@codex] [@tools].
+The full agent receives `list_files`, `search_files`, `read_file`, `write_file`, `create_directory`, `get_editor_state`, `open_file`, `select_text`, `apply_edits`, `add_annotations`, `dismiss_annotations`, and `run_editor_action` [@workflow]. `list_files` and `read_file` are paged and report continuation or truncation metadata. `read_file` returns current editor-visible contents and revision, including unsaved buffer contents; later pages must present the first page's revision, and `write_file`, `apply_edits`, and `add_annotations` reuse that same revision [@codex] [@tools].
 
 The tool host is a bounded channel from the Codex worker into the editor loop. `EditorToolHost` packages each read, write, navigation, selection, or editor action as an `EditorToolRequest`, waits for the editor owner to answer, and times out if the dispatcher stalls [@tools]. The Codex worker rejects tool calls for unknown sessions, inactive turns, cancelled turns, commit-message sessions, and oversized arguments before it forwards a request [@codex].
 
 ## Serialized And Optional Follow Playback
 
-The editor serializes tool execution through `service_background`. By default, it dispatches the next tool immediately. With `agent.follow_tool_calls = true`, it first resolves and opens the target when relevant, moves the cursor to the first affected range for `apply_edits`, renders, and uses the configured dwell period before dispatch [@workflow] [@editor].
+The editor serializes tool execution through `service_background`. By default, it dispatches the next tool immediately and restores the user's active buffer after incidental file tools. Explicit navigation tools still change focus. With `agent.follow_tool_calls = true`, it first resolves and opens the target when relevant, moves the cursor to the first affected range for `apply_edits`, renders, and uses the configured dwell period before dispatch [@workflow] [@editor].
 
 Path resolution stays fail-closed. Agent tool paths must be non-empty, remain under the active workspace root after lexical normalization, avoid symlink components, and avoid ignored workspace paths. Secret-like filenames require the explicit `agent.allow_sensitive_paths` grant [@editor]. `list_files` and `search_files` apply the same policy, avoid symlink-following workspace walks, and use bounded safe reads for content search on Unix [@codex] [@workflow].
 
