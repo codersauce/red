@@ -4267,6 +4267,22 @@ groups = [["\\bif\\b", "\\belse\\b", "\\bendif\\b"]]
             leader.get("."),
             Some(&KeyAction::Single(Action::CodeAction))
         );
+        let Some(KeyAction::Nested(code)) = leader.get("c") else {
+            panic!("expected a Space c code-action mapping");
+        };
+        assert_eq!(code.get("a"), Some(&KeyAction::Single(Action::CodeAction)));
+        assert_eq!(
+            code.get("c"),
+            Some(&KeyAction::Single(Action::PluginCommand(
+                "GitSubmitMessage".to_string()
+            )))
+        );
+        assert_eq!(
+            code.get("q"),
+            Some(&KeyAction::Single(Action::PluginCommand(
+                "GitCancelMessage".to_string()
+            )))
+        );
         assert_eq!(
             leader.get("r"),
             Some(&KeyAction::Single(Action::StartRename))

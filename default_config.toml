@@ -450,7 +450,7 @@ Esc = { EnterMode = "Normal" }
 "G" = { PluginCommand = "GitDashboard" }
 "?" = "CommandPalette"
 "h" = { "s" = { PluginCommand = "GitHunkStage" }, "u" = { PluginCommand = "GitHunkUnstage" }, "r" = { PluginCommand = "GitHunkReset" } }
-"c" = { "c" = { PluginCommand = "GitSubmitMessage" }, "q" = { PluginCommand = "GitCancelMessage" } }
+"c" = { "a" = "CodeAction", "c" = { PluginCommand = "GitSubmitMessage" }, "q" = { PluginCommand = "GitCancelMessage" } }
 
 [keys.normal." "."]"]
 "c" = "NextInlineComment"
