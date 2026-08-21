@@ -101,9 +101,17 @@ fn builtin_source(name: &str, argument_index: usize) -> Option<Source> {
         _ => name,
     };
     match canonical {
-        "edit" | "write" | "split" | "sp" | "vsplit" | "vs" | "InlineHistoryExport" => {
-            Some(Source::Files)
-        }
+        "edit"
+        | "write"
+        | "saveas"
+        | "file"
+        | "new"
+        | "vnew"
+        | "split"
+        | "sp"
+        | "vsplit"
+        | "vs"
+        | "InlineHistoryExport" => Some(Source::Files),
         _ if argument_index != 0 => None,
         "syntax" | "syn" | "ft" => Some(Source::Syntax),
         "set" => Some(choices(command::SET_OPTIONS)),
@@ -408,7 +416,8 @@ mod tests {
         fs::create_dir(directory.path().join("zdir")).unwrap();
         fs::write(directory.path().join("afile"), "").unwrap();
         for command in [
-            "e", "edit", "w", "write", "sp", "split", "vs", "vsplit", "e!",
+            "e", "edit", "w", "write", "saveas", "file", "new", "vnew", "sp", "split", "vs",
+            "vsplit", "e!",
         ] {
             let mut state = None;
             let mut line = format!("{command} {}/", directory.path().display());

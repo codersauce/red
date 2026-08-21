@@ -4,6 +4,7 @@
 // requests a normal buffer switch and never mutates buffer contents.
 
 struct BufferSummary {
+    id: i32,
     name: String,
 }
 
@@ -12,7 +13,7 @@ struct EditorInfo {
 }
 
 struct BufferPickerData {
-    name: String,
+    id: i32,
 }
 
 struct BufferPickerItem {
@@ -43,12 +44,16 @@ fn editor_info_loaded(info: EditorInfo) {
     let index = 0;
     while index < red::len(info.buffers) && index < 500 {
         let buffer = info.buffers[index];
+        let label = buffer.name;
+        if buffer.name == "[No Name]" {
+            label = buffer.name + " #" + buffer.id;
+        }
         items = red::push(items, BufferPickerItem {
-            id: buffer.name,
-            label: buffer.name,
+            id: "buffer:" + buffer.id,
+            label: label,
             kind: "Buffer",
             data: BufferPickerData {
-                name: buffer.name,
+                id: buffer.id,
             },
         });
         index = index + 1;
@@ -67,5 +72,5 @@ fn editor_info_loaded(info: EditorInfo) {
 }
 
 fn buffer_selected(item: BufferPickerItem) {
-    red::execute("OpenBuffer", item.data.name);
+    red::execute("OpenBufferById", item.data.id);
 }

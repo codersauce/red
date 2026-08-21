@@ -36,6 +36,11 @@ impl BufferId {
         const BUFFER_ID_INCREMENT: u64 = 1;
         Self(NEXT_BUFFER_ID.fetch_add(BUFFER_ID_INCREMENT, /*order*/ Ordering::Relaxed))
     }
+
+    /// Returns the stable process-local number shown in buffer lists and plugin snapshots.
+    pub fn as_u64(self) -> u64 {
+        self.0
+    }
 }
 
 /// Half-open regular-expression match in zero-based line and scalar coordinates.

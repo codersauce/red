@@ -20,12 +20,24 @@ pub(crate) const BUILTIN_COLON_COMMANDS: &[&str] = &[
     "quit",
     "write",
     "buffer-next",
+    "bnext",
     "buffer-prev",
+    "bprevious",
+    "buffer",
+    "b",
+    "b#",
     "bd",
     "bdelete",
     "buffer-delete",
     "edit",
     "enew",
+    "new",
+    "vnew",
+    "saveas",
+    "file",
+    "ls",
+    "buffers",
+    "files",
     "split",
     "sp",
     "vsplit",
@@ -601,12 +613,21 @@ fn builtin_commands() -> Vec<BuiltinCommand> {
             Action::NewBuffer,
         ),
         builtin(
+            "buffer.list",
+            "List buffers",
+            "Buffer",
+            "Show open buffer numbers, names, and unsaved changes",
+            Some(":ls"),
+            &[":buffers", ":files", "open buffers"],
+            Action::ListBuffers,
+        ),
+        builtin(
             "buffer.alternate",
             "Alternate buffer",
             "Buffer",
             "Switch to the most recently used buffer",
-            None,
-            &["recent buffer", "last buffer", "toggle buffer"],
+            Some(":b#"),
+            &[":b #", "recent buffer", "last buffer", "toggle buffer"],
             Action::AlternateBuffer,
         ),
         builtin(
@@ -615,7 +636,7 @@ fn builtin_commands() -> Vec<BuiltinCommand> {
             "Buffer",
             "Switch to the next buffer",
             Some(":bn"),
-            &[":buffer-next"],
+            &[":bnext", ":buffer-next"],
             Action::NextBuffer,
         ),
         builtin(
@@ -624,7 +645,7 @@ fn builtin_commands() -> Vec<BuiltinCommand> {
             "Buffer",
             "Switch to the previous buffer",
             Some(":bp"),
-            &[":buffer-prev"],
+            &[":bprevious", ":buffer-prev"],
             Action::PreviousBuffer,
         ),
         builtin(
@@ -860,6 +881,24 @@ fn builtin_commands() -> Vec<BuiltinCommand> {
             Some(":syntax"),
             &[":syn", ":ft", "filetype", "language"],
             Action::OpenSyntaxPicker,
+        ),
+        builtin(
+            "window.new_horizontal",
+            "New buffer in horizontal split",
+            "Window",
+            "Create a horizontal split containing an empty, unnamed buffer",
+            Some(":new"),
+            &["new split", "horizontal scratch buffer"],
+            Action::SplitHorizontalNewBuffer,
+        ),
+        builtin(
+            "window.new_vertical",
+            "New buffer in vertical split",
+            "Window",
+            "Create a vertical split containing an empty, unnamed buffer",
+            Some(":vnew"),
+            &["vertical scratch buffer"],
+            Action::SplitVerticalNewBuffer,
         ),
         builtin(
             "window.split_horizontal",
@@ -1404,6 +1443,7 @@ fn action_label(action: &Action) -> String {
         Action::PluginCommand(name) => humanize_identifier(name),
         Action::Save => "Save file".to_string(),
         Action::NewBuffer => "New buffer".to_string(),
+        Action::ListBuffers => "List buffers".to_string(),
         Action::Quit(_) => "Quit".to_string(),
         Action::Undo => "Undo".to_string(),
         Action::Redo => "Redo".to_string(),
@@ -1439,6 +1479,8 @@ fn action_label(action: &Action) -> String {
         Action::ToggleWrap => "Toggle line wrapping".to_string(),
         Action::SplitHorizontal => "Split horizontally".to_string(),
         Action::SplitVertical => "Split vertically".to_string(),
+        Action::SplitHorizontalNewBuffer => "New buffer in horizontal split".to_string(),
+        Action::SplitVerticalNewBuffer => "New buffer in vertical split".to_string(),
         Action::CloseWindow => "Close window".to_string(),
         Action::OnlyWindow => "Keep only current window".to_string(),
         Action::BalanceWindows => "Balance windows".to_string(),
@@ -1580,6 +1622,45 @@ mod tests {
                 .commands,
             ["enew"]
         );
+    }
+
+    #[test]
+    fn palette_exposes_standard_buffer_and_new_split_commands() {
+        let entries = entries(&default_keys(), &[]);
+        for (id, command, action) in [
+            ("buffer.list", ":ls", Action::ListBuffers),
+            (
+                "window.new_horizontal",
+                ":new",
+                Action::SplitHorizontalNewBuffer,
+            ),
+            (
+                "window.new_vertical",
+                ":vnew",
+                Action::SplitVerticalNewBuffer,
+            ),
+        ] {
+            let entry = entries.iter().find(|entry| entry.id == id).unwrap();
+            assert_eq!(entry.colon.as_deref(), Some(command));
+            assert_eq!(entry.action, action);
+        }
+
+        let aliases = colon_completion_names(&[]);
+        for name in [
+            "b",
+            "buffer",
+            "bnext",
+            "bprevious",
+            "ls",
+            "buffers",
+            "files",
+            "new",
+            "vnew",
+            "saveas",
+            "file",
+        ] {
+            assert!(aliases.iter().any(|alias| alias == name), "{name}");
+        }
     }
 
     #[test]
