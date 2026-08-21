@@ -10,7 +10,6 @@
 
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use fuzzy_matcher::skim::SkimMatcherV2;
-use fuzzy_matcher::FuzzyMatcher;
 use ropey::{Rope, RopeSlice};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -41,8 +40,11 @@ use crate::{
 };
 
 use super::{
-    dialog::BorderStyle, first_prompt_line, spinner_frame, ActionBar, ActionPriority, Component,
-    Dialog, IconCatalog, List, ScreenRect, UiAction, SPINNER_FRAME_INTERVAL_MS,
+    dialog::BorderStyle,
+    first_prompt_line,
+    picker_matching::{match_path, PathCandidate},
+    spinner_frame, ActionBar, ActionPriority, Component, Dialog, IconCatalog, List, ScreenRect,
+    UiAction, SPINNER_FRAME_INTERVAL_MS,
 };
 
 type SelectAction = Box<dyn Fn(String) -> Action + Send>;
@@ -54,6 +56,7 @@ type FilterHighlightAction = Box<dyn Fn(&PickerItem, &str) -> PickerFilterHighli
 enum PickerMatchKind {
     Exact,
     ExactIgnoreCase,
+    Filename,
     Fuzzy,
 }
 
@@ -62,14 +65,20 @@ fn default_filter_score(
     label: &str,
     query: &str,
 ) -> Option<(PickerMatchKind, Reverse<i64>)> {
-    // Keep smart-case eligibility, but rank whole labels ahead of fuzzy prefixes.
-    let score = matcher.fuzzy_match(label, query)?;
-    let kind = if label == query {
-        PickerMatchKind::Exact
+    let candidate = PathCandidate::from_path(label);
+    let matched = match_path(matcher, candidate, query)?;
+    let (kind, score) = if label == query {
+        (PickerMatchKind::Exact, matched.score)
     } else if label.eq_ignore_ascii_case(query) {
-        PickerMatchKind::ExactIgnoreCase
+        (PickerMatchKind::ExactIgnoreCase, matched.score)
+    } else if candidate.has_parent() {
+        matched
+            .filename_score
+            .map_or((PickerMatchKind::Fuzzy, matched.score), |filename_score| {
+                (PickerMatchKind::Filename, filename_score)
+            })
     } else {
-        PickerMatchKind::Fuzzy
+        (PickerMatchKind::Fuzzy, matched.score)
     };
     Some((kind, Reverse(score)))
 }
@@ -6557,6 +6566,55 @@ mod tests {
                 "",
                 &["DrawTail", "Draw", "draw"],
                 &["DrawTail", "Draw", "draw"],
+            ),
+            (
+                "recap",
+                &[
+                    "/workspace/codex.fcoury-recap/src/lib.rs",
+                    "/workspace/codex.fcoury-recap/src/thread_recap.rs",
+                    "/workspace/codex.fcoury-recap/src/recap.rs",
+                    "/workspace/codex.fcoury-recap/src/app.rs",
+                ],
+                &[
+                    "/workspace/codex.fcoury-recap/src/recap.rs",
+                    "/workspace/codex.fcoury-recap/src/thread_recap.rs",
+                    "/workspace/codex.fcoury-recap/src/lib.rs",
+                    "/workspace/codex.fcoury-recap/src/app.rs",
+                ],
+            ),
+            (
+                "recap",
+                &[
+                    r"C:\workspace\codex.fcoury-recap\src\lib.rs",
+                    r"C:\workspace\codex.fcoury-recap\src\thread_recap.rs",
+                    r"C:\workspace\codex.fcoury-recap\src\recap.rs",
+                ],
+                &[
+                    r"C:\workspace\codex.fcoury-recap\src\recap.rs",
+                    r"C:\workspace\codex.fcoury-recap\src\thread_recap.rs",
+                    r"C:\workspace\codex.fcoury-recap\src\lib.rs",
+                ],
+            ),
+            (
+                "routing",
+                &[
+                    "/workspace/routing/src/lib.rs",
+                    "/workspace/other/src/app.rs",
+                ],
+                &["/workspace/routing/src/lib.rs"],
+            ),
+            (
+                "src/recap",
+                &["/workspace/lib/recap.rs", "/workspace/src/recap.rs"],
+                &["/workspace/src/recap.rs"],
+            ),
+            (
+                "Recap",
+                &[
+                    "/workspace/recap/src/recap.rs",
+                    "/workspace/recap/src/Recap.rs",
+                ],
+                &["/workspace/recap/src/Recap.rs"],
             ),
         ];
 

@@ -27,6 +27,7 @@ mod learn;
 mod list;
 mod messages;
 mod picker;
+mod picker_matching;
 mod prompt_buffer;
 mod rich_text;
 mod selection;
