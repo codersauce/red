@@ -236,6 +236,7 @@ struct AgentState {
     session_browser_debounce: String,
     session_browser_results: [Json],
     session_browser_results_query: String,
+    session_browser_views: Json,
     session_switch_target: String,
     session_switch_previous: String,
     model_header_text: String,
@@ -299,6 +300,7 @@ fn initial_state() -> AgentState {
         session_browser_debounce: "",
         session_browser_results: [],
         session_browser_results_query: "",
+        session_browser_views: Json {},
         session_switch_target: "",
         session_switch_previous: "",
         model_header_text: "",
@@ -653,23 +655,34 @@ fn choose_session() {
     ensure_conversation_panel();
     red::state_patch(AgentState {
         session_browser_open: true,
-        session_browser_scope: "red",
-        session_browser_query: "",
         session_browser_cwd: "",
         session_browser_request: -1,
         session_browser_results: [],
         session_browser_results_query: "",
     });
-    red::execute("EnterTextPanelContext", "agent-conversation", "Search previous sessions…");
-    refresh_session_browser_header();
-    render_session_browser([], "", true);
     red::request("GetConfig", session_browser_cwd_loaded, "cwd");
 }
 
 fn session_browser_cwd_loaded(result: AgentStringValueEvent) {
     if !state().session_browser_open { return; }
     let cwd = red::string(result.value, ".");
-    red::state_patch(AgentState { session_browser_cwd: cwd });
+    let previous = state().session_browser_views[cwd];
+    let scope = "red";
+    let query = "";
+    if previous != red::null() {
+        scope = red::string(previous.scope, "red");
+        query = red::string(previous.query, "");
+    }
+    red::state_patch(AgentState {
+        session_browser_cwd: cwd,
+        session_browser_scope: scope,
+        session_browser_query: query,
+    });
+    red::execute("EnterTextPanelContext", "agent-conversation", "Search previous sessions…", Json {
+        key: cwd, query: query,
+    });
+    refresh_session_browser_header();
+    render_session_browser([], "", true);
     request_sessions();
 }
 
@@ -801,6 +814,15 @@ fn close_session_browser() {
     if !state().session_browser_open { return; }
     let debounce = red::string(state().session_browser_debounce, "");
     if debounce != "" { red::execute("CancelTimeout", debounce); }
+    let cwd = red::string(state().session_browser_cwd, "");
+    if cwd != "" {
+        let views = state().session_browser_views;
+        views[cwd] = Json {
+            scope: state().session_browser_scope,
+            query: state().session_browser_query,
+        };
+        red::state_patch(AgentState { session_browser_views: views });
+    }
     red::state_patch(AgentState {
         session_browser_open: false,
         session_browser_request: -1,

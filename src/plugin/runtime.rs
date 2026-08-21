@@ -1816,7 +1816,17 @@ impl RedHost {
                     .and_then(Value::as_str)
                     .ok_or_else(|| anyhow::anyhow!("EnterTextPanelContext requires a placeholder"))?
                     .to_string();
-                self.send_request(PluginRequest::EnterTextPanelContext { id, placeholder });
+                let options = args
+                    .get(2)
+                    .map(value_to_json)
+                    .map(serde_json::from_value::<crate::plugin::TextPanelContextOptions>)
+                    .transpose()?
+                    .unwrap_or_default();
+                self.send_request(PluginRequest::EnterTextPanelContext {
+                    id,
+                    placeholder,
+                    options,
+                });
             }
             "ExitTextPanelContext" => {
                 let id = args
@@ -8241,10 +8251,23 @@ mod tests {
 
         let _catalog = open_unprimed_agent(&mut runtime).await;
         runtime.execute_command("AgentSessions").await.unwrap();
+        let cwd_request = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::GetConfig { request_id, key } if key.as_deref() == Some("cwd") => {
+                request_id
+            }
+            _ => panic!("expected workspace request before entering the panel browser"),
+        };
+        runtime
+            .resolve_request(cwd_request, serde_json::json!({"value": "/workspace"}))
+            .await
+            .unwrap();
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
-            PluginRequest::EnterTextPanelContext { id, placeholder }
-                if id == "agent-conversation" && placeholder == "Search previous sessions…"
+            PluginRequest::EnterTextPanelContext { id, placeholder, options }
+                if id == "agent-conversation"
+                    && placeholder == "Search previous sessions…"
+                    && options.key == "/workspace"
+                    && options.query.is_empty()
         ));
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
@@ -8260,16 +8283,6 @@ mod tests {
                 if id == "agent-conversation"
                     && blocks.iter().any(|block| block.id == "session-browser:loading")
         ));
-        let cwd_request = match ACTION_DISPATCHER.recv_request() {
-            PluginRequest::GetConfig { request_id, key } if key.as_deref() == Some("cwd") => {
-                request_id
-            }
-            _ => panic!("expected workspace request after entering the panel browser"),
-        };
-        runtime
-            .resolve_request(cwd_request, serde_json::json!({"value": "/workspace"}))
-            .await
-            .unwrap();
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
             PluginRequest::SetTextPanelStatus { id, status: Some(status) }
@@ -8385,24 +8398,22 @@ mod tests {
             }
             _ => panic!("expected workspace session request"),
         };
+        let listed_sessions = serde_json::json!({
+            "sessions": [{
+                "id": "foreign-thread",
+                "cwd": "/workspace",
+                "label": "Earlier conversation",
+                "detail": "2h ago · Codex CLI · workspace",
+                "snippet": "",
+                "source": "Codex CLI",
+                "time_group": "Recent",
+                "is_red": false,
+                "updated_at": 42
+            }],
+            "error": ""
+        });
         runtime
-            .resolve_request(
-                workspace_request,
-                serde_json::json!({
-                    "sessions": [{
-                        "id": "foreign-thread",
-                        "cwd": "/workspace",
-                        "label": "Earlier conversation",
-                        "detail": "2h ago · Codex CLI · workspace",
-                        "snippet": "",
-                        "source": "Codex CLI",
-                        "time_group": "Recent",
-                        "is_red": false,
-                        "updated_at": 42
-                    }],
-                    "error": ""
-                }),
-            )
+            .resolve_request(workspace_request, listed_sessions.clone())
             .await
             .unwrap();
         assert!(matches!(
@@ -8424,6 +8435,82 @@ mod tests {
             }
             _ => panic!("expected in-pane session blocks"),
         };
+
+        runtime
+            .notify(
+                "panel:event:agent-conversation",
+                serde_json::json!({"action":"filter_cancel","text":""}),
+            )
+            .await
+            .unwrap();
+        let mut exited_picker = false;
+        while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
+            if let PluginRequest::ExitTextPanelContext { id } = request {
+                assert_eq!(id, "agent-conversation");
+                exited_picker = true;
+            }
+        }
+        assert!(exited_picker);
+
+        runtime.execute_command("AgentSessions").await.unwrap();
+        let reopened_cwd_request = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::GetConfig { request_id, key } if key.as_deref() == Some("cwd") => {
+                request_id
+            }
+            _ => panic!("expected workspace request while reopening the session picker"),
+        };
+        runtime
+            .resolve_request(
+                reopened_cwd_request,
+                serde_json::json!({"value": "/workspace"}),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::EnterTextPanelContext { id, options, .. }
+                if id == "agent-conversation"
+                    && options.key == "/workspace"
+                    && options.query == "needle"
+        ));
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::SetTextPanelHeaderDetail { detail: Some(detail), .. }
+                if detail.secondary == "This workspace"
+        ));
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::UpdateTextPanel { blocks, .. }
+                if blocks.iter().any(|block| block.id == "session-browser:loading")
+        ));
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::SetTextPanelStatus { status: Some(status), .. } if status.busy
+        ));
+        let reopened_request = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::AgentSessionRequest {
+                request_id,
+                request,
+            } => {
+                assert_eq!(request.scope, crate::codex::AgentSessionScope::Workspace);
+                assert_eq!(request.query, "needle");
+                request_id
+            }
+            _ => panic!("expected restored workspace scope and query"),
+        };
+        runtime
+            .resolve_request(reopened_request, listed_sessions)
+            .await
+            .unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::SetTextPanelStatus { status: None, .. }
+        ));
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::UpdateTextPanel { blocks, .. }
+                if blocks.iter().any(|block| block.id == session_block_id)
+        ));
 
         runtime
             .notify(

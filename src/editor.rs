@@ -1877,6 +1877,7 @@ pub enum PluginRequest {
     EnterTextPanelContext {
         id: String,
         placeholder: String,
+        options: plugin::TextPanelContextOptions,
     },
     ExitTextPanelContext {
         id: String,
@@ -11314,11 +11315,16 @@ impl Editor {
                         needs_render = true;
                     }
                 }
-                PluginRequest::EnterTextPanelContext { id, placeholder } => {
-                    if self
-                        .panel_manager
-                        .enter_text_panel_context(&id, placeholder)
-                    {
+                PluginRequest::EnterTextPanelContext {
+                    id,
+                    placeholder,
+                    options,
+                } => {
+                    if self.panel_manager.enter_text_panel_context_with_options(
+                        &id,
+                        placeholder,
+                        options,
+                    ) {
                         needs_render = true;
                     }
                 }

@@ -378,14 +378,17 @@ contrasted. Plugins do not need to configure a border to make resizing visible.
 
 `PanelConfig` may include `composer: Json { placeholder: String, rows: i32 }` for a persistent footer composer and `header_actions: [Json { id: String, label: String, compact_label?: String, shortcut?: String }]` for clickable, right-aligned header controls. Row panels can also set `surface: ThemeStyleSpec` and `border: ThemeStyleSpec` to resolve theme-aware panel foreground, background, and separator colors without affecting other panels. Header actions emit `panel:event:<id>` using their configured `id`; optional shortcuts trigger the same action without changing the composer draft and appear in contextual keyboard help. Compact labels are selected automatically on narrow panels, with the rightmost actions retained when space is especially limited. Focus the footer with `FocusTextPanelComposer(id)`, update its enabled/status state with `SetTextPanelComposerState(id, enabled, status?)`, and clear its draft with `ClearTextPanelComposer(id)`.
 
-`EnterTextPanelContext(id, placeholder)` gives a plugin a temporary in-pane
+`EnterTextPanelContext(id, placeholder, options?)` gives a plugin a temporary in-pane
 surface while retaining the panel's blocks, scroll position, search state,
 status, composer draft, and composer focus. The conversation composer is hidden
 and replaced by a search field at the top of an embedded picker. Action blocks
 become selectable rows; arrows and `Ctrl-j` / `Ctrl-k` move between them, `Enter`
 emits `activate_block` for the selected row, and `Esc` or `Ctrl-c` emits
 `filter_cancel`. Editing the search field emits `filter_input` with its complete
-contents. Call `ExitTextPanelContext(id)` to restore the retained conversation
+contents. Passing `Json { key: String, query: String }` restores the initial
+query and the selection and scroll position previously remembered for that key;
+if the old selection disappears, the nearest remaining row is selected instead.
+Call `ExitTextPanelContext(id)` to restore the retained conversation
 exactly. A second enter is ignored until the current context exits.
 
 A focused footer is a host-owned modal text area, not an editor file buffer. It supports Unicode-safe editing, wrapping, click-to-position cursor movement, counts, Vim word and character motions, `d`/`c`/`y` operators, inner/around text objects, Visual/Visual-line/Visual-block selections, transactional undo/redo, local yank/paste registers, dot-repeat, local macro recording, and prompt-local `/` or `?` searches. Its mode, pending operator, selection, undo tree, register, and search never alter the main editor. File writes, Ex commands, window operations, LSP requests, and plugin callbacks cannot be invoked through textarea keys.

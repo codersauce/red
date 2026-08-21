@@ -41,8 +41,9 @@ pub use overlay::{OverlayAlignment, OverlayConfig, OverlayManager};
 pub use panel::{
     PanelConfig, PanelManager, PanelManagerSnapshot, PanelRow, PanelRowKind, PanelSegment,
     PanelSessionSnapshot, PanelSide, PanelSnapshotKind, TextPanelBlock, TextPanelBlockFormat,
-    TextPanelBlockKind, TextPanelComposerConfig, TextPanelComposerSnapshot, TextPanelHeaderAction,
-    TextPanelHeaderDetail, TextPanelSessionSnapshot, TextPanelSnapshotFocus, TextPanelStatus,
+    TextPanelBlockKind, TextPanelComposerConfig, TextPanelComposerSnapshot,
+    TextPanelContextOptions, TextPanelHeaderAction, TextPanelHeaderDetail,
+    TextPanelSessionSnapshot, TextPanelSnapshotFocus, TextPanelStatus,
 };
 pub use registry::{PluginRegistry, PluginStatus, RED_HOST_API_VERSION};
 pub use runtime::{
