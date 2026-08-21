@@ -17,6 +17,7 @@ pub(super) enum DiagnosticReportKind {
 struct DocumentReports {
     push: Vec<Diagnostic>,
     pull: Vec<Diagnostic>,
+    provisional: bool,
 }
 
 #[derive(Default)]
@@ -32,11 +33,49 @@ impl DiagnosticReports {
         diagnostics: &[Diagnostic],
     ) -> Vec<Diagnostic> {
         let reports = self.documents.entry(uri.to_string()).or_default();
+        if reports.provisional {
+            reports.push.clear();
+            reports.pull.clear();
+            reports.provisional = false;
+        }
         match kind {
             DiagnosticReportKind::Push => reports.push = diagnostics.to_vec(),
             DiagnosticReportKind::Pull => reports.pull = diagnostics.to_vec(),
         }
         merged_reports(reports)
+    }
+
+    /// Restores both channels optimistically until the restarted server responds.
+    pub(super) fn restore(
+        &mut self,
+        uri: String,
+        push: Vec<Diagnostic>,
+        pull: Vec<Diagnostic>,
+    ) -> Vec<Diagnostic> {
+        let reports = DocumentReports {
+            push,
+            pull,
+            provisional: true,
+        };
+        let merged = merged_reports(&reports);
+        self.documents.insert(uri, reports);
+        merged
+    }
+
+    pub(super) fn entries(
+        &self,
+    ) -> impl Iterator<Item = (&str, &[Diagnostic], &[Diagnostic])> + '_ {
+        self.documents.iter().map(|(uri, reports)| {
+            (
+                uri.as_str(),
+                reports.push.as_slice(),
+                reports.pull.as_slice(),
+            )
+        })
+    }
+
+    pub(super) fn has_provisional(&self) -> bool {
+        self.documents.values().any(|reports| reports.provisional)
     }
 
     /// Move untouched diagnostic ranges with their text and discard edited ranges.
@@ -232,6 +271,25 @@ mod tests {
         );
     }
 
+    fn diagnostic_workspace(contents: &str) -> (tempfile::TempDir, std::path::PathBuf, String) {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join("Cargo.toml"),
+            "[package]\nname = \"diagnostic-cache\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        let file = root.path().join("main.rs");
+        std::fs::write(&file, contents).unwrap();
+        let uri = crate::lsp::file_uri(&file).unwrap();
+        (root, file, uri)
+    }
+
+    fn cached_editor(file: &std::path::Path, contents: &str, cache: &std::path::Path) -> Editor {
+        let mut editor = editor(file.to_string_lossy().into_owned(), contents, true);
+        editor.enable_diagnostic_cache(cache.to_path_buf());
+        editor
+    }
+
     #[test]
     fn pushed_and_pulled_diagnostics_replace_only_their_own_reports() {
         let root = tempfile::tempdir().unwrap();
@@ -262,6 +320,276 @@ mod tests {
         assert_eq!(editor.diagnostics[&uri], vec![compiler, native]);
         pull(&mut editor, &uri, json!({ "kind": "full", "items": [] }));
         assert!(editor.diagnostics[&uri].is_empty());
+    }
+
+    #[test]
+    fn cached_diagnostics_restore_both_reports_and_gutter_signs_after_restart() {
+        let (root, file, uri) = diagnostic_workspace("x\n");
+        let cache = root.path().join("cache");
+        let compiler = diagnostic("cached compiler error");
+        let native = diagnostic("cached native error");
+
+        let mut first = cached_editor(&file, "x\n", &cache);
+        push(&mut first, &uri, vec![compiler.clone()]);
+        pull(
+            &mut first,
+            &uri,
+            json!({ "kind": "full", "items": [native.clone()] }),
+        );
+        first.persist_diagnostic_cache(true);
+
+        let mut restarted = cached_editor(&file, "x\n", &cache);
+        assert_eq!(restarted.diagnostics[&uri], vec![compiler, native]);
+        assert!(restarted.diagnostic_reports.has_provisional());
+        assert!(restarted.gutter_sign_manager.visible_sign(0, 0).is_some());
+
+        let refresh = restarted.handle_lsp_message(
+            &InboundMessage::Message(ResponseMessage {
+                id: 1,
+                result: json!({}),
+                request: Some(Request::new("initialize", json!({}))),
+            }),
+            Some("initialize".to_string()),
+        );
+        assert!(matches!(refresh, Some(Action::RefreshDiagnostics)));
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+
+            assert_eq!(
+                std::fs::metadata(&cache).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+            let cached_file = std::fs::read_dir(&cache)
+                .unwrap()
+                .next()
+                .unwrap()
+                .unwrap()
+                .path();
+            assert_eq!(
+                std::fs::metadata(cached_file).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+    }
+
+    #[test]
+    fn cached_diagnostics_reject_changed_document_contents() {
+        let (root, file, uri) = diagnostic_workspace("before\n");
+        let cache = root.path().join("cache");
+        let mut first = cached_editor(&file, "before\n", &cache);
+        push(&mut first, &uri, vec![diagnostic("outdated error")]);
+        first.persist_diagnostic_cache(true);
+
+        std::fs::write(&file, "after\n").unwrap();
+        let restarted = cached_editor(&file, "after\n", &cache);
+
+        assert!(!restarted.diagnostics.contains_key(&uri));
+        assert!(!restarted.diagnostic_reports.has_provisional());
+    }
+
+    #[test]
+    fn cached_diagnostics_validate_unsaved_buffer_contents_instead_of_disk() {
+        let (root, file, uri) = diagnostic_workspace("saved on disk\n");
+        let cache = root.path().join("cache");
+        let unsaved = "restored unsaved contents\n";
+        let mut first = cached_editor(&file, unsaved, &cache);
+        push(&mut first, &uri, vec![diagnostic("unsaved buffer error")]);
+        first.persist_diagnostic_cache(true);
+
+        let resumed = cached_editor(&file, unsaved, &cache);
+        assert_eq!(resumed.diagnostics[&uri][0].message, "unsaved buffer error");
+
+        let clean_restart = cached_editor(&file, "saved on disk\n", &cache);
+        assert!(!clean_restart.diagnostics.contains_key(&uri));
+    }
+
+    #[test]
+    fn cached_diagnostics_reject_changed_language_server_configuration() {
+        let (root, file, uri) = diagnostic_workspace("x\n");
+        let cache = root.path().join("cache");
+        let mut first = cached_editor(&file, "x\n", &cache);
+        push(&mut first, &uri, vec![diagnostic("old server error")]);
+        first.persist_diagnostic_cache(true);
+
+        let mut restarted = editor(file.to_string_lossy().into_owned(), "x\n", true);
+        restarted
+            .config
+            .lsp
+            .servers
+            .get_mut("rust")
+            .unwrap()
+            .args
+            .push("--different-configuration".to_string());
+        restarted.enable_diagnostic_cache(cache);
+
+        assert!(!restarted.diagnostics.contains_key(&uri));
+    }
+
+    #[test]
+    fn cached_diagnostics_reject_changed_workspace_manifests() {
+        let (root, file, uri) = diagnostic_workspace("x\n");
+        let cache = root.path().join("cache");
+        let mut first = cached_editor(&file, "x\n", &cache);
+        push(&mut first, &uri, vec![diagnostic("old dependency error")]);
+        first.persist_diagnostic_cache(true);
+
+        std::fs::write(
+            root.path().join("Cargo.toml"),
+            "[package]\nname = \"changed-dependencies\"\nversion = \"0.2.0\"\n",
+        )
+        .unwrap();
+        let restarted = cached_editor(&file, "x\n", &cache);
+
+        assert!(!restarted.diagnostics.contains_key(&uri));
+    }
+
+    #[test]
+    fn first_fresh_report_replaces_both_provisional_diagnostic_channels() {
+        let (root, file, uri) = diagnostic_workspace("x\n");
+        let cache = root.path().join("cache");
+        let mut first = cached_editor(&file, "x\n", &cache);
+        push(&mut first, &uri, vec![diagnostic("outdated compiler")]);
+        pull(
+            &mut first,
+            &uri,
+            json!({ "kind": "full", "items": [diagnostic("outdated native")] }),
+        );
+        first.persist_diagnostic_cache(true);
+
+        let mut restarted = cached_editor(&file, "x\n", &cache);
+        let current = diagnostic("fresh compiler");
+        push(&mut restarted, &uri, vec![current.clone()]);
+
+        assert_eq!(restarted.diagnostics[&uri], vec![current]);
+        assert!(!restarted.diagnostic_reports.has_provisional());
+
+        let native = diagnostic("fresh native");
+        pull(
+            &mut restarted,
+            &uri,
+            json!({ "kind": "full", "items": [native.clone()] }),
+        );
+        assert_eq!(restarted.diagnostics[&uri][1], native);
+    }
+
+    #[test]
+    fn fresh_empty_report_removes_cached_findings_for_the_next_restart() {
+        let (root, file, uri) = diagnostic_workspace("x\n");
+        let cache = root.path().join("cache");
+        let mut first = cached_editor(&file, "x\n", &cache);
+        push(&mut first, &uri, vec![diagnostic("resolved error")]);
+        first.persist_diagnostic_cache(true);
+
+        let mut refreshed = cached_editor(&file, "x\n", &cache);
+        push(&mut refreshed, &uri, vec![]);
+        assert!(refreshed.diagnostics[&uri].is_empty());
+        refreshed.persist_diagnostic_cache(true);
+
+        let restarted = cached_editor(&file, "x\n", &cache);
+        assert!(!restarted.diagnostics.contains_key(&uri));
+    }
+
+    #[test]
+    fn cached_diagnostics_restore_unopened_workspace_documents() {
+        let (root, file, _) = diagnostic_workspace("fn main() {}\n");
+        let other = root.path().join("other.rs");
+        std::fs::write(&other, "broken();\n").unwrap();
+        let other_uri = crate::lsp::file_uri(&other).unwrap();
+        let cache = root.path().join("cache");
+        let mut first = cached_editor(&file, "fn main() {}\n", &cache);
+        push(
+            &mut first,
+            &other_uri,
+            vec![diagnostic("unopened document error")],
+        );
+        first.persist_diagnostic_cache(true);
+
+        let restarted = cached_editor(&file, "fn main() {}\n", &cache);
+        assert_eq!(
+            restarted.diagnostics[&other_uri][0].message,
+            "unopened document error"
+        );
+
+        std::fs::write(&other, "fixed();\n").unwrap();
+        let changed = cached_editor(&file, "fn main() {}\n", &cache);
+        assert!(!changed.diagnostics.contains_key(&other_uri));
+    }
+
+    #[test]
+    fn cached_diagnostics_load_when_a_workspace_is_opened_after_startup() {
+        let (root, file, uri) = diagnostic_workspace("x\n");
+        let cache = root.path().join("cache");
+        let mut first = cached_editor(&file, "x\n", &cache);
+        push(&mut first, &uri, vec![diagnostic("lazy workspace error")]);
+        first.persist_diagnostic_cache(true);
+
+        let config = Config {
+            show_diagnostics: true,
+            ..Config::default()
+        };
+        let mut restarted = Editor::with_size(
+            Box::new(LspManager::new(config.lsp.clone())),
+            60,
+            12,
+            config,
+            Theme::default(),
+            vec![Buffer::new(None, String::new())],
+        )
+        .unwrap();
+        restarted.test_disable_terminal_output();
+        restarted.enable_diagnostic_cache(cache);
+        assert!(restarted.diagnostics.is_empty());
+
+        restarted.buffer_manager.add_buffer(Buffer::new(
+            Some(file.to_string_lossy().into_owned()),
+            "x\n".to_string(),
+        ));
+        restarted.restore_cached_diagnostics();
+
+        assert_eq!(
+            restarted.diagnostics[&uri][0].message,
+            "lazy workspace error"
+        );
+    }
+
+    #[test]
+    fn cached_diagnostics_expire_instead_of_restoring_old_findings() {
+        let (root, file, uri) = diagnostic_workspace("x\n");
+        let cache = root.path().join("cache");
+        let mut first = cached_editor(&file, "x\n", &cache);
+        push(&mut first, &uri, vec![diagnostic("old cached error")]);
+        first.persist_diagnostic_cache(true);
+
+        let cached_file = std::fs::read_dir(&cache)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let mut saved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&cached_file).unwrap()).unwrap();
+        saved["captured_at_ms"] = json!(0);
+        std::fs::write(&cached_file, serde_json::to_vec(&saved).unwrap()).unwrap();
+
+        let restarted = cached_editor(&file, "x\n", &cache);
+        assert!(!restarted.diagnostics.contains_key(&uri));
+    }
+
+    #[test]
+    fn cached_diagnostics_do_not_cross_workspace_roots() {
+        let (first_root, first_file, first_uri) = diagnostic_workspace("x\n");
+        let (second_root, second_file, second_uri) = diagnostic_workspace("x\n");
+        let cache = tempfile::tempdir().unwrap();
+        let mut first = cached_editor(&first_file, "x\n", cache.path());
+        push(&mut first, &first_uri, vec![diagnostic("first workspace")]);
+        first.persist_diagnostic_cache(true);
+
+        let second = cached_editor(&second_file, "x\n", cache.path());
+        assert!(!second.diagnostics.contains_key(&first_uri));
+        assert!(!second.diagnostics.contains_key(&second_uri));
+        assert_ne!(first_root.path(), second_root.path());
     }
 
     #[test]

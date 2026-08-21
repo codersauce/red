@@ -267,6 +267,7 @@ async fn run_editor_inner(args: Args) -> anyhow::Result<()> {
             );
         }
     }
+    editor.enable_diagnostic_cache(Config::path("cache/lsp-diagnostics"));
     editor.set_session_store(session_store);
 
     if let Some(session) = &args.core_session {

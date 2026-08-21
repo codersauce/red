@@ -21,6 +21,7 @@ mod agent_models;
 mod buffer_manager;
 mod command_mode;
 mod completion_resolve;
+mod diagnostic_cache;
 mod diagnostics;
 mod diagnostics_picker;
 mod display_layout;
@@ -3467,6 +3468,7 @@ pub struct Editor {
     /// Map of diagnostics per file uri
     diagnostics: HashMap<String, Vec<Diagnostic>>,
     diagnostic_reports: diagnostics::DiagnosticReports,
+    diagnostic_cache: Option<diagnostic_cache::DiagnosticCache>,
 
     /// Indentation rules per file type
     indentation: HashMap<String, Indentation>,
@@ -4416,6 +4418,7 @@ impl Editor {
         let count = loaded.config.languages.len();
         self.config.languages = loaded.config.languages;
         self.config.lsp = loaded.config.lsp;
+        self.mark_diagnostic_cache_dirty();
         self.config.formatting = loaded.config.formatting;
         self.config.commenting = loaded.config.commenting;
         self.config_diagnostics = loaded.diagnostics;
@@ -4830,6 +4833,7 @@ impl Editor {
             clipboard,
             diagnostics: HashMap::new(),
             diagnostic_reports: diagnostics::DiagnosticReports::default(),
+            diagnostic_cache: None,
             indentation,
             render_commands: VecDeque::new(),
             overlay_manager: plugin::OverlayManager::new(),
@@ -12803,6 +12807,7 @@ impl Editor {
             return;
         }
         self.diagnostic_reports.remove(&uri);
+        self.mark_diagnostic_cache_dirty();
         self.sync_diagnostic_gutter_signs();
     }
 
@@ -12824,6 +12829,7 @@ impl Editor {
         log!("Adding diagnostics for {uri}: {diagnostics:#?}");
         let merged = self.diagnostic_reports.update(&uri, kind, diagnostics);
         self.diagnostics.insert(uri, merged);
+        self.mark_diagnostic_cache_dirty();
         self.sync_diagnostic_gutter_signs();
 
         Some(Action::Refresh)
@@ -13533,9 +13539,8 @@ impl Editor {
         match msg {
             InboundMessage::Message(msg) => {
                 if let Some(ref method) = method {
-                    if method == "initialize" {
-                        // self.server_capabilities = self.lsp.get_server_capabilities().cloned();
-                        // log!("server capabilities: {:#?}", self.server_capabilities);
+                    if method == "initialize" && self.diagnostic_reports.has_provisional() {
+                        return Some(Action::RefreshDiagnostics);
                     }
 
                     if method == "textDocument/diagnostic" && self.config.show_diagnostics {
@@ -22677,6 +22682,7 @@ impl Editor {
                 }
                 self.diagnostics.remove(uri);
                 self.diagnostic_reports.remove(uri);
+                self.mark_diagnostic_cache_dirty();
             }
         }
         self.lsp_coordinator.forget_buffer(removed_id);
@@ -22788,6 +22794,7 @@ impl Editor {
     }
 
     async fn ensure_buffer_lsp_opened(&mut self, buffer_index: usize) -> anyhow::Result<()> {
+        self.restore_cached_diagnostics();
         let Some(buffer) = self.buffer_manager.get(buffer_index) else {
             return Ok(());
         };
@@ -22832,6 +22839,7 @@ impl Editor {
                     self.diagnostics.insert(current_uri.clone(), diagnostics);
                 }
             }
+            self.mark_diagnostic_cache_dirty();
         }
         self.sync_diagnostic_gutter_signs();
         self.ensure_buffer_lsp_opened(buffer_index).await
@@ -23987,6 +23995,7 @@ impl Editor {
         if let Some((uri, edit)) = diagnostic_edit {
             if let Some(diagnostics) = self.diagnostic_reports.rebase(&uri, &edit, new_text) {
                 self.diagnostics.insert(uri, diagnostics);
+                self.mark_diagnostic_cache_dirty();
                 self.sync_diagnostic_gutter_signs();
             }
         }
@@ -24606,6 +24615,56 @@ impl Editor {
         self.session_manager.set_store(store);
     }
 
+    /// Enables provisional, workspace-scoped diagnostics recovery across editor launches.
+    pub fn enable_diagnostic_cache(&mut self, directory: PathBuf) {
+        self.diagnostic_cache = Some(diagnostic_cache::DiagnosticCache::new(directory));
+        self.restore_cached_diagnostics();
+    }
+
+    fn restore_cached_diagnostics(&mut self) {
+        if !self.config.show_diagnostics {
+            return;
+        }
+        let Some(cache) = &mut self.diagnostic_cache else {
+            return;
+        };
+        let restored = cache.load(&self.config.lsp, &self.buffer_manager);
+        let mut changed = false;
+        for reports in restored {
+            if self.diagnostics.contains_key(&reports.uri) {
+                continue;
+            }
+            let diagnostics =
+                self.diagnostic_reports
+                    .restore(reports.uri.clone(), reports.push, reports.pull);
+            self.diagnostics.insert(reports.uri, diagnostics);
+            changed = true;
+        }
+        if changed {
+            self.sync_diagnostic_gutter_signs();
+        }
+    }
+
+    fn mark_diagnostic_cache_dirty(&mut self) {
+        if let Some(cache) = &mut self.diagnostic_cache {
+            cache.mark_dirty();
+        }
+    }
+
+    fn persist_diagnostic_cache(&mut self, force: bool) {
+        let Some(cache) = &mut self.diagnostic_cache else {
+            return;
+        };
+        if let Err(error) = cache.flush(
+            &self.config.lsp,
+            &self.buffer_manager,
+            &self.diagnostic_reports,
+            force,
+        ) {
+            log!("failed to persist diagnostic cache: {error}");
+        }
+    }
+
     #[doc(hidden)]
     pub fn test_persist_session_snapshot(&mut self, force: bool, due: bool) {
         if due {
@@ -25192,6 +25251,7 @@ impl Editor {
     }
 
     fn persist_session_snapshot(&mut self, force: bool) -> bool {
+        self.persist_diagnostic_cache(force);
         // Learn Red checkpoints the real workspace before opening its scratch
         // window. Keep that recovery snapshot intact until the lesson exits.
         if self.learn_session.is_some() {
@@ -26531,6 +26591,7 @@ impl Editor {
                 if let Some(diagnostics) = self.diagnostics.remove(uri) {
                     self.diagnostics.insert(new_uri.clone(), diagnostics);
                 }
+                self.mark_diagnostic_cache_dirty();
             }
             if let Err(error) = self
                 .lsp
