@@ -137,6 +137,40 @@ async fn hover_opens_active_lsp_buffer_before_request() {
 }
 
 #[tokio::test]
+async fn code_action_opens_a_loading_picker_before_the_server_responds() {
+    let (mut editor, events) = recording_editor(vec![Buffer::new(
+        Some("src/main.rs".to_string()),
+        "fn main() {}".to_string(),
+    )]);
+
+    editor
+        .test_execute_action(Action::CodeAction)
+        .await
+        .unwrap();
+
+    let frame = (0..24)
+        .map(|line| editor.test_render_row(line).unwrap())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(frame.contains("Code actions"), "{frame}");
+    assert!(
+        frame.contains("Fetching available code actions..."),
+        "{frame}"
+    );
+    assert!(frame.contains("Loading actions..."), "{frame}");
+    assert!(
+        frame
+            .chars()
+            .any(|character| "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏".contains(character)),
+        "{frame}"
+    );
+    assert!(matches!(
+        recorded(&events).as_slice(),
+        [LspEvent::DidOpen(file), LspEvent::CodeAction { .. }] if file == "src/main.rs"
+    ));
+}
+
+#[tokio::test]
 async fn daily_driver_lsp_actions_open_active_buffer_and_use_utf16_cursor() {
     let (mut editor, events) = recording_editor(vec![Buffer::new(
         Some("src/main.rs".to_string()),
@@ -151,6 +185,10 @@ async fn daily_driver_lsp_actions_open_active_buffer_and_use_utf16_cursor() {
         .unwrap();
     editor
         .test_execute_action(Action::CodeAction)
+        .await
+        .unwrap();
+    editor
+        .test_execute_action(Action::CloseDialog)
         .await
         .unwrap();
     editor

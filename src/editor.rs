@@ -240,6 +240,7 @@ const AGENT_BRIDGE_CAPACITY: usize = 64;
 const PLUGIN_MANAGER_PICKER_ID: i32 = 9_101;
 const PLUGIN_MANAGER_ACTION_PICKER_ID: i32 = 9_102;
 const PLUGIN_MANAGER_INSTALL_PICKER_ID: i32 = 9_103;
+const CODE_ACTION_PICKER_ID: i32 = 9_104;
 
 fn diagnostic_priority(severity: Option<&DiagnosticSeverity>) -> i32 {
     match severity {
@@ -3497,6 +3498,8 @@ pub struct Editor {
     pending_plugin_references: HashMap<i64, RequestId>,
     pending_plugin_inlay_hints: HashMap<i64, RequestId>,
     pending_lsp_edit_requests: HashMap<i64, PendingLspEdit>,
+    /// LSP request currently owning the visible, cancellable code-action picker.
+    pending_code_action_request: Option<i64>,
     pending_lsp_format_saves: HashMap<i64, PendingLspFormatSave>,
     pending_lsp_revision_snapshots: HashMap<i64, Vec<(String, u64)>>,
     pending_completions: HashMap<i64, PendingCompletion>,
@@ -4842,6 +4845,7 @@ impl Editor {
             pending_plugin_references: HashMap::new(),
             pending_plugin_inlay_hints: HashMap::new(),
             pending_lsp_edit_requests: HashMap::new(),
+            pending_code_action_request: None,
             pending_lsp_format_saves: HashMap::new(),
             pending_lsp_revision_snapshots: HashMap::new(),
             pending_completions: HashMap::new(),
@@ -13087,21 +13091,48 @@ impl Editor {
         ))
     }
 
+    fn code_action_loading_picker(&self) -> Picker {
+        let mut picker = Picker::builder()
+            .title("Code actions")
+            .id(CODE_ACTION_PICKER_ID)
+            .status("Loading actions...")
+            .busy(true)
+            .build(self);
+        picker.set_empty_message(Some("Fetching available code actions...".to_string()));
+        picker
+    }
+
+    fn finish_code_action_request(&mut self, request_id: i64) -> bool {
+        if self.pending_code_action_request != Some(request_id) {
+            return false;
+        }
+        self.pending_code_action_request = None;
+        self.current_dialog
+            .as_ref()
+            .is_some_and(|dialog| dialog.picker_id() == Some(CODE_ACTION_PICKER_ID))
+    }
+
     fn code_action_picker(&mut self, response: &ResponseMessage) -> Option<Action> {
         let pending = self.pending_lsp_edit_requests.remove(&response.id)?;
         let revision_snapshot = self.pending_lsp_revision_snapshots.remove(&response.id);
+        if !self.finish_code_action_request(response.id) {
+            return None;
+        }
         if !self.pending_lsp_edit_is_current(&pending) {
             self.set_legacy_message(Some(
                 "code-action response is stale; buffer changed".to_string(),
             ));
-            return None;
+            return Some(Action::CloseDialog);
         }
         let values = match &response.result {
-            Value::Null => return None,
+            Value::Null => {
+                self.set_legacy_message(Some("no applicable LSP code actions".to_string()));
+                return Some(Action::CloseDialog);
+            }
             Value::Array(values) => values,
             _ => {
                 self.set_legacy_message(Some("invalid LSP code-action response".to_string()));
-                return None;
+                return Some(Action::CloseDialog);
             }
         };
 
@@ -13200,10 +13231,11 @@ impl Editor {
             if self.last_error.is_none() {
                 self.set_legacy_message(Some("no applicable LSP code actions".to_string()));
             }
-            return None;
+            return Some(Action::CloseDialog);
         }
         let picker = Picker::builder()
             .title("Code actions")
+            .id(CODE_ACTION_PICKER_ID)
             .structured_items(items)
             .select_action(move |item| {
                 actions.get(&item).cloned().unwrap_or_else(|| {
@@ -13733,6 +13765,11 @@ impl Editor {
                     return Some(Action::ShowDialog);
                 }
                 self.set_notification_message(Severity::Error, Some(error_msg.message.clone()));
+                if method.as_deref() == Some("textDocument/codeAction")
+                    && self.finish_code_action_request(id)
+                {
+                    return Some(Action::CloseDialog);
+                }
                 let save_as = save.as_ref().is_some_and(|save| save.save_as.is_some());
                 if (error_msg.code == -32601 || save_as)
                     && method.as_deref() == Some("textDocument/formatting")
@@ -13811,6 +13848,11 @@ impl Editor {
                         return Some(Action::ShowDialog);
                     }
                     self.set_legacy_message(Some(error.to_string()));
+                    if method.as_deref() == Some("textDocument/codeAction")
+                        && self.finish_code_action_request(*id)
+                    {
+                        return Some(Action::CloseDialog);
+                    }
                     let save_as = save.as_ref().is_some_and(|save| save.save_as.is_some());
                     if (matches!(
                         error,
@@ -19527,16 +19569,35 @@ impl Editor {
                         uri,
                     };
                     let revisions = self.open_buffer_revision_snapshot();
-                    self.ensure_current_buffer_lsp_opened().await?;
-                    let request_id = self.lsp.code_action(&file, range, diagnostics).await?;
+                    self.release_current_dialog_callbacks(runtime);
+                    self.pending_code_action_request = None;
+                    self.current_dialog = Some(Box::new(self.code_action_loading_picker()));
+                    self.render(buffer)?;
+
+                    let request: anyhow::Result<i64> = async {
+                        self.ensure_current_buffer_lsp_opened().await?;
+                        Ok(self.lsp.code_action(&file, range, diagnostics).await?)
+                    }
+                    .await;
+                    let request_id = match request {
+                        Ok(request_id) => request_id,
+                        Err(error) => {
+                            self.current_dialog = None;
+                            self.render(buffer)?;
+                            return Err(error);
+                        }
+                    };
                     if request_id > 0 {
+                        self.pending_code_action_request = Some(request_id);
                         self.pending_lsp_edit_requests.insert(request_id, pending);
                         self.pending_lsp_revision_snapshots
                             .insert(request_id, revisions);
                     } else {
+                        self.current_dialog = None;
                         self.set_legacy_message(Some(
                             "no language server is available for this file".to_string(),
                         ));
+                        self.render(buffer)?;
                     }
                 }
             }
@@ -20537,6 +20598,13 @@ impl Editor {
                     )
                     .await?;
                     return Ok(false);
+                }
+                if self
+                    .current_dialog
+                    .as_ref()
+                    .is_some_and(|dialog| dialog.picker_id() == Some(CODE_ACTION_PICKER_ID))
+                {
+                    self.pending_code_action_request = None;
                 }
                 self.release_current_dialog_callbacks(runtime);
                 self.current_dialog = None;
@@ -37421,6 +37489,18 @@ builtin = "rust"
                 uri: uri.clone(),
             },
         );
+        editor.pending_code_action_request = Some(43);
+        editor.current_dialog = Some(Box::new(editor.code_action_loading_picker()));
+        let mut loading = RenderBuffer::new(60, 12, &Style::default());
+        editor
+            .current_dialog
+            .as_ref()
+            .unwrap()
+            .draw(&mut loading)
+            .unwrap();
+        assert!(render_text_rows(&loading)
+            .join("\n")
+            .contains("Fetching available code actions..."));
         let message = InboundMessage::Message(ResponseMessage {
             id: 43,
             result: serde_json::json!([{
@@ -37442,6 +37522,23 @@ builtin = "rust"
             editor.handle_lsp_message(&message, Some("textDocument/codeAction".to_string()));
 
         assert!(matches!(action, Some(Action::ShowDialog)));
+        assert_eq!(editor.pending_code_action_request, None);
+        let mut loaded = RenderBuffer::new(60, 12, &Style::default());
+        editor
+            .current_dialog
+            .as_ref()
+            .unwrap()
+            .draw(&mut loaded)
+            .unwrap();
+        let loaded_frame = render_text_rows(&loaded).join("\n");
+        assert!(
+            loaded_frame.contains("Remove unused binding"),
+            "{loaded_frame}"
+        );
+        assert!(
+            !loaded_frame.contains("Loading actions..."),
+            "{loaded_frame}"
+        );
         let selected = editor
             .current_dialog
             .as_mut()
@@ -37464,6 +37561,133 @@ builtin = "rust"
                 && expected_revisions == &vec![(documents[0].uri.clone(), revision)]
                 && label == "Remove unused binding"
         ));
+    }
+
+    #[test]
+    fn empty_code_action_response_closes_the_loading_picker() {
+        let path = std::env::temp_dir().join("red-empty-code-action.rs");
+        let mut editor = lsp_test_editor(vec![Buffer::new(
+            Some(path.to_string_lossy().into_owned()),
+            "let value = 1;".to_string(),
+        )]);
+        let uri = editor.buffer_manager[0].uri().unwrap().unwrap();
+        editor.pending_lsp_edit_requests.insert(
+            43,
+            PendingLspEdit {
+                buffer_id: editor.buffer_manager[0].id(),
+                revision: editor.buffer_manager[0].revision(),
+                uri: uri.clone(),
+            },
+        );
+        editor.pending_code_action_request = Some(43);
+        editor.current_dialog = Some(Box::new(editor.code_action_loading_picker()));
+        let message = InboundMessage::Message(ResponseMessage {
+            id: 43,
+            result: serde_json::json!([]),
+            request: Some(crate::lsp::Request::new(
+                "textDocument/codeAction",
+                serde_json::json!({ "textDocument": { "uri": uri } }),
+            )),
+        });
+
+        let action =
+            editor.handle_lsp_message(&message, Some("textDocument/codeAction".to_string()));
+
+        assert!(matches!(action, Some(Action::CloseDialog)));
+        assert_eq!(editor.pending_code_action_request, None);
+        assert!(editor.pending_lsp_edit_requests.is_empty());
+        assert_eq!(
+            editor.last_error.as_deref(),
+            Some("no applicable LSP code actions")
+        );
+    }
+
+    #[tokio::test]
+    async fn closing_a_loading_code_action_picker_ignores_its_late_response() {
+        let path = std::env::temp_dir().join("red-cancelled-code-action.rs");
+        let mut editor = lsp_test_editor(vec![Buffer::new(
+            Some(path.to_string_lossy().into_owned()),
+            "let value = 1;".to_string(),
+        )]);
+        let uri = editor.buffer_manager[0].uri().unwrap().unwrap();
+        editor.pending_lsp_edit_requests.insert(
+            43,
+            PendingLspEdit {
+                buffer_id: editor.buffer_manager[0].id(),
+                revision: editor.buffer_manager[0].revision(),
+                uri: uri.clone(),
+            },
+        );
+        editor.pending_code_action_request = Some(43);
+        editor.current_dialog = Some(Box::new(editor.code_action_loading_picker()));
+
+        editor
+            .test_execute_production_action(Action::CloseDialog)
+            .await
+            .unwrap();
+        assert_eq!(editor.pending_code_action_request, None);
+        assert!(editor.current_dialog.is_none());
+
+        let message = InboundMessage::Message(ResponseMessage {
+            id: 43,
+            result: serde_json::json!([{
+                "title": "Run fix",
+                "command": { "title": "Run fix", "command": "test.fix" }
+            }]),
+            request: Some(crate::lsp::Request::new(
+                "textDocument/codeAction",
+                serde_json::json!({ "textDocument": { "uri": uri } }),
+            )),
+        });
+
+        assert!(editor
+            .handle_lsp_message(&message, Some("textDocument/codeAction".to_string()))
+            .is_none());
+        assert!(editor.current_dialog.is_none());
+        assert!(editor.pending_lsp_edit_requests.is_empty());
+    }
+
+    #[test]
+    fn failed_code_action_requests_close_the_loading_picker() {
+        let failures = [
+            InboundMessage::RequestError {
+                id: 43,
+                error: crate::lsp::LspError::RequestTimeout(Duration::from_secs(30)),
+            },
+            InboundMessage::Error(crate::lsp::ResponseError {
+                id: Some(43),
+                code: -32603,
+                message: "code action failed".to_string(),
+                data: None,
+            }),
+        ];
+
+        for failure in failures {
+            let path = std::env::temp_dir().join("red-failed-code-action.rs");
+            let mut editor = lsp_test_editor(vec![Buffer::new(
+                Some(path.to_string_lossy().into_owned()),
+                "let value = 1;".to_string(),
+            )]);
+            let uri = editor.buffer_manager[0].uri().unwrap().unwrap();
+            editor.pending_lsp_edit_requests.insert(
+                43,
+                PendingLspEdit {
+                    buffer_id: editor.buffer_manager[0].id(),
+                    revision: editor.buffer_manager[0].revision(),
+                    uri,
+                },
+            );
+            editor.pending_code_action_request = Some(43);
+            editor.current_dialog = Some(Box::new(editor.code_action_loading_picker()));
+
+            let action =
+                editor.handle_lsp_message(&failure, Some("textDocument/codeAction".to_string()));
+
+            assert!(matches!(action, Some(Action::CloseDialog)));
+            assert_eq!(editor.pending_code_action_request, None);
+            assert!(editor.pending_lsp_edit_requests.is_empty());
+            assert!(editor.last_error.is_some());
+        }
     }
 
     #[test]
@@ -39121,6 +39345,8 @@ while True:
             editor.test_execute_production_action(action).await.unwrap();
             assert!(editor.pending_lsp_edit_requests.is_empty());
             assert!(editor.pending_lsp_revision_snapshots.is_empty());
+            assert_eq!(editor.pending_code_action_request, None);
+            assert!(editor.current_dialog.is_none());
             assert!(editor
                 .last_error
                 .as_deref()

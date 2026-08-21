@@ -5230,8 +5230,11 @@ mod tests {
             .to_json();
         let rows = rows.as_array().unwrap();
 
-        assert_eq!(rows.len(), 201);
-        assert!(rows.last().unwrap()["path"].is_null());
+        assert_eq!(rows.len(), 334, "expanded trees must not be capped");
+        assert!(
+            rows.iter().all(|row| row["path"].is_string()),
+            "complete directory listings must not contain a truncation row"
+        );
         let modified_row = rows
             .iter()
             .find(|row| row["id"] == "./codex-rs/tui/src/tui/screen_size.rs")
