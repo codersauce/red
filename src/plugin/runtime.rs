@@ -8396,6 +8396,7 @@ mod tests {
                         "detail": "2h ago · Codex CLI · workspace",
                         "snippet": "",
                         "source": "Codex CLI",
+                        "time_group": "Recent",
                         "is_red": false,
                         "updated_at": 42
                     }],
@@ -8410,6 +8411,9 @@ mod tests {
         ));
         let session_block_id = match ACTION_DISPATCHER.recv_request() {
             PluginRequest::UpdateTextPanel { id, blocks } if id == "agent-conversation" => {
+                assert!(blocks.iter().any(|block| {
+                    block.id == "session-browser:group:Recent" && block.text == "Recent"
+                }));
                 let session = blocks
                     .iter()
                     .find(|block| block.id.starts_with("session-browser:session:"))

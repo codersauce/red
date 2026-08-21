@@ -37,6 +37,7 @@ pub struct AgentSessionSummary {
     pub detail: String,
     pub snippet: String,
     pub source: String,
+    pub time_group: String,
     pub is_red: bool,
     pub updated_at: i64,
 }
@@ -271,7 +272,8 @@ fn summarize(
         .and_then(|name| name.to_str())
         .filter(|name| !name.is_empty())
         .unwrap_or(cwd.as_str());
-    let detail = format!("{} · {source} · {location}", relative_time(updated_at));
+    let age = session_age(updated_at);
+    let detail = format!("{} · {source} · {location}", relative_time(age));
     Some(AgentSessionSummary {
         id,
         cwd,
@@ -279,6 +281,7 @@ fn summarize(
         detail,
         snippet,
         source,
+        time_group: session_time_group(age).to_string(),
         is_red,
         updated_at,
     })
@@ -358,12 +361,24 @@ fn source_label(source: &Value, is_red: bool) -> String {
     }
 }
 
-fn relative_time(timestamp: i64) -> String {
+fn session_age(timestamp: i64) -> i64 {
     let now = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .map(|duration| duration.as_secs() as i64)
         .unwrap_or(timestamp);
-    let seconds = now.saturating_sub(timestamp).max(0);
+    now.saturating_sub(timestamp).max(0)
+}
+
+fn session_time_group(seconds: i64) -> &'static str {
+    match seconds {
+        0..=86_399 => "Recent",
+        86_400..=604_799 => "This week",
+        604_800..=2_591_999 => "This month",
+        _ => "Earlier",
+    }
+}
+
+fn relative_time(seconds: i64) -> String {
     match seconds {
         0..=59 => "just now".to_string(),
         60..=3599 => format!("{}m ago", seconds / 60),
@@ -399,6 +414,7 @@ mod tests {
         let summary = summarize(&request, &thread, String::new()).unwrap();
         assert_eq!(summary.label, "Fix the picker");
         assert_eq!(summary.source, "Red");
+        assert_eq!(summary.time_group, "Earlier");
         assert!(summary.is_red);
 
         thread["source"] = json!("vscode");
@@ -406,6 +422,17 @@ mod tests {
         assert_eq!(cli_summary.label, "Fix the picker");
         assert_eq!(cli_summary.source, "Red");
         assert!(cli_summary.is_red);
+    }
+
+    #[test]
+    fn session_time_groups_follow_relative_age_boundaries() {
+        assert_eq!(session_time_group(0), "Recent");
+        assert_eq!(session_time_group(86_399), "Recent");
+        assert_eq!(session_time_group(86_400), "This week");
+        assert_eq!(session_time_group(604_799), "This week");
+        assert_eq!(session_time_group(604_800), "This month");
+        assert_eq!(session_time_group(2_591_999), "This month");
+        assert_eq!(session_time_group(2_592_000), "Earlier");
     }
 
     #[test]

@@ -736,7 +736,16 @@ fn render_session_browser(sessions: [Json], error: String, loading: bool) {
             id: "session-browser:error", kind: "error", format: "plain", text: error,
         });
     }
+    let current_group = "";
     for session in sessions {
+        let group = red::string(session.time_group, "Earlier");
+        if group != current_group {
+            blocks = red::push(blocks, AgentTextBlock {
+                id: "session-browser:group:" + group,
+                kind: "text", format: "plain", text: group,
+            });
+            current_group = group;
+        }
         let detail = red::string(session.detail, "");
         let snippet = red::string(session.snippet, "");
         if !red::bool(session.is_red, false) { detail = detail + " · Continue in Red"; }

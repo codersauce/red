@@ -825,6 +825,7 @@ const MAX_COMPOSER_BYTES: usize = PROMPT_MAX_BYTES;
 const COMPOSER_MAX_HEIGHT_PERCENT: usize = 70;
 const COMPOSER_CHROME_ROWS: usize = 2;
 const EMBEDDED_PICKER_CHROME_ROWS: usize = 3;
+const EMBEDDED_PICKER_ITEM_INSET: usize = 2;
 
 struct ComposerLayoutCache {
     buffer_id: BufferId,
@@ -1442,6 +1443,11 @@ impl TextPanel {
 
                 let style = block_style(&block.kind);
                 let mut block_lines = if block.kind == TextPanelBlockKind::Action {
+                    let action_width = if self.temporary_context.is_some() {
+                        width.saturating_sub(picker_item_text_inset(width))
+                    } else {
+                        width
+                    };
                     block
                         .text
                         .lines()
@@ -1449,7 +1455,7 @@ impl TextPanel {
                             RenderedTextLine::plain(
                                 crate::unicode_utils::truncate_display_width_with_marker(
                                     line,
-                                    width,
+                                    action_width,
                                     "…",
                                     crate::unicode_utils::TruncationSide::Right,
                                 ),
@@ -1491,7 +1497,9 @@ impl TextPanel {
                     .blocks
                     .get(block_index + 1)
                     .is_some_and(|next| next.kind == TextPanelBlockKind::Action);
-            if !continues_action {
+            let picker_group_heading =
+                self.temporary_context.is_some() && block.id.starts_with("session-browser:group:");
+            if !picker_group_heading && (!continues_action || self.temporary_context.is_some()) {
                 lines.push(RenderedTextLine::plain(
                     String::new(),
                     TextPanelSpanStyle::Text,
@@ -4077,7 +4085,13 @@ impl PanelManager {
             panel.scroll.min(max_scroll)
         };
         let line = lines.get(scroll + screen_row - title_rows)?;
-        let column = metrics.column(placement.x, x);
+        let picker_inset =
+            if panel.temporary_context.is_some() && picker_action_link(line).is_some() {
+                picker_item_text_inset(metrics.width)
+            } else {
+                0
+            };
+        let column = metrics.column(placement.x, x).checked_sub(picker_inset)?;
         let mut used = 0usize;
         for span in &line.spans {
             let end = used.saturating_add(display_width(&span.text));
@@ -5307,19 +5321,34 @@ fn render_text_panel(
         let y = position
             .y
             .saturating_add(title_rows + picker_header_rows + offset);
-        if panel.temporary_context.is_some()
-            && line.spans.iter().any(|span| {
-                span.link
-                    .as_ref()
-                    .is_some_and(|link| Some(link.id) == panel.selected_link)
-            })
-        {
-            let selected = theme.selected_style(
-                &palette.surface,
-                &theme.list_selection_style(),
-                SelectionForegroundPriority::Content,
-            );
-            buffer.set_text(content_position.x, y, &" ".repeat(metrics.width), &selected);
+        if panel.temporary_context.is_some() {
+            if let Some(link) = picker_action_link(line) {
+                let title = line_index == 0
+                    || layout
+                        .rendered
+                        .get(line_index - 1)
+                        .and_then(picker_action_link)
+                        .is_none_or(|previous| previous.id != link.id);
+                render_text_panel_picker_item(
+                    buffer,
+                    Point::new(content_position.x, y),
+                    metrics.width,
+                    line,
+                    Some(link.id) == panel.selected_link,
+                    title,
+                    &palette,
+                );
+                continue;
+            }
+            if render_text_panel_picker_group(
+                buffer,
+                Point::new(content_position.x, y),
+                metrics.width,
+                line,
+                &palette,
+            ) {
+                continue;
+            }
         }
         let prompt_card = layout
             .prompt_cards
@@ -5484,14 +5513,19 @@ fn render_text_panel_picker_header(
         return;
     };
     let y = position.y.saturating_add(title_rows);
-    let prefix = "› ";
+    let search = SurfaceCardPalette::new(palette, false, SurfaceCardColors::default());
+    buffer.set_text(position.x, y, &" ".repeat(width), &search.content.surface);
+    let prefix = "⌕ ";
     if width >= display_width(prefix) {
-        buffer.set_text(position.x, y, prefix, &palette.accent);
+        buffer.set_text(position.x, y, prefix, &search.content.accent);
         let query = composer.prompt.text();
         let (text, style) = if query.is_empty() {
-            (composer.config.placeholder.as_str(), &palette.muted)
+            (
+                composer.config.placeholder.as_str(),
+                &search.content.secondary,
+            )
         } else {
-            (query.as_str(), &palette.primary)
+            (query.as_str(), &search.content.primary)
         };
         buffer.set_text(
             position.x.saturating_add(display_width(prefix)),
@@ -5501,11 +5535,23 @@ fn render_text_panel_picker_header(
         );
     }
     if rows > 1 {
-        buffer.set_text(
-            position.x,
-            y.saturating_add(1),
-            &fit_display_width("↑↓ select · Enter resume · Esc back · Alt-S scope", width),
-            &palette.muted,
+        render_picker_fragments(
+            buffer,
+            Point::new(position.x, y.saturating_add(1)),
+            width,
+            &[
+                ("↑↓", &palette.accent),
+                (" select", &palette.secondary),
+                ("  ·  ", &palette.divider),
+                ("Enter", &palette.accent),
+                (" resume", &palette.secondary),
+                ("  ·  ", &palette.divider),
+                ("Esc", &palette.accent),
+                (" back", &palette.secondary),
+                ("  ·  ", &palette.divider),
+                ("Alt-S", &palette.accent),
+                (" scope", &palette.secondary),
+            ],
         );
     }
     if rows > 2 {
@@ -5515,6 +5561,140 @@ fn render_text_panel_picker_header(
             &"─".repeat(width),
             &palette.divider,
         );
+    }
+}
+
+fn picker_item_text_inset(width: usize) -> usize {
+    if width > EMBEDDED_PICKER_ITEM_INSET {
+        EMBEDDED_PICKER_ITEM_INSET
+    } else {
+        0
+    }
+}
+
+fn picker_action_link(line: &RenderedTextLine) -> Option<&TextPanelLink> {
+    line.spans.iter().find_map(|span| {
+        span.link
+            .as_ref()
+            .filter(|link| matches!(&link.target, TextPanelLinkTarget::PanelAction { .. }))
+    })
+}
+
+fn render_text_panel_picker_group(
+    buffer: &mut RenderBuffer,
+    position: Point,
+    width: usize,
+    line: &RenderedTextLine,
+    palette: &TextPanelPalette,
+) -> bool {
+    let heading = line
+        .spans
+        .iter()
+        .map(|span| span.text.as_str())
+        .collect::<String>();
+    if !matches!(
+        heading.as_str(),
+        "Recent" | "This week" | "This month" | "Earlier"
+    ) {
+        return false;
+    }
+    let label = format!("●  {}", heading.to_uppercase());
+    let label_width = display_width(&label);
+    buffer.set_text(
+        position.x,
+        position.y,
+        &fit_display_width(&label, width),
+        &palette.accent,
+    );
+    if width > label_width.saturating_add(2) {
+        let start = label_width.saturating_add(2);
+        buffer.set_text(
+            position.x.saturating_add(start),
+            position.y,
+            &"─".repeat(width.saturating_sub(start)),
+            &palette.divider,
+        );
+    }
+    true
+}
+
+fn render_text_panel_picker_item(
+    buffer: &mut RenderBuffer,
+    position: Point,
+    width: usize,
+    line: &RenderedTextLine,
+    selected: bool,
+    title: bool,
+    palette: &TextPanelPalette,
+) {
+    let card = SurfaceCardPalette::new(palette, selected, SurfaceCardColors::default());
+    buffer.set_text(
+        position.x,
+        position.y,
+        &" ".repeat(width),
+        &card.content.surface,
+    );
+    let inset = picker_item_text_inset(width);
+    if inset > 0 {
+        buffer.set_text(
+            position.x,
+            position.y,
+            if selected { "▌" } else { "│" },
+            &card.edge,
+        );
+    }
+    let content_position = Point::new(position.x.saturating_add(inset), position.y);
+    let content_width = width.saturating_sub(inset);
+    let text = line
+        .spans
+        .iter()
+        .map(|span| span.text.as_str())
+        .collect::<String>();
+    if title {
+        let style = Style {
+            bold: true,
+            ..card.content.primary.clone()
+        };
+        buffer.set_text(
+            content_position.x,
+            content_position.y,
+            &fit_display_width(&text, content_width),
+            &style,
+        );
+        return;
+    }
+
+    let mut fragments = Vec::new();
+    for (index, segment) in text.split(" · ").enumerate() {
+        if index > 0 {
+            fragments.push((" · ", &card.content.divider));
+        }
+        let style = if segment == "Red" || segment == "Continue in Red" {
+            &card.content.accent
+        } else if index == 0 {
+            &card.content.secondary
+        } else {
+            &card.content.muted
+        };
+        fragments.push((segment, style));
+    }
+    render_picker_fragments(buffer, content_position, content_width, &fragments);
+}
+
+fn render_picker_fragments(
+    buffer: &mut RenderBuffer,
+    position: Point,
+    width: usize,
+    fragments: &[(&str, &Style)],
+) {
+    let mut used = 0usize;
+    for &(text, style) in fragments {
+        if used >= width {
+            break;
+        }
+        let text = truncate_display_width(text, width.saturating_sub(used));
+        buffer.set_text(position.x.saturating_add(used), position.y, &text, style);
+        used = used.saturating_add(display_width(&text));
     }
 }
 
@@ -7274,6 +7454,12 @@ mod tests {
             "agent",
             vec![
                 TextPanelBlock {
+                    id: "session-browser:group:Recent".to_string(),
+                    kind: TextPanelBlockKind::Text,
+                    format: TextPanelBlockFormat::Plain,
+                    text: "Recent".to_string(),
+                },
+                TextPanelBlock {
                     id: "session:one".to_string(),
                     kind: TextPanelBlockKind::Action,
                     format: TextPanelBlockFormat::Plain,
@@ -7312,6 +7498,22 @@ mod tests {
         manager.render(&mut frame, &theme);
         assert!(row_text(&frame, 2).contains("Search previous sessions"));
         assert!(row_text(&frame, 3).contains("select"));
+        let group = text_position(&frame, "RECENT").expect("session cards have a recency heading");
+        assert!(row_text(&frame, group.y).contains('─'));
+        let first_session = text_position(&frame, "Previous session").unwrap();
+        let older_session = text_position(&frame, "Older session").unwrap();
+        assert_eq!(older_session.y, first_session.y + 3);
+        assert_eq!(
+            frame.cells[first_session.y * frame.width + first_session.x - 2].text,
+            "▌"
+        );
+        assert_eq!(
+            frame.cells[older_session.y * frame.width + older_session.x - 2].text,
+            "│"
+        );
+        assert!(text_style(&frame, "Previous session").bold);
+        assert!(!text_style(&frame, "1h ago").bold);
+        assert!(text_style(&frame, "Enter").bold);
         assert!(!(0..20).any(|row| row_text(&frame, row).contains("unsent follow-up")));
         let snapshot = manager.snapshot(80);
         let saved = snapshot
@@ -7363,6 +7565,10 @@ mod tests {
             .unwrap();
         assert_eq!(cancel.action, "filter_cancel");
         assert!(!manager.toggle_focused_text_region(80));
+        assert!(matches!(
+            manager.text_action_at_position(first_session.x, first_session.y, 80, 20),
+            Some(TextPanelLinkTarget::PanelAction { block_id, .. }) if block_id == "session:one"
+        ));
 
         assert!(manager.exit_text_panel_context("agent"));
         let panel = &manager.text_panels["agent"];
