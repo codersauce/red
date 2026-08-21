@@ -10,6 +10,7 @@
 
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use fuzzy_matcher::skim::SkimMatcherV2;
+use rayon::prelude::*;
 use ropey::{Rope, RopeSlice};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -48,8 +49,8 @@ use super::{
 };
 
 type SelectAction = Box<dyn Fn(String) -> Action + Send>;
-type FilterAction = Box<dyn Fn(&PickerItem, &str) -> Option<i64> + Send>;
-type FilterTieBreaker = Box<dyn Fn(&PickerItem) -> usize + Send>;
+type FilterAction = Box<dyn Fn(&PickerItem, &str) -> Option<i64> + Send + Sync>;
+type FilterTieBreaker = Box<dyn Fn(&PickerItem) -> usize + Send + Sync>;
 type FilterHighlightAction = Box<dyn Fn(&PickerItem, &str) -> PickerFilterHighlights + Send>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -91,6 +92,7 @@ const LOCATION_PREVIEW_CACHE_CAPACITY: usize = 8;
 const COMMAND_COLUMN_GAP: usize = 2;
 const PICKER_ICON_WIDTH: usize = 2;
 const PICKER_ITEM_PREFIX_WIDTH: usize = 2 + PICKER_ICON_WIDTH;
+const PARALLEL_FILTER_MIN_ITEMS: usize = 1_024;
 const INTRINSIC_COLUMN_GAP: usize = 2;
 const INTRINSIC_FOOTER_GAP: usize = 4;
 
@@ -347,6 +349,8 @@ pub struct Picker {
     matcher: SkimMatcherV2,
     select_action: Option<SelectAction>,
     filter_action: Option<FilterAction>,
+    incremental_filter: bool,
+    filtered_query: Option<String>,
     filter_tie_breaker: Option<FilterTieBreaker>,
     filter_highlight_action: Option<FilterHighlightAction>,
     search: String,
@@ -524,6 +528,8 @@ impl Picker {
             matcher: SkimMatcherV2::default(),
             select_action: None,
             filter_action: None,
+            incremental_filter: false,
+            filtered_query: None,
             filter_tie_breaker: None,
             filter_highlight_action: None,
             search: String::new(),
@@ -775,36 +781,69 @@ impl Picker {
     pub fn filter(&mut self, term: &str) {
         if let Some(items) = &self.dynamic_items {
             if self.external_filter || term.is_empty() {
-                self.visible_dynamic_items = (0..items.len()).collect();
+                self.visible_dynamic_items.clear();
+                self.visible_dynamic_items.extend(0..items.len());
             } else {
-                let mut matches = items
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(index, item)| {
-                        self.filter_action
-                            .as_ref()
-                            .map_or_else(
-                                || default_filter_score(&self.matcher, &item.label, term),
-                                |filter| {
-                                    filter(item, term)
-                                        .map(|score| (PickerMatchKind::Fuzzy, Reverse(score)))
-                                },
-                            )
-                            .map(|score| {
-                                let tie_breaker = self
-                                    .filter_tie_breaker
-                                    .as_ref()
-                                    .map_or(0, |tie_breaker| tie_breaker(item));
-                                (index, score, tie_breaker)
-                            })
-                    })
-                    .collect::<Vec<_>>();
+                let filter_action = self.filter_action.as_ref();
+                let filter_tie_breaker = self.filter_tie_breaker.as_ref();
+                let matcher = &self.matcher;
+                let score_item = |index: usize| {
+                    let item = &items[index];
+                    filter_action
+                        .as_ref()
+                        .map_or_else(
+                            || default_filter_score(matcher, &item.label, term),
+                            |filter| {
+                                filter(item, term)
+                                    .map(|score| (PickerMatchKind::Fuzzy, Reverse(score)))
+                            },
+                        )
+                        .map(|score| {
+                            let tie_breaker = filter_tie_breaker
+                                .as_ref()
+                                .map_or(0, |tie_breaker| tie_breaker(item));
+                            (index, score, tie_breaker)
+                        })
+                };
+                let can_reuse_matches = self.incremental_filter
+                    && self
+                        .filtered_query
+                        .as_deref()
+                        .is_some_and(|previous| term.starts_with(previous));
+                let mut matches = if self.incremental_filter
+                    && (if can_reuse_matches {
+                        self.visible_dynamic_items.len()
+                    } else {
+                        items.len()
+                    }) >= PARALLEL_FILTER_MIN_ITEMS
+                {
+                    if can_reuse_matches {
+                        self.visible_dynamic_items
+                            .par_iter()
+                            .filter_map(|index| score_item(*index))
+                            .collect::<Vec<_>>()
+                    } else {
+                        (0..items.len())
+                            .into_par_iter()
+                            .filter_map(score_item)
+                            .collect()
+                    }
+                } else if can_reuse_matches {
+                    self.visible_dynamic_items
+                        .iter()
+                        .copied()
+                        .filter_map(score_item)
+                        .collect()
+                } else {
+                    (0..items.len()).filter_map(score_item).collect()
+                };
                 matches.sort_unstable_by_key(|(index, score, tie_breaker)| {
                     (*score, *tie_breaker, *index)
                 });
                 self.visible_dynamic_items =
                     matches.into_iter().map(|(index, _, _)| index).collect();
             }
+            self.filtered_query = Some(term.to_string());
             self.list.set_item_count(self.visible_dynamic_items.len());
             self.command_column_widths.set(None);
             return;
@@ -835,6 +874,7 @@ impl Picker {
         let previous = self.selected_item();
         self.item_preview_root = None;
         self.dynamic_items = None;
+        self.filtered_query = None;
         self.visible_dynamic_items.clear();
         self.items = items;
         let search = self.search.clone();
@@ -846,6 +886,7 @@ impl Picker {
         let previous = self.selected_item();
         self.item_preview_root = Some(root);
         self.dynamic_items = None;
+        self.filtered_query = None;
         self.visible_dynamic_items.clear();
         self.items = items;
         let search = self.search.clone();
@@ -858,6 +899,7 @@ impl Picker {
         self.item_preview_root = None;
         self.items.clear();
         self.dynamic_items = Some(items);
+        self.filtered_query = None;
         let search = self.search.clone();
         self.filter(&search);
         self.resize_to_viewport(self.viewport_width, self.viewport_height);
@@ -873,6 +915,7 @@ impl Picker {
                 let previous = self.selected_item();
                 let selected_id = self.selected_dynamic_item().map(|item| item.id.clone());
                 self.dynamic_items = Some(items);
+                self.filtered_query = None;
                 let query = self.search.clone();
                 self.filter(&query);
                 self.resize_to_viewport(self.viewport_width, self.viewport_height);
@@ -3596,6 +3639,7 @@ pub struct PickerBuilder {
     id: Option<i32>,
     select_action: Option<SelectAction>,
     filter_action: Option<FilterAction>,
+    incremental_filter: bool,
     filter_tie_breaker: Option<FilterTieBreaker>,
     filter_highlight_action: Option<FilterHighlightAction>,
     placeholder: Option<String>,
@@ -3622,6 +3666,7 @@ impl PickerBuilder {
             id: None,
             select_action: None,
             filter_action: None,
+            incremental_filter: false,
             filter_tie_breaker: None,
             filter_highlight_action: None,
             placeholder: None,
@@ -3664,16 +3709,24 @@ impl PickerBuilder {
     /// Sets the scorer used to filter structured picker rows for the current query.
     pub fn filter_action(
         mut self,
-        filter: impl Fn(&PickerItem, &str) -> Option<i64> + Send + 'static,
+        filter: impl Fn(&PickerItem, &str) -> Option<i64> + Send + Sync + 'static,
     ) -> Self {
         self.filter_action = Some(Box::new(filter));
+        self
+    }
+
+    /// Reuses prior matches when an extended query cannot match previously rejected rows.
+    ///
+    /// Custom scorers may opt in only when their matching predicate is prefix-monotonic.
+    pub(crate) fn incremental_filter(mut self) -> Self {
+        self.incremental_filter = true;
         self
     }
 
     /// Sets an ascending secondary sort key for structured rows with equal filter scores.
     pub fn filter_tie_breaker(
         mut self,
-        tie_breaker: impl Fn(&PickerItem) -> usize + Send + 'static,
+        tie_breaker: impl Fn(&PickerItem) -> usize + Send + Sync + 'static,
     ) -> Self {
         self.filter_tie_breaker = Some(Box::new(tie_breaker));
         self
@@ -3752,6 +3805,7 @@ impl PickerBuilder {
         let id = self.id;
         let select_action = self.select_action;
         let filter_action = self.filter_action;
+        let incremental_filter = self.incremental_filter;
         let filter_tie_breaker = self.filter_tie_breaker;
         let filter_highlight_action = self.filter_highlight_action;
         let placeholder = self.placeholder;
@@ -3772,6 +3826,7 @@ impl PickerBuilder {
             picker.select_action = Some(select_action);
         }
         picker.filter_action = filter_action;
+        picker.incremental_filter = incremental_filter;
         picker.filter_tie_breaker = filter_tie_breaker;
         picker.filter_highlight_action = filter_highlight_action;
         picker.placeholder = placeholder;
@@ -6642,6 +6697,141 @@ mod tests {
                 assert_eq!(visible_picker_labels(picker), labels);
             }
         }
+    }
+
+    #[test]
+    fn incremental_picker_filter_only_scores_previous_matches() {
+        let editor = test_editor();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let filter_calls = Arc::clone(&calls);
+        let mut picker = Picker::builder()
+            .structured_items(vec![
+                dynamic_item("alpha", "alpha"),
+                dynamic_item("alpine", "alpine"),
+                dynamic_item("beta", "beta"),
+                dynamic_item("alphabet", "alphabet"),
+            ])
+            .filter_action(move |item, query| {
+                filter_calls.fetch_add(1, Ordering::Relaxed);
+                item.label.contains(query).then_some(1)
+            })
+            .incremental_filter()
+            .build(&editor);
+
+        picker.filter("al");
+        assert_eq!(calls.swap(0, Ordering::Relaxed), 4);
+        assert_eq!(
+            visible_picker_labels(&picker),
+            ["alpha", "alpine", "alphabet"]
+        );
+
+        picker.filter("alp");
+        assert_eq!(calls.swap(0, Ordering::Relaxed), 3);
+        assert_eq!(
+            visible_picker_labels(&picker),
+            ["alpha", "alpine", "alphabet"]
+        );
+
+        picker.filter("alph");
+        assert_eq!(calls.swap(0, Ordering::Relaxed), 3);
+        assert_eq!(visible_picker_labels(&picker), ["alpha", "alphabet"]);
+
+        picker.filter("alpha");
+        assert_eq!(calls.swap(0, Ordering::Relaxed), 2);
+        assert_eq!(visible_picker_labels(&picker), ["alpha", "alphabet"]);
+    }
+
+    #[test]
+    fn incremental_picker_parallel_filter_preserves_stable_order_and_narrowing() {
+        let editor = test_editor();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let filter_calls = Arc::clone(&calls);
+        let item_count = super::PARALLEL_FILTER_MIN_ITEMS * 3;
+        let items = (0..item_count)
+            .map(|index| {
+                let label = if index % 2 == 0 { "alpha" } else { "beta" };
+                dynamic_item(&format!("item-{index:04}"), label)
+            })
+            .collect();
+        let mut picker = Picker::builder()
+            .structured_items(items)
+            .filter_action(move |item, query| {
+                filter_calls.fetch_add(1, Ordering::Relaxed);
+                item.label.contains(query).then_some(1)
+            })
+            .incremental_filter()
+            .build(&editor);
+
+        picker.filter("a");
+        assert_eq!(calls.swap(0, Ordering::Relaxed), item_count);
+
+        picker.filter("al");
+        assert_eq!(calls.swap(0, Ordering::Relaxed), item_count);
+        assert_eq!(
+            picker.visible_dynamic_items,
+            (0..item_count).step_by(2).collect::<Vec<_>>(),
+        );
+
+        picker.filter("alp");
+        assert_eq!(calls.swap(0, Ordering::Relaxed), item_count / 2);
+    }
+
+    #[test]
+    fn incremental_picker_filter_rescores_all_rows_when_the_query_broadens() {
+        let editor = test_editor();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let filter_calls = Arc::clone(&calls);
+        let mut picker = Picker::builder()
+            .structured_items(vec![
+                dynamic_item("alpha", "alpha"),
+                dynamic_item("alpine", "alpine"),
+                dynamic_item("beta", "beta"),
+            ])
+            .filter_action(move |item, query| {
+                filter_calls.fetch_add(1, Ordering::Relaxed);
+                item.label.contains(query).then_some(1)
+            })
+            .incremental_filter()
+            .build(&editor);
+
+        picker.filter("alp");
+        calls.store(0, Ordering::Relaxed);
+
+        picker.filter("a");
+        assert_eq!(calls.swap(0, Ordering::Relaxed), 3);
+        assert_eq!(visible_picker_labels(&picker), ["alpha", "alpine", "beta"]);
+
+        picker.filter("be");
+        assert_eq!(calls.swap(0, Ordering::Relaxed), 3);
+        assert_eq!(visible_picker_labels(&picker), ["beta"]);
+    }
+
+    #[test]
+    fn incremental_picker_filter_includes_new_rows_after_items_are_replaced() {
+        let editor = test_editor();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let filter_calls = Arc::clone(&calls);
+        let mut picker = Picker::builder()
+            .structured_items(vec![
+                dynamic_item("alpha", "alpha"),
+                dynamic_item("beta", "beta"),
+            ])
+            .filter_action(move |item, query| {
+                filter_calls.fetch_add(1, Ordering::Relaxed);
+                item.label.contains(query).then_some(1)
+            })
+            .incremental_filter()
+            .build(&editor);
+        picker.set_search("al".to_string());
+        calls.store(0, Ordering::Relaxed);
+
+        picker.replace_structured_items(vec![
+            dynamic_item("alpine", "alpine"),
+            dynamic_item("beta", "beta"),
+        ]);
+
+        assert_eq!(calls.swap(0, Ordering::Relaxed), 2);
+        assert_eq!(visible_picker_labels(&picker), ["alpine"]);
     }
 
     #[test]
