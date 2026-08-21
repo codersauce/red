@@ -404,6 +404,7 @@ Esc = { EnterMode = "Normal" }
 "w" = "NextWindow"
 "W" = "PreviousWindow"
 "p" = "PreviousWindow"
+"n" = "SplitHorizontalNewBuffer"
 "s" = "SplitHorizontal"
 "v" = "SplitVertical"
 "d" = "SplitVertical"

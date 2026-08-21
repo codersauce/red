@@ -1544,6 +1544,13 @@ impl RedHost {
                     .to_string();
                 self.send_request(PluginRequest::Action(Action::OpenBuffer(name)));
             }
+            "OpenBufferById" => {
+                let id = args
+                    .first()
+                    .and_then(value_to_u64)
+                    .ok_or_else(|| anyhow::anyhow!("OpenBufferById requires a buffer ID"))?;
+                self.send_request(PluginRequest::Action(Action::OpenBufferById(id)));
+            }
             "WatchDirectory" => {
                 let path = args
                     .first()
@@ -11213,8 +11220,9 @@ mod tests {
                 request_id,
                 serde_json::json!({
                     "buffers": [
-                        { "name": "src/main.rs", "path": "src/main.rs", "dirty": false },
-                        { "name": "[No Name]", "path": null, "dirty": true },
+                        { "id": 41, "name": "src/main.rs", "path": "src/main.rs", "dirty": false },
+                        { "id": 42, "name": "[No Name]", "path": null, "dirty": true },
+                        { "id": 43, "name": "[No Name]", "path": null, "dirty": false },
                     ],
                 }),
             )
@@ -11232,18 +11240,20 @@ mod tests {
                 assert_eq!(owner, "buffer_picker");
                 assert_eq!(title.as_deref(), Some("Buffers"));
                 assert_eq!(items[0].label, "src/main.rs");
-                assert_eq!(items[1].label, "[No Name]");
+                assert_eq!(items[1].label, "[No Name] #42");
+                assert_eq!(items[2].label, "[No Name] #43");
+                assert_ne!(items[1].id, items[2].id);
                 (handle, items)
             }
             _ => panic!("unexpected plugin request"),
         };
 
         runtime
-            .notify_picker(handle, PickerCallback::Selected(items[1].clone()))
+            .notify_picker(handle, PickerCallback::Selected(items[2].clone()))
             .unwrap();
 
         match ACTION_DISPATCHER.recv_request() {
-            PluginRequest::Action(Action::OpenBuffer(name)) => assert_eq!(name, "[No Name]"),
+            PluginRequest::Action(Action::OpenBufferById(id)) => assert_eq!(id, 43),
             _ => panic!("unexpected plugin request"),
         }
     }

@@ -28,6 +28,14 @@ Red `0.15.0` retains the complete `0.4.0`, `0.6.0`, `0.7.0`, `0.8.0`, `0.9.0`,
 `0.10.0`, `0.11.0`, `0.12.0`, and `0.14.0` contracts, so existing packages that declare those
 minors continue to load. New packages should target `"red_api_version": "^0.15.0"`.
 
+## Buffer selection
+
+`GetEditorInfo` includes a stable process-local `id` on every buffer summary.
+Use `OpenBufferById(id: i32)` to select that exact live buffer, including multiple
+unnamed buffers that all have the display name `[No Name]`. Buffer IDs survive
+buffer-list compaction but are not persistent across editor processes. The older
+`OpenBuffer(name: String)` call remains available for unambiguous buffer names.
+
 ## Document-symbol breadcrumbs
 
 Host API `0.13.0` adds `document_id` to `GetWindows` entries and successful

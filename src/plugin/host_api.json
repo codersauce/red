@@ -50,6 +50,7 @@
     { "name": "ClosePicker", "kind": "execute", "signature": "(id: i32)", "introduced": "0.1.0" },
     { "name": "OpenLocation", "kind": "execute", "signature": "(location: Location, target?: String)", "introduced": "0.1.0" },
     { "name": "OpenBuffer", "kind": "execute", "signature": "(name: String)", "introduced": "0.1.0" },
+    { "name": "OpenBufferById", "kind": "execute", "signature": "(id: i32)", "introduced": "0.15.0" },
     { "name": "WatchDirectory", "kind": "execute", "signature": "(path: String, id: i32, recursive: bool, interval_ms: i32)", "introduced": "0.1.0" },
     { "name": "UnwatchDirectory", "kind": "execute", "signature": "(id: i32)", "introduced": "0.1.0" },
     { "name": "CreateOverlay", "kind": "execute", "signature": "(id: String, config: OverlayConfig)", "introduced": "0.1.0" },

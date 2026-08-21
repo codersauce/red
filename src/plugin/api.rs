@@ -1687,6 +1687,7 @@ mod tests {
         let expected = [
             ("ShowDialog", "()"),
             ("OpenBuffer", "(name: String)"),
+            ("OpenBufferById", "(id: i32)"),
             (
                 "OpenAgentComposer",
                 "(title: String, id: i32, query: String, history: [String])",
