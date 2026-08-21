@@ -43,7 +43,7 @@ use crate::{
 use super::{
     dialog::BorderStyle,
     first_prompt_line,
-    picker_matching::{match_path, PathCandidate},
+    picker_matching::{match_path, path_match_highlights, PathCandidate},
     spinner_frame, ActionBar, ActionPriority, Component, Dialog, IconCatalog, List, ScreenRect,
     UiAction, SPINNER_FRAME_INTERVAL_MS,
 };
@@ -66,7 +66,37 @@ fn default_filter_score(
     label: &str,
     query: &str,
 ) -> Option<(PickerMatchKind, Reverse<i64>)> {
-    let candidate = PathCandidate::from_path(label);
+    default_path_filter_score(matcher, PathCandidate::from_path(label), label, query)
+}
+
+fn default_item_filter_score(
+    matcher: &SkimMatcherV2,
+    item: &PickerItem,
+    query: &str,
+) -> Option<(PickerMatchKind, Reverse<i64>)> {
+    if item.kind.as_deref() != Some("FilePath") {
+        return default_filter_score(matcher, &item.label, query);
+    }
+
+    let path = item
+        .data
+        .get("search_path")
+        .and_then(Value::as_str)
+        .unwrap_or(&item.id);
+    default_path_filter_score(
+        matcher,
+        PathCandidate::new(path, &item.label, item.annotation.as_deref()),
+        &item.label,
+        query,
+    )
+}
+
+fn default_path_filter_score(
+    matcher: &SkimMatcherV2,
+    candidate: PathCandidate<'_>,
+    label: &str,
+    query: &str,
+) -> Option<(PickerMatchKind, Reverse<i64>)> {
     let matched = match_path(matcher, candidate, query)?;
     let (kind, score) = if label == query {
         (PickerMatchKind::Exact, matched.score)
@@ -695,6 +725,28 @@ impl Picker {
         picker.live = true;
         picker.visible_dynamic_items = (0..items.len()).collect();
         picker.list.set_item_count(items.len());
+        if items
+            .iter()
+            .any(|item| item.kind.as_deref() == Some("FilePath"))
+        {
+            let matcher = SkimMatcherV2::default();
+            picker.filter_highlight_action = Some(Box::new(move |item, query| {
+                if item.kind.as_deref() == Some("FilePath") {
+                    let path = item
+                        .data
+                        .get("search_path")
+                        .and_then(Value::as_str)
+                        .unwrap_or(&item.id);
+                    path_match_highlights(
+                        &matcher,
+                        PathCandidate::new(path, &item.label, item.annotation.as_deref()),
+                        query,
+                    )
+                } else {
+                    path_match_highlights(&matcher, PathCandidate::from_path(&item.label), query)
+                }
+            }));
+        }
         picker.dynamic_items = Some(items);
         picker.external_filter = options.external_filter;
         picker.placeholder = options.placeholder;
@@ -792,7 +844,7 @@ impl Picker {
                     filter_action
                         .as_ref()
                         .map_or_else(
-                            || default_filter_score(matcher, &item.label, term),
+                            || default_item_filter_score(matcher, item, term),
                             |filter| {
                                 filter(item, term)
                                     .map(|score| (PickerMatchKind::Fuzzy, Reverse(score)))
@@ -966,6 +1018,12 @@ impl Picker {
 
     pub fn set_status(&mut self, status: Option<String>) {
         self.status = status;
+    }
+
+    /// Keeps file previews aligned with structurally shared open-buffer contents.
+    pub(crate) fn set_location_preview_contents(&mut self, contents: HashMap<String, Rope>) {
+        self.location_preview_overrides = contents;
+        self.preview_text_cache.borrow_mut().clear();
     }
 
     fn set_busy(&mut self, busy: bool) {
@@ -2580,7 +2638,12 @@ pub(crate) fn picker_kind_icon(kind: &str, style: PickerIconStyle) -> &'static s
 
 fn item_file_path(item: &PickerItem) -> Option<&str> {
     match item.kind.as_deref()? {
-        "FilePath" => Some(item.id.as_str()),
+        "FilePath" => Some(
+            item.data
+                .get("path")
+                .and_then(Value::as_str)
+                .unwrap_or(&item.id),
+        ),
         "FileMatch" => item
             .data
             .get("location")
@@ -5202,6 +5265,35 @@ mod tests {
     }
 
     #[test]
+    fn callback_picker_location_preview_uses_an_open_buffer_snapshot() {
+        let editor = test_editor();
+        let path = "/tmp/red-callback-unsaved-preview.rs".to_string();
+        let mut item = dynamic_item(&path, "unsaved.rs");
+        item.kind = Some("FilePath".to_string());
+        item.preview = Some(PickerPreview::Location {
+            path: path.clone(),
+            line: Some(0),
+            column: Some(0),
+            matches: Vec::new(),
+        });
+        let mut picker = Picker::new_callback(
+            Some("Buffers".to_string()),
+            &editor,
+            vec![item],
+            PickerHandle::from_raw(49),
+            PickerOptions::default(),
+        );
+        picker.set_location_preview_contents(HashMap::from([(
+            path.clone(),
+            Rope::from_str("let unsaved = true;\n"),
+        )]));
+
+        let preview = picker.location_preview(&path, Some(0), 0, 10);
+
+        assert_eq!(preview.text.as_ref(), "let unsaved = true;\n");
+    }
+
+    #[test]
     fn unsaved_buffer_snapshot_keeps_large_location_preview_bounded() {
         const FOCUS_LINE: usize = 4_000;
 
@@ -5429,6 +5521,29 @@ mod tests {
                 g: 165,
                 b: 132,
             })
+        );
+    }
+
+    #[test]
+    fn file_rows_with_stable_ids_use_the_path_for_their_icon() {
+        let editor = test_editor();
+        let mut item = dynamic_item("buffer:41", "main.rs");
+        item.kind = Some("FilePath".to_string());
+        item.data = json!({
+            "path": "/workspace/src/main.rs",
+            "search_path": "src/main.rs",
+        });
+        let picker = Picker::new_dynamic(
+            Some("Buffers".to_string()),
+            &editor,
+            vec![item.clone()],
+            41,
+            PickerOptions::default(),
+        );
+
+        assert_eq!(
+            picker.item_icon(&item),
+            picker_file_icon("/workspace/src/main.rs", editor.picker_icons().style)
         );
     }
 
@@ -6569,6 +6684,49 @@ mod tests {
                 .collect(),
             None => picker.list.items().iter().map(String::as_str).collect(),
         }
+    }
+
+    #[test]
+    fn dynamic_file_rows_search_and_highlight_their_workspace_relative_parent() {
+        let editor = test_editor();
+        let mut first = dynamic_item("buffer:41", "main.rs");
+        first.kind = Some("FilePath".to_string());
+        first.annotation = Some("src/editor".to_string());
+        first.data = json!({
+            "path": "/workspace/src/editor/main.rs",
+            "search_path": "src/editor/main.rs",
+        });
+        let mut second = dynamic_item("buffer:42", "main.rs");
+        second.kind = Some("FilePath".to_string());
+        second.annotation = Some("docs".to_string());
+        second.data = json!({
+            "path": "/workspace/docs/main.rs",
+            "search_path": "docs/main.rs",
+        });
+        let mut scratch = dynamic_item("buffer:9", "[No Name]");
+        scratch.kind = Some("Buffer".to_string());
+        let mut picker = Picker::new_dynamic(
+            Some("Buffers".to_string()),
+            &editor,
+            vec![first, second, scratch],
+            12,
+            PickerOptions::default(),
+        );
+
+        picker.filter("editor");
+
+        assert_eq!(visible_picker_labels(&picker), ["main.rs"]);
+        let selected = picker.selected_dynamic_item().unwrap();
+        let highlights = picker.filter_highlight_action.as_ref().unwrap()(selected, "editor");
+        assert!(highlights.label.is_empty());
+        assert!(!highlights.annotation.is_empty());
+
+        picker.filter("docs/main");
+        assert_eq!(visible_picker_labels(&picker), ["main.rs"]);
+        assert_eq!(picker.selected_dynamic_item().unwrap().id, "buffer:42");
+
+        picker.filter("no name");
+        assert_eq!(visible_picker_labels(&picker), ["[No Name]"]);
     }
 
     #[test]

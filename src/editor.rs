@@ -10606,7 +10606,25 @@ impl Editor {
                         continue;
                     }
                     let history_key = Self::picker_history_key(&title, None);
+                    let preview_paths = items
+                        .iter()
+                        .filter_map(|item| match item.preview.as_ref() {
+                            Some(PickerPreview::Location { path, .. }) => Some(path.as_str()),
+                            _ => item.data.get("path").and_then(Value::as_str),
+                        })
+                        .collect::<HashSet<_>>();
+                    let preview_contents = self
+                        .buffer_manager
+                        .iter()
+                        .filter_map(|buffer| {
+                            let path = buffer.file.as_ref()?;
+                            preview_paths
+                                .contains(path.as_str())
+                                .then(|| (path.clone(), buffer.contents_snapshot()))
+                        })
+                        .collect();
                     let mut picker = Picker::new_callback(title, self, items, handle, options);
+                    picker.set_location_preview_contents(preview_contents);
                     if let Some(history_key) = history_key {
                         let history = self.picker_history(&history_key).to_vec();
                         picker.set_history(history_key, history);
@@ -28172,12 +28190,67 @@ pub struct BufferInfo {
     id: BufferId,
     name: String,
     path: Option<String>,
+    display_path: Option<String>,
     dirty: bool,
+    active: bool,
+    alternate: bool,
+    line: usize,
+    column: usize,
 }
 
 impl From<&Editor> for EditorInfo {
     fn from(editor: &Editor) -> Self {
-        let buffers = editor.buffer_manager.iter().map(|b| b.into()).collect();
+        let active_id = editor.buffer_manager.active_buffer().map(Buffer::id);
+        let alternate_id = editor
+            .buffer_manager
+            .alternate_index()
+            .and_then(|index| editor.buffer_manager.get(index))
+            .map(Buffer::id);
+        let recent_ranks = editor
+            .buffer_manager
+            .recent_buffer_ids()
+            .rev()
+            .enumerate()
+            .map(|(rank, id)| (id, rank))
+            .collect::<HashMap<_, _>>();
+        let cwd = std::env::current_dir().ok();
+        let mut buffers = editor
+            .buffer_manager
+            .iter()
+            .map(|buffer| {
+                let active = Some(buffer.id()) == active_id;
+                let line = if active {
+                    editor.buffer_line()
+                } else {
+                    buffer.vtop.saturating_add(buffer.pos.1)
+                };
+                let grapheme_column = if active { editor.cx } else { buffer.pos.0 };
+                let column = buffer
+                    .get(line)
+                    .map(|text| grapheme_to_byte(text.trim_end_matches('\n'), grapheme_column))
+                    .unwrap_or_default();
+                let display_path = buffer.file.as_deref().map(|path| {
+                    let path = Path::new(path);
+                    cwd.as_deref()
+                        .and_then(|root| path.strip_prefix(root).ok())
+                        .unwrap_or(path)
+                        .to_string_lossy()
+                        .into_owned()
+                });
+                BufferInfo {
+                    id: buffer.id(),
+                    name: buffer.name().to_string(),
+                    path: buffer.file.clone(),
+                    display_path,
+                    dirty: buffer.is_dirty(),
+                    active,
+                    alternate: Some(buffer.id()) == alternate_id,
+                    line,
+                    column,
+                }
+            })
+            .collect::<Vec<_>>();
+        buffers.sort_by_key(|buffer| recent_ranks.get(&buffer.id).copied().unwrap_or(usize::MAX));
         let theme = editor.theme.clone();
         Self {
             buffers,
@@ -28190,17 +28263,6 @@ impl From<&Editor> for EditorInfo {
             cx: editor.cx,
             cy: editor.cy,
             vx: editor.vx,
-        }
-    }
-}
-
-impl From<&Buffer> for BufferInfo {
-    fn from(buffer: &Buffer) -> Self {
-        Self {
-            id: buffer.id(),
-            name: buffer.name().to_string(),
-            path: buffer.file.clone(),
-            dirty: buffer.is_dirty(),
         }
     }
 }
@@ -29138,6 +29200,49 @@ mod test {
         editor.set_default_register(Content::charwise("o\nt\nt\nf\n".to_string()));
 
         assert_eq!(copied.lock().unwrap().as_deref(), Some("o\nt\nt\nf\n"));
+    }
+
+    #[test]
+    fn editor_info_orders_buffers_by_recency_and_exposes_navigation_metadata() {
+        let mut editor = test_editor(80, 24);
+        let cwd = std::env::current_dir().unwrap();
+        let first = cwd.join("src/first.rs");
+        let second = cwd.join("src/second.rs");
+        let unvisited = cwd.join("docs/guide.md");
+        editor.buffer_manager.replace_buffers(vec![
+            Buffer::new(
+                Some(first.to_string_lossy().into_owned()),
+                "a😀z\n".to_string(),
+            ),
+            Buffer::new(
+                Some(second.to_string_lossy().into_owned()),
+                "second\n".to_string(),
+            ),
+            Buffer::new(
+                Some(unvisited.to_string_lossy().into_owned()),
+                "guide\n".to_string(),
+            ),
+        ]);
+        editor.buffer_manager.set_active_index(1);
+        editor.buffer_manager.set_active_index(0);
+        editor.cx = 2;
+        editor.cy = 0;
+
+        let info = editor.info();
+
+        assert_eq!(
+            info.buffers
+                .iter()
+                .map(|buffer| buffer.display_path.as_deref().unwrap())
+                .collect::<Vec<_>>(),
+            ["src/first.rs", "src/second.rs", "docs/guide.md"]
+        );
+        assert!(info.buffers[0].active);
+        assert!(!info.buffers[0].alternate);
+        assert_eq!(info.buffers[0].column, 5);
+        assert!(info.buffers[1].alternate);
+        assert!(!info.buffers[1].active);
+        assert_ne!(info.buffers[0].id, info.buffers[1].id);
     }
 
     #[tokio::test]
