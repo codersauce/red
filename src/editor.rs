@@ -25845,6 +25845,40 @@ impl Editor {
         self.cx = self.cx.min(max_cursor_x);
     }
 
+    /// Reveal wrapped EOF continuations without scrolling the cursor offscreen.
+    ///
+    /// Earlier logical lines may leave only one screen row for the final line.
+    /// Scroll those rows away until its last segment appears or the cursor's
+    /// segment reaches the top of the viewport.
+    fn reveal_last_wrapped_line(&mut self, line_index: usize, display_col: usize, height: usize) {
+        if line_index != self.last_navigable_line() {
+            return;
+        }
+
+        for _ in 0..height {
+            let Some(window) = self.active_window_with_editor_view() else {
+                break;
+            };
+            let layout = self.layout_for_window(&window);
+            let Some(cursor_segment) = layout.rows.iter().find(|segment| {
+                segment.line == line_index && segment.contains_cursor_col(display_col)
+            }) else {
+                break;
+            };
+            let last_segment_visible = layout
+                .rows
+                .iter()
+                .any(|segment| segment.line == line_index && segment.last_segment);
+            if last_segment_visible || cursor_segment.row == 0 {
+                break;
+            }
+            if !self.scroll_wrapped_viewport_down_one_screen_line() {
+                break;
+            }
+            self.cy = line_index.saturating_sub(self.vtop);
+        }
+    }
+
     fn ensure_cursor_visible(&mut self) {
         let width = self.active_content_width();
         if width == 0 {
@@ -25911,6 +25945,7 @@ impl Editor {
         }
 
         self.cy = buffer_line.saturating_sub(self.vtop);
+        self.reveal_last_wrapped_line(buffer_line, display_col, height);
     }
 
     fn start_selection(&mut self) {

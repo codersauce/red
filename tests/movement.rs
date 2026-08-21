@@ -352,6 +352,98 @@ async fn test_wrap_renders_long_line_across_screen_rows() {
 }
 
 #[tokio::test]
+async fn test_wrap_renders_final_line_at_viewport_bottom_when_enabled_by_default() {
+    for trailing_newline in [false, true] {
+        let ending = if trailing_newline { "\n" } else { "" };
+        let contents = format!("one\ntwo\nthree\nabcdefghijklmnop{ending}");
+        let buffer = Buffer::new(None, contents);
+        let mut harness = EditorHarness::with_config_and_size(buffer, Config::default(), 10, 6);
+        assert!(harness.wrap());
+
+        harness.execute_action(Action::MoveToBottom).await.unwrap();
+
+        let screen = (0..4)
+            .map(|row| harness.render_row(row).unwrap())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            screen.contains("ghijkl"),
+            "final line should wrap below its first segment \
+             (trailing newline: {trailing_newline}): {screen:?}"
+        );
+        assert!(
+            screen.contains("mnop"),
+            "final line should remain visible through its last segment \
+             (trailing newline: {trailing_newline}): {screen:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_wrap_renders_final_line_at_viewport_bottom_when_toggled_on() {
+    for trailing_newline in [false, true] {
+        let ending = if trailing_newline { "\n" } else { "" };
+        let contents = format!("one\ntwo\nthree\nabcdefghijklmnop{ending}");
+        let buffer = Buffer::new(None, contents);
+        let config = Config {
+            wrap: Some(false),
+            ..Default::default()
+        };
+        let mut harness = EditorHarness::with_config_and_size(buffer, config, 10, 6);
+
+        harness.execute_action(Action::MoveToBottom).await.unwrap();
+        harness.execute_action(Action::ToggleWrap).await.unwrap();
+
+        let screen = (0..4)
+            .map(|row| harness.render_row(row).unwrap())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            screen.contains("ghijkl"),
+            "final line should wrap below its first segment after toggling \
+             (trailing newline: {trailing_newline}): {screen:?}"
+        );
+        assert!(
+            screen.contains("mnop"),
+            "final line should remain visible through its last segment after toggling \
+             (trailing newline: {trailing_newline}): {screen:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_wrap_keeps_cursor_visible_when_final_line_exceeds_viewport_height() {
+    let contents = "one\ntwo\nthree\nabcdefghijklmnopqrstuvwxyz0123456789\n";
+    let buffer = Buffer::new(None, contents.to_string());
+    let mut harness = EditorHarness::with_config_and_size(buffer, Config::default(), 10, 6);
+
+    harness.execute_action(Action::MoveToBottom).await.unwrap();
+
+    let screen = (0..4)
+        .map(|row| harness.render_row(row).unwrap())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert_eq!(
+        harness.render_cursor_position(),
+        Some((4, 0)),
+        "the first segment should remain visible: {screen:?}"
+    );
+    for (row, expected) in [(0, "abcdef"), (1, "ghijkl"), (2, "mnopqr"), (3, "stuvwx")] {
+        assert_eq!(
+            harness
+                .render_row(row)
+                .unwrap()
+                .chars()
+                .skip(4)
+                .take(6)
+                .collect::<String>(),
+            expected,
+            "final line should fill the viewport without hiding its cursor"
+        );
+    }
+}
+
+#[tokio::test]
 async fn test_nowrap_scrolls_horizontally_as_cursor_moves() {
     let buffer = Buffer::new(None, "abcdefghijklmnopqrstuvwxyz".to_string());
     let config = Config {
@@ -466,7 +558,7 @@ async fn test_screen_line_down_updates_rendered_cursor_without_lag() {
 
 #[tokio::test]
 async fn test_screen_line_down_reveals_hidden_wrapped_segment() {
-    let content = format!("one\ntwo\nthree\n{}", "abcdefghijklmnop");
+    let content = format!("one\ntwo\nthree\n{}\nlast", "abcdefghijklmnop");
     let buffer = Buffer::new(None, content);
     let config = Config {
         wrap: Some(true),
@@ -490,7 +582,7 @@ async fn test_screen_line_down_reveals_hidden_wrapped_segment() {
 
 #[tokio::test]
 async fn test_screen_line_up_returns_from_hidden_wrapped_segment() {
-    let content = format!("one\ntwo\nthree\n{}", "abcdefghijklmnop");
+    let content = format!("one\ntwo\nthree\n{}\nlast", "abcdefghijklmnop");
     let buffer = Buffer::new(None, content);
     let config = Config {
         wrap: Some(true),
