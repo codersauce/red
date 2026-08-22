@@ -36,6 +36,7 @@ SCENARIOS = (
     "undo-prune",
     "highlight",
     "tree-selection",
+    "workspace-navigation",
     "husk-completion",
     "husk-config",
     "husk-update",

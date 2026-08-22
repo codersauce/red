@@ -68,6 +68,7 @@ navigation baselines were frozen after rebasing to `d92777c`.
 | Gutter namespace updates | 97.94% |
 | Decoration namespace updates | 97.48% |
 | Long transcript cursor lookup | 97.35% |
+| Git workspace row navigation | 96.35% |
 | Shared modal editor backward word motion | 87.58% |
 | Shared modal editor forward word motion | 87.01% |
 | Printable ASCII frame rendering | 85.25% |
@@ -96,6 +97,12 @@ and 8,192 files. In the single 8,192-entry before/after run, opening fell from
 and resident-memory growth fell from 41,120 to 39,616 KiB. The optimization
 retains one cached row position per tree rather than allocating a per-row index.
 
+A real Git-dashboard PTY run with 120 changed files confirmed the optimized
+workspace path also improves end-to-end behavior: median file-list input fell
+from 516 to 368 microseconds, full-frame rendering fell from 373 to 264
+microseconds, and diff navigation fell from 372 to 319 microseconds. File-list
+churn spawned one Git process and core-owned diff navigation spawned none.
+
 Five alternating real typing runs showed 6.04% faster median input events,
 7.44% faster median full-frame rendering, 9.27% faster process-to-first-paint
 time, 35.07% faster interactive startup, and 45.09% faster bundled plugin
@@ -105,8 +112,8 @@ objective.
 
 ## Remaining gaps
 
-- Broad process startup, full-frame typing, crash recovery, Git integration,
-  broader Vim editing, platform-specific paths,
+- Broad process startup, full-frame typing, crash recovery, repository
+  discovery and status refresh, broader Vim editing, platform-specific paths,
   and several other areas above still require dedicated before/after fixtures
   before claiming a 50% improvement.
 - An eager Neo-tree row index was intentionally rejected because it increased

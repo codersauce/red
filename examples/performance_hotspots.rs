@@ -14,7 +14,8 @@ use red::{
     plugin::{
         Decoration, DecorationAnchor, DecorationManager, GutterSign, GutterSignManager,
         PanelConfig, PanelManager, PanelRow, PanelRowKind, PanelSide, PluginRegistry, Runtime,
-        TextPanelBlock, TextPanelBlockFormat, TextPanelBlockKind, TreePanelModel,
+        TextPanelBlock, TextPanelBlockFormat, TextPanelBlockKind, TreePanelModel, WorkspaceConfig,
+        WorkspaceManager, WorkspaceModel, WorkspaceRow,
     },
     preferences::PreferencesStore,
     theme::{parse_vscode_theme, Style, Theme},
@@ -58,6 +59,8 @@ const UNDO_TRANSACTIONS: usize = 512;
 const HIGHLIGHT_REQUESTS: usize = 2_000;
 const TREE_PANEL_ROWS: usize = 8_192;
 const TREE_PANEL_LOOKUPS: usize = 256;
+const WORKSPACE_ROWS: usize = 12_000;
+const WORKSPACE_NAVIGATIONS: usize = 1_000;
 
 fn main() -> Result<()> {
     let scenario = std::env::args().nth(1).unwrap_or_else(|| "all".into());
@@ -140,6 +143,9 @@ fn main() -> Result<()> {
     }
     if scenario == "all" || scenario == "tree-selection" {
         results.push(benchmark_tree_panel_selection()?);
+    }
+    if scenario == "all" || scenario == "workspace-navigation" {
+        results.push(benchmark_workspace_navigation()?);
     }
 
     anyhow::ensure!(
@@ -766,6 +772,41 @@ fn benchmark_tree_panel_selection() -> Result<serde_json::Value> {
         "neotree_repeated_row_selection",
         started,
         TREE_PANEL_LOOKUPS,
+    ))
+}
+
+fn benchmark_workspace_navigation() -> Result<serde_json::Value> {
+    let mut workspaces = WorkspaceManager::default();
+    workspaces.open("git".to_string(), WorkspaceConfig::default());
+    let model = WorkspaceModel {
+        rows: (0..WORKSPACE_ROWS)
+            .map(|index| WorkspaceRow {
+                id: format!("file-{index:05}"),
+                selectable: true,
+                depth: 0,
+                path: Some(format!("src/file-{index:05}.rs")),
+                segments: Vec::new(),
+                right_segments: Vec::new(),
+                data: serde_json::Value::Null,
+            })
+            .collect(),
+        ..WorkspaceModel::default()
+    };
+    anyhow::ensure!(
+        workspaces.update("git", model, &Theme::default()),
+        "workspace benchmark failed to initialize rows"
+    );
+    workspaces.handle_action("last".to_string(), 40, 120);
+
+    let started = Instant::now();
+    for index in 0..WORKSPACE_NAVIGATIONS {
+        let action = if index % 2 == 0 { "up" } else { "down" };
+        black_box(workspaces.handle_action(action.to_string(), 40, 120));
+    }
+    Ok(report(
+        "git_workspace_row_navigation",
+        started,
+        WORKSPACE_NAVIGATIONS,
     ))
 }
 

@@ -551,11 +551,7 @@ impl PluginWorkspace {
         if self.rows_visible.is_empty() {
             return;
         }
-        let mut next = self
-            .rows_visible
-            .iter()
-            .position(|index| *index == self.selected)
-            .unwrap_or(0);
+        let mut next = self.rows_visible.binary_search(&self.selected).unwrap_or(0);
         loop {
             let candidate = next
                 .saturating_add_signed(delta)
@@ -619,7 +615,7 @@ impl PluginWorkspace {
                 self.rows_visible.push(index);
             }
         }
-        if !self.rows_visible.contains(&self.selected) {
+        if self.rows_visible.binary_search(&self.selected).is_err() {
             self.selected = self
                 .rows_visible
                 .iter()
@@ -675,7 +671,8 @@ impl PluginWorkspace {
             selected_index: self.selected,
             row: self
                 .rows_visible
-                .contains(&self.selected)
+                .binary_search(&self.selected)
+                .is_ok()
                 .then(|| self.model.rows.get(self.selected).cloned())
                 .flatten(),
             focus: self.focus,
@@ -716,12 +713,11 @@ impl PluginWorkspace {
                     .collect()
             })
             .unwrap_or_default();
-        if !self.detail_visible.contains(&self.detail_cursor) {
+        if let Err(position) = self.detail_visible.binary_search(&self.detail_cursor) {
             self.detail_cursor = self
                 .detail_visible
-                .iter()
+                .get(position)
                 .copied()
-                .find(|index| *index >= self.detail_cursor)
                 .or_else(|| self.detail_visible.last().copied())
                 .unwrap_or(0);
         }
@@ -772,8 +768,7 @@ impl PluginWorkspace {
         }
         let position = self
             .detail_visible
-            .iter()
-            .position(|index| *index == self.detail_cursor)
+            .binary_search(&self.detail_cursor)
             .unwrap_or(0);
         self.detail_cursor = self.detail_visible[position
             .saturating_add_signed(delta)
@@ -853,13 +848,11 @@ impl PluginWorkspace {
         if let Some(target) = target {
             let current = self
                 .detail_visible
-                .iter()
-                .position(|index| *index == self.detail_cursor)
+                .binary_search(&self.detail_cursor)
                 .unwrap_or(0);
             let target = self
                 .detail_visible
-                .iter()
-                .position(|index| *index == target)
+                .binary_search(&target)
                 .unwrap_or(current);
             self.move_detail(target as isize - current as isize, visible_rows);
         }
