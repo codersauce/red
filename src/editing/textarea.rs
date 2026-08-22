@@ -268,7 +268,12 @@ impl TextArea {
 
     /// Moves the cursor to a bounded, absolute extended-grapheme position.
     pub fn set_cursor(&mut self, cursor: usize) {
-        self.state.cursor = cursor.min(grapheme_len(&self.text()));
+        let length = if self.buffer.is_ascii() {
+            self.buffer.byte_len()
+        } else {
+            grapheme_len(&self.text())
+        };
+        self.state.cursor = cursor.min(length);
         self.state.preferred_column = None;
         self.sync_buffer_cursor();
     }
@@ -1778,6 +1783,11 @@ impl TextArea {
     }
 
     fn current_line_start(&self) -> usize {
+        if self.buffer.is_ascii() {
+            return self
+                .buffer
+                .position_to_char_idx(TextPosition::new(self.cursor_position().line, 0));
+        }
         let text = self.text();
         let byte = grapheme_to_byte(&text, self.state.cursor);
         text[..byte]
@@ -1786,6 +1796,11 @@ impl TextArea {
     }
 
     fn current_line_end(&self) -> usize {
+        if self.buffer.is_ascii() {
+            return self
+                .buffer
+                .position_to_char_idx(TextPosition::new(self.cursor_position().line, usize::MAX));
+        }
         let text = self.text();
         let byte = grapheme_to_byte(&text, self.state.cursor);
         text[byte..].find('\n').map_or_else(
@@ -1836,8 +1851,11 @@ impl TextArea {
     }
 
     fn grapheme_index_for_position(&self, position: TextPosition) -> usize {
-        let text = self.text();
         let index = self.buffer.position_to_char_idx(position);
+        if self.buffer.is_ascii() {
+            return index;
+        }
+        let text = self.text();
         let byte = text
             .char_indices()
             .nth(index)
@@ -2085,6 +2103,68 @@ mod tests {
         assert!(area.undo());
         assert_eq!(area.text(), "a👋b");
         assert_eq!(area.cursor(), 2);
+    }
+
+    #[test]
+    fn indexed_ascii_cursor_positions_match_unicode_aware_reference_boundaries() {
+        let samples = [
+            "",
+            "\n",
+            "\n\n",
+            "alpha",
+            "alpha\nbravo\ncharlie",
+            "alpha\n\nbravo\n",
+            "\t leading spaces\t\nnext\tline",
+            "normalized\r\nwindows\rnewlines",
+            "e\u{301} 👨‍👩‍👧\n漢字 🇧🇷",
+            "\u{301}leading\ntrailing\u{200d}",
+        ];
+
+        for sample in samples {
+            let mut area = TextArea::new(sample);
+            let contents = area.text();
+            let grapheme_count = crate::unicode_utils::grapheme_len(&contents);
+            for cursor in 0..=grapheme_count + 2 {
+                area.set_cursor(cursor);
+                let bounded = cursor.min(grapheme_count);
+                let byte = super::grapheme_to_byte(&contents, bounded);
+                let expected_start = contents[..byte].rfind('\n').map_or(0, |index| {
+                    crate::unicode_utils::grapheme_len(&contents[..index + 1])
+                });
+                let expected_end = contents[byte..].find('\n').map_or_else(
+                    || crate::unicode_utils::grapheme_len(&contents),
+                    |index| crate::unicode_utils::grapheme_len(&contents[..byte + index]),
+                );
+                assert_eq!(area.cursor(), bounded, "{sample:?} at cursor {cursor}");
+                assert_eq!(
+                    area.current_line_start(),
+                    expected_start,
+                    "{sample:?} at cursor {cursor}"
+                );
+                assert_eq!(
+                    area.current_line_end(),
+                    expected_end,
+                    "{sample:?} at cursor {cursor}"
+                );
+
+                for line in 0..=area.buffer.len() + 1 {
+                    for character in [0, 1, 2, 32, usize::MAX] {
+                        let position = crate::undo::TextPosition::new(line, character);
+                        let index = area.buffer.position_to_char_idx(position);
+                        let byte = contents
+                            .char_indices()
+                            .nth(index)
+                            .map_or(contents.len(), |(byte, _)| byte);
+                        let expected = crate::unicode_utils::grapheme_len(&contents[..byte]);
+                        assert_eq!(
+                            area.grapheme_index_for_position(position),
+                            expected,
+                            "{sample:?} at line {line}, character {character}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]

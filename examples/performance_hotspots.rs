@@ -3,12 +3,13 @@
 use std::{hint::black_box, time::Instant};
 
 use anyhow::Result;
+use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 use red::{
     agent_conversation::AgentConversationSnapshot,
     buffer::Buffer,
     config::Config,
     editing::{MotionResolver, TextArea},
-    editor::{DetachedEditorCore, Editor, RenderBuffer, SearchDirection},
+    editor::{DetachedEditorCore, Editor, Mode, RenderBuffer, SearchDirection},
     highlighter::Highlighter,
     inline_history::{InlineConversation, InlineHistory, InlineHistoryTurn},
     lsp::{LspManager, RealLspClient},
@@ -96,6 +97,7 @@ const TEXTAREA_DOCUMENT_LOADS: usize = 128;
 const GIT_STATUS_FILES: usize = 2_048;
 const GIT_STATUS_INDEX_BUILDS: usize = 32;
 const LAYOUT_CURSOR_LOOKUPS: usize = 2_048;
+const TEXTAREA_VIM_MOTIONS: usize = 2_048;
 
 fn main() -> Result<()> {
     let scenario = std::env::args().nth(1).unwrap_or_else(|| "all".into());
@@ -244,6 +246,12 @@ fn main() -> Result<()> {
     }
     if scenario == "all" || scenario == "layout-word-cursor" {
         results.push(benchmark_layout_cursor_lookup(WrapMode::Word)?);
+    }
+    if scenario == "all" || scenario == "textarea-vim-word" {
+        results.push(benchmark_embedded_vim_motion(/*line_motion*/ false)?);
+    }
+    if scenario == "all" || scenario == "textarea-vim-line" {
+        results.push(benchmark_embedded_vim_motion(/*line_motion*/ true)?);
     }
 
     anyhow::ensure!(
@@ -1648,6 +1656,45 @@ fn benchmark_layout_cursor_lookup(mode: WrapMode) -> Result<serde_json::Value> {
         },
         started,
         LAYOUT_CURSOR_LOOKUPS,
+    ))
+}
+
+fn benchmark_embedded_vim_motion(line_motion: bool) -> Result<serde_json::Value> {
+    let line = "ordinary_identifier another_editor_word and more ascii content\n";
+    let mut area = TextArea::new(line.repeat(512));
+    let origin = line.len() * 256;
+    area.set_mode(Mode::Normal);
+    area.set_cursor(origin);
+    let first = Event::Key(KeyEvent::new(
+        KeyCode::Char(if line_motion { '$' } else { 'w' }),
+        KeyModifiers::NONE,
+    ));
+    let second = Event::Key(KeyEvent::new(
+        KeyCode::Char(if line_motion { '0' } else { 'b' }),
+        KeyModifiers::NONE,
+    ));
+
+    let started = Instant::now();
+    for index in 0..TEXTAREA_VIM_MOTIONS {
+        let event = if index % 2 == 0 { &first } else { &second };
+        anyhow::ensure!(
+            area.handle_event(black_box(event), 120) == red::editing::TextAreaOutcome::Changed,
+            "embedded Vim motion was not handled"
+        );
+        black_box(area.cursor());
+    }
+    anyhow::ensure!(
+        area.cursor() == origin && area.mode() == Mode::Normal,
+        "embedded Vim motion lost its cursor or Normal mode"
+    );
+    Ok(report(
+        if line_motion {
+            "embedded_vim_line_boundary_motions"
+        } else {
+            "embedded_vim_word_motions"
+        },
+        started,
+        TEXTAREA_VIM_MOTIONS,
     ))
 }
 

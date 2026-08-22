@@ -69,7 +69,9 @@ navigation baselines were frozen after rebasing to `d92777c`.
 | Multi-file process startup loading | 98.92% |
 | Husk unchanged document updates | 98.44% |
 | Viewport cursor snapshot updates | 98.58% |
+| Embedded Vim line-boundary motions | 98.48% |
 | Gutter namespace updates | 97.94% |
+| Embedded Vim word motions | 97.88% |
 | Decoration namespace updates | 97.48% |
 | Long transcript cursor lookup | 97.35% |
 | Character-wrapped layout cursor lookup | 97.29% |
@@ -129,6 +131,13 @@ lookup medians from 12,941 to 439 microseconds. Both paths retain existing
 duplicate-position and equidistant-column tie-breaking, omitted soft-wrap
 separators, Unicode graphemes, wide characters, tabs, hard breaks, blank rows,
 and zero-width view behavior.
+
+Embedded Vim motions were measured over 2,048 real Normal-mode input events
+against a 512-line production `TextArea`. Eleven alternating release-build
+samples reduced `w`/`b` word-motion medians from 186,095 to 3,950 microseconds
+and `$`/`0` line-boundary medians from 116,150 to 1,760 microseconds. Indexed
+ASCII cursor conversion retains empty and trailing lines, normalized CRLF,
+bounded positions, combining marks, emoji, and the unchanged Unicode fallback.
 
 Multi-file startup uses the same production loader as the executable. Across
 four startup passes over 128 distinct source files, seven alternating samples

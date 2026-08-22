@@ -58,6 +58,8 @@ SCENARIOS = (
     "git-status-index",
     "layout-grapheme-cursor",
     "layout-word-cursor",
+    "textarea-vim-word",
+    "textarea-vim-line",
     "husk-completion",
     "husk-config",
     "husk-update",
