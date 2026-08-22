@@ -3,6 +3,8 @@
 
 Build first with `cargo build --locked --release`, then run:
     python3 scripts/git_workspace_bench.py --files 80 --presses 120
+
+Use `--binary /path/to/red` to compare frozen before/after release binaries.
 """
 
 import argparse
@@ -21,7 +23,6 @@ import time
 
 
 ROOT = Path(__file__).resolve().parent.parent
-BIN = ROOT / "target" / "release" / "red"
 TIMING = re.compile(r"\[PERF\] (\S+)(?: (.*?))?: (\d+)us")
 
 
@@ -100,8 +101,6 @@ def print_samples(title, samples, invocations):
 
 
 def run(args):
-    if not BIN.exists():
-        raise SystemExit("build the release binary first: cargo build --locked --release")
     with tempfile.TemporaryDirectory(prefix="red-git-workspace-perf-") as temp_name:
         temp = Path(temp_name)
         repository = temp / "repository"
@@ -123,7 +122,7 @@ def run(args):
         )
         process = subprocess.Popen(
             [
-                str(BIN),
+                str(args.binary),
                 "--root",
                 str(repository),
                 "--config-override",
@@ -236,12 +235,16 @@ def run(args):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--binary", type=Path, default=ROOT / "target/release/red")
     parser.add_argument("--files", type=int, default=80)
     parser.add_argument("--presses", type=int, default=120)
     parser.add_argument("--delay-ms", type=float, default=2)
     parser.add_argument("--rows", type=int, default=30)
     parser.add_argument("--cols", type=int, default=100)
     args = parser.parse_args()
+    args.binary = args.binary.resolve()
+    if not args.binary.is_file():
+        parser.error(f"release binary does not exist: {args.binary}")
     if args.files < 2 or args.presses < 1 or args.delay_ms < 0:
         parser.error("files >= 2, presses >= 1, and delay-ms >= 0 are required")
     run(args)

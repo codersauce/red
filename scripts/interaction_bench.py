@@ -40,7 +40,8 @@ def send_keys(master, keys, delay):
 
 
 def run(args):
-    if not BIN.exists():
+    binary = Path(args.binary).resolve()
+    if not binary.is_file():
         raise SystemExit("build the release binary first: cargo build --locked --release")
 
     file_path = Path(args.file).resolve()
@@ -55,7 +56,10 @@ def run(args):
         config_dir = temp / "red"
         config_dir.mkdir()
         log = temp / "red.log"
-        (config_dir / "config.toml").write_text(f'log_file = "{log}"\n', encoding="utf-8")
+        (config_dir / "config.toml").write_text(
+            f'log_file = "{log}"\nshow_whats_new = false\nfetch_release_notes = false\n',
+            encoding="utf-8",
+        )
 
         master, slave = pty.openpty()
         fcntl.ioctl(
@@ -64,7 +68,7 @@ def run(args):
             struct.pack("HHHH", args.rows, args.cols, 0, 0),
         )
         argv = [
-            str(BIN),
+            str(binary),
             "--root",
             str(root),
             "--config-override",
@@ -118,6 +122,38 @@ def run(args):
         time.sleep(0.4)
         os.write(master, b"100j")
         time.sleep(0.25)
+        if args.scenario == "typing" and args.typing_context != "source":
+            if args.typing_context == "heading":
+                position = b"0f 8l"
+            elif args.typing_context == "identifier":
+                position = b"0fr5l"
+            elif args.typing_context == "comment":
+                extension = file_path.suffix.lower()
+                if args.comment_marker is not None:
+                    marker = args.comment_marker.encode()
+                elif extension == ".lua":
+                    marker = b"-"
+                elif extension in {
+                    ".toml",
+                    ".yaml",
+                    ".yml",
+                    ".sh",
+                    ".bash",
+                    ".zsh",
+                    ".fish",
+                    ".ps1",
+                    ".psm1",
+                    ".psd1",
+                    ".gitcommit",
+                }:
+                    marker = b"#"
+                else:
+                    marker = b"/"
+                position = b"0f" + marker + b"12l"
+            else:
+                position = b'0f"10l'
+            os.write(master, position)
+            time.sleep(0.1)
         with log.open("a", encoding="utf-8") as stream:
             stream.write("[BENCH] begin\n")
         bytes_before = drained[0]
@@ -127,7 +163,12 @@ def run(args):
         if args.scenario == "typing":
             os.write(master, b"i")
             for index in range(args.cycles):
-                os.write(master, b"a" if index % 2 == 0 else "\u03bb".encode())
+                if args.typing_context == "identifier":
+                    inserted = b"x" if index % 2 == 0 else b"y"
+                else:
+                    punctuation = b"." if args.typing_context != "source" else b"a"
+                    inserted = punctuation if index % 2 == 0 else "\u03bb".encode()
+                os.write(master, inserted)
                 time.sleep(delay)
             os.write(master, b"\x1b")
         elif args.scenario == "search":
@@ -181,6 +222,14 @@ def run(args):
                     label = f"{label} {detail.split()[0]}"
                 samples[label].append(micros)
 
+        if args.scenario == "typing":
+            observed_edits = len(samples.get("edit:replace_char", []))
+            if observed_edits < args.cycles:
+                raise SystemExit(
+                    "typing benchmark did not observe the expected text insertions "
+                    f"({observed_edits}/{args.cycles}); a modal dialog may be intercepting input"
+                )
+
         print(
             f"\n=== {args.scenario} {args.rows}x{args.cols}, cycles={args.cycles}, "
             f"delay={args.delay_ms:g}ms, first-paint={first_paint_ms:.1f}ms, "
@@ -200,6 +249,7 @@ def run(args):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--binary", default=str(BIN), help="editor binary to benchmark")
     parser.add_argument("scenario", choices=("typing", "search", "picker"))
     parser.add_argument("--file", default=str(ROOT / "src" / "editor.rs"))
     parser.add_argument("--root", default=str(ROOT))
@@ -210,6 +260,17 @@ def main():
     parser.add_argument("--delay-ms", type=float, default=10)
     parser.add_argument("--picker-load-wait", type=float, default=1.5)
     parser.add_argument("--startup-timeout", type=float, default=12)
+    parser.add_argument(
+        "--typing-context",
+        choices=("source", "comment", "string", "heading", "identifier"),
+        default="source",
+        help="place typing inside source, a line comment, string, Markdown heading, or identifier",
+    )
+    parser.add_argument(
+        "--comment-marker",
+        choices=("/", "#", "-"),
+        help="override the line-comment marker for an injected fenced language",
+    )
     parser.add_argument("--config-override", action="append", default=[])
     args = parser.parse_args()
     if args.cycles is None:

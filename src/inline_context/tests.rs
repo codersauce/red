@@ -138,6 +138,118 @@ async fn inline_context_rejects_unsafe_ignored_binary_and_oversized_files() {
             "{forbidden}"
         );
     }
+
+    let found = snapshot(root.path())
+        .execute(InlineContextCall::SearchFiles {
+            query: "needle".into(),
+        })
+        .await
+        .unwrap();
+    let matches = found["matches"].as_array().unwrap();
+    assert!(matches.iter().any(|entry| entry["path"] == "safe.c"));
+    for forbidden in [
+        "ignored.c",
+        ".env",
+        "credential.txt",
+        "private.pem",
+        "secrets/value.c",
+        ".git/config",
+        "link.c",
+    ] {
+        assert!(
+            !matches.iter().any(|entry| entry["path"] == forbidden),
+            "searched restricted path {forbidden}"
+        );
+    }
+}
+
+#[test]
+fn inline_workspace_reader_remains_anchored_and_rejects_replaced_symlinks() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("workspace");
+    std::fs::create_dir(&root).unwrap();
+    std::fs::write(root.join("source.rs"), "original\n").unwrap();
+    let reader = crate::codex::InlineWorkspaceReader::new(&root).unwrap();
+
+    let original = directory.path().join("original");
+    std::fs::rename(&root, &original).unwrap();
+    std::fs::create_dir(&root).unwrap();
+    std::fs::write(root.join("source.rs"), "replacement\n").unwrap();
+    assert_eq!(
+        reader.read("source.rs", MAX_FILE_BYTES).unwrap(),
+        Some("original\n".to_string())
+    );
+
+    let outside = directory.path().join("outside.rs");
+    std::fs::write(&outside, "private\n").unwrap();
+    std::fs::remove_file(original.join("source.rs")).unwrap();
+    symlink(&outside, original.join("source.rs")).unwrap();
+    assert!(reader.read("source.rs", MAX_FILE_BYTES).unwrap().is_none());
+    assert!(reader.read("../outside.rs", MAX_FILE_BYTES).is_err());
+    assert!(reader.read("/etc/passwd", MAX_FILE_BYTES).is_err());
+}
+
+#[tokio::test]
+async fn inline_context_listing_preserves_nested_ignores_and_path_boundaries() {
+    let root = tempfile::tempdir().unwrap();
+    git(root.path(), &["init", "-q"]);
+    std::fs::write(root.path().join(".gitignore"), "*.tmp\n!kept.tmp\n").unwrap();
+    std::fs::write(root.path().join("ignored.tmp"), "ignored\n").unwrap();
+    std::fs::write(root.path().join("kept.tmp"), "visible\n").unwrap();
+    std::fs::create_dir(root.path().join("nested")).unwrap();
+    std::fs::write(root.path().join("nested/.ignore"), "ignored.rs\n").unwrap();
+    std::fs::write(root.path().join("nested/ignored.rs"), "ignored\n").unwrap();
+    std::fs::write(root.path().join("nested/visible.rs"), "visible\n").unwrap();
+    std::fs::create_dir(root.path().join("Credentials")).unwrap();
+    std::fs::write(root.path().join("Credentials/value.rs"), "private\n").unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    std::fs::write(outside.path().join("outside.rs"), "private\n").unwrap();
+    symlink(outside.path(), root.path().join("outside-link")).unwrap();
+    symlink(
+        outside.path().join("outside.rs"),
+        root.path().join("outside.rs"),
+    )
+    .unwrap();
+
+    let files = snapshot(root.path())
+        .execute(InlineContextCall::ListFiles {})
+        .await
+        .unwrap();
+    let files = files["files"].as_array().unwrap();
+    for allowed in ["kept.tmp", "nested/visible.rs"] {
+        assert!(files.contains(&json!(allowed)), "missing {allowed}");
+    }
+    for forbidden in [
+        "ignored.tmp",
+        "nested/ignored.rs",
+        "Credentials/value.rs",
+        ".git/config",
+        ".GIT/config",
+        "outside-link/outside.rs",
+        "outside.rs",
+    ] {
+        assert!(!files.contains(&json!(forbidden)), "disclosed {forbidden}");
+    }
+}
+
+#[tokio::test]
+async fn inline_context_listing_rejects_symlinked_workspace_roots() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("workspace");
+    std::fs::create_dir(&root).unwrap();
+    let alias = directory.path().join("alias");
+    symlink(&root, &alias).unwrap();
+    let context = InlineContextSnapshot {
+        root: alias,
+        visible: BTreeMap::new(),
+        allow_sensitive_paths: false,
+    };
+
+    let error = context
+        .execute(InlineContextCall::ListFiles {})
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("symlink"), "{error}");
 }
 
 #[tokio::test]

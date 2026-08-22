@@ -2375,6 +2375,7 @@ dependencies = [
  "tree-sitter-toml-ng",
  "tree-sitter-typescript",
  "tree-sitter-yaml",
+ "unicode-ident",
  "unicode-linebreak",
  "unicode-segmentation",
  "unicode-width 0.2.1",

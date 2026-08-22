@@ -43,7 +43,7 @@ use red::lsp::{LspClient, LspManager};
 use red::preferences::PreferencesStore;
 use red::session::SessionStore;
 use red::theme::{parse_vscode_theme, parse_vscode_theme_contents, Theme};
-use red::utils::{expand_user_path, same_file_path};
+use red::utils::expand_user_path;
 use red::{log, run_self_check, LOGGER};
 
 #[cfg(unix)]
@@ -1192,21 +1192,7 @@ fn resolve_log_path(config_dir: &Path, configured_path: &str) -> anyhow::Result<
 }
 
 async fn load_startup_buffers(files: &[String]) -> anyhow::Result<Vec<Buffer>> {
-    let mut buffers = Vec::with_capacity(files.len());
-    for file in files {
-        let buffer = Buffer::load_or_create(Some(file.clone())).await?;
-        let duplicate = buffer.file.as_deref().is_some_and(|candidate| {
-            buffers.iter().any(|open: &Buffer| {
-                open.file
-                    .as_deref()
-                    .is_some_and(|open| same_file_path(Path::new(open), Path::new(candidate)))
-            })
-        });
-        if !duplicate {
-            buffers.push(buffer);
-        }
-    }
-    Ok(buffers)
+    red::buffer::load_startup_buffers(files).await
 }
 
 #[cfg(test)]

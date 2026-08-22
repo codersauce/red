@@ -71,6 +71,45 @@ pub(super) fn apply_workspace_settings(
     }
 }
 
+/// Keep Rust analysis responsive unless explicit configuration requests eager priming.
+pub(super) fn apply_fast_startup_defaults(config: &mut LanguageServerConfig, language_id: &str) {
+    if language_id != "rust" {
+        return;
+    }
+
+    let configured = config
+        .initialization_options
+        .as_ref()
+        .and_then(|options| options.get("cachePriming")?.get("enable"))
+        .or_else(|| {
+            config
+                .settings
+                .as_ref()?
+                .get("rust-analyzer")?
+                .get("cachePriming")?
+                .get("enable")
+        })
+        .or_else(|| {
+            config
+                .settings
+                .as_ref()?
+                .get("rust-analyzer.cachePriming.enable")
+        })
+        .cloned()
+        .unwrap_or(Value::Bool(false));
+
+    let _ = insert_missing(
+        &mut config.initialization_options,
+        &["cachePriming", "enable"],
+        &configured,
+    );
+    let _ = insert_missing(
+        &mut config.settings,
+        &["rust-analyzer", "cachePriming", "enable"],
+        &configured,
+    );
+}
+
 fn find_settings_file(workspace_root: &Path) -> Option<PathBuf> {
     let repository_root = workspace_root
         .ancestors()
@@ -291,6 +330,39 @@ mod tests {
             config.settings.as_ref().unwrap()["rust-analyzer"]["rustfmt"]["extraArgs"],
             expected
         );
+    }
+
+    #[test]
+    fn fast_startup_disables_cache_priming_without_overriding_explicit_values() {
+        let mut config = rust_server();
+        apply_fast_startup_defaults(&mut config, "rust");
+        assert_eq!(
+            config.initialization_options.as_ref().unwrap()["cachePriming"]["enable"],
+            json!(false)
+        );
+        assert_eq!(
+            config.settings.as_ref().unwrap()["rust-analyzer"]["cachePriming"]["enable"],
+            json!(false)
+        );
+
+        let mut explicit = rust_server();
+        explicit.initialization_options = Some(json!({
+            "cachePriming": { "enable": true }
+        }));
+        apply_fast_startup_defaults(&mut explicit, "rust");
+        assert_eq!(
+            explicit.initialization_options.as_ref().unwrap()["cachePriming"]["enable"],
+            json!(true)
+        );
+        assert_eq!(
+            explicit.settings.as_ref().unwrap()["rust-analyzer"]["cachePriming"]["enable"],
+            json!(true)
+        );
+
+        let mut other_language = rust_server();
+        apply_fast_startup_defaults(&mut other_language, "python");
+        assert!(other_language.initialization_options.is_none());
+        assert!(other_language.settings.is_none());
     }
 
     #[test]

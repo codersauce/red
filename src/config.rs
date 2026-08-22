@@ -1718,6 +1718,7 @@ impl Config {
         let mut disabled_servers = HashSet::new();
         let mut disable_agent = false;
         let mut disable_lsp = false;
+        let mut validated_config = None;
 
         if !contents.trim().is_empty() {
             let mut user_value = match toml::from_str::<toml::Value>(contents) {
@@ -1744,38 +1745,44 @@ impl Config {
             let table = user_value.as_table().ok_or_else(|| {
                 anyhow::anyhow!("user config must contain a top-level TOML table")
             })?;
-            for (key, value) in sorted_table_entries(table) {
-                let unit_path = vec![key.to_string()];
-                if !known_top_level_field(key) {
-                    diagnostics.push(diagnostic_for_path(
-                        contents,
-                        source.clone(),
-                        "CFG101",
-                        ConfigDiagnosticSeverity::Warning,
-                        &unit_path,
-                        "unknown configuration field; it was ignored".to_string(),
-                        "no setting was applied".to_string(),
-                    ));
-                    continue;
-                }
+            validated_config = try_merge_valid_user_config(&base_value, &user_value);
+            if validated_config.is_none() {
+                for (key, value) in sorted_table_entries(table) {
+                    let unit_path = vec![key.to_string()];
+                    if !known_top_level_field(key) {
+                        diagnostics.push(diagnostic_for_path(
+                            contents,
+                            source.clone(),
+                            "CFG101",
+                            ConfigDiagnosticSeverity::Warning,
+                            &unit_path,
+                            "unknown configuration field; it was ignored".to_string(),
+                            "no setting was applied".to_string(),
+                        ));
+                        continue;
+                    }
 
-                apply_user_value(
-                    &mut base_value,
-                    value.clone(),
-                    &unit_path,
-                    contents,
-                    &source,
-                    &mut diagnostics,
-                    &mut disabled_plugins,
-                    &mut disabled_permissions,
-                    &mut disabled_servers,
-                    &mut disable_agent,
-                    &mut disable_lsp,
-                );
+                    apply_user_value(
+                        &mut base_value,
+                        value.clone(),
+                        &unit_path,
+                        contents,
+                        &source,
+                        &mut diagnostics,
+                        &mut disabled_plugins,
+                        &mut disabled_permissions,
+                        &mut disabled_servers,
+                        &mut disable_agent,
+                        &mut disable_lsp,
+                    );
+                }
             }
         }
 
-        let mut config = deserialize_config(base_value)?;
+        let mut config = match validated_config {
+            Some(config) => config,
+            None => deserialize_config(base_value)?,
+        };
         for plugin in disabled_plugins {
             config.plugins.remove(&plugin);
         }
@@ -1950,6 +1957,38 @@ fn deserialize_config(value: toml::Value) -> anyhow::Result<Config> {
         .map_err(|error| anyhow::anyhow!("failed to deserialize merged config: {error}"))?;
     config.apply_disabled_plugins();
     Ok(config)
+}
+
+/// Accepts ordinary valid settings together while preserving granular recovery.
+///
+/// Capability-bearing sections and dynamic entries retain their existing
+/// field-by-field validation because their replacement and quarantine rules
+/// cannot be expressed as a plain recursive table merge.
+fn try_merge_valid_user_config(base: &toml::Value, user: &toml::Value) -> Option<Config> {
+    let table = user.as_table()?;
+    if table.keys().any(|key| {
+        matches!(
+            key.as_str(),
+            "keys"
+                | "plugins"
+                | "plugin_permissions"
+                | "plugin_config"
+                | "agent"
+                | "languages"
+                | "matchit"
+        )
+    }) || table
+        .get("lsp")
+        .and_then(toml::Value::as_table)
+        .is_some_and(|lsp| lsp.contains_key("servers"))
+        || first_unknown_path(user, &[]).is_some()
+    {
+        return None;
+    }
+
+    let mut candidate = base.clone();
+    merge_config_values(&mut candidate, user.clone(), &[]);
+    deserialize_config(candidate).ok()
 }
 
 fn safe_loaded_config(path: &Path, code: &str, message: String) -> anyhow::Result<LoadedConfig> {
@@ -3067,6 +3106,94 @@ wrap = "yes"
             loaded.config.keys.normal.get("x"),
             Some(&KeyAction::Single(Action::MoveScreenLineDown))
         );
+    }
+
+    #[test]
+    fn valid_configuration_sections_merge_once_without_losing_defaults_or_overrides() {
+        let loaded = Config::load_user_toml(
+            r#"
+scrolloff = 4
+wrap = false
+
+[search]
+ignorecase = true
+smartcase = false
+
+[completion]
+enabled = true
+auto_trigger = false
+max_buffer_words = 2048
+
+[formatting]
+on_save = false
+
+[key_hints]
+enabled = false
+delay_ms = 75
+"#,
+            Path::new("/tmp/config.toml"),
+            &["completion.max_buffer_words = 4096".to_string()],
+        )
+        .unwrap();
+
+        assert!(loaded.is_clean());
+        assert_eq!(loaded.config.scrolloff, Some(4));
+        assert_eq!(loaded.config.wrap, Some(false));
+        assert!(loaded.config.search.ignorecase);
+        assert!(!loaded.config.search.smartcase);
+        assert!(!loaded.config.completion.auto_trigger);
+        assert_eq!(loaded.config.completion.max_buffer_words, 4096);
+        assert!(!loaded.config.formatting.on_save);
+        assert!(!loaded.config.key_hints.enabled);
+        assert!(loaded.config.plugins.contains_key("theme_browser"));
+    }
+
+    #[test]
+    fn bulk_configuration_falls_back_for_unknown_and_invalid_sibling_settings() {
+        let loaded = Config::load_user_toml(
+            r#"
+scrolloff = 6
+
+[completion]
+auto_trigger = false
+debounce_ms = "soon"
+unknown_setting = true
+"#,
+            Path::new("/tmp/config.toml"),
+            &[],
+        )
+        .unwrap();
+
+        assert_eq!(loaded.recovery, ConfigRecovery::Partial);
+        assert_eq!(loaded.config.scrolloff, Some(6));
+        assert!(!loaded.config.completion.auto_trigger);
+        assert!(loaded.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "CFG102" && diagnostic.path == "completion.debounce_ms"
+        }));
+        assert!(loaded.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "CFG101" && diagnostic.path == "completion.unknown_setting"
+        }));
+    }
+
+    #[test]
+    fn bulk_configuration_never_bypasses_capability_or_dynamic_entry_validation() {
+        let base = embedded_config_value().unwrap();
+        for source in [
+            "[keys.normal]\nx = 'MoveDown'",
+            "[plugins]\ncustom = 'custom.hk'",
+            "[plugin_permissions.custom]\nprocess = ['git']",
+            "[plugin_config.custom]\nenabled = true",
+            "[agent]\ncommand = '/custom/codex'",
+            "[languages.custom]\nextensions = ['custom']",
+            "[matchit]\nenabled = true",
+            "[lsp.servers.custom]\ncommand = 'custom-lsp'",
+        ] {
+            let value = toml::from_str(source).unwrap();
+            assert!(
+                try_merge_valid_user_config(&base, &value).is_none(),
+                "{source}"
+            );
+        }
     }
 
     #[test]

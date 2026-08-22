@@ -135,19 +135,21 @@ impl TextLayout {
         if row >= self.rows.len() {
             return None;
         }
+        let row_start = self
+            .positions
+            .partition_point(|position| position.row < row);
+        let row_len = self.positions[row_start..].partition_point(|position| position.row == row);
+        let positions = &self.positions[row_start..row_start + row_len];
         if self.wrap_mode == WrapMode::Grapheme {
-            return self
-                .positions
+            return positions
                 .iter()
                 .enumerate()
-                .filter(|(_, position)| position.row == row)
                 .min_by_key(|(_, position)| position.column.abs_diff(column))
-                .map(|(offset, _)| offset);
+                .map(|(offset, _)| row_start + offset);
         }
-        self.positions
+        positions
             .iter()
             .enumerate()
-            .filter(|(_, position)| position.row == row)
             .min_by_key(|(offset, position)| {
                 (
                     position.column.abs_diff(column),
@@ -155,7 +157,7 @@ impl TextLayout {
                     Reverse(*offset),
                 )
             })
-            .map(|(offset, _)| offset)
+            .map(|(offset, _)| row_start + offset)
     }
 }
 
@@ -497,6 +499,77 @@ mod tests {
         );
         let wide = TextLayout::new("漢x", LayoutOptions::word(4));
         assert_eq!(wide.nearest_offset_on_row(0, 1), Some(0));
+    }
+
+    #[test]
+    fn indexed_cursor_lookup_preserves_linear_scan_tie_breaks_for_both_wrap_modes() {
+        let samples = [
+            "",
+            "\n",
+            "\n\n",
+            "abcd\n",
+            "one two three",
+            "one   two",
+            "hello world",
+            "  leading   and trailing  ",
+            "\t\tword\t next\t",
+            "漢字かな カナ",
+            "e\u{301} 👨‍👩‍👧‍👦 🇧🇷 x",
+            "abcd\u{200b}\u{200d}x\u{301}",
+            "\u{301}a\u{200b}\n",
+            "non\u{a0}breaking narrow\u{202f}space",
+            "https://example.test/a-very-long-path?q=one_two",
+            "\r\nlast\r",
+        ];
+
+        for text in samples {
+            for width in 0..=16 {
+                for wrap_mode in [WrapMode::Grapheme, WrapMode::Word] {
+                    let layout = TextLayout::new(
+                        text,
+                        LayoutOptions {
+                            wrap_mode,
+                            ..LayoutOptions::grapheme(width)
+                        },
+                    );
+                    for row in 0..=layout.rows().len() {
+                        for column in 0..=width + 2 {
+                            let expected = if row >= layout.rows().len() {
+                                None
+                            } else if wrap_mode == WrapMode::Grapheme {
+                                layout
+                                    .positions()
+                                    .iter()
+                                    .enumerate()
+                                    .filter(|(_, position)| position.row == row)
+                                    .min_by_key(|(_, position)| position.column.abs_diff(column))
+                                    .map(|(offset, _)| offset)
+                            } else {
+                                layout
+                                    .positions()
+                                    .iter()
+                                    .enumerate()
+                                    .filter(|(_, position)| position.row == row)
+                                    .min_by_key(|(offset, position)| {
+                                        (
+                                            position.column.abs_diff(column),
+                                            position.column,
+                                            Reverse(*offset),
+                                        )
+                                    })
+                                    .map(|(offset, _)| offset)
+                            };
+                            assert_eq!(
+                                layout.nearest_offset_on_row(row, column),
+                                expected,
+                                "{text:?} at width {width}, row {row}, column {column}, \
+                                 mode {wrap_mode:?}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]

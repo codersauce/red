@@ -55,10 +55,12 @@ mod signature_help;
 mod snippet;
 
 use std::{
+    borrow::Cow,
     cell::RefCell,
     cmp::Ordering,
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
     ffi::OsStr,
+    fmt::Write as _,
     fs,
     io::Write as _,
     num::NonZeroUsize,
@@ -237,6 +239,9 @@ const AGENT_EVENTS_PER_TICK: usize = 64;
 const GUTTER_SIGN_COLUMN_WIDTH: usize = 2;
 const DIAGNOSTIC_GUTTER_NAMESPACE: &str = "diagnostics";
 const MAX_HIGHLIGHT_SLICE_BYTES: usize = 512 * 1024;
+const MAX_MARKDOWN_FENCE_LOOKBACK_LINES: usize = 256;
+const MAX_SEARCH_HISTORY_ENTRIES: usize = 6;
+const MAX_SEARCH_HISTORY_MATCHES_PER_ENTRY: usize = 16_384;
 const MAX_PLUGIN_VIEWPORT_LINE_CHARS: usize = 64 * 1024;
 const MAX_AGENT_FAILURE_MESSAGE_CHARS: usize = 2048;
 const AGENT_BRIDGE_CAPACITY: usize = 64;
@@ -302,6 +307,12 @@ fn diagnostic_foreground(theme: &Theme, severity: Option<&DiagnosticSeverity>) -
         .or_else(|| theme.error_style.as_ref().and_then(|style| style.fg)),
     }
     .or(theme.style.fg)
+}
+
+#[inline(never)]
+fn append_viewport_indentation_key(key: &mut String, line: usize, width: usize, text: &str) {
+    write!(key, "{line}:{width}:{};", u8::from(text.trim().is_empty()))
+        .expect("writing an indentation key into a string cannot fail");
 }
 
 #[cfg(not(test))]
@@ -1023,7 +1034,7 @@ pub enum SubstituteDecision {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PlannedSubstitution {
     start_char: usize,
-    end_char: usize,
+    range: TextRange,
     replacement: String,
 }
 
@@ -1114,24 +1125,52 @@ fn expanded_path_string(path: &str) -> anyhow::Result<String> {
     Ok(expand_user_path(path)?.to_string_lossy().into_owned())
 }
 
+#[derive(Default)]
+struct SnapshotFileIdentities {
+    paths: HashSet<PathBuf>,
+    #[cfg(unix)]
+    files: HashSet<(u64, u64)>,
+}
+
+impl SnapshotFileIdentities {
+    fn insert(&mut self, path: PathBuf) -> bool {
+        if self.paths.contains(&path) {
+            return false;
+        }
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+
+            if fs::metadata(&path)
+                .ok()
+                .is_some_and(|metadata| !self.files.insert((metadata.dev(), metadata.ino())))
+            {
+                return false;
+            }
+        }
+
+        #[cfg(not(unix))]
+        if self
+            .paths
+            .iter()
+            .any(|existing| same_file_path(existing, &path))
+        {
+            return false;
+        }
+
+        self.paths.insert(path)
+    }
+}
+
 fn snapshot_duplicate_file_count(snapshot: &SessionSnapshot) -> usize {
-    let mut unique_paths = Vec::<PathBuf>::new();
+    let mut unique_paths = SnapshotFileIdentities::default();
     snapshot
         .buffers
         .iter()
         .filter_map(|buffer| buffer.path.as_deref())
         .filter_map(|path| normalized_file_path(path).ok())
-        .filter(|path| {
-            if unique_paths
-                .iter()
-                .any(|unique| same_file_path(unique, path))
-            {
-                true
-            } else {
-                unique_paths.push(path.clone());
-                false
-            }
-        })
+        .filter(|path| !unique_paths.insert(path.clone()))
         .count()
 }
 
@@ -2879,7 +2918,7 @@ pub enum Mode {
     VisualBlock,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 /// Concrete syntax style over a UTF-8 byte range.
 pub struct StyleInfo {
     /// Inclusive byte offset.
@@ -3011,6 +3050,19 @@ impl<'a> StyleCursor<'a> {
             })
             .map(|index| &self.spans[index].style)
     }
+
+    fn next_change(&self) -> Option<usize> {
+        self.spans
+            .get(self.next)
+            .map(|span| span.start)
+            .into_iter()
+            .chain(self.active.iter().map(|index| self.spans[*index].end))
+            .min()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.spans.is_empty()
+    }
 }
 
 fn style_info_to_highlight_spans(style_info: Vec<StyleInfo>) -> Vec<HighlightSpan> {
@@ -3122,7 +3174,10 @@ enum TerminalCursorState {
 
 #[derive(Debug, Default)]
 struct StatuslineGitCache {
+    /// Red selects its process working directory before constructing the editor.
+    working_directory: PathBuf,
     search_dir: Option<PathBuf>,
+    search_directory_identity: Option<(u64, u64)>,
     repository_root: Option<PathBuf>,
     branch: Option<String>,
     changes: Option<StatuslineGitChanges>,
@@ -3260,6 +3315,9 @@ pub struct Editor {
 
     /// Picker callbacks may enqueue navigation that must commit before the next input event.
     service_background_before_next_input: bool,
+
+    /// Rows changed by the most recent detached frame, reused for protocol deltas.
+    last_detached_changed_rows: Vec<usize>,
 
     /// Active window represented by the last committed frame.
     last_rendered_window: Option<WindowId>,
@@ -3465,6 +3523,9 @@ pub struct Editor {
     /// Matches for the most recently rendered or previewed search.
     search_match_cache: Option<SearchMatchCache>,
 
+    /// Bounded prior queries reused when an incremental search is edited.
+    search_match_history: VecDeque<SearchMatchCache>,
+
     /// Whether persistent hlsearch rendering has been cleared with :noh.
     search_highlights_suppressed: bool,
 
@@ -3568,6 +3629,8 @@ pub struct DetachedEditorCore {
     revision: u64,
     rows: Vec<String>,
     row_spans: Vec<Vec<crate::headless::StyledSpan>>,
+    serialized_render_generation: u64,
+    serialized_width: usize,
     cursor: (usize, usize),
     cursor_state: crate::terminal_output::CursorState,
     stopped: bool,
@@ -3610,6 +3673,8 @@ impl DetachedEditorCore {
             .render_cursor_position()
             .unwrap_or((editor.cx, editor.cy));
         let cursor_state = editor.terminal_cursor_state();
+        let serialized_render_generation = editor.render_generation;
+        let serialized_width = render_buffer.width;
         Ok(Self {
             editor,
             runtime,
@@ -3617,6 +3682,8 @@ impl DetachedEditorCore {
             revision: 0,
             rows,
             row_spans,
+            serialized_render_generation,
+            serialized_width,
             cursor,
             cursor_state,
             stopped: false,
@@ -3768,6 +3835,35 @@ impl DetachedEditorCore {
         self.pending_paste.clear();
     }
 
+    #[doc(hidden)]
+    pub fn benchmark_incremental_frame(
+        &mut self,
+        iteration: usize,
+    ) -> anyhow::Result<crate::headless::RenderDelta> {
+        let row = self.render_buffer.height / 2;
+        let text = if iteration.is_multiple_of(2) {
+            "a"
+        } else {
+            "b"
+        };
+        self.render_buffer.set_text(0, row, text, &Style::default());
+        let previous = self
+            .editor
+            .previous_render_buffer
+            .as_mut()
+            .expect("detached initialization commits an initial frame");
+        let changes = self.render_buffer.diff(previous);
+        previous.apply_changes(&changes);
+        self.editor.last_detached_changed_rows.clear();
+        for change in &changes {
+            if self.editor.last_detached_changed_rows.last() != Some(&change.y) {
+                self.editor.last_detached_changed_rows.push(change.y);
+            }
+        }
+        self.editor.render_generation = self.editor.render_generation.wrapping_add(1);
+        self.finish_render()
+    }
+
     /// Prepares a pending release modal only after a client authenticates.
     pub fn prepare_startup_whats_new(&mut self) -> anyhow::Result<bool> {
         if !self.editor.prepare_startup_whats_new() {
@@ -3814,21 +3910,68 @@ impl DetachedEditorCore {
 
     fn finish_render(&mut self) -> anyhow::Result<crate::headless::RenderDelta> {
         let _span = perf::PerfSpan::start("detach:serialize_frame");
-        let next_rows = render_text_rows(&self.render_buffer);
-        let next_row_spans = render_styled_rows(&self.render_buffer, &self.editor.theme.style);
         let next_cursor = self
             .editor
             .render_cursor_position()
             .unwrap_or((self.editor.cx, self.editor.cy));
         let next_cursor_state = self.editor.terminal_cursor_state();
-        let changed = next_rows != self.rows
-            || next_row_spans != self.row_spans
-            || next_cursor != self.cursor
-            || next_cursor_state != self.cursor_state;
-        if changed {
+        let generation_delta = self
+            .editor
+            .render_generation
+            .wrapping_sub(self.serialized_render_generation);
+        let dimensions_unchanged = self.render_buffer.width == self.serialized_width
+            && self.render_buffer.height == self.rows.len()
+            && self.row_spans.len() == self.rows.len();
+        let lines = if dimensions_unchanged && generation_delta <= 1 {
+            if generation_delta == 0 {
+                Vec::new()
+            } else {
+                self.serialize_changed_rows()
+            }
+        } else {
+            self.serialize_full_frame()
+        };
+        if !lines.is_empty() || next_cursor != self.cursor || next_cursor_state != self.cursor_state
+        {
             self.revision = self.revision.saturating_add(1);
         }
-        let lines: Vec<_> = next_rows
+        perf::gauge_max("detach:changed_rows", lines.len() as u64);
+        self.serialized_render_generation = self.editor.render_generation;
+        self.serialized_width = self.render_buffer.width;
+        self.cursor = next_cursor;
+        self.cursor_state = next_cursor_state;
+        Ok(crate::headless::RenderDelta {
+            revision: self.revision,
+            lines,
+            cursor: self.cursor,
+            cursor_state: Some(self.cursor_state),
+        })
+    }
+
+    fn serialize_changed_rows(&mut self) -> Vec<crate::headless::LinePatch> {
+        let mut lines = Vec::with_capacity(self.editor.last_detached_changed_rows.len());
+        for &row in &self.editor.last_detached_changed_rows {
+            let start = row.saturating_mul(self.render_buffer.width);
+            let end = start.saturating_add(self.render_buffer.width);
+            let Some(cells) = self.render_buffer.cells.get(start..end) else {
+                continue;
+            };
+            let text = render_text_row(cells);
+            let spans = render_styled_row(cells, &self.editor.theme.style);
+            if self.rows.get(row) == Some(&text) && self.row_spans.get(row) == Some(&spans) {
+                continue;
+            }
+            self.rows[row].clone_from(&text);
+            self.row_spans[row].clone_from(&spans);
+            lines.push(crate::headless::LinePatch { row, text, spans });
+        }
+        lines
+    }
+
+    fn serialize_full_frame(&mut self) -> Vec<crate::headless::LinePatch> {
+        let next_rows = render_text_rows(&self.render_buffer);
+        let next_row_spans = render_styled_rows(&self.render_buffer, &self.editor.theme.style);
+        let lines = next_rows
             .iter()
             .enumerate()
             .filter(|(row, text)| {
@@ -3841,17 +3984,9 @@ impl DetachedEditorCore {
                 spans: next_row_spans.get(row).cloned().unwrap_or_default(),
             })
             .collect();
-        perf::gauge_max("detach:changed_rows", lines.len() as u64);
         self.rows = next_rows;
         self.row_spans = next_row_spans;
-        self.cursor = next_cursor;
-        self.cursor_state = next_cursor_state;
-        Ok(crate::headless::RenderDelta {
-            revision: self.revision,
-            lines,
-            cursor: self.cursor,
-            cursor_state: Some(self.cursor_state),
-        })
+        lines
     }
 }
 
@@ -3859,16 +3994,18 @@ fn render_text_rows(buffer: &RenderBuffer) -> Vec<String> {
     buffer
         .cells
         .chunks(buffer.width.max(1))
-        .map(|row| {
-            let mut text = String::new();
-            let mut column = 0;
-            while let Some(cell) = row.get(column) {
-                text.push_str(&cell.text);
-                column += display_width(&cell.text).max(1);
-            }
-            text
-        })
+        .map(render_text_row)
         .collect()
+}
+
+fn render_text_row(row: &[render_buffer::Cell]) -> String {
+    let mut text = String::new();
+    let mut column = 0;
+    while let Some(cell) = row.get(column) {
+        text.push_str(&cell.text);
+        column += display_width(&cell.text).max(1);
+    }
+    text
 }
 
 fn render_styled_rows(
@@ -3878,31 +4015,36 @@ fn render_styled_rows(
     buffer
         .cells
         .chunks(buffer.width.max(1))
-        .map(|row| {
-            let mut spans: Vec<crate::headless::StyledSpan> = Vec::new();
-            let mut column = 0;
-            while let Some(cell) = row.get(column) {
-                let (fg, bg) = rendering::resolve_cell_colors(&cell.style, theme_style);
-                let style = Style {
-                    fg: Some(fg),
-                    bg: Some(bg),
-                    bold: cell.style.bold,
-                    italic: cell.style.italic,
-                    underline: cell.style.underline,
-                };
-                if let Some(span) = spans.last_mut().filter(|span| span.style == style) {
-                    span.text.push_str(&cell.text);
-                } else {
-                    spans.push(crate::headless::StyledSpan {
-                        text: cell.text.clone(),
-                        style,
-                    });
-                }
-                column += display_width(&cell.text).max(1);
-            }
-            spans
-        })
+        .map(|row| render_styled_row(row, theme_style))
         .collect()
+}
+
+fn render_styled_row(
+    row: &[render_buffer::Cell],
+    theme_style: &Style,
+) -> Vec<crate::headless::StyledSpan> {
+    let mut spans: Vec<crate::headless::StyledSpan> = Vec::new();
+    let mut column = 0;
+    while let Some(cell) = row.get(column) {
+        let (fg, bg) = rendering::resolve_cell_colors(&cell.style, theme_style);
+        let style = Style {
+            fg: Some(fg),
+            bg: Some(bg),
+            bold: cell.style.bold,
+            italic: cell.style.italic,
+            underline: cell.style.underline,
+        };
+        if let Some(span) = spans.last_mut().filter(|span| span.style == style) {
+            span.text.push_str(&cell.text);
+        } else {
+            spans.push(crate::headless::StyledSpan {
+                text: cell.text.clone(),
+                style,
+            });
+        }
+        column += display_width(&cell.text).max(1);
+    }
+    spans
 }
 
 fn detached_input_to_crossterm(event: crate::headless::InputEvent) -> Event {
@@ -4050,6 +4192,7 @@ struct EditorEventSnapshot {
     width: usize,
     height: usize,
     buffer_index: usize,
+    buffer_revision: u64,
     window_id: Option<WindowId>,
     windows: Vec<WindowLayoutEventSnapshot>,
 }
@@ -4756,7 +4899,10 @@ impl Editor {
             language_config_path: Config::path("config.toml"),
             language_config_overrides: Vec::new(),
             theme,
-            statusline_git_cache: StatuslineGitCache::default(),
+            statusline_git_cache: StatuslineGitCache {
+                working_directory: get_workspace_path(),
+                ..StatuslineGitCache::default()
+            },
             plugin_registry,
             plugin_catalog: BTreeMap::new(),
             plugin_catalog_url: plugin::catalog::catalog_url(),
@@ -4786,6 +4932,7 @@ impl Editor {
             suppress_reactivation_click: false,
             render_generation: 0,
             service_background_before_next_input: false,
+            last_detached_changed_rows: Vec::new(),
             last_rendered_window: None,
             last_rendered_viewport: None,
             splash_shown: false,
@@ -4857,6 +5004,7 @@ impl Editor {
             search_direction: SearchDirection::Forward,
             active_search: None,
             search_match_cache: None,
+            search_match_history: VecDeque::new(),
             search_highlights_suppressed: false,
             notifications: NotificationCenter::default(),
             message_browser: None,
@@ -6425,6 +6573,7 @@ impl Editor {
         let content_start = gutter_width + 1;
         let content_width = self.window_content_width(&window);
         let indentation = self.indentation();
+        let mut indentation_key = String::with_capacity(layout.rows.len() * 8);
         let rows = layout
             .rows
             .iter()
@@ -6441,6 +6590,14 @@ impl Editor {
                 let text = text.trim_end_matches(['\r', '\n']);
                 let indent_width =
                     leading_whitespace_display_width(text, indentation.tab_width.max(1));
+                if segment.first_segment {
+                    append_viewport_indentation_key(
+                        &mut indentation_key,
+                        segment.line,
+                        indent_width,
+                        text,
+                    );
+                }
                 json!({
                     "screen_row": segment.row,
                     "line": segment.line,
@@ -6478,6 +6635,7 @@ impl Editor {
                 "shift_width": indentation.shift_width,
                 "tab_width": indentation.tab_width,
             },
+            "indentation_key": indentation_key,
             "line_count": buffer.navigable_line_count(),
             "revision": buffer.revision(),
             "file": buffer.file,
@@ -6579,9 +6737,26 @@ impl Editor {
         line: usize,
         grapheme_index: usize,
     ) -> usize {
-        self.buffer_manager
-            .get(buffer_index)
-            .and_then(|buffer| buffer.get(line))
+        let Some(buffer) = self.buffer_manager.get(buffer_index) else {
+            return grapheme_index;
+        };
+        if buffer.is_ascii() {
+            let contents = buffer.contents_snapshot();
+            let Some(text) = contents.get_line(line) else {
+                return grapheme_index;
+            };
+            let length = text.len_chars();
+            let character = grapheme_index.min(length);
+            if character.saturating_add(1) == length
+                && text.get_char(character) == Some('\n')
+                && text.get_char(character.saturating_sub(1)) == Some('\r')
+            {
+                return length;
+            }
+            return character;
+        }
+        buffer
+            .get(line)
             .map(|text| {
                 text.graphemes(true)
                     .take(grapheme_index)
@@ -6616,29 +6791,59 @@ impl Editor {
 
     /// Returns the display width of the current line
     fn line_length(&self) -> usize {
-        if let Some(line) = self.viewport_line(self.cy) {
-            let line = line.trim_end_matches('\n');
-            return grapheme_len(line);
-        }
-        0
+        self.length_for_line(self.buffer_line())
     }
 
     fn grapheme_to_char_on_line(&self, x: usize, y: usize) -> usize {
-        self.current_buffer()
+        if x == 0 {
+            return 0;
+        }
+        let buffer = self.current_buffer();
+        if buffer.is_ascii() {
+            let contents = buffer.contents_snapshot();
+            return contents
+                .get_line(y)
+                .map(|line| {
+                    let length = line.len_chars();
+                    let newline = line.get_char(length.saturating_sub(1)) == Some('\n');
+                    x.min(length.saturating_sub(usize::from(newline)))
+                })
+                .unwrap_or(x);
+        }
+        buffer
             .get(y)
             .map(|line| grapheme_to_char(line.trim_end_matches('\n'), x))
             .unwrap_or(x)
     }
 
     fn char_to_grapheme_on_line(&self, x: usize, y: usize) -> usize {
-        self.current_buffer()
+        let buffer = self.current_buffer();
+        if buffer.is_ascii() {
+            return self.grapheme_to_char_on_line(x, y);
+        }
+        buffer
             .get(y)
             .map(|line| char_to_grapheme(line.trim_end_matches('\n'), x))
             .unwrap_or(x)
     }
 
     fn next_word_search_char_on_line(&self, x: usize, y: usize) -> usize {
-        let Some(line) = self.current_buffer().get(y) else {
+        let buffer = self.current_buffer();
+        if buffer.is_ascii() {
+            let contents = buffer.contents_snapshot();
+            let Some(line) = contents.get_line(y) else {
+                return x;
+            };
+            let length = line.len_chars();
+            let newline = line.get_char(length.saturating_sub(1)) == Some('\n');
+            let length = length.saturating_sub(usize::from(newline));
+            return if x > 0 && x < length && line.get_char(x).is_some_and(char::is_whitespace) {
+                x - 1
+            } else {
+                x.min(length)
+            };
+        }
+        let Some(line) = buffer.get(y) else {
             return x;
         };
         let line = line.trim_end_matches('\n');
@@ -6665,7 +6870,19 @@ impl Editor {
     }
 
     fn length_for_line(&self, n: usize) -> usize {
-        if let Some(line) = self.current_buffer().get(n) {
+        let buffer = self.current_buffer();
+        if buffer.is_ascii() {
+            let contents = buffer.contents_snapshot();
+            return contents
+                .get_line(n)
+                .map(|line| {
+                    let length = line.len_chars();
+                    let newline = line.get_char(length.saturating_sub(1)) == Some('\n');
+                    length.saturating_sub(usize::from(newline))
+                })
+                .unwrap_or_default();
+        }
+        if let Some(line) = buffer.get(n) {
             let line = line.trim_end_matches('\n');
             return grapheme_len(line);
         }
@@ -6810,6 +7027,11 @@ impl Editor {
             } else {
                 vtop.saturating_sub(margin)
             };
+            if language_id.as_deref() == Some("markdown") {
+                if let Some(fence_start) = Self::markdown_fence_start(buffer, vtop) {
+                    parse_start = parse_start.min(fence_start);
+                }
+            }
             let mut parse_end = (vtop + height + margin).min(line_count);
 
             if buffer.line_range_byte_len(parse_start, parse_end) > MAX_HIGHLIGHT_SLICE_BYTES {
@@ -6821,15 +7043,8 @@ impl Editor {
                 }
             }
 
-            let mut text = String::new();
-            let mut line_offsets = Vec::with_capacity(parse_end - parse_start + 1);
-            for line in parse_start..parse_end {
-                line_offsets.push(text.len());
-                if let Some(line) = buffer.get(line) {
-                    text.push_str(&line);
-                }
-            }
-            line_offsets.push(text.len());
+            let (text, line_offsets) =
+                buffer.line_range_contents_with_offsets(parse_start, parse_end);
 
             let spans = self.highlight_spans_for_language(language_id.as_deref(), &text)?;
             if self.highlight_cache.len() >= 32 {
@@ -6866,6 +7081,52 @@ impl Editor {
                 style: span.style.clone(),
             })
             .collect())
+    }
+
+    fn markdown_fence_start(buffer: &Buffer, viewport_start: usize) -> Option<usize> {
+        let mut inspected_bytes = 0_usize;
+        for (offset, line) in buffer
+            .preceding_lines(viewport_start)
+            .take(MAX_MARKDOWN_FENCE_LOOKBACK_LINES)
+            .enumerate()
+        {
+            inspected_bytes = inspected_bytes.saturating_add(line.len_bytes());
+            if inspected_bytes > 64 * 1024 {
+                return None;
+            }
+            let joined;
+            let source = if let Some(source) = line.as_str() {
+                source
+            } else {
+                joined = line.to_string();
+                &joined
+            };
+            let trimmed = source.trim_end_matches(['\r', '\n']);
+            let indentation = trimmed.len() - trimmed.trim_start_matches(' ').len();
+            if indentation > 3 {
+                continue;
+            }
+            let marker = &trimmed[indentation..];
+            let Some(character @ ('`' | '~')) = marker.chars().next() else {
+                continue;
+            };
+            let marker_length = marker
+                .bytes()
+                .take_while(|byte| *byte == character as u8)
+                .count();
+            if marker_length < 3 {
+                continue;
+            }
+            let information = marker[marker_length..].trim();
+            if information.is_empty() {
+                return None;
+            }
+            if character == '`' && information.contains('`') {
+                continue;
+            }
+            return Some(viewport_start - offset - 1);
+        }
+        None
     }
 
     pub fn draw_line_diagnostics(&mut self, buffer: &mut RenderBuffer, line_num: usize) {
@@ -7028,6 +7289,28 @@ impl Editor {
     }
 
     fn current_cursor_display_col(&self) -> usize {
+        let buffer = self.current_buffer();
+        if buffer.is_ascii() {
+            let contents = buffer.contents_snapshot();
+            let Some(line) = contents.get_line(self.buffer_line()) else {
+                return self.cx;
+            };
+            let mut length = line.len_chars();
+            if line.get_char(length.saturating_sub(1)) == Some('\n') {
+                length -= 1;
+            }
+            if line.get_char(length.saturating_sub(1)) == Some('\r') {
+                length -= 1;
+            }
+            let cursor = self.cx.min(length);
+            if line
+                .slice(..cursor)
+                .chunks()
+                .all(crate::unicode_utils::is_printable_ascii)
+            {
+                return cursor;
+            }
+        }
         if let Some(line) = self.current_line_contents() {
             return grapheme_to_column_with_tabs(
                 trim_line_ending(&line),
@@ -7548,6 +7831,7 @@ impl Editor {
             width,
             height,
             buffer_index: self.buffer_manager.active_index(),
+            buffer_revision: self.current_buffer().revision(),
             window_id: self.window_manager.active_stable_window_id(),
             windows: self
                 .window_manager
@@ -7602,35 +7886,55 @@ impl Editor {
             || before.width != after.width
             || before.height != after.height;
         let windows_changed = layout_changed || before.buffer_index != after.buffer_index;
-        self.refresh_plugin_snapshots(
-            runtime,
-            cursor_changed || viewport_changed,
-            windows_changed,
-            false,
-        )?;
+        let updated_cursor_only = cursor_changed
+            && !viewport_changed
+            && !windows_changed
+            && before.buffer_revision == after.buffer_revision
+            && self.active_window_with_editor_view().is_some_and(|window| {
+                runtime.update_viewport_cursor(json!({
+                    "x": window.cx,
+                    "y": window.vtop + window.cy,
+                    "lsp_character": self.lsp_character_for_cursor(
+                        window.buffer_index,
+                        window.vtop + window.cy,
+                        window.cx,
+                    ),
+                    "screen_row": window.cy,
+                }))
+            });
+        if !updated_cursor_only {
+            self.refresh_plugin_snapshots(
+                runtime,
+                cursor_changed || viewport_changed,
+                windows_changed,
+                false,
+            )?;
+        }
 
-        let current_window_ids = after
-            .windows
-            .iter()
-            .map(|window| window.id)
-            .collect::<HashSet<_>>();
-        for window_id in before
-            .windows
-            .iter()
-            .map(|window| window.id)
-            .filter(|window_id| !current_window_ids.contains(window_id))
-        {
-            self.window_bar_manager.close_window(window_id);
-            self.plugin_registry
-                .notify(
-                    runtime,
-                    "window:closed",
-                    json!({
-                        "window_id": window_id.0,
-                        "cause": cause,
-                    }),
-                )
-                .await?;
+        if before.windows != after.windows {
+            let current_window_ids = after
+                .windows
+                .iter()
+                .map(|window| window.id)
+                .collect::<HashSet<_>>();
+            for window_id in before
+                .windows
+                .iter()
+                .map(|window| window.id)
+                .filter(|window_id| !current_window_ids.contains(window_id))
+            {
+                self.window_bar_manager.close_window(window_id);
+                self.plugin_registry
+                    .notify(
+                        runtime,
+                        "window:closed",
+                        json!({
+                            "window_id": window_id.0,
+                            "cause": cause,
+                        }),
+                    )
+                    .await?;
+            }
         }
 
         if before.window_id != after.window_id {
@@ -7775,6 +8079,29 @@ impl Editor {
         let has_display_row_margin = scrolloff > 0
             && (self.wrap || has_comments)
             && self.active_window_with_editor_view().is_some_and(|window| {
+                if self.edit_batch.is_active()
+                    && self.wrap
+                    && !has_comments
+                    && buffer_line == 0
+                    && self.vtop == 0
+                    && self.skipcol == 0
+                    && self.visible_inline_suggestion().is_none()
+                {
+                    let width = self.window_content_width(&window);
+                    let rows = viewport_height.saturating_sub(scrolloff);
+                    // Break-indent always retains at least 20 text cells. Reserve
+                    // another cell per row for a clipped wide grapheme, so this
+                    // only bypasses layout when the cursor provably fits above
+                    // the bottom scroll margin even in the worst case.
+                    let continuation_width = width.min(20).saturating_sub(1).max(1);
+                    let guaranteed_visible_columns = width
+                        .saturating_sub(1)
+                        .saturating_add(rows.saturating_sub(1).saturating_mul(continuation_width));
+                    if self.current_cursor_display_col() < guaranteed_visible_columns {
+                        return true;
+                    }
+                }
+
                 let layout = self.layout_for_window(&window);
                 let display_col = self.current_cursor_display_col();
                 self.viewport_cursor_row_bounds(&layout)
@@ -9271,6 +9598,32 @@ impl Editor {
         // initialization are not lost.
         event::poll(Duration::from_millis(0))?;
 
+        let mut startup_highlighters = Vec::new();
+        if let Some(language) =
+            self.highlight_language_id_for_buffer_index(self.buffer_manager.active_index())
+        {
+            if let Some(prepared) = self.highlighter.prepare_language_in_background(&language) {
+                startup_highlighters.push(prepared);
+            }
+            if language == "markdown" {
+                let end = usize::from(self.size.1).saturating_mul(2);
+                let source = self.current_buffer();
+                if source.line_range_byte_len(0, end) <= MAX_HIGHLIGHT_SLICE_BYTES {
+                    let visible = source.line_range_contents(0, end);
+                    for injection in self
+                        .highlighter
+                        .startup_injected_language_ids(&language, &visible)
+                    {
+                        if let Some(prepared) =
+                            self.highlighter.prepare_language_in_background(&injection)
+                        {
+                            startup_highlighters.push(prepared);
+                        }
+                    }
+                }
+            }
+        }
+
         {
             let plugin_startup = perf::PerfSpan::start("startup:plugins");
             self.refresh_plugin_snapshots(runtime, true, true, true)?;
@@ -9297,6 +9650,9 @@ impl Editor {
         self.resize_terminal_surface(columns, rows, &mut buffer);
         self.prepare_startup_welcome();
         self.prepare_startup_whats_new();
+        for prepared in startup_highlighters {
+            self.highlighter.finish_prepared_language(prepared);
+        }
         self.render(&mut buffer)?;
         self.mark_whats_new_presented();
         drop(interactive_startup);
@@ -10196,6 +10552,7 @@ impl Editor {
         let mut needs_render = false;
         let mut needs_motion_render = false;
         let mut needs_editor_windows_render = inline_activity_changed && !full_animation_changed;
+        let mut pending_progress = Vec::<ProgressParams>::new();
 
         // Always pump LSP responses: this completes initialization and flushes
         // queued document updates even when diagnostics are hidden. A bounded
@@ -10204,6 +10561,38 @@ impl Editor {
         for _ in 0..LSP_MESSAGES_PER_TICK {
             match self.lsp.recv_response().await {
                 Ok(Some((msg, method))) => {
+                    if let InboundMessage::Notification(ParsedNotification::Progress(progress)) =
+                        &msg
+                    {
+                        let kind = progress
+                            .kind
+                            .as_deref()
+                            .or_else(|| progress.value.get("kind").and_then(Value::as_str));
+                        if kind == Some("report") {
+                            if let Some(pending) = pending_progress.iter_mut().find(|pending| {
+                                pending.token == progress.token
+                                    && pending.lsp_client == progress.lsp_client
+                            }) {
+                                *pending = progress.clone();
+                            } else {
+                                pending_progress.push(progress.clone());
+                            }
+                            continue;
+                        }
+
+                        if let Some(index) = pending_progress.iter().position(|pending| {
+                            pending.token == progress.token
+                                && pending.lsp_client == progress.lsp_client
+                        }) {
+                            self.dispatch_lsp_progress(
+                                pending_progress.remove(index),
+                                buffer,
+                                runtime,
+                            )
+                            .await?;
+                        }
+                    }
+
                     // Progress only changes the editor surface when one of its
                     // listeners submits an actual overlay update below.
                     let progress_only = matches!(
@@ -10244,6 +10633,10 @@ impl Editor {
                     break;
                 }
             }
+        }
+        for progress in pending_progress {
+            self.dispatch_lsp_progress(progress, buffer, runtime)
+                .await?;
         }
 
         // Startup refreshes form short request chains. Drain a bounded batch so each
@@ -13055,6 +13448,19 @@ impl Editor {
         Some(Action::ShowProgress(progress_params.clone()))
     }
 
+    async fn dispatch_lsp_progress(
+        &mut self,
+        progress: ProgressParams,
+        buffer: &mut RenderBuffer,
+        runtime: &mut Runtime,
+    ) -> anyhow::Result<()> {
+        let message = InboundMessage::Notification(ParsedNotification::Progress(progress));
+        if let Some(action) = self.handle_lsp_message(&message, None) {
+            self.execute(&action, buffer, runtime).await?;
+        }
+        Ok(())
+    }
+
     fn completion_filter_for_response(&self, msg: &ResponseMessage) -> Option<String> {
         let req = msg.request.as_ref()?;
         let params = req.params.as_object()?;
@@ -15733,30 +16139,68 @@ impl Editor {
             .build()
             .map_err(|error| anyhow::anyhow!("invalid substitute pattern: {error}"))?;
         let mut substitutions = Vec::new();
-        for line_index in command.start_line..=end_line {
-            let line = self.current_buffer().get(line_index).unwrap_or_default();
-            let line = line
+        let snapshot = self.current_buffer().contents_snapshot();
+        let mut line_start = snapshot.line_to_char(command.start_line);
+        for (offset, contents) in snapshot
+            .lines_at(command.start_line)
+            .take(end_line - command.start_line + 1)
+            .enumerate()
+        {
+            let line_index = command.start_line + offset;
+            let next_line_start = line_start + contents.len_chars();
+            let contents = contents
+                .as_str()
+                .map(Cow::Borrowed)
+                .unwrap_or_else(|| Cow::Owned(contents.to_string()));
+            let line = contents
                 .strip_suffix("\r\n")
-                .or_else(|| line.strip_suffix('\n'))
-                .unwrap_or(&line);
-            let line_start = self
-                .current_buffer()
-                .position_to_char_idx(TextPosition::new(line_index, /*character*/ 0));
-            for captures in regex.captures_iter(line) {
-                let matched = captures
-                    .get(/*index*/ 0)
-                    .expect("regex captures always include the full match");
-                let mut replacement = String::new();
-                captures.expand(&command.replacement, &mut replacement);
+                .or_else(|| contents.strip_suffix('\n'))
+                .unwrap_or(&contents);
+            let mut append = |matched: regex::Match<'_>, replacement: String| {
+                let prefix = &line[..matched.start()];
+                let start_character = if prefix.is_ascii() {
+                    prefix.len()
+                } else {
+                    prefix.chars().count()
+                };
+                let matched_text = &line[matched.start()..matched.end()];
+                let end_character = start_character
+                    + if matched_text.is_ascii() {
+                        matched_text.len()
+                    } else {
+                        matched_text.chars().count()
+                    };
                 substitutions.push(PlannedSubstitution {
-                    start_char: line_start + line[..matched.start()].chars().count(),
-                    end_char: line_start + line[..matched.end()].chars().count(),
+                    start_char: line_start + start_character,
+                    range: TextRange::new(
+                        TextPosition::new(line_index, start_character),
+                        TextPosition::new(line_index, end_character),
+                    ),
                     replacement,
                 });
-                if !command.replace_all {
-                    break;
+            };
+
+            if command.replacement.contains('$') {
+                for captures in regex.captures_iter(line) {
+                    let matched = captures
+                        .get(/*index*/ 0)
+                        .expect("regex captures always include the full match");
+                    let mut replacement = String::new();
+                    captures.expand(&command.replacement, &mut replacement);
+                    append(matched, replacement);
+                    if !command.replace_all {
+                        break;
+                    }
+                }
+            } else {
+                for matched in regex.find_iter(line) {
+                    append(matched, command.replacement.clone());
+                    if !command.replace_all {
+                        break;
+                    }
                 }
             }
+            line_start = next_line_start;
         }
         Ok(substitutions)
     }
@@ -15769,10 +16213,7 @@ impl Editor {
         let Some(substitution) = confirmation.substitutions.get(confirmation.current) else {
             return Ok(());
         };
-        let position = self
-            .current_buffer()
-            .char_idx_to_position(substitution.start_char);
-        self.move_to_text_position(position);
+        self.move_to_text_position(substitution.range.start);
         self.refresh_cursor_goal();
         self.set_legacy_message(Some(format!(
             "replace with {:?}? (y/n/a/q/l)",
@@ -15795,13 +16236,7 @@ impl Editor {
         substitutions.sort_by_key(|substitution| substitution.start_char);
         self.begin_transaction("substitute");
         for substitution in substitutions.into_iter().rev() {
-            let range = TextRange::new(
-                self.current_buffer()
-                    .char_idx_to_position(substitution.start_char),
-                self.current_buffer()
-                    .char_idx_to_position(substitution.end_char),
-            );
-            self.replace_range(range, &substitution.replacement);
+            self.replace_range(substitution.range, &substitution.replacement);
         }
         self.commit_transaction(self.cursor_snapshot());
         self.notify_change(runtime).await?;
@@ -15842,9 +16277,8 @@ impl Editor {
         }
 
         let case_insensitive = self.search_uses_case_insensitive(pattern);
-        let buffer = self.current_buffer();
-        let buffer_id = buffer.id();
-        let revision = buffer.revision();
+        let buffer_id = self.current_buffer().id();
+        let revision = self.current_buffer().revision();
         if let Some(cache) = &self.search_match_cache {
             if cache.buffer_id == buffer_id
                 && cache.revision == revision
@@ -15855,9 +16289,28 @@ impl Editor {
             }
         }
 
+        self.search_match_history.retain(|entry| {
+            entry.buffer_id == buffer_id
+                && entry.revision == revision
+                && entry.case_insensitive == case_insensitive
+        });
+        if let Some(index) = self
+            .search_match_history
+            .iter()
+            .position(|entry| entry.pattern == pattern)
+        {
+            let entry = self
+                .search_match_history
+                .remove(index)
+                .expect("matched search history index remains present");
+            let matches = Arc::clone(&entry.matches);
+            self.replace_search_match_cache(entry);
+            return Ok(matches);
+        }
+
         let regex = self.compile_search_regex(pattern)?;
-        let matches = Arc::from(buffer.regex_matches(&regex));
-        self.search_match_cache = Some(SearchMatchCache {
+        let matches = Arc::from(self.current_buffer().regex_matches(&regex));
+        self.replace_search_match_cache(SearchMatchCache {
             buffer_id,
             revision,
             pattern: pattern.to_string(),
@@ -15865,6 +16318,26 @@ impl Editor {
             matches: Arc::clone(&matches),
         });
         Ok(matches)
+    }
+
+    fn replace_search_match_cache(&mut self, next: SearchMatchCache) {
+        let buffer_id = next.buffer_id;
+        let revision = next.revision;
+        let case_insensitive = next.case_insensitive;
+        let Some(previous) = self.search_match_cache.replace(next) else {
+            return;
+        };
+        if previous.buffer_id != buffer_id
+            || previous.revision != revision
+            || previous.case_insensitive != case_insensitive
+            || previous.matches.len() > MAX_SEARCH_HISTORY_MATCHES_PER_ENTRY
+        {
+            return;
+        }
+        self.search_match_history.push_front(previous);
+        if self.search_match_history.len() > MAX_SEARCH_HISTORY_ENTRIES {
+            self.search_match_history.pop_back();
+        }
     }
 
     fn search_match_in_direction(
@@ -15875,24 +16348,24 @@ impl Editor {
         wrap: bool,
     ) -> Option<SearchMatch> {
         let origin_x = self.grapheme_to_char_on_line(origin.x, origin.y);
+        let origin = (origin.y, origin_x);
         match direction {
-            SearchDirection::Forward => matches
-                .iter()
-                .copied()
-                .find(|match_| {
-                    match_.start_y > origin.y
-                        || (match_.start_y == origin.y && match_.start_x > origin_x)
-                })
-                .or_else(|| wrap.then(|| matches.first().copied()).flatten()),
-            SearchDirection::Backward => matches
-                .iter()
-                .rev()
-                .copied()
-                .find(|match_| {
-                    match_.start_y < origin.y
-                        || (match_.start_y == origin.y && match_.start_x < origin_x)
-                })
-                .or_else(|| wrap.then(|| matches.last().copied()).flatten()),
+            SearchDirection::Forward => {
+                let index =
+                    matches.partition_point(|match_| (match_.start_y, match_.start_x) <= origin);
+                matches
+                    .get(index)
+                    .copied()
+                    .or_else(|| wrap.then(|| matches.first().copied()).flatten())
+            }
+            SearchDirection::Backward => {
+                let index =
+                    matches.partition_point(|match_| (match_.start_y, match_.start_x) < origin);
+                index
+                    .checked_sub(1)
+                    .and_then(|index| matches.get(index).copied())
+                    .or_else(|| wrap.then(|| matches.last().copied()).flatten())
+            }
         }
     }
 
@@ -15908,11 +16381,15 @@ impl Editor {
             .current_buffer()
             .line_range_byte_len(origin.y, origin.y.saturating_add(1))
             > MAX_HIGHLIGHT_SLICE_BYTES
-            || (self.vtop..viewport_end).any(|line| {
-                self.current_buffer()
-                    .line_range_byte_len(line, line.saturating_add(1))
-                    > MAX_HIGHLIGHT_SLICE_BYTES
-            });
+            || (self
+                .current_buffer()
+                .line_range_byte_len(self.vtop, viewport_end)
+                > MAX_HIGHLIGHT_SLICE_BYTES
+                && (self.vtop..viewport_end).any(|line| {
+                    self.current_buffer()
+                        .line_range_byte_len(line, line.saturating_add(1))
+                        > MAX_HIGHLIGHT_SLICE_BYTES
+                }));
 
         if has_oversized_line {
             let regex = self.compile_search_regex(pattern)?;
@@ -17342,16 +17819,20 @@ impl Editor {
 
     fn cursor_lsp_position(&self) -> crate::lsp::Position {
         let position = self.cursor_text_position();
-        let character = self
-            .current_buffer()
-            .get(position.line)
-            .map(|line| {
-                line.chars()
-                    .take(position.character)
-                    .map(char::len_utf16)
-                    .sum()
-            })
-            .unwrap_or(position.character);
+        let buffer = self.current_buffer();
+        let character = if buffer.is_ascii() {
+            position.character
+        } else {
+            buffer
+                .get(position.line)
+                .map(|line| {
+                    line.chars()
+                        .take(position.character)
+                        .map(char::len_utf16)
+                        .sum()
+                })
+                .unwrap_or(position.character)
+        };
         crate::lsp::Position {
             line: position.line,
             character,
@@ -17360,34 +17841,28 @@ impl Editor {
 
     fn symbol_under_cursor(&self) -> String {
         let position = self.cursor_text_position();
-        let Some(line) = self.current_buffer().get(position.line) else {
+        let contents = self.current_buffer().contents_snapshot();
+        let Some(line) = contents.get_line(position.line) else {
             return String::new();
         };
-        let characters = line.chars().collect::<Vec<_>>();
         let is_symbol = |character: char| character.is_alphanumeric() || character == '_';
-        let mut cursor = position.character.min(characters.len());
-        if cursor == characters.len()
-            || !characters
-                .get(cursor)
-                .is_some_and(|value| is_symbol(*value))
-        {
+        let length = line.len_chars();
+        let mut cursor = position.character.min(length);
+        if cursor == length || !line.get_char(cursor).is_some_and(is_symbol) {
             cursor = cursor.saturating_sub(1);
         }
-        if !characters
-            .get(cursor)
-            .is_some_and(|value| is_symbol(*value))
-        {
+        if !line.get_char(cursor).is_some_and(is_symbol) {
             return String::new();
         }
         let mut start = cursor;
-        while start > 0 && is_symbol(characters[start - 1]) {
+        while start > 0 && line.get_char(start - 1).is_some_and(is_symbol) {
             start -= 1;
         }
         let mut end = cursor + 1;
-        while end < characters.len() && is_symbol(characters[end]) {
+        while end < length && line.get_char(end).is_some_and(is_symbol) {
             end += 1;
         }
-        characters[start..end].iter().collect()
+        line.slice(start..end).to_string()
     }
 
     fn word_motion_range(
@@ -17425,9 +17900,9 @@ impl Editor {
         let start = self
             .word_motion_target(count, true, true, big_word)
             .or_else(|| {
-                let characters = self.current_buffer().contents().chars().collect::<Vec<_>>();
+                let characters = self.current_buffer().contents_snapshot();
                 let mut index = self.current_buffer().position_to_char_idx(cursor);
-                let current = *characters.get(index)?;
+                let current = characters.get_char(index)?;
                 if index == 0 || current.is_whitespace() {
                     return None;
                 }
@@ -17441,7 +17916,7 @@ impl Editor {
                     }
                 };
                 let current_kind = kind(current);
-                while index > 0 && kind(characters[index - 1]) == current_kind {
+                while index > 0 && kind(characters.char(index - 1)) == current_kind {
                     index -= 1;
                 }
                 Some(self.current_buffer().char_idx_to_position(index))
@@ -17457,9 +17932,8 @@ impl Editor {
             .or_else(|| {
                 let index = self.current_buffer().position_to_char_idx(start);
                 self.current_buffer()
-                    .contents()
-                    .chars()
-                    .nth(index)
+                    .contents_snapshot()
+                    .get_char(index)
                     .filter(|character| !character.is_whitespace())
                     .map(|_| start)
             })?;
@@ -17515,10 +17989,18 @@ impl Editor {
     }
 
     fn line_character_len(&self, line: usize) -> usize {
-        self.current_buffer()
-            .get(line)
-            .map(|contents| trim_line_ending(&contents).chars().count())
-            .unwrap_or(0)
+        let contents = self.current_buffer().contents_snapshot();
+        let Some(line) = contents.get_line(line) else {
+            return 0;
+        };
+        let mut length = line.len_chars();
+        if line.get_char(length.saturating_sub(1)) == Some('\n') {
+            length -= 1;
+        }
+        if line.get_char(length.saturating_sub(1)) == Some('\r') {
+            length -= 1;
+        }
+        length
     }
 
     fn line_end_motion_range(&self, count: u16) -> TextRange {
@@ -17536,15 +18018,23 @@ impl Editor {
     fn line_start_motion_range(&self, first_non_blank: bool) -> Option<TextRange> {
         let end = self.cursor_text_position();
         let start_character = if first_non_blank {
-            self.current_buffer()
-                .get(end.line)
+            let contents = self.current_buffer().contents_snapshot();
+            contents
+                .get_line(end.line)
                 .map(|line| {
-                    trim_line_ending(&line)
+                    let mut length = line.len_chars();
+                    if line.get_char(length.saturating_sub(1)) == Some('\n') {
+                        length -= 1;
+                    }
+                    if line.get_char(length.saturating_sub(1)) == Some('\r') {
+                        length -= 1;
+                    }
+                    line.slice(..length)
                         .chars()
                         .take_while(|character| character.is_whitespace())
                         .count()
                 })
-                .unwrap_or(0)
+                .unwrap_or_default()
         } else {
             0
         };
@@ -17930,12 +18420,24 @@ impl Editor {
 
     fn indentation_columns_for_line(&self, line: usize) -> usize {
         let indentation = self.indentation();
-        self.current_buffer().get(line).map_or(0, |contents| {
-            display_width_with_tabs(
-                Self::leading_indentation_text(&contents),
-                indentation.tab_width.max(1),
-            )
-        })
+        let contents = self.current_buffer().contents_snapshot();
+        let Some(line) = contents.get_line(line) else {
+            return 0;
+        };
+        let mut length = line.len_chars();
+        while length > 0
+            && line
+                .get_char(length - 1)
+                .is_some_and(|character| matches!(character, '\r' | '\n'))
+        {
+            length -= 1;
+        }
+        let prefix = line
+            .slice(..length)
+            .chars()
+            .take_while(|character| character.is_whitespace())
+            .collect::<String>();
+        display_width_with_tabs(&prefix, indentation.tab_width.max(1))
     }
 
     fn indentation_decision_for_line(&mut self, line: usize) -> IndentDecision {
@@ -18706,18 +19208,9 @@ impl Editor {
                     self.scheduled_completion = None;
                 }
 
-                if self
-                    .current_dialog
-                    .as_ref()
-                    .map(|dialog| dialog.allows_event_passthrough())
-                    .unwrap_or(false)
-                {
-                    self.render(buffer)?;
-                } else {
-                    let draw_span = perf::PerfSpan::start("edit:draw_line");
-                    self.render_edited_window_rows(buffer)?;
-                    drop(draw_span);
-                }
+                let draw_span = perf::PerfSpan::start("edit:draw_line");
+                self.render_edited_window_rows(buffer)?;
+                drop(draw_span);
             }
             Action::DeleteCharAt(x, y) => {
                 self.begin_transaction("delete char");
@@ -20537,16 +21030,7 @@ impl Editor {
                 if started_transaction {
                     self.commit_transaction(self.cursor_snapshot());
                 }
-                if self
-                    .current_dialog
-                    .as_ref()
-                    .map(|dialog| dialog.allows_event_passthrough())
-                    .unwrap_or(false)
-                {
-                    self.render(buffer)?;
-                } else {
-                    self.render_edited_window_rows(buffer)?;
-                }
+                self.render_edited_window_rows(buffer)?;
             }
             Action::Save => {
                 if !self.save_action(buffer, runtime).await? {
@@ -22386,7 +22870,19 @@ impl Editor {
         self.cy = y.saturating_sub(self.vtop);
     }
 
-    async fn execute_block_action(
+    // Visual-block completion can recursively dispatch actions while replaying
+    // prior edits. Keep its large future off the ordinary 2 MiB input stack.
+    #[inline(never)]
+    fn execute_block_action<'a>(
+        &'a mut self,
+        buffer: &'a mut RenderBuffer,
+        runtime: &'a mut Runtime,
+        mode: Mode,
+    ) -> BoxFuture<'a, anyhow::Result<()>> {
+        Box::pin(self.execute_block_action_impl(buffer, runtime, mode))
+    }
+
+    async fn execute_block_action_impl(
         &mut self,
         buffer: &mut RenderBuffer,
         runtime: &mut Runtime,
@@ -22482,6 +22978,69 @@ impl Editor {
         Ok(())
     }
 
+    /// Collapse ordinary keyword typing only where character hooks cannot affect semantics.
+    fn batched_block_replay_text(actions: &[Action]) -> Option<String> {
+        const MAX_BATCHED_BLOCK_INSERT_BYTES: usize = 256;
+
+        if !(2..=MAX_BATCHED_BLOCK_INSERT_BYTES).contains(&actions.len()) {
+            return None;
+        }
+
+        let mut text = String::with_capacity(actions.len());
+        for action in actions {
+            let Action::InsertCharAtCursorPos(character) = action else {
+                return None;
+            };
+            if !character.is_ascii_alphanumeric() && *character != '_' {
+                return None;
+            }
+            text.push(*character);
+        }
+        Some(text)
+    }
+
+    /// Reject contexts where individual characters can change editing semantics.
+    fn can_batch_block_replay(&self) -> bool {
+        if self.learn_session.is_some()
+            || self.tutorial_controller.is_some()
+            || self.snippet_session.is_some()
+            || self
+                .current_dialog
+                .as_ref()
+                .is_some_and(|dialog| dialog.allows_event_passthrough())
+            || matches!(
+                self.current_language_id().as_deref(),
+                Some("python" | "py" | "pyw")
+            )
+            || self
+                .current_buffer()
+                .file
+                .as_deref()
+                .and_then(|file| self.lsp.server_capabilities_for_file(file))
+                .and_then(|capabilities| capabilities.signature_help_provider.as_ref())
+                .is_some()
+        {
+            return false;
+        }
+
+        let Some(line) = self.current_buffer().get(self.buffer_line()) else {
+            return false;
+        };
+        let line = trim_line_ending(&line);
+        let trimmed = line.trim();
+        if trimmed.len() <= 32
+            && trimmed
+                .chars()
+                .all(|character| character.is_ascii_alphabetic())
+        {
+            return false;
+        }
+
+        !(self.config.commenting.auto_wrap
+            && self.configured_comment_text_width() != 0
+            && self.comment_continuation_prefix(line).is_some())
+    }
+
     async fn execute_on_block(
         &mut self,
         buffer: &mut RenderBuffer,
@@ -22506,6 +23065,7 @@ impl Editor {
         if matches!(actions.last(), Some(Action::EnterMode(Mode::Normal))) {
             actions.pop();
         }
+        let batched_action = Self::batched_block_replay_text(&actions).map(Action::InsertString);
 
         let (y0, y1) = if selection.y0 < selection.y1 {
             (selection.y0, selection.y1)
@@ -22534,10 +23094,25 @@ impl Editor {
             }
             self.cy = y.saturating_sub(self.vtop);
             self.cx = selection.x0;
-            for action in &actions {
+            let batch = batched_action
+                .as_ref()
+                .filter(|_| self.can_batch_block_replay());
+            let replay_actions = batch
+                .map(std::slice::from_ref)
+                .unwrap_or(actions.as_slice());
+            for action in replay_actions {
+                if batch.is_some() {
+                    self.generated_indent = None;
+                }
                 if let Err(error) = self.execute(action, &mut scratch_buffer, runtime).await {
                     replay_result = Err(error);
                     break;
+                }
+                if batch.is_some() {
+                    self.schedule_automatic_completion();
+                    if let Some((_, cause)) = &mut self.deferred_plugin_event {
+                        *cause = "InsertCharAtCursorPos".to_string();
+                    }
                 }
                 match self.replay_checkpoint(&mut scratch_buffer, runtime).await {
                     Ok(false) => {}
@@ -23334,7 +23909,6 @@ impl Editor {
     }
 
     async fn ensure_buffer_lsp_opened(&mut self, buffer_index: usize) -> anyhow::Result<()> {
-        self.restore_cached_diagnostics();
         let Some(buffer) = self.buffer_manager.get(buffer_index) else {
             return Ok(());
         };
@@ -23347,7 +23921,11 @@ impl Editor {
         if self.lsp_coordinator.is_document_opened(&uri) {
             return Ok(());
         }
-        let contents = buffer.contents();
+
+        // Cache restoration resolves Cargo workspaces and must never run for
+        // ordinary requests or edits after this document has already opened.
+        self.restore_cached_diagnostics();
+        let contents = self.buffer_manager[buffer_index].contents();
         self.lsp.did_open(&file, &contents).await?;
         self.lsp_coordinator.mark_document_opened(uri);
         Ok(())
@@ -24371,19 +24949,52 @@ impl Editor {
     }
 
     fn update_anchors_for_edit(&mut self, edit: AppliedTextEdit) {
-        self.transform_inline_history_for_edit(edit);
+        if !self.inline_history.conversations.is_empty()
+            || !self.inline_jobs.is_empty()
+            || self.inline_history_browser.is_some()
+        {
+            self.transform_inline_history_for_edit(edit);
+        }
         self.transform_snippet_anchors(edit);
         let buffer_id = self.current_buffer().id();
-        let buffer = &self.buffer_manager[self.buffer_manager.active_index()];
-        for comment in &mut self.inline_comments {
-            if comment.anchor.buffer_id != buffer_id {
-                continue;
+        if !self.inline_comments.is_empty() {
+            let buffer = &self.buffer_manager[self.buffer_manager.active_index()];
+            for comment in &mut self.inline_comments {
+                if comment.anchor.buffer_id != buffer_id {
+                    continue;
+                }
+                Self::transform_inline_comment_anchor(&mut comment.anchor, edit, buffer);
+                Self::transform_inline_comment_anchor(&mut comment.end_anchor, edit, buffer);
+                comment.refresh_staleness(buffer);
             }
-            Self::transform_inline_comment_anchor(&mut comment.anchor, edit, buffer);
-            Self::transform_inline_comment_anchor(&mut comment.end_anchor, edit, buffer);
-            comment.refresh_staleness(buffer);
+            self.refresh_history_annotation_states();
         }
-        self.refresh_history_annotation_states();
+
+        let has_marks = self
+            .local_marks
+            .get(&buffer_id)
+            .is_some_and(|marks| !marks.is_empty())
+            || self
+                .global_marks
+                .values()
+                .any(|anchor| anchor.buffer_id == buffer_id)
+            || self
+                .special_marks
+                .keys()
+                .any(|(id, mark)| *id == buffer_id && *mark != '.')
+            || self.window_manager.windows().into_iter().any(|window| {
+                window
+                    .jump_list
+                    .entries
+                    .iter()
+                    .any(|entry| entry.buffer_id == buffer_id)
+            });
+        // Every caller replaces the last-change mark immediately after this
+        // method, so its old anchor never needs an intermediate transformation.
+        if !has_marks {
+            return;
+        }
+
         if let Some(marks) = self.local_marks.get_mut(&buffer_id) {
             for anchor in marks.values_mut() {
                 Self::transform_anchor_for_edit(
@@ -24404,8 +25015,8 @@ impl Editor {
                 );
             }
         }
-        for ((anchor_buffer_id, _), anchor) in &mut self.special_marks {
-            if *anchor_buffer_id == buffer_id {
+        for ((anchor_buffer_id, mark), anchor) in &mut self.special_marks {
+            if *anchor_buffer_id == buffer_id && *mark != '.' {
                 Self::transform_anchor_for_edit(
                     anchor,
                     edit.start_char,
@@ -24449,7 +25060,9 @@ impl Editor {
             .chain(
                 self.special_marks
                     .iter()
-                    .filter(|((anchor_buffer_id, _), _)| *anchor_buffer_id == buffer_id)
+                    .filter(|((anchor_buffer_id, mark), _)| {
+                        *anchor_buffer_id == buffer_id && *mark != '.'
+                    })
                     .map(|(_, anchor)| anchor),
             )
             .map(|anchor| anchor.char_index)
@@ -24477,7 +25090,7 @@ impl Editor {
             .for_each(update_fallback);
         self.special_marks
             .iter_mut()
-            .filter(|((anchor_buffer_id, _), _)| *anchor_buffer_id == buffer_id)
+            .filter(|((anchor_buffer_id, mark), _)| *anchor_buffer_id == buffer_id && *mark != '.')
             .map(|(_, anchor)| anchor)
             .for_each(update_fallback);
         for window in self.window_manager.windows_mut() {
@@ -24510,19 +25123,40 @@ impl Editor {
                     )
                 })
             });
-        let pending =
-            (self.config.lsp.enabled && self.current_buffer().file.is_some()).then(|| {
-                let source = self.current_buffer();
-                (
-                    source.id(),
-                    source.revision(),
-                    source.contents_snapshot(),
-                    crate::lsp::Range {
-                        start: source.position_to_lsp(range.start),
-                        end: source.position_to_lsp(range.end),
-                    },
-                )
-            });
+        let pending = if self.config.lsp.enabled {
+            let source = self.current_buffer();
+            source.file.as_deref().and_then(|file| {
+                let requires_snapshot = self
+                    .lsp_coordinator
+                    .requires_before_snapshot(source.id(), source.revision());
+                let full_sync = requires_snapshot
+                    && self
+                        .lsp
+                        .server_capabilities_for_file(file)
+                        .is_some_and(|capabilities| {
+                            !matches!(
+                                capabilities
+                                    .text_document_sync
+                                    .as_ref()
+                                    .and_then(|sync| sync.change_kind()),
+                                Some(crate::lsp::TextDocumentSyncKind::Incremental)
+                            )
+                        });
+                (!full_sync).then(|| {
+                    (
+                        source.id(),
+                        source.revision(),
+                        requires_snapshot.then(|| source.contents_snapshot()),
+                        crate::lsp::Range {
+                            start: source.position_to_lsp(range.start),
+                            end: source.position_to_lsp(range.end),
+                        },
+                    )
+                })
+            })
+        } else {
+            None
+        };
         let Some(edit) =
             apply_transactional_replacement(self.current_buffer_mut(), range, new_text)
         else {
@@ -25315,6 +25949,7 @@ impl Editor {
         let Some(cache) = &mut self.diagnostic_cache else {
             return;
         };
+        let _span = perf::PerfSpan::start("diagnostic_cache:restore");
         let restored = cache.load(&self.config.lsp, &self.buffer_manager);
         let mut changed = false;
         for reports in restored {
@@ -25374,7 +26009,7 @@ impl Editor {
     }
 
     pub fn buffers_from_session_snapshot(snapshot: &SessionSnapshot) -> Vec<Buffer> {
-        let mut restored_paths = Vec::<PathBuf>::new();
+        let mut restored_paths = SnapshotFileIdentities::default();
         snapshot
             .buffers
             .iter()
@@ -25382,20 +26017,13 @@ impl Editor {
                 let mut detached_duplicate = false;
                 let path = saved.path.as_deref().and_then(|path| {
                     match normalized_file_path(path) {
-                        Ok(normalized)
-                            if restored_paths
-                                .iter()
-                                .any(|restored| same_file_path(restored, &normalized)) =>
-                        {
+                        Ok(normalized) if !restored_paths.insert(normalized.clone()) => {
                             // Preserve the duplicate's recoverable contents without keeping a
                             // second live document identity for the same file.
                             detached_duplicate = true;
                             None
                         }
-                        Ok(normalized) => {
-                            restored_paths.push(normalized.clone());
-                            Some(normalized.to_string_lossy().into_owned())
-                        }
+                        Ok(normalized) => Some(normalized.to_string_lossy().into_owned()),
                         Err(_) => Some(path.to_string()),
                     }
                 });
@@ -29097,44 +29725,29 @@ fn directory_snapshot(path: &str, recursive: bool) -> Value {
     json!({ "path": path, "entries": entries, "recursive": true })
 }
 
-fn git_status_listing(path: &str) -> Value {
+#[doc(hidden)]
+pub fn git_status_listing(path: &str) -> Value {
     let search_dir = git_search_dir(path);
-    let root_output = Command::new("git")
-        .arg("-C")
-        .arg(&search_dir)
-        .args(["rev-parse", "--show-toplevel"])
-        .output();
-
-    let root_output = match root_output {
-        Ok(output) if output.status.success() => output,
-        Ok(_) => {
-            return json!({
-                "root": null,
-                "statuses": [],
-                "status_index": {},
-                "error": null,
-            });
-        }
-        Err(err) => {
-            return json!({
-                "root": null,
-                "statuses": [],
-                "status_index": {},
-                "error": err.to_string(),
-            });
-        }
-    };
-
-    let root = String::from_utf8_lossy(&root_output.stdout)
-        .trim()
-        .to_string();
-    if root.is_empty() {
+    let Some(root) = Path::new(&search_dir)
+        .canonicalize()
+        .ok()
+        .and_then(|directory| {
+            directory
+                .ancestors()
+                .find(|ancestor| ancestor.join(".git").exists())
+                .map(|ancestor| ancestor.to_string_lossy().into_owned())
+        })
+    else {
         return json!({
             "root": null,
             "statuses": [],
             "status_index": {},
             "error": null,
         });
+    };
+
+    if let Some(listing) = cached_git_status_listing(&root) {
+        return listing;
     }
 
     let status_output = Command::new("git")
@@ -29149,7 +29762,7 @@ fn git_status_listing(path: &str) -> Value {
         ])
         .output();
 
-    match status_output {
+    let listing = match status_output {
         Ok(output) if output.status.success() => {
             let statuses = parse_git_status_records(&output.stdout, &root);
             let status_index = git_status_index(&statuses, &root);
@@ -29172,6 +29785,154 @@ fn git_status_listing(path: &str) -> Value {
             "status_index": {},
             "error": err.to_string(),
         }),
+    };
+    if listing["error"].is_null() {
+        cache_git_status_listing(&root, &listing);
+    }
+    listing
+}
+
+struct CachedGitStatus {
+    fingerprint: u64,
+    observed_at: Instant,
+    listing: Value,
+}
+
+static GIT_STATUS_CACHE: std::sync::LazyLock<std::sync::Mutex<HashMap<String, CachedGitStatus>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
+const MAX_GIT_STATUS_CACHE_ENTRIES: usize = 16;
+const MAX_GIT_STATUS_FINGERPRINT_ENTRIES: usize = 512;
+const GIT_STATUS_CACHE_LIFETIME: Duration = Duration::from_millis(250);
+
+fn cached_git_status_listing(root: &str) -> Option<Value> {
+    let cache = GIT_STATUS_CACHE.lock().ok()?;
+    let entry = cache.get(root)?;
+    if entry.observed_at.elapsed() > GIT_STATUS_CACHE_LIFETIME
+        || git_status_fingerprint(Path::new(root))? != entry.fingerprint
+    {
+        return None;
+    }
+    Some(entry.listing.clone())
+}
+
+fn cache_git_status_listing(root: &str, listing: &Value) {
+    let Some(fingerprint) = git_status_fingerprint(Path::new(root)) else {
+        return;
+    };
+    let Ok(mut cache) = GIT_STATUS_CACHE.lock() else {
+        return;
+    };
+    if cache.len() >= MAX_GIT_STATUS_CACHE_ENTRIES && !cache.contains_key(root) {
+        let oldest = cache
+            .iter()
+            .min_by_key(|(_, entry)| entry.observed_at)
+            .map(|(root, _)| root.clone());
+        if let Some(oldest) = oldest {
+            cache.remove(&oldest);
+        }
+    }
+    cache.insert(
+        root.to_owned(),
+        CachedGitStatus {
+            fingerprint,
+            observed_at: Instant::now(),
+            listing: listing.clone(),
+        },
+    );
+}
+
+fn git_status_fingerprint(root: &Path) -> Option<u64> {
+    use std::{
+        collections::hash_map::DefaultHasher,
+        hash::{Hash, Hasher},
+    };
+
+    let mut hasher = DefaultHasher::new();
+    let mut pending = vec![root.to_path_buf()];
+    let mut inspected = 0;
+    while let Some(directory) = pending.pop() {
+        let mut entries = fs::read_dir(&directory)
+            .ok()?
+            .map(|entry| entry.map(|entry| entry.path()))
+            .collect::<Result<Vec<_>, _>>()
+            .ok()?;
+        entries.sort_unstable();
+        for path in entries {
+            if path.file_name() == Some(OsStr::new(".git")) {
+                continue;
+            }
+            inspected += 1;
+            if inspected > MAX_GIT_STATUS_FINGERPRINT_ENTRIES {
+                return None;
+            }
+            path.strip_prefix(root).ok()?.hash(&mut hasher);
+            let metadata = fs::symlink_metadata(&path).ok()?;
+            hash_git_status_metadata(&metadata, &mut hasher);
+            if metadata.is_dir() {
+                pending.push(path);
+            }
+        }
+    }
+
+    let marker = root.join(".git");
+    let git_directory = if marker.is_dir() {
+        marker
+    } else {
+        let pointer = fs::read_to_string(&marker).ok()?;
+        let target = pointer.trim().strip_prefix("gitdir:")?.trim();
+        root.join(target).canonicalize().ok()?
+    };
+    let common_directory = fs::read_to_string(git_directory.join("commondir"))
+        .ok()
+        .map(|target| git_directory.join(target.trim()))
+        .unwrap_or_else(|| git_directory.clone());
+    for path in [
+        git_directory.join("index"),
+        git_directory.join("HEAD"),
+        common_directory.join("config"),
+        common_directory.join("packed-refs"),
+        common_directory.join("info/exclude"),
+    ] {
+        path.hash(&mut hasher);
+        match fs::symlink_metadata(&path) {
+            Ok(metadata) => hash_git_status_metadata(&metadata, &mut hasher),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false.hash(&mut hasher),
+            Err(_) => return None,
+        }
+    }
+    if let Ok(head) = fs::read_to_string(git_directory.join("HEAD")) {
+        head.hash(&mut hasher);
+        if let Some(reference) = head.trim().strip_prefix("ref: ") {
+            let reference = common_directory.join(reference);
+            if let Ok(metadata) = fs::symlink_metadata(reference) {
+                hash_git_status_metadata(&metadata, &mut hasher);
+            }
+        }
+    }
+
+    Some(hasher.finish())
+}
+
+fn hash_git_status_metadata(metadata: &fs::Metadata, hasher: &mut impl std::hash::Hasher) {
+    use std::hash::Hash as _;
+
+    metadata.len().hash(hasher);
+    metadata.is_dir().hash(hasher);
+    metadata.is_symlink().hash(hasher);
+    metadata.permissions().readonly().hash(hasher);
+    if let Ok(modified) = metadata.modified() {
+        modified.hash(hasher);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+
+        metadata.dev().hash(hasher);
+        metadata.ino().hash(hasher);
+        metadata.ctime().hash(hasher);
+        metadata.ctime_nsec().hash(hasher);
+        metadata.mode().hash(hasher);
     }
 }
 
@@ -29221,10 +29982,15 @@ fn parse_git_status_records(output: &[u8], root: &str) -> Vec<Value> {
     statuses
 }
 
-pub(crate) fn git_status_index(statuses: &[Value], root: &str) -> Value {
-    let root = normalize_plugin_path(root);
+/// Indexes changed Git paths and their directories using Neo-tree status precedence.
+pub fn git_status_index(statuses: &[Value], root: &str) -> Value {
+    let root = if root.contains('\\') {
+        Cow::Owned(normalize_plugin_path(root))
+    } else {
+        Cow::Borrowed(root)
+    };
     let root = if root == "/" {
-        root.as_str()
+        root.as_ref()
     } else {
         root.trim_end_matches('/')
     };
@@ -29246,9 +30012,13 @@ pub(crate) fn git_status_index(statuses: &[Value], root: &str) -> Value {
         else {
             continue;
         };
-        let path = normalize_plugin_path(path);
+        let path = if path.contains('\\') {
+            Cow::Owned(normalize_plugin_path(path))
+        } else {
+            Cow::Borrowed(path)
+        };
         let path = if path == "/" {
-            path.as_str()
+            path.as_ref()
         } else {
             path.trim_end_matches('/')
         };
@@ -29266,7 +30036,17 @@ pub(crate) fn git_status_index(statuses: &[Value], root: &str) -> Value {
         }
         let mut parent = relative;
         while let Some((ancestor, _)) = parent.rsplit_once('/') {
-            prefer_git_status(&mut index, &format!("{root_prefix}{ancestor}"), status);
+            let ancestor_path = &path[..root_prefix.len() + ancestor.len()];
+            if !prefer_git_status(&mut index, ancestor_path, status)
+                && index
+                    .get(ancestor_path)
+                    .and_then(Value::as_str)
+                    .is_some_and(|current| current != "ignored")
+            {
+                // Every non-ignored directory status was already propagated to
+                // its parents at equal or higher precedence.
+                break;
+            }
             parent = ancestor;
         }
     }
@@ -29274,7 +30054,7 @@ pub(crate) fn git_status_index(statuses: &[Value], root: &str) -> Value {
     Value::Object(index)
 }
 
-fn prefer_git_status(index: &mut serde_json::Map<String, Value>, path: &str, status: &str) {
+fn prefer_git_status(index: &mut serde_json::Map<String, Value>, path: &str, status: &str) -> bool {
     let replace = index
         .get(path)
         .and_then(Value::as_str)
@@ -29282,6 +30062,7 @@ fn prefer_git_status(index: &mut serde_json::Map<String, Value>, path: &str, sta
     if replace {
         index.insert(path.to_string(), Value::String(status.to_string()));
     }
+    replace
 }
 
 fn git_status_rank(status: &str) -> u8 {
@@ -29360,6 +30141,89 @@ fn adjust_color_brightness(color: Option<Color>, percentage: i32) -> Option<Colo
 
 // These methods are made public for test utilities but hidden from docs.
 impl Editor {
+    /// Resolves the production pending-operator word-end boundary for benchmarks.
+    #[doc(hidden)]
+    pub fn benchmark_word_end_operator(&self, backward: bool, big_word: bool) -> Option<TextRange> {
+        if backward {
+            self.previous_end_word_motion_range(/*count*/ 1, big_word)
+        } else {
+            self.end_word_motion_range(/*count*/ 1, big_word)
+        }
+    }
+
+    /// Runs the production cursor conversion used by text motion and word search.
+    #[doc(hidden)]
+    pub fn benchmark_cursor_conversion(
+        &self,
+        column: usize,
+        line: usize,
+        word_search: bool,
+    ) -> usize {
+        if word_search {
+            self.next_word_search_char_on_line(column, line)
+        } else {
+            self.char_to_grapheme_on_line(column, line)
+        }
+    }
+
+    /// Reads the production logical line boundary used by editor cursor motions.
+    #[doc(hidden)]
+    pub fn benchmark_line_boundary(&self, line: usize, last_cell: bool) -> usize {
+        if last_cell {
+            self.last_cell_for_line(line)
+        } else {
+            self.length_for_line(line)
+        }
+    }
+
+    /// Reads the display column used by production cursor positioning.
+    #[doc(hidden)]
+    pub fn benchmark_cursor_display_column(&self) -> usize {
+        self.current_cursor_display_col()
+    }
+
+    /// Reads the UTF-16 cursor offset used by language requests and snapshots.
+    #[doc(hidden)]
+    pub fn benchmark_lsp_cursor_character(&self, window_snapshot: bool) -> usize {
+        if window_snapshot {
+            self.lsp_character_for_cursor(
+                self.buffer_manager.active_index(),
+                self.buffer_line(),
+                self.cx,
+            )
+        } else {
+            self.cursor_lsp_position().character
+        }
+    }
+
+    /// Reads the scalar boundary used directly or by Vim line-end operators.
+    #[doc(hidden)]
+    pub fn benchmark_scalar_line_boundary(&self, operator: bool) -> usize {
+        if operator {
+            self.line_end_motion_range(/*count*/ 1).end.character
+        } else {
+            self.line_character_len(self.buffer_line())
+        }
+    }
+
+    /// Extracts the production initial symbol used by language-server rename.
+    #[doc(hidden)]
+    pub fn benchmark_rename_symbol(&self) -> String {
+        self.symbol_under_cursor()
+    }
+
+    /// Reads leading whitespace through Vim operators or automatic indentation.
+    #[doc(hidden)]
+    pub fn benchmark_leading_whitespace(&self, operator: bool) -> usize {
+        if operator {
+            self.line_start_motion_range(/*first_non_blank*/ true)
+                .map(|range| range.start.character)
+                .unwrap_or_default()
+        } else {
+            self.indentation_columns_for_line(self.buffer_line())
+        }
+    }
+
     #[doc(hidden)]
     pub fn test_cx(&self) -> usize {
         self.cx
@@ -29402,6 +30266,19 @@ impl Editor {
     #[doc(hidden)]
     pub fn test_current_buffer_index(&self) -> usize {
         self.buffer_manager.active_index()
+    }
+
+    #[doc(hidden)]
+    pub fn test_search_match_from_origin(
+        &mut self,
+        pattern: &str,
+        x: usize,
+        y: usize,
+        direction: SearchDirection,
+        wrap: bool,
+    ) -> anyhow::Result<Option<SearchMatch>> {
+        let origin = HistoryEntry::new(self.current_buffer().file.clone(), x, y);
+        self.search_match_from_origin(pattern, &origin, direction, wrap)
     }
 
     #[doc(hidden)]
@@ -32625,6 +33502,67 @@ builtin = "rust"
     }
 
     #[tokio::test]
+    async fn detached_incremental_frame_serializes_only_the_changed_row() {
+        drain_plugin_requests();
+        let mut core = DetachedEditorCore::new(test_editor(/*width*/ 80, /*height*/ 24))
+            .await
+            .unwrap();
+
+        let first = core.benchmark_incremental_frame(/*iteration*/ 0).unwrap();
+        assert_eq!(first.lines.len(), 1);
+        assert_eq!(first.lines[0].row, 12);
+        assert!(first.lines[0].text.starts_with('a'));
+        assert_eq!(
+            first.lines[0]
+                .spans
+                .iter()
+                .map(|span| span.text.as_str())
+                .collect::<String>(),
+            first.lines[0].text
+        );
+
+        let second = core.benchmark_incremental_frame(/*iteration*/ 1).unwrap();
+        assert_eq!(second.lines.len(), 1);
+        assert_eq!(second.lines[0].row, 12);
+        assert!(second.lines[0].text.starts_with('b'));
+        assert_eq!(
+            core.snapshot(/*last_revision*/ None).lines[12].text,
+            second.lines[0].text
+        );
+
+        let unchanged = core.finish_render().unwrap();
+        assert!(unchanged.lines.is_empty());
+        assert_eq!(unchanged.revision, second.revision);
+        drain_plugin_requests();
+    }
+
+    #[tokio::test]
+    async fn detached_multiple_pending_frames_reserialize_every_changed_row() {
+        drain_plugin_requests();
+        let mut core = DetachedEditorCore::new(test_editor(/*width*/ 80, /*height*/ 24))
+            .await
+            .unwrap();
+        core.render_buffer
+            .set_text(/*x*/ 0, /*y*/ 2, "first", &Style::default());
+        core.render_buffer
+            .set_text(/*x*/ 0, /*y*/ 4, "second", &Style::default());
+        core.editor.last_detached_changed_rows = vec![4];
+        core.editor.render_generation = core.editor.render_generation.wrapping_add(2);
+
+        let delta = core.finish_render().unwrap();
+
+        assert!(delta
+            .lines
+            .iter()
+            .any(|line| line.row == 2 && line.text.starts_with("first")));
+        assert!(delta
+            .lines
+            .iter()
+            .any(|line| line.row == 4 && line.text.starts_with("second")));
+        drain_plugin_requests();
+    }
+
+    #[tokio::test]
     async fn production_resize_event_accepts_zero_and_tiny_dimensions() {
         let mut editor = test_editor(80, 24);
         let mut buffer = RenderBuffer::new(80, 24, &Style::default());
@@ -33452,6 +34390,77 @@ builtin = "rust"
     }
 
     #[tokio::test]
+    async fn lsp_progress_reports_coalesce_without_losing_independent_task_boundaries() {
+        drain_plugin_requests();
+        let (mut editor, responses, _requests) = lsp_progress_test_editor();
+        let mut buffer =
+            RenderBuffer::new(/*width*/ 80, /*height*/ 24, &Style::default());
+        let mut runtime = Runtime::new();
+        runtime
+            .load_plugin(
+                "progress-recorder",
+                r#"
+                    pub fn activate() {
+                        red::state_set("trace", "");
+                        red::on("lsp:progress", progress);
+                    }
+
+                    fn progress(event: Json) {
+                        let trace = red::string(red::state("trace"), "")
+                            + red::string(event.value.kind, "")
+                            + ":"
+                            + red::string(event.value.message, "")
+                            + ",";
+                        red::state_set("trace", trace);
+                        red::execute("Print", trace);
+                    }
+                "#,
+            )
+            .await
+            .unwrap();
+
+        for (token, kind, message) in [
+            (7, "begin", "first-begin"),
+            (7, "report", "first-stale"),
+            (8, "begin", "second-begin"),
+            (8, "report", "second-stale"),
+            (7, "report", "first-latest"),
+            (8, "report", "second-latest"),
+            (7, "end", "first-end"),
+            (8, "end", "second-end"),
+        ] {
+            let progress = serde_json::from_value(json!({
+                "token": token,
+                "value": {
+                    "kind": kind,
+                    "title": "Indexing",
+                    "message": message,
+                },
+            }))
+            .unwrap();
+            responses
+                .try_send(InboundMessage::Notification(ParsedNotification::Progress(
+                    progress,
+                )))
+                .unwrap();
+        }
+
+        editor
+            .service_background(&mut buffer, &mut runtime)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            editor.last_error.as_deref(),
+            Some(
+                "begin:first-begin,begin:second-begin,report:first-latest,end:first-end,report:second-latest,end:second-end,"
+            )
+        );
+        runtime.deactivate_all().await.unwrap();
+        drain_plugin_requests();
+    }
+
+    #[tokio::test]
     async fn detached_input_processes_only_a_bounded_batch_of_agent_events() {
         drain_plugin_requests();
         let mut core = DetachedEditorCore::new(test_editor(/*width*/ 80, /*height*/ 24))
@@ -34093,6 +35102,68 @@ builtin = "rust"
                 self.observation()
             );
         }
+    }
+
+    #[test]
+    fn visual_block_batch_only_accepts_bounded_ascii_keyword_insertions() {
+        let actions = "value_42"
+            .chars()
+            .map(Action::InsertCharAtCursorPos)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            Editor::batched_block_replay_text(&actions).as_deref(),
+            Some("value_42")
+        );
+
+        for rejected in [
+            vec![Action::InsertCharAtCursorPos('x')],
+            vec![
+                Action::InsertCharAtCursorPos('x'),
+                Action::InsertCharAtCursorPos('😀'),
+            ],
+            vec![
+                Action::InsertCharAtCursorPos('x'),
+                Action::InsertCharAtCursorPos(' '),
+            ],
+            vec![
+                Action::InsertCharAtCursorPos('x'),
+                Action::InsertCharAtCursorPos('}'),
+            ],
+            vec![Action::InsertCharAtCursorPos('x'), Action::MoveLeft],
+            vec![Action::InsertCharAtCursorPos('x'); 257],
+        ] {
+            assert!(
+                Editor::batched_block_replay_text(&rejected).is_none(),
+                "unsafe block replay was batched: {rejected:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn visual_block_batch_preserves_indentation_and_comment_hooks() {
+        let mut editor = test_editor(/*width*/ 80, /*height*/ 24);
+        for (file, source, expected) in [
+            ("fixture.rs", "fn value_0() {}", true),
+            ("fixture.rs", "fn value_😀() {}", true),
+            ("fixture.rs", "end", false),
+            ("fixture.rs", "", false),
+            ("fixture.rs", "// ordinary comment", false),
+            ("fixture.py", "value_0 = 1", false),
+        ] {
+            editor.buffer_manager[0] = Buffer::new(Some(file.to_string()), source.to_string());
+            assert_eq!(
+                editor.can_batch_block_replay(),
+                expected,
+                "unexpected batch safety decision for {file}: {source:?}"
+            );
+        }
+
+        editor.buffer_manager[0] = Buffer::new(
+            Some("fixture.rs".to_string()),
+            "// ordinary comment".to_string(),
+        );
+        editor.config.commenting.auto_wrap = false;
+        assert!(editor.can_batch_block_replay());
     }
 
     #[tokio::test]
@@ -34803,6 +35874,121 @@ builtin = "rust"
     }
 
     #[test]
+    fn incremental_search_reuses_bounded_prior_queries_without_stale_matches() {
+        let mut editor = test_editor(/*width*/ 80, /*height*/ 24);
+        let prefix = editor.search_matches("hel").unwrap();
+        let complete = editor.search_matches("hello").unwrap();
+
+        let previous = editor.search_matches("hel").unwrap();
+        assert!(Arc::ptr_eq(&prefix, &previous));
+        assert!(Arc::ptr_eq(
+            &complete,
+            &editor.search_matches("hello").unwrap()
+        ));
+
+        for index in 0..MAX_SEARCH_HISTORY_ENTRIES + 4 {
+            editor.search_matches(&format!("missing{index}")).unwrap();
+        }
+        assert_eq!(
+            editor.search_match_history.len(),
+            MAX_SEARCH_HISTORY_ENTRIES
+        );
+
+        editor.current_buffer_mut().insert_str(0, 0, "hello ");
+        let refreshed = editor.search_matches("hello").unwrap();
+        assert!(!Arc::ptr_eq(&complete, &refreshed));
+        assert_eq!(refreshed.len(), 2);
+        assert!(editor.search_match_history.iter().all(|entry| {
+            entry.revision == editor.current_buffer().revision()
+                && entry.buffer_id == editor.current_buffer().id()
+        }));
+    }
+
+    #[test]
+    fn incremental_search_does_not_retain_pathologically_dense_prior_matches() {
+        let mut editor = test_editor(/*width*/ 80, /*height*/ 24);
+        editor.current_buffer_mut().insert_str(
+            0,
+            0,
+            &"x".repeat(MAX_SEARCH_HISTORY_MATCHES_PER_ENTRY + 1),
+        );
+        let dense = editor.search_matches("x").unwrap();
+        assert!(dense.len() > MAX_SEARCH_HISTORY_MATCHES_PER_ENTRY);
+
+        editor.search_matches("hello").unwrap();
+
+        assert!(editor
+            .search_match_history
+            .iter()
+            .all(|entry| entry.pattern != "x"));
+    }
+
+    #[test]
+    fn search_match_navigation_preserves_direction_boundaries_and_wrapping() {
+        let editor = test_editor(/*width*/ 80, /*height*/ 24);
+        let matches = [
+            SearchMatch {
+                start_x: 0,
+                start_y: 0,
+                end_x: 1,
+                end_y: 0,
+            },
+            SearchMatch {
+                start_x: 3,
+                start_y: 0,
+                end_x: 4,
+                end_y: 0,
+            },
+            SearchMatch {
+                start_x: 0,
+                start_y: 1,
+                end_x: 1,
+                end_y: 1,
+            },
+            SearchMatch {
+                start_x: 2,
+                start_y: 1,
+                end_x: 3,
+                end_y: 1,
+            },
+        ];
+
+        let origin = HistoryEntry::new(None, 3, 0);
+        assert_eq!(
+            editor.search_match_in_direction(&matches, &origin, SearchDirection::Forward, false),
+            Some(matches[2]),
+        );
+        assert_eq!(
+            editor.search_match_in_direction(&matches, &origin, SearchDirection::Backward, false),
+            Some(matches[0]),
+        );
+
+        let first = HistoryEntry::new(None, 0, 0);
+        assert_eq!(
+            editor.search_match_in_direction(&matches, &first, SearchDirection::Backward, false),
+            None,
+        );
+        assert_eq!(
+            editor.search_match_in_direction(&matches, &first, SearchDirection::Backward, true),
+            Some(matches[3]),
+        );
+
+        let last = HistoryEntry::new(None, 2, 1);
+        assert_eq!(
+            editor.search_match_in_direction(&matches, &last, SearchDirection::Forward, false),
+            None,
+        );
+        assert_eq!(
+            editor.search_match_in_direction(&matches, &last, SearchDirection::Forward, true),
+            Some(matches[0]),
+        );
+        assert_eq!(
+            editor.search_match_in_direction(&[], &first, SearchDirection::Forward, true),
+            None,
+        );
+    }
+
+    #[test]
     fn incremental_search_on_an_oversized_line_only_finds_the_next_match() {
         let mut editor = test_editor(/*width*/ 80, /*height*/ 24);
         editor.buffer_manager[0] = Buffer::new(
@@ -34984,6 +36170,65 @@ builtin = "rust"
     }
 
     #[test]
+    fn markdown_viewport_preserves_offscreen_fenced_language_after_edit() {
+        for marker in ["```powershell", "~~~powershell", "   ```powershell"] {
+            let config = Config::default();
+            let lsp = Box::new(crate::lsp::LspManager::new(config.lsp.clone()));
+            let theme = parse_vscode_theme("themes/mocha.json").unwrap();
+            let contents = format!(
+                "## heading\n\n{marker}\n{}\n```\n",
+                "$retainedvalue = 123456789; \"retained\"\n".repeat(160)
+            );
+            let buffer = Buffer::new(Some("fenced-source.md".to_string()), contents);
+            let mut editor = Editor::with_size(lsp, 120, 22, config, theme, vec![buffer]).unwrap();
+            editor.test_disable_terminal_output();
+
+            let before = editor.viewport_highlight_spans(0, 100, 20).unwrap();
+            assert_eq!(editor.highlight_cache[&0].start_line, 2);
+            assert!(
+                before.iter().any(|span| span.start == 28 && span.end == 38),
+                "offscreen {marker} lost its injected PowerShell string"
+            );
+
+            editor.current_buffer_mut().insert_str(7, 100, "xy");
+            let after = editor.viewport_highlight_spans(0, 100, 20).unwrap();
+            assert_eq!(editor.highlight_cache[&0].start_line, 2);
+            assert!(
+                after.iter().any(|span| span.start == 30 && span.end == 40),
+                "edited offscreen {marker} lost its injected PowerShell string"
+            );
+        }
+    }
+
+    #[test]
+    fn markdown_fence_lookback_stops_at_closing_markers_and_bounds_deep_documents() {
+        let config = Config::default();
+        let lsp = Box::new(crate::lsp::LspManager::new(config.lsp.clone()));
+        let theme = parse_vscode_theme("themes/mocha.json").unwrap();
+        let contents = format!(
+            "```powershell\n$retainedvalue = 1;\n```\n{}",
+            "ordinary retained markdown text\n".repeat(120)
+        );
+        let buffer = Buffer::new(Some("closed-source.md".to_string()), contents);
+        let mut editor = Editor::with_size(lsp, 120, 22, config, theme, vec![buffer]).unwrap();
+        editor.viewport_highlight_spans(0, 80, 20).unwrap();
+        assert_eq!(editor.highlight_cache[&0].start_line, 60);
+
+        let config = Config::default();
+        let lsp = Box::new(crate::lsp::LspManager::new(config.lsp.clone()));
+        let theme = parse_vscode_theme("themes/mocha.json").unwrap();
+        let contents = format!(
+            "```powershell\n{}",
+            "$retainedvalue = 123456789; \"retained\"\n"
+                .repeat(MAX_MARKDOWN_FENCE_LOOKBACK_LINES + 80)
+        );
+        let buffer = Buffer::new(Some("deep-source.md".to_string()), contents);
+        let mut editor = Editor::with_size(lsp, 120, 22, config, theme, vec![buffer]).unwrap();
+        editor.viewport_highlight_spans(0, 300, 20).unwrap();
+        assert_eq!(editor.highlight_cache[&0].start_line, 280);
+    }
+
+    #[test]
     fn yaml_highlighting_keeps_document_context_after_an_edit() {
         let contents = r#"jobs:
   test:
@@ -35143,6 +36388,37 @@ builtin = "rust"
             .iter()
             .skip(1)
             .all(|row| row["text"].as_str() == Some("")));
+    }
+
+    #[test]
+    fn plugin_viewport_indentation_key_ignores_text_but_tracks_guide_geometry() {
+        let config = Config::default();
+        let lsp = Box::new(crate::lsp::LspManager::new(config.lsp.clone()));
+        let buffer = Buffer::new(None, "root\n    value\n    \n    next\n".to_string());
+        let mut editor =
+            Editor::with_size(lsp, 80, 12, config, Theme::default(), vec![buffer]).unwrap();
+        let original = editor.plugin_viewport_layout_payload();
+        let original_key = original["indentation_key"].as_str().unwrap().to_string();
+
+        editor.current_buffer_mut().insert_str(9, 1, "x");
+        let content_change = editor.plugin_viewport_layout_payload();
+        assert_ne!(content_change["revision"], original["revision"]);
+        assert_eq!(
+            content_change["indentation_key"],
+            original["indentation_key"]
+        );
+
+        editor.current_buffer_mut().insert_str(0, 1, " ");
+        let indentation_change = editor.plugin_viewport_layout_payload();
+        let indentation_key = indentation_change["indentation_key"].as_str().unwrap();
+        assert_ne!(indentation_key, original_key);
+
+        editor.current_buffer_mut().insert_str(4, 2, "x");
+        let blank_change = editor.plugin_viewport_layout_payload();
+        assert_ne!(
+            blank_change["indentation_key"],
+            indentation_change["indentation_key"]
+        );
     }
 
     #[test]
@@ -36232,6 +37508,335 @@ builtin = "rust"
     }
 
     #[test]
+    fn indexed_word_end_operators_preserve_unicode_groups_and_document_edges() {
+        for (contents, line, column, backward, big_word, expected) in [
+            ("alpha remaining", 0, 2, true, false, Some("alp")),
+            ("αβγ remaining", 0, 2, true, false, Some("αβγ")),
+            ("symbol-parts remaining", 0, 5, true, true, Some("symbol")),
+            ("remaining alpha", 0, 14, false, false, Some("a")),
+            ("remaining 終わり", 0, 12, false, false, Some("り")),
+            ("prefix\r\n終わり", 1, 2, false, false, Some("り")),
+            ("alpha", 0, 0, true, false, None),
+            (" ", 0, 0, false, false, None),
+        ] {
+            let mut editor = test_editor(/*width*/ 80, /*height*/ 24);
+            editor
+                .buffer_manager
+                .replace_buffers(vec![Buffer::new(None, contents.to_string())]);
+            editor.test_set_viewport_cursor(/*vtop*/ 0, column, line);
+            let actual = editor
+                .benchmark_word_end_operator(backward, big_word)
+                .map(|range| editor.current_buffer().text_in_range(range));
+            assert_eq!(
+                actual.as_deref(),
+                expected,
+                "{contents:?} line={line} column={column} backward={backward} big={big_word}"
+            );
+        }
+    }
+
+    #[test]
+    fn indexed_cursor_conversion_preserves_ascii_unicode_and_crlf_boundaries() {
+        for contents in [
+            "word  next\n",
+            "word\t next\r\n",
+            "\n",
+            "e\u{301}clair 👋 終\n",
+        ] {
+            let mut editor = test_editor(/*width*/ 80, /*height*/ 24);
+            editor
+                .buffer_manager
+                .replace_buffers(vec![Buffer::new(None, contents.to_string())]);
+            for line in [0, 1, 9] {
+                for column in [0, 1, 3, 5, 9, usize::MAX] {
+                    let source = editor.current_buffer().get(line);
+                    let expected_reverse = source
+                        .as_deref()
+                        .map(|text| char_to_grapheme(text.trim_end_matches('\n'), column))
+                        .unwrap_or(column);
+                    let expected_search = source
+                        .as_deref()
+                        .map(|text| {
+                            let text = text.trim_end_matches('\n');
+                            if column > 0
+                                && text.graphemes(true).nth(column).is_some_and(|grapheme| {
+                                    grapheme.chars().all(char::is_whitespace)
+                                })
+                            {
+                                grapheme_to_char(text, column - 1)
+                            } else {
+                                grapheme_to_char(text, column)
+                            }
+                        })
+                        .unwrap_or(column);
+                    assert_eq!(
+                        editor.benchmark_cursor_conversion(column, line, /*word_search*/ false),
+                        expected_reverse,
+                        "reverse {contents:?} line={line} column={column}"
+                    );
+                    assert_eq!(
+                        editor.benchmark_cursor_conversion(column, line, /*word_search*/ true),
+                        expected_search,
+                        "search {contents:?} line={line} column={column}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn indexed_editor_line_boundaries_preserve_unicode_crlf_and_viewports() {
+        for contents in [
+            "ordinary ASCII words\nnext",
+            "ordinary\r\n\r\nfinal",
+            "\n",
+            "e\u{301}clair 👋 終\nnext",
+        ] {
+            let mut editor = test_editor(/*width*/ 80, /*height*/ 24);
+            editor
+                .buffer_manager
+                .replace_buffers(vec![Buffer::new(None, contents.to_string())]);
+            for line in [0, 1, 2, 9] {
+                let expected = editor
+                    .current_buffer()
+                    .get(line)
+                    .map(|text| grapheme_len(text.trim_end_matches('\n')))
+                    .unwrap_or_default();
+                assert_eq!(
+                    editor.benchmark_line_boundary(line, /*last_cell*/ false),
+                    expected,
+                    "length {contents:?} line={line}"
+                );
+                assert_eq!(
+                    editor.benchmark_line_boundary(line, /*last_cell*/ true),
+                    expected.saturating_sub(1),
+                    "last cell {contents:?} line={line}"
+                );
+            }
+            if editor.current_buffer().get(1).is_some() {
+                editor.test_set_viewport_cursor(/*vtop*/ 1, /*cx*/ 0, /*cy*/ 0);
+                assert_eq!(editor.line_length(), editor.length_for_line(1));
+            }
+        }
+    }
+
+    #[test]
+    fn indexed_cursor_positions_preserve_tabs_unicode_utf16_crlf_and_viewports() {
+        for contents in [
+            "ordinary ASCII words\nnext",
+            "first\tsecond\nnext",
+            "control\u{7} character\u{7f}\r\nfinal",
+            "ordinary\r\n\r\nfinal",
+            "\n",
+            "e\u{301}clair 👋 終\nnext",
+        ] {
+            let mut editor = test_editor(/*width*/ 80, /*height*/ 24);
+            editor
+                .buffer_manager
+                .replace_buffers(vec![Buffer::new(None, contents.to_string())]);
+            for line in [0, 1, 2, 9] {
+                for column in [0, 1, 2, 5, 9, 24, usize::MAX] {
+                    editor.test_set_viewport_cursor(line, column, /*cy*/ 0);
+                    let source = editor.current_buffer().get(line);
+                    let expected_display = source
+                        .as_deref()
+                        .map(|text| {
+                            grapheme_to_column_with_tabs(
+                                trim_line_ending(text),
+                                column,
+                                editor.active_tab_width(),
+                            )
+                        })
+                        .unwrap_or(column);
+                    let expected_window_lsp = source
+                        .as_deref()
+                        .map(|text| {
+                            text.graphemes(true)
+                                .take(column)
+                                .flat_map(str::chars)
+                                .map(char::len_utf16)
+                                .sum()
+                        })
+                        .unwrap_or(column);
+                    let character = source
+                        .as_deref()
+                        .map(|text| grapheme_to_char(text.trim_end_matches('\n'), column))
+                        .unwrap_or(column);
+                    let expected_lsp = source
+                        .as_deref()
+                        .map(|text| text.chars().take(character).map(char::len_utf16).sum())
+                        .unwrap_or(character);
+                    assert_eq!(
+                        editor.benchmark_cursor_display_column(),
+                        expected_display,
+                        "display {contents:?} line={line} column={column}"
+                    );
+                    assert_eq!(
+                        editor.benchmark_lsp_cursor_character(/*window_snapshot*/ false),
+                        expected_lsp,
+                        "request LSP {contents:?} line={line} column={column}"
+                    );
+                    assert_eq!(
+                        editor.benchmark_lsp_cursor_character(/*window_snapshot*/ true),
+                        expected_window_lsp,
+                        "window LSP {contents:?} line={line} column={column}"
+                    );
+                    assert_eq!(
+                        editor.lsp_character_for_cursor(usize::MAX, line, column),
+                        column,
+                        "missing buffer {contents:?} line={line} column={column}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn indexed_scalar_line_boundaries_and_symbols_preserve_unicode_and_crlf() {
+        for contents in [
+            "alpha beta\nsecond",
+            "name_42! next\r\n\r\nfinal",
+            "λvariable終 e\u{301}clair 👋\nnext",
+            "\n",
+            "punctuation!? _done",
+        ] {
+            let mut editor = test_editor(/*width*/ 80, /*height*/ 24);
+            editor
+                .buffer_manager
+                .replace_buffers(vec![Buffer::new(None, contents.to_string())]);
+            for line in [0, 1, 2, 9] {
+                let source = editor.current_buffer().get(line);
+                let expected_length = source
+                    .as_deref()
+                    .map(|text| trim_line_ending(text).chars().count())
+                    .unwrap_or_default();
+                assert_eq!(
+                    editor.line_character_len(line),
+                    expected_length,
+                    "scalar length {contents:?} line={line}"
+                );
+                for column in [0, 1, 2, 5, 9, 30, usize::MAX] {
+                    editor.test_set_viewport_cursor(line, column, /*cy*/ 0);
+                    let character = source
+                        .as_deref()
+                        .map(|text| grapheme_to_char(text.trim_end_matches('\n'), column))
+                        .unwrap_or(column);
+                    let expected_symbol = source
+                        .as_deref()
+                        .map(|text| {
+                            let characters = text.chars().collect::<Vec<_>>();
+                            let is_symbol = |value: char| value.is_alphanumeric() || value == '_';
+                            let mut cursor = character.min(characters.len());
+                            if cursor == characters.len()
+                                || !characters.get(cursor).copied().is_some_and(is_symbol)
+                            {
+                                cursor = cursor.saturating_sub(1);
+                            }
+                            if !characters.get(cursor).copied().is_some_and(is_symbol) {
+                                return String::new();
+                            }
+                            let mut start = cursor;
+                            while start > 0 && is_symbol(characters[start - 1]) {
+                                start -= 1;
+                            }
+                            let mut end = cursor + 1;
+                            while end < characters.len() && is_symbol(characters[end]) {
+                                end += 1;
+                            }
+                            characters[start..end].iter().collect()
+                        })
+                        .unwrap_or_default();
+                    assert_eq!(
+                        editor.benchmark_rename_symbol(),
+                        expected_symbol,
+                        "symbol {contents:?} line={line} column={column}"
+                    );
+                    if source.is_some() {
+                        let end_line = line.min(editor.last_navigable_line());
+                        let expected_end = editor
+                            .current_buffer()
+                            .get(end_line)
+                            .map(|text| trim_line_ending(&text).chars().count())
+                            .unwrap_or_default();
+                        let range = editor.line_end_motion_range(/*count*/ 1);
+                        assert_eq!(
+                            (range.end.line, range.end.character),
+                            (end_line, expected_end),
+                            "line end {contents:?} line={line} column={column}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn indexed_leading_whitespace_preserves_unicode_tabs_line_endings_and_viewports() {
+        for contents in [
+            "\t    ordinary source\n  next",
+            "\u{2003}\t  λvariable終\r\n\tfinal",
+            " \t \r\n\t  \nfinal",
+            "\n",
+            "no-indent",
+        ] {
+            let mut editor = test_editor(/*width*/ 80, /*height*/ 24);
+            editor
+                .buffer_manager
+                .replace_buffers(vec![Buffer::new(None, contents.to_string())]);
+            for line in [0, 1, 2, 9] {
+                let source = editor.current_buffer().get(line);
+                let expected_indent = source
+                    .as_deref()
+                    .map(|text| {
+                        display_width_with_tabs(
+                            Editor::leading_indentation_text(text),
+                            editor.indentation().tab_width.max(1),
+                        )
+                    })
+                    .unwrap_or_default();
+                assert_eq!(
+                    editor.indentation_columns_for_line(line),
+                    expected_indent,
+                    "indentation {contents:?} line={line}"
+                );
+                for column in [0, 1, 2, 5, 12, usize::MAX] {
+                    editor.test_set_viewport_cursor(line, column, /*cy*/ 0);
+                    let end_character = source
+                        .as_deref()
+                        .map(|text| grapheme_to_char(text.trim_end_matches('\n'), column))
+                        .unwrap_or(column);
+                    for first_non_blank in [false, true] {
+                        let start_character = if first_non_blank {
+                            source
+                                .as_deref()
+                                .map(|text| {
+                                    trim_line_ending(text)
+                                        .chars()
+                                        .take_while(|character| character.is_whitespace())
+                                        .count()
+                                })
+                                .unwrap_or_default()
+                        } else {
+                            0
+                        };
+                        let expected = (start_character != end_character).then(|| {
+                            TextRange::new(
+                                TextPosition::new(line, start_character),
+                                TextPosition::new(line, end_character),
+                            )
+                        });
+                        assert_eq!(
+                            editor.line_start_motion_range(first_non_blank),
+                            expected,
+                            "line start {contents:?} line={line} column={column} first_non_blank={first_non_blank}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn parse_git_status_records_normalizes_statuses() {
         let output = b" M src/editor.rs\0?? plugins/neotree.js\0!! target/\0";
         let statuses = parse_git_status_records(output, "/repo");
@@ -36325,6 +37930,69 @@ builtin = "rust"
     }
 
     #[test]
+    fn git_status_index_reuses_ancestors_without_hiding_later_conflicts() {
+        let statuses = [
+            ("src/nested/first.rs", "modified"),
+            ("src/nested/second.rs", "modified"),
+            ("src/nested/third.rs", "untracked"),
+            ("src/nested/fourth.rs", "conflict"),
+            ("src/nested/fifth.rs", "staged"),
+        ]
+        .into_iter()
+        .map(|(path, status)| {
+            json!({
+                "path": path,
+                "absolute_path": format!("/repo/{path}"),
+                "status": status,
+            })
+        })
+        .collect::<Vec<_>>();
+
+        let index = git_status_index(&statuses, "/repo/");
+        assert_eq!(index["/repo/src"], "conflict");
+        assert_eq!(index["/repo/src/nested"], "conflict");
+        assert_eq!(index["/repo/src/nested/first.rs"], "modified");
+        assert_eq!(index["/repo/src/nested/third.rs"], "untracked");
+        assert_eq!(index["/repo/src/nested/fourth.rs"], "conflict");
+        assert_eq!(index["/repo/src/nested/fifth.rs"], "staged");
+    }
+
+    #[test]
+    fn git_status_index_propagates_tracked_children_past_ignored_directories() {
+        let statuses = [
+            json!({
+                "path": "src/nested",
+                "absolute_path": "/repo/src/nested",
+                "status": "ignored",
+            }),
+            json!({
+                "path": "src/nested/staged.rs",
+                "absolute_path": "/repo/src/nested/staged.rs",
+                "status": "staged",
+            }),
+        ];
+
+        let index = git_status_index(&statuses, "/repo");
+        assert_eq!(index["/repo/src/nested"], "ignored");
+        assert_eq!(index["/repo/src/nested/staged.rs"], "staged");
+        assert_eq!(index["/repo/src"], "staged");
+    }
+
+    #[test]
+    fn git_status_index_normalizes_windows_separators_without_changing_precedence() {
+        let statuses = [json!({
+            "path": "src\\nested\\main.rs",
+            "absolute_path": "C:\\repo\\src\\nested\\main.rs",
+            "status": "modified",
+        })];
+
+        let index = git_status_index(&statuses, "C:\\repo\\");
+        assert_eq!(index["C:/repo/src"], "modified");
+        assert_eq!(index["C:/repo/src/nested"], "modified");
+        assert_eq!(index["C:/repo/src/nested/main.rs"], "modified");
+    }
+
+    #[test]
     fn git_status_index_preserves_a_filesystem_root_repository() {
         let statuses = [json!({
             "path": "src/main.rs",
@@ -36350,6 +38018,235 @@ builtin = "rust"
         assert!(listing["statuses"].as_array().unwrap().is_empty());
         assert!(listing["status_index"].as_object().unwrap().is_empty());
         assert!(listing["error"].is_null());
+    }
+
+    #[test]
+    fn git_status_cache_invalidates_worktree_ignored_and_index_changes() {
+        let root = tempfile::tempdir().unwrap();
+        assert!(Command::new("git")
+            .args(["init", "--quiet"])
+            .arg(root.path())
+            .status()
+            .unwrap()
+            .success());
+        fs::write(root.path().join(".gitignore"), "ignored.log\n").unwrap();
+        fs::write(root.path().join("tracked.rs"), "first\n").unwrap();
+        assert!(Command::new("git")
+            .arg("-C")
+            .arg(root.path())
+            .args(["add", ".gitignore", "tracked.rs"])
+            .status()
+            .unwrap()
+            .success());
+        assert!(Command::new("git")
+            .arg("-C")
+            .arg(root.path())
+            .args([
+                "-c",
+                "user.name=Red Test",
+                "-c",
+                "user.email=red@example.invalid",
+                "commit",
+                "--quiet",
+                "-m",
+                "initial",
+            ])
+            .status()
+            .unwrap()
+            .success());
+
+        let path = root.path().to_str().unwrap();
+        let initial = git_status_listing(path);
+        assert_eq!(git_status_listing(path), initial);
+
+        fs::write(root.path().join("tracked.rs"), "changed\n").unwrap();
+        let changed = git_status_listing(path);
+        assert_ne!(changed, initial);
+        assert!(changed["statuses"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["path"] == "tracked.rs" && entry["status"] == "modified"));
+
+        fs::write(root.path().join("untracked.rs"), "untracked\n").unwrap();
+        fs::write(root.path().join("ignored.log"), "ignored\n").unwrap();
+        let expanded = git_status_listing(path);
+        assert!(expanded["statuses"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["path"] == "untracked.rs"));
+        assert!(expanded["statuses"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["path"] == "ignored.log" && entry["status"] == "ignored"));
+
+        assert!(Command::new("git")
+            .arg("-C")
+            .arg(root.path())
+            .args(["add", "untracked.rs", "tracked.rs"])
+            .status()
+            .unwrap()
+            .success());
+        let staged = git_status_listing(path);
+        assert_ne!(staged, expanded);
+        fs::remove_file(root.path().join("ignored.log")).unwrap();
+        assert!(!git_status_listing(path)["statuses"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["path"] == "ignored.log"));
+    }
+
+    #[test]
+    fn git_status_cache_rejects_oversized_worktrees() {
+        let root = tempfile::tempdir().unwrap();
+        for index in 0..=MAX_GIT_STATUS_FINGERPRINT_ENTRIES {
+            fs::write(root.path().join(format!("file-{index:04}.rs")), "x").unwrap();
+        }
+        assert!(git_status_fingerprint(root.path()).is_none());
+    }
+
+    #[test]
+    fn git_status_listing_discovers_nested_repositories_and_retains_statuses() {
+        let root = tempfile::tempdir().unwrap();
+        assert!(Command::new("git")
+            .args(["init", "--quiet"])
+            .arg(root.path())
+            .status()
+            .unwrap()
+            .success());
+        fs::write(root.path().join(".gitignore"), "ignored.log\n").unwrap();
+        fs::write(root.path().join("tracked.rs"), "first\n").unwrap();
+        assert!(Command::new("git")
+            .arg("-C")
+            .arg(root.path())
+            .args(["add", ".gitignore", "tracked.rs"])
+            .status()
+            .unwrap()
+            .success());
+        assert!(Command::new("git")
+            .arg("-C")
+            .arg(root.path())
+            .args([
+                "-c",
+                "user.name=Red Test",
+                "-c",
+                "user.email=red@example.invalid",
+                "commit",
+                "--quiet",
+                "-m",
+                "initial",
+            ])
+            .status()
+            .unwrap()
+            .success());
+        fs::write(root.path().join("tracked.rs"), "changed\n").unwrap();
+        fs::write(root.path().join("ignored.log"), "ignored\n").unwrap();
+        let nested = root.path().join("packages/inner/src");
+        fs::create_dir_all(&nested).unwrap();
+        let source = nested.join("new.rs");
+        fs::write(&source, "untracked\n").unwrap();
+
+        let listing = git_status_listing(source.to_str().unwrap());
+        assert_eq!(
+            listing["root"],
+            normalize_plugin_path(
+                root.path()
+                    .canonicalize()
+                    .unwrap()
+                    .to_string_lossy()
+                    .as_ref()
+            )
+        );
+        let statuses = listing["statuses"].as_array().unwrap();
+        assert!(statuses.iter().any(|entry| entry["status"] == "modified"));
+        assert!(statuses.iter().any(|entry| entry["status"] == "ignored"));
+        assert!(statuses.iter().any(|entry| entry["status"] == "untracked"));
+
+        let linked_parent = tempfile::tempdir().unwrap();
+        let linked = linked_parent.path().join("linked");
+        assert!(Command::new("git")
+            .arg("-C")
+            .arg(root.path())
+            .args(["worktree", "add", "--quiet", "--detach"])
+            .arg(&linked)
+            .status()
+            .unwrap()
+            .success());
+        fs::write(linked.join("linked.rs"), "linked source\n").unwrap();
+        let linked_listing = git_status_listing(linked.join("linked.rs").to_str().unwrap());
+        assert_eq!(
+            linked_listing["root"],
+            normalize_plugin_path(linked.canonicalize().unwrap().to_string_lossy().as_ref())
+        );
+        assert!(linked_listing["statuses"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["path"] == "linked.rs"));
+
+        let inner = root.path().join("packages/inner");
+        assert!(Command::new("git")
+            .args(["init", "--quiet"])
+            .arg(&inner)
+            .status()
+            .unwrap()
+            .success());
+        let nested_listing = git_status_listing(source.to_str().unwrap());
+        assert_eq!(
+            nested_listing["root"],
+            normalize_plugin_path(inner.canonicalize().unwrap().to_string_lossy().as_ref())
+        );
+        assert!(nested_listing["statuses"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["path"] == "src/"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn git_status_listing_follows_retargeted_repository_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let first = root.path().join("first");
+        let second = root.path().join("second");
+        for repository in [&first, &second] {
+            assert!(Command::new("git")
+                .args(["init", "--quiet"])
+                .arg(repository)
+                .status()
+                .unwrap()
+                .success());
+            fs::write(repository.join("untracked.rs"), "source\n").unwrap();
+        }
+        let alias = root.path().join("active");
+        symlink(&first, &alias).unwrap();
+        let first_listing = git_status_listing(alias.to_str().unwrap());
+        assert_eq!(
+            first_listing["root"],
+            first.canonicalize().unwrap().to_string_lossy().into_owned()
+        );
+
+        fs::remove_file(&alias).unwrap();
+        symlink(&second, &alias).unwrap();
+        let second_listing = git_status_listing(alias.to_str().unwrap());
+        assert_eq!(
+            second_listing["root"],
+            second
+                .canonicalize()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned()
+        );
+        assert!(second_listing["statuses"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["path"] == "untracked.rs"));
     }
 
     fn test_home_dir() -> PathBuf {
@@ -37143,6 +39040,7 @@ builtin = "rust"
         completion.show(vec![completion_item("alpha")], completion_x, completion_y);
         editor.current_dialog = Some(Box::new(completion));
         editor.render(&mut render_buffer).unwrap();
+        let full_renders = editor.full_render_count;
 
         let event = Event::Key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE));
         if let Some(action) = editor.handle_event(&event).unwrap() {
@@ -37157,6 +39055,10 @@ builtin = "rust"
         assert!(
             rendered_row.contains("config_file.e"),
             "expected active row {active_row} to show typed text, got {rendered_row:?}"
+        );
+        assert_eq!(
+            editor.full_render_count, full_renders,
+            "completion typing should repaint the editor without forcing a full frame"
         );
     }
 
@@ -38659,6 +40561,41 @@ builtin = "rust"
             .warnings
             .iter()
             .any(|warning| warning.contains("Collapsed duplicate saved buffer")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn session_restore_detaches_symlink_and_hardlink_duplicates() {
+        let directory = tempfile::tempdir().unwrap();
+        let original = directory.path().join("original.rs");
+        let symlink = directory.path().join("symlink.rs");
+        let hardlink = directory.path().join("hardlink.rs");
+        std::fs::write(&original, "original\n").unwrap();
+        std::os::unix::fs::symlink(&original, &symlink).unwrap();
+        std::fs::hard_link(&original, &hardlink).unwrap();
+        let mut editor = lsp_test_editor(vec![
+            Buffer::new(
+                Some(original.to_string_lossy().into_owned()),
+                "original\n".to_string(),
+            ),
+            Buffer::new(
+                Some(symlink.to_string_lossy().into_owned()),
+                "unsaved symlink\n".to_string(),
+            ),
+            Buffer::new(
+                Some(hardlink.to_string_lossy().into_owned()),
+                "unsaved hardlink\n".to_string(),
+            ),
+        ]);
+
+        let restored = Editor::buffers_from_session_snapshot(&editor.test_session_snapshot());
+
+        assert_eq!(restored.len(), 3);
+        assert_eq!(restored[0].file.as_deref(), original.to_str());
+        assert!(restored[1].file.is_none() && restored[1].is_dirty());
+        assert_eq!(restored[1].contents(), "unsaved symlink\n");
+        assert!(restored[2].file.is_none() && restored[2].is_dirty());
+        assert_eq!(restored[2].contents(), "unsaved hardlink\n");
     }
 
     #[tokio::test]

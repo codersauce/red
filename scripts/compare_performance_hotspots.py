@@ -1,0 +1,332 @@
+#!/usr/bin/env python3
+"""Compare pinned Red hotspot benchmark binaries using repeated median samples."""
+
+import argparse
+import json
+from pathlib import Path
+import statistics
+import subprocess
+import sys
+
+
+SCENARIOS = (
+    "decorations",
+    "gutters",
+    "agent",
+    "picker",
+    "panel",
+    "viewport",
+    "timers",
+    "search",
+    "completion",
+    "rows",
+    "json",
+    "render",
+    "preferences",
+    "detached",
+    "startup",
+    "word-motion",
+    "word-next",
+    "word-prev",
+    "resolver-next",
+    "resolver-prev",
+    "resolver-range",
+    "resolver-change-word",
+    "resolver-delete-word",
+    "resolver-count-change",
+    "resolver-count-delete",
+    "resolver-find-forward-ascii",
+    "resolver-find-backward-ascii",
+    "resolver-find-forward-unicode",
+    "resolver-find-backward-unicode",
+    "editor-word-end-backward",
+    "editor-word-end-forward",
+    "editor-cursor-reverse",
+    "editor-cursor-word-search",
+    "editor-line-length",
+    "editor-line-last-cell",
+    "editor-cursor-display",
+    "editor-lsp-position",
+    "editor-lsp-window",
+    "editor-line-scalar-ascii",
+    "editor-line-scalar-unicode",
+    "editor-line-end-ascii",
+    "editor-line-end-unicode",
+    "editor-rename-ascii",
+    "editor-rename-unicode",
+    "column-scalar-forward",
+    "column-scalar-reverse",
+    "column-grapheme-forward",
+    "column-grapheme-reverse",
+    "editor-line-start",
+    "editor-indent-ascii",
+    "editor-indent-unicode",
+    "paragraph-final-cursor",
+    "sentence-final-cursor",
+    "paragraph",
+    "sentence",
+    "undo-prune",
+    "highlight",
+    "highlight-comment",
+    "highlight-comment-unicode",
+    "highlight-comment-crlf",
+    "highlight-string",
+    "highlight-string-unicode",
+    "highlight-string-crlf",
+    "identifier-javascript",
+    "identifier-jsx",
+    "identifier-typescript",
+    "identifier-tsx",
+    "identifier-lua",
+    "identifier-husk",
+    "identifier-toml",
+    "identifier-yaml",
+    "identifier-bash",
+    "identifier-fish",
+    "identifier-powershell",
+    "markdown-fenced-identifier-javascript",
+    "markdown-fenced-identifier-jsx",
+    "markdown-fenced-identifier-typescript",
+    "markdown-fenced-identifier-tsx",
+    "markdown-fenced-identifier-lua",
+    "markdown-fenced-identifier-husk",
+    "markdown-fenced-identifier-toml",
+    "markdown-fenced-identifier-yaml",
+    "markdown-fenced-identifier-bash",
+    "markdown-fenced-identifier-fish",
+    "markdown-fenced-identifier-powershell",
+    "numeric-rust",
+    "numeric-javascript",
+    "numeric-jsx",
+    "numeric-typescript",
+    "numeric-tsx",
+    "numeric-json",
+    "numeric-toml",
+    "numeric-yaml",
+    "numeric-lua",
+    "numeric-powershell",
+    "numeric-husk",
+    "markdown-fenced-numeric-rust",
+    "markdown-fenced-numeric-javascript",
+    "markdown-fenced-numeric-jsx",
+    "markdown-fenced-numeric-typescript",
+    "markdown-fenced-numeric-tsx",
+    "markdown-fenced-numeric-json",
+    "markdown-fenced-numeric-toml",
+    "markdown-fenced-numeric-yaml",
+    "markdown-fenced-numeric-lua",
+    "markdown-fenced-numeric-powershell",
+    "markdown-fenced-numeric-husk",
+    "javascript-comment",
+    "javascript-string",
+    "jsx-comment",
+    "jsx-string",
+    "typescript-comment",
+    "typescript-string",
+    "tsx-comment",
+    "tsx-string",
+    "json-string",
+    "toml-comment",
+    "toml-string",
+    "yaml-comment",
+    "yaml-string",
+    "bash-comment",
+    "bash-string",
+    "fish-comment",
+    "fish-string",
+    "powershell-comment",
+    "powershell-string",
+    "lua-comment",
+    "lua-string",
+    "markdown-heading-h1",
+    "markdown-heading-h2",
+    "markdown-heading-h3",
+    "markdown-heading-unicode",
+    "markdown-heading-crlf",
+    "markdown-heading-injected",
+    "markdown-fenced-rust-comment",
+    "markdown-fenced-rust-string",
+    "markdown-fenced-rust-unicode",
+    "markdown-fenced-rust-crlf",
+    "markdown-fenced-husk-comment",
+    "markdown-fenced-husk-string",
+    "markdown-fenced-husk-unicode",
+    "markdown-fenced-husk-crlf",
+    "markdown-fenced-javascript-comment",
+    "markdown-fenced-javascript-string",
+    "markdown-fenced-jsx-comment",
+    "markdown-fenced-jsx-string",
+    "markdown-fenced-typescript-comment",
+    "markdown-fenced-typescript-string",
+    "markdown-fenced-tsx-comment",
+    "markdown-fenced-tsx-string",
+    "markdown-fenced-json-string",
+    "markdown-fenced-toml-comment",
+    "markdown-fenced-toml-string",
+    "markdown-fenced-yaml-comment",
+    "markdown-fenced-yaml-string",
+    "markdown-fenced-bash-comment",
+    "markdown-fenced-bash-string",
+    "markdown-fenced-fish-comment",
+    "markdown-fenced-fish-string",
+    "markdown-fenced-powershell-comment",
+    "markdown-fenced-powershell-string",
+    "markdown-fenced-lua-comment",
+    "markdown-fenced-lua-string",
+    "husk-comment",
+    "husk-string",
+    "husk-comment-unicode",
+    "husk-comment-crlf",
+    "gitcommit-comment",
+    "gitcommit-branch",
+    "gitcommit-path",
+    "gitcommit-diff",
+    "gitcommit-subject",
+    "gitcommit-unicode",
+    "gitcommit-crlf",
+    "tree-selection",
+    "workspace-navigation",
+    "inline-stream",
+    "statusline",
+    "lsp-routing",
+    "session-restore",
+    "workspace-files",
+    "workspace-search",
+    "plugin-events",
+    "session-write",
+    "session-codec-encode",
+    "session-codec-decode",
+    "frame-full",
+    "git-discovery",
+    "startup-files",
+    "lsp-changes",
+    "textarea-typing",
+    "startup-config",
+    "startup-theme",
+    "theme-colors",
+    "ascii-graphemes",
+    "textarea-open",
+    "git-status-index",
+    "git-status-refresh",
+    "git-status-outside",
+    "buffer-last-line",
+    "buffer-line-count",
+    "search-sparse-ascii",
+    "search-sparse-unicode",
+    "layout-grapheme-cursor",
+    "layout-word-cursor",
+    "textarea-vim-word",
+    "textarea-vim-line",
+    "textarea-vim-match",
+    "textarea-delete",
+    "textarea-word-delete",
+    "textarea-home-end",
+    "paragraph-operator",
+    "sentence-operator",
+    "vim-long-line-end",
+    "paragraph-long-line",
+    "textarea-undo",
+    "textarea-redo",
+    "text-object-delimited",
+    "text-object-quoted",
+    "text-object-quote-ascii-inner",
+    "text-object-quote-ascii-around",
+    "text-object-quote-unicode-inner",
+    "text-object-quote-unicode-around",
+    "text-object-word",
+    "text-object-big-word",
+    "text-object-paragraph-inner",
+    "text-object-paragraph-around",
+    "text-object-sentence-inner",
+    "text-object-sentence-around",
+    "husk-completion",
+    "husk-config",
+    "husk-update",
+)
+
+
+def measure(binary, scenario):
+    process = subprocess.run(
+        [str(binary), scenario],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    results = json.loads(process.stdout)
+    if len(results) != 1:
+        raise ValueError(f"{binary} returned {len(results)} results for {scenario}")
+    return results[0]
+
+
+def compare(before, after, scenario, samples):
+    before_samples = []
+    after_samples = []
+    before_result = None
+    after_result = None
+    for sample in range(samples):
+        if sample % 2:
+            after_result = measure(after, scenario)
+            before_result = measure(before, scenario)
+        else:
+            before_result = measure(before, scenario)
+            after_result = measure(after, scenario)
+        if before_result["iterations"] != after_result["iterations"]:
+            raise ValueError(f"iteration count differs for {scenario}")
+        before_samples.append(before_result["elapsed_us"])
+        after_samples.append(after_result["elapsed_us"])
+
+    before_median = statistics.median(before_samples)
+    after_median = statistics.median(after_samples)
+    improvement = (
+        round((before_median - after_median) / before_median * 100, 2)
+        if before_median
+        else 0.0
+    )
+    return {
+        "scenario": before_result["scenario"],
+        "samples": samples,
+        "iterations": before_result["iterations"],
+        "before_median_us": before_median,
+        "after_median_us": after_median,
+        "improvement_percent": improvement,
+        "before_samples_us": before_samples,
+        "after_samples_us": after_samples,
+    }
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--before", type=Path, required=True)
+    parser.add_argument("--after", type=Path, required=True)
+    parser.add_argument("--samples", type=int, default=5)
+    parser.add_argument("--scenarios", nargs="+", choices=SCENARIOS, default=SCENARIOS)
+    parser.add_argument("--minimum-improvement", type=float)
+    arguments = parser.parse_args()
+    if arguments.samples < 1:
+        parser.error("--samples must be at least 1")
+
+    results = [
+        compare(arguments.before, arguments.after, scenario, arguments.samples)
+        for scenario in arguments.scenarios
+    ]
+    print(json.dumps({"results": results}, indent=2))
+
+    if arguments.minimum_improvement is not None:
+        failures = [
+            result
+            for result in results
+            if result["improvement_percent"] < arguments.minimum_improvement
+        ]
+        if failures:
+            for failure in failures:
+                print(
+                    f"{failure['scenario']}: {failure['improvement_percent']}% is below "
+                    f"the {arguments.minimum_improvement}% improvement target",
+                    file=sys.stderr,
+                )
+            return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

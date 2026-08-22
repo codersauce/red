@@ -9,6 +9,8 @@ mod embedding;
 mod stdlib;
 
 use std::{
+    borrow::Cow,
+    cell::RefCell,
     collections::{BTreeMap, HashMap, HashSet},
     fmt,
     sync::Arc,
@@ -251,7 +253,7 @@ impl Value {
     /// Converts JSON into Husk's shared runtime representation.
     #[must_use]
     pub fn from_json(value: serde_json::Value) -> Self {
-        json_to_value(&value)
+        json_into_value(value)
     }
 
     /// Converts a runtime value into its JSON boundary representation.
@@ -750,10 +752,10 @@ impl CompiledProgram {
             )));
         }
 
-        let mut declarations = options.declarations.clone();
+        let mut declarations = Cow::Borrowed(options.declarations.as_slice());
         for module in &options.modules {
             module.validate()?;
-            declarations.push(module_declaration_ast(module)?);
+            declarations.to_mut().push(module_declaration_ast(module)?);
         }
 
         let semantic = if options.typecheck {
@@ -1149,6 +1151,16 @@ impl CompiledProgram {
     #[must_use]
     pub fn semantic_result(&self) -> Option<&SemanticResult> {
         self.semantic.as_deref()
+    }
+
+    /// Release parsing and type-checking data after host validation is complete.
+    ///
+    /// Executable HIR, diagnostics sources, annotations, and module descriptors
+    /// remain intact, so the program can still be loaded and activated normally.
+    pub fn discard_analysis(&mut self) {
+        self.syntax = Arc::new(File { items: Vec::new() });
+        self.semantic = None;
+        self.module_semantics = Arc::new(BTreeMap::new());
     }
 
     /// Semantic results for every source module in a compiled package.
@@ -5561,9 +5573,9 @@ fn iterable_values(value: Value) -> anyhow::Result<Box<dyn Iterator<Item = Value
                 (0..length).map(move |index| values[index].clone()),
             ))
         }
-        Value::Json(serde_json::Value::Array(values)) => Ok(Box::new(
-            values.into_iter().map(|value| json_to_value(&value)),
-        )),
+        Value::Json(serde_json::Value::Array(values)) => {
+            Ok(Box::new(values.into_iter().map(json_into_value)))
+        }
         Value::String(value) => Ok(Box::new(
             value
                 .chars()
@@ -5601,6 +5613,108 @@ fn enum_constructor_path(path: &str) -> Option<(&str, &str)> {
     (is_type && is_case).then_some((type_name, case))
 }
 
+const SCALAR_JSON_OBJECT_CACHE_SLOTS: usize = 32;
+
+type ScalarJsonObjectCacheEntry = (u64, Arc<BTreeMap<String, Value>>);
+
+thread_local! {
+    static SCALAR_JSON_OBJECT_CACHE: RefCell<[Option<ScalarJsonObjectCacheEntry>; SCALAR_JSON_OBJECT_CACHE_SLOTS]> =
+        const { RefCell::new([const { None }; SCALAR_JSON_OBJECT_CACHE_SLOTS]) };
+}
+
+fn scalar_json_object_fingerprint(
+    values: &serde_json::Map<String, serde_json::Value>,
+) -> Option<u64> {
+    if values.len() != 2 {
+        return None;
+    }
+
+    let mut fingerprint = 0xcbf2_9ce4_8422_2325_u64;
+    for (name, value) in values {
+        for byte in name.bytes() {
+            fingerprint ^= u64::from(byte);
+            fingerprint = fingerprint.wrapping_mul(0x0100_0000_01b3);
+        }
+        let encoded = match value {
+            serde_json::Value::Bool(value) => u64::from(*value),
+            serde_json::Value::Number(value) => value.as_i64()? as u64,
+            _ => return None,
+        };
+        fingerprint ^= encoded;
+        fingerprint = fingerprint.wrapping_mul(0x0100_0000_01b3);
+    }
+    Some(fingerprint)
+}
+
+fn cached_scalar_json_object(
+    values: &serde_json::Map<String, serde_json::Value>,
+    fingerprint: u64,
+) -> Option<Arc<BTreeMap<String, Value>>> {
+    SCALAR_JSON_OBJECT_CACHE.with(|cache| {
+        let cache = cache.borrow();
+        let (cached_fingerprint, cached) =
+            cache[(fingerprint as usize) & (SCALAR_JSON_OBJECT_CACHE_SLOTS - 1)].as_ref()?;
+        if *cached_fingerprint != fingerprint || cached.len() != values.len() {
+            return None;
+        }
+        cached
+            .iter()
+            .zip(values)
+            .all(|((cached_name, cached_value), (name, value))| {
+                cached_name == name
+                    && match (cached_value, value) {
+                        (Value::Bool(cached), serde_json::Value::Bool(value)) => cached == value,
+                        (Value::Int(cached), serde_json::Value::Number(value)) => {
+                            value.as_i64() == Some(*cached)
+                        }
+                        _ => false,
+                    }
+            })
+            .then(|| Arc::clone(cached))
+    })
+}
+
+fn json_into_value(value: serde_json::Value) -> Value {
+    match value {
+        serde_json::Value::Null => Value::Null,
+        serde_json::Value::Bool(value) => Value::Bool(value),
+        serde_json::Value::Number(value) => {
+            if let Some(integer) = value.as_i64() {
+                Value::Int(integer)
+            } else if let Some(float) = value.as_f64() {
+                Value::Float(float)
+            } else {
+                Value::Json(serde_json::Value::Number(value))
+            }
+        }
+        serde_json::Value::String(value) => Value::String(value),
+        serde_json::Value::Array(values) => {
+            Value::Array(Arc::new(values.into_iter().map(json_into_value).collect()))
+        }
+        serde_json::Value::Object(values) => {
+            let fingerprint = scalar_json_object_fingerprint(&values);
+            if let Some(cached) =
+                fingerprint.and_then(|key| cached_scalar_json_object(&values, key))
+            {
+                return Value::Object(cached);
+            }
+            let mut object = BTreeMap::new();
+            for (key, value) in values {
+                object.insert(key, json_into_value(value));
+            }
+            let object = Arc::new(object);
+            if let Some(fingerprint) = fingerprint {
+                SCALAR_JSON_OBJECT_CACHE.with(|cache| {
+                    cache.borrow_mut()
+                        [(fingerprint as usize) & (SCALAR_JSON_OBJECT_CACHE_SLOTS - 1)] =
+                        Some((fingerprint, Arc::clone(&object)));
+                });
+            }
+            Value::Object(object)
+        }
+    }
+}
+
 fn json_to_value(value: &serde_json::Value) -> Value {
     match value {
         serde_json::Value::Null => Value::Null,
@@ -5618,12 +5732,13 @@ fn json_to_value(value: &serde_json::Value) -> Value {
         serde_json::Value::Array(values) => {
             Value::Array(Arc::new(values.iter().map(json_to_value).collect()))
         }
-        serde_json::Value::Object(values) => Value::Object(Arc::new(
-            values
-                .iter()
-                .map(|(key, value)| (key.clone(), json_to_value(value)))
-                .collect(),
-        )),
+        serde_json::Value::Object(values) => {
+            let mut object = BTreeMap::new();
+            for (key, value) in values {
+                object.insert(key.clone(), json_to_value(value));
+            }
+            Value::Object(Arc::new(object))
+        }
     }
 }
 
@@ -6318,6 +6433,104 @@ mod tests {
 
     impl Host for TestHost {
         fn log(&mut self, _message: &str) {}
+    }
+
+    #[test]
+    fn owned_json_conversion_preserves_nested_values_and_unicode() {
+        let json = serde_json::json!({
+            "text": "héllo 🦀",
+            "values": [null, true, -42, 3.25, { "nested": "世界" }],
+        });
+
+        let runtime = Value::from_json(json.clone());
+
+        assert_eq!(runtime.to_json(), json);
+        assert!(matches!(runtime, Value::Object(_)));
+    }
+
+    #[test]
+    fn repeated_scalar_json_objects_share_copy_on_write_storage() {
+        let json = serde_json::json!({ "tabs": false, "width": 8 });
+        let Value::Object(mut first) = Value::from_json(json.clone()) else {
+            panic!("scalar JSON records must remain runtime objects");
+        };
+        let Value::Object(second) = Value::from_json(json) else {
+            panic!("scalar JSON records must remain runtime objects");
+        };
+
+        assert!(Arc::ptr_eq(&first, &second));
+        Arc::make_mut(&mut first).insert("width".to_string(), Value::Int(12));
+
+        assert_eq!(first.get("width"), Some(&Value::Int(12)));
+        assert_eq!(second.get("width"), Some(&Value::Int(8)));
+    }
+
+    #[test]
+    fn scalar_json_cache_distinguishes_booleans_and_integer_values() {
+        let first = Value::from_json(serde_json::json!({ "flag": true, "value": 1 }));
+        let second = Value::from_json(serde_json::json!({ "flag": false, "value": 1 }));
+        let third = Value::from_json(serde_json::json!({ "flag": true, "value": 2 }));
+
+        assert_eq!(
+            first.to_json(),
+            serde_json::json!({ "flag": true, "value": 1 })
+        );
+        assert_eq!(
+            second.to_json(),
+            serde_json::json!({ "flag": false, "value": 1 })
+        );
+        assert_eq!(
+            third.to_json(),
+            serde_json::json!({ "flag": true, "value": 2 })
+        );
+    }
+
+    #[test]
+    fn scalar_json_cache_does_not_retain_string_or_nested_values() {
+        for json in [
+            serde_json::json!({ "label": "private", "value": 1 }),
+            serde_json::json!({ "nested": { "value": 1 }, "flag": true }),
+            serde_json::json!({ "ratio": 1.5, "flag": true }),
+        ] {
+            let Value::Object(first) = Value::from_json(json.clone()) else {
+                panic!("JSON records must remain runtime objects");
+            };
+            let Value::Object(second) = Value::from_json(json) else {
+                panic!("JSON records must remain runtime objects");
+            };
+
+            assert!(!Arc::ptr_eq(&first, &second));
+        }
+    }
+
+    #[test]
+    fn discarding_analysis_preserves_executable_compiled_program() {
+        let mut program = CompiledProgram::compile_at(
+            "optimized",
+            "plugins/optimized.hk",
+            "pub fn answer() -> i32 { return 42; }",
+            &CompileOptions::default(),
+        )
+        .unwrap();
+        let expected_functions = program.hir_functions();
+        assert!(!program.syntax().items.is_empty());
+        assert!(program.semantic_result().is_some());
+
+        program.discard_analysis();
+
+        assert!(program.syntax().items.is_empty());
+        assert!(program.semantic_result().is_none());
+        assert_eq!(program.hir_functions(), expected_functions);
+
+        let mut host = TestHost;
+        let mut vm = Vm::new();
+        vm.load_compiled_plugin("optimized", program, &mut host)
+            .unwrap();
+        assert_eq!(
+            vm.call_export("optimized", "answer", Vec::new(), &mut host)
+                .unwrap(),
+            Value::Int(42)
+        );
     }
 
     #[test]

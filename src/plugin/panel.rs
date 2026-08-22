@@ -11,7 +11,8 @@
 
 use std::{
     cell::RefCell,
-    collections::HashMap,
+    collections::{hash_map::DefaultHasher, HashMap},
+    hash::{Hash, Hasher},
     ops::Range,
     sync::Arc,
     time::{Duration, Instant},
@@ -1423,11 +1424,14 @@ impl TextPanelLayout {
             return None;
         }
         let offset = self.clamp(offset);
-        self.lines.iter().enumerate().find_map(|(row, line)| {
-            let index = offset.checked_sub(line.first)?;
-            let cell = line.cells.get(index)?;
-            Some((row, index, cell.column))
-        })
+        let row = self
+            .lines
+            .partition_point(|line| line.first <= offset)
+            .checked_sub(1)?;
+        let line = self.lines.get(row)?;
+        let index = offset.checked_sub(line.first)?;
+        let cell = line.cells.get(index)?;
+        Some((row, index, cell.column))
     }
 
     fn offset_at(&self, row: usize, column: usize) -> Option<usize> {
@@ -2273,9 +2277,16 @@ pub struct PluginPanel {
     pub id: String,
     pub config: PanelConfig,
     pub rows: Vec<PanelRow>,
+    row_positions: HashMap<u64, usize>,
     tree: Option<TreePanelModel>,
     pub selected: usize,
     pub scroll: usize,
+}
+
+fn path_hash(path: &str) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    path.hash(&mut hasher);
+    hasher.finish()
 }
 
 impl PluginPanel {
@@ -2284,6 +2295,7 @@ impl PluginPanel {
             id,
             config,
             rows: Vec::new(),
+            row_positions: HashMap::new(),
             tree: None,
             selected: 0,
             scroll: 0,
@@ -2292,6 +2304,13 @@ impl PluginPanel {
 
     pub fn update_rows(&mut self, rows: Vec<PanelRow>) {
         self.tree = None;
+        self.row_positions.clear();
+        self.row_positions.reserve(rows.len());
+        for (index, row) in rows.iter().enumerate() {
+            self.row_positions
+                .entry(path_hash(&row.id))
+                .or_insert(index);
+        }
         self.rows = rows;
         if self.row_count() == 0 {
             self.selected = 0;
@@ -2308,6 +2327,7 @@ impl PluginPanel {
     fn update_tree(&mut self, model: TreePanelModel) {
         let selected_id = self.selected_row().map(|row| row.id);
         self.rows.clear();
+        self.row_positions.clear();
         self.tree = Some(model);
         let count = self.row_count();
         if count == 0 {
@@ -2403,7 +2423,13 @@ impl PluginPanel {
 
     pub fn select_row_by_id(&mut self, row_id: &str, panel_height: usize) -> bool {
         let index = self.tree.as_ref().map_or_else(
-            || self.rows.iter().position(|row| row.id == row_id),
+            || {
+                self.row_positions
+                    .get(&path_hash(row_id))
+                    .copied()
+                    .filter(|index| self.rows.get(*index).is_some_and(|row| row.id == row_id))
+                    .or_else(|| self.rows.iter().position(|row| row.id == row_id))
+            },
             |tree| tree.position(row_id),
         );
         let Some(index) = index else {
@@ -9618,6 +9644,19 @@ mod tests {
     }
 
     #[test]
+    fn select_row_by_id_preserves_first_duplicate_and_recovers_from_hash_collisions() {
+        let mut panel = PluginPanel::new("tree".to_string(), PanelConfig::default());
+        panel.update_rows(vec![row("duplicate"), row("other"), row("duplicate")]);
+
+        assert!(panel.select_row_by_id("duplicate", 10));
+        assert_eq!(panel.selected, 0);
+
+        panel.row_positions.insert(path_hash("duplicate"), 1);
+        assert!(panel.select_row_by_id("duplicate", 10));
+        assert_eq!(panel.selected, 0);
+    }
+
+    #[test]
     fn render_panel_right_aligns_badges() {
         let mut panel = PluginPanel::new("tree".to_string(), PanelConfig::default());
         let mut row = row("src");
@@ -9908,6 +9947,35 @@ mod tests {
             narrow_user.selected_text(0, narrow_user.len - 1, false),
             "alpha beta gamma\nsecond line"
         );
+    }
+
+    #[test]
+    fn text_panel_position_skips_empty_and_chrome_rows_at_shared_offsets() {
+        let layout = TextPanelLayout::new(vec![
+            RenderedTextLine::chrome("heading".to_string(), TextPanelSpanStyle::Text),
+            RenderedTextLine::plain(String::new(), TextPanelSpanStyle::Text),
+            RenderedTextLine::plain("alpha".to_string(), TextPanelSpanStyle::Text),
+            RenderedTextLine::chrome("divider".to_string(), TextPanelSpanStyle::Text),
+            RenderedTextLine::plain(String::new(), TextPanelSpanStyle::Text),
+            RenderedTextLine::plain("界β".to_string(), TextPanelSpanStyle::Text),
+            RenderedTextLine::chrome("footer".to_string(), TextPanelSpanStyle::Text),
+        ]);
+
+        assert_eq!(layout.position(0), Some((2, 0, 0)));
+        assert_eq!(layout.position(4), Some((2, 4, 4)));
+        assert_eq!(layout.position(5), Some((5, 0, 0)));
+        assert_eq!(layout.position(6), Some((5, 1, 2)));
+        assert_eq!(layout.position(usize::MAX), Some((5, 1, 2)));
+    }
+
+    #[test]
+    fn text_panel_position_rejects_layouts_without_selectable_cells() {
+        let layout = TextPanelLayout::new(vec![
+            RenderedTextLine::chrome("heading".to_string(), TextPanelSpanStyle::Text),
+            RenderedTextLine::plain(String::new(), TextPanelSpanStyle::Text),
+        ]);
+
+        assert_eq!(layout.position(0), None);
     }
 
     #[test]

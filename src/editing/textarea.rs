@@ -1,6 +1,6 @@
 //! Host-independent, rope-backed Vim editing for embedded text surfaces.
 
-use std::collections::HashMap;
+use std::{borrow::Cow, collections::HashMap};
 
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use unicode_segmentation::UnicodeSegmentation;
@@ -184,14 +184,14 @@ impl TextArea {
     pub fn with_max_bytes(text: impl AsRef<str>, max_bytes: usize) -> Self {
         let normalized = normalize_newlines(text.as_ref());
         let text = if normalized.len() <= max_bytes {
-            normalized
+            normalized.as_ref()
         } else {
-            String::new()
+            ""
         };
         let mut area = Self {
-            buffer: unnamed_buffer(&text),
+            buffer: unnamed_buffer(text),
             state: EditState {
-                cursor: grapheme_len(&text),
+                cursor: grapheme_len(text),
                 ..EditState::default()
             },
             max_bytes,
@@ -268,7 +268,7 @@ impl TextArea {
 
     /// Moves the cursor to a bounded, absolute extended-grapheme position.
     pub fn set_cursor(&mut self, cursor: usize) {
-        self.state.cursor = cursor.min(grapheme_len(&self.text()));
+        self.state.cursor = cursor.min(self.document_grapheme_len());
         self.state.preferred_column = None;
         self.sync_buffer_cursor();
     }
@@ -279,7 +279,7 @@ impl TextArea {
         if text.len() > self.max_bytes {
             return false;
         }
-        let end = grapheme_len(&self.text());
+        let end = self.document_grapheme_len();
         self.replace_graphemes(0, end, &text, grapheme_len(&text), "replace text area")
     }
 
@@ -290,6 +290,15 @@ impl TextArea {
             return false;
         }
         let cursor = self.state.cursor;
+        if self.buffer.is_ascii() && text.is_ascii() {
+            return self.replace_graphemes(
+                cursor,
+                cursor,
+                &text,
+                cursor.saturating_add(text.len()),
+                "insert text",
+            );
+        }
         let mut prefix = self.text();
         prefix.truncate(grapheme_to_byte(&prefix, cursor));
         prefix.push_str(&text);
@@ -308,7 +317,7 @@ impl TextArea {
 
     /// Removes the complete extended grapheme directly under the cursor.
     pub fn delete(&mut self) -> bool {
-        if self.state.cursor >= grapheme_len(&self.text()) {
+        if self.state.cursor >= self.document_grapheme_len() {
             return false;
         }
         let cursor = self.state.cursor;
@@ -319,6 +328,30 @@ impl TextArea {
     pub fn delete_previous_word(&mut self) -> bool {
         if self.state.cursor == 0 {
             return false;
+        }
+        if self.buffer.is_ascii() {
+            let mut start = self.state.cursor;
+            let mut seen_word = false;
+            for character in self
+                .buffer
+                .contents_snapshot()
+                .chars_at(self.state.cursor)
+                .reversed()
+            {
+                let whitespace = character.is_whitespace();
+                if seen_word && whitespace {
+                    break;
+                }
+                seen_word |= !whitespace;
+                start -= 1;
+            }
+            return self.replace_graphemes(
+                start,
+                self.state.cursor,
+                "",
+                start,
+                "delete previous word",
+            );
         }
         let text = self.text();
         let end = grapheme_to_byte(&text, self.state.cursor);
@@ -459,7 +492,7 @@ impl TextArea {
                 return TextAreaOutcome::Changed;
             }
             KeyCode::End => {
-                self.set_cursor(grapheme_len(&self.text()));
+                self.set_cursor(self.document_grapheme_len());
                 return TextAreaOutcome::Changed;
             }
             KeyCode::Backspace if is_word_backspace(key) => {
@@ -1083,7 +1116,7 @@ impl TextArea {
         } else {
             let first = anchor.min(self.state.cursor);
             let last = anchor.max(self.state.cursor).saturating_add(1);
-            self.range_for_graphemes(first, last.min(grapheme_len(&self.text())))
+            self.range_for_graphemes(first, last.min(self.document_grapheme_len()))
         };
         self.apply_operator(operator, range, linewise, keys);
     }
@@ -1329,7 +1362,7 @@ impl TextArea {
                 self.current_line_start()
             } else {
                 let end = self.current_line_end();
-                if end < grapheme_len(&self.text()) {
+                if end < self.document_grapheme_len() {
                     end + 1
                 } else {
                     end
@@ -1479,9 +1512,9 @@ impl TextArea {
     }
 
     fn move_to_matching_delimiter(&mut self) {
-        let text = self.text();
-        let cursor_byte = grapheme_to_byte(&text, self.state.cursor);
-        let Some(character) = text[cursor_byte..].chars().next() else {
+        let cursor = self.buffer.position_to_char_idx(self.cursor_position());
+        let contents = self.buffer.contents_snapshot();
+        let Some(character) = contents.get_char(cursor) else {
             return;
         };
         let (open, close, forward) = match character {
@@ -1493,24 +1526,34 @@ impl TextArea {
             '}' => ('{', '}', false),
             _ => return,
         };
-        let chars = text.chars().collect::<Vec<_>>();
-        let cursor = text[..cursor_byte].chars().count();
+        let starting = if forward { open } else { close };
+        let ending = if forward { close } else { open };
         let mut depth = 0usize;
-        let indices: Box<dyn Iterator<Item = usize>> = if forward {
-            Box::new(cursor..chars.len())
-        } else {
-            Box::new((0..=cursor).rev())
-        };
-        for index in indices {
-            if chars[index] == if forward { open } else { close } {
+        let mut matching = |index, character| {
+            if character == starting {
                 depth += 1;
-            } else if chars[index] == if forward { close } else { open } {
+                None
+            } else if character == ending {
                 depth = depth.saturating_sub(1);
-                if depth == 0 {
-                    self.move_to_position(self.buffer.char_idx_to_position(index));
-                    break;
-                }
+                (depth == 0).then_some(index)
+            } else {
+                None
             }
+        };
+        let target = if forward {
+            contents
+                .chars_at(cursor)
+                .enumerate()
+                .find_map(|(offset, character)| matching(cursor + offset, character))
+        } else {
+            contents
+                .chars_at(cursor + 1)
+                .reversed()
+                .enumerate()
+                .find_map(|(offset, character)| matching(cursor - offset, character))
+        };
+        if let Some(index) = target {
+            self.move_to_position(self.buffer.char_idx_to_position(index));
         }
     }
 
@@ -1769,6 +1812,11 @@ impl TextArea {
     }
 
     fn current_line_start(&self) -> usize {
+        if self.buffer.is_ascii() {
+            return self
+                .buffer
+                .position_to_char_idx(TextPosition::new(self.cursor_position().line, 0));
+        }
         let text = self.text();
         let byte = grapheme_to_byte(&text, self.state.cursor);
         text[..byte]
@@ -1776,7 +1824,20 @@ impl TextArea {
             .map_or(0, |index| grapheme_len(&text[..index + 1]))
     }
 
+    fn document_grapheme_len(&self) -> usize {
+        if self.buffer.is_ascii() {
+            self.buffer.byte_len()
+        } else {
+            grapheme_len(&self.text())
+        }
+    }
+
     fn current_line_end(&self) -> usize {
+        if self.buffer.is_ascii() {
+            return self
+                .buffer
+                .position_to_char_idx(TextPosition::new(self.cursor_position().line, usize::MAX));
+        }
         let text = self.text();
         let byte = grapheme_to_byte(&text, self.state.cursor);
         text[byte..].find('\n').map_or_else(
@@ -1817,6 +1878,9 @@ impl TextArea {
     }
 
     fn position_for_grapheme(&self, index: usize) -> TextPosition {
+        if self.buffer.is_ascii() {
+            return self.buffer.char_idx_to_position(index);
+        }
         let text = self.text();
         let byte = grapheme_to_byte(&text, index);
         self.buffer
@@ -1824,8 +1888,11 @@ impl TextArea {
     }
 
     fn grapheme_index_for_position(&self, position: TextPosition) -> usize {
-        let text = self.text();
         let index = self.buffer.position_to_char_idx(position);
+        if self.buffer.is_ascii() {
+            return index;
+        }
+        let text = self.text();
         let byte = text
             .char_indices()
             .nth(index)
@@ -1848,10 +1915,10 @@ impl TextArea {
     }
 
     fn line_character_len(&self, line: usize) -> usize {
-        self.buffer
-            .get(line)
-            .map(|contents| trim_line_ending(&contents).chars().count())
-            .unwrap_or_default()
+        if line > self.buffer.len() {
+            return 0;
+        }
+        self.buffer.line_char_len_without_ending(line)
     }
 
     fn last_editable_line(&self) -> usize {
@@ -1866,33 +1933,56 @@ impl TextArea {
         cursor: usize,
         label: &str,
     ) -> bool {
-        let contents = self.text();
-        let start_byte = grapheme_to_byte(&contents, start);
-        let end_byte = grapheme_to_byte(&contents, end);
-        let previous = &contents[start_byte..end_byte];
-        if previous == replacement
-            || contents
-                .len()
-                .saturating_sub(previous.len())
-                .saturating_add(replacement.len())
-                > self.max_bytes
-        {
-            return false;
-        }
-
-        let range = TextRange::new(
-            self.buffer
-                .char_idx_to_position(contents[..start_byte].chars().count()),
-            self.buffer
-                .char_idx_to_position(contents[..end_byte].chars().count()),
-        );
+        let ascii = self.buffer.is_ascii() && replacement.is_ascii();
+        let range = if ascii {
+            let range = TextRange::new(
+                self.buffer.char_idx_to_position(start),
+                self.buffer.char_idx_to_position(end),
+            );
+            let previous = self.buffer.text_in_range(range);
+            if previous == replacement
+                || self
+                    .buffer
+                    .byte_len()
+                    .saturating_sub(previous.len())
+                    .saturating_add(replacement.len())
+                    > self.max_bytes
+            {
+                return false;
+            }
+            range
+        } else {
+            let contents = self.text();
+            let start_byte = grapheme_to_byte(&contents, start);
+            let end_byte = grapheme_to_byte(&contents, end);
+            let previous = &contents[start_byte..end_byte];
+            if previous == replacement
+                || contents
+                    .len()
+                    .saturating_sub(previous.len())
+                    .saturating_add(replacement.len())
+                    > self.max_bytes
+            {
+                return false;
+            }
+            TextRange::new(
+                self.buffer
+                    .char_idx_to_position(contents[..start_byte].chars().count()),
+                self.buffer
+                    .char_idx_to_position(contents[..end_byte].chars().count()),
+            )
+        };
         let started_transaction = !self.buffer.undo_history.is_transaction_active();
         if started_transaction {
             let before = self.cursor_snapshot();
             self.buffer.undo_history.begin_transaction(label, before);
         }
         apply_transactional_replacement(&mut self.buffer, range, replacement);
-        self.state.cursor = cursor.min(grapheme_len(&self.text()));
+        self.state.cursor = if ascii {
+            cursor.min(self.buffer.byte_len())
+        } else {
+            cursor.min(self.document_grapheme_len())
+        };
         self.state.preferred_column = None;
         self.sync_buffer_cursor();
         if started_transaction {
@@ -1912,6 +2002,9 @@ impl TextArea {
 
     fn cursor_snapshot(&self) -> CursorSnapshot {
         let position = self.cursor_position();
+        if self.buffer.is_ascii() {
+            return CursorSnapshot::new(position.character, position.line, 0);
+        }
         let line = self.buffer.get(position.line).unwrap_or_default();
         CursorSnapshot::new(
             char_to_grapheme(&line, position.character),
@@ -1926,11 +2019,23 @@ impl TextArea {
     }
 
     fn restore_cursor(&mut self, snapshot: CursorSnapshot) {
-        let prefix = self.buffer.line_range_contents(0, snapshot.y);
-        let line = self.buffer.get(snapshot.y).unwrap_or_default();
-        self.state.cursor = grapheme_len(&prefix)
-            .saturating_add(snapshot.x.min(grapheme_len(&line)))
-            .min(grapheme_len(&self.text()));
+        self.state.cursor = if self.buffer.is_ascii() {
+            let start = self
+                .buffer
+                .position_to_char_idx(TextPosition::new(snapshot.y, 0));
+            let end = self
+                .buffer
+                .position_to_char_idx(TextPosition::new(snapshot.y.saturating_add(1), 0));
+            start
+                .saturating_add(snapshot.x.min(end.saturating_sub(start)))
+                .min(self.buffer.char_len())
+        } else {
+            let prefix = self.buffer.line_range_contents(0, snapshot.y);
+            let line = self.buffer.get(snapshot.y).unwrap_or_default();
+            grapheme_len(&prefix)
+                .saturating_add(snapshot.x.min(grapheme_len(&line)))
+                .min(self.document_grapheme_len())
+        };
         self.state.preferred_column = None;
         self.sync_buffer_cursor();
     }
@@ -1955,8 +2060,11 @@ fn operator_for_character(character: char) -> Operator {
     }
 }
 
-fn normalize_newlines(text: &str) -> String {
-    text.replace("\r\n", "\n").replace('\r', "\n")
+fn normalize_newlines(text: &str) -> Cow<'_, str> {
+    if !text.as_bytes().contains(&b'\r') {
+        return Cow::Borrowed(text);
+    }
+    Cow::Owned(text.replace("\r\n", "\n").replace('\r', "\n"))
 }
 
 fn unnamed_buffer(text: &str) -> Buffer {
@@ -1974,6 +2082,321 @@ fn unnamed_buffer(text: &str) -> Buffer {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn ascii_edits_preserve_multiline_cursor_snapshots_and_undo_redo() {
+        let mut area = TextArea::new("alpha\nbravo\ncharlie");
+        area.set_cursor("alpha\nbr".len());
+
+        assert!(area.insert("XY"));
+        assert_eq!(area.text(), "alpha\nbrXYavo\ncharlie");
+        assert_eq!(area.cursor(), "alpha\nbrXY".len());
+        assert_eq!(area.buffer.pos, (4, 1));
+
+        assert!(area.undo());
+        assert_eq!(area.text(), "alpha\nbravo\ncharlie");
+        assert_eq!(area.cursor(), "alpha\nbr".len());
+        assert_eq!(area.buffer.pos, (2, 1));
+
+        assert!(area.redo());
+        assert_eq!(area.text(), "alpha\nbrXYavo\ncharlie");
+        assert_eq!(area.cursor(), "alpha\nbrXY".len());
+        assert_eq!(area.buffer.pos, (4, 1));
+    }
+
+    #[test]
+    fn ascii_fast_path_preserves_newline_normalization_and_byte_capacity() {
+        let mut area = TextArea::with_max_bytes("ab", 7);
+        area.set_cursor(1);
+
+        assert!(area.insert("x\r\ny\rz"));
+        assert_eq!(area.text(), "ax\ny\nzb");
+        assert_eq!(area.cursor(), 6);
+        assert!(!area.insert("q"));
+        assert_eq!(area.text(), "ax\ny\nzb");
+        assert!(area.undo());
+        assert_eq!(area.text(), "ab");
+        assert_eq!(area.cursor(), 1);
+    }
+
+    #[test]
+    fn indexed_ascii_deletion_preserves_word_whitespace_unicode_and_undo() {
+        for original in [
+            "",
+            "word",
+            "one two three",
+            "one   two   ",
+            "\tleading\twords\t",
+            "first\n\nsecond word",
+            "e\u{301}clair 👨‍👩‍👧 family",
+            "漢字\u{3000}かな",
+        ] {
+            let count = crate::unicode_utils::grapheme_len(original);
+            for cursor in 0..=count {
+                let mut area = TextArea::new(original);
+                area.set_cursor(cursor);
+                let byte = super::grapheme_to_byte(original, cursor);
+                let start = crate::unicode_utils::previous_word_start(&original[..byte]);
+                let expected = format!("{}{}", &original[..start], &original[byte..]);
+                assert_eq!(area.delete_previous_word(), cursor != 0);
+                assert_eq!(area.text(), expected, "{original:?} at cursor {cursor}");
+                assert_eq!(
+                    area.cursor(),
+                    crate::unicode_utils::grapheme_len(&original[..start]),
+                    "{original:?} at cursor {cursor}"
+                );
+                if cursor != 0 {
+                    assert!(area.undo());
+                    assert_eq!(area.text(), original);
+                    assert_eq!(area.cursor(), cursor);
+                }
+
+                let mut area = TextArea::new(original);
+                area.set_cursor(cursor);
+                if cursor == count {
+                    assert!(!area.delete());
+                } else {
+                    let end = super::grapheme_to_byte(original, cursor + 1);
+                    assert!(area.delete());
+                    assert_eq!(
+                        area.text(),
+                        format!("{}{}", &original[..byte], &original[end..]),
+                        "{original:?} at cursor {cursor}"
+                    );
+                    assert_eq!(area.cursor(), cursor);
+                    assert!(area.undo());
+                    assert_eq!(area.text(), original);
+                    assert_eq!(area.cursor(), cursor);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn indexed_document_boundaries_preserve_ascii_and_unicode_home_end_navigation() {
+        for original in [
+            "",
+            "plain ascii draft",
+            "first\n\nlast\n",
+            "normalized\r\nwindows\rline",
+            "e\u{301} 👨‍👩‍👧\n漢字 🇧🇷",
+            "\u{301}leading\ntrailing\u{200d}",
+        ] {
+            let mut area = TextArea::new(original);
+            let text = area.text();
+            let expected = crate::unicode_utils::grapheme_len(&text);
+            assert_eq!(area.document_grapheme_len(), expected);
+            for code in [KeyCode::Home, KeyCode::End, KeyCode::Home, KeyCode::End] {
+                assert_eq!(
+                    area.handle_event(&Event::Key(KeyEvent::new(code, KeyModifiers::NONE)), 80),
+                    TextAreaOutcome::Changed
+                );
+                assert_eq!(
+                    area.cursor(),
+                    if code == KeyCode::Home { 0 } else { expected },
+                    "{original:?} after {code:?}"
+                );
+            }
+            area.set_cursor(usize::MAX);
+            assert_eq!(area.cursor(), expected);
+        }
+    }
+
+    #[test]
+    fn indexed_cursor_restoration_matches_unicode_reference_for_every_snapshot() {
+        for original in [
+            "",
+            "alpha",
+            "alpha\nbravo\ncharlie",
+            "alpha\n\nbravo\n",
+            "\tleading words\t\nnext",
+            "e\u{301} 👨‍👩‍👧\n漢字 🇧🇷",
+            "\u{301}leading\ntrailing\u{200d}",
+        ] {
+            let mut area = TextArea::new(original);
+            for line_index in 0..=area.buffer.len() + 2 {
+                for column in [0, 1, 2, 8, 128, usize::MAX] {
+                    let prefix = area.buffer.line_range_contents(0, line_index);
+                    let line = area.buffer.get(line_index).unwrap_or_default();
+                    let expected = crate::unicode_utils::grapheme_len(&prefix)
+                        .saturating_add(column.min(crate::unicode_utils::grapheme_len(&line)))
+                        .min(crate::unicode_utils::grapheme_len(original));
+                    area.restore_cursor(crate::undo::CursorSnapshot::new(column, line_index, 0));
+                    assert_eq!(
+                        area.cursor(),
+                        expected,
+                        "{original:?} at line {line_index}, column {column}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn borrowed_textarea_loading_preserves_normalized_capacity_and_unicode_cursors() {
+        let area = TextArea::with_max_bytes("ab\r\ncd\r", 6);
+        assert_eq!(area.text(), "ab\ncd\n");
+        assert_eq!(area.cursor(), 6);
+        assert_eq!(area.buffer.pos, (0, 2));
+
+        let oversized = TextArea::with_max_bytes("abcdefg", 6);
+        assert_eq!(oversized.text(), "");
+        assert_eq!(oversized.cursor(), 0);
+
+        let unicode = TextArea::new("e\u{301}\r\n👋");
+        assert_eq!(unicode.text(), "e\u{301}\n👋");
+        assert_eq!(unicode.cursor(), 3);
+        assert_eq!(unicode.buffer.pos, (1, 1));
+    }
+
+    #[test]
+    fn ascii_to_unicode_transition_preserves_combining_grapheme_cursors() {
+        let mut area = TextArea::new("ab");
+        area.set_cursor(1);
+
+        assert!(area.insert("👋"));
+        assert_eq!(area.text(), "a👋b");
+        assert_eq!(area.cursor(), 2);
+        assert!(!area.buffer.is_ascii());
+
+        assert!(area.insert("\u{301}"));
+        assert_eq!(area.text(), "a👋\u{301}b");
+        assert_eq!(area.cursor(), 2);
+        assert!(area.undo());
+        assert_eq!(area.text(), "a👋b");
+        assert_eq!(area.cursor(), 2);
+    }
+
+    #[test]
+    fn indexed_ascii_cursor_positions_match_unicode_aware_reference_boundaries() {
+        let samples = [
+            "",
+            "\n",
+            "\n\n",
+            "alpha",
+            "alpha\nbravo\ncharlie",
+            "alpha\n\nbravo\n",
+            "\t leading spaces\t\nnext\tline",
+            "normalized\r\nwindows\rnewlines",
+            "e\u{301} 👨‍👩‍👧\n漢字 🇧🇷",
+            "\u{301}leading\ntrailing\u{200d}",
+        ];
+
+        for sample in samples {
+            let mut area = TextArea::new(sample);
+            let contents = area.text();
+            let grapheme_count = crate::unicode_utils::grapheme_len(&contents);
+            for cursor in 0..=grapheme_count + 2 {
+                area.set_cursor(cursor);
+                let bounded = cursor.min(grapheme_count);
+                let byte = super::grapheme_to_byte(&contents, bounded);
+                let expected_start = contents[..byte].rfind('\n').map_or(0, |index| {
+                    crate::unicode_utils::grapheme_len(&contents[..index + 1])
+                });
+                let expected_end = contents[byte..].find('\n').map_or_else(
+                    || crate::unicode_utils::grapheme_len(&contents),
+                    |index| crate::unicode_utils::grapheme_len(&contents[..byte + index]),
+                );
+                assert_eq!(area.cursor(), bounded, "{sample:?} at cursor {cursor}");
+                assert_eq!(
+                    area.current_line_start(),
+                    expected_start,
+                    "{sample:?} at cursor {cursor}"
+                );
+                assert_eq!(
+                    area.current_line_end(),
+                    expected_end,
+                    "{sample:?} at cursor {cursor}"
+                );
+
+                for line in 0..=area.buffer.len() + 1 {
+                    for character in [0, 1, 2, 32, usize::MAX] {
+                        let position = crate::undo::TextPosition::new(line, character);
+                        let index = area.buffer.position_to_char_idx(position);
+                        let byte = contents
+                            .char_indices()
+                            .nth(index)
+                            .map_or(contents.len(), |(byte, _)| byte);
+                        let expected = crate::unicode_utils::grapheme_len(&contents[..byte]);
+                        assert_eq!(
+                            area.grapheme_index_for_position(position),
+                            expected,
+                            "{sample:?} at line {line}, character {character}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn rope_delimiter_matching_preserves_nested_and_unicode_cursor_positions() {
+        let samples = [
+            "",
+            "no delimiters",
+            "(alpha)",
+            "(one (two) three)",
+            "before [one [two] three] after",
+            "{one {two} three}",
+            "([{}])",
+            "(unclosed",
+            "closing)",
+            "first (\n nested (word)\n final)\n",
+            "e\u{301} (👨‍👩‍👧 [漢字]) 🇧🇷",
+            "\u{301}leading {👩‍💻 {λ}} trailing",
+        ];
+
+        for sample in samples {
+            let mut area = TextArea::new(sample);
+            area.set_mode(crate::editor::Mode::Normal);
+            let text = area.text();
+            let chars = text.chars().collect::<Vec<_>>();
+            for offset in 0..=crate::unicode_utils::grapheme_len(&text) {
+                area.set_cursor(offset);
+                let byte = super::grapheme_to_byte(&text, offset);
+                let scalar = text[..byte].chars().count();
+                let expected = chars.get(scalar).copied().and_then(|character| {
+                    let (opening, closing, forward) = match character {
+                        '(' => ('(', ')', true),
+                        '[' => ('[', ']', true),
+                        '{' => ('{', '}', true),
+                        ')' => ('(', ')', false),
+                        ']' => ('[', ']', false),
+                        '}' => ('{', '}', false),
+                        _ => return None,
+                    };
+                    let mut depth = 0usize;
+                    let indices: Box<dyn Iterator<Item = usize>> = if forward {
+                        Box::new(scalar..chars.len())
+                    } else {
+                        Box::new((0..=scalar).rev())
+                    };
+                    for index in indices {
+                        if chars[index] == if forward { opening } else { closing } {
+                            depth += 1;
+                        } else if chars[index] == if forward { closing } else { opening } {
+                            depth = depth.saturating_sub(1);
+                            if depth == 0 {
+                                let target = text
+                                    .char_indices()
+                                    .nth(index)
+                                    .map_or(text.len(), |(byte, _)| byte);
+                                return Some(crate::unicode_utils::grapheme_len(&text[..target]));
+                            }
+                        }
+                    }
+                    None
+                });
+
+                area.move_to_matching_delimiter();
+                assert_eq!(
+                    area.cursor(),
+                    expected.unwrap_or(offset),
+                    "{sample:?} at grapheme {offset}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn word_backspace_in_search_edits_only_the_search_pattern() {

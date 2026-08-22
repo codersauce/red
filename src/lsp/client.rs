@@ -47,6 +47,7 @@ const MAX_LSP_STDERR_LINE_BYTES: usize = 64 * 1024;
 const MAX_LSP_STDERR_TAIL_LINES: usize = 8;
 const MAX_PENDING_LSP_MESSAGES: usize = 512;
 const MAX_PENDING_LSP_BYTES: usize = 16 * 1024 * 1024;
+const DOCUMENT_DIFF_BLOCK_BYTES: usize = 32;
 const SHUTDOWN_RESPONSE_TIMEOUT: Duration = Duration::from_secs(1);
 #[cfg(windows)]
 const PROCESS_EXIT_GRACE: Duration = Duration::from_millis(100);
@@ -582,7 +583,7 @@ async fn process_lsp_message(
 
         if let Some(id) = res.get("id").and_then(Value::as_i64) {
             log!("[lsp] incoming request: id={}, method={}", id, method);
-        } else {
+        } else if method != "$/progress" {
             log!("[lsp] incoming notification: method={}", method);
         }
 
@@ -843,11 +844,20 @@ impl RealLspClient {
         }
 
         // Common prefix, backed up to a char boundary.
-        let mut prefix = old_text
-            .as_bytes()
+        let old_bytes = old_text.as_bytes();
+        let new_bytes = new_text.as_bytes();
+        let shared_length = old_bytes.len().min(new_bytes.len());
+        let mut prefix = 0;
+        while shared_length.saturating_sub(prefix) >= DOCUMENT_DIFF_BLOCK_BYTES
+            && old_bytes[prefix..prefix + DOCUMENT_DIFF_BLOCK_BYTES]
+                == new_bytes[prefix..prefix + DOCUMENT_DIFF_BLOCK_BYTES]
+        {
+            prefix += DOCUMENT_DIFF_BLOCK_BYTES;
+        }
+        prefix += old_bytes[prefix..]
             .iter()
-            .zip(new_text.as_bytes())
-            .take_while(|(a, b)| a == b)
+            .zip(&new_bytes[prefix..])
+            .take_while(|(left, right)| left == right)
             .count();
         while !old_text.is_char_boundary(prefix) {
             prefix -= 1;
@@ -856,11 +866,24 @@ impl RealLspClient {
         // Common suffix of the remainders, backed up to char boundaries.
         let old_rest = &old_text[prefix..];
         let new_rest = &new_text[prefix..];
-        let mut suffix = old_rest
-            .as_bytes()
+        let old_rest_bytes = old_rest.as_bytes();
+        let new_rest_bytes = new_rest.as_bytes();
+        let shared_remainder = old_rest_bytes.len().min(new_rest_bytes.len());
+        let mut suffix = 0;
+        while shared_remainder.saturating_sub(suffix) >= DOCUMENT_DIFF_BLOCK_BYTES {
+            let old_end = old_rest_bytes.len() - suffix;
+            let new_end = new_rest_bytes.len() - suffix;
+            if old_rest_bytes[old_end - DOCUMENT_DIFF_BLOCK_BYTES..old_end]
+                != new_rest_bytes[new_end - DOCUMENT_DIFF_BLOCK_BYTES..new_end]
+            {
+                break;
+            }
+            suffix += DOCUMENT_DIFF_BLOCK_BYTES;
+        }
+        suffix += old_rest_bytes[..old_rest_bytes.len() - suffix]
             .iter()
             .rev()
-            .zip(new_rest.as_bytes().iter().rev())
+            .zip(new_rest_bytes[..new_rest_bytes.len() - suffix].iter().rev())
             .take_while(|(a, b)| a == b)
             .count();
         while !old_rest.is_char_boundary(old_rest.len() - suffix)
@@ -890,14 +913,33 @@ impl RealLspClient {
             }];
         }
 
+        let start = Self::position_at_byte(old_text, prefix);
+        let end = old_text[prefix..old_end]
+            .chars()
+            .fold(start, |mut position, character| {
+                if character == '\n' {
+                    position.line += 1;
+                    position.character = 0;
+                } else {
+                    position.character += character.len_utf16();
+                }
+                position
+            });
+
         vec![TextDocumentContentChangeEvent {
-            range: Some(Range {
-                start: Self::position_at_byte(old_text, prefix),
-                end: Self::position_at_byte(old_text, old_end),
-            }),
+            range: Some(Range { start, end }),
             range_length: None,
             text: new_text[prefix..new_end].to_string(),
         }]
+    }
+
+    /// Runs the production incremental-document diff for reproducible benchmarks.
+    #[doc(hidden)]
+    pub fn benchmark_incremental_document_change(
+        old_text: &str,
+        new_text: &str,
+    ) -> Vec<TextDocumentContentChangeEvent> {
+        Self::calculate_changes(old_text, new_text)
     }
 
     pub async fn did_open_with_language_id(
@@ -3883,6 +3925,51 @@ mod test {
         assert_eq!(range.end.line, 0);
         assert_eq!(range.end.character, 3);
         assert_eq!(change.text, "X");
+    }
+
+    #[test]
+    fn incremental_changes_preserve_unicode_at_every_comparison_block_boundary() {
+        for boundary in [31, 32, 33, 63, 64, 65] {
+            let old = format!("{}👋 unchanged suffix λe\u{301}", "a".repeat(boundary));
+            let new = format!("{}👋β unchanged suffix λe\u{301}", "a".repeat(boundary));
+            let change = single_change(&old, &new);
+            let range = change.range.as_ref().unwrap();
+
+            assert_eq!(range.start.line, 0);
+            assert_eq!(range.start.character, boundary + 2);
+            assert_eq!(range.end, range.start);
+            assert_eq!(change.text, "β");
+            assert_eq!(apply_change(&old, &change), new);
+        }
+    }
+
+    #[test]
+    fn incremental_multiline_deletions_advance_utf16_positions_once() {
+        let prefix = format!("{}\n", "before 👋 ".repeat(24));
+        let removed = "first 👋\nsecond λ\nthird";
+        let suffix = format!("\n{}", "after 👋 ".repeat(24));
+        let old = format!("{prefix}{removed}{suffix}");
+        let new = format!("{prefix}{suffix}");
+        let change = single_change(&old, &new);
+        let range = change.range.as_ref().unwrap();
+
+        assert_eq!(range.start.line, 1);
+        assert_eq!(range.start.character, 0);
+        assert_eq!(range.end.line, 3);
+        assert_eq!(range.end.character, "third".len());
+        assert!(change.text.is_empty());
+        assert_eq!(apply_change(&old, &change), new);
+    }
+
+    #[test]
+    fn incremental_changes_preserve_crlf_fallback_at_a_block_boundary() {
+        let prefix = "x".repeat(DOCUMENT_DIFF_BLOCK_BYTES - 1);
+        let old = format!("{prefix}\r\nunchanged 👋\n");
+        let new = format!("{prefix}\nunchanged 👋\n");
+        let change = single_change(&old, &new);
+
+        assert!(change.range.is_none());
+        assert_eq!(change.text, new);
     }
 
     #[test]

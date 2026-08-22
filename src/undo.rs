@@ -455,21 +455,31 @@ impl UndoHistory {
             self.nodes[index].transaction.before_revision
         });
 
-        let mut nodes = Vec::with_capacity(retained.len());
-        for (new_index, &old_index) in retained.iter().enumerate() {
-            let mut node = self.nodes[old_index].clone();
+        let retained_count = retained.len();
+        let mut retained_indices = retained.iter().copied();
+        let mut next_retained = retained_indices.next();
+        let previous_nodes = std::mem::take(&mut self.nodes);
+        let mut nodes = Vec::with_capacity(retained_count);
+        for (old_index, mut node) in previous_nodes.into_iter().enumerate() {
+            if next_retained != Some(old_index) {
+                continue;
+            }
+            let new_index = nodes.len();
             node.parent = new_index.checked_sub(1);
-            node.children = if new_index + 1 < retained.len() {
-                vec![new_index + 1]
-            } else {
-                Vec::new()
-            };
+            node.children.clear();
+            if new_index + 1 < retained_count {
+                node.children.push(new_index + 1);
+            }
             nodes.push(node);
+            next_retained = retained_indices.next();
         }
 
         self.nodes = nodes;
         self.root_revision = new_root_revision;
-        self.root_children = (!self.nodes.is_empty()).then_some(0).into_iter().collect();
+        self.root_children.clear();
+        if !self.nodes.is_empty() {
+            self.root_children.push(0);
+        }
         self.current = self.nodes.len().checked_sub(1);
         self.branch_selection.clear();
         for parent in 0..self.nodes.len().saturating_sub(1) {

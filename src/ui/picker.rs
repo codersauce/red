@@ -36,7 +36,7 @@ use crate::{
     theme::{SelectionForegroundPriority, Style, Theme},
     unicode_utils::{
         byte_to_char, char_slice, delete_last_word, display_width, fit_display_width,
-        truncate_display_width,
+        is_printable_ascii, truncate_display_width,
     },
 };
 
@@ -116,6 +116,7 @@ fn default_path_filter_score(
 
 const MIN_HORIZONTAL_PREVIEW_PANE_WIDTH: usize = 40;
 const MAX_PREVIEW_HIGHLIGHT_BYTES: usize = 64 * 1024;
+const MAX_CACHED_PREVIEW_HIGHLIGHT_SPANS: usize = 4_096;
 pub(crate) const MAX_UNFOCUSED_PREVIEW_BYTES: u64 = 256 * 1024;
 const MAX_LOCATION_PREVIEW_SCAN_BYTES: usize = 8 * 1024 * 1024;
 const LOCATION_PREVIEW_CACHE_CAPACITY: usize = 8;
@@ -123,6 +124,8 @@ const COMMAND_COLUMN_GAP: usize = 2;
 const PICKER_ICON_WIDTH: usize = 2;
 const PICKER_ITEM_PREFIX_WIDTH: usize = 2 + PICKER_ICON_WIDTH;
 const PARALLEL_FILTER_MIN_ITEMS: usize = 1_024;
+const MAX_FILTER_HISTORY_ENTRIES: usize = 8;
+const MAX_FILTER_HISTORY_ITEMS_PER_ENTRY: usize = 16_384;
 const INTRINSIC_COLUMN_GAP: usize = 2;
 const INTRINSIC_FOOTER_GAP: usize = 4;
 
@@ -280,6 +283,14 @@ struct PreviewHighlightSpan {
     style: Style,
 }
 
+struct CachedPreviewHighlights {
+    key: String,
+    location: bool,
+    source: String,
+    source_start: usize,
+    spans: Arc<[PreviewHighlightSpan]>,
+}
+
 struct PreviewHighlighter {
     highlighter: RefCell<Option<Highlighter>>,
     registry: Arc<LanguageRegistry>,
@@ -381,6 +392,8 @@ pub struct Picker {
     filter_action: Option<FilterAction>,
     incremental_filter: bool,
     filtered_query: Option<String>,
+    /// Recent exact queries retained only while the authoritative items remain unchanged.
+    filtered_history: VecDeque<(String, Vec<usize>)>,
     filter_tie_breaker: Option<FilterTieBreaker>,
     filter_highlight_action: Option<FilterHighlightAction>,
     search: String,
@@ -400,6 +413,7 @@ pub struct Picker {
     placeholder: Option<String>,
     preview_scroll: isize,
     preview_highlighter: PreviewHighlighter,
+    preview_highlight_cache: RefCell<Option<CachedPreviewHighlights>>,
     preview_text_cache: RefCell<VecDeque<Arc<CachedLocationPreview>>>,
     location_preview_overrides: HashMap<String, Rope>,
     history_key: Option<String>,
@@ -560,6 +574,7 @@ impl Picker {
             filter_action: None,
             incremental_filter: false,
             filtered_query: None,
+            filtered_history: VecDeque::new(),
             filter_tie_breaker: None,
             filter_highlight_action: None,
             search: String::new(),
@@ -579,6 +594,7 @@ impl Picker {
             placeholder: None,
             preview_scroll: 0,
             preview_highlighter: PreviewHighlighter::new(&editor.theme, editor.language_registry()),
+            preview_highlight_cache: RefCell::new(None),
             preview_text_cache: RefCell::new(VecDeque::new()),
             location_preview_overrides: HashMap::new(),
             history_key: None,
@@ -702,6 +718,7 @@ impl Picker {
         self.theme = theme.clone();
         self.preview_highlighter =
             PreviewHighlighter::new(theme, Arc::clone(&self.preview_highlighter.registry));
+        *self.preview_highlight_cache.borrow_mut() = None;
     }
 
     fn set_presentation_for_viewport(
@@ -832,9 +849,23 @@ impl Picker {
 
     pub fn filter(&mut self, term: &str) {
         if let Some(items) = &self.dynamic_items {
-            if self.external_filter || term.is_empty() {
-                self.visible_dynamic_items.clear();
+            let can_reuse_history =
+                !self.external_filter && (self.incremental_filter || self.filter_action.is_none());
+            let cached = (can_reuse_history && !term.is_empty())
+                .then(|| {
+                    self.filtered_history
+                        .iter()
+                        .position(|(query, _)| query == term)
+                })
+                .flatten()
+                .and_then(|index| self.filtered_history.remove(index))
+                .map(|(_, matches)| matches);
+            let previous = if let Some(matches) = cached {
+                std::mem::replace(&mut self.visible_dynamic_items, matches)
+            } else if self.external_filter || term.is_empty() {
+                let previous = std::mem::take(&mut self.visible_dynamic_items);
                 self.visible_dynamic_items.extend(0..items.len());
+                previous
             } else {
                 let filter_action = self.filter_action.as_ref();
                 let filter_tie_breaker = self.filter_tie_breaker.as_ref();
@@ -857,11 +888,11 @@ impl Picker {
                             (index, score, tie_breaker)
                         })
                 };
-                let can_reuse_matches = self.incremental_filter
+                let can_reuse_matches = (self.incremental_filter || self.filter_action.is_none())
                     && self
                         .filtered_query
                         .as_deref()
-                        .is_some_and(|previous| term.starts_with(previous));
+                        .is_some_and(|previous| !previous.is_empty() && term.starts_with(previous));
                 let mut matches = if self.incremental_filter
                     && (if can_reuse_matches {
                         self.visible_dynamic_items.len()
@@ -892,8 +923,18 @@ impl Picker {
                 matches.sort_unstable_by_key(|(index, score, tie_breaker)| {
                     (*score, *tie_breaker, *index)
                 });
-                self.visible_dynamic_items =
-                    matches.into_iter().map(|(index, _, _)| index).collect();
+                std::mem::replace(
+                    &mut self.visible_dynamic_items,
+                    matches.into_iter().map(|(index, _, _)| index).collect(),
+                )
+            };
+            if can_reuse_history {
+                if let Some(query) = self.filtered_query.take().filter(|query| !query.is_empty()) {
+                    if previous.len() <= MAX_FILTER_HISTORY_ITEMS_PER_ENTRY {
+                        self.filtered_history.push_front((query, previous));
+                        self.filtered_history.truncate(MAX_FILTER_HISTORY_ENTRIES);
+                    }
+                }
             }
             self.filtered_query = Some(term.to_string());
             self.list.set_item_count(self.visible_dynamic_items.len());
@@ -927,6 +968,7 @@ impl Picker {
         self.item_preview_root = None;
         self.dynamic_items = None;
         self.filtered_query = None;
+        self.filtered_history.clear();
         self.visible_dynamic_items.clear();
         self.items = items;
         let search = self.search.clone();
@@ -939,6 +981,7 @@ impl Picker {
         self.item_preview_root = Some(root);
         self.dynamic_items = None;
         self.filtered_query = None;
+        self.filtered_history.clear();
         self.visible_dynamic_items.clear();
         self.items = items;
         let search = self.search.clone();
@@ -952,6 +995,7 @@ impl Picker {
         self.items.clear();
         self.dynamic_items = Some(items);
         self.filtered_query = None;
+        self.filtered_history.clear();
         let search = self.search.clone();
         self.filter(&search);
         self.resize_to_viewport(self.viewport_width, self.viewport_height);
@@ -968,6 +1012,7 @@ impl Picker {
                 let selected_id = self.selected_dynamic_item().map(|item| item.id.clone());
                 self.dynamic_items = Some(items);
                 self.filtered_query = None;
+                self.filtered_history.clear();
                 let query = self.search.clone();
                 self.filter(&query);
                 self.resize_to_viewport(self.viewport_width, self.viewport_height);
@@ -1482,6 +1527,19 @@ impl Picker {
         match_style: &Style,
         matches: &[[usize; 2]],
     ) -> usize {
+        if is_printable_ascii(text) {
+            let visible = &text[..text.len().min(width)];
+            buffer.set_printable_ascii(x, y, visible, style);
+            for [start, end] in matches {
+                if start >= end || *start >= visible.len() {
+                    continue;
+                }
+                let end = (*end).min(visible.len());
+                buffer.set_printable_ascii(x + *start, y, &visible[*start..end], match_style);
+            }
+            return visible.len();
+        }
+
         let visible = truncate_display_width(text, width);
         buffer.set_text(x, y, &visible, style);
         let visible_width = display_width(&visible);
@@ -1809,7 +1867,7 @@ impl Picker {
                 .filter(|matches| !matches.is_empty());
             let label_matches = derived_label_matches.unwrap_or(&item.matches);
             let y = rect.y + offset;
-            buffer.set_text(rect.x, y, &" ".repeat(rect.width), &row_style);
+            buffer.fill_ascii_spaces(rect.x, y, rect.width, &row_style);
 
             self.draw_item_prefix(buffer, rect.x, y, item, &row_style, is_selected);
             let x = rect.x + PICKER_ITEM_PREFIX_WIDTH;
@@ -2194,7 +2252,7 @@ impl Picker {
             let y = rect.y + offset;
             let is_selected = selected == Some(item_index);
             let row_style = self.result_row_style(is_selected);
-            buffer.set_text(rect.x, y, &" ".repeat(rect.width), &row_style);
+            buffer.fill_ascii_spaces(rect.x, y, rect.width, &row_style);
             if is_selected {
                 let marker_style = self.semantic_foreground(
                     &row_style,
@@ -2226,7 +2284,7 @@ impl Picker {
             let y = rect.y + offset;
             let is_selected = selected == Some(item_index);
             let row_style = self.result_row_style(is_selected);
-            buffer.set_text(rect.x, y, &" ".repeat(rect.width), &row_style);
+            buffer.fill_ascii_spaces(rect.x, y, rect.width, &row_style);
             if is_selected {
                 let marker_style = self.semantic_foreground(
                     &row_style,
@@ -2254,12 +2312,11 @@ impl Picker {
             return Ok(());
         }
 
-        let blank_line = " ".repeat(preview_width);
         for offset in 0..preview_height {
-            buffer.set_text(
+            buffer.fill_ascii_spaces(
                 preview_x,
                 layout.rect.y + offset,
-                &blank_line,
+                preview_width,
                 &self.theme.ui_style.picker_item,
             );
         }
@@ -2323,9 +2380,17 @@ impl Picker {
                     SelectionForegroundPriority::Selection,
                 );
             }
-            let visible = fit_display_width(line.text, preview_width);
             let y = layout.rect.y + offset;
-            buffer.set_text(preview_x, y, &visible, &line_style);
+            if is_printable_ascii(line.text) {
+                if focused {
+                    buffer.fill_ascii_spaces(preview_x, y, preview_width, &line_style);
+                }
+                let visible = &line.text[..line.text.len().min(preview_width)];
+                buffer.set_printable_ascii(preview_x, y, visible, &line_style);
+            } else {
+                let visible = fit_display_width(line.text, preview_width);
+                buffer.set_text(preview_x, y, &visible, &line_style);
+            }
             self.draw_preview_syntax(
                 buffer,
                 preview_x,
@@ -2474,12 +2539,12 @@ impl Picker {
         preview: &PickerPreview,
         text: &str,
         lines: &[PreviewLine<'_>],
-    ) -> Vec<PreviewHighlightSpan> {
+    ) -> Arc<[PreviewHighlightSpan]> {
         let Some(first) = lines.first() else {
-            return Vec::new();
+            return Arc::from([]);
         };
         let Some(last) = lines.last() else {
-            return Vec::new();
+            return Arc::from([]);
         };
         let start = first.start;
         let end = floor_char_boundary(
@@ -2488,15 +2553,42 @@ impl Picker {
                 .min(start.saturating_add(MAX_PREVIEW_HIGHLIGHT_BYTES)),
         );
         if start >= end {
-            return Vec::new();
+            return Arc::from([]);
         }
 
-        let mut spans = self
-            .preview_highlighter
-            .highlight(preview, &text[start..end]);
+        let (key, location) = match preview {
+            PickerPreview::Text {
+                language: Some(language),
+                ..
+            } => (language.as_str(), false),
+            PickerPreview::Text { language: None, .. } => return Arc::from([]),
+            PickerPreview::Location { path, .. } => (path.as_str(), true),
+        };
+        let source = &text[start..end];
+        if let Some(cached) = self.preview_highlight_cache.borrow().as_ref() {
+            if cached.key == key
+                && cached.location == location
+                && cached.source_start == start
+                && cached.source == source
+            {
+                return Arc::clone(&cached.spans);
+            }
+        }
+
+        let mut spans = self.preview_highlighter.highlight(preview, source);
         for span in &mut spans {
             span.start += start;
             span.end += start;
+        }
+        let spans: Arc<[PreviewHighlightSpan]> = Arc::from(spans);
+        if spans.len() <= MAX_CACHED_PREVIEW_HIGHLIGHT_SPANS {
+            *self.preview_highlight_cache.borrow_mut() = Some(CachedPreviewHighlights {
+                key: key.to_string(),
+                location,
+                source: source.to_string(),
+                source_start: start,
+                spans: Arc::clone(&spans),
+            });
         }
         spans
     }
@@ -2517,8 +2609,12 @@ impl Picker {
             return;
         }
 
-        let visible = truncate_display_width(line.text, width);
-        let visible_end = visible.len();
+        let ascii = is_printable_ascii(line.text);
+        let visible_end = if ascii {
+            line.text.len().min(width)
+        } else {
+            truncate_display_width(line.text, width).len()
+        };
         for span in spans
             .iter()
             .filter(|span| span.end > line.start && span.start < line.end)
@@ -2539,18 +2635,24 @@ impl Picker {
                 continue;
             }
 
-            let prefix = &line.text[..start];
-            let segment = &line.text[start..end];
-            let segment_x = display_width(prefix);
+            let segment_x = if ascii {
+                start
+            } else {
+                display_width(&line.text[..start])
+            };
             if segment_x >= width {
                 continue;
             }
-            let segment = truncate_display_width(segment, width - segment_x);
             let mut style = merge_preview_style(line_style, &span.style);
             if selected {
                 style = self.theme.ensure_text_contrast(&style);
             }
-            buffer.set_text(x + segment_x, y, &segment, &style);
+            if ascii {
+                buffer.set_printable_ascii(x + segment_x, y, &line.text[start..end], &style);
+            } else {
+                let segment = truncate_display_width(&line.text[start..end], width - segment_x);
+                buffer.set_text(x + segment_x, y, &segment, &style);
+            }
         }
     }
 
@@ -3627,6 +3729,10 @@ impl Component for Picker {
 }
 
 fn display_width_tail(text: &str, max_width: usize) -> &str {
+    if is_printable_ascii(text) {
+        return &text[text.len().saturating_sub(max_width)..];
+    }
+
     let mut width = 0;
     let mut start = text.len();
     for (index, grapheme) in text.grapheme_indices(true).rev() {
@@ -6180,6 +6286,47 @@ mod tests {
     }
 
     #[test]
+    fn preview_syntax_cache_reuses_exact_source_and_invalidates_on_changes() {
+        let mut theme = Theme::default();
+        theme.token_styles.push(TokenStyle {
+            name: Some("keyword".to_string()),
+            scope: vec!["keyword".to_string()],
+            style: Style {
+                bold: true,
+                ..Style::default()
+            },
+        });
+        let editor = test_editor_with_theme_and_size(theme.clone(), 120, 24);
+        let mut picker = Picker::new(/*title*/ None, &editor, &[], /*id*/ None);
+        let text = "let first = true;\n";
+        let preview = PickerPreview::Text {
+            text: text.to_string(),
+            language: Some("rust".to_string()),
+        };
+        let lines = super::preview_lines(text, /*start_line*/ 0, /*max_lines*/ 1);
+
+        let first = picker.preview_highlight_spans(&preview, text, &lines);
+        let repeated = picker.preview_highlight_spans(&preview, text, &lines);
+        assert!(!first.is_empty());
+        assert!(Arc::ptr_eq(&first, &repeated));
+
+        let updated = "fn second() {}\n";
+        let updated_preview = PickerPreview::Text {
+            text: updated.to_string(),
+            language: Some("rust".to_string()),
+        };
+        let updated_lines =
+            super::preview_lines(updated, /*start_line*/ 0, /*max_lines*/ 1);
+        let changed = picker.preview_highlight_spans(&updated_preview, updated, &updated_lines);
+        assert!(!Arc::ptr_eq(&first, &changed));
+
+        picker.apply_theme(&theme);
+        assert!(picker.preview_highlight_cache.borrow().is_none());
+        let rethemed = picker.preview_highlight_spans(&updated_preview, updated, &updated_lines);
+        assert!(!Arc::ptr_eq(&changed, &rethemed));
+    }
+
+    #[test]
     fn picker_text_preview_uses_explicit_language_for_syntax_highlighting() {
         let keyword_color = Color::Rgb {
             r: 34,
@@ -6712,6 +6859,76 @@ mod tests {
         assert!(picker.list.items().is_empty());
     }
 
+    #[test]
+    fn structured_picker_refinement_restores_candidates_when_the_query_broadens() {
+        let editor = test_editor();
+        let mut picker = Picker::new_dynamic(
+            /*title*/ None,
+            &editor,
+            vec![
+                dynamic_item("needle", "needle"),
+                dynamic_item("nearby", "nearby"),
+                dynamic_item("other", "other"),
+            ],
+            /*id*/ 26,
+            PickerOptions::default(),
+        );
+
+        picker.filter("ne");
+        assert_eq!(visible_picker_labels(&picker), ["needle", "nearby"]);
+        picker.filter("need");
+        assert_eq!(visible_picker_labels(&picker), ["needle"]);
+        picker.filter("ne");
+        assert_eq!(visible_picker_labels(&picker), ["needle", "nearby"]);
+        picker.filter("");
+        assert_eq!(
+            visible_picker_labels(&picker),
+            ["needle", "nearby", "other"]
+        );
+    }
+
+    #[test]
+    fn custom_picker_filters_can_add_matches_when_a_query_is_extended() {
+        let editor = test_editor();
+        let mut picker = Picker::builder()
+            .structured_items(vec![
+                dynamic_item("first", "first"),
+                dynamic_item("second", "second"),
+            ])
+            .filter_action(|item, query| match (item.id.as_str(), query) {
+                ("first", "n") | ("second", "ne") => Some(10),
+                _ => None,
+            })
+            .build(&editor);
+
+        picker.filter("n");
+        assert_eq!(visible_picker_labels(&picker), ["first"]);
+        picker.filter("ne");
+        assert_eq!(visible_picker_labels(&picker), ["second"]);
+    }
+
+    #[test]
+    fn replacing_picker_items_invalidates_previous_refinement_candidates() {
+        let editor = test_editor();
+        let mut picker = Picker::new_dynamic(
+            /*title*/ None,
+            &editor,
+            vec![dynamic_item("old", "needle")],
+            /*id*/ 27,
+            PickerOptions::default(),
+        );
+
+        picker.filter("ne");
+        picker.filter("need");
+        picker.replace_structured_items(vec![
+            dynamic_item("other", "other"),
+            dynamic_item("new", "needlework"),
+        ]);
+        picker.filter("needle");
+
+        assert_eq!(visible_picker_labels(&picker), ["needlework"]);
+    }
+
     fn visible_picker_labels(picker: &Picker) -> Vec<&str> {
         match &picker.dynamic_items {
             Some(items) => picker
@@ -6934,6 +7151,100 @@ mod tests {
         picker.filter("alpha");
         assert_eq!(calls.swap(0, Ordering::Relaxed), 2);
         assert_eq!(visible_picker_labels(&picker), ["alpha", "alphabet"]);
+    }
+
+    #[test]
+    fn incremental_picker_reuses_recent_exact_queries_without_rescoring() {
+        let editor = test_editor();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let filter_calls = Arc::clone(&calls);
+        let mut picker = Picker::builder()
+            .structured_items(vec![
+                dynamic_item("alpha", "alpha"),
+                dynamic_item("alpine", "alpine"),
+                dynamic_item("beta", "beta"),
+            ])
+            .filter_action(move |item, query| {
+                filter_calls.fetch_add(1, Ordering::Relaxed);
+                item.label.contains(query).then_some(1)
+            })
+            .incremental_filter()
+            .build(&editor);
+
+        picker.filter("al");
+        picker.filter("alp");
+        calls.store(0, Ordering::Relaxed);
+
+        picker.filter("al");
+        assert_eq!(calls.swap(0, Ordering::Relaxed), 0);
+        assert_eq!(visible_picker_labels(&picker), ["alpha", "alpine"]);
+
+        picker.filter("alp");
+        assert_eq!(calls.swap(0, Ordering::Relaxed), 0);
+        assert_eq!(visible_picker_labels(&picker), ["alpha", "alpine"]);
+    }
+
+    #[test]
+    fn incremental_picker_history_is_bounded_and_invalidated_by_new_items() {
+        let editor = test_editor();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let filter_calls = Arc::clone(&calls);
+        let mut picker = Picker::builder()
+            .structured_items(vec![
+                dynamic_item("alpha", "alpha"),
+                dynamic_item("beta", "beta"),
+            ])
+            .filter_action(move |item, query| {
+                filter_calls.fetch_add(1, Ordering::Relaxed);
+                item.label.contains(query).then_some(1)
+            })
+            .incremental_filter()
+            .build(&editor);
+
+        for index in 0..super::MAX_FILTER_HISTORY_ENTRIES + 3 {
+            picker.set_search(format!("missing{index}"));
+        }
+        assert_eq!(
+            picker.filtered_history.len(),
+            super::MAX_FILTER_HISTORY_ENTRIES
+        );
+
+        picker.set_search("al".to_string());
+        picker.set_search("be".to_string());
+        calls.store(0, Ordering::Relaxed);
+        picker.replace_structured_items(vec![
+            dynamic_item("alpine", "alpine"),
+            dynamic_item("berry", "berry"),
+        ]);
+        assert_eq!(calls.swap(0, Ordering::Relaxed), 2);
+        assert_eq!(visible_picker_labels(&picker), ["berry"]);
+
+        picker.set_search("al".to_string());
+        assert_eq!(calls.swap(0, Ordering::Relaxed), 2);
+        assert_eq!(visible_picker_labels(&picker), ["alpine"]);
+    }
+
+    #[test]
+    fn incremental_picker_does_not_retain_oversized_prior_result_sets() {
+        let editor = test_editor();
+        let item_count = super::MAX_FILTER_HISTORY_ITEMS_PER_ENTRY + 1;
+        let items = (0..item_count)
+            .map(|index| dynamic_item(&format!("item-{index}"), "alpha"))
+            .collect();
+        let mut picker = Picker::builder()
+            .structured_items(items)
+            .filter_action(|item, query| item.label.contains(query).then_some(1))
+            .incremental_filter()
+            .build(&editor);
+
+        picker.filter("a");
+        assert_eq!(picker.visible_dynamic_items.len(), item_count);
+        picker.filter("al");
+
+        assert!(picker
+            .filtered_history
+            .iter()
+            .all(|(query, _)| query != "a"));
     }
 
     #[test]

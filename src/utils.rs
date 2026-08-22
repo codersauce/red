@@ -5,7 +5,8 @@
 //! is a convenience boundary rather than a security boundary for untrusted paths.
 
 use std::{
-    env,
+    borrow::Cow,
+    env, io,
     path::{Component, Path, PathBuf},
 };
 
@@ -24,7 +25,8 @@ pub fn expand_user_path(path: &str) -> anyhow::Result<PathBuf> {
 /// Keeping the lexical path preserves the spelling the user opened while giving file
 /// buffers a stable identity across workspace-relative and absolute open requests.
 pub fn normalized_file_path(path: &str) -> anyhow::Result<PathBuf> {
-    Ok(expand_user_path(path)?.absolutize()?.into_owned())
+    let path = expand_user_path(path)?;
+    Ok(absolutize_file_path(&path)?.into_owned())
 }
 
 /// Returns whether two paths identify the same file.
@@ -32,14 +34,22 @@ pub fn normalized_file_path(path: &str) -> anyhow::Result<PathBuf> {
 /// Lexical equality also covers files that do not exist yet. When both paths exist,
 /// filesystem identity additionally folds symlink, hard-link, and case aliases.
 pub fn same_file_path(left: &Path, right: &Path) -> bool {
-    let Ok(left) = left.absolutize() else {
+    let Ok(left) = absolutize_file_path(left) else {
         return false;
     };
-    let Ok(right) = right.absolutize() else {
+    let Ok(right) = absolutize_file_path(right) else {
         return false;
     };
 
     left == right || same_file::is_same_file(left.as_ref(), right.as_ref()).unwrap_or(false)
+}
+
+fn absolutize_file_path(path: &Path) -> io::Result<Cow<'_, Path>> {
+    if path.is_absolute() {
+        path.absolutize_from(path)
+    } else {
+        path.absolutize()
+    }
 }
 
 pub fn expand_user_path_with_home(path: &str, home: &Path) -> anyhow::Result<PathBuf> {
@@ -250,6 +260,23 @@ mod tests {
         let absolute = std::env::current_dir().unwrap().join(relative);
 
         assert!(same_file_path(relative, &absolute));
+    }
+
+    #[test]
+    fn absolute_file_paths_preserve_parent_normalization_and_identity() {
+        let root = std::env::current_dir().unwrap();
+        let expected = root.join("folder").join("main.rs");
+        let path = root
+            .join("folder")
+            .join("nested")
+            .join("..")
+            .join("main.rs");
+
+        assert_eq!(
+            normalized_file_path(path.to_str().unwrap()).unwrap(),
+            expected
+        );
+        assert!(same_file_path(&path, &expected));
     }
 
     #[cfg(unix)]

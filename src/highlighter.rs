@@ -11,12 +11,13 @@ use std::{
     ops::Range,
     path::{Path, PathBuf},
     sync::Arc,
+    thread::{self, JoinHandle},
 };
 
 use anyhow::Context as _;
 use husk_lexer::{Keyword, Lexer, TokenKind, Trivia};
 use libloading::Library;
-use tree_sitter::{Language, Parser, Query, QueryCursor, StreamingIterator};
+use tree_sitter::{Language, Parser, Query, QueryCursor, StreamingIterator, Tree};
 use tree_sitter_language::LanguageFn;
 
 use crate::{
@@ -452,6 +453,24 @@ struct LanguageHighlighter {
     query: Query,
     injection_query: Option<Query>,
     capture_styles: Vec<Option<Style>>,
+    cached_tree: Option<CachedSyntaxTree>,
+}
+
+struct CachedSyntaxTree {
+    source: String,
+    tree: Tree,
+}
+
+struct CompiledLanguageQueries {
+    language: Language,
+    query: Query,
+    injection_query: Option<Query>,
+}
+
+pub(crate) struct PendingLanguageHighlighter {
+    language_id: String,
+    registry: Arc<LanguageRegistry>,
+    task: JoinHandle<anyhow::Result<CompiledLanguageQueries>>,
 }
 
 struct Injection {
@@ -466,8 +485,15 @@ struct RawInjection {
     content_end: usize,
 }
 
+struct CachedHighlight {
+    language_id: String,
+    code: String,
+    styles: Vec<StyleInfo>,
+}
+
 pub struct Highlighter {
     highlighters: HashMap<String, LanguageHighlighter>,
+    cached_highlight: Option<CachedHighlight>,
     registry: Arc<LanguageRegistry>,
     theme: Theme,
     husk_styles: HuskStyles,
@@ -529,6 +555,8 @@ impl GitCommitStyles {
 }
 
 const MAX_INJECTION_DEPTH: usize = 3;
+const MAX_CACHED_HIGHLIGHT_BYTES: usize = 64 * 1024;
+const MAX_CACHED_HIGHLIGHT_SPANS: usize = 4_096;
 
 const LANGUAGE_NAMES: &[(&str, &str)] = &[
     ("rs", "rust"),
@@ -601,6 +629,7 @@ impl Highlighter {
     pub fn with_registry(theme: &Theme, registry: Arc<LanguageRegistry>) -> anyhow::Result<Self> {
         Ok(Self {
             highlighters: HashMap::new(),
+            cached_highlight: None,
             registry,
             theme: theme.clone(),
             husk_styles: HuskStyles::new(theme),
@@ -612,6 +641,118 @@ impl Highlighter {
     #[must_use]
     pub fn registry(&self) -> Arc<LanguageRegistry> {
         Arc::clone(&self.registry)
+    }
+
+    /// Identifies a bounded set of configured fenced languages before the
+    /// Markdown parser is available. Unknown and duplicate aliases are ignored;
+    /// false positives only prewarm an existing grammar and never change spans.
+    pub(crate) fn startup_injected_language_ids(
+        &self,
+        language_id: &str,
+        source: &str,
+    ) -> Vec<String> {
+        const MAX_STARTUP_INJECTION_LANGUAGES: usize = 3;
+        if language_id != "markdown" {
+            return Vec::new();
+        }
+
+        let mut languages = Vec::new();
+        for line in source.lines() {
+            let line = line.trim_start();
+            let Some(info) = line
+                .strip_prefix("```")
+                .or_else(|| line.strip_prefix("~~~"))
+            else {
+                continue;
+            };
+            let Some(name) = info.split_whitespace().next() else {
+                continue;
+            };
+            let Some(resolved) = self.language_id_for_name(name) else {
+                continue;
+            };
+            if resolved == language_id || languages.iter().any(|language| language == resolved) {
+                continue;
+            }
+            languages.push(resolved.to_string());
+            if languages.len() == MAX_STARTUP_INJECTION_LANGUAGES {
+                break;
+            }
+        }
+        languages
+    }
+
+    /// Compile the first visible language's queries while independent startup
+    /// work runs. The registry snapshot keeps dynamic grammar libraries alive.
+    pub(crate) fn prepare_language_in_background(
+        &self,
+        language_id: &str,
+    ) -> Option<PendingLanguageHighlighter> {
+        if self.highlighters.contains_key(language_id) {
+            return None;
+        }
+        let definition = self.registry.languages.get(language_id)?;
+        if definition.specialized.is_some() || definition.highlight_queries.is_empty() {
+            return None;
+        }
+        let grammar = definition.grammar.clone()?;
+        let highlights = definition.highlight_queries.join("\n");
+        let injections = definition.injection_query.clone();
+        let task = thread::Builder::new()
+            .name("red-highlight-startup".to_string())
+            .spawn(move || {
+                let language = grammar_language(&grammar);
+                let query = Query::new(&language, &highlights)?;
+                let injection_query = injections
+                    .as_deref()
+                    .map(|source| Query::new(&language, source))
+                    .transpose()?;
+                Ok(CompiledLanguageQueries {
+                    language,
+                    query,
+                    injection_query,
+                })
+            })
+            .ok()?;
+        Some(PendingLanguageHighlighter {
+            language_id: language_id.to_string(),
+            registry: Arc::clone(&self.registry),
+            task,
+        })
+    }
+
+    /// Install a completed query only when its exact language snapshot is still
+    /// current. Failure remains best-effort; ordinary lazy loading retries it.
+    pub(crate) fn finish_prepared_language(&mut self, pending: PendingLanguageHighlighter) {
+        let Ok(Ok(prepared)) = pending.task.join() else {
+            return;
+        };
+        if !Arc::ptr_eq(&self.registry, &pending.registry)
+            || self.highlighters.contains_key(&pending.language_id)
+        {
+            return;
+        }
+
+        let mut parser = Parser::new();
+        if parser.set_language(&prepared.language).is_err() {
+            return;
+        }
+        let capture_styles = prepared
+            .query
+            .capture_names()
+            .iter()
+            .map(|scope| self.theme.get_style(scope))
+            .collect();
+        self.highlighters.insert(
+            pending.language_id,
+            LanguageHighlighter {
+                parser,
+                query: prepared.query,
+                injection_query: prepared.injection_query,
+                capture_styles,
+                cached_tree: None,
+            },
+        );
     }
 
     pub fn language_id_for_file(&self, file: Option<&str>) -> Option<&str> {
@@ -705,7 +846,442 @@ impl Highlighter {
     }
 
     pub fn highlight(&mut self, language_id: &str, code: &str) -> anyhow::Result<Vec<StyleInfo>> {
-        self.highlight_with_depth(language_id, code, 0)
+        if let Some(cached) = &self.cached_highlight {
+            if cached.language_id == language_id && cached.code == code {
+                return Ok(cached.styles.clone());
+            }
+        }
+
+        if let Some(styles) = self.reuse_specialized_token_highlight(language_id, code) {
+            return Ok(styles);
+        }
+
+        if let Some(styles) = self.reuse_markdown_injected_token_highlight(language_id, code) {
+            return Ok(styles);
+        }
+
+        if let Some(styles) = self.reuse_stable_token_highlight(language_id, code) {
+            return Ok(styles);
+        }
+
+        let styles = self.highlight_with_depth(language_id, code, 0)?;
+        self.cached_highlight = if code.len() <= MAX_CACHED_HIGHLIGHT_BYTES
+            && styles.len() <= MAX_CACHED_HIGHLIGHT_SPANS
+        {
+            Some(CachedHighlight {
+                language_id: language_id.to_string(),
+                code: code.to_string(),
+                styles: styles.clone(),
+            })
+        } else {
+            None
+        };
+        Ok(styles)
+    }
+
+    /// Recompute one independent commit line or preserve one stable Husk token.
+    fn reuse_specialized_token_highlight(
+        &mut self,
+        language_id: &str,
+        code: &str,
+    ) -> Option<Vec<StyleInfo>> {
+        if code.len() > MAX_CACHED_HIGHLIGHT_BYTES {
+            return None;
+        }
+        let definition = self.registry.languages.get(language_id)?;
+        let specialized = definition.specialized?;
+        if definition.grammar.is_some() || !definition.highlight_queries.is_empty() {
+            return None;
+        }
+        let cached = self.cached_highlight.as_mut()?;
+        if cached.language_id != language_id {
+            return None;
+        }
+        let edit = crate::syntax_indent::replacement_edit(&cached.code, code);
+        let inserted = &code[edit.start_byte..edit.new_end_byte];
+        let removed = &cached.code[edit.start_byte..edit.old_end_byte];
+        if inserted.contains(['\r', '\n']) || removed.contains(['\r', '\n']) {
+            return None;
+        }
+        let delta = isize::try_from(edit.new_end_byte)
+            .ok()?
+            .checked_sub(isize::try_from(edit.old_end_byte).ok()?)?;
+
+        let styles = match (language_id, specialized) {
+            ("gitcommit", SpecializedHighlighter::GitCommit) => {
+                let line_start = cached.code[..edit.start_byte]
+                    .rfind('\n')
+                    .map_or(0, |position| position + 1);
+                let old_line_end = cached.code[edit.old_end_byte..]
+                    .find('\n')
+                    .map_or(cached.code.len(), |offset| edit.old_end_byte + offset);
+                let new_line_end = old_line_end.checked_add_signed(delta)?;
+                let mut updated = Vec::with_capacity(cached.styles.len() + 4);
+                updated.extend(
+                    cached
+                        .styles
+                        .iter()
+                        .filter(|style| style.end <= line_start)
+                        .cloned(),
+                );
+                for mut style in
+                    highlight_git_commit(&code[line_start..new_line_end], &self.git_commit_styles)
+                {
+                    style.start += line_start;
+                    style.end += line_start;
+                    updated.push(style);
+                }
+                for style in cached
+                    .styles
+                    .iter()
+                    .filter(|style| style.start >= old_line_end)
+                {
+                    let mut style = style.clone();
+                    style.start = style.start.checked_add_signed(delta)?;
+                    style.end = style.end.checked_add_signed(delta)?;
+                    updated.push(style);
+                }
+                updated
+            }
+            ("husk", SpecializedHighlighter::Husk) => {
+                let covering = cached
+                    .styles
+                    .iter()
+                    .find(|style| style.start < edit.start_byte && style.end > edit.old_end_byte);
+                let (comment, string) = if let Some(covering) = covering {
+                    let token = cached.code.get(covering.start..covering.end)?;
+                    let comment = self
+                        .husk_styles
+                        .comment
+                        .as_ref()
+                        .is_some_and(|style| *style == covering.style)
+                        && token.starts_with("//")
+                        && !token.contains('\n')
+                        && edit.start_byte > covering.start.saturating_add(2);
+                    let string = self
+                        .husk_styles
+                        .string
+                        .as_ref()
+                        .is_some_and(|style| *style == covering.style)
+                        && token.starts_with('"')
+                        && token.ends_with('"')
+                        && !token.contains(['\r', '\n'])
+                        && !inserted.chars().chain(removed.chars()).any(|character| {
+                            character.is_control() || matches!(character, '"' | '\\')
+                        });
+                    (comment, string)
+                } else {
+                    (false, false)
+                };
+                let numeric = stable_husk_numeric_token(
+                    &cached.code,
+                    edit.start_byte,
+                    edit.old_end_byte,
+                    inserted,
+                );
+                let identifier = stable_husk_identifier_token(
+                    &cached.code,
+                    code,
+                    edit.start_byte,
+                    edit.old_end_byte,
+                    inserted,
+                );
+                if !comment && !string && !numeric && !identifier {
+                    return None;
+                }
+                let mut updated = cached.styles.clone();
+                for style in &mut updated {
+                    if style.end <= edit.start_byte {
+                        continue;
+                    }
+                    if style.start >= edit.old_end_byte {
+                        style.start = style.start.checked_add_signed(delta)?;
+                        style.end = style.end.checked_add_signed(delta)?;
+                    } else if style.start < edit.start_byte && style.end >= edit.old_end_byte {
+                        style.end = style.end.checked_add_signed(delta)?;
+                    } else {
+                        return None;
+                    }
+                }
+                updated
+            }
+            _ => return None,
+        };
+        if styles.len() > MAX_CACHED_HIGHLIGHT_SPANS {
+            return None;
+        }
+        cached.code.clear();
+        cached.code.push_str(code);
+        cached.styles.clone_from(&styles);
+        Some(styles)
+    }
+
+    /// Preserve Markdown and an optional injected tree for one stable fenced token.
+    fn reuse_markdown_injected_token_highlight(
+        &mut self,
+        language_id: &str,
+        code: &str,
+    ) -> Option<Vec<StyleInfo>> {
+        if language_id != "markdown" || code.len() > MAX_CACHED_HIGHLIGHT_BYTES {
+            return None;
+        }
+        let markdown = self.registry.languages.get("markdown")?;
+        if !bundled_highlight_definition(markdown, "markdown")
+            || markdown.injection_query.as_deref() != Some(MARKDOWN_INJECTION_QUERY)
+        {
+            return None;
+        }
+
+        let cached = self.cached_highlight.as_ref()?;
+        if cached.language_id != "markdown" {
+            return None;
+        }
+        let outer = self.highlighters.get("markdown")?.cached_tree.as_ref()?;
+        if outer.source != cached.code {
+            return None;
+        }
+        let outer_edit = crate::syntax_indent::replacement_edit(&cached.code, code);
+        let inserted = code.get(outer_edit.start_byte..outer_edit.new_end_byte)?;
+        let removed = cached
+            .code
+            .get(outer_edit.start_byte..outer_edit.old_end_byte)?;
+        if inserted.chars().chain(removed.chars()).any(|character| {
+            character.is_control() || matches!(character, '`' | '~' | '\u{2028}' | '\u{2029}')
+        }) {
+            return None;
+        }
+
+        let content = outer
+            .tree
+            .root_node()
+            .named_descendant_for_byte_range(outer_edit.start_byte, outer_edit.old_end_byte)?;
+        if content.kind() != "code_fence_content"
+            || content.start_byte() >= outer_edit.start_byte
+            || content.end_byte() <= outer_edit.old_end_byte
+        {
+            return None;
+        }
+        let fence = content.parent()?;
+        if fence.kind() != "fenced_code_block" {
+            return None;
+        }
+        let injected_language = {
+            let mut fence_cursor = fence.walk();
+            let info = fence
+                .named_children(&mut fence_cursor)
+                .find(|node| node.kind() == "info_string")?;
+            let mut info_cursor = info.walk();
+            let language = info
+                .named_children(&mut info_cursor)
+                .find(|node| node.kind() == "language")?;
+            let language_name = cached.code.get(language.byte_range())?;
+            self.language_id_for_name(language_name)?.to_string()
+        };
+        let definition = self.registry.languages.get(&injected_language)?;
+        let specialized_husk = injected_language == "husk"
+            && matches!(definition.specialized, Some(SpecializedHighlighter::Husk))
+            && definition.grammar.is_none()
+            && definition.highlight_queries.is_empty();
+        if (!specialized_husk && !bundled_highlight_definition(definition, &injected_language))
+            || definition.injection_query.is_some()
+        {
+            return None;
+        }
+
+        let delta = isize::try_from(outer_edit.new_end_byte)
+            .ok()?
+            .checked_sub(isize::try_from(outer_edit.old_end_byte).ok()?)?;
+        let content_start = content.start_byte();
+        let old_content_end = content.end_byte();
+        let new_content_end = old_content_end.checked_add_signed(delta)?;
+        let old_contents = cached.code.get(content_start..old_content_end)?;
+        let new_contents = code.get(content_start..new_content_end)?;
+        let nested_edit = if specialized_husk {
+            let covering = cached.styles.iter().find(|style| {
+                style.start >= content_start
+                    && style.end <= old_content_end
+                    && style.start < outer_edit.start_byte
+                    && style.end > outer_edit.old_end_byte
+                    && (self
+                        .husk_styles
+                        .comment
+                        .as_ref()
+                        .is_some_and(|expected| *expected == style.style)
+                        || self
+                            .husk_styles
+                            .string
+                            .as_ref()
+                            .is_some_and(|expected| *expected == style.style)
+                        || self
+                            .husk_styles
+                            .numeric
+                            .as_ref()
+                            .is_some_and(|expected| *expected == style.style))
+            });
+            let (comment, string) = if let Some(covering) = covering {
+                let token = cached.code.get(covering.start..covering.end)?;
+                let comment = self
+                    .husk_styles
+                    .comment
+                    .as_ref()
+                    .is_some_and(|style| *style == covering.style)
+                    && token.starts_with("//")
+                    && !token.contains('\n')
+                    && outer_edit.start_byte > covering.start.saturating_add(2);
+                let string = self
+                    .husk_styles
+                    .string
+                    .as_ref()
+                    .is_some_and(|style| *style == covering.style)
+                    && token.starts_with('"')
+                    && token.ends_with('"')
+                    && !token.contains(['\r', '\n'])
+                    && !inserted
+                        .chars()
+                        .chain(removed.chars())
+                        .any(|character| matches!(character, '"' | '\\'));
+                (comment, string)
+            } else {
+                (false, false)
+            };
+            let numeric = stable_husk_numeric_token(
+                old_contents,
+                outer_edit.start_byte.checked_sub(content_start)?,
+                outer_edit.old_end_byte.checked_sub(content_start)?,
+                inserted,
+            );
+            let identifier = stable_husk_identifier_token(
+                old_contents,
+                new_contents,
+                outer_edit.start_byte.checked_sub(content_start)?,
+                outer_edit.old_end_byte.checked_sub(content_start)?,
+                inserted,
+            );
+            if !comment && !string && !numeric && !identifier {
+                return None;
+            }
+            None
+        } else {
+            let nested = self
+                .highlighters
+                .get(&injected_language)?
+                .cached_tree
+                .as_ref()?;
+            if nested.source != old_contents {
+                return None;
+            }
+            let nested_edit = crate::syntax_indent::replacement_edit(old_contents, new_contents);
+            stable_bundled_token(
+                &injected_language,
+                old_contents,
+                new_contents,
+                nested,
+                &nested_edit,
+            )?;
+            Some(nested_edit)
+        };
+
+        let mut styles = cached.styles.clone();
+        for style in &mut styles {
+            if style.end <= outer_edit.start_byte {
+                continue;
+            }
+            if style.start >= outer_edit.old_end_byte {
+                style.start = style.start.checked_add_signed(delta)?;
+                style.end = style.end.checked_add_signed(delta)?;
+            } else if style.start < outer_edit.start_byte && style.end >= outer_edit.old_end_byte {
+                style.end = style.end.checked_add_signed(delta)?;
+            } else {
+                return None;
+            }
+        }
+
+        let outer = self
+            .highlighters
+            .get_mut("markdown")?
+            .cached_tree
+            .as_mut()?;
+        outer.tree.edit(&outer_edit);
+        outer.source.clear();
+        outer.source.push_str(code);
+        if let Some(nested_edit) = nested_edit {
+            let nested = self
+                .highlighters
+                .get_mut(&injected_language)?
+                .cached_tree
+                .as_mut()?;
+            nested.tree.edit(&nested_edit);
+            nested.source.clear();
+            nested.source.push_str(new_contents);
+        }
+        let cached = self.cached_highlight.as_mut()?;
+        cached.code.clear();
+        cached.code.push_str(code);
+        cached.styles.clone_from(&styles);
+        Some(styles)
+    }
+
+    /// Preserve exact bundled captures when an edit cannot change one token's
+    /// grammar, boundaries, or predicates. Each supported grammar and token
+    /// has its own restrictive validation before sharing the existing tree.
+    fn reuse_stable_token_highlight(
+        &mut self,
+        language_id: &str,
+        code: &str,
+    ) -> Option<Vec<StyleInfo>> {
+        if code.len() > MAX_CACHED_HIGHLIGHT_BYTES {
+            return None;
+        }
+
+        let definition = self.registry.languages.get(language_id)?;
+        if !bundled_highlight_definition(definition, language_id)
+            || (language_id == "markdown"
+                && definition.injection_query.as_deref() != Some(MARKDOWN_INJECTION_QUERY))
+        {
+            return None;
+        }
+
+        let cached = self.cached_highlight.as_mut()?;
+        if cached.language_id != language_id {
+            return None;
+        }
+        let syntax = self
+            .highlighters
+            .get_mut(language_id)?
+            .cached_tree
+            .as_mut()?;
+        if syntax.source != cached.code {
+            return None;
+        }
+
+        let edit = crate::syntax_indent::replacement_edit(&cached.code, code);
+        let delta = isize::try_from(edit.new_end_byte)
+            .ok()?
+            .checked_sub(isize::try_from(edit.old_end_byte).ok()?)?;
+        stable_bundled_token(language_id, &cached.code, code, syntax, &edit)?;
+
+        let mut styles = cached.styles.clone();
+        for style in &mut styles {
+            if style.end <= edit.start_byte {
+                continue;
+            }
+            if style.start >= edit.old_end_byte {
+                style.start = style.start.checked_add_signed(delta)?;
+                style.end = style.end.checked_add_signed(delta)?;
+            } else if style.start < edit.start_byte && style.end >= edit.old_end_byte {
+                style.end = style.end.checked_add_signed(delta)?;
+            } else {
+                return None;
+            }
+        }
+
+        syntax.tree.edit(&edit);
+        syntax.source.clear();
+        syntax.source.push_str(code);
+        cached.code.clear();
+        cached.code.push_str(code);
+        cached.styles.clone_from(&styles);
+        Some(styles)
     }
 
     fn highlight_with_depth(
@@ -714,7 +1290,8 @@ impl Highlighter {
         code: &str,
         depth: usize,
     ) -> anyhow::Result<Vec<StyleInfo>> {
-        let Some(definition) = self.registry.languages.get(language_id).cloned() else {
+        let registry = Arc::clone(&self.registry);
+        let Some(definition) = registry.languages.get(language_id) else {
             return Ok(Vec::new());
         };
         if let Some(specialized) = definition.specialized {
@@ -755,6 +1332,7 @@ impl Highlighter {
                     query,
                     injection_query,
                     capture_styles,
+                    cached_tree: None,
                 },
             );
         }
@@ -766,45 +1344,64 @@ impl Highlighter {
             let Some(highlighter) = self.highlighters.get_mut(&definition.id) else {
                 return Ok(Vec::new());
             };
-            let Some(tree) = highlighter.parser.parse(code, None) else {
+            let previous_tree = highlighter.cached_tree.take().map(|mut cached| {
+                cached.tree.edit(&crate::syntax_indent::replacement_edit(
+                    &cached.source,
+                    code,
+                ));
+                cached.tree
+            });
+            let parsed = highlighter.parser.parse(code, previous_tree.as_ref());
+            let Some(tree) = parsed else {
                 return Ok(Vec::new());
             };
 
-            let mut cursor = QueryCursor::new();
-            let mut matches = cursor.matches(&highlighter.query, tree.root_node(), code.as_bytes());
-            let mut refinement_colors = Vec::new();
+            {
+                let mut cursor = QueryCursor::new();
+                let mut matches =
+                    cursor.matches(&highlighter.query, tree.root_node(), code.as_bytes());
+                let mut refinement_colors = Vec::new();
 
-            while let Some(mat) = matches.next() {
-                for cap in mat.captures {
-                    let node = cap.node;
-                    let start = node.start_byte();
-                    let end = node.end_byte();
-                    let capture_name = highlighter.query.capture_names()[cap.index as usize];
-                    if let Some(style) = highlighter.capture_styles[cap.index as usize].as_ref() {
-                        let captured = StyleInfo {
-                            start,
-                            end,
-                            style: style.clone(),
-                        };
-                        if capture_refines_equal_range(capture_name) {
-                            refinement_colors.push(captured);
-                        } else {
-                            colors.push(captured);
+                while let Some(mat) = matches.next() {
+                    for cap in mat.captures {
+                        let node = cap.node;
+                        let start = node.start_byte();
+                        let end = node.end_byte();
+                        let capture_name = highlighter.query.capture_names()[cap.index as usize];
+                        if let Some(style) = highlighter.capture_styles[cap.index as usize].as_ref()
+                        {
+                            let captured = StyleInfo {
+                                start,
+                                end,
+                                style: style.clone(),
+                            };
+                            if capture_refines_equal_range(capture_name) {
+                                refinement_colors.push(captured);
+                            } else {
+                                colors.push(captured);
+                            }
                         }
                     }
                 }
-            }
 
-            // Query cursors return captures in syntax-tree order, which can put a
-            // broad scalar capture after a more specific capture over the same
-            // bytes. Keep semantic refinements later so the renderer's stable
-            // equal-range tie-break selects them.
-            colors.extend(refinement_colors);
+                // Query cursors return captures in syntax-tree order, which can put a
+                // broad scalar capture after a more specific capture over the same
+                // bytes. Keep semantic refinements later so the renderer's stable
+                // equal-range tie-break selects them.
+                colors.extend(refinement_colors);
+            }
 
             if depth < MAX_INJECTION_DEPTH {
                 if let Some(injection_query) = &highlighter.injection_query {
                     raw_injections = collect_injections(injection_query, tree.root_node(), code);
                 }
+            }
+
+            if code.len() <= MAX_CACHED_HIGHLIGHT_BYTES {
+                highlighter.cached_tree = Some(CachedSyntaxTree {
+                    source: code.to_owned(),
+                    tree,
+                });
             }
         }
 
@@ -836,6 +1433,646 @@ impl Highlighter {
 
         Ok(colors)
     }
+}
+
+fn stable_husk_numeric_token(source: &str, start: usize, end: usize, inserted: &str) -> bool {
+    if !inserted.bytes().all(|byte| byte.is_ascii_digit()) {
+        return false;
+    }
+    let line_start = source[..start].rfind('\n').map_or(0, |index| index + 1);
+    let line_end = source[end..]
+        .find('\n')
+        .map_or(source.len(), |offset| end + offset);
+    let line = &source[line_start..line_end];
+    Lexer::new(line).any(|token| {
+        let range = token.span.range;
+        let token_start = line_start + range.start;
+        let token_end = line_start + range.end;
+        matches!(token.kind, TokenKind::IntLiteral(_))
+            && token_start < start
+            && token_end > end
+            && line.get(range).is_some_and(|text| {
+                !text.starts_with('0') && text.bytes().all(|byte| byte.is_ascii_digit())
+            })
+    })
+}
+
+fn stable_husk_identifier_token(
+    previous_source: &str,
+    source: &str,
+    start: usize,
+    end: usize,
+    inserted: &str,
+) -> bool {
+    if !inserted.bytes().all(|byte| byte.is_ascii_lowercase()) {
+        return false;
+    }
+    let line_start = previous_source[..start]
+        .rfind('\n')
+        .map_or(0, |index| index + 1);
+    let line_end = previous_source[end..]
+        .find('\n')
+        .map_or(previous_source.len(), |offset| end + offset);
+    let line = &previous_source[line_start..line_end];
+    Lexer::new(line).any(|token| {
+        let TokenKind::Ident(previous) = token.kind else {
+            return false;
+        };
+        let token_start = line_start + token.span.range.start;
+        let token_end = line_start + token.span.range.end;
+        if token_start >= start
+            || token_end <= end
+            || !previous.bytes().all(|byte| byte.is_ascii_lowercase())
+            || is_husk_builtin_type(&previous)
+        {
+            return false;
+        }
+        let updated_end = token_end - (end - start) + inserted.len();
+        source.get(token_start..updated_end).is_some_and(|updated| {
+            updated.bytes().all(|byte| byte.is_ascii_lowercase())
+                && !husk_lexer::is_keyword(updated)
+                && !is_husk_builtin_type(updated)
+        })
+    })
+}
+
+fn bundled_highlight_definition(definition: &RuntimeLanguageDefinition, language_id: &str) -> bool {
+    let expected_queries = match language_id {
+        "rust" => &[tree_sitter_rust::HIGHLIGHTS_QUERY][..],
+        "markdown" => &[MARKDOWN_HIGHLIGHT_QUERY][..],
+        "javascript" => JAVASCRIPT_HIGHLIGHT_QUERIES,
+        "jsx" => JSX_HIGHLIGHT_QUERIES,
+        "typescript" => TYPESCRIPT_HIGHLIGHT_QUERIES,
+        "tsx" => TSX_HIGHLIGHT_QUERIES,
+        "json" => &[tree_sitter_json::HIGHLIGHTS_QUERY][..],
+        "toml" => &[tree_sitter_toml_ng::HIGHLIGHTS_QUERY][..],
+        "yaml" => &[
+            tree_sitter_yaml::HIGHLIGHTS_QUERY,
+            YAML_ADDITIONAL_HIGHLIGHTS_QUERY,
+        ][..],
+        "bash" => &[tree_sitter_bash::HIGHLIGHT_QUERY][..],
+        "fish" => &[tree_sitter_fish::HIGHLIGHTS_QUERY][..],
+        "powershell" => &[tree_sitter_powershell::HIGHLIGHTS_QUERY][..],
+        "lua" => &[tree_sitter_lua::HIGHLIGHTS_QUERY][..],
+        _ => return false,
+    };
+    matches!(definition.grammar.as_ref(), Some(GrammarSource::Bundled(_)))
+        && definition.highlight_queries.len() == expected_queries.len()
+        && definition
+            .highlight_queries
+            .iter()
+            .zip(expected_queries)
+            .all(|(actual, expected)| actual == expected)
+}
+
+fn stable_bundled_token(
+    language_id: &str,
+    previous_source: &str,
+    source: &str,
+    syntax: &CachedSyntaxTree,
+    edit: &tree_sitter::InputEdit,
+) -> Option<()> {
+    let token = syntax
+        .tree
+        .root_node()
+        .named_descendant_for_byte_range(edit.start_byte, edit.old_end_byte)?;
+    if token.start_byte() >= edit.start_byte || token.end_byte() <= edit.old_end_byte {
+        return None;
+    }
+
+    let delta = isize::try_from(edit.new_end_byte)
+        .ok()?
+        .checked_sub(isize::try_from(edit.old_end_byte).ok()?)?;
+    let inserted = source.get(edit.start_byte..edit.new_end_byte)?;
+    match token.kind() {
+        "integer_literal" | "decimal_integer_literal" | "integer" | "integer_scalar" | "number" => {
+            let supported = match token.kind() {
+                "integer_literal" => language_id == "rust",
+                "decimal_integer_literal" => language_id == "powershell",
+                "integer" => language_id == "toml",
+                "integer_scalar" => language_id == "yaml",
+                "number" => matches!(
+                    language_id,
+                    "javascript" | "jsx" | "typescript" | "tsx" | "json" | "lua"
+                ),
+                _ => false,
+            };
+            let previous = previous_source.get(token.byte_range())?;
+            let end = token.end_byte().checked_add_signed(delta)?;
+            let updated = source.get(token.start_byte()..end)?;
+            if !supported
+                || previous.starts_with('0')
+                || !previous.bytes().all(|byte| byte.is_ascii_digit())
+                || !inserted.bytes().all(|byte| byte.is_ascii_digit())
+                || !updated.bytes().all(|byte| byte.is_ascii_digit())
+            {
+                return None;
+            }
+        }
+        "identifier" | "type_identifier" | "field_identifier" => {
+            let previous = previous_source.get(token.byte_range())?;
+            let end = token.end_byte().checked_add_signed(delta)?;
+            let updated = source.get(token.start_byte()..end)?;
+            if language_id == "rust" {
+                if !previous.starts_with(|character: char| character.is_ascii_lowercase())
+                    || !previous.chars().all(|character| {
+                        character == '_' || unicode_ident::is_xid_continue(character)
+                    })
+                    || !inserted.chars().all(|character| {
+                        character == '_' || unicode_ident::is_xid_continue(character)
+                    })
+                    || rust_keyword(updated)
+                {
+                    return None;
+                }
+            } else {
+                if token.kind() != "identifier"
+                    || !matches!(
+                        language_id,
+                        "javascript" | "jsx" | "typescript" | "tsx" | "lua"
+                    )
+                    || !previous.bytes().all(|byte| byte.is_ascii_lowercase())
+                    || !inserted.bytes().all(|byte| byte.is_ascii_lowercase())
+                    || !updated.bytes().all(|byte| byte.is_ascii_lowercase())
+                {
+                    return None;
+                }
+                let sensitive = if language_id == "lua" {
+                    lua_sensitive_identifier
+                } else {
+                    ecmascript_sensitive_identifier
+                };
+                if sensitive(previous) || sensitive(updated) {
+                    return None;
+                }
+            }
+        }
+        "bare_key" | "string_scalar" | "variable_name" | "word" | "variable" => {
+            let parent = token.parent()?;
+            let supported = match (language_id, token.kind()) {
+                ("toml", "bare_key") => parent.kind() == "pair",
+                ("yaml", "string_scalar") => {
+                    if parent.kind() != "plain_scalar" {
+                        return None;
+                    }
+                    let flow = parent.parent()?;
+                    let mapping = flow.parent()?;
+                    flow.kind() == "flow_node"
+                        && mapping.kind() == "block_mapping_pair"
+                        && mapping.child_by_field_name("key") == Some(flow)
+                }
+                ("bash", "variable_name") => {
+                    parent.kind() == "variable_assignment"
+                        && parent.child_by_field_name("name") == Some(token)
+                }
+                ("fish", "word") => {
+                    parent.kind() == "function_definition"
+                        && parent.child_by_field_name("name") == Some(token)
+                }
+                ("powershell", "variable") => true,
+                _ => false,
+            };
+            if !supported || !inserted.bytes().all(|byte| byte.is_ascii_lowercase()) {
+                return None;
+            }
+            let previous = previous_source.get(token.byte_range())?;
+            let end = token.end_byte().checked_add_signed(delta)?;
+            let updated = source.get(token.start_byte()..end)?;
+            let (previous, updated) = if language_id == "powershell" {
+                (previous.strip_prefix('$')?, updated.strip_prefix('$')?)
+            } else {
+                (previous, updated)
+            };
+            if !previous.bytes().all(|byte| byte.is_ascii_lowercase())
+                || !updated.bytes().all(|byte| byte.is_ascii_lowercase())
+            {
+                return None;
+            }
+            let sensitive = match language_id {
+                "yaml" => yaml_sensitive_identifier(previous) || yaml_sensitive_identifier(updated),
+                "fish" => fish_sensitive_identifier(previous) || fish_sensitive_identifier(updated),
+                "powershell" => {
+                    powershell_sensitive_identifier(previous)
+                        || powershell_sensitive_identifier(updated)
+                }
+                _ => false,
+            };
+            if sensitive {
+                return None;
+            }
+        }
+        "inline" => {
+            if language_id != "markdown" || token.parent()?.kind() != "atx_heading" {
+                return None;
+            }
+            let removed = previous_source.get(edit.start_byte..edit.old_end_byte)?;
+            if inserted.chars().chain(removed.chars()).any(|character| {
+                character.is_control()
+                    || matches!(
+                        character,
+                        '#' | '\\'
+                            | '`'
+                            | '*'
+                            | '_'
+                            | '['
+                            | ']'
+                            | '!'
+                            | '>'
+                            | '|'
+                            | '~'
+                            | '='
+                            | ':'
+                            | '\u{2028}'
+                            | '\u{2029}'
+                    )
+            }) {
+                return None;
+            }
+        }
+        "line_comment" => {
+            if language_id != "rust" {
+                return None;
+            }
+            let previous = previous_source.get(token.byte_range())?;
+            if !previous.starts_with("//")
+                || previous.starts_with("///")
+                || previous.starts_with("//!")
+                || edit.start_byte <= token.start_byte().saturating_add(2)
+                || inserted.contains(['\r', '\n'])
+            {
+                return None;
+            }
+        }
+        "comment" => {
+            let previous = previous_source.get(token.byte_range())?;
+            let marker = match language_id {
+                "javascript" | "jsx" | "typescript" | "tsx" => "//",
+                "toml" | "yaml" | "bash" | "fish" | "powershell" => "#",
+                _ => return None,
+            };
+            if !previous.starts_with(marker)
+                || edit.start_byte <= token.start_byte().saturating_add(marker.len())
+                || inserted.contains(['\r', '\n', '\u{2028}', '\u{2029}'])
+            {
+                return None;
+            }
+        }
+        "comment_content" => {
+            if language_id != "lua" {
+                return None;
+            }
+            let parent = token.parent()?;
+            let previous = previous_source.get(parent.byte_range())?;
+            if parent.kind() != "comment"
+                || !previous.starts_with("--")
+                || previous.starts_with("--[")
+                || inserted.contains(['\r', '\n'])
+            {
+                return None;
+            }
+        }
+        "string_content" => {
+            let expected_parent = match language_id {
+                "rust" => "string_literal",
+                "json" | "bash" | "lua" => "string",
+                _ => return None,
+            };
+            if token.parent()?.kind() != expected_parent
+                || inserted.chars().any(|character| {
+                    character.is_control()
+                        || matches!(character, '"' | '\\')
+                        || (language_id == "bash" && matches!(character, '$' | '`'))
+                })
+            {
+                return None;
+            }
+        }
+        "string_fragment" => {
+            if !matches!(language_id, "javascript" | "jsx" | "typescript" | "tsx")
+                || token.parent()?.kind() != "string"
+                || inserted.chars().any(|character| {
+                    character.is_control()
+                        || matches!(character, '"' | '\'' | '\\' | '\u{2028}' | '\u{2029}')
+                })
+            {
+                return None;
+            }
+        }
+        "string" | "double_quote_scalar" | "double_quote_string" | "expandable_string_literal" => {
+            let expected_kind = match language_id {
+                "toml" => "string",
+                "yaml" => "double_quote_scalar",
+                "fish" => "double_quote_string",
+                "powershell" => "expandable_string_literal",
+                _ => return None,
+            };
+            let previous = previous_source.get(token.byte_range())?;
+            if token.kind() != expected_kind
+                || !previous.starts_with('"')
+                || !previous.ends_with('"')
+                || previous.starts_with("\"\"\"")
+                || inserted.chars().any(|character| {
+                    character.is_control()
+                        || matches!(character, '"' | '\\')
+                        || (matches!(language_id, "fish" | "powershell")
+                            && matches!(character, '$' | '`'))
+                })
+            {
+                return None;
+            }
+        }
+        _ => return None,
+    }
+    Some(())
+}
+
+fn rust_keyword(identifier: &str) -> bool {
+    matches!(
+        identifier,
+        "abstract"
+            | "as"
+            | "async"
+            | "await"
+            | "become"
+            | "box"
+            | "break"
+            | "const"
+            | "continue"
+            | "crate"
+            | "default"
+            | "do"
+            | "dyn"
+            | "else"
+            | "enum"
+            | "extern"
+            | "false"
+            | "final"
+            | "fn"
+            | "for"
+            | "gen"
+            | "if"
+            | "impl"
+            | "in"
+            | "let"
+            | "loop"
+            | "macro"
+            | "match"
+            | "mod"
+            | "move"
+            | "mut"
+            | "override"
+            | "priv"
+            | "pub"
+            | "raw"
+            | "ref"
+            | "return"
+            | "safe"
+            | "self"
+            | "static"
+            | "struct"
+            | "super"
+            | "trait"
+            | "true"
+            | "try"
+            | "type"
+            | "typeof"
+            | "union"
+            | "unsafe"
+            | "unsized"
+            | "use"
+            | "virtual"
+            | "where"
+            | "while"
+            | "yield"
+    )
+}
+
+fn ecmascript_sensitive_identifier(identifier: &str) -> bool {
+    matches!(
+        identifier,
+        "abstract"
+            | "any"
+            | "arguments"
+            | "as"
+            | "assert"
+            | "asserts"
+            | "async"
+            | "await"
+            | "bigint"
+            | "boolean"
+            | "break"
+            | "case"
+            | "catch"
+            | "class"
+            | "console"
+            | "const"
+            | "constructor"
+            | "continue"
+            | "debugger"
+            | "declare"
+            | "default"
+            | "delete"
+            | "do"
+            | "document"
+            | "else"
+            | "enum"
+            | "eval"
+            | "export"
+            | "extends"
+            | "false"
+            | "finally"
+            | "for"
+            | "from"
+            | "function"
+            | "get"
+            | "global"
+            | "if"
+            | "implements"
+            | "import"
+            | "in"
+            | "infer"
+            | "instanceof"
+            | "interface"
+            | "intrinsic"
+            | "is"
+            | "keyof"
+            | "let"
+            | "module"
+            | "namespace"
+            | "never"
+            | "new"
+            | "null"
+            | "number"
+            | "object"
+            | "of"
+            | "out"
+            | "override"
+            | "package"
+            | "private"
+            | "protected"
+            | "prototype"
+            | "public"
+            | "readonly"
+            | "require"
+            | "return"
+            | "satisfies"
+            | "set"
+            | "static"
+            | "string"
+            | "super"
+            | "switch"
+            | "symbol"
+            | "target"
+            | "this"
+            | "throw"
+            | "true"
+            | "try"
+            | "type"
+            | "typeof"
+            | "undefined"
+            | "unique"
+            | "unknown"
+            | "using"
+            | "var"
+            | "void"
+            | "while"
+            | "window"
+            | "with"
+            | "yield"
+    )
+}
+
+fn lua_sensitive_identifier(identifier: &str) -> bool {
+    matches!(
+        identifier,
+        "and"
+            | "assert"
+            | "break"
+            | "collectgarbage"
+            | "do"
+            | "dofile"
+            | "else"
+            | "elseif"
+            | "end"
+            | "error"
+            | "false"
+            | "for"
+            | "function"
+            | "getfenv"
+            | "getmetatable"
+            | "global"
+            | "goto"
+            | "if"
+            | "in"
+            | "ipairs"
+            | "load"
+            | "loadfile"
+            | "loadstring"
+            | "local"
+            | "module"
+            | "next"
+            | "nil"
+            | "not"
+            | "or"
+            | "pairs"
+            | "pcall"
+            | "print"
+            | "rawequal"
+            | "rawget"
+            | "rawset"
+            | "repeat"
+            | "require"
+            | "return"
+            | "select"
+            | "self"
+            | "setfenv"
+            | "setmetatable"
+            | "then"
+            | "tonumber"
+            | "tostring"
+            | "true"
+            | "type"
+            | "until"
+            | "unpack"
+            | "while"
+            | "xpcall"
+    )
+}
+
+fn yaml_sensitive_identifier(identifier: &str) -> bool {
+    matches!(
+        identifier,
+        "false" | "no" | "null" | "off" | "on" | "true" | "yes"
+    )
+}
+
+fn fish_sensitive_identifier(identifier: &str) -> bool {
+    matches!(
+        identifier,
+        "and"
+            | "begin"
+            | "break"
+            | "case"
+            | "continue"
+            | "else"
+            | "end"
+            | "for"
+            | "function"
+            | "if"
+            | "in"
+            | "not"
+            | "or"
+            | "return"
+            | "set"
+            | "switch"
+            | "test"
+            | "while"
+    )
+}
+
+fn powershell_sensitive_identifier(identifier: &str) -> bool {
+    matches!(
+        identifier,
+        "args"
+            | "error"
+            | "event"
+            | "eventargs"
+            | "eventsubscriber"
+            | "executioncontext"
+            | "false"
+            | "foreach"
+            | "home"
+            | "host"
+            | "input"
+            | "iscoreclr"
+            | "islinux"
+            | "ismacos"
+            | "iswindows"
+            | "lastsuccess"
+            | "matches"
+            | "myinvocation"
+            | "nestedpromptlevel"
+            | "null"
+            | "pid"
+            | "profile"
+            | "psboundparameters"
+            | "pscommandpath"
+            | "psculture"
+            | "psdebugcontext"
+            | "pshome"
+            | "psitem"
+            | "psscriptroot"
+            | "pssenderinfo"
+            | "psuiculture"
+            | "psversiontable"
+            | "pwd"
+            | "sender"
+            | "shellid"
+            | "stacktrace"
+            | "switch"
+            | "this"
+            | "true"
+    )
 }
 
 fn capture_refines_equal_range(scope: &str) -> bool {
@@ -1534,6 +2771,1575 @@ mod tests {
         let tree = parser.parse(code, None).unwrap();
         let query = Query::new(&language, query_source).unwrap();
         collect_injections(&query, tree.root_node(), code)
+    }
+
+    #[test]
+    fn repeated_highlighting_reuses_matching_language_and_source() {
+        let mut highlighter = highlighter();
+        let source = "fn greeting() { let value = 42; }";
+
+        let first = highlighter.highlight("rust", source).unwrap();
+        assert!(!first.is_empty());
+        let second = highlighter.highlight("rust", source).unwrap();
+
+        assert_eq!(first.len(), second.len());
+        for (original, repeated) in first.iter().zip(&second) {
+            assert_eq!(original.start, repeated.start);
+            assert_eq!(original.end, repeated.end);
+            assert_eq!(original.style, repeated.style);
+        }
+        assert_eq!(
+            highlighter
+                .cached_highlight
+                .as_ref()
+                .map(|cached| cached.code.as_str()),
+            Some(source)
+        );
+
+        let changed = "fn greeting() { return; }";
+        let updated = highlighter.highlight("rust", changed).unwrap();
+        assert_token_highlighted(&updated, changed, "return");
+        assert_eq!(
+            highlighter
+                .cached_highlight
+                .as_ref()
+                .map(|cached| cached.code.as_str()),
+            Some(changed)
+        );
+
+        let other_language = highlighter.highlight("javascript", "return true;").unwrap();
+        assert_token_highlighted(&other_language, "return true;", "true");
+        assert_eq!(
+            highlighter
+                .cached_highlight
+                .as_ref()
+                .map(|cached| cached.language_id.as_str()),
+            Some("javascript")
+        );
+    }
+
+    #[test]
+    fn background_language_preparation_preserves_styles_and_injections() {
+        for (language, source) in [
+            ("rust", "fn greeting(value: usize) -> usize { value }\n"),
+            ("markdown", "# Example\n\n```rust\nfn greet() {}\n```\n"),
+            ("yaml", "root:\n  enabled: true\n"),
+        ] {
+            let mut prepared = highlighter();
+            let pending = prepared
+                .prepare_language_in_background(language)
+                .expect("tree-sitter language should be prepared");
+            prepared.finish_prepared_language(pending);
+            assert!(prepared.highlighters.contains_key(language));
+
+            let actual = prepared.highlight(language, source).unwrap();
+            let expected = highlighter().highlight(language, source).unwrap();
+            let shape = |styles: &[StyleInfo]| {
+                styles
+                    .iter()
+                    .map(|style| (style.start, style.end, style.style.clone()))
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(shape(&actual), shape(&expected), "{language}");
+            assert!(prepared.prepare_language_in_background(language).is_none());
+        }
+        assert!(highlighter()
+            .prepare_language_in_background("husk")
+            .is_none());
+        assert!(highlighter()
+            .prepare_language_in_background("unknown")
+            .is_none());
+    }
+
+    #[test]
+    fn startup_injected_languages_resolve_aliases_deduplicate_and_stay_bounded() {
+        let highlighter = highlighter();
+        let source = concat!(
+            "```unknown\nignored\n```\n",
+            "  ```shell options\nprintf hi\n```\n",
+            "```sh\ntrue\n```\n",
+            "~~~pwsh\nGet-Item .\n~~~\n",
+            "```rust\nfn main() {}\n```\n",
+            "```yaml\nignored: true\n```\n",
+        );
+        assert_eq!(
+            highlighter.startup_injected_language_ids("markdown", source),
+            vec!["bash", "powershell", "rust"]
+        );
+        assert!(highlighter
+            .startup_injected_language_ids("rust", source)
+            .is_empty());
+    }
+
+    #[test]
+    fn background_language_preparation_rejects_stale_registries_and_invalid_queries() {
+        let mut stale = highlighter();
+        let pending = stale.prepare_language_in_background("rust").unwrap();
+        stale.registry = Arc::new(LanguageRegistry::bundled());
+        stale.finish_prepared_language(pending);
+        assert!(!stale.highlighters.contains_key("rust"));
+        assert!(!stale
+            .highlight("rust", "fn current() {}\n")
+            .unwrap()
+            .is_empty());
+
+        let mut registry = LanguageRegistry::bundled();
+        registry
+            .languages
+            .get_mut("rust")
+            .unwrap()
+            .highlight_queries = vec!["(unknown_node) @function".to_string()];
+        let theme = parse_vscode_theme("themes/mocha.json").unwrap();
+        let mut invalid = Highlighter::with_registry(&theme, Arc::new(registry)).unwrap();
+        let pending = invalid.prepare_language_in_background("rust").unwrap();
+        invalid.finish_prepared_language(pending);
+        assert!(!invalid.highlighters.contains_key("rust"));
+        assert!(invalid
+            .highlight("rust", "fn original_error() {}\n")
+            .is_err());
+    }
+
+    #[test]
+    fn repeated_markdown_highlighting_preserves_nested_language_offsets() {
+        let mut highlighter = highlighter();
+        let source = "# Example\n\n```rust\nfn greeting() {}\n```\n";
+
+        let first = highlighter.highlight("markdown", source).unwrap();
+        let second = highlighter.highlight("markdown", source).unwrap();
+        assert_eq!(first.len(), second.len());
+        assert_token_highlighted(&second, source, "fn");
+        for (original, repeated) in first.iter().zip(&second) {
+            assert_eq!(original.start, repeated.start);
+            assert_eq!(original.end, repeated.end);
+            assert_eq!(original.style, repeated.style);
+        }
+    }
+
+    #[test]
+    fn incremental_highlighting_matches_cold_parses_across_unicode_and_context_changes() {
+        for (language, sources) in [
+            (
+                "rust",
+                vec![
+                    "fn greet() { let value = \"café\"; }\n",
+                    "fn greet() { let value = \"café 🦀\"; }\n",
+                    "fn greet() { /* comment\nvalue */ let value = 42; }\n",
+                    "fn greet() { return; }\n",
+                ],
+            ),
+            (
+                "yaml",
+                vec![
+                    "root:\n  title: café\n",
+                    "root:\n  title: \"café 世界\"\n  nested:\n    enabled: true\n",
+                    "root:\n  title: value\n",
+                ],
+            ),
+            (
+                "markdown",
+                vec![
+                    "# Example\n\n```rust\nfn greet() {}\n```\n",
+                    "# Example 🦀\n\n```rust\nfn greet() { let value = 1; }\n```\n",
+                    "# Example\n\n```javascript\nconst value = true;\n```\n",
+                ],
+            ),
+        ] {
+            let mut incremental = highlighter();
+            for source in sources {
+                let actual = incremental.highlight(language, source).unwrap();
+                let expected = highlighter().highlight(language, source).unwrap();
+                let shape = |styles: &[StyleInfo]| {
+                    styles
+                        .iter()
+                        .map(|style| (style.start, style.end, style.style.clone()))
+                        .collect::<Vec<_>>()
+                };
+                assert_eq!(shape(&actual), shape(&expected), "{language}: {source}");
+            }
+        }
+    }
+
+    #[test]
+    fn rust_identifier_edits_reuse_captures_without_reparsing() {
+        let sources = [
+            "fn greeting(value: usize) -> usize { value + 1 }\n",
+            "fn gλreeting(value: usize) -> usize { value + 1 }\n",
+            "fn gλreeting(va世界lue: usize) -> usize { value + 1 }\n",
+            "fn gλreeting(valλue: usize) -> usize { value + 1 }\n",
+            "fn gλreeting(value: usize) -> usize { value + 1 }\n",
+        ];
+        let mut incremental = highlighter();
+        incremental.highlight("rust", sources[0]).unwrap();
+
+        for source in &sources[1..] {
+            let actual = incremental.highlight("rust", source).unwrap();
+            let expected = highlighter().highlight("rust", source).unwrap();
+            let shape = |styles: &[StyleInfo]| {
+                styles
+                    .iter()
+                    .map(|style| (style.start, style.end, style.style.clone()))
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(shape(&actual), shape(&expected), "{source}");
+            assert!(
+                incremental.highlighters["rust"]
+                    .cached_tree
+                    .as_ref()
+                    .unwrap()
+                    .tree
+                    .root_node()
+                    .has_changes(),
+                "interior identifier edits should reuse the edited syntax tree: {source}"
+            );
+        }
+    }
+
+    #[test]
+    fn bundled_identifier_edits_preserve_direct_and_fenced_parser_captures() {
+        for (language, contents) in [
+            (
+                "javascript",
+                "function retainedvalue(value) { return value; }\n",
+            ),
+            ("jsx", "function retainedvalue(value) { return value; }\n"),
+            (
+                "typescript",
+                "function retainedvalue(value: string) { return value; }\n",
+            ),
+            (
+                "tsx",
+                "function retainedvalue(value: string) { return value; }\n",
+            ),
+            ("lua", "local retainedvalue = 123456789\n"),
+            ("husk", "fn retainedvalue() { let value = 123456789; }\n"),
+            ("toml", "retainedvalue = 123456789\n"),
+            ("yaml", "retainedvalue: 123456789\n"),
+            ("bash", "retainedvalue=123456789\n"),
+            ("fish", "function retainedvalue\nend\n"),
+            ("powershell", "$retainedvalue = 123456789; \"retained\"\n"),
+        ] {
+            for fenced in [false, true] {
+                let before = if fenced {
+                    format!(
+                        "## heading\n\n```{language}\n{contents}```\n\n```rust\nfn sibling() {{}}\n```\n"
+                    )
+                } else {
+                    contents.to_string()
+                };
+                let outer = if fenced { "markdown" } else { language };
+                let mut incremental = highlighter();
+                incremental.highlight(outer, &before).unwrap();
+                let inserted = before.replace("retainedvalue", "retainxyedvalue");
+                let deleted = inserted.replace("retainxyedvalue", "retainyedvalue");
+                for source in [inserted, deleted] {
+                    let actual = incremental.highlight(outer, &source).unwrap();
+                    let expected = highlighter().highlight(outer, &source).unwrap();
+                    let shape = |styles: &[StyleInfo]| {
+                        styles
+                            .iter()
+                            .map(|style| (style.start, style.end, style.style.clone()))
+                            .collect::<Vec<_>>()
+                    };
+                    assert_eq!(shape(&actual), shape(&expected), "{language}: {source}");
+                    if outer != "husk" {
+                        assert!(
+                            incremental.highlighters[outer]
+                                .cached_tree
+                                .as_ref()
+                                .unwrap()
+                                .tree
+                                .root_node()
+                                .has_changes(),
+                            "{language} outer identifier tree was not reused (fenced={fenced})"
+                        );
+                    }
+                    if fenced && language != "husk" {
+                        assert!(
+                            incremental.highlighters[language]
+                                .cached_tree
+                                .as_ref()
+                                .unwrap()
+                                .tree
+                                .root_node()
+                                .has_changes(),
+                            "{language} fenced identifier tree was not reused"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn identifier_keywords_builtins_case_and_custom_queries_reparse() {
+        for (language, before, after) in [
+            (
+                "javascript",
+                "function reurn() { return 1; }\n",
+                "function return() { return 1; }\n",
+            ),
+            (
+                "javascript",
+                "function consle() { return 1; }\n",
+                "function console() { return 1; }\n",
+            ),
+            (
+                "javascript",
+                "function console() { return 1; }\n",
+                "function consxole() { return 1; }\n",
+            ),
+            (
+                "jsx",
+                "function retained() { return 1; }\n",
+                "function retaiNed() { return 1; }\n",
+            ),
+            (
+                "typescript",
+                "function intrface() { return 1; }\n",
+                "function interface() { return 1; }\n",
+            ),
+            ("lua", "local prnt = 123\n", "local print = 123\n"),
+            ("lua", "local slf = 123\n", "local self = 123\n"),
+            ("husk", "let bol = 123;\n", "let bool = 123;\n"),
+            ("husk", "let retrn = 123;\n", "let return = 123;\n"),
+            ("toml", "retainedvalue = 123\n", "retained.value = 123\n"),
+            ("yaml", "tue: 123\n", "true: 123\n"),
+            ("yaml", "key: retainedvalue\n", "key: retainxyedvalue\n"),
+            ("bash", "retainedvalue=123\n", "retained_value=123\n"),
+            ("fish", "function tst\nend\n", "function test\nend\n"),
+            (
+                "fish",
+                "set retainedvalue 123\n",
+                "set retainxyedvalue 123\n",
+            ),
+            ("powershell", "$tue = 123\n", "$true = 123\n"),
+            (
+                "powershell",
+                "$global:retainedvalue = 123\n",
+                "$global:retainxyedvalue = 123\n",
+            ),
+        ] {
+            for fenced in [false, true] {
+                let before = if fenced {
+                    format!("## heading\n\n```{language}\n{before}```\n")
+                } else {
+                    before.to_string()
+                };
+                let after = if fenced {
+                    format!("## heading\n\n```{language}\n{after}```\n")
+                } else {
+                    after.to_string()
+                };
+                let outer = if fenced { "markdown" } else { language };
+                let mut incremental = highlighter();
+                incremental.highlight(outer, &before).unwrap();
+                let actual = incremental.highlight(outer, &after).unwrap();
+                let expected = highlighter().highlight(outer, &after).unwrap();
+                let shape = |styles: &[StyleInfo]| {
+                    styles
+                        .iter()
+                        .map(|style| (style.start, style.end, style.style.clone()))
+                        .collect::<Vec<_>>()
+                };
+                assert_eq!(shape(&actual), shape(&expected), "{language}: {after}");
+                if outer != "husk" {
+                    assert!(
+                        !incremental.highlighters[outer]
+                            .cached_tree
+                            .as_ref()
+                            .unwrap()
+                            .tree
+                            .root_node()
+                            .has_changes(),
+                        "{language} sensitive identifier must reparse (fenced={fenced})"
+                    );
+                }
+            }
+        }
+
+        let mut registry = LanguageRegistry::bundled();
+        registry
+            .languages
+            .get_mut("javascript")
+            .unwrap()
+            .highlight_queries
+            .push("((identifier) @function (#match? @function \"x\"))".to_string());
+        let theme = parse_vscode_theme("themes/mocha.json").unwrap();
+        let mut customized = Highlighter::with_registry(&theme, Arc::new(registry)).unwrap();
+        customized
+            .highlight("javascript", "function retained() {}\n")
+            .unwrap();
+        customized
+            .highlight("javascript", "function retaxined() {}\n")
+            .unwrap();
+        assert!(!customized.highlighters["javascript"]
+            .cached_tree
+            .as_ref()
+            .unwrap()
+            .tree
+            .root_node()
+            .has_changes());
+    }
+
+    #[test]
+    fn rust_comment_and_string_edits_reuse_exact_fresh_parser_captures() {
+        for sources in [
+            vec![
+                "// retained comment text\nfn value() {}\n",
+                "// retained.! comment text\nfn value() {}\n",
+                "// retained.! λ界 comment text\nfn value() {}\n",
+                "// retained λ界 comment text\nfn value() {}\n",
+            ],
+            vec![
+                "// retained comment text\r\nfn value() {}\r\n",
+                "// retained.! comment text\r\nfn value() {}\r\n",
+            ],
+            vec![
+                "fn value() { let text = \"retained string text\"; }\n",
+                "fn value() { let text = \"retained.! string text\"; }\n",
+                "fn value() { let text = \"retained.! λ界 string text\"; }\n",
+                "fn value() { let text = \"retained λ界 string text\"; }\n",
+            ],
+            vec![
+                "fn value() { let text = \"retained string text\"; }\r\n",
+                "fn value() { let text = \"retained.! string text\"; }\r\n",
+            ],
+        ] {
+            let mut incremental = highlighter();
+            incremental.highlight("rust", sources[0]).unwrap();
+
+            for source in &sources[1..] {
+                let actual = incremental.highlight("rust", source).unwrap();
+                let expected = highlighter().highlight("rust", source).unwrap();
+                let shape = |styles: &[StyleInfo]| {
+                    styles
+                        .iter()
+                        .map(|style| (style.start, style.end, style.style.clone()))
+                        .collect::<Vec<_>>()
+                };
+                assert_eq!(shape(&actual), shape(&expected), "{source}");
+                assert!(
+                    incremental.highlighters["rust"]
+                        .cached_tree
+                        .as_ref()
+                        .unwrap()
+                        .tree
+                        .root_node()
+                        .has_changes(),
+                    "safe Rust token edit should retain its existing syntax tree: {source}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn rust_token_edits_reparse_documentation_boundaries_and_string_escapes() {
+        for (before, after) in [
+            (
+                "// retained comment\nfn value() {}\n",
+                "/// retained comment\nfn value() {}\n",
+            ),
+            (
+                "// retained comment\nfn value() {}\n",
+                "// retained\ncomment\nfn value() {}\n",
+            ),
+            (
+                "fn value() { let text = \"retained string\"; }\n",
+                "fn value() { let text = \"retained\\ string\"; }\n",
+            ),
+            (
+                "fn value() { let text = \"retained string\"; }\n",
+                "fn value() { let text = \"retained\" string\"; }\n",
+            ),
+            (
+                "/* retained comment */\nfn value() {}\n",
+                "/* retained.! comment */\nfn value() {}\n",
+            ),
+        ] {
+            let mut incremental = highlighter();
+            incremental.highlight("rust", before).unwrap();
+            let actual = incremental.highlight("rust", after).unwrap();
+            let expected = highlighter().highlight("rust", after).unwrap();
+            let shape = |styles: &[StyleInfo]| {
+                styles
+                    .iter()
+                    .map(|style| (style.start, style.end, style.style.clone()))
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(shape(&actual), shape(&expected), "{after}");
+            assert!(
+                !incremental.highlighters["rust"]
+                    .cached_tree
+                    .as_ref()
+                    .unwrap()
+                    .tree
+                    .root_node()
+                    .has_changes(),
+                "grammar-changing Rust token edit must reparse: {after}"
+            );
+        }
+    }
+
+    #[test]
+    fn bundled_decimal_digit_edits_preserve_direct_and_fenced_parser_captures() {
+        for (language, contents) in [
+            ("rust", "fn value() -> usize { 123456789 }\n"),
+            ("javascript", "const value = 123456789;\n"),
+            ("jsx", "const value = 123456789;\n"),
+            ("typescript", "const value: number = 123456789;\n"),
+            ("tsx", "const value: number = 123456789;\n"),
+            ("json", "{\"value\": 123456789}\n"),
+            ("toml", "value = 123456789\n"),
+            ("yaml", "value: 123456789\n"),
+            ("lua", "local value = 123456789\n"),
+            ("powershell", "$value = 123456789; \"retained\"\n"),
+            ("husk", "let value = 123456789;\n"),
+        ] {
+            for fenced in [false, true] {
+                let before = if fenced {
+                    format!("## heading\n\n```{language}\n{contents}```\n")
+                } else {
+                    contents.to_string()
+                };
+                let outer = if fenced { "markdown" } else { language };
+                let mut incremental = highlighter();
+                incremental.highlight(outer, &before).unwrap();
+                let inserted = before.replace("123456789", "12347856789");
+                let deleted = inserted.replace("12347856789", "1234756789");
+                for source in [inserted, deleted] {
+                    let actual = incremental.highlight(outer, &source).unwrap();
+                    let expected = highlighter().highlight(outer, &source).unwrap();
+                    let shape = |styles: &[StyleInfo]| {
+                        styles
+                            .iter()
+                            .map(|style| (style.start, style.end, style.style.clone()))
+                            .collect::<Vec<_>>()
+                    };
+                    assert_eq!(shape(&actual), shape(&expected), "{language}: {source}");
+                    if outer != "husk" {
+                        assert!(
+                            incremental.highlighters[outer]
+                                .cached_tree
+                                .as_ref()
+                                .unwrap()
+                                .tree
+                                .root_node()
+                                .has_changes(),
+                            "{language} outer numeric tree was not reused (fenced={fenced})"
+                        );
+                    }
+                    if fenced && language != "husk" {
+                        assert!(incremental.highlighters[language]
+                            .cached_tree
+                            .as_ref()
+                            .unwrap()
+                            .tree
+                            .root_node()
+                            .has_changes());
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn numeric_grammar_boundaries_and_custom_queries_reparse() {
+        for (language, before, after) in [
+            ("rust", "let value = 123456;", "let value = 123.456;"),
+            ("rust", "let value = 123456;", "let value = 123_456;"),
+            ("rust", "let value = 0x123456;", "let value = 0x1237456;"),
+            (
+                "javascript",
+                "const value = 123456;",
+                "const value = 123e456;",
+            ),
+            (
+                "javascript",
+                "const value = 123456n;",
+                "const value = 1237456n;",
+            ),
+            ("json", "{\"value\": 123456}", "{\"value\": 123.456}"),
+            ("toml", "value = 123456\n", "value = 123_456\n"),
+            ("yaml", "value: 123456\n", "value: 123.456\n"),
+            ("lua", "local value = 0x123456", "local value = 0x1237456"),
+            (
+                "powershell",
+                "$value = 123456; \"retained\"",
+                "$value = 123.456; \"retained\"",
+            ),
+        ] {
+            let mut incremental = highlighter();
+            incremental.highlight(language, before).unwrap();
+            let actual = incremental.highlight(language, after).unwrap();
+            let expected = highlighter().highlight(language, after).unwrap();
+            let shape = |styles: &[StyleInfo]| {
+                styles
+                    .iter()
+                    .map(|style| (style.start, style.end, style.style.clone()))
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(shape(&actual), shape(&expected), "{language}: {after}");
+            assert!(!incremental.highlighters[language]
+                .cached_tree
+                .as_ref()
+                .unwrap()
+                .tree
+                .root_node()
+                .has_changes());
+        }
+
+        let mut registry = LanguageRegistry::bundled();
+        registry
+            .languages
+            .get_mut("javascript")
+            .unwrap()
+            .highlight_queries
+            .push("((number) @function (#match? @function \"7\"))".to_string());
+        let theme = parse_vscode_theme("themes/mocha.json").unwrap();
+        let mut customized = Highlighter::with_registry(&theme, Arc::new(registry)).unwrap();
+        customized
+            .highlight("javascript", "const value = 123456;")
+            .unwrap();
+        customized
+            .highlight("javascript", "const value = 1237456;")
+            .unwrap();
+        assert!(!customized.highlighters["javascript"]
+            .cached_tree
+            .as_ref()
+            .unwrap()
+            .tree
+            .root_node()
+            .has_changes());
+    }
+
+    #[test]
+    fn bundled_javascript_and_json_token_edits_match_fresh_parser_captures() {
+        for (language, sources) in [
+            (
+                "javascript",
+                vec![
+                    "// retained comment\nconst value = \"retained string\";\n",
+                    "// retained.! λ comment\nconst value = \"retained string\";\n",
+                    "// retained.! λ comment\nconst value = \"retained.! λ string\";\n",
+                ],
+            ),
+            (
+                "jsx",
+                vec![
+                    "// retained comment\nconst value = \"retained string\";\n",
+                    "// retained.! λ comment\nconst value = \"retained string\";\n",
+                    "// retained.! λ comment\nconst value = \"retained.! λ string\";\n",
+                ],
+            ),
+            (
+                "typescript",
+                vec![
+                    "// retained comment\r\nconst value: string = \"retained string\";\r\n",
+                    "// retained.! λ comment\r\nconst value: string = \"retained string\";\r\n",
+                    "// retained.! λ comment\r\nconst value: string = \"retained.! λ string\";\r\n",
+                ],
+            ),
+            (
+                "tsx",
+                vec![
+                    "// retained comment\nconst value: string = 'retained string';\n",
+                    "// retained.! λ comment\nconst value: string = 'retained string';\n",
+                    "// retained.! λ comment\nconst value: string = 'retained.! λ string';\n",
+                ],
+            ),
+            (
+                "json",
+                vec![
+                    "{\"retained key\": \"retained value\"}\n",
+                    "{\"retained.! λ key\": \"retained value\"}\n",
+                    "{\"retained.! λ key\": \"retained.! λ value\"}\n",
+                ],
+            ),
+        ] {
+            let mut incremental = highlighter();
+            incremental.highlight(language, sources[0]).unwrap();
+
+            for source in &sources[1..] {
+                let actual = incremental.highlight(language, source).unwrap();
+                let expected = highlighter().highlight(language, source).unwrap();
+                let shape = |styles: &[StyleInfo]| {
+                    styles
+                        .iter()
+                        .map(|style| (style.start, style.end, style.style.clone()))
+                        .collect::<Vec<_>>()
+                };
+                assert_eq!(shape(&actual), shape(&expected), "{language}: {source}");
+                assert!(
+                    incremental.highlighters[language]
+                        .cached_tree
+                        .as_ref()
+                        .unwrap()
+                        .tree
+                        .root_node()
+                        .has_changes(),
+                    "safe {language} token edit should reuse its existing syntax tree"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn specialized_husk_token_edits_match_fresh_lexer_captures() {
+        for sources in [
+            vec![
+                "pub fn activate() { let value = \"retained string\"; } // retained comment\n",
+                "pub fn activate() { let value = \"retained string\"; } // retained. λ comment\n",
+                "pub fn activate() { let value = \"retained. λ string\"; } // retained. λ comment\n",
+            ],
+            vec![
+                "pub fn activate() { let value = \"retained 世界 string\"; } // retained 世界 comment\r\n",
+                "pub fn activate() { let value = \"retained 世界 string\"; } // retained. λ 世界 comment\r\n",
+            ],
+        ] {
+            let mut incremental = highlighter();
+            incremental.highlight("husk", sources[0]).unwrap();
+            for source in &sources[1..] {
+                let actual = incremental.highlight("husk", source).unwrap();
+                let expected = highlighter().highlight("husk", source).unwrap();
+                let shape = |styles: &[StyleInfo]| {
+                    styles
+                        .iter()
+                        .map(|style| (style.start, style.end, style.style.clone()))
+                        .collect::<Vec<_>>()
+                };
+                assert_eq!(shape(&actual), shape(&expected), "{source}");
+            }
+        }
+    }
+
+    #[test]
+    fn specialized_git_commit_line_edits_preserve_semantic_fresh_parser_captures() {
+        let cases = [
+            (
+                "retained subject\n# existing comment\n",
+                "retained. λ subject\n# existing comment\n",
+            ),
+            (
+                "# retained comment\n# next comment\n",
+                "# retained. λ comment\n# next comment\n",
+            ),
+            (
+                "# On branch retained_branch\n# modified: retained/path.rs\n",
+                "# On branch retained.λ_branch\n# modified: retained/path.rs\n",
+            ),
+            (
+                "# modified: retained/path.rs\r\n# +retained diff\r\n",
+                "# modified: retained.λ/path.rs\r\n# +retained diff\r\n",
+            ),
+            ("# ordinary body\n", "# On branch ordinary body\n"),
+            ("# +retained diff\n", "# -retained diff\n"),
+            ("# plain path\n", "# 'plain' path\n"),
+        ];
+        for (before, after) in cases {
+            let mut incremental = highlighter();
+            incremental.highlight("gitcommit", before).unwrap();
+            let actual = incremental.highlight("gitcommit", after).unwrap();
+            let expected = highlighter().highlight("gitcommit", after).unwrap();
+            let shape = |styles: &[StyleInfo]| {
+                styles
+                    .iter()
+                    .map(|style| (style.start, style.end, style.style.clone()))
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(shape(&actual), shape(&expected), "{after}");
+        }
+    }
+
+    #[test]
+    fn specialized_husk_and_commit_syntax_boundaries_fall_back_safely() {
+        for (language, before, after) in [
+            (
+                "husk",
+                "let value = \"retained string\";\n",
+                "let value = \"retained\\ string\";\n",
+            ),
+            (
+                "husk",
+                "let value = \"retained string\";\n",
+                "let value = \"retained\" string\";\n",
+            ),
+            ("husk", "// retained comment\n", "// retained\n comment\n"),
+            (
+                "gitcommit",
+                "# retained comment\n# later comment\n",
+                "# retained\n comment\n# later comment\n",
+            ),
+        ] {
+            let mut incremental = highlighter();
+            incremental.highlight(language, before).unwrap();
+            let actual = incremental.highlight(language, after).unwrap();
+            let expected = highlighter().highlight(language, after).unwrap();
+            let shape = |styles: &[StyleInfo]| {
+                styles
+                    .iter()
+                    .map(|style| (style.start, style.end, style.style.clone()))
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(shape(&actual), shape(&expected), "{language}: {after}");
+        }
+    }
+
+    #[test]
+    fn javascript_and_json_syntax_changes_reparse_before_reusing_captures() {
+        for (language, before, after) in [
+            (
+                "javascript",
+                "// retained comment\nconst value = 1;\n",
+                "// retained\n comment\nconst value = 1;\n",
+            ),
+            (
+                "javascript",
+                "// retained comment\nconst value = 1;\n",
+                "// retained\u{2028} comment\nconst value = 1;\n",
+            ),
+            (
+                "javascript",
+                "/* retained comment */\nconst value = 1;\n",
+                "/* retained.! comment */\nconst value = 1;\n",
+            ),
+            (
+                "javascript",
+                "const value = \"retained string\";\n",
+                "const value = \"retained\\ string\";\n",
+            ),
+            (
+                "typescript",
+                "const value = `retained string`;\n",
+                "const value = `retained.! string`;\n",
+            ),
+            (
+                "json",
+                "{\"key\": \"retained value\"}\n",
+                "{\"key\": \"retained\\ value\"}\n",
+            ),
+        ] {
+            let mut incremental = highlighter();
+            incremental.highlight(language, before).unwrap();
+            let actual = incremental.highlight(language, after).unwrap();
+            let expected = highlighter().highlight(language, after).unwrap();
+            let shape = |styles: &[StyleInfo]| {
+                styles
+                    .iter()
+                    .map(|style| (style.start, style.end, style.style.clone()))
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(shape(&actual), shape(&expected), "{language}: {after}");
+            assert!(
+                !incremental.highlighters[language]
+                    .cached_tree
+                    .as_ref()
+                    .unwrap()
+                    .tree
+                    .root_node()
+                    .has_changes(),
+                "grammar-changing {language} token edit must reparse"
+            );
+        }
+    }
+
+    #[test]
+    fn configuration_and_shell_token_edits_match_fresh_parser_captures() {
+        for (language, sources) in [
+            (
+                "toml",
+                vec![
+                    "key = \"retained string\" # retained comment\n",
+                    "key = \"retained string\" # retained.! λ comment\n",
+                    "key = \"retained.! λ string\" # retained.! λ comment\n",
+                ],
+            ),
+            (
+                "yaml",
+                vec![
+                    "---\nkey: \"retained string\" # retained comment\r\n",
+                    "---\nkey: \"retained string\" # retained.! λ comment\r\n",
+                    "---\nkey: \"retained.! λ string\" # retained.! λ comment\r\n",
+                ],
+            ),
+            (
+                "bash",
+                vec![
+                    "echo \"retained string\" # retained comment\n",
+                    "echo \"retained string\" # retained.! λ comment\n",
+                    "echo \"retained.! λ string\" # retained.! λ comment\n",
+                ],
+            ),
+            (
+                "fish",
+                vec![
+                    "echo \"retained string\" # retained comment\n",
+                    "echo \"retained string\" # retained.! λ comment\n",
+                    "echo \"retained.! λ string\" # retained.! λ comment\n",
+                ],
+            ),
+            (
+                "powershell",
+                vec![
+                    "$value = \"retained string\" # retained comment\n",
+                    "$value = \"retained string\" # retained.! λ comment\n",
+                    "$value = \"retained.! λ string\" # retained.! λ comment\n",
+                ],
+            ),
+            (
+                "lua",
+                vec![
+                    "local value = \"retained string\" -- retained comment\n",
+                    "local value = \"retained string\" -- retained.! λ comment\n",
+                    "local value = \"retained.! λ string\" -- retained.! λ comment\n",
+                ],
+            ),
+        ] {
+            let mut incremental = highlighter();
+            incremental.highlight(language, sources[0]).unwrap();
+
+            for source in &sources[1..] {
+                let actual = incremental.highlight(language, source).unwrap();
+                let expected = highlighter().highlight(language, source).unwrap();
+                let shape = |styles: &[StyleInfo]| {
+                    styles
+                        .iter()
+                        .map(|style| (style.start, style.end, style.style.clone()))
+                        .collect::<Vec<_>>()
+                };
+                assert_eq!(shape(&actual), shape(&expected), "{language}: {source}");
+                assert!(
+                    incremental.highlighters[language]
+                        .cached_tree
+                        .as_ref()
+                        .unwrap()
+                        .tree
+                        .root_node()
+                        .has_changes(),
+                    "safe {language} token edit should reuse its existing syntax tree"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn markdown_fenced_husk_tokens_preserve_fresh_specialized_lexer_captures() {
+        for sources in [
+            vec![
+                "## outer heading\n\n```husk\npub fn value() { let text = \"retained string\"; } // retained comment\n```\n\n```rust\nfn sibling() {}\n```\n",
+                "## outer heading\n\n```husk\npub fn value() { let text = \"retained string\"; } // retained. λ comment\n```\n\n```rust\nfn sibling() {}\n```\n",
+                "## outer heading\n\n```husk\npub fn value() { let text = \"retained. λ string\"; } // retained. λ comment\n```\n\n```rust\nfn sibling() {}\n```\n",
+            ],
+            vec![
+                "## outer 世界\r\n\r\n```hk\r\npub fn value() { let text = \"retained 世界 string\"; } // retained 世界 comment\r\n```\r\n",
+                "## outer 世界\r\n\r\n```hk\r\npub fn value() { let text = \"retained 世界 string\"; } // retained. λ 世界 comment\r\n```\r\n",
+                "## outer 世界\r\n\r\n```hk\r\npub fn value() { let text = \"retained. λ 世界 string\"; } // retained. λ 世界 comment\r\n```\r\n",
+            ],
+            vec![
+                "```husk\n// retained comment\n```\n\n```husk\n// later comment\n```\n",
+                "```husk\n// retained. λ comment\n```\n\n```husk\n// later comment\n```\n",
+            ],
+        ] {
+            let mut incremental = highlighter();
+            incremental.highlight("markdown", sources[0]).unwrap();
+            for source in &sources[1..] {
+                let actual = incremental.highlight("markdown", source).unwrap();
+                let expected = highlighter().highlight("markdown", source).unwrap();
+                let shape = |styles: &[StyleInfo]| {
+                    styles
+                        .iter()
+                        .map(|style| (style.start, style.end, style.style.clone()))
+                        .collect::<Vec<_>>()
+                };
+                assert_eq!(shape(&actual), shape(&expected), "{source}");
+                assert!(incremental.highlighters["markdown"]
+                    .cached_tree
+                    .as_ref()
+                    .unwrap()
+                    .tree
+                    .root_node()
+                    .has_changes());
+                assert!(!incremental.highlighters.contains_key("husk"));
+            }
+        }
+    }
+
+    #[test]
+    fn markdown_fenced_husk_boundaries_and_custom_definitions_reparse() {
+        for (before, after) in [
+            (
+                "```husk\n// retained comment\n```\n",
+                "```husk\n// retained\n comment\n```\n",
+            ),
+            (
+                "```husk\n// retained comment\n```\n",
+                "```husk\n// retained` comment\n```\n",
+            ),
+            (
+                "```husk\nlet value = \"retained string\";\n```\n",
+                "```husk\nlet value = \"retained\\ string\";\n```\n",
+            ),
+            (
+                "```husk\nlet value = \"retained string\";\n```\n",
+                "```husk\nlet value = \"retained\" string\";\n```\n",
+            ),
+        ] {
+            let mut incremental = highlighter();
+            incremental.highlight("markdown", before).unwrap();
+            let actual = incremental.highlight("markdown", after).unwrap();
+            let expected = highlighter().highlight("markdown", after).unwrap();
+            let shape = |styles: &[StyleInfo]| {
+                styles
+                    .iter()
+                    .map(|style| (style.start, style.end, style.style.clone()))
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(shape(&actual), shape(&expected), "{after}");
+            assert!(!incremental.highlighters["markdown"]
+                .cached_tree
+                .as_ref()
+                .unwrap()
+                .tree
+                .root_node()
+                .has_changes());
+        }
+
+        let mut registry = LanguageRegistry::bundled();
+        registry
+            .languages
+            .get_mut("husk")
+            .unwrap()
+            .highlight_queries
+            .push("customized specialized definition".to_string());
+        let theme = parse_vscode_theme("themes/mocha.json").unwrap();
+        let mut customized = Highlighter::with_registry(&theme, Arc::new(registry)).unwrap();
+        customized
+            .highlight("markdown", "```husk\n// retained comment\n```\n")
+            .unwrap();
+        customized
+            .highlight("markdown", "```husk\n// retained. λ comment\n```\n")
+            .unwrap();
+        assert!(!customized.highlighters["markdown"]
+            .cached_tree
+            .as_ref()
+            .unwrap()
+            .tree
+            .root_node()
+            .has_changes());
+    }
+
+    #[test]
+    fn markdown_fenced_tokens_preserve_fresh_outer_and_injected_captures() {
+        for (language, contents) in [
+            (
+                "rust",
+                "fn retained_name() { let value = \"retained string\"; } // retained comment\n",
+            ),
+            (
+                "javascript",
+                "const value = \"retained string\"; // retained comment\n",
+            ),
+            (
+                "jsx",
+                "const value = \"retained string\"; // retained comment\n",
+            ),
+            (
+                "typescript",
+                "const value: string = \"retained string\"; // retained comment\n",
+            ),
+            (
+                "tsx",
+                "const value: string = \"retained string\"; // retained comment\n",
+            ),
+            ("json", "{\"key\": \"retained string\"}\n"),
+            ("toml", "key = \"retained string\" # retained comment\n"),
+            ("yaml", "key: \"retained string\" # retained comment\n"),
+            ("bash", "echo \"retained string\" # retained comment\n"),
+            ("fish", "echo \"retained string\" # retained comment\n"),
+            (
+                "powershell",
+                "$value = \"retained string\" # retained comment\n",
+            ),
+            (
+                "lua",
+                "local value = \"retained string\" -- retained comment\n",
+            ),
+        ] {
+            let sibling = if language == "rust" {
+                "```javascript\nconst sibling = true;\n```\n"
+            } else {
+                "```rust\nfn sibling() {}\n```\n"
+            };
+            let original = format!("## outer heading\n\n```{language}\n{contents}```\n\n{sibling}");
+            let mut sources = Vec::new();
+            if contents.contains("retained comment") {
+                sources.push(original.replace("retained comment", "retained. λ comment"));
+            }
+            let previous = sources.last().unwrap_or(&original);
+            sources.push(previous.replace("retained string", "retained. λ string"));
+            if language == "rust" {
+                let previous = sources.last().unwrap();
+                sources.push(previous.replace("retained_name", "retainλed_name"));
+            }
+
+            let mut incremental = highlighter();
+            incremental.highlight("markdown", &original).unwrap();
+            for source in sources {
+                let actual = incremental.highlight("markdown", &source).unwrap();
+                let expected = highlighter().highlight("markdown", &source).unwrap();
+                let shape = |styles: &[StyleInfo]| {
+                    styles
+                        .iter()
+                        .map(|style| (style.start, style.end, style.style.clone()))
+                        .collect::<Vec<_>>()
+                };
+                assert_eq!(shape(&actual), shape(&expected), "{language}: {source}");
+                for id in ["markdown", language] {
+                    assert!(
+                        incremental.highlighters[id]
+                            .cached_tree
+                            .as_ref()
+                            .unwrap()
+                            .tree
+                            .root_node()
+                            .has_changes(),
+                        "safe fenced {language} edit should retain the {id} syntax tree"
+                    );
+                }
+            }
+        }
+
+        let before = "## outer 世界\r\n\r\n```rust\r\n// retained 世界 comment\r\n```\r\n";
+        let after = before.replace("retained 世界", "retained. λ 世界");
+        let mut incremental = highlighter();
+        incremental.highlight("markdown", before).unwrap();
+        let actual = incremental.highlight("markdown", &after).unwrap();
+        let expected = highlighter().highlight("markdown", &after).unwrap();
+        assert_eq!(actual.len(), expected.len());
+        for (actual, expected) in actual.iter().zip(expected) {
+            assert_eq!((actual.start, actual.end), (expected.start, expected.end));
+            assert_eq!(actual.style, expected.style);
+        }
+    }
+
+    #[test]
+    fn markdown_fenced_structural_edits_and_duplicate_trees_reparse() {
+        for (before, after) in [
+            (
+                "```rust\n// retained comment\n```\n",
+                "```rust\n// retained\n comment\n```\n",
+            ),
+            (
+                "```rust\n// retained comment\n```\n",
+                "```rust\n// retained` comment\n```\n",
+            ),
+            (
+                "```rust\n// retained comment\n```\n",
+                "```rust\n// retained~ comment\n```\n",
+            ),
+            (
+                "```rust\nlet value = \"retained string\";\n```\n",
+                "```rust\nlet value = \"retained\\ string\";\n```\n",
+            ),
+            (
+                "```bash\necho \"retained string\"\n```\n",
+                "```bash\necho \"retained$ string\"\n```\n",
+            ),
+            (
+                "```rust\n// retained comment\n```\n\n```rust\nfn later() {}\n```\n",
+                "```rust\n// retained. λ comment\n```\n\n```rust\nfn later() {}\n```\n",
+            ),
+            (
+                "```rust\n// retained comment\n```\n",
+                "```javascript\n// retained comment\n```\n",
+            ),
+        ] {
+            let mut incremental = highlighter();
+            incremental.highlight("markdown", before).unwrap();
+            let actual = incremental.highlight("markdown", after).unwrap();
+            let expected = highlighter().highlight("markdown", after).unwrap();
+            let shape = |styles: &[StyleInfo]| {
+                styles
+                    .iter()
+                    .map(|style| (style.start, style.end, style.style.clone()))
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(shape(&actual), shape(&expected), "{after}");
+            assert!(
+                !incremental.highlighters["markdown"]
+                    .cached_tree
+                    .as_ref()
+                    .unwrap()
+                    .tree
+                    .root_node()
+                    .has_changes(),
+                "fenced structural or ambiguous edit must reparse: {after}"
+            );
+        }
+    }
+
+    #[test]
+    fn markdown_fenced_custom_injected_queries_reparse_before_styling() {
+        let mut registry = LanguageRegistry::bundled();
+        registry
+            .languages
+            .get_mut("javascript")
+            .unwrap()
+            .highlight_queries
+            .push("((comment) @function (#match? @function \"λ\"))".to_string());
+        let registry = Arc::new(registry);
+        let theme = parse_vscode_theme("themes/mocha.json").unwrap();
+        let mut customized = Highlighter::with_registry(&theme, Arc::clone(&registry)).unwrap();
+        customized
+            .highlight("markdown", "```javascript\n// retained comment\n```\n")
+            .unwrap();
+
+        let source = "```javascript\n// retained λ comment\n```\n";
+        let actual = customized.highlight("markdown", source).unwrap();
+        let expected = Highlighter::with_registry(&theme, registry)
+            .unwrap()
+            .highlight("markdown", source)
+            .unwrap();
+        let shape = |styles: &[StyleInfo]| {
+            styles
+                .iter()
+                .map(|style| (style.start, style.end, style.style.clone()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(shape(&actual), shape(&expected));
+        assert!(!customized.highlighters["markdown"]
+            .cached_tree
+            .as_ref()
+            .unwrap()
+            .tree
+            .root_node()
+            .has_changes());
+    }
+
+    #[test]
+    fn markdown_heading_edits_preserve_fresh_captures_and_fenced_injections() {
+        for sources in [
+            vec!["# retained heading\n", "# retained. λ heading\n"],
+            vec!["## retained heading\n", "## retained. λ heading\n"],
+            vec!["### retained heading\n", "### retained. λ heading\n"],
+            vec![
+                "## retained 世界😀 heading\r\n",
+                "## retained. λ 世界😀 heading\r\n",
+            ],
+            vec![
+                "## retained heading\n\n```rust\nfn greeting() {}\n```\n\n```javascript\nconst value = true;\n```\n",
+                "## retained. λ heading\n\n```rust\nfn greeting() {}\n```\n\n```javascript\nconst value = true;\n```\n",
+                "## retained. λ. λ heading\n\n```rust\nfn greeting() {}\n```\n\n```javascript\nconst value = true;\n```\n",
+            ],
+        ] {
+            let mut incremental = highlighter();
+            incremental.highlight("markdown", sources[0]).unwrap();
+
+            for source in &sources[1..] {
+                let actual = incremental.highlight("markdown", source).unwrap();
+                let expected = highlighter().highlight("markdown", source).unwrap();
+                let shape = |styles: &[StyleInfo]| {
+                    styles
+                        .iter()
+                        .map(|style| (style.start, style.end, style.style.clone()))
+                        .collect::<Vec<_>>()
+                };
+                assert_eq!(shape(&actual), shape(&expected), "{source}");
+                assert!(incremental.highlighters["markdown"]
+                    .cached_tree
+                    .as_ref()
+                    .unwrap()
+                    .tree
+                    .root_node()
+                    .has_changes());
+            }
+        }
+    }
+
+    #[test]
+    fn markdown_structural_and_fenced_edits_reparse_before_reusing_captures() {
+        for (before, after) in [
+            ("## retained heading\n", "## retained# heading\n"),
+            ("## retained heading\n", "## retained` heading\n"),
+            ("## retained heading\n", "## retained\\ heading\n"),
+            ("## retained heading\n", "## retained\n heading\n"),
+            ("## retained heading\n", "### retained heading\n"),
+            (
+                "## retained heading\n\n```rust\nfn greeting() {}\n```\n",
+                "## retained heading\n\n```rust\nfn greet.ing() {}\n```\n",
+            ),
+        ] {
+            let mut incremental = highlighter();
+            incremental.highlight("markdown", before).unwrap();
+            let actual = incremental.highlight("markdown", after).unwrap();
+            let expected = highlighter().highlight("markdown", after).unwrap();
+            let shape = |styles: &[StyleInfo]| {
+                styles
+                    .iter()
+                    .map(|style| (style.start, style.end, style.style.clone()))
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(shape(&actual), shape(&expected), "{after}");
+            assert!(!incremental.highlighters["markdown"]
+                .cached_tree
+                .as_ref()
+                .unwrap()
+                .tree
+                .root_node()
+                .has_changes());
+        }
+
+        let mut registry = LanguageRegistry::bundled();
+        registry
+            .languages
+            .get_mut("markdown")
+            .unwrap()
+            .injection_query = Some(format!("{MARKDOWN_INJECTION_QUERY}\n"));
+        let theme = parse_vscode_theme("themes/mocha.json").unwrap();
+        let mut customized = Highlighter::with_registry(&theme, Arc::new(registry)).unwrap();
+        customized
+            .highlight("markdown", "## retained heading\n")
+            .unwrap();
+        customized
+            .highlight("markdown", "## retained λ heading\n")
+            .unwrap();
+        assert!(!customized.highlighters["markdown"]
+            .cached_tree
+            .as_ref()
+            .unwrap()
+            .tree
+            .root_node()
+            .has_changes());
+    }
+
+    #[test]
+    fn configuration_and_shell_syntax_changes_reparse_before_reusing_captures() {
+        for (language, before, after) in [
+            (
+                "toml",
+                "key = \"\"\"retained string\"\"\"\n",
+                "key = \"\"\"retained.! string\"\"\"\n",
+            ),
+            (
+                "toml",
+                "key = \"retained string\" # retained comment\n",
+                "key = \"retained string\" # retained\n comment\n",
+            ),
+            (
+                "yaml",
+                "---\nkey: \"retained string\"\n",
+                "---\nkey: \"retained\\ string\"\n",
+            ),
+            (
+                "bash",
+                "echo \"retained string\"\n",
+                "echo \"retained$ string\"\n",
+            ),
+            (
+                "bash",
+                "echo \"retained string\"\n",
+                "echo \"retained` string\"\n",
+            ),
+            (
+                "fish",
+                "echo \"retained string\"\n",
+                "echo \"retained$ string\"\n",
+            ),
+            (
+                "powershell",
+                "$value = \"retained string\"\n",
+                "$value = \"retained$ string\"\n",
+            ),
+            (
+                "powershell",
+                "$value = \"retained string\"\n",
+                "$value = \"retained` string\"\n",
+            ),
+            (
+                "lua",
+                "--[[ retained comment ]]\nlocal value = 1\n",
+                "--[[ retained.! comment ]]\nlocal value = 1\n",
+            ),
+            (
+                "lua",
+                "local value = \"retained string\"\n",
+                "local value = \"retained\\ string\"\n",
+            ),
+        ] {
+            let mut incremental = highlighter();
+            incremental.highlight(language, before).unwrap();
+            let actual = incremental.highlight(language, after).unwrap();
+            let expected = highlighter().highlight(language, after).unwrap();
+            let shape = |styles: &[StyleInfo]| {
+                styles
+                    .iter()
+                    .map(|style| (style.start, style.end, style.style.clone()))
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(shape(&actual), shape(&expected), "{language}: {after}");
+            assert!(
+                !incremental.highlighters[language]
+                    .cached_tree
+                    .as_ref()
+                    .unwrap()
+                    .tree
+                    .root_node()
+                    .has_changes(),
+                "grammar-changing {language} token edit must reparse"
+            );
+        }
+    }
+
+    #[test]
+    fn customized_javascript_queries_reparse_interior_token_edits() {
+        let mut registry = LanguageRegistry::bundled();
+        registry
+            .languages
+            .get_mut("javascript")
+            .unwrap()
+            .highlight_queries
+            .push("((comment) @function (#match? @function \"λ\"))".to_string());
+        let registry = Arc::new(registry);
+        let theme = parse_vscode_theme("themes/mocha.json").unwrap();
+        let mut customized = Highlighter::with_registry(&theme, Arc::clone(&registry)).unwrap();
+        customized
+            .highlight("javascript", "// retained comment\n")
+            .unwrap();
+
+        let source = "// retained λ comment\n";
+        let actual = customized.highlight("javascript", source).unwrap();
+        let expected = Highlighter::with_registry(&theme, registry)
+            .unwrap()
+            .highlight("javascript", source)
+            .unwrap();
+        let shape = |styles: &[StyleInfo]| {
+            styles
+                .iter()
+                .map(|style| (style.start, style.end, style.style.clone()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(shape(&actual), shape(&expected));
+        assert!(!customized.highlighters["javascript"]
+            .cached_tree
+            .as_ref()
+            .unwrap()
+            .tree
+            .root_node()
+            .has_changes());
+    }
+
+    #[test]
+    fn rust_identifier_edits_reuse_captures_inside_real_editor_viewports() {
+        let mut source = include_str!("editor.rs")
+            .lines()
+            .skip(60)
+            .take(80)
+            .collect::<Vec<_>>()
+            .join("\n");
+        source.push('\n');
+        let insertion = source.find("\nuse crate::{").unwrap() + 1;
+        let mut incremental = highlighter();
+        incremental.highlight("rust", &source).unwrap();
+        source.insert(insertion, 'a');
+        incremental.highlight("rust", &source).unwrap();
+        for (offset, character) in ['λ', 'a', 'λ', 'a'].into_iter().enumerate() {
+            let cursor = insertion
+                + source[insertion..]
+                    .char_indices()
+                    .nth(offset + 1)
+                    .unwrap()
+                    .0;
+            source.insert(cursor, character);
+            incremental.highlight("rust", &source).unwrap();
+            assert!(
+                incremental.highlighters["rust"]
+                    .cached_tree
+                    .as_ref()
+                    .unwrap()
+                    .tree
+                    .root_node()
+                    .has_changes(),
+                "real Rust viewport identifier edit should reuse existing captures"
+            );
+        }
+    }
+
+    #[test]
+    fn rust_identifier_edits_reparse_keywords_boundaries_and_custom_queries() {
+        let cases = [
+            (
+                "fn example() { let usae = 1; }\n",
+                "fn example() { let use = 1; }\n",
+            ),
+            (
+                "fn example() { let value = 1; }\n",
+                "fn example() { let value! = 1; }\n",
+            ),
+            (
+                "fn Example() { let value = 1; }\n",
+                "fn Exλample() { let value = 1; }\n",
+            ),
+        ];
+
+        for (before, after) in cases {
+            let mut incremental = highlighter();
+            incremental.highlight("rust", before).unwrap();
+            let actual = incremental.highlight("rust", after).unwrap();
+            let expected = highlighter().highlight("rust", after).unwrap();
+            let shape = |styles: &[StyleInfo]| {
+                styles
+                    .iter()
+                    .map(|style| (style.start, style.end, style.style.clone()))
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(shape(&actual), shape(&expected), "{after}");
+            assert!(
+                !incremental.highlighters["rust"]
+                    .cached_tree
+                    .as_ref()
+                    .unwrap()
+                    .tree
+                    .root_node()
+                    .has_changes(),
+                "syntax-changing identifier edits must reparse: {after}"
+            );
+        }
+
+        let mut registry = LanguageRegistry::bundled();
+        registry
+            .languages
+            .get_mut("rust")
+            .unwrap()
+            .highlight_queries
+            .push("((identifier) @function (#match? @function \"λ\"))".to_string());
+        let registry = Arc::new(registry);
+        let theme = parse_vscode_theme("themes/mocha.json").unwrap();
+        let mut customized = Highlighter::with_registry(&theme, Arc::clone(&registry)).unwrap();
+        customized.highlight("rust", "fn greeting() {}\n").unwrap();
+        let actual = customized.highlight("rust", "fn gλreeting() {}\n").unwrap();
+        let expected = Highlighter::with_registry(&theme, registry)
+            .unwrap()
+            .highlight("rust", "fn gλreeting() {}\n")
+            .unwrap();
+        assert_eq!(actual.len(), expected.len());
+        assert!(!customized.highlighters["rust"]
+            .cached_tree
+            .as_ref()
+            .unwrap()
+            .tree
+            .root_node()
+            .has_changes());
+    }
+
+    #[test]
+    fn oversized_highlight_requests_do_not_retain_source_or_styles() {
+        let mut highlighter = highlighter();
+        highlighter.highlight("rust", "fn cached() {}").unwrap();
+        assert!(highlighter.cached_highlight.is_some());
+
+        let source = format!("// {}", "a".repeat(MAX_CACHED_HIGHLIGHT_BYTES));
+        highlighter.highlight("rust", &source).unwrap();
+        assert!(highlighter.cached_highlight.is_none());
+        assert!(highlighter.highlighters["rust"].cached_tree.is_none());
     }
 
     #[test]

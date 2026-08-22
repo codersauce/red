@@ -10,17 +10,21 @@
 //! callbacks, commands, and state active and records a reload error. Callers should
 //! inspect status rather than assuming a changed source file became live.
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
 use std::time::{Duration, Instant, SystemTime};
 
 use crate::editor::EditorStateSnapshot;
+use rayon::prelude::*;
 use semver::{Version, VersionReq};
 use serde::Serialize;
 
 use super::package::{PluginPackageManifest, PLUGIN_MANIFEST_FILE};
 use super::{PluginMetadata, RequestId, Runtime};
+
+const PARALLEL_PLUGIN_STARTUP_MIN: usize = 4;
 
 /// Lifecycle authority for configured Husk plugins.
 pub struct PluginRegistry {
@@ -28,6 +32,7 @@ pub struct PluginRegistry {
     metadata: HashMap<String, PluginMetadata>,
     initialized: bool,
     statuses: HashMap<String, PluginStatus>,
+    pending_plugins: usize,
     modified_at: HashMap<String, PluginModification>,
     last_hot_reload_poll: Instant,
 }
@@ -95,6 +100,7 @@ impl PluginRegistry {
             metadata: HashMap::new(),
             initialized: false,
             statuses: HashMap::new(),
+            pending_plugins: 0,
             modified_at: HashMap::new(),
             last_hot_reload_poll: Instant::now(),
         }
@@ -106,8 +112,7 @@ impl PluginRegistry {
     /// discovery of unrelated plugins.
     pub fn add(&mut self, name: &str, path: &str) {
         self.plugins.push((name.to_string(), path.to_string()));
-        self.statuses
-            .insert(name.to_string(), PluginStatus::Pending);
+        self.set_status(name.to_string(), PluginStatus::Pending);
         self.modified_at
             .insert(name.to_string(), plugin_modification(path));
 
@@ -118,7 +123,7 @@ impl PluginRegistry {
             Err(error) => {
                 let diagnostic = format!("failed to load plugin metadata: {error}");
                 crate::log!("Plugin `{name}` quarantined during metadata: {diagnostic}");
-                self.statuses.insert(
+                self.set_status(
                     name.to_string(),
                     PluginStatus::Quarantined {
                         stage: "metadata".to_string(),
@@ -149,10 +154,50 @@ impl PluginRegistry {
         &self.statuses
     }
 
+    fn set_status(&mut self, name: String, status: PluginStatus) {
+        let was_pending = matches!(self.statuses.get(&name), Some(PluginStatus::Pending));
+        let is_pending = matches!(&status, PluginStatus::Pending);
+        if was_pending != is_pending {
+            if is_pending {
+                self.pending_plugins += 1;
+            } else {
+                self.pending_plugins -= 1;
+            }
+        }
+        self.statuses.insert(name, status);
+    }
+
     /// Activates plugins in dependency order and quarantines independent failures.
     pub async fn initialize(&mut self, runtime: &mut Runtime) -> anyhow::Result<()> {
         let mut pending = self.plugins.clone();
         pending.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
+        let mut precompiled = if pending.len() >= PARALLEL_PLUGIN_STARTUP_MIN {
+            let typecheck_enabled = runtime.typecheck_enabled();
+            pending
+                .par_iter()
+                .filter(|(name, path)| {
+                    !is_husk_package(path)
+                        && matches!(self.statuses.get(name), Some(PluginStatus::Pending))
+                        && self
+                            .metadata
+                            .get(name)
+                            .is_none_or(|metadata| !is_lazy(metadata))
+                })
+                .map(|(name, path)| {
+                    let source = plugin_source(path).and_then(|source| {
+                        super::runtime::compile_startup_plugin(
+                            name,
+                            &plugin_display_path(path),
+                            &source,
+                            typecheck_enabled,
+                        )
+                    });
+                    (name.clone(), source)
+                })
+                .collect::<HashMap<_, _>>()
+        } else {
+            HashMap::new()
+        };
         while !pending.is_empty() {
             let mut deferred = Vec::new();
             let mut progressed = false;
@@ -184,9 +229,14 @@ impl PluginRegistry {
                     progressed = true;
                     continue;
                 }
-                match load_plugin(runtime, &name, &plugin).await {
+                let result = if let Some(program) = precompiled.remove(&name) {
+                    program.and_then(|program| runtime.load_precompiled_plugin(&name, program))
+                } else {
+                    load_plugin(runtime, &name, &plugin).await
+                };
+                match result {
                     Ok(()) => {
-                        self.statuses.insert(name, PluginStatus::Active);
+                        self.set_status(name, PluginStatus::Active);
                     }
                     Err(error) => {
                         self.quarantine(
@@ -289,7 +339,7 @@ impl PluginRegistry {
             );
         }
         crate::log!("Plugin `{name}` quarantined during {stage}: {diagnostic}");
-        self.statuses.insert(
+        self.set_status(
             name.to_string(),
             PluginStatus::Quarantined {
                 stage: stage.to_string(),
@@ -361,21 +411,23 @@ impl PluginRegistry {
         args: serde_json::Value,
     ) -> anyhow::Result<()> {
         let _span = crate::editor::perf::PerfSpan::with_detail("notify", event);
-        let pending = self
-            .plugins
-            .iter()
-            .filter(|(name, _)| matches!(self.statuses.get(name), Some(PluginStatus::Pending)))
-            .filter(|(name, _)| {
-                self.metadata.get(name).is_some_and(|metadata| {
-                    metadata.activation_events.iter().any(|activation| {
-                        activation == event || activation == &format!("onEvent:{event}")
+        if self.pending_plugins != 0 {
+            let pending = self
+                .plugins
+                .iter()
+                .filter(|(name, _)| matches!(self.statuses.get(name), Some(PluginStatus::Pending)))
+                .filter(|(name, _)| {
+                    self.metadata.get(name).is_some_and(|metadata| {
+                        metadata.activation_events.iter().any(|activation| {
+                            activation == event || activation == &format!("onEvent:{event}")
+                        })
                     })
                 })
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-        for (name, path) in pending {
-            self.activate_one(runtime, &name, &path).await;
+                .cloned()
+                .collect::<Vec<_>>();
+            for (name, path) in pending {
+                self.activate_one(runtime, &name, &path).await;
+            }
         }
         for (plugin, error) in runtime.notify_isolated(event, args) {
             let path = self
@@ -432,7 +484,7 @@ impl PluginRegistry {
         }
         match load_plugin(runtime, name, path).await {
             Ok(()) => {
-                self.statuses.insert(name.to_string(), PluginStatus::Active);
+                self.set_status(name.to_string(), PluginStatus::Active);
             }
             Err(error) => self.quarantine(
                 runtime,
@@ -737,7 +789,7 @@ impl PluginRegistry {
         };
         match result {
             Ok(()) => {
-                self.statuses.insert(name.to_string(), PluginStatus::Active);
+                self.set_status(name.to_string(), PluginStatus::Active);
             }
             Err(error) => {
                 crate::log!("Plugin `{name}` hot reload rejected: {error}");
@@ -747,7 +799,7 @@ impl PluginRegistry {
                     } else {
                         self.metadata.remove(name);
                     }
-                    self.statuses.insert(
+                    self.set_status(
                         name.to_string(),
                         PluginStatus::ActiveWithReloadError {
                             path: plugin_display_path(path),
@@ -971,14 +1023,14 @@ fn diagnostic_stage(error: &anyhow::Error) -> &'static str {
     }
 }
 
-fn plugin_source(plugin: &str) -> anyhow::Result<String> {
+fn plugin_source(plugin: &str) -> anyhow::Result<Cow<'static, str>> {
     if crate::assets::is_bundled_plugin_specifier(plugin) {
         return crate::assets::bundled_plugin_contents(plugin)
-            .map(str::to_string)
+            .map(Cow::Borrowed)
             .ok_or_else(|| anyhow::anyhow!("bundled plugin `{plugin}` was not found"));
     }
 
-    Ok(fs::read_to_string(plugin)?)
+    Ok(Cow::Owned(fs::read_to_string(plugin)?))
 }
 
 async fn load_plugin(runtime: &mut Runtime, name: &str, plugin: &str) -> anyhow::Result<()> {
@@ -1015,6 +1067,57 @@ mod tests {
 
     fn drain_requests() {
         while ACTION_DISPATCHER.try_recv_request().is_some() {}
+    }
+
+    #[test]
+    fn bundled_plugin_sources_borrow_immutable_embedded_assets() {
+        let specifier = crate::assets::bundled_plugin_specifier("agent.hk").unwrap();
+        let source = plugin_source(&specifier).unwrap();
+
+        assert!(matches!(source, Cow::Borrowed(_)));
+        assert!(!source.is_empty());
+    }
+
+    #[tokio::test]
+    async fn pending_plugin_count_tracks_activation_quarantine_and_lazy_events() {
+        let eager_directory = tempfile_dir("pending-count-eager");
+        let eager = eager_directory.join("plugin.hk");
+        fs::write(&eager, "pub fn activate() {}\n").unwrap();
+        let invalid_directory = tempfile_dir("pending-count-invalid");
+        let invalid = invalid_directory.join("plugin.hk");
+        fs::write(&invalid, "pub fn activate() {}\n").unwrap();
+        fs::write(invalid_directory.join("package.json"), "invalid metadata").unwrap();
+        let lazy = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/example-plugin/index.hk");
+
+        let mut registry = PluginRegistry::new();
+        registry.add("invalid", invalid.to_str().unwrap());
+        assert_eq!(registry.pending_plugins, 0);
+        registry.add("eager", eager.to_str().unwrap());
+        registry.add("example-plugin", lazy.to_str().unwrap());
+        assert_eq!(registry.pending_plugins, 2);
+
+        let mut runtime = Runtime::new();
+        registry.initialize(&mut runtime).await.unwrap();
+        assert_eq!(registry.pending_plugins, 1);
+        assert!(matches!(
+            registry.statuses().get("example-plugin"),
+            Some(PluginStatus::Pending)
+        ));
+
+        registry
+            .notify(&mut runtime, "cursor:moved", serde_json::json!({}))
+            .await
+            .unwrap();
+        assert_eq!(registry.pending_plugins, 1);
+        registry
+            .notify(&mut runtime, "editor:ready", serde_json::json!({}))
+            .await
+            .unwrap();
+        assert_eq!(registry.pending_plugins, 0);
+        assert!(matches!(
+            registry.statuses().get("example-plugin"),
+            Some(PluginStatus::Active)
+        ));
     }
 
     #[tokio::test]
@@ -1427,6 +1530,42 @@ mod tests {
             ACTION_DISPATCHER.recv_request(),
             PluginRequest::Action(Action::Print(message)) if message == "isolated"
         ));
+    }
+
+    #[tokio::test]
+    async fn parallel_startup_preserves_activation_order_and_quarantines_compile_failures() {
+        drain_requests();
+        let directory = tempfile_dir("parallel-startup-order");
+        let mut registry = PluginRegistry::new();
+        for name in ["zeta", "alpha", "broken", "middle", "omega"] {
+            let path = directory.join(format!("{name}.hk"));
+            let source = if name == "broken" {
+                "fn activate( {".to_string()
+            } else {
+                format!("pub fn activate() {{ red::execute(\"Print\", \"{name}\"); }}")
+            };
+            fs::write(&path, source).unwrap();
+            registry.add(name, path.to_str().unwrap());
+        }
+        let mut runtime = Runtime::new();
+
+        registry.initialize(&mut runtime).await.unwrap();
+
+        for expected in ["alpha", "middle", "omega", "zeta"] {
+            assert!(matches!(
+                ACTION_DISPATCHER.recv_request(),
+                PluginRequest::Action(Action::Print(message)) if message == expected
+            ));
+            assert_eq!(
+                registry.statuses().get(expected),
+                Some(&PluginStatus::Active)
+            );
+        }
+        assert!(matches!(
+            registry.statuses().get("broken"),
+            Some(PluginStatus::Quarantined { stage, .. }) if stage == "compile"
+        ));
+        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
     }
 
     #[tokio::test]

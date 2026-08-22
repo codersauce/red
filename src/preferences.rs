@@ -71,6 +71,7 @@ impl PanelLayoutPreference {
 pub struct PreferencesStore {
     path: Option<PathBuf>,
     preferences: Preferences,
+    plugin_storage_dirty: bool,
 }
 
 impl PreferencesStore {
@@ -79,6 +80,7 @@ impl PreferencesStore {
         Self {
             path: None,
             preferences: Preferences::default(),
+            plugin_storage_dirty: false,
         }
     }
 
@@ -122,6 +124,7 @@ impl PreferencesStore {
         let mut store = Self {
             path: Some(path),
             preferences,
+            plugin_storage_dirty: false,
         };
         if let Err(error) = store.import_legacy_plugin_storage() {
             log_if_configured(&format!("failed to import legacy plugin storage: {error}"));
@@ -370,10 +373,16 @@ impl PreferencesStore {
         key: &str,
         value: serde_json::Value,
     ) -> anyhow::Result<()> {
-        self.preferences
-            .plugin_storage
-            .insert(plugin_storage_key(plugin, key), value);
-        self.save()
+        let storage_key = plugin_storage_key(plugin, key);
+        if !self.plugin_storage_dirty
+            && self.preferences.plugin_storage.get(&storage_key) == Some(&value)
+        {
+            return Ok(());
+        }
+
+        self.preferences.plugin_storage.insert(storage_key, value);
+        self.plugin_storage_dirty = true;
+        self.save_plugin_storage()
     }
 
     /// Flushes deferred preferences and ordered exit-hook values in one write.
@@ -385,8 +394,9 @@ impl PreferencesStore {
             self.preferences
                 .plugin_storage
                 .insert(plugin_storage_key(&plugin, &key), value);
+            self.plugin_storage_dirty = true;
         }
-        self.save()
+        self.save_plugin_storage()
     }
 
     /// Returns an opaque copy suitable for co-snapshotting with editor recovery.
@@ -404,12 +414,20 @@ impl PreferencesStore {
         snapshot: &HashMap<String, serde_json::Value>,
     ) -> anyhow::Result<()> {
         for (key, value) in snapshot {
-            self.preferences
-                .plugin_storage
-                .entry(key.clone())
-                .or_insert_with(|| value.clone());
+            if let std::collections::hash_map::Entry::Vacant(entry) =
+                self.preferences.plugin_storage.entry(key.clone())
+            {
+                entry.insert(value.clone());
+                self.plugin_storage_dirty = true;
+            }
         }
-        self.save()
+        self.save_plugin_storage()
+    }
+
+    fn save_plugin_storage(&mut self) -> anyhow::Result<()> {
+        self.save()?;
+        self.plugin_storage_dirty = false;
+        Ok(())
     }
 
     /// Persists owner-only JSON for filesystem-backed stores.
@@ -481,7 +499,8 @@ impl PreferencesStore {
                 });
         }
         if changed {
-            self.save()?;
+            self.plugin_storage_dirty = true;
+            self.save_plugin_storage()?;
         }
         Ok(())
     }
@@ -917,6 +936,122 @@ mod tests {
         assert_eq!(
             store.plugin_storage("other", "history"),
             Some(&serde_json::json!(["other"]))
+        );
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn unchanged_plugin_storage_does_not_rewrite_persisted_preferences() {
+        let dir = unique_temp_dir("unchanged-plugin-storage");
+        let path = dir.join("preferences.json");
+        let mut store = PreferencesStore::load(&path);
+        let value = serde_json::json!({"transcript": "private response"});
+        store
+            .set_plugin_storage("agent", "conversation", value.clone())
+            .unwrap();
+        let modified = fs::metadata(&path).unwrap().modified().unwrap();
+
+        store
+            .set_plugin_storage("agent", "conversation", value)
+            .unwrap();
+
+        assert_eq!(fs::metadata(&path).unwrap().modified().unwrap(), modified);
+        assert!(!store.plugin_storage_dirty);
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_plugin_storage_write_retries_an_unchanged_value() {
+        let dir = unique_temp_dir("retry-plugin-storage");
+        let path = dir.join("preferences.json");
+        let outside = dir.join("outside.json");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(&outside, "outside secret").unwrap();
+        std::os::unix::fs::symlink(&outside, &path).unwrap();
+        let mut store = PreferencesStore::load(&path);
+        let value = serde_json::json!("private response");
+
+        assert!(store
+            .set_plugin_storage("agent", "conversation", value.clone())
+            .is_err());
+        assert!(store.plugin_storage_dirty);
+        assert_eq!(fs::read_to_string(&outside).unwrap(), "outside secret");
+
+        fs::remove_file(&path).unwrap();
+        store
+            .set_plugin_storage("agent", "conversation", value.clone())
+            .unwrap();
+
+        assert!(!store.plugin_storage_dirty);
+        assert_eq!(
+            PreferencesStore::load(&path).plugin_storage("agent", "conversation"),
+            Some(&value)
+        );
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_batched_plugin_storage_write_retries_an_unchanged_value() {
+        let dir = unique_temp_dir("retry-batched-plugin-storage");
+        let path = dir.join("preferences.json");
+        let outside = dir.join("outside.json");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(&outside, "outside secret").unwrap();
+        std::os::unix::fs::symlink(&outside, &path).unwrap();
+        let mut store = PreferencesStore::load(&path);
+        let value = serde_json::json!("private response");
+
+        assert!(store
+            .flush_plugin_storage(vec![(
+                "agent".to_string(),
+                "conversation".to_string(),
+                value.clone(),
+            )])
+            .is_err());
+        assert!(store.plugin_storage_dirty);
+        assert_eq!(fs::read_to_string(&outside).unwrap(), "outside secret");
+
+        fs::remove_file(&path).unwrap();
+        store
+            .set_plugin_storage("agent", "conversation", value.clone())
+            .unwrap();
+
+        assert!(!store.plugin_storage_dirty);
+        assert_eq!(
+            PreferencesStore::load(&path).plugin_storage("agent", "conversation"),
+            Some(&value)
+        );
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_merged_plugin_storage_write_retries_an_unchanged_value() {
+        let dir = unique_temp_dir("retry-merged-plugin-storage");
+        let path = dir.join("preferences.json");
+        let outside = dir.join("outside.json");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(&outside, "outside secret").unwrap();
+        std::os::unix::fs::symlink(&outside, &path).unwrap();
+        let mut store = PreferencesStore::load(&path);
+        let value = serde_json::json!("private response");
+        let snapshot = HashMap::from([("agent:conversation".to_string(), value.clone())]);
+
+        assert!(store.merge_plugin_storage_snapshot(&snapshot).is_err());
+        assert!(store.plugin_storage_dirty);
+        assert_eq!(fs::read_to_string(&outside).unwrap(), "outside secret");
+
+        fs::remove_file(&path).unwrap();
+        store
+            .set_plugin_storage("agent", "conversation", value.clone())
+            .unwrap();
+
+        assert!(!store.plugin_storage_dirty);
+        assert_eq!(
+            PreferencesStore::load(&path).plugin_storage("agent", "conversation"),
+            Some(&value)
         );
         fs::remove_dir_all(dir).ok();
     }

@@ -15,7 +15,9 @@ pub(crate) fn apply_transactional_replacement(
     range: TextRange,
     replacement: &str,
 ) -> Option<AppliedTextEdit> {
-    let previous = buffer.text_in_range(range);
+    let start_char = buffer.position_to_char_idx(range.start);
+    let end_char = buffer.position_to_char_idx(range.end);
+    let previous = buffer.text_in_char_range(start_char, end_char);
     if previous == replacement {
         return None;
     }
@@ -25,11 +27,11 @@ pub(crate) fn apply_transactional_replacement(
     );
 
     let edit = AppliedTextEdit {
-        start_char: buffer.position_to_char_idx(range.start),
-        end_char: buffer.position_to_char_idx(range.end),
+        start_char,
+        end_char,
         new_char_len: replacement.chars().count(),
     };
-    buffer.replace_range_raw(range, replacement);
+    buffer.replace_char_range_raw(start_char, end_char, replacement);
     buffer
         .undo_history
         .record_replace(range, edit.start_char, previous, replacement.to_string());

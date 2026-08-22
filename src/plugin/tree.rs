@@ -5,6 +5,7 @@
 //! only for the terminal viewport or a selected row.
 
 use std::{
+    cell::Cell,
     collections::{HashMap, HashSet},
     sync::Arc,
 };
@@ -169,6 +170,7 @@ pub struct TreePanelModel {
     status_root: String,
     directories: Vec<TreeDirectory>,
     rows: Vec<TreeRow>,
+    last_position: Cell<Option<usize>>,
     statuses: HashMap<String, GitStatus>,
     selected: HashSet<String>,
     clipboard: HashMap<String, ClipboardAction>,
@@ -176,7 +178,7 @@ pub struct TreePanelModel {
 
 impl TreePanelModel {
     /// Builds a complete index while borrowing shared directory-entry arrays from Husk.
-    pub(crate) fn from_husk_values(args: &[Value]) -> anyhow::Result<Self> {
+    pub fn from_husk_values(args: &[Value]) -> anyhow::Result<Self> {
         anyhow::ensure!(
             args.len() == 7,
             "a tree panel model requires seven arguments"
@@ -244,6 +246,7 @@ impl TreePanelModel {
                 last: true,
                 expanded: root_expanded,
             }],
+            last_position: Cell::new(None),
             statuses,
             selected,
             clipboard,
@@ -307,7 +310,26 @@ impl TreePanelModel {
     }
 
     pub(crate) fn position(&self, id: &str) -> Option<usize> {
-        self.rows.iter().position(|row| match row.source {
+        if let Some(index) = self.last_position.get() {
+            if self
+                .rows
+                .get(index)
+                .is_some_and(|row| self.row_id_matches(row, id))
+            {
+                return Some(index);
+            }
+        }
+
+        let position = self
+            .rows
+            .iter()
+            .position(|row| self.row_id_matches(row, id));
+        self.last_position.set(position);
+        position
+    }
+
+    fn row_id_matches(&self, row: &TreeRow, id: &str) -> bool {
+        match row.source {
             TreeRowSource::Root => id == ".",
             TreeRowSource::Entry { directory, entry } => {
                 self.directories[directory as usize]
@@ -316,7 +338,7 @@ impl TreePanelModel {
                     .and_then(|value| value_field_string(value, "path"))
                     == Some(id)
             }
-        })
+        }
     }
 
     pub(crate) fn row(&self, index: usize) -> Option<PanelRow> {
@@ -675,5 +697,29 @@ mod tests {
         assert_eq!(file.segments[1].text, "  ");
         assert_eq!(file.segments[2].text, "└ ");
         assert_eq!(file.segments[3].text, " ");
+    }
+
+    #[test]
+    fn repeated_positions_reuse_only_the_matching_tree_row() {
+        let model = model(
+            serde_json::json!([{
+                "path": ".",
+                "entries": [
+                    { "name": "first.rs", "path": "./first.rs", "kind": "file" },
+                    { "name": "second.rs", "path": "./second.rs", "kind": "file" }
+                ]
+            }]),
+            serde_json::json!(["."]),
+        );
+
+        assert_eq!(model.last_position.get(), None);
+        assert_eq!(model.position("./second.rs"), Some(2));
+        assert_eq!(model.last_position.get(), Some(2));
+        assert_eq!(model.position("./second.rs"), Some(2));
+        assert_eq!(model.position("./first.rs"), Some(1));
+        assert_eq!(model.last_position.get(), Some(1));
+        assert_eq!(model.position("./missing.rs"), None);
+        assert_eq!(model.last_position.get(), None);
+        assert_eq!(model.position("."), Some(0));
     }
 }

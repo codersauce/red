@@ -295,11 +295,13 @@ extern "red" {
 "#;
 
 static RED_HOST_AST: OnceLock<husk_ast::File> = OnceLock::new();
+static RED_HOST_PAYLOAD_SCHEMA: OnceLock<PluginPayloadSchema> = OnceLock::new();
 
 struct RedHost {
     dispatcher: Arc<Dispatcher<PluginRequest, PluginResponse>>,
     process_manager: ProcessManager,
     pending_timeouts: Vec<PendingTimeout>,
+    next_timeout_at: Option<Instant>,
     snapshots: HashMap<String, Value>,
     policy: RedPluginPolicy,
     staged_policy: Option<RedPluginPolicy>,
@@ -343,21 +345,30 @@ struct PluginPayloadSchema {
     callback_parameters: HashMap<String, Vec<TypeExpr>>,
 }
 
+pub(super) struct PreparedStartupPlugin {
+    program: CompiledProgram,
+    payload_schema: PluginPayloadSchema,
+}
+
 impl PluginPayloadSchema {
     fn for_source(source: &HuskFile) -> Self {
         let mut schema = Self::default();
-        schema.add_module(red_host_ast(), &[]);
         schema.add_module(source, &[]);
         schema
     }
 
     fn for_package(package: &ResolvedPackage) -> Self {
         let mut schema = Self::default();
-        schema.add_module(red_host_ast(), &[]);
         for module in &package.modules {
             schema.add_module(&module.syntax, &module.module_path);
         }
         schema
+    }
+
+    fn definition(&self, name: &str) -> Option<&PayloadTypeDefinition> {
+        self.definitions
+            .get(name)
+            .or_else(|| red_host_payload_schema().definitions.get(name))
     }
 
     fn add_module(&mut self, syntax: &HuskFile, module_path: &[String]) {
@@ -430,7 +441,7 @@ impl PluginPayloadSchema {
     }
 
     fn named_record(&self, name: &str, payload: &serde_json::Value) -> anyhow::Result<Value> {
-        let Some(PayloadTypeDefinition::Record(fields)) = self.definitions.get(name) else {
+        let Some(PayloadTypeDefinition::Record(fields)) = self.definition(name) else {
             return Ok(Value::from_json(payload.clone()));
         };
         self.decode_record(name, fields, "", payload, name, 0)
@@ -513,12 +524,10 @@ impl PluginPayloadSchema {
                     format!("{module}::{}", name.name)
                 };
                 let (type_name, definition) = self
-                    .definitions
-                    .get(&qualified)
+                    .definition(&qualified)
                     .map(|definition| (qualified.as_str(), definition))
                     .or_else(|| {
-                        self.definitions
-                            .get(&name.name)
+                        self.definition(&name.name)
                             .map(|definition| (name.name.as_str(), definition))
                     })
                     .map_or((name.name.as_str(), None), |(name, definition)| {
@@ -689,7 +698,7 @@ fn payload_variant_name(name: &str) -> String {
 #[derive(Debug, Clone)]
 struct RedPluginPolicy {
     commands: HashMap<String, RedCommand>,
-    event_listeners: HashMap<String, Vec<Callback>>,
+    event_listeners: HashMap<String, Arc<Vec<Callback>>>,
     pending_requests: HashMap<RequestId, Callback>,
     picker_handlers: HashMap<PickerHandle, PickerRegistration>,
     composer_handlers: HashMap<ComposerHandle, ComposerRegistration>,
@@ -697,7 +706,7 @@ struct RedPluginPolicy {
     typed_states: HashMap<String, Value>,
     state_initializers: HashMap<String, Callback>,
     state_record_types: HashMap<String, String>,
-    payload_schemas: HashMap<String, PluginPayloadSchema>,
+    payload_schemas: HashMap<String, Arc<PluginPayloadSchema>>,
     lifecycle_callbacks: HashMap<String, HashMap<String, Callback>>,
     config_bindings: HashMap<String, HashSet<Option<String>>>,
     next_request_id: i64,
@@ -792,7 +801,7 @@ impl RedPluginPolicy {
         self.commands
             .retain(|_, command| command.callback.plugin() != plugin);
         self.event_listeners.retain(|_, callbacks| {
-            callbacks.retain(|callback| callback.plugin() != plugin);
+            Arc::make_mut(callbacks).retain(|callback| callback.plugin() != plugin);
             !callbacks.is_empty()
         });
         self.pending_requests
@@ -882,6 +891,7 @@ impl RedHost {
             dispatcher,
             process_manager: ProcessManager::new(process_permissions),
             pending_timeouts: Vec::new(),
+            next_timeout_at: None,
             snapshots: HashMap::new(),
             policy: RedPluginPolicy::default(),
             staged_policy: None,
@@ -899,6 +909,17 @@ impl RedHost {
         self.snapshots.insert(name.into(), Value::from_json(value));
     }
 
+    fn update_viewport_cursor(&mut self, cursor: serde_json::Value) -> bool {
+        let Some(Value::Object(viewport)) = self.snapshots.get_mut("viewport_layout") else {
+            return false;
+        };
+        if !viewport.contains_key("cursor") {
+            return false;
+        }
+        Arc::make_mut(viewport).insert("cursor".to_string(), Value::from_json(cursor));
+        true
+    }
+
     fn poll_process_events(&mut self) -> Vec<serde_json::Value> {
         self.process_manager
             .poll_events()
@@ -907,16 +928,21 @@ impl RedHost {
             .collect()
     }
 
-    fn begin_reload(&mut self) {
+    fn begin_initial_activation(&mut self) {
         self.staged_policy = Some(self.policy.clone());
-        // State export runs against a cloned previous-policy snapshot, just as
-        // the compatibility VM evaluates it on a cloned previous VM. This
-        // keeps export-time state mutations transactional when export fails.
-        self.teardown_policy = Some(self.policy.clone());
+        self.teardown_policy = None;
         self.policy_phase = PolicyPhase::Teardown;
         self.staged_effects = Some(Vec::new());
         self.staged_replacement_start = None;
         self.staged_teardown_start = None;
+    }
+
+    fn begin_reload(&mut self) {
+        self.begin_initial_activation();
+        // State export runs against a cloned previous-policy snapshot, just as
+        // the compatibility VM evaluates it on a cloned previous VM. This
+        // keeps export-time state mutations transactional when export fails.
+        self.teardown_policy = Some(self.policy.clone());
     }
 
     fn commit_reload(&mut self) {
@@ -1018,20 +1044,39 @@ impl RedHost {
     }
 
     fn schedule_timeout_with_id(&mut self, id: String, delay_ms: u64) {
-        self.pending_timeouts.push(PendingTimeout {
-            id,
-            expires_at: Instant::now() + Duration::from_millis(delay_ms),
-        });
+        let expires_at = Instant::now() + Duration::from_millis(delay_ms);
+        self.next_timeout_at = Some(
+            self.next_timeout_at
+                .map_or(expires_at, |next| next.min(expires_at)),
+        );
+        self.pending_timeouts
+            .push(PendingTimeout { id, expires_at });
     }
 
     fn cancel_timeout_now(&mut self, timer_id: &str) {
-        self.pending_timeouts
-            .retain(|timeout| timeout.id != timer_id);
+        let mut removed_earliest = false;
+        self.pending_timeouts.retain(|timeout| {
+            let keep = timeout.id != timer_id;
+            removed_earliest |= !keep && Some(timeout.expires_at) == self.next_timeout_at;
+            keep
+        });
+        if removed_earliest {
+            self.next_timeout_at = self
+                .pending_timeouts
+                .iter()
+                .map(|timeout| timeout.expires_at)
+                .min();
+        }
     }
 
     fn poll_timer_callbacks(&mut self) -> Vec<PluginRequest> {
-        let mut requests = Vec::new();
         let now = Instant::now();
+        if self.next_timeout_at.is_none_or(|next| next > now) {
+            return Vec::new();
+        }
+
+        let mut requests = Vec::new();
+        let mut next_timeout_at: Option<Instant> = None;
         self.pending_timeouts.retain(|timeout| {
             if timeout.expires_at <= now {
                 requests.push(PluginRequest::TimeoutCallback {
@@ -1039,9 +1084,13 @@ impl RedHost {
                 });
                 false
             } else {
+                next_timeout_at = Some(
+                    next_timeout_at.map_or(timeout.expires_at, |next| next.min(timeout.expires_at)),
+                );
                 true
             }
         });
+        self.next_timeout_at = next_timeout_at;
         requests
     }
 }
@@ -2306,11 +2355,12 @@ impl RedHost {
             "red::on" => {
                 let event = red_required_string(args, 0, path)?;
                 let callback = red_required_callback(args, 1, path)?.clone();
-                self.policy_mut()
+                let listeners = self
+                    .policy_mut()
                     .event_listeners
                     .entry(event.to_string())
-                    .or_default()
-                    .push(callback);
+                    .or_default();
+                Arc::make_mut(listeners).push(callback);
                 Ok(Value::Unit)
             }
             "red::execute" => {
@@ -3095,11 +3145,8 @@ impl Host for RedHost {
                     );
                 }
                 super::api::RedFunctionAnnotation::Event { name } => {
-                    self.policy_mut()
-                        .event_listeners
-                        .entry(name)
-                        .or_default()
-                        .push(function.callback().clone());
+                    let listeners = self.policy_mut().event_listeners.entry(name).or_default();
+                    Arc::make_mut(listeners).push(function.callback().clone());
                 }
                 super::api::RedFunctionAnnotation::StateInitializer => {
                     let Some(husk_ast::TypeExpr {
@@ -3720,6 +3767,10 @@ impl Runtime {
         self.inner.lock().unwrap().typecheck_enabled = enabled;
     }
 
+    pub(super) fn typecheck_enabled(&self) -> bool {
+        self.inner.lock().unwrap().typecheck_enabled
+    }
+
     pub async fn load_plugin(&mut self, name: &str, source: &str) -> anyhow::Result<()> {
         self.load_plugin_at(name, format!("plugins/{name}.hk"), source)
             .await
@@ -3745,14 +3796,37 @@ impl Runtime {
             )?
         };
         let payload_schema = PluginPayloadSchema::for_source(program.syntax());
-        let RuntimeInner { plugins, host, .. } = &mut *inner;
-        host.begin_reload();
+        Self::activate_compiled_plugin(&mut inner, name, program, payload_schema)
+    }
+
+    pub(super) fn load_precompiled_plugin(
+        &mut self,
+        name: &str,
+        prepared: PreparedStartupPlugin,
+    ) -> anyhow::Result<()> {
+        let _span = crate::editor::perf::PerfSpan::with_detail("husk:load", name);
+        let mut inner = self.inner.lock().unwrap();
+        Self::activate_compiled_plugin(&mut inner, name, prepared.program, prepared.payload_schema)
+    }
+
+    fn activate_compiled_plugin(
+        inner: &mut RuntimeInner,
+        name: &str,
+        program: CompiledProgram,
+        payload_schema: PluginPayloadSchema,
+    ) -> anyhow::Result<()> {
+        let RuntimeInner { plugins, host, .. } = inner;
+        let was_loaded = plugins.contains_key(name);
+        if was_loaded {
+            host.begin_reload();
+        } else {
+            host.begin_initial_activation();
+        }
         host.staged_policy
             .as_mut()
             .expect("reload staging must be active")
             .payload_schemas
-            .insert(name.to_string(), payload_schema);
-        let was_loaded = plugins.contains_key(name);
+            .insert(name.to_string(), Arc::new(payload_schema));
         let vm = plugins
             .entry(name.to_string())
             .or_insert_with(new_plugin_vm);
@@ -3787,13 +3861,17 @@ impl Runtime {
         };
         let payload_schema = PluginPayloadSchema::for_package(&package);
         let RuntimeInner { plugins, host, .. } = &mut *inner;
-        host.begin_reload();
+        let was_loaded = plugins.contains_key(name);
+        if was_loaded {
+            host.begin_reload();
+        } else {
+            host.begin_initial_activation();
+        }
         host.staged_policy
             .as_mut()
             .expect("reload staging must be active")
             .payload_schemas
-            .insert(name.to_string(), payload_schema);
-        let was_loaded = plugins.contains_key(name);
+            .insert(name.to_string(), Arc::new(payload_schema));
         let vm = plugins
             .entry(name.to_string())
             .or_insert_with(new_plugin_vm);
@@ -3887,15 +3965,12 @@ impl Runtime {
         let _span = crate::editor::perf::PerfSpan::with_detail("husk:notify", event);
         let mut inner = self.inner.lock().unwrap();
         let RuntimeInner { plugins, host, .. } = &mut *inner;
-        let callbacks = host
-            .policy()
-            .event_listeners
-            .get(event)
-            .cloned()
-            .unwrap_or_default();
-        for callback in callbacks {
-            let argument = decoded_callback_payload(host, &callback, 0, &args)?;
-            call_plugin_callback(plugins, host, &callback, vec![argument])?;
+        let Some(callbacks) = host.policy().event_listeners.get(event).cloned() else {
+            return Ok(());
+        };
+        for callback in callbacks.iter() {
+            let argument = decoded_callback_payload(host, callback, 0, &args)?;
+            call_plugin_callback(plugins, host, callback, vec![argument])?;
         }
         Ok(())
     }
@@ -3907,22 +3982,18 @@ impl Runtime {
     ) -> Vec<(String, anyhow::Error)> {
         let mut inner = self.inner.lock().unwrap();
         let RuntimeInner { plugins, host, .. } = &mut *inner;
-        let callbacks = host
-            .policy()
-            .event_listeners
-            .get(event)
-            .cloned()
-            .unwrap_or_default();
+        let Some(callbacks) = host.policy().event_listeners.get(event).cloned() else {
+            return Vec::new();
+        };
         callbacks
-            .into_iter()
+            .iter()
             .filter_map(|callback| {
-                let plugin = callback.plugin().to_string();
-                decoded_callback_payload(host, &callback, 0, &args)
+                decoded_callback_payload(host, callback, 0, &args)
                     .and_then(|argument| {
-                        call_plugin_callback(plugins, host, &callback, vec![argument])
+                        call_plugin_callback(plugins, host, callback, vec![argument])
                     })
                     .err()
-                    .map(|error| (plugin, error))
+                    .map(|error| (callback.plugin().to_string(), error))
             })
             .collect()
     }
@@ -3935,19 +4006,16 @@ impl Runtime {
     ) -> Vec<(String, anyhow::Error)> {
         let mut inner = self.inner.lock().unwrap();
         let RuntimeInner { plugins, host, .. } = &mut *inner;
-        let callbacks = host
-            .policy()
-            .event_listeners
-            .get(event)
-            .cloned()
-            .unwrap_or_default();
+        let Some(callbacks) = host.policy().event_listeners.get(event).cloned() else {
+            return Vec::new();
+        };
         callbacks
-            .into_iter()
+            .iter()
             .filter(|callback| callback.plugin() == plugin)
             .filter_map(|callback| {
-                decoded_callback_payload(host, &callback, 0, &args)
+                decoded_callback_payload(host, callback, 0, &args)
                     .and_then(|argument| {
-                        call_plugin_callback(plugins, host, &callback, vec![argument])
+                        call_plugin_callback(plugins, host, callback, vec![argument])
                     })
                     .err()
                     .map(|error| (plugin.to_string(), error))
@@ -4082,6 +4150,19 @@ impl Runtime {
     pub fn set_snapshot(&mut self, name: impl Into<String>, value: serde_json::Value) {
         let mut inner = self.inner.lock().unwrap();
         inner.host.set_snapshot(name, value);
+    }
+
+    /// Replaces only the cursor in an existing viewport snapshot.
+    ///
+    /// Shared row and metadata values remain untouched, and previously cloned
+    /// snapshots continue to observe their original cursor.
+    #[must_use]
+    pub fn update_viewport_cursor(&mut self, cursor: serde_json::Value) -> bool {
+        self.inner
+            .lock()
+            .unwrap()
+            .host
+            .update_viewport_cursor(cursor)
     }
 
     pub fn poll_process_events(&mut self) -> Vec<serde_json::Value> {
@@ -4296,6 +4377,38 @@ fn red_host_ast() -> &'static HuskFile {
     })
 }
 
+fn red_host_payload_schema() -> &'static PluginPayloadSchema {
+    RED_HOST_PAYLOAD_SCHEMA.get_or_init(|| {
+        let mut schema = PluginPayloadSchema::default();
+        schema.add_module(red_host_ast(), &[]);
+        schema
+    })
+}
+
+pub(super) fn compile_startup_plugin(
+    name: &str,
+    path: &str,
+    source: &str,
+    typecheck_enabled: bool,
+) -> anyhow::Result<PreparedStartupPlugin> {
+    let mut program = if typecheck_enabled {
+        compile_plugin_source(name, path, source)
+    } else {
+        CompiledProgram::compile_at(
+            name,
+            path,
+            source,
+            &CompileOptions::legacy_runtime_compatibility(),
+        )
+    }?;
+    let payload_schema = PluginPayloadSchema::for_source(program.syntax());
+    program.discard_analysis();
+    Ok(PreparedStartupPlugin {
+        program,
+        payload_schema,
+    })
+}
+
 fn compile_plugin_source(name: &str, path: &str, source: &str) -> anyhow::Result<CompiledProgram> {
     let host = red_host_ast();
     let options = CompileOptions::legacy_runtime_compatibility()
@@ -4352,6 +4465,57 @@ mod tests {
 
     fn drain_requests() {
         while ACTION_DISPATCHER.try_recv_request().is_some() {}
+    }
+
+    #[test]
+    fn plugin_payload_schemas_reuse_shared_host_type_definitions() {
+        let parsed = husk_parser::parse_str("pub fn activate() {}");
+        let schema = PluginPayloadSchema::for_source(parsed.file.as_ref().unwrap());
+
+        assert!(!schema.definitions.contains_key("PickerItem"));
+        assert!(matches!(
+            schema.definition("PickerItem"),
+            Some(PayloadTypeDefinition::Record(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn cloned_reload_policies_share_immutable_plugin_payload_schemas() {
+        let mut runtime = Runtime::new();
+        runtime
+            .load_plugin("schema-sharing", "pub fn activate() {}")
+            .await
+            .unwrap();
+        let inner = runtime.inner.lock().unwrap();
+        let cloned = inner.host.policy.clone();
+
+        assert!(Arc::ptr_eq(
+            inner
+                .host
+                .policy
+                .payload_schemas
+                .get("schema-sharing")
+                .unwrap(),
+            cloned.payload_schemas.get("schema-sharing").unwrap(),
+        ));
+    }
+
+    #[tokio::test]
+    async fn first_plugin_activation_does_not_clone_an_unused_teardown_policy() {
+        let mut runtime = Runtime::new();
+        runtime
+            .load_plugin("existing", "pub fn activate() {}")
+            .await
+            .unwrap();
+        let mut inner = runtime.inner.lock().unwrap();
+
+        inner.host.begin_initial_activation();
+
+        assert!(inner.host.staged_policy.is_some());
+        assert!(inner.host.teardown_policy.is_none());
+        assert!(inner.host.policy.payload_schemas.contains_key("existing"));
+        inner.host.rollback_reload();
+        assert!(inner.host.policy.payload_schemas.contains_key("existing"));
     }
 
     #[tokio::test]
@@ -5396,6 +5560,67 @@ mod tests {
         assert_eq!(runtime.pending_timeout_count(), 1);
         runtime.cancel_test_timeout(&pending);
         assert_eq!(runtime.pending_timeout_count(), 0);
+    }
+
+    #[test]
+    fn viewport_cursor_updates_share_rows_without_mutating_previous_snapshots() {
+        let mut host = RedHost::new(HashMap::new());
+        host.set_snapshot(
+            "viewport_layout",
+            serde_json::json!({
+                "cursor": { "x": 1, "y": 2 },
+                "rows": [{ "line": 0, "text": "unchanged" }],
+            }),
+        );
+        let previous = host.snapshots.get("viewport_layout").unwrap().clone();
+
+        assert!(host.update_viewport_cursor(serde_json::json!({ "x": 4, "y": 5 })));
+
+        let Value::Object(previous) = previous else {
+            panic!("expected the previous viewport object");
+        };
+        let Some(Value::Object(current)) = host.snapshots.get("viewport_layout") else {
+            panic!("expected the updated viewport object");
+        };
+        assert_eq!(
+            previous["cursor"].to_json(),
+            serde_json::json!({ "x": 1, "y": 2 })
+        );
+        assert_eq!(
+            current["cursor"].to_json(),
+            serde_json::json!({ "x": 4, "y": 5 })
+        );
+        let (Value::Array(previous_rows), Value::Array(current_rows)) =
+            (&previous["rows"], &current["rows"])
+        else {
+            panic!("expected shared viewport rows");
+        };
+        assert!(Arc::ptr_eq(previous_rows, current_rows));
+    }
+
+    #[test]
+    fn viewport_cursor_updates_require_an_existing_cursor_snapshot() {
+        let mut host = RedHost::new(HashMap::new());
+        assert!(!host.update_viewport_cursor(serde_json::json!({ "x": 1 })));
+
+        host.set_snapshot("viewport_layout", serde_json::json!({ "rows": [] }));
+        assert!(!host.update_viewport_cursor(serde_json::json!({ "x": 1 })));
+    }
+
+    #[tokio::test]
+    async fn cancelling_the_earliest_timeout_recomputes_the_next_deadline() {
+        let mut runtime = Runtime::new();
+        let earliest = runtime.schedule_test_timeout(0);
+        let pending = runtime.schedule_test_timeout(60_000);
+
+        runtime.cancel_test_timeout(&earliest);
+
+        assert!(runtime.poll_timer_callbacks().is_empty());
+        assert_eq!(runtime.pending_timeout_count(), 1);
+        assert!(runtime.inner.lock().unwrap().host.next_timeout_at.is_some());
+
+        runtime.cancel_test_timeout(&pending);
+        assert!(runtime.inner.lock().unwrap().host.next_timeout_at.is_none());
     }
 
     #[tokio::test]
@@ -11603,6 +11828,76 @@ mod tests {
             .await
             .unwrap();
 
+        assert!(matches!(
+            ACTION_DISPATCHER.try_recv_request(),
+            Some(PluginRequest::SetDecorations { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn indent_guides_skip_same_line_edits_without_indentation_changes() {
+        drain_requests();
+
+        let mut layout = sample_indent_layout();
+        layout["indentation_key"] = serde_json::json!("0:0:0;1:4:0;2:8:0;3:4:0;4:0:0;");
+        let mut runtime = Runtime::new();
+        runtime.set_snapshot(
+            "editor_info",
+            sample_indent_editor_info(
+                Color::Rgb {
+                    r: 40,
+                    g: 41,
+                    b: 42,
+                },
+                Color::Rgb {
+                    r: 80,
+                    g: 81,
+                    b: 82,
+                },
+            ),
+        );
+        runtime.set_snapshot("viewport_layout", layout.clone());
+        runtime
+            .load_plugin(
+                "indent_guides",
+                include_str!("../../plugins/indent_guides.hk"),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.try_recv_request(),
+            Some(PluginRequest::SetDecorations { .. })
+        ));
+
+        layout["revision"] = serde_json::json!(2);
+        layout["cursor"]["x"] = serde_json::json!(9);
+        layout["rows"][2]["text"] = serde_json::json!("        updated();");
+        runtime.set_snapshot("viewport_layout", layout.clone());
+        runtime
+            .notify("cursor:moved", serde_json::json!({}))
+            .await
+            .unwrap();
+        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
+
+        layout["revision"] = serde_json::json!(3);
+        layout["rows"][2]["text"] = serde_json::json!("            updated();");
+        layout["indentation_key"] = serde_json::json!("0:0:0;1:4:0;2:12:0;3:4:0;4:0:0;");
+        runtime.set_snapshot("viewport_layout", layout.clone());
+        runtime
+            .notify("buffer:changed", serde_json::json!({}))
+            .await
+            .unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.try_recv_request(),
+            Some(PluginRequest::SetDecorations { .. })
+        ));
+
+        layout["cursor"]["y"] = serde_json::json!(3);
+        runtime.set_snapshot("viewport_layout", layout);
+        runtime
+            .notify("cursor:moved", serde_json::json!({}))
+            .await
+            .unwrap();
         assert!(matches!(
             ACTION_DISPATCHER.try_recv_request(),
             Some(PluginRequest::SetDecorations { .. })
