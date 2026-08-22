@@ -1676,6 +1676,58 @@ async fn substitute_uses_rust_regex_captures_and_escaped_delimiters() {
 }
 
 #[tokio::test]
+async fn visual_substitute_replacement_supports_vim_line_breaks() {
+    let mut harness = EditorHarness::with_config(
+        Buffer::new(None, "one two\nthree four\nkeep same".to_string()),
+        default_key_config(),
+    );
+    harness
+        .execute_action(Action::EnterMode(Mode::VisualLine))
+        .await
+        .unwrap();
+    harness.execute_action(Action::MoveDown).await.unwrap();
+
+    command_key(&mut harness, KeyCode::Char(':')).await;
+    type_normal_keys(&mut harness, r"s/ /\r/g").await;
+    command_key(&mut harness, KeyCode::Enter).await;
+
+    harness.assert_mode(Mode::Normal);
+    harness.assert_buffer_contents("one\ntwo\nthree\nfour\nkeep same");
+    harness.execute_action(Action::Undo).await.unwrap();
+    harness.assert_buffer_contents("one two\nthree four\nkeep same");
+}
+
+#[tokio::test]
+async fn substitute_line_break_replacement_preserves_crlf() {
+    let buffer = Buffer::new(None, "one two\r\nthree four\r\n".to_string());
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+
+    harness
+        .execute_action(Action::Command(r"%s/ /\r/g".to_string()))
+        .await
+        .unwrap();
+
+    harness.assert_buffer_contents("one\r\ntwo\r\nthree\r\nfour\r\n");
+}
+
+#[tokio::test]
+async fn substitute_replacement_preserves_non_newline_escapes() {
+    let mut harness = EditorHarness::with_content("value");
+    harness
+        .execute_action(Action::Command(r"s/value/\n/".to_string()))
+        .await
+        .unwrap();
+    harness.assert_buffer_contents(r"\n");
+
+    harness.execute_action(Action::Undo).await.unwrap();
+    harness
+        .execute_action(Action::Command(r"s/value/\\r/".to_string()))
+        .await
+        .unwrap();
+    harness.assert_buffer_contents(r"\r");
+}
+
+#[tokio::test]
 async fn substitute_does_not_match_the_carriage_return_in_crlf_buffers() {
     let buffer = Buffer::new(None, "abc\r\ndef\r\n".to_string());
     let mut harness = EditorHarness::with_config(buffer, default_key_config());
