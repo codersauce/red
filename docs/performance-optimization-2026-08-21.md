@@ -56,6 +56,8 @@ navigation baselines were frozen after rebasing to `d92777c`.
 | --- | ---: |
 | Husk unchanged configuration refresh | 99.99% |
 | Neo-tree repeated row selection | 99.98% |
+| Shared Vim keyword word text objects | 99.89% |
+| Shared Vim whitespace-delimited WORD objects | 99.80% |
 | Crash-recovery buffer restoration | 99.77% |
 | Repeated themed syntax highlighting | 99.61% |
 | Embedded text-area ASCII typing | 99.29% |
@@ -197,6 +199,13 @@ Eleven alternating release-build samples reduced delimiter medians from 100,937
 to 1,077 microseconds and quote medians from 60,761 to 6,771 microseconds while
 preserving innermost pairs, unmatched delimiters, odd/even backslash escaping,
 Unicode scalar positions, and inner versus around selection boundaries.
+
+Shared Vim keyword and whitespace-delimited WORD objects were independently
+measured across 2,048 production selections on long ASCII source lines. Eleven
+alternating release-build samples reduced keyword-object medians from 1,698,623
+to 1,816 microseconds and WORD-object medians from 1,181,118 to 2,416
+microseconds while preserving punctuation groups, leading/trailing whitespace,
+tabs, out-of-range cursors, inner/around semantics, and Unicode grapheme rules.
 
 Multi-file startup uses the same production loader as the executable. Across
 four startup passes over 128 distinct source files, seven alternating samples

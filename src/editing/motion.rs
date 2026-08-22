@@ -565,6 +565,9 @@ impl<'buffer> MotionResolver<'buffer> {
     }
 
     fn word_text_object(&self, scope: TextObjectScope, big_word: bool) -> Option<TextRange> {
+        if self.buffer.is_ascii() {
+            return self.ascii_word_text_object(scope, big_word);
+        }
         let line_index = self.cursor.line;
         let line = self.buffer.get(line_index)?;
         let chars = trim_line_ending(&line).chars().collect::<Vec<_>>();
@@ -616,6 +619,60 @@ impl<'buffer> MotionResolver<'buffer> {
             }
         }
 
+        Some(TextRange::new(
+            TextPosition::new(line_index, start),
+            TextPosition::new(line_index, end),
+        ))
+    }
+
+    fn ascii_word_text_object(&self, scope: TextObjectScope, big_word: bool) -> Option<TextRange> {
+        let line_index = self.cursor.line;
+        if line_index > self.buffer.len() {
+            return None;
+        }
+        let length = self.buffer.line_char_len_without_ending(line_index);
+        if length == 0 {
+            return None;
+        }
+        let contents = self.buffer.contents_snapshot();
+        let line = contents.get_line(line_index)?;
+        let unit_kind = |index| {
+            let character = line.get_char(index)?;
+            if big_word && !character.is_whitespace() {
+                Some(TextUnitKind::Keyword)
+            } else {
+                text_unit_kind(character)
+            }
+        };
+        let cursor = self.cursor.character.min(length - 1);
+        let target = if unit_kind(cursor).is_some() {
+            cursor
+        } else {
+            (cursor..length)
+                .find(|index| unit_kind(*index).is_some())
+                .or_else(|| (0..=cursor).rev().find(|index| unit_kind(*index).is_some()))?
+        };
+        let kind = unit_kind(target)?;
+        let mut start = target;
+        while start > 0 && unit_kind(start - 1) == Some(kind) {
+            start -= 1;
+        }
+        let mut end = target + 1;
+        while end < length && unit_kind(end) == Some(kind) {
+            end += 1;
+        }
+
+        if scope == TextObjectScope::Around {
+            if end < length && line.get_char(end).is_some_and(char::is_whitespace) {
+                while end < length && line.get_char(end).is_some_and(char::is_whitespace) {
+                    end += 1;
+                }
+            } else {
+                while start > 0 && line.get_char(start - 1).is_some_and(char::is_whitespace) {
+                    start -= 1;
+                }
+            }
+        }
         Some(TextRange::new(
             TextPosition::new(line_index, start),
             TextPosition::new(line_index, end),
@@ -1308,5 +1365,96 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn indexed_word_objects_preserve_punctuation_whitespace_and_unicode_boundaries() {
+        for text in [
+            "",
+            "word",
+            "alpha beta",
+            "  leading and trailing  ",
+            "alpha,beta... gamma",
+            "\talpha\tbeta\t",
+            "___ symbols + punctuation",
+        ] {
+            let buffer = Buffer::new(None, text.to_string());
+            let chars = text.chars().collect::<Vec<_>>();
+            for cursor in 0..=chars.len() + 1 {
+                for big_word in [false, true] {
+                    for scope in [TextObjectScope::Inner, TextObjectScope::Around] {
+                        let unit_kind = |index: usize| {
+                            let character = *chars.get(index)?;
+                            if big_word && !character.is_whitespace() {
+                                Some(super::TextUnitKind::Keyword)
+                            } else {
+                                super::text_unit_kind(character)
+                            }
+                        };
+                        let expected = if chars.is_empty() {
+                            None
+                        } else {
+                            let bounded = cursor.min(chars.len() - 1);
+                            let target = if unit_kind(bounded).is_some() {
+                                Some(bounded)
+                            } else {
+                                (bounded..chars.len())
+                                    .find(|index| unit_kind(*index).is_some())
+                                    .or_else(|| {
+                                        (0..=bounded)
+                                            .rev()
+                                            .find(|index| unit_kind(*index).is_some())
+                                    })
+                            };
+                            target.map(|target| {
+                                let kind = unit_kind(target);
+                                let mut start = target;
+                                while start > 0 && unit_kind(start - 1) == kind {
+                                    start -= 1;
+                                }
+                                let mut end = target + 1;
+                                while end < chars.len() && unit_kind(end) == kind {
+                                    end += 1;
+                                }
+                                if scope == TextObjectScope::Around {
+                                    if end < chars.len() && chars[end].is_whitespace() {
+                                        while end < chars.len() && chars[end].is_whitespace() {
+                                            end += 1;
+                                        }
+                                    } else {
+                                        while start > 0 && chars[start - 1].is_whitespace() {
+                                            start -= 1;
+                                        }
+                                    }
+                                }
+                                (start, end)
+                            })
+                        };
+                        let resolver = MotionResolver::new(&buffer, TextPosition::new(0, cursor));
+                        let actual = resolver
+                            .text_object(
+                                scope,
+                                if big_word {
+                                    TextObjectKind::BigWord
+                                } else {
+                                    TextObjectKind::Word
+                                },
+                            )
+                            .map(|range| (range.start.character, range.end.character));
+                        assert_eq!(
+                            actual, expected,
+                            "{text:?} at {cursor}, big={big_word}, {scope:?}"
+                        );
+                    }
+                }
+            }
+        }
+
+        let unicode = Buffer::new(None, "e\u{301}clair, 👨‍👩‍👧 tail".to_string());
+        let resolver = MotionResolver::new(&unicode, TextPosition::new(0, 1));
+        let range = resolver
+            .text_object(TextObjectScope::Inner, TextObjectKind::Word)
+            .unwrap();
+        assert_eq!(unicode.text_in_range(range), "e\u{301}clair");
     }
 }

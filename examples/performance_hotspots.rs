@@ -292,6 +292,12 @@ fn main() -> Result<()> {
     if scenario == "all" || scenario == "text-object-quoted" {
         results.push(benchmark_text_object_selection(/*quoted*/ true)?);
     }
+    if scenario == "all" || scenario == "text-object-word" {
+        results.push(benchmark_word_text_object(/*big_word*/ false)?);
+    }
+    if scenario == "all" || scenario == "text-object-big-word" {
+        results.push(benchmark_word_text_object(/*big_word*/ true)?);
+    }
 
     anyhow::ensure!(
         !results.is_empty(),
@@ -1978,6 +1984,42 @@ fn benchmark_text_object_selection(quoted: bool) -> Result<serde_json::Value> {
             "shared_vim_escaped_quote_text_objects"
         } else {
             "shared_vim_nested_delimiter_text_objects"
+        },
+        started,
+        TEXTAREA_VIM_MOTIONS,
+    ))
+}
+
+fn benchmark_word_text_object(big_word: bool) -> Result<serde_json::Value> {
+    let prefix = "ordinary_identifier ".repeat(1_024);
+    let target = "target_identifier,punctuation";
+    let buffer = Buffer::new(
+        None,
+        format!("{prefix}{target}{}", " trailing_identifier".repeat(1_024)),
+    );
+    let cursor = prefix.len() + 4;
+    let resolver = MotionResolver::new(&buffer, TextPosition::new(0, cursor));
+    let kind = if big_word {
+        TextObjectKind::BigWord
+    } else {
+        TextObjectKind::Word
+    };
+    let started = Instant::now();
+    for _ in 0..TEXTAREA_VIM_MOTIONS {
+        let range = resolver
+            .text_object(TextObjectScope::Inner, kind)
+            .ok_or_else(|| anyhow::anyhow!("Vim word text object was not found"))?;
+        anyhow::ensure!(
+            range.start.character <= cursor && range.end.character > cursor,
+            "Vim word text object did not contain the cursor"
+        );
+        black_box(range);
+    }
+    Ok(report(
+        if big_word {
+            "shared_vim_whitespace_delimited_word_objects"
+        } else {
+            "shared_vim_keyword_word_text_objects"
         },
         started,
         TEXTAREA_VIM_MOTIONS,

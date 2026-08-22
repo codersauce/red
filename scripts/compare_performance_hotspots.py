@@ -72,6 +72,8 @@ SCENARIOS = (
     "textarea-redo",
     "text-object-delimited",
     "text-object-quoted",
+    "text-object-word",
+    "text-object-big-word",
     "husk-completion",
     "husk-config",
     "husk-update",
