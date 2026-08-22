@@ -979,7 +979,14 @@ impl Highlighter {
                     edit.old_end_byte,
                     inserted,
                 );
-                if !comment && !string && !numeric {
+                let identifier = stable_husk_identifier_token(
+                    &cached.code,
+                    code,
+                    edit.start_byte,
+                    edit.old_end_byte,
+                    inserted,
+                );
+                if !comment && !string && !numeric && !identifier {
                     return None;
                 }
                 let mut updated = cached.styles.clone();
@@ -1143,7 +1150,14 @@ impl Highlighter {
                 outer_edit.old_end_byte.checked_sub(content_start)?,
                 inserted,
             );
-            if !comment && !string && !numeric {
+            let identifier = stable_husk_identifier_token(
+                old_contents,
+                new_contents,
+                outer_edit.start_byte.checked_sub(content_start)?,
+                outer_edit.old_end_byte.checked_sub(content_start)?,
+                inserted,
+            );
+            if !comment && !string && !numeric && !identifier {
                 return None;
             }
             None
@@ -1443,6 +1457,45 @@ fn stable_husk_numeric_token(source: &str, start: usize, end: usize, inserted: &
     })
 }
 
+fn stable_husk_identifier_token(
+    previous_source: &str,
+    source: &str,
+    start: usize,
+    end: usize,
+    inserted: &str,
+) -> bool {
+    if !inserted.bytes().all(|byte| byte.is_ascii_lowercase()) {
+        return false;
+    }
+    let line_start = previous_source[..start]
+        .rfind('\n')
+        .map_or(0, |index| index + 1);
+    let line_end = previous_source[end..]
+        .find('\n')
+        .map_or(previous_source.len(), |offset| end + offset);
+    let line = &previous_source[line_start..line_end];
+    Lexer::new(line).any(|token| {
+        let TokenKind::Ident(previous) = token.kind else {
+            return false;
+        };
+        let token_start = line_start + token.span.range.start;
+        let token_end = line_start + token.span.range.end;
+        if token_start >= start
+            || token_end <= end
+            || !previous.bytes().all(|byte| byte.is_ascii_lowercase())
+            || is_husk_builtin_type(&previous)
+        {
+            return false;
+        }
+        let updated_end = token_end - (end - start) + inserted.len();
+        source.get(token_start..updated_end).is_some_and(|updated| {
+            updated.bytes().all(|byte| byte.is_ascii_lowercase())
+                && !husk_lexer::is_keyword(updated)
+                && !is_husk_builtin_type(updated)
+        })
+    })
+}
+
 fn bundled_highlight_definition(definition: &RuntimeLanguageDefinition, language_id: &str) -> bool {
     let expected_queries = match language_id {
         "rust" => &[tree_sitter_rust::HIGHLIGHTS_QUERY][..],
@@ -1517,23 +1570,41 @@ fn stable_bundled_token(
             }
         }
         "identifier" | "type_identifier" | "field_identifier" => {
-            if language_id != "rust" {
-                return None;
-            }
             let previous = previous_source.get(token.byte_range())?;
-            if !previous.starts_with(|character: char| character.is_ascii_lowercase())
-                || !previous
-                    .chars()
-                    .all(|character| character == '_' || unicode_ident::is_xid_continue(character))
-                || !inserted
-                    .chars()
-                    .all(|character| character == '_' || unicode_ident::is_xid_continue(character))
-            {
-                return None;
-            }
             let end = token.end_byte().checked_add_signed(delta)?;
-            if rust_keyword(source.get(token.start_byte()..end)?) {
-                return None;
+            let updated = source.get(token.start_byte()..end)?;
+            if language_id == "rust" {
+                if !previous.starts_with(|character: char| character.is_ascii_lowercase())
+                    || !previous.chars().all(|character| {
+                        character == '_' || unicode_ident::is_xid_continue(character)
+                    })
+                    || !inserted.chars().all(|character| {
+                        character == '_' || unicode_ident::is_xid_continue(character)
+                    })
+                    || rust_keyword(updated)
+                {
+                    return None;
+                }
+            } else {
+                if token.kind() != "identifier"
+                    || !matches!(
+                        language_id,
+                        "javascript" | "jsx" | "typescript" | "tsx" | "lua"
+                    )
+                    || !previous.bytes().all(|byte| byte.is_ascii_lowercase())
+                    || !inserted.bytes().all(|byte| byte.is_ascii_lowercase())
+                    || !updated.bytes().all(|byte| byte.is_ascii_lowercase())
+                {
+                    return None;
+                }
+                let sensitive = if language_id == "lua" {
+                    lua_sensitive_identifier
+                } else {
+                    ecmascript_sensitive_identifier
+                };
+                if sensitive(previous) || sensitive(updated) {
+                    return None;
+                }
             }
         }
         "inline" => {
@@ -1719,6 +1790,158 @@ fn rust_keyword(identifier: &str) -> bool {
             | "where"
             | "while"
             | "yield"
+    )
+}
+
+fn ecmascript_sensitive_identifier(identifier: &str) -> bool {
+    matches!(
+        identifier,
+        "abstract"
+            | "any"
+            | "arguments"
+            | "as"
+            | "assert"
+            | "asserts"
+            | "async"
+            | "await"
+            | "bigint"
+            | "boolean"
+            | "break"
+            | "case"
+            | "catch"
+            | "class"
+            | "console"
+            | "const"
+            | "constructor"
+            | "continue"
+            | "debugger"
+            | "declare"
+            | "default"
+            | "delete"
+            | "do"
+            | "document"
+            | "else"
+            | "enum"
+            | "eval"
+            | "export"
+            | "extends"
+            | "false"
+            | "finally"
+            | "for"
+            | "from"
+            | "function"
+            | "get"
+            | "global"
+            | "if"
+            | "implements"
+            | "import"
+            | "in"
+            | "infer"
+            | "instanceof"
+            | "interface"
+            | "intrinsic"
+            | "is"
+            | "keyof"
+            | "let"
+            | "module"
+            | "namespace"
+            | "never"
+            | "new"
+            | "null"
+            | "number"
+            | "object"
+            | "of"
+            | "out"
+            | "override"
+            | "package"
+            | "private"
+            | "protected"
+            | "prototype"
+            | "public"
+            | "readonly"
+            | "require"
+            | "return"
+            | "satisfies"
+            | "set"
+            | "static"
+            | "string"
+            | "super"
+            | "switch"
+            | "symbol"
+            | "target"
+            | "this"
+            | "throw"
+            | "true"
+            | "try"
+            | "type"
+            | "typeof"
+            | "undefined"
+            | "unique"
+            | "unknown"
+            | "using"
+            | "var"
+            | "void"
+            | "while"
+            | "window"
+            | "with"
+            | "yield"
+    )
+}
+
+fn lua_sensitive_identifier(identifier: &str) -> bool {
+    matches!(
+        identifier,
+        "and"
+            | "assert"
+            | "break"
+            | "collectgarbage"
+            | "do"
+            | "dofile"
+            | "else"
+            | "elseif"
+            | "end"
+            | "error"
+            | "false"
+            | "for"
+            | "function"
+            | "getfenv"
+            | "getmetatable"
+            | "global"
+            | "goto"
+            | "if"
+            | "in"
+            | "ipairs"
+            | "load"
+            | "loadfile"
+            | "loadstring"
+            | "local"
+            | "module"
+            | "next"
+            | "nil"
+            | "not"
+            | "or"
+            | "pairs"
+            | "pcall"
+            | "print"
+            | "rawequal"
+            | "rawget"
+            | "rawset"
+            | "repeat"
+            | "require"
+            | "return"
+            | "select"
+            | "self"
+            | "setfenv"
+            | "setmetatable"
+            | "then"
+            | "tonumber"
+            | "tostring"
+            | "true"
+            | "type"
+            | "until"
+            | "unpack"
+            | "while"
+            | "xpcall"
     )
 }
 
@@ -2639,6 +2862,172 @@ mod tests {
                 "interior identifier edits should reuse the edited syntax tree: {source}"
             );
         }
+    }
+
+    #[test]
+    fn bundled_identifier_edits_preserve_direct_and_fenced_parser_captures() {
+        for (language, contents) in [
+            (
+                "javascript",
+                "function retainedvalue(value) { return value; }\n",
+            ),
+            ("jsx", "function retainedvalue(value) { return value; }\n"),
+            (
+                "typescript",
+                "function retainedvalue(value: string) { return value; }\n",
+            ),
+            (
+                "tsx",
+                "function retainedvalue(value: string) { return value; }\n",
+            ),
+            ("lua", "local retainedvalue = 123456789\n"),
+            ("husk", "fn retainedvalue() { let value = 123456789; }\n"),
+        ] {
+            for fenced in [false, true] {
+                let before = if fenced {
+                    format!(
+                        "## heading\n\n```{language}\n{contents}```\n\n```rust\nfn sibling() {{}}\n```\n"
+                    )
+                } else {
+                    contents.to_string()
+                };
+                let outer = if fenced { "markdown" } else { language };
+                let mut incremental = highlighter();
+                incremental.highlight(outer, &before).unwrap();
+                let inserted = before.replace("retainedvalue", "retainxyedvalue");
+                let deleted = inserted.replace("retainxyedvalue", "retainyedvalue");
+                for source in [inserted, deleted] {
+                    let actual = incremental.highlight(outer, &source).unwrap();
+                    let expected = highlighter().highlight(outer, &source).unwrap();
+                    let shape = |styles: &[StyleInfo]| {
+                        styles
+                            .iter()
+                            .map(|style| (style.start, style.end, style.style.clone()))
+                            .collect::<Vec<_>>()
+                    };
+                    assert_eq!(shape(&actual), shape(&expected), "{language}: {source}");
+                    if outer != "husk" {
+                        assert!(
+                            incremental.highlighters[outer]
+                                .cached_tree
+                                .as_ref()
+                                .unwrap()
+                                .tree
+                                .root_node()
+                                .has_changes(),
+                            "{language} outer identifier tree was not reused (fenced={fenced})"
+                        );
+                    }
+                    if fenced && language != "husk" {
+                        assert!(
+                            incremental.highlighters[language]
+                                .cached_tree
+                                .as_ref()
+                                .unwrap()
+                                .tree
+                                .root_node()
+                                .has_changes(),
+                            "{language} fenced identifier tree was not reused"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn identifier_keywords_builtins_case_and_custom_queries_reparse() {
+        for (language, before, after) in [
+            (
+                "javascript",
+                "function reurn() { return 1; }\n",
+                "function return() { return 1; }\n",
+            ),
+            (
+                "javascript",
+                "function consle() { return 1; }\n",
+                "function console() { return 1; }\n",
+            ),
+            (
+                "javascript",
+                "function console() { return 1; }\n",
+                "function consxole() { return 1; }\n",
+            ),
+            (
+                "jsx",
+                "function retained() { return 1; }\n",
+                "function retaiNed() { return 1; }\n",
+            ),
+            (
+                "typescript",
+                "function intrface() { return 1; }\n",
+                "function interface() { return 1; }\n",
+            ),
+            ("lua", "local prnt = 123\n", "local print = 123\n"),
+            ("lua", "local slf = 123\n", "local self = 123\n"),
+            ("husk", "let bol = 123;\n", "let bool = 123;\n"),
+            ("husk", "let retrn = 123;\n", "let return = 123;\n"),
+        ] {
+            for fenced in [false, true] {
+                let before = if fenced {
+                    format!("## heading\n\n```{language}\n{before}```\n")
+                } else {
+                    before.to_string()
+                };
+                let after = if fenced {
+                    format!("## heading\n\n```{language}\n{after}```\n")
+                } else {
+                    after.to_string()
+                };
+                let outer = if fenced { "markdown" } else { language };
+                let mut incremental = highlighter();
+                incremental.highlight(outer, &before).unwrap();
+                let actual = incremental.highlight(outer, &after).unwrap();
+                let expected = highlighter().highlight(outer, &after).unwrap();
+                let shape = |styles: &[StyleInfo]| {
+                    styles
+                        .iter()
+                        .map(|style| (style.start, style.end, style.style.clone()))
+                        .collect::<Vec<_>>()
+                };
+                assert_eq!(shape(&actual), shape(&expected), "{language}: {after}");
+                if outer != "husk" {
+                    assert!(
+                        !incremental.highlighters[outer]
+                            .cached_tree
+                            .as_ref()
+                            .unwrap()
+                            .tree
+                            .root_node()
+                            .has_changes(),
+                        "{language} sensitive identifier must reparse (fenced={fenced})"
+                    );
+                }
+            }
+        }
+
+        let mut registry = LanguageRegistry::bundled();
+        registry
+            .languages
+            .get_mut("javascript")
+            .unwrap()
+            .highlight_queries
+            .push("((identifier) @function (#match? @function \"x\"))".to_string());
+        let theme = parse_vscode_theme("themes/mocha.json").unwrap();
+        let mut customized = Highlighter::with_registry(&theme, Arc::new(registry)).unwrap();
+        customized
+            .highlight("javascript", "function retained() {}\n")
+            .unwrap();
+        customized
+            .highlight("javascript", "function retaxined() {}\n")
+            .unwrap();
+        assert!(!customized.highlighters["javascript"]
+            .cached_tree
+            .as_ref()
+            .unwrap()
+            .tree
+            .root_node()
+            .has_changes());
     }
 
     #[test]

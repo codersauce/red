@@ -54,6 +54,18 @@ navigation baselines were frozen after rebasing to `d92777c`.
 
 | Runtime path | Median improvement |
 | --- | ---: |
+| Markdown fenced Husk identifier highlighting | 99.26% |
+| Markdown fenced JavaScript identifier highlighting | 98.79% |
+| Markdown fenced TSX identifier highlighting | 98.79% |
+| Markdown fenced TypeScript identifier highlighting | 98.77% |
+| Markdown fenced JSX identifier highlighting | 98.75% |
+| Markdown fenced Lua identifier highlighting | 98.61% |
+| Lua identifier highlighting | 97.61% |
+| TSX identifier highlighting | 97.41% |
+| JSX identifier highlighting | 97.37% |
+| JavaScript identifier highlighting | 97.36% |
+| TypeScript identifier highlighting | 97.32% |
+| Husk identifier highlighting | 93.07% |
 | Markdown fenced PowerShell numeric-literal highlighting | 99.30% |
 | PowerShell numeric-literal highlighting | 99.09% |
 | Markdown fenced Husk numeric-literal highlighting | 99.01% |
@@ -766,6 +778,21 @@ cached tree by the exact edit. The shortcut excludes token boundaries, reserved
 keywords, uppercase-sensitive names, non-identifier Unicode, custom queries,
 and source or span cache-limit violations; Unicode edits, comments, YAML
 context, Markdown language injections, and fresh-parser parity remain covered.
+
+Seven alternating release-build samples per ordinary identifier scenario
+applied 128 interior lowercase edits to 96-line documents. Direct JavaScript,
+JSX, TypeScript, TSX, Lua, and Husk medians respectively fell from 22,578 to
+595, 23,345 to 614, 22,517 to 603, 22,401 to 581, 14,561 to 348, and 5,812 to
+403 microseconds. Their Markdown-fenced equivalents respectively fell from
+85,434 to 1,031, 85,912 to 1,070, 84,708 to 1,038, 85,089 to 1,032, 46,921 to
+652, and 81,682 to 606 microseconds. Bundled Tree-sitter grammars require exact
+ordinary identifier nodes, lowercase ASCII source and insertions, complete
+queries, and strict interior edit bounds; specialized Husk validates the
+edited physical line with its actual lexer. Reserved and contextual keywords,
+theme-sensitive built-in names, uppercase predicates, Husk built-in types,
+custom queries, token boundaries, and fence markers retain complete parsing.
+Direct captures, outer Markdown captures, sibling injections, and all UTF-8
+offsets match fresh-parser results.
 
 Seven additional alternating release-build samples per configuration, shell,
 Lua, and Husk numeric scenario applied 128 interior ASCII-digit edits to

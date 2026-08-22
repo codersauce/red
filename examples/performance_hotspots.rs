@@ -356,6 +356,24 @@ fn main() -> Result<()> {
         )?);
     }
     for (name, language, fenced) in [
+        ("identifier-javascript", "javascript", false),
+        ("identifier-jsx", "jsx", false),
+        ("identifier-typescript", "typescript", false),
+        ("identifier-tsx", "tsx", false),
+        ("identifier-lua", "lua", false),
+        ("identifier-husk", "husk", false),
+        ("markdown-fenced-identifier-javascript", "javascript", true),
+        ("markdown-fenced-identifier-jsx", "jsx", true),
+        ("markdown-fenced-identifier-typescript", "typescript", true),
+        ("markdown-fenced-identifier-tsx", "tsx", true),
+        ("markdown-fenced-identifier-lua", "lua", true),
+        ("markdown-fenced-identifier-husk", "husk", true),
+    ] {
+        if scenario == "all" || scenario == name {
+            results.push(benchmark_identifier_highlighting(language, fenced)?);
+        }
+    }
+    for (name, language, fenced) in [
         ("numeric-rust", "rust", false),
         ("numeric-javascript", "javascript", false),
         ("numeric-jsx", "jsx", false),
@@ -1843,6 +1861,49 @@ fn benchmark_cross_language_token_highlighting(
         _ => unreachable!("benchmark uses a supported bundled language token"),
     };
     Ok(report(scenario, started, RUST_TOKEN_HIGHLIGHT_EDITS))
+}
+
+fn benchmark_identifier_highlighting(language: &str, fenced: bool) -> Result<serde_json::Value> {
+    let theme = parse_vscode_theme("themes/mocha.json")?;
+    let mut highlighter = Highlighter::new(&theme)?;
+    let contents = (0..96)
+        .map(|_| match language {
+            "lua" => "local retainedvalue = 123456789\n",
+            "husk" => "fn retainedvalue() { let value = 123456789; }\n",
+            _ => "function retainedvalue() { return 123456789; }\n",
+        })
+        .collect::<String>();
+    let mut source = if fenced {
+        format!("## outer heading\n\n```{language}\n{contents}```\n")
+    } else {
+        contents
+    };
+    let outer_language = if fenced { "markdown" } else { language };
+    let mut cursor = source.find("retainedvalue").expect("identifier marker") + 5;
+    black_box(highlighter.highlight(outer_language, &source)?);
+
+    let started = Instant::now();
+    for index in 0..RUST_TOKEN_HIGHLIGHT_EDITS {
+        let character = if index % 2 == 0 { 'x' } else { 'y' };
+        source.insert(cursor, character);
+        cursor += 1;
+        let spans = highlighter.highlight(black_box(outer_language), black_box(&source))?;
+        anyhow::ensure!(
+            spans
+                .iter()
+                .any(|span| span.start < cursor && span.end >= cursor)
+                || spans.iter().any(|span| span.start > cursor),
+            "{language} identifier edit lost its syntax capture"
+        );
+        black_box(spans);
+    }
+
+    let scenario = if fenced {
+        format!("markdown_fenced_{language}_identifier_highlighting")
+    } else {
+        format!("{language}_identifier_highlighting")
+    };
+    Ok(report(&scenario, started, RUST_TOKEN_HIGHLIGHT_EDITS))
 }
 
 fn benchmark_numeric_literal_highlighting(
