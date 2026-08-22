@@ -12690,37 +12690,40 @@ impl Editor {
         Ok(quit)
     }
 
-    async fn replay_last_semantic_change(
-        &mut self,
-        buffer: &mut RenderBuffer,
-        runtime: &mut Runtime,
-    ) -> anyhow::Result<()> {
-        let Some(change) = self.last_semantic_change.clone() else {
-            self.set_legacy_message(Some("no change to repeat".to_string()));
-            return Ok(());
-        };
+    #[inline(never)]
+    fn replay_last_semantic_change<'a>(
+        &'a mut self,
+        buffer: &'a mut RenderBuffer,
+        runtime: &'a mut Runtime,
+    ) -> BoxFuture<'a, anyhow::Result<()>> {
+        Box::pin(async move {
+            let Some(change) = self.last_semantic_change.clone() else {
+                self.set_legacy_message(Some("no change to repeat".to_string()));
+                return Ok(());
+            };
 
-        self.pending_semantic_change = None;
-        self.replaying_semantic_change = true;
-        let result = async {
-            for event in &change.events {
-                if let Some(action) = self.handle_event_with_runtime(event, Some(runtime))? {
-                    if self
-                        .handle_resolved_key_action(event, &action, buffer, runtime)
-                        .await?
-                    {
-                        anyhow::bail!("repeated change attempted to quit the editor");
+            self.pending_semantic_change = None;
+            self.replaying_semantic_change = true;
+            let result = async {
+                for event in &change.events {
+                    if let Some(action) = self.handle_event_with_runtime(event, Some(runtime))? {
+                        if self
+                            .handle_resolved_key_action(event, &action, buffer, runtime)
+                            .await?
+                        {
+                            anyhow::bail!("repeated change attempted to quit the editor");
+                        }
+                    }
+                    if self.replay_checkpoint(buffer, runtime).await? {
+                        break;
                     }
                 }
-                if self.replay_checkpoint(buffer, runtime).await? {
-                    break;
-                }
+                Ok(())
             }
-            Ok(())
-        }
-        .await;
-        self.replaying_semantic_change = false;
-        result
+            .await;
+            self.replaying_semantic_change = false;
+            result
+        })
     }
 
     async fn play_macro(
