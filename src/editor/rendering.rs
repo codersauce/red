@@ -1597,7 +1597,13 @@ impl Editor {
             && self.learn_session.is_none()
             && !self.force_full_redraw
             && self.last_rendered_window == self.window_manager.active_stable_window_id()
-            && self.current_dialog.is_none()
+            && self.current_dialog.as_ref().is_none_or(|dialog| {
+                dialog.allows_event_passthrough()
+                    && self.panel_manager.reserved_left_width() == 0
+                    && self.panel_manager.reserved_right_width() == 0
+                    && self.panel_manager.reserved_top_height() == 0
+                    && self.panel_manager.reserved_bottom_height() == 0
+            })
             && self.keyboard_shortcuts.is_none()
             && !self.keymap_hints_visible
             && !self.panel_manager.has_focused_panel()
@@ -1627,6 +1633,8 @@ impl Editor {
         self.update_and_render_overlays(buffer)?;
         self.render_learn_coach(buffer);
         self.render_dialog(buffer)?;
+        self.shortcut_help_regions
+            .clone_from(&buffer.shortcut_help_regions);
         self.update_terminal_cursor_surface(buffer);
         self.render_cursor_cell(buffer);
         self.last_rendered_cursor_position = self.render_cursor_position();
@@ -4792,17 +4800,51 @@ mod tests {
         let mut buffer = RenderBuffer::new(60, 12, &Style::default());
 
         editor.render(&mut buffer).unwrap();
+        let full_renders = editor.full_render_count;
         assert!(rendered_rows(&buffer)
             .iter()
             .any(|row| row.contains("alpha")));
 
         editor.render_edited_window_rows(&mut buffer).unwrap();
 
+        assert_eq!(
+            editor.full_render_count, full_renders,
+            "passthrough completion must reuse editor surfaces rather than repaint every surface"
+        );
         assert!(
             rendered_rows(&buffer)
                 .iter()
                 .any(|row| row.contains("alpha")),
             "edited window rows must repaint the active completion dialog"
+        );
+    }
+
+    #[test]
+    fn edited_window_rows_keep_full_repaint_for_completion_over_docked_panes() {
+        let source = Buffer::new(None, "hello\nworld\n".to_string());
+        let mut editor = rendering_test_editor(source);
+        editor.panel_manager.create_panel(
+            "files".to_string(),
+            crate::plugin::PanelConfig {
+                width: 12,
+                ..crate::plugin::PanelConfig::default()
+            },
+        );
+        let mut completion = CompletionUI::new();
+        let item = serde_json::from_value(serde_json::json!({ "label": "alpha" })).unwrap();
+        completion.show(vec![item], 0, 0);
+        editor.current_dialog = Some(Box::new(completion));
+        let mut buffer = RenderBuffer::new(60, 12, &Style::default());
+
+        editor.render(&mut buffer).unwrap();
+        let full_renders = editor.full_render_count;
+
+        editor.render_edited_window_rows(&mut buffer).unwrap();
+
+        assert_eq!(
+            editor.full_render_count,
+            full_renders + 1,
+            "completion that can overlap preserved panes must repaint every surface"
         );
     }
 

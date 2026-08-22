@@ -16,7 +16,7 @@ use std::{
 use anyhow::Context as _;
 use husk_lexer::{Keyword, Lexer, TokenKind, Trivia};
 use libloading::Library;
-use tree_sitter::{Language, Parser, Query, QueryCursor, StreamingIterator};
+use tree_sitter::{Language, Parser, Query, QueryCursor, StreamingIterator, Tree};
 use tree_sitter_language::LanguageFn;
 
 use crate::{
@@ -452,6 +452,12 @@ struct LanguageHighlighter {
     query: Query,
     injection_query: Option<Query>,
     capture_styles: Vec<Option<Style>>,
+    cached_tree: Option<CachedSyntaxTree>,
+}
+
+struct CachedSyntaxTree {
+    source: String,
+    tree: Tree,
 }
 
 struct Injection {
@@ -721,6 +727,10 @@ impl Highlighter {
             }
         }
 
+        if let Some(styles) = self.reuse_rust_identifier_highlight(language_id, code) {
+            return Ok(styles);
+        }
+
         let styles = self.highlight_with_depth(language_id, code, 0)?;
         self.cached_highlight = if code.len() <= MAX_CACHED_HIGHLIGHT_BYTES
             && styles.len() <= MAX_CACHED_HIGHLIGHT_SPANS
@@ -734,6 +744,97 @@ impl Highlighter {
             None
         };
         Ok(styles)
+    }
+
+    /// Preserve bundled Rust captures when an edit stays inside one ordinary
+    /// identifier. Its leading byte and token boundaries cannot change, so the
+    /// grammar and bundled query keep the same nodes, captures, and predicates.
+    fn reuse_rust_identifier_highlight(
+        &mut self,
+        language_id: &str,
+        code: &str,
+    ) -> Option<Vec<StyleInfo>> {
+        if language_id != "rust" || code.len() > MAX_CACHED_HIGHLIGHT_BYTES {
+            return None;
+        }
+
+        let definition = self.registry.languages.get(language_id)?;
+        if definition.highlight_queries.len() != 1
+            || definition.highlight_queries[0] != tree_sitter_rust::HIGHLIGHTS_QUERY
+        {
+            return None;
+        }
+
+        let cached = self.cached_highlight.as_mut()?;
+        if cached.language_id != language_id {
+            return None;
+        }
+        let syntax = self
+            .highlighters
+            .get_mut(language_id)?
+            .cached_tree
+            .as_mut()?;
+        if syntax.source != cached.code {
+            return None;
+        }
+
+        let edit = crate::syntax_indent::replacement_edit(&cached.code, code);
+        let identifier = syntax
+            .tree
+            .root_node()
+            .named_descendant_for_byte_range(edit.start_byte, edit.old_end_byte)?;
+        if !matches!(
+            identifier.kind(),
+            "identifier" | "type_identifier" | "field_identifier"
+        ) || identifier.start_byte() >= edit.start_byte
+            || identifier.end_byte() <= edit.old_end_byte
+        {
+            return None;
+        }
+
+        let old_identifier = &cached.code[identifier.byte_range()];
+        if !old_identifier.starts_with(|character: char| character.is_ascii_lowercase())
+            || !old_identifier
+                .chars()
+                .all(|character| character == '_' || unicode_ident::is_xid_continue(character))
+            || !code[edit.start_byte..edit.new_end_byte]
+                .chars()
+                .all(|character| character == '_' || unicode_ident::is_xid_continue(character))
+        {
+            return None;
+        }
+
+        let delta = isize::try_from(edit.new_end_byte)
+            .ok()?
+            .checked_sub(isize::try_from(edit.old_end_byte).ok()?)?;
+        let identifier_end = identifier.end_byte().checked_add_signed(delta)?;
+        let new_identifier = &code[identifier.start_byte()..identifier_end];
+        if rust_keyword(new_identifier) {
+            return None;
+        }
+
+        let mut styles = cached.styles.clone();
+        for style in &mut styles {
+            if style.end <= edit.start_byte {
+                continue;
+            }
+            if style.start >= edit.old_end_byte {
+                style.start = style.start.checked_add_signed(delta)?;
+                style.end = style.end.checked_add_signed(delta)?;
+            } else if style.start < edit.start_byte && style.end >= edit.old_end_byte {
+                style.end = style.end.checked_add_signed(delta)?;
+            } else {
+                return None;
+            }
+        }
+
+        syntax.tree.edit(&edit);
+        syntax.source.clear();
+        syntax.source.push_str(code);
+        cached.code.clear();
+        cached.code.push_str(code);
+        cached.styles.clone_from(&styles);
+        Some(styles)
     }
 
     fn highlight_with_depth(
@@ -784,6 +885,7 @@ impl Highlighter {
                     query,
                     injection_query,
                     capture_styles,
+                    cached_tree: None,
                 },
             );
         }
@@ -795,45 +897,64 @@ impl Highlighter {
             let Some(highlighter) = self.highlighters.get_mut(&definition.id) else {
                 return Ok(Vec::new());
             };
-            let Some(tree) = highlighter.parser.parse(code, None) else {
+            let previous_tree = highlighter.cached_tree.take().map(|mut cached| {
+                cached.tree.edit(&crate::syntax_indent::replacement_edit(
+                    &cached.source,
+                    code,
+                ));
+                cached.tree
+            });
+            let parsed = highlighter.parser.parse(code, previous_tree.as_ref());
+            let Some(tree) = parsed else {
                 return Ok(Vec::new());
             };
 
-            let mut cursor = QueryCursor::new();
-            let mut matches = cursor.matches(&highlighter.query, tree.root_node(), code.as_bytes());
-            let mut refinement_colors = Vec::new();
+            {
+                let mut cursor = QueryCursor::new();
+                let mut matches =
+                    cursor.matches(&highlighter.query, tree.root_node(), code.as_bytes());
+                let mut refinement_colors = Vec::new();
 
-            while let Some(mat) = matches.next() {
-                for cap in mat.captures {
-                    let node = cap.node;
-                    let start = node.start_byte();
-                    let end = node.end_byte();
-                    let capture_name = highlighter.query.capture_names()[cap.index as usize];
-                    if let Some(style) = highlighter.capture_styles[cap.index as usize].as_ref() {
-                        let captured = StyleInfo {
-                            start,
-                            end,
-                            style: style.clone(),
-                        };
-                        if capture_refines_equal_range(capture_name) {
-                            refinement_colors.push(captured);
-                        } else {
-                            colors.push(captured);
+                while let Some(mat) = matches.next() {
+                    for cap in mat.captures {
+                        let node = cap.node;
+                        let start = node.start_byte();
+                        let end = node.end_byte();
+                        let capture_name = highlighter.query.capture_names()[cap.index as usize];
+                        if let Some(style) = highlighter.capture_styles[cap.index as usize].as_ref()
+                        {
+                            let captured = StyleInfo {
+                                start,
+                                end,
+                                style: style.clone(),
+                            };
+                            if capture_refines_equal_range(capture_name) {
+                                refinement_colors.push(captured);
+                            } else {
+                                colors.push(captured);
+                            }
                         }
                     }
                 }
-            }
 
-            // Query cursors return captures in syntax-tree order, which can put a
-            // broad scalar capture after a more specific capture over the same
-            // bytes. Keep semantic refinements later so the renderer's stable
-            // equal-range tie-break selects them.
-            colors.extend(refinement_colors);
+                // Query cursors return captures in syntax-tree order, which can put a
+                // broad scalar capture after a more specific capture over the same
+                // bytes. Keep semantic refinements later so the renderer's stable
+                // equal-range tie-break selects them.
+                colors.extend(refinement_colors);
+            }
 
             if depth < MAX_INJECTION_DEPTH {
                 if let Some(injection_query) = &highlighter.injection_query {
                     raw_injections = collect_injections(injection_query, tree.root_node(), code);
                 }
+            }
+
+            if code.len() <= MAX_CACHED_HIGHLIGHT_BYTES {
+                highlighter.cached_tree = Some(CachedSyntaxTree {
+                    source: code.to_owned(),
+                    tree,
+                });
             }
         }
 
@@ -865,6 +986,67 @@ impl Highlighter {
 
         Ok(colors)
     }
+}
+
+fn rust_keyword(identifier: &str) -> bool {
+    matches!(
+        identifier,
+        "abstract"
+            | "as"
+            | "async"
+            | "await"
+            | "become"
+            | "box"
+            | "break"
+            | "const"
+            | "continue"
+            | "crate"
+            | "default"
+            | "do"
+            | "dyn"
+            | "else"
+            | "enum"
+            | "extern"
+            | "false"
+            | "final"
+            | "fn"
+            | "for"
+            | "gen"
+            | "if"
+            | "impl"
+            | "in"
+            | "let"
+            | "loop"
+            | "macro"
+            | "match"
+            | "mod"
+            | "move"
+            | "mut"
+            | "override"
+            | "priv"
+            | "pub"
+            | "raw"
+            | "ref"
+            | "return"
+            | "safe"
+            | "self"
+            | "static"
+            | "struct"
+            | "super"
+            | "trait"
+            | "true"
+            | "try"
+            | "type"
+            | "typeof"
+            | "union"
+            | "unsafe"
+            | "unsized"
+            | "use"
+            | "virtual"
+            | "where"
+            | "while"
+            | "yield"
+    )
 }
 
 fn capture_refines_equal_range(scope: &str) -> bool {
@@ -1627,6 +1809,188 @@ mod tests {
     }
 
     #[test]
+    fn incremental_highlighting_matches_cold_parses_across_unicode_and_context_changes() {
+        for (language, sources) in [
+            (
+                "rust",
+                vec![
+                    "fn greet() { let value = \"café\"; }\n",
+                    "fn greet() { let value = \"café 🦀\"; }\n",
+                    "fn greet() { /* comment\nvalue */ let value = 42; }\n",
+                    "fn greet() { return; }\n",
+                ],
+            ),
+            (
+                "yaml",
+                vec![
+                    "root:\n  title: café\n",
+                    "root:\n  title: \"café 世界\"\n  nested:\n    enabled: true\n",
+                    "root:\n  title: value\n",
+                ],
+            ),
+            (
+                "markdown",
+                vec![
+                    "# Example\n\n```rust\nfn greet() {}\n```\n",
+                    "# Example 🦀\n\n```rust\nfn greet() { let value = 1; }\n```\n",
+                    "# Example\n\n```javascript\nconst value = true;\n```\n",
+                ],
+            ),
+        ] {
+            let mut incremental = highlighter();
+            for source in sources {
+                let actual = incremental.highlight(language, source).unwrap();
+                let expected = highlighter().highlight(language, source).unwrap();
+                let shape = |styles: &[StyleInfo]| {
+                    styles
+                        .iter()
+                        .map(|style| (style.start, style.end, style.style.clone()))
+                        .collect::<Vec<_>>()
+                };
+                assert_eq!(shape(&actual), shape(&expected), "{language}: {source}");
+            }
+        }
+    }
+
+    #[test]
+    fn rust_identifier_edits_reuse_captures_without_reparsing() {
+        let sources = [
+            "fn greeting(value: usize) -> usize { value + 1 }\n",
+            "fn gλreeting(value: usize) -> usize { value + 1 }\n",
+            "fn gλreeting(va世界lue: usize) -> usize { value + 1 }\n",
+            "fn gλreeting(valλue: usize) -> usize { value + 1 }\n",
+            "fn gλreeting(value: usize) -> usize { value + 1 }\n",
+        ];
+        let mut incremental = highlighter();
+        incremental.highlight("rust", sources[0]).unwrap();
+
+        for source in &sources[1..] {
+            let actual = incremental.highlight("rust", source).unwrap();
+            let expected = highlighter().highlight("rust", source).unwrap();
+            let shape = |styles: &[StyleInfo]| {
+                styles
+                    .iter()
+                    .map(|style| (style.start, style.end, style.style.clone()))
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(shape(&actual), shape(&expected), "{source}");
+            assert!(
+                incremental.highlighters["rust"]
+                    .cached_tree
+                    .as_ref()
+                    .unwrap()
+                    .tree
+                    .root_node()
+                    .has_changes(),
+                "interior identifier edits should reuse the edited syntax tree: {source}"
+            );
+        }
+    }
+
+    #[test]
+    fn rust_identifier_edits_reuse_captures_inside_real_editor_viewports() {
+        let mut source = include_str!("editor.rs")
+            .lines()
+            .skip(60)
+            .take(80)
+            .collect::<Vec<_>>()
+            .join("\n");
+        source.push('\n');
+        let insertion = source.find("\nuse crate::{").unwrap() + 1;
+        let mut incremental = highlighter();
+        incremental.highlight("rust", &source).unwrap();
+        source.insert(insertion, 'a');
+        incremental.highlight("rust", &source).unwrap();
+        for (offset, character) in ['λ', 'a', 'λ', 'a'].into_iter().enumerate() {
+            let cursor = insertion
+                + source[insertion..]
+                    .char_indices()
+                    .nth(offset + 1)
+                    .unwrap()
+                    .0;
+            source.insert(cursor, character);
+            incremental.highlight("rust", &source).unwrap();
+            assert!(
+                incremental.highlighters["rust"]
+                    .cached_tree
+                    .as_ref()
+                    .unwrap()
+                    .tree
+                    .root_node()
+                    .has_changes(),
+                "real Rust viewport identifier edit should reuse existing captures"
+            );
+        }
+    }
+
+    #[test]
+    fn rust_identifier_edits_reparse_keywords_boundaries_and_custom_queries() {
+        let cases = [
+            (
+                "fn example() { let usae = 1; }\n",
+                "fn example() { let use = 1; }\n",
+            ),
+            (
+                "fn example() { let value = 1; }\n",
+                "fn example() { let value! = 1; }\n",
+            ),
+            (
+                "fn Example() { let value = 1; }\n",
+                "fn Exλample() { let value = 1; }\n",
+            ),
+        ];
+
+        for (before, after) in cases {
+            let mut incremental = highlighter();
+            incremental.highlight("rust", before).unwrap();
+            let actual = incremental.highlight("rust", after).unwrap();
+            let expected = highlighter().highlight("rust", after).unwrap();
+            let shape = |styles: &[StyleInfo]| {
+                styles
+                    .iter()
+                    .map(|style| (style.start, style.end, style.style.clone()))
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(shape(&actual), shape(&expected), "{after}");
+            assert!(
+                !incremental.highlighters["rust"]
+                    .cached_tree
+                    .as_ref()
+                    .unwrap()
+                    .tree
+                    .root_node()
+                    .has_changes(),
+                "syntax-changing identifier edits must reparse: {after}"
+            );
+        }
+
+        let mut registry = LanguageRegistry::bundled();
+        registry
+            .languages
+            .get_mut("rust")
+            .unwrap()
+            .highlight_queries
+            .push("((identifier) @function (#match? @function \"λ\"))".to_string());
+        let registry = Arc::new(registry);
+        let theme = parse_vscode_theme("themes/mocha.json").unwrap();
+        let mut customized = Highlighter::with_registry(&theme, Arc::clone(&registry)).unwrap();
+        customized.highlight("rust", "fn greeting() {}\n").unwrap();
+        let actual = customized.highlight("rust", "fn gλreeting() {}\n").unwrap();
+        let expected = Highlighter::with_registry(&theme, registry)
+            .unwrap()
+            .highlight("rust", "fn gλreeting() {}\n")
+            .unwrap();
+        assert_eq!(actual.len(), expected.len());
+        assert!(!customized.highlighters["rust"]
+            .cached_tree
+            .as_ref()
+            .unwrap()
+            .tree
+            .root_node()
+            .has_changes());
+    }
+
+    #[test]
     fn oversized_highlight_requests_do_not_retain_source_or_styles() {
         let mut highlighter = highlighter();
         highlighter.highlight("rust", "fn cached() {}").unwrap();
@@ -1635,6 +1999,7 @@ mod tests {
         let source = format!("// {}", "a".repeat(MAX_CACHED_HIGHLIGHT_BYTES));
         highlighter.highlight("rust", &source).unwrap();
         assert!(highlighter.cached_highlight.is_none());
+        assert!(highlighter.highlighters["rust"].cached_tree.is_none());
     }
 
     #[test]

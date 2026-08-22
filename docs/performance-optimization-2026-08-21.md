@@ -101,6 +101,8 @@ navigation baselines were frozen after rebasing to `d92777c`.
 | Shared ASCII grapheme counting | 94.94% |
 | ASCII LSP rename-symbol extraction | 94.70% |
 | LSP absolute-document routing | 94.68% |
+| Real-terminal redundant full-frame publication | 93.65% |
+| Real-terminal edit-invalidated Rust highlighting | 93.42% |
 | Shared display-column-to-scalar conversion | 93.33% |
 | Unicode Vim line-end operators | 93.21% |
 | Editor scalar-to-grapheme cursor conversion | 92.82% |
@@ -136,7 +138,9 @@ navigation baselines were frozen after rebasing to `d92777c`.
 | Long-line Vim backward word motion | 80.33% |
 | Theme hexadecimal color parsing | 79.71% |
 | Detached incremental frame serialization | 79.06% |
+| Real-terminal completion-aware edit frames | 78.19% |
 | Shared Vim final sentence cursor boundary | 75.93% |
+| Real-terminal typing action handling | 75.81% |
 | Embedded forward Delete-key editing | 75.72% |
 | Shared Vim final paragraph cursor boundary | 75.63% |
 | Shared Vim Unicode forward character search | 75.52% |
@@ -147,12 +151,14 @@ navigation baselines were frozen after rebasing to `d92777c`.
 | Shared Vim ASCII around quoted text objects | 74.66% |
 | Shared Vim sentence navigation | 74.63% |
 | LSP incremental large-document changes | 74.61% |
+| Real-terminal text-insertion events | 74.32% |
 | Shared Vim Unicode inner quoted text objects | 74.07% |
 | Embedded Vim long-line end motions | 72.63% |
 | Shared Vim paragraph navigation | 72.60% |
 | Undo history capacity pruning | 72.42% |
 | ASCII automatic indentation columns | 71.81% |
 | Unicode automatic indentation columns | 71.42% |
+| Real-terminal edited-window painting | 69.23% |
 | LSP completion filtering | 67.58% |
 | Vim first-nonblank line-start operators | 64.81% |
 | Structured picker ranking | 64.81% |
@@ -161,8 +167,6 @@ navigation baselines were frozen after rebasing to `d92777c`.
 | Shared Vim inner paragraph text objects | 63.01% |
 | Git workspace status directory indexing | 60.28% |
 | Git repository discovery and branch refresh | 58.73% |
-| Real-terminal typing action handling | 57.59% |
-| Real-terminal text-insertion events | 56.64% |
 | Plugin cursor-event delivery | 56.35% |
 | In-buffer search navigation | 55.98% |
 | Owned Husk JSON boundary conversion | 54.49% |
@@ -463,24 +467,43 @@ Unicode text insertions at four-millisecond spacing through the production
 executable on a 50-row, 120-column PTY. The harness disables first-run release
 notes and requires one observed insertion per requested key so modal dialogs
 cannot silently intercept the workload. Median user-visible typing events fell
-from 1,589 to 689 microseconds, and complete action handling fell from 1,561 to
-662 microseconds. Cursor-moved plugin delivery fell from 727 to 36 microseconds
-because indentation guides reuse an exact visible-geometry signature across
-ordinary same-line text edits and horizontal motion. Editor chrome fell from 85
-to 16 microseconds, and bundled plugin startup fell from 35,873 to 17,263
-microseconds. Syntax-highlight cache misses still consumed 290 microseconds per
-optimized key. Complete frames improved only 27.26%, window painting 17.35%,
-full interactive startup 41.06%, and terminal diff and flush 26.83%; those
-end-to-end paths remain open. Process-to-first-paint also remains unresolved
+from 1,612 to 414 microseconds, and complete action handling fell from 1,575 to
+381 microseconds. Cursor-moved plugin delivery independently fell from 727 to
+36 microseconds because indentation guides reuse an exact visible-geometry
+signature across ordinary same-line text edits and horizontal motion.
+
+Automatic completion previously forced a complete editor render for each
+subsequent text insertion. Completion-aware surface reuse reduced the median
+production edit frame from 587 to 128 microseconds and the number of full
+frames in each 60-insertion session from 63 to four. The replacement frame
+includes every visible editor window, status line, completion popup, cursor,
+and terminal diff; even compared against only the previous window-paint phase,
+it improved from 416 to 128 microseconds. Docked panes, modal dialogs, visible
+overlays, signature help, and other unsafe surfaces retain the complete-frame
+fallback.
+
+Edit-invalidated Rust highlighting fell from 304 to 20 microseconds. Bounded
+per-language syntax trees support incremental parsing after general source
+edits. Interior edits to ordinary lowercase bundled-Rust identifiers additionally
+reuse their existing Tree-sitter captures, shifting every UTF-8 byte span and
+cached tree by the exact edit. The shortcut excludes token boundaries, reserved
+keywords, uppercase-sensitive names, non-identifier Unicode, custom queries,
+and source or span cache-limit violations; Unicode edits, comments, YAML
+context, Markdown language injections, and fresh-parser parity remain covered.
+
+Editor chrome independently fell from 85 to 16 microseconds, and bundled plugin
+startup fell from 35,873 to 17,263 microseconds. Full interactive startup still
+improved only 41.88%, terminal diff and flush only 21.95%, and overlay/cursor
+composition remained unchanged. Process-to-first-paint also remains unresolved
 because executable warm-up and filesystem effects make its samples unstable.
 
 ## Remaining gaps
 
-- Single-file process startup, full interactive startup, complete real-terminal
-  frames, window painting, edit-invalidated syntax highlighting, overlay/cursor
-  composition, terminal diff and flush, recovery snapshot writes, in-repository
-  Git subprocess status refresh, broader Vim editing, platform-specific paths,
-  and several other areas above do not yet meet the 50% improvement target.
+- Single-file process startup, full interactive startup, overlay/cursor
+  composition, terminal diff and flush, general non-identifier syntax edits,
+  recovery snapshot writes, in-repository Git subprocess status refresh, broader
+  Vim editing, platform-specific paths, and several other areas above do not yet
+  meet the 50% improvement target.
 - Real-repository Git status refresh improved 35.67%, from 418,087 to 268,941
   microseconds across 32 requests, but the remaining `git status` subprocess
   still keeps this path below the target.

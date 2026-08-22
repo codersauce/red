@@ -18984,18 +18984,9 @@ impl Editor {
                     self.scheduled_completion = None;
                 }
 
-                if self
-                    .current_dialog
-                    .as_ref()
-                    .map(|dialog| dialog.allows_event_passthrough())
-                    .unwrap_or(false)
-                {
-                    self.render(buffer)?;
-                } else {
-                    let draw_span = perf::PerfSpan::start("edit:draw_line");
-                    self.render_edited_window_rows(buffer)?;
-                    drop(draw_span);
-                }
+                let draw_span = perf::PerfSpan::start("edit:draw_line");
+                self.render_edited_window_rows(buffer)?;
+                drop(draw_span);
             }
             Action::DeleteCharAt(x, y) => {
                 self.begin_transaction("delete char");
@@ -20815,16 +20806,7 @@ impl Editor {
                 if started_transaction {
                     self.commit_transaction(self.cursor_snapshot());
                 }
-                if self
-                    .current_dialog
-                    .as_ref()
-                    .map(|dialog| dialog.allows_event_passthrough())
-                    .unwrap_or(false)
-                {
-                    self.render(buffer)?;
-                } else {
-                    self.render_edited_window_rows(buffer)?;
-                }
+                self.render_edited_window_rows(buffer)?;
             }
             Action::Save => {
                 if !self.save_action(buffer, runtime).await? {
@@ -38215,6 +38197,7 @@ builtin = "rust"
         completion.show(vec![completion_item("alpha")], completion_x, completion_y);
         editor.current_dialog = Some(Box::new(completion));
         editor.render(&mut render_buffer).unwrap();
+        let full_renders = editor.full_render_count;
 
         let event = Event::Key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE));
         if let Some(action) = editor.handle_event(&event).unwrap() {
@@ -38229,6 +38212,10 @@ builtin = "rust"
         assert!(
             rendered_row.contains("config_file.e"),
             "expected active row {active_row} to show typed text, got {rendered_row:?}"
+        );
+        assert_eq!(
+            editor.full_render_count, full_renders,
+            "completion typing should repaint the editor without forcing a full frame"
         );
     }
 

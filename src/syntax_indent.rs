@@ -483,7 +483,7 @@ fn point(source: &str, byte: usize) -> Point {
     )
 }
 
-fn replacement_edit(old: &str, new: &str) -> InputEdit {
+pub(crate) fn replacement_edit(old: &str, new: &str) -> InputEdit {
     let mut start = old
         .bytes()
         .zip(new.bytes())
