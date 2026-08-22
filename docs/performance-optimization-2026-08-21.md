@@ -70,6 +70,7 @@ navigation baselines were frozen after rebasing to `d92777c`.
 | Husk unchanged document updates | 98.44% |
 | Viewport cursor snapshot updates | 98.58% |
 | Embedded Vim line-boundary motions | 98.48% |
+| Shared Vim final-sentence operators | 98.20% |
 | Gutter namespace updates | 97.94% |
 | Embedded Vim word motions | 97.88% |
 | Decoration namespace updates | 97.48% |
@@ -102,6 +103,7 @@ navigation baselines were frozen after rebasing to `d92777c`.
 | Undo history capacity pruning | 72.42% |
 | LSP completion filtering | 67.58% |
 | Structured picker ranking | 64.81% |
+| Shared Vim paragraph boundary operators | 63.42% |
 | Git workspace status directory indexing | 60.28% |
 | Git repository discovery and branch refresh | 58.73% |
 | Plugin cursor-event delivery | 56.35% |
@@ -161,6 +163,13 @@ a 1,024-line draft. Eleven alternating release-build samples reduced the median
 from 8,938 to 279 microseconds while preserving normalized CRLF, empty drafts,
 multiline boundaries, combining marks, family emoji, regional-indicator flags,
 out-of-range cursor clamping, and the original Unicode grapheme-counting path.
+
+Shared Vim operator boundaries were measured over 2,048 production paragraph
+and sentence range resolutions ending at a large document's final line. Eleven
+alternating release-build samples reduced paragraph medians from 7,014 to 2,566
+microseconds and final-sentence medians from 158,573 to 2,847 microseconds while
+preserving punctuation boundaries, leading whitespace, linewise register shape,
+Unicode scalars, and empty or unterminated final sentences.
 
 Multi-file startup uses the same production loader as the executable. Across
 four startup passes over 128 distinct source files, seven alternating samples

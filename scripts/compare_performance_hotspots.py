@@ -64,6 +64,8 @@ SCENARIOS = (
     "textarea-delete",
     "textarea-word-delete",
     "textarea-home-end",
+    "paragraph-operator",
+    "sentence-operator",
     "husk-completion",
     "husk-config",
     "husk-update",

@@ -382,8 +382,21 @@ impl<'buffer> MotionResolver<'buffer> {
             return None;
         }
 
-        let units = self.sentence_units();
         let mut cursor = self.buffer.position_to_char_idx(self.cursor);
+        if !backward && count <= 1 && self.cursor.line == self.buffer.last_navigable_line() {
+            let contents = self.buffer.contents_snapshot();
+            let mut remaining = contents.chars_at(cursor);
+            if remaining.next().is_some_and(|character| {
+                !character.is_whitespace() && !matches!(character, '.' | '!' | '?')
+            }) && remaining.all(|character| !matches!(character, '.' | '!' | '?' | '\n' | '\r'))
+            {
+                return Some(BoundaryMotion {
+                    position: self.last_cursor_position(),
+                    ends_at_buffer: true,
+                });
+            }
+        }
+        let units = self.sentence_units();
 
         for _ in 0..count.max(1) {
             if backward {
@@ -451,9 +464,7 @@ impl<'buffer> MotionResolver<'buffer> {
         }
 
         if motion.ends_at_buffer {
-            let end = self
-                .buffer
-                .char_idx_to_position(self.buffer.contents().chars().count());
+            let end = self.buffer.char_idx_to_position(self.buffer.char_len());
             if cursor == end {
                 return None;
             }
@@ -1123,6 +1134,27 @@ mod tests {
         let (range, linewise) = at_end.sentence_range(1, false).unwrap();
         assert!(!linewise);
         assert_eq!(buffer.text_in_range(range), "a");
+    }
+
+    #[test]
+    fn final_sentence_ranges_preserve_unicode_whitespace_and_punctuation_boundaries() {
+        for (text, character, expected) in [
+            ("first.\n\nfinal words", 0, "final words"),
+            ("first.\n\n  final words", 2, "final words"),
+            ("first.\n\n漢字 👋 tail", 0, "漢字 👋 tail"),
+            ("first.\n\nfinal. another", 0, "final. "),
+        ] {
+            let buffer = Buffer::new(None, text.to_string());
+            let line = buffer.last_navigable_line();
+            let resolver = MotionResolver::new(&buffer, TextPosition::new(line, character));
+            let (range, _) = resolver.sentence_range(1, false).unwrap();
+            assert_eq!(buffer.text_in_range(range), expected, "{text:?}");
+        }
+
+        let buffer = Buffer::new(None, "first.\n\n  final words".to_string());
+        let whitespace = MotionResolver::new(&buffer, TextPosition::new(2, 0));
+        let (range, _) = whitespace.sentence_range(1, false).unwrap();
+        assert_eq!(buffer.text_in_range(range), "  final words");
     }
 
     #[test]

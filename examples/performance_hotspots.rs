@@ -267,6 +267,12 @@ fn main() -> Result<()> {
     if scenario == "all" || scenario == "textarea-home-end" {
         results.push(benchmark_embedded_home_end_navigation()?);
     }
+    if scenario == "all" || scenario == "paragraph-operator" {
+        results.push(benchmark_boundary_operator(/*sentence*/ false)?);
+    }
+    if scenario == "all" || scenario == "sentence-operator" {
+        results.push(benchmark_boundary_operator(/*sentence*/ true)?);
+    }
 
     anyhow::ensure!(
         !results.is_empty(),
@@ -1803,6 +1809,37 @@ fn benchmark_embedded_home_end_navigation() -> Result<serde_json::Value> {
     );
     Ok(report(
         "embedded_home_end_document_navigation",
+        started,
+        TEXTAREA_VIM_MOTIONS,
+    ))
+}
+
+fn benchmark_boundary_operator(sentence: bool) -> Result<serde_json::Value> {
+    let prefix = "ordinary sentence. another follows.\n\n".repeat(768);
+    let ending = "final sentence with ordinary words";
+    let buffer = Buffer::new(None, format!("{prefix}{ending}"));
+    let cursor = buffer.char_idx_to_position(prefix.len());
+    let resolver = MotionResolver::new(&buffer, cursor);
+    let started = Instant::now();
+    for _ in 0..TEXTAREA_VIM_MOTIONS {
+        let (range, _) = if sentence {
+            resolver.sentence_range(/*count*/ 1, /*backward*/ false)
+        } else {
+            resolver.paragraph_range(/*count*/ 1, /*backward*/ false)
+        }
+        .ok_or_else(|| anyhow::anyhow!("boundary operator did not reach the document end"))?;
+        anyhow::ensure!(
+            range.end == buffer.char_idx_to_position(prefix.len() + ending.len()),
+            "boundary operator selected the wrong document end"
+        );
+        black_box(range);
+    }
+    Ok(report(
+        if sentence {
+            "shared_vim_sentence_operator_document_boundary"
+        } else {
+            "shared_vim_paragraph_operator_document_boundary"
+        },
         started,
         TEXTAREA_VIM_MOTIONS,
     ))

@@ -584,6 +584,11 @@ impl Buffer {
         self.content.len_bytes()
     }
 
+    /// Returns the Unicode scalar count without flattening or scanning the rope.
+    pub(crate) fn char_len(&self) -> usize {
+        self.content.len_chars()
+    }
+
     /// Checks ASCII without flattening or scanning the rope.
     pub(crate) fn is_ascii(&self) -> bool {
         self.content.len_bytes() == self.content.len_chars()
