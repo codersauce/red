@@ -25,6 +25,9 @@ use red::{
     theme::{parse_vscode_theme, parse_vscode_theme_contents, Style, Theme},
     ui::{CompletionUI, Picker, PickerItem, PickerOptions},
     undo::{CursorSnapshot, TextPosition, TextRange, UndoHistory},
+    unicode_utils::{
+        char_to_column, column_to_char, column_to_grapheme_with_tabs, grapheme_to_column_with_tabs,
+    },
 };
 use serde_json::json;
 
@@ -247,6 +250,26 @@ fn main() -> Result<()> {
     }
     if scenario == "all" || scenario == "editor-rename-unicode" {
         results.push(benchmark_editor_rename_symbol(/*unicode*/ true)?);
+    }
+    if scenario == "all" || scenario == "column-scalar-forward" {
+        results.push(benchmark_display_coordinate_conversion(
+            /*grapheme*/ false, /*reverse*/ false,
+        )?);
+    }
+    if scenario == "all" || scenario == "column-scalar-reverse" {
+        results.push(benchmark_display_coordinate_conversion(
+            /*grapheme*/ false, /*reverse*/ true,
+        )?);
+    }
+    if scenario == "all" || scenario == "column-grapheme-forward" {
+        results.push(benchmark_display_coordinate_conversion(
+            /*grapheme*/ true, /*reverse*/ false,
+        )?);
+    }
+    if scenario == "all" || scenario == "column-grapheme-reverse" {
+        results.push(benchmark_display_coordinate_conversion(
+            /*grapheme*/ true, /*reverse*/ true,
+        )?);
     }
     if scenario == "all" || scenario == "paragraph" {
         results.push(benchmark_paragraph_motion());
@@ -1205,6 +1228,38 @@ fn benchmark_editor_rename_symbol(unicode: bool) -> Result<serde_json::Value> {
         },
         started,
         WORD_OPERATOR_LOOKUPS,
+    ))
+}
+
+fn benchmark_display_coordinate_conversion(
+    grapheme: bool,
+    reverse: bool,
+) -> Result<serde_json::Value> {
+    let line = "ordinary_identifier ".repeat(1_024);
+    let position = line.len() - 1;
+    let started = Instant::now();
+    for _ in 0..TEXTAREA_VIM_MOTIONS {
+        let converted = match (grapheme, reverse) {
+            (false, false) => char_to_column(&line, position),
+            (false, true) => column_to_char(&line, position),
+            (true, false) => grapheme_to_column_with_tabs(&line, position, /*tab_width*/ 4),
+            (true, true) => column_to_grapheme_with_tabs(&line, position, /*tab_width*/ 4),
+        };
+        anyhow::ensure!(
+            converted == position,
+            "display coordinate conversion changed its scalar or grapheme boundary"
+        );
+        black_box(converted);
+    }
+    Ok(report(
+        match (grapheme, reverse) {
+            (false, false) => "shared_ascii_scalar_to_display_column",
+            (false, true) => "shared_ascii_display_column_to_scalar",
+            (true, false) => "shared_ascii_grapheme_to_display_column",
+            (true, true) => "shared_ascii_display_column_to_grapheme",
+        },
+        started,
+        TEXTAREA_VIM_MOTIONS,
     ))
 }
 

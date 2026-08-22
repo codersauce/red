@@ -67,6 +67,8 @@ navigation baselines were frozen after rebasing to `d92777c`.
 | Crash-recovery buffer restoration | 99.77% |
 | Repeated themed syntax highlighting | 99.61% |
 | Git status requests outside repositories | 99.58% |
+| Shared display-column-to-grapheme conversion | 99.46% |
+| Shared grapheme-to-display-column conversion | 99.45% |
 | Embedded text-area ASCII typing | 99.29% |
 | Agent streamed transcript updates | 99.18% |
 | Shared modal editor word operators | 99.17% |
@@ -98,6 +100,7 @@ navigation baselines were frozen after rebasing to `d92777c`.
 | Shared ASCII grapheme counting | 94.94% |
 | ASCII LSP rename-symbol extraction | 94.70% |
 | LSP absolute-document routing | 94.68% |
+| Shared display-column-to-scalar conversion | 93.33% |
 | Unicode Vim line-end operators | 93.21% |
 | Editor scalar-to-grapheme cursor conversion | 92.82% |
 | Workspace inline file discovery | 92.65% |
@@ -110,6 +113,7 @@ navigation baselines were frozen after rebasing to `d92777c`.
 | Embedded Vim nested delimiter matching | 90.03% |
 | ASCII Vim line-end operators | 89.83% |
 | ASCII Unicode-scalar line boundaries | 89.78% |
+| Shared scalar-to-display-column conversion | 89.31% |
 | Unicode scalar line boundaries | 89.12% |
 | Sparse Unicode full-buffer regex searching | 89.12% |
 | Shared Vim escaped-quote text objects | 88.86% |
@@ -311,6 +315,17 @@ Unicode medians fell from 4,101 to 718 microseconds. The shared indexed paths
 preserve LF/CRLF endings, missing lines, scalar versus grapheme boundaries,
 cursor saturation, punctuation, underscores, combining marks, emoji, CJK,
 Unicode symbols, and viewport offsets.
+
+Shared terminal-coordinate helpers were independently measured across 2,048
+forward and reverse Unicode-scalar and tab-aware grapheme conversions on 20 KiB
+ASCII lines. Eleven alternating release-build samples reduced scalar-to-column
+medians from 19,969 to 2,135 microseconds, column-to-scalar medians from 32,116
+to 2,141 microseconds, grapheme-to-column medians from 388,290 to 2,130
+microseconds, and column-to-grapheme medians from 394,493 to 2,131
+microseconds. Exhaustive alignment checks preserve all 128 ASCII values,
+zero-width control characters, tab stops, LF/CRLF, Unicode byte boundaries,
+combining marks, CJK, emoji sequences, regional-indicator flags, and saturated
+cursor positions.
 
 Shared Vim paragraph objects were independently measured across 128 inner and
 128 around selections spanning 768-line paragraphs. Eleven alternating

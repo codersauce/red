@@ -57,7 +57,27 @@ pub fn display_width_with_tabs(s: &str, tab_width: usize) -> usize {
 }
 
 pub fn is_printable_ascii(s: &str) -> bool {
-    s.bytes().all(|b| (0x20..=0x7E).contains(&b))
+    const HIGH_BITS: u64 = 0x8080_8080_8080_8080;
+    const SPACE_BYTES: u64 = 0x2020_2020_2020_2020;
+    const ONE_BYTES: u64 = 0x0101_0101_0101_0101;
+
+    let mut chunks = s.as_bytes().chunks_exact(std::mem::size_of::<u64>());
+    if chunks.any(|chunk| {
+        let bytes: [u8; std::mem::size_of::<u64>()] = chunk
+            .try_into()
+            .expect("chunks_exact always produces full machine words");
+        let word = u64::from_ne_bytes(bytes);
+        word & HIGH_BITS != 0
+            || word.wrapping_sub(SPACE_BYTES) & !word & HIGH_BITS != 0
+            || word.wrapping_add(ONE_BYTES) & HIGH_BITS != 0
+    }) {
+        return false;
+    }
+
+    chunks
+        .remainder()
+        .iter()
+        .all(|byte| (0x20..=0x7E).contains(byte))
 }
 
 /// Calculate terminal display width from an existing display column.
@@ -320,11 +340,17 @@ pub fn prev_grapheme_boundary(s: &str, byte_offset: usize) -> Option<usize> {
 
 /// Calculate the display column of a character at a given character index
 pub fn char_to_column(line: &str, char_idx: usize) -> usize {
+    if let Some(column) = printable_ascii_coordinate(line, char_idx, /*reverse*/ false) {
+        return column;
+    }
     line.chars().take(char_idx).map(char_display_width).sum()
 }
 
 /// Find the character index that contains the given display column
 pub fn column_to_char(line: &str, target_column: usize) -> usize {
+    if let Some(character) = printable_ascii_coordinate(line, target_column, /*reverse*/ true) {
+        return character;
+    }
     let mut current_column = 0;
     let mut char_count = 0;
 
@@ -352,6 +378,9 @@ pub fn grapheme_to_column(line: &str, grapheme_idx: usize) -> usize {
 
 /// Calculate a grapheme's display column while expanding tabs.
 pub fn grapheme_to_column_with_tabs(line: &str, grapheme_idx: usize, tab_width: usize) -> usize {
+    if let Some(column) = printable_ascii_coordinate(line, grapheme_idx, /*reverse*/ false) {
+        return column;
+    }
     let tab_width = tab_width.max(1);
     let mut column = 0;
     for grapheme in line.graphemes(true).take(grapheme_idx) {
@@ -383,6 +412,9 @@ pub fn column_to_grapheme(line: &str, target_column: usize) -> usize {
 
 /// Find the grapheme containing a display column while expanding tabs.
 pub fn column_to_grapheme_with_tabs(line: &str, target_column: usize, tab_width: usize) -> usize {
+    if let Some(grapheme) = printable_ascii_coordinate(line, target_column, /*reverse*/ true) {
+        return grapheme;
+    }
     let tab_width = tab_width.max(1);
     let mut current_column = 0;
     let mut grapheme_count = 0;
@@ -401,6 +433,17 @@ pub fn column_to_grapheme_with_tabs(line: &str, target_column: usize, tab_width:
     }
 
     grapheme_count
+}
+
+fn printable_ascii_coordinate(line: &str, position: usize, reverse: bool) -> Option<usize> {
+    let cursor = position.min(line.len());
+    let end = if reverse {
+        cursor.saturating_add(1).min(line.len())
+    } else {
+        cursor
+    };
+    let prefix = line.get(..end)?;
+    is_printable_ascii(prefix).then_some(cursor)
 }
 
 #[cfg(test)]
@@ -455,6 +498,106 @@ mod tests {
         assert!(!is_printable_ascii("left\tright"));
         assert_eq!(display_width_with_tabs("line\r", 4), 4);
         assert_eq!(display_width_with_tabs("left\tright", 4), 13);
+    }
+
+    #[test]
+    fn printable_ascii_word_scanning_preserves_every_ascii_byte_and_alignment() {
+        for byte in 0..=0x7f {
+            for offset in 0..24 {
+                let mut bytes = vec![b'A'; 25];
+                bytes[offset] = byte;
+                let text = std::str::from_utf8(&bytes).unwrap();
+                assert_eq!(
+                    is_printable_ascii(text),
+                    (0x20..=0x7e).contains(&byte),
+                    "byte={byte:#04x} offset={offset}"
+                );
+            }
+        }
+        for text in ["ordinary λ", "ordinary 👋", "ordinary 終", "e\u{301}"] {
+            assert!(!is_printable_ascii(text), "{text:?}");
+        }
+    }
+
+    #[test]
+    fn printable_ascii_coordinates_preserve_unicode_controls_tabs_and_bounds() {
+        for text in [
+            "",
+            "ordinary ASCII words",
+            "\tleading tab",
+            "prefix\tinside",
+            "prefix\r\n",
+            "prefix\0inside\u{7f}",
+            "hello世界",
+            "e\u{301}clair 👋 終",
+            "👨‍👩‍👧 family 🇧🇷",
+            "\u{301}leading combining",
+        ] {
+            for position in [0, 1, 2, 3, 5, 9, 20, 64, usize::MAX] {
+                let expected_forward = text
+                    .chars()
+                    .take(position)
+                    .map(char_display_width)
+                    .sum::<usize>();
+                let mut expected_reverse = 0;
+                let mut column = 0;
+                for (index, character) in text.chars().enumerate() {
+                    let width = char_display_width(character);
+                    if column + width > position {
+                        expected_reverse = index;
+                        break;
+                    }
+                    column += width;
+                    expected_reverse = index + 1;
+                }
+                assert_eq!(
+                    char_to_column(text, position),
+                    expected_forward,
+                    "scalar forward {text:?} position={position}"
+                );
+                assert_eq!(
+                    column_to_char(text, position),
+                    expected_reverse,
+                    "scalar reverse {text:?} position={position}"
+                );
+                for tab_width in [0, 1, 2, 4, 8] {
+                    let width = tab_width.max(1);
+                    let mut expected_grapheme_forward = 0;
+                    for grapheme in text.graphemes(true).take(position) {
+                        expected_grapheme_forward += if grapheme == "\t" {
+                            width - (expected_grapheme_forward % width)
+                        } else {
+                            display_width(grapheme)
+                        };
+                    }
+                    let mut expected_grapheme_reverse = 0;
+                    let mut display_column = 0;
+                    for (index, grapheme) in text.graphemes(true).enumerate() {
+                        let grapheme_width = if grapheme == "\t" {
+                            width - (display_column % width)
+                        } else {
+                            display_width(grapheme)
+                        };
+                        if display_column + grapheme_width > position {
+                            expected_grapheme_reverse = index;
+                            break;
+                        }
+                        display_column += grapheme_width;
+                        expected_grapheme_reverse = index + 1;
+                    }
+                    assert_eq!(
+                        grapheme_to_column_with_tabs(text, position, tab_width),
+                        expected_grapheme_forward,
+                        "grapheme forward {text:?} position={position} tabs={tab_width}"
+                    );
+                    assert_eq!(
+                        column_to_grapheme_with_tabs(text, position, tab_width),
+                        expected_grapheme_reverse,
+                        "grapheme reverse {text:?} position={position} tabs={tab_width}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
