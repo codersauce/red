@@ -246,6 +246,15 @@ waiting = "steady_underscore"
 #
 # Apply language changes without restarting using `:languages reload`.
 
+# Manual and insert-mode comment formatting target 100 source columns by default.
+# A language definition can override this with its own text_width.
+# Set text_width to 0 to disable automatic wrapping and make gq use the viewport.
+[commenting]
+text_width = 100
+auto_wrap = true
+continue_on_enter = true
+continue_on_open_line = true
+
 # Comment templates use Neovim's commentstring format. The single %s is
 # replaced with each selected line. Add or override languages and extensions
 # here without installing or starting a language server.
@@ -302,7 +311,7 @@ Esc = { EnterMode = "Normal" }
 "o" = "InsertLineBelowCursor"
 "O" = "InsertLineAtCursor"
 "G" = "MoveToBottom"
-"g" = { "g" = "MoveToTop", "%" = "MatchitBackward", "c" = { StartCommentOperator = 1 }, "d" = "GoToDefinition", "j" = "MoveScreenLineDown", "k" = "MoveScreenLineUp", "0" = "MoveToScreenLineStart", "^" = "MoveToScreenLineFirstNonBlank", "$" = "MoveToScreenLineEnd", "e" = "MoveToPreviousWordEnd", "E" = "MoveToPreviousBigWordEnd", "J" = { JoinLinesKeepSpaces = 2 }, "W" = "ToggleWrap", "v" = "RestoreLastVisualSelection", "u" = { StartLowercaseOperator = 1 }, "U" = { StartUppercaseOperator = 1 }, "~" = { StartToggleCaseOperator = 1 }, "-" = "SelectPreviousUndoBranch", "+" = "SelectNextUndoBranch" }
+"g" = { "g" = "MoveToTop", "%" = "MatchitBackward", "c" = { StartCommentOperator = 1 }, "q" = { StartFormatOperator = 1 }, "d" = "GoToDefinition", "j" = "MoveScreenLineDown", "k" = "MoveScreenLineUp", "0" = "MoveToScreenLineStart", "^" = "MoveToScreenLineFirstNonBlank", "$" = "MoveToScreenLineEnd", "e" = "MoveToPreviousWordEnd", "E" = "MoveToPreviousBigWordEnd", "J" = { JoinLinesKeepSpaces = 2 }, "W" = "ToggleWrap", "v" = "RestoreLastVisualSelection", "u" = { StartLowercaseOperator = 1 }, "U" = { StartUppercaseOperator = 1 }, "~" = { StartToggleCaseOperator = 1 }, "-" = "SelectPreviousUndoBranch", "+" = "SelectNextUndoBranch" }
 "u" = "Undo"
 "U" = "Redo"
 "Ctrl-r" = "Redo"
@@ -491,7 +500,7 @@ Esc = { EnterMode = "Normal" }
 ">" = { IndentSelection = 1 }
 "<" = { UnindentSelection = 1 }
 "J" = [ { JoinLines = 2 }, { EnterMode = "Normal" } ]
-"g" = { "c" = [ "ToggleCommentSelection", { EnterMode = "Normal" } ], "J" = [ { JoinLinesKeepSpaces = 2 }, { EnterMode = "Normal" } ], "v" = "RestoreLastVisualSelection" }
+"g" = { "c" = [ "ToggleCommentSelection", { EnterMode = "Normal" } ], "q" = [ "FormatSelection", { EnterMode = "Normal" } ], "J" = [ { JoinLinesKeepSpaces = 2 }, { EnterMode = "Normal" } ], "v" = "RestoreLastVisualSelection" }
 "u" = [ { TransformSelection = "Lower" }, { EnterMode = "Normal" } ]
 "U" = [ { TransformSelection = "Upper" }, { EnterMode = "Normal" } ]
 "~" = [ { TransformSelection = "Toggle" }, { EnterMode = "Normal" } ]
