@@ -142,6 +142,7 @@ navigation baselines were frozen after rebasing to `d92777c`.
 | Real-terminal cursor-moved plugin delivery | 95.05% |
 | Real-terminal file-picker query resolution | 95.00% |
 | Shared ASCII grapheme counting | 94.94% |
+| Real-repository Git subprocess status refresh | 94.93% |
 | Real-terminal JSON string highlighting | 94.74% |
 | ASCII LSP rename-symbol extraction | 94.70% |
 | LSP absolute-document routing | 94.68% |
@@ -331,6 +332,20 @@ samples reduced the median from 172,090 to 731 microseconds by avoiding Git
 subprocesses when no repository exists. Real repositories retain modified,
 untracked, and ignored status entries, nested repository precedence, linked
 worktrees, canonical roots, and retargeted directory symlinks.
+
+Real-repository Git status requests were independently measured across 32
+production refreshes containing modified, untracked, and ignored files.
+Eleven alternating release-build samples reduced the median from 224,319 to
+11,371 microseconds. A 250-millisecond burst cache retains at most 16
+repository listings and fingerprints at most 512 working-tree entries before
+reusing any subprocess result. Stable paths, file types, permissions, lengths,
+nanosecond modification/change times, Git index, HEAD, current ref, packed
+refs, local configuration, exclude rules, and linked-worktree common
+directories must all remain unchanged. Oversized worktrees, inaccessible
+metadata, changed files or indexes, expired entries, nested repository changes,
+and retargeted symlinks retain the existing fresh Git subprocess. A real
+120-file Git dashboard still starts one Git process during file-list churn
+and none while navigating the diff pane.
 
 Git workspace status indexing was measured over 32 production directory-index
 builds for 2,048 changed files across nested crate directories. Eleven alternating
@@ -875,13 +890,9 @@ filesystem effects make its samples unstable.
 ## Remaining gaps
 
 - Single-file process startup, terminal diff and flush, remaining syntax-token
-  classes and edits inside Markdown fenced-language injections, recovery snapshot writes,
-  in-repository Git subprocess status refresh, broader Vim editing,
-  platform-specific paths, and several other areas above do not yet meet the
-  50% improvement target.
-- Real-repository Git status refresh improved 35.67%, from 418,087 to 268,941
-  microseconds across 32 requests, but the remaining `git status` subprocess
-  still keeps this path below the target.
+  classes and edits inside Markdown fenced-language injections, recovery snapshot
+  writes, broader Vim editing, platform-specific paths, and several other areas
+  above do not yet meet the 50% improvement target.
 - An eager Neo-tree row index was intentionally rejected because it increased
   memory and slowed opening; the retained single-position cache avoids both
   regressions in real 2,048- and 8,192-entry terminal runs.

@@ -29640,6 +29640,10 @@ pub fn git_status_listing(path: &str) -> Value {
         });
     };
 
+    if let Some(listing) = cached_git_status_listing(&root) {
+        return listing;
+    }
+
     let status_output = Command::new("git")
         .arg("-C")
         .arg(&root)
@@ -29652,7 +29656,7 @@ pub fn git_status_listing(path: &str) -> Value {
         ])
         .output();
 
-    match status_output {
+    let listing = match status_output {
         Ok(output) if output.status.success() => {
             let statuses = parse_git_status_records(&output.stdout, &root);
             let status_index = git_status_index(&statuses, &root);
@@ -29675,6 +29679,154 @@ pub fn git_status_listing(path: &str) -> Value {
             "status_index": {},
             "error": err.to_string(),
         }),
+    };
+    if listing["error"].is_null() {
+        cache_git_status_listing(&root, &listing);
+    }
+    listing
+}
+
+struct CachedGitStatus {
+    fingerprint: u64,
+    observed_at: Instant,
+    listing: Value,
+}
+
+static GIT_STATUS_CACHE: std::sync::LazyLock<std::sync::Mutex<HashMap<String, CachedGitStatus>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
+const MAX_GIT_STATUS_CACHE_ENTRIES: usize = 16;
+const MAX_GIT_STATUS_FINGERPRINT_ENTRIES: usize = 512;
+const GIT_STATUS_CACHE_LIFETIME: Duration = Duration::from_millis(250);
+
+fn cached_git_status_listing(root: &str) -> Option<Value> {
+    let cache = GIT_STATUS_CACHE.lock().ok()?;
+    let entry = cache.get(root)?;
+    if entry.observed_at.elapsed() > GIT_STATUS_CACHE_LIFETIME
+        || git_status_fingerprint(Path::new(root))? != entry.fingerprint
+    {
+        return None;
+    }
+    Some(entry.listing.clone())
+}
+
+fn cache_git_status_listing(root: &str, listing: &Value) {
+    let Some(fingerprint) = git_status_fingerprint(Path::new(root)) else {
+        return;
+    };
+    let Ok(mut cache) = GIT_STATUS_CACHE.lock() else {
+        return;
+    };
+    if cache.len() >= MAX_GIT_STATUS_CACHE_ENTRIES && !cache.contains_key(root) {
+        let oldest = cache
+            .iter()
+            .min_by_key(|(_, entry)| entry.observed_at)
+            .map(|(root, _)| root.clone());
+        if let Some(oldest) = oldest {
+            cache.remove(&oldest);
+        }
+    }
+    cache.insert(
+        root.to_owned(),
+        CachedGitStatus {
+            fingerprint,
+            observed_at: Instant::now(),
+            listing: listing.clone(),
+        },
+    );
+}
+
+fn git_status_fingerprint(root: &Path) -> Option<u64> {
+    use std::{
+        collections::hash_map::DefaultHasher,
+        hash::{Hash, Hasher},
+    };
+
+    let mut hasher = DefaultHasher::new();
+    let mut pending = vec![root.to_path_buf()];
+    let mut inspected = 0;
+    while let Some(directory) = pending.pop() {
+        let mut entries = fs::read_dir(&directory)
+            .ok()?
+            .map(|entry| entry.map(|entry| entry.path()))
+            .collect::<Result<Vec<_>, _>>()
+            .ok()?;
+        entries.sort_unstable();
+        for path in entries {
+            if path.file_name() == Some(OsStr::new(".git")) {
+                continue;
+            }
+            inspected += 1;
+            if inspected > MAX_GIT_STATUS_FINGERPRINT_ENTRIES {
+                return None;
+            }
+            path.strip_prefix(root).ok()?.hash(&mut hasher);
+            let metadata = fs::symlink_metadata(&path).ok()?;
+            hash_git_status_metadata(&metadata, &mut hasher);
+            if metadata.is_dir() {
+                pending.push(path);
+            }
+        }
+    }
+
+    let marker = root.join(".git");
+    let git_directory = if marker.is_dir() {
+        marker
+    } else {
+        let pointer = fs::read_to_string(&marker).ok()?;
+        let target = pointer.trim().strip_prefix("gitdir:")?.trim();
+        root.join(target).canonicalize().ok()?
+    };
+    let common_directory = fs::read_to_string(git_directory.join("commondir"))
+        .ok()
+        .map(|target| git_directory.join(target.trim()))
+        .unwrap_or_else(|| git_directory.clone());
+    for path in [
+        git_directory.join("index"),
+        git_directory.join("HEAD"),
+        common_directory.join("config"),
+        common_directory.join("packed-refs"),
+        common_directory.join("info/exclude"),
+    ] {
+        path.hash(&mut hasher);
+        match fs::symlink_metadata(&path) {
+            Ok(metadata) => hash_git_status_metadata(&metadata, &mut hasher),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false.hash(&mut hasher),
+            Err(_) => return None,
+        }
+    }
+    if let Ok(head) = fs::read_to_string(git_directory.join("HEAD")) {
+        head.hash(&mut hasher);
+        if let Some(reference) = head.trim().strip_prefix("ref: ") {
+            let reference = common_directory.join(reference);
+            if let Ok(metadata) = fs::symlink_metadata(reference) {
+                hash_git_status_metadata(&metadata, &mut hasher);
+            }
+        }
+    }
+
+    Some(hasher.finish())
+}
+
+fn hash_git_status_metadata(metadata: &fs::Metadata, hasher: &mut impl std::hash::Hasher) {
+    use std::hash::Hash as _;
+
+    metadata.len().hash(hasher);
+    metadata.is_dir().hash(hasher);
+    metadata.is_symlink().hash(hasher);
+    metadata.permissions().readonly().hash(hasher);
+    if let Ok(modified) = metadata.modified() {
+        modified.hash(hasher);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+
+        metadata.dev().hash(hasher);
+        metadata.ino().hash(hasher);
+        metadata.ctime().hash(hasher);
+        metadata.ctime_nsec().hash(hasher);
+        metadata.mode().hash(hasher);
     }
 }
 
@@ -37630,6 +37782,94 @@ builtin = "rust"
         assert!(listing["statuses"].as_array().unwrap().is_empty());
         assert!(listing["status_index"].as_object().unwrap().is_empty());
         assert!(listing["error"].is_null());
+    }
+
+    #[test]
+    fn git_status_cache_invalidates_worktree_ignored_and_index_changes() {
+        let root = tempfile::tempdir().unwrap();
+        assert!(Command::new("git")
+            .args(["init", "--quiet"])
+            .arg(root.path())
+            .status()
+            .unwrap()
+            .success());
+        fs::write(root.path().join(".gitignore"), "ignored.log\n").unwrap();
+        fs::write(root.path().join("tracked.rs"), "first\n").unwrap();
+        assert!(Command::new("git")
+            .arg("-C")
+            .arg(root.path())
+            .args(["add", ".gitignore", "tracked.rs"])
+            .status()
+            .unwrap()
+            .success());
+        assert!(Command::new("git")
+            .arg("-C")
+            .arg(root.path())
+            .args([
+                "-c",
+                "user.name=Red Test",
+                "-c",
+                "user.email=red@example.invalid",
+                "commit",
+                "--quiet",
+                "-m",
+                "initial",
+            ])
+            .status()
+            .unwrap()
+            .success());
+
+        let path = root.path().to_str().unwrap();
+        let initial = git_status_listing(path);
+        assert_eq!(git_status_listing(path), initial);
+
+        fs::write(root.path().join("tracked.rs"), "changed\n").unwrap();
+        let changed = git_status_listing(path);
+        assert_ne!(changed, initial);
+        assert!(changed["statuses"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["path"] == "tracked.rs" && entry["status"] == "modified"));
+
+        fs::write(root.path().join("untracked.rs"), "untracked\n").unwrap();
+        fs::write(root.path().join("ignored.log"), "ignored\n").unwrap();
+        let expanded = git_status_listing(path);
+        assert!(expanded["statuses"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["path"] == "untracked.rs"));
+        assert!(expanded["statuses"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["path"] == "ignored.log" && entry["status"] == "ignored"));
+
+        assert!(Command::new("git")
+            .arg("-C")
+            .arg(root.path())
+            .args(["add", "untracked.rs", "tracked.rs"])
+            .status()
+            .unwrap()
+            .success());
+        let staged = git_status_listing(path);
+        assert_ne!(staged, expanded);
+        fs::remove_file(root.path().join("ignored.log")).unwrap();
+        assert!(!git_status_listing(path)["statuses"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["path"] == "ignored.log"));
+    }
+
+    #[test]
+    fn git_status_cache_rejects_oversized_worktrees() {
+        let root = tempfile::tempdir().unwrap();
+        for index in 0..=MAX_GIT_STATUS_FINGERPRINT_ENTRIES {
+            fs::write(root.path().join(format!("file-{index:04}.rs")), "x").unwrap();
+        }
+        assert!(git_status_fingerprint(root.path()).is_none());
     }
 
     #[test]
