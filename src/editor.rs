@@ -16012,10 +16012,7 @@ impl Editor {
             if runtime.command_plugin(cmd).is_some() {
                 return vec![Action::PluginCommand(cmd.to_string())];
             }
-            self.set_notification_message(
-                Severity::Error,
-                Some(format!("unknown command {cmd:?}")),
-            );
+            self.set_routine_error(Some(format!("unknown command {cmd:?}")));
             return vec![];
         };
 
@@ -43843,15 +43840,16 @@ while True:
 
     #[tokio::test]
     async fn command_feedback_renders_after_prompt_closes() {
-        for (command, dirty, expected, marker) in [
+        for (command, dirty, expected, marker, needs_attention) in [
             (
                 "q",
                 true,
                 "The following buffers have unwritten changes: [No Name]",
                 "",
+                false,
             ),
-            ("w", true, "No file name", "× "),
-            ("xyz", false, "unknown command \"xyz\"", "× "),
+            ("w", true, "No file name", "× ", true),
+            ("xyz", false, "unknown command \"xyz\"", "× ", false),
         ] {
             let mut editor = test_editor(100, 5);
             editor.current_buffer_mut().dirty = dirty;
@@ -43873,13 +43871,13 @@ while True:
             assert!(!processed.quit, "command {command:?} unexpectedly quit");
             assert_eq!(editor.last_error.as_deref(), Some(expected));
             let row = render_row(&render_buffer, 4);
-            let message = if marker.is_empty() {
-                assert!(!row.contains(":messages"));
-                row.trim_end()
-            } else {
+            let message = if needs_attention {
                 row.trim_end()
                     .strip_suffix("[1 needs attention · :messages]")
                     .expect("errors should include the attention badge")
+            } else {
+                assert!(!row.contains(":messages"));
+                row.trim_end()
             };
             assert_eq!(message.trim_end(), format!("{marker}{expected}"));
         }

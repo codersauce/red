@@ -19,16 +19,19 @@ fn quiet_feedback_is_retained_without_unread_attention() {
     for notice in [
         notice(Severity::Success, "saved"),
         notice(Severity::Info, "copied").with_attention(AttentionPolicy::Quiet),
+        notice(Severity::Error, "unknown command").with_attention(AttentionPolicy::Quiet),
     ] {
         center.publish(notice, now).unwrap();
     }
     for at in [now, later(now, 10)] {
         let counts = center.counts(at.monotonic);
-        assert_eq!(counts.total, 2);
+        assert_eq!(counts.total, 3);
         assert_eq!(counts.unread, 0);
         assert_eq!(counts.unseen, 0);
         assert_eq!(counts.needs_acknowledgment, 0);
     }
+    assert_eq!(center.counts(now.monotonic).active, 3);
+    assert_eq!(center.counts(later(now, 10).monotonic).active, 0);
 }
 
 #[test]
