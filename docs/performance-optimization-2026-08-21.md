@@ -158,21 +158,30 @@ navigation baselines were frozen after rebasing to `d92777c`.
 | Undo history capacity pruning | 72.42% |
 | ASCII automatic indentation columns | 71.81% |
 | Unicode automatic indentation columns | 71.42% |
+| Real-terminal YAML typing action handling | 71.04% |
+| Real-terminal YAML text-insertion events | 69.78% |
 | Real-terminal edited-window painting | 69.23% |
 | LSP completion filtering | 67.58% |
 | Vim first-nonblank line-start operators | 64.81% |
 | Structured picker ranking | 64.81% |
+| Real-terminal Markdown typing action handling | 64.30% |
 | Shared Vim around paragraph text objects | 63.73% |
 | Shared Vim paragraph boundary operators | 63.42% |
 | Shared Vim inner paragraph text objects | 63.01% |
+| Real-terminal Markdown text-insertion events | 62.37% |
 | Complete real-terminal interactive startup | 60.80% |
 | Git workspace status directory indexing | 60.28% |
 | Git repository discovery and branch refresh | 58.73% |
+| Real-terminal YAML completion-aware edit frames | 58.12% |
+| Real-terminal Markdown completion-aware edit frames | 56.44% |
 | Plugin cursor-event delivery | 56.35% |
 | In-buffer search navigation | 55.98% |
+| Real-terminal edit-invalidated YAML highlighting | 55.94% |
 | Owned Husk JSON boundary conversion | 54.49% |
+| Complete real-terminal YAML interactive startup | 54.08% |
 | Bundled theme startup loading | 53.81% |
 | Complete editor frame composition | 52.88% |
+| Real-terminal edit-invalidated Markdown highlighting | 52.65% |
 | Real-terminal bundled plugin startup | 51.88% |
 | Bundled plugin startup | 51.22% |
 
@@ -502,17 +511,29 @@ theme and discards stale, failed, unsupported, or already-initialized results.
 Real Rust, YAML, and Markdown sessions still open and accept verified Unicode
 edits.
 
+Nine additional alternating runs per language exercised 40 verified ASCII and
+Unicode insertions into real YAML and Markdown files. Exact viewport contents
+and UTF-8 line offsets now come from one pre-sized Rope traversal instead of
+allocating a temporary string for every source line. YAML highlighting fell
+from 345 to 152 microseconds, and Markdown highlighting fell from 452 to 214
+microseconds, while preserving complete YAML document-prefix context and nested
+Markdown language injections. YAML typing events fell from 1,797 to 543
+microseconds, typing actions from 1,768 to 512, edit frames from 628 to 263,
+and interactive startup from 39,845 to 18,297. Markdown typing events fell from
+1,584 to 596 microseconds, typing actions from 1,552 to 554, and edit frames
+from 714 to 311. Markdown startup improved only 48.61% and remains open.
+
 Terminal diff and flush improved only 19.51%, and overlay/cursor composition
 remained unchanged. Process-to-first-paint also remains unresolved because
 executable warm-up and filesystem effects make its samples unstable.
 
 ## Remaining gaps
 
-- Single-file process startup, overlay/cursor composition, terminal diff and
-  flush, general non-identifier syntax edits, recovery snapshot writes,
-  in-repository Git subprocess status refresh, broader Vim editing,
-  platform-specific paths, and several other areas above do not yet meet the 50%
-  improvement target.
+- Single-file process startup, Markdown startup, overlay/cursor composition,
+  terminal diff and flush, broader non-identifier syntax edits, recovery
+  snapshot writes, in-repository Git subprocess status refresh, broader Vim
+  editing, platform-specific paths, and several other areas above do not yet
+  meet the 50% improvement target.
 - Real-repository Git status refresh improved 35.67%, from 418,087 to 268,941
   microseconds across 32 requests, but the remaining `git status` subprocess
   still keeps this path below the target.

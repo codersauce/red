@@ -7031,15 +7031,8 @@ impl Editor {
                 }
             }
 
-            let mut text = String::new();
-            let mut line_offsets = Vec::with_capacity(parse_end - parse_start + 1);
-            for line in parse_start..parse_end {
-                line_offsets.push(text.len());
-                if let Some(line) = buffer.get(line) {
-                    text.push_str(&line);
-                }
-            }
-            line_offsets.push(text.len());
+            let (text, line_offsets) =
+                buffer.line_range_contents_with_offsets(parse_start, parse_end);
 
             let spans = self.highlight_spans_for_language(language_id.as_deref(), &text)?;
             if self.highlight_cache.len() >= 32 {

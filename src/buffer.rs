@@ -326,6 +326,31 @@ impl Buffer {
         self.content.slice(start_char..end_char).to_string()
     }
 
+    /// Copies a line range once while recording each exact UTF-8 line boundary.
+    /// Rope chunks are borrowed directly, avoiding one temporary allocation per
+    /// visible line while preserving CRLF and Ropey's full line-break rules.
+    pub(crate) fn line_range_contents_with_offsets(
+        &self,
+        start: usize,
+        end: usize,
+    ) -> (String, Vec<usize>) {
+        let line_count = self.content.len_lines();
+        let start = start.min(line_count);
+        let end = end.min(line_count).max(start);
+        let mut text = String::with_capacity(self.line_range_byte_len(start, end));
+        let mut offsets = Vec::with_capacity(end - start + 1);
+        if start < line_count {
+            for line in self.content.lines_at(start).take(end - start) {
+                offsets.push(text.len());
+                for chunk in line.chunks() {
+                    text.push_str(chunk);
+                }
+            }
+        }
+        offsets.push(text.len());
+        (text, offsets)
+    }
+
     /// Returns at most `max_chars` Unicode scalar values from one line.
     pub(crate) fn line_prefix_contents(&self, line: usize, max_chars: usize) -> String {
         let line_count = self.content.len_lines();
@@ -1971,6 +1996,22 @@ mod test {
 
             assert_eq!(buffer.line_range_contents(0, usize::MAX), contents);
             assert_eq!(buffer.line_range_byte_len(0, usize::MAX), contents.len());
+            for start in 0..=buffer.content.len_lines() + 1 {
+                for end in 0..=buffer.content.len_lines() + 1 {
+                    let (text, offsets) = buffer.line_range_contents_with_offsets(start, end);
+                    assert_eq!(text, buffer.line_range_contents(start, end));
+                    let clamped_start = start.min(buffer.content.len_lines());
+                    let clamped_end = end.min(buffer.content.len_lines()).max(clamped_start);
+                    let mut expected = Vec::with_capacity(clamped_end - clamped_start + 1);
+                    let mut bytes = 0;
+                    for line in clamped_start..clamped_end {
+                        expected.push(bytes);
+                        bytes += buffer.get(line).unwrap().len();
+                    }
+                    expected.push(bytes);
+                    assert_eq!(offsets, expected, "{contents:?}: {start}..{end}");
+                }
+            }
         }
 
         let buffer = Buffer::new(Some("test.txt".to_string()), "zero\r\none\ntwo".to_string());
