@@ -278,6 +278,7 @@ Enter Command mode with `:` or `;`.
 | `:e <file>` / `:e!` | Open or reload a file |
 | `:<number>` / `:$` | Jump to a line or the last line |
 | `:bn` / `:bd` | Select the next buffer or delete a buffer |
+| `:bufdo {command}` | Run a non-interactive Ex command in every open buffer |
 | `:sp [file]` / `:vs [file]` | Open a horizontal or vertical split |
 | `:close` / `:only` | Close the window or keep only the current window |
 | `:wrap` / `:nowrap` | Enable or disable wrapping |

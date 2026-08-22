@@ -77,14 +77,19 @@ impl ParsedCommand {
         self.flags.contains(&CommandFlag::Force)
     }
 
-    /// Reassembles the single unexpanded path consumed by file commands.
+    /// Reassembles the unexpanded argument text following the command name.
     ///
-    /// Splitting and joining on literal spaces preserves whitespace inside the
-    /// path, including repeated spaces returned by command completion.
+    /// Splitting and joining on literal spaces preserves repeated spaces returned
+    /// by command completion and nested command arguments.
+    pub(crate) fn argument_text(&self) -> Option<String> {
+        let arguments = self.args.join(" ");
+        let arguments = arguments.trim_start();
+        (!arguments.is_empty()).then(|| arguments.to_string())
+    }
+
+    /// Reassembles the single unexpanded path consumed by file commands.
     pub(crate) fn file_argument(&self) -> Option<String> {
-        let path = self.args.join(" ");
-        let path = path.trim_start();
-        (!path.is_empty()).then(|| path.to_string())
+        self.argument_text()
     }
 }
 

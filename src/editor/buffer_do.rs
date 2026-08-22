@@ -1,0 +1,155 @@
+//! Safe iteration of non-interactive Ex commands over open buffers.
+
+use super::*;
+
+impl Editor {
+    #[inline(never)]
+    pub(super) fn execute_buffer_do<'a>(
+        &'a mut self,
+        command: &'a str,
+        start: Option<u64>,
+        end: Option<u64>,
+        buffer: &'a mut RenderBuffer,
+        runtime: &'a mut Runtime,
+    ) -> BoxFuture<'a, anyhow::Result<()>> {
+        Box::pin(self.execute_buffer_do_impl(command, start, end, buffer, runtime))
+    }
+
+    async fn execute_buffer_do_impl(
+        &mut self,
+        command: &str,
+        start: Option<u64>,
+        end: Option<u64>,
+        buffer: &mut RenderBuffer,
+        runtime: &mut Runtime,
+    ) -> anyhow::Result<()> {
+        let mut targets = self
+            .buffer_manager
+            .iter()
+            .map(Buffer::id)
+            .filter(|id| start.is_none_or(|start| id.as_u64() >= start))
+            .filter(|id| end.is_none_or(|end| id.as_u64() <= end))
+            .collect::<Vec<_>>();
+        targets.sort_unstable_by_key(|id| id.as_u64());
+
+        if targets.is_empty() {
+            self.set_legacy_message(Some("No buffers in range".to_string()));
+            self.render(buffer)?;
+            return Ok(());
+        }
+
+        for target in targets {
+            let Some(index) = self
+                .buffer_manager
+                .iter()
+                .position(|source| source.id() == target)
+            else {
+                self.set_legacy_message(Some(
+                    "bufdo stopped because the buffer list changed".to_string(),
+                ));
+                self.render(buffer)?;
+                return Ok(());
+            };
+            self.set_current_buffer(buffer, index).await?;
+
+            let actions = self.handle_command(command, runtime);
+            if actions.is_empty() {
+                if self.last_error.is_none() {
+                    self.set_legacy_message(Some(format!("bufdo could not execute {command:?}")));
+                    self.render(buffer)?;
+                }
+                return Ok(());
+            }
+            if let Some(action) = actions
+                .iter()
+                .find(|action| !Self::action_is_buffer_do_safe(action))
+            {
+                let reason = if matches!(action, Action::Substitute(command) if command.confirm) {
+                    "interactive substitute confirmation"
+                } else {
+                    "commands outside its supported non-interactive subset"
+                };
+                self.set_legacy_message(Some(format!(
+                    "bufdo does not support {reason}: {command:?}"
+                )));
+                self.render(buffer)?;
+                return Ok(());
+            }
+
+            for action in actions {
+                if let Action::Substitute(substitute) = &action {
+                    let substitutions = match self.plan_substitutions(substitute) {
+                        Ok(substitutions) => substitutions,
+                        Err(error) => {
+                            self.set_legacy_message(Some(error.to_string()));
+                            self.render(buffer)?;
+                            return Ok(());
+                        }
+                    };
+                    if substitutions.is_empty() {
+                        if substitute.suppress_errors {
+                            self.set_legacy_message(None);
+                            continue;
+                        }
+                        self.set_legacy_message(Some("pattern not found".to_string()));
+                        self.render(buffer)?;
+                        return Ok(());
+                    }
+                }
+
+                let save_without_file =
+                    matches!(action, Action::Save) && self.current_buffer().file.is_none();
+                let invalid_syntax = matches!(
+                    &action,
+                    Action::SetSyntax(syntax)
+                        if !matches!(syntax.trim().to_ascii_lowercase().as_str(), "auto" | "off")
+                            && self.highlighter.language_id_for_name(syntax).is_none()
+                );
+                let dirty_before = self.current_buffer().is_dirty();
+                let blocked_reload = matches!(action, Action::ReloadFile(false)) && dirty_before;
+                if self.execute(&action, buffer, runtime).await? {
+                    return Ok(());
+                }
+                if blocked_reload || save_without_file || invalid_syntax {
+                    return Ok(());
+                }
+                if matches!(action, Action::Save)
+                    && dirty_before
+                    && self.current_buffer().is_dirty()
+                    && !self.buffer_has_pending_format_save(target)
+                {
+                    return Ok(());
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn action_is_buffer_do_safe(action: &Action) -> bool {
+        matches!(
+            action,
+            Action::Save
+                | Action::ReloadFile(_)
+                | Action::Substitute(SubstituteCommand { confirm: false, .. })
+                | Action::JoinLines(_)
+                | Action::JoinLinesKeepSpaces(_)
+                | Action::JoinLinesInRange { .. }
+                | Action::GoToLine(_)
+                | Action::MoveToBottom
+                | Action::Print(_)
+                | Action::ClearSearchHighlight
+                | Action::SetWrap(_)
+                | Action::SetRelativeLineNumbers(_)
+                | Action::SetSyntax(_)
+        )
+    }
+
+    fn buffer_has_pending_format_save(&self, buffer_id: BufferId) -> bool {
+        self.pending_lsp_format_saves.keys().any(|request_id| {
+            self.pending_lsp_edit_requests
+                .get(request_id)
+                .is_some_and(|pending| pending.buffer_id == buffer_id)
+        })
+    }
+}

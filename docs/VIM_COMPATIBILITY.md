@@ -1,6 +1,6 @@
 # Red Vim compatibility matrix
 
-**Matrix version:** 1.7
+**Matrix version:** 1.8
 **Validated against:** Red 0.5.0, August 2026
 **Status vocabulary:** **supported**, **intentional difference**, **not yet supported**
 
@@ -79,7 +79,7 @@ the corresponding integration tests.
 | Empty buffers | **supported** | The synthetic editable line remains cursor-safe across insert, delete, render, and undo. |
 | Unnamed buffer creation | **supported** | `:enew` opens an empty unnamed buffer in the current window, preserves existing unsaved buffers, and reuses an already-empty unnamed buffer. |
 | Ex command abbreviations | **supported** | Built-in Vim commands honor their documented minimum prefixes, including `:e[dit]`, `:ene[w]`, `:sav[eas]`, `:se[t]`, and `:sy[ntax]`. Exact names and existing aliases take precedence; ambiguous and too-short prefixes are rejected. |
-| Buffer commands | **supported** | `:new` and `:vnew` create new buffers in splits; `:b[uffer] {name|number|#}`, `:bnext`, `:bprevious`, and `:ls`/`:buffers`/`:files` navigate or list stable buffer identities. `:saveas {path}` writes a new association, while `:file {path}` names the buffer without writing. |
+| Buffer commands | **supported** | `:new` and `:vnew` create new buffers in splits; `:b[uffer] {name|number|#}`, `:bnext`, `:bprevious`, and `:ls`/`:buffers`/`:files` navigate or list stable buffer identities. `:[buffer-id-range]bufd[o][!] {command}` snapshots the open buffers in stable-ID order, stops on the first error, and leaves the final or failing buffer active. Red treats every open buffer as listed and preserves dirty buffers while switching, so the outer `!` is accepted but does not change traversal. Nested non-interactive editing and buffer-local option commands are supported; buffer/window restructuring, modal UI, plugin commands, and `|` command chains are not. The substitute `e` flag suppresses missing-pattern errors during traversal. `:saveas {path}` writes a new association, while `:file {path}` names the buffer without writing. |
 | Final line / trailing newline | **supported** | Both forms render and edit without exposing a phantom gutter line. |
 | Multi-window and docked panes | **supported** | Active-buffer cursor, viewport, wrapping, gutter width, and focus-cycle state are window-aware. `Ctrl-w h/j/k/l` moves between editor windows and panes; `Ctrl-w H/J/K/L` moves the focused editor window, row pane, or text pane to the corresponding outer edge without replacing its identity, content, or draft. |
 | Embedded plugin text areas | **supported** | Agent dialogs and text-panel composers reuse Unicode-aware word, paragraph, and sentence motions, character searches, ordinary and sentence text objects, and transactional replacement. Counts, operators, Visual selections, local registers, undo/redo, dot-repeat, macros, and prompt-local search remain isolated. Tree-sitter structural objects and swaps stay editor-owned and are unavailable in grammar-free composers. |

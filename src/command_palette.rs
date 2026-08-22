@@ -28,6 +28,7 @@ pub(crate) const BUILTIN_COLON_COMMANDS: &[CommandSpec] = &[
     CommandSpec::exact("b#"),
     CommandSpec::exact("bd"),
     CommandSpec::new("bdelete", 2),
+    CommandSpec::new("bufdo", 4),
     CommandSpec::exact("buffer-delete"),
     CommandSpec::new("edit", 1),
     CommandSpec::new("enew", 3),

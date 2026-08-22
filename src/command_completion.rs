@@ -48,7 +48,7 @@ struct ArgumentContext<'a> {
 }
 
 impl<'a> ArgumentContext<'a> {
-    fn parse(line: &'a str) -> Option<Self> {
+    fn parse_at(line: &'a str, offset: usize) -> Option<Self> {
         let start = line.find(|ch: char| !ch.is_whitespace())?;
         let end = line[start..]
             .find(char::is_whitespace)
@@ -57,10 +57,10 @@ impl<'a> ArgumentContext<'a> {
         if end == line.len() {
             return Some(Self {
                 command,
-                command_end: end,
+                command_end: offset + end,
                 preceding: Vec::new(),
                 fragment: "",
-                replacement: end..end,
+                replacement: offset + end..offset + end,
                 needs_leading_space: true,
             });
         }
@@ -71,13 +71,63 @@ impl<'a> ArgumentContext<'a> {
             .map_or(end, |(offset, ch)| end + offset + ch.len_utf8());
         Some(Self {
             command,
-            command_end: end,
+            command_end: offset + end,
             preceding: line[end..argument_start].split_whitespace().collect(),
             fragment: &line[argument_start..],
-            replacement: argument_start..line.len(),
+            replacement: offset + argument_start..offset + line.len(),
             needs_leading_space: false,
         })
     }
+}
+
+fn bufdo_nested_start(line: &str) -> Option<usize> {
+    let mut command_start = line.find(|ch: char| !ch.is_whitespace())?;
+    let bytes = line.as_bytes();
+    if bytes.get(command_start) == Some(&b'%') {
+        command_start += 1;
+    } else {
+        let first_end = command_start
+            + bytes[command_start..]
+                .iter()
+                .take_while(|byte| byte.is_ascii_digit())
+                .count();
+        if first_end > command_start {
+            command_start = first_end;
+            if bytes.get(command_start) == Some(&b',') {
+                command_start += 1;
+                command_start += bytes[command_start..]
+                    .iter()
+                    .take_while(|byte| byte.is_ascii_digit())
+                    .count();
+            }
+        }
+    }
+    command_start += line[command_start..]
+        .chars()
+        .take_while(|ch| ch.is_whitespace())
+        .map(char::len_utf8)
+        .sum::<usize>();
+    let command_end = line[command_start..]
+        .find(char::is_whitespace)
+        .map_or(line.len(), |offset| command_start + offset);
+    if command_end == line.len() {
+        return None;
+    }
+    let parsed = command::parse(
+        command_palette::BUILTIN_COLON_COMMANDS,
+        &line[command_start..command_end],
+    )?;
+    if parsed.commands.as_slice() != ["bufdo"] {
+        return None;
+    }
+    Some(
+        command_end
+            + line[command_end..]
+                .chars()
+                .take_while(|ch| ch.is_whitespace())
+                .map(char::len_utf8)
+                .sum::<usize>(),
+    )
 }
 
 enum Source {
@@ -166,7 +216,29 @@ pub(crate) fn complete(
             return;
         }
     }
-    let Some(context) = ArgumentContext::parse(line) else {
+    let nested_start = bufdo_nested_start(line);
+    if nested_start == Some(line.len()) {
+        let candidates = command_palette::colon_completion_names(plugins)
+            .into_iter()
+            .filter(|name| name != "bufdo")
+            .collect::<Vec<_>>();
+        let selected = match direction {
+            CompletionDirection::Next => 0,
+            CompletionDirection::Previous => candidates.len() - 1,
+        };
+        let mut current = CommandCompletionState {
+            replacement: line.len()..line.len(),
+            candidates,
+            selected,
+            needs_leading_space: false,
+        };
+        current.apply(line);
+        *state = Some(current);
+        return;
+    }
+    let (completion_line, offset) =
+        nested_start.map_or((&line[..], 0), |start| (&line[start..], start));
+    let Some(context) = ArgumentContext::parse_at(completion_line, offset) else {
         return;
     };
     let argument_source = source(&context, plugins);
@@ -184,7 +256,9 @@ pub(crate) fn complete(
         let start = context.replacement.start - context.command.len();
         let names = command_palette::colon_completion_names(plugins)
             .into_iter()
-            .filter(|name| name.starts_with(context.command))
+            .filter(|name| {
+                name.starts_with(context.command) && (nested_start.is_none() || name != "bufdo")
+            })
             .collect();
         (start..line.len(), false, names)
     } else {
@@ -341,6 +415,10 @@ mod tests {
             ("syntax RU", "syntax rust"),
             ("sy ru", "sy rust"),
             ("syn ru", "syn rust"),
+            ("bufdo synt", "bufdo syntax"),
+            ("bufdo syntax RU", "bufdo syntax rust"),
+            ("bufd! synt", "bufd! syntax"),
+            ("2,4bufdo synt", "2,4bufdo syntax"),
             ("ft ", "ft auto"),
             ("syntax rust extra", "syntax rust extra"),
             ("q sr", "q sr"),
@@ -465,7 +543,7 @@ mod tests {
 
     #[test]
     fn context_preserves_whitespace_and_byte_boundaries() {
-        let context = ArgumentContext::parse("Service  one\u{2003}é").unwrap();
+        let context = ArgumentContext::parse_at("Service  one\u{2003}é", 0).unwrap();
         assert_eq!(context.preceding, ["one"]);
         assert_eq!(context.fragment, "é");
         assert_eq!(&"Service  one\u{2003}é"[context.replacement], "é");
