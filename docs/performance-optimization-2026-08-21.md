@@ -84,6 +84,7 @@ navigation baselines were frozen after rebasing to `d92777c`.
 | Long-line Vim backward word motion | 80.33% |
 | Detached incremental frame serialization | 79.06% |
 | Shared Vim sentence navigation | 74.63% |
+| LSP incremental large-document changes | 74.61% |
 | Shared Vim paragraph navigation | 72.60% |
 | Undo history capacity pruning | 72.42% |
 | LSP completion filtering | 67.58% |
@@ -110,6 +111,11 @@ Multi-file startup uses the same production loader as the executable. Across
 four startup passes over 128 distinct source files, seven alternating samples
 reduced the median from 1,245,405 to 13,426 microseconds while preserving first
 argument order, missing-file behavior, relative aliases, symlinks, and hard links.
+
+Incremental LSP synchronization was measured across 256 Unicode edits in a
+4,096-line source document. Eleven alternating samples reduced the median from
+57,096 to 14,494 microseconds while retaining minimal ranges, UTF-16 positions,
+multiline deletion coordinates, combining marks, and the existing CRLF fallback.
 
 Real detached-terminal coverage separately exercised editing, 32 KiB of Unicode
 paste, repeated resizes, reattachment, and owner shutdown. Detached-frame median

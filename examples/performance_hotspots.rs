@@ -11,7 +11,7 @@ use red::{
     editor::{DetachedEditorCore, Editor, RenderBuffer, SearchDirection},
     highlighter::Highlighter,
     inline_history::{InlineConversation, InlineHistory, InlineHistoryTurn},
-    lsp::LspManager,
+    lsp::{LspManager, RealLspClient},
     plugin::{
         Decoration, DecorationAnchor, DecorationManager, GutterSign, GutterSignManager,
         PanelConfig, PanelManager, PanelRow, PanelRowKind, PanelSide, PluginRegistry, PluginStatus,
@@ -83,6 +83,8 @@ const GIT_DISCOVERY_DEPTH: usize = 16;
 const GIT_REPOSITORY_DISCOVERIES: usize = 512;
 const STARTUP_FILE_COUNT: usize = 128;
 const STARTUP_FILE_LOADS: usize = 4;
+const LSP_DOCUMENT_LINES: usize = 4_096;
+const LSP_INCREMENTAL_CHANGES: usize = 256;
 
 fn main() -> Result<()> {
     let scenario = std::env::args().nth(1).unwrap_or_else(|| "all".into());
@@ -201,6 +203,9 @@ fn main() -> Result<()> {
     }
     if scenario == "all" || scenario == "startup-files" {
         results.push(benchmark_startup_file_loading()?);
+    }
+    if scenario == "all" || scenario == "lsp-changes" {
+        results.push(benchmark_lsp_incremental_changes()?);
     }
 
     anyhow::ensure!(
@@ -1340,6 +1345,41 @@ fn benchmark_startup_file_loading() -> Result<serde_json::Value> {
         "multi_file_process_startup_loading",
         started,
         STARTUP_FILE_LOADS,
+    ))
+}
+
+fn benchmark_lsp_incremental_changes() -> Result<serde_json::Value> {
+    let before = (0..LSP_DOCUMENT_LINES)
+        .map(|line| {
+            format!(
+                "fn language_service_line_{line:04}(value: usize) -> usize {{ value.saturating_add({line}) }} // 👋 document synchronization\n"
+            )
+        })
+        .collect::<String>();
+    let target = format!("language_service_line_{:04}", LSP_DOCUMENT_LINES * 3 / 4);
+    let insertion = before
+        .find(&target)
+        .ok_or_else(|| anyhow::anyhow!("LSP document benchmark target line was not found"))?
+        + target.len();
+    let mut after = before.clone();
+    after.insert_str(insertion, "_λ👋");
+
+    let started = Instant::now();
+    for _ in 0..LSP_INCREMENTAL_CHANGES {
+        let changes = RealLspClient::benchmark_incremental_document_change(
+            black_box(&before),
+            black_box(&after),
+        );
+        anyhow::ensure!(
+            changes.len() == 1 && changes[0].text == "_λ👋",
+            "LSP document benchmark produced an incorrect incremental change"
+        );
+        black_box(changes);
+    }
+    Ok(report(
+        "lsp_incremental_large_document_changes",
+        started,
+        LSP_INCREMENTAL_CHANGES,
     ))
 }
 

@@ -48,6 +48,7 @@ SCENARIOS = (
     "frame-full",
     "git-discovery",
     "startup-files",
+    "lsp-changes",
     "husk-completion",
     "husk-config",
     "husk-update",
