@@ -365,6 +365,18 @@ fn main() -> Result<()> {
         ("tsx-comment", "tsx", true),
         ("tsx-string", "tsx", false),
         ("json-string", "json", false),
+        ("toml-comment", "toml", true),
+        ("toml-string", "toml", false),
+        ("yaml-comment", "yaml", true),
+        ("yaml-string", "yaml", false),
+        ("bash-comment", "bash", true),
+        ("bash-string", "bash", false),
+        ("fish-comment", "fish", true),
+        ("fish-string", "fish", false),
+        ("powershell-comment", "powershell", true),
+        ("powershell-string", "powershell", false),
+        ("lua-comment", "lua", true),
+        ("lua-string", "lua", false),
     ] {
         if scenario == "all" || scenario == name {
             results.push(benchmark_cross_language_token_highlighting(
@@ -1616,16 +1628,40 @@ fn benchmark_cross_language_token_highlighting(
 ) -> Result<serde_json::Value> {
     let theme = parse_vscode_theme("themes/mocha.json")?;
     let mut highlighter = Highlighter::new(&theme)?;
-    let mut source = if language == "json" {
-        format!(
+    let mut source = match language {
+        "json" => format!(
             "{{\n{}\n}}\n",
             (0..96)
                 .map(|index| format!("  \"key_{index:03}\": \"retained string contents\""))
                 .collect::<Vec<_>>()
                 .join(",\n")
-        )
-    } else {
-        (0..96)
+        ),
+        "yaml" => format!(
+            "---\n{}",
+            (0..96)
+                .map(|index| {
+                    format!("key_{index:03}: \"retained string contents\" # retained comment contents\n")
+                })
+                .collect::<String>()
+        ),
+        "toml" | "bash" | "fish" | "powershell" | "lua" => (0..96)
+            .map(|index| match language {
+                "toml" => format!(
+                    "key_{index:03} = \"retained string contents\" # retained comment contents\n"
+                ),
+                "bash" | "fish" => format!(
+                    "echo \"retained string contents {index:03}\" # retained comment contents\n"
+                ),
+                "powershell" => format!(
+                    "$value_{index:03} = \"retained string contents\" # retained comment contents\n"
+                ),
+                "lua" => format!(
+                    "local value_{index:03} = \"retained string contents\" -- retained comment contents\n"
+                ),
+                _ => unreachable!("configuration and shell language"),
+            })
+            .collect(),
+        _ => (0..96)
             .map(|index| {
                 if matches!(language, "typescript" | "tsx") {
                     format!(
@@ -1637,19 +1673,20 @@ fn benchmark_cross_language_token_highlighting(
                     )
                 }
             })
-            .collect::<String>()
+            .collect(),
     };
     let marker = if comment {
-        "// retained comment"
+        match language {
+            "lua" => "-- retained comment",
+            "toml" | "yaml" | "bash" | "fish" | "powershell" => "# retained comment",
+            _ => "// retained comment",
+        }
     } else {
         "\"retained string"
     };
     let mut cursor = source.find(marker).expect("cross-language token marker")
-        + if comment {
-            "// retained".len()
-        } else {
-            "\"retained".len()
-        };
+        + marker.find("retained").expect("retained token marker")
+        + "retained".len();
     black_box(highlighter.highlight(language, &source)?);
 
     let started = Instant::now();
@@ -1677,7 +1714,19 @@ fn benchmark_cross_language_token_highlighting(
         ("tsx", true) => "tsx_line_comment_highlighting",
         ("tsx", false) => "tsx_string_highlighting",
         ("json", false) => "json_string_highlighting",
-        _ => unreachable!("benchmark uses a bundled JavaScript-family or JSON token"),
+        ("toml", true) => "toml_line_comment_highlighting",
+        ("toml", false) => "toml_string_highlighting",
+        ("yaml", true) => "yaml_line_comment_highlighting",
+        ("yaml", false) => "yaml_string_highlighting",
+        ("bash", true) => "bash_line_comment_highlighting",
+        ("bash", false) => "bash_string_highlighting",
+        ("fish", true) => "fish_line_comment_highlighting",
+        ("fish", false) => "fish_string_highlighting",
+        ("powershell", true) => "powershell_line_comment_highlighting",
+        ("powershell", false) => "powershell_string_highlighting",
+        ("lua", true) => "lua_line_comment_highlighting",
+        ("lua", false) => "lua_string_highlighting",
+        _ => unreachable!("benchmark uses a supported bundled language token"),
     };
     Ok(report(scenario, started, RUST_TOKEN_HIGHLIGHT_EDITS))
 }

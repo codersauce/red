@@ -123,7 +123,28 @@ def run(args):
         os.write(master, b"100j")
         time.sleep(0.25)
         if args.scenario == "typing" and args.typing_context != "source":
-            position = b"0f/12l" if args.typing_context == "comment" else b'0f"10l'
+            if args.typing_context == "comment":
+                extension = file_path.suffix.lower()
+                if extension == ".lua":
+                    marker = b"-"
+                elif extension in {
+                    ".toml",
+                    ".yaml",
+                    ".yml",
+                    ".sh",
+                    ".bash",
+                    ".zsh",
+                    ".fish",
+                    ".ps1",
+                    ".psm1",
+                    ".psd1",
+                }:
+                    marker = b"#"
+                else:
+                    marker = b"/"
+                position = b"0f" + marker + b"12l"
+            else:
+                position = b'0f"10l'
             os.write(master, position)
             time.sleep(0.1)
         with log.open("a", encoding="utf-8") as stream:

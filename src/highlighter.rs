@@ -890,6 +890,15 @@ impl Highlighter {
             "typescript" => TYPESCRIPT_HIGHLIGHT_QUERIES,
             "tsx" => TSX_HIGHLIGHT_QUERIES,
             "json" => &[tree_sitter_json::HIGHLIGHTS_QUERY][..],
+            "toml" => &[tree_sitter_toml_ng::HIGHLIGHTS_QUERY][..],
+            "yaml" => &[
+                tree_sitter_yaml::HIGHLIGHTS_QUERY,
+                YAML_ADDITIONAL_HIGHLIGHTS_QUERY,
+            ][..],
+            "bash" => &[tree_sitter_bash::HIGHLIGHT_QUERY][..],
+            "fish" => &[tree_sitter_fish::HIGHLIGHTS_QUERY][..],
+            "powershell" => &[tree_sitter_powershell::HIGHLIGHTS_QUERY][..],
+            "lua" => &[tree_sitter_lua::HIGHLIGHTS_QUERY][..],
             _ => return None,
         };
         let definition = self.registry.languages.get(language_id)?;
@@ -966,13 +975,29 @@ impl Highlighter {
                 }
             }
             "comment" => {
-                if !matches!(language_id, "javascript" | "jsx" | "typescript" | "tsx") {
+                let previous = &cached.code[token.byte_range()];
+                let marker = match language_id {
+                    "javascript" | "jsx" | "typescript" | "tsx" => "//",
+                    "toml" | "yaml" | "bash" | "fish" | "powershell" => "#",
+                    _ => return None,
+                };
+                if !previous.starts_with(marker)
+                    || edit.start_byte <= token.start_byte().saturating_add(marker.len())
+                    || inserted.contains(['\r', '\n', '\u{2028}', '\u{2029}'])
+                {
                     return None;
                 }
-                let previous = &cached.code[token.byte_range()];
-                if !previous.starts_with("//")
-                    || edit.start_byte <= token.start_byte().saturating_add(2)
-                    || inserted.contains(['\r', '\n', '\u{2028}', '\u{2029}'])
+            }
+            "comment_content" => {
+                if language_id != "lua" {
+                    return None;
+                }
+                let parent = token.parent()?;
+                let previous = &cached.code[parent.byte_range()];
+                if parent.kind() != "comment"
+                    || !previous.starts_with("--")
+                    || previous.starts_with("--[")
+                    || inserted.contains(['\r', '\n'])
                 {
                     return None;
                 }
@@ -980,13 +1005,15 @@ impl Highlighter {
             "string_content" => {
                 let expected_parent = match language_id {
                     "rust" => "string_literal",
-                    "json" => "string",
+                    "json" | "bash" | "lua" => "string",
                     _ => return None,
                 };
                 if token.parent()?.kind() != expected_parent
-                    || inserted
-                        .chars()
-                        .any(|character| character.is_control() || matches!(character, '"' | '\\'))
+                    || inserted.chars().any(|character| {
+                        character.is_control()
+                            || matches!(character, '"' | '\\')
+                            || (language_id == "bash" && matches!(character, '$' | '`'))
+                    })
                 {
                     return None;
                 }
@@ -997,6 +1024,32 @@ impl Highlighter {
                     || inserted.chars().any(|character| {
                         character.is_control()
                             || matches!(character, '"' | '\'' | '\\' | '\u{2028}' | '\u{2029}')
+                    })
+                {
+                    return None;
+                }
+            }
+            "string"
+            | "double_quote_scalar"
+            | "double_quote_string"
+            | "expandable_string_literal" => {
+                let expected_kind = match language_id {
+                    "toml" => "string",
+                    "yaml" => "double_quote_scalar",
+                    "fish" => "double_quote_string",
+                    "powershell" => "expandable_string_literal",
+                    _ => return None,
+                };
+                let previous = &cached.code[token.byte_range()];
+                if token.kind() != expected_kind
+                    || !previous.starts_with('"')
+                    || !previous.ends_with('"')
+                    || previous.starts_with("\"\"\"")
+                    || inserted.chars().any(|character| {
+                        character.is_control()
+                            || matches!(character, '"' | '\\')
+                            || (matches!(language_id, "fish" | "powershell")
+                                && matches!(character, '$' | '`'))
                     })
                 {
                     return None;
@@ -2362,6 +2415,163 @@ mod tests {
                 "json",
                 "{\"key\": \"retained value\"}\n",
                 "{\"key\": \"retained\\ value\"}\n",
+            ),
+        ] {
+            let mut incremental = highlighter();
+            incremental.highlight(language, before).unwrap();
+            let actual = incremental.highlight(language, after).unwrap();
+            let expected = highlighter().highlight(language, after).unwrap();
+            let shape = |styles: &[StyleInfo]| {
+                styles
+                    .iter()
+                    .map(|style| (style.start, style.end, style.style.clone()))
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(shape(&actual), shape(&expected), "{language}: {after}");
+            assert!(
+                !incremental.highlighters[language]
+                    .cached_tree
+                    .as_ref()
+                    .unwrap()
+                    .tree
+                    .root_node()
+                    .has_changes(),
+                "grammar-changing {language} token edit must reparse"
+            );
+        }
+    }
+
+    #[test]
+    fn configuration_and_shell_token_edits_match_fresh_parser_captures() {
+        for (language, sources) in [
+            (
+                "toml",
+                vec![
+                    "key = \"retained string\" # retained comment\n",
+                    "key = \"retained string\" # retained.! λ comment\n",
+                    "key = \"retained.! λ string\" # retained.! λ comment\n",
+                ],
+            ),
+            (
+                "yaml",
+                vec![
+                    "---\nkey: \"retained string\" # retained comment\r\n",
+                    "---\nkey: \"retained string\" # retained.! λ comment\r\n",
+                    "---\nkey: \"retained.! λ string\" # retained.! λ comment\r\n",
+                ],
+            ),
+            (
+                "bash",
+                vec![
+                    "echo \"retained string\" # retained comment\n",
+                    "echo \"retained string\" # retained.! λ comment\n",
+                    "echo \"retained.! λ string\" # retained.! λ comment\n",
+                ],
+            ),
+            (
+                "fish",
+                vec![
+                    "echo \"retained string\" # retained comment\n",
+                    "echo \"retained string\" # retained.! λ comment\n",
+                    "echo \"retained.! λ string\" # retained.! λ comment\n",
+                ],
+            ),
+            (
+                "powershell",
+                vec![
+                    "$value = \"retained string\" # retained comment\n",
+                    "$value = \"retained string\" # retained.! λ comment\n",
+                    "$value = \"retained.! λ string\" # retained.! λ comment\n",
+                ],
+            ),
+            (
+                "lua",
+                vec![
+                    "local value = \"retained string\" -- retained comment\n",
+                    "local value = \"retained string\" -- retained.! λ comment\n",
+                    "local value = \"retained.! λ string\" -- retained.! λ comment\n",
+                ],
+            ),
+        ] {
+            let mut incremental = highlighter();
+            incremental.highlight(language, sources[0]).unwrap();
+
+            for source in &sources[1..] {
+                let actual = incremental.highlight(language, source).unwrap();
+                let expected = highlighter().highlight(language, source).unwrap();
+                let shape = |styles: &[StyleInfo]| {
+                    styles
+                        .iter()
+                        .map(|style| (style.start, style.end, style.style.clone()))
+                        .collect::<Vec<_>>()
+                };
+                assert_eq!(shape(&actual), shape(&expected), "{language}: {source}");
+                assert!(
+                    incremental.highlighters[language]
+                        .cached_tree
+                        .as_ref()
+                        .unwrap()
+                        .tree
+                        .root_node()
+                        .has_changes(),
+                    "safe {language} token edit should reuse its existing syntax tree"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn configuration_and_shell_syntax_changes_reparse_before_reusing_captures() {
+        for (language, before, after) in [
+            (
+                "toml",
+                "key = \"\"\"retained string\"\"\"\n",
+                "key = \"\"\"retained.! string\"\"\"\n",
+            ),
+            (
+                "toml",
+                "key = \"retained string\" # retained comment\n",
+                "key = \"retained string\" # retained\n comment\n",
+            ),
+            (
+                "yaml",
+                "---\nkey: \"retained string\"\n",
+                "---\nkey: \"retained\\ string\"\n",
+            ),
+            (
+                "bash",
+                "echo \"retained string\"\n",
+                "echo \"retained$ string\"\n",
+            ),
+            (
+                "bash",
+                "echo \"retained string\"\n",
+                "echo \"retained` string\"\n",
+            ),
+            (
+                "fish",
+                "echo \"retained string\"\n",
+                "echo \"retained$ string\"\n",
+            ),
+            (
+                "powershell",
+                "$value = \"retained string\"\n",
+                "$value = \"retained$ string\"\n",
+            ),
+            (
+                "powershell",
+                "$value = \"retained string\"\n",
+                "$value = \"retained` string\"\n",
+            ),
+            (
+                "lua",
+                "--[[ retained comment ]]\nlocal value = 1\n",
+                "--[[ retained.! comment ]]\nlocal value = 1\n",
+            ),
+            (
+                "lua",
+                "local value = \"retained string\"\n",
+                "local value = \"retained\\ string\"\n",
             ),
         ] {
             let mut incremental = highlighter();

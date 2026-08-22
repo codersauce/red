@@ -80,10 +80,14 @@ navigation baselines were frozen after rebasing to `d92777c`.
 | Inline-assistance answer streaming | 98.93% |
 | Shared Vim nested delimiter text objects | 98.93% |
 | Multi-file process startup loading | 98.92% |
+| YAML line-comment punctuation and Unicode highlighting | 98.78% |
+| YAML string punctuation and Unicode highlighting | 98.73% |
 | Husk unchanged document updates | 98.44% |
 | Viewport cursor snapshot updates | 98.58% |
 | Embedded Vim line-boundary motions | 98.48% |
+| PowerShell line-comment punctuation and Unicode highlighting | 98.37% |
 | Editor LSP request cursor coordinates | 98.29% |
+| PowerShell string punctuation and Unicode highlighting | 98.21% |
 | Shared Vim final-sentence operators | 98.20% |
 | Real-terminal Unicode and CRLF visual-block insertion | 98.01% |
 | Real-terminal Unicode visual-block insertion | 97.99% |
@@ -92,15 +96,21 @@ navigation baselines were frozen after rebasing to `d92777c`.
 | Shared Vim around final-sentence text objects | 97.88% |
 | Embedded Vim word motions | 97.88% |
 | Shared Vim inner final-sentence text objects | 97.87% |
+| Lua line-comment punctuation and Unicode highlighting | 97.83% |
 | Real-terminal CRLF visual-block insertion | 97.82% |
+| Bash string punctuation and Unicode highlighting | 97.80% |
+| Fish line-comment punctuation and Unicode highlighting | 97.79% |
 | Real-terminal incremental-LSP visual-block insertion | 97.73% |
 | Real-terminal full-document-LSP visual-block insertion | 97.71% |
 | Real-terminal split-window visual-block insertion | 97.65% |
+| Lua string punctuation and Unicode highlighting | 97.64% |
+| Bash line-comment punctuation and Unicode highlighting | 97.55% |
 | Decoration namespace updates | 97.48% |
 | Rust string punctuation highlighting | 97.46% |
 | Rust line-comment punctuation highlighting | 97.38% |
 | Long transcript cursor lookup | 97.35% |
 | Rust Unicode line-comment highlighting | 97.33% |
+| Fish string punctuation and Unicode highlighting | 97.31% |
 | Character-wrapped layout cursor lookup | 97.29% |
 | Real-terminal bundled-plugin visual-block insertion | 97.26% |
 | Rust CRLF line-comment highlighting | 97.21% |
@@ -117,10 +127,12 @@ navigation baselines were frozen after rebasing to `d92777c`.
 | JSX string punctuation and Unicode highlighting | 96.64% |
 | Word-wrapped layout cursor lookup | 96.61% |
 | JavaScript line-comment punctuation and Unicode highlighting | 96.54% |
+| TOML line-comment punctuation and Unicode highlighting | 96.51% |
 | Git workspace row navigation | 96.35% |
 | Editor logical line-length lookup | 96.33% |
 | JavaScript string punctuation and Unicode highlighting | 96.28% |
 | Editor final-cell boundary lookup | 96.24% |
+| TOML string punctuation and Unicode highlighting | 95.93% |
 | Real-terminal cursor-moved plugin delivery | 95.05% |
 | Real-terminal file-picker query resolution | 95.00% |
 | Shared ASCII grapheme counting | 94.94% |
@@ -134,32 +146,42 @@ navigation baselines were frozen after rebasing to `d92777c`.
 | Editor scalar-to-grapheme cursor conversion | 92.82% |
 | Workspace inline file discovery | 92.65% |
 | Editor backward word-end boundary operators | 92.63% |
+| Real-terminal PowerShell line-comment highlighting | 91.97% |
 | Shared buffer final-line lookup | 91.46% |
+| Real-terminal PowerShell string highlighting | 91.43% |
 | Shared buffer navigable-line counting | 91.38% |
 | Embedded redo cursor restoration | 91.33% |
 | Embedded text-area document loading | 91.26% |
 | Real-terminal incremental search input events | 90.89% |
 | Sparse ASCII full-buffer regex searching | 90.87% |
+| Real-terminal Fish line-comment highlighting | 90.72% |
 | Real-terminal CRLF line-comment highlighting | 90.56% |
 | Real-terminal line-comment highlighting | 90.48% |
+| Real-terminal Bash line-comment highlighting | 90.48% |
 | Real-terminal CRLF string highlighting | 90.37% |
 | Embedded Vim nested delimiter matching | 90.03% |
+| Real-terminal Bash string highlighting | 89.91% |
 | ASCII Vim line-end operators | 89.83% |
 | ASCII Unicode-scalar line boundaries | 89.78% |
 | Real-terminal Unicode line-comment highlighting | 89.62% |
 | Real-terminal string highlighting | 89.62% |
 | Real-terminal TSX line-comment highlighting | 89.38% |
 | Shared scalar-to-display-column conversion | 89.31% |
+| Real-terminal YAML line-comment highlighting | 89.29% |
+| Real-terminal Lua line-comment highlighting | 89.23% |
 | Unicode scalar line boundaries | 89.12% |
 | Sparse Unicode full-buffer regex searching | 89.12% |
 | Real-terminal Unicode string highlighting | 88.89% |
+| Real-terminal Fish string highlighting | 88.89% |
 | Shared Vim escaped-quote text objects | 88.86% |
 | Shared Vim ASCII backward character search | 88.82% |
+| Real-terminal YAML string highlighting | 88.78% |
 | Real-terminal JSX line-comment highlighting | 88.44% |
 | Shared Vim long-line paragraph operators | 88.15% |
 | Real-terminal TypeScript string highlighting | 88.05% |
 | Real-terminal TypeScript line-comment highlighting | 87.97% |
 | Real-terminal TSX string highlighting | 87.84% |
+| Real-terminal Lua string highlighting | 87.79% |
 | Real-terminal JSX string highlighting | 87.59% |
 | Shared modal editor backward word motion | 87.58% |
 | Real-terminal JavaScript string highlighting | 87.41% |
@@ -178,6 +200,8 @@ navigation baselines were frozen after rebasing to `d92777c`.
 | Unicode LSP rename-symbol extraction | 82.49% |
 | Editor forward word-end boundary operators | 81.94% |
 | Real-terminal editor chrome rendering | 81.18% |
+| Real-terminal TOML line-comment highlighting | 81.18% |
+| Real-terminal TOML string highlighting | 81.18% |
 | Long-line Vim backward word motion | 80.33% |
 | Theme hexadecimal color parsing | 79.71% |
 | Detached incremental frame serialization | 79.06% |
@@ -238,7 +262,9 @@ navigation baselines were frozen after rebasing to `d92777c`.
 | Real-terminal bundled-plugin substitution | 60.34% |
 | Git workspace status directory indexing | 60.28% |
 | Real-terminal overlay and cursor composition | 60.00% |
+| Real-terminal YAML line-comment edit frames | 60.00% |
 | Real-terminal CRLF string edit frames | 59.66% |
+| Real-terminal YAML string edit frames | 59.31% |
 | Real-terminal Unicode substitution | 59.09% |
 | Real-terminal CRLF line-comment edit frames | 58.74% |
 | Git repository discovery and branch refresh | 58.73% |
@@ -258,6 +284,7 @@ navigation baselines were frozen after rebasing to `d92777c`.
 | Real-terminal file-picker window painting | 55.56% |
 | Complete real-terminal file-picker frames | 55.42% |
 | Real-terminal incremental-LSP substitution | 54.67% |
+| Real-terminal PowerShell line-comment edit frames | 54.51% |
 | Owned Husk JSON boundary conversion | 54.49% |
 | Real-terminal TSX line-comment edit frames | 54.14% |
 | Complete real-terminal YAML interactive startup | 54.08% |
@@ -265,6 +292,7 @@ navigation baselines were frozen after rebasing to `d92777c`.
 | Complete real-terminal file-picker input events | 53.41% |
 | Complete real-terminal incremental search frames | 53.11% |
 | Complete editor frame composition | 52.88% |
+| Real-terminal PowerShell string edit frames | 52.72% |
 | Real-terminal edit-invalidated Markdown highlighting | 52.65% |
 | Real-terminal TypeScript string edit frames | 52.65% |
 | Real-terminal TSX string edit frames | 52.65% |
@@ -272,6 +300,7 @@ navigation baselines were frozen after rebasing to `d92777c`.
 | Bundled plugin startup | 51.22% |
 | Real-terminal JSX line-comment edit frames | 50.79% |
 | Real-terminal TypeScript line-comment edit frames | 50.57% |
+| Real-terminal Lua line-comment edit frames | 50.21% |
 | Real-terminal JavaScript string edit frames | 50.00% |
 
 Complete frame composition was measured across 160 production `Editor::render`
@@ -641,6 +670,32 @@ comment frames from 254 to 125; and JavaScript string frames from 248 to 124.
 Complete input events and action handling, JavaScript comment frames, and JSX
 string frames remain below the target and are excluded from verified results.
 
+Seven alternating release-build samples across 96-line TOML, YAML, Bash, Fish,
+PowerShell, and Lua fixtures applied 128 punctuation and Unicode edits per
+comment and quoted string. TOML comment and string medians fell from 13,836
+to 483 and 14,122 to 575 microseconds; YAML fell from 38,315 to 467 and 38,310
+to 488; Bash fell from 20,650 to 506 and 20,756 to 457; Fish fell from 18,725
+to 414 and 18,890 to 508; PowerShell fell from 26,718 to 435 and 27,117 to
+486; and Lua fell from 23,324 to 507 and 23,793 to 561. Exact bundled grammars
+and their complete bundled query sets remain mandatory. Hash comments, Lua
+line comments, and ordinary quoted string nodes each validate their own
+grammar boundaries. Shell variable interpolation and command substitutions,
+PowerShell backticks, TOML multiline strings, Lua block comments, newline and
+escape insertion, custom grammars or queries, and oversized sources retain
+normal parsing. Fresh-parser parity also preserves YAML document prefixes,
+Unicode, CRLF, and exact syntax-style ranges.
+
+Five alternating real-terminal sessions per configuration or shell token
+exercised 32 punctuation and Unicode edits using extension-aware `#` and Lua
+`--` comment placement. TOML comment and string highlighting each fell from
+85 to 16 microseconds; YAML fell from 196 to 21 and 196 to 22; Bash fell from
+105 to 10 and 109 to 11; Fish fell from 97 to nine and 99 to 11; PowerShell
+fell from 137 to 11 and 140 to 12; and Lua fell from 130 to 14 and 131 to 16.
+Complete YAML comment and string edit frames fell from 290 to 116 and 290 to
+118 microseconds; PowerShell frames fell from 233 to 106 and 239 to 113; and
+Lua comment frames fell from 233 to 116. TOML, Bash, Fish, and Lua string
+frames plus complete input events remain below the target and are excluded.
+
 Nine further alternating real-terminal sessions per Unicode-source token
 reduced complete comment edit frames from 354 to 151 microseconds and string
 edit frames from 362 to 158. Mixed Unicode rows now coalesce their ordinary
@@ -787,10 +842,11 @@ filesystem effects make its samples unstable.
 
 ## Remaining gaps
 
-- Single-file process startup, terminal diff and flush, remaining non-identifier
-  and non-Rust syntax edits, recovery snapshot writes, in-repository Git subprocess status
-  refresh, broader Vim editing, platform-specific paths, and several other
-  areas above do not yet meet the 50% improvement target.
+- Single-file process startup, terminal diff and flush, remaining syntax-token
+  classes and Markdown or injected-language edits, recovery snapshot writes,
+  in-repository Git subprocess status refresh, broader Vim editing,
+  platform-specific paths, and several other areas above do not yet meet the
+  50% improvement target.
 - Real-repository Git status refresh improved 35.67%, from 418,087 to 268,941
   microseconds across 32 requests, but the remaining `git status` subprocess
   still keeps this path below the target.
@@ -804,6 +860,9 @@ filesystem effects make its samples unstable.
   corruption detection, owner isolation, invalid-snapshot rejection, and crash
   rotation but improved durable snapshot writes by only 11.76%; its added
   memory and implementation complexity were therefore rejected.
+- Skipping unchanged terminal-cell assignments improved isolated ASCII repaint
+  by only 8.10% and left JavaScript comment and JSX string frames below 50%;
+  the extra per-cell branch was rejected after real-terminal validation.
 
 ## Reproducing measurements
 
