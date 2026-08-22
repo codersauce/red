@@ -42,6 +42,8 @@ Use [Followed Editing](followed-editing) for the full-agent write path: Red reve
 
 For task-oriented operation, use [Inspect Agent History](../../guides/agent/inspect-agent-history). For inline AI suggestions that run beside language-server completion rather than through Codex turns, use [Copilot Inline Completion](../../guides/agent/copilot-completion) [@copilot-guide]. For prerequisites and offline readiness checks, use [Agent Check](../../reference/agent/agent-check). For the accepted integration decision, use [Direct Codex App-Server](../../decisions/agent/direct-codex-app-server).
 
+Keep that Copilot route out of the Codex app-server reading path. Copilot is a completion provider with opt-in source transmission and ghost-text acceptance semantics, while this architecture hub covers Codex threads, dynamic tools, followed edits, and agent-attributed history [@copilot-guide] [@workflow] [@codex].
+
 ## Boundaries To Preserve
 
 Do not collapse the Codex transport, editor transaction path, and Husk UI into one ownership model. The Codex worker owns the app-server protocol and dynamic-tool dispatch [@codex]. `AgentManager` owns bridge state, turn state, conversation state, and editor-tool channels inside the editor core [@manager]. Text writes enter the visible editor through editor-owned transactions and saves, not through Codex native file changes [@workflow] [@editor]. The bundled agent plugin listens to `agent:*` events and sends `Agent*` requests; it does not own the Codex process or mutate buffers directly [@agent-plugin].
