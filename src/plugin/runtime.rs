@@ -4819,6 +4819,23 @@ mod tests {
             .unwrap();
     }
 
+    async fn notify_lsp_symbols_progress(runtime: &mut Runtime, kind: &str) {
+        runtime
+            .notify(
+                "lsp:progress",
+                serde_json::json!({
+                    "token": "index",
+                    "kind": kind,
+                    "lsp_client": {
+                        "name": "rust_analyzer",
+                        "workspace_root": "/repo",
+                    },
+                }),
+            )
+            .await
+            .unwrap();
+    }
+
     async fn pump_process_events(runtime: &mut Runtime) -> anyhow::Result<()> {
         for event in runtime.poll_process_events() {
             let Some(process_id) = event
@@ -17117,6 +17134,137 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn lsp_references_waits_for_active_server_progress_before_requesting() {
+        drain_requests();
+
+        let mut runtime = Runtime::new();
+        load_lsp_symbols(&mut runtime).await;
+        notify_lsp_symbols_progress(&mut runtime, "begin").await;
+
+        runtime.execute_command("LspReferences").await.unwrap();
+        let handle = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::OpenCallbackPicker {
+                handle,
+                items,
+                options,
+                ..
+            } => {
+                assert!(items.is_empty());
+                assert_eq!(
+                    options.status.as_deref(),
+                    Some("Waiting for language server...")
+                );
+                assert!(options.busy);
+                handle
+            }
+            _ => panic!("expected waiting references picker"),
+        };
+        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
+
+        notify_lsp_symbols_progress(&mut runtime, "end").await;
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::UpdatePickerStatus { id, status: Some(status) }
+                if id == handle.get() && status == "Fetching references..."
+        ));
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::UpdatePickerBusy { id, busy: true } if id == handle.get()
+        ));
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::References {
+                include_declaration: true,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn lsp_references_retries_empty_and_timed_out_results_after_progress() {
+        drain_requests();
+
+        let mut runtime = Runtime::new();
+        load_lsp_symbols(&mut runtime).await;
+
+        runtime.execute_command("LspReferences").await.unwrap();
+        let handle = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::OpenCallbackPicker { handle, .. } => handle,
+            _ => panic!("expected references loading picker"),
+        };
+        let first_request = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::References { request_id, .. } => request_id,
+            _ => panic!("expected references request"),
+        };
+        notify_lsp_symbols_progress(&mut runtime, "begin").await;
+        runtime
+            .resolve_request(first_request, sample_reference_payload_with_count(0))
+            .await
+            .unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::UpdatePickerStatus { id, status: Some(status) }
+                if id == handle.get() && status == "Waiting for language server..."
+        ));
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::UpdatePickerBusy { id, busy: true } if id == handle.get()
+        ));
+
+        notify_lsp_symbols_progress(&mut runtime, "end").await;
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::UpdatePickerStatus { id, .. } if id == handle.get()
+        ));
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::UpdatePickerBusy { id, busy: true } if id == handle.get()
+        ));
+        let second_request = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::References { request_id, .. } => request_id,
+            _ => panic!("expected retried references request"),
+        };
+
+        notify_lsp_symbols_progress(&mut runtime, "begin").await;
+        runtime
+            .resolve_request(
+                second_request,
+                serde_json::json!({
+                    "ok": false,
+                    "error": "LSP request timed out after 30s",
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::UpdatePickerStatus { id, status: Some(status) }
+                if id == handle.get() && status == "Waiting for language server..."
+        ));
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::UpdatePickerBusy { id, busy: true } if id == handle.get()
+        ));
+
+        notify_lsp_symbols_progress(&mut runtime, "end").await;
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::UpdatePickerStatus { id, .. } if id == handle.get()
+        ));
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::UpdatePickerBusy { id, busy: true } if id == handle.get()
+        ));
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::References { .. }
+        ));
+        assert!(runtime
+            .notify_picker(handle, PickerCallback::Cancelled)
+            .unwrap());
+    }
+
+    #[tokio::test]
     async fn lsp_symbols_batches_pathological_reference_results() {
         drain_requests();
 
@@ -17124,6 +17272,22 @@ mod tests {
         load_lsp_symbols(&mut runtime).await;
 
         runtime.execute_command("LspReferences").await.unwrap();
+        let reference_handle = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::OpenCallbackPicker {
+                handle,
+                title,
+                items,
+                options,
+                ..
+            } => {
+                assert_eq!(title.as_deref(), Some("References"));
+                assert!(items.is_empty());
+                assert_eq!(options.status.as_deref(), Some("Fetching references..."));
+                assert!(options.busy);
+                handle
+            }
+            _ => panic!("expected references loading picker"),
+        };
         let request_id = match ACTION_DISPATCHER.recv_request() {
             PluginRequest::References {
                 request_id,
@@ -17138,23 +17302,17 @@ mod tests {
             .resolve_request(request_id, sample_reference_payload_with_count(4_097))
             .await
             .unwrap();
-
-        let reference_handle = match ACTION_DISPATCHER.recv_request() {
-            PluginRequest::OpenCallbackPicker {
-                handle,
-                items,
-                options,
-                ..
-            } => {
-                assert!(items.is_empty());
-                assert_eq!(options.status.as_deref(), Some("Loading 0/4097 references"));
-                handle
+        match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::UpdatePickerStatus { id, status } => {
+                assert_eq!(id, reference_handle.get());
+                assert_eq!(status.as_deref(), Some("Loading 0/4097 references"));
             }
-            _ => panic!("expected empty references picker"),
-        };
+            _ => panic!("expected references loading status"),
+        }
 
         let mut final_items = Vec::new();
         let mut final_status = None;
+        let mut busy = true;
         for _ in 0..80 {
             let callbacks = runtime.poll_timer_callbacks();
             assert!(!callbacks.is_empty(), "expected a pending reference batch");
@@ -17179,6 +17337,13 @@ mod tests {
                         assert_eq!(id, reference_handle.get());
                         final_status = status;
                     }
+                    PluginRequest::UpdatePickerBusy {
+                        id,
+                        busy: next_busy,
+                    } => {
+                        assert_eq!(id, reference_handle.get());
+                        busy = next_busy;
+                    }
                     _ => panic!("unexpected request while batching references"),
                 }
             }
@@ -17193,6 +17358,7 @@ mod tests {
             final_status.as_deref(),
             Some("4096 references (results truncated)")
         );
+        assert!(!busy);
         assert!(runtime.poll_timer_callbacks().is_empty());
         assert!(runtime
             .notify_picker(reference_handle, PickerCallback::Cancelled)
@@ -17334,6 +17500,10 @@ mod tests {
         load_lsp_symbols(&mut runtime).await;
 
         runtime.execute_command("LspReferences").await.unwrap();
+        let stale_handle = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::OpenCallbackPicker { handle, .. } => handle,
+            _ => panic!("expected references loading picker"),
+        };
         let stale_request_id = match ACTION_DISPATCHER.recv_request() {
             PluginRequest::References {
                 request_id,
@@ -17345,6 +17515,14 @@ mod tests {
             _ => panic!("unexpected plugin request"),
         };
         runtime.execute_command("LspReferences").await.unwrap();
+        match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::ClosePicker { id } => assert_eq!(id, stale_handle.get()),
+            _ => panic!("expected stale references picker to close"),
+        }
+        let handle = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::OpenCallbackPicker { handle, .. } => handle,
+            _ => panic!("expected replacement references loading picker"),
+        };
         let request_id = match ACTION_DISPATCHER.recv_request() {
             PluginRequest::References { request_id, .. } => request_id,
             _ => panic!("unexpected plugin request"),
@@ -17385,20 +17563,26 @@ mod tests {
         assert!(ACTION_DISPATCHER.try_recv_request().is_none());
         runtime.resolve_request(request_id, payload).await.unwrap();
 
-        let (handle, item) = match ACTION_DISPATCHER.recv_request() {
-            PluginRequest::OpenCallbackPicker {
-                handle,
-                title,
-                items,
-                ..
-            } => {
-                assert_eq!(title.as_deref(), Some("References"));
+        let item = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::UpdatePickerItems { id, items } => {
+                assert_eq!(id, handle.get());
                 assert_eq!(items.len(), 2);
                 assert_eq!(items[0].label, "src/lib.rs");
-                (handle, items[0].clone())
+                items[0].clone()
             }
-            _ => panic!("unexpected plugin request"),
+            _ => panic!("expected reference picker items"),
         };
+        match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::UpdatePickerStatus { id, status } => {
+                assert_eq!(id, handle.get());
+                assert_eq!(status.as_deref(), Some("2 references"));
+            }
+            _ => panic!("expected reference count"),
+        }
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::UpdatePickerBusy { id, busy: false } if id == handle.get()
+        ));
         runtime
             .notify_picker(handle, PickerCallback::Selected(item))
             .unwrap();
