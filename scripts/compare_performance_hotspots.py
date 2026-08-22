@@ -43,6 +43,7 @@ SCENARIOS = (
     "session-restore",
     "workspace-files",
     "workspace-search",
+    "plugin-events",
     "husk-completion",
     "husk-config",
     "husk-update",

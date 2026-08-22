@@ -698,7 +698,7 @@ fn payload_variant_name(name: &str) -> String {
 #[derive(Debug, Clone)]
 struct RedPluginPolicy {
     commands: HashMap<String, RedCommand>,
-    event_listeners: HashMap<String, Vec<Callback>>,
+    event_listeners: HashMap<String, Arc<Vec<Callback>>>,
     pending_requests: HashMap<RequestId, Callback>,
     picker_handlers: HashMap<PickerHandle, PickerRegistration>,
     composer_handlers: HashMap<ComposerHandle, ComposerRegistration>,
@@ -801,7 +801,7 @@ impl RedPluginPolicy {
         self.commands
             .retain(|_, command| command.callback.plugin() != plugin);
         self.event_listeners.retain(|_, callbacks| {
-            callbacks.retain(|callback| callback.plugin() != plugin);
+            Arc::make_mut(callbacks).retain(|callback| callback.plugin() != plugin);
             !callbacks.is_empty()
         });
         self.pending_requests
@@ -2355,11 +2355,12 @@ impl RedHost {
             "red::on" => {
                 let event = red_required_string(args, 0, path)?;
                 let callback = red_required_callback(args, 1, path)?.clone();
-                self.policy_mut()
+                let listeners = self
+                    .policy_mut()
                     .event_listeners
                     .entry(event.to_string())
-                    .or_default()
-                    .push(callback);
+                    .or_default();
+                Arc::make_mut(listeners).push(callback);
                 Ok(Value::Unit)
             }
             "red::execute" => {
@@ -3144,11 +3145,8 @@ impl Host for RedHost {
                     );
                 }
                 super::api::RedFunctionAnnotation::Event { name } => {
-                    self.policy_mut()
-                        .event_listeners
-                        .entry(name)
-                        .or_default()
-                        .push(function.callback().clone());
+                    let listeners = self.policy_mut().event_listeners.entry(name).or_default();
+                    Arc::make_mut(listeners).push(function.callback().clone());
                 }
                 super::api::RedFunctionAnnotation::StateInitializer => {
                     let Some(husk_ast::TypeExpr {
@@ -3967,15 +3965,12 @@ impl Runtime {
         let _span = crate::editor::perf::PerfSpan::with_detail("husk:notify", event);
         let mut inner = self.inner.lock().unwrap();
         let RuntimeInner { plugins, host, .. } = &mut *inner;
-        let callbacks = host
-            .policy()
-            .event_listeners
-            .get(event)
-            .cloned()
-            .unwrap_or_default();
-        for callback in callbacks {
-            let argument = decoded_callback_payload(host, &callback, 0, &args)?;
-            call_plugin_callback(plugins, host, &callback, vec![argument])?;
+        let Some(callbacks) = host.policy().event_listeners.get(event).cloned() else {
+            return Ok(());
+        };
+        for callback in callbacks.iter() {
+            let argument = decoded_callback_payload(host, callback, 0, &args)?;
+            call_plugin_callback(plugins, host, callback, vec![argument])?;
         }
         Ok(())
     }
@@ -3987,22 +3982,18 @@ impl Runtime {
     ) -> Vec<(String, anyhow::Error)> {
         let mut inner = self.inner.lock().unwrap();
         let RuntimeInner { plugins, host, .. } = &mut *inner;
-        let callbacks = host
-            .policy()
-            .event_listeners
-            .get(event)
-            .cloned()
-            .unwrap_or_default();
+        let Some(callbacks) = host.policy().event_listeners.get(event).cloned() else {
+            return Vec::new();
+        };
         callbacks
-            .into_iter()
+            .iter()
             .filter_map(|callback| {
-                let plugin = callback.plugin().to_string();
-                decoded_callback_payload(host, &callback, 0, &args)
+                decoded_callback_payload(host, callback, 0, &args)
                     .and_then(|argument| {
-                        call_plugin_callback(plugins, host, &callback, vec![argument])
+                        call_plugin_callback(plugins, host, callback, vec![argument])
                     })
                     .err()
-                    .map(|error| (plugin, error))
+                    .map(|error| (callback.plugin().to_string(), error))
             })
             .collect()
     }
@@ -4015,19 +4006,16 @@ impl Runtime {
     ) -> Vec<(String, anyhow::Error)> {
         let mut inner = self.inner.lock().unwrap();
         let RuntimeInner { plugins, host, .. } = &mut *inner;
-        let callbacks = host
-            .policy()
-            .event_listeners
-            .get(event)
-            .cloned()
-            .unwrap_or_default();
+        let Some(callbacks) = host.policy().event_listeners.get(event).cloned() else {
+            return Vec::new();
+        };
         callbacks
-            .into_iter()
+            .iter()
             .filter(|callback| callback.plugin() == plugin)
             .filter_map(|callback| {
-                decoded_callback_payload(host, &callback, 0, &args)
+                decoded_callback_payload(host, callback, 0, &args)
                     .and_then(|argument| {
-                        call_plugin_callback(plugins, host, &callback, vec![argument])
+                        call_plugin_callback(plugins, host, callback, vec![argument])
                     })
                     .err()
                     .map(|error| (plugin.to_string(), error))

@@ -14,9 +14,9 @@ use red::{
     lsp::LspManager,
     plugin::{
         Decoration, DecorationAnchor, DecorationManager, GutterSign, GutterSignManager,
-        PanelConfig, PanelManager, PanelRow, PanelRowKind, PanelSide, PluginRegistry, Runtime,
-        TextPanelBlock, TextPanelBlockFormat, TextPanelBlockKind, TreePanelModel, WorkspaceConfig,
-        WorkspaceManager, WorkspaceModel, WorkspaceRow,
+        PanelConfig, PanelManager, PanelRow, PanelRowKind, PanelSide, PluginRegistry, PluginStatus,
+        Runtime, TextPanelBlock, TextPanelBlockFormat, TextPanelBlockKind, TreePanelModel,
+        WorkspaceConfig, WorkspaceManager, WorkspaceModel, WorkspaceRow,
     },
     preferences::PreferencesStore,
     theme::{parse_vscode_theme, Style, Theme},
@@ -72,6 +72,8 @@ const WORKSPACE_SEARCH_DIRECTORIES: usize = 8;
 const WORKSPACE_SEARCH_FILES_PER_DIRECTORY: usize = 32;
 const WORKSPACE_SEARCH_LISTINGS: usize = 8;
 const WORKSPACE_CONTENT_SEARCHES: usize = 4;
+const PLUGIN_EVENT_BACKGROUND: usize = 64;
+const PLUGIN_EVENT_DELIVERIES: usize = 4_096;
 
 fn main() -> Result<()> {
     let scenario = std::env::args().nth(1).unwrap_or_else(|| "all".into());
@@ -175,6 +177,9 @@ fn main() -> Result<()> {
     }
     if scenario == "all" || scenario == "workspace-search" {
         results.push(benchmark_workspace_content_search()?);
+    }
+    if scenario == "all" || scenario == "plugin-events" {
+        results.push(benchmark_plugin_event_delivery()?);
     }
 
     anyhow::ensure!(
@@ -1087,6 +1092,64 @@ fn workspace_search_fixture() -> Result<tempfile::TempDir> {
     #[cfg(unix)]
     std::os::unix::fs::symlink(root.join("module-00/source-000.rs"), root.join("link.rs"))?;
     Ok(directory)
+}
+
+fn benchmark_plugin_event_delivery() -> Result<serde_json::Value> {
+    let directory = tempfile::tempdir()?;
+    let listener = directory.path().join("listener.hk");
+    let background = directory.path().join("background.hk");
+    std::fs::write(
+        &listener,
+        "pub fn activate() { red::on(\"cursor:moved\", observe); }\nfn observe(event: Json) {}\n",
+    )?;
+    std::fs::write(&background, "pub fn activate() {}\n")?;
+    let mut plugins = PluginRegistry::new();
+    plugins.add("listener", &listener.to_string_lossy());
+    for index in 0..PLUGIN_EVENT_BACKGROUND {
+        plugins.add(
+            &format!("background-{index:03}"),
+            &background.to_string_lossy(),
+        );
+    }
+    let mut runtime = Runtime::try_new()?;
+    let executor = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    executor.block_on(plugins.initialize(&mut runtime))?;
+    anyhow::ensure!(
+        plugins
+            .statuses()
+            .values()
+            .all(|status| matches!(status, PluginStatus::Active)),
+        "plugin event benchmark failed to activate all plugins"
+    );
+    let payload = json!({ "x": 4, "y": 8 });
+
+    let started = Instant::now();
+    executor.block_on(async {
+        for _ in 0..PLUGIN_EVENT_DELIVERIES {
+            plugins
+                .notify(
+                    &mut runtime,
+                    black_box("cursor:moved"),
+                    black_box(payload.clone()),
+                )
+                .await?;
+        }
+        Ok::<(), anyhow::Error>(())
+    })?;
+    anyhow::ensure!(
+        matches!(
+            plugins.statuses().get("listener"),
+            Some(PluginStatus::Active)
+        ),
+        "plugin event benchmark quarantined its listener"
+    );
+    Ok(report(
+        "plugin_cursor_event_delivery",
+        started,
+        PLUGIN_EVENT_DELIVERIES,
+    ))
 }
 
 fn decoration(line: usize, priority: i32) -> Decoration {

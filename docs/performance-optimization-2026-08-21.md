@@ -87,6 +87,7 @@ navigation baselines were frozen after rebasing to `d92777c`.
 | Undo history capacity pruning | 72.42% |
 | LSP completion filtering | 67.58% |
 | Structured picker ranking | 64.81% |
+| Plugin cursor-event delivery | 56.35% |
 | In-buffer search navigation | 55.98% |
 | Owned Husk JSON boundary conversion | 54.49% |
 | Bundled plugin startup | 51.22% |

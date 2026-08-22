@@ -32,6 +32,7 @@ pub struct PluginRegistry {
     metadata: HashMap<String, PluginMetadata>,
     initialized: bool,
     statuses: HashMap<String, PluginStatus>,
+    pending_plugins: usize,
     modified_at: HashMap<String, PluginModification>,
     last_hot_reload_poll: Instant,
 }
@@ -99,6 +100,7 @@ impl PluginRegistry {
             metadata: HashMap::new(),
             initialized: false,
             statuses: HashMap::new(),
+            pending_plugins: 0,
             modified_at: HashMap::new(),
             last_hot_reload_poll: Instant::now(),
         }
@@ -110,8 +112,7 @@ impl PluginRegistry {
     /// discovery of unrelated plugins.
     pub fn add(&mut self, name: &str, path: &str) {
         self.plugins.push((name.to_string(), path.to_string()));
-        self.statuses
-            .insert(name.to_string(), PluginStatus::Pending);
+        self.set_status(name.to_string(), PluginStatus::Pending);
         self.modified_at
             .insert(name.to_string(), plugin_modification(path));
 
@@ -122,7 +123,7 @@ impl PluginRegistry {
             Err(error) => {
                 let diagnostic = format!("failed to load plugin metadata: {error}");
                 crate::log!("Plugin `{name}` quarantined during metadata: {diagnostic}");
-                self.statuses.insert(
+                self.set_status(
                     name.to_string(),
                     PluginStatus::Quarantined {
                         stage: "metadata".to_string(),
@@ -151,6 +152,19 @@ impl PluginRegistry {
     /// Returns current lifecycle status keyed by plugin name.
     pub fn statuses(&self) -> &HashMap<String, PluginStatus> {
         &self.statuses
+    }
+
+    fn set_status(&mut self, name: String, status: PluginStatus) {
+        let was_pending = matches!(self.statuses.get(&name), Some(PluginStatus::Pending));
+        let is_pending = matches!(&status, PluginStatus::Pending);
+        if was_pending != is_pending {
+            if is_pending {
+                self.pending_plugins += 1;
+            } else {
+                self.pending_plugins -= 1;
+            }
+        }
+        self.statuses.insert(name, status);
     }
 
     /// Activates plugins in dependency order and quarantines independent failures.
@@ -222,7 +236,7 @@ impl PluginRegistry {
                 };
                 match result {
                     Ok(()) => {
-                        self.statuses.insert(name, PluginStatus::Active);
+                        self.set_status(name, PluginStatus::Active);
                     }
                     Err(error) => {
                         self.quarantine(
@@ -325,7 +339,7 @@ impl PluginRegistry {
             );
         }
         crate::log!("Plugin `{name}` quarantined during {stage}: {diagnostic}");
-        self.statuses.insert(
+        self.set_status(
             name.to_string(),
             PluginStatus::Quarantined {
                 stage: stage.to_string(),
@@ -397,21 +411,23 @@ impl PluginRegistry {
         args: serde_json::Value,
     ) -> anyhow::Result<()> {
         let _span = crate::editor::perf::PerfSpan::with_detail("notify", event);
-        let pending = self
-            .plugins
-            .iter()
-            .filter(|(name, _)| matches!(self.statuses.get(name), Some(PluginStatus::Pending)))
-            .filter(|(name, _)| {
-                self.metadata.get(name).is_some_and(|metadata| {
-                    metadata.activation_events.iter().any(|activation| {
-                        activation == event || activation == &format!("onEvent:{event}")
+        if self.pending_plugins != 0 {
+            let pending = self
+                .plugins
+                .iter()
+                .filter(|(name, _)| matches!(self.statuses.get(name), Some(PluginStatus::Pending)))
+                .filter(|(name, _)| {
+                    self.metadata.get(name).is_some_and(|metadata| {
+                        metadata.activation_events.iter().any(|activation| {
+                            activation == event || activation == &format!("onEvent:{event}")
+                        })
                     })
                 })
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-        for (name, path) in pending {
-            self.activate_one(runtime, &name, &path).await;
+                .cloned()
+                .collect::<Vec<_>>();
+            for (name, path) in pending {
+                self.activate_one(runtime, &name, &path).await;
+            }
         }
         for (plugin, error) in runtime.notify_isolated(event, args) {
             let path = self
@@ -468,7 +484,7 @@ impl PluginRegistry {
         }
         match load_plugin(runtime, name, path).await {
             Ok(()) => {
-                self.statuses.insert(name.to_string(), PluginStatus::Active);
+                self.set_status(name.to_string(), PluginStatus::Active);
             }
             Err(error) => self.quarantine(
                 runtime,
@@ -773,7 +789,7 @@ impl PluginRegistry {
         };
         match result {
             Ok(()) => {
-                self.statuses.insert(name.to_string(), PluginStatus::Active);
+                self.set_status(name.to_string(), PluginStatus::Active);
             }
             Err(error) => {
                 crate::log!("Plugin `{name}` hot reload rejected: {error}");
@@ -783,7 +799,7 @@ impl PluginRegistry {
                     } else {
                         self.metadata.remove(name);
                     }
-                    self.statuses.insert(
+                    self.set_status(
                         name.to_string(),
                         PluginStatus::ActiveWithReloadError {
                             path: plugin_display_path(path),
@@ -1060,6 +1076,48 @@ mod tests {
 
         assert!(matches!(source, Cow::Borrowed(_)));
         assert!(!source.is_empty());
+    }
+
+    #[tokio::test]
+    async fn pending_plugin_count_tracks_activation_quarantine_and_lazy_events() {
+        let eager_directory = tempfile_dir("pending-count-eager");
+        let eager = eager_directory.join("plugin.hk");
+        fs::write(&eager, "pub fn activate() {}\n").unwrap();
+        let invalid_directory = tempfile_dir("pending-count-invalid");
+        let invalid = invalid_directory.join("plugin.hk");
+        fs::write(&invalid, "pub fn activate() {}\n").unwrap();
+        fs::write(invalid_directory.join("package.json"), "invalid metadata").unwrap();
+        let lazy = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/example-plugin/index.hk");
+
+        let mut registry = PluginRegistry::new();
+        registry.add("invalid", invalid.to_str().unwrap());
+        assert_eq!(registry.pending_plugins, 0);
+        registry.add("eager", eager.to_str().unwrap());
+        registry.add("example-plugin", lazy.to_str().unwrap());
+        assert_eq!(registry.pending_plugins, 2);
+
+        let mut runtime = Runtime::new();
+        registry.initialize(&mut runtime).await.unwrap();
+        assert_eq!(registry.pending_plugins, 1);
+        assert!(matches!(
+            registry.statuses().get("example-plugin"),
+            Some(PluginStatus::Pending)
+        ));
+
+        registry
+            .notify(&mut runtime, "cursor:moved", serde_json::json!({}))
+            .await
+            .unwrap();
+        assert_eq!(registry.pending_plugins, 1);
+        registry
+            .notify(&mut runtime, "editor:ready", serde_json::json!({}))
+            .await
+            .unwrap();
+        assert_eq!(registry.pending_plugins, 0);
+        assert!(matches!(
+            registry.statuses().get("example-plugin"),
+            Some(PluginStatus::Active)
+        ));
     }
 
     #[tokio::test]
