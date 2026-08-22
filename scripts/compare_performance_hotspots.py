@@ -35,6 +35,7 @@ SCENARIOS = (
     "sentence",
     "undo-prune",
     "highlight",
+    "tree-selection",
     "husk-completion",
     "husk-config",
     "husk-update",

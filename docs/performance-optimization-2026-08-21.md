@@ -55,6 +55,7 @@ navigation baselines were frozen after rebasing to `d92777c`.
 | Runtime path | Median improvement |
 | --- | ---: |
 | Husk unchanged configuration refresh | 99.99% |
+| Neo-tree repeated row selection | 99.98% |
 | Repeated themed syntax highlighting | 99.61% |
 | Agent streamed transcript updates | 99.18% |
 | Shared modal editor word operators | 99.17% |
@@ -89,6 +90,12 @@ serialization fell from 107 microseconds to below the trace timer's
 one-microsecond resolution, and p95 fell from 118 to 73 microseconds.
 Full-frame resize deltas remain intentionally more expensive.
 
+Real Neo-tree PTY runs confirmed every entry remained reachable at both 2,048
+and 8,192 files. In the single 8,192-entry before/after run, opening fell from
+75.78 to 42.32 milliseconds, navigation p95 fell from 4,661 to 627 microseconds,
+and resident-memory growth fell from 41,120 to 39,616 KiB. The optimization
+retains one cached row position per tree rather than allocating a per-row index.
+
 Five alternating real typing runs showed 6.04% faster median input events,
 7.44% faster median full-frame rendering, 9.27% faster process-to-first-paint
 time, 35.07% faster interactive startup, and 45.09% faster bundled plugin
@@ -99,12 +106,12 @@ objective.
 ## Remaining gaps
 
 - Broad process startup, full-frame typing, crash recovery, Git integration,
-  Neo-tree memory, broader Vim editing, platform-specific paths,
+  broader Vim editing, platform-specific paths,
   and several other areas above still require dedicated before/after fixtures
   before claiming a 50% improvement.
-- An eager Neo-tree row index was intentionally rejected: real 2,048- and
-  8,192-entry terminal runs showed greater memory use and slightly slower open
-  times despite a favorable isolated lookup benchmark.
+- An eager Neo-tree row index was intentionally rejected because it increased
+  memory and slowed opening; the retained single-position cache avoids both
+  regressions in real 2,048- and 8,192-entry terminal runs.
 
 ## Reproducing measurements
 

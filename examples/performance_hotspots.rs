@@ -14,7 +14,7 @@ use red::{
     plugin::{
         Decoration, DecorationAnchor, DecorationManager, GutterSign, GutterSignManager,
         PanelConfig, PanelManager, PanelRow, PanelRowKind, PanelSide, PluginRegistry, Runtime,
-        TextPanelBlock, TextPanelBlockFormat, TextPanelBlockKind,
+        TextPanelBlock, TextPanelBlockFormat, TextPanelBlockKind, TreePanelModel,
     },
     preferences::PreferencesStore,
     theme::{parse_vscode_theme, Style, Theme},
@@ -56,6 +56,8 @@ const SENTENCE_MOTIONS: usize = 128;
 const UNDO_HISTORY_CAPACITY: usize = 128;
 const UNDO_TRANSACTIONS: usize = 512;
 const HIGHLIGHT_REQUESTS: usize = 2_000;
+const TREE_PANEL_ROWS: usize = 8_192;
+const TREE_PANEL_LOOKUPS: usize = 256;
 
 fn main() -> Result<()> {
     let scenario = std::env::args().nth(1).unwrap_or_else(|| "all".into());
@@ -135,6 +137,9 @@ fn main() -> Result<()> {
     }
     if scenario == "all" || scenario == "highlight" {
         results.push(benchmark_repeated_syntax_highlighting()?);
+    }
+    if scenario == "all" || scenario == "tree-selection" {
+        results.push(benchmark_tree_panel_selection()?);
     }
 
     anyhow::ensure!(
@@ -722,6 +727,45 @@ fn benchmark_repeated_syntax_highlighting() -> Result<serde_json::Value> {
         "repeated_syntax_highlighting",
         started,
         HIGHLIGHT_REQUESTS,
+    ))
+}
+
+fn benchmark_tree_panel_selection() -> Result<serde_json::Value> {
+    let entries = (0..TREE_PANEL_ROWS)
+        .map(|index| {
+            json!({
+                "name": format!("file-{index:04}.rs"),
+                "path": format!("./file-{index:04}.rs"),
+                "kind": "file",
+            })
+        })
+        .collect::<Vec<_>>();
+    let model = TreePanelModel::from_husk_values(&[
+        husk_runtime::Value::String("/repo".to_string()),
+        husk_runtime::Value::from_json(json!([{ "path": ".", "entries": entries }])),
+        husk_runtime::Value::from_json(json!(["."])),
+        husk_runtime::Value::from_json(json!([])),
+        husk_runtime::Value::from_json(json!([])),
+        husk_runtime::Value::String(String::new()),
+        husk_runtime::Value::from_json(json!([])),
+    ])?;
+    let mut panels = PanelManager::default();
+    panels.create_panel("tree".to_string(), PanelConfig::default());
+    panels.update_tree_panel("tree", model);
+    let target = format!("./file-{:04}.rs", TREE_PANEL_ROWS - 1);
+    anyhow::ensure!(
+        panels.select_row_by_id("tree", &target, 40),
+        "tree panel benchmark target is missing"
+    );
+
+    let started = Instant::now();
+    for _ in 0..TREE_PANEL_LOOKUPS {
+        black_box(panels.select_row_by_id("tree", black_box(&target), 40));
+    }
+    Ok(report(
+        "neotree_repeated_row_selection",
+        started,
+        TREE_PANEL_LOOKUPS,
     ))
 }
 
