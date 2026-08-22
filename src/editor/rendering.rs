@@ -1330,9 +1330,12 @@ impl Editor {
         }
     }
 
-    fn update_terminal_cursor_surface(&mut self, buffer: &RenderBuffer) {
-        self.last_rendered_cursor_surface = self
-            .render_cursor_position()
+    fn update_terminal_cursor_surface(
+        &mut self,
+        buffer: &RenderBuffer,
+        cursor_position: Option<(usize, usize)>,
+    ) {
+        self.last_rendered_cursor_surface = cursor_position
             .and_then(|(x, y)| {
                 (x < buffer.width && y < buffer.height)
                     .then(|| buffer.cells.get(y * buffer.width + x))
@@ -1494,7 +1497,7 @@ impl Editor {
 
         // Update overlay positions and render them
         let overlays_span = super::perf::PerfSpan::start("render:overlays+cursor");
-        self.update_and_render_overlays(buffer)?;
+        let cursor_position = self.update_and_render_overlays(buffer)?;
         self.render_learn_coach(buffer);
         // Modal content and its action menu must be above plugin paint commands
         // and floating overlays, which may otherwise erase text or borders.
@@ -1507,9 +1510,9 @@ impl Editor {
         if let Some(help) = &self.keyboard_shortcuts {
             help.render(buffer, &self.theme)?;
         }
-        self.update_terminal_cursor_surface(buffer);
-        self.render_cursor_cell(buffer);
-        self.last_rendered_cursor_position = self.render_cursor_position();
+        self.update_terminal_cursor_surface(buffer, cursor_position);
+        self.render_cursor_cell(buffer, cursor_position);
+        self.last_rendered_cursor_position = cursor_position;
         drop(overlays_span);
 
         // Flush changes to terminal
@@ -1542,12 +1545,16 @@ impl Editor {
             )
     }
 
-    fn render_cursor_cell(&self, buffer: &mut RenderBuffer) {
+    fn render_cursor_cell(
+        &self,
+        buffer: &mut RenderBuffer,
+        cursor_position: Option<(usize, usize)>,
+    ) {
         if self.workspace_manager.is_active() || !self.uses_synthetic_block_cursor() {
             return;
         }
 
-        let Some((x, y)) = self.render_cursor_position() else {
+        let Some((x, y)) = cursor_position else {
             return;
         };
         if x >= buffer.width || y >= buffer.height {
@@ -1630,14 +1637,14 @@ impl Editor {
             self.render_window(buffer, self.window_manager.active_window_id())?;
         }
         self.render_ui_chrome(buffer)?;
-        self.update_and_render_overlays(buffer)?;
+        let cursor_position = self.update_and_render_overlays(buffer)?;
         self.render_learn_coach(buffer);
         self.render_dialog(buffer)?;
         self.shortcut_help_regions
             .clone_from(&buffer.shortcut_help_regions);
-        self.update_terminal_cursor_surface(buffer);
-        self.render_cursor_cell(buffer);
-        self.last_rendered_cursor_position = self.render_cursor_position();
+        self.update_terminal_cursor_surface(buffer, cursor_position);
+        self.render_cursor_cell(buffer, cursor_position);
+        self.last_rendered_cursor_position = cursor_position;
 
         let changes = self.render_buffer_changes(buffer);
         self.render_diff(&changes)?;
@@ -1736,8 +1743,8 @@ impl Editor {
         self.render_window_rows(buffer, active_window_id, &rows)?;
         self.draw_statusline(buffer);
         self.draw_commandline(buffer);
-        self.update_terminal_cursor_surface(buffer);
-        self.render_cursor_cell(buffer);
+        self.update_terminal_cursor_surface(buffer, new_cursor_position);
+        self.render_cursor_cell(buffer, new_cursor_position);
 
         let changes = buffer.diff_row_snapshots(&snapshots);
         self.render_diff(&changes)?;
@@ -2500,8 +2507,15 @@ impl Editor {
         Ok(())
     }
 
-    fn update_and_render_overlays(&mut self, buffer: &mut RenderBuffer) -> anyhow::Result<()> {
-        let cursor_pos = self.render_cursor_position().map(|(x, y)| Point::new(x, y));
+    fn update_and_render_overlays(
+        &mut self,
+        buffer: &mut RenderBuffer,
+    ) -> anyhow::Result<Option<(usize, usize)>> {
+        let cursor_position = self.render_cursor_position();
+        if !self.overlay_manager.has_visible_content() {
+            return Ok(cursor_position);
+        }
+        let cursor_pos = cursor_position.map(|(x, y)| Point::new(x, y));
 
         // Update positions for all overlays
         self.overlay_manager.update_positions(
@@ -2513,7 +2527,7 @@ impl Editor {
         // Render all dirty overlays
         self.overlay_manager.render_all(buffer);
 
-        Ok(())
+        Ok(cursor_position)
     }
 
     /// Renders the main editor content (text buffer) within a window
@@ -4078,6 +4092,43 @@ mod tests {
             Editor::with_size(lsp, 60, 12, config, Theme::default(), vec![source]).unwrap();
         editor.test_disable_terminal_output();
         editor
+    }
+
+    #[test]
+    fn empty_overlays_defer_positioning_until_content_becomes_visible() {
+        let mut editor = rendering_test_editor(Buffer::new(None, "source\n".into()));
+        editor.overlay_manager.create_overlay(
+            "idle-progress".into(),
+            crate::plugin::OverlayConfig {
+                align: crate::plugin::OverlayAlignment::Top,
+                x_padding: 0,
+                ..crate::plugin::OverlayConfig::default()
+            },
+        );
+        let mut frame = RenderBuffer::new(60, 12, &editor.theme.style);
+
+        editor.render(&mut frame).unwrap();
+        let overlay = editor
+            .overlay_manager
+            .get_overlay_mut("idle-progress")
+            .unwrap();
+        assert_eq!(overlay.position, None);
+        overlay.update_content(vec![("progress".into(), Style::default())]);
+
+        editor.render(&mut frame).unwrap();
+        let overlay = editor
+            .overlay_manager
+            .get_overlay_mut("idle-progress")
+            .unwrap();
+        assert_eq!(overlay.position, Some(Point::new(/*x*/ 52, /*y*/ 0)));
+        assert!(!overlay.is_dirty());
+        assert_eq!(
+            frame.cells[52..60]
+                .iter()
+                .map(|cell| cell.c)
+                .collect::<String>(),
+            "progress"
+        );
     }
 
     #[test]
