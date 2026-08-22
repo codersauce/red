@@ -1114,24 +1114,52 @@ fn expanded_path_string(path: &str) -> anyhow::Result<String> {
     Ok(expand_user_path(path)?.to_string_lossy().into_owned())
 }
 
+#[derive(Default)]
+struct SnapshotFileIdentities {
+    paths: HashSet<PathBuf>,
+    #[cfg(unix)]
+    files: HashSet<(u64, u64)>,
+}
+
+impl SnapshotFileIdentities {
+    fn insert(&mut self, path: PathBuf) -> bool {
+        if self.paths.contains(&path) {
+            return false;
+        }
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+
+            if fs::metadata(&path)
+                .ok()
+                .is_some_and(|metadata| !self.files.insert((metadata.dev(), metadata.ino())))
+            {
+                return false;
+            }
+        }
+
+        #[cfg(not(unix))]
+        if self
+            .paths
+            .iter()
+            .any(|existing| same_file_path(existing, &path))
+        {
+            return false;
+        }
+
+        self.paths.insert(path)
+    }
+}
+
 fn snapshot_duplicate_file_count(snapshot: &SessionSnapshot) -> usize {
-    let mut unique_paths = Vec::<PathBuf>::new();
+    let mut unique_paths = SnapshotFileIdentities::default();
     snapshot
         .buffers
         .iter()
         .filter_map(|buffer| buffer.path.as_deref())
         .filter_map(|path| normalized_file_path(path).ok())
-        .filter(|path| {
-            if unique_paths
-                .iter()
-                .any(|unique| same_file_path(unique, path))
-            {
-                true
-            } else {
-                unique_paths.push(path.clone());
-                false
-            }
-        })
+        .filter(|path| !unique_paths.insert(path.clone()))
         .count()
 }
 
@@ -25482,7 +25510,7 @@ impl Editor {
     }
 
     pub fn buffers_from_session_snapshot(snapshot: &SessionSnapshot) -> Vec<Buffer> {
-        let mut restored_paths = Vec::<PathBuf>::new();
+        let mut restored_paths = SnapshotFileIdentities::default();
         snapshot
             .buffers
             .iter()
@@ -25490,20 +25518,13 @@ impl Editor {
                 let mut detached_duplicate = false;
                 let path = saved.path.as_deref().and_then(|path| {
                     match normalized_file_path(path) {
-                        Ok(normalized)
-                            if restored_paths
-                                .iter()
-                                .any(|restored| same_file_path(restored, &normalized)) =>
-                        {
+                        Ok(normalized) if !restored_paths.insert(normalized.clone()) => {
                             // Preserve the duplicate's recoverable contents without keeping a
                             // second live document identity for the same file.
                             detached_duplicate = true;
                             None
                         }
-                        Ok(normalized) => {
-                            restored_paths.push(normalized.clone());
-                            Some(normalized.to_string_lossy().into_owned())
-                        }
+                        Ok(normalized) => Some(normalized.to_string_lossy().into_owned()),
                         Err(_) => Some(path.to_string()),
                     }
                 });
@@ -38906,6 +38927,41 @@ builtin = "rust"
             .warnings
             .iter()
             .any(|warning| warning.contains("Collapsed duplicate saved buffer")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn session_restore_detaches_symlink_and_hardlink_duplicates() {
+        let directory = tempfile::tempdir().unwrap();
+        let original = directory.path().join("original.rs");
+        let symlink = directory.path().join("symlink.rs");
+        let hardlink = directory.path().join("hardlink.rs");
+        std::fs::write(&original, "original\n").unwrap();
+        std::os::unix::fs::symlink(&original, &symlink).unwrap();
+        std::fs::hard_link(&original, &hardlink).unwrap();
+        let mut editor = lsp_test_editor(vec![
+            Buffer::new(
+                Some(original.to_string_lossy().into_owned()),
+                "original\n".to_string(),
+            ),
+            Buffer::new(
+                Some(symlink.to_string_lossy().into_owned()),
+                "unsaved symlink\n".to_string(),
+            ),
+            Buffer::new(
+                Some(hardlink.to_string_lossy().into_owned()),
+                "unsaved hardlink\n".to_string(),
+            ),
+        ]);
+
+        let restored = Editor::buffers_from_session_snapshot(&editor.test_session_snapshot());
+
+        assert_eq!(restored.len(), 3);
+        assert_eq!(restored[0].file.as_deref(), original.to_str());
+        assert!(restored[1].file.is_none() && restored[1].is_dirty());
+        assert_eq!(restored[1].contents(), "unsaved symlink\n");
+        assert!(restored[2].file.is_none() && restored[2].is_dirty());
+        assert_eq!(restored[2].contents(), "unsaved hardlink\n");
     }
 
     #[tokio::test]

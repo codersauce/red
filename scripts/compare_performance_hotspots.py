@@ -40,6 +40,7 @@ SCENARIOS = (
     "inline-stream",
     "statusline",
     "lsp-routing",
+    "session-restore",
     "husk-completion",
     "husk-config",
     "husk-update",

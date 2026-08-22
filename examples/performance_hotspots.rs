@@ -66,6 +66,8 @@ const INLINE_CONVERSATIONS: usize = 4_096;
 const INLINE_ANSWER_DELTAS: usize = 1_000;
 const STATUSLINE_FRAMES: usize = 1_000;
 const LSP_DOCUMENT_RESOLVES: usize = 1_000;
+const RECOVERY_BUFFERS: usize = 32;
+const RECOVERY_RESTORES: usize = 8;
 
 fn main() -> Result<()> {
     let scenario = std::env::args().nth(1).unwrap_or_else(|| "all".into());
@@ -160,6 +162,9 @@ fn main() -> Result<()> {
     }
     if scenario == "all" || scenario == "lsp-routing" {
         results.push(benchmark_lsp_document_routing()?);
+    }
+    if scenario == "all" || scenario == "session-restore" {
+        results.push(benchmark_session_buffer_restoration()?);
     }
 
     anyhow::ensure!(
@@ -943,6 +948,46 @@ fn benchmark_lsp_document_routing() -> Result<serde_json::Value> {
         "lsp_absolute_document_routing",
         started,
         LSP_DOCUMENT_RESOLVES,
+    ))
+}
+
+fn benchmark_session_buffer_restoration() -> Result<serde_json::Value> {
+    let directory = tempfile::tempdir()?;
+    let mut buffers = Vec::with_capacity(RECOVERY_BUFFERS);
+    for index in 0..RECOVERY_BUFFERS {
+        let path = directory.path().join(format!("recovered-{index:03}.rs"));
+        let contents = format!("fn recovered_{index}() {{}}\n");
+        std::fs::write(&path, &contents)?;
+        buffers.push(Buffer::new(
+            Some(path.to_string_lossy().into_owned()),
+            contents,
+        ));
+    }
+    let mut config = Config::default();
+    config.lsp.enabled = false;
+    let mut editor = Editor::with_size(
+        Box::new(LspManager::new(config.lsp.clone())),
+        120,
+        40,
+        config,
+        Theme::default(),
+        buffers,
+    )?;
+    let snapshot = editor.test_session_snapshot();
+
+    let started = Instant::now();
+    for _ in 0..RECOVERY_RESTORES {
+        let recovered = Editor::buffers_from_session_snapshot(black_box(&snapshot));
+        anyhow::ensure!(
+            recovered.len() == RECOVERY_BUFFERS,
+            "session benchmark did not recover all file-backed buffers"
+        );
+        black_box(recovered);
+    }
+    Ok(report(
+        "crash_recovery_buffer_restoration",
+        started,
+        RECOVERY_RESTORES,
     ))
 }
 

@@ -56,6 +56,7 @@ navigation baselines were frozen after rebasing to `d92777c`.
 | --- | ---: |
 | Husk unchanged configuration refresh | 99.99% |
 | Neo-tree repeated row selection | 99.98% |
+| Crash-recovery buffer restoration | 99.77% |
 | Repeated themed syntax highlighting | 99.61% |
 | Agent streamed transcript updates | 99.18% |
 | Shared modal editor word operators | 99.17% |
@@ -121,8 +122,8 @@ objective.
 
 ## Remaining gaps
 
-- Broad process startup, full-frame typing, crash recovery, repository
-  discovery and status refresh, broader Vim editing, platform-specific paths,
+- Broad process startup, full-frame typing, recovery snapshot writes,
+  repository discovery and status refresh, broader Vim editing, platform-specific paths,
   and several other areas above still require dedicated before/after fixtures
   before claiming a 50% improvement.
 - An eager Neo-tree row index was intentionally rejected because it increased
