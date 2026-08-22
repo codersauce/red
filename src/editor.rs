@@ -28005,17 +28005,21 @@ impl Editor {
             if self.transaction_active() {
                 self.commit_transaction(self.cursor_snapshot());
             }
-            let end = self.current_buffer().char_idx_to_position(usize::MAX);
             self.begin_transaction_with_origin(
                 label,
                 EditOrigin::Lsp {
                     server: "language server".to_string(),
                 },
             );
-            self.replace_range(
-                TextRange::new(TextPosition::new(0, 0), end),
-                &document.contents,
-            );
+            for batch in document.edit_batches {
+                // Ranges in a protocol batch refer to the same pre-edit snapshot.
+                for edit in batch.into_iter().rev() {
+                    let start = self.current_buffer().char_idx_to_position(edit.start);
+                    let end = self.current_buffer().char_idx_to_position(edit.end);
+                    self.replace_range(TextRange::new(start, end), &edit.new_text);
+                }
+            }
+            debug_assert_eq!(self.current_buffer().contents(), document.contents);
             self.commit_transaction(self.cursor_snapshot());
             changed.push(index);
         }
@@ -41326,6 +41330,93 @@ builtin = "rust"
                 .map(|tx| &tx.origin),
             Some(EditOrigin::Lsp { .. })
         ));
+    }
+
+    #[tokio::test]
+    async fn workspace_edit_rebases_diagnostics_until_each_channel_refreshes() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("main.rs");
+        let original = "fn main() {\n    missing();\n    other();\n}\n";
+        std::fs::write(&path, original).unwrap();
+        let mut editor = lsp_test_editor(vec![Buffer::new(
+            Some(path.to_string_lossy().into_owned()),
+            original.to_string(),
+        )]);
+        let uri = editor.buffer_manager[0].uri().unwrap().unwrap();
+        let pushed = line_diagnostic(
+            (1, 4),
+            (1, 11),
+            DiagnosticSeverity::Error,
+            "missing import",
+            None,
+        );
+        let pulled = line_diagnostic(
+            (2, 4),
+            (2, 9),
+            DiagnosticSeverity::Warning,
+            "other warning",
+            None,
+        );
+        editor.add_diagnostics(Some(&uri), &[pushed]);
+        editor.update_diagnostics(
+            Some(&uri),
+            &[pulled],
+            diagnostics::DiagnosticReportKind::Pull,
+        );
+        let revision = editor.buffer_manager[0].revision();
+
+        editor
+            .test_execute_production_action(Action::ApplyLspWorkspaceEdit {
+                documents: vec![LspDocumentEdit {
+                    uri: uri.clone(),
+                    version: None,
+                    edits: vec![lsp_edit((0, 0), (0, 0), "use crate::missing;\n")],
+                }],
+                expected_revisions: vec![(uri.clone(), revision)],
+                command: None,
+                label: "import missing item".to_string(),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            editor.current_buffer().contents(),
+            "use crate::missing;\nfn main() {\n    missing();\n    other();\n}\n"
+        );
+        assert!(editor.current_buffer().is_dirty());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        let diagnostics = &editor.diagnostics[&uri];
+        assert_eq!(diagnostics.len(), 2);
+        assert_eq!(
+            diagnostics
+                .iter()
+                .find(|diagnostic| diagnostic.message == "missing import")
+                .unwrap()
+                .range
+                .start
+                .line,
+            2
+        );
+        assert_eq!(
+            diagnostics
+                .iter()
+                .find(|diagnostic| diagnostic.message == "other warning")
+                .unwrap()
+                .range
+                .start
+                .line,
+            3
+        );
+
+        editor.update_diagnostics(Some(&uri), &[], diagnostics::DiagnosticReportKind::Pull);
+
+        assert_eq!(editor.diagnostics[&uri].len(), 1);
+        assert_eq!(editor.diagnostics[&uri][0].message, "missing import");
+        assert_eq!(editor.diagnostics[&uri][0].range.start.line, 2);
+
+        editor.add_diagnostics(Some(&uri), &[]);
+
+        assert!(editor.diagnostics[&uri].is_empty());
     }
 
     #[tokio::test]
