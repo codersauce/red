@@ -55,6 +55,7 @@ mod signature_help;
 mod snippet;
 
 use std::{
+    borrow::Cow,
     cell::RefCell,
     cmp::Ordering,
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
@@ -29368,10 +29369,15 @@ fn parse_git_status_records(output: &[u8], root: &str) -> Vec<Value> {
     statuses
 }
 
-pub(crate) fn git_status_index(statuses: &[Value], root: &str) -> Value {
-    let root = normalize_plugin_path(root);
+/// Indexes changed Git paths and their directories using Neo-tree status precedence.
+pub fn git_status_index(statuses: &[Value], root: &str) -> Value {
+    let root = if root.contains('\\') {
+        Cow::Owned(normalize_plugin_path(root))
+    } else {
+        Cow::Borrowed(root)
+    };
     let root = if root == "/" {
-        root.as_str()
+        root.as_ref()
     } else {
         root.trim_end_matches('/')
     };
@@ -29393,9 +29399,13 @@ pub(crate) fn git_status_index(statuses: &[Value], root: &str) -> Value {
         else {
             continue;
         };
-        let path = normalize_plugin_path(path);
+        let path = if path.contains('\\') {
+            Cow::Owned(normalize_plugin_path(path))
+        } else {
+            Cow::Borrowed(path)
+        };
         let path = if path == "/" {
-            path.as_str()
+            path.as_ref()
         } else {
             path.trim_end_matches('/')
         };
@@ -29413,7 +29423,17 @@ pub(crate) fn git_status_index(statuses: &[Value], root: &str) -> Value {
         }
         let mut parent = relative;
         while let Some((ancestor, _)) = parent.rsplit_once('/') {
-            prefer_git_status(&mut index, &format!("{root_prefix}{ancestor}"), status);
+            let ancestor_path = &path[..root_prefix.len() + ancestor.len()];
+            if !prefer_git_status(&mut index, ancestor_path, status)
+                && index
+                    .get(ancestor_path)
+                    .and_then(Value::as_str)
+                    .is_some_and(|current| current != "ignored")
+            {
+                // Every non-ignored directory status was already propagated to
+                // its parents at equal or higher precedence.
+                break;
+            }
             parent = ancestor;
         }
     }
@@ -29421,7 +29441,7 @@ pub(crate) fn git_status_index(statuses: &[Value], root: &str) -> Value {
     Value::Object(index)
 }
 
-fn prefer_git_status(index: &mut serde_json::Map<String, Value>, path: &str, status: &str) {
+fn prefer_git_status(index: &mut serde_json::Map<String, Value>, path: &str, status: &str) -> bool {
     let replace = index
         .get(path)
         .and_then(Value::as_str)
@@ -29429,6 +29449,7 @@ fn prefer_git_status(index: &mut serde_json::Map<String, Value>, path: &str, sta
     if replace {
         index.insert(path.to_string(), Value::String(status.to_string()));
     }
+    replace
 }
 
 fn git_status_rank(status: &str) -> u8 {
@@ -36608,6 +36629,69 @@ builtin = "rust"
         assert!(index.get("/repo/src").is_none());
         assert!(index.get("/repo/src/lsp").is_none());
         assert!(index.get("/repo/target/").is_none());
+    }
+
+    #[test]
+    fn git_status_index_reuses_ancestors_without_hiding_later_conflicts() {
+        let statuses = [
+            ("src/nested/first.rs", "modified"),
+            ("src/nested/second.rs", "modified"),
+            ("src/nested/third.rs", "untracked"),
+            ("src/nested/fourth.rs", "conflict"),
+            ("src/nested/fifth.rs", "staged"),
+        ]
+        .into_iter()
+        .map(|(path, status)| {
+            json!({
+                "path": path,
+                "absolute_path": format!("/repo/{path}"),
+                "status": status,
+            })
+        })
+        .collect::<Vec<_>>();
+
+        let index = git_status_index(&statuses, "/repo/");
+        assert_eq!(index["/repo/src"], "conflict");
+        assert_eq!(index["/repo/src/nested"], "conflict");
+        assert_eq!(index["/repo/src/nested/first.rs"], "modified");
+        assert_eq!(index["/repo/src/nested/third.rs"], "untracked");
+        assert_eq!(index["/repo/src/nested/fourth.rs"], "conflict");
+        assert_eq!(index["/repo/src/nested/fifth.rs"], "staged");
+    }
+
+    #[test]
+    fn git_status_index_propagates_tracked_children_past_ignored_directories() {
+        let statuses = [
+            json!({
+                "path": "src/nested",
+                "absolute_path": "/repo/src/nested",
+                "status": "ignored",
+            }),
+            json!({
+                "path": "src/nested/staged.rs",
+                "absolute_path": "/repo/src/nested/staged.rs",
+                "status": "staged",
+            }),
+        ];
+
+        let index = git_status_index(&statuses, "/repo");
+        assert_eq!(index["/repo/src/nested"], "ignored");
+        assert_eq!(index["/repo/src/nested/staged.rs"], "staged");
+        assert_eq!(index["/repo/src"], "staged");
+    }
+
+    #[test]
+    fn git_status_index_normalizes_windows_separators_without_changing_precedence() {
+        let statuses = [json!({
+            "path": "src\\nested\\main.rs",
+            "absolute_path": "C:\\repo\\src\\nested\\main.rs",
+            "status": "modified",
+        })];
+
+        let index = git_status_index(&statuses, "C:\\repo\\");
+        assert_eq!(index["C:/repo/src"], "modified");
+        assert_eq!(index["C:/repo/src/nested"], "modified");
+        assert_eq!(index["C:/repo/src/nested/main.rs"], "modified");
     }
 
     #[test]

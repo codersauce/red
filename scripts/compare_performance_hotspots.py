@@ -55,6 +55,7 @@ SCENARIOS = (
     "theme-colors",
     "ascii-graphemes",
     "textarea-open",
+    "git-status-index",
     "husk-completion",
     "husk-config",
     "husk-update",

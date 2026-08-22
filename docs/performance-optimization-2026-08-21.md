@@ -94,6 +94,7 @@ navigation baselines were frozen after rebasing to `d92777c`.
 | Undo history capacity pruning | 72.42% |
 | LSP completion filtering | 67.58% |
 | Structured picker ranking | 64.81% |
+| Git workspace status directory indexing | 60.28% |
 | Git repository discovery and branch refresh | 58.73% |
 | Plugin cursor-event delivery | 56.35% |
 | In-buffer search navigation | 55.98% |
@@ -112,6 +113,12 @@ Git repository discovery was measured over 512 expired-cache refreshes through
 16 nested directories. Eleven alternating samples reduced the median from 51,601
 to 21,297 microseconds while preserving nested repositories, linked worktrees,
 detached HEADs, symlink retargeting, and renamed physical directories.
+
+Git workspace status indexing was measured over 32 production directory-index
+builds for 2,048 changed files across nested crate directories. Eleven alternating
+samples reduced the median from 54,699 to 21,726 microseconds while preserving
+conflict precedence, ignored-directory boundaries, tracked children, Windows
+path separators, filesystem-root repositories, and out-of-repository filtering.
 
 Multi-file startup uses the same production loader as the executable. Across
 four startup passes over 128 distinct source files, seven alternating samples

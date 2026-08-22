@@ -92,6 +92,8 @@ const STARTUP_THEME_LOADS: usize = 256;
 const THEME_COLOR_PARSES: usize = 16_384;
 const ASCII_GRAPHEME_COUNTS: usize = 1_024;
 const TEXTAREA_DOCUMENT_LOADS: usize = 128;
+const GIT_STATUS_FILES: usize = 2_048;
+const GIT_STATUS_INDEX_BUILDS: usize = 32;
 
 fn main() -> Result<()> {
     let scenario = std::env::args().nth(1).unwrap_or_else(|| "all".into());
@@ -231,6 +233,9 @@ fn main() -> Result<()> {
     }
     if scenario == "all" || scenario == "textarea-open" {
         results.push(benchmark_embedded_textarea_loading()?);
+    }
+    if scenario == "all" || scenario == "git-status-index" {
+        results.push(benchmark_git_status_indexing()?);
     }
 
     anyhow::ensure!(
@@ -1563,6 +1568,49 @@ fn benchmark_embedded_textarea_loading() -> Result<serde_json::Value> {
         "embedded_text_area_document_loading",
         started,
         TEXTAREA_DOCUMENT_LOADS,
+    ))
+}
+
+fn benchmark_git_status_indexing() -> Result<serde_json::Value> {
+    const ROOT: &str = "/workspace/repository";
+    let statuses = (0..GIT_STATUS_FILES)
+        .map(|index| {
+            let path = format!(
+                "src/workspace/crate-{:02}/module/deep/source-{index:04}.rs",
+                index % 16
+            );
+            let status = if index % 127 == 0 {
+                "conflict"
+            } else if index % 17 == 0 {
+                "ignored"
+            } else if index % 7 == 0 {
+                "untracked"
+            } else {
+                "modified"
+            };
+            json!({
+                "path": path,
+                "absolute_path": format!("{ROOT}/{path}"),
+                "status": status,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let started = Instant::now();
+    for _ in 0..GIT_STATUS_INDEX_BUILDS {
+        let index = red::editor::git_status_index(black_box(&statuses), black_box(ROOT));
+        anyhow::ensure!(
+            index["/workspace/repository/src"] == "conflict"
+                && index["/workspace/repository/src/workspace/crate-00/module/deep/source-0000.rs"]
+                    == "conflict",
+            "Git status indexing lost conflict precedence or changed files"
+        );
+        black_box(index);
+    }
+    Ok(report(
+        "git_workspace_status_directory_indexing",
+        started,
+        GIT_STATUS_INDEX_BUILDS,
     ))
 }
 
