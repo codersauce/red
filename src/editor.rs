@@ -10552,6 +10552,7 @@ impl Editor {
         let mut needs_render = false;
         let mut needs_motion_render = false;
         let mut needs_editor_windows_render = inline_activity_changed && !full_animation_changed;
+        let mut pending_progress = Vec::<ProgressParams>::new();
 
         // Always pump LSP responses: this completes initialization and flushes
         // queued document updates even when diagnostics are hidden. A bounded
@@ -10560,6 +10561,38 @@ impl Editor {
         for _ in 0..LSP_MESSAGES_PER_TICK {
             match self.lsp.recv_response().await {
                 Ok(Some((msg, method))) => {
+                    if let InboundMessage::Notification(ParsedNotification::Progress(progress)) =
+                        &msg
+                    {
+                        let kind = progress
+                            .kind
+                            .as_deref()
+                            .or_else(|| progress.value.get("kind").and_then(Value::as_str));
+                        if kind == Some("report") {
+                            if let Some(pending) = pending_progress.iter_mut().find(|pending| {
+                                pending.token == progress.token
+                                    && pending.lsp_client == progress.lsp_client
+                            }) {
+                                *pending = progress.clone();
+                            } else {
+                                pending_progress.push(progress.clone());
+                            }
+                            continue;
+                        }
+
+                        if let Some(index) = pending_progress.iter().position(|pending| {
+                            pending.token == progress.token
+                                && pending.lsp_client == progress.lsp_client
+                        }) {
+                            self.dispatch_lsp_progress(
+                                pending_progress.remove(index),
+                                buffer,
+                                runtime,
+                            )
+                            .await?;
+                        }
+                    }
+
                     // Progress only changes the editor surface when one of its
                     // listeners submits an actual overlay update below.
                     let progress_only = matches!(
@@ -10600,6 +10633,10 @@ impl Editor {
                     break;
                 }
             }
+        }
+        for progress in pending_progress {
+            self.dispatch_lsp_progress(progress, buffer, runtime)
+                .await?;
         }
 
         // Startup refreshes form short request chains. Drain a bounded batch so each
@@ -13409,6 +13446,19 @@ impl Editor {
 
     fn process_progress(&mut self, progress_params: &ProgressParams) -> Option<Action> {
         Some(Action::ShowProgress(progress_params.clone()))
+    }
+
+    async fn dispatch_lsp_progress(
+        &mut self,
+        progress: ProgressParams,
+        buffer: &mut RenderBuffer,
+        runtime: &mut Runtime,
+    ) -> anyhow::Result<()> {
+        let message = InboundMessage::Notification(ParsedNotification::Progress(progress));
+        if let Some(action) = self.handle_lsp_message(&message, None) {
+            self.execute(&action, buffer, runtime).await?;
+        }
+        Ok(())
     }
 
     fn completion_filter_for_response(&self, msg: &ResponseMessage) -> Option<String> {
@@ -23859,7 +23909,6 @@ impl Editor {
     }
 
     async fn ensure_buffer_lsp_opened(&mut self, buffer_index: usize) -> anyhow::Result<()> {
-        self.restore_cached_diagnostics();
         let Some(buffer) = self.buffer_manager.get(buffer_index) else {
             return Ok(());
         };
@@ -23872,7 +23921,11 @@ impl Editor {
         if self.lsp_coordinator.is_document_opened(&uri) {
             return Ok(());
         }
-        let contents = buffer.contents();
+
+        // Cache restoration resolves Cargo workspaces and must never run for
+        // ordinary requests or edits after this document has already opened.
+        self.restore_cached_diagnostics();
+        let contents = self.buffer_manager[buffer_index].contents();
         self.lsp.did_open(&file, &contents).await?;
         self.lsp_coordinator.mark_document_opened(uri);
         Ok(())
@@ -25896,6 +25949,7 @@ impl Editor {
         let Some(cache) = &mut self.diagnostic_cache else {
             return;
         };
+        let _span = perf::PerfSpan::start("diagnostic_cache:restore");
         let restored = cache.load(&self.config.lsp, &self.buffer_manager);
         let mut changed = false;
         for reports in restored {
@@ -34336,6 +34390,77 @@ builtin = "rust"
     }
 
     #[tokio::test]
+    async fn lsp_progress_reports_coalesce_without_losing_independent_task_boundaries() {
+        drain_plugin_requests();
+        let (mut editor, responses, _requests) = lsp_progress_test_editor();
+        let mut buffer =
+            RenderBuffer::new(/*width*/ 80, /*height*/ 24, &Style::default());
+        let mut runtime = Runtime::new();
+        runtime
+            .load_plugin(
+                "progress-recorder",
+                r#"
+                    pub fn activate() {
+                        red::state_set("trace", "");
+                        red::on("lsp:progress", progress);
+                    }
+
+                    fn progress(event: Json) {
+                        let trace = red::string(red::state("trace"), "")
+                            + red::string(event.value.kind, "")
+                            + ":"
+                            + red::string(event.value.message, "")
+                            + ",";
+                        red::state_set("trace", trace);
+                        red::execute("Print", trace);
+                    }
+                "#,
+            )
+            .await
+            .unwrap();
+
+        for (token, kind, message) in [
+            (7, "begin", "first-begin"),
+            (7, "report", "first-stale"),
+            (8, "begin", "second-begin"),
+            (8, "report", "second-stale"),
+            (7, "report", "first-latest"),
+            (8, "report", "second-latest"),
+            (7, "end", "first-end"),
+            (8, "end", "second-end"),
+        ] {
+            let progress = serde_json::from_value(json!({
+                "token": token,
+                "value": {
+                    "kind": kind,
+                    "title": "Indexing",
+                    "message": message,
+                },
+            }))
+            .unwrap();
+            responses
+                .try_send(InboundMessage::Notification(ParsedNotification::Progress(
+                    progress,
+                )))
+                .unwrap();
+        }
+
+        editor
+            .service_background(&mut buffer, &mut runtime)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            editor.last_error.as_deref(),
+            Some(
+                "begin:first-begin,begin:second-begin,report:first-latest,end:first-end,report:second-latest,end:second-end,"
+            )
+        );
+        runtime.deactivate_all().await.unwrap();
+        drain_plugin_requests();
+    }
+
+    #[tokio::test]
     async fn detached_input_processes_only_a_bounded_batch_of_agent_events() {
         drain_plugin_requests();
         let mut core = DetachedEditorCore::new(test_editor(/*width*/ 80, /*height*/ 24))
@@ -38027,11 +38152,13 @@ builtin = "rust"
         let listing = git_status_listing(source.to_str().unwrap());
         assert_eq!(
             listing["root"],
-            root.path()
-                .canonicalize()
-                .unwrap()
-                .to_string_lossy()
-                .into_owned()
+            normalize_plugin_path(
+                root.path()
+                    .canonicalize()
+                    .unwrap()
+                    .to_string_lossy()
+                    .as_ref()
+            )
         );
         let statuses = listing["statuses"].as_array().unwrap();
         assert!(statuses.iter().any(|entry| entry["status"] == "modified"));
@@ -38052,11 +38179,7 @@ builtin = "rust"
         let linked_listing = git_status_listing(linked.join("linked.rs").to_str().unwrap());
         assert_eq!(
             linked_listing["root"],
-            linked
-                .canonicalize()
-                .unwrap()
-                .to_string_lossy()
-                .into_owned()
+            normalize_plugin_path(linked.canonicalize().unwrap().to_string_lossy().as_ref())
         );
         assert!(linked_listing["statuses"]
             .as_array()
@@ -38074,7 +38197,7 @@ builtin = "rust"
         let nested_listing = git_status_listing(source.to_str().unwrap());
         assert_eq!(
             nested_listing["root"],
-            inner.canonicalize().unwrap().to_string_lossy().into_owned()
+            normalize_plugin_path(inner.canonicalize().unwrap().to_string_lossy().as_ref())
         );
         assert!(nested_listing["statuses"]
             .as_array()

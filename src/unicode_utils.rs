@@ -61,12 +61,9 @@ pub fn is_printable_ascii(s: &str) -> bool {
     const SPACE_BYTES: u64 = 0x2020_2020_2020_2020;
     const ONE_BYTES: u64 = 0x0101_0101_0101_0101;
 
-    let mut chunks = s.as_bytes().chunks_exact(std::mem::size_of::<u64>());
-    if chunks.any(|chunk| {
-        let bytes: [u8; std::mem::size_of::<u64>()] = chunk
-            .try_into()
-            .expect("chunks_exact always produces full machine words");
-        let word = u64::from_ne_bytes(bytes);
+    let (chunks, remainder) = s.as_bytes().as_chunks::<{ std::mem::size_of::<u64>() }>();
+    if chunks.iter().any(|chunk| {
+        let word = u64::from_ne_bytes(*chunk);
         word & HIGH_BITS != 0
             || word.wrapping_sub(SPACE_BYTES) & !word & HIGH_BITS != 0
             || word.wrapping_add(ONE_BYTES) & HIGH_BITS != 0
@@ -74,10 +71,7 @@ pub fn is_printable_ascii(s: &str) -> bool {
         return false;
     }
 
-    chunks
-        .remainder()
-        .iter()
-        .all(|byte| (0x20..=0x7E).contains(byte))
+    remainder.iter().all(|byte| (0x20..=0x7E).contains(byte))
 }
 
 /// Calculate terminal display width from an existing display column.

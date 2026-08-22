@@ -583,7 +583,7 @@ async fn process_lsp_message(
 
         if let Some(id) = res.get("id").and_then(Value::as_i64) {
             log!("[lsp] incoming request: id={}, method={}", id, method);
-        } else {
+        } else if method != "$/progress" {
             log!("[lsp] incoming notification: method={}", method);
         }
 
