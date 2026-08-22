@@ -99,6 +99,7 @@ navigation baselines were frozen after rebasing to `d92777c`.
 | Editor logical line-length lookup | 96.33% |
 | Editor final-cell boundary lookup | 96.24% |
 | Real-terminal cursor-moved plugin delivery | 95.05% |
+| Real-terminal file-picker query resolution | 95.00% |
 | Shared ASCII grapheme counting | 94.94% |
 | ASCII LSP rename-symbol extraction | 94.70% |
 | LSP absolute-document routing | 94.68% |
@@ -135,6 +136,7 @@ navigation baselines were frozen after rebasing to `d92777c`.
 | Idle plugin timer polling | 84.29% |
 | Default editor status-line rendering | 83.45% |
 | Workspace inline content search | 82.60% |
+| Real-terminal file-picker chrome | 82.50% |
 | Unicode LSP rename-symbol extraction | 82.49% |
 | Editor forward word-end boundary operators | 81.94% |
 | Real-terminal editor chrome rendering | 81.18% |
@@ -180,12 +182,16 @@ navigation baselines were frozen after rebasing to `d92777c`.
 | Real-terminal YAML completion-aware edit frames | 58.12% |
 | Real-terminal Markdown completion-aware edit frames | 56.44% |
 | Plugin cursor-event delivery | 56.35% |
+| Real-terminal file-picker dialog and preview composition | 56.35% |
 | Complete real-terminal Markdown interactive startup | 56.22% |
 | In-buffer search navigation | 55.98% |
 | Real-terminal edit-invalidated YAML highlighting | 55.94% |
+| Real-terminal file-picker window painting | 55.56% |
+| Complete real-terminal file-picker frames | 55.42% |
 | Owned Husk JSON boundary conversion | 54.49% |
 | Complete real-terminal YAML interactive startup | 54.08% |
 | Bundled theme startup loading | 53.81% |
+| Complete real-terminal file-picker input events | 53.41% |
 | Complete real-terminal incremental search frames | 53.11% |
 | Complete editor frame composition | 52.88% |
 | Real-terminal edit-invalidated Markdown highlighting | 52.65% |
@@ -552,6 +558,24 @@ selection styles, modal/workspace precedence, current-match precedence,
 navigation direction, wraparound, and preview/cancel restoration remain
 unchanged. Search-frame terminal diff and flush improved only 19.23%, from
 52 to 42 microseconds, and remains below the target.
+
+Nine alternating real-terminal file-picker sessions exercised 12 query-edit
+cycles apiece against frozen release executables. Exact-query resolution fell
+from 60 to three microseconds, complete picker input events from 586 to 273,
+complete picker frames from 480 to 214, dialog and preview composition from
+197 to 86, editor window painting from 117 to 52, and chrome from 80 to 14
+microseconds. Locally filtered structured pickers retain a bounded history of
+eight previous queries, excluding result sets larger than 16,384 items and
+invalidating every prior ranking when authoritative items change. External
+filters, custom nonincremental scorers, stable ordering, selection identity,
+and asynchronous updates retain their existing behavior. Printable ASCII
+results and preview rows reuse terminal-cell storage without temporary
+strings; tabs, control characters, Unicode, highlighting, and clipped wide
+graphemes retain their general fallbacks. Preview syntax captures are shared
+only for an exact source window, preview identity, language, and active
+theme, with bounded source and capture counts. Picker-frame terminal diff and
+flush improved only 27.66%, from 47 to 34 microseconds, and remains below the
+target.
 
 Eleven alternating real-terminal runs reduced overlay and cursor composition
 from five to two microseconds. Each frame resolves cursor geometry once for
