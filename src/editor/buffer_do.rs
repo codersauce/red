@@ -107,10 +107,11 @@ impl Editor {
                 );
                 let dirty_before = self.current_buffer().is_dirty();
                 let blocked_reload = matches!(action, Action::ReloadFile(false)) && dirty_before;
+                let blocked_delete = matches!(action, Action::DeleteBuffer(false)) && dirty_before;
                 if self.execute(&action, buffer, runtime).await? {
                     return Ok(());
                 }
-                if blocked_reload || save_without_file || invalid_syntax {
+                if blocked_reload || blocked_delete || save_without_file || invalid_syntax {
                     return Ok(());
                 }
                 if matches!(action, Action::Save)
@@ -142,6 +143,7 @@ impl Editor {
                 | Action::SetWrap(_)
                 | Action::SetRelativeLineNumbers(_)
                 | Action::SetSyntax(_)
+                | Action::DeleteBuffer(_)
         )
     }
 
