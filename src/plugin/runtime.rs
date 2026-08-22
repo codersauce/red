@@ -1252,7 +1252,8 @@ impl RedHost {
             "SetCursorPosition" => {
                 let x = args.first().and_then(value_to_u64).unwrap_or(0) as usize;
                 let y = args.get(1).and_then(value_to_u64).unwrap_or(0) as usize;
-                self.send_request(PluginRequest::SetCursorPosition { x, y });
+                let jump = args.get(2).and_then(Value::as_bool).unwrap_or(false);
+                self.send_request(PluginRequest::SetCursorPosition { x, y, jump });
             }
             "CloseScratchBuffer" => {
                 let buffer_index = args
@@ -15223,7 +15224,8 @@ mod tests {
                                 .await
                                 .unwrap();
                         }
-                        PluginRequest::SetCursorPosition { x, y } => {
+                        PluginRequest::SetCursorPosition { x, y, jump } => {
+                            assert!(jump);
                             result = Some(Ok((x, y)));
                         }
                         PluginRequest::Action(Action::Print(message)) => {

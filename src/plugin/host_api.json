@@ -29,7 +29,7 @@
     { "name": "AgentForgetSession", "kind": "execute", "signature": "(session_id: String)", "introduced": "0.9.0" },
     { "name": "AgentPermissionResponse", "kind": "execute", "signature": "(request_id: String, option_id: String?)", "introduced": "0.1.0" },
     { "name": "RevertTransaction", "kind": "execute", "signature": "(transaction_id: String)", "introduced": "0.1.0" },
-    { "name": "SetCursorPosition", "kind": "execute", "signature": "(x: i32, y: i32)", "introduced": "0.1.0" },
+    { "name": "SetCursorPosition", "kind": "execute", "signature": "(x: i32, y: i32, jump?: bool)", "introduced": "0.1.0" },
     { "name": "CloseScratchBuffer", "kind": "execute", "signature": "(id: i32)", "introduced": "0.1.0" },
     { "name": "SetStorage", "kind": "execute", "signature": "(key: String, value: Json)", "introduced": "0.1.0" },
     { "name": "SetDecorations", "kind": "execute", "signature": "(namespace: String, decorations: [Decoration])", "introduced": "0.1.0" },

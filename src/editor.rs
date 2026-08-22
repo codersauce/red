@@ -1772,6 +1772,7 @@ pub enum PluginRequest {
     SetCursorPosition {
         x: usize,
         y: usize,
+        jump: bool,
     },
     GetCursorDisplayColumn {
         request_id: RequestId,
@@ -3254,6 +3255,9 @@ pub struct Editor {
     /// Incremented after full renders so event handling can avoid duplicate frames.
     render_generation: u64,
 
+    /// Picker callbacks may enqueue navigation that must commit before the next input event.
+    service_background_before_next_input: bool,
+
     /// Active window represented by the last committed frame.
     last_rendered_window: Option<WindowId>,
 
@@ -3538,6 +3542,10 @@ pub struct Editor {
     pending_lsp_format_saves: HashMap<i64, PendingLspFormatSave>,
     pending_lsp_revision_snapshots: HashMap<i64, Vec<(String, u64)>>,
     pending_completions: HashMap<i64, PendingCompletion>,
+    /// Definition requests whose eventual destination must precede queued CTRL-O/CTRL-I actions.
+    pending_definition_requests: HashSet<i64>,
+    /// Jumplist traversal typed while a definition request is still in flight.
+    deferred_jump_navigation: VecDeque<Action>,
     pending_completion_resolutions: HashMap<i64, completion_resolve::PendingCompletionResolution>,
     scheduled_completion: Option<ScheduledCompletion>,
     // Keep optional AI state out of Editor values and the startup futures that own them.
@@ -4772,6 +4780,7 @@ impl Editor {
             is_focused: true,
             suppress_reactivation_click: false,
             render_generation: 0,
+            service_background_before_next_input: false,
             last_rendered_window: None,
             last_rendered_viewport: None,
             splash_shown: false,
@@ -4887,6 +4896,8 @@ impl Editor {
             pending_lsp_format_saves: HashMap::new(),
             pending_lsp_revision_snapshots: HashMap::new(),
             pending_completions: HashMap::new(),
+            pending_definition_requests: HashSet::new(),
+            deferred_jump_navigation: VecDeque::new(),
             pending_completion_resolutions: HashMap::new(),
             scheduled_completion: None,
             inline_completion: Box::default(),
@@ -9328,6 +9339,11 @@ impl Editor {
                 if processed.quit {
                     break 'editor_loop;
                 }
+                if std::mem::take(&mut self.service_background_before_next_input) {
+                    self.service_background(&mut buffer, runtime).await?;
+                    serviced_background = true;
+                    break;
+                }
                 if processed.navigation_deferred {
                     if let Some(signature) = processed
                         .drain_repeated_motion
@@ -10189,12 +10205,29 @@ impl Editor {
                         &msg,
                         InboundMessage::Notification(ParsedNotification::Progress(_))
                     );
+                    let completed_definition =
+                        if method.as_deref() == Some("textDocument/definition") {
+                            match &msg {
+                                InboundMessage::Message(response) => Some(response.id),
+                                InboundMessage::RequestError { id, .. } => Some(*id),
+                                _ => None,
+                            }
+                        } else {
+                            None
+                        };
                     if let Some(action) = self.handle_lsp_message(&msg, method) {
                         // TODO: handle quit
                         let generation_before = self.render_generation;
                         self.execute(&action, buffer, runtime).await?;
                         if !progress_only && self.render_generation == generation_before {
                             needs_render = true;
+                        }
+                    }
+                    if let Some(request_id) = completed_definition {
+                        self.pending_definition_requests.remove(&request_id);
+                        if self.pending_definition_requests.is_empty() {
+                            self.execute_deferred_jump_navigation(buffer, runtime)
+                                .await?;
                         }
                     }
                 }
@@ -10769,7 +10802,13 @@ impl Editor {
                         .resolve_request(runtime, request_id, pos)
                         .await?;
                 }
-                PluginRequest::SetCursorPosition { x, y } => {
+                PluginRequest::SetCursorPosition { x, y, jump } => {
+                    if jump {
+                        self.execute(&Action::MoveTo(x, y.saturating_add(1)), buffer, runtime)
+                            .await?;
+                        needs_motion_render = true;
+                        continue;
+                    }
                     self.cx = x;
                     let viewport_height = self.vheight().max(1);
                     // Adjust viewport if needed
@@ -12651,37 +12690,40 @@ impl Editor {
         Ok(quit)
     }
 
-    async fn replay_last_semantic_change(
-        &mut self,
-        buffer: &mut RenderBuffer,
-        runtime: &mut Runtime,
-    ) -> anyhow::Result<()> {
-        let Some(change) = self.last_semantic_change.clone() else {
-            self.set_legacy_message(Some("no change to repeat".to_string()));
-            return Ok(());
-        };
+    #[inline(never)]
+    fn replay_last_semantic_change<'a>(
+        &'a mut self,
+        buffer: &'a mut RenderBuffer,
+        runtime: &'a mut Runtime,
+    ) -> BoxFuture<'a, anyhow::Result<()>> {
+        Box::pin(async move {
+            let Some(change) = self.last_semantic_change.clone() else {
+                self.set_legacy_message(Some("no change to repeat".to_string()));
+                return Ok(());
+            };
 
-        self.pending_semantic_change = None;
-        self.replaying_semantic_change = true;
-        let result = async {
-            for event in &change.events {
-                if let Some(action) = self.handle_event_with_runtime(event, Some(runtime))? {
-                    if self
-                        .handle_resolved_key_action(event, &action, buffer, runtime)
-                        .await?
-                    {
-                        anyhow::bail!("repeated change attempted to quit the editor");
+            self.pending_semantic_change = None;
+            self.replaying_semantic_change = true;
+            let result = async {
+                for event in &change.events {
+                    if let Some(action) = self.handle_event_with_runtime(event, Some(runtime))? {
+                        if self
+                            .handle_resolved_key_action(event, &action, buffer, runtime)
+                            .await?
+                        {
+                            anyhow::bail!("repeated change attempted to quit the editor");
+                        }
+                    }
+                    if self.replay_checkpoint(buffer, runtime).await? {
+                        break;
                     }
                 }
-                if self.replay_checkpoint(buffer, runtime).await? {
-                    break;
-                }
+                Ok(())
             }
-            Ok(())
-        }
-        .await;
-        self.replaying_semantic_change = false;
-        result
+            .await;
+            self.replaying_semantic_change = false;
+            result
+        })
     }
 
     async fn play_macro(
@@ -18172,7 +18214,7 @@ impl Editor {
             .ensure_notified_revision(action_buffer_id, action_buffer_revision);
         let event_snapshot_before_action = self.event_snapshot();
         let action_cause = Self::action_cause(action);
-        let jump_entry_before_action = self.current_jump_entry();
+        let jump_entry_before_action = self.jump_origin_for_action(action);
         let picker_handle_before_action = self
             .current_dialog
             .as_ref()
@@ -18489,7 +18531,7 @@ impl Editor {
             | Action::ViewInlineAssistAnswer
             | Action::EscalateInlineAssist
             | Action::StageInlineAssistHandoff { .. } => {
-                add_to_history = false;
+                add_to_history = tracking && Self::records_jump(action);
                 if let std::ops::ControlFlow::Break(quit) =
                     self.execute_inline_action(action, buffer, runtime).await?
                 {
@@ -19213,7 +19255,8 @@ impl Editor {
             Action::JumpToMark { mark, linewise } => {
                 if *mark == '\'' {
                     add_to_history = false;
-                    if let Some(entry) = self.jump_back_entry() {
+                    if let Some(entry) = self.active_jump_list().previous_context.clone() {
+                        self.remember_previous_context(self.current_jump_entry());
                         self.jump_to_entry(&entry, buffer, runtime).await?;
                     } else {
                         self.set_legacy_message(Some("previous jump is not set".to_string()));
@@ -19764,9 +19807,11 @@ impl Editor {
                 if let Some(file) = self.current_buffer().file.clone() {
                     let position = self.cursor_lsp_position();
                     self.ensure_current_buffer_lsp_opened().await?;
-                    self.lsp
+                    let request_id = self
+                        .lsp
                         .goto_definition(&file, position.character, position.line)
                         .await?;
+                    self.pending_definition_requests.insert(request_id);
                 }
             }
             Action::Hover => {
@@ -20925,7 +20970,13 @@ impl Editor {
                 self.open_inline_history(buffer, runtime).await?;
             }
             Action::InlineHistoryAction(action) => {
-                add_to_history = false;
+                add_to_history = tracking
+                    && matches!(
+                        action,
+                        crate::inline_history::HistoryAction::FollowFile { .. }
+                            | crate::inline_history::HistoryAction::Jump
+                            | crate::inline_history::HistoryAction::ShowAnnotations
+                    );
                 self.handle_inline_history_action(action, buffer, runtime)
                     .await?;
             }
@@ -21492,8 +21543,13 @@ impl Editor {
             }
             Action::JumpBack => {
                 add_to_history = false;
+                if !self.pending_definition_requests.is_empty() {
+                    self.deferred_jump_navigation.push_back(Action::JumpBack);
+                    return Ok(false);
+                }
                 if let Some(entry) = self.jump_back_entry() {
                     log!("jumping back to {entry:?}");
+                    self.remember_previous_context(self.current_jump_entry());
                     self.jump_to_entry(&entry, buffer, runtime).await?;
                 } else {
                     self.set_legacy_message(Some("at start of jump list".to_string()));
@@ -21502,8 +21558,13 @@ impl Editor {
             }
             Action::JumpForward => {
                 add_to_history = false;
+                if !self.pending_definition_requests.is_empty() {
+                    self.deferred_jump_navigation.push_back(Action::JumpForward);
+                    return Ok(false);
+                }
                 if let Some(entry) = self.jump_forward_entry() {
                     log!("jumping forward to {entry:?}");
+                    self.remember_previous_context(self.current_jump_entry());
                     self.jump_to_entry(&entry, buffer, runtime).await?;
                 } else {
                     self.set_legacy_message(Some("at end of jump list".to_string()));
@@ -21529,6 +21590,10 @@ impl Editor {
                 self.plugin_registry
                     .notify_picker(runtime, *handle, event.as_ref().clone())
                     .await?;
+                // A picker selection may enqueue its OpenLocation request from the
+                // callback. Commit that navigation before accepting the next key,
+                // so an immediately typed CTRL-O sees the new jump.
+                self.service_background_before_next_input = true;
             }
             Action::NotifyComposer(handle, event) => {
                 self.plugin_registry
@@ -21804,7 +21869,7 @@ impl Editor {
         self.finish_snippet_after_action(action);
 
         if add_to_history && Self::records_jump(action) {
-            self.save_to_history(jump_entry_before_action);
+            self.save_jump_after_action(jump_entry_before_action, action);
         }
 
         if self.current_buffer().id() == action_buffer_id
@@ -21940,9 +22005,26 @@ impl Editor {
                 | Action::SwapPreviousFunction
                 | Action::NextDiagnostic
                 | Action::PreviousDiagnostic
+                | Action::NextInlineComment
+                | Action::PreviousInlineComment
+                | Action::OpenInlineComment(_)
+                | Action::FocusInlineComment(_)
+                | Action::NavigateInlineCommentCard { .. }
+                | Action::NavigateOverlappingInlineComment { open: true, .. }
+                | Action::OpenInlineJob(_)
+                | Action::OpenLatestInlineCompletion
+                | Action::OpenInlineCompletion(_)
+                | Action::ViewInlineChanges { .. }
+                | Action::ViewInlineAgentChanges { .. }
                 | Action::MoveTo(_, _)
                 | Action::MoveToFilePos(_, _, _)
+                | Action::GoToLine(_)
                 | Action::JumpToMark { .. }
+                | Action::InlineHistoryAction(
+                    crate::inline_history::HistoryAction::FollowFile { .. }
+                        | crate::inline_history::HistoryAction::Jump
+                        | crate::inline_history::HistoryAction::ShowAnnotations,
+                )
                 | Action::OpenLocation(_, _)
                 | Action::OpenFile(_)
                 | Action::OpenBuffer(_)
@@ -21981,6 +22063,26 @@ impl Editor {
         }
     }
 
+    fn jump_origin_for_action(&self, action: &Action) -> JumpEntry {
+        if matches!(
+            action,
+            Action::InlineHistoryAction(
+                crate::inline_history::HistoryAction::FollowFile { .. }
+                    | crate::inline_history::HistoryAction::Jump
+                    | crate::inline_history::HistoryAction::ShowAnnotations,
+            ) | Action::OpenInlineJob(_)
+                | Action::OpenLatestInlineCompletion
+                | Action::OpenInlineCompletion(_)
+                | Action::ViewInlineChanges { .. }
+                | Action::ViewInlineAgentChanges { .. }
+        ) {
+            if let Some(browser) = &self.inline_history_browser {
+                return browser.origin.clone();
+            }
+        }
+        self.current_jump_entry()
+    }
+
     fn clean_jump_list(&mut self) {
         let valid_buffers = self
             .buffer_manager
@@ -21990,6 +22092,13 @@ impl Editor {
         let current_buffer_id = self.current_buffer().id();
         let current_line = self.buffer_line();
         let list = self.active_jump_list_mut();
+        if list
+            .previous_context
+            .as_ref()
+            .is_some_and(|entry| !valid_buffers.contains(&entry.buffer_id))
+        {
+            list.previous_context = None;
+        }
         let old_index = list.index.min(list.entries.len());
         let mut keep = vec![false; list.entries.len()];
 
@@ -22038,6 +22147,14 @@ impl Editor {
                 .entries
                 .retain(|entry| entry.buffer_id != buffer_id);
             window.jump_list.index = retained_before_index.min(window.jump_list.entries.len());
+            if window
+                .jump_list
+                .previous_context
+                .as_ref()
+                .is_some_and(|entry| entry.buffer_id == buffer_id)
+            {
+                window.jump_list.previous_context = None;
+            }
         }
     }
 
@@ -22046,7 +22163,38 @@ impl Editor {
         if entry.buffer_id == current.buffer_id && entry.char_index == current.char_index {
             return;
         }
+        self.remember_previous_context(entry.clone());
         self.push_history_entry(entry);
+    }
+
+    fn save_jump_after_action(&mut self, entry: JumpEntry, action: &Action) {
+        let current = self.current_jump_entry();
+        let moved = entry.buffer_id != current.buffer_id || entry.char_index != current.char_index;
+        if !moved && !Self::records_stationary_jump(action) {
+            return;
+        }
+        self.remember_previous_context(entry.clone());
+        self.push_history_entry(entry);
+    }
+
+    fn records_stationary_jump(action: &Action) -> bool {
+        matches!(
+            action,
+            Action::FindNext
+                | Action::FindPrevious
+                | Action::RepeatSearch
+                | Action::RepeatSearchOpposite
+                | Action::SearchWordUnderCursor
+                | Action::MoveToBottom
+                | Action::MoveToTop
+                | Action::MoveTo(_, _)
+                | Action::GoToLine(_)
+                | Action::JumpToMark { .. }
+        )
+    }
+
+    fn remember_previous_context(&mut self, entry: JumpEntry) {
+        self.active_jump_list_mut().previous_context = Some(entry);
     }
 
     fn push_current_history_entry(&mut self) {
@@ -22124,6 +22272,17 @@ impl Editor {
             false,
         )
         .await?;
+        Ok(())
+    }
+
+    async fn execute_deferred_jump_navigation(
+        &mut self,
+        buffer: &mut RenderBuffer,
+        runtime: &mut Runtime,
+    ) -> anyhow::Result<()> {
+        while let Some(action) = self.deferred_jump_navigation.pop_front() {
+            self.execute(&action, buffer, runtime).await?;
+        }
         Ok(())
     }
 
@@ -23877,6 +24036,9 @@ impl Editor {
                     KeyAction::Single(Action::MoveToViewportBottom(_)) => {
                         KeyAction::Single(Action::MoveToViewportBottom(count))
                     }
+                    KeyAction::Single(Action::MoveToBottom) => {
+                        KeyAction::Single(Action::GoToLine(usize::from(count)))
+                    }
                     KeyAction::Single(Action::HalfPageDown(_)) => {
                         KeyAction::Single(Action::HalfPageDown(count))
                     }
@@ -25071,6 +25233,7 @@ impl Editor {
                 window_index: self.window_manager.active_window_id(),
                 jumps: snapshot.jumps.clone(),
                 jump_index: snapshot.jump_index,
+                previous_context: None,
             }]
         } else {
             snapshot.window_jumps.clone()
@@ -25088,6 +25251,10 @@ impl Editor {
                     JumpList {
                         index: saved.jump_index.min(entries.len()),
                         entries,
+                        previous_context: saved
+                            .previous_context
+                            .as_ref()
+                            .and_then(|jump| self.restore_session_jump(jump, &buffer_map)),
                     },
                 )
             })
@@ -25417,6 +25584,11 @@ impl Editor {
                     window_index,
                     jump_index: window.jump_list.index.min(jumps.len()),
                     jumps,
+                    previous_context: window
+                        .jump_list
+                        .previous_context
+                        .as_ref()
+                        .and_then(|jump| self.snapshot_jump(jump, &buffer_indices)),
                 }
             })
             .collect::<Vec<_>>();
@@ -32771,9 +32943,24 @@ builtin = "rust"
         editor.test_disable_terminal_output();
         let mut core = DetachedEditorCore::new(editor).await.unwrap();
 
-        ACTION_DISPATCHER.send_request(PluginRequest::SetCursorPosition { x: 0, y: 2 });
+        ACTION_DISPATCHER.send_request(PluginRequest::SetCursorPosition {
+            x: 0,
+            y: 2,
+            jump: false,
+        });
         let position = core.tick().await.unwrap().expect("cursor-position render");
         assert_eq!(position.cursor.1, 2);
+
+        ACTION_DISPATCHER.send_request(PluginRequest::SetCursorPosition {
+            x: 0,
+            y: 3,
+            jump: true,
+        });
+        let jump = core.tick().await.unwrap().expect("jump-position render");
+        assert_eq!(jump.cursor.1, 3);
+        ACTION_DISPATCHER.send_request(PluginRequest::Action(Action::JumpBack));
+        let returned = core.tick().await.unwrap().expect("jump-back render");
+        assert_eq!(returned.cursor.1, 2);
 
         ACTION_DISPATCHER.send_request(PluginRequest::SetCursorDisplayColumn { column: 1, y: 3 });
         let column = core.tick().await.unwrap().expect("cursor-column render");
@@ -32781,7 +32968,9 @@ builtin = "rust"
         drain_plugin_requests();
     }
 
-    fn lsp_progress_test_editor() -> (
+    fn lsp_channel_test_editor(
+        buffer: Buffer,
+    ) -> (
         Editor,
         tokio::sync::mpsc::Sender<InboundMessage>,
         tokio::sync::mpsc::Receiver<crate::lsp::OutboundMessage>,
@@ -32804,11 +32993,19 @@ builtin = "rust"
             /*height*/ 24,
             config,
             Theme::default(),
-            vec![Buffer::new(None, "hello".to_string())],
+            vec![buffer],
         )
         .unwrap();
         editor.test_disable_terminal_output();
         (editor, responses, requests)
+    }
+
+    fn lsp_progress_test_editor() -> (
+        Editor,
+        tokio::sync::mpsc::Sender<InboundMessage>,
+        tokio::sync::mpsc::Receiver<crate::lsp::OutboundMessage>,
+    ) {
+        lsp_channel_test_editor(Buffer::new(None, "hello".to_string()))
     }
 
     fn lsp_progress_notification(token: Value, index: usize) -> InboundMessage {
@@ -32823,6 +33020,60 @@ builtin = "rust"
         }))
         .unwrap();
         InboundMessage::Notification(ParsedNotification::Progress(progress))
+    }
+
+    #[tokio::test]
+    async fn jump_back_waits_for_an_in_flight_definition_destination() {
+        let directory = tempfile::tempdir().unwrap();
+        let file = directory.path().join("definition.rs");
+        std::fs::write(&file, "zero\none\ntwo\n").unwrap();
+        let (mut editor, responses, _requests) = lsp_channel_test_editor(Buffer::new(
+            Some(file.to_string_lossy().into_owned()),
+            "zero\none\ntwo\n".to_string(),
+        ));
+        let mut frame = RenderBuffer::new(/*width*/ 80, /*height*/ 24, &Style::default());
+        let mut runtime = Runtime::new();
+        let uri = editor.current_buffer().uri().unwrap().unwrap();
+        let request_id = editor
+            .lsp
+            .send_request("textDocument/definition", json!({}), /*force*/ true)
+            .await
+            .unwrap();
+        editor.pending_definition_requests.insert(request_id);
+
+        editor
+            .execute(&Action::JumpBack, &mut frame, &mut runtime)
+            .await
+            .unwrap();
+        assert_eq!(editor.buffer_line(), 0);
+        assert_eq!(editor.deferred_jump_navigation.len(), 1);
+
+        responses
+            .send(InboundMessage::Message(ResponseMessage {
+                id: request_id,
+                result: json!({
+                    "uri": uri,
+                    "range": {
+                        "start": { "line": 2, "character": 0 },
+                        "end": { "line": 2, "character": 0 }
+                    }
+                }),
+                request: None,
+            }))
+            .await
+            .unwrap();
+        editor
+            .service_background(&mut frame, &mut runtime)
+            .await
+            .unwrap();
+
+        assert_eq!(editor.buffer_line(), 0);
+        assert!(editor.deferred_jump_navigation.is_empty());
+        editor
+            .execute(&Action::JumpForward, &mut frame, &mut runtime)
+            .await
+            .unwrap();
+        assert_eq!(editor.buffer_line(), 2);
     }
 
     #[tokio::test]
@@ -39875,8 +40126,8 @@ while True:
             .await
             .expect("failed formatter initialization should fall back to an unformatted save");
 
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), "value   \n");
-        assert_eq!(editor.buffer_manager[0].contents(), "value   \n");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "value\n");
+        assert_eq!(editor.buffer_manager[0].contents(), "value\n");
         assert!(!editor.buffer_manager[0].is_dirty());
         assert!(editor.pending_lsp_edit_requests.is_empty());
         assert!(editor.pending_lsp_format_saves.is_empty());
@@ -39947,8 +40198,8 @@ while True:
                 .await
                 .expect("failed formatter initialization should not abort a new-document save");
 
-            assert_eq!(std::fs::read_to_string(&target).unwrap(), "value   \n");
-            assert_eq!(editor.current_buffer().contents(), "value   \n");
+            assert_eq!(std::fs::read_to_string(&target).unwrap(), "value\n");
+            assert_eq!(editor.current_buffer().contents(), "value\n");
             assert!(!editor.current_buffer().is_dirty());
             assert!(editor.pending_lsp_edit_requests.is_empty());
             assert!(editor.pending_lsp_format_saves.is_empty());

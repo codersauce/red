@@ -1140,6 +1140,9 @@ async fn mark_jumps_participate_in_the_jumplist_and_support_linewise_motion() {
 
     type_normal_keys(&mut harness, "''").await;
     harness.assert_cursor_at(0, 2);
+
+    type_normal_keys(&mut harness, "''").await;
+    harness.assert_cursor_at(2, 0);
 }
 
 #[tokio::test]

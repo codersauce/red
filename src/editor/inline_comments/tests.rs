@@ -14,7 +14,7 @@ use crate::{
     lsp::LspManager,
     plugin::Runtime,
     theme::{Style, Theme},
-    undo::TextRange,
+    undo::{TextPosition, TextRange},
     unicode_utils::display_width,
 };
 use crossterm::event::{
@@ -715,6 +715,28 @@ fn clearing_inline_comments_preserves_cursor_near_eof() {
     editor.clear_inline_comments();
     editor.check_bounds();
     assert_eq!(editor.buffer_line(), 4);
+}
+
+#[tokio::test]
+async fn inline_comment_navigation_participates_in_the_jumplist() {
+    let mut editor = editor("zero\none\ntwo\nthree\nfour\nfive\n", 40, 10, false);
+    editor.move_to_text_position(TextPosition::new(2, 0));
+    editor.set_inline_comment("first comment");
+    editor.move_to_text_position(TextPosition::new(5, 0));
+    editor.set_inline_comment("second comment");
+    editor.move_to_text_position(TextPosition::new(0, 0));
+
+    editor
+        .test_execute_production_action(Action::NextInlineComment)
+        .await
+        .unwrap();
+    assert_eq!(editor.buffer_line(), 2);
+
+    editor
+        .test_execute_production_action(Action::JumpBack)
+        .await
+        .unwrap();
+    assert_eq!(editor.buffer_line(), 0);
 }
 
 #[test]

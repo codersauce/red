@@ -387,6 +387,7 @@ async fn default_format_on_save_requests_once_before_writing_and_ignores_a_dupli
         recorded(&events),
         vec![
             LspEvent::DidOpen(path.to_string_lossy().into_owned()),
+            LspEvent::DidChange(path.to_string_lossy().into_owned()),
             LspEvent::FormatDocument(path.to_string_lossy().into_owned()),
         ]
     );

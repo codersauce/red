@@ -180,6 +180,8 @@ pub(crate) struct JumpEntry {
 pub(crate) struct JumpList {
     pub(crate) entries: Vec<JumpEntry>,
     pub(crate) index: usize,
+    /// Destination used by Vim's previous-context mark (`''` and `` `` ``).
+    pub(crate) previous_context: Option<JumpEntry>,
 }
 
 impl Window {

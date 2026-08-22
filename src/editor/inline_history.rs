@@ -40,7 +40,7 @@ pub(super) struct HistoryRow {
 
 #[derive(Debug)]
 pub(super) struct HistoryBrowser {
-    origin: JumpEntry,
+    pub(super) origin: JumpEntry,
     viewport: (usize, usize, usize),
     active_comments: HashMap<(WindowId, BufferId), uuid::Uuid>,
     file: Option<String>,
@@ -577,9 +577,7 @@ impl Editor {
         self.clear_history_preview();
         self.current_dialog = None;
         self.inline_comment_selections = browser.active_comments;
-        if jump {
-            self.save_to_history(browser.origin);
-        } else {
+        if !jump {
             self.jump_to_entry(&browser.origin, buffer, runtime).await?;
             let line = self.buffer_line();
             self.vtop = browser.viewport.0.min(line);
