@@ -2439,6 +2439,184 @@ async fn buffer_selection_rejects_ambiguous_names_and_supports_stable_ids() {
 }
 
 #[tokio::test]
+async fn bufdo_substitutes_all_buffers_and_finishes_on_the_last() {
+    let buffers = vec![
+        Buffer::new(/*file*/ None, "foo one\n".to_string()),
+        Buffer::new(/*file*/ None, "foo two\n".to_string()),
+        Buffer::new(/*file*/ None, "foo three\n".to_string()),
+    ];
+    let ids = buffers
+        .iter()
+        .map(|buffer| buffer.id().as_u64())
+        .collect::<Vec<_>>();
+    let mut editor = Editor::test_with_size(
+        Box::new(MockLsp),
+        /*width*/ 80,
+        /*height*/ 24,
+        Config::default(),
+        Theme::default(),
+        buffers,
+    )
+    .unwrap();
+    editor.test_disable_terminal_output();
+    let mut harness = EditorHarness { editor };
+
+    harness
+        .execute_action(Action::Command("bufd! %s/foo/bar/g".to_string()))
+        .await
+        .unwrap();
+
+    assert_eq!(harness.current_buffer_index(), 2);
+    harness.assert_buffer_contents("bar three\n");
+    harness
+        .execute_action(Action::OpenBufferById(ids[0]))
+        .await
+        .unwrap();
+    harness.assert_buffer_contents("bar one\n");
+    harness
+        .execute_action(Action::OpenBufferById(ids[1]))
+        .await
+        .unwrap();
+    harness.assert_buffer_contents("bar two\n");
+}
+
+#[tokio::test]
+async fn bufdo_stops_on_substitute_error_unless_e_suppresses_it() {
+    let make_harness = || {
+        let buffers = vec![
+            Buffer::new(/*file*/ None, "foo one\n".to_string()),
+            Buffer::new(/*file*/ None, "no match\n".to_string()),
+            Buffer::new(/*file*/ None, "foo three\n".to_string()),
+        ];
+        let ids = buffers
+            .iter()
+            .map(|buffer| buffer.id().as_u64())
+            .collect::<Vec<_>>();
+        let mut editor = Editor::test_with_size(
+            Box::new(MockLsp),
+            /*width*/ 80,
+            /*height*/ 24,
+            Config::default(),
+            Theme::default(),
+            buffers,
+        )
+        .unwrap();
+        editor.test_disable_terminal_output();
+        (EditorHarness { editor }, ids)
+    };
+    let (mut harness, ids) = make_harness();
+
+    harness
+        .execute_action(Action::Command("bufdo %s/foo/bar/g".to_string()))
+        .await
+        .unwrap();
+
+    assert_eq!(harness.current_buffer_index(), 1);
+    assert_eq!(harness.last_error(), Some("pattern not found"));
+    harness
+        .execute_action(Action::OpenBufferById(ids[0]))
+        .await
+        .unwrap();
+    harness.assert_buffer_contents("bar one\n");
+    harness
+        .execute_action(Action::OpenBufferById(ids[2]))
+        .await
+        .unwrap();
+    harness.assert_buffer_contents("foo three\n");
+
+    let (mut harness, ids) = make_harness();
+    harness
+        .execute_action(Action::Command("bufdo %s/foo/bar/ge".to_string()))
+        .await
+        .unwrap();
+
+    assert_eq!(harness.current_buffer_index(), 2);
+    harness.assert_buffer_contents("bar three\n");
+    harness
+        .execute_action(Action::OpenBufferById(ids[0]))
+        .await
+        .unwrap();
+    harness.assert_buffer_contents("bar one\n");
+    harness
+        .execute_action(Action::OpenBufferById(ids[1]))
+        .await
+        .unwrap();
+    harness.assert_buffer_contents("no match\n");
+}
+
+#[tokio::test]
+async fn bufdo_uses_stable_buffer_id_ranges_and_rejects_interactive_commands() {
+    let buffers = vec![
+        Buffer::new(/*file*/ None, "foo one\n".to_string()),
+        Buffer::new(/*file*/ None, "foo two\n".to_string()),
+        Buffer::new(/*file*/ None, "foo three\n".to_string()),
+    ];
+    let ids = buffers
+        .iter()
+        .map(|buffer| buffer.id().as_u64())
+        .collect::<Vec<_>>();
+    let mut editor = Editor::test_with_size(
+        Box::new(MockLsp),
+        /*width*/ 80,
+        /*height*/ 24,
+        Config::default(),
+        Theme::default(),
+        buffers,
+    )
+    .unwrap();
+    editor.test_disable_terminal_output();
+    let mut harness = EditorHarness { editor };
+
+    harness
+        .execute_action(Action::Command(format!(
+            "{},{}bufdo %s/foo/bar/g",
+            ids[1], ids[2]
+        )))
+        .await
+        .unwrap();
+
+    assert_eq!(harness.current_buffer_index(), 2);
+    harness
+        .execute_action(Action::OpenBufferById(ids[0]))
+        .await
+        .unwrap();
+    harness.assert_buffer_contents("foo one\n");
+    harness
+        .execute_action(Action::OpenBufferById(ids[1]))
+        .await
+        .unwrap();
+    harness.assert_buffer_contents("bar two\n");
+    harness
+        .execute_action(Action::OpenBufferById(ids[2]))
+        .await
+        .unwrap();
+    harness.assert_buffer_contents("bar three\n");
+
+    harness
+        .execute_action(Action::Command("bufdo enew".to_string()))
+        .await
+        .unwrap();
+
+    assert_eq!(harness.buffer_names().len(), 3);
+    assert_eq!(harness.current_buffer_index(), 0);
+    assert!(harness
+        .last_error()
+        .is_some_and(|message| message.contains("supported non-interactive subset")));
+
+    harness
+        .execute_action(Action::Command(
+            "bufdo syntax definitely-missing".to_string(),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(harness.current_buffer_index(), 0);
+    assert!(harness
+        .last_error()
+        .is_some_and(|message| message.contains("unknown syntax")));
+}
+
+#[tokio::test]
 async fn buffer_listing_aliases_show_stable_numbers_without_opening_splits() {
     for command in ["ls", "buffers", "files", "b", "buffer"] {
         let mut harness = EditorHarness::with_content("contents\n");

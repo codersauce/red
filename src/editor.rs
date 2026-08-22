@@ -19,6 +19,7 @@ mod agent_annotations;
 mod agent_manager;
 mod agent_models;
 mod buffer_actions;
+mod buffer_do;
 mod buffer_manager;
 mod command_mode;
 mod completion_resolve;
@@ -1008,6 +1009,8 @@ pub struct SubstituteCommand {
     replace_all: bool,
     case_insensitive: bool,
     confirm: bool,
+    #[serde(default)]
+    suppress_errors: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2615,6 +2618,12 @@ pub enum Action {
     DumpTimers,
     DoPing,
     Command(String),
+    /// Executes one non-interactive built-in Ex command over a stable buffer-ID snapshot.
+    BufferDo {
+        command: String,
+        start: Option<u64>,
+        end: Option<u64>,
+    },
     PluginCommand(String),
     SetCursor(usize, usize),
     SetWaitingKey(Box<KeyAction>),
@@ -15620,6 +15629,30 @@ impl Editor {
         })
     }
 
+    fn resolve_ex_buffer_range(range: &str) -> anyhow::Result<(Option<u64>, Option<u64>)> {
+        if range.is_empty() || range == "%" {
+            return Ok((None, None));
+        }
+        anyhow::ensure!(
+            range != "'<,'>",
+            "bufdo does not support the last visual range"
+        );
+        let mut ids = range.split(',');
+        let start = ids
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("bufdo range is empty"))?
+            .parse::<u64>()?;
+        let end = ids
+            .next()
+            .map(str::parse::<u64>)
+            .transpose()?
+            .unwrap_or(start);
+        anyhow::ensure!(ids.next().is_none(), "bufdo range has too many endpoints");
+        anyhow::ensure!(start > 0 && end > 0, "bufdo buffer IDs start at one");
+        anyhow::ensure!(start <= end, "bufdo range start exceeds its end");
+        Ok((Some(start), Some(end)))
+    }
+
     fn parse_substitute_command(&self, command: &str) -> anyhow::Result<Option<SubstituteCommand>> {
         let (range, command) = Self::split_ex_line_range(command);
         let command = command.trim_start();
@@ -15637,7 +15670,9 @@ impl Editor {
         let (replacement, flags) = parse_substitute_segment(remainder, delimiter)?;
         anyhow::ensure!(!pattern.is_empty(), "substitute pattern cannot be empty");
         anyhow::ensure!(
-            flags.chars().all(|flag| matches!(flag, 'g' | 'i' | 'c')),
+            flags
+                .chars()
+                .all(|flag| matches!(flag, 'g' | 'i' | 'c' | 'e')),
             "unsupported substitute flags: {flags}"
         );
 
@@ -15659,6 +15694,7 @@ impl Editor {
             replace_all: flags.contains('g'),
             case_insensitive: flags.contains('i'),
             confirm: flags.contains('c'),
+            suppress_errors: flags.contains('e'),
         }))
     }
 
@@ -15714,6 +15750,28 @@ impl Editor {
             .unwrap_or((ranged_command, ""));
         let keep_spaces = name.ends_with('!');
         let name = name.strip_suffix('!').unwrap_or(name);
+        let parsed_ranged_command =
+            command::parse(command_palette::BUILTIN_COLON_COMMANDS, ranged_command);
+        if let Some(parsed) =
+            parsed_ranged_command.filter(|parsed| parsed.commands.as_slice() == ["bufdo"])
+        {
+            let Some(command) = parsed.argument_text() else {
+                self.set_legacy_message(Some("usage: bufdo {command}".to_string()));
+                return Vec::new();
+            };
+            let (start, end) = match Self::resolve_ex_buffer_range(range) {
+                Ok(range) => range,
+                Err(error) => {
+                    self.set_legacy_message(Some(error.to_string()));
+                    return Vec::new();
+                }
+            };
+            return vec![Action::BufferDo {
+                command,
+                start,
+                end,
+            }];
+        }
         if matches!(name, "j" | "join") {
             if range.is_empty() {
                 let count = if arguments.trim().is_empty() {
@@ -19900,7 +19958,9 @@ impl Editor {
                         return Ok(false);
                     }
                 };
-                if command.confirm && !substitutions.is_empty() {
+                if substitutions.is_empty() && command.suppress_errors {
+                    self.render(buffer)?;
+                } else if command.confirm && !substitutions.is_empty() {
                     let confirmation = SubstituteConfirmation {
                         substitutions,
                         current: 0,
@@ -20359,6 +20419,14 @@ impl Editor {
                     return Ok(true);
                 }
                 self.render(buffer)?;
+            }
+            Action::BufferDo {
+                command,
+                start,
+                end,
+            } => {
+                self.execute_buffer_do(command, *start, *end, buffer, runtime)
+                    .await?;
             }
             Action::PluginCommand(cmd) => {
                 let demo = match (

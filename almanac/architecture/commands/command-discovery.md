@@ -15,6 +15,9 @@ sources:
   - id: editor-dispatch
     type: file
     path: src/editor.rs
+  - id: buffer-do
+    type: file
+    path: src/editor/buffer_do.rs
   - id: default-config
     type: file
     path: default_config.toml
@@ -39,11 +42,13 @@ The low-level parser in `src/command.rs` receives authoritative built-in command
 
 The editor adds command-specific handling around that parser. It special-cases register and join commands, uses parsed canonical names for syntax, set, and messages commands, and maps the remaining parsed command names to semantic `Action` values such as save, quit, buffer movement, deletion, edit/reload, split, and wrap [@editor-dispatch]. If built-in parsing fails but the runtime has a registered plugin command with the exact input name, the editor returns `Action::PluginCommand`; otherwise it records an unknown-command error [@editor-dispatch].
 
+`:bufdo` parses its optional range as stable buffer ids rather than line numbers, snapshots matching open-buffer ids, and reparses its nested command after activating each target so line ranges such as `%` resolve against that buffer. Traversal stops on parse, substitution, write, or reload errors and rejects nested actions that could invalidate the snapshot or open interactive UI. The outer force flag is accepted for Vim compatibility; Red already preserves dirty buffers during ordinary buffer switches [@editor-dispatch] [@buffer-do].
+
 Advertising a built-in colon form is a parser and dispatch change, not only palette metadata. A built-in command that appears in docs or `CommandPaletteEntry::colon` must also be present in the built-in command list passed to `command::parse` and must map to an `Action` in `Editor::handle_command`; otherwise the palette can describe a `:<name>` form that direct colon input still reports as unknown [@command-palette] [@editor-dispatch].
 
 ## Completion Names
 
-Colon completion uses the palette module's command-name inventory rather than the parser alone. `colon_completion_names` starts with built-in colon commands, adds special built-ins such as `commands`, `command-palette`, debug commands, registers, undotree, `j`, and `join`, and then appends plugin command names that do not collide with built-in colon names [@command-palette]. The editor uses that list for command-name completion. `src/command_completion.rs` selects argument providers after a space: fixed choices for commands such as `set`, `languages`, and `Copilot`, file paths for file commands, and language ids for syntax commands. `Tab` cycles forward and `Shift-Tab` cycles backward through the original matches; typing resets the cycle. Positional choices replace only the current argument; file completion retains its existing whole-path replacement behavior. Completion never executes a command or plugin callback [@command-completion] [@editor-dispatch].
+Colon completion uses the palette module's command-name inventory rather than the parser alone. `colon_completion_names` starts with built-in colon commands, adds special built-ins such as `commands`, `command-palette`, debug commands, registers, undotree, `j`, and `join`, and then appends plugin command names that do not collide with built-in colon names [@command-palette]. The editor uses that list for command-name completion. `src/command_completion.rs` selects argument providers after a space: fixed choices for commands such as `set`, `languages`, and `Copilot`, file paths for file commands, and language ids for syntax commands. After `bufdo`, completion restarts at the nested command, including optional stable-ID ranges, and excludes recursive `bufdo` completion. `Tab` cycles forward and `Shift-Tab` cycles backward through the original matches; typing resets the cycle. Positional choices replace only the current argument; file completion retains its existing whole-path replacement behavior. Completion never executes a command or plugin callback [@command-completion] [@editor-dispatch].
 
 Built-in precedence is intentional. `colon_name_is_builtin` treats special names and anything the built-in parser can resolve as reserved, so plugin commands with those names can still be active internally but do not create alternate colon command entries in discovery surfaces [@command-palette]. This matches the plugin API boundary described in [Red Host API](../plugins/red-host-api).
 
