@@ -8,7 +8,7 @@ use red::{
     agent_conversation::AgentConversationSnapshot,
     buffer::Buffer,
     config::Config,
-    editing::{MotionResolver, TextArea},
+    editing::{MotionResolver, TextArea, TextObjectKind, TextObjectScope},
     editor::{DetachedEditorCore, Editor, Mode, RenderBuffer, SearchDirection},
     highlighter::Highlighter,
     inline_history::{InlineConversation, InlineHistory, InlineHistoryTurn},
@@ -285,6 +285,12 @@ fn main() -> Result<()> {
     }
     if scenario == "all" || scenario == "textarea-redo" {
         results.push(benchmark_embedded_undo_restoration(/*redo*/ true)?);
+    }
+    if scenario == "all" || scenario == "text-object-delimited" {
+        results.push(benchmark_text_object_selection(/*quoted*/ false)?);
+    }
+    if scenario == "all" || scenario == "text-object-quoted" {
+        results.push(benchmark_text_object_selection(/*quoted*/ true)?);
     }
 
     anyhow::ensure!(
@@ -1936,6 +1942,45 @@ fn benchmark_embedded_undo_restoration(redo: bool) -> Result<serde_json::Value> 
         },
         started,
         TEXTAREA_UNDO_RESTORES,
+    ))
+}
+
+fn benchmark_text_object_selection(quoted: bool) -> Result<serde_json::Value> {
+    let prefix = "ordinary_identifier ".repeat(1_024);
+    let (target, kind) = if quoted {
+        ("\"selected \\\" quote\"", TextObjectKind::Quote('"'))
+    } else {
+        (
+            "(outer (selected) suffix)",
+            TextObjectKind::Delimited {
+                open: '(',
+                close: ')',
+            },
+        )
+    };
+    let contents = format!("{prefix}{target}{}", " trailing_words".repeat(1_024));
+    let cursor = prefix.len() + target.find("selected").unwrap();
+    let buffer = Buffer::new(None, contents);
+    let resolver = MotionResolver::new(&buffer, TextPosition::new(0, cursor));
+    let started = Instant::now();
+    for _ in 0..TEXTAREA_VIM_MOTIONS {
+        let range = resolver
+            .text_object(TextObjectScope::Inner, kind)
+            .ok_or_else(|| anyhow::anyhow!("Vim text object was not found"))?;
+        anyhow::ensure!(
+            range.start.character <= cursor && range.end.character > cursor,
+            "Vim text object did not contain its cursor"
+        );
+        black_box(range);
+    }
+    Ok(report(
+        if quoted {
+            "shared_vim_escaped_quote_text_objects"
+        } else {
+            "shared_vim_nested_delimiter_text_objects"
+        },
+        started,
+        TEXTAREA_VIM_MOTIONS,
     ))
 }
 

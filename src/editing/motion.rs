@@ -860,28 +860,52 @@ impl<'buffer> MotionResolver<'buffer> {
         open: char,
         close: char,
     ) -> Option<TextRange> {
-        let characters = self.buffer.contents().chars().collect::<Vec<_>>();
+        let contents = self.buffer.contents_snapshot();
         let cursor = self.buffer.position_to_char_idx(self.cursor);
-        let mut stack = Vec::new();
-        let mut best_pair = None;
-
-        for (index, character) in characters.iter().copied().enumerate() {
-            if character == open {
-                stack.push(index);
-            } else if character == close {
-                let Some(open_index) = stack.pop() else {
-                    continue;
-                };
-                if open_index <= cursor
-                    && cursor <= index
-                    && best_pair.is_none_or(|(best_open_index, _)| open_index > best_open_index)
-                {
-                    best_pair = Some((open_index, index));
-                }
-            }
+        if cursor >= contents.len_chars() {
+            return None;
         }
-
-        let (open_index, close_index) = best_pair?;
+        let start = if contents.get_char(cursor) == Some(close) {
+            cursor
+        } else {
+            cursor + 1
+        };
+        let mut depth = 0usize;
+        let open_index =
+            contents
+                .chars_at(start)
+                .reversed()
+                .enumerate()
+                .find_map(|(offset, character)| {
+                    if character == close {
+                        depth += 1;
+                    } else if character == open {
+                        if depth == 0 {
+                            return Some(start - offset - 1);
+                        }
+                        depth -= 1;
+                    }
+                    None
+                })?;
+        depth = 0;
+        let close_index =
+            contents
+                .chars_at(open_index)
+                .enumerate()
+                .find_map(|(offset, character)| {
+                    if character == open {
+                        depth += 1;
+                    } else if character == close {
+                        depth = depth.saturating_sub(1);
+                        if depth == 0 {
+                            return Some(open_index + offset);
+                        }
+                    }
+                    None
+                })?;
+        if cursor > close_index {
+            return None;
+        }
         let (start, end) = match scope {
             TextObjectScope::Inner => (open_index + 1, close_index),
             TextObjectScope::Around => (open_index, close_index + 1),
@@ -894,27 +918,35 @@ impl<'buffer> MotionResolver<'buffer> {
 
     fn quote_text_object(&self, scope: TextObjectScope, quote: char) -> Option<TextRange> {
         let line = self.buffer.get(self.cursor.line)?;
-        let characters = trim_line_ending(&line).chars().collect::<Vec<_>>();
-        let quote_positions = characters
-            .iter()
-            .enumerate()
-            .filter_map(|(index, character)| {
-                (*character == quote && !is_escaped_quote(&characters, index)).then_some(index)
-            })
-            .collect::<Vec<_>>();
-
-        for pair in quote_positions.chunks(2) {
-            if let [start, end] = pair {
-                if *start <= self.cursor.character && self.cursor.character <= *end {
-                    let (start, end) = match scope {
-                        TextObjectScope::Inner => (start + 1, *end),
-                        TextObjectScope::Around => (*start, end + 1),
+        let line = trim_line_ending(&line);
+        let mut start = None;
+        for (byte, _) in line.match_indices(quote) {
+            let backslashes = line[..byte]
+                .bytes()
+                .rev()
+                .take_while(|character| *character == b'\\')
+                .count();
+            if backslashes % 2 == 1 {
+                continue;
+            }
+            let index = if self.buffer.is_ascii() {
+                byte
+            } else {
+                line[..byte].chars().count()
+            };
+            if let Some(open) = start.take() {
+                if open <= self.cursor.character && self.cursor.character <= index {
+                    let (first, last) = match scope {
+                        TextObjectScope::Inner => (open + 1, index),
+                        TextObjectScope::Around => (open, index + 1),
                     };
                     return Some(TextRange::new(
-                        TextPosition::new(self.cursor.line, start),
-                        TextPosition::new(self.cursor.line, end),
+                        TextPosition::new(self.cursor.line, first),
+                        TextPosition::new(self.cursor.line, last),
                     ));
                 }
+            } else {
+                start = Some(index);
             }
         }
         None
@@ -966,19 +998,6 @@ fn text_unit_kind(character: char) -> Option<TextUnitKind> {
     } else {
         Some(TextUnitKind::Symbol)
     }
-}
-
-fn is_escaped_quote(characters: &[char], index: usize) -> bool {
-    let mut slash_count = 0;
-    let mut previous = index;
-    while previous > 0 {
-        previous -= 1;
-        if characters[previous] != '\\' {
-            break;
-        }
-        slash_count += 1;
-    }
-    slash_count % 2 == 1
 }
 
 #[cfg(test)]
@@ -1206,5 +1225,88 @@ mod tests {
             .text_object(TextObjectScope::Inner, TextObjectKind::Quote('"'))
             .unwrap();
         assert_eq!(quoted.text_in_range(range), "a \\\" quote");
+    }
+
+    #[test]
+    fn indexed_text_objects_match_nested_and_escaped_reference_at_every_cursor() {
+        for text in [
+            "",
+            "plain text",
+            "(alpha)",
+            "(outer (inner) tail)",
+            "before [one [two] three] after",
+            ")unmatched (open",
+            "prefix \"first\" between \"second\"",
+            "prefix \"a \\\" quote\" suffix",
+            r#"prefix "even \\" next "tail""#,
+            "e\u{301} (👨‍👩‍👧 [漢字]) \"🇧🇷 quoted\"",
+        ] {
+            let buffer = Buffer::new(None, text.to_string());
+            let characters = text.chars().collect::<Vec<_>>();
+            for cursor in 0..=characters.len() {
+                let resolver = MotionResolver::new(&buffer, TextPosition::new(0, cursor));
+                for scope in [TextObjectScope::Inner, TextObjectScope::Around] {
+                    for (opening, closing) in [('(', ')'), ('[', ']')] {
+                        let mut stack = Vec::new();
+                        let mut expected: Option<(usize, usize)> = None;
+                        for (index, character) in characters.iter().copied().enumerate() {
+                            if character == opening {
+                                stack.push(index);
+                            } else if character == closing {
+                                if let Some(start) = stack.pop() {
+                                    if start <= cursor
+                                        && cursor <= index
+                                        && expected.is_none_or(|(best, _)| start > best)
+                                    {
+                                        expected = Some((start, index));
+                                    }
+                                }
+                            }
+                        }
+                        let expected = expected.map(|(start, end)| match scope {
+                            TextObjectScope::Inner => (start + 1, end),
+                            TextObjectScope::Around => (start, end + 1),
+                        });
+                        let actual = resolver
+                            .text_object(
+                                scope,
+                                TextObjectKind::Delimited {
+                                    open: opening,
+                                    close: closing,
+                                },
+                            )
+                            .map(|range| (range.start.character, range.end.character));
+                        assert_eq!(actual, expected, "{text:?} at {cursor} {scope:?}");
+                    }
+
+                    let quotes = characters
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(index, character)| {
+                            if *character != '"' {
+                                return None;
+                            }
+                            let slash_count = characters[..index]
+                                .iter()
+                                .rev()
+                                .take_while(|value| **value == '\\')
+                                .count();
+                            (slash_count % 2 == 0).then_some(index)
+                        })
+                        .collect::<Vec<_>>();
+                    let expected = quotes.chunks(2).find_map(|pair| match pair {
+                        [start, end] if *start <= cursor && cursor <= *end => Some(match scope {
+                            TextObjectScope::Inner => (start + 1, *end),
+                            TextObjectScope::Around => (*start, end + 1),
+                        }),
+                        _ => None,
+                    });
+                    let actual = resolver
+                        .text_object(scope, TextObjectKind::Quote('"'))
+                        .map(|range| (range.start.character, range.end.character));
+                    assert_eq!(actual, expected, "{text:?} quote at {cursor} {scope:?}");
+                }
+            }
+        }
     }
 }

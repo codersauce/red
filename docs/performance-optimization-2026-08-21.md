@@ -66,6 +66,7 @@ navigation baselines were frozen after rebasing to `d92777c`.
 | Husk completion ranking | 99.42% |
 | Structured panel row selection | 99.91% |
 | Inline-assistance answer streaming | 98.93% |
+| Shared Vim nested delimiter text objects | 98.93% |
 | Multi-file process startup loading | 98.92% |
 | Husk unchanged document updates | 98.44% |
 | Viewport cursor snapshot updates | 98.58% |
@@ -85,6 +86,7 @@ navigation baselines were frozen after rebasing to `d92777c`.
 | Embedded redo cursor restoration | 91.33% |
 | Embedded text-area document loading | 91.26% |
 | Embedded Vim nested delimiter matching | 90.03% |
+| Shared Vim escaped-quote text objects | 88.86% |
 | Shared Vim long-line paragraph operators | 88.15% |
 | Shared modal editor backward word motion | 87.58% |
 | Shared modal editor forward word motion | 87.01% |
@@ -188,6 +190,13 @@ samples reduced undo medians from 2,628 to 416 microseconds and redo medians fro
 2,513 to 218 microseconds while preserving empty and trailing lines, invalid
 snapshot coordinates, tabs, combining marks, emoji, Unicode cursor positions,
 and exact undo/redo history restoration.
+
+Shared Vim text objects were independently measured across 2,048 nested
+delimiter selections and 2,048 escaped-quote selections on large source lines.
+Eleven alternating release-build samples reduced delimiter medians from 100,937
+to 1,077 microseconds and quote medians from 60,761 to 6,771 microseconds while
+preserving innermost pairs, unmatched delimiters, odd/even backslash escaping,
+Unicode scalar positions, and inner versus around selection boundaries.
 
 Multi-file startup uses the same production loader as the executable. Across
 four startup passes over 128 distinct source files, seven alternating samples

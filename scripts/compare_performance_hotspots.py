@@ -70,6 +70,8 @@ SCENARIOS = (
     "paragraph-long-line",
     "textarea-undo",
     "textarea-redo",
+    "text-object-delimited",
+    "text-object-quoted",
     "husk-completion",
     "husk-config",
     "husk-update",
