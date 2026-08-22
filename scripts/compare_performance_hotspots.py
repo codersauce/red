@@ -63,6 +63,7 @@ SCENARIOS = (
     "textarea-vim-match",
     "textarea-delete",
     "textarea-word-delete",
+    "textarea-home-end",
     "husk-completion",
     "husk-config",
     "husk-update",

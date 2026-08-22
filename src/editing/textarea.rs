@@ -268,12 +268,7 @@ impl TextArea {
 
     /// Moves the cursor to a bounded, absolute extended-grapheme position.
     pub fn set_cursor(&mut self, cursor: usize) {
-        let length = if self.buffer.is_ascii() {
-            self.buffer.byte_len()
-        } else {
-            grapheme_len(&self.text())
-        };
-        self.state.cursor = cursor.min(length);
+        self.state.cursor = cursor.min(self.document_grapheme_len());
         self.state.preferred_column = None;
         self.sync_buffer_cursor();
     }
@@ -284,7 +279,7 @@ impl TextArea {
         if text.len() > self.max_bytes {
             return false;
         }
-        let end = grapheme_len(&self.text());
+        let end = self.document_grapheme_len();
         self.replace_graphemes(0, end, &text, grapheme_len(&text), "replace text area")
     }
 
@@ -322,12 +317,7 @@ impl TextArea {
 
     /// Removes the complete extended grapheme directly under the cursor.
     pub fn delete(&mut self) -> bool {
-        let length = if self.buffer.is_ascii() {
-            self.buffer.byte_len()
-        } else {
-            grapheme_len(&self.text())
-        };
-        if self.state.cursor >= length {
+        if self.state.cursor >= self.document_grapheme_len() {
             return false;
         }
         let cursor = self.state.cursor;
@@ -502,7 +492,7 @@ impl TextArea {
                 return TextAreaOutcome::Changed;
             }
             KeyCode::End => {
-                self.set_cursor(grapheme_len(&self.text()));
+                self.set_cursor(self.document_grapheme_len());
                 return TextAreaOutcome::Changed;
             }
             KeyCode::Backspace if is_word_backspace(key) => {
@@ -1126,7 +1116,7 @@ impl TextArea {
         } else {
             let first = anchor.min(self.state.cursor);
             let last = anchor.max(self.state.cursor).saturating_add(1);
-            self.range_for_graphemes(first, last.min(grapheme_len(&self.text())))
+            self.range_for_graphemes(first, last.min(self.document_grapheme_len()))
         };
         self.apply_operator(operator, range, linewise, keys);
     }
@@ -1372,7 +1362,7 @@ impl TextArea {
                 self.current_line_start()
             } else {
                 let end = self.current_line_end();
-                if end < grapheme_len(&self.text()) {
+                if end < self.document_grapheme_len() {
                     end + 1
                 } else {
                     end
@@ -1834,6 +1824,14 @@ impl TextArea {
             .map_or(0, |index| grapheme_len(&text[..index + 1]))
     }
 
+    fn document_grapheme_len(&self) -> usize {
+        if self.buffer.is_ascii() {
+            self.buffer.byte_len()
+        } else {
+            grapheme_len(&self.text())
+        }
+    }
+
     fn current_line_end(&self) -> usize {
         if self.buffer.is_ascii() {
             return self
@@ -1983,7 +1981,7 @@ impl TextArea {
         self.state.cursor = if ascii {
             cursor.min(self.buffer.byte_len())
         } else {
-            cursor.min(grapheme_len(&self.text()))
+            cursor.min(self.document_grapheme_len())
         };
         self.state.preferred_column = None;
         self.sync_buffer_cursor();
@@ -2025,7 +2023,7 @@ impl TextArea {
         let line = self.buffer.get(snapshot.y).unwrap_or_default();
         self.state.cursor = grapheme_len(&prefix)
             .saturating_add(snapshot.x.min(grapheme_len(&line)))
-            .min(grapheme_len(&self.text()));
+            .min(self.document_grapheme_len());
         self.state.preferred_column = None;
         self.sync_buffer_cursor();
     }
@@ -2159,6 +2157,36 @@ mod tests {
                     assert_eq!(area.cursor(), cursor);
                 }
             }
+        }
+    }
+
+    #[test]
+    fn indexed_document_boundaries_preserve_ascii_and_unicode_home_end_navigation() {
+        for original in [
+            "",
+            "plain ascii draft",
+            "first\n\nlast\n",
+            "normalized\r\nwindows\rline",
+            "e\u{301} 👨‍👩‍👧\n漢字 🇧🇷",
+            "\u{301}leading\ntrailing\u{200d}",
+        ] {
+            let mut area = TextArea::new(original);
+            let text = area.text();
+            let expected = crate::unicode_utils::grapheme_len(&text);
+            assert_eq!(area.document_grapheme_len(), expected);
+            for code in [KeyCode::Home, KeyCode::End, KeyCode::Home, KeyCode::End] {
+                assert_eq!(
+                    area.handle_event(&Event::Key(KeyEvent::new(code, KeyModifiers::NONE)), 80),
+                    TextAreaOutcome::Changed
+                );
+                assert_eq!(
+                    area.cursor(),
+                    if code == KeyCode::Home { 0 } else { expected },
+                    "{original:?} after {code:?}"
+                );
+            }
+            area.set_cursor(usize::MAX);
+            assert_eq!(area.cursor(), expected);
         }
     }
 

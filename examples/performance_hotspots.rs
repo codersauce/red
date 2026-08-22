@@ -264,6 +264,9 @@ fn main() -> Result<()> {
     if scenario == "all" || scenario == "textarea-word-delete" {
         results.push(benchmark_embedded_textarea_deletion(/*word*/ true)?);
     }
+    if scenario == "all" || scenario == "textarea-home-end" {
+        results.push(benchmark_embedded_home_end_navigation()?);
+    }
 
     anyhow::ensure!(
         !results.is_empty(),
@@ -1778,6 +1781,30 @@ fn benchmark_embedded_textarea_deletion(word: bool) -> Result<serde_json::Value>
         },
         started,
         TEXTAREA_DELETE_EVENTS,
+    ))
+}
+
+fn benchmark_embedded_home_end_navigation() -> Result<serde_json::Value> {
+    let mut area = TextArea::new("ordinary editor draft contents\n".repeat(1_024));
+    let home = Event::Key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE));
+    let end = Event::Key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE));
+    let started = Instant::now();
+    for index in 0..TEXTAREA_VIM_MOTIONS {
+        let event = if index % 2 == 0 { &home } else { &end };
+        anyhow::ensure!(
+            area.handle_event(black_box(event), 120) == red::editing::TextAreaOutcome::Changed,
+            "embedded Home/End event was not handled"
+        );
+        black_box(area.cursor());
+    }
+    anyhow::ensure!(
+        area.cursor() == area.buffer().byte_len(),
+        "embedded Home/End navigation lost the final document boundary"
+    );
+    Ok(report(
+        "embedded_home_end_document_navigation",
+        started,
+        TEXTAREA_VIM_MOTIONS,
     ))
 }
 

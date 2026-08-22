@@ -75,6 +75,7 @@ navigation baselines were frozen after rebasing to `d92777c`.
 | Decoration namespace updates | 97.48% |
 | Long transcript cursor lookup | 97.35% |
 | Character-wrapped layout cursor lookup | 97.29% |
+| Embedded Home/End document navigation | 96.88% |
 | Word-wrapped layout cursor lookup | 96.61% |
 | Git workspace row navigation | 96.35% |
 | Shared ASCII grapheme counting | 94.94% |
@@ -154,6 +155,12 @@ Delete-key medians from 4,177 to 1,014 microseconds and Ctrl-Backspace word
 deletion medians from 4,794 to 1,205 microseconds. Rope-indexed ASCII paths
 preserve whitespace-delimited words, empty buffers, tabs, multiline drafts,
 combining marks, emoji, CJK text, cursor boundaries, and undo restoration.
+
+Embedded Home/End navigation was measured over 2,048 real editing events across
+a 1,024-line draft. Eleven alternating release-build samples reduced the median
+from 8,938 to 279 microseconds while preserving normalized CRLF, empty drafts,
+multiline boundaries, combining marks, family emoji, regional-indicator flags,
+out-of-range cursor clamping, and the original Unicode grapheme-counting path.
 
 Multi-file startup uses the same production loader as the executable. Across
 four startup passes over 128 distinct source files, seven alternating samples
