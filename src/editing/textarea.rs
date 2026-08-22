@@ -6,8 +6,8 @@ use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use unicode_segmentation::UnicodeSegmentation;
 
 use super::{
-    apply_transactional_replacement, text_object_kind_for_key, CharacterMotion, MotionResolver,
-    TextObjectKind, TextObjectScope,
+    apply_transactional_replacement, plain_line, reflow_text, text_object_kind_for_key,
+    CharacterMotion, MotionResolver, TextObjectKind, TextObjectScope,
 };
 use crate::{
     buffer::Buffer,
@@ -109,6 +109,7 @@ enum Operator {
     Delete,
     Change,
     Yank,
+    Format,
 }
 
 #[derive(Debug, Clone)]
@@ -167,6 +168,8 @@ pub struct TextArea {
     macro_registers: HashMap<char, Vec<char>>,
     replaying: bool,
     insert_recipe: Option<Vec<char>>,
+    format_width: usize,
+    format_tab_width: usize,
 }
 
 impl TextArea {
@@ -196,6 +199,8 @@ impl TextArea {
             macro_registers: HashMap::new(),
             replaying: false,
             insert_recipe: None,
+            format_width: 79,
+            format_tab_width: 4,
         };
         area.sync_buffer_cursor();
         area
@@ -372,6 +377,8 @@ impl TextArea {
         event: &Event,
         layout: LayoutOptions,
     ) -> TextAreaOutcome {
+        self.format_width = layout.width.min(79).max(1);
+        self.format_tab_width = layout.tab_width;
         match event {
             Event::Paste(text) => {
                 self.state.pending = None;
@@ -715,7 +722,10 @@ impl TextArea {
                 let count = operator_count.saturating_mul(motion_count.unwrap_or(1));
                 if matches!(
                     (operator, character),
-                    (Operator::Delete, 'd') | (Operator::Change, 'c') | (Operator::Yank, 'y')
+                    (Operator::Delete, 'd')
+                        | (Operator::Change, 'c')
+                        | (Operator::Yank, 'y')
+                        | (Operator::Format, 'q')
                 ) {
                     self.operate_current_lines(operator, count, keys);
                 } else if matches!(character, 'i' | 'a') {
@@ -805,6 +815,21 @@ impl TextArea {
                         } else {
                             self.move_to_line(line);
                         }
+                    }
+                    'q' if operator.is_none() => {
+                        if self.is_visual() {
+                            self.apply_selection(Operator::Format, keys);
+                        } else {
+                            self.state.pending = Some(PendingInput::Operator {
+                                operator: Operator::Format,
+                                operator_count: count,
+                                motion_count: None,
+                                keys,
+                            });
+                        }
+                    }
+                    'q' if operator == Some(Operator::Format) => {
+                        self.operate_current_lines(Operator::Format, count, keys);
                     }
                     'e' | 'E' => {
                         if let Some(operator) = operator {
@@ -998,6 +1023,10 @@ impl TextArea {
         linewise: bool,
         keys: Vec<char>,
     ) {
+        if operator == Operator::Format {
+            self.format_range(range, keys);
+            return;
+        }
         let text = self.buffer.text_in_range(range);
         if text.is_empty() {
             return;
@@ -1030,6 +1059,17 @@ impl TextArea {
         let Some(anchor) = self.state.selection_anchor else {
             return;
         };
+        if operator == Operator::Format {
+            let first = self.position_for_grapheme(anchor).line;
+            let last = self.cursor_position().line;
+            self.apply_operator(
+                operator,
+                self.linewise_range(first.min(last), first.max(last)),
+                true,
+                keys,
+            );
+            return;
+        }
         let linewise = self.state.mode == Mode::VisualLine;
         if self.state.mode == Mode::VisualBlock {
             self.apply_block_selection(operator, anchor, keys);
@@ -1094,6 +1134,44 @@ impl TextArea {
         } else {
             self.set_mode(Mode::Normal);
         }
+    }
+
+    fn format_range(&mut self, range: TextRange, keys: Vec<char>) {
+        let first = range.start.line.min(self.last_editable_line());
+        let last = if range.end.line > first && range.end.character == 0 {
+            range.end.line.saturating_sub(1)
+        } else {
+            range.end.line
+        }
+        .min(self.last_editable_line());
+        let range = self.linewise_range(first, last);
+        let original = self.buffer.text_in_range(range);
+        let formatted = reflow_text(
+            &original,
+            self.format_width,
+            self.format_tab_width,
+            plain_line,
+        );
+        if original == formatted {
+            self.set_mode(Mode::Normal);
+            return;
+        }
+
+        let start = self.grapheme_index_for_position(range.start);
+        let end = self.grapheme_index_for_position(range.end);
+        let cursor_text = formatted.trim_end_matches(&['\r', '\n'][..]);
+        let last_line_start = cursor_text.rfind('\n').map_or(0, |offset| offset + 1);
+        let leading = cursor_text[last_line_start..]
+            .graphemes(true)
+            .take_while(|grapheme| grapheme.chars().all(char::is_whitespace))
+            .count();
+        let cursor = start
+            .saturating_add(grapheme_len(&cursor_text[..last_line_start]))
+            .saturating_add(leading);
+        if self.replace_graphemes(start, end, &formatted, cursor, "format text") {
+            self.record_change(keys);
+        }
+        self.set_mode(Mode::Normal);
     }
 
     fn move_word(&mut self, motion: char, count: u16) {

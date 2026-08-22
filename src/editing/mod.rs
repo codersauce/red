@@ -6,10 +6,12 @@
 //! commands, filesystem access, LSP notifications, and rendering remain host concerns.
 
 mod motion;
+mod reflow;
 mod textarea;
 mod transaction;
 
 pub(crate) use motion::text_object_kind_for_key;
 pub use motion::{CharacterMotion, MotionResolver, TextObjectKind, TextObjectScope};
+pub(crate) use reflow::{plain_line, reflow_text, ReflowLine};
 pub use textarea::{EditState, RegisterContent, TextArea, TextAreaOutcome};
 pub(crate) use transaction::apply_transactional_replacement;

@@ -676,6 +676,9 @@ impl Default for ClipboardConfig {
 #[serde(deny_unknown_fields)]
 /// Language-specific comment templates keyed by canonical language or extension.
 pub struct CommentingConfig {
+    /// Preferred source width for manual and automatic comment formatting.
+    #[serde(default = "default_comment_text_width")]
+    pub text_width: usize,
     /// Templates containing one placeholder for the original line contents.
     #[serde(default = "default_comment_templates")]
     pub languages: HashMap<String, String>,
@@ -684,9 +687,14 @@ pub struct CommentingConfig {
 impl Default for CommentingConfig {
     fn default() -> Self {
         Self {
+            text_width: default_comment_text_width(),
             languages: default_comment_templates(),
         }
     }
+}
+
+const fn default_comment_text_width() -> usize {
+    100
 }
 
 fn default_comment_templates() -> HashMap<String, String> {
@@ -1041,6 +1049,9 @@ pub struct LanguageConfig {
     /// Vim-style line-comment template containing a single `%s` placeholder.
     #[serde(default)]
     pub comment: Option<String>,
+    /// Preferred source width for comments in this language.
+    #[serde(default)]
+    pub text_width: Option<usize>,
     /// Preferred indentation width for files recognized as this language.
     #[serde(default)]
     pub indent_width: Option<usize>,
@@ -2212,6 +2223,7 @@ fn known_schema_path(path: &[String]) -> bool {
                 | "filenames"
                 | "aliases"
                 | "comment"
+                | "text_width"
                 | "indent_width"
                 | "grammar"
                 | "lsp"
@@ -2251,7 +2263,8 @@ fn known_schema_path(path: &[String]) -> bool {
             matches!(*field, "name" | "command" | "args" | "root_markers" | "env")
         }
         ["languages", _, "formatter", "env", _] => true,
-        ["commenting", "languages"] | ["commenting", "languages", _] => true,
+        ["commenting", field] => matches!(*field, "text_width" | "languages"),
+        ["commenting", "languages", _] => true,
         ["matchit", field] => matches!(*field, "enabled" | "pairs" | "languages"),
         ["matchit", "languages", _] | ["matchit", "languages", _, "groups"] => true,
         _ => false,
@@ -4064,7 +4077,7 @@ input_position = "left"
     }
 
     #[test]
-    fn default_config_maps_normal_and_visual_comment_operators() {
+    fn default_config_maps_normal_and_visual_comment_and_format_operators() {
         let config: Config = toml::from_str(include_str!("../default_config.toml")).unwrap();
 
         let Some(KeyAction::Nested(normal_g)) = config.keys.normal.get("g") else {
@@ -4073,6 +4086,10 @@ input_position = "left"
         assert_eq!(
             normal_g.get("c"),
             Some(&KeyAction::Single(Action::StartCommentOperator(1)))
+        );
+        assert_eq!(
+            normal_g.get("q"),
+            Some(&KeyAction::Single(Action::StartFormatOperator(1)))
         );
 
         let Some(KeyAction::Nested(visual_g)) = config.keys.visual.get("g") else {
@@ -4085,12 +4102,20 @@ input_position = "left"
                 Action::EnterMode(Mode::Normal),
             ]))
         );
+        assert_eq!(
+            visual_g.get("q"),
+            Some(&KeyAction::Multiple(vec![
+                Action::FormatSelection,
+                Action::EnterMode(Mode::Normal),
+            ]))
+        );
     }
 
     #[test]
     fn comment_configuration_defaults_cover_line_and_wrapping_comments() {
         let config = Config::default();
 
+        assert_eq!(config.commenting.text_width, 100);
         assert_eq!(config.commenting.languages["fish"], "# %s");
         assert_eq!(config.commenting.languages["rust"], "// %s");
         assert!(!config.commenting.languages.contains_key("python"));
@@ -4098,6 +4123,19 @@ input_position = "left"
         assert_eq!(config.commenting.languages["html"], "<!-- %s -->");
         assert_eq!(config.commenting.languages["css"], "/* %s */");
         assert!(!config.commenting.languages.contains_key("json"));
+    }
+
+    #[test]
+    fn comment_text_width_supports_global_and_language_overrides() {
+        let loaded = Config::load_user_toml(
+            "[commenting]\ntext_width = 88\n[languages.rust]\ntext_width = 92\n",
+            Path::new("/tmp/config.toml"),
+            &[],
+        )
+        .unwrap();
+
+        assert_eq!(loaded.config.commenting.text_width, 88);
+        assert_eq!(loaded.config.languages["rust"].text_width, Some(92));
     }
 
     #[test]

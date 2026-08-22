@@ -134,6 +134,9 @@ impl Editor {
                     | Action::ToggleCommentRange(_)
                     | Action::ToggleCommentSelection
                     | Action::StartCommentOperator(_)
+                    | Action::StartFormatOperator(_)
+                    | Action::FormatTextRange(_)
+                    | Action::FormatSelection
                     | Action::StartLowercaseOperator(_)
                     | Action::StartUppercaseOperator(_)
                     | Action::StartToggleCaseOperator(_)

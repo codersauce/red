@@ -770,6 +770,71 @@ async fn comment_operation_preserves_windows_line_endings() {
 }
 
 #[tokio::test]
+async fn format_gqq_reflows_comments_to_the_configured_width() {
+    let mut config = default_key_config();
+    config.commenting.text_width = 24;
+    let buffer = Buffer::new(
+        Some("main.rs".to_string()),
+        "// alpha beta gamma delta epsilon zeta".to_string(),
+    );
+    let mut harness = EditorHarness::with_config(buffer, config);
+
+    type_normal_keys(&mut harness, "gqq").await;
+
+    harness.assert_buffer_contents("// alpha beta gamma\n// delta epsilon zeta");
+    harness.assert_cursor_at(0, 1);
+    type_normal_keys(&mut harness, "u").await;
+    harness.assert_buffer_contents("// alpha beta gamma delta epsilon zeta");
+    harness.execute_action(Action::Redo).await.unwrap();
+    harness.assert_buffer_contents("// alpha beta gamma\n// delta epsilon zeta");
+}
+
+#[tokio::test]
+async fn format_operator_honors_motions_visual_ranges_and_crlf() {
+    let mut config = default_key_config();
+    config.commenting.text_width = 20;
+    let buffer = Buffer::new(
+        Some("main.rs".to_string()),
+        "// alpha beta\r\n// gamma delta\r\n// epsilon zeta\r\nlast".to_string(),
+    );
+    let mut harness = EditorHarness::with_config(buffer, config);
+
+    type_normal_keys(&mut harness, "gqj").await;
+    harness.assert_buffer_contents("// alpha beta gamma\r\n// delta\r\n// epsilon zeta\r\nlast");
+
+    type_normal_keys(&mut harness, "Vjgq").await;
+    harness.assert_buffer_contents("// alpha beta gamma\r\n// delta epsilon\r\n// zeta\r\nlast");
+    harness.assert_mode(Mode::Normal);
+}
+
+#[tokio::test]
+async fn format_gqgq_honors_a_line_count() {
+    let mut config = default_key_config();
+    config.commenting.text_width = 20;
+    let buffer = Buffer::new(
+        Some("main.rs".to_string()),
+        "// alpha beta\n// gamma delta\nlast".to_string(),
+    );
+    let mut harness = EditorHarness::with_config(buffer, config);
+
+    type_normal_keys(&mut harness, "2gqgq").await;
+
+    harness.assert_buffer_contents("// alpha beta gamma\n// delta\nlast");
+}
+
+#[tokio::test]
+async fn format_gqq_reflows_plain_text_without_a_comment_language() {
+    let mut config = default_key_config();
+    config.commenting.text_width = 16;
+    let buffer = Buffer::new(None, "alpha beta gamma delta epsilon".to_string());
+    let mut harness = EditorHarness::with_config(buffer, config);
+
+    type_normal_keys(&mut harness, "gqq").await;
+
+    harness.assert_buffer_contents("alpha beta gamma\ndelta epsilon");
+}
+
+#[tokio::test]
 async fn comment_unknown_language_leaves_the_buffer_unchanged() {
     let mut harness = comment_harness("data.json", "{\"value\": 1}");
 

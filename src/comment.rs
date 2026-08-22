@@ -4,6 +4,8 @@
 //! placeholder is inserted before a line and text after it is inserted after a
 //! line, allowing the same implementation to handle line and wrapping comments.
 
+use crate::editing::ReflowLine;
+
 /// Validated left and right halves of a language-specific comment template.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CommentSyntax {
@@ -34,6 +36,57 @@ impl CommentSyntax {
 
         line.strip_prefix(self.left.trim())
             .is_some_and(|content| content.trim_end().ends_with(self.right.trim()))
+    }
+
+    /// Classifies one complete comment line for paragraph reflow.
+    pub(crate) fn reflow_line(&self, line: &str) -> Option<ReflowLine> {
+        let content = line.trim_start_matches(char::is_whitespace);
+        let indent = &line[..line.len() - content.len()];
+        let left_marker = self.left.trim_end();
+        let after_left = content.strip_prefix(left_marker)?;
+
+        if !self.right.trim().is_empty() {
+            let right_marker = self.right.trim();
+            let body = after_left.trim_end().strip_suffix(right_marker)?.trim();
+            if body.is_empty() {
+                return Some(ReflowLine::Literal(line.to_string()));
+            }
+            return Some(ReflowLine::paragraph(
+                format!("{indent}{}", self.left),
+                body,
+                self.right.clone(),
+            ));
+        }
+
+        let marker_character = left_marker.chars().last();
+        let extra_marker_len = after_left
+            .char_indices()
+            .take_while(|(_, character)| Some(*character) == marker_character || *character == '!')
+            .map(|(offset, character)| offset + character.len_utf8())
+            .last()
+            .unwrap_or_default();
+        let (extra_marker, body) = after_left.split_at(extra_marker_len);
+        let body = body.trim();
+        if body.is_empty() {
+            return Some(ReflowLine::Literal(line.to_string()));
+        }
+        let padding = self.left.strip_prefix(left_marker).unwrap_or_default();
+        Some(ReflowLine::paragraph(
+            format!("{indent}{left_marker}{extra_marker}{padding}"),
+            body,
+            "",
+        ))
+    }
+
+    /// Reports a wrapping-comment opener that cannot be represented line-by-line.
+    pub(crate) fn is_unclosed_wrapping_start(&self, line: &str) -> bool {
+        let left_marker = self.left.trim();
+        let right_marker = self.right.trim();
+        !right_marker.is_empty()
+            && line
+                .trim_start_matches(char::is_whitespace)
+                .starts_with(left_marker)
+            && !line.trim_end().ends_with(right_marker)
     }
 
     /// Toggles the supplied lines as one range, preserving relative indentation.
@@ -111,6 +164,7 @@ fn leading_whitespace(line: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::CommentSyntax;
+    use crate::editing::ReflowLine;
 
     fn toggle(template: &str, lines: &[&str]) -> Vec<String> {
         let syntax = CommentSyntax::parse(template).expect("test template should be valid");
@@ -190,5 +244,39 @@ mod tests {
             toggle("# %s", &["\talpha", "\t\tbeta"]),
             ["\t# alpha", "\t# \tbeta"]
         );
+    }
+
+    #[test]
+    fn extracts_reflow_parts_and_preserves_documentation_leaders() {
+        let syntax = CommentSyntax::parse("// %s").unwrap();
+
+        assert_eq!(
+            syntax.reflow_line("    /// documented item"),
+            Some(ReflowLine::paragraph("    /// ", "documented item", ""))
+        );
+        assert_eq!(
+            syntax.reflow_line("    //! module docs"),
+            Some(ReflowLine::paragraph("    //! ", "module docs", ""))
+        );
+        assert_eq!(
+            syntax.reflow_line("    // - list item"),
+            Some(ReflowLine::paragraph("    // ", "- list item", ""))
+        );
+        assert_eq!(
+            syntax.reflow_line("    //"),
+            Some(ReflowLine::Literal("    //".to_string()))
+        );
+    }
+
+    #[test]
+    fn extracts_complete_wrapping_comments_but_rejects_open_blocks() {
+        let syntax = CommentSyntax::parse("/* %s */").unwrap();
+
+        assert_eq!(
+            syntax.reflow_line("  /* comment body */"),
+            Some(ReflowLine::paragraph("  /* ", "comment body", " */"))
+        );
+        assert!(syntax.reflow_line("  /* comment body").is_none());
+        assert!(syntax.is_unclosed_wrapping_start("  /* comment body"));
     }
 }

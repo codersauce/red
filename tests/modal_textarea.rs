@@ -91,6 +91,42 @@ fn word_wrap_does_not_turn_visual_rows_into_logical_lines() {
     assert_eq!(area.text(), "one two three\nlast");
 }
 
+#[test]
+fn embedded_textarea_formats_current_and_visual_lines_as_one_undoable_change() {
+    let mut area = TextArea::new("alpha beta gamma delta\nepsilon zeta eta theta");
+    area.set_cursor(0);
+    area.set_mode(Mode::Normal);
+
+    for character in "gqq".chars() {
+        assert_eq!(
+            area.handle_event(&event(character), 12),
+            TextAreaOutcome::Changed
+        );
+    }
+    assert_eq!(
+        area.text(),
+        "alpha beta\ngamma delta\nepsilon zeta eta theta"
+    );
+    assert_eq!(area.buffer().pos, (0, 1));
+    assert!(area.undo());
+    assert_eq!(
+        area.text(),
+        "alpha beta gamma delta\nepsilon zeta eta theta"
+    );
+
+    for character in "VGgq".chars() {
+        assert_eq!(
+            area.handle_event(&event(character), 12),
+            TextAreaOutcome::Changed
+        );
+    }
+    assert_eq!(
+        area.text(),
+        "alpha beta\ngamma delta\nepsilon zeta\neta theta"
+    );
+    assert_eq!(area.mode(), Mode::Normal);
+}
+
 #[tokio::test]
 async fn embedded_textareas_match_file_editor_for_shared_vim_sequences() {
     let cases = [
