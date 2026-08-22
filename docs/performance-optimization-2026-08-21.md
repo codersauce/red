@@ -65,6 +65,7 @@ navigation baselines were frozen after rebasing to `d92777c`.
 | Husk completion ranking | 99.42% |
 | Structured panel row selection | 99.91% |
 | Inline-assistance answer streaming | 98.93% |
+| Multi-file process startup loading | 98.92% |
 | Husk unchanged document updates | 98.44% |
 | Viewport cursor snapshot updates | 98.58% |
 | Gutter namespace updates | 97.94% |
@@ -105,6 +106,11 @@ Git repository discovery was measured over 512 expired-cache refreshes through
 to 21,297 microseconds while preserving nested repositories, linked worktrees,
 detached HEADs, symlink retargeting, and renamed physical directories.
 
+Multi-file startup uses the same production loader as the executable. Across
+four startup passes over 128 distinct source files, seven alternating samples
+reduced the median from 1,245,405 to 13,426 microseconds while preserving first
+argument order, missing-file behavior, relative aliases, symlinks, and hard links.
+
 Real detached-terminal coverage separately exercised editing, 32 KiB of Unicode
 paste, repeated resizes, reattachment, and owner shutdown. Detached-frame median
 serialization fell from 107 microseconds to below the trace timer's
@@ -138,7 +144,7 @@ objective.
 
 ## Remaining gaps
 
-- Broad process startup, real-terminal end-to-end typing, recovery snapshot writes,
+- Single-file process startup, real-terminal end-to-end typing, recovery snapshot writes,
   Git subprocess status refresh, broader Vim editing, platform-specific paths,
   and several other areas above still require dedicated before/after fixtures
   before claiming a 50% improvement.

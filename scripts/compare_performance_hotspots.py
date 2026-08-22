@@ -47,6 +47,7 @@ SCENARIOS = (
     "session-write",
     "frame-full",
     "git-discovery",
+    "startup-files",
     "husk-completion",
     "husk-config",
     "husk-update",

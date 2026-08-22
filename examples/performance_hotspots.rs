@@ -81,6 +81,8 @@ const SNAPSHOT_WRITES: usize = 6;
 const FULL_FRAME_RENDERS: usize = 160;
 const GIT_DISCOVERY_DEPTH: usize = 16;
 const GIT_REPOSITORY_DISCOVERIES: usize = 512;
+const STARTUP_FILE_COUNT: usize = 128;
+const STARTUP_FILE_LOADS: usize = 4;
 
 fn main() -> Result<()> {
     let scenario = std::env::args().nth(1).unwrap_or_else(|| "all".into());
@@ -196,6 +198,9 @@ fn main() -> Result<()> {
     }
     if scenario == "all" || scenario == "git-discovery" {
         results.push(benchmark_git_repository_discovery()?);
+    }
+    if scenario == "all" || scenario == "startup-files" {
+        results.push(benchmark_startup_file_loading()?);
     }
 
     anyhow::ensure!(
@@ -1304,6 +1309,37 @@ fn benchmark_git_repository_discovery() -> Result<serde_json::Value> {
         "git_repository_discovery_and_branch_refresh",
         started,
         GIT_REPOSITORY_DISCOVERIES,
+    ))
+}
+
+fn benchmark_startup_file_loading() -> Result<serde_json::Value> {
+    let directory = tempfile::tempdir()?;
+    let mut files = Vec::with_capacity(STARTUP_FILE_COUNT);
+    for index in 0..STARTUP_FILE_COUNT {
+        let path = directory.path().join(format!("source-{index:03}.rs"));
+        std::fs::write(
+            &path,
+            format!("fn source_{index}() -> usize {{ {index} }}\n"),
+        )?;
+        files.push(path.to_string_lossy().into_owned());
+    }
+    let executor = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+
+    let started = Instant::now();
+    for _ in 0..STARTUP_FILE_LOADS {
+        let buffers = executor.block_on(red::buffer::load_startup_buffers(black_box(&files)))?;
+        anyhow::ensure!(
+            buffers.len() == STARTUP_FILE_COUNT,
+            "startup file benchmark lost or duplicated a source buffer"
+        );
+        black_box(buffers);
+    }
+    Ok(report(
+        "multi_file_process_startup_loading",
+        started,
+        STARTUP_FILE_LOADS,
     ))
 }
 

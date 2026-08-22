@@ -12,7 +12,11 @@
 //! controlled undo/redo replay.
 
 use ropey::{Rope, RopeSlice};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::{
+    collections::HashSet,
+    path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
+};
 
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -21,8 +25,67 @@ use crate::undo::{TextPosition, TextRange, UndoHistory};
 use crate::unicode_utils::{char_to_column, column_to_char, display_width, trim_line_ending};
 use crate::utils::{expand_user_path, normalized_file_path};
 
+#[cfg(not(unix))]
+use crate::utils::same_file_path;
+
 const FIRST_BUFFER_ID: u64 = 1;
 static NEXT_BUFFER_ID: AtomicU64 = AtomicU64::new(FIRST_BUFFER_ID);
+
+#[derive(Default)]
+struct StartupFileIdentities {
+    paths: HashSet<PathBuf>,
+    #[cfg(unix)]
+    files: HashSet<(u64, u64)>,
+}
+
+impl StartupFileIdentities {
+    fn insert(&mut self, path: &Path) -> bool {
+        if self.paths.contains(path) {
+            return false;
+        }
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+
+            if std::fs::metadata(path)
+                .ok()
+                .is_some_and(|metadata| !self.files.insert((metadata.dev(), metadata.ino())))
+            {
+                return false;
+            }
+        }
+
+        #[cfg(not(unix))]
+        if self
+            .paths
+            .iter()
+            .any(|previous| same_file_path(previous, path))
+        {
+            return false;
+        }
+
+        self.paths.insert(path.to_path_buf())
+    }
+}
+
+/// Loads startup files in argument order while collapsing aliases of the same file.
+#[doc(hidden)]
+pub async fn load_startup_buffers(files: &[String]) -> anyhow::Result<Vec<Buffer>> {
+    let mut buffers = Vec::with_capacity(files.len());
+    let mut identities = StartupFileIdentities::default();
+    for file in files {
+        let buffer = Buffer::load_or_create(Some(file.clone())).await?;
+        let duplicate = buffer
+            .file
+            .as_deref()
+            .is_some_and(|candidate| !identities.insert(Path::new(candidate)));
+        if !duplicate {
+            buffers.push(buffer);
+        }
+    }
+    Ok(buffers)
+}
 
 /// Stable identity for one in-memory buffer.
 ///
@@ -1244,6 +1307,67 @@ mod test {
             .undo_history
             .commit_transaction(CursorSnapshot::default());
         buffer.refresh_dirty();
+    }
+
+    #[tokio::test]
+    async fn startup_file_loading_preserves_order_and_deduplicates_missing_paths() {
+        let directory = tempfile::tempdir().unwrap();
+        let first = directory.path().join("first.rs");
+        let missing = directory.path().join("not-created.rs");
+        let last = directory.path().join("last.rs");
+        fs::write(&first, "first\n").unwrap();
+        fs::write(&last, "last\n").unwrap();
+        let first = first.to_string_lossy().into_owned();
+        let missing = missing.to_string_lossy().into_owned();
+        let last = last.to_string_lossy().into_owned();
+
+        let buffers = load_startup_buffers(&[
+            first.clone(),
+            missing.clone(),
+            first.clone(),
+            last.clone(),
+            missing.clone(),
+        ])
+        .await
+        .unwrap();
+
+        assert_eq!(
+            buffers
+                .iter()
+                .map(|buffer| buffer.file.as_deref().unwrap())
+                .collect::<Vec<_>>(),
+            [first.as_str(), missing.as_str(), last.as_str()]
+        );
+        assert_eq!(buffers[1].contents(), "\n");
+        assert!(!Path::new(&missing).exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn startup_file_loading_collapses_hard_links_and_symbolic_aliases() {
+        let directory = tempfile::tempdir().unwrap();
+        let original = directory.path().join("original.rs");
+        let hard_link = directory.path().join("hard-link.rs");
+        let symbolic = directory.path().join("symbolic.rs");
+        let distinct = directory.path().join("distinct.rs");
+        fs::write(&original, "shared\n").unwrap();
+        fs::hard_link(&original, &hard_link).unwrap();
+        symlink(&original, &symbolic).unwrap();
+        fs::write(&distinct, "distinct\n").unwrap();
+        let hard_link = hard_link.to_string_lossy().into_owned();
+        let original = original.to_string_lossy().into_owned();
+        let symbolic = symbolic.to_string_lossy().into_owned();
+        let distinct = distinct.to_string_lossy().into_owned();
+
+        let buffers =
+            load_startup_buffers(&[hard_link.clone(), original, symbolic, distinct.clone()])
+                .await
+                .unwrap();
+
+        assert_eq!(buffers.len(), 2);
+        assert_eq!(buffers[0].file.as_deref(), Some(hard_link.as_str()));
+        assert_eq!(buffers[0].contents(), "shared\n");
+        assert_eq!(buffers[1].file.as_deref(), Some(distinct.as_str()));
     }
 
     #[test]
