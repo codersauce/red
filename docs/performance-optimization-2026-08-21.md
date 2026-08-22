@@ -54,6 +54,13 @@ navigation baselines were frozen after rebasing to `d92777c`.
 
 | Runtime path | Median improvement |
 | --- | ---: |
+| Real-terminal PowerShell variable highlighting | 94.55% |
+| Real-terminal YAML mapping-key highlighting | 88.41% |
+| Real-terminal TOML bare-key highlighting | 83.75% |
+| Real-terminal Bash assignment-name highlighting | 81.13% |
+| Real-terminal Fish function-name highlighting | 74.42% |
+| Real-terminal PowerShell variable edit frames | 70.57% |
+| Real-terminal YAML mapping-key edit frames | 58.08% |
 | Markdown fenced PowerShell variable highlighting | 99.15% |
 | PowerShell variable highlighting | 99.04% |
 | YAML mapping-key highlighting | 98.69% |
@@ -788,6 +795,17 @@ cached tree by the exact edit. The shortcut excludes token boundaries, reserved
 keywords, uppercase-sensitive names, non-identifier Unicode, custom queries,
 and source or span cache-limit violations; Unicode edits, comments, YAML
 context, Markdown language injections, and fresh-parser parity remain covered.
+
+Seven alternating real-terminal sessions per configuration and shell language
+applied 24 lowercase identifier edits to production editor viewports. TOML,
+YAML, Bash, Fish, and PowerShell highlighting respectively fell from 80 to 13,
+164 to 19, 53 to ten, 43 to 11, and 257 to 14 microseconds. Complete YAML
+editor-window frames fell from 260 to 109 microseconds, and complete PowerShell
+editor-window frames fell from 350 to 103 microseconds. The production driver
+positions the cursor strictly inside the visible identifier and alternates
+ASCII lowercase insertions. Complete input events, action handling, other
+editor-window frames, and real-terminal fenced PowerShell edits remain below
+the 50% threshold and are intentionally excluded.
 
 Seven alternating release-build samples per configuration and shell identifier
 scenario applied 128 interior lowercase edits to 96 declarations. Direct TOML

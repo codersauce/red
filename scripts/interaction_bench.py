@@ -125,6 +125,8 @@ def run(args):
         if args.scenario == "typing" and args.typing_context != "source":
             if args.typing_context == "heading":
                 position = b"0f 8l"
+            elif args.typing_context == "identifier":
+                position = b"0fr5l"
             elif args.typing_context == "comment":
                 extension = file_path.suffix.lower()
                 if args.comment_marker is not None:
@@ -161,8 +163,12 @@ def run(args):
         if args.scenario == "typing":
             os.write(master, b"i")
             for index in range(args.cycles):
-                punctuation = b"." if args.typing_context != "source" else b"a"
-                os.write(master, punctuation if index % 2 == 0 else "\u03bb".encode())
+                if args.typing_context == "identifier":
+                    inserted = b"x" if index % 2 == 0 else b"y"
+                else:
+                    punctuation = b"." if args.typing_context != "source" else b"a"
+                    inserted = punctuation if index % 2 == 0 else "\u03bb".encode()
+                os.write(master, inserted)
                 time.sleep(delay)
             os.write(master, b"\x1b")
         elif args.scenario == "search":
@@ -256,9 +262,9 @@ def main():
     parser.add_argument("--startup-timeout", type=float, default=12)
     parser.add_argument(
         "--typing-context",
-        choices=("source", "comment", "string", "heading"),
+        choices=("source", "comment", "string", "heading", "identifier"),
         default="source",
-        help="place typing inside ordinary source, a line comment, string, or Markdown heading",
+        help="place typing inside source, a line comment, string, Markdown heading, or identifier",
     )
     parser.add_argument(
         "--comment-marker",
