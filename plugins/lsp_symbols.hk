@@ -1,11 +1,11 @@
 // Document-symbol, workspace-symbol, and reference pickers backed by LSP requests.
 //
 // Picker rows retain serialized source locations and open them through the plugin
-// location contract, including explicit column encoding. Live workspace queries replace
-// results for the active picker instead of creating competing dialogs, and request IDs
-// keep late LSP responses from replacing newer flows. Large symbol and reference responses
-// are converted in cancellable timer batches so no callback monopolizes the Husk instruction
-// budget; a final safety ceiling bounds pathological server responses.
+// location contract, including explicit column encoding. Live workspace queries filter and
+// rank the current rows locally while debounced LSP results replace the picker candidates;
+// request IDs keep late responses from replacing newer flows. Large symbol and reference
+// responses are converted in cancellable timer batches so no callback monopolizes the Husk
+// instruction budget; a final safety ceiling bounds pathological server responses.
 
 struct SymbolIconOptions {
     enabled: bool,
@@ -81,6 +81,8 @@ struct LspSymbolsState {
     batch_workspace_only: bool,
     reference_file: String,
     reference_position: Option<Position>,
+    workspace_query: String,
+    workspace_query_timer: String,
     picker: Option<i32>,
     request: i32,
     waiting_for_references: bool,
@@ -99,6 +101,8 @@ fn initial_state() -> LspSymbolsState {
         batch_workspace_only: false,
         reference_file: "",
         reference_position: None,
+        workspace_query: "",
+        workspace_query_timer: "",
         picker: None,
         request: -1,
         waiting_for_references: false,
@@ -224,9 +228,10 @@ fn document_symbols() {
 fn workspace_symbols() {
     begin_symbol_flow();
     let handle = red::execute("OpenPicker", "Workspace Symbols", [], PickerOptions {
-        external_filter: true,
         placeholder: "Type to search workspace symbols",
         status: "Loading workspace symbols",
+        busy: true,
+        item_layout: "label_first",
     }, PickerHandlers {
         query: workspace_query,
         selected: open_symbol_selection,
@@ -243,7 +248,30 @@ fn workspace_query(query: String) {
         return;
     }
     cancel_symbol_batch();
-    request_workspace_symbols(query);
+    schedule_workspace_query(query);
+}
+
+fn schedule_workspace_query(query: String) {
+    let current = state();
+    if current.workspace_query_timer != "" {
+        red::execute("CancelTimeout", current.workspace_query_timer);
+    }
+    current.workspace_query = query;
+    current.workspace_query_timer = red::execute("SetTimeout", 100);
+    // Invalidate any request that predates the current picker query. Its eventual
+    // callback will be ignored even if it arrives before the debounce expires.
+    current.request = -1;
+    save_state(current);
+}
+
+fn cancel_workspace_query() {
+    let current = state();
+    if current.workspace_query_timer != "" {
+        red::execute("CancelTimeout", current.workspace_query_timer);
+    }
+    current.workspace_query = "";
+    current.workspace_query_timer = "";
+    save_state(current);
 }
 
 fn request_workspace_symbols(query: String) {
@@ -373,13 +401,13 @@ fn update_workspace_symbols(result: SymbolsResult, request_id: i32) {
         cancel_symbol_batch();
         red::execute("UpdatePickerItems", handle, []);
         red::execute("UpdatePickerStatus", handle, "Workspace symbols unavailable: " + result.error);
+        red::execute("UpdatePickerBusy", handle, false);
         return;
     }
 
     let total = red::len(result.symbols);
     if total > 64 {
         start_symbol_batch(result.symbols, true, handle);
-        red::execute("UpdatePickerItems", handle, []);
         red::execute("UpdatePickerStatus", handle, "Loading 0/" + total + " symbols");
         return;
     }
@@ -389,6 +417,7 @@ fn update_workspace_symbols(result: SymbolsResult, request_id: i32) {
     let count = red::len(items);
     red::execute("UpdatePickerItems", handle, items);
     red::execute("UpdatePickerStatus", handle, count + " symbols");
+    red::execute("UpdatePickerBusy", handle, false);
 }
 
 fn start_symbol_batch(symbols: [LspSymbol], workspace_only: bool, handle: i32) {
@@ -428,6 +457,19 @@ fn schedule_symbol_batch() {
 #[red::on("timeout:callback")]
 fn symbol_batch_timeout(event: TimerEvent) {
     let current = state();
+    if event.timer_id == current.workspace_query_timer {
+        let query = current.workspace_query;
+        let Some(handle) = current.picker else {
+            cancel_workspace_query();
+            return;
+        };
+        current.workspace_query_timer = "";
+        save_state(current);
+        red::execute("UpdatePickerBusy", handle, true);
+        red::execute("UpdatePickerStatus", handle, "Searching workspace symbols");
+        request_workspace_symbols(query);
+        return;
+    }
     if event.timer_id != current.batch_timer {
         return;
     }
@@ -489,7 +531,7 @@ fn symbol_batch_timeout(event: TimerEvent) {
     } else {
         red::execute("UpdatePickerStatus", handle, red::len(items) + " " + noun);
     }
-    if kind == "references" {
+    if kind == "references" || (kind == "symbols" && workspace_only) {
         red::execute("UpdatePickerBusy", handle, false);
     }
     clear_symbol_batch();
@@ -649,6 +691,7 @@ fn finish_symbol_flow() {
     current.picker = None;
     current.waiting_for_references = false;
     save_state(current);
+    cancel_workspace_query();
     cancel_symbol_batch();
     let current = state();
     current.request = -1;
