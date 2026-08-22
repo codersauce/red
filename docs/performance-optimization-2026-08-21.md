@@ -81,6 +81,7 @@ navigation baselines were frozen after rebasing to `d92777c`.
 | LSP absolute-document routing | 94.68% |
 | Workspace inline file discovery | 92.65% |
 | Embedded text-area document loading | 91.26% |
+| Embedded Vim nested delimiter matching | 90.03% |
 | Shared modal editor backward word motion | 87.58% |
 | Shared modal editor forward word motion | 87.01% |
 | Printable ASCII frame rendering | 85.25% |
@@ -138,6 +139,12 @@ samples reduced `w`/`b` word-motion medians from 186,095 to 3,950 microseconds
 and `$`/`0` line-boundary medians from 116,150 to 1,760 microseconds. Indexed
 ASCII cursor conversion retains empty and trailing lines, normalized CRLF,
 bounded positions, combining marks, emoji, and the unchanged Unicode fallback.
+
+Embedded Vim delimiter matching was measured across 1,024 real `%` input events
+against a document containing nested parentheses, brackets, and braces. Eleven
+alternating samples reduced the median from 29,496 to 2,942 microseconds while
+preserving reverse searches, unmatched delimiters, multiline nesting, combining
+marks, emoji, Unicode cursor positions, and the editor's existing mode behavior.
 
 Multi-file startup uses the same production loader as the executable. Across
 four startup passes over 128 distinct source files, seven alternating samples

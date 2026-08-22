@@ -98,6 +98,7 @@ const GIT_STATUS_FILES: usize = 2_048;
 const GIT_STATUS_INDEX_BUILDS: usize = 32;
 const LAYOUT_CURSOR_LOOKUPS: usize = 2_048;
 const TEXTAREA_VIM_MOTIONS: usize = 2_048;
+const TEXTAREA_DELIMITER_MOTIONS: usize = 1_024;
 
 fn main() -> Result<()> {
     let scenario = std::env::args().nth(1).unwrap_or_else(|| "all".into());
@@ -252,6 +253,9 @@ fn main() -> Result<()> {
     }
     if scenario == "all" || scenario == "textarea-vim-line" {
         results.push(benchmark_embedded_vim_motion(/*line_motion*/ true)?);
+    }
+    if scenario == "all" || scenario == "textarea-vim-match" {
+        results.push(benchmark_embedded_vim_delimiter_motion()?);
     }
 
     anyhow::ensure!(
@@ -1695,6 +1699,37 @@ fn benchmark_embedded_vim_motion(line_motion: bool) -> Result<serde_json::Value>
         },
         started,
         TEXTAREA_VIM_MOTIONS,
+    ))
+}
+
+fn benchmark_embedded_vim_delimiter_motion() -> Result<serde_json::Value> {
+    let prefix = "ordinary editor line and retained source text\n".repeat(512);
+    let source = format!(
+        "{prefix}fn (value (nested) [item] {{entry}}) tail\n{}",
+        "remaining editor source and ordinary words\n".repeat(512)
+    );
+    let origin = prefix.len() + "fn ".len();
+    let mut area = TextArea::new(source);
+    area.set_mode(Mode::Normal);
+    area.set_cursor(origin);
+    let event = Event::Key(KeyEvent::new(KeyCode::Char('%'), KeyModifiers::NONE));
+
+    let started = Instant::now();
+    for _ in 0..TEXTAREA_DELIMITER_MOTIONS {
+        anyhow::ensure!(
+            area.handle_event(black_box(&event), 120) == red::editing::TextAreaOutcome::Changed,
+            "embedded Vim delimiter motion was not handled"
+        );
+        black_box(area.cursor());
+    }
+    anyhow::ensure!(
+        area.cursor() == origin && area.mode() == Mode::Normal,
+        "embedded Vim delimiter motion lost its original cursor"
+    );
+    Ok(report(
+        "embedded_vim_nested_delimiter_motions",
+        started,
+        TEXTAREA_DELIMITER_MOTIONS,
     ))
 }
 

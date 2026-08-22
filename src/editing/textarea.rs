@@ -1493,9 +1493,9 @@ impl TextArea {
     }
 
     fn move_to_matching_delimiter(&mut self) {
-        let text = self.text();
-        let cursor_byte = grapheme_to_byte(&text, self.state.cursor);
-        let Some(character) = text[cursor_byte..].chars().next() else {
+        let cursor = self.buffer.position_to_char_idx(self.cursor_position());
+        let contents = self.buffer.contents_snapshot();
+        let Some(character) = contents.get_char(cursor) else {
             return;
         };
         let (open, close, forward) = match character {
@@ -1507,24 +1507,34 @@ impl TextArea {
             '}' => ('{', '}', false),
             _ => return,
         };
-        let chars = text.chars().collect::<Vec<_>>();
-        let cursor = text[..cursor_byte].chars().count();
+        let starting = if forward { open } else { close };
+        let ending = if forward { close } else { open };
         let mut depth = 0usize;
-        let indices: Box<dyn Iterator<Item = usize>> = if forward {
-            Box::new(cursor..chars.len())
-        } else {
-            Box::new((0..=cursor).rev())
-        };
-        for index in indices {
-            if chars[index] == if forward { open } else { close } {
+        let mut matching = |index, character| {
+            if character == starting {
                 depth += 1;
-            } else if chars[index] == if forward { close } else { open } {
+                None
+            } else if character == ending {
                 depth = depth.saturating_sub(1);
-                if depth == 0 {
-                    self.move_to_position(self.buffer.char_idx_to_position(index));
-                    break;
-                }
+                (depth == 0).then_some(index)
+            } else {
+                None
             }
+        };
+        let target = if forward {
+            contents
+                .chars_at(cursor)
+                .enumerate()
+                .find_map(|(offset, character)| matching(cursor + offset, character))
+        } else {
+            contents
+                .chars_at(cursor + 1)
+                .reversed()
+                .enumerate()
+                .find_map(|(offset, character)| matching(cursor - offset, character))
+        };
+        if let Some(index) = target {
+            self.move_to_position(self.buffer.char_idx_to_position(index));
         }
     }
 
@@ -2163,6 +2173,75 @@ mod tests {
                         );
                     }
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn rope_delimiter_matching_preserves_nested_and_unicode_cursor_positions() {
+        let samples = [
+            "",
+            "no delimiters",
+            "(alpha)",
+            "(one (two) three)",
+            "before [one [two] three] after",
+            "{one {two} three}",
+            "([{}])",
+            "(unclosed",
+            "closing)",
+            "first (\n nested (word)\n final)\n",
+            "e\u{301} (👨‍👩‍👧 [漢字]) 🇧🇷",
+            "\u{301}leading {👩‍💻 {λ}} trailing",
+        ];
+
+        for sample in samples {
+            let mut area = TextArea::new(sample);
+            area.set_mode(crate::editor::Mode::Normal);
+            let text = area.text();
+            let chars = text.chars().collect::<Vec<_>>();
+            for offset in 0..=crate::unicode_utils::grapheme_len(&text) {
+                area.set_cursor(offset);
+                let byte = super::grapheme_to_byte(&text, offset);
+                let scalar = text[..byte].chars().count();
+                let expected = chars.get(scalar).copied().and_then(|character| {
+                    let (opening, closing, forward) = match character {
+                        '(' => ('(', ')', true),
+                        '[' => ('[', ']', true),
+                        '{' => ('{', '}', true),
+                        ')' => ('(', ')', false),
+                        ']' => ('[', ']', false),
+                        '}' => ('{', '}', false),
+                        _ => return None,
+                    };
+                    let mut depth = 0usize;
+                    let indices: Box<dyn Iterator<Item = usize>> = if forward {
+                        Box::new(scalar..chars.len())
+                    } else {
+                        Box::new((0..=scalar).rev())
+                    };
+                    for index in indices {
+                        if chars[index] == if forward { opening } else { closing } {
+                            depth += 1;
+                        } else if chars[index] == if forward { closing } else { opening } {
+                            depth = depth.saturating_sub(1);
+                            if depth == 0 {
+                                let target = text
+                                    .char_indices()
+                                    .nth(index)
+                                    .map_or(text.len(), |(byte, _)| byte);
+                                return Some(crate::unicode_utils::grapheme_len(&text[..target]));
+                            }
+                        }
+                    }
+                    None
+                });
+
+                area.move_to_matching_delimiter();
+                assert_eq!(
+                    area.cursor(),
+                    expected.unwrap_or(offset),
+                    "{sample:?} at grapheme {offset}"
+                );
             }
         }
     }

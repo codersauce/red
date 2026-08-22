@@ -60,6 +60,7 @@ SCENARIOS = (
     "layout-word-cursor",
     "textarea-vim-word",
     "textarea-vim-line",
+    "textarea-vim-match",
     "husk-completion",
     "husk-config",
     "husk-update",
