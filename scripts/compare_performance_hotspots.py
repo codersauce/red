@@ -37,6 +37,7 @@ SCENARIOS = (
     "highlight",
     "tree-selection",
     "workspace-navigation",
+    "inline-stream",
     "husk-completion",
     "husk-config",
     "husk-update",

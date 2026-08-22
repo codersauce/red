@@ -10,6 +10,7 @@ use red::{
     editing::MotionResolver,
     editor::{DetachedEditorCore, Editor, RenderBuffer, SearchDirection},
     highlighter::Highlighter,
+    inline_history::{InlineConversation, InlineHistory, InlineHistoryTurn},
     lsp::LspManager,
     plugin::{
         Decoration, DecorationAnchor, DecorationManager, GutterSign, GutterSignManager,
@@ -61,6 +62,8 @@ const TREE_PANEL_ROWS: usize = 8_192;
 const TREE_PANEL_LOOKUPS: usize = 256;
 const WORKSPACE_ROWS: usize = 12_000;
 const WORKSPACE_NAVIGATIONS: usize = 1_000;
+const INLINE_CONVERSATIONS: usize = 4_096;
+const INLINE_ANSWER_DELTAS: usize = 1_000;
 
 fn main() -> Result<()> {
     let scenario = std::env::args().nth(1).unwrap_or_else(|| "all".into());
@@ -146,6 +149,9 @@ fn main() -> Result<()> {
     }
     if scenario == "all" || scenario == "workspace-navigation" {
         results.push(benchmark_workspace_navigation()?);
+    }
+    if scenario == "all" || scenario == "inline-stream" {
+        results.push(benchmark_inline_answer_streaming()?);
     }
 
     anyhow::ensure!(
@@ -807,6 +813,59 @@ fn benchmark_workspace_navigation() -> Result<serde_json::Value> {
         "git_workspace_row_navigation",
         started,
         WORKSPACE_NAVIGATIONS,
+    ))
+}
+
+fn benchmark_inline_answer_streaming() -> Result<serde_json::Value> {
+    let range = TextRange::insertion(TextPosition::default());
+    let template: InlineHistoryTurn = serde_json::from_value(json!({
+        "request_id": "request-0000",
+        "created_at_ms": 0,
+        "prompt": "Explain this function",
+        "before": "fn example() {}",
+        "original_range": range,
+        "location": {
+            "file": "src/main.rs",
+            "range": range,
+            "start_char": 0,
+            "end_char": 0
+        },
+        "state": "pending",
+        "result": null
+    }))?;
+    let mut history = InlineHistory {
+        conversations: (0..INLINE_CONVERSATIONS)
+            .map(|index| {
+                let mut turn = template.clone();
+                turn.request_id = format!("request-{index:04}");
+                InlineConversation {
+                    id: format!("conversation-{index:04}"),
+                    cwd: "/workspace".to_string(),
+                    file: "src/main.rs".to_string(),
+                    turns: vec![turn],
+                    resolved: false,
+                    visible_request: None,
+                }
+            })
+            .collect(),
+        ..InlineHistory::default()
+    };
+    let request = format!("request-{:04}", INLINE_CONVERSATIONS - 1);
+
+    let started = Instant::now();
+    for _ in 0..INLINE_ANSWER_DELTAS {
+        history.append_answer(black_box(&request), black_box("streamed response "));
+    }
+    anyhow::ensure!(
+        history.turn(&request).is_some_and(|turn| {
+            turn.answer.len() == INLINE_ANSWER_DELTAS * "streamed response ".len()
+        }),
+        "inline streaming benchmark did not retain every answer delta"
+    );
+    Ok(report(
+        "inline_assistance_answer_streaming",
+        started,
+        INLINE_ANSWER_DELTAS,
     ))
 }
 

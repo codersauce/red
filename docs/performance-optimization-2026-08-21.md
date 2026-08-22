@@ -63,6 +63,7 @@ navigation baselines were frozen after rebasing to `d92777c`.
 | Plugin preference persistence | 99.38% |
 | Husk completion ranking | 99.42% |
 | Structured panel row selection | 99.91% |
+| Inline-assistance answer streaming | 98.93% |
 | Husk unchanged document updates | 98.44% |
 | Viewport cursor snapshot updates | 98.58% |
 | Gutter namespace updates | 97.94% |
