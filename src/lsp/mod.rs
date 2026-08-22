@@ -237,6 +237,7 @@ pub struct ResponseError {
     pub(crate) code: i64,
     pub(crate) message: String,
     pub(crate) data: Option<Value>,
+    pub(crate) request: Option<Request>,
 }
 
 #[derive(Debug)]

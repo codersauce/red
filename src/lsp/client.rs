@@ -549,6 +549,7 @@ async fn process_lsp_message(
             code,
             message,
             data,
+            request: None,
         }))
         .await
         .map_err(|e| LspError::ChannelInboundError(e.to_string()))?;
@@ -1264,6 +1265,7 @@ impl LspClient for RealLspClient {
                                     )));
                                 }
 
+                                error.request = Some(request);
                                 return Ok(Some((msg, Some(method))));
                             }
                         }
@@ -2339,6 +2341,7 @@ mod test {
                 code: -32802,
                 message: "server cancelled the request".to_string(),
                 data: Some(json!({ "retriggerRequest": true })),
+                request: None,
             }))
             .await
             .unwrap();
@@ -3154,6 +3157,7 @@ mod test {
             code,
             message: "server cancelled the request".to_string(),
             data,
+            request: None,
         })
     }
 
@@ -3397,6 +3401,9 @@ mod test {
             };
             assert_eq!(error.id, Some(id));
             assert_eq!(error.code, code);
+            let request = error.request.as_ref().expect("response keeps its request");
+            assert_eq!(request.method, method);
+            assert_eq!(request.params["textDocument"]["uri"], DIAGNOSTIC_URI);
             assert_eq!(response_method.as_deref(), Some(method));
             assert!(client.pending_responses.is_empty());
             assert!(client.pending_diagnostics.is_empty());

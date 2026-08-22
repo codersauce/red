@@ -143,8 +143,8 @@ use crate::{
     },
     matchit::{self, MatchDirection, MatchMotion},
     notification::{
-        AttentionPolicy, MessageAction, Notice, NotificationCenter, NotificationError,
-        NotificationId, NotificationSource, NotificationTime, Severity,
+        AttentionPolicy, DisplayPriority, MessageAction, Notice, NotificationCenter,
+        NotificationError, NotificationId, NotificationSource, NotificationTime, Severity,
     },
     plugin::{self, ComposerHandle, PickerHandle, PluginRegistry, RequestId, Runtime},
     preferences::{PanelLayoutPreference, PreferencesStore},
@@ -14119,6 +14119,76 @@ impl Editor {
         )
     }
 
+    fn publish_lsp_response_error(&mut self, error: &crate::lsp::ResponseError) -> bool {
+        let Some(request) = error.request.as_ref() else {
+            return false;
+        };
+        let uri = request
+            .params
+            .get("textDocument")
+            .and_then(Value::as_object)
+            .and_then(|document| document.get("uri"))
+            .and_then(Value::as_str);
+        let file = uri.and_then(|uri| lsp_file_path(uri).ok());
+        let filename = file.as_deref().and_then(|file| {
+            Path::new(file)
+                .file_name()
+                .and_then(OsStr::to_str)
+                .map(str::to_string)
+        });
+        let operation = match request.method.as_str() {
+            "textDocument/diagnostic" => "diagnostics".to_string(),
+            "textDocument/inlayHint" => "inlay hints".to_string(),
+            "textDocument/completion" => "completion".to_string(),
+            "textDocument/formatting" => "formatting".to_string(),
+            method => method.to_string(),
+        };
+        let summary = filename.as_ref().map_or_else(
+            || format!("{operation} failed"),
+            |filename| format!("{operation} failed for {filename}"),
+        );
+        let server_name = file
+            .as_deref()
+            .and_then(|file| self.lsp.server_name_for_file(file))
+            .unwrap_or_else(|| "language server".to_string());
+        let workspace_root = file
+            .as_deref()
+            .and_then(|file| self.lsp.workspace_root_for_file(file))
+            .map(|root| root.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let mut details = format!(
+            "Server: {server_name}\nRequest: {}\nCode: {}",
+            request.method, error.code
+        );
+        if let Some(file) = &file {
+            details.push_str("\nDocument: ");
+            details.push_str(file);
+        }
+        if let Some(data) = &error.data {
+            details.push_str("\nData: ");
+            details.push_str(&data.to_string());
+        }
+        details.push_str("\n\n");
+        details.push_str(&error.message);
+        let notice = Notice::new(
+            NotificationSource::LanguageServer {
+                name: server_name,
+                workspace_root,
+                generation: 0,
+            },
+            Severity::Error,
+            &summary,
+        )
+        .with_details(details);
+        if let Err(publish_error) = self.publish_notification(notice) {
+            log!("could not retain contextual LSP error: {publish_error}");
+            self.set_notification_message(Severity::Error, Some(summary));
+        } else {
+            self.last_error = Some(summary);
+        }
+        true
+    }
+
     fn handle_lsp_message(
         &mut self,
         msg: &InboundMessage,
@@ -14381,7 +14451,9 @@ impl Editor {
                 {
                     return Some(Action::ShowDialog);
                 }
-                self.set_notification_message(Severity::Error, Some(error_msg.message.clone()));
+                if !self.publish_lsp_response_error(error_msg) {
+                    self.set_notification_message(Severity::Error, Some(error_msg.message.clone()));
+                }
                 if method.as_deref() == Some("textDocument/codeAction")
                     && self.finish_code_action_request(id)
                 {
@@ -39978,6 +40050,64 @@ builtin = "rust"
     }
 
     #[test]
+    fn correlated_lsp_error_has_contextual_summary_and_details() {
+        let mut editor = test_editor(80, 10);
+        let path = Path::new("/tmp/project/src/pull_requests_screen.rs");
+        let uri = crate::lsp::file_uri(path).unwrap();
+        let message = InboundMessage::Error(crate::lsp::ResponseError {
+            id: Some(42),
+            code: -32603,
+            message: "request handler panicked: template arguments were missing".to_string(),
+            data: Some(serde_json::json!({ "retry": false })),
+            request: Some(crate::lsp::Request::new(
+                "textDocument/diagnostic",
+                serde_json::json!({
+                    "textDocument": { "uri": uri }
+                }),
+            )),
+        });
+
+        let action =
+            editor.handle_lsp_message(&message, Some("textDocument/diagnostic".to_string()));
+
+        assert!(action.is_none());
+        assert_eq!(
+            editor.last_error.as_deref(),
+            Some("diagnostics failed for pull_requests_screen.rs")
+        );
+        let record = editor
+            .notifications
+            .records()
+            .find(|record| {
+                record.content.summary == "diagnostics failed for pull_requests_screen.rs"
+            })
+            .unwrap();
+        let NotificationSource::LanguageServer { name, .. } = &record.source else {
+            panic!("expected a language-server notification");
+        };
+        assert!(!name.is_empty());
+        assert_eq!(
+            record.content.summary,
+            "diagnostics failed for pull_requests_screen.rs"
+        );
+        let details = record.content.details.as_deref().unwrap();
+        assert!(details.contains(&format!("Server: {name}")), "{details}");
+        assert!(
+            details.contains("Request: textDocument/diagnostic"),
+            "{details}"
+        );
+        assert!(details.contains("Code: -32603"), "{details}");
+        assert!(
+            details.contains("Document: /tmp/project/src/pull_requests_screen.rs"),
+            "{details}"
+        );
+        assert!(
+            details.contains("request handler panicked: template arguments were missing"),
+            "{details}"
+        );
+    }
+
+    #[test]
     fn lsp_processing_error_produces_a_visible_print_action() {
         let mut editor = test_editor(40, 10);
         let message = InboundMessage::ProcessingError(crate::lsp::LspError::ServerError(
@@ -41289,6 +41419,7 @@ builtin = "rust"
                 code: -32603,
                 message: "code action failed".to_string(),
                 data: None,
+                request: None,
             }),
         ];
 
@@ -42814,6 +42945,7 @@ while True:
                     code: -32601,
                     message: "method not found".to_string(),
                     data: None,
+                    request: None,
                 }),
             };
 
@@ -42871,6 +43003,7 @@ while True:
                     code: -32601,
                     message: "method not found".to_string(),
                     data: None,
+                    request: None,
                 }),
                 "timeout" => InboundMessage::RequestError {
                     id: 71,
@@ -42885,6 +43018,7 @@ while True:
                     code: -32603,
                     message: "formatter failed".to_string(),
                     data: None,
+                    request: None,
                 }),
                 _ => InboundMessage::RequestError {
                     id: 71,
@@ -43214,6 +43348,7 @@ while True:
             code: -32603,
             message: "formatter failed".to_string(),
             data: None,
+            request: None,
         });
 
         assert!(editor
@@ -43237,6 +43372,7 @@ while True:
             code: -32802,
             message: "server cancelled the request".to_string(),
             data: Some(serde_json::json!({ "retriggerRequest": true })),
+            request: None,
         });
 
         let action = editor.handle_lsp_message(&message, Some("workspace/symbol".to_string()));
@@ -43256,6 +43392,7 @@ while True:
             code: -32801,
             message: "content modified".to_string(),
             data: None,
+            request: None,
         });
 
         let action =

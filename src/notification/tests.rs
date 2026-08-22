@@ -122,6 +122,27 @@ fn acknowledgement_hides_an_error_without_deleting_it() {
 }
 
 #[test]
+fn foreground_result_temporarily_leads_without_hiding_an_older_error() {
+    let now = NotificationTime::now();
+    let mut center = NotificationCenter::default();
+    let error = center
+        .publish(notice(Severity::Error, "diagnostics failed"), now)
+        .unwrap();
+    let result = center
+        .publish(
+            notice(Severity::Success, ":wa — no modified buffers")
+                .with_display_priority(DisplayPriority::Foreground),
+            now,
+        )
+        .unwrap();
+
+    assert_eq!(center.primary(now.monotonic).unwrap().id, result);
+    assert_eq!(center.counts(now.monotonic).needs_acknowledgment, 1);
+    assert_eq!(center.primary(later(now, 5).monotonic).unwrap().id, error);
+    assert!(center.get(error).is_some());
+}
+
+#[test]
 fn progress_updates_and_completion_retain_one_identity() {
     let now = NotificationTime::now();
     let mut center = NotificationCenter::default();

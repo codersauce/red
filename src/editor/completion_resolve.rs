@@ -277,6 +277,7 @@ mod tests {
                     code: -32603,
                     message: "resolve failed".to_string(),
                     data: None,
+                    request: None,
                 }),
                 _ => InboundMessage::RequestError {
                     id: 23,

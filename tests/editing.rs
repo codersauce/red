@@ -2757,6 +2757,7 @@ async fn wall_saves_modified_file_buffers_and_preserves_the_active_buffer() {
     assert_eq!(fs::read_to_string(&second_path).unwrap(), "2second old\n");
     assert!(!clean_path.exists());
     assert!(!harness.is_dirty());
+    assert_eq!(harness.last_error(), Some(":wa — wrote 2 buffers"));
     harness
         .execute_action(Action::OpenBufferById(ids[1].as_u64()))
         .await
@@ -2818,13 +2819,28 @@ async fn wall_saves_named_buffers_before_reporting_a_dirty_unnamed_buffer() {
     assert_eq!(harness.editor.test_current_buffer().id(), ids[0]);
     assert_eq!(fs::read_to_string(&first_path).unwrap(), "1first old\n");
     assert_eq!(fs::read_to_string(&second_path).unwrap(), "2second old\n");
-    let expected_error = format!("No file name for buffer {}", ids[1].as_u64());
+    let expected_error = format!(
+        ":wa — wrote 2 of 3 buffers; No file name for buffer {}",
+        ids[1].as_u64()
+    );
     assert_eq!(harness.last_error(), Some(expected_error.as_str()));
     harness
         .execute_action(Action::OpenBufferById(ids[1].as_u64()))
         .await
         .unwrap();
     assert!(harness.is_dirty());
+}
+
+#[tokio::test]
+async fn wall_reports_when_there_are_no_modified_buffers() {
+    let mut harness = EditorHarness::with_content("clean\n");
+
+    harness
+        .execute_action(Action::Command("wa".to_string()))
+        .await
+        .unwrap();
+
+    assert_eq!(harness.last_error(), Some(":wa — no modified buffers"));
 }
 
 #[tokio::test]
