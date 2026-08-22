@@ -13847,6 +13847,18 @@ impl Editor {
                 if method.as_deref() == Some("completionItem/resolve") {
                     return self.completion_resolution_failed(id, &error_msg.message);
                 }
+                if method.as_deref() == Some("textDocument/inlayHint") && error_msg.code == -32801 {
+                    if let Some(request_id) = self.pending_plugin_inlay_hints.remove(&id) {
+                        return Some(Action::ResolvePluginRequest(
+                            request_id.get(),
+                            json!({
+                                "ok": false,
+                                "hints": [],
+                                "request_id": request_id.get(),
+                            }),
+                        ));
+                    }
+                }
                 if let Some(request_id) = self.take_pending_plugin_request(method.as_deref()?, id) {
                     return Some(Action::ResolvePluginRequest(
                         request_id.get(),
@@ -40059,6 +40071,35 @@ while True:
 
         assert!(matches!(action, Some(Action::ResolvePluginRequest(7, _))));
         assert!(!editor.pending_plugin_workspace_symbols.contains_key(&42));
+    }
+
+    #[test]
+    fn content_modified_resolves_inlay_hints_without_a_visible_error() {
+        let mut editor = test_editor(40, 10);
+        editor
+            .pending_plugin_inlay_hints
+            .insert(42, RequestId::from_raw(7));
+        let message = InboundMessage::Error(crate::lsp::ResponseError {
+            id: Some(42),
+            code: -32801,
+            message: "content modified".to_string(),
+            data: None,
+        });
+
+        let action =
+            editor.handle_lsp_message(&message, Some("textDocument/inlayHint".to_string()));
+
+        assert!(matches!(
+            action,
+            Some(Action::ResolvePluginRequest(7, payload))
+                if payload == serde_json::json!({
+                    "ok": false,
+                    "hints": [],
+                    "request_id": 7,
+                })
+        ));
+        assert!(!editor.pending_plugin_inlay_hints.contains_key(&42));
+        assert!(editor.last_error.is_none());
     }
 
     #[test]
