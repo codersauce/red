@@ -999,15 +999,27 @@ pub struct FormattingConfig {
     /// Format supported documents immediately before saving them. Defaults to on.
     #[serde(default = "default_true")]
     pub on_save: bool,
+    /// Remove trailing spaces and tabs before save-time formatting.
+    #[serde(default = "default_true")]
+    pub trim_trailing_whitespace: bool,
+    /// Language ids whose trailing whitespace must remain untouched.
+    #[serde(default = "default_trailing_whitespace_exclusions")]
+    pub trim_trailing_whitespace_exclude: Vec<String>,
     /// Backend selected for explicit and save-time formatting.
     #[serde(default)]
     pub provider: FormattingProvider,
+}
+
+fn default_trailing_whitespace_exclusions() -> Vec<String> {
+    vec!["gitcommit".to_string(), "markdown".to_string()]
 }
 
 impl Default for FormattingConfig {
     fn default() -> Self {
         Self {
             on_save: true,
+            trim_trailing_whitespace: true,
+            trim_trailing_whitespace_exclude: default_trailing_whitespace_exclusions(),
             provider: FormattingProvider::default(),
         }
     }
@@ -2168,7 +2180,13 @@ fn known_schema_path(path: &[String]) -> bool {
             matches!(*field, "enabled" | "sync_on_yank" | "sync_on_paste")
         }
         ["lsp", field] => matches!(*field, "enabled" | "format_on_save" | "servers"),
-        ["formatting", field] => matches!(*field, "on_save" | "provider"),
+        ["formatting", field] => matches!(
+            *field,
+            "on_save"
+                | "trim_trailing_whitespace"
+                | "trim_trailing_whitespace_exclude"
+                | "provider"
+        ),
         ["lsp", "servers", _] => true,
         ["lsp", "servers", _, field] => matches!(
             *field,
@@ -4689,6 +4707,13 @@ workspace_name = "frontend"
     #[test]
     fn formatting_defaults_to_on_for_missing_fields_and_files() {
         assert!(Config::default().formatting.on_save);
+        assert!(Config::default().formatting.trim_trailing_whitespace);
+        assert_eq!(
+            Config::default()
+                .formatting
+                .trim_trailing_whitespace_exclude,
+            ["gitcommit", "markdown"]
+        );
         assert!(toml::from_str::<FormattingConfig>("").unwrap().on_save);
         let config: Config = toml::from_str("theme = \"red.json\"\n[keys]").unwrap();
         assert!(config.formatting.on_save);

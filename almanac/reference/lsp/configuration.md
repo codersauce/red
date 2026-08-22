@@ -22,6 +22,8 @@ LSP configuration in Red is the TOML-backed contract for enabling language-serve
 | --- | --- | --- | --- |
 | `lsp.enabled` | boolean | `true` | Master switch for language-server activity [@config]. |
 | `formatting.on_save` | boolean | `true` | Formats supported documents before saving; set to `false` to disable [@config]. |
+| `formatting.trim_trailing_whitespace` | boolean | `true` | Removes trailing spaces and tabs before save-time formatting [@config]. |
+| `formatting.trim_trailing_whitespace_exclude` | array of strings | `["gitcommit", "markdown"]` | Language ids that preserve trailing whitespace during save-time formatting [@config]. |
 | `formatting.provider` | string | `"auto"` | Selects `auto`, `external`, or `lsp` formatting [@config]. |
 | `lsp.format_on_save` | boolean | unset | Legacy alias for `formatting.on_save`; the modern key wins within the same config layer [@config]. |
 | `lsp.servers` | table of named server configs | embedded defaults | Launch and routing definitions keyed by server name [@config]. |

@@ -191,6 +191,8 @@ waiting = "steady_underscore"
 #
 # [formatting]
 # on_save = false
+# trim_trailing_whitespace = true
+# trim_trailing_whitespace_exclude = ["gitcommit", "markdown"]
 # provider = "auto" # "auto", "external", or "lsp"
 #
 # [lsp.servers.rust]

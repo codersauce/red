@@ -109,11 +109,15 @@ expanded in arguments and environment values. Project-local executables under
 `node_modules/.bin`, `.venv/bin`, `venv/bin`, and `vendor/bin` take precedence over
 `PATH`.
 
-The global `[formatting]` table supports `on_save` (default `true`) and a `provider` of `auto`,
-`external`, or `lsp`. `auto` prefers an installed language-pack formatter and falls
-back to LSP when the formatter is absent; a formatter that starts and fails does not
-silently switch engines. Set `formatting.on_save = false` to disable automatic
-formatting without disabling the explicit Format Document action. The legacy
+The global `[formatting]` table supports `on_save` (default `true`),
+`trim_trailing_whitespace` (default `true`), and a `provider` of `auto`, `external`,
+or `lsp`. Save-time formatting removes trailing spaces and tabs before invoking the
+formatter, except for language ids in `trim_trailing_whitespace_exclude` (default
+`["gitcommit", "markdown"]`). `auto` prefers an installed language-pack formatter and
+falls back to LSP when the formatter is absent; a formatter that starts and fails does
+not silently switch engines. Set `formatting.on_save = false` to disable automatic
+formatting and its whitespace cleanup without disabling the explicit Format Document
+action. The legacy
 `lsp.format_on_save` flag remains accepted as an alias for either boolean value.
 The modern key wins when both appear in the same config layer; later command-line
 overrides still take precedence.

@@ -27108,6 +27108,22 @@ impl Editor {
         let format_on_save = self.config.formatting.on_save;
         let mut format_warning = None;
         let mut use_lsp = format_on_save;
+        if format_on_save {
+            let file = self.current_buffer().file.clone();
+            let trimmed = match self
+                .trim_trailing_whitespace_before_format(file.as_deref(), runtime)
+                .await
+            {
+                Ok(trimmed) => trimmed,
+                Err(error) => {
+                    self.resume_insert_transaction_after_save(resume_insert_transaction);
+                    return Err(error);
+                }
+            };
+            if trimmed {
+                self.render(buffer)?;
+            }
+        }
         if format_on_save && self.config.formatting.provider != FormattingProvider::Lsp {
             let file = self.current_buffer().file.clone();
             let external = self.external_format_on_save(file.as_deref(), runtime).await;
@@ -27222,6 +27238,21 @@ impl Editor {
         let format_on_save = self.config.formatting.on_save;
         let mut format_warning = None;
         let mut use_lsp = format_on_save;
+        if format_on_save {
+            let trimmed = match self
+                .trim_trailing_whitespace_before_format(Some(new_file_name), runtime)
+                .await
+            {
+                Ok(trimmed) => trimmed,
+                Err(error) => {
+                    self.resume_insert_transaction_after_save(resume_insert_transaction);
+                    return Err(error);
+                }
+            };
+            if trimmed {
+                self.render(buffer)?;
+            }
+        }
         if format_on_save && self.config.formatting.provider != FormattingProvider::Lsp {
             let external = self
                 .external_format_on_save(Some(new_file_name), runtime)
@@ -27415,6 +27446,50 @@ impl Editor {
             ));
         }
         Ok(())
+    }
+
+    fn should_trim_trailing_whitespace_before_format(&self, file: Option<&str>) -> bool {
+        if !self.config.formatting.trim_trailing_whitespace {
+            return false;
+        }
+        let language = file
+            .and_then(|file| self.highlighter.language_id_for_file(Some(file)))
+            .map(str::to_string)
+            .or_else(|| self.current_language_id());
+        !language.is_some_and(|language| {
+            self.config
+                .formatting
+                .trim_trailing_whitespace_exclude
+                .iter()
+                .any(|excluded| excluded.eq_ignore_ascii_case(&language))
+        })
+    }
+
+    async fn trim_trailing_whitespace_before_format(
+        &mut self,
+        file: Option<&str>,
+        runtime: &mut Runtime,
+    ) -> anyhow::Result<bool> {
+        if !self.should_trim_trailing_whitespace_before_format(file) {
+            return Ok(false);
+        }
+        let contents = self.current_buffer().contents();
+        let Some(trimmed) = trim_trailing_horizontal_whitespace(&contents) else {
+            return Ok(false);
+        };
+        let end = self.current_buffer().char_idx_to_position(usize::MAX);
+        self.begin_transaction_with_origin(
+            "trim trailing whitespace",
+            EditOrigin::Formatter {
+                name: "trailing whitespace".to_string(),
+            },
+        );
+        self.replace_range(TextRange::new(TextPosition::new(0, 0), end), &trimmed);
+        self.check_bounds();
+        self.refresh_cursor_goal();
+        self.commit_transaction(self.cursor_snapshot());
+        self.notify_change(runtime).await?;
+        Ok(true)
     }
 
     fn formatter_definition_for_file(&self, file: &str) -> Option<&LanguageFormatterConfig> {
@@ -27991,6 +28066,25 @@ fn offset_text_position(start: TextPosition, text: &str, char_offset: usize) -> 
     }
 
     TextPosition::new(line, character)
+}
+
+fn trim_trailing_horizontal_whitespace(contents: &str) -> Option<String> {
+    let mut trimmed_contents = String::with_capacity(contents.len());
+    let mut changed = false;
+    for line_with_ending in contents.split_inclusive('\n') {
+        let (line, newline) = line_with_ending
+            .strip_suffix('\n')
+            .map_or((line_with_ending, ""), |line| (line, "\n"));
+        let (line, carriage_return) = line
+            .strip_suffix('\r')
+            .map_or((line, ""), |line| (line, "\r"));
+        let trimmed = line.trim_end_matches([' ', '\t']);
+        changed |= trimmed.len() != line.len();
+        trimmed_contents.push_str(trimmed);
+        trimmed_contents.push_str(carriage_return);
+        trimmed_contents.push_str(newline);
+    }
+    changed.then_some(trimmed_contents)
 }
 
 fn insert_at_grapheme_column(lines: &mut Vec<String>, y: usize, x: usize, text: &str) {
@@ -37216,6 +37310,78 @@ builtin = "rust"
         let mut editor = Editor::with_size(lsp, 60, 12, config, Theme::default(), buffers).unwrap();
         editor.test_disable_terminal_output();
         editor
+    }
+
+    #[test]
+    fn trailing_whitespace_cleanup_preserves_line_endings_and_language_exclusions() {
+        assert_eq!(
+            trim_trailing_horizontal_whitespace("one  \r\ntwo\t\nthree  "),
+            Some("one\r\ntwo\nthree".to_string())
+        );
+        assert_eq!(trim_trailing_horizontal_whitespace("one\r\ntwo\n"), None);
+
+        let mut editor = lsp_test_editor(vec![Buffer::new(
+            Some("README.md".to_string()),
+            "hard break  \n".to_string(),
+        )]);
+        assert!(!editor.should_trim_trailing_whitespace_before_format(Some("README.md")));
+        editor
+            .config
+            .formatting
+            .trim_trailing_whitespace_exclude
+            .clear();
+        assert!(editor.should_trim_trailing_whitespace_before_format(Some("README.md")));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn save_trims_trailing_whitespace_before_external_formatting() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("document.testfmt");
+        std::fs::write(&path, "disk\n").unwrap();
+        let formatter = root.path().join("reject-trailing-whitespace");
+        std::fs::write(
+            &formatter,
+            "#!/bin/sh\ncontents=$(cat)\nif printf '%s' \"$contents\" | grep -q '[[:blank:]]$'; then exit 9; fi\nprintf '%s\\n' \"$contents\" | tr 'a-z' 'A-Z'\n",
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&formatter).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&formatter, permissions).unwrap();
+
+        let mut config = Config::default();
+        config.lsp.enabled = false;
+        config.languages.insert(
+            "testfmt".to_string(),
+            crate::config::LanguageConfig {
+                extensions: vec!["testfmt".to_string()],
+                formatter: Some(LanguageFormatterConfig {
+                    name: "Strict formatter".to_string(),
+                    command: formatter.to_string_lossy().into_owned(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        );
+        let lsp = Box::new(crate::lsp::LspManager::new(config.lsp.clone()));
+        let buffer = Buffer::new(
+            Some(path.to_string_lossy().into_owned()),
+            "hello  \n".to_string(),
+        );
+        let mut editor =
+            Editor::with_size(lsp, 60, 12, config, Theme::default(), vec![buffer]).unwrap();
+        editor.test_disable_terminal_output();
+
+        editor
+            .test_execute_production_action(Action::Save)
+            .await
+            .unwrap();
+
+        assert_eq!(editor.current_buffer().contents(), "HELLO\n");
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "HELLO\n");
+        assert!(!editor.current_buffer().is_dirty());
     }
 
     #[cfg(unix)]
