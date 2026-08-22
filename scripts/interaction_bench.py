@@ -56,7 +56,10 @@ def run(args):
         config_dir = temp / "red"
         config_dir.mkdir()
         log = temp / "red.log"
-        (config_dir / "config.toml").write_text(f'log_file = "{log}"\n', encoding="utf-8")
+        (config_dir / "config.toml").write_text(
+            f'log_file = "{log}"\nshow_whats_new = false\nfetch_release_notes = false\n',
+            encoding="utf-8",
+        )
 
         master, slave = pty.openpty()
         fcntl.ioctl(
@@ -181,6 +184,14 @@ def run(args):
                 if label in ("notify", "drain"):
                     label = f"{label} {detail.split()[0]}"
                 samples[label].append(micros)
+
+        if args.scenario == "typing":
+            observed_edits = len(samples.get("edit:replace_char", []))
+            if observed_edits < args.cycles:
+                raise SystemExit(
+                    "typing benchmark did not observe the expected text insertions "
+                    f"({observed_edits}/{args.cycles}); a modal dialog may be intercepting input"
+                )
 
         print(
             f"\n=== {args.scenario} {args.rows}x{args.cols}, cycles={args.cycles}, "
