@@ -59,6 +59,8 @@ navigation baselines were frozen after rebasing to `d92777c`.
 | Shared Vim keyword word text objects | 99.89% |
 | Shared Vim ASCII change-word operators | 99.88% |
 | Shared Vim ASCII delete-word operators | 99.87% |
+| Shared Vim counted change-word operators | 99.85% |
+| Shared Vim counted delete-word operators | 99.85% |
 | Shared Vim whitespace-delimited WORD objects | 99.80% |
 | Crash-recovery buffer restoration | 99.77% |
 | Repeated themed syntax highlighting | 99.61% |
@@ -245,6 +247,13 @@ Eleven alternating release-build samples reduced change medians from 134,874 to
 167 microseconds and delete medians from 134,737 to 172 microseconds while
 preserving keyword versus WORD groups, punctuation, leading and trailing
 whitespace, CRLF, counts, out-of-range cursors, and Unicode grapheme fallback.
+
+Counted Vim change-word and delete-word operators were independently measured
+across 512 four-word production selections before a long untouched document
+tail. Eleven alternating release-build samples reduced counted change medians
+from 132,566 to 196 microseconds and counted delete medians from 132,823 to 201
+microseconds while preserving multiline traversal, CRLF, punctuation, WORD
+groups, whitespace retention, exhaustion, and Unicode grapheme fallback.
 
 Shared Vim paragraph objects were independently measured across 128 inner and
 128 around selections spanning 768-line paragraphs. Eleven alternating

@@ -33,6 +33,8 @@ SCENARIOS = (
     "resolver-range",
     "resolver-change-word",
     "resolver-delete-word",
+    "resolver-count-change",
+    "resolver-count-delete",
     "paragraph",
     "sentence",
     "undo-prune",

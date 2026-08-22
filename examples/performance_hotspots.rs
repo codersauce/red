@@ -179,6 +179,12 @@ fn main() -> Result<()> {
     if scenario == "all" || scenario == "resolver-delete-word" {
         results.push(benchmark_prefix_word_operator(/*change_word*/ false)?);
     }
+    if scenario == "all" || scenario == "resolver-count-change" {
+        results.push(benchmark_counted_word_operator(/*change_word*/ true)?);
+    }
+    if scenario == "all" || scenario == "resolver-count-delete" {
+        results.push(benchmark_counted_word_operator(/*change_word*/ false)?);
+    }
     if scenario == "all" || scenario == "paragraph" {
         results.push(benchmark_paragraph_motion());
     }
@@ -877,6 +883,32 @@ fn benchmark_prefix_word_operator(change_word: bool) -> Result<serde_json::Value
             "shared_vim_ascii_change_word_operator"
         } else {
             "shared_vim_ascii_delete_word_operator"
+        },
+        started,
+        WORD_OPERATOR_LOOKUPS,
+    ))
+}
+
+fn benchmark_counted_word_operator(change_word: bool) -> Result<serde_json::Value> {
+    let suffix = "ordinary_identifier and retained editor source ".repeat(512);
+    let buffer = Buffer::new(None, format!("first second third fourth  {suffix}"));
+    let resolver = MotionResolver::new(&buffer, TextPosition::new(0, 0));
+    let started = Instant::now();
+    for _ in 0..WORD_OPERATOR_LOOKUPS {
+        let range = resolver
+            .word_range(/*count*/ 4, change_word, /*big_word*/ false)
+            .ok_or_else(|| anyhow::anyhow!("counted Vim operator lost its selected range"))?;
+        anyhow::ensure!(
+            range.end.character == if change_word { 25 } else { 27 },
+            "counted Vim operator changed its selected words or trailing whitespace"
+        );
+        black_box(range);
+    }
+    Ok(report(
+        if change_word {
+            "shared_vim_counted_change_word_operator"
+        } else {
+            "shared_vim_counted_delete_word_operator"
         },
         started,
         WORD_OPERATOR_LOOKUPS,
