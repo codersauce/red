@@ -20,7 +20,7 @@ use red::{
         WorkspaceConfig, WorkspaceManager, WorkspaceModel, WorkspaceRow,
     },
     preferences::PreferencesStore,
-    session::SessionStore,
+    session::{SessionSnapshot, SessionStore},
     text_layout::{LayoutOptions, TextLayout, WrapMode},
     theme::{parse_vscode_theme, parse_vscode_theme_contents, Style, Theme},
     ui::{CompletionUI, Picker, PickerItem, PickerOptions},
@@ -493,6 +493,12 @@ fn main() -> Result<()> {
     }
     if scenario == "all" || scenario == "session-write" {
         results.push(benchmark_session_snapshot_writes()?);
+    }
+    if scenario == "all" || scenario == "session-codec-encode" {
+        results.push(benchmark_session_snapshot_codec(/*decode*/ false)?);
+    }
+    if scenario == "all" || scenario == "session-codec-decode" {
+        results.push(benchmark_session_snapshot_codec(/*decode*/ true)?);
     }
     if scenario == "all" || scenario == "frame-full" {
         results.push(benchmark_full_editor_frames()?);
@@ -2446,8 +2452,7 @@ fn benchmark_plugin_event_delivery() -> Result<serde_json::Value> {
     ))
 }
 
-fn benchmark_session_snapshot_writes() -> Result<serde_json::Value> {
-    let directory = tempfile::tempdir()?;
+fn benchmark_session_snapshot_fixture() -> Result<SessionSnapshot> {
     let mut buffers = Vec::with_capacity(SNAPSHOT_WRITE_BUFFERS);
     for buffer_index in 0..SNAPSHOT_WRITE_BUFFERS {
         let mut buffer = Buffer::new(
@@ -2480,7 +2485,12 @@ fn benchmark_session_snapshot_writes() -> Result<serde_json::Value> {
         Theme::default(),
         buffers,
     )?;
-    let mut snapshot = editor.test_session_snapshot();
+    Ok(editor.test_session_snapshot())
+}
+
+fn benchmark_session_snapshot_writes() -> Result<serde_json::Value> {
+    let directory = tempfile::tempdir()?;
+    let mut snapshot = benchmark_session_snapshot_fixture()?;
     let store = SessionStore::new(directory.path().join("recovery"));
     store.write(&mut snapshot)?;
 
@@ -2499,6 +2509,35 @@ fn benchmark_session_snapshot_writes() -> Result<serde_json::Value> {
         started,
         SNAPSHOT_WRITES,
     ))
+}
+
+fn benchmark_session_snapshot_codec(decode: bool) -> Result<serde_json::Value> {
+    let snapshot = benchmark_session_snapshot_fixture()?;
+    let encoded = serde_json::to_vec(&snapshot)?;
+    let started = Instant::now();
+    for _ in 0..SNAPSHOT_WRITES {
+        if decode {
+            let restored: SessionSnapshot = serde_json::from_slice(black_box(&encoded))?;
+            anyhow::ensure!(
+                restored.buffers.len() == SNAPSHOT_WRITE_BUFFERS,
+                "snapshot decoding lost a recovery buffer"
+            );
+            black_box(restored);
+        } else {
+            let contents = serde_json::to_vec(black_box(&snapshot))?;
+            anyhow::ensure!(
+                contents.len() == encoded.len(),
+                "snapshot encoding changed the recovery payload length"
+            );
+            black_box(contents);
+        }
+    }
+    let scenario = if decode {
+        "crash_recovery_snapshot_decoding"
+    } else {
+        "crash_recovery_snapshot_encoding"
+    };
+    Ok(report(scenario, started, SNAPSHOT_WRITES))
 }
 
 fn benchmark_full_editor_frames() -> Result<serde_json::Value> {

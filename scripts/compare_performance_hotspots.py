@@ -150,6 +150,8 @@ SCENARIOS = (
     "workspace-search",
     "plugin-events",
     "session-write",
+    "session-codec-encode",
+    "session-codec-decode",
     "frame-full",
     "git-discovery",
     "startup-files",
