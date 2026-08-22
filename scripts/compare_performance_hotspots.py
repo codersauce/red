@@ -66,6 +66,8 @@ SCENARIOS = (
     "textarea-home-end",
     "paragraph-operator",
     "sentence-operator",
+    "vim-long-line-end",
+    "paragraph-long-line",
     "husk-completion",
     "husk-config",
     "husk-update",

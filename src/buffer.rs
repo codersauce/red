@@ -1193,7 +1193,7 @@ impl Buffer {
         line_start_char + x
     }
 
-    fn line_char_len_without_ending(&self, line: usize) -> usize {
+    pub(crate) fn line_char_len_without_ending(&self, line: usize) -> usize {
         let line = self.content.line(line);
         let mut len = line.len_chars();
         if len > 0 && line.char(len - 1) == '\n' {

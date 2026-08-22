@@ -1915,10 +1915,10 @@ impl TextArea {
     }
 
     fn line_character_len(&self, line: usize) -> usize {
-        self.buffer
-            .get(line)
-            .map(|contents| trim_line_ending(&contents).chars().count())
-            .unwrap_or_default()
+        if line > self.buffer.len() {
+            return 0;
+        }
+        self.buffer.line_char_len_without_ending(line)
     }
 
     fn last_editable_line(&self) -> usize {

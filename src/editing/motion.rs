@@ -444,12 +444,11 @@ impl<'buffer> MotionResolver<'buffer> {
         let target = motion.position;
         let first_non_blank = self
             .buffer
-            .get(cursor.line)
-            .map(|line| {
-                trim_line_ending(&line)
-                    .chars()
+            .contents_snapshot()
+            .get_line(cursor.line)
+            .and_then(|line| {
+                line.chars()
                     .position(|character| !character.is_whitespace())
-                    .unwrap_or_default()
             })
             .unwrap_or_default();
 
@@ -922,10 +921,10 @@ impl<'buffer> MotionResolver<'buffer> {
     }
 
     fn line_character_len(&self, line: usize) -> usize {
-        self.buffer
-            .get(line)
-            .map(|contents| trim_line_ending(&contents).chars().count())
-            .unwrap_or_default()
+        if line > self.buffer.len() {
+            return 0;
+        }
+        self.buffer.line_char_len_without_ending(line)
     }
 }
 
@@ -1155,6 +1154,35 @@ mod tests {
         let whitespace = MotionResolver::new(&buffer, TextPosition::new(2, 0));
         let (range, _) = whitespace.sentence_range(1, false).unwrap();
         assert_eq!(buffer.text_in_range(range), "  final words");
+    }
+
+    #[test]
+    fn indexed_line_lengths_preserve_unicode_crlf_and_linewise_paragraph_ranges() {
+        for (text, character, expected, linewise) in [
+            ("alpha\n\nbeta", 2, "pha", false),
+            ("  alpha\n\nbeta", 2, "  alpha\n", true),
+            ("\talpha\n\nbeta", 0, "\talpha\n", true),
+            ("e\u{301}clair 👋\n\n漢字", 2, "clair 👋", false),
+            ("alpha\r\n\r\nbeta", 2, "pha", false),
+        ] {
+            let buffer = Buffer::new(None, text.to_string());
+            let resolver = MotionResolver::new(&buffer, TextPosition::new(0, character));
+            let (range, actual_linewise) = resolver.paragraph_range(1, false).unwrap();
+            assert_eq!(buffer.text_in_range(range), expected, "{text:?}");
+            assert_eq!(actual_linewise, linewise, "{text:?}");
+            for line in 0..=buffer.len() {
+                let expected = buffer
+                    .get(line)
+                    .map(|value| {
+                        crate::unicode_utils::trim_line_ending(&value)
+                            .chars()
+                            .count()
+                    })
+                    .unwrap_or_default();
+                assert_eq!(resolver.line_character_len(line), expected);
+            }
+            assert_eq!(resolver.line_character_len(buffer.len() + 1), 0);
+        }
     }
 
     #[test]

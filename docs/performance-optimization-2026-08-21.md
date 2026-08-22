@@ -84,6 +84,7 @@ navigation baselines were frozen after rebasing to `d92777c`.
 | Workspace inline file discovery | 92.65% |
 | Embedded text-area document loading | 91.26% |
 | Embedded Vim nested delimiter matching | 90.03% |
+| Shared Vim long-line paragraph operators | 88.15% |
 | Shared modal editor backward word motion | 87.58% |
 | Shared modal editor forward word motion | 87.01% |
 | Printable ASCII frame rendering | 85.25% |
@@ -99,6 +100,7 @@ navigation baselines were frozen after rebasing to `d92777c`.
 | Embedded Ctrl-Backspace word deletion | 74.86% |
 | Shared Vim sentence navigation | 74.63% |
 | LSP incremental large-document changes | 74.61% |
+| Embedded Vim long-line end motions | 72.63% |
 | Shared Vim paragraph navigation | 72.60% |
 | Undo history capacity pruning | 72.42% |
 | LSP completion filtering | 67.58% |
@@ -170,6 +172,13 @@ alternating release-build samples reduced paragraph medians from 7,014 to 2,566
 microseconds and final-sentence medians from 158,573 to 2,847 microseconds while
 preserving punctuation boundaries, leading whitespace, linewise register shape,
 Unicode scalars, and empty or unterminated final sentences.
+
+Long-line Vim editing was measured over 2,048 real `$`/`0` input events and
+2,048 shared paragraph operator resolutions against 40 KiB source lines. Eleven
+alternating release-build samples reduced line-end motions from 5,989 to 1,639
+microseconds and paragraph operators from 16,873 to 1,999 microseconds while
+preserving Unicode scalar counts, CRLF, tabs, empty lines, first-nonblank
+columns, and linewise versus characterwise selections.
 
 Multi-file startup uses the same production loader as the executable. Across
 four startup passes over 128 distinct source files, seven alternating samples

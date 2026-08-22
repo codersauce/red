@@ -273,6 +273,12 @@ fn main() -> Result<()> {
     if scenario == "all" || scenario == "sentence-operator" {
         results.push(benchmark_boundary_operator(/*sentence*/ true)?);
     }
+    if scenario == "all" || scenario == "vim-long-line-end" {
+        results.push(benchmark_long_line_end_motion()?);
+    }
+    if scenario == "all" || scenario == "paragraph-long-line" {
+        results.push(benchmark_long_line_paragraph_operator()?);
+    }
 
     anyhow::ensure!(
         !results.is_empty(),
@@ -1840,6 +1846,51 @@ fn benchmark_boundary_operator(sentence: bool) -> Result<serde_json::Value> {
         } else {
             "shared_vim_paragraph_operator_document_boundary"
         },
+        started,
+        TEXTAREA_VIM_MOTIONS,
+    ))
+}
+
+fn benchmark_long_line_end_motion() -> Result<serde_json::Value> {
+    let mut area = TextArea::new("ordinary_identifier ".repeat(2_048));
+    area.set_mode(Mode::Normal);
+    area.set_cursor(0);
+    let end = Event::Key(KeyEvent::new(KeyCode::Char('$'), KeyModifiers::NONE));
+    let start = Event::Key(KeyEvent::new(KeyCode::Char('0'), KeyModifiers::NONE));
+    let started = Instant::now();
+    for index in 0..TEXTAREA_VIM_MOTIONS {
+        let event = if index % 2 == 0 { &end } else { &start };
+        anyhow::ensure!(
+            area.handle_event(black_box(event), 120) == red::editing::TextAreaOutcome::Changed,
+            "long-line Vim motion was not handled"
+        );
+        black_box(area.cursor());
+    }
+    anyhow::ensure!(area.cursor() == 0, "long-line Vim motion lost its cursor");
+    Ok(report(
+        "embedded_vim_long_line_end_motions",
+        started,
+        TEXTAREA_VIM_MOTIONS,
+    ))
+}
+
+fn benchmark_long_line_paragraph_operator() -> Result<serde_json::Value> {
+    let line = "ordinary_identifier ".repeat(2_048);
+    let buffer = Buffer::new(None, format!("{line}\n\nnext paragraph"));
+    let resolver = MotionResolver::new(&buffer, TextPosition::new(0, line.len() / 2));
+    let started = Instant::now();
+    for _ in 0..TEXTAREA_VIM_MOTIONS {
+        let (range, linewise) = resolver
+            .paragraph_range(/*count*/ 1, /*backward*/ false)
+            .ok_or_else(|| anyhow::anyhow!("long-line paragraph operator lost its range"))?;
+        anyhow::ensure!(
+            range.end == TextPosition::new(0, line.len()) && !linewise,
+            "long-line paragraph operator changed its range or shape"
+        );
+        black_box(range);
+    }
+    Ok(report(
+        "shared_vim_long_line_paragraph_operators",
         started,
         TEXTAREA_VIM_MOTIONS,
     ))
