@@ -968,6 +968,7 @@ async fn inline_history_file_link_navigates_without_applying_or_saving() {
     let mut editor = editor("original\n");
     begin(&mut editor, "group", "one", line_range(0, 1), "Explain");
     complete(&mut editor, "one", None, "See another file").await;
+    let origin_file = editor.current_buffer().file.clone();
     editor
         .open_inline_history(
             &mut RenderBuffer::new(100, 30, &Style::default()),
@@ -975,15 +976,14 @@ async fn inline_history_file_link_navigates_without_applying_or_saving() {
         )
         .await
         .unwrap();
-    run_history_action(
-        &mut editor,
-        HistoryAction::FollowFile {
+    editor
+        .test_execute_production_action(Action::InlineHistoryAction(HistoryAction::FollowFile {
             path: destination.to_string_lossy().into_owned(),
             line: Some(2),
             column: Some(2),
-        },
-    )
-    .await;
+        }))
+        .await
+        .unwrap();
     assert!(editor.inline_history_browser.is_none());
     assert_eq!(
         editor.current_buffer().file.as_deref(),
@@ -999,6 +999,12 @@ async fn inline_history_file_link_navigates_without_applying_or_saving() {
         editor.inline_history.turn("one").unwrap().state,
         InlineTurnState::Completed
     );
+
+    editor
+        .test_execute_production_action(Action::JumpBack)
+        .await
+        .unwrap();
+    assert_eq!(editor.current_buffer().file, origin_file);
 }
 
 #[tokio::test]

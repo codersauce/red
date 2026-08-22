@@ -1254,6 +1254,30 @@ async fn test_file_movement() {
 }
 
 #[tokio::test]
+async fn counted_g_targets_an_absolute_line_and_records_the_jump() {
+    let buffer = Buffer::new(None, "one\ntwo\nthree\nfour\nfive".to_string());
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+
+    type_normal_keys(&mut harness, "3G").await;
+    harness.assert_cursor_at(0, 2);
+
+    harness.execute_action(Action::JumpBack).await.unwrap();
+    harness.assert_cursor_at(0, 0);
+}
+
+#[tokio::test]
+async fn stationary_jump_still_leaves_a_return_destination() {
+    let mut harness = EditorHarness::with_content("one\ntwo\nthree\nfour\nfive");
+
+    harness.execute_action(Action::MoveToBottom).await.unwrap();
+    harness.execute_action(Action::MoveToBottom).await.unwrap();
+    harness.execute_action(Action::MoveUp).await.unwrap();
+    harness.execute_action(Action::JumpBack).await.unwrap();
+
+    harness.assert_cursor_at(0, 4);
+}
+
+#[tokio::test]
 async fn jump_back_records_current_position_for_jump_forward() {
     let mut harness = EditorHarness::with_content("one\ntwo\nthree\nfour\nfive");
 
@@ -1450,6 +1474,27 @@ async fn per_window_jumplists_round_trip_through_session_recovery() {
     restored.assert_cursor_at(0, 3);
     restored.execute_action(Action::JumpBack).await.unwrap();
     restored.assert_cursor_at(0, 1);
+}
+
+#[tokio::test]
+async fn previous_context_mark_round_trips_through_session_recovery() {
+    let contents = "one\ntwo\nthree\nfour\nfive";
+    let mut source = EditorHarness::with_content(contents);
+    source.execute_action(Action::MoveTo(0, 5)).await.unwrap();
+    let snapshot = source.editor.test_session_snapshot();
+
+    let mut buffers = Editor::buffers_from_session_snapshot(&snapshot);
+    let mut restored = EditorHarness::with_buffer(buffers.remove(0));
+    restored.editor.restore_session_snapshot(&snapshot).unwrap();
+    restored
+        .execute_action(Action::JumpToMark {
+            mark: '\'',
+            linewise: true,
+        })
+        .await
+        .unwrap();
+
+    restored.assert_cursor_at(0, 0);
 }
 
 #[tokio::test]

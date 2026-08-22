@@ -200,6 +200,9 @@ pub struct SessionWindowJumps {
     pub jumps: Vec<SessionJump>,
     /// Current position in [`Self::jumps`].
     pub jump_index: usize,
+    /// Destination used by the previous-context mark in this window.
+    #[serde(default)]
+    pub previous_context: Option<SessionJump>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

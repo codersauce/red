@@ -169,14 +169,24 @@ async fn inline_agent_outcome_groups_real_writes_and_survives_completion_and_rec
             .count(),
         2
     );
+    let return_file = editor.current_buffer().file.clone();
     editor
-        .view_inline_agent_changes("inline-request", 0, 1, &mut frame, &mut runtime)
+        .test_execute_production_action(Action::ViewInlineAgentChanges {
+            request_id: "inline-request".into(),
+            outcome: 0,
+            change: 1,
+        })
         .await
         .unwrap();
     assert_eq!(
         editor.current_buffer().file.as_deref(),
         root.path().join("second.rs").to_str()
     );
+    editor
+        .test_execute_production_action(Action::JumpBack)
+        .await
+        .unwrap();
+    assert_eq!(editor.current_buffer().file, return_file);
     let mut recovered: InlineHistory =
         serde_json::from_slice(&serde_json::to_vec(&editor.inline_history).unwrap()).unwrap();
     recovered.recover();

@@ -329,9 +329,7 @@ impl Editor {
         {
             self.view_inline_changes(request, 0, frame, runtime).await
         } else if latest {
-            let origin = self.current_jump_entry();
             self.open_inline_job(&group, frame, runtime).await?;
-            self.save_to_history(origin);
             Ok(())
         } else {
             self.open_inline_history_request(&group, request, frame, runtime)

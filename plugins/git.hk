@@ -3908,7 +3908,7 @@ fn navigate_patch(patch: String, cursor_line: i32, forward: bool) {
         print_hunk_boundary(forward);
         return;
     }
-    red::execute("SetCursorPosition", 0, target);
+    red::execute("SetCursorPosition", 0, target, true);
 }
 
 fn print_hunk_boundary(forward: bool) {
