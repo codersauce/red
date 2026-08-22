@@ -4192,6 +4192,7 @@ struct EditorEventSnapshot {
     width: usize,
     height: usize,
     buffer_index: usize,
+    buffer_id: BufferId,
     buffer_revision: u64,
     window_id: Option<WindowId>,
     windows: Vec<WindowLayoutEventSnapshot>,
@@ -7831,6 +7832,7 @@ impl Editor {
             width,
             height,
             buffer_index: self.buffer_manager.active_index(),
+            buffer_id: self.current_buffer().id(),
             buffer_revision: self.current_buffer().revision(),
             window_id: self.window_manager.active_stable_window_id(),
             windows: self
@@ -7870,22 +7872,24 @@ impl Editor {
     ) -> anyhow::Result<()> {
         let after = self.event_snapshot();
         perf::gauge_max("plugin_window_count", after.windows.len() as u64);
+        let buffer_changed =
+            before.buffer_index != after.buffer_index || before.buffer_id != after.buffer_id;
         let cursor_changed = before.cx != after.cx
             || before.y != after.y
             || before.vtop != after.vtop
-            || before.buffer_index != after.buffer_index;
+            || buffer_changed;
         let viewport_changed = before.vtop != after.vtop
             || before.vleft != after.vleft
             || before.skipcol != after.skipcol
             || before.wrap != after.wrap
             || before.width != after.width
             || before.height != after.height
-            || before.buffer_index != after.buffer_index;
+            || buffer_changed;
         let layout_changed = before.windows != after.windows
             || before.window_id != after.window_id
             || before.width != after.width
             || before.height != after.height;
-        let windows_changed = layout_changed || before.buffer_index != after.buffer_index;
+        let windows_changed = layout_changed || buffer_changed;
         let updated_cursor_only = cursor_changed
             && !viewport_changed
             && !windows_changed
@@ -7961,7 +7965,7 @@ impl Editor {
                 .await?;
         }
 
-        if before.window_id == after.window_id && before.buffer_index != after.buffer_index {
+        if before.window_id == after.window_id && buffer_changed {
             self.plugin_registry
                 .notify(
                     runtime,
@@ -34871,6 +34875,7 @@ builtin = "rust"
                     red::on("window:layout_changed", layout_changed);
                     red::on("window:closed", window_closed);
                     red::on("window:focused", window_focused);
+                    red::on("window:buffer_changed", buffer_changed);
                 }
 
                 fn layout_changed(event: Json) {
@@ -34883,6 +34888,10 @@ builtin = "rust"
 
                 fn window_focused(event: Json) {
                     red::execute("Print", "window:focused");
+                }
+
+                fn buffer_changed(event: Json) {
+                    red::execute("Print", "window:buffer_changed");
                 }
             "#,
         )
@@ -44366,6 +44375,48 @@ while True:
         let content_row = render_row(&render_buffer, 1);
         assert!(content_row.contains("1 hello"), "{content_row:?}");
         assert_eq!(editor.render_cursor_position().map(|(_, y)| y), Some(1));
+    }
+
+    #[tokio::test]
+    async fn deleting_buffer_notifies_plugins_when_replacement_reuses_its_index() {
+        for (buffers, expected_name) in [
+            (
+                vec![Buffer::new(Some("only.rs".to_string()), "only".to_string())],
+                "[No Name]",
+            ),
+            (
+                vec![
+                    Buffer::new(Some("first.rs".to_string()), "first".to_string()),
+                    Buffer::new(Some("second.rs".to_string()), "second".to_string()),
+                ],
+                "second.rs",
+            ),
+        ] {
+            let mut editor = test_editor(/*width*/ 80, /*height*/ 24);
+            editor.buffer_manager.replace_buffers(buffers);
+            let removed_id = editor.current_buffer().id();
+            let mut runtime = Runtime::new();
+            install_window_event_recorder(&mut editor, &mut runtime).await;
+            let mut render_buffer =
+                RenderBuffer::new(/*width*/ 80, /*height*/ 24, &Style::default());
+
+            editor
+                .execute(
+                    &Action::DeleteBuffer(/*force*/ false),
+                    &mut render_buffer,
+                    &mut runtime,
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(editor.buffer_manager.active_index(), 0);
+            assert_ne!(editor.current_buffer().id(), removed_id);
+            assert_eq!(editor.current_buffer().name(), expected_name);
+            assert_eq!(
+                collect_print_requests(),
+                vec!["window:buffer_changed".to_string()]
+            );
+        }
     }
 
     #[tokio::test]
