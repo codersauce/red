@@ -22824,6 +22824,69 @@ impl Editor {
         Ok(())
     }
 
+    /// Collapse ordinary keyword typing only where character hooks cannot affect semantics.
+    fn batched_block_replay_text(actions: &[Action]) -> Option<String> {
+        const MAX_BATCHED_BLOCK_INSERT_BYTES: usize = 256;
+
+        if !(2..=MAX_BATCHED_BLOCK_INSERT_BYTES).contains(&actions.len()) {
+            return None;
+        }
+
+        let mut text = String::with_capacity(actions.len());
+        for action in actions {
+            let Action::InsertCharAtCursorPos(character) = action else {
+                return None;
+            };
+            if !character.is_ascii_alphanumeric() && *character != '_' {
+                return None;
+            }
+            text.push(*character);
+        }
+        Some(text)
+    }
+
+    /// Reject contexts where individual characters can change editing semantics.
+    fn can_batch_block_replay(&self) -> bool {
+        if self.learn_session.is_some()
+            || self.tutorial_controller.is_some()
+            || self.snippet_session.is_some()
+            || self
+                .current_dialog
+                .as_ref()
+                .is_some_and(|dialog| dialog.allows_event_passthrough())
+            || matches!(
+                self.current_language_id().as_deref(),
+                Some("python" | "py" | "pyw")
+            )
+            || self
+                .current_buffer()
+                .file
+                .as_deref()
+                .and_then(|file| self.lsp.server_capabilities_for_file(file))
+                .and_then(|capabilities| capabilities.signature_help_provider.as_ref())
+                .is_some()
+        {
+            return false;
+        }
+
+        let Some(line) = self.current_buffer().get(self.buffer_line()) else {
+            return false;
+        };
+        let line = trim_line_ending(&line);
+        let trimmed = line.trim();
+        if trimmed.len() <= 32
+            && trimmed
+                .chars()
+                .all(|character| character.is_ascii_alphabetic())
+        {
+            return false;
+        }
+
+        !(self.config.commenting.auto_wrap
+            && self.configured_comment_text_width() != 0
+            && self.comment_continuation_prefix(line).is_some())
+    }
+
     async fn execute_on_block(
         &mut self,
         buffer: &mut RenderBuffer,
@@ -22848,6 +22911,7 @@ impl Editor {
         if matches!(actions.last(), Some(Action::EnterMode(Mode::Normal))) {
             actions.pop();
         }
+        let batched_action = Self::batched_block_replay_text(&actions).map(Action::InsertString);
 
         let (y0, y1) = if selection.y0 < selection.y1 {
             (selection.y0, selection.y1)
@@ -22876,10 +22940,25 @@ impl Editor {
             }
             self.cy = y.saturating_sub(self.vtop);
             self.cx = selection.x0;
-            for action in &actions {
+            let batch = batched_action
+                .as_ref()
+                .filter(|_| self.can_batch_block_replay());
+            let replay_actions = batch
+                .map(std::slice::from_ref)
+                .unwrap_or(actions.as_slice());
+            for action in replay_actions {
+                if batch.is_some() {
+                    self.generated_indent = None;
+                }
                 if let Err(error) = self.execute(action, &mut scratch_buffer, runtime).await {
                     replay_result = Err(error);
                     break;
+                }
+                if batch.is_some() {
+                    self.schedule_automatic_completion();
+                    if let Some((_, cause)) = &mut self.deferred_plugin_event {
+                        *cause = "InsertCharAtCursorPos".to_string();
+                    }
                 }
                 match self.replay_checkpoint(&mut scratch_buffer, runtime).await {
                     Ok(false) => {}
@@ -34586,6 +34665,68 @@ builtin = "rust"
                 self.observation()
             );
         }
+    }
+
+    #[test]
+    fn visual_block_batch_only_accepts_bounded_ascii_keyword_insertions() {
+        let actions = "value_42"
+            .chars()
+            .map(Action::InsertCharAtCursorPos)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            Editor::batched_block_replay_text(&actions).as_deref(),
+            Some("value_42")
+        );
+
+        for rejected in [
+            vec![Action::InsertCharAtCursorPos('x')],
+            vec![
+                Action::InsertCharAtCursorPos('x'),
+                Action::InsertCharAtCursorPos('😀'),
+            ],
+            vec![
+                Action::InsertCharAtCursorPos('x'),
+                Action::InsertCharAtCursorPos(' '),
+            ],
+            vec![
+                Action::InsertCharAtCursorPos('x'),
+                Action::InsertCharAtCursorPos('}'),
+            ],
+            vec![Action::InsertCharAtCursorPos('x'), Action::MoveLeft],
+            vec![Action::InsertCharAtCursorPos('x'); 257],
+        ] {
+            assert!(
+                Editor::batched_block_replay_text(&rejected).is_none(),
+                "unsafe block replay was batched: {rejected:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn visual_block_batch_preserves_indentation_and_comment_hooks() {
+        let mut editor = test_editor(/*width*/ 80, /*height*/ 24);
+        for (file, source, expected) in [
+            ("fixture.rs", "fn value_0() {}", true),
+            ("fixture.rs", "fn value_😀() {}", true),
+            ("fixture.rs", "end", false),
+            ("fixture.rs", "", false),
+            ("fixture.rs", "// ordinary comment", false),
+            ("fixture.py", "value_0 = 1", false),
+        ] {
+            editor.buffer_manager[0] = Buffer::new(Some(file.to_string()), source.to_string());
+            assert_eq!(
+                editor.can_batch_block_replay(),
+                expected,
+                "unexpected batch safety decision for {file}: {source:?}"
+            );
+        }
+
+        editor.buffer_manager[0] = Buffer::new(
+            Some("fixture.rs".to_string()),
+            "// ordinary comment".to_string(),
+        );
+        editor.config.commenting.auto_wrap = false;
+        assert!(editor.can_batch_block_replay());
     }
 
     #[tokio::test]

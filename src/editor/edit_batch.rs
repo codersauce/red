@@ -518,6 +518,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bounded_block_replay_batches_unicode_rows_and_preserves_undo() {
+        let source = "fn value_0() {}\r\nfn value_😀() {}\r\nfn value_2() {}\r\n";
+        let inserted = "prefix_42";
+        let mut h = Harness::new(source);
+        h.event(KeyCode::Char('v'), KeyModifiers::CONTROL).await;
+        h.keys("2jI").await;
+        h.keys(inserted).await;
+
+        let before = h.counts();
+        let replay_start = h.editor.actions.len();
+        h.keys("\u{1b}").await;
+        h.assert_one_publication(before);
+
+        let expected = source
+            .split_inclusive('\n')
+            .map(|line| format!("{inserted}{line}"))
+            .collect::<String>();
+        assert_eq!(h.editor.current_buffer().contents(), expected);
+        assert_eq!(
+            h.editor.actions[replay_start..]
+                .iter()
+                .filter(|action| matches!(action, Action::InsertString(text) if text == inserted))
+                .count(),
+            2,
+            "each secondary row should use one bounded insertion"
+        );
+        assert_eq!(
+            (h.editor.cx, h.editor.buffer_line()),
+            (inserted.len() - 1, 0)
+        );
+
+        h.keys("u").await;
+        assert_eq!(h.editor.current_buffer().contents(), source);
+        h.event(KeyCode::Char('r'), KeyModifiers::CONTROL).await;
+        assert_eq!(h.editor.current_buffer().contents(), expected);
+    }
+
+    #[tokio::test]
     async fn an_external_action_observes_the_latest_revision() {
         let mut h = Harness::new("value\n");
         h.editor.begin_edit_batch();

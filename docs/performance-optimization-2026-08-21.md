@@ -85,13 +85,21 @@ navigation baselines were frozen after rebasing to `d92777c`.
 | Embedded Vim line-boundary motions | 98.48% |
 | Editor LSP request cursor coordinates | 98.29% |
 | Shared Vim final-sentence operators | 98.20% |
+| Real-terminal Unicode and CRLF visual-block insertion | 98.01% |
+| Real-terminal Unicode visual-block insertion | 97.99% |
+| Real-terminal visual-block insertion | 97.97% |
 | Gutter namespace updates | 97.94% |
 | Shared Vim around final-sentence text objects | 97.88% |
 | Embedded Vim word motions | 97.88% |
 | Shared Vim inner final-sentence text objects | 97.87% |
+| Real-terminal CRLF visual-block insertion | 97.82% |
+| Real-terminal incremental-LSP visual-block insertion | 97.73% |
+| Real-terminal full-document-LSP visual-block insertion | 97.71% |
+| Real-terminal split-window visual-block insertion | 97.65% |
 | Decoration namespace updates | 97.48% |
 | Long transcript cursor lookup | 97.35% |
 | Character-wrapped layout cursor lookup | 97.29% |
+| Real-terminal bundled-plugin visual-block insertion | 97.26% |
 | Embedded Home/End document navigation | 96.88% |
 | Editor cursor display-column positioning | 96.83% |
 | Word-wrapped layout cursor lookup | 96.61% |
@@ -576,6 +584,25 @@ only for an exact source window, preview identity, language, and active
 theme, with bounded source and capture counts. Picker-frame terminal diff and
 flush improved only 27.66%, from 47 to 34 microseconds, and remains below the
 target.
+
+Seven alternating real-terminal sessions per visual-block scenario replayed 128
+characters across 16 rows in 2,000-line files. Ordinary completion fell from
+95,037 to 1,926 microseconds, Unicode source from 108,210 to 2,180, CRLF
+source from 86,503 to 1,886, and combined Unicode/CRLF source from 107,256 to
+2,131. Bundled plugins fell from 83,885 to 2,297 microseconds, shared-buffer
+split windows from 79,592 to 1,868, incremental LSP synchronization from
+87,975 to 1,996, and full-document LSP synchronization from 87,462 to 2,004.
+A bounded ASCII-keyword insertion of at most 256 characters now runs as one
+canonical transactional replacement per secondary row instead of separately
+dispatching every character. Unicode input, punctuation, whitespace, oversized
+insertions, Python, indentation-sensitive words, wrapping comments, snippets,
+completion dialogs, signature-help providers, tutorials, and learning sessions
+retain their existing per-character path. Automatic completion state, plugin
+event causes, primary cursor restoration, cancellation checkpoints, shared
+window contents, exact saved Unicode/CRLF bytes, and one undo transaction all
+remain intact. Every terminal run verified one completed render and one buffer
+notification; both language-server modes additionally verified one document
+notification and the exact synchronized source.
 
 Eleven alternating real-terminal runs reduced overlay and cursor composition
 from five to two microseconds. Each frame resolves cursor geometry once for
