@@ -59,6 +59,7 @@ navigation baselines were frozen after rebasing to `d92777c`.
 | Shared Vim keyword word text objects | 99.89% |
 | Shared Vim ASCII change-word operators | 99.88% |
 | Shared Vim ASCII delete-word operators | 99.87% |
+| Editor next-word search cursor adjustment | 99.87% |
 | Shared Vim counted change-word operators | 99.85% |
 | Shared Vim counted delete-word operators | 99.85% |
 | Shared Vim whitespace-delimited WORD objects | 99.80% |
@@ -91,6 +92,7 @@ navigation baselines were frozen after rebasing to `d92777c`.
 | Git workspace row navigation | 96.35% |
 | Shared ASCII grapheme counting | 94.94% |
 | LSP absolute-document routing | 94.68% |
+| Editor scalar-to-grapheme cursor conversion | 92.82% |
 | Workspace inline file discovery | 92.65% |
 | Editor backward word-end boundary operators | 92.63% |
 | Shared buffer final-line lookup | 91.46% |
@@ -263,6 +265,13 @@ Eleven alternating release-build samples reduced backward medians from 8,245
 to 608 microseconds and forward medians from 3,849 to 695 microseconds while
 preserving pending-operator ranges, ASCII cursor bounds, CRLF, keyword versus
 WORD grouping, Unicode scalar positions, and empty or whitespace boundaries.
+
+Editor cursor conversions were independently measured across 2,048 production
+scalar-to-grapheme conversions and next-word whitespace adjustments on 20 KiB
+ASCII source lines. Eleven alternating release-build samples reduced reverse
+cursor medians from 5,305 to 381 microseconds and next-word adjustment medians
+from 302,008 to 407 microseconds while preserving missing lines, cursor clamps,
+CRLF, tabs, combining marks, emoji, and unchanged Unicode grapheme behavior.
 
 Shared Vim paragraph objects were independently measured across 128 inner and
 128 around selections spanning 768-line paragraphs. Eleven alternating

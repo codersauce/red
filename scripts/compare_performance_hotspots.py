@@ -37,6 +37,8 @@ SCENARIOS = (
     "resolver-count-delete",
     "editor-word-end-backward",
     "editor-word-end-forward",
+    "editor-cursor-reverse",
+    "editor-cursor-word-search",
     "paragraph",
     "sentence",
     "undo-prune",

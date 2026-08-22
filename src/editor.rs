@@ -6777,14 +6777,33 @@ impl Editor {
     }
 
     fn char_to_grapheme_on_line(&self, x: usize, y: usize) -> usize {
-        self.current_buffer()
+        let buffer = self.current_buffer();
+        if buffer.is_ascii() {
+            return self.grapheme_to_char_on_line(x, y);
+        }
+        buffer
             .get(y)
             .map(|line| char_to_grapheme(line.trim_end_matches('\n'), x))
             .unwrap_or(x)
     }
 
     fn next_word_search_char_on_line(&self, x: usize, y: usize) -> usize {
-        let Some(line) = self.current_buffer().get(y) else {
+        let buffer = self.current_buffer();
+        if buffer.is_ascii() {
+            let contents = buffer.contents_snapshot();
+            let Some(line) = contents.get_line(y) else {
+                return x;
+            };
+            let length = line.len_chars();
+            let newline = line.get_char(length.saturating_sub(1)) == Some('\n');
+            let length = length.saturating_sub(usize::from(newline));
+            return if x > 0 && x < length && line.get_char(x).is_some_and(char::is_whitespace) {
+                x - 1
+            } else {
+                x.min(length)
+            };
+        }
+        let Some(line) = buffer.get(y) else {
             return x;
         };
         let line = line.trim_end_matches('\n');
@@ -29530,6 +29549,21 @@ impl Editor {
         }
     }
 
+    /// Runs the production cursor conversion used by text motion and word search.
+    #[doc(hidden)]
+    pub fn benchmark_cursor_conversion(
+        &self,
+        column: usize,
+        line: usize,
+        word_search: bool,
+    ) -> usize {
+        if word_search {
+            self.next_word_search_char_on_line(column, line)
+        } else {
+            self.char_to_grapheme_on_line(column, line)
+        }
+    }
+
     #[doc(hidden)]
     pub fn test_cx(&self) -> usize {
         self.cx
@@ -36565,6 +36599,55 @@ builtin = "rust"
                 expected,
                 "{contents:?} line={line} column={column} backward={backward} big={big_word}"
             );
+        }
+    }
+
+    #[test]
+    fn indexed_cursor_conversion_preserves_ascii_unicode_and_crlf_boundaries() {
+        for contents in [
+            "word  next\n",
+            "word\t next\r\n",
+            "\n",
+            "e\u{301}clair 👋 終\n",
+        ] {
+            let mut editor = test_editor(/*width*/ 80, /*height*/ 24);
+            editor
+                .buffer_manager
+                .replace_buffers(vec![Buffer::new(None, contents.to_string())]);
+            for line in [0, 1, 9] {
+                for column in [0, 1, 3, 5, 9, usize::MAX] {
+                    let source = editor.current_buffer().get(line);
+                    let expected_reverse = source
+                        .as_deref()
+                        .map(|text| char_to_grapheme(text.trim_end_matches('\n'), column))
+                        .unwrap_or(column);
+                    let expected_search = source
+                        .as_deref()
+                        .map(|text| {
+                            let text = text.trim_end_matches('\n');
+                            if column > 0
+                                && text.graphemes(true).nth(column).is_some_and(|grapheme| {
+                                    grapheme.chars().all(char::is_whitespace)
+                                })
+                            {
+                                grapheme_to_char(text, column - 1)
+                            } else {
+                                grapheme_to_char(text, column)
+                            }
+                        })
+                        .unwrap_or(column);
+                    assert_eq!(
+                        editor.benchmark_cursor_conversion(column, line, /*word_search*/ false),
+                        expected_reverse,
+                        "reverse {contents:?} line={line} column={column}"
+                    );
+                    assert_eq!(
+                        editor.benchmark_cursor_conversion(column, line, /*word_search*/ true),
+                        expected_search,
+                        "search {contents:?} line={line} column={column}"
+                    );
+                }
+            }
         }
     }
 

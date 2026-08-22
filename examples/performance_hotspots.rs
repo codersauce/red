@@ -191,6 +191,16 @@ fn main() -> Result<()> {
     if scenario == "all" || scenario == "editor-word-end-forward" {
         results.push(benchmark_editor_word_end_operator(/*backward*/ false)?);
     }
+    if scenario == "all" || scenario == "editor-cursor-reverse" {
+        results.push(benchmark_editor_cursor_conversion(
+            /*word_search*/ false,
+        )?);
+    }
+    if scenario == "all" || scenario == "editor-cursor-word-search" {
+        results.push(benchmark_editor_cursor_conversion(
+            /*word_search*/ true,
+        )?);
+    }
     if scenario == "all" || scenario == "paragraph" {
         results.push(benchmark_paragraph_motion());
     }
@@ -959,6 +969,39 @@ fn benchmark_editor_word_end_operator(backward: bool) -> Result<serde_json::Valu
         },
         started,
         WORD_OPERATOR_LOOKUPS,
+    ))
+}
+
+fn benchmark_editor_cursor_conversion(word_search: bool) -> Result<serde_json::Value> {
+    let contents = "ordinary_identifier ".repeat(1_024);
+    let cursor = contents.len() - 1;
+    let mut config = Config::default();
+    config.lsp.enabled = false;
+    let editor = Editor::with_size(
+        Box::new(LspManager::new(config.lsp.clone())),
+        120,
+        40,
+        config,
+        Theme::default(),
+        vec![Buffer::new(None, contents)],
+    )?;
+    let started = Instant::now();
+    for _ in 0..TEXTAREA_VIM_MOTIONS {
+        let converted = editor.benchmark_cursor_conversion(cursor, /*line*/ 0, word_search);
+        anyhow::ensure!(
+            converted == cursor - usize::from(word_search),
+            "editor cursor conversion changed its scalar position or whitespace adjustment"
+        );
+        black_box(converted);
+    }
+    Ok(report(
+        if word_search {
+            "editor_next_word_search_cursor_conversion"
+        } else {
+            "editor_scalar_to_grapheme_cursor_conversion"
+        },
+        started,
+        TEXTAREA_VIM_MOTIONS,
     ))
 }
 
