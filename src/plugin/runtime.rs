@@ -17371,6 +17371,7 @@ mod tests {
 
         let mut runtime = Runtime::new();
         load_lsp_symbols(&mut runtime).await;
+        let timeout_count = runtime.pending_timeout_count();
 
         runtime
             .execute_command("LspWorkspaceSymbols")
@@ -17378,8 +17379,16 @@ mod tests {
             .unwrap();
 
         let handle = match ACTION_DISPATCHER.recv_request() {
-            PluginRequest::OpenCallbackPicker { handle, title, .. } => {
+            PluginRequest::OpenCallbackPicker {
+                handle,
+                title,
+                options,
+                ..
+            } => {
                 assert_eq!(title.as_deref(), Some("Workspace Symbols"));
+                assert!(!options.external_filter);
+                assert!(options.busy);
+                assert_eq!(options.item_layout, crate::ui::PickerItemLayout::LabelFirst);
                 handle
             }
             _ => panic!("unexpected plugin request"),
@@ -17393,8 +17402,43 @@ mod tests {
         };
 
         runtime
+            .notify_picker(handle, PickerCallback::Query("mai".to_string()))
+            .unwrap();
+        runtime
             .notify_picker(handle, PickerCallback::Query("main".to_string()))
             .unwrap();
+        assert_eq!(runtime.pending_timeout_count(), timeout_count + 1);
+        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
+
+        runtime
+            .resolve_request(initial_request_id, sample_symbol_payload_with_count(2))
+            .await
+            .unwrap();
+        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
+
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        let callbacks = runtime.poll_timer_callbacks();
+        assert_eq!(callbacks.len(), 1);
+        let PluginRequest::TimeoutCallback { timer_id } = &callbacks[0] else {
+            panic!("expected workspace-symbol debounce timeout");
+        };
+        runtime
+            .notify(
+                "timeout:callback",
+                serde_json::json!({ "timer_id": timer_id }),
+            )
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::UpdatePickerBusy { id, busy: true } if id == handle.get()
+        ));
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::UpdatePickerStatus { id, status }
+                if id == handle.get() && status.as_deref() == Some("Searching workspace symbols")
+        ));
 
         let query_request_id = match ACTION_DISPATCHER.recv_request() {
             PluginRequest::WorkspaceSymbols { request_id, query } => {
@@ -17403,12 +17447,6 @@ mod tests {
             }
             _ => panic!("unexpected plugin request"),
         };
-
-        runtime
-            .resolve_request(initial_request_id, sample_symbol_payload_with_count(2))
-            .await
-            .unwrap();
-        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
 
         runtime
             .resolve_request(query_request_id, sample_symbol_payload())
@@ -17430,10 +17468,36 @@ mod tests {
             }
             _ => panic!("unexpected plugin request"),
         }
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::UpdatePickerBusy { id, busy: false } if id == handle.get()
+        ));
 
         runtime
             .notify_picker(handle, PickerCallback::Query("later".to_string()))
             .unwrap();
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        let callbacks = runtime.poll_timer_callbacks();
+        assert_eq!(callbacks.len(), 1);
+        let PluginRequest::TimeoutCallback { timer_id } = &callbacks[0] else {
+            panic!("expected workspace-symbol debounce timeout");
+        };
+        runtime
+            .notify(
+                "timeout:callback",
+                serde_json::json!({ "timer_id": timer_id }),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::UpdatePickerBusy { id, busy: true } if id == handle.get()
+        ));
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::UpdatePickerStatus { id, status }
+                if id == handle.get() && status.as_deref() == Some("Searching workspace symbols")
+        ));
         let late_request_id = match ACTION_DISPATCHER.recv_request() {
             PluginRequest::WorkspaceSymbols { request_id, query } => {
                 assert_eq!(query, "later");
@@ -17449,6 +17513,116 @@ mod tests {
             .await
             .unwrap();
         assert!(runtime.picker_plugin(handle).is_none());
+        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
+    }
+
+    #[tokio::test]
+    async fn lsp_symbols_workspace_batch_keeps_previous_items_until_replacement_arrives() {
+        drain_requests();
+
+        let mut runtime = Runtime::new();
+        load_lsp_symbols(&mut runtime).await;
+        runtime
+            .execute_command("LspWorkspaceSymbols")
+            .await
+            .unwrap();
+
+        let handle = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::OpenCallbackPicker { handle, .. } => handle,
+            _ => panic!("expected workspace-symbol picker"),
+        };
+        let initial_request_id = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::WorkspaceSymbols { request_id, .. } => request_id,
+            _ => panic!("expected initial workspace-symbol request"),
+        };
+        runtime
+            .resolve_request(initial_request_id, sample_symbol_payload())
+            .await
+            .unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::UpdatePickerItems { id, ref items }
+                if id == handle.get() && items.len() == 1
+        ));
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::UpdatePickerStatus { id, .. } if id == handle.get()
+        ));
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::UpdatePickerBusy { id, busy: false } if id == handle.get()
+        ));
+
+        runtime
+            .notify_picker(handle, PickerCallback::Query("symbol".to_string()))
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        let callbacks = runtime.poll_timer_callbacks();
+        assert_eq!(callbacks.len(), 1);
+        let PluginRequest::TimeoutCallback { timer_id } = &callbacks[0] else {
+            panic!("expected workspace-symbol debounce timeout");
+        };
+        runtime
+            .notify(
+                "timeout:callback",
+                serde_json::json!({ "timer_id": timer_id }),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::UpdatePickerBusy { id, busy: true } if id == handle.get()
+        ));
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::UpdatePickerStatus { id, .. } if id == handle.get()
+        ));
+        let query_request_id = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::WorkspaceSymbols { request_id, query } => {
+                assert_eq!(query, "symbol");
+                request_id
+            }
+            _ => panic!("expected debounced workspace-symbol request"),
+        };
+
+        runtime
+            .resolve_request(query_request_id, sample_symbol_payload_with_count(65))
+            .await
+            .unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::UpdatePickerStatus { id, ref status }
+                if id == handle.get() && status.as_deref() == Some("Loading 0/65 symbols")
+        ));
+        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
+
+        for expected_count in [64, 65] {
+            let callbacks = runtime.poll_timer_callbacks();
+            assert_eq!(callbacks.len(), 1);
+            let PluginRequest::TimeoutCallback { timer_id } = &callbacks[0] else {
+                panic!("expected workspace-symbol batch timeout");
+            };
+            runtime
+                .notify(
+                    "timeout:callback",
+                    serde_json::json!({ "timer_id": timer_id }),
+                )
+                .await
+                .unwrap();
+            assert!(matches!(
+                ACTION_DISPATCHER.recv_request(),
+                PluginRequest::UpdatePickerItems { id, ref items }
+                    if id == handle.get() && items.len() == expected_count
+            ));
+            assert!(matches!(
+                ACTION_DISPATCHER.recv_request(),
+                PluginRequest::UpdatePickerStatus { id, .. } if id == handle.get()
+            ));
+        }
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::UpdatePickerBusy { id, busy: false } if id == handle.get()
+        ));
         assert!(ACTION_DISPATCHER.try_recv_request().is_none());
     }
 

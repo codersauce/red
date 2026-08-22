@@ -6506,6 +6506,43 @@ mod tests {
     }
 
     #[test]
+    fn callback_picker_filters_and_ranks_locally_while_emitting_queries() {
+        let editor = test_editor();
+        let handle = PickerHandle::from_raw(12);
+        let items = vec![
+            dynamic_item("scattered", "EventProcessorWithHumanOutput"),
+            dynamic_item("embedded", "ApprovalPromptContext"),
+            dynamic_item("unrelated", "WorkspaceSymbol"),
+            dynamic_item("exact", "Prompt"),
+        ];
+        let mut picker = Picker::new_callback(
+            /*title*/ Some("Workspace Symbols".to_string()),
+            &editor,
+            items,
+            handle,
+            PickerOptions::default(),
+        );
+
+        let mut action = None;
+        for character in "Prompt".chars() {
+            action = picker.handle_event(&key(KeyCode::Char(character), KeyModifiers::NONE));
+        }
+
+        assert_eq!(
+            action,
+            Some(KeyAction::Single(Action::NotifyPicker(
+                handle,
+                Box::new(PickerCallback::Query("Prompt".to_string())),
+            )))
+        );
+        let labels = visible_picker_labels(&picker);
+        assert_eq!(labels.first(), Some(&"Prompt"));
+        assert!(labels.contains(&"ApprovalPromptContext"));
+        assert!(labels.contains(&"EventProcessorWithHumanOutput"));
+        assert!(!labels.contains(&"WorkspaceSymbol"));
+    }
+
+    #[test]
     fn replacing_dynamic_items_preserves_selection_by_id() {
         let editor = test_editor();
         let items = vec![dynamic_item("a", "alpha"), dynamic_item("b", "bravo")];
