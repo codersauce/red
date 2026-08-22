@@ -13,6 +13,8 @@ use std::{
     collections::{HashMap, HashSet},
     future::Future,
     path::{Path, PathBuf},
+    process::Command,
+    sync::Mutex,
 };
 
 use path_absolutize::Absolutize;
@@ -71,6 +73,7 @@ pub struct LspManager {
     failed_clients: HashSet<String>,
     opened_documents: HashSet<String>,
     document_clients: HashMap<String, String>,
+    cargo_workspace_roots: Mutex<HashMap<PathBuf, Option<PathBuf>>>,
     next_client_poll: usize,
 }
 
@@ -113,6 +116,7 @@ impl LspManager {
             failed_clients: HashSet::new(),
             opened_documents: HashSet::new(),
             document_clients: HashMap::new(),
+            cargo_workspace_roots: Mutex::new(HashMap::new()),
             next_client_poll: 0,
         }
     }
@@ -137,7 +141,12 @@ impl LspManager {
 
         let path = Path::new(file);
         let path = path.absolutize().ok()?.to_path_buf();
-        let workspace_root = find_workspace_root(&path, server);
+        let workspace_root = find_workspace_root(
+            &path,
+            server,
+            &selector.language_id,
+            &self.cargo_workspace_roots,
+        );
         let uri = file_uri(&path).ok()?;
 
         Some(DocumentInfo {
@@ -173,6 +182,10 @@ impl LspManager {
             super::workspace_settings::apply_workspace_settings(
                 &mut config,
                 &document.workspace_root,
+                &document.language_id,
+            );
+            super::workspace_settings::apply_fast_startup_defaults(
+                &mut config,
                 &document.language_id,
             );
 
@@ -260,9 +273,25 @@ fn document_key(document: &DocumentInfo) -> String {
     format!("{}:{}", client_key(document), document.uri)
 }
 
-fn find_workspace_root(path: &Path, server: &LanguageServerConfig) -> PathBuf {
+fn find_workspace_root(
+    path: &Path,
+    server: &LanguageServerConfig,
+    language_id: &str,
+    cargo_workspace_roots: &Mutex<HashMap<PathBuf, Option<PathBuf>>>,
+) -> PathBuf {
     let start = path.parent().unwrap_or(path);
+    let marker_root = marker_workspace_root(start, server);
 
+    if language_id == "rust" {
+        if let Some(workspace_root) = cargo_workspace_root(start, server, cargo_workspace_roots) {
+            return workspace_root;
+        }
+    }
+
+    marker_root
+}
+
+fn marker_workspace_root(start: &Path, server: &LanguageServerConfig) -> PathBuf {
     for ancestor in start.ancestors() {
         if server
             .root_markers
@@ -274,6 +303,107 @@ fn find_workspace_root(path: &Path, server: &LanguageServerConfig) -> PathBuf {
     }
 
     std::env::current_dir().unwrap_or_else(|_| start.to_path_buf())
+}
+
+fn cargo_workspace_root(
+    start: &Path,
+    server: &LanguageServerConfig,
+    cache: &Mutex<HashMap<PathBuf, Option<PathBuf>>>,
+) -> Option<PathBuf> {
+    let manifest = start
+        .ancestors()
+        .map(|ancestor| ancestor.join("Cargo.toml"))
+        .find(|candidate| candidate.is_file())?;
+    let manifest = std::fs::canonicalize(&manifest).unwrap_or(manifest);
+
+    if let Some(cached) = cache
+        .lock()
+        .ok()
+        .and_then(|roots| roots.get(&manifest).cloned())
+    {
+        return cached;
+    }
+
+    let resolved = locate_cargo_workspace(&manifest, start, server);
+    if let Ok(mut roots) = cache.lock() {
+        roots.insert(manifest, resolved.clone());
+    }
+    resolved
+}
+
+fn locate_cargo_workspace(
+    manifest: &Path,
+    document_directory: &Path,
+    server: &LanguageServerConfig,
+) -> Option<PathBuf> {
+    let mut command = cargo_command_for_server(server);
+    let output = command
+        .args([
+            "locate-project",
+            "--workspace",
+            "--message-format",
+            "plain",
+            "--manifest-path",
+        ])
+        .arg(manifest)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let workspace_manifest = std::str::from_utf8(&output.stdout).ok()?.trim();
+    if workspace_manifest.is_empty() {
+        return None;
+    }
+    let workspace_manifest = PathBuf::from(workspace_manifest);
+    if workspace_manifest
+        .file_name()
+        .and_then(|name| name.to_str())
+        != Some("Cargo.toml")
+        || !workspace_manifest.is_file()
+    {
+        return None;
+    }
+    let workspace_root = workspace_manifest.parent()?;
+    let workspace_root = std::fs::canonicalize(workspace_root).ok()?;
+    let document_directory = std::fs::canonicalize(document_directory)
+        .unwrap_or_else(|_| document_directory.to_path_buf());
+    if !document_directory.starts_with(&workspace_root) {
+        return None;
+    }
+
+    let repository_root = document_directory
+        .ancestors()
+        .find(|ancestor| ancestor.join(".git").exists())
+        .and_then(|root| std::fs::canonicalize(root).ok());
+    if repository_root
+        .as_ref()
+        .is_some_and(|repository_root| !workspace_root.starts_with(repository_root))
+    {
+        return None;
+    }
+
+    Some(workspace_root)
+}
+
+fn cargo_command_for_server(server: &LanguageServerConfig) -> Command {
+    let rustup = Path::new(&server.command)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name == "rustup" || name == "rustup.exe");
+    if rustup
+        && server
+            .args
+            .first()
+            .is_some_and(|argument| argument == "run")
+    {
+        if let Some(toolchain) = server.args.get(1) {
+            let mut command = Command::new(&server.command);
+            command.args(["run", toolchain, "cargo"]);
+            return command;
+        }
+    }
+    Command::new("cargo")
 }
 
 #[async_trait::async_trait]
@@ -347,6 +477,7 @@ impl LspClient for LspManager {
         self.config = replacement.config;
         self.document_selectors = replacement.document_selectors;
         self.filename_selectors = replacement.filename_selectors;
+        self.cargo_workspace_roots = replacement.cargo_workspace_roots;
         self.client_poll_order
             .retain(|key| self.clients.contains_key(key));
         self.next_client_poll = 0;
@@ -851,6 +982,7 @@ impl LspClient for LspManager {
 mod tests {
     use std::{
         collections::HashMap,
+        fs,
         sync::{
             atomic::{AtomicBool, AtomicUsize, Ordering},
             Arc,
@@ -984,6 +1116,91 @@ mod tests {
         });
 
         assert!(manager.resolve_document("README.md").is_none());
+    }
+
+    #[test]
+    fn rust_members_share_the_cargo_workspace_root() {
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir(root.path().join(".git")).unwrap();
+        fs::write(
+            root.path().join("Cargo.toml"),
+            "[workspace]\nmembers = [\"core\", \"tui\"]\nresolver = \"2\"\n",
+        )
+        .unwrap();
+        let mut files = Vec::new();
+        for member in ["core", "tui"] {
+            let directory = root.path().join(member).join("src");
+            fs::create_dir_all(&directory).unwrap();
+            fs::write(
+                root.path().join(member).join("Cargo.toml"),
+                format!(
+                    "[package]\nname = \"{member}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n"
+                ),
+            )
+            .unwrap();
+            let file = directory.join("lib.rs");
+            fs::write(&file, "pub fn example() {}\n").unwrap();
+            files.push(file);
+        }
+        let mut rust = server("rust", &["rs"]);
+        rust.command = "rustup".to_string();
+        rust.args = vec![
+            "run".to_string(),
+            "stable".to_string(),
+            "rust-analyzer".to_string(),
+        ];
+        rust.root_markers = vec!["Cargo.toml".to_string(), ".git".to_string()];
+        let manager = LspManager::new(LspConfig {
+            enabled: true,
+            format_on_save: false,
+            servers: HashMap::from([("rust".to_string(), rust)]),
+        });
+
+        let core = manager
+            .resolve_document(files[0].to_string_lossy().as_ref())
+            .unwrap();
+        let tui = manager
+            .resolve_document(files[1].to_string_lossy().as_ref())
+            .unwrap();
+        let expected = fs::canonicalize(root.path()).unwrap();
+
+        assert_eq!(core.workspace_root, expected);
+        assert_eq!(tui.workspace_root, expected);
+        assert_eq!(client_key(&core), client_key(&tui));
+    }
+
+    #[test]
+    fn cargo_workspace_discovery_does_not_escape_a_nested_repository() {
+        let outer = tempfile::tempdir().unwrap();
+        fs::write(
+            outer.path().join("Cargo.toml"),
+            "[workspace]\nmembers = [\"nested/member\"]\nresolver = \"2\"\n",
+        )
+        .unwrap();
+        let repository = outer.path().join("nested");
+        let member = repository.join("member");
+        fs::create_dir_all(repository.join(".git")).unwrap();
+        fs::create_dir_all(member.join("src")).unwrap();
+        fs::write(
+            member.join("Cargo.toml"),
+            "[package]\nname = \"member\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        let file = member.join("src/lib.rs");
+        fs::write(&file, "pub fn example() {}\n").unwrap();
+        let mut rust = server("rust", &["rs"]);
+        rust.root_markers = vec!["Cargo.toml".to_string(), ".git".to_string()];
+        let manager = LspManager::new(LspConfig {
+            enabled: true,
+            format_on_save: false,
+            servers: HashMap::from([("rust".to_string(), rust)]),
+        });
+
+        let document = manager
+            .resolve_document(file.to_string_lossy().as_ref())
+            .unwrap();
+
+        assert_eq!(document.workspace_root, member);
     }
 
     #[test]

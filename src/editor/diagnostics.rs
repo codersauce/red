@@ -3,9 +3,16 @@
 //! A server can publish compiler diagnostics and return its own native diagnostics
 //! from a pull request. An empty report clears only the channel that produced it.
 
-use std::collections::HashMap;
+use std::{
+    collections::HashMap,
+    path::Path,
+    time::{Duration, Instant},
+};
 
-use crate::lsp::{Diagnostic, Position, Range};
+use crate::lsp::{file_path, Diagnostic, Position, Range};
+
+const EMPTY_REPORT_RETRY_DELAY: Duration = Duration::from_secs(2);
+const MAX_PROVISIONAL_AGE: Duration = Duration::from_secs(10 * 60);
 
 #[derive(Clone, Copy)]
 pub(super) enum DiagnosticReportKind {
@@ -18,6 +25,12 @@ struct DocumentReports {
     push: Vec<Diagnostic>,
     pull: Vec<Diagnostic>,
     provisional: bool,
+    defer_empty: bool,
+    priming: bool,
+    ready: bool,
+    empty_report_deferred: bool,
+    retry_at: Option<Instant>,
+    expires_at: Option<Instant>,
 }
 
 #[derive(Default)]
@@ -34,9 +47,27 @@ impl DiagnosticReports {
     ) -> Vec<Diagnostic> {
         let reports = self.documents.entry(uri.to_string()).or_default();
         if reports.provisional {
+            let now = Instant::now();
+            let keep_provisional = diagnostics.is_empty()
+                && reports.defer_empty
+                && !reports.ready
+                && reports
+                    .expires_at
+                    .is_some_and(|expires_at| now < expires_at)
+                && (reports.priming
+                    || !reports.empty_report_deferred
+                    || reports.retry_at.is_some());
+            if keep_provisional {
+                if !reports.priming && !reports.empty_report_deferred {
+                    reports.empty_report_deferred = true;
+                    reports.retry_at = Some(now + EMPTY_REPORT_RETRY_DELAY);
+                }
+                return merged_reports(reports);
+            }
             reports.push.clear();
             reports.pull.clear();
             reports.provisional = false;
+            reports.retry_at = None;
         }
         match kind {
             DiagnosticReportKind::Push => reports.push = diagnostics.to_vec(),
@@ -51,11 +82,19 @@ impl DiagnosticReports {
         uri: String,
         push: Vec<Diagnostic>,
         pull: Vec<Diagnostic>,
+        defer_empty: bool,
     ) -> Vec<Diagnostic> {
+        let now = Instant::now();
         let reports = DocumentReports {
             push,
             pull,
             provisional: true,
+            defer_empty,
+            priming: false,
+            ready: false,
+            empty_report_deferred: false,
+            retry_at: None,
+            expires_at: Some(now + MAX_PROVISIONAL_AGE),
         };
         let merged = merged_reports(&reports);
         self.documents.insert(uri, reports);
@@ -76,6 +115,49 @@ impl DiagnosticReports {
 
     pub(super) fn has_provisional(&self) -> bool {
         self.documents.values().any(|reports| reports.provisional)
+    }
+
+    pub(super) fn take_retry_due(&mut self, uri: &str, now: Instant) -> bool {
+        let Some(reports) = self.documents.get_mut(uri) else {
+            return false;
+        };
+        if !reports.provisional || reports.priming {
+            return false;
+        }
+        let retry_due = reports.retry_at.is_some_and(|retry_at| retry_at <= now)
+            || reports
+                .expires_at
+                .is_some_and(|expires_at| expires_at <= now);
+        if retry_due {
+            reports.retry_at = None;
+            reports.ready |= reports
+                .expires_at
+                .is_some_and(|expires_at| expires_at <= now);
+        }
+        retry_due
+    }
+
+    /// Tracks rust-analyzer cache priming for restored documents in one workspace.
+    pub(super) fn set_workspace_priming(&mut self, workspace_root: &Path, active: bool) -> bool {
+        let mut affected = false;
+        for (uri, reports) in &mut self.documents {
+            if !reports.provisional || !reports.defer_empty {
+                continue;
+            }
+            let Ok(path) = file_path(uri) else {
+                continue;
+            };
+            if !Path::new(&path).starts_with(workspace_root) {
+                continue;
+            }
+            reports.priming = active;
+            if !active {
+                reports.ready = true;
+                reports.retry_at = None;
+            }
+            affected = true;
+        }
+        affected
     }
 
     /// Move untouched diagnostic ranges with their text and discard edited ranges.
@@ -446,6 +528,25 @@ mod tests {
     }
 
     #[test]
+    fn cached_state_rejects_changed_repository_lsp_settings() {
+        let (root, file, uri) = diagnostic_workspace("x\n");
+        let cache = root.path().join("cache");
+        let mut first = cached_editor(&file, "x\n", &cache);
+        push(&mut first, &uri, vec![diagnostic("old configuration")]);
+        first.persist_diagnostic_cache(true);
+        std::fs::create_dir(root.path().join(".vscode")).unwrap();
+        std::fs::write(
+            root.path().join(".vscode/settings.json"),
+            r#"{"rust-analyzer.cachePriming.enable":true}"#,
+        )
+        .unwrap();
+
+        let restarted = cached_editor(&file, "x\n", &cache);
+
+        assert!(!restarted.diagnostics.contains_key(&uri));
+    }
+
+    #[test]
     fn first_fresh_report_replaces_both_provisional_diagnostic_channels() {
         let (root, file, uri) = diagnostic_workspace("x\n");
         let cache = root.path().join("cache");
@@ -475,7 +576,7 @@ mod tests {
     }
 
     #[test]
-    fn fresh_empty_report_removes_cached_findings_for_the_next_restart() {
+    fn empty_report_waits_for_priming_before_removing_cached_findings() {
         let (root, file, uri) = diagnostic_workspace("x\n");
         let cache = root.path().join("cache");
         let mut first = cached_editor(&file, "x\n", &cache);
@@ -484,11 +585,138 @@ mod tests {
 
         let mut refreshed = cached_editor(&file, "x\n", &cache);
         push(&mut refreshed, &uri, vec![]);
+        assert_eq!(refreshed.diagnostics[&uri][0].message, "resolved error");
+        assert!(refreshed
+            .diagnostic_reports
+            .set_workspace_priming(root.path(), true));
+        push(&mut refreshed, &uri, vec![]);
+        assert_eq!(refreshed.diagnostics[&uri][0].message, "resolved error");
+        assert!(refreshed
+            .diagnostic_reports
+            .set_workspace_priming(root.path(), false));
+        push(&mut refreshed, &uri, vec![]);
         assert!(refreshed.diagnostics[&uri].is_empty());
         refreshed.persist_diagnostic_cache(true);
 
         let restarted = cached_editor(&file, "x\n", &cache);
         assert!(!restarted.diagnostics.contains_key(&uri));
+    }
+
+    #[test]
+    fn empty_report_is_rechecked_when_no_priming_progress_arrives() {
+        let (root, file, uri) = diagnostic_workspace("x\n");
+        let cache = root.path().join("cache");
+        let mut first = cached_editor(&file, "x\n", &cache);
+        push(&mut first, &uri, vec![diagnostic("resolved error")]);
+        first.persist_diagnostic_cache(true);
+
+        let mut restarted = cached_editor(&file, "x\n", &cache);
+        push(&mut restarted, &uri, vec![]);
+        assert_eq!(restarted.diagnostics[&uri][0].message, "resolved error");
+        assert!(restarted
+            .diagnostic_reports
+            .take_retry_due(&uri, Instant::now() + EMPTY_REPORT_RETRY_DELAY));
+        push(&mut restarted, &uri, vec![]);
+
+        assert!(restarted.diagnostics[&uri].is_empty());
+        assert!(!restarted.diagnostic_reports.has_provisional());
+    }
+
+    #[test]
+    fn prime_caches_end_queues_a_fresh_diagnostic_request() {
+        let (root, file, uri) = diagnostic_workspace("x\n");
+        let cache = root.path().join("cache");
+        let mut first = cached_editor(&file, "x\n", &cache);
+        push(&mut first, &uri, vec![diagnostic("resolved error")]);
+        first.persist_diagnostic_cache(true);
+        let mut restarted = cached_editor(&file, "x\n", &cache);
+        let mut progress: crate::lsp::ProgressParams = serde_json::from_value(json!({
+            "token": "rustAnalyzer/PrimeCaches",
+            "value": { "kind": "end" }
+        }))
+        .unwrap();
+        progress.enrich("rust", root.path().to_string_lossy());
+
+        restarted.process_progress(&progress);
+
+        assert!(restarted.diagnostic_refresh_after_progress);
+        push(&mut restarted, &uri, vec![]);
+        assert!(restarted.diagnostics[&uri].is_empty());
+    }
+
+    #[test]
+    fn cached_read_only_lsp_artifacts_restore_with_matching_contents() {
+        let (root, file, uri) = diagnostic_workspace("fn main() {}\n");
+        let cache = root.path().join("cache");
+        let mut first = cached_editor(&file, "fn main() {}\n", &cache);
+        let symbols = json!([{
+            "name": "main",
+            "kind": 12,
+            "range": {
+                "start": { "line": 0, "character": 0 },
+                "end": { "line": 0, "character": 12 }
+            },
+            "selectionRange": {
+                "start": { "line": 0, "character": 3 },
+                "end": { "line": 0, "character": 7 }
+            }
+        }]);
+        let hints = crate::editor::diagnostic_cache::InlayHintSnapshot {
+            range: Range {
+                start: Position {
+                    line: 0,
+                    character: 0,
+                },
+                end: Position {
+                    line: 1,
+                    character: 0,
+                },
+            },
+            result: json!([{
+                "position": { "line": 0, "character": 9 },
+                "label": ": ()",
+                "kind": 1
+            }]),
+        };
+        first
+            .cached_document_symbols
+            .insert(uri.clone(), symbols.clone());
+        first.cached_inlay_hints.insert(uri.clone(), hints.clone());
+        first.mark_diagnostic_cache_dirty();
+        first.persist_diagnostic_cache(true);
+
+        let restarted = cached_editor(&file, "fn main() {}\n", &cache);
+
+        assert_eq!(restarted.cached_document_symbols[&uri], symbols);
+        assert_eq!(restarted.cached_inlay_hints[&uri], hints);
+
+        std::fs::write(&file, "fn changed() {}\n").unwrap();
+        let changed = cached_editor(&file, "fn changed() {}\n", &cache);
+        assert!(!changed.cached_document_symbols.contains_key(&uri));
+        assert!(!changed.cached_inlay_hints.contains_key(&uri));
+    }
+
+    #[test]
+    fn concurrent_workspace_sessions_merge_cached_documents() {
+        let (root, first_file, first_uri) = diagnostic_workspace("first();\n");
+        let second_file = root.path().join("second.rs");
+        std::fs::write(&second_file, "second();\n").unwrap();
+        let second_uri = crate::lsp::file_uri(&second_file).unwrap();
+        let cache = root.path().join("cache");
+        let mut first = cached_editor(&first_file, "first();\n", &cache);
+        let mut second = cached_editor(&second_file, "second();\n", &cache);
+
+        push(&mut first, &first_uri, vec![diagnostic("first error")]);
+        first.persist_diagnostic_cache(true);
+        push(&mut second, &second_uri, vec![diagnostic("second error")]);
+        second.persist_diagnostic_cache(true);
+
+        let restarted = cached_editor(&first_file, "first();\n", &cache);
+        assert_eq!(restarted.diagnostics[&first_uri][0].message, "first error");
+        assert_eq!(
+            restarted.diagnostics[&second_uri][0].message,
+            "second error"
+        );
     }
 
     #[test]
