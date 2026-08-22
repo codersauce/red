@@ -80,6 +80,7 @@ navigation baselines were frozen after rebasing to `d92777c`.
 | LSP completion filtering | 67.58% |
 | Structured picker ranking | 64.81% |
 | In-buffer search navigation | 55.98% |
+| Bundled plugin startup | 51.22% |
 
 Real detached-terminal coverage separately exercised editing, 32 KiB of Unicode
 paste, repeated resizes, reattachment, and owner shutdown. Detached-frame median
@@ -96,10 +97,6 @@ objective.
 
 ## Remaining gaps
 
-- Bundled plugin startup improves by approximately 43–46% across longer repeated
-  runs. Parallel compilation, shared immutable payload schemas, cached host-call
-  signatures, borrowed embedded sources, and lighter initial activation help,
-  but the 50% target is not yet reproducible.
 - Owned Husk JSON conversion improves by approximately 42%. Moving strings and
   inserting sorted object fields directly avoids duplicate string clones and
   temporary sort buffers, but the runtime object representation still allocates.
@@ -130,5 +127,5 @@ CARGO_TARGET_DIR=/Users/felipe.coury/code/red/target \
 
 Use a baseline that actually contains the requested scenario. A later frozen
 binary may already contain an earlier optimization and therefore cannot measure
-that earlier change. Include `startup` with the minimum-improvement gate only
-when its independently repeated median actually exceeds 50%.
+that earlier change. Plugin startup uses a separately pinned `c7408b2` baseline
+and passed the minimum-improvement gate over 21 alternating samples.

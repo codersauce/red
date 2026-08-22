@@ -1152,6 +1152,16 @@ impl CompiledProgram {
         self.semantic.as_deref()
     }
 
+    /// Release parsing and type-checking data after host validation is complete.
+    ///
+    /// Executable HIR, diagnostics sources, annotations, and module descriptors
+    /// remain intact, so the program can still be loaded and activated normally.
+    pub fn discard_analysis(&mut self) {
+        self.syntax = Arc::new(File { items: Vec::new() });
+        self.semantic = None;
+        self.module_semantics = Arc::new(BTreeMap::new());
+    }
+
     /// Semantic results for every source module in a compiled package.
     #[must_use]
     pub fn module_semantic_results(&self) -> &BTreeMap<String, Arc<SemanticResult>> {
@@ -6360,6 +6370,36 @@ mod tests {
 
         assert_eq!(runtime.to_json(), json);
         assert!(matches!(runtime, Value::Object(_)));
+    }
+
+    #[test]
+    fn discarding_analysis_preserves_executable_compiled_program() {
+        let mut program = CompiledProgram::compile_at(
+            "optimized",
+            "plugins/optimized.hk",
+            "pub fn answer() -> i32 { return 42; }",
+            &CompileOptions::default(),
+        )
+        .unwrap();
+        let expected_functions = program.hir_functions();
+        assert!(!program.syntax().items.is_empty());
+        assert!(program.semantic_result().is_some());
+
+        program.discard_analysis();
+
+        assert!(program.syntax().items.is_empty());
+        assert!(program.semantic_result().is_none());
+        assert_eq!(program.hir_functions(), expected_functions);
+
+        let mut host = TestHost;
+        let mut vm = Vm::new();
+        vm.load_compiled_plugin("optimized", program, &mut host)
+            .unwrap();
+        assert_eq!(
+            vm.call_export("optimized", "answer", Vec::new(), &mut host)
+                .unwrap(),
+            Value::Int(42)
+        );
     }
 
     #[test]

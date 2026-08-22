@@ -4403,7 +4403,7 @@ pub(super) fn compile_startup_plugin(
     source: &str,
     typecheck_enabled: bool,
 ) -> anyhow::Result<PreparedStartupPlugin> {
-    let program = if typecheck_enabled {
+    let mut program = if typecheck_enabled {
         compile_plugin_source(name, path, source)
     } else {
         CompiledProgram::compile_at(
@@ -4414,6 +4414,7 @@ pub(super) fn compile_startup_plugin(
         )
     }?;
     let payload_schema = PluginPayloadSchema::for_source(program.syntax());
+    program.discard_analysis();
     Ok(PreparedStartupPlugin {
         program,
         payload_schema,
