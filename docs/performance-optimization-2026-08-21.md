@@ -54,6 +54,16 @@ navigation baselines were frozen after rebasing to `d92777c`.
 
 | Runtime path | Median improvement |
 | --- | ---: |
+| Markdown fenced PowerShell variable highlighting | 99.15% |
+| PowerShell variable highlighting | 99.04% |
+| YAML mapping-key highlighting | 98.69% |
+| Markdown fenced YAML mapping-key highlighting | 98.67% |
+| Markdown fenced TOML key highlighting | 98.19% |
+| Markdown fenced Fish function-name highlighting | 97.97% |
+| Markdown fenced Bash assignment-name highlighting | 97.83% |
+| TOML bare-key highlighting | 96.91% |
+| Fish function-name highlighting | 96.48% |
+| Bash assignment-name highlighting | 96.24% |
 | Markdown fenced Husk identifier highlighting | 99.26% |
 | Markdown fenced JavaScript identifier highlighting | 98.79% |
 | Markdown fenced TSX identifier highlighting | 98.79% |
@@ -778,6 +788,20 @@ cached tree by the exact edit. The shortcut excludes token boundaries, reserved
 keywords, uppercase-sensitive names, non-identifier Unicode, custom queries,
 and source or span cache-limit violations; Unicode edits, comments, YAML
 context, Markdown language injections, and fresh-parser parity remain covered.
+
+Seven alternating release-build samples per configuration and shell identifier
+scenario applied 128 interior lowercase edits to 96 declarations. Direct TOML
+bare keys, YAML mapping keys, Bash assignment names, Fish function names, and
+PowerShell variables respectively fell from 10,829 to 335, 27,732 to 363,
+6,911 to 260, 9,783 to 344, and 43,410 to 417 microseconds. Their Markdown-
+fenced equivalents respectively fell from 37,587 to 682, 51,356 to 682,
+27,215 to 591, 35,910 to 728, and 99,503 to 843 microseconds. Every shortcut
+requires its exact grammar node, parent ancestry or named field, complete
+bundled queries, lowercase ASCII text, and strict interior edit bounds. YAML
+scalar values and boolean-like keys, dotted TOML keys, arbitrary Fish command
+arguments, Fish reserved commands, scoped or automatic PowerShell variables,
+underscores, case changes, fence markers, and custom queries retain complete
+parsing.
 
 Seven alternating release-build samples per ordinary identifier scenario
 applied 128 interior lowercase edits to 96-line documents. Direct JavaScript,

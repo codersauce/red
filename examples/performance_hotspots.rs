@@ -362,12 +362,22 @@ fn main() -> Result<()> {
         ("identifier-tsx", "tsx", false),
         ("identifier-lua", "lua", false),
         ("identifier-husk", "husk", false),
+        ("identifier-toml", "toml", false),
+        ("identifier-yaml", "yaml", false),
+        ("identifier-bash", "bash", false),
+        ("identifier-fish", "fish", false),
+        ("identifier-powershell", "powershell", false),
         ("markdown-fenced-identifier-javascript", "javascript", true),
         ("markdown-fenced-identifier-jsx", "jsx", true),
         ("markdown-fenced-identifier-typescript", "typescript", true),
         ("markdown-fenced-identifier-tsx", "tsx", true),
         ("markdown-fenced-identifier-lua", "lua", true),
         ("markdown-fenced-identifier-husk", "husk", true),
+        ("markdown-fenced-identifier-toml", "toml", true),
+        ("markdown-fenced-identifier-yaml", "yaml", true),
+        ("markdown-fenced-identifier-bash", "bash", true),
+        ("markdown-fenced-identifier-fish", "fish", true),
+        ("markdown-fenced-identifier-powershell", "powershell", true),
     ] {
         if scenario == "all" || scenario == name {
             results.push(benchmark_identifier_highlighting(language, fenced)?);
@@ -1870,6 +1880,11 @@ fn benchmark_identifier_highlighting(language: &str, fenced: bool) -> Result<ser
         .map(|_| match language {
             "lua" => "local retainedvalue = 123456789\n",
             "husk" => "fn retainedvalue() { let value = 123456789; }\n",
+            "toml" => "retainedvalue = 123456789\n",
+            "yaml" => "retainedvalue: 123456789\n",
+            "bash" => "retainedvalue=123456789\n",
+            "fish" => "function retainedvalue\nend\n",
+            "powershell" => "$retainedvalue = 123456789; \"retained\"\n",
             _ => "function retainedvalue() { return 123456789; }\n",
         })
         .collect::<String>();

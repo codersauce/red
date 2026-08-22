@@ -1607,6 +1607,60 @@ fn stable_bundled_token(
                 }
             }
         }
+        "bare_key" | "string_scalar" | "variable_name" | "word" | "variable" => {
+            let parent = token.parent()?;
+            let supported = match (language_id, token.kind()) {
+                ("toml", "bare_key") => parent.kind() == "pair",
+                ("yaml", "string_scalar") => {
+                    if parent.kind() != "plain_scalar" {
+                        return None;
+                    }
+                    let flow = parent.parent()?;
+                    let mapping = flow.parent()?;
+                    flow.kind() == "flow_node"
+                        && mapping.kind() == "block_mapping_pair"
+                        && mapping.child_by_field_name("key") == Some(flow)
+                }
+                ("bash", "variable_name") => {
+                    parent.kind() == "variable_assignment"
+                        && parent.child_by_field_name("name") == Some(token)
+                }
+                ("fish", "word") => {
+                    parent.kind() == "function_definition"
+                        && parent.child_by_field_name("name") == Some(token)
+                }
+                ("powershell", "variable") => true,
+                _ => false,
+            };
+            if !supported || !inserted.bytes().all(|byte| byte.is_ascii_lowercase()) {
+                return None;
+            }
+            let previous = previous_source.get(token.byte_range())?;
+            let end = token.end_byte().checked_add_signed(delta)?;
+            let updated = source.get(token.start_byte()..end)?;
+            let (previous, updated) = if language_id == "powershell" {
+                (previous.strip_prefix('$')?, updated.strip_prefix('$')?)
+            } else {
+                (previous, updated)
+            };
+            if !previous.bytes().all(|byte| byte.is_ascii_lowercase())
+                || !updated.bytes().all(|byte| byte.is_ascii_lowercase())
+            {
+                return None;
+            }
+            let sensitive = match language_id {
+                "yaml" => yaml_sensitive_identifier(previous) || yaml_sensitive_identifier(updated),
+                "fish" => fish_sensitive_identifier(previous) || fish_sensitive_identifier(updated),
+                "powershell" => {
+                    powershell_sensitive_identifier(previous)
+                        || powershell_sensitive_identifier(updated)
+                }
+                _ => false,
+            };
+            if sensitive {
+                return None;
+            }
+        }
         "inline" => {
             if language_id != "markdown" || token.parent()?.kind() != "atx_heading" {
                 return None;
@@ -1942,6 +1996,82 @@ fn lua_sensitive_identifier(identifier: &str) -> bool {
             | "unpack"
             | "while"
             | "xpcall"
+    )
+}
+
+fn yaml_sensitive_identifier(identifier: &str) -> bool {
+    matches!(
+        identifier,
+        "false" | "no" | "null" | "off" | "on" | "true" | "yes"
+    )
+}
+
+fn fish_sensitive_identifier(identifier: &str) -> bool {
+    matches!(
+        identifier,
+        "and"
+            | "begin"
+            | "break"
+            | "case"
+            | "continue"
+            | "else"
+            | "end"
+            | "for"
+            | "function"
+            | "if"
+            | "in"
+            | "not"
+            | "or"
+            | "return"
+            | "set"
+            | "switch"
+            | "test"
+            | "while"
+    )
+}
+
+fn powershell_sensitive_identifier(identifier: &str) -> bool {
+    matches!(
+        identifier,
+        "args"
+            | "error"
+            | "event"
+            | "eventargs"
+            | "eventsubscriber"
+            | "executioncontext"
+            | "false"
+            | "foreach"
+            | "home"
+            | "host"
+            | "input"
+            | "iscoreclr"
+            | "islinux"
+            | "ismacos"
+            | "iswindows"
+            | "lastsuccess"
+            | "matches"
+            | "myinvocation"
+            | "nestedpromptlevel"
+            | "null"
+            | "pid"
+            | "profile"
+            | "psboundparameters"
+            | "pscommandpath"
+            | "psculture"
+            | "psdebugcontext"
+            | "pshome"
+            | "psitem"
+            | "psscriptroot"
+            | "pssenderinfo"
+            | "psuiculture"
+            | "psversiontable"
+            | "pwd"
+            | "sender"
+            | "shellid"
+            | "stacktrace"
+            | "switch"
+            | "this"
+            | "true"
     )
 }
 
@@ -2882,6 +3012,11 @@ mod tests {
             ),
             ("lua", "local retainedvalue = 123456789\n"),
             ("husk", "fn retainedvalue() { let value = 123456789; }\n"),
+            ("toml", "retainedvalue = 123456789\n"),
+            ("yaml", "retainedvalue: 123456789\n"),
+            ("bash", "retainedvalue=123456789\n"),
+            ("fish", "function retainedvalue\nend\n"),
+            ("powershell", "$retainedvalue = 123456789; \"retained\"\n"),
         ] {
             for fenced in [false, true] {
                 let before = if fenced {
@@ -2967,6 +3102,22 @@ mod tests {
             ("lua", "local slf = 123\n", "local self = 123\n"),
             ("husk", "let bol = 123;\n", "let bool = 123;\n"),
             ("husk", "let retrn = 123;\n", "let return = 123;\n"),
+            ("toml", "retainedvalue = 123\n", "retained.value = 123\n"),
+            ("yaml", "tue: 123\n", "true: 123\n"),
+            ("yaml", "key: retainedvalue\n", "key: retainxyedvalue\n"),
+            ("bash", "retainedvalue=123\n", "retained_value=123\n"),
+            ("fish", "function tst\nend\n", "function test\nend\n"),
+            (
+                "fish",
+                "set retainedvalue 123\n",
+                "set retainxyedvalue 123\n",
+            ),
+            ("powershell", "$tue = 123\n", "$true = 123\n"),
+            (
+                "powershell",
+                "$global:retainedvalue = 123\n",
+                "$global:retainxyedvalue = 123\n",
+            ),
         ] {
             for fenced in [false, true] {
                 let before = if fenced {
