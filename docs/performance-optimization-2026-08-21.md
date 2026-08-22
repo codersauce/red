@@ -58,6 +58,7 @@ navigation baselines were frozen after rebasing to `d92777c`.
 | Neo-tree repeated row selection | 99.98% |
 | Crash-recovery buffer restoration | 99.77% |
 | Repeated themed syntax highlighting | 99.61% |
+| Embedded text-area ASCII typing | 99.29% |
 | Agent streamed transcript updates | 99.18% |
 | Shared modal editor word operators | 99.17% |
 | Long-line Vim forward word motion | 99.05% |
@@ -116,6 +117,11 @@ Incremental LSP synchronization was measured across 256 Unicode edits in a
 4,096-line source document. Eleven alternating samples reduced the median from
 57,096 to 14,494 microseconds while retaining minimal ranges, UTF-16 positions,
 multiline deletion coordinates, combining marks, and the existing CRLF fallback.
+
+Embedded agent-composer and panel editing was measured over 256 ASCII insertions
+into a 32 KiB production `TextArea`. Eleven alternating samples reduced the median
+from 132,870 to 950 microseconds while preserving multiline cursor snapshots,
+undo/redo, byte limits, newline normalization, and Unicode grapheme transitions.
 
 Real detached-terminal coverage separately exercised editing, 32 KiB of Unicode
 paste, repeated resizes, reattachment, and owner shutdown. Detached-frame median

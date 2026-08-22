@@ -49,6 +49,7 @@ SCENARIOS = (
     "git-discovery",
     "startup-files",
     "lsp-changes",
+    "textarea-typing",
     "husk-completion",
     "husk-config",
     "husk-update",

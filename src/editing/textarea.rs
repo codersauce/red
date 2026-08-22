@@ -290,6 +290,15 @@ impl TextArea {
             return false;
         }
         let cursor = self.state.cursor;
+        if self.buffer.is_ascii() && text.is_ascii() {
+            return self.replace_graphemes(
+                cursor,
+                cursor,
+                &text,
+                cursor.saturating_add(text.len()),
+                "insert text",
+            );
+        }
         let mut prefix = self.text();
         prefix.truncate(grapheme_to_byte(&prefix, cursor));
         prefix.push_str(&text);
@@ -1817,6 +1826,9 @@ impl TextArea {
     }
 
     fn position_for_grapheme(&self, index: usize) -> TextPosition {
+        if self.buffer.is_ascii() {
+            return self.buffer.char_idx_to_position(index);
+        }
         let text = self.text();
         let byte = grapheme_to_byte(&text, index);
         self.buffer
@@ -1866,33 +1878,56 @@ impl TextArea {
         cursor: usize,
         label: &str,
     ) -> bool {
-        let contents = self.text();
-        let start_byte = grapheme_to_byte(&contents, start);
-        let end_byte = grapheme_to_byte(&contents, end);
-        let previous = &contents[start_byte..end_byte];
-        if previous == replacement
-            || contents
-                .len()
-                .saturating_sub(previous.len())
-                .saturating_add(replacement.len())
-                > self.max_bytes
-        {
-            return false;
-        }
-
-        let range = TextRange::new(
-            self.buffer
-                .char_idx_to_position(contents[..start_byte].chars().count()),
-            self.buffer
-                .char_idx_to_position(contents[..end_byte].chars().count()),
-        );
+        let ascii = self.buffer.is_ascii() && replacement.is_ascii();
+        let range = if ascii {
+            let range = TextRange::new(
+                self.buffer.char_idx_to_position(start),
+                self.buffer.char_idx_to_position(end),
+            );
+            let previous = self.buffer.text_in_range(range);
+            if previous == replacement
+                || self
+                    .buffer
+                    .byte_len()
+                    .saturating_sub(previous.len())
+                    .saturating_add(replacement.len())
+                    > self.max_bytes
+            {
+                return false;
+            }
+            range
+        } else {
+            let contents = self.text();
+            let start_byte = grapheme_to_byte(&contents, start);
+            let end_byte = grapheme_to_byte(&contents, end);
+            let previous = &contents[start_byte..end_byte];
+            if previous == replacement
+                || contents
+                    .len()
+                    .saturating_sub(previous.len())
+                    .saturating_add(replacement.len())
+                    > self.max_bytes
+            {
+                return false;
+            }
+            TextRange::new(
+                self.buffer
+                    .char_idx_to_position(contents[..start_byte].chars().count()),
+                self.buffer
+                    .char_idx_to_position(contents[..end_byte].chars().count()),
+            )
+        };
         let started_transaction = !self.buffer.undo_history.is_transaction_active();
         if started_transaction {
             let before = self.cursor_snapshot();
             self.buffer.undo_history.begin_transaction(label, before);
         }
         apply_transactional_replacement(&mut self.buffer, range, replacement);
-        self.state.cursor = cursor.min(grapheme_len(&self.text()));
+        self.state.cursor = if ascii {
+            cursor.min(self.buffer.byte_len())
+        } else {
+            cursor.min(grapheme_len(&self.text()))
+        };
         self.state.preferred_column = None;
         self.sync_buffer_cursor();
         if started_transaction {
@@ -1912,6 +1947,9 @@ impl TextArea {
 
     fn cursor_snapshot(&self) -> CursorSnapshot {
         let position = self.cursor_position();
+        if self.buffer.is_ascii() {
+            return CursorSnapshot::new(position.character, position.line, 0);
+        }
         let line = self.buffer.get(position.line).unwrap_or_default();
         CursorSnapshot::new(
             char_to_grapheme(&line, position.character),
@@ -1974,6 +2012,60 @@ fn unnamed_buffer(text: &str) -> Buffer {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn ascii_edits_preserve_multiline_cursor_snapshots_and_undo_redo() {
+        let mut area = TextArea::new("alpha\nbravo\ncharlie");
+        area.set_cursor("alpha\nbr".len());
+
+        assert!(area.insert("XY"));
+        assert_eq!(area.text(), "alpha\nbrXYavo\ncharlie");
+        assert_eq!(area.cursor(), "alpha\nbrXY".len());
+        assert_eq!(area.buffer.pos, (4, 1));
+
+        assert!(area.undo());
+        assert_eq!(area.text(), "alpha\nbravo\ncharlie");
+        assert_eq!(area.cursor(), "alpha\nbr".len());
+        assert_eq!(area.buffer.pos, (2, 1));
+
+        assert!(area.redo());
+        assert_eq!(area.text(), "alpha\nbrXYavo\ncharlie");
+        assert_eq!(area.cursor(), "alpha\nbrXY".len());
+        assert_eq!(area.buffer.pos, (4, 1));
+    }
+
+    #[test]
+    fn ascii_fast_path_preserves_newline_normalization_and_byte_capacity() {
+        let mut area = TextArea::with_max_bytes("ab", 7);
+        area.set_cursor(1);
+
+        assert!(area.insert("x\r\ny\rz"));
+        assert_eq!(area.text(), "ax\ny\nzb");
+        assert_eq!(area.cursor(), 6);
+        assert!(!area.insert("q"));
+        assert_eq!(area.text(), "ax\ny\nzb");
+        assert!(area.undo());
+        assert_eq!(area.text(), "ab");
+        assert_eq!(area.cursor(), 1);
+    }
+
+    #[test]
+    fn ascii_to_unicode_transition_preserves_combining_grapheme_cursors() {
+        let mut area = TextArea::new("ab");
+        area.set_cursor(1);
+
+        assert!(area.insert("👋"));
+        assert_eq!(area.text(), "a👋b");
+        assert_eq!(area.cursor(), 2);
+        assert!(!area.buffer.is_ascii());
+
+        assert!(area.insert("\u{301}"));
+        assert_eq!(area.text(), "a👋\u{301}b");
+        assert_eq!(area.cursor(), 2);
+        assert!(area.undo());
+        assert_eq!(area.text(), "a👋b");
+        assert_eq!(area.cursor(), 2);
+    }
 
     #[test]
     fn word_backspace_in_search_edits_only_the_search_pattern() {

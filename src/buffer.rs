@@ -584,6 +584,11 @@ impl Buffer {
         self.content.len_bytes()
     }
 
+    /// Checks ASCII without flattening or scanning the rope.
+    pub(crate) fn is_ascii(&self) -> bool {
+        self.content.len_bytes() == self.content.len_chars()
+    }
+
     /// Returns the last line that can hold an editor cursor.
     pub fn last_navigable_line(&self) -> usize {
         let last_line = self.len();

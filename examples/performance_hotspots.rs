@@ -7,7 +7,7 @@ use red::{
     agent_conversation::AgentConversationSnapshot,
     buffer::Buffer,
     config::Config,
-    editing::MotionResolver,
+    editing::{MotionResolver, TextArea},
     editor::{DetachedEditorCore, Editor, RenderBuffer, SearchDirection},
     highlighter::Highlighter,
     inline_history::{InlineConversation, InlineHistory, InlineHistoryTurn},
@@ -85,6 +85,8 @@ const STARTUP_FILE_COUNT: usize = 128;
 const STARTUP_FILE_LOADS: usize = 4;
 const LSP_DOCUMENT_LINES: usize = 4_096;
 const LSP_INCREMENTAL_CHANGES: usize = 256;
+const TEXTAREA_INITIAL_BYTES: usize = 32 * 1024;
+const TEXTAREA_INSERTIONS: usize = 256;
 
 fn main() -> Result<()> {
     let scenario = std::env::args().nth(1).unwrap_or_else(|| "all".into());
@@ -206,6 +208,9 @@ fn main() -> Result<()> {
     }
     if scenario == "all" || scenario == "lsp-changes" {
         results.push(benchmark_lsp_incremental_changes()?);
+    }
+    if scenario == "all" || scenario == "textarea-typing" {
+        results.push(benchmark_embedded_textarea_typing()?);
     }
 
     anyhow::ensure!(
@@ -1380,6 +1385,32 @@ fn benchmark_lsp_incremental_changes() -> Result<serde_json::Value> {
         "lsp_incremental_large_document_changes",
         started,
         LSP_INCREMENTAL_CHANGES,
+    ))
+}
+
+fn benchmark_embedded_textarea_typing() -> Result<serde_json::Value> {
+    let mut area = TextArea::new("a".repeat(TEXTAREA_INITIAL_BYTES));
+    anyhow::ensure!(
+        area.cursor() == TEXTAREA_INITIAL_BYTES,
+        "text-area benchmark did not position the insertion cursor"
+    );
+
+    let started = Instant::now();
+    for _ in 0..TEXTAREA_INSERTIONS {
+        anyhow::ensure!(
+            area.insert(black_box("x")),
+            "text-area benchmark unexpectedly rejected an insertion"
+        );
+    }
+    anyhow::ensure!(
+        area.cursor() == TEXTAREA_INITIAL_BYTES + TEXTAREA_INSERTIONS
+            && area.text().len() == TEXTAREA_INITIAL_BYTES + TEXTAREA_INSERTIONS,
+        "text-area benchmark lost inserted text or cursor state"
+    );
+    Ok(report(
+        "embedded_text_area_ascii_typing",
+        started,
+        TEXTAREA_INSERTIONS,
     ))
 }
 
