@@ -7,6 +7,11 @@ The `good-pr` instructions override generic GitHub/PR publishing defaults.
 Do not open draft PRs unless the user explicitly asks for a draft, and do not
 add title prefixes such as `[codex]` unless requested.
 
+# New Features
+
+Unless strictly asked, create new features on new worktrees using the worktrunk
+tool with the wt command.
+
 # Validation
 
 Run `cargo clippy --all-targets --all-features -- -D warnings` before pushing
