@@ -27547,6 +27547,16 @@ impl Editor {
         lsp_items
     }
 
+    fn supersede_pending_completions(&mut self, snapshot: &CompletionSnapshot) {
+        for pending in self.pending_completions.values_mut() {
+            if pending.snapshot.buffer_id == snapshot.buffer_id
+                && pending.snapshot.uri == snapshot.uri
+            {
+                pending.superseded = true;
+            }
+        }
+    }
+
     async fn request_completion(
         &mut self,
         trigger_character: Option<char>,
@@ -27557,13 +27567,13 @@ impl Editor {
 
         self.scheduled_completion = None;
         let buffer_items = self.buffer_completion_items();
-        let snapshot = self.completion_snapshot();
+        // Fresh candidates target this revision, even when they refresh an existing popup.
+        let snapshot = self.activate_completion_snapshot(self.completion_snapshot());
         let displayed_immediately = !buffer_items.is_empty()
             && self.show_completion_items(buffer_items.clone(), snapshot.clone());
-        let pending_snapshot = self
-            .completion_snapshot
-            .clone()
-            .unwrap_or_else(|| snapshot.clone());
+        if displayed_immediately {
+            self.supersede_pending_completions(&snapshot);
+        }
 
         let uri = match self.current_buffer().uri() {
             Ok(uri) => uri,
@@ -27601,12 +27611,15 @@ impl Editor {
                 }
             };
             if request_id > 0 {
+                if !displayed_immediately {
+                    self.supersede_pending_completions(&snapshot);
+                }
                 self.pending_lsp_edit_requests.insert(request_id, pending);
                 self.pending_completions.insert(
                     request_id,
                     PendingCompletion {
                         buffer_items,
-                        snapshot: pending_snapshot,
+                        snapshot,
                         displayed_immediately,
                         superseded: false,
                     },
@@ -38792,6 +38805,138 @@ builtin = "rust"
 
         assert_eq!(editor.current_buffer().contents(), "torch.manual_seed");
         assert!(editor.current_dialog.is_none());
+    }
+
+    #[tokio::test]
+    async fn refreshed_buffer_completion_accepts_its_current_text_edit() {
+        let mut editor = completion_typing_editor();
+        editor
+            .buffer_manager
+            .push_buffer(Buffer::new(None, "manual_seed".to_string()));
+        assert!(editor.request_completion(None).await.unwrap());
+        let mut render_buffer = RenderBuffer::new(80, 24, &Style::default());
+        let mut runtime = Runtime::new();
+
+        type_completion_suffix(&mut editor, "u", &mut render_buffer, &mut runtime).await;
+        assert!(editor.request_completion(None).await.unwrap());
+        editor
+            .process_editor_event(
+                Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+                &mut render_buffer,
+                &mut runtime,
+                EventRenderMode::Immediate,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(editor.current_buffer().contents(), "torch.manual_seed");
+        assert!(editor.current_dialog.is_none());
+    }
+
+    #[tokio::test]
+    async fn refreshed_lsp_completion_rebases_only_typing_after_its_request() {
+        let mut editor = completion_typing_editor();
+        editor
+            .buffer_manager
+            .push_buffer(Buffer::new(None, "manual_seed".to_string()));
+        assert!(editor.request_completion(None).await.unwrap());
+        let mut render_buffer = RenderBuffer::new(80, 24, &Style::default());
+        let mut runtime = Runtime::new();
+
+        type_completion_suffix(&mut editor, "u", &mut render_buffer, &mut runtime).await;
+        assert!(editor.request_completion(None).await.unwrap());
+        let snapshot = editor.completion_snapshot.clone().unwrap();
+        editor.pending_completions.insert(
+            42,
+            PendingCompletion {
+                buffer_items: editor.buffer_completion_items(),
+                snapshot,
+                displayed_immediately: true,
+                superseded: false,
+            },
+        );
+        let response = InboundMessage::Message(ResponseMessage {
+            id: 42,
+            result: serde_json::json!([{
+                "label": "manual_seed",
+                "textEdit": {
+                    "range": {
+                        "start": { "line": 0, "character": 6 },
+                        "end": { "line": 0, "character": 10 }
+                    },
+                    "newText": "manual_seed"
+                }
+            }]),
+            request: Some(crate::lsp::Request::new(
+                "textDocument/completion",
+                serde_json::json!({ "position": { "line": 0, "character": 10 } }),
+            )),
+        });
+
+        assert!(matches!(
+            editor.handle_lsp_message(&response, Some("textDocument/completion".to_string())),
+            Some(Action::ShowDialog)
+        ));
+        type_completion_suffix(&mut editor, "al", &mut render_buffer, &mut runtime).await;
+        editor
+            .process_editor_event(
+                Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+                &mut render_buffer,
+                &mut runtime,
+                EventRenderMode::Immediate,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(editor.current_buffer().contents(), "torch.manual_seed");
+        assert!(editor.current_dialog.is_none());
+    }
+
+    #[tokio::test]
+    async fn refreshed_completion_supersedes_older_in_flight_responses() {
+        let mut editor = completion_typing_editor();
+        editor
+            .buffer_manager
+            .push_buffer(Buffer::new(None, "manual_seed".to_string()));
+        assert!(editor.request_completion(None).await.unwrap());
+        let snapshot = editor.completion_snapshot.clone().unwrap();
+        editor.pending_completions.insert(
+            41,
+            PendingCompletion {
+                buffer_items: editor.buffer_completion_items(),
+                snapshot,
+                displayed_immediately: true,
+                superseded: false,
+            },
+        );
+
+        assert!(editor.request_completion(None).await.unwrap());
+        let response = InboundMessage::Message(ResponseMessage {
+            id: 41,
+            result: serde_json::json!([{ "label": "manual_old" }]),
+            request: Some(crate::lsp::Request::new(
+                "textDocument/completion",
+                serde_json::json!({ "position": { "line": 0, "character": 9 } }),
+            )),
+        });
+
+        assert!(editor
+            .handle_lsp_message(&response, Some("textDocument/completion".to_string()))
+            .is_none());
+
+        let mut render_buffer = RenderBuffer::new(80, 24, &Style::default());
+        let mut runtime = Runtime::new();
+        editor
+            .process_editor_event(
+                Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+                &mut render_buffer,
+                &mut runtime,
+                EventRenderMode::Immediate,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(editor.current_buffer().contents(), "torch.manual_seed");
     }
 
     #[tokio::test]
