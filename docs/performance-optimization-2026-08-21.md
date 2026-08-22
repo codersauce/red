@@ -56,6 +56,7 @@ navigation baselines were frozen after rebasing to `d92777c`.
 | --- | ---: |
 | Husk unchanged configuration refresh | 99.99% |
 | Neo-tree repeated row selection | 99.98% |
+| Plugin/window LSP cursor snapshot coordinates | 99.89% |
 | Shared Vim keyword word text objects | 99.89% |
 | Shared Vim ASCII change-word operators | 99.88% |
 | Shared Vim ASCII delete-word operators | 99.87% |
@@ -79,6 +80,7 @@ navigation baselines were frozen after rebasing to `d92777c`.
 | Husk unchanged document updates | 98.44% |
 | Viewport cursor snapshot updates | 98.58% |
 | Embedded Vim line-boundary motions | 98.48% |
+| Editor LSP request cursor coordinates | 98.29% |
 | Shared Vim final-sentence operators | 98.20% |
 | Gutter namespace updates | 97.94% |
 | Shared Vim around final-sentence text objects | 97.88% |
@@ -88,6 +90,7 @@ navigation baselines were frozen after rebasing to `d92777c`.
 | Long transcript cursor lookup | 97.35% |
 | Character-wrapped layout cursor lookup | 97.29% |
 | Embedded Home/End document navigation | 96.88% |
+| Editor cursor display-column positioning | 96.83% |
 | Word-wrapped layout cursor lookup | 96.61% |
 | Git workspace row navigation | 96.35% |
 | Editor logical line-length lookup | 96.33% |
@@ -281,6 +284,15 @@ lines. Eleven alternating release-build samples reduced line-length medians from
 9,688 to 356 microseconds and final-cell medians from 9,611 to 361 microseconds
 while preserving viewport offsets, missing lines, LF/CRLF endings, empty rows,
 combining marks, emoji, CJK, and Unicode grapheme counts.
+
+Editor cursor positioning was independently measured across 2,048 production
+display-column, LSP-request, and plugin/window LSP-snapshot lookups on 20 KiB
+ASCII source lines. Eleven alternating release-build samples reduced display
+medians from 401,011 to 12,717 microseconds, request coordinates from 22,153
+to 378 microseconds, and window-snapshot coordinates from 325,746 to 356
+microseconds while preserving tabs, ASCII control characters, LF/CRLF endings,
+missing lines and buffers, viewport offsets, cursor saturation, combining
+marks, emoji, CJK, Unicode grapheme boundaries, and UTF-16 positions.
 
 Shared Vim paragraph objects were independently measured across 128 inner and
 128 around selections spanning 768-line paragraphs. Eleven alternating

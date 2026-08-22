@@ -6713,9 +6713,26 @@ impl Editor {
         line: usize,
         grapheme_index: usize,
     ) -> usize {
-        self.buffer_manager
-            .get(buffer_index)
-            .and_then(|buffer| buffer.get(line))
+        let Some(buffer) = self.buffer_manager.get(buffer_index) else {
+            return grapheme_index;
+        };
+        if buffer.is_ascii() {
+            let contents = buffer.contents_snapshot();
+            let Some(text) = contents.get_line(line) else {
+                return grapheme_index;
+            };
+            let length = text.len_chars();
+            let character = grapheme_index.min(length);
+            if character.saturating_add(1) == length
+                && text.get_char(character) == Some('\n')
+                && text.get_char(character.saturating_sub(1)) == Some('\r')
+            {
+                return length;
+            }
+            return character;
+        }
+        buffer
+            .get(line)
             .map(|text| {
                 text.graphemes(true)
                     .take(grapheme_index)
@@ -7201,6 +7218,28 @@ impl Editor {
     }
 
     fn current_cursor_display_col(&self) -> usize {
+        let buffer = self.current_buffer();
+        if buffer.is_ascii() {
+            let contents = buffer.contents_snapshot();
+            let Some(line) = contents.get_line(self.buffer_line()) else {
+                return self.cx;
+            };
+            let mut length = line.len_chars();
+            if line.get_char(length.saturating_sub(1)) == Some('\n') {
+                length -= 1;
+            }
+            if line.get_char(length.saturating_sub(1)) == Some('\r') {
+                length -= 1;
+            }
+            let cursor = self.cx.min(length);
+            if line
+                .slice(..cursor)
+                .chunks()
+                .all(crate::unicode_utils::is_printable_ascii)
+            {
+                return cursor;
+            }
+        }
         if let Some(line) = self.current_line_contents() {
             return grapheme_to_column_with_tabs(
                 trim_line_ending(&line),
@@ -17536,16 +17575,20 @@ impl Editor {
 
     fn cursor_lsp_position(&self) -> crate::lsp::Position {
         let position = self.cursor_text_position();
-        let character = self
-            .current_buffer()
-            .get(position.line)
-            .map(|line| {
-                line.chars()
-                    .take(position.character)
-                    .map(char::len_utf16)
-                    .sum()
-            })
-            .unwrap_or(position.character);
+        let buffer = self.current_buffer();
+        let character = if buffer.is_ascii() {
+            position.character
+        } else {
+            buffer
+                .get(position.line)
+                .map(|line| {
+                    line.chars()
+                        .take(position.character)
+                        .map(char::len_utf16)
+                        .sum()
+                })
+                .unwrap_or(position.character)
+        };
         crate::lsp::Position {
             line: position.line,
             character,
@@ -29582,6 +29625,26 @@ impl Editor {
         }
     }
 
+    /// Reads the display column used by production cursor positioning.
+    #[doc(hidden)]
+    pub fn benchmark_cursor_display_column(&self) -> usize {
+        self.current_cursor_display_col()
+    }
+
+    /// Reads the UTF-16 cursor offset used by language requests and snapshots.
+    #[doc(hidden)]
+    pub fn benchmark_lsp_cursor_character(&self, window_snapshot: bool) -> usize {
+        if window_snapshot {
+            self.lsp_character_for_cursor(
+                self.buffer_manager.active_index(),
+                self.buffer_line(),
+                self.cx,
+            )
+        } else {
+            self.cursor_lsp_position().character
+        }
+    }
+
     #[doc(hidden)]
     pub fn test_cx(&self) -> usize {
         self.cx
@@ -36701,6 +36764,77 @@ builtin = "rust"
             if editor.current_buffer().get(1).is_some() {
                 editor.test_set_viewport_cursor(/*vtop*/ 1, /*cx*/ 0, /*cy*/ 0);
                 assert_eq!(editor.line_length(), editor.length_for_line(1));
+            }
+        }
+    }
+
+    #[test]
+    fn indexed_cursor_positions_preserve_tabs_unicode_utf16_crlf_and_viewports() {
+        for contents in [
+            "ordinary ASCII words\nnext",
+            "first\tsecond\nnext",
+            "control\u{7} character\u{7f}\r\nfinal",
+            "ordinary\r\n\r\nfinal",
+            "\n",
+            "e\u{301}clair 👋 終\nnext",
+        ] {
+            let mut editor = test_editor(/*width*/ 80, /*height*/ 24);
+            editor
+                .buffer_manager
+                .replace_buffers(vec![Buffer::new(None, contents.to_string())]);
+            for line in [0, 1, 2, 9] {
+                for column in [0, 1, 2, 5, 9, 24, usize::MAX] {
+                    editor.test_set_viewport_cursor(line, column, /*cy*/ 0);
+                    let source = editor.current_buffer().get(line);
+                    let expected_display = source
+                        .as_deref()
+                        .map(|text| {
+                            grapheme_to_column_with_tabs(
+                                trim_line_ending(text),
+                                column,
+                                editor.active_tab_width(),
+                            )
+                        })
+                        .unwrap_or(column);
+                    let expected_window_lsp = source
+                        .as_deref()
+                        .map(|text| {
+                            text.graphemes(true)
+                                .take(column)
+                                .flat_map(str::chars)
+                                .map(char::len_utf16)
+                                .sum()
+                        })
+                        .unwrap_or(column);
+                    let character = source
+                        .as_deref()
+                        .map(|text| grapheme_to_char(text.trim_end_matches('\n'), column))
+                        .unwrap_or(column);
+                    let expected_lsp = source
+                        .as_deref()
+                        .map(|text| text.chars().take(character).map(char::len_utf16).sum())
+                        .unwrap_or(character);
+                    assert_eq!(
+                        editor.benchmark_cursor_display_column(),
+                        expected_display,
+                        "display {contents:?} line={line} column={column}"
+                    );
+                    assert_eq!(
+                        editor.benchmark_lsp_cursor_character(/*window_snapshot*/ false),
+                        expected_lsp,
+                        "request LSP {contents:?} line={line} column={column}"
+                    );
+                    assert_eq!(
+                        editor.benchmark_lsp_cursor_character(/*window_snapshot*/ true),
+                        expected_window_lsp,
+                        "window LSP {contents:?} line={line} column={column}"
+                    );
+                    assert_eq!(
+                        editor.lsp_character_for_cursor(usize::MAX, line, column),
+                        column,
+                        "missing buffer {contents:?} line={line} column={column}"
+                    );
+                }
             }
         }
     }

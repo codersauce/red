@@ -207,6 +207,21 @@ fn main() -> Result<()> {
     if scenario == "all" || scenario == "editor-line-last-cell" {
         results.push(benchmark_editor_line_boundary(/*last_cell*/ true)?);
     }
+    if scenario == "all" || scenario == "editor-cursor-display" {
+        results.push(benchmark_editor_cursor_position(
+            /*language_server*/ false, /*window_snapshot*/ false,
+        )?);
+    }
+    if scenario == "all" || scenario == "editor-lsp-position" {
+        results.push(benchmark_editor_cursor_position(
+            /*language_server*/ true, /*window_snapshot*/ false,
+        )?);
+    }
+    if scenario == "all" || scenario == "editor-lsp-window" {
+        results.push(benchmark_editor_cursor_position(
+            /*language_server*/ true, /*window_snapshot*/ true,
+        )?);
+    }
     if scenario == "all" || scenario == "paragraph" {
         results.push(benchmark_paragraph_motion());
     }
@@ -1038,6 +1053,49 @@ fn benchmark_editor_line_boundary(last_cell: bool) -> Result<serde_json::Value> 
             "editor_ascii_final_cell_lookup"
         } else {
             "editor_ascii_logical_line_length"
+        },
+        started,
+        TEXTAREA_VIM_MOTIONS,
+    ))
+}
+
+fn benchmark_editor_cursor_position(
+    language_server: bool,
+    window_snapshot: bool,
+) -> Result<serde_json::Value> {
+    let contents = "ordinary_identifier ".repeat(1_024);
+    let cursor = contents.len() - 1;
+    let mut config = Config::default();
+    config.lsp.enabled = false;
+    let mut editor = Editor::with_size(
+        Box::new(LspManager::new(config.lsp.clone())),
+        120,
+        40,
+        config,
+        Theme::default(),
+        vec![Buffer::new(None, contents)],
+    )?;
+    editor.test_set_viewport_cursor(/*vtop*/ 0, cursor, /*cy*/ 0);
+    let started = Instant::now();
+    for _ in 0..TEXTAREA_VIM_MOTIONS {
+        let position = if language_server {
+            editor.benchmark_lsp_cursor_character(window_snapshot)
+        } else {
+            editor.benchmark_cursor_display_column()
+        };
+        anyhow::ensure!(
+            position == cursor,
+            "editor cursor position changed its display column or UTF-16 offset"
+        );
+        black_box(position);
+    }
+    Ok(report(
+        if !language_server {
+            "editor_ascii_cursor_display_column"
+        } else if window_snapshot {
+            "editor_ascii_window_lsp_cursor_character"
+        } else {
+            "editor_ascii_lsp_cursor_position"
         },
         started,
         TEXTAREA_VIM_MOTIONS,
