@@ -9524,6 +9524,10 @@ impl Editor {
         // initialization are not lost.
         event::poll(Duration::from_millis(0))?;
 
+        let startup_highlighter = self
+            .highlight_language_id_for_buffer_index(self.buffer_manager.active_index())
+            .and_then(|language| self.highlighter.prepare_language_in_background(&language));
+
         {
             let plugin_startup = perf::PerfSpan::start("startup:plugins");
             self.refresh_plugin_snapshots(runtime, true, true, true)?;
@@ -9550,6 +9554,9 @@ impl Editor {
         self.resize_terminal_surface(columns, rows, &mut buffer);
         self.prepare_startup_welcome();
         self.prepare_startup_whats_new();
+        if let Some(prepared) = startup_highlighter {
+            self.highlighter.finish_prepared_language(prepared);
+        }
         self.render(&mut buffer)?;
         self.mark_whats_new_presented();
         drop(interactive_startup);

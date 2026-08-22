@@ -165,6 +165,7 @@ navigation baselines were frozen after rebasing to `d92777c`.
 | Shared Vim around paragraph text objects | 63.73% |
 | Shared Vim paragraph boundary operators | 63.42% |
 | Shared Vim inner paragraph text objects | 63.01% |
+| Complete real-terminal interactive startup | 60.80% |
 | Git workspace status directory indexing | 60.28% |
 | Git repository discovery and branch refresh | 58.73% |
 | Plugin cursor-event delivery | 56.35% |
@@ -492,18 +493,26 @@ and source or span cache-limit violations; Unicode edits, comments, YAML
 context, Markdown language injections, and fresh-parser parity remain covered.
 
 Editor chrome independently fell from 85 to 16 microseconds, and bundled plugin
-startup fell from 35,873 to 17,263 microseconds. Full interactive startup still
-improved only 41.88%, terminal diff and flush only 21.95%, and overlay/cursor
-composition remained unchanged. Process-to-first-paint also remains unresolved
-because executable warm-up and filesystem effects make its samples unstable.
+startup fell from 35,873 to 17,263 microseconds. Complete interactive startup
+fell from 46,299 to 18,149 microseconds after the first visible language's
+Tree-sitter query compilation moved onto a background worker during independent
+plugin initialization. Query and injection compilation retain their exact
+language-registry snapshot; the foreground installs captures with the current
+theme and discards stale, failed, unsupported, or already-initialized results.
+Real Rust, YAML, and Markdown sessions still open and accept verified Unicode
+edits.
+
+Terminal diff and flush improved only 19.51%, and overlay/cursor composition
+remained unchanged. Process-to-first-paint also remains unresolved because
+executable warm-up and filesystem effects make its samples unstable.
 
 ## Remaining gaps
 
-- Single-file process startup, full interactive startup, overlay/cursor
-  composition, terminal diff and flush, general non-identifier syntax edits,
-  recovery snapshot writes, in-repository Git subprocess status refresh, broader
-  Vim editing, platform-specific paths, and several other areas above do not yet
-  meet the 50% improvement target.
+- Single-file process startup, overlay/cursor composition, terminal diff and
+  flush, general non-identifier syntax edits, recovery snapshot writes,
+  in-repository Git subprocess status refresh, broader Vim editing,
+  platform-specific paths, and several other areas above do not yet meet the 50%
+  improvement target.
 - Real-repository Git status refresh improved 35.67%, from 418,087 to 268,941
   microseconds across 32 requests, but the remaining `git status` subprocess
   still keeps this path below the target.

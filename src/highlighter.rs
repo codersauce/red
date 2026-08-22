@@ -11,6 +11,7 @@ use std::{
     ops::Range,
     path::{Path, PathBuf},
     sync::Arc,
+    thread::{self, JoinHandle},
 };
 
 use anyhow::Context as _;
@@ -460,6 +461,18 @@ struct CachedSyntaxTree {
     tree: Tree,
 }
 
+struct CompiledLanguageQueries {
+    language: Language,
+    query: Query,
+    injection_query: Option<Query>,
+}
+
+pub(crate) struct PendingLanguageHighlighter {
+    language_id: String,
+    registry: Arc<LanguageRegistry>,
+    task: JoinHandle<anyhow::Result<CompiledLanguageQueries>>,
+}
+
 struct Injection {
     language_id: String,
     content_start: usize,
@@ -628,6 +641,79 @@ impl Highlighter {
     #[must_use]
     pub fn registry(&self) -> Arc<LanguageRegistry> {
         Arc::clone(&self.registry)
+    }
+
+    /// Compile the first visible language's queries while independent startup
+    /// work runs. The registry snapshot keeps dynamic grammar libraries alive.
+    pub(crate) fn prepare_language_in_background(
+        &self,
+        language_id: &str,
+    ) -> Option<PendingLanguageHighlighter> {
+        if self.highlighters.contains_key(language_id) {
+            return None;
+        }
+        let definition = self.registry.languages.get(language_id)?;
+        if definition.specialized.is_some() || definition.highlight_queries.is_empty() {
+            return None;
+        }
+        let grammar = definition.grammar.clone()?;
+        let highlights = definition.highlight_queries.join("\n");
+        let injections = definition.injection_query.clone();
+        let task = thread::Builder::new()
+            .name("red-highlight-startup".to_string())
+            .spawn(move || {
+                let language = grammar_language(&grammar);
+                let query = Query::new(&language, &highlights)?;
+                let injection_query = injections
+                    .as_deref()
+                    .map(|source| Query::new(&language, source))
+                    .transpose()?;
+                Ok(CompiledLanguageQueries {
+                    language,
+                    query,
+                    injection_query,
+                })
+            })
+            .ok()?;
+        Some(PendingLanguageHighlighter {
+            language_id: language_id.to_string(),
+            registry: Arc::clone(&self.registry),
+            task,
+        })
+    }
+
+    /// Install a completed query only when its exact language snapshot is still
+    /// current. Failure remains best-effort; ordinary lazy loading retries it.
+    pub(crate) fn finish_prepared_language(&mut self, pending: PendingLanguageHighlighter) {
+        let Ok(Ok(prepared)) = pending.task.join() else {
+            return;
+        };
+        if !Arc::ptr_eq(&self.registry, &pending.registry)
+            || self.highlighters.contains_key(&pending.language_id)
+        {
+            return;
+        }
+
+        let mut parser = Parser::new();
+        if parser.set_language(&prepared.language).is_err() {
+            return;
+        }
+        let capture_styles = prepared
+            .query
+            .capture_names()
+            .iter()
+            .map(|scope| self.theme.get_style(scope))
+            .collect();
+        self.highlighters.insert(
+            pending.language_id,
+            LanguageHighlighter {
+                parser,
+                query: prepared.query,
+                injection_query: prepared.injection_query,
+                capture_styles,
+                cached_tree: None,
+            },
+        );
     }
 
     pub fn language_id_for_file(&self, file: Option<&str>) -> Option<&str> {
@@ -1790,6 +1876,67 @@ mod tests {
                 .map(|cached| cached.language_id.as_str()),
             Some("javascript")
         );
+    }
+
+    #[test]
+    fn background_language_preparation_preserves_styles_and_injections() {
+        for (language, source) in [
+            ("rust", "fn greeting(value: usize) -> usize { value }\n"),
+            ("markdown", "# Example\n\n```rust\nfn greet() {}\n```\n"),
+            ("yaml", "root:\n  enabled: true\n"),
+        ] {
+            let mut prepared = highlighter();
+            let pending = prepared
+                .prepare_language_in_background(language)
+                .expect("tree-sitter language should be prepared");
+            prepared.finish_prepared_language(pending);
+            assert!(prepared.highlighters.contains_key(language));
+
+            let actual = prepared.highlight(language, source).unwrap();
+            let expected = highlighter().highlight(language, source).unwrap();
+            let shape = |styles: &[StyleInfo]| {
+                styles
+                    .iter()
+                    .map(|style| (style.start, style.end, style.style.clone()))
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(shape(&actual), shape(&expected), "{language}");
+            assert!(prepared.prepare_language_in_background(language).is_none());
+        }
+        assert!(highlighter()
+            .prepare_language_in_background("husk")
+            .is_none());
+        assert!(highlighter()
+            .prepare_language_in_background("unknown")
+            .is_none());
+    }
+
+    #[test]
+    fn background_language_preparation_rejects_stale_registries_and_invalid_queries() {
+        let mut stale = highlighter();
+        let pending = stale.prepare_language_in_background("rust").unwrap();
+        stale.registry = Arc::new(LanguageRegistry::bundled());
+        stale.finish_prepared_language(pending);
+        assert!(!stale.highlighters.contains_key("rust"));
+        assert!(!stale
+            .highlight("rust", "fn current() {}\n")
+            .unwrap()
+            .is_empty());
+
+        let mut registry = LanguageRegistry::bundled();
+        registry
+            .languages
+            .get_mut("rust")
+            .unwrap()
+            .highlight_queries = vec!["(unknown_node) @function".to_string()];
+        let theme = parse_vscode_theme("themes/mocha.json").unwrap();
+        let mut invalid = Highlighter::with_registry(&theme, Arc::new(registry)).unwrap();
+        let pending = invalid.prepare_language_in_background("rust").unwrap();
+        invalid.finish_prepared_language(pending);
+        assert!(!invalid.highlighters.contains_key("rust"));
+        assert!(invalid
+            .highlight("rust", "fn original_error() {}\n")
+            .is_err());
     }
 
     #[test]
