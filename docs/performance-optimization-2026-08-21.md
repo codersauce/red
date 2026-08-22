@@ -132,6 +132,9 @@ objective.
 - An eager Neo-tree row index was intentionally rejected because it increased
   memory and slowed opening; the retained single-position cache avoids both
   regressions in real 2,048- and 8,192-entry terminal runs.
+- A SHA-256-verified recovery-generation cache was also rejected: although it
+  preserved all corruption and no-follow safeguards, durable snapshot writes
+  became 3.93% slower in the 24-buffer, 48-undo-node fixture.
 
 ## Reproducing measurements
 

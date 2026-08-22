@@ -19,6 +19,7 @@ use red::{
         WorkspaceConfig, WorkspaceManager, WorkspaceModel, WorkspaceRow,
     },
     preferences::PreferencesStore,
+    session::SessionStore,
     theme::{parse_vscode_theme, Style, Theme},
     ui::{CompletionUI, Picker, PickerItem, PickerOptions},
     undo::{CursorSnapshot, TextPosition, TextRange, UndoHistory},
@@ -74,6 +75,9 @@ const WORKSPACE_SEARCH_LISTINGS: usize = 8;
 const WORKSPACE_CONTENT_SEARCHES: usize = 4;
 const PLUGIN_EVENT_BACKGROUND: usize = 64;
 const PLUGIN_EVENT_DELIVERIES: usize = 4_096;
+const SNAPSHOT_WRITE_BUFFERS: usize = 24;
+const SNAPSHOT_WRITE_UNDO_NODES: usize = 48;
+const SNAPSHOT_WRITES: usize = 6;
 
 fn main() -> Result<()> {
     let scenario = std::env::args().nth(1).unwrap_or_else(|| "all".into());
@@ -180,6 +184,9 @@ fn main() -> Result<()> {
     }
     if scenario == "all" || scenario == "plugin-events" {
         results.push(benchmark_plugin_event_delivery()?);
+    }
+    if scenario == "all" || scenario == "session-write" {
+        results.push(benchmark_session_snapshot_writes()?);
     }
 
     anyhow::ensure!(
@@ -1149,6 +1156,61 @@ fn benchmark_plugin_event_delivery() -> Result<serde_json::Value> {
         "plugin_cursor_event_delivery",
         started,
         PLUGIN_EVENT_DELIVERIES,
+    ))
+}
+
+fn benchmark_session_snapshot_writes() -> Result<serde_json::Value> {
+    let directory = tempfile::tempdir()?;
+    let mut buffers = Vec::with_capacity(SNAPSHOT_WRITE_BUFFERS);
+    for buffer_index in 0..SNAPSHOT_WRITE_BUFFERS {
+        let mut buffer = Buffer::new(
+            None,
+            format!("buffer {buffer_index} retained recovery contents\n").repeat(96),
+        );
+        for node_index in 0..SNAPSHOT_WRITE_UNDO_NODES {
+            buffer
+                .undo_history
+                .begin_transaction("insert", CursorSnapshot::default());
+            buffer.undo_history.record_replace(
+                TextRange::insertion(TextPosition::new(0, node_index)),
+                node_index,
+                String::new(),
+                format!("retained undo payload {buffer_index}:{node_index} ").repeat(8),
+            );
+            buffer
+                .undo_history
+                .commit_transaction(CursorSnapshot::default());
+        }
+        buffers.push(buffer);
+    }
+    let mut config = Config::default();
+    config.lsp.enabled = false;
+    let mut editor = Editor::with_size(
+        Box::new(LspManager::new(config.lsp.clone())),
+        120,
+        40,
+        config,
+        Theme::default(),
+        buffers,
+    )?;
+    let mut snapshot = editor.test_session_snapshot();
+    let store = SessionStore::new(directory.path().join("recovery"));
+    store.write(&mut snapshot)?;
+
+    let started = Instant::now();
+    for _ in 0..SNAPSHOT_WRITES {
+        store.write(black_box(&mut snapshot))?;
+    }
+    let restored = store.load()?;
+    anyhow::ensure!(
+        restored.buffers.len() == SNAPSHOT_WRITE_BUFFERS
+            && restored.generation == (SNAPSHOT_WRITES + 1) as u64,
+        "snapshot benchmark failed to retain every buffer and generation"
+    );
+    Ok(report(
+        "crash_recovery_snapshot_writes",
+        started,
+        SNAPSHOT_WRITES,
     ))
 }
 
