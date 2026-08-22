@@ -60,6 +60,8 @@ SCENARIOS = (
     "git-status-outside",
     "buffer-last-line",
     "buffer-line-count",
+    "search-sparse-ascii",
+    "search-sparse-unicode",
     "layout-grapheme-cursor",
     "layout-word-cursor",
     "textarea-vim-word",

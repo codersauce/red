@@ -400,7 +400,14 @@ impl Buffer {
         let mut x = 0;
         let mut y = 0;
 
-        let mut position_at = |byte| {
+        let mut position_at = |byte: usize| {
+            if byte.saturating_sub(previous_byte) > 1_024 {
+                let character = self.content.byte_to_char(byte);
+                y = self.content.char_to_line(character);
+                x = character - self.content.line_to_char(y);
+                previous_byte = byte;
+                return (x, y);
+            }
             for (offset, character) in contents[previous_byte..byte].char_indices() {
                 match character {
                     '\r' if bytes.get(previous_byte + offset + 1) == Some(&b'\n') => x += 1,
@@ -1870,6 +1877,38 @@ mod test {
                     };
                     let (start_x, start_y) = position(match_.start());
                     let (end_x, end_y) = position(match_.end());
+                    SearchMatch {
+                        start_x,
+                        start_y,
+                        end_x,
+                        end_y,
+                    }
+                })
+                .collect::<Vec<_>>();
+
+            assert_eq!(buffer.regex_matches(&regex), expected, "pattern: {pattern}");
+        }
+    }
+
+    #[test]
+    fn sparse_regex_matches_preserve_indexed_unicode_and_crlf_positions() {
+        let prefix = "α\r\nbeta\u{000B}γ\u{000C}終\u{0085}👋\u{2028}tail\u{2029}".repeat(256);
+        let contents = format!("{prefix}first needle\r\n{prefix}second needle");
+        let buffer = Buffer::new(Some("unicode.txt".to_string()), contents.clone());
+
+        for pattern in ["needle", r"(?s)first.*?second", r"\b"] {
+            let regex = Regex::new(pattern).unwrap();
+            let expected = regex
+                .find_iter(&contents)
+                .filter(|matched| matched.start() != matched.end())
+                .map(|matched| {
+                    let position = |byte| {
+                        let character = buffer.content.byte_to_char(byte);
+                        let line = buffer.content.char_to_line(character);
+                        (character - buffer.content.line_to_char(line), line)
+                    };
+                    let (start_x, start_y) = position(matched.start());
+                    let (end_x, end_y) = position(matched.end());
                     SearchMatch {
                         start_x,
                         start_y,

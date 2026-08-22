@@ -98,6 +98,7 @@ const GIT_STATUS_FILES: usize = 2_048;
 const GIT_STATUS_INDEX_BUILDS: usize = 32;
 const GIT_STATUS_REFRESHES: usize = 32;
 const BUFFER_LINE_LOOKUPS: usize = 4_096;
+const SPARSE_REGEX_SEARCHES: usize = 128;
 const LAYOUT_CURSOR_LOOKUPS: usize = 2_048;
 const TEXTAREA_VIM_MOTIONS: usize = 2_048;
 const TEXTAREA_DELIMITER_MOTIONS: usize = 1_024;
@@ -257,6 +258,12 @@ fn main() -> Result<()> {
     }
     if scenario == "all" || scenario == "buffer-line-count" {
         results.push(benchmark_buffer_line_boundary(/*count*/ true)?);
+    }
+    if scenario == "all" || scenario == "search-sparse-ascii" {
+        results.push(benchmark_sparse_regex_matches(/*unicode*/ false)?);
+    }
+    if scenario == "all" || scenario == "search-sparse-unicode" {
+        results.push(benchmark_sparse_regex_matches(/*unicode*/ true)?);
     }
     if scenario == "all" || scenario == "layout-grapheme-cursor" {
         results.push(benchmark_layout_cursor_lookup(WrapMode::Grapheme)?);
@@ -1785,6 +1792,39 @@ fn benchmark_buffer_line_boundary(count: bool) -> Result<serde_json::Value> {
         },
         started,
         BUFFER_LINE_LOOKUPS,
+    ))
+}
+
+fn benchmark_sparse_regex_matches(unicode: bool) -> Result<serde_json::Value> {
+    let gap = if unicode {
+        "漢字 👋 e\u{301} retained ordinary editor source\r\n"
+    } else {
+        "ordinary ASCII retained editor source contents\n"
+    };
+    let contents = format!(
+        "{}needle_target\n{}needle_target",
+        gap.repeat(1_024),
+        gap.repeat(1_024)
+    );
+    let buffer = Buffer::new(None, contents);
+    let expression = regex::Regex::new("needle_target")?;
+    let started = Instant::now();
+    for _ in 0..SPARSE_REGEX_SEARCHES {
+        let matches = buffer.regex_matches(black_box(&expression));
+        anyhow::ensure!(
+            matches.len() == 2 && matches[0].start_y == 1_024 && matches[1].start_y == 2_049,
+            "sparse regex search changed match coordinates"
+        );
+        black_box(matches);
+    }
+    Ok(report(
+        if unicode {
+            "shared_buffer_sparse_unicode_regex_matches"
+        } else {
+            "shared_buffer_sparse_ascii_regex_matches"
+        },
+        started,
+        SPARSE_REGEX_SEARCHES,
     ))
 }
 

@@ -92,7 +92,9 @@ navigation baselines were frozen after rebasing to `d92777c`.
 | Shared buffer navigable-line counting | 91.38% |
 | Embedded redo cursor restoration | 91.33% |
 | Embedded text-area document loading | 91.26% |
+| Sparse ASCII full-buffer regex searching | 90.87% |
 | Embedded Vim nested delimiter matching | 90.03% |
+| Sparse Unicode full-buffer regex searching | 89.12% |
 | Shared Vim escaped-quote text objects | 88.86% |
 | Shared Vim long-line paragraph operators | 88.15% |
 | Shared modal editor backward word motion | 87.58% |
@@ -158,6 +160,13 @@ unterminated source line. Eleven alternating release-build samples reduced
 final-line medians from 12,954 to 1,106 microseconds and line-count medians from
 12,798 to 1,103 microseconds while preserving empty named and unnamed buffers,
 trailing LF/CRLF separators, repeated blank lines, and Unicode scalar contents.
+
+Sparse full-buffer search was independently measured across 128 production
+regex searches for widely separated matches within 2,049-line ASCII and
+Unicode/CRLF documents. Eleven alternating release-build samples reduced ASCII
+medians from 10,341 to 944 microseconds and Unicode medians from 8,884 to 967
+microseconds while retaining dense-match behavior, multiline matches, Unicode
+line separators, scalar coordinates, and zero-width match filtering.
 
 Wrapped cursor hit-testing was measured over 2,048 production lookups across
 more than 256 visual rows. Eleven alternating release-build samples reduced
