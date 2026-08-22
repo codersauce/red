@@ -97,9 +97,15 @@ navigation baselines were frozen after rebasing to `d92777c`.
 | Real-terminal full-document-LSP visual-block insertion | 97.71% |
 | Real-terminal split-window visual-block insertion | 97.65% |
 | Decoration namespace updates | 97.48% |
+| Rust string punctuation highlighting | 97.46% |
+| Rust line-comment punctuation highlighting | 97.38% |
 | Long transcript cursor lookup | 97.35% |
+| Rust Unicode line-comment highlighting | 97.33% |
 | Character-wrapped layout cursor lookup | 97.29% |
 | Real-terminal bundled-plugin visual-block insertion | 97.26% |
+| Rust CRLF line-comment highlighting | 97.21% |
+| Rust CRLF string highlighting | 97.15% |
+| Rust Unicode string highlighting | 97.13% |
 | Embedded Home/End document navigation | 96.88% |
 | Editor cursor display-column positioning | 96.83% |
 | Word-wrapped layout cursor lookup | 96.61% |
@@ -124,12 +130,18 @@ navigation baselines were frozen after rebasing to `d92777c`.
 | Embedded text-area document loading | 91.26% |
 | Real-terminal incremental search input events | 90.89% |
 | Sparse ASCII full-buffer regex searching | 90.87% |
+| Real-terminal CRLF line-comment highlighting | 90.56% |
+| Real-terminal line-comment highlighting | 90.48% |
+| Real-terminal CRLF string highlighting | 90.37% |
 | Embedded Vim nested delimiter matching | 90.03% |
 | ASCII Vim line-end operators | 89.83% |
 | ASCII Unicode-scalar line boundaries | 89.78% |
+| Real-terminal Unicode line-comment highlighting | 89.62% |
+| Real-terminal string highlighting | 89.62% |
 | Shared scalar-to-display-column conversion | 89.31% |
 | Unicode scalar line boundaries | 89.12% |
 | Sparse Unicode full-buffer regex searching | 89.12% |
+| Real-terminal Unicode string highlighting | 88.89% |
 | Shared Vim escaped-quote text objects | 88.86% |
 | Shared Vim ASCII backward character search | 88.82% |
 | Shared Vim long-line paragraph operators | 88.15% |
@@ -207,9 +219,13 @@ navigation baselines were frozen after rebasing to `d92777c`.
 | Real-terminal bundled-plugin substitution | 60.34% |
 | Git workspace status directory indexing | 60.28% |
 | Real-terminal overlay and cursor composition | 60.00% |
+| Real-terminal CRLF string edit frames | 59.66% |
 | Real-terminal Unicode substitution | 59.09% |
+| Real-terminal CRLF line-comment edit frames | 58.74% |
 | Git repository discovery and branch refresh | 58.73% |
+| Real-terminal string edit frames | 58.42% |
 | Real-terminal Unicode macro playback | 58.36% |
+| Real-terminal line-comment edit frames | 58.19% |
 | Real-terminal YAML completion-aware edit frames | 58.12% |
 | Real-terminal Unicode and CRLF macro playback | 57.84% |
 | Real-terminal Markdown completion-aware edit frames | 56.44% |
@@ -547,6 +563,32 @@ keywords, uppercase-sensitive names, non-identifier Unicode, custom queries,
 and source or span cache-limit violations; Unicode edits, comments, YAML
 context, Markdown language injections, and fresh-parser parity remain covered.
 
+Seven alternating release-build samples per Rust token scenario applied 128
+non-identifier edits to bounded 96-line documents. Ordinary line-comment
+punctuation fell from 34,480 to 904 microseconds, Unicode comment edits from
+34,433 to 920, and CRLF comment edits from 34,244 to 955. String punctuation
+fell from 34,508 to 878 microseconds, Unicode string edits from 34,417 to 988,
+and CRLF string edits from 34,453 to 981. Existing captures and cached syntax
+trees are shifted only when the edit remains strictly inside an ordinary line
+comment or plain string-content node. Documentation prefixes, newline
+insertion, quote and escape characters, control bytes, raw or block comments,
+custom queries, token boundaries, and oversized caches retain the complete
+parser path. Fresh-parser parity covers punctuation, Unicode, CRLF, insertions,
+deletions, and all rejected syntax changes.
+
+Another seven alternating real-terminal sessions per source variant inserted
+32 alternating punctuation and Unicode characters inside Rust comments and
+strings. Ordinary comment highlighting fell from 189 to 18 microseconds,
+Unicode-source comments from 183 to 19, and CRLF comments from 180 to 17.
+Ordinary string highlighting fell from 183 to 19 microseconds, Unicode-source
+strings from 189 to 21, and CRLF strings from 187 to 18. Complete ordinary
+comment edit frames fell from 299 to 125 microseconds, CRLF comment frames
+from 286 to 118, ordinary string frames from 291 to 121, and CRLF string
+frames from 295 to 119. Unicode-source comment and string frames improved only
+46.48% and 47.22%, respectively; complete input events and action handling
+also remain below the target and are intentionally excluded from the verified
+results.
+
 Editor chrome independently fell from 85 to 16 microseconds, and bundled plugin
 startup fell from 35,873 to 17,263 microseconds. Complete interactive startup
 fell from 46,299 to 18,149 microseconds after the first visible language's
@@ -684,8 +726,8 @@ filesystem effects make its samples unstable.
 
 ## Remaining gaps
 
-- Single-file process startup, terminal diff and flush, broader non-identifier
-  syntax edits, recovery snapshot writes, in-repository Git subprocess status
+- Single-file process startup, terminal diff and flush, remaining non-identifier
+  and non-Rust syntax edits, recovery snapshot writes, in-repository Git subprocess status
   refresh, broader Vim editing, platform-specific paths, and several other
   areas above do not yet meet the 50% improvement target.
 - Real-repository Git status refresh improved 35.67%, from 418,087 to 268,941
@@ -697,6 +739,10 @@ filesystem effects make its samples unstable.
 - A SHA-256-verified recovery-generation cache was also rejected: although it
   preserved all corruption and no-follow safeguards, durable snapshot writes
   became 3.93% slower in the 24-buffer, 48-undo-node fixture.
+- An exact-byte verified recovery-generation cache preserved protected handles,
+  corruption detection, owner isolation, invalid-snapshot rejection, and crash
+  rotation but improved durable snapshot writes by only 11.76%; its added
+  memory and implementation complexity were therefore rejected.
 
 ## Reproducing measurements
 

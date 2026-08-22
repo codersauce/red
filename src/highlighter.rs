@@ -852,7 +852,7 @@ impl Highlighter {
             }
         }
 
-        if let Some(styles) = self.reuse_rust_identifier_highlight(language_id, code) {
+        if let Some(styles) = self.reuse_rust_token_highlight(language_id, code) {
             return Ok(styles);
         }
 
@@ -871,10 +871,10 @@ impl Highlighter {
         Ok(styles)
     }
 
-    /// Preserve bundled Rust captures when an edit stays inside one ordinary
-    /// identifier. Its leading byte and token boundaries cannot change, so the
-    /// grammar and bundled query keep the same nodes, captures, and predicates.
-    fn reuse_rust_identifier_highlight(
+    /// Preserve bundled Rust captures for edits confined to one stable token.
+    /// Identifiers, ordinary line comments, and plain string content each have
+    /// separate guards preventing boundary, grammar, or query changes.
+    fn reuse_rust_token_highlight(
         &mut self,
         language_id: &str,
         code: &str,
@@ -904,38 +904,57 @@ impl Highlighter {
         }
 
         let edit = crate::syntax_indent::replacement_edit(&cached.code, code);
-        let identifier = syntax
+        let token = syntax
             .tree
             .root_node()
             .named_descendant_for_byte_range(edit.start_byte, edit.old_end_byte)?;
-        if !matches!(
-            identifier.kind(),
-            "identifier" | "type_identifier" | "field_identifier"
-        ) || identifier.start_byte() >= edit.start_byte
-            || identifier.end_byte() <= edit.old_end_byte
-        {
-            return None;
-        }
-
-        let old_identifier = &cached.code[identifier.byte_range()];
-        if !old_identifier.starts_with(|character: char| character.is_ascii_lowercase())
-            || !old_identifier
-                .chars()
-                .all(|character| character == '_' || unicode_ident::is_xid_continue(character))
-            || !code[edit.start_byte..edit.new_end_byte]
-                .chars()
-                .all(|character| character == '_' || unicode_ident::is_xid_continue(character))
-        {
+        if token.start_byte() >= edit.start_byte || token.end_byte() <= edit.old_end_byte {
             return None;
         }
 
         let delta = isize::try_from(edit.new_end_byte)
             .ok()?
             .checked_sub(isize::try_from(edit.old_end_byte).ok()?)?;
-        let identifier_end = identifier.end_byte().checked_add_signed(delta)?;
-        let new_identifier = &code[identifier.start_byte()..identifier_end];
-        if rust_keyword(new_identifier) {
-            return None;
+        let inserted = &code[edit.start_byte..edit.new_end_byte];
+        match token.kind() {
+            "identifier" | "type_identifier" | "field_identifier" => {
+                let previous = &cached.code[token.byte_range()];
+                if !previous.starts_with(|character: char| character.is_ascii_lowercase())
+                    || !previous.chars().all(|character| {
+                        character == '_' || unicode_ident::is_xid_continue(character)
+                    })
+                    || !inserted.chars().all(|character| {
+                        character == '_' || unicode_ident::is_xid_continue(character)
+                    })
+                {
+                    return None;
+                }
+                let end = token.end_byte().checked_add_signed(delta)?;
+                if rust_keyword(&code[token.start_byte()..end]) {
+                    return None;
+                }
+            }
+            "line_comment" => {
+                let previous = &cached.code[token.byte_range()];
+                if !previous.starts_with("//")
+                    || previous.starts_with("///")
+                    || previous.starts_with("//!")
+                    || edit.start_byte <= token.start_byte().saturating_add(2)
+                    || inserted.contains(['\r', '\n'])
+                {
+                    return None;
+                }
+            }
+            "string_content" => {
+                if token.parent()?.kind() != "string_literal"
+                    || inserted
+                        .chars()
+                        .any(|character| character.is_control() || matches!(character, '"' | '\\'))
+                {
+                    return None;
+                }
+            }
+            _ => return None,
         }
 
         let mut styles = cached.styles.clone();
@@ -2089,6 +2108,105 @@ mod tests {
                     .root_node()
                     .has_changes(),
                 "interior identifier edits should reuse the edited syntax tree: {source}"
+            );
+        }
+    }
+
+    #[test]
+    fn rust_comment_and_string_edits_reuse_exact_fresh_parser_captures() {
+        for sources in [
+            vec![
+                "// retained comment text\nfn value() {}\n",
+                "// retained.! comment text\nfn value() {}\n",
+                "// retained.! λ界 comment text\nfn value() {}\n",
+                "// retained λ界 comment text\nfn value() {}\n",
+            ],
+            vec![
+                "// retained comment text\r\nfn value() {}\r\n",
+                "// retained.! comment text\r\nfn value() {}\r\n",
+            ],
+            vec![
+                "fn value() { let text = \"retained string text\"; }\n",
+                "fn value() { let text = \"retained.! string text\"; }\n",
+                "fn value() { let text = \"retained.! λ界 string text\"; }\n",
+                "fn value() { let text = \"retained λ界 string text\"; }\n",
+            ],
+            vec![
+                "fn value() { let text = \"retained string text\"; }\r\n",
+                "fn value() { let text = \"retained.! string text\"; }\r\n",
+            ],
+        ] {
+            let mut incremental = highlighter();
+            incremental.highlight("rust", sources[0]).unwrap();
+
+            for source in &sources[1..] {
+                let actual = incremental.highlight("rust", source).unwrap();
+                let expected = highlighter().highlight("rust", source).unwrap();
+                let shape = |styles: &[StyleInfo]| {
+                    styles
+                        .iter()
+                        .map(|style| (style.start, style.end, style.style.clone()))
+                        .collect::<Vec<_>>()
+                };
+                assert_eq!(shape(&actual), shape(&expected), "{source}");
+                assert!(
+                    incremental.highlighters["rust"]
+                        .cached_tree
+                        .as_ref()
+                        .unwrap()
+                        .tree
+                        .root_node()
+                        .has_changes(),
+                    "safe Rust token edit should retain its existing syntax tree: {source}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn rust_token_edits_reparse_documentation_boundaries_and_string_escapes() {
+        for (before, after) in [
+            (
+                "// retained comment\nfn value() {}\n",
+                "/// retained comment\nfn value() {}\n",
+            ),
+            (
+                "// retained comment\nfn value() {}\n",
+                "// retained\ncomment\nfn value() {}\n",
+            ),
+            (
+                "fn value() { let text = \"retained string\"; }\n",
+                "fn value() { let text = \"retained\\ string\"; }\n",
+            ),
+            (
+                "fn value() { let text = \"retained string\"; }\n",
+                "fn value() { let text = \"retained\" string\"; }\n",
+            ),
+            (
+                "/* retained comment */\nfn value() {}\n",
+                "/* retained.! comment */\nfn value() {}\n",
+            ),
+        ] {
+            let mut incremental = highlighter();
+            incremental.highlight("rust", before).unwrap();
+            let actual = incremental.highlight("rust", after).unwrap();
+            let expected = highlighter().highlight("rust", after).unwrap();
+            let shape = |styles: &[StyleInfo]| {
+                styles
+                    .iter()
+                    .map(|style| (style.start, style.end, style.style.clone()))
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(shape(&actual), shape(&expected), "{after}");
+            assert!(
+                !incremental.highlighters["rust"]
+                    .cached_tree
+                    .as_ref()
+                    .unwrap()
+                    .tree
+                    .root_node()
+                    .has_changes(),
+                "grammar-changing Rust token edit must reparse: {after}"
             );
         }
     }

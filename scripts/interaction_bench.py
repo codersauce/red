@@ -122,6 +122,10 @@ def run(args):
         time.sleep(0.4)
         os.write(master, b"100j")
         time.sleep(0.25)
+        if args.scenario == "typing" and args.typing_context != "source":
+            position = b"0f/12l" if args.typing_context == "comment" else b'0f"10l'
+            os.write(master, position)
+            time.sleep(0.1)
         with log.open("a", encoding="utf-8") as stream:
             stream.write("[BENCH] begin\n")
         bytes_before = drained[0]
@@ -131,7 +135,8 @@ def run(args):
         if args.scenario == "typing":
             os.write(master, b"i")
             for index in range(args.cycles):
-                os.write(master, b"a" if index % 2 == 0 else "\u03bb".encode())
+                punctuation = b"." if args.typing_context != "source" else b"a"
+                os.write(master, punctuation if index % 2 == 0 else "\u03bb".encode())
                 time.sleep(delay)
             os.write(master, b"\x1b")
         elif args.scenario == "search":
@@ -223,6 +228,12 @@ def main():
     parser.add_argument("--delay-ms", type=float, default=10)
     parser.add_argument("--picker-load-wait", type=float, default=1.5)
     parser.add_argument("--startup-timeout", type=float, default=12)
+    parser.add_argument(
+        "--typing-context",
+        choices=("source", "comment", "string"),
+        default="source",
+        help="place typing inside ordinary source, a line comment, or string contents",
+    )
     parser.add_argument("--config-override", action="append", default=[])
     args = parser.parse_args()
     if args.cycles is None:

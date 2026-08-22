@@ -64,6 +64,7 @@ const SENTENCE_MOTIONS: usize = 128;
 const UNDO_HISTORY_CAPACITY: usize = 128;
 const UNDO_TRANSACTIONS: usize = 512;
 const HIGHLIGHT_REQUESTS: usize = 2_000;
+const RUST_TOKEN_HIGHLIGHT_EDITS: usize = 128;
 const TREE_PANEL_ROWS: usize = 8_192;
 const TREE_PANEL_LOOKUPS: usize = 256;
 const WORKSPACE_ROWS: usize = 12_000;
@@ -323,6 +324,36 @@ fn main() -> Result<()> {
     }
     if scenario == "all" || scenario == "highlight" {
         results.push(benchmark_repeated_syntax_highlighting()?);
+    }
+    if scenario == "all" || scenario == "highlight-comment" {
+        results.push(benchmark_rust_token_highlighting(
+            /*comment*/ true, /*unicode*/ false, /*crlf*/ false,
+        )?);
+    }
+    if scenario == "all" || scenario == "highlight-comment-unicode" {
+        results.push(benchmark_rust_token_highlighting(
+            /*comment*/ true, /*unicode*/ true, /*crlf*/ false,
+        )?);
+    }
+    if scenario == "all" || scenario == "highlight-comment-crlf" {
+        results.push(benchmark_rust_token_highlighting(
+            /*comment*/ true, /*unicode*/ false, /*crlf*/ true,
+        )?);
+    }
+    if scenario == "all" || scenario == "highlight-string" {
+        results.push(benchmark_rust_token_highlighting(
+            /*comment*/ false, /*unicode*/ false, /*crlf*/ false,
+        )?);
+    }
+    if scenario == "all" || scenario == "highlight-string-unicode" {
+        results.push(benchmark_rust_token_highlighting(
+            /*comment*/ false, /*unicode*/ true, /*crlf*/ false,
+        )?);
+    }
+    if scenario == "all" || scenario == "highlight-string-crlf" {
+        results.push(benchmark_rust_token_highlighting(
+            /*comment*/ false, /*unicode*/ false, /*crlf*/ true,
+        )?);
     }
     if scenario == "all" || scenario == "tree-selection" {
         results.push(benchmark_tree_panel_selection()?);
@@ -1495,6 +1526,71 @@ fn benchmark_repeated_syntax_highlighting() -> Result<serde_json::Value> {
         started,
         HIGHLIGHT_REQUESTS,
     ))
+}
+
+fn benchmark_rust_token_highlighting(
+    comment: bool,
+    unicode: bool,
+    crlf: bool,
+) -> Result<serde_json::Value> {
+    let theme = parse_vscode_theme("themes/mocha.json")?;
+    let mut highlighter = Highlighter::new(&theme)?;
+    let newline = if crlf { "\r\n" } else { "\n" };
+    let mut source = (0..96)
+        .map(|index| {
+            format!(
+                "fn value_{index:03}() -> &'static str {{ \"retained string contents\" }} // retained comment contents{newline}"
+            )
+        })
+        .collect::<String>();
+    let marker = if comment {
+        "// retained comment"
+    } else {
+        "\"retained string"
+    };
+    let mut cursor = source.find(marker).expect("token benchmark marker")
+        + if comment {
+            "// retained".len()
+        } else {
+            "\"retained".len()
+        };
+    black_box(highlighter.highlight("rust", &source)?);
+
+    let started = Instant::now();
+    for index in 0..RUST_TOKEN_HIGHLIGHT_EDITS {
+        let inserted = if unicode {
+            if index % 2 == 0 {
+                "λ"
+            } else {
+                "界"
+            }
+        } else if index % 2 == 0 {
+            "."
+        } else {
+            "!"
+        };
+        source.insert_str(cursor, inserted);
+        cursor += inserted.len();
+        let spans = highlighter.highlight(black_box("rust"), black_box(&source))?;
+        anyhow::ensure!(
+            spans
+                .iter()
+                .any(|span| span.start < cursor && span.end >= cursor),
+            "Rust token edit lost its retained syntax capture"
+        );
+        black_box(spans);
+    }
+
+    let scenario = match (comment, unicode, crlf) {
+        (true, false, false) => "rust_line_comment_punctuation_highlighting",
+        (true, true, false) => "rust_line_comment_unicode_highlighting",
+        (true, false, true) => "rust_line_comment_crlf_highlighting",
+        (false, false, false) => "rust_string_punctuation_highlighting",
+        (false, true, false) => "rust_string_unicode_highlighting",
+        (false, false, true) => "rust_string_crlf_highlighting",
+        _ => unreachable!("benchmark selects one non-overlapping token variant"),
+    };
+    Ok(report(scenario, started, RUST_TOKEN_HIGHLIGHT_EDITS))
 }
 
 fn benchmark_tree_panel_selection() -> Result<serde_json::Value> {
