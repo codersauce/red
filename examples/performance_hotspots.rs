@@ -355,6 +355,23 @@ fn main() -> Result<()> {
             /*comment*/ false, /*unicode*/ false, /*crlf*/ true,
         )?);
     }
+    for (name, language, comment) in [
+        ("javascript-comment", "javascript", true),
+        ("javascript-string", "javascript", false),
+        ("jsx-comment", "jsx", true),
+        ("jsx-string", "jsx", false),
+        ("typescript-comment", "typescript", true),
+        ("typescript-string", "typescript", false),
+        ("tsx-comment", "tsx", true),
+        ("tsx-string", "tsx", false),
+        ("json-string", "json", false),
+    ] {
+        if scenario == "all" || scenario == name {
+            results.push(benchmark_cross_language_token_highlighting(
+                language, comment,
+            )?);
+        }
+    }
     if scenario == "all" || scenario == "tree-selection" {
         results.push(benchmark_tree_panel_selection()?);
     }
@@ -1589,6 +1606,78 @@ fn benchmark_rust_token_highlighting(
         (false, true, false) => "rust_string_unicode_highlighting",
         (false, false, true) => "rust_string_crlf_highlighting",
         _ => unreachable!("benchmark selects one non-overlapping token variant"),
+    };
+    Ok(report(scenario, started, RUST_TOKEN_HIGHLIGHT_EDITS))
+}
+
+fn benchmark_cross_language_token_highlighting(
+    language: &str,
+    comment: bool,
+) -> Result<serde_json::Value> {
+    let theme = parse_vscode_theme("themes/mocha.json")?;
+    let mut highlighter = Highlighter::new(&theme)?;
+    let mut source = if language == "json" {
+        format!(
+            "{{\n{}\n}}\n",
+            (0..96)
+                .map(|index| format!("  \"key_{index:03}\": \"retained string contents\""))
+                .collect::<Vec<_>>()
+                .join(",\n")
+        )
+    } else {
+        (0..96)
+            .map(|index| {
+                if matches!(language, "typescript" | "tsx") {
+                    format!(
+                        "function value_{index:03}(): string {{ return \"retained string contents\"; }} // retained comment contents\n"
+                    )
+                } else {
+                    format!(
+                        "function value_{index:03}() {{ return \"retained string contents\"; }} // retained comment contents\n"
+                    )
+                }
+            })
+            .collect::<String>()
+    };
+    let marker = if comment {
+        "// retained comment"
+    } else {
+        "\"retained string"
+    };
+    let mut cursor = source.find(marker).expect("cross-language token marker")
+        + if comment {
+            "// retained".len()
+        } else {
+            "\"retained".len()
+        };
+    black_box(highlighter.highlight(language, &source)?);
+
+    let started = Instant::now();
+    for index in 0..RUST_TOKEN_HIGHLIGHT_EDITS {
+        let inserted = if index % 2 == 0 { "." } else { "λ" };
+        source.insert_str(cursor, inserted);
+        cursor += inserted.len();
+        let spans = highlighter.highlight(black_box(language), black_box(&source))?;
+        anyhow::ensure!(
+            spans
+                .iter()
+                .any(|span| span.start < cursor && span.end >= cursor),
+            "{language} token edit lost its retained syntax capture"
+        );
+        black_box(spans);
+    }
+
+    let scenario = match (language, comment) {
+        ("javascript", true) => "javascript_line_comment_highlighting",
+        ("javascript", false) => "javascript_string_highlighting",
+        ("jsx", true) => "jsx_line_comment_highlighting",
+        ("jsx", false) => "jsx_string_highlighting",
+        ("typescript", true) => "typescript_line_comment_highlighting",
+        ("typescript", false) => "typescript_string_highlighting",
+        ("tsx", true) => "tsx_line_comment_highlighting",
+        ("tsx", false) => "tsx_string_highlighting",
+        ("json", false) => "json_string_highlighting",
+        _ => unreachable!("benchmark uses a bundled JavaScript-family or JSON token"),
     };
     Ok(report(scenario, started, RUST_TOKEN_HIGHLIGHT_EDITS))
 }

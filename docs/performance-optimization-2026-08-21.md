@@ -106,15 +106,25 @@ navigation baselines were frozen after rebasing to `d92777c`.
 | Rust CRLF line-comment highlighting | 97.21% |
 | Rust CRLF string highlighting | 97.15% |
 | Rust Unicode string highlighting | 97.13% |
+| JSON string punctuation and Unicode highlighting | 96.97% |
 | Embedded Home/End document navigation | 96.88% |
+| TypeScript line-comment punctuation and Unicode highlighting | 96.86% |
+| TSX line-comment punctuation and Unicode highlighting | 96.85% |
 | Editor cursor display-column positioning | 96.83% |
+| JSX line-comment punctuation and Unicode highlighting | 96.80% |
+| TypeScript string punctuation and Unicode highlighting | 96.77% |
+| TSX string punctuation and Unicode highlighting | 96.69% |
+| JSX string punctuation and Unicode highlighting | 96.64% |
 | Word-wrapped layout cursor lookup | 96.61% |
+| JavaScript line-comment punctuation and Unicode highlighting | 96.54% |
 | Git workspace row navigation | 96.35% |
 | Editor logical line-length lookup | 96.33% |
+| JavaScript string punctuation and Unicode highlighting | 96.28% |
 | Editor final-cell boundary lookup | 96.24% |
 | Real-terminal cursor-moved plugin delivery | 95.05% |
 | Real-terminal file-picker query resolution | 95.00% |
 | Shared ASCII grapheme counting | 94.94% |
+| Real-terminal JSON string highlighting | 94.74% |
 | ASCII LSP rename-symbol extraction | 94.70% |
 | LSP absolute-document routing | 94.68% |
 | Real-terminal redundant full-frame publication | 93.65% |
@@ -138,14 +148,22 @@ navigation baselines were frozen after rebasing to `d92777c`.
 | ASCII Unicode-scalar line boundaries | 89.78% |
 | Real-terminal Unicode line-comment highlighting | 89.62% |
 | Real-terminal string highlighting | 89.62% |
+| Real-terminal TSX line-comment highlighting | 89.38% |
 | Shared scalar-to-display-column conversion | 89.31% |
 | Unicode scalar line boundaries | 89.12% |
 | Sparse Unicode full-buffer regex searching | 89.12% |
 | Real-terminal Unicode string highlighting | 88.89% |
 | Shared Vim escaped-quote text objects | 88.86% |
 | Shared Vim ASCII backward character search | 88.82% |
+| Real-terminal JSX line-comment highlighting | 88.44% |
 | Shared Vim long-line paragraph operators | 88.15% |
+| Real-terminal TypeScript string highlighting | 88.05% |
+| Real-terminal TypeScript line-comment highlighting | 87.97% |
+| Real-terminal TSX string highlighting | 87.84% |
+| Real-terminal JSX string highlighting | 87.59% |
 | Shared modal editor backward word motion | 87.58% |
+| Real-terminal JavaScript string highlighting | 87.41% |
+| Real-terminal JavaScript line-comment highlighting | 87.14% |
 | Shared modal editor forward word motion | 87.01% |
 | Printable ASCII frame rendering | 85.25% |
 | Startup user-configuration loading | 84.04% |
@@ -212,6 +230,7 @@ navigation baselines were frozen after rebasing to `d92777c`.
 | Real-terminal incremental-LSP macro playback | 63.12% |
 | Shared Vim inner paragraph text objects | 63.01% |
 | Real-terminal Markdown text-insertion events | 62.37% |
+| Real-terminal JSON string edit frames | 61.51% |
 | Real-terminal Unicode and CRLF substitution | 61.37% |
 | Complete real-terminal interactive startup | 60.80% |
 | Real-terminal bundled-plugin macro playback | 60.71% |
@@ -240,14 +259,20 @@ navigation baselines were frozen after rebasing to `d92777c`.
 | Complete real-terminal file-picker frames | 55.42% |
 | Real-terminal incremental-LSP substitution | 54.67% |
 | Owned Husk JSON boundary conversion | 54.49% |
+| Real-terminal TSX line-comment edit frames | 54.14% |
 | Complete real-terminal YAML interactive startup | 54.08% |
 | Bundled theme startup loading | 53.81% |
 | Complete real-terminal file-picker input events | 53.41% |
 | Complete real-terminal incremental search frames | 53.11% |
 | Complete editor frame composition | 52.88% |
 | Real-terminal edit-invalidated Markdown highlighting | 52.65% |
+| Real-terminal TypeScript string edit frames | 52.65% |
+| Real-terminal TSX string edit frames | 52.65% |
 | Real-terminal bundled plugin startup | 51.88% |
 | Bundled plugin startup | 51.22% |
+| Real-terminal JSX line-comment edit frames | 50.79% |
+| Real-terminal TypeScript line-comment edit frames | 50.57% |
+| Real-terminal JavaScript string edit frames | 50.00% |
 
 Complete frame composition was measured across 160 production `Editor::render`
 calls at 160 columns by 48 rows. Eleven alternating release-build samples
@@ -588,6 +613,33 @@ comment edit frames fell from 299 to 125 microseconds, CRLF comment frames
 from 286 to 118, ordinary string frames from 291 to 121, and CRLF string
 frames from 295 to 119. At this stage, Unicode-source comment and string frames
 improved only 46.48% and 47.22%, respectively.
+
+Seven alternating release-build samples across 96-line JavaScript, JSX,
+TypeScript, TSX, and JSON fixtures applied 128 punctuation and Unicode edits
+per source token. JavaScript comment and string medians fell from 26,018 to
+899 and 25,751 to 957 microseconds; JSX medians fell from 26,942 to 861 and
+27,059 to 910; TypeScript medians fell from 30,373 to 954 and 30,918 to 1,000;
+TSX medians fell from 30,479 to 960 and 31,123 to 1,030; and JSON string
+medians fell from 11,204 to 339. Capture reuse requires the actual bundled
+grammar, its exact complete bundled highlight-query list, bounded source and
+style caches, and an edit strictly inside a JavaScript-family `//` comment,
+ordinary quoted string, or JSON key/value string. Block comments, template
+literals, quote or escape insertion, JavaScript Unicode line separators,
+custom grammars or queries, token boundaries, and oversized source retain the
+complete parser path. Fresh-parser parity covers punctuation, Unicode, CRLF,
+JSON keys and values, and all rejected syntax changes.
+
+Five further alternating real-terminal sessions per JavaScript-family comment
+or string and JSON string exercised 32 punctuation and Unicode edits through
+production editor releases. JavaScript highlighting fell from 140 to 18 and
+143 to 18 microseconds; JSX fell from 147 to 17 and 145 to 18; TypeScript fell
+from 158 to 19 and 159 to 19; TSX fell from 160 to 17 and 148 to 18; and JSON
+fell from 209 to 11. Complete JSON string edit frames fell from 317 to 122
+microseconds; TSX comment and string frames from 266 to 122 and 245 to 116;
+TypeScript comment and string frames from 263 to 130 and 264 to 125; JSX
+comment frames from 254 to 125; and JavaScript string frames from 248 to 124.
+Complete input events and action handling, JavaScript comment frames, and JSX
+string frames remain below the target and are excluded from verified results.
 
 Nine further alternating real-terminal sessions per Unicode-source token
 reduced complete comment edit frames from 354 to 151 microseconds and string

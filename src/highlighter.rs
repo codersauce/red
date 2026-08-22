@@ -852,7 +852,7 @@ impl Highlighter {
             }
         }
 
-        if let Some(styles) = self.reuse_rust_token_highlight(language_id, code) {
+        if let Some(styles) = self.reuse_stable_token_highlight(language_id, code) {
             return Ok(styles);
         }
 
@@ -871,21 +871,35 @@ impl Highlighter {
         Ok(styles)
     }
 
-    /// Preserve bundled Rust captures for edits confined to one stable token.
-    /// Identifiers, ordinary line comments, and plain string content each have
-    /// separate guards preventing boundary, grammar, or query changes.
-    fn reuse_rust_token_highlight(
+    /// Preserve exact bundled captures when an edit cannot change one token's
+    /// grammar, boundaries, or predicates. Each supported grammar and token
+    /// has its own restrictive validation before sharing the existing tree.
+    fn reuse_stable_token_highlight(
         &mut self,
         language_id: &str,
         code: &str,
     ) -> Option<Vec<StyleInfo>> {
-        if language_id != "rust" || code.len() > MAX_CACHED_HIGHLIGHT_BYTES {
+        if code.len() > MAX_CACHED_HIGHLIGHT_BYTES {
             return None;
         }
 
+        let expected_queries = match language_id {
+            "rust" => &[tree_sitter_rust::HIGHLIGHTS_QUERY][..],
+            "javascript" => JAVASCRIPT_HIGHLIGHT_QUERIES,
+            "jsx" => JSX_HIGHLIGHT_QUERIES,
+            "typescript" => TYPESCRIPT_HIGHLIGHT_QUERIES,
+            "tsx" => TSX_HIGHLIGHT_QUERIES,
+            "json" => &[tree_sitter_json::HIGHLIGHTS_QUERY][..],
+            _ => return None,
+        };
         let definition = self.registry.languages.get(language_id)?;
-        if definition.highlight_queries.len() != 1
-            || definition.highlight_queries[0] != tree_sitter_rust::HIGHLIGHTS_QUERY
+        if !matches!(definition.grammar.as_ref(), Some(GrammarSource::Bundled(_)))
+            || definition.highlight_queries.len() != expected_queries.len()
+            || !definition
+                .highlight_queries
+                .iter()
+                .zip(expected_queries)
+                .all(|(actual, expected)| actual == expected)
         {
             return None;
         }
@@ -918,6 +932,9 @@ impl Highlighter {
         let inserted = &code[edit.start_byte..edit.new_end_byte];
         match token.kind() {
             "identifier" | "type_identifier" | "field_identifier" => {
+                if language_id != "rust" {
+                    return None;
+                }
                 let previous = &cached.code[token.byte_range()];
                 if !previous.starts_with(|character: char| character.is_ascii_lowercase())
                     || !previous.chars().all(|character| {
@@ -935,6 +952,9 @@ impl Highlighter {
                 }
             }
             "line_comment" => {
+                if language_id != "rust" {
+                    return None;
+                }
                 let previous = &cached.code[token.byte_range()];
                 if !previous.starts_with("//")
                     || previous.starts_with("///")
@@ -945,11 +965,39 @@ impl Highlighter {
                     return None;
                 }
             }
+            "comment" => {
+                if !matches!(language_id, "javascript" | "jsx" | "typescript" | "tsx") {
+                    return None;
+                }
+                let previous = &cached.code[token.byte_range()];
+                if !previous.starts_with("//")
+                    || edit.start_byte <= token.start_byte().saturating_add(2)
+                    || inserted.contains(['\r', '\n', '\u{2028}', '\u{2029}'])
+                {
+                    return None;
+                }
+            }
             "string_content" => {
-                if token.parent()?.kind() != "string_literal"
+                let expected_parent = match language_id {
+                    "rust" => "string_literal",
+                    "json" => "string",
+                    _ => return None,
+                };
+                if token.parent()?.kind() != expected_parent
                     || inserted
                         .chars()
                         .any(|character| character.is_control() || matches!(character, '"' | '\\'))
+                {
+                    return None;
+                }
+            }
+            "string_fragment" => {
+                if !matches!(language_id, "javascript" | "jsx" | "typescript" | "tsx")
+                    || token.parent()?.kind() != "string"
+                    || inserted.chars().any(|character| {
+                        character.is_control()
+                            || matches!(character, '"' | '\'' | '\\' | '\u{2028}' | '\u{2029}')
+                    })
                 {
                     return None;
                 }
@@ -2209,6 +2257,173 @@ mod tests {
                 "grammar-changing Rust token edit must reparse: {after}"
             );
         }
+    }
+
+    #[test]
+    fn bundled_javascript_and_json_token_edits_match_fresh_parser_captures() {
+        for (language, sources) in [
+            (
+                "javascript",
+                vec![
+                    "// retained comment\nconst value = \"retained string\";\n",
+                    "// retained.! λ comment\nconst value = \"retained string\";\n",
+                    "// retained.! λ comment\nconst value = \"retained.! λ string\";\n",
+                ],
+            ),
+            (
+                "jsx",
+                vec![
+                    "// retained comment\nconst value = \"retained string\";\n",
+                    "// retained.! λ comment\nconst value = \"retained string\";\n",
+                    "// retained.! λ comment\nconst value = \"retained.! λ string\";\n",
+                ],
+            ),
+            (
+                "typescript",
+                vec![
+                    "// retained comment\r\nconst value: string = \"retained string\";\r\n",
+                    "// retained.! λ comment\r\nconst value: string = \"retained string\";\r\n",
+                    "// retained.! λ comment\r\nconst value: string = \"retained.! λ string\";\r\n",
+                ],
+            ),
+            (
+                "tsx",
+                vec![
+                    "// retained comment\nconst value: string = 'retained string';\n",
+                    "// retained.! λ comment\nconst value: string = 'retained string';\n",
+                    "// retained.! λ comment\nconst value: string = 'retained.! λ string';\n",
+                ],
+            ),
+            (
+                "json",
+                vec![
+                    "{\"retained key\": \"retained value\"}\n",
+                    "{\"retained.! λ key\": \"retained value\"}\n",
+                    "{\"retained.! λ key\": \"retained.! λ value\"}\n",
+                ],
+            ),
+        ] {
+            let mut incremental = highlighter();
+            incremental.highlight(language, sources[0]).unwrap();
+
+            for source in &sources[1..] {
+                let actual = incremental.highlight(language, source).unwrap();
+                let expected = highlighter().highlight(language, source).unwrap();
+                let shape = |styles: &[StyleInfo]| {
+                    styles
+                        .iter()
+                        .map(|style| (style.start, style.end, style.style.clone()))
+                        .collect::<Vec<_>>()
+                };
+                assert_eq!(shape(&actual), shape(&expected), "{language}: {source}");
+                assert!(
+                    incremental.highlighters[language]
+                        .cached_tree
+                        .as_ref()
+                        .unwrap()
+                        .tree
+                        .root_node()
+                        .has_changes(),
+                    "safe {language} token edit should reuse its existing syntax tree"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn javascript_and_json_syntax_changes_reparse_before_reusing_captures() {
+        for (language, before, after) in [
+            (
+                "javascript",
+                "// retained comment\nconst value = 1;\n",
+                "// retained\n comment\nconst value = 1;\n",
+            ),
+            (
+                "javascript",
+                "// retained comment\nconst value = 1;\n",
+                "// retained\u{2028} comment\nconst value = 1;\n",
+            ),
+            (
+                "javascript",
+                "/* retained comment */\nconst value = 1;\n",
+                "/* retained.! comment */\nconst value = 1;\n",
+            ),
+            (
+                "javascript",
+                "const value = \"retained string\";\n",
+                "const value = \"retained\\ string\";\n",
+            ),
+            (
+                "typescript",
+                "const value = `retained string`;\n",
+                "const value = `retained.! string`;\n",
+            ),
+            (
+                "json",
+                "{\"key\": \"retained value\"}\n",
+                "{\"key\": \"retained\\ value\"}\n",
+            ),
+        ] {
+            let mut incremental = highlighter();
+            incremental.highlight(language, before).unwrap();
+            let actual = incremental.highlight(language, after).unwrap();
+            let expected = highlighter().highlight(language, after).unwrap();
+            let shape = |styles: &[StyleInfo]| {
+                styles
+                    .iter()
+                    .map(|style| (style.start, style.end, style.style.clone()))
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(shape(&actual), shape(&expected), "{language}: {after}");
+            assert!(
+                !incremental.highlighters[language]
+                    .cached_tree
+                    .as_ref()
+                    .unwrap()
+                    .tree
+                    .root_node()
+                    .has_changes(),
+                "grammar-changing {language} token edit must reparse"
+            );
+        }
+    }
+
+    #[test]
+    fn customized_javascript_queries_reparse_interior_token_edits() {
+        let mut registry = LanguageRegistry::bundled();
+        registry
+            .languages
+            .get_mut("javascript")
+            .unwrap()
+            .highlight_queries
+            .push("((comment) @function (#match? @function \"λ\"))".to_string());
+        let registry = Arc::new(registry);
+        let theme = parse_vscode_theme("themes/mocha.json").unwrap();
+        let mut customized = Highlighter::with_registry(&theme, Arc::clone(&registry)).unwrap();
+        customized
+            .highlight("javascript", "// retained comment\n")
+            .unwrap();
+
+        let source = "// retained λ comment\n";
+        let actual = customized.highlight("javascript", source).unwrap();
+        let expected = Highlighter::with_registry(&theme, registry)
+            .unwrap()
+            .highlight("javascript", source)
+            .unwrap();
+        let shape = |styles: &[StyleInfo]| {
+            styles
+                .iter()
+                .map(|style| (style.start, style.end, style.style.clone()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(shape(&actual), shape(&expected));
+        assert!(!customized.highlighters["javascript"]
+            .cached_tree
+            .as_ref()
+            .unwrap()
+            .tree
+            .root_node()
+            .has_changes());
     }
 
     #[test]
