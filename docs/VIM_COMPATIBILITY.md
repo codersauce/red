@@ -1,6 +1,6 @@
 # Red Vim compatibility matrix
 
-**Matrix version:** 1.8
+**Matrix version:** 1.9
 **Validated against:** Red 0.5.0, August 2026
 **Status vocabulary:** **supported**, **intentional difference**, **not yet supported**
 
@@ -62,7 +62,7 @@ the corresponding integration tests.
 | Search syntax | **intentional difference** | Patterns use Rust `regex` syntax rather than Vim's regex dialect. |
 | Substitute ranges | **supported** | Current line, `%`, one-based numeric line/range, and `'<,'>` last-Visual range. Visual `:` prefills that range, so substitution applies to every line touched by character, line, or block selections. |
 | Substitute flags | **supported** | `g`, `i`, and explicit `c` confirmation with `y/n/a/q/l`. All accepted replacements from one command form one transaction. |
-| Substitute syntax | **intentional difference** | Patterns and capture expansion use Rust `regex`; delimiters may be escaped. Vim magic modes, expression replacement, and omitted trailing delimiters are not supported. |
+| Substitute syntax | **intentional difference** | Patterns and capture expansion use Rust `regex`; delimiters may be escaped. Replacement `\r` splits the line and preserves its LF or CRLF ending, and `\\` inserts one backslash. Captures use Rust forms such as `$0`, `$1`, and `$name`, rather than Vim's `&`, `\0`, and `\1`. Unlike Neovim, `\n` remains the two literal characters instead of inserting NUL. Vim magic modes, expression replacement, and omitted trailing delimiters are not supported. |
 | Undo/redo | **supported** | Linear, per-buffer transactions with dirty-state checkpoints. |
 | Undo tree | **supported** | Undo followed by a new edit creates a sibling branch. `g-`/`g+` select a sibling deterministically and redo traverses it; `:undotree` opens the small visual navigator. |
 | Jumplist | **supported** | Search, long/file motions, structural motions, and structural swaps record window-local jumps; splits copy their source window's list, positions follow edits, same-line entries are cleaned up, and `Ctrl-o` / `Ctrl-i` (`Tab`) traverse backward/forward without discarding the forward branch. |

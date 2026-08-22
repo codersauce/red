@@ -915,6 +915,39 @@ fn parse_substitute_segment(input: &str, delimiter: char) -> anyhow::Result<(Str
     anyhow::bail!("substitute is missing a closing {delimiter}")
 }
 
+fn decode_substitute_replacement(input: &str) -> String {
+    let mut decoded = String::with_capacity(input.len());
+    let mut characters = input.chars();
+    while let Some(character) = characters.next() {
+        if character != '\\' {
+            decoded.push(character);
+            continue;
+        }
+
+        match characters.next() {
+            Some('r') => decoded.push('\n'),
+            Some('\\') => decoded.push('\\'),
+            Some(character) => {
+                decoded.push('\\');
+                decoded.push(character);
+            }
+            None => decoded.push('\\'),
+        }
+    }
+    decoded
+}
+
+fn substitute_replacement_with_line_ending<'a>(
+    replacement: &'a str,
+    line_ending: &str,
+) -> Cow<'a, str> {
+    if line_ending == "\n" || !replacement.contains('\n') {
+        Cow::Borrowed(replacement)
+    } else {
+        Cow::Owned(replacement.replace('\n', line_ending))
+    }
+}
+
 #[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct EditorViewState {
@@ -15674,6 +15707,7 @@ impl Editor {
         let body = &body[delimiter.len_utf8()..];
         let (pattern, remainder) = parse_substitute_segment(body, delimiter)?;
         let (replacement, flags) = parse_substitute_segment(remainder, delimiter)?;
+        let replacement = decode_substitute_replacement(&replacement);
         anyhow::ensure!(!pattern.is_empty(), "substitute pattern cannot be empty");
         anyhow::ensure!(
             flags
@@ -16211,6 +16245,15 @@ impl Editor {
             .build()
             .map_err(|error| anyhow::anyhow!("invalid substitute pattern: {error}"))?;
         let mut substitutions = Vec::new();
+        let default_line_ending = if self
+            .current_buffer()
+            .get(0)
+            .is_some_and(|line| line.ends_with("\r\n"))
+        {
+            "\r\n"
+        } else {
+            "\n"
+        };
         let snapshot = self.current_buffer().contents_snapshot();
         let mut line_start = snapshot.line_to_char(command.start_line);
         for (offset, contents) in snapshot
@@ -16224,6 +16267,15 @@ impl Editor {
                 .as_str()
                 .map(Cow::Borrowed)
                 .unwrap_or_else(|| Cow::Owned(contents.to_string()));
+            let line_ending = if contents.ends_with("\r\n") {
+                "\r\n"
+            } else if contents.ends_with('\n') {
+                "\n"
+            } else {
+                default_line_ending
+            };
+            let replacement =
+                substitute_replacement_with_line_ending(&command.replacement, line_ending);
             let line = contents
                 .strip_suffix("\r\n")
                 .or_else(|| contents.strip_suffix('\n'))
@@ -16252,21 +16304,21 @@ impl Editor {
                 });
             };
 
-            if command.replacement.contains('$') {
+            if replacement.contains('$') {
                 for captures in regex.captures_iter(line) {
                     let matched = captures
                         .get(/*index*/ 0)
                         .expect("regex captures always include the full match");
-                    let mut replacement = String::new();
-                    captures.expand(&command.replacement, &mut replacement);
-                    append(matched, replacement);
+                    let mut replacement_text = String::new();
+                    captures.expand(&replacement, &mut replacement_text);
+                    append(matched, replacement_text);
                     if !command.replace_all {
                         break;
                     }
                 }
             } else {
                 for matched in regex.find_iter(line) {
-                    append(matched, command.replacement.clone());
+                    append(matched, replacement.to_string());
                     if !command.replace_all {
                         break;
                     }
