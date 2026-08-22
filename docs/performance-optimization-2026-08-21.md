@@ -90,6 +90,8 @@ navigation baselines were frozen after rebasing to `d92777c`.
 | Embedded Home/End document navigation | 96.88% |
 | Word-wrapped layout cursor lookup | 96.61% |
 | Git workspace row navigation | 96.35% |
+| Editor logical line-length lookup | 96.33% |
+| Editor final-cell boundary lookup | 96.24% |
 | Shared ASCII grapheme counting | 94.94% |
 | LSP absolute-document routing | 94.68% |
 | Editor scalar-to-grapheme cursor conversion | 92.82% |
@@ -272,6 +274,13 @@ ASCII source lines. Eleven alternating release-build samples reduced reverse
 cursor medians from 5,305 to 381 microseconds and next-word adjustment medians
 from 302,008 to 407 microseconds while preserving missing lines, cursor clamps,
 CRLF, tabs, combining marks, emoji, and unchanged Unicode grapheme behavior.
+
+Editor line-boundary primitives were independently measured across 2,048
+logical line-length and final-cell production lookups on 20 KiB ASCII source
+lines. Eleven alternating release-build samples reduced line-length medians from
+9,688 to 356 microseconds and final-cell medians from 9,611 to 361 microseconds
+while preserving viewport offsets, missing lines, LF/CRLF endings, empty rows,
+combining marks, emoji, CJK, and Unicode grapheme counts.
 
 Shared Vim paragraph objects were independently measured across 128 inner and
 128 around selections spanning 768-line paragraphs. Eleven alternating

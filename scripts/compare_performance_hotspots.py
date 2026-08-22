@@ -39,6 +39,8 @@ SCENARIOS = (
     "editor-word-end-forward",
     "editor-cursor-reverse",
     "editor-cursor-word-search",
+    "editor-line-length",
+    "editor-line-last-cell",
     "paragraph",
     "sentence",
     "undo-prune",

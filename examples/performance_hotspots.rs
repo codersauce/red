@@ -201,6 +201,12 @@ fn main() -> Result<()> {
             /*word_search*/ true,
         )?);
     }
+    if scenario == "all" || scenario == "editor-line-length" {
+        results.push(benchmark_editor_line_boundary(/*last_cell*/ false)?);
+    }
+    if scenario == "all" || scenario == "editor-line-last-cell" {
+        results.push(benchmark_editor_line_boundary(/*last_cell*/ true)?);
+    }
     if scenario == "all" || scenario == "paragraph" {
         results.push(benchmark_paragraph_motion());
     }
@@ -999,6 +1005,39 @@ fn benchmark_editor_cursor_conversion(word_search: bool) -> Result<serde_json::V
             "editor_next_word_search_cursor_conversion"
         } else {
             "editor_scalar_to_grapheme_cursor_conversion"
+        },
+        started,
+        TEXTAREA_VIM_MOTIONS,
+    ))
+}
+
+fn benchmark_editor_line_boundary(last_cell: bool) -> Result<serde_json::Value> {
+    let contents = "ordinary_identifier ".repeat(1_024);
+    let expected = contents.len() - usize::from(last_cell);
+    let mut config = Config::default();
+    config.lsp.enabled = false;
+    let editor = Editor::with_size(
+        Box::new(LspManager::new(config.lsp.clone())),
+        120,
+        40,
+        config,
+        Theme::default(),
+        vec![Buffer::new(None, contents)],
+    )?;
+    let started = Instant::now();
+    for _ in 0..TEXTAREA_VIM_MOTIONS {
+        let boundary = editor.benchmark_line_boundary(/*line*/ 0, last_cell);
+        anyhow::ensure!(
+            boundary == expected,
+            "editor line boundary changed its navigable width"
+        );
+        black_box(boundary);
+    }
+    Ok(report(
+        if last_cell {
+            "editor_ascii_final_cell_lookup"
+        } else {
+            "editor_ascii_logical_line_length"
         },
         started,
         TEXTAREA_VIM_MOTIONS,

@@ -6750,11 +6750,7 @@ impl Editor {
 
     /// Returns the display width of the current line
     fn line_length(&self) -> usize {
-        if let Some(line) = self.viewport_line(self.cy) {
-            let line = line.trim_end_matches('\n');
-            return grapheme_len(line);
-        }
-        0
+        self.length_for_line(self.buffer_line())
     }
 
     fn grapheme_to_char_on_line(&self, x: usize, y: usize) -> usize {
@@ -6830,7 +6826,19 @@ impl Editor {
     }
 
     fn length_for_line(&self, n: usize) -> usize {
-        if let Some(line) = self.current_buffer().get(n) {
+        let buffer = self.current_buffer();
+        if buffer.is_ascii() {
+            let contents = buffer.contents_snapshot();
+            return contents
+                .get_line(n)
+                .map(|line| {
+                    let length = line.len_chars();
+                    let newline = line.get_char(length.saturating_sub(1)) == Some('\n');
+                    length.saturating_sub(usize::from(newline))
+                })
+                .unwrap_or_default();
+        }
+        if let Some(line) = buffer.get(n) {
             let line = line.trim_end_matches('\n');
             return grapheme_len(line);
         }
@@ -29564,6 +29572,16 @@ impl Editor {
         }
     }
 
+    /// Reads the production logical line boundary used by editor cursor motions.
+    #[doc(hidden)]
+    pub fn benchmark_line_boundary(&self, line: usize, last_cell: bool) -> usize {
+        if last_cell {
+            self.last_cell_for_line(line)
+        } else {
+            self.length_for_line(line)
+        }
+    }
+
     #[doc(hidden)]
     pub fn test_cx(&self) -> usize {
         self.cx
@@ -36647,6 +36665,42 @@ builtin = "rust"
                         "search {contents:?} line={line} column={column}"
                     );
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn indexed_editor_line_boundaries_preserve_unicode_crlf_and_viewports() {
+        for contents in [
+            "ordinary ASCII words\nnext",
+            "ordinary\r\n\r\nfinal",
+            "\n",
+            "e\u{301}clair 👋 終\nnext",
+        ] {
+            let mut editor = test_editor(/*width*/ 80, /*height*/ 24);
+            editor
+                .buffer_manager
+                .replace_buffers(vec![Buffer::new(None, contents.to_string())]);
+            for line in [0, 1, 2, 9] {
+                let expected = editor
+                    .current_buffer()
+                    .get(line)
+                    .map(|text| grapheme_len(text.trim_end_matches('\n')))
+                    .unwrap_or_default();
+                assert_eq!(
+                    editor.benchmark_line_boundary(line, /*last_cell*/ false),
+                    expected,
+                    "length {contents:?} line={line}"
+                );
+                assert_eq!(
+                    editor.benchmark_line_boundary(line, /*last_cell*/ true),
+                    expected.saturating_sub(1),
+                    "last cell {contents:?} line={line}"
+                );
+            }
+            if editor.current_buffer().get(1).is_some() {
+                editor.test_set_viewport_cursor(/*vtop*/ 1, /*cx*/ 0, /*cy*/ 0);
+                assert_eq!(editor.line_length(), editor.length_for_line(1));
             }
         }
     }
