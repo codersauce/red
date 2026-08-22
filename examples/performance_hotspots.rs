@@ -100,6 +100,7 @@ const LAYOUT_CURSOR_LOOKUPS: usize = 2_048;
 const TEXTAREA_VIM_MOTIONS: usize = 2_048;
 const TEXTAREA_DELIMITER_MOTIONS: usize = 1_024;
 const TEXTAREA_DELETE_EVENTS: usize = 256;
+const TEXTAREA_UNDO_RESTORES: usize = 128;
 
 fn main() -> Result<()> {
     let scenario = std::env::args().nth(1).unwrap_or_else(|| "all".into());
@@ -278,6 +279,12 @@ fn main() -> Result<()> {
     }
     if scenario == "all" || scenario == "paragraph-long-line" {
         results.push(benchmark_long_line_paragraph_operator()?);
+    }
+    if scenario == "all" || scenario == "textarea-undo" {
+        results.push(benchmark_embedded_undo_restoration(/*redo*/ false)?);
+    }
+    if scenario == "all" || scenario == "textarea-redo" {
+        results.push(benchmark_embedded_undo_restoration(/*redo*/ true)?);
     }
 
     anyhow::ensure!(
@@ -1893,6 +1900,42 @@ fn benchmark_long_line_paragraph_operator() -> Result<serde_json::Value> {
         "shared_vim_long_line_paragraph_operators",
         started,
         TEXTAREA_VIM_MOTIONS,
+    ))
+}
+
+fn benchmark_embedded_undo_restoration(redo: bool) -> Result<serde_json::Value> {
+    let source = "ordinary editor recovery line and retained cursor contents\n".repeat(768);
+    let insertion = source.len() - 2;
+    let mut areas = Vec::with_capacity(TEXTAREA_UNDO_RESTORES);
+    for _ in 0..TEXTAREA_UNDO_RESTORES {
+        let mut area = TextArea::new(&source);
+        area.set_cursor(insertion);
+        anyhow::ensure!(area.insert("x"), "undo benchmark insertion failed");
+        if redo {
+            anyhow::ensure!(area.undo(), "redo benchmark preparation failed");
+        }
+        areas.push(area);
+    }
+
+    let started = Instant::now();
+    for area in &mut areas {
+        let restored = if redo { area.redo() } else { area.undo() };
+        anyhow::ensure!(restored, "embedded undo/redo restoration failed");
+        black_box(area.cursor());
+    }
+    let expected = insertion + usize::from(redo);
+    anyhow::ensure!(
+        areas.iter().all(|area| area.cursor() == expected),
+        "embedded undo/redo restoration lost its original cursor"
+    );
+    Ok(report(
+        if redo {
+            "embedded_redo_multiline_cursor_restoration"
+        } else {
+            "embedded_undo_multiline_cursor_restoration"
+        },
+        started,
+        TEXTAREA_UNDO_RESTORES,
     ))
 }
 

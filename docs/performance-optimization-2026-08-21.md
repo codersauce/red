@@ -82,6 +82,7 @@ navigation baselines were frozen after rebasing to `d92777c`.
 | Shared ASCII grapheme counting | 94.94% |
 | LSP absolute-document routing | 94.68% |
 | Workspace inline file discovery | 92.65% |
+| Embedded redo cursor restoration | 91.33% |
 | Embedded text-area document loading | 91.26% |
 | Embedded Vim nested delimiter matching | 90.03% |
 | Shared Vim long-line paragraph operators | 88.15% |
@@ -89,6 +90,7 @@ navigation baselines were frozen after rebasing to `d92777c`.
 | Shared modal editor forward word motion | 87.01% |
 | Printable ASCII frame rendering | 85.25% |
 | Startup user-configuration loading | 84.04% |
+| Embedded undo cursor restoration | 84.17% |
 | Long-line Vim word-end motion | 84.79% |
 | Idle plugin timer polling | 84.29% |
 | Default editor status-line rendering | 83.45% |
@@ -179,6 +181,13 @@ alternating release-build samples reduced line-end motions from 5,989 to 1,639
 microseconds and paragraph operators from 16,873 to 1,999 microseconds while
 preserving Unicode scalar counts, CRLF, tabs, empty lines, first-nonblank
 columns, and linewise versus characterwise selections.
+
+Embedded undo and redo were independently measured across 128 production
+restorations near the end of 768-line drafts. Eleven alternating release-build
+samples reduced undo medians from 2,628 to 416 microseconds and redo medians from
+2,513 to 218 microseconds while preserving empty and trailing lines, invalid
+snapshot coordinates, tabs, combining marks, emoji, Unicode cursor positions,
+and exact undo/redo history restoration.
 
 Multi-file startup uses the same production loader as the executable. Across
 four startup passes over 128 distinct source files, seven alternating samples

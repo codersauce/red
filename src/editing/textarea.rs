@@ -2019,11 +2019,23 @@ impl TextArea {
     }
 
     fn restore_cursor(&mut self, snapshot: CursorSnapshot) {
-        let prefix = self.buffer.line_range_contents(0, snapshot.y);
-        let line = self.buffer.get(snapshot.y).unwrap_or_default();
-        self.state.cursor = grapheme_len(&prefix)
-            .saturating_add(snapshot.x.min(grapheme_len(&line)))
-            .min(self.document_grapheme_len());
+        self.state.cursor = if self.buffer.is_ascii() {
+            let start = self
+                .buffer
+                .position_to_char_idx(TextPosition::new(snapshot.y, 0));
+            let end = self
+                .buffer
+                .position_to_char_idx(TextPosition::new(snapshot.y.saturating_add(1), 0));
+            start
+                .saturating_add(snapshot.x.min(end.saturating_sub(start)))
+                .min(self.buffer.char_len())
+        } else {
+            let prefix = self.buffer.line_range_contents(0, snapshot.y);
+            let line = self.buffer.get(snapshot.y).unwrap_or_default();
+            grapheme_len(&prefix)
+                .saturating_add(snapshot.x.min(grapheme_len(&line)))
+                .min(self.document_grapheme_len())
+        };
         self.state.preferred_column = None;
         self.sync_buffer_cursor();
     }
@@ -2187,6 +2199,36 @@ mod tests {
             }
             area.set_cursor(usize::MAX);
             assert_eq!(area.cursor(), expected);
+        }
+    }
+
+    #[test]
+    fn indexed_cursor_restoration_matches_unicode_reference_for_every_snapshot() {
+        for original in [
+            "",
+            "alpha",
+            "alpha\nbravo\ncharlie",
+            "alpha\n\nbravo\n",
+            "\tleading words\t\nnext",
+            "e\u{301} 👨‍👩‍👧\n漢字 🇧🇷",
+            "\u{301}leading\ntrailing\u{200d}",
+        ] {
+            let mut area = TextArea::new(original);
+            for line_index in 0..=area.buffer.len() + 2 {
+                for column in [0, 1, 2, 8, 128, usize::MAX] {
+                    let prefix = area.buffer.line_range_contents(0, line_index);
+                    let line = area.buffer.get(line_index).unwrap_or_default();
+                    let expected = crate::unicode_utils::grapheme_len(&prefix)
+                        .saturating_add(column.min(crate::unicode_utils::grapheme_len(&line)))
+                        .min(crate::unicode_utils::grapheme_len(original));
+                    area.restore_cursor(crate::undo::CursorSnapshot::new(column, line_index, 0));
+                    assert_eq!(
+                        area.cursor(),
+                        expected,
+                        "{original:?} at line {line_index}, column {column}"
+                    );
+                }
+            }
         }
     }
 
