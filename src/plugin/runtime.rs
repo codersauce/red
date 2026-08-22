@@ -11835,6 +11835,76 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn indent_guides_skip_same_line_edits_without_indentation_changes() {
+        drain_requests();
+
+        let mut layout = sample_indent_layout();
+        layout["indentation_key"] = serde_json::json!("0:0:0;1:4:0;2:8:0;3:4:0;4:0:0;");
+        let mut runtime = Runtime::new();
+        runtime.set_snapshot(
+            "editor_info",
+            sample_indent_editor_info(
+                Color::Rgb {
+                    r: 40,
+                    g: 41,
+                    b: 42,
+                },
+                Color::Rgb {
+                    r: 80,
+                    g: 81,
+                    b: 82,
+                },
+            ),
+        );
+        runtime.set_snapshot("viewport_layout", layout.clone());
+        runtime
+            .load_plugin(
+                "indent_guides",
+                include_str!("../../plugins/indent_guides.hk"),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.try_recv_request(),
+            Some(PluginRequest::SetDecorations { .. })
+        ));
+
+        layout["revision"] = serde_json::json!(2);
+        layout["cursor"]["x"] = serde_json::json!(9);
+        layout["rows"][2]["text"] = serde_json::json!("        updated();");
+        runtime.set_snapshot("viewport_layout", layout.clone());
+        runtime
+            .notify("cursor:moved", serde_json::json!({}))
+            .await
+            .unwrap();
+        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
+
+        layout["revision"] = serde_json::json!(3);
+        layout["rows"][2]["text"] = serde_json::json!("            updated();");
+        layout["indentation_key"] = serde_json::json!("0:0:0;1:4:0;2:12:0;3:4:0;4:0:0;");
+        runtime.set_snapshot("viewport_layout", layout.clone());
+        runtime
+            .notify("buffer:changed", serde_json::json!({}))
+            .await
+            .unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.try_recv_request(),
+            Some(PluginRequest::SetDecorations { .. })
+        ));
+
+        layout["cursor"]["y"] = serde_json::json!(3);
+        runtime.set_snapshot("viewport_layout", layout);
+        runtime
+            .notify("cursor:moved", serde_json::json!({}))
+            .await
+            .unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.try_recv_request(),
+            Some(PluginRequest::SetDecorations { .. })
+        ));
+    }
+
+    #[tokio::test]
     async fn indent_guides_renders_decorations_from_viewport_layout_response() {
         drain_requests();
 

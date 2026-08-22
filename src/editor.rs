@@ -60,6 +60,7 @@ use std::{
     cmp::Ordering,
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
     ffi::OsStr,
+    fmt::Write as _,
     fs,
     io::Write as _,
     num::NonZeroUsize,
@@ -303,6 +304,12 @@ fn diagnostic_foreground(theme: &Theme, severity: Option<&DiagnosticSeverity>) -
         .or_else(|| theme.error_style.as_ref().and_then(|style| style.fg)),
     }
     .or(theme.style.fg)
+}
+
+#[inline(never)]
+fn append_viewport_indentation_key(key: &mut String, line: usize, width: usize, text: &str) {
+    write!(key, "{line}:{width}:{};", u8::from(text.trim().is_empty()))
+        .expect("writing an indentation key into a string cannot fail");
 }
 
 #[cfg(not(test))]
@@ -6559,6 +6566,7 @@ impl Editor {
         let content_start = gutter_width + 1;
         let content_width = self.window_content_width(&window);
         let indentation = self.indentation();
+        let mut indentation_key = String::with_capacity(layout.rows.len() * 8);
         let rows = layout
             .rows
             .iter()
@@ -6575,6 +6583,14 @@ impl Editor {
                 let text = text.trim_end_matches(['\r', '\n']);
                 let indent_width =
                     leading_whitespace_display_width(text, indentation.tab_width.max(1));
+                if segment.first_segment {
+                    append_viewport_indentation_key(
+                        &mut indentation_key,
+                        segment.line,
+                        indent_width,
+                        text,
+                    );
+                }
                 json!({
                     "screen_row": segment.row,
                     "line": segment.line,
@@ -6612,6 +6628,7 @@ impl Editor {
                 "shift_width": indentation.shift_width,
                 "tab_width": indentation.tab_width,
             },
+            "indentation_key": indentation_key,
             "line_count": buffer.navigable_line_count(),
             "revision": buffer.revision(),
             "file": buffer.file,
@@ -22647,7 +22664,19 @@ impl Editor {
         self.cy = y.saturating_sub(self.vtop);
     }
 
-    async fn execute_block_action(
+    // Visual-block completion can recursively dispatch actions while replaying
+    // prior edits. Keep its large future off the ordinary 2 MiB input stack.
+    #[inline(never)]
+    fn execute_block_action<'a>(
+        &'a mut self,
+        buffer: &'a mut RenderBuffer,
+        runtime: &'a mut Runtime,
+        mode: Mode,
+    ) -> BoxFuture<'a, anyhow::Result<()>> {
+        Box::pin(self.execute_block_action_impl(buffer, runtime, mode))
+    }
+
+    async fn execute_block_action_impl(
         &mut self,
         buffer: &mut RenderBuffer,
         runtime: &mut Runtime,
@@ -35620,6 +35649,37 @@ builtin = "rust"
             .iter()
             .skip(1)
             .all(|row| row["text"].as_str() == Some("")));
+    }
+
+    #[test]
+    fn plugin_viewport_indentation_key_ignores_text_but_tracks_guide_geometry() {
+        let config = Config::default();
+        let lsp = Box::new(crate::lsp::LspManager::new(config.lsp.clone()));
+        let buffer = Buffer::new(None, "root\n    value\n    \n    next\n".to_string());
+        let mut editor =
+            Editor::with_size(lsp, 80, 12, config, Theme::default(), vec![buffer]).unwrap();
+        let original = editor.plugin_viewport_layout_payload();
+        let original_key = original["indentation_key"].as_str().unwrap().to_string();
+
+        editor.current_buffer_mut().insert_str(9, 1, "x");
+        let content_change = editor.plugin_viewport_layout_payload();
+        assert_ne!(content_change["revision"], original["revision"]);
+        assert_eq!(
+            content_change["indentation_key"],
+            original["indentation_key"]
+        );
+
+        editor.current_buffer_mut().insert_str(0, 1, " ");
+        let indentation_change = editor.plugin_viewport_layout_payload();
+        let indentation_key = indentation_change["indentation_key"].as_str().unwrap();
+        assert_ne!(indentation_key, original_key);
+
+        editor.current_buffer_mut().insert_str(4, 2, "x");
+        let blank_change = editor.plugin_viewport_layout_payload();
+        assert_ne!(
+            blank_change["indentation_key"],
+            indentation_change["indentation_key"]
+        );
     }
 
     #[test]

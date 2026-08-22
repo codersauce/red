@@ -97,6 +97,7 @@ navigation baselines were frozen after rebasing to `d92777c`.
 | Git workspace row navigation | 96.35% |
 | Editor logical line-length lookup | 96.33% |
 | Editor final-cell boundary lookup | 96.24% |
+| Real-terminal cursor-moved plugin delivery | 95.05% |
 | Shared ASCII grapheme counting | 94.94% |
 | ASCII LSP rename-symbol extraction | 94.70% |
 | LSP absolute-document routing | 94.68% |
@@ -131,7 +132,7 @@ navigation baselines were frozen after rebasing to `d92777c`.
 | Workspace inline content search | 82.60% |
 | Unicode LSP rename-symbol extraction | 82.49% |
 | Editor forward word-end boundary operators | 81.94% |
-| Real-terminal editor chrome rendering | 81.91% |
+| Real-terminal editor chrome rendering | 81.18% |
 | Long-line Vim backward word motion | 80.33% |
 | Theme hexadecimal color parsing | 79.71% |
 | Detached incremental frame serialization | 79.06% |
@@ -160,12 +161,14 @@ navigation baselines were frozen after rebasing to `d92777c`.
 | Shared Vim inner paragraph text objects | 63.01% |
 | Git workspace status directory indexing | 60.28% |
 | Git repository discovery and branch refresh | 58.73% |
+| Real-terminal typing action handling | 57.59% |
+| Real-terminal text-insertion events | 56.64% |
 | Plugin cursor-event delivery | 56.35% |
 | In-buffer search navigation | 55.98% |
 | Owned Husk JSON boundary conversion | 54.49% |
 | Bundled theme startup loading | 53.81% |
 | Complete editor frame composition | 52.88% |
-| Real-terminal bundled plugin startup | 53.28% |
+| Real-terminal bundled plugin startup | 51.88% |
 | Bundled plugin startup | 51.22% |
 
 Complete frame composition was measured across 160 production `Editor::render`
@@ -459,23 +462,25 @@ Eleven alternating real-terminal typing runs exercised 60 verified ASCII and
 Unicode text insertions at four-millisecond spacing through the production
 executable on a 50-row, 120-column PTY. The harness disables first-run release
 notes and requires one observed insertion per requested key so modal dialogs
-cannot silently intercept the workload. Median editor chrome fell from 94 to 17
-microseconds, and bundled plugin startup fell from 35,896 to 16,769
-microseconds. User-visible typing events improved only 12.10%, from 1,562 to
-1,373 microseconds. Cursor-moved plugin callbacks consumed 739 microseconds per
-optimized key, and syntax-highlight cache misses consumed another 233
-microseconds. Complete frames improved 29.43%, window painting 17.19%, full
-interactive startup 42.05%, terminal diff and flush 23.81%, and
-process-to-first-paint 6.60%; those end-to-end paths remain open.
+cannot silently intercept the workload. Median user-visible typing events fell
+from 1,589 to 689 microseconds, and complete action handling fell from 1,561 to
+662 microseconds. Cursor-moved plugin delivery fell from 727 to 36 microseconds
+because indentation guides reuse an exact visible-geometry signature across
+ordinary same-line text edits and horizontal motion. Editor chrome fell from 85
+to 16 microseconds, and bundled plugin startup fell from 35,873 to 17,263
+microseconds. Syntax-highlight cache misses still consumed 290 microseconds per
+optimized key. Complete frames improved only 27.26%, window painting 17.35%,
+full interactive startup 41.06%, and terminal diff and flush 26.83%; those
+end-to-end paths remain open. Process-to-first-paint also remains unresolved
+because executable warm-up and filesystem effects make its samples unstable.
 
 ## Remaining gaps
 
-- Single-file process startup, real-terminal end-to-end typing, full interactive
-  startup, complete real-terminal frames, window painting, cursor-moved plugin
-  delivery, edit-invalidated syntax highlighting, overlay/cursor composition,
-  terminal diff and flush, recovery snapshot writes, in-repository Git subprocess
-  status refresh, broader Vim editing, platform-specific paths, and several other
-  areas above do not yet meet the 50% improvement target.
+- Single-file process startup, full interactive startup, complete real-terminal
+  frames, window painting, edit-invalidated syntax highlighting, overlay/cursor
+  composition, terminal diff and flush, recovery snapshot writes, in-repository
+  Git subprocess status refresh, broader Vim editing, platform-specific paths,
+  and several other areas above do not yet meet the 50% improvement target.
 - Real-repository Git status refresh improved 35.67%, from 418,087 to 268,941
   microseconds across 32 requests, but the remaining `git status` subprocess
   still keeps this path below the target.
