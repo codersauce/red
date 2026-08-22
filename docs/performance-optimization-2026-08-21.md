@@ -131,6 +131,7 @@ navigation baselines were frozen after rebasing to `d92777c`.
 | Workspace inline content search | 82.60% |
 | Unicode LSP rename-symbol extraction | 82.49% |
 | Editor forward word-end boundary operators | 81.94% |
+| Real-terminal editor chrome rendering | 80.49% |
 | Long-line Vim backward word motion | 80.33% |
 | Theme hexadecimal color parsing | 79.71% |
 | Detached incremental frame serialization | 79.06% |
@@ -152,6 +153,7 @@ navigation baselines were frozen after rebasing to `d92777c`.
 | ASCII automatic indentation columns | 71.81% |
 | Unicode automatic indentation columns | 71.42% |
 | LSP completion filtering | 67.58% |
+| Real-terminal editor window painting | 66.97% |
 | Vim first-nonblank line-start operators | 64.81% |
 | Structured picker ranking | 64.81% |
 | Shared Vim around paragraph text objects | 63.73% |
@@ -164,7 +166,9 @@ navigation baselines were frozen after rebasing to `d92777c`.
 | Owned Husk JSON boundary conversion | 54.49% |
 | Bundled theme startup loading | 53.81% |
 | Complete editor frame composition | 52.88% |
+| Real-terminal bundled plugin startup | 52.74% |
 | Bundled plugin startup | 51.22% |
+| Real-terminal complete frame rendering | 50.34% |
 
 Complete frame composition was measured across 160 production `Editor::render`
 calls at 160 columns by 48 rows. Eleven alternating release-build samples
@@ -453,16 +457,20 @@ from 315 to 263 microseconds. The editor captures its fixed working directory
 once, avoids resolving absolute paths against the current directory, and skips
 diagnostic URI conversion when no diagnostics exist.
 
-Five alternating real typing runs showed 6.04% faster median input events,
-7.44% faster median full-frame rendering, 9.27% faster process-to-first-paint
-time, 35.07% faster interactive startup, and 45.09% faster bundled plugin
-startup. Full-frame p95 was 1.63% slower in that noisy sample. These end-to-end
-paths remain useful regression checks, but do not meet the 50% per-area
-objective.
+Eleven alternating real-terminal typing runs exercised 60 ASCII and Unicode
+keypresses at four-millisecond spacing through the production executable on a
+50-row, 120-column PTY. Median editor chrome fell from 82 to 16 microseconds,
+window painting from 109 to 36 microseconds, bundled plugin startup from 35,871
+to 16,952 microseconds, and complete frame rendering from 292 to 145
+microseconds. User-visible input events improved 46.77%, from 325 to 173
+microseconds, but still missed the 50% target. Full interactive startup improved
+41.14%, terminal diff and flush improved 29.41%, process-to-first-paint improved
+6.57%, and overlay/cursor composition did not improve; those paths remain open.
 
 ## Remaining gaps
 
-- Single-file process startup, real-terminal end-to-end typing, recovery
+- Single-file process startup, real-terminal end-to-end typing, full interactive
+  startup, overlay/cursor composition, terminal diff and flush, recovery
   snapshot writes, in-repository Git subprocess status refresh, broader Vim
   editing, platform-specific paths, and several other areas above do not yet
   meet the 50% improvement target.
