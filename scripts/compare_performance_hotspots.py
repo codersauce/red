@@ -45,6 +45,7 @@ SCENARIOS = (
     "workspace-search",
     "plugin-events",
     "session-write",
+    "frame-full",
     "husk-completion",
     "husk-config",
     "husk-update",

@@ -3039,6 +3039,19 @@ impl<'a> StyleCursor<'a> {
             })
             .map(|index| &self.spans[index].style)
     }
+
+    fn next_change(&self) -> Option<usize> {
+        self.spans
+            .get(self.next)
+            .map(|span| span.start)
+            .into_iter()
+            .chain(self.active.iter().map(|index| self.spans[*index].end))
+            .min()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.spans.is_empty()
+    }
 }
 
 fn style_info_to_highlight_spans(style_info: Vec<StyleInfo>) -> Vec<HighlightSpan> {

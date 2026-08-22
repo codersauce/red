@@ -90,7 +90,14 @@ navigation baselines were frozen after rebasing to `d92777c`.
 | Plugin cursor-event delivery | 56.35% |
 | In-buffer search navigation | 55.98% |
 | Owned Husk JSON boundary conversion | 54.49% |
+| Complete editor frame composition | 52.88% |
 | Bundled plugin startup | 51.22% |
+
+Complete frame composition was measured across 160 production `Editor::render`
+calls at 160 columns by 48 rows. Eleven alternating release-build samples
+reduced the median from 28,808 to 13,575 microseconds while retaining window
+layout, gutters, source painting, syntax-style boundaries, chrome, overlays,
+cursor composition, exact Unicode-aware frame differencing, and final flush.
 
 Real detached-terminal coverage separately exercised editing, 32 KiB of Unicode
 paste, repeated resizes, reattachment, and owner shutdown. Detached-frame median
@@ -125,7 +132,7 @@ objective.
 
 ## Remaining gaps
 
-- Broad process startup, full-frame typing, recovery snapshot writes,
+- Broad process startup, real-terminal end-to-end typing, recovery snapshot writes,
   repository discovery and status refresh, broader Vim editing, platform-specific paths,
   and several other areas above still require dedicated before/after fixtures
   before claiming a 50% improvement.

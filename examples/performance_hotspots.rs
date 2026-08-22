@@ -78,6 +78,7 @@ const PLUGIN_EVENT_DELIVERIES: usize = 4_096;
 const SNAPSHOT_WRITE_BUFFERS: usize = 24;
 const SNAPSHOT_WRITE_UNDO_NODES: usize = 48;
 const SNAPSHOT_WRITES: usize = 6;
+const FULL_FRAME_RENDERS: usize = 160;
 
 fn main() -> Result<()> {
     let scenario = std::env::args().nth(1).unwrap_or_else(|| "all".into());
@@ -187,6 +188,9 @@ fn main() -> Result<()> {
     }
     if scenario == "all" || scenario == "session-write" {
         results.push(benchmark_session_snapshot_writes()?);
+    }
+    if scenario == "all" || scenario == "frame-full" {
+        results.push(benchmark_full_editor_frames()?);
     }
 
     anyhow::ensure!(
@@ -1211,6 +1215,45 @@ fn benchmark_session_snapshot_writes() -> Result<serde_json::Value> {
         "crash_recovery_snapshot_writes",
         started,
         SNAPSHOT_WRITES,
+    ))
+}
+
+fn benchmark_full_editor_frames() -> Result<serde_json::Value> {
+    let contents = (0..128)
+        .map(|line| {
+            format!(
+                "fn editor_frame_line_{line:03}(value: usize) -> usize {{ value.saturating_add({line}) }} // complete frame composition"
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut config = Config::default();
+    config.lsp.enabled = false;
+    config.splash = Some(false);
+    let mut editor = Editor::with_size(
+        Box::new(LspManager::new(config.lsp.clone())),
+        160,
+        48,
+        config,
+        Theme::default(),
+        vec![Buffer::new(None, contents)],
+    )?;
+    editor.test_disable_terminal_output();
+    let mut buffer = RenderBuffer::new(160, 48, &Style::default());
+    editor.render(&mut buffer)?;
+
+    let started = Instant::now();
+    for _ in 0..FULL_FRAME_RENDERS {
+        editor.render(black_box(&mut buffer))?;
+    }
+    anyhow::ensure!(
+        buffer.cells.iter().any(|cell| cell.text == "f"),
+        "full-frame benchmark did not preserve source cells"
+    );
+    Ok(report(
+        "complete_editor_frame_composition",
+        started,
+        FULL_FRAME_RENDERS,
     ))
 }
 

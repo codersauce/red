@@ -47,7 +47,7 @@ use crate::{
 
 use super::{
     adjust_color_brightness, diagnostic_foreground, diagnostic_priority,
-    display_layout::{DisplayLayout, InlineCommentContent},
+    display_layout::{DisplayLayout, InlineCommentContent, LineSegment},
     inline_comments::InlineCommentConnector,
     render_buffer::Change,
     Editor, Mode, Point, Rect, RenderBuffer, StatuslineGitChanges, StyleCursor,
@@ -1189,6 +1189,101 @@ pub(super) fn resolve_cell_colors(cell_style: &Style, theme_style: &Style) -> (C
     (fg, bg)
 }
 
+#[derive(Clone, Copy)]
+struct SourceSegmentGeometry {
+    x: usize,
+    y: usize,
+    width: usize,
+    tab_width: usize,
+}
+
+fn render_source_segment(
+    buffer: &mut RenderBuffer,
+    segment: &LineSegment,
+    line: &str,
+    geometry: SourceSegmentGeometry,
+    styles: &mut StyleCursor<'_>,
+    theme_style: &Style,
+    theme: &Theme,
+) {
+    let clear = |start: usize, width: usize, buffer: &mut RenderBuffer| {
+        if matches!(theme_style.bg, Some(Color::Rgba { .. })) {
+            buffer.fill_rect(start, geometry.y, width, 1, ' ', theme_style, theme);
+        } else {
+            buffer.fill_ascii_spaces(start, geometry.y, width, theme_style);
+        }
+    };
+    let text = &line[segment.start_byte..segment.end_byte];
+    if text.bytes().all(|byte| (b' '..=b'~').contains(&byte)) {
+        let skipped = segment
+            .start_col
+            .saturating_sub(segment.start_grapheme_col)
+            .min(text.len());
+        let first_column = segment.start_grapheme_col + skipped;
+        let local_x = segment.visual_offset + first_column.saturating_sub(segment.start_col);
+        let visible = &text[skipped
+            ..text
+                .len()
+                .min(skipped.saturating_add(geometry.width.saturating_sub(local_x)))];
+        if local_x > 0 {
+            clear(geometry.x, local_x.min(geometry.width), buffer);
+        }
+        let filled = local_x.saturating_add(visible.len()).min(geometry.width);
+        if filled < geometry.width {
+            clear(geometry.x + filled, geometry.width - filled, buffer);
+        }
+        if styles.is_empty() {
+            buffer.set_printable_ascii(geometry.x + local_x, geometry.y, visible, theme_style);
+            return;
+        }
+        let mut offset = 0;
+        while offset < visible.len() {
+            let source = segment.source_offset + segment.start_byte + skipped + offset;
+            let style = styles.style_at(source).unwrap_or(theme_style);
+            let end = styles
+                .next_change()
+                .map(|boundary| offset + boundary.saturating_sub(source).max(1))
+                .unwrap_or(visible.len())
+                .min(visible.len());
+            buffer.set_printable_ascii(
+                geometry.x + local_x + offset,
+                geometry.y,
+                &visible[offset..end],
+                style,
+            );
+            offset = end;
+        }
+        return;
+    }
+
+    clear(geometry.x, geometry.width, buffer);
+    let mut grapheme_col = segment.start_grapheme_col;
+    for (byte_offset, grapheme) in text.grapheme_indices(true) {
+        let width = if grapheme == "\t" {
+            geometry.tab_width - (grapheme_col % geometry.tab_width)
+        } else {
+            display_width(grapheme)
+        };
+        if grapheme_col < segment.start_col {
+            grapheme_col += width;
+            continue;
+        }
+        let local_x = segment.visual_offset + grapheme_col.saturating_sub(segment.start_col);
+        if local_x >= geometry.width {
+            break;
+        }
+        let style = styles
+            .style_at(segment.source_offset + segment.start_byte + byte_offset)
+            .unwrap_or(theme_style);
+        if grapheme == "\t" {
+            buffer.set_text(geometry.x + local_x, geometry.y, &" ".repeat(width), style);
+        } else {
+            buffer.set_text(geometry.x + local_x, geometry.y, grapheme, style);
+        }
+        grapheme_col += width;
+    }
+}
+
 impl Editor {
     pub(crate) fn terminal_cursor_state(&self) -> crate::terminal_output::CursorState {
         let position = (self.is_focused && !self.uses_synthetic_block_cursor())
@@ -1874,9 +1969,8 @@ impl Editor {
                 self.render_inline_comment_row_in_window(buffer, window, comment);
                 continue;
             }
-            self.fill_line_in_window(buffer, term_x, term_y, content_width, &theme_style);
-
             let Some(segment) = layout.row(row) else {
+                self.fill_line_in_window(buffer, term_x, term_y, content_width, &theme_style);
                 continue;
             };
             if cached_line.as_ref().map(|(line, _)| *line) != Some(segment.line) {
@@ -1885,44 +1979,24 @@ impl Editor {
                     .map(|line| (segment.line, line));
             }
             let Some((_, line)) = cached_line.as_ref() else {
+                self.fill_line_in_window(buffer, term_x, term_y, content_width, &theme_style);
                 continue;
             };
             let line = trim_line_ending(line);
-            let mut grapheme_col = segment.start_grapheme_col;
-            for (byte_offset, grapheme) in
-                line[segment.start_byte..segment.end_byte].grapheme_indices(true)
-            {
-                if grapheme_col < segment.start_col {
-                    grapheme_col += if grapheme == "\t" {
-                        tab_width - (grapheme_col % tab_width)
-                    } else {
-                        display_width(grapheme)
-                    };
-                    continue;
-                }
-                let local_x =
-                    segment.visual_offset + grapheme_col.saturating_sub(segment.start_col);
-                if local_x >= content_width {
-                    break;
-                }
-
-                let style = style_cursor
-                    .style_at(segment.source_offset + segment.start_byte + byte_offset)
-                    .unwrap_or(&theme_style);
-                let term_x = self.window_to_terminal_x(window, content_start + local_x);
-                if grapheme == "\t" {
-                    let tab_span = tab_width - (grapheme_col % tab_width);
-                    buffer.set_text(term_x, term_y, &" ".repeat(tab_span), style);
-                } else {
-                    buffer.set_text(term_x, term_y, grapheme, style);
-                }
-
-                grapheme_col += if grapheme == "\t" {
-                    tab_width - (grapheme_col % tab_width)
-                } else {
-                    display_width(grapheme)
-                };
-            }
+            render_source_segment(
+                buffer,
+                segment,
+                line,
+                SourceSegmentGeometry {
+                    x: self.window_to_terminal_x(window, content_start),
+                    y: term_y,
+                    width: content_width,
+                    tab_width,
+                },
+                &mut style_cursor,
+                &theme_style,
+                &self.theme,
+            );
             self.render_decorations_for_segment(
                 buffer,
                 window,
@@ -2432,53 +2506,30 @@ impl Editor {
         for segment in &layout.rows {
             let term_y = self.window_to_terminal_y(window, segment.row);
             let term_x = self.window_to_terminal_x(window, gutter_width + 1);
-            self.fill_line_in_window(buffer, term_x, term_y, content_width, &theme_style);
-
             if cached_line.as_ref().map(|(line, _)| *line) != Some(segment.line) {
                 cached_line = self.buffer_manager[window.buffer_index]
                     .get(segment.line)
                     .map(|line| (segment.line, line));
             }
             let Some((_, line)) = cached_line.as_ref() else {
+                self.fill_line_in_window(buffer, term_x, term_y, content_width, &theme_style);
                 continue;
             };
             let line = trim_line_ending(line);
-            let mut grapheme_col = segment.start_grapheme_col;
-            for (byte_offset, grapheme) in
-                line[segment.start_byte..segment.end_byte].grapheme_indices(true)
-            {
-                if grapheme_col < segment.start_col {
-                    grapheme_col += if grapheme == "\t" {
-                        tab_width - (grapheme_col % tab_width)
-                    } else {
-                        display_width(grapheme)
-                    };
-                    continue;
-                }
-                let local_x =
-                    segment.visual_offset + grapheme_col.saturating_sub(segment.start_col);
-                if local_x >= content_width {
-                    break;
-                }
-
-                let style = style_cursor
-                    .style_at(segment.source_offset + segment.start_byte + byte_offset)
-                    .unwrap_or(&theme_style);
-                let term_x = self.window_to_terminal_x(window, content_start + local_x);
-                let term_y = self.window_to_terminal_y(window, segment.row);
-                if grapheme == "\t" {
-                    let tab_span = tab_width - (grapheme_col % tab_width);
-                    buffer.set_text(term_x, term_y, &" ".repeat(tab_span), style);
-                } else {
-                    buffer.set_text(term_x, term_y, grapheme, style);
-                }
-
-                grapheme_col += if grapheme == "\t" {
-                    tab_width - (grapheme_col % tab_width)
-                } else {
-                    display_width(grapheme)
-                };
-            }
+            render_source_segment(
+                buffer,
+                segment,
+                line,
+                SourceSegmentGeometry {
+                    x: self.window_to_terminal_x(window, content_start),
+                    y: term_y,
+                    width: content_width,
+                    tab_width,
+                },
+                &mut style_cursor,
+                &theme_style,
+                &self.theme,
+            );
             self.render_decorations_for_segment(
                 buffer,
                 window,
@@ -3332,8 +3383,7 @@ impl Editor {
 
         let term_width = self.size.0 as usize;
         let y = self.size.1 as usize - 2;
-        let clear_line = " ".repeat(term_width);
-        buffer.set_text(0, y, &clear_line, &self.theme.statusline_style.inner_style);
+        buffer.fill_ascii_spaces(0, y, term_width, &self.theme.statusline_style.inner_style);
 
         let wants_git = configured(StatuslineSection::GitBranch)
             || configured(StatuslineSection::GitChanges)
@@ -3624,8 +3674,7 @@ impl Editor {
         }
 
         let y = self.size.1 as usize - 1;
-        let clear_line = " ".repeat(width);
-        buffer.set_text(0, y, &clear_line, &style);
+        buffer.fill_ascii_spaces(0, y, width, &style);
 
         if !self.has_term() {
             let wc = if let Some(ref waiting_command) = self.waiting_command {
@@ -3962,7 +4011,7 @@ mod tests {
     use crate::{
         buffer::Buffer,
         config::Config,
-        editor::display_layout::LineSegment,
+        editor::{display_layout::LineSegment, HighlightSpan},
         lsp::{LspManager, Position, Range},
         plugin::{Decoration, DecorationAnchor},
         theme::Theme,
@@ -4311,6 +4360,158 @@ mod tests {
             last_segment: true,
             visual_offset: 0,
         }
+    }
+
+    #[test]
+    fn ascii_source_spans_preserve_overlapping_highlight_boundaries() {
+        let theme = Theme::default();
+        let outer = Style {
+            fg: Some(Color::Rgb { r: 1, g: 2, b: 3 }),
+            ..Style::default()
+        };
+        let inner = Style {
+            fg: Some(Color::Rgb { r: 4, g: 5, b: 6 }),
+            ..Style::default()
+        };
+        let later = Style {
+            fg: Some(Color::Rgb { r: 7, g: 8, b: 9 }),
+            ..Style::default()
+        };
+        let spans = vec![
+            HighlightSpan {
+                start: 20,
+                end: 27,
+                order: 0,
+                priority: 7,
+                style: outer.clone(),
+            },
+            HighlightSpan {
+                start: 22,
+                end: 25,
+                order: 1,
+                priority: 3,
+                style: inner,
+            },
+            HighlightSpan {
+                start: 22,
+                end: 25,
+                order: 2,
+                priority: 3,
+                style: later.clone(),
+            },
+        ];
+        let mut cursor = StyleCursor::new(&spans);
+        let mut source = segment(0, 8, true);
+        source.end_byte = 8;
+        source.source_offset = 20;
+        let mut buffer = RenderBuffer::new(10, 1, &theme.style);
+
+        render_source_segment(
+            &mut buffer,
+            &source,
+            "abcdefgh",
+            SourceSegmentGeometry {
+                x: 0,
+                y: 0,
+                width: 10,
+                tab_width: 4,
+            },
+            &mut cursor,
+            &theme.style,
+            &theme,
+        );
+
+        assert_eq!(rendered_rows(&buffer), vec!["abcdefgh  "]);
+        assert!(buffer.cells[..2].iter().all(|cell| cell.style == outer));
+        assert!(buffer.cells[2..5].iter().all(|cell| cell.style == later));
+        assert!(buffer.cells[5..7].iter().all(|cell| cell.style == outer));
+        assert!(buffer.cells[7..]
+            .iter()
+            .all(|cell| cell.style == theme.style));
+    }
+
+    #[test]
+    fn ascii_source_repaint_clears_stale_cells_and_wrapped_indentation() {
+        let theme = Theme::default();
+        let stale = Style {
+            bold: true,
+            ..Style::default()
+        };
+        let mut buffer = RenderBuffer::new(12, 1, &stale);
+        buffer.set_text(0, 0, "XXXXXXXXXXXX", &stale);
+        let mut source = segment(0, 3, false);
+        source.end_byte = 3;
+        source.visual_offset = 2;
+        let mut cursor = StyleCursor::new(&[]);
+
+        render_source_segment(
+            &mut buffer,
+            &source,
+            "abc",
+            SourceSegmentGeometry {
+                x: 1,
+                y: 0,
+                width: 10,
+                tab_width: 4,
+            },
+            &mut cursor,
+            &theme.style,
+            &theme,
+        );
+
+        assert_eq!(rendered_rows(&buffer), vec!["X  abc     X"]);
+        assert!(buffer.cells[1..11]
+            .iter()
+            .all(|cell| cell.style == theme.style));
+        assert_eq!(buffer.cells[0].style, stale);
+        assert_eq!(buffer.cells[11].style, stale);
+    }
+
+    #[test]
+    fn unicode_and_tabs_preserve_grapheme_widths_outside_ascii_fast_path() {
+        let theme = Theme::default();
+        let accented = "e\u{301}";
+        let line = format!("a\t界{accented}");
+        let wide_style = Style {
+            italic: true,
+            ..Style::default()
+        };
+        let wide_start = line.find('界').unwrap();
+        let spans = vec![HighlightSpan {
+            start: wide_start,
+            end: wide_start + '界'.len_utf8(),
+            order: 0,
+            priority: '界'.len_utf8(),
+            style: wide_style.clone(),
+        }];
+        let mut cursor = StyleCursor::new(&spans);
+        let mut source = segment(0, 7, true);
+        source.end_byte = line.len();
+        let mut buffer = RenderBuffer::new(10, 1, &theme.style);
+
+        render_source_segment(
+            &mut buffer,
+            &source,
+            &line,
+            SourceSegmentGeometry {
+                x: 0,
+                y: 0,
+                width: 10,
+                tab_width: 4,
+            },
+            &mut cursor,
+            &theme.style,
+            &theme,
+        );
+
+        assert_eq!(buffer.cells[0].text, "a");
+        assert!(buffer.cells[1..4].iter().all(|cell| cell.text == " "));
+        assert_eq!(buffer.cells[4].text, "界");
+        assert_eq!(buffer.cells[5].text, " ");
+        assert_eq!(buffer.cells[4].style, wide_style);
+        assert_eq!(buffer.cells[5].style, wide_style);
+        assert_eq!(buffer.cells[6].text, accented);
+        assert!(buffer.cells[7..].iter().all(|cell| cell.text == " "));
     }
 
     fn decoration(anchor: DecorationAnchor, text: &str) -> Decoration {
