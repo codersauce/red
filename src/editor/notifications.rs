@@ -131,6 +131,10 @@ impl Editor {
         self.set_message_with_attention(Severity::Info, AttentionPolicy::Quiet, message);
     }
 
+    pub(super) fn set_routine_error(&mut self, message: Option<String>) {
+        self.set_message_with_attention(Severity::Error, AttentionPolicy::Quiet, message);
+    }
+
     pub(super) fn set_notification_message(&mut self, severity: Severity, message: Option<String>) {
         self.set_message_with_attention(severity, AttentionPolicy::for_severity(severity), message);
     }
@@ -887,6 +891,17 @@ mod tests {
         assert_eq!(
             editor.notifications.records().next().unwrap().severity,
             Severity::Error
+        );
+        assert_eq!(
+            editor.notifications.records().next().unwrap().attention,
+            AttentionPolicy::Quiet
+        );
+        assert_eq!(
+            editor
+                .notifications
+                .counts(Instant::now())
+                .needs_acknowledgment,
+            0
         );
         assert_eq!(
             editor.handle_command("messages", &runtime),

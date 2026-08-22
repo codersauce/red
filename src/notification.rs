@@ -296,11 +296,15 @@ impl Notice {
         self
     }
 
+    /// Sets both the user's attention obligation and its matching foreground lifetime.
     pub fn with_attention(mut self, attention: AttentionPolicy) -> Self {
         self.attention = attention;
-        if attention == AttentionPolicy::RequiresAcknowledgment {
-            self.lifetime = NoticeLifetime::UntilAcknowledged;
-        }
+        self.lifetime = match attention {
+            AttentionPolicy::Quiet | AttentionPolicy::IfMissed => {
+                NoticeLifetime::Transient(DEFAULT_NOTICE_DURATION)
+            }
+            AttentionPolicy::RequiresAcknowledgment => NoticeLifetime::UntilAcknowledged,
+        };
         self
     }
 
