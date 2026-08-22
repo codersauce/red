@@ -41,6 +41,12 @@ struct InlayHintsResult {
     hints: [InlayHint],
 }
 
+struct RefreshedInlayHintsResult {
+    ok: bool,
+    hints: [InlayHint],
+    request_id: i32,
+}
+
 struct InlayHintGroup {
     line: i32,
     hints: [InlayHint],
@@ -190,6 +196,17 @@ fn hints_loaded(result: InlayHintsResult, request_id: i32) {
     red::state_patch(InlayHintsState { hints: Some(result) });
     red::state_patch(InlayHintsState { hints_loaded: true });
     render_if_ready();
+}
+
+#[red::on("lsp:inlay_hints_refreshed")]
+fn refreshed_hints_loaded(result: RefreshedInlayHintsResult) {
+    hints_loaded(
+        InlayHintsResult {
+            ok: result.ok,
+            hints: result.hints,
+        },
+        result.request_id
+    );
 }
 
 fn render_if_ready() {

@@ -3509,6 +3509,9 @@ pub struct Editor {
     diagnostics: HashMap<String, Vec<Diagnostic>>,
     diagnostic_reports: diagnostics::DiagnosticReports,
     diagnostic_cache: Option<diagnostic_cache::DiagnosticCache>,
+    diagnostic_refresh_after_progress: bool,
+    cached_document_symbols: HashMap<String, Value>,
+    cached_inlay_hints: HashMap<String, diagnostic_cache::InlayHintSnapshot>,
 
     /// Indentation rules per file type
     indentation: HashMap<String, Indentation>,
@@ -3538,7 +3541,7 @@ pub struct Editor {
     pending_plugin_document_symbols: HashMap<i64, PendingDocumentSymbols>,
     pending_plugin_workspace_symbols: HashMap<i64, RequestId>,
     pending_plugin_references: HashMap<i64, RequestId>,
-    pending_plugin_inlay_hints: HashMap<i64, RequestId>,
+    pending_plugin_inlay_hints: HashMap<i64, PendingInlayHints>,
     pending_lsp_edit_requests: HashMap<i64, PendingLspEdit>,
     /// LSP request currently owning the visible, cancellable code-action picker.
     pending_code_action_request: Option<i64>,
@@ -4060,6 +4063,17 @@ struct PendingDocumentSymbols {
     buffer_id: BufferId,
     uri: String,
     revision: u64,
+    resolved_from_cache: bool,
+}
+
+#[derive(Debug, Clone)]
+struct PendingInlayHints {
+    plugin_request_id: RequestId,
+    buffer_id: BufferId,
+    uri: String,
+    revision: u64,
+    range: Range,
+    resolved_from_cache: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -4457,6 +4471,7 @@ impl Editor {
                 self.lsp_coordinator.mark_document_closed(&uri);
                 self.diagnostics.remove(&uri);
                 self.diagnostic_reports.remove(&uri);
+                self.invalidate_cached_lsp_display_data(&uri);
             }
             self.lsp_coordinator.mark_document_opened(uri);
         }
@@ -4882,6 +4897,9 @@ impl Editor {
             diagnostics: HashMap::new(),
             diagnostic_reports: diagnostics::DiagnosticReports::default(),
             diagnostic_cache: None,
+            diagnostic_refresh_after_progress: false,
+            cached_document_symbols: HashMap::new(),
+            cached_inlay_hints: HashMap::new(),
             indentation,
             render_commands: VecDeque::new(),
             overlay_manager: plugin::OverlayManager::new(),
@@ -10246,6 +10264,12 @@ impl Editor {
             }
         }
 
+        if let Ok(Some(uri)) = self.current_buffer().uri() {
+            if self.diagnostic_reports.take_retry_due(&uri, Instant::now()) {
+                self.request_diagnostics().await?;
+            }
+        }
+
         // Startup refreshes form short request chains. Drain a bounded batch so each
         // operation does not wait for a separate 10 ms editor tick.
         for _ in 0..PLUGIN_REQUESTS_PER_TICK {
@@ -11132,6 +11156,30 @@ impl Editor {
                     let buffer_id = target_buffer.id();
                     let uri = target_buffer.uri()?.expect("file-backed buffer has a URI");
                     let revision = target_buffer.revision();
+                    let mut pending = PendingDocumentSymbols {
+                        plugin_request_id: request_id,
+                        buffer_id,
+                        uri: uri.clone(),
+                        revision,
+                        resolved_from_cache: false,
+                    };
+
+                    if let Some(result) = self.cached_document_symbols.get(&uri).cloned() {
+                        let response = ResponseMessage {
+                            id: 0,
+                            result,
+                            request: None,
+                        };
+                        if let Ok(mut payload) =
+                            self.plugin_document_symbols_payload(&response, &pending)
+                        {
+                            payload["provisional"] = json!(true);
+                            self.plugin_registry
+                                .resolve_request(runtime, request_id, payload)
+                                .await?;
+                            pending.resolved_from_cache = true;
+                        }
+                    }
 
                     let request_result: anyhow::Result<i64> = async {
                         self.ensure_buffer_lsp_opened(buffer_index).await?;
@@ -11141,17 +11189,10 @@ impl Editor {
 
                     match request_result {
                         Ok(lsp_request_id) if lsp_request_id > 0 => {
-                            self.pending_plugin_document_symbols.insert(
-                                lsp_request_id,
-                                PendingDocumentSymbols {
-                                    plugin_request_id: request_id,
-                                    buffer_id,
-                                    uri,
-                                    revision,
-                                },
-                            );
+                            self.pending_plugin_document_symbols
+                                .insert(lsp_request_id, pending);
                         }
-                        Ok(_) => {
+                        Ok(_) if !pending.resolved_from_cache => {
                             self.plugin_registry
                                 .resolve_request(
                                     runtime,
@@ -11162,7 +11203,7 @@ impl Editor {
                                 )
                                 .await?;
                         }
-                        Err(err) => {
+                        Err(err) if !pending.resolved_from_cache => {
                             self.plugin_registry
                                 .resolve_request(
                                     runtime,
@@ -11171,6 +11212,7 @@ impl Editor {
                                 )
                                 .await?;
                         }
+                        Ok(_) | Err(_) => {}
                     }
                 }
                 PluginRequest::ResolveThemeStyle { request_id, spec } => {
@@ -11322,6 +11364,12 @@ impl Editor {
                             .await?;
                         continue;
                     };
+                    let buffer_id = self.current_buffer().id();
+                    let uri = self
+                        .current_buffer()
+                        .uri()?
+                        .expect("file-backed buffer has a URI");
+                    let revision = self.current_buffer().revision();
 
                     let range = range.unwrap_or_else(|| {
                         let contents = self.current_buffer().contents();
@@ -11346,19 +11394,47 @@ impl Editor {
                             end: crate::lsp::Position { line, character },
                         }
                     });
+                    let mut pending = PendingInlayHints {
+                        plugin_request_id: request_id,
+                        buffer_id,
+                        uri: uri.clone(),
+                        revision,
+                        range: range.clone(),
+                        resolved_from_cache: false,
+                    };
+
+                    if let Some(result) = self
+                        .cached_inlay_hints
+                        .get(&uri)
+                        .and_then(|snapshot| cached_inlay_hint_result(snapshot, &range))
+                    {
+                        let response = ResponseMessage {
+                            id: 0,
+                            result,
+                            request: None,
+                        };
+                        if let Ok(mut payload) = self.plugin_inlay_hints_payload(&response) {
+                            payload["provisional"] = json!(true);
+                            payload["request_id"] = json!(request_id.get());
+                            self.plugin_registry
+                                .resolve_request(runtime, request_id, payload)
+                                .await?;
+                            pending.resolved_from_cache = true;
+                        }
+                    }
 
                     let request_result: anyhow::Result<i64> = async {
                         self.ensure_current_buffer_lsp_opened().await?;
-                        Ok(self.lsp.inlay_hint(&file, range).await?)
+                        Ok(self.lsp.inlay_hint(&file, range.clone()).await?)
                     }
                     .await;
 
                     match request_result {
                         Ok(lsp_request_id) if lsp_request_id > 0 => {
                             self.pending_plugin_inlay_hints
-                                .insert(lsp_request_id, request_id);
+                                .insert(lsp_request_id, pending);
                         }
-                        Ok(_) => {
+                        Ok(_) if !pending.resolved_from_cache => {
                             self.plugin_registry
                                 .resolve_request(
                                     runtime,
@@ -11369,7 +11445,7 @@ impl Editor {
                                 )
                                 .await?;
                         }
-                        Err(err) => {
+                        Err(err) if !pending.resolved_from_cache => {
                             self.plugin_registry
                                 .resolve_request(
                                     runtime,
@@ -11378,6 +11454,7 @@ impl Editor {
                                 )
                                 .await?;
                         }
+                        Ok(_) | Err(_) => {}
                     }
                 }
                 PluginRequest::GetTextDisplayWidth { request_id, text } => {
@@ -13052,6 +13129,23 @@ impl Editor {
     }
 
     fn process_progress(&mut self, progress_params: &ProgressParams) -> Option<Action> {
+        let ProgressToken::String(token) = &progress_params.token else {
+            return Some(Action::ShowProgress(progress_params.clone()));
+        };
+        if !token.to_ascii_lowercase().contains("primecaches") {
+            return Some(Action::ShowProgress(progress_params.clone()));
+        }
+        let Some(client) = &progress_params.lsp_client else {
+            return Some(Action::ShowProgress(progress_params.clone()));
+        };
+        let active = progress_params.kind.as_deref() != Some("end");
+        if self
+            .diagnostic_reports
+            .set_workspace_priming(Path::new(&client.workspace_root), active)
+            && !active
+        {
+            self.diagnostic_refresh_after_progress = true;
+        }
         Some(Action::ShowProgress(progress_params.clone()))
     }
 
@@ -13105,7 +13199,10 @@ impl Editor {
             }
             "workspace/symbol" => self.pending_plugin_workspace_symbols.remove(&id)?,
             "textDocument/references" => self.pending_plugin_references.remove(&id)?,
-            "textDocument/inlayHint" => self.pending_plugin_inlay_hints.remove(&id)?,
+            "textDocument/inlayHint" => {
+                let pending = self.pending_plugin_inlay_hints.remove(&id)?;
+                (!pending.resolved_from_cache).then_some(pending.plugin_request_id)?
+            }
             _ => return None,
         })
     }
@@ -13741,9 +13838,23 @@ impl Editor {
                         {
                             let payload = match self.plugin_document_symbols_payload(msg, &pending)
                             {
-                                Ok(payload) => payload,
+                                Ok(mut payload) => {
+                                    self.cached_document_symbols
+                                        .insert(pending.uri.clone(), msg.result.clone());
+                                    self.mark_diagnostic_cache_dirty();
+                                    payload["provisional"] = json!(false);
+                                    payload
+                                }
                                 Err(err) => plugin_lsp_error(&err.to_string()),
                             };
+                            if pending.resolved_from_cache {
+                                return payload["ok"].as_bool().unwrap_or(false).then(|| {
+                                    Action::NotifyPlugins(
+                                        "lsp:document_symbols_refreshed".to_string(),
+                                        payload,
+                                    )
+                                });
+                            }
                             return Some(Action::ResolvePluginRequest(
                                 pending.plugin_request_id.get(),
                                 payload,
@@ -13774,13 +13885,36 @@ impl Editor {
                     }
 
                     if method == "textDocument/inlayHint" {
-                        if let Some(request_id) = self.pending_plugin_inlay_hints.remove(&msg.id) {
-                            let mut payload = match self.plugin_inlay_hints_payload(msg) {
-                                Ok(payload) => payload,
-                                Err(err) => plugin_lsp_error(&err.to_string()),
-                            };
-                            payload["request_id"] = json!(request_id.get());
-                            return Some(Action::ResolvePluginRequest(request_id.get(), payload));
+                        if let Some(pending) = self.pending_plugin_inlay_hints.remove(&msg.id) {
+                            let mut payload =
+                                match self.plugin_inlay_hints_payload_for_pending(msg, &pending) {
+                                    Ok(payload) => {
+                                        self.cached_inlay_hints.insert(
+                                            pending.uri.clone(),
+                                            diagnostic_cache::InlayHintSnapshot {
+                                                range: pending.range.clone(),
+                                                result: msg.result.clone(),
+                                            },
+                                        );
+                                        self.mark_diagnostic_cache_dirty();
+                                        payload
+                                    }
+                                    Err(err) => plugin_lsp_error(&err.to_string()),
+                                };
+                            payload["request_id"] = json!(pending.plugin_request_id.get());
+                            payload["provisional"] = json!(false);
+                            if pending.resolved_from_cache {
+                                return payload["ok"].as_bool().unwrap_or(false).then(|| {
+                                    Action::NotifyPlugins(
+                                        "lsp:inlay_hints_refreshed".to_string(),
+                                        payload,
+                                    )
+                                });
+                            }
+                            return Some(Action::ResolvePluginRequest(
+                                pending.plugin_request_id.get(),
+                                payload,
+                            ));
                         }
                     }
 
@@ -13931,10 +14065,13 @@ impl Editor {
                     return self.completion_resolution_failed(id, &error_msg.message);
                 }
                 if method.as_deref() == Some("textDocument/inlayHint") {
-                    if let Some(request_id) = self.pending_plugin_inlay_hints.remove(&id) {
+                    if let Some(pending) = self.pending_plugin_inlay_hints.remove(&id) {
+                        if pending.resolved_from_cache {
+                            return None;
+                        }
                         return Some(Action::ResolvePluginRequest(
-                            request_id.get(),
-                            plugin_inlay_hints_error(request_id, &error_msg.message),
+                            pending.plugin_request_id.get(),
+                            plugin_inlay_hints_error(pending.plugin_request_id, &error_msg.message),
                         ));
                     }
                 }
@@ -14019,10 +14156,13 @@ impl Editor {
                     return self.completion_resolution_failed(*id, &error.to_string());
                 }
                 if method.as_deref() == Some("textDocument/inlayHint") {
-                    if let Some(request_id) = self.pending_plugin_inlay_hints.remove(id) {
+                    if let Some(pending) = self.pending_plugin_inlay_hints.remove(id) {
+                        if pending.resolved_from_cache {
+                            return None;
+                        }
                         return Some(Action::ResolvePluginRequest(
-                            request_id.get(),
-                            plugin_inlay_hints_error(request_id, &error.to_string()),
+                            pending.plugin_request_id.get(),
+                            plugin_inlay_hints_error(pending.plugin_request_id, &error.to_string()),
                         ));
                     }
                 }
@@ -21669,6 +21809,11 @@ impl Editor {
                 self.plugin_registry
                     .notify(runtime, method, params.clone())
                     .await?;
+                if method == "lsp:progress"
+                    && std::mem::take(&mut self.diagnostic_refresh_after_progress)
+                {
+                    self.request_diagnostics().await?;
+                }
             }
             Action::NotifyPlugin(plugin, method, params) => {
                 self.plugin_registry
@@ -23092,6 +23237,9 @@ impl Editor {
         index: usize,
         runtime: &mut Runtime,
     ) -> anyhow::Result<()> {
+        if let Ok(Some(uri)) = self.buffer_manager[index].uri() {
+            self.invalidate_cached_lsp_display_data(&uri);
+        }
         let id = self.buffer_manager[index].id();
         let revision = self.buffer_manager[index].revision();
         self.sync_inline_change_summaries();
@@ -23367,6 +23515,7 @@ impl Editor {
             return Ok(());
         }
         if let Some(previous_uri) = previous_uri {
+            self.invalidate_cached_lsp_display_data(previous_uri);
             if self.lsp_coordinator.mark_document_closed(previous_uri) {
                 if let Ok(file) = lsp_file_path(previous_uri) {
                     self.lsp.did_close(&file).await?;
@@ -23725,6 +23874,34 @@ impl Editor {
         Ok(json!({
             "ok": true,
             "file": file,
+            "hints": hints,
+        }))
+    }
+
+    fn plugin_inlay_hints_payload_for_pending(
+        &self,
+        response: &ResponseMessage,
+        pending: &PendingInlayHints,
+    ) -> anyhow::Result<Value> {
+        anyhow::ensure!(
+            self.buffer_manager.iter().any(|buffer| {
+                buffer.id() == pending.buffer_id
+                    && buffer.revision() == pending.revision
+                    && buffer.uri().ok().flatten().as_deref() == Some(pending.uri.as_str())
+            }),
+            "inlay hint response is no longer current"
+        );
+        anyhow::ensure!(
+            response_text_document_uri(response).is_none_or(|uri| uri == pending.uri),
+            "inlay hint response belongs to another document"
+        );
+        let hints = plugin_json(serde_json::to_value(
+            self.normalize_inlay_hints(&response.result)?,
+        )?);
+
+        Ok(json!({
+            "ok": true,
+            "file": self.uri_to_file(&pending.uri),
             "hints": hints,
         }))
     }
@@ -25302,30 +25479,42 @@ impl Editor {
         self.session_manager.set_store(store);
     }
 
-    /// Enables provisional, workspace-scoped diagnostics recovery across editor launches.
+    /// Enables provisional, workspace-scoped LSP display recovery across editor launches.
     pub fn enable_diagnostic_cache(&mut self, directory: PathBuf) {
         self.diagnostic_cache = Some(diagnostic_cache::DiagnosticCache::new(directory));
         self.restore_cached_diagnostics();
     }
 
     fn restore_cached_diagnostics(&mut self) {
-        if !self.config.show_diagnostics {
-            return;
-        }
         let Some(cache) = &mut self.diagnostic_cache else {
             return;
         };
         let restored = cache.load(&self.config.lsp, &self.buffer_manager);
         let mut changed = false;
-        for reports in restored {
-            if self.diagnostics.contains_key(&reports.uri) {
-                continue;
+        for state in restored {
+            if let Some(symbols) = state.document_symbols {
+                self.cached_document_symbols
+                    .entry(state.uri.clone())
+                    .or_insert(symbols);
             }
-            let diagnostics =
-                self.diagnostic_reports
-                    .restore(reports.uri.clone(), reports.push, reports.pull);
-            self.diagnostics.insert(reports.uri, diagnostics);
-            changed = true;
+            if let Some(hints) = state.inlay_hints {
+                self.cached_inlay_hints
+                    .entry(state.uri.clone())
+                    .or_insert(hints);
+            }
+            if self.config.show_diagnostics
+                && (!state.push.is_empty() || !state.pull.is_empty())
+                && !self.diagnostics.contains_key(&state.uri)
+            {
+                let diagnostics = self.diagnostic_reports.restore(
+                    state.uri.clone(),
+                    state.push,
+                    state.pull,
+                    state.defer_empty,
+                );
+                self.diagnostics.insert(state.uri, diagnostics);
+                changed = true;
+            }
         }
         if changed {
             self.sync_diagnostic_gutter_signs();
@@ -25338,6 +25527,14 @@ impl Editor {
         }
     }
 
+    fn invalidate_cached_lsp_display_data(&mut self, uri: &str) {
+        let removed_symbols = self.cached_document_symbols.remove(uri).is_some();
+        let removed_hints = self.cached_inlay_hints.remove(uri).is_some();
+        if removed_symbols || removed_hints {
+            self.mark_diagnostic_cache_dirty();
+        }
+    }
+
     fn persist_diagnostic_cache(&mut self, force: bool) {
         let Some(cache) = &mut self.diagnostic_cache else {
             return;
@@ -25346,6 +25543,8 @@ impl Editor {
             &self.config.lsp,
             &self.buffer_manager,
             &self.diagnostic_reports,
+            &self.cached_document_symbols,
+            &self.cached_inlay_hints,
             force,
         ) {
             log!("failed to persist diagnostic cache: {error}");
@@ -28476,6 +28675,41 @@ fn response_text_document_uri(response: &ResponseMessage) -> Option<&str> {
         .as_object()?
         .get("uri")?
         .as_str()
+}
+
+fn cached_inlay_hint_result(
+    snapshot: &diagnostic_cache::InlayHintSnapshot,
+    requested: &Range,
+) -> Option<Value> {
+    let position = |position: crate::lsp::Position| (position.line, position.character);
+    if position(snapshot.range.start) > position(requested.start)
+        || position(snapshot.range.end) < position(requested.end)
+    {
+        return None;
+    }
+    if snapshot.result.is_null() {
+        return Some(Value::Null);
+    }
+    let hints = snapshot.result.as_array()?;
+    let start = position(requested.start);
+    let end = position(requested.end);
+    Some(Value::Array(
+        hints
+            .iter()
+            .filter(|hint| {
+                hint.get("position")
+                    .cloned()
+                    .and_then(|position| {
+                        serde_json::from_value::<crate::lsp::Position>(position).ok()
+                    })
+                    .is_some_and(|hint| {
+                        let hint = position(hint);
+                        start <= hint && hint < end
+                    })
+            })
+            .cloned()
+            .collect(),
+    ))
 }
 
 fn normalized_document_symbol(
@@ -37319,6 +37553,7 @@ builtin = "rust"
             buffer_id: buffer.id(),
             uri: buffer.uri().unwrap().unwrap(),
             revision: buffer.revision(),
+            resolved_from_cache: false,
         }
     }
 
@@ -37532,6 +37767,7 @@ builtin = "rust"
                     buffer_id: editor.current_buffer().id(),
                     uri: editor.current_buffer().uri().unwrap().unwrap(),
                     revision: 0,
+                    resolved_from_cache: false,
                 },
             )
             .unwrap();
@@ -37600,6 +37836,7 @@ builtin = "rust"
                     buffer_id: editor.current_buffer().id(),
                     uri: editor.current_buffer().uri().unwrap().unwrap(),
                     revision: 0,
+                    resolved_from_cache: false,
                 },
             )
             .unwrap();
@@ -37612,6 +37849,53 @@ builtin = "rust"
         assert_eq!(symbols[0]["kind_name"], "Function");
         assert_eq!(symbols[0]["file"], editor.uri_to_file(&other_uri));
         assert_eq!(symbols[0]["selection_range"]["start"]["line"], 4);
+    }
+
+    #[test]
+    fn fresh_document_symbols_replace_cache_and_notify_breadcrumbs() {
+        let mut editor = test_editor(40, 10);
+        let file = "/tmp/project/src/symbol-cache.rs";
+        editor.buffer_manager.push_buffer(Buffer::new(
+            Some(file.to_string()),
+            "fn main() {}\n".to_string(),
+        ));
+        editor.buffer_manager.set_active_index(1);
+        let mut pending = pending_document_symbols(&editor, 1);
+        pending.resolved_from_cache = true;
+        let uri = pending.uri.clone();
+        editor.pending_plugin_document_symbols.insert(42, pending);
+        let result = json!([{
+            "name": "main",
+            "kind": 12,
+            "range": {
+                "start": { "line": 0, "character": 0 },
+                "end": { "line": 0, "character": 12 }
+            },
+            "selectionRange": {
+                "start": { "line": 0, "character": 3 },
+                "end": { "line": 0, "character": 7 }
+            }
+        }]);
+        let message = InboundMessage::Message(ResponseMessage {
+            id: 42,
+            result: result.clone(),
+            request: Some(crate::lsp::Request::new(
+                "textDocument/documentSymbol",
+                json!({ "textDocument": { "uri": uri } }),
+            )),
+        });
+
+        let action =
+            editor.handle_lsp_message(&message, Some("textDocument/documentSymbol".to_string()));
+
+        assert!(matches!(
+            action,
+            Some(Action::NotifyPlugins(topic, payload))
+                if topic == "lsp:document_symbols_refreshed"
+                    && payload["provisional"] == false
+                    && payload["symbols"][0]["name"] == "main"
+        ));
+        assert_eq!(editor.cached_document_symbols[&uri], result);
     }
 
     #[test]
@@ -40919,12 +41203,31 @@ while True:
         assert!(!editor.pending_plugin_workspace_symbols.contains_key(&42));
     }
 
+    fn pending_inlay_hints(editor: &Editor, request_id: i64) -> PendingInlayHints {
+        PendingInlayHints {
+            plugin_request_id: RequestId::from_raw(request_id),
+            buffer_id: editor.current_buffer().id(),
+            uri: "file:///tmp/inlay-hints.rs".to_string(),
+            revision: editor.current_buffer().revision(),
+            range: Range {
+                start: crate::lsp::Position {
+                    line: 0,
+                    character: 0,
+                },
+                end: crate::lsp::Position {
+                    line: 1,
+                    character: 0,
+                },
+            },
+            resolved_from_cache: false,
+        }
+    }
+
     #[test]
     fn content_modified_resolves_inlay_hints_without_a_visible_error() {
         let mut editor = test_editor(40, 10);
-        editor
-            .pending_plugin_inlay_hints
-            .insert(42, RequestId::from_raw(7));
+        let pending = pending_inlay_hints(&editor, 7);
+        editor.pending_plugin_inlay_hints.insert(42, pending);
         let message = InboundMessage::Error(crate::lsp::ResponseError {
             id: Some(42),
             code: -32801,
@@ -40952,9 +41255,8 @@ while True:
     #[test]
     fn timeout_resolves_inlay_hints_with_a_schema_safe_retry_payload() {
         let mut editor = test_editor(40, 10);
-        editor
-            .pending_plugin_inlay_hints
-            .insert(42, RequestId::from_raw(7));
+        let pending = pending_inlay_hints(&editor, 7);
+        editor.pending_plugin_inlay_hints.insert(42, pending);
         let message = InboundMessage::RequestError {
             id: 42,
             error: crate::lsp::LspError::RequestTimeout(std::time::Duration::from_secs(30)),
@@ -41009,6 +41311,96 @@ while True:
         assert_eq!(hints[0]["position"]["line"], 2);
         assert_eq!(hints[0]["label"][0]["value"], ": PathBuf");
         assert_eq!(hints[0]["kind"], 1);
+    }
+
+    #[test]
+    fn cached_inlay_hints_are_used_only_for_covered_ranges() {
+        let snapshot = diagnostic_cache::InlayHintSnapshot {
+            range: Range {
+                start: crate::lsp::Position {
+                    line: 10,
+                    character: 0,
+                },
+                end: crate::lsp::Position {
+                    line: 20,
+                    character: 0,
+                },
+            },
+            result: json!([
+                { "position": { "line": 11, "character": 2 }, "label": ": first" },
+                { "position": { "line": 18, "character": 2 }, "label": ": second" }
+            ]),
+        };
+        let covered = Range {
+            start: crate::lsp::Position {
+                line: 11,
+                character: 0,
+            },
+            end: crate::lsp::Position {
+                line: 15,
+                character: 0,
+            },
+        };
+        let outside = Range {
+            start: crate::lsp::Position {
+                line: 0,
+                character: 0,
+            },
+            end: crate::lsp::Position {
+                line: 12,
+                character: 0,
+            },
+        };
+
+        assert_eq!(
+            cached_inlay_hint_result(&snapshot, &covered),
+            Some(json!([
+                { "position": { "line": 11, "character": 2 }, "label": ": first" }
+            ]))
+        );
+        assert!(cached_inlay_hint_result(&snapshot, &outside).is_none());
+    }
+
+    #[test]
+    fn fresh_inlay_hints_replace_cache_and_notify_after_provisional_response() {
+        let mut editor = test_editor(40, 10);
+        let file = "/tmp/project/src/inlay-cache.rs";
+        editor.buffer_manager.push_buffer(Buffer::new(
+            Some(file.to_string()),
+            "fn main() {}\n".to_string(),
+        ));
+        editor.buffer_manager.set_active_index(1);
+        let uri = editor.current_buffer().uri().unwrap().unwrap();
+        let mut pending = pending_inlay_hints(&editor, 7);
+        pending.uri = uri.clone();
+        pending.resolved_from_cache = true;
+        editor.pending_plugin_inlay_hints.insert(42, pending);
+        let message = InboundMessage::Message(ResponseMessage {
+            id: 42,
+            result: json!([{
+                "position": { "line": 0, "character": 8 },
+                "label": ": ()"
+            }]),
+            request: Some(crate::lsp::Request::new(
+                "textDocument/inlayHint",
+                json!({ "textDocument": { "uri": uri } }),
+            )),
+        });
+
+        let action =
+            editor.handle_lsp_message(&message, Some("textDocument/inlayHint".to_string()));
+
+        assert!(matches!(
+            action,
+            Some(Action::NotifyPlugins(topic, payload))
+                if topic == "lsp:inlay_hints_refreshed"
+                    && payload["request_id"] == 7
+                    && payload["provisional"] == false
+        ));
+        assert_eq!(
+            editor.cached_inlay_hints[&uri].result[0]["label"],
+            json!(": ()")
+        );
     }
 
     #[tokio::test]

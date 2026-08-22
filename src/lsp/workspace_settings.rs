@@ -1,4 +1,4 @@
-//! Bounded, formatting-only imports from repository-local VS Code settings.
+//! Bounded imports of safe rust-analyzer options from repository-local VS Code settings.
 //!
 //! Workspace settings are applied to a cloned server configuration, so one
 //! repository cannot change another repository's language-server behavior.
@@ -10,6 +10,7 @@ use std::{
 };
 
 use json_comments::StripComments;
+use path_absolutize::Absolutize;
 use serde_json::{Map, Value};
 
 use crate::{config::LanguageServerConfig, log};
@@ -18,6 +19,11 @@ const MAX_SETTINGS_BYTES: u64 = 1024 * 1024;
 const MAX_RUSTFMT_ARGS: usize = 64;
 const MAX_RUSTFMT_ARG_BYTES: usize = 8 * 1024;
 const RUSTFMT_EXTRA_ARGS_KEY: &str = "rust-analyzer.rustfmt.extraArgs";
+const CARGO_TARGET_DIR_KEY: &str = "rust-analyzer.cargo.targetDir";
+const CACHE_PRIMING_ENABLE_KEY: &str = "rust-analyzer.cachePriming.enable";
+const CHECK_WORKSPACE_KEY: &str = "rust-analyzer.check.workspace";
+const CARGO_ALL_TARGETS_KEY: &str = "rust-analyzer.cargo.allTargets";
+const WORKSPACE_FOLDER_PLACEHOLDER: &str = "${workspaceFolder}";
 
 /// Merge safe project-local rustfmt settings without changing shared defaults.
 pub(super) fn apply_workspace_settings(
@@ -42,53 +48,98 @@ pub(super) fn apply_workspace_settings(
             return;
         }
     };
-    let Some(project_args) = rustfmt_extra_args(&settings) else {
+    if let Some(project_args) = rustfmt_extra_args(&settings) {
+        let existing_args = existing_rustfmt_args(config).cloned();
+        let args = existing_args.unwrap_or(project_args);
+        merge_setting(
+            config,
+            &["rustfmt", "extraArgs"],
+            &["rust-analyzer", "rustfmt", "extraArgs"],
+            &args,
+            &path,
+            "rustfmt extra arguments",
+        );
+    }
+
+    if let Some(target_dir) = cargo_target_dir(&settings, &path) {
+        merge_project_setting(
+            config,
+            &["cargo", "targetDir"],
+            &["rust-analyzer", "cargo", "targetDir"],
+            CARGO_TARGET_DIR_KEY,
+            target_dir,
+            &path,
+            "Cargo target directory",
+        );
+    }
+
+    merge_project_bool(
+        config,
+        &settings,
+        CACHE_PRIMING_ENABLE_KEY,
+        &["rust-analyzer", "cachePriming", "enable"],
+        &["cachePriming", "enable"],
+        &path,
+    );
+    merge_project_bool(
+        config,
+        &settings,
+        CHECK_WORKSPACE_KEY,
+        &["rust-analyzer", "check", "workspace"],
+        &["check", "workspace"],
+        &path,
+    );
+    merge_project_bool(
+        config,
+        &settings,
+        CARGO_ALL_TARGETS_KEY,
+        &["rust-analyzer", "cargo", "allTargets"],
+        &["cargo", "allTargets"],
+        &path,
+    );
+}
+
+/// Avoid eager whole-workspace priming unless the user or repository opted back in.
+pub(super) fn apply_fast_startup_defaults(config: &mut LanguageServerConfig, language_id: &str) {
+    if language_id != "rust" {
         return;
-    };
-
-    let existing_args = existing_rustfmt_args(config).cloned();
-    let args = existing_args.unwrap_or(project_args);
-
-    if !insert_missing(
-        &mut config.initialization_options,
-        &["rustfmt", "extraArgs"],
-        &args,
-    ) {
-        log!(
-            "[lsp] could not merge rustfmt workspace settings into initialization options for {}",
-            path.display()
-        );
     }
-    if !insert_missing(
-        &mut config.settings,
-        &["rust-analyzer", "rustfmt", "extraArgs"],
-        &args,
-    ) {
-        log!(
-            "[lsp] could not merge rustfmt workspace settings into dynamic settings for {}",
-            path.display()
-        );
-    }
+
+    let value = existing_setting(
+        config,
+        &["cachePriming", "enable"],
+        &["rust-analyzer", "cachePriming", "enable"],
+        CACHE_PRIMING_ENABLE_KEY,
+    )
+    .cloned()
+    .unwrap_or(Value::Bool(false));
+    merge_setting(
+        config,
+        &["cachePriming", "enable"],
+        &["rust-analyzer", "cachePriming", "enable"],
+        &value,
+        Path::new("built-in rust-analyzer defaults"),
+        "cache priming",
+    );
 }
 
 fn find_settings_file(workspace_root: &Path) -> Option<PathBuf> {
     let repository_root = workspace_root
         .ancestors()
         .find(|ancestor| ancestor.join(".git").exists());
+    let settings_boundary = repository_root.unwrap_or(workspace_root);
 
     for ancestor in workspace_root.ancestors() {
         let candidate = ancestor.join(".vscode").join("settings.json");
         if candidate.is_file() {
-            if let Some(repository_root) = repository_root {
-                let canonical_root = fs::canonicalize(repository_root).ok()?;
-                let canonical_candidate = fs::canonicalize(&candidate).ok()?;
-                if !canonical_candidate.starts_with(canonical_root) {
-                    log!(
-                        "[lsp] ignored workspace settings outside the repository: {}",
-                        candidate.display()
-                    );
-                    return None;
-                }
+            let canonical_boundary = fs::canonicalize(settings_boundary).ok()?;
+            let canonical_candidate = fs::canonicalize(&candidate).ok()?;
+            if !canonical_candidate.starts_with(canonical_boundary) {
+                log!(
+                    "[lsp] ignored workspace settings outside the workspace boundary: {}",
+                    candidate.display()
+                );
+                return None;
             }
             return Some(candidate);
         }
@@ -189,6 +240,146 @@ fn rustfmt_extra_args(settings: &Value) -> Option<Value> {
     }
 
     Some(Value::Array(args.clone()))
+}
+
+fn cargo_target_dir(settings: &Value, settings_path: &Path) -> Option<Value> {
+    let raw = project_setting(
+        settings,
+        CARGO_TARGET_DIR_KEY,
+        &["rust-analyzer", "cargo", "targetDir"],
+    )?
+    .as_str()?;
+    if raw.is_empty() || raw.contains('\0') {
+        return None;
+    }
+
+    let workspace_folder = settings_path.parent()?.parent()?;
+    let relative = if let Some(suffix) = raw.strip_prefix(WORKSPACE_FOLDER_PLACEHOLDER) {
+        suffix.strip_prefix('/')?
+    } else {
+        if raw.contains("${") {
+            return None;
+        }
+        raw
+    };
+    if relative.is_empty() {
+        return None;
+    }
+
+    let workspace_folder = workspace_folder.absolutize().ok()?.to_path_buf();
+    let target = Path::new(relative)
+        .absolutize_from(&workspace_folder)
+        .ok()?
+        .to_path_buf();
+    if !target.starts_with(&workspace_folder) || target == workspace_folder {
+        return None;
+    }
+
+    Some(Value::String(target.to_string_lossy().into_owned()))
+}
+
+fn project_setting<'a>(settings: &'a Value, flat: &str, nested: &[&str]) -> Option<&'a Value> {
+    settings
+        .get(flat)
+        .or_else(|| value_at_path(settings, nested))
+}
+
+fn merge_project_bool(
+    config: &mut LanguageServerConfig,
+    settings: &Value,
+    flat: &str,
+    dynamic_path: &[&str],
+    initialization_path: &[&str],
+    settings_path: &Path,
+) {
+    let Some(value) =
+        project_setting(settings, flat, dynamic_path).filter(|value| value.is_boolean())
+    else {
+        return;
+    };
+    merge_project_setting(
+        config,
+        initialization_path,
+        dynamic_path,
+        flat,
+        value.clone(),
+        settings_path,
+        flat,
+    );
+}
+
+fn merge_project_setting(
+    config: &mut LanguageServerConfig,
+    initialization_path: &[&str],
+    dynamic_path: &[&str],
+    flat: &str,
+    project_value: Value,
+    settings_path: &Path,
+    label: &str,
+) {
+    let value = existing_setting(config, initialization_path, dynamic_path, flat)
+        .cloned()
+        .unwrap_or(project_value);
+    merge_setting(
+        config,
+        initialization_path,
+        dynamic_path,
+        &value,
+        settings_path,
+        label,
+    );
+}
+
+fn merge_setting(
+    config: &mut LanguageServerConfig,
+    initialization_path: &[&str],
+    dynamic_path: &[&str],
+    value: &Value,
+    source: &Path,
+    label: &str,
+) {
+    if !insert_missing(
+        &mut config.initialization_options,
+        initialization_path,
+        value,
+    ) {
+        log!(
+            "[lsp] could not merge {label} into initialization options from {}",
+            source.display()
+        );
+    }
+    if !insert_missing(&mut config.settings, dynamic_path, value) {
+        log!(
+            "[lsp] could not merge {label} into dynamic settings from {}",
+            source.display()
+        );
+    }
+}
+
+fn existing_setting<'a>(
+    config: &'a LanguageServerConfig,
+    initialization_path: &[&str],
+    dynamic_path: &[&str],
+    flat: &str,
+) -> Option<&'a Value> {
+    config
+        .initialization_options
+        .as_ref()
+        .and_then(|value| value_at_path(value, initialization_path))
+        .or_else(|| {
+            config
+                .settings
+                .as_ref()
+                .and_then(|value| value_at_path(value, dynamic_path))
+        })
+        .or_else(|| config.settings.as_ref().and_then(|value| value.get(flat)))
+}
+
+fn value_at_path<'a>(mut value: &'a Value, path: &[&str]) -> Option<&'a Value> {
+    for part in path {
+        value = value.get(*part)?;
+    }
+    Some(value)
 }
 
 fn existing_rustfmt_args(config: &LanguageServerConfig) -> Option<&Value> {
@@ -472,6 +663,128 @@ mod tests {
     }
 
     #[test]
+    fn imports_repository_local_target_dir_and_workload_settings() {
+        let (repository, workspace) = repository();
+        write_settings(
+            repository.path(),
+            r#"{
+                "rust-analyzer.cargo.targetDir": "${workspaceFolder}/codex-rs/target/rust-analyzer",
+                "rust-analyzer.cachePriming.enable": true,
+                "rust-analyzer.check.workspace": false,
+                "rust-analyzer.cargo.allTargets": false
+            }"#,
+        );
+
+        let mut config = rust_server();
+        apply_workspace_settings(&mut config, &workspace, "rust");
+
+        let target = repository
+            .path()
+            .join("codex-rs/target/rust-analyzer")
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(
+            config.initialization_options,
+            Some(json!({
+                "cargo": { "targetDir": target, "allTargets": false },
+                "cachePriming": { "enable": true },
+                "check": { "workspace": false },
+            }))
+        );
+        assert_eq!(
+            config.settings,
+            Some(json!({
+                "rust-analyzer": {
+                    "cargo": { "targetDir": target, "allTargets": false },
+                    "cachePriming": { "enable": true },
+                    "check": { "workspace": false },
+                }
+            }))
+        );
+    }
+
+    #[test]
+    fn rejects_target_dirs_outside_the_settings_workspace() {
+        for target_dir in ["../outside", "/tmp/outside", "${workspaceFolder}"] {
+            let (repository, workspace) = repository();
+            write_settings(
+                repository.path(),
+                &json!({ CARGO_TARGET_DIR_KEY: target_dir }).to_string(),
+            );
+            let mut config = rust_server();
+
+            apply_workspace_settings(&mut config, &workspace, "rust");
+
+            assert!(config.initialization_options.is_none(), "{target_dir}");
+            assert!(config.settings.is_none(), "{target_dir}");
+        }
+    }
+
+    #[test]
+    fn explicit_target_dir_and_workload_settings_take_precedence() {
+        let (repository, workspace) = repository();
+        write_settings(
+            repository.path(),
+            r#"{
+                "rust-analyzer.cargo.targetDir": "target/project",
+                "rust-analyzer.cachePriming.enable": false
+            }"#,
+        );
+        let mut config = rust_server();
+        config.initialization_options = Some(json!({
+            "cargo": { "targetDir": "/trusted/user/target" },
+            "cachePriming": { "enable": true },
+        }));
+
+        apply_workspace_settings(&mut config, &workspace, "rust");
+
+        assert_eq!(
+            config.initialization_options.as_ref().unwrap()["cargo"]["targetDir"],
+            json!("/trusted/user/target")
+        );
+        assert_eq!(
+            config.initialization_options.as_ref().unwrap()["cachePriming"]["enable"],
+            json!(true)
+        );
+        assert_eq!(
+            config.settings.as_ref().unwrap()["rust-analyzer"]["cargo"]["targetDir"],
+            json!("/trusted/user/target")
+        );
+        assert_eq!(
+            config.settings.as_ref().unwrap()["rust-analyzer"]["cachePriming"]["enable"],
+            json!(true)
+        );
+    }
+
+    #[test]
+    fn fast_startup_disables_cache_priming_without_overriding_explicit_values() {
+        let mut config = rust_server();
+        apply_fast_startup_defaults(&mut config, "rust");
+        assert_eq!(
+            config.initialization_options.as_ref().unwrap()["cachePriming"]["enable"],
+            json!(false)
+        );
+        assert_eq!(
+            config.settings.as_ref().unwrap()["rust-analyzer"]["cachePriming"]["enable"],
+            json!(false)
+        );
+
+        let mut explicit = rust_server();
+        explicit.initialization_options = Some(json!({
+            "cachePriming": { "enable": true }
+        }));
+        apply_fast_startup_defaults(&mut explicit, "rust");
+        assert_eq!(
+            explicit.initialization_options.as_ref().unwrap()["cachePriming"]["enable"],
+            json!(true)
+        );
+        assert_eq!(
+            explicit.settings.as_ref().unwrap()["rust-analyzer"]["cachePriming"]["enable"],
+            json!(true)
+        );
+    }
+
+    #[test]
     fn ignores_non_rust_documents() {
         let (repository, workspace) = repository();
         write_settings(
@@ -573,6 +886,28 @@ mod tests {
 
         let mut config = rust_server();
         apply_workspace_settings(&mut config, &workspace, "rust");
+
+        assert!(config.initialization_options.is_none());
+        assert!(config.settings.is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_settings_symlinked_outside_a_workspace_without_git() {
+        let workspace = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let external = outside.path().join("settings.json");
+        fs::write(
+            &external,
+            r#"{"rust-analyzer.cargo.targetDir":"target/rust-analyzer"}"#,
+        )
+        .unwrap();
+        let vscode = workspace.path().join(".vscode");
+        fs::create_dir(&vscode).unwrap();
+        std::os::unix::fs::symlink(external, vscode.join("settings.json")).unwrap();
+        let mut config = rust_server();
+
+        apply_workspace_settings(&mut config, workspace.path(), "rust");
 
         assert!(config.initialization_options.is_none());
         assert!(config.settings.is_none());

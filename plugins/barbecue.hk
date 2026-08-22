@@ -327,6 +327,11 @@ fn symbols_loaded(result: BarbecueSymbolsResult) {
     render_windows();
 }
 
+#[red::on("lsp:document_symbols_refreshed")]
+fn refreshed_symbols_loaded(result: BarbecueSymbolsResult) {
+    symbols_loaded(result);
+}
+
 fn symbol_record(result: BarbecueSymbolsResult) -> SymbolRecord {
     return SymbolRecord {
         file: result.file,

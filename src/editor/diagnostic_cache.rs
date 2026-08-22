@@ -1,8 +1,8 @@
-//! Best-effort, workspace-scoped recovery of provisional language-server findings.
+//! Best-effort, workspace-scoped recovery of provisional language-server display data.
 //!
-//! Cached diagnostics are never authoritative. Their document text, language-server
-//! configuration, and workspace manifests must still match before they are displayed,
-//! and the first fresh report replaces both restored producer channels.
+//! Cached diagnostics, symbols, and inlay hints are never authoritative. Their document
+//! text, language-server configuration, and workspace manifests must still match before
+//! they are displayed. Mutating requests always go to the live server.
 
 use std::{
     collections::{BTreeSet, HashMap, HashSet},
@@ -21,12 +21,12 @@ use sha2::{Digest as _, Sha256};
 use crate::{
     buffer::Buffer,
     config::{LanguageServerConfig, LspConfig},
-    lsp::{file_path, Diagnostic, LspManager},
+    lsp::{file_path, Diagnostic, LspManager, Range},
 };
 
 use super::diagnostics::DiagnosticReports;
 
-const CACHE_SCHEMA_VERSION: u32 = 1;
+const CACHE_SCHEMA_VERSION: u32 = 2;
 const MAX_CACHE_FILE_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_CACHED_DOCUMENT_BYTES: u64 = 16 * 1024 * 1024;
 const CACHE_WRITE_DEBOUNCE: Duration = Duration::from_secs(2);
@@ -61,6 +61,16 @@ struct CachedDocument {
     push: Vec<Diagnostic>,
     #[serde(default)]
     pull: Vec<Diagnostic>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    document_symbols: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    inlay_hints: Option<InlayHintSnapshot>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub(super) struct InlayHintSnapshot {
+    pub(super) range: Range,
+    pub(super) result: Value,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -86,10 +96,13 @@ struct ReportSnapshot {
     pull: Vec<Diagnostic>,
 }
 
-pub(super) struct RestoredDiagnosticReports {
+pub(super) struct RestoredDocumentState {
     pub(super) uri: String,
     pub(super) push: Vec<Diagnostic>,
     pub(super) pull: Vec<Diagnostic>,
+    pub(super) defer_empty: bool,
+    pub(super) document_symbols: Option<Value>,
+    pub(super) inlay_hints: Option<InlayHintSnapshot>,
 }
 
 /// Debounces owner-private cache writes and tracks workspaces already hydrated.
@@ -119,7 +132,7 @@ impl DiagnosticCache {
         &mut self,
         config: &LspConfig,
         buffers: &[Buffer],
-    ) -> Vec<RestoredDiagnosticReports> {
+    ) -> Vec<RestoredDocumentState> {
         if !config.enabled {
             return Vec::new();
         }
@@ -167,7 +180,11 @@ impl DiagnosticCache {
             }
 
             for cached in workspace.documents {
-                if cached.push.is_empty() && cached.pull.is_empty() {
+                if cached.push.is_empty()
+                    && cached.pull.is_empty()
+                    && cached.document_symbols.is_none()
+                    && cached.inlay_hints.is_none()
+                {
                     continue;
                 }
                 let Ok(path) = file_path(&cached.uri) else {
@@ -195,10 +212,13 @@ impl DiagnosticCache {
                 if current_hash != Some(cached.content_sha256) {
                     continue;
                 }
-                restored.push(RestoredDiagnosticReports {
+                restored.push(RestoredDocumentState {
                     uri: cached.uri,
                     push: cached.push,
                     pull: cached.pull,
+                    defer_empty: route.language_id == "rust",
+                    document_symbols: cached.document_symbols,
+                    inlay_hints: cached.inlay_hints,
                 });
             }
         }
@@ -212,6 +232,8 @@ impl DiagnosticCache {
         config: &LspConfig,
         buffers: &[Buffer],
         reports: &DiagnosticReports,
+        document_symbols: &HashMap<String, Value>,
+        inlay_hints: &HashMap<String, InlayHintSnapshot>,
         force: bool,
     ) -> anyhow::Result<()> {
         self.finish_writer(force)?;
@@ -236,11 +258,21 @@ impl DiagnosticCache {
                 pull: pull.to_vec(),
             })
             .collect::<Vec<_>>();
+        let document_symbols = document_symbols.clone();
+        let inlay_hints = inlay_hints.clone();
         self.dirty_since = None;
         match std::thread::Builder::new()
             .name("red-diagnostic-cache".to_string())
-            .spawn(move || persist_workspaces(&directory, &config, &documents, &reports))
-        {
+            .spawn(move || {
+                persist_workspaces(
+                    &directory,
+                    &config,
+                    &documents,
+                    &reports,
+                    &document_symbols,
+                    &inlay_hints,
+                )
+            }) {
             Ok(writer) => self.writer = Some(writer),
             Err(error) => {
                 self.mark_dirty();
@@ -295,6 +327,8 @@ fn persist_workspaces(
     config: &LspConfig,
     open_documents: &[OpenDocument],
     reports: &[ReportSnapshot],
+    document_symbols: &HashMap<String, Value>,
+    inlay_hints: &HashMap<String, InlayHintSnapshot>,
 ) -> anyhow::Result<()> {
     if !config.enabled {
         return Ok(());
@@ -327,17 +361,34 @@ fn persist_workspaces(
         );
     }
 
-    for report in reports {
-        if report.push.is_empty() && report.pull.is_empty() {
+    let reports_by_uri = reports
+        .iter()
+        .map(|report| (report.uri.as_str(), report))
+        .collect::<HashMap<_, _>>();
+    let state_uris = reports_by_uri
+        .keys()
+        .copied()
+        .chain(document_symbols.keys().map(String::as_str))
+        .chain(inlay_hints.keys().map(String::as_str))
+        .collect::<BTreeSet<_>>();
+
+    for uri in &state_uris {
+        let report = reports_by_uri.get(uri).copied();
+        let symbols = document_symbols.get(*uri);
+        let hints = inlay_hints.get(*uri);
+        if report.is_none_or(|report| report.push.is_empty() && report.pull.is_empty())
+            && symbols.is_none()
+            && hints.is_none()
+        {
             continue;
         }
-        let Ok(path) = file_path(&report.uri) else {
+        let Ok(path) = file_path(uri) else {
             continue;
         };
         let Some(route) = routing.resolve_document(&path) else {
             continue;
         };
-        if route.uri != report.uri {
+        if route.uri != *uri {
             continue;
         }
         let workspace_root = canonical_workspace_root(&route.workspace_root);
@@ -347,7 +398,7 @@ fn persist_workspaces(
         let Some(server) = config.servers.get(&route.server_name) else {
             continue;
         };
-        let content_sha256 = match open_by_uri.get(report.uri.as_str()) {
+        let content_sha256 = match open_by_uri.get(*uri) {
             Some(contents) => hash_rope(contents),
             None => match hash_file(Path::new(&path)) {
                 Ok(hash) => hash,
@@ -355,22 +406,57 @@ fn persist_workspaces(
             },
         };
         workspace.documents.push(CachedDocument {
-            uri: report.uri.clone(),
+            uri: (*uri).to_string(),
             server_name: route.server_name,
             content_sha256,
             server_config_sha256: server_fingerprint(server)?,
-            push: report.push.clone(),
-            pull: report.pull.clone(),
+            push: report.map_or_else(Vec::new, |report| report.push.clone()),
+            pull: report.map_or_else(Vec::new, |report| report.pull.clone()),
+            document_symbols: symbols.cloned(),
+            inlay_hints: hints.cloned(),
         });
     }
 
     for workspace in workspaces.values_mut() {
+        merge_previous_documents(
+            directory,
+            workspace,
+            open_by_uri.keys().copied(),
+            &state_uris,
+        );
         workspace
             .documents
             .sort_unstable_by(|left, right| left.uri.cmp(&right.uri));
         write_workspace(directory, workspace)?;
     }
     Ok(())
+}
+
+fn merge_previous_documents<'a>(
+    directory: &Path,
+    workspace: &mut CachedWorkspace,
+    open_uris: impl Iterator<Item = &'a str>,
+    replaced_uris: &BTreeSet<&str>,
+) {
+    let open_uris = open_uris.collect::<HashSet<_>>();
+    let path = workspace_cache_path(directory, &workspace.workspace_root);
+    let Ok(Some(previous)) = read_workspace(&path) else {
+        return;
+    };
+    if previous.version != CACHE_SCHEMA_VERSION
+        || previous.workspace_root != workspace.workspace_root
+        || previous.workspace_sha256 != workspace.workspace_sha256
+        || cache_expired(previous.captured_at_ms)
+    {
+        return;
+    }
+
+    workspace
+        .documents
+        .extend(previous.documents.into_iter().filter(|document| {
+            !open_uris.contains(document.uri.as_str())
+                && !replaced_uris.contains(document.uri.as_str())
+        }));
 }
 
 fn canonical_workspace_root(root: &Path) -> PathBuf {
@@ -463,6 +549,10 @@ fn workspace_fingerprint(root: &Path, config: &LspConfig) -> io::Result<[u8; 32]
     }
 
     let mut digest = Sha256::new();
+    let mut config_value = serde_json::to_value(config).map_err(io::Error::other)?;
+    canonicalize_json(&mut config_value);
+    digest.update(b"lsp-config");
+    digest.update(serde_json::to_vec(&config_value).map_err(io::Error::other)?);
     for marker in markers {
         digest.update(marker.as_bytes());
         digest.update([0]);
@@ -477,7 +567,37 @@ fn workspace_fingerprint(root: &Path, config: &LspConfig) -> io::Result<[u8; 32]
             Err(error) => return Err(error),
         }
     }
+    digest.update(b"repository-local-lsp-settings");
+    match workspace_settings_file(root) {
+        Some(path) => {
+            digest.update([1]);
+            digest.update(hash_file(&path)?);
+        }
+        None => digest.update([0]),
+    }
     Ok(digest.finalize().into())
+}
+
+fn workspace_settings_file(workspace_root: &Path) -> Option<PathBuf> {
+    let repository_root = workspace_root
+        .ancestors()
+        .find(|ancestor| ancestor.join(".git").exists());
+    let settings_boundary = repository_root.unwrap_or(workspace_root);
+    for ancestor in workspace_root.ancestors() {
+        let candidate = ancestor.join(".vscode/settings.json");
+        if candidate.is_file() {
+            let canonical_boundary = fs::canonicalize(settings_boundary).ok()?;
+            let canonical_candidate = fs::canonicalize(&candidate).ok()?;
+            if !canonical_candidate.starts_with(canonical_boundary) {
+                return None;
+            }
+            return Some(candidate);
+        }
+        if repository_root.is_none() || repository_root == Some(ancestor) {
+            break;
+        }
+    }
+    None
 }
 
 fn read_workspace(path: &Path) -> anyhow::Result<Option<CachedWorkspace>> {
