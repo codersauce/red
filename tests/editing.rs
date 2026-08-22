@@ -2545,6 +2545,85 @@ async fn bufdo_stops_on_substitute_error_unless_e_suppresses_it() {
 }
 
 #[tokio::test]
+async fn bufdo_deletes_each_snapshotted_buffer_and_leaves_a_blank_buffer() {
+    let buffers = vec![
+        Buffer::new(Some("one.rs".to_string()), "one\n".to_string()),
+        Buffer::new(Some("two.rs".to_string()), "two\n".to_string()),
+        Buffer::new(Some("three.rs".to_string()), "three\n".to_string()),
+    ];
+    let original_ids = buffers.iter().map(Buffer::id).collect::<Vec<_>>();
+    let mut editor = Editor::test_with_size(
+        Box::new(MockLsp),
+        /*width*/ 80,
+        /*height*/ 24,
+        Config::default(),
+        Theme::default(),
+        buffers,
+    )
+    .unwrap();
+    editor.test_disable_terminal_output();
+    let mut harness = EditorHarness { editor };
+
+    harness
+        .execute_action(Action::Command("bufdo bd".to_string()))
+        .await
+        .unwrap();
+
+    assert_eq!(harness.buffer_names(), vec!["[No Name]"]);
+    assert!(harness.editor.test_current_buffer().is_blank());
+    assert!(!original_ids.contains(&harness.editor.test_current_buffer().id()));
+}
+
+#[tokio::test]
+async fn bufdo_delete_stops_at_a_dirty_buffer_unless_forced() {
+    let buffers = vec![
+        Buffer::new(Some("one.rs".to_string()), "one\n".to_string()),
+        Buffer::new(Some("two.rs".to_string()), "two\n".to_string()),
+        Buffer::new(Some("three.rs".to_string()), "three\n".to_string()),
+    ];
+    let second_id = buffers[1].id().as_u64();
+    let mut editor = Editor::test_with_size(
+        Box::new(MockLsp),
+        /*width*/ 80,
+        /*height*/ 24,
+        Config::default(),
+        Theme::default(),
+        buffers,
+    )
+    .unwrap();
+    editor.test_disable_terminal_output();
+    let mut harness = EditorHarness { editor };
+    harness
+        .execute_action(Action::OpenBufferById(second_id))
+        .await
+        .unwrap();
+    harness
+        .execute_action(Action::InsertCharAtCursorPos('x'))
+        .await
+        .unwrap();
+
+    harness
+        .execute_action(Action::Command("bufdo bd".to_string()))
+        .await
+        .unwrap();
+
+    assert_eq!(harness.buffer_names(), vec!["two.rs", "three.rs"]);
+    assert_eq!(harness.buffer_contents(), "xtwo\n");
+    assert_eq!(
+        harness.last_error(),
+        Some("No write since last change (add ! to override)")
+    );
+
+    harness
+        .execute_action(Action::Command("bufdo bd!".to_string()))
+        .await
+        .unwrap();
+
+    assert_eq!(harness.buffer_names(), vec!["[No Name]"]);
+    assert!(harness.editor.test_current_buffer().is_blank());
+}
+
+#[tokio::test]
 async fn bufdo_uses_stable_buffer_id_ranges_and_rejects_interactive_commands() {
     let buffers = vec![
         Buffer::new(/*file*/ None, "foo one\n".to_string()),
