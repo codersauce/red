@@ -38,7 +38,7 @@ pub use document::{DocumentEdit, DocumentSnapshot};
 pub use gutter::{GutterSign, GutterSignManager};
 pub use location::{LocationColumnEncoding, OpenLocationTarget, PluginLocation};
 pub use metadata::PluginMetadata;
-pub use overlay::{OverlayAlignment, OverlayConfig, OverlayManager};
+pub use overlay::{OverlayAlignment, OverlayConfig, OverlayManager, OverlayOverflow};
 pub use panel::{
     PanelConfig, PanelManager, PanelManagerSnapshot, PanelRow, PanelRowKind, PanelSegment,
     PanelSessionSnapshot, PanelSide, PanelSnapshotKind, TextPanelBlock, TextPanelBlockFormat,

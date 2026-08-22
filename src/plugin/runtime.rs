@@ -12479,12 +12479,38 @@ mod tests {
         runtime
             .resolve_request(
                 request_id,
-                serde_json::json!({ "size": [80, 24], "theme": { "ui_style": {} } }),
+                serde_json::json!({
+                    "size": [80, 24],
+                    "theme": {
+                        "ui_style": {
+                            "muted": {
+                                "fg": { "Rgb": { "r": 153, "g": 153, "b": 153 } },
+                                "bg": { "Rgb": { "r": 17, "g": 17, "b": 17 } },
+                                "bold": false,
+                                "italic": false
+                            },
+                            "popup_title": {
+                                "fg": { "Rgb": { "r": 238, "g": 238, "b": 238 } },
+                                "bg": { "Rgb": { "r": 34, "g": 34, "b": 34 } },
+                                "bold": true,
+                                "italic": false
+                            }
+                        }
+                    }
+                }),
             )
             .await
             .unwrap();
         match ACTION_DISPATCHER.recv_request() {
-            PluginRequest::CreateOverlay { id, .. } => assert_eq!(id, "fidget-progress"),
+            PluginRequest::CreateOverlay { id, config } => {
+                assert_eq!(id, "fidget-progress");
+                assert_eq!(config.max_width, 60);
+                assert!(matches!(
+                    config.overflow,
+                    crate::plugin::OverlayOverflow::TruncateLeft
+                ));
+                assert_eq!(config.truncate_marker, "…");
+            }
             _ => panic!("unexpected plugin request"),
         }
         match ACTION_DISPATCHER.recv_request() {
@@ -12517,6 +12543,7 @@ mod tests {
                 assert_eq!(lines.len(), 2);
                 assert_eq!(lines[0].0, "Loading (25%) Indexing");
                 assert_eq!(lines[1].0, "rust-analyzer ⠋");
+                assert!(lines.iter().all(|(_, style)| style.bg.is_none()));
             }
             _ => panic!("unexpected plugin request"),
         }
