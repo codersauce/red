@@ -53,6 +53,8 @@ SCENARIOS = (
     "startup-config",
     "startup-theme",
     "theme-colors",
+    "ascii-graphemes",
+    "textarea-open",
     "husk-completion",
     "husk-config",
     "husk-update",

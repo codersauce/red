@@ -289,6 +289,10 @@ pub fn byte_to_char(line: &str, byte_offset: usize) -> usize {
 
 /// Count the number of grapheme clusters in a string
 pub fn grapheme_len(s: &str) -> usize {
+    if s.is_ascii() {
+        // CRLF is the only multi-byte extended grapheme possible in ASCII.
+        return s.len() - s.matches("\r\n").count();
+    }
     s.graphemes(true).count()
 }
 
@@ -546,6 +550,24 @@ mod tests {
         assert_eq!(grapheme_char_range(line, 2), Some((8, 10)));
         assert_eq!(grapheme_char_range(line, 3), Some((10, 11)));
         assert_eq!(grapheme_char_range(line, 4), None);
+    }
+
+    #[test]
+    fn ascii_grapheme_count_preserves_crlf_and_unicode_cluster_boundaries() {
+        for (text, expected) in [
+            ("", 0),
+            ("ordinary ASCII text\nnext line", 29),
+            ("a\r\nb", 3),
+            ("a\r\n\r\nb", 4),
+            ("a\rb\nc", 5),
+            ("\r\r\n\n", 3),
+            ("e\u{0301}", 1),
+            ("👨‍👩‍👧‍👦", 1),
+            ("🇧🇷", 1),
+            ("e\u{0301}\r\n👋", 3),
+        ] {
+            assert_eq!(grapheme_len(text), expected, "{text:?}");
+        }
     }
 
     #[test]

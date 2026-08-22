@@ -90,6 +90,8 @@ const TEXTAREA_INSERTIONS: usize = 256;
 const STARTUP_CONFIG_LOADS: usize = 24;
 const STARTUP_THEME_LOADS: usize = 256;
 const THEME_COLOR_PARSES: usize = 16_384;
+const ASCII_GRAPHEME_COUNTS: usize = 1_024;
+const TEXTAREA_DOCUMENT_LOADS: usize = 128;
 
 fn main() -> Result<()> {
     let scenario = std::env::args().nth(1).unwrap_or_else(|| "all".into());
@@ -223,6 +225,12 @@ fn main() -> Result<()> {
     }
     if scenario == "all" || scenario == "theme-colors" {
         results.push(benchmark_theme_color_parsing()?);
+    }
+    if scenario == "all" || scenario == "ascii-graphemes" {
+        results.push(benchmark_ascii_grapheme_counting());
+    }
+    if scenario == "all" || scenario == "textarea-open" {
+        results.push(benchmark_embedded_textarea_loading()?);
     }
 
     anyhow::ensure!(
@@ -1522,6 +1530,39 @@ fn benchmark_theme_color_parsing() -> Result<serde_json::Value> {
         "theme_hex_color_parsing",
         started,
         THEME_COLOR_PARSES,
+    ))
+}
+
+fn benchmark_ascii_grapheme_counting() -> serde_json::Value {
+    let contents = "ordinary ASCII editor line and cursor text\n".repeat(768);
+
+    let started = Instant::now();
+    for _ in 0..ASCII_GRAPHEME_COUNTS {
+        black_box(red::unicode_utils::grapheme_len(black_box(&contents)));
+    }
+    report(
+        "ascii_editor_grapheme_counting",
+        started,
+        ASCII_GRAPHEME_COUNTS,
+    )
+}
+
+fn benchmark_embedded_textarea_loading() -> Result<serde_json::Value> {
+    let contents = "ordinary ASCII composer draft line\n".repeat(768);
+
+    let started = Instant::now();
+    for _ in 0..TEXTAREA_DOCUMENT_LOADS {
+        let area = TextArea::new(black_box(&contents));
+        anyhow::ensure!(
+            area.cursor() == contents.len() && area.buffer().contents().len() == contents.len(),
+            "embedded textarea loading lost draft contents or cursor position"
+        );
+        black_box(area);
+    }
+    Ok(report(
+        "embedded_text_area_document_loading",
+        started,
+        TEXTAREA_DOCUMENT_LOADS,
     ))
 }
 

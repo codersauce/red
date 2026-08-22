@@ -73,8 +73,10 @@ navigation baselines were frozen after rebasing to `d92777c`.
 | Decoration namespace updates | 97.48% |
 | Long transcript cursor lookup | 97.35% |
 | Git workspace row navigation | 96.35% |
+| Shared ASCII grapheme counting | 94.94% |
 | LSP absolute-document routing | 94.68% |
 | Workspace inline file discovery | 92.65% |
+| Embedded text-area document loading | 91.26% |
 | Shared modal editor backward word motion | 87.58% |
 | Shared modal editor forward word motion | 87.01% |
 | Printable ASCII frame rendering | 85.25% |
@@ -140,6 +142,14 @@ comment markers inside JSON strings, scoped token styles, and workbench-color
 fallbacks. The underlying hexadecimal color parser separately improved from
 488 to 99 microseconds over 16,384 six- and eight-digit colors while preserving
 shorthand, named colors, transparency, alpha channels, and invalid-input errors.
+
+Shared ASCII grapheme counting was measured over 1,024 large multiline source
+strings through the same helper used by editor navigation, layout, prompts, and
+composers. Eleven alternating samples reduced the median from 242,610 to 12,283
+microseconds while retaining CRLF grapheme pairing, combining marks, family
+emoji, regional-indicator flags, and mixed Unicode. Opening 128 real embedded
+draft documents independently improved from 27,405 to 2,394 microseconds while
+preserving normalized byte caps, cursor positions, and exact document contents.
 
 Real detached-terminal coverage separately exercised editing, 32 KiB of Unicode
 paste, repeated resizes, reattachment, and owner shutdown. Detached-frame median

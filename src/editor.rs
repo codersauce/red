@@ -3302,6 +3302,9 @@ pub struct Editor {
     /// Incremented after full renders so event handling can avoid duplicate frames.
     render_generation: u64,
 
+    /// Picker callbacks may enqueue navigation that must commit before the next input event.
+    service_background_before_next_input: bool,
+
     /// Rows changed by the most recent detached frame, reused for protocol deltas.
     last_detached_changed_rows: Vec<usize>,
 
@@ -4914,6 +4917,7 @@ impl Editor {
             is_focused: true,
             suppress_reactivation_click: false,
             render_generation: 0,
+            service_background_before_next_input: false,
             last_detached_changed_rows: Vec::new(),
             last_rendered_window: None,
             last_rendered_viewport: None,

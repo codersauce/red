@@ -1,6 +1,6 @@
 //! Host-independent, rope-backed Vim editing for embedded text surfaces.
 
-use std::collections::HashMap;
+use std::{borrow::Cow, collections::HashMap};
 
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use unicode_segmentation::UnicodeSegmentation;
@@ -184,14 +184,14 @@ impl TextArea {
     pub fn with_max_bytes(text: impl AsRef<str>, max_bytes: usize) -> Self {
         let normalized = normalize_newlines(text.as_ref());
         let text = if normalized.len() <= max_bytes {
-            normalized
+            normalized.as_ref()
         } else {
-            String::new()
+            ""
         };
         let mut area = Self {
-            buffer: unnamed_buffer(&text),
+            buffer: unnamed_buffer(text),
             state: EditState {
-                cursor: grapheme_len(&text),
+                cursor: grapheme_len(text),
                 ..EditState::default()
             },
             max_bytes,
@@ -1993,8 +1993,11 @@ fn operator_for_character(character: char) -> Operator {
     }
 }
 
-fn normalize_newlines(text: &str) -> String {
-    text.replace("\r\n", "\n").replace('\r', "\n")
+fn normalize_newlines(text: &str) -> Cow<'_, str> {
+    if !text.as_bytes().contains(&b'\r') {
+        return Cow::Borrowed(text);
+    }
+    Cow::Owned(text.replace("\r\n", "\n").replace('\r', "\n"))
 }
 
 fn unnamed_buffer(text: &str) -> Buffer {
@@ -2047,6 +2050,23 @@ mod tests {
         assert!(area.undo());
         assert_eq!(area.text(), "ab");
         assert_eq!(area.cursor(), 1);
+    }
+
+    #[test]
+    fn borrowed_textarea_loading_preserves_normalized_capacity_and_unicode_cursors() {
+        let area = TextArea::with_max_bytes("ab\r\ncd\r", 6);
+        assert_eq!(area.text(), "ab\ncd\n");
+        assert_eq!(area.cursor(), 6);
+        assert_eq!(area.buffer.pos, (0, 2));
+
+        let oversized = TextArea::with_max_bytes("abcdefg", 6);
+        assert_eq!(oversized.text(), "");
+        assert_eq!(oversized.cursor(), 0);
+
+        let unicode = TextArea::new("e\u{301}\r\n👋");
+        assert_eq!(unicode.text(), "e\u{301}\n👋");
+        assert_eq!(unicode.cursor(), 3);
+        assert_eq!(unicode.buffer.pos, (1, 1));
     }
 
     #[test]
