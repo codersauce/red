@@ -75,7 +75,9 @@ navigation baselines were frozen after rebasing to `d92777c`.
 | Embedded Vim line-boundary motions | 98.48% |
 | Shared Vim final-sentence operators | 98.20% |
 | Gutter namespace updates | 97.94% |
+| Shared Vim around final-sentence text objects | 97.88% |
 | Embedded Vim word motions | 97.88% |
+| Shared Vim inner final-sentence text objects | 97.87% |
 | Decoration namespace updates | 97.48% |
 | Long transcript cursor lookup | 97.35% |
 | Character-wrapped layout cursor lookup | 97.29% |
@@ -215,6 +217,13 @@ release-build samples reduced inner medians from 16,028 to 5,928 microseconds
 and around medians from 16,338 to 5,925 microseconds while preserving
 whitespace-only groups, CRLF, Unicode whitespace, empty/trailing lines,
 out-of-range cursors, and exact paragraph selection scopes.
+
+Shared Vim final-sentence objects were independently measured across 2,048
+inner and around production selections following real paragraph boundaries.
+Eleven alternating release-build samples reduced inner medians from 102,767 to
+2,194 microseconds and around medians from 103,380 to 2,195 microseconds while
+preserving punctuation, counts, leading and trailing whitespace, Unicode scalar
+positions, and inner versus around selection scopes.
 
 Multi-file startup uses the same production loader as the executable. Across
 four startup passes over 128 distinct source files, seven alternating samples

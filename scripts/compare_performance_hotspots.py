@@ -76,6 +76,8 @@ SCENARIOS = (
     "text-object-big-word",
     "text-object-paragraph-inner",
     "text-object-paragraph-around",
+    "text-object-sentence-inner",
+    "text-object-sentence-around",
     "husk-completion",
     "husk-config",
     "husk-update",

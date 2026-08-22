@@ -304,6 +304,12 @@ fn main() -> Result<()> {
     if scenario == "all" || scenario == "text-object-paragraph-around" {
         results.push(benchmark_paragraph_text_object(TextObjectScope::Around)?);
     }
+    if scenario == "all" || scenario == "text-object-sentence-inner" {
+        results.push(benchmark_sentence_text_object(TextObjectScope::Inner)?);
+    }
+    if scenario == "all" || scenario == "text-object-sentence-around" {
+        results.push(benchmark_sentence_text_object(TextObjectScope::Around)?);
+    }
 
     anyhow::ensure!(
         !results.is_empty(),
@@ -2056,6 +2062,35 @@ fn benchmark_paragraph_text_object(scope: TextObjectScope) -> Result<serde_json:
         },
         started,
         TEXTAREA_UNDO_RESTORES,
+    ))
+}
+
+fn benchmark_sentence_text_object(scope: TextObjectScope) -> Result<serde_json::Value> {
+    let prefix = "ordinary sentence. another follows.\n\n".repeat(512);
+    let ending = "final unterminated sentence with retained editor words";
+    let buffer = Buffer::new(None, format!("{prefix}{ending}"));
+    let cursor = buffer.char_idx_to_position(prefix.len() + 8);
+    let resolver = MotionResolver::new(&buffer, cursor);
+    let started = Instant::now();
+    for _ in 0..TEXTAREA_VIM_MOTIONS {
+        let range = resolver
+            .text_object(scope, TextObjectKind::Sentence)
+            .ok_or_else(|| anyhow::anyhow!("final sentence text object was not found"))?;
+        anyhow::ensure!(
+            range.start == buffer.char_idx_to_position(prefix.len())
+                && range.end == buffer.char_idx_to_position(prefix.len() + ending.len()),
+            "final sentence text object changed its source boundaries"
+        );
+        black_box(range);
+    }
+    Ok(report(
+        if scope == TextObjectScope::Inner {
+            "shared_vim_inner_final_sentence_text_objects"
+        } else {
+            "shared_vim_around_final_sentence_text_objects"
+        },
+        started,
+        TEXTAREA_VIM_MOTIONS,
     ))
 }
 

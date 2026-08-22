@@ -680,6 +680,28 @@ impl<'buffer> MotionResolver<'buffer> {
     }
 
     fn sentence_text_object(&self, scope: TextObjectScope, count: u16) -> Option<TextRange> {
+        if count <= 1 && self.cursor.line == self.buffer.last_navigable_line() {
+            let contents = self.buffer.contents_snapshot();
+            if let Some(line) = contents.get_line(self.cursor.line) {
+                let follows_boundary = self.cursor.line == 0
+                    || contents
+                        .get_line(self.cursor.line - 1)
+                        .is_some_and(Buffer::line_slice_is_empty);
+                let first = line.get_char(0);
+                if follows_boundary
+                    && first.is_some_and(|character| !character.is_whitespace())
+                    && self.cursor.character < line.len_chars()
+                    && line
+                        .chars()
+                        .all(|character| !matches!(character, '.' | '!' | '?' | '\n' | '\r'))
+                {
+                    return Some(TextRange::new(
+                        TextPosition::new(self.cursor.line, 0),
+                        self.buffer.char_idx_to_position(self.buffer.char_len()),
+                    ));
+                }
+            }
+        }
         let units = self.sentence_units();
         let cursor = self.buffer.position_to_char_idx(self.cursor);
         let current = units
@@ -1509,5 +1531,38 @@ mod tests {
             .unwrap();
         assert_eq!(buffer.text_in_range(inner), "first\nsecond\n");
         assert_eq!(buffer.text_in_range(around), "first\nsecond\n\n");
+    }
+
+    #[test]
+    fn indexed_final_sentence_objects_preserve_punctuation_unicode_and_counts() {
+        for text in [
+            "final unterminated sentence",
+            "first.\n\nfinal words and whitespace  ",
+            "first.\n\n漢字 👨‍👩‍👧 e\u{301}clair",
+        ] {
+            let buffer = Buffer::new(None, text.to_string());
+            let line = buffer.last_navigable_line();
+            let expected = buffer.get(line).unwrap();
+            for character in [0, 1, expected.chars().count().saturating_sub(1)] {
+                let resolver = MotionResolver::new(&buffer, TextPosition::new(line, character));
+                for scope in [TextObjectScope::Inner, TextObjectScope::Around] {
+                    let range = resolver
+                        .text_object(scope, TextObjectKind::Sentence)
+                        .unwrap();
+                    assert_eq!(buffer.text_in_range(range), expected, "{text:?} {scope:?}");
+                }
+            }
+        }
+
+        let punctuated = Buffer::new(None, "first.\n\nfinal. next".to_string());
+        let resolver = MotionResolver::new(&punctuated, TextPosition::new(2, 0));
+        let inner = resolver
+            .text_object(TextObjectScope::Inner, TextObjectKind::Sentence)
+            .unwrap();
+        let around = resolver
+            .text_object(TextObjectScope::Around, TextObjectKind::Sentence)
+            .unwrap();
+        assert_eq!(punctuated.text_in_range(inner), "final.");
+        assert_eq!(punctuated.text_in_range(around), "final. ");
     }
 }
