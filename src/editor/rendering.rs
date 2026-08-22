@@ -38,7 +38,7 @@ use crate::{
     undo::{TextPosition, TextRange},
     unicode_utils::{
         char_prefix, display_width, display_width_with_tabs, fit_display_width,
-        grapheme_to_column_with_tabs, trim_line_ending, truncate_display_width,
+        grapheme_to_column_with_tabs, is_printable_ascii, trim_line_ending, truncate_display_width,
         truncate_display_width_with_marker, TruncationSide,
     },
     utils::{expand_user_path, get_workspace_path},
@@ -1473,7 +1473,7 @@ impl Editor {
 
         // Render global UI elements
         let chrome_span = super::perf::PerfSpan::start("render:chrome");
-        self.render_ui_chrome(buffer)?;
+        self.draw_statusline(buffer);
         // A modal workspace replaces editor chrome but remains below dialogs
         // and overlays so prompts and transient menus stay interactive.
         if self.workspace_manager.is_active() {
@@ -2945,8 +2945,12 @@ impl Editor {
             return Ok(());
         }
 
-        let active_search = self.active_search.clone();
-        let pattern = active_search
+        let current_match = self
+            .active_search
+            .as_ref()
+            .and_then(|search| search.preview);
+        let pattern = self
+            .active_search
             .as_ref()
             .map(|search| search.draft.as_str())
             .filter(|draft| !draft.is_empty())
@@ -2972,9 +2976,12 @@ impl Editor {
             .buffer_manager
             .get(window.buffer_index)
             .is_some_and(|buffer| {
-                (visible_start..=visible_end).any(|line| {
-                    buffer.line_range_byte_len(line, line + 1) > MAX_HIGHLIGHT_SLICE_BYTES
-                })
+                buffer.line_range_byte_len(visible_start, visible_end.saturating_add(1))
+                    > MAX_HIGHLIGHT_SLICE_BYTES
+                    && (visible_start..=visible_end).any(|line| {
+                        buffer.line_range_byte_len(line, line.saturating_add(1))
+                            > MAX_HIGHLIGHT_SLICE_BYTES
+                    })
             })
         {
             return Ok(());
@@ -2985,7 +2992,6 @@ impl Editor {
             Err(_) => return Ok(()),
         };
         let first_visible = matches.partition_point(|match_| match_.end_y < visible_start);
-        let current_match = active_search.as_ref().and_then(|search| search.preview);
         let current_start = current_match.map(|match_| (match_.start_x, match_.start_y));
         let cursor_start = (!self.is_search()).then(|| {
             (
@@ -3005,6 +3011,10 @@ impl Editor {
             .as_ref()
             .and_then(|style| style.bg)
             .or(match_bg);
+        let tab_width = self.tab_width_for_buffer_index(window.buffer_index);
+        let content_start = self.gutter_width_for_window(window) + 1;
+        let content_width = self.window_content_width(window);
+        let mut cached_line: Option<(usize, String, bool, std::ops::Range<usize>)> = None;
         for match_ in matches[first_visible..]
             .iter()
             .copied()
@@ -3018,13 +3028,26 @@ impl Editor {
             let end_y = match_.end_y.min(visible_end);
 
             for line_index in start_y..=end_y {
-                let line = self
-                    .buffer_manager
-                    .get(window.buffer_index)
-                    .and_then(|buffer| buffer.get(line_index))
-                    .unwrap_or_default();
-                let line = trim_line_ending(&line);
-                let line_len = line.chars().count();
+                if cached_line.as_ref().map(|(line, _, _, _)| *line) != Some(line_index) {
+                    let line = self
+                        .buffer_manager
+                        .get(window.buffer_index)
+                        .and_then(|buffer| buffer.get(line_index))
+                        .unwrap_or_default();
+                    let ascii_columns = is_printable_ascii(trim_line_ending(&line));
+                    let first_segment = layout
+                        .rows
+                        .partition_point(|segment| segment.line < line_index);
+                    let last_segment = first_segment
+                        + layout.rows[first_segment..]
+                            .partition_point(|segment| segment.line == line_index);
+                    cached_line =
+                        Some((line_index, line, ascii_columns, first_segment..last_segment));
+                }
+                let Some((_, line, ascii_columns, segments)) = cached_line.as_ref() else {
+                    continue;
+                };
+                let line = trim_line_ending(line);
                 let start_x = if line_index == match_.start_y {
                     match_.start_x
                 } else {
@@ -3033,20 +3056,53 @@ impl Editor {
                 let end_x = if line_index == match_.end_y {
                     match_.end_x
                 } else {
-                    line_len
+                    line.chars().count()
                 };
                 if end_x <= start_x {
                     continue;
                 }
 
-                let tab_width = self.tab_width_for_buffer_index(window.buffer_index);
-                let start_col = display_width_with_tabs(char_prefix(line, start_x), tab_width);
-                let end_col = display_width_with_tabs(char_prefix(line, end_x), tab_width);
-                let points =
-                    self.display_col_range_points_in_window(window, line_index, start_col, end_col);
-                if let Some(bg) = bg {
-                    buffer.set_bg_for_points(points, &bg, &self.theme);
+                let (start_col, end_col) = if *ascii_columns {
+                    (start_x, end_x)
                 } else {
+                    (
+                        display_width_with_tabs(char_prefix(line, start_x), tab_width),
+                        display_width_with_tabs(char_prefix(line, end_x), tab_width),
+                    )
+                };
+                if let Some(bg) = bg {
+                    for segment in &layout.rows[segments.clone()] {
+                        let start = start_col.max(segment.start_col);
+                        let end = end_col.min(segment.end_col);
+                        if end <= start {
+                            continue;
+                        }
+
+                        let local_start =
+                            segment.visual_offset + start.saturating_sub(segment.start_col);
+                        if local_start >= content_width {
+                            continue;
+                        }
+                        let local_end = (segment.visual_offset
+                            + end.saturating_sub(segment.start_col))
+                        .min(content_width);
+                        let terminal_y = self.window_to_terminal_y(window, segment.row);
+                        buffer.set_bg_for_range(
+                            Point::new(
+                                self.window_to_terminal_x(window, content_start + local_start),
+                                terminal_y,
+                            ),
+                            Point::new(
+                                self.window_to_terminal_x(window, content_start + local_end - 1),
+                                terminal_y,
+                            ),
+                            &bg,
+                            &self.theme,
+                        );
+                    }
+                } else {
+                    let points = self
+                        .display_col_range_points_in_window(window, line_index, start_col, end_col);
                     buffer.apply_selection_for_points(
                         points,
                         &selection_style,
@@ -3700,8 +3756,12 @@ impl Editor {
     }
 
     fn statusline_search_position(&mut self) -> Option<(usize, usize)> {
-        let active_search = self.active_search.clone();
-        let pattern = active_search
+        let preview = self
+            .active_search
+            .as_ref()
+            .and_then(|search| search.preview);
+        let pattern = self
+            .active_search
             .as_ref()
             .map(|search| search.draft.as_str())
             .filter(|pattern| !pattern.is_empty())
@@ -3711,8 +3771,7 @@ impl Editor {
         if matches.is_empty() {
             return None;
         }
-        let current = active_search
-            .and_then(|search| search.preview)
+        let current = preview
             .map(|preview| (preview.start_y, preview.start_x))
             .unwrap_or((
                 self.buffer_line(),
@@ -5506,6 +5565,59 @@ mod tests {
             .unwrap();
 
         assert!(editor.search_match_cache.is_none());
+    }
+
+    #[test]
+    fn search_highlight_ranges_preserve_tabs_controls_unicode_and_wrapping() {
+        let config = Config::default();
+        let lsp = Box::new(LspManager::new(config.lsp.clone()));
+        let source = Buffer::new(
+            None,
+            "x\u{0007}alpha\n\talpha\n👋 alpha\nabcdefghijklalpha\n".to_string(),
+        );
+        let mut editor =
+            Editor::with_size(lsp, 18, 12, config, Theme::default(), vec![source]).unwrap();
+        let highlight = Color::Rgb {
+            r: 91,
+            g: 122,
+            b: 153,
+        };
+        editor.theme.find_match_style = Some(Style {
+            bg: Some(highlight),
+            ..Style::default()
+        });
+        editor.search_term = "alpha".to_string();
+        let window = editor.window_manager.active_window().unwrap().clone();
+        let tab_width = editor.tab_width_for_buffer_index(window.buffer_index);
+        let expected: HashSet<_> = (0..4)
+            .flat_map(|line_index| {
+                let line = editor.current_buffer().get(line_index).unwrap();
+                let start = line.find("alpha").unwrap();
+                let start_col = display_width_with_tabs(&line[..start], tab_width);
+                editor.display_col_range_points_in_window(
+                    &window,
+                    line_index,
+                    start_col,
+                    start_col + "alpha".len(),
+                )
+            })
+            .map(|point| (point.x, point.y))
+            .collect();
+        assert!(!expected.is_empty());
+
+        let mut buffer = RenderBuffer::new(18, 12, &Style::default());
+        editor
+            .render_search_highlights_in_window(&mut buffer, &window)
+            .unwrap();
+
+        let actual: HashSet<_> = buffer
+            .cells
+            .iter()
+            .enumerate()
+            .filter(|(_, cell)| cell.style.bg == Some(highlight))
+            .map(|(index, _)| (index % buffer.width, index / buffer.width))
+            .collect();
+        assert_eq!(actual, expected);
     }
 
     #[test]

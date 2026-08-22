@@ -239,6 +239,8 @@ const AGENT_EVENTS_PER_TICK: usize = 64;
 const GUTTER_SIGN_COLUMN_WIDTH: usize = 2;
 const DIAGNOSTIC_GUTTER_NAMESPACE: &str = "diagnostics";
 const MAX_HIGHLIGHT_SLICE_BYTES: usize = 512 * 1024;
+const MAX_SEARCH_HISTORY_ENTRIES: usize = 6;
+const MAX_SEARCH_HISTORY_MATCHES_PER_ENTRY: usize = 16_384;
 const MAX_PLUGIN_VIEWPORT_LINE_CHARS: usize = 64 * 1024;
 const MAX_AGENT_FAILURE_MESSAGE_CHARS: usize = 2048;
 const AGENT_BRIDGE_CAPACITY: usize = 64;
@@ -3520,6 +3522,9 @@ pub struct Editor {
     /// Matches for the most recently rendered or previewed search.
     search_match_cache: Option<SearchMatchCache>,
 
+    /// Bounded prior queries reused when an incremental search is edited.
+    search_match_history: VecDeque<SearchMatchCache>,
+
     /// Whether persistent hlsearch rendering has been cleared with :noh.
     search_highlights_suppressed: bool,
 
@@ -4998,6 +5003,7 @@ impl Editor {
             search_direction: SearchDirection::Forward,
             active_search: None,
             search_match_cache: None,
+            search_match_history: VecDeque::new(),
             search_highlights_suppressed: false,
             notifications: NotificationCenter::default(),
             message_browser: None,
@@ -16117,9 +16123,8 @@ impl Editor {
         }
 
         let case_insensitive = self.search_uses_case_insensitive(pattern);
-        let buffer = self.current_buffer();
-        let buffer_id = buffer.id();
-        let revision = buffer.revision();
+        let buffer_id = self.current_buffer().id();
+        let revision = self.current_buffer().revision();
         if let Some(cache) = &self.search_match_cache {
             if cache.buffer_id == buffer_id
                 && cache.revision == revision
@@ -16130,9 +16135,28 @@ impl Editor {
             }
         }
 
+        self.search_match_history.retain(|entry| {
+            entry.buffer_id == buffer_id
+                && entry.revision == revision
+                && entry.case_insensitive == case_insensitive
+        });
+        if let Some(index) = self
+            .search_match_history
+            .iter()
+            .position(|entry| entry.pattern == pattern)
+        {
+            let entry = self
+                .search_match_history
+                .remove(index)
+                .expect("matched search history index remains present");
+            let matches = Arc::clone(&entry.matches);
+            self.replace_search_match_cache(entry);
+            return Ok(matches);
+        }
+
         let regex = self.compile_search_regex(pattern)?;
-        let matches = Arc::from(buffer.regex_matches(&regex));
-        self.search_match_cache = Some(SearchMatchCache {
+        let matches = Arc::from(self.current_buffer().regex_matches(&regex));
+        self.replace_search_match_cache(SearchMatchCache {
             buffer_id,
             revision,
             pattern: pattern.to_string(),
@@ -16140,6 +16164,26 @@ impl Editor {
             matches: Arc::clone(&matches),
         });
         Ok(matches)
+    }
+
+    fn replace_search_match_cache(&mut self, next: SearchMatchCache) {
+        let buffer_id = next.buffer_id;
+        let revision = next.revision;
+        let case_insensitive = next.case_insensitive;
+        let Some(previous) = self.search_match_cache.replace(next) else {
+            return;
+        };
+        if previous.buffer_id != buffer_id
+            || previous.revision != revision
+            || previous.case_insensitive != case_insensitive
+            || previous.matches.len() > MAX_SEARCH_HISTORY_MATCHES_PER_ENTRY
+        {
+            return;
+        }
+        self.search_match_history.push_front(previous);
+        if self.search_match_history.len() > MAX_SEARCH_HISTORY_ENTRIES {
+            self.search_match_history.pop_back();
+        }
     }
 
     fn search_match_in_direction(
@@ -16183,11 +16227,15 @@ impl Editor {
             .current_buffer()
             .line_range_byte_len(origin.y, origin.y.saturating_add(1))
             > MAX_HIGHLIGHT_SLICE_BYTES
-            || (self.vtop..viewport_end).any(|line| {
-                self.current_buffer()
-                    .line_range_byte_len(line, line.saturating_add(1))
-                    > MAX_HIGHLIGHT_SLICE_BYTES
-            });
+            || (self
+                .current_buffer()
+                .line_range_byte_len(self.vtop, viewport_end)
+                > MAX_HIGHLIGHT_SLICE_BYTES
+                && (self.vtop..viewport_end).any(|line| {
+                    self.current_buffer()
+                        .line_range_byte_len(line, line.saturating_add(1))
+                        > MAX_HIGHLIGHT_SLICE_BYTES
+                }));
 
         if has_oversized_line {
             let regex = self.compile_search_regex(pattern)?;
@@ -35245,6 +35293,56 @@ builtin = "rust"
 
         assert!(!Arc::ptr_eq(&first, &second));
         assert_eq!(second.len(), 2);
+    }
+
+    #[test]
+    fn incremental_search_reuses_bounded_prior_queries_without_stale_matches() {
+        let mut editor = test_editor(/*width*/ 80, /*height*/ 24);
+        let prefix = editor.search_matches("hel").unwrap();
+        let complete = editor.search_matches("hello").unwrap();
+
+        let previous = editor.search_matches("hel").unwrap();
+        assert!(Arc::ptr_eq(&prefix, &previous));
+        assert!(Arc::ptr_eq(
+            &complete,
+            &editor.search_matches("hello").unwrap()
+        ));
+
+        for index in 0..MAX_SEARCH_HISTORY_ENTRIES + 4 {
+            editor.search_matches(&format!("missing{index}")).unwrap();
+        }
+        assert_eq!(
+            editor.search_match_history.len(),
+            MAX_SEARCH_HISTORY_ENTRIES
+        );
+
+        editor.current_buffer_mut().insert_str(0, 0, "hello ");
+        let refreshed = editor.search_matches("hello").unwrap();
+        assert!(!Arc::ptr_eq(&complete, &refreshed));
+        assert_eq!(refreshed.len(), 2);
+        assert!(editor.search_match_history.iter().all(|entry| {
+            entry.revision == editor.current_buffer().revision()
+                && entry.buffer_id == editor.current_buffer().id()
+        }));
+    }
+
+    #[test]
+    fn incremental_search_does_not_retain_pathologically_dense_prior_matches() {
+        let mut editor = test_editor(/*width*/ 80, /*height*/ 24);
+        editor.current_buffer_mut().insert_str(
+            0,
+            0,
+            &"x".repeat(MAX_SEARCH_HISTORY_MATCHES_PER_ENTRY + 1),
+        );
+        let dense = editor.search_matches("x").unwrap();
+        assert!(dense.len() > MAX_SEARCH_HISTORY_MATCHES_PER_ENTRY);
+
+        editor.search_matches("hello").unwrap();
+
+        assert!(editor
+            .search_match_history
+            .iter()
+            .all(|entry| entry.pattern != "x"));
     }
 
     #[test]

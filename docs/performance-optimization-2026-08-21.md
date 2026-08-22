@@ -65,6 +65,7 @@ navigation baselines were frozen after rebasing to `d92777c`.
 | Shared Vim counted delete-word operators | 99.85% |
 | Shared Vim whitespace-delimited WORD objects | 99.80% |
 | Crash-recovery buffer restoration | 99.77% |
+| Real-terminal incremental search query resolution | 99.74% |
 | Repeated themed syntax highlighting | 99.61% |
 | Git status requests outside repositories | 99.58% |
 | Shared display-column-to-grapheme conversion | 99.46% |
@@ -112,6 +113,7 @@ navigation baselines were frozen after rebasing to `d92777c`.
 | Shared buffer navigable-line counting | 91.38% |
 | Embedded redo cursor restoration | 91.33% |
 | Embedded text-area document loading | 91.26% |
+| Real-terminal incremental search input events | 90.89% |
 | Sparse ASCII full-buffer regex searching | 90.87% |
 | Embedded Vim nested delimiter matching | 90.03% |
 | ASCII Vim line-end operators | 89.83% |
@@ -129,6 +131,7 @@ navigation baselines were frozen after rebasing to `d92777c`.
 | Embedded undo cursor restoration | 84.17% |
 | Long-line Vim word-end motion | 84.79% |
 | Shared Vim ASCII forward character search | 84.55% |
+| Real-terminal incremental search chrome | 84.44% |
 | Idle plugin timer polling | 84.29% |
 | Default editor status-line rendering | 83.45% |
 | Workspace inline content search | 82.60% |
@@ -165,6 +168,7 @@ navigation baselines were frozen after rebasing to `d92777c`.
 | Vim first-nonblank line-start operators | 64.81% |
 | Structured picker ranking | 64.81% |
 | Real-terminal Markdown typing action handling | 64.30% |
+| Real-terminal incremental search window painting | 64.00% |
 | Shared Vim around paragraph text objects | 63.73% |
 | Shared Vim paragraph boundary operators | 63.42% |
 | Shared Vim inner paragraph text objects | 63.01% |
@@ -182,6 +186,7 @@ navigation baselines were frozen after rebasing to `d92777c`.
 | Owned Husk JSON boundary conversion | 54.49% |
 | Complete real-terminal YAML interactive startup | 54.08% |
 | Bundled theme startup loading | 53.81% |
+| Complete real-terminal incremental search frames | 53.11% |
 | Complete editor frame composition | 52.88% |
 | Real-terminal edit-invalidated Markdown highlighting | 52.65% |
 | Real-terminal bundled plugin startup | 51.88% |
@@ -529,6 +534,24 @@ bounded, deduplicated set of visible fenced-language grammars alongside outer
 Markdown syntax and independent plugin initialization. Unsupported aliases,
 oversized viewports, stale registries, failed queries, and repeated languages
 retain the existing safe foreground fallback.
+
+Nine alternating real-terminal search sessions exercised 12 incremental query
+cycles apiece against frozen release executables. Query resolution fell from
+1,950 to five microseconds, complete input events from 2,316 to 211, editor
+chrome from 90 to 14, window painting from 150 to 54, and complete search
+frames from 354 to 166 microseconds. A bounded history reuses prior regex
+results only when stable buffer identity, content revision, effective case
+sensitivity, and exact pattern match; pathologically dense result sets are not
+retained. Viewport-wide byte bounds avoid unnecessary per-line checks, repeated
+matches reuse their source line and visible layout segments, and printable
+ASCII uses direct display columns. Highlight backgrounds paint contiguous
+visible screen ranges without per-match layout reconstruction or point
+allocations, and complete editor frames paint their command line only once.
+Wrapping, horizontal clipping, tabs, control characters, Unicode, custom
+selection styles, modal/workspace precedence, current-match precedence,
+navigation direction, wraparound, and preview/cancel restoration remain
+unchanged. Search-frame terminal diff and flush improved only 19.23%, from
+52 to 42 microseconds, and remains below the target.
 
 Eleven alternating real-terminal runs reduced overlay and cursor composition
 from five to two microseconds. Each frame resolves cursor geometry once for
