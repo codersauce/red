@@ -127,7 +127,9 @@ def run(args):
                 position = b"0f 8l"
             elif args.typing_context == "comment":
                 extension = file_path.suffix.lower()
-                if extension == ".lua":
+                if args.comment_marker is not None:
+                    marker = args.comment_marker.encode()
+                elif extension == ".lua":
                     marker = b"-"
                 elif extension in {
                     ".toml",
@@ -257,6 +259,11 @@ def main():
         choices=("source", "comment", "string", "heading"),
         default="source",
         help="place typing inside ordinary source, a line comment, string, or Markdown heading",
+    )
+    parser.add_argument(
+        "--comment-marker",
+        choices=("/", "#", "-"),
+        help="override the line-comment marker for an injected fenced language",
     )
     parser.add_argument("--config-override", action="append", default=[])
     args = parser.parse_args()

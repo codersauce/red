@@ -77,11 +77,36 @@ navigation baselines were frozen after rebasing to `d92777c`.
 | Plugin preference persistence | 99.38% |
 | Husk completion ranking | 99.42% |
 | Structured panel row selection | 99.91% |
+| Markdown fenced JSON string highlighting | 98.98% |
+| Markdown fenced Unicode Rust line-comment highlighting | 98.96% |
+| Markdown fenced Rust line-comment highlighting | 98.94% |
+| Markdown fenced YAML string highlighting | 98.94% |
 | Inline-assistance answer streaming | 98.93% |
 | Shared Vim nested delimiter text objects | 98.93% |
 | Multi-file process startup loading | 98.92% |
+| Markdown fenced PowerShell string highlighting | 98.90% |
+| Markdown fenced TSX line-comment highlighting | 98.90% |
+| Markdown fenced Lua string highlighting | 98.89% |
+| Markdown fenced TSX string highlighting | 98.87% |
+| Markdown fenced TypeScript string highlighting | 98.87% |
+| Markdown fenced JavaScript string highlighting | 98.85% |
+| Markdown fenced YAML line-comment highlighting | 98.84% |
+| Markdown fenced JavaScript line-comment highlighting | 98.82% |
+| Markdown fenced Rust string highlighting | 98.82% |
+| Markdown fenced CRLF Rust line-comment highlighting | 98.81% |
+| Markdown fenced JSX string highlighting | 98.80% |
+| Markdown fenced PowerShell line-comment highlighting | 98.79% |
 | YAML line-comment punctuation and Unicode highlighting | 98.78% |
+| Markdown fenced Lua line-comment highlighting | 98.77% |
+| Markdown fenced JSX line-comment highlighting | 98.76% |
+| Markdown fenced TOML line-comment highlighting | 98.74% |
+| Markdown fenced TypeScript line-comment highlighting | 98.74% |
 | YAML string punctuation and Unicode highlighting | 98.73% |
+| Markdown fenced Fish string highlighting | 98.73% |
+| Markdown fenced Bash line-comment highlighting | 98.62% |
+| Markdown fenced Fish line-comment highlighting | 98.59% |
+| Markdown fenced Bash string highlighting | 98.57% |
+| Markdown fenced TOML string highlighting | 98.56% |
 | Husk unchanged document updates | 98.44% |
 | Viewport cursor snapshot updates | 98.58% |
 | Embedded Vim line-boundary motions | 98.48% |
@@ -139,20 +164,38 @@ navigation baselines were frozen after rebasing to `d92777c`.
 | JavaScript string punctuation and Unicode highlighting | 96.28% |
 | Editor final-cell boundary lookup | 96.24% |
 | TOML string punctuation and Unicode highlighting | 95.93% |
+| Real-terminal Markdown fenced CRLF Rust line-comment highlighting | 95.88% |
+| Real-terminal Markdown fenced Rust line-comment highlighting | 95.84% |
+| Real-terminal Markdown fenced Unicode Rust line-comment highlighting | 95.82% |
+| Real-terminal Markdown fenced JSX line-comment highlighting | 95.17% |
+| Real-terminal Markdown fenced Rust string highlighting | 95.15% |
+| Real-terminal Markdown fenced TypeScript string highlighting | 95.15% |
+| Real-terminal Markdown fenced JavaScript line-comment highlighting | 95.11% |
+| Real-terminal Markdown fenced TSX line-comment highlighting | 95.11% |
 | Real-terminal cursor-moved plugin delivery | 95.05% |
 | Real-terminal file-picker query resolution | 95.00% |
+| Real-terminal Markdown fenced PowerShell line-comment highlighting | 95.00% |
 | Shared ASCII grapheme counting | 94.94% |
+| Real-terminal Markdown fenced YAML line-comment highlighting | 94.94% |
 | Real-repository Git subprocess status refresh | 94.93% |
+| Real-terminal Markdown fenced JavaScript string highlighting | 94.89% |
 | Real-terminal JSON string highlighting | 94.74% |
 | ASCII LSP rename-symbol extraction | 94.70% |
 | LSP absolute-document routing | 94.68% |
+| Real-terminal Markdown fenced Lua line-comment highlighting | 94.44% |
+| Real-terminal Markdown fenced TOML line-comment highlighting | 94.40% |
+| Real-terminal Markdown fenced YAML string highlighting | 94.36% |
+| Real-terminal Markdown fenced Lua string highlighting | 93.89% |
 | Real-terminal redundant full-frame publication | 93.65% |
 | Husk CRLF line-comment highlighting | 93.65% |
 | Real-terminal edit-invalidated Rust highlighting | 93.42% |
+| Real-terminal Markdown fenced JSON string highlighting | 93.42% |
+| Real-terminal Markdown fenced Fish line-comment highlighting | 93.36% |
 | Shared display-column-to-scalar conversion | 93.33% |
 | Husk line-comment highlighting | 93.26% |
 | Unicode Vim line-end operators | 93.21% |
 | Husk Unicode line-comment highlighting | 93.02% |
+| Real-terminal Markdown fenced Bash string highlighting | 92.97% |
 | Editor scalar-to-grapheme cursor conversion | 92.82% |
 | Workspace inline file discovery | 92.65% |
 | Editor backward word-end boundary operators | 92.63% |
@@ -222,32 +265,47 @@ navigation baselines were frozen after rebasing to `d92777c`.
 | Theme hexadecimal color parsing | 79.71% |
 | Detached incremental frame serialization | 79.06% |
 | Real-terminal completion-aware edit frames | 78.19% |
+| Real-terminal Markdown fenced CRLF Rust line-comment edit frames | 77.37% |
+| Real-terminal Markdown fenced Rust line-comment edit frames | 77.36% |
+| Real-terminal Markdown fenced Rust string edit frames | 76.91% |
+| Real-terminal Markdown fenced Unicode Rust line-comment edit frames | 76.70% |
 | Shared Vim final sentence cursor boundary | 75.93% |
+| Real-terminal Markdown fenced JSX line-comment edit frames | 75.85% |
 | Real-terminal typing action handling | 75.81% |
 | Embedded forward Delete-key editing | 75.72% |
 | Shared Vim final paragraph cursor boundary | 75.63% |
 | Shared Vim Unicode forward character search | 75.52% |
 | Real-terminal Husk line-comment highlighting | 75.51% |
+| Real-terminal Markdown fenced TypeScript string edit frames | 75.48% |
 | Shared Vim Unicode backward character search | 75.26% |
+| Real-terminal Markdown fenced TSX line-comment edit frames | 75.21% |
+| Real-terminal Markdown fenced JavaScript string edit frames | 75.16% |
 | Shared Vim Unicode around quoted text objects | 75.15% |
 | Shared Vim ASCII inner quoted text objects | 75.00% |
 | Real-terminal Husk Unicode line-comment highlighting | 75.00% |
 | Embedded Ctrl-Backspace word deletion | 74.86% |
+| Real-terminal Markdown fenced JavaScript line-comment edit frames | 74.72% |
 | Shared Vim ASCII around quoted text objects | 74.66% |
 | Shared Vim sentence navigation | 74.63% |
 | LSP incremental large-document changes | 74.61% |
 | Real-terminal text-insertion events | 74.32% |
 | Shared Vim Unicode inner quoted text objects | 74.07% |
 | Real-terminal Husk CRLF line-comment highlighting | 73.33% |
+| Real-terminal Markdown fenced PowerShell line-comment edit frames | 72.98% |
 | Real-terminal Husk string highlighting | 72.92% |
 | Embedded Vim long-line end motions | 72.63% |
 | Real-terminal Unicode counted character deletion | 72.58% |
 | Shared Vim paragraph navigation | 72.60% |
 | Undo history capacity pruning | 72.42% |
 | ASCII automatic indentation columns | 71.81% |
+| Real-terminal Markdown fenced Lua string edit frames | 71.74% |
+| Real-terminal Markdown fenced Lua line-comment edit frames | 71.71% |
 | Unicode automatic indentation columns | 71.42% |
+| Real-terminal Markdown fenced TOML line-comment edit frames | 71.23% |
 | Real-terminal Unicode and CRLF counted character deletion | 71.09% |
 | Real-terminal YAML typing action handling | 71.04% |
+| Real-terminal Markdown fenced YAML string edit frames | 70.99% |
+| Real-terminal Markdown fenced YAML line-comment edit frames | 70.64% |
 | Real-terminal CRLF counted character deletion | 70.54% |
 | Real-terminal full-document-LSP substitution | 70.47% |
 | Real-terminal full-document-LSP counted character deletion | 70.18% |
@@ -255,12 +313,15 @@ navigation baselines were frozen after rebasing to `d92777c`.
 | Real-terminal edited-window painting | 69.23% |
 | Real-terminal counted character deletion | 68.43% |
 | Real-terminal split-window counted character deletion | 67.94% |
+| Real-terminal Markdown fenced Fish line-comment edit frames | 67.71% |
 | Git commit line-comment highlighting | 67.66% |
 | LSP completion filtering | 67.58% |
 | Real-terminal full-document-LSP macro playback | 66.77% |
 | Git commit diff highlighting | 66.62% |
+| Real-terminal Markdown fenced JSON string edit frames | 66.56% |
 | Real-terminal split-window macro playback | 66.25% |
 | Real-terminal CRLF macro playback | 66.13% |
+| Real-terminal Markdown fenced Bash string edit frames | 65.91% |
 | Real-terminal bundled-plugin counted character deletion | 65.77% |
 | Git commit CRLF highlighting | 65.26% |
 | Real-terminal split-window substitution | 64.83% |
@@ -316,6 +377,7 @@ navigation baselines were frozen after rebasing to `d92777c`.
 | Real-terminal TSX line-comment edit frames | 54.14% |
 | Complete real-terminal YAML interactive startup | 54.08% |
 | Bundled theme startup loading | 53.81% |
+| Real-terminal Markdown fenced Unicode Rust line-comment typing actions | 53.50% |
 | Complete real-terminal file-picker input events | 53.41% |
 | Complete real-terminal incremental search frames | 53.11% |
 | Complete editor frame composition | 52.88% |
@@ -323,11 +385,21 @@ navigation baselines were frozen after rebasing to `d92777c`.
 | Real-terminal edit-invalidated Markdown highlighting | 52.65% |
 | Real-terminal TypeScript string edit frames | 52.65% |
 | Real-terminal TSX string edit frames | 52.65% |
+| Real-terminal Markdown fenced CRLF Rust line-comment typing actions | 52.59% |
+| Real-terminal Markdown fenced Rust line-comment typing actions | 52.57% |
+| Real-terminal Markdown fenced TypeScript string typing actions | 52.49% |
 | Real-terminal bundled plugin startup | 51.88% |
+| Real-terminal Markdown fenced Unicode Rust line-comment input events | 51.42% |
+| Real-terminal Markdown fenced Rust string typing actions | 51.29% |
+| Real-terminal Markdown fenced CRLF Rust line-comment input events | 51.26% |
 | Bundled plugin startup | 51.22% |
+| Real-terminal Markdown fenced JSX line-comment typing actions | 50.99% |
+| Real-terminal Markdown fenced Rust line-comment input events | 50.98% |
+| Real-terminal Markdown fenced TypeScript string input events | 50.86% |
 | Real-terminal JSX line-comment edit frames | 50.79% |
 | Real-terminal TypeScript line-comment edit frames | 50.57% |
 | Real-terminal Lua line-comment edit frames | 50.21% |
+| Real-terminal Markdown fenced TSX line-comment typing actions | 50.14% |
 | Real-terminal JavaScript string edit frames | 50.00% |
 
 Complete frame composition was measured across 160 production `Editor::render`
@@ -764,6 +836,46 @@ highlighting already took only eight to 11 microseconds before optimization;
 its real-terminal improvements, complete Husk edit frames, and all complete
 input events remain below the 50% target and are excluded.
 
+Seven alternating release-build samples per Markdown fenced-language token
+applied 128 punctuation and Unicode edits to one 96-line injection while
+preserving an outer heading and a differently typed sibling code fence. Rust
+comment and string medians fell from 190,782 to 2,029 and 190,024 to 2,243
+microseconds; Unicode and CRLF comments fell from 201,587 to 2,091 and 189,908
+to 2,261. JavaScript comments and strings fell from 165,882 to 1,951 and
+165,567 to 1,903; JSX from 167,008 to 2,070 and 166,357 to 1,990; TypeScript
+from 165,066 to 2,082 and 166,089 to 1,870; TSX from 165,057 to 1,814 and
+165,998 to 1,872; and JSON strings from 92,522 to 945.
+
+Fenced TOML comments and strings fell from 104,716 to 1,320 and 104,272 to
+1,505 microseconds; YAML from 127,235 to 1,471 and 126,494 to 1,346; Bash from
+99,271 to 1,372 and 98,975 to 1,417; Fish from 97,719 to 1,377 and 97,638 to
+1,243; PowerShell from 123,540 to 1,491 and 123,014 to 1,359; and Lua from
+127,366 to 1,566 and 127,508 to 1,410. Reuse requires exact bundled outer
+Markdown and nested-language grammars, every bundled highlight query, the
+original Markdown injection query, a matching cached injection source, bounded
+document/capture caches, and an edit strictly inside an independently
+validated nested token. Outer and nested trees, source snapshots, overlapping
+Markdown captures, injected captures, and sibling-language offsets shift by
+exact UTF-8 byte ranges together. Fence markers, newlines, escapes, shell
+interpolation, custom outer or nested queries, unknown languages, duplicate
+same-language fences whose cached source does not match, and structural edits
+retain complete parsing.
+
+Five alternating real-terminal sessions per fenced-language variant applied 32
+punctuation and Unicode edits through the production editor. All 18 tested
+injected highlighters improved 92.97% to 95.88%, and all 18 complete editor-
+window frames improved 65.91% to 77.37%. Fenced Rust comment, string, Unicode-
+comment, and CRLF-comment frames fell from 508 to 115, 511 to 118, 515 to 120,
+and 486 to 110 microseconds. JavaScript comment and string frames fell from
+443 to 112 and 479 to 119; JSX comment frames from 472 to 114; TypeScript
+string frames from 469 to 115; TSX comment frames from 468 to 116; and JSON
+string frames from 326 to 109. TOML comment, YAML comment/string, Bash string,
+Fish comment, PowerShell comment, and Lua comment/string frames respectively
+fell from 365 to 105, 344 to 101, 355 to 103, 352 to 120, 353 to 114, 396 to
+107, 403 to 114, and 414 to 117 microseconds. Seven complete typing-action
+paths improved 50.14% to 53.50%, and four complete input events improved
+50.86% to 51.42%; every action or event below 50% remains excluded.
+
 Seven alternating release-build samples across 96-line Markdown heading
 fixtures applied 128 punctuation and Unicode edits per heading. H1, H2, and
 H3 medians fell from 16,204 to 370, 16,463 to 360, and 16,258 to 369
@@ -932,7 +1044,7 @@ filesystem effects make its samples unstable.
 ## Remaining gaps
 
 - Single-file process startup, terminal diff and flush, remaining syntax-token
-  classes and edits inside Markdown fenced-language injections, recovery snapshot
+  classes and unsupported edits inside Markdown fenced-language injections, recovery snapshot
   writes, broader Vim editing, platform-specific paths, and several other areas
   above do not yet meet the 50% improvement target.
 - An eager Neo-tree row index was intentionally rejected because it increased

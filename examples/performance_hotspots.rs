@@ -399,6 +399,51 @@ fn main() -> Result<()> {
         }
     }
     for (name, language, variant) in [
+        ("markdown-fenced-rust-comment", "rust", "comment"),
+        ("markdown-fenced-rust-string", "rust", "string"),
+        ("markdown-fenced-rust-unicode", "rust", "unicode"),
+        ("markdown-fenced-rust-crlf", "rust", "crlf"),
+        (
+            "markdown-fenced-javascript-comment",
+            "javascript",
+            "comment",
+        ),
+        ("markdown-fenced-javascript-string", "javascript", "string"),
+        ("markdown-fenced-jsx-comment", "jsx", "comment"),
+        ("markdown-fenced-jsx-string", "jsx", "string"),
+        (
+            "markdown-fenced-typescript-comment",
+            "typescript",
+            "comment",
+        ),
+        ("markdown-fenced-typescript-string", "typescript", "string"),
+        ("markdown-fenced-tsx-comment", "tsx", "comment"),
+        ("markdown-fenced-tsx-string", "tsx", "string"),
+        ("markdown-fenced-json-string", "json", "string"),
+        ("markdown-fenced-toml-comment", "toml", "comment"),
+        ("markdown-fenced-toml-string", "toml", "string"),
+        ("markdown-fenced-yaml-comment", "yaml", "comment"),
+        ("markdown-fenced-yaml-string", "yaml", "string"),
+        ("markdown-fenced-bash-comment", "bash", "comment"),
+        ("markdown-fenced-bash-string", "bash", "string"),
+        ("markdown-fenced-fish-comment", "fish", "comment"),
+        ("markdown-fenced-fish-string", "fish", "string"),
+        (
+            "markdown-fenced-powershell-comment",
+            "powershell",
+            "comment",
+        ),
+        ("markdown-fenced-powershell-string", "powershell", "string"),
+        ("markdown-fenced-lua-comment", "lua", "comment"),
+        ("markdown-fenced-lua-string", "lua", "string"),
+    ] {
+        if scenario == "all" || scenario == name {
+            results.push(benchmark_markdown_fenced_token_highlighting(
+                language, variant,
+            )?);
+        }
+    }
+    for (name, language, variant) in [
         ("husk-comment", "husk", "comment"),
         ("husk-string", "husk", "string"),
         ("husk-comment-unicode", "husk", "unicode"),
@@ -1819,6 +1864,126 @@ fn benchmark_markdown_heading_highlighting(
         _ => unreachable!("benchmark uses a supported Markdown heading scenario"),
     };
     Ok(report(scenario, started, RUST_TOKEN_HIGHLIGHT_EDITS))
+}
+
+fn benchmark_markdown_fenced_token_highlighting(
+    language: &str,
+    variant: &str,
+) -> Result<serde_json::Value> {
+    let theme = parse_vscode_theme("themes/mocha.json")?;
+    let mut highlighter = Highlighter::new(&theme)?;
+    let newline = if variant == "crlf" { "\r\n" } else { "\n" };
+    let unicode = if variant == "unicode" {
+        " 世界😀"
+    } else {
+        ""
+    };
+    let contents = if language == "json" {
+        format!(
+            "{{{newline}{}{newline}}}{newline}",
+            (0..96)
+                .map(|index| format!("  \"key_{index:03}\": \"retained{unicode} string contents\""))
+                .collect::<Vec<_>>()
+                .join(&format!(",{newline}"))
+        )
+    } else {
+        (0..96)
+            .map(|index| match language {
+                "rust" => format!(
+                    "fn value_{index:03}() {{ let value = \"retained{unicode} string contents\"; }} // retained{unicode} comment contents{newline}"
+                ),
+                "javascript" | "jsx" | "typescript" | "tsx" => format!(
+                    "function value_{index:03}() {{ return \"retained{unicode} string contents\"; }} // retained{unicode} comment contents{newline}"
+                ),
+                "toml" => format!(
+                    "key_{index:03} = \"retained{unicode} string contents\" # retained{unicode} comment contents{newline}"
+                ),
+                "yaml" => format!(
+                    "key_{index:03}: \"retained{unicode} string contents\" # retained{unicode} comment contents{newline}"
+                ),
+                "bash" | "fish" => format!(
+                    "echo \"retained{unicode} string contents {index:03}\" # retained{unicode} comment contents{newline}"
+                ),
+                "powershell" => format!(
+                    "$value_{index:03} = \"retained{unicode} string contents\" # retained{unicode} comment contents{newline}"
+                ),
+                "lua" => format!(
+                    "local value_{index:03} = \"retained{unicode} string contents\" -- retained{unicode} comment contents{newline}"
+                ),
+                _ => unreachable!("supported fenced language"),
+            })
+            .collect::<String>()
+    };
+    let sibling = if language == "rust" {
+        "javascript"
+    } else {
+        "rust"
+    };
+    let sibling_contents = if sibling == "rust" {
+        "fn preserved_sibling() {}"
+    } else {
+        "const preserved_sibling = true;"
+    };
+    let mut source = format!(
+        "## retained outer heading{newline}{newline}```{language}{newline}{contents}```{newline}{newline}```{sibling}{newline}{sibling_contents}{newline}```{newline}"
+    );
+    let marker = if variant == "string" {
+        "\"retained"
+    } else {
+        match language {
+            "lua" => "-- retained",
+            "toml" | "yaml" | "bash" | "fish" | "powershell" => "# retained",
+            _ => "// retained",
+        }
+    };
+    let fence_start = source
+        .find(&format!("```{language}{newline}"))
+        .expect("fenced language delimiter")
+        + format!("```{language}{newline}").len();
+    let mut cursor = fence_start
+        + source[fence_start..]
+            .find(marker)
+            .expect("fenced token marker")
+        + marker.len();
+    black_box(highlighter.highlight("markdown", &source)?);
+
+    let started = Instant::now();
+    for index in 0..RUST_TOKEN_HIGHLIGHT_EDITS {
+        let inserted = if index % 2 == 0 { "." } else { "λ" };
+        source.insert_str(cursor, inserted);
+        cursor += inserted.len();
+        let spans = highlighter.highlight(black_box("markdown"), black_box(&source))?;
+        let content_start = source
+            .find(&format!("```{language}{newline}"))
+            .expect("fenced language delimiter")
+            + format!("```{language}{newline}").len();
+        let content_end = content_start
+            + source[content_start..]
+                .find("```")
+                .expect("fenced closing delimiter");
+        anyhow::ensure!(
+            spans.iter().any(|span| {
+                span.start >= content_start
+                    && span.end <= content_end
+                    && span.start < cursor
+                    && span.end >= cursor
+            }),
+            "fenced {language} {variant} edit lost its injected token style"
+        );
+        let sibling_start = source
+            .find(sibling_contents)
+            .expect("preserved sibling injection");
+        anyhow::ensure!(
+            spans
+                .iter()
+                .any(|span| span.start == sibling_start && span.end > sibling_start),
+            "fenced {language} {variant} edit lost the sibling injection"
+        );
+        black_box(spans);
+    }
+
+    let scenario = format!("markdown_fenced_{language}_{variant}_highlighting");
+    Ok(report(&scenario, started, RUST_TOKEN_HIGHLIGHT_EDITS))
 }
 
 fn benchmark_specialized_token_highlighting(
