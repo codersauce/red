@@ -175,6 +175,7 @@ navigation baselines were frozen after rebasing to `d92777c`.
 | Real-terminal YAML completion-aware edit frames | 58.12% |
 | Real-terminal Markdown completion-aware edit frames | 56.44% |
 | Plugin cursor-event delivery | 56.35% |
+| Complete real-terminal Markdown interactive startup | 56.22% |
 | In-buffer search navigation | 55.98% |
 | Real-terminal edit-invalidated YAML highlighting | 55.94% |
 | Owned Husk JSON boundary conversion | 54.49% |
@@ -521,7 +522,12 @@ Markdown language injections. YAML typing events fell from 1,797 to 543
 microseconds, typing actions from 1,768 to 512, edit frames from 628 to 263,
 and interactive startup from 39,845 to 18,297. Markdown typing events fell from
 1,584 to 596 microseconds, typing actions from 1,552 to 554, and edit frames
-from 714 to 311. Markdown startup improved only 48.61% and remains open.
+from 714 to 311. A subsequent nine-run alternating comparison reduced complete
+Markdown interactive startup from 42,463 to 18,591 microseconds by preparing a
+bounded, deduplicated set of visible fenced-language grammars alongside outer
+Markdown syntax and independent plugin initialization. Unsupported aliases,
+oversized viewports, stale registries, failed queries, and repeated languages
+retain the existing safe foreground fallback.
 
 Terminal diff and flush improved only 19.51%, and overlay/cursor composition
 remained unchanged. Process-to-first-paint also remains unresolved because
@@ -529,11 +535,11 @@ executable warm-up and filesystem effects make its samples unstable.
 
 ## Remaining gaps
 
-- Single-file process startup, Markdown startup, overlay/cursor composition,
-  terminal diff and flush, broader non-identifier syntax edits, recovery
-  snapshot writes, in-repository Git subprocess status refresh, broader Vim
-  editing, platform-specific paths, and several other areas above do not yet
-  meet the 50% improvement target.
+- Single-file process startup, overlay/cursor composition, terminal diff and
+  flush, broader non-identifier syntax edits, recovery snapshot writes,
+  in-repository Git subprocess status refresh, broader Vim editing,
+  platform-specific paths, and several other areas above do not yet meet the
+  50% improvement target.
 - Real-repository Git status refresh improved 35.67%, from 418,087 to 268,941
   microseconds across 32 requests, but the remaining `git status` subprocess
   still keeps this path below the target.

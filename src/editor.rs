@@ -9517,9 +9517,31 @@ impl Editor {
         // initialization are not lost.
         event::poll(Duration::from_millis(0))?;
 
-        let startup_highlighter = self
-            .highlight_language_id_for_buffer_index(self.buffer_manager.active_index())
-            .and_then(|language| self.highlighter.prepare_language_in_background(&language));
+        let mut startup_highlighters = Vec::new();
+        if let Some(language) =
+            self.highlight_language_id_for_buffer_index(self.buffer_manager.active_index())
+        {
+            if let Some(prepared) = self.highlighter.prepare_language_in_background(&language) {
+                startup_highlighters.push(prepared);
+            }
+            if language == "markdown" {
+                let end = usize::from(self.size.1).saturating_mul(2);
+                let source = self.current_buffer();
+                if source.line_range_byte_len(0, end) <= MAX_HIGHLIGHT_SLICE_BYTES {
+                    let visible = source.line_range_contents(0, end);
+                    for injection in self
+                        .highlighter
+                        .startup_injected_language_ids(&language, &visible)
+                    {
+                        if let Some(prepared) =
+                            self.highlighter.prepare_language_in_background(&injection)
+                        {
+                            startup_highlighters.push(prepared);
+                        }
+                    }
+                }
+            }
+        }
 
         {
             let plugin_startup = perf::PerfSpan::start("startup:plugins");
@@ -9547,7 +9569,7 @@ impl Editor {
         self.resize_terminal_surface(columns, rows, &mut buffer);
         self.prepare_startup_welcome();
         self.prepare_startup_whats_new();
-        if let Some(prepared) = startup_highlighter {
+        for prepared in startup_highlighters {
             self.highlighter.finish_prepared_language(prepared);
         }
         self.render(&mut buffer)?;

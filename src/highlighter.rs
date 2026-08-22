@@ -643,6 +643,45 @@ impl Highlighter {
         Arc::clone(&self.registry)
     }
 
+    /// Identifies a bounded set of configured fenced languages before the
+    /// Markdown parser is available. Unknown and duplicate aliases are ignored;
+    /// false positives only prewarm an existing grammar and never change spans.
+    pub(crate) fn startup_injected_language_ids(
+        &self,
+        language_id: &str,
+        source: &str,
+    ) -> Vec<String> {
+        const MAX_STARTUP_INJECTION_LANGUAGES: usize = 3;
+        if language_id != "markdown" {
+            return Vec::new();
+        }
+
+        let mut languages = Vec::new();
+        for line in source.lines() {
+            let line = line.trim_start();
+            let Some(info) = line
+                .strip_prefix("```")
+                .or_else(|| line.strip_prefix("~~~"))
+            else {
+                continue;
+            };
+            let Some(name) = info.split_whitespace().next() else {
+                continue;
+            };
+            let Some(resolved) = self.language_id_for_name(name) else {
+                continue;
+            };
+            if resolved == language_id || languages.iter().any(|language| language == resolved) {
+                continue;
+            }
+            languages.push(resolved.to_string());
+            if languages.len() == MAX_STARTUP_INJECTION_LANGUAGES {
+                break;
+            }
+        }
+        languages
+    }
+
     /// Compile the first visible language's queries while independent startup
     /// work runs. The registry snapshot keeps dynamic grammar libraries alive.
     pub(crate) fn prepare_language_in_background(
@@ -1909,6 +1948,26 @@ mod tests {
         assert!(highlighter()
             .prepare_language_in_background("unknown")
             .is_none());
+    }
+
+    #[test]
+    fn startup_injected_languages_resolve_aliases_deduplicate_and_stay_bounded() {
+        let highlighter = highlighter();
+        let source = concat!(
+            "```unknown\nignored\n```\n",
+            "  ```shell options\nprintf hi\n```\n",
+            "```sh\ntrue\n```\n",
+            "~~~pwsh\nGet-Item .\n~~~\n",
+            "```rust\nfn main() {}\n```\n",
+            "```yaml\nignored: true\n```\n",
+        );
+        assert_eq!(
+            highlighter.startup_injected_language_ids("markdown", source),
+            vec!["bash", "powershell", "rust"]
+        );
+        assert!(highlighter
+            .startup_injected_language_ids("rust", source)
+            .is_empty());
     }
 
     #[test]
