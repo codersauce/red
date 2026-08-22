@@ -96,6 +96,7 @@ const ASCII_GRAPHEME_COUNTS: usize = 1_024;
 const TEXTAREA_DOCUMENT_LOADS: usize = 128;
 const GIT_STATUS_FILES: usize = 2_048;
 const GIT_STATUS_INDEX_BUILDS: usize = 32;
+const GIT_STATUS_REFRESHES: usize = 32;
 const LAYOUT_CURSOR_LOOKUPS: usize = 2_048;
 const TEXTAREA_VIM_MOTIONS: usize = 2_048;
 const TEXTAREA_DELIMITER_MOTIONS: usize = 1_024;
@@ -243,6 +244,12 @@ fn main() -> Result<()> {
     }
     if scenario == "all" || scenario == "git-status-index" {
         results.push(benchmark_git_status_indexing()?);
+    }
+    if scenario == "all" || scenario == "git-status-refresh" {
+        results.push(benchmark_git_status_refresh(/*repository*/ true)?);
+    }
+    if scenario == "all" || scenario == "git-status-outside" {
+        results.push(benchmark_git_status_refresh(/*repository*/ false)?);
     }
     if scenario == "all" || scenario == "layout-grapheme-cursor" {
         results.push(benchmark_layout_cursor_lookup(WrapMode::Grapheme)?);
@@ -1684,6 +1691,66 @@ fn benchmark_git_status_indexing() -> Result<serde_json::Value> {
         "git_workspace_status_directory_indexing",
         started,
         GIT_STATUS_INDEX_BUILDS,
+    ))
+}
+
+fn benchmark_git_status_refresh(repository: bool) -> Result<serde_json::Value> {
+    let directory = tempfile::tempdir()?;
+    let nested = directory.path().join("src/workspace/nested");
+    std::fs::create_dir_all(&nested)?;
+    if repository {
+        let initialized = std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .arg(directory.path())
+            .output()?;
+        anyhow::ensure!(
+            initialized.status.success(),
+            "Git fixture initialization failed"
+        );
+        std::fs::write(directory.path().join(".gitignore"), "ignored.log\n")?;
+        std::fs::write(directory.path().join("tracked.rs"), "original contents\n")?;
+        let staged = std::process::Command::new("git")
+            .arg("-C")
+            .arg(directory.path())
+            .args(["add", ".gitignore", "tracked.rs"])
+            .output()?;
+        anyhow::ensure!(staged.status.success(), "Git fixture staging failed");
+        std::fs::write(directory.path().join("tracked.rs"), "modified contents\n")?;
+        std::fs::write(directory.path().join("ignored.log"), "ignored contents\n")?;
+        std::fs::write(nested.join("untracked.rs"), "untracked contents\n")?;
+    }
+    let path = nested.to_string_lossy();
+    let started = Instant::now();
+    for _ in 0..GIT_STATUS_REFRESHES {
+        let listing = red::editor::git_status_listing(black_box(&path));
+        if repository {
+            anyhow::ensure!(
+                listing["root"].is_string()
+                    && listing["statuses"]
+                        .as_array()
+                        .is_some_and(|statuses| statuses
+                            .iter()
+                            .any(|status| status["status"] == "ignored")),
+                "Git refresh lost the repository root or ignored status entries"
+            );
+        } else {
+            anyhow::ensure!(
+                listing["root"].is_null()
+                    && listing["statuses"].as_array().is_some_and(Vec::is_empty)
+                    && listing["error"].is_null(),
+                "Git refresh fabricated repository status outside a repository"
+            );
+        }
+        black_box(listing);
+    }
+    Ok(report(
+        if repository {
+            "git_repository_subprocess_status_refresh"
+        } else {
+            "git_non_repository_status_refresh"
+        },
+        started,
+        GIT_STATUS_REFRESHES,
     ))
 }
 

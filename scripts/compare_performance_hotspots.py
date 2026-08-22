@@ -56,6 +56,8 @@ SCENARIOS = (
     "ascii-graphemes",
     "textarea-open",
     "git-status-index",
+    "git-status-refresh",
+    "git-status-outside",
     "layout-grapheme-cursor",
     "layout-word-cursor",
     "textarea-vim-word",

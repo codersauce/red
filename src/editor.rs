@@ -29245,45 +29245,26 @@ fn directory_snapshot(path: &str, recursive: bool) -> Value {
     json!({ "path": path, "entries": entries, "recursive": true })
 }
 
-fn git_status_listing(path: &str) -> Value {
+#[doc(hidden)]
+pub fn git_status_listing(path: &str) -> Value {
     let search_dir = git_search_dir(path);
-    let root_output = Command::new("git")
-        .arg("-C")
-        .arg(&search_dir)
-        .args(["rev-parse", "--show-toplevel"])
-        .output();
-
-    let root_output = match root_output {
-        Ok(output) if output.status.success() => output,
-        Ok(_) => {
-            return json!({
-                "root": null,
-                "statuses": [],
-                "status_index": {},
-                "error": null,
-            });
-        }
-        Err(err) => {
-            return json!({
-                "root": null,
-                "statuses": [],
-                "status_index": {},
-                "error": err.to_string(),
-            });
-        }
-    };
-
-    let root = String::from_utf8_lossy(&root_output.stdout)
-        .trim()
-        .to_string();
-    if root.is_empty() {
+    let Some(root) = Path::new(&search_dir)
+        .canonicalize()
+        .ok()
+        .and_then(|directory| {
+            directory
+                .ancestors()
+                .find(|ancestor| ancestor.join(".git").exists())
+                .map(|ancestor| ancestor.to_string_lossy().into_owned())
+        })
+    else {
         return json!({
             "root": null,
             "statuses": [],
             "status_index": {},
             "error": null,
         });
-    }
+    };
 
     let status_output = Command::new("git")
         .arg("-C")
@@ -36720,6 +36701,149 @@ builtin = "rust"
         assert!(listing["statuses"].as_array().unwrap().is_empty());
         assert!(listing["status_index"].as_object().unwrap().is_empty());
         assert!(listing["error"].is_null());
+    }
+
+    #[test]
+    fn git_status_listing_discovers_nested_repositories_and_retains_statuses() {
+        let root = tempfile::tempdir().unwrap();
+        assert!(Command::new("git")
+            .args(["init", "--quiet"])
+            .arg(root.path())
+            .status()
+            .unwrap()
+            .success());
+        fs::write(root.path().join(".gitignore"), "ignored.log\n").unwrap();
+        fs::write(root.path().join("tracked.rs"), "first\n").unwrap();
+        assert!(Command::new("git")
+            .arg("-C")
+            .arg(root.path())
+            .args(["add", ".gitignore", "tracked.rs"])
+            .status()
+            .unwrap()
+            .success());
+        assert!(Command::new("git")
+            .arg("-C")
+            .arg(root.path())
+            .args([
+                "-c",
+                "user.name=Red Test",
+                "-c",
+                "user.email=red@example.invalid",
+                "commit",
+                "--quiet",
+                "-m",
+                "initial",
+            ])
+            .status()
+            .unwrap()
+            .success());
+        fs::write(root.path().join("tracked.rs"), "changed\n").unwrap();
+        fs::write(root.path().join("ignored.log"), "ignored\n").unwrap();
+        let nested = root.path().join("packages/inner/src");
+        fs::create_dir_all(&nested).unwrap();
+        let source = nested.join("new.rs");
+        fs::write(&source, "untracked\n").unwrap();
+
+        let listing = git_status_listing(source.to_str().unwrap());
+        assert_eq!(
+            listing["root"],
+            root.path()
+                .canonicalize()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned()
+        );
+        let statuses = listing["statuses"].as_array().unwrap();
+        assert!(statuses.iter().any(|entry| entry["status"] == "modified"));
+        assert!(statuses.iter().any(|entry| entry["status"] == "ignored"));
+        assert!(statuses.iter().any(|entry| entry["status"] == "untracked"));
+
+        let linked_parent = tempfile::tempdir().unwrap();
+        let linked = linked_parent.path().join("linked");
+        assert!(Command::new("git")
+            .arg("-C")
+            .arg(root.path())
+            .args(["worktree", "add", "--quiet", "--detach"])
+            .arg(&linked)
+            .status()
+            .unwrap()
+            .success());
+        fs::write(linked.join("linked.rs"), "linked source\n").unwrap();
+        let linked_listing = git_status_listing(linked.join("linked.rs").to_str().unwrap());
+        assert_eq!(
+            linked_listing["root"],
+            linked
+                .canonicalize()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned()
+        );
+        assert!(linked_listing["statuses"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["path"] == "linked.rs"));
+
+        let inner = root.path().join("packages/inner");
+        assert!(Command::new("git")
+            .args(["init", "--quiet"])
+            .arg(&inner)
+            .status()
+            .unwrap()
+            .success());
+        let nested_listing = git_status_listing(source.to_str().unwrap());
+        assert_eq!(
+            nested_listing["root"],
+            inner.canonicalize().unwrap().to_string_lossy().into_owned()
+        );
+        assert!(nested_listing["statuses"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["path"] == "src/"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn git_status_listing_follows_retargeted_repository_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let first = root.path().join("first");
+        let second = root.path().join("second");
+        for repository in [&first, &second] {
+            assert!(Command::new("git")
+                .args(["init", "--quiet"])
+                .arg(repository)
+                .status()
+                .unwrap()
+                .success());
+            fs::write(repository.join("untracked.rs"), "source\n").unwrap();
+        }
+        let alias = root.path().join("active");
+        symlink(&first, &alias).unwrap();
+        let first_listing = git_status_listing(alias.to_str().unwrap());
+        assert_eq!(
+            first_listing["root"],
+            first.canonicalize().unwrap().to_string_lossy().into_owned()
+        );
+
+        fs::remove_file(&alias).unwrap();
+        symlink(&second, &alias).unwrap();
+        let second_listing = git_status_listing(alias.to_str().unwrap());
+        assert_eq!(
+            second_listing["root"],
+            second
+                .canonicalize()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned()
+        );
+        assert!(second_listing["statuses"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["path"] == "untracked.rs"));
     }
 
     fn test_home_dir() -> PathBuf {

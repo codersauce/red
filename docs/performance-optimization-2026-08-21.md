@@ -60,6 +60,7 @@ navigation baselines were frozen after rebasing to `d92777c`.
 | Shared Vim whitespace-delimited WORD objects | 99.80% |
 | Crash-recovery buffer restoration | 99.77% |
 | Repeated themed syntax highlighting | 99.61% |
+| Git status requests outside repositories | 99.58% |
 | Embedded text-area ASCII typing | 99.29% |
 | Agent streamed transcript updates | 99.18% |
 | Shared modal editor word operators | 99.17% |
@@ -135,6 +136,13 @@ Git repository discovery was measured over 512 expired-cache refreshes through
 16 nested directories. Eleven alternating samples reduced the median from 51,601
 to 21,297 microseconds while preserving nested repositories, linked worktrees,
 detached HEADs, symlink retargeting, and renamed physical directories.
+
+Git status requests outside repositories were measured across 32 production
+refreshes from nested workspace directories. Eleven alternating release-build
+samples reduced the median from 172,090 to 731 microseconds by avoiding Git
+subprocesses when no repository exists. Real repositories retain modified,
+untracked, and ignored status entries, nested repository precedence, linked
+worktrees, canonical roots, and retargeted directory symlinks.
 
 Git workspace status indexing was measured over 32 production directory-index
 builds for 2,048 changed files across nested crate directories. Eleven alternating
@@ -296,10 +304,13 @@ objective.
 
 ## Remaining gaps
 
-- Single-file process startup, real-terminal end-to-end typing, recovery snapshot writes,
-  Git subprocess status refresh, broader Vim editing, platform-specific paths,
-  and several other areas above still require dedicated before/after fixtures
-  before claiming a 50% improvement.
+- Single-file process startup, real-terminal end-to-end typing, recovery
+  snapshot writes, in-repository Git subprocess status refresh, broader Vim
+  editing, platform-specific paths, and several other areas above do not yet
+  meet the 50% improvement target.
+- Real-repository Git status refresh improved 35.67%, from 418,087 to 268,941
+  microseconds across 32 requests, but the remaining `git status` subprocess
+  still keeps this path below the target.
 - An eager Neo-tree row index was intentionally rejected because it increased
   memory and slowed opening; the retained single-position cache avoids both
   regressions in real 2,048- and 8,192-entry terminal runs.
@@ -310,18 +321,16 @@ objective.
 ## Reproducing measurements
 
 ```shell
-CARGO_TARGET_DIR=/Users/felipe.coury/code/red/target \
-  cargo build --locked --release --example performance_hotspots
+cargo build --locked --release --example performance_hotspots
 
 python3 scripts/compare_performance_hotspots.py \
   --before /path/to/frozen-baseline \
-  --after /Users/felipe.coury/code/red/target/release/examples/performance_hotspots \
+  --after target/release/examples/performance_hotspots \
   --samples 7 \
   --scenarios picker preferences detached \
   --minimum-improvement 50
 
-CARGO_TARGET_DIR=/Users/felipe.coury/code/red/target \
-  cargo clippy --all-targets --all-features -- -D warnings
+cargo clippy --locked --all-targets --all-features -- -D warnings
 ```
 
 Use a baseline that actually contains the requested scenario. A later frozen
