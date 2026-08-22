@@ -57,6 +57,7 @@ pub struct CompletionUI {
     filter: String,
     last_filter: Option<String>,
     viewport: SelectionViewport,
+    selection_manually_changed: bool,
     visible: bool,
     anchor_x: usize,
     anchor_y: usize,
@@ -114,9 +115,12 @@ impl CompletionUI {
     }
 
     pub fn update_items(&mut self, items: Vec<CompletionResponseItem>, filter: &str) {
-        let selected = self
-            .selected_item()
-            .map(CompletionSelectionIdentity::from_item);
+        let selected = if self.selection_manually_changed {
+            self.selected_item()
+                .map(CompletionSelectionIdentity::from_item)
+        } else {
+            None
+        };
         self.filter.clear();
         self.filter.push_str(filter);
         self.replace_items(items, selected.as_ref());
@@ -159,6 +163,7 @@ impl CompletionUI {
         self.matched_label_indices.clear();
         self.filter.clear();
         self.last_filter = None;
+        self.selection_manually_changed = false;
     }
 
     pub fn is_visible(&self) -> bool {
@@ -298,13 +303,16 @@ impl CompletionUI {
         });
         if let Some(selection) = exact_selection.or(matching_label) {
             self.viewport.select(selection);
-        } else if let Some(preselected) = self.items.iter().position(|index| {
-            self.all_items
-                .get(*index)
-                .and_then(|item| item.preselect)
-                .unwrap_or(false)
-        }) {
-            self.viewport.select(preselected);
+        } else {
+            self.selection_manually_changed = false;
+            if let Some(preselected) = self.items.iter().position(|index| {
+                self.all_items
+                    .get(*index)
+                    .and_then(|item| item.preselect)
+                    .unwrap_or(false)
+            }) {
+                self.viewport.select(preselected);
+            }
         }
     }
 
@@ -375,7 +383,9 @@ impl CompletionUI {
             return;
         }
 
+        let previous_selection = self.viewport.selected();
         self.viewport.move_by(delta);
+        self.selection_manually_changed |= self.viewport.selected() != previous_selection;
     }
 
     fn move_page(&mut self, up: bool) {
@@ -953,6 +963,67 @@ mod tests {
     }
 
     #[test]
+    fn asynchronous_item_updates_select_the_new_highest_ranked_item() {
+        let mut buffer_item = item("printable_buffer", Some(CompletionItemKind::Text));
+        buffer_item.sort_text = Some("~buffer:printable_buffer".to_string());
+
+        let mut ui = CompletionUI::new();
+        ui.show(vec![buffer_item.clone()], 20, 0);
+        ui.set_filter("pri");
+        assert_eq!(ui.selected_item().unwrap().label, "printable_buffer");
+
+        let mut lsp_item = item("print", Some(CompletionItemKind::Function));
+        lsp_item.sort_text = Some("00".to_string());
+        ui.update_items(vec![buffer_item, lsp_item], "pri");
+
+        assert_eq!(ui.selected_item().unwrap().label, "print");
+    }
+
+    #[test]
+    fn asynchronous_item_updates_honor_server_preselection() {
+        let mut buffer_item = item("printable_buffer", Some(CompletionItemKind::Text));
+        buffer_item.sort_text = Some("~buffer:printable_buffer".to_string());
+
+        let mut ui = CompletionUI::new();
+        ui.show(vec![buffer_item.clone()], 20, 0);
+        ui.set_filter("pri");
+
+        let mut preferred_item = item("priority", Some(CompletionItemKind::Variable));
+        preferred_item.sort_text = Some("99".to_string());
+        preferred_item.preselect = Some(true);
+        let mut top_ranked_item = item("print", Some(CompletionItemKind::Function));
+        top_ranked_item.sort_text = Some("00".to_string());
+
+        ui.update_items(vec![buffer_item, top_ranked_item, preferred_item], "pri");
+
+        assert_eq!(ui.selected_item().unwrap().label, "priority");
+    }
+
+    #[test]
+    fn asynchronous_item_updates_preserve_manual_selection_over_server_preselection() {
+        let first_buffer_item = item("alpha", Some(CompletionItemKind::Text));
+        let selected_buffer_item = item("beta", Some(CompletionItemKind::Text));
+
+        let mut ui = CompletionUI::new();
+        ui.show(
+            vec![first_buffer_item.clone(), selected_buffer_item.clone()],
+            20,
+            0,
+        );
+        ui.move_selection(1);
+        assert_eq!(ui.selected_item().unwrap().label, "beta");
+
+        let mut preferred_item = item("aardvark", Some(CompletionItemKind::Function));
+        preferred_item.preselect = Some(true);
+        ui.update_items(
+            vec![first_buffer_item, selected_buffer_item, preferred_item],
+            "",
+        );
+
+        assert_eq!(ui.selected_item().unwrap().label, "beta");
+    }
+
+    #[test]
     fn asynchronous_item_updates_preserve_the_selected_label() {
         let mut ui = CompletionUI::new();
         ui.show(
@@ -981,6 +1052,40 @@ mod tests {
         );
 
         assert_eq!(ui.selected_item().unwrap().label, "manual_seed");
+    }
+
+    #[test]
+    fn changing_the_filter_releases_an_explicit_completion_selection() {
+        for (initial_filter, event) in [
+            ("pr", key(KeyCode::Char('i'), KeyModifiers::NONE)),
+            ("prin", key(KeyCode::Backspace, KeyModifiers::NONE)),
+        ] {
+            let mut ui = CompletionUI::new();
+            ui.show(
+                vec![
+                    item("printable_buffer", Some(CompletionItemKind::Text)),
+                    item("printer_buffer", Some(CompletionItemKind::Text)),
+                ],
+                20,
+                0,
+            );
+            ui.set_filter(initial_filter);
+            ui.move_selection(1);
+            ui.handle_event(&event);
+
+            let mut preferred_item = item("print", Some(CompletionItemKind::Function));
+            preferred_item.preselect = Some(true);
+            ui.update_items(
+                vec![
+                    item("printable_buffer", Some(CompletionItemKind::Text)),
+                    item("printer_buffer", Some(CompletionItemKind::Text)),
+                    preferred_item,
+                ],
+                "pri",
+            );
+
+            assert_eq!(ui.selected_item().unwrap().label, "print");
+        }
     }
 
     #[test]

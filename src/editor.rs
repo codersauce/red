@@ -38772,6 +38772,72 @@ builtin = "rust"
     }
 
     #[tokio::test]
+    async fn delayed_lsp_completion_selects_its_best_match_over_buffer_words() {
+        let mut editor = completion_typing_editor();
+        let request_snapshot = editor.completion_snapshot();
+        let buffer_items = vec![completion_item("manual_seed")];
+        assert!(editor.show_completion_items(buffer_items.clone(), request_snapshot));
+        assert_eq!(
+            editor
+                .current_dialog
+                .as_ref()
+                .and_then(|dialog| dialog.selected_completion())
+                .map(|item| item.label.as_str()),
+            Some("manual_seed")
+        );
+        let pending_snapshot = editor.completion_snapshot.clone().unwrap();
+        editor.pending_completions.insert(
+            42,
+            PendingCompletion {
+                buffer_items,
+                snapshot: pending_snapshot,
+                displayed_immediately: true,
+                superseded: false,
+            },
+        );
+        let response = InboundMessage::Message(ResponseMessage {
+            id: 42,
+            result: serde_json::json!([{
+                "label": "many",
+                "sortText": "00",
+                "preselect": true
+            }]),
+            request: Some(crate::lsp::Request::new(
+                "textDocument/completion",
+                serde_json::json!({ "position": { "line": 0, "character": 9 } }),
+            )),
+        });
+
+        assert!(matches!(
+            editor.handle_lsp_message(&response, Some("textDocument/completion".to_string())),
+            Some(Action::ShowDialog)
+        ));
+        assert_eq!(
+            editor
+                .current_dialog
+                .as_ref()
+                .and_then(|dialog| dialog.selected_completion())
+                .map(|item| item.label.as_str()),
+            Some("many")
+        );
+
+        let mut render_buffer = RenderBuffer::new(80, 24, &Style::default());
+        let mut runtime = Runtime::new();
+        editor
+            .process_editor_event(
+                Event::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)),
+                &mut render_buffer,
+                &mut runtime,
+                EventRenderMode::Immediate,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(editor.current_buffer().contents(), "torch.many");
+        assert!(editor.current_dialog.is_none());
+    }
+
+    #[tokio::test]
     async fn completion_merges_lsp_results_into_the_visible_menu_after_typing() {
         let mut editor = completion_typing_editor();
         let request_snapshot = editor.completion_snapshot();
