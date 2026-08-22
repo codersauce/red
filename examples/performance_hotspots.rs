@@ -306,6 +306,12 @@ fn main() -> Result<()> {
             /*unicode*/ true, /*operator*/ false,
         )?);
     }
+    if scenario == "all" || scenario == "paragraph-final-cursor" {
+        results.push(benchmark_final_document_motion(/*sentence*/ false)?);
+    }
+    if scenario == "all" || scenario == "sentence-final-cursor" {
+        results.push(benchmark_final_document_motion(/*sentence*/ true)?);
+    }
     if scenario == "all" || scenario == "paragraph" {
         results.push(benchmark_paragraph_motion());
     }
@@ -1375,6 +1381,36 @@ fn benchmark_editor_leading_whitespace(unicode: bool, operator: bool) -> Result<
             "editor_unicode_automatic_indentation_columns"
         } else {
             "editor_ascii_automatic_indentation_columns"
+        },
+        started,
+        TEXTAREA_VIM_MOTIONS,
+    ))
+}
+
+fn benchmark_final_document_motion(sentence: bool) -> Result<serde_json::Value> {
+    let source = format!("{}final", "ordinary_identifier ".repeat(1_024));
+    let expected = source.len() - 1;
+    let buffer = Buffer::new(None, source);
+    let resolver = MotionResolver::new(&buffer, TextPosition::new(/*line*/ 0, expected));
+    let started = Instant::now();
+    for _ in 0..TEXTAREA_VIM_MOTIONS {
+        let position = if sentence {
+            resolver.sentence_target(/*count*/ 1, /*backward*/ false)
+        } else {
+            resolver.paragraph_target(/*count*/ 1, /*backward*/ false)
+        }
+        .ok_or_else(|| anyhow::anyhow!("Vim document motion lost the final cursor position"))?;
+        anyhow::ensure!(
+            position == TextPosition::new(/*line*/ 0, expected),
+            "Vim document motion changed its final grapheme position"
+        );
+        black_box(position);
+    }
+    Ok(report(
+        if sentence {
+            "shared_vim_final_sentence_cursor_boundary"
+        } else {
+            "shared_vim_final_paragraph_cursor_boundary"
         },
         started,
         TEXTAREA_VIM_MOTIONS,

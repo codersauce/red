@@ -61,6 +61,8 @@ SCENARIOS = (
     "editor-line-start",
     "editor-indent-ascii",
     "editor-indent-unicode",
+    "paragraph-final-cursor",
+    "sentence-final-cursor",
     "paragraph",
     "sentence",
     "undo-prune",

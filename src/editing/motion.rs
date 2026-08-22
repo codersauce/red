@@ -588,6 +588,20 @@ impl<'buffer> MotionResolver<'buffer> {
 
     fn last_cursor_position(&self) -> TextPosition {
         let line = self.buffer.last_navigable_line();
+        if self.buffer.is_ascii() {
+            let contents = self.buffer.contents_snapshot();
+            let Some(source) = contents.get_line(line) else {
+                return TextPosition::new(line, 0);
+            };
+            let mut length = source.len_chars();
+            if source.get_char(length.saturating_sub(1)) == Some('\n') {
+                length -= 1;
+            }
+            if source.get_char(length.saturating_sub(1)) == Some('\r') {
+                length -= 1;
+            }
+            return TextPosition::new(line, length.saturating_sub(1));
+        }
         let Some(contents) = self.buffer.get(line) else {
             return TextPosition::new(line, 0);
         };
@@ -1188,6 +1202,7 @@ fn text_unit_kind(character: char) -> Option<TextUnitKind> {
 mod tests {
     use super::{MotionResolver, TextObjectKind, TextObjectScope};
     use crate::{buffer::Buffer, undo::TextPosition};
+    use unicode_segmentation::UnicodeSegmentation;
 
     #[test]
     fn shared_word_motion_preserves_change_whitespace_and_grapheme_groups() {
@@ -1266,6 +1281,44 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn indexed_final_cursor_preserves_unicode_graphemes_crlf_and_motion_boundaries() {
+        for source in [
+            "ordinary final source",
+            "first\r\nfinal\r\n",
+            "first\nfinal e\u{301}",
+            "first\nfinal 👨‍👩‍👧",
+            "first\nfinal 🇧🇷",
+            "first\nfinal 終",
+        ] {
+            let buffer = Buffer::new(None, source.to_string());
+            let line = buffer.last_navigable_line();
+            let text = buffer.get(line).unwrap();
+            let text = crate::unicode_utils::trim_line_ending(&text);
+            let expected = text.graphemes(true).next_back().map_or(0, |grapheme| {
+                text.chars().count() - grapheme.chars().count()
+            });
+            let resolver = MotionResolver::new(&buffer, TextPosition::new(line, expected));
+            assert_eq!(
+                resolver.paragraph_target(/*count*/ 1, /*backward*/ false),
+                Some(TextPosition::new(line, expected)),
+                "paragraph {source:?}"
+            );
+            assert_eq!(
+                resolver.sentence_target(/*count*/ 1, /*backward*/ false),
+                Some(TextPosition::new(line, expected)),
+                "sentence {source:?}"
+            );
+        }
+
+        let empty = Buffer::new(None, String::new());
+        let resolver = MotionResolver::new(&empty, TextPosition::new(/*line*/ 0, /*character*/ 0));
+        assert_eq!(
+            resolver.last_cursor_position(),
+            TextPosition::new(/*line*/ 0, /*character*/ 0)
+        );
     }
 
     #[test]

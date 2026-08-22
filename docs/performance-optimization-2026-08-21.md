@@ -134,7 +134,9 @@ navigation baselines were frozen after rebasing to `d92777c`.
 | Long-line Vim backward word motion | 80.33% |
 | Theme hexadecimal color parsing | 79.71% |
 | Detached incremental frame serialization | 79.06% |
+| Shared Vim final sentence cursor boundary | 75.93% |
 | Embedded forward Delete-key editing | 75.72% |
+| Shared Vim final paragraph cursor boundary | 75.63% |
 | Shared Vim Unicode forward character search | 75.52% |
 | Shared Vim Unicode backward character search | 75.26% |
 | Embedded Ctrl-Backspace word deletion | 74.86% |
@@ -351,6 +353,14 @@ forward medians fell from 2,394 to 586 microseconds and backward medians from
 2,421 to 599 microseconds. Indexed bidirectional Rope traversal preserves
 repeated-target counts, excluded cursor characters, scalar boundaries, missing
 lines, cursor saturation, LF/CRLF endings, combining marks, CJK, and emoji.
+
+Shared Vim end-of-document motions were independently measured across 2,048
+paragraph and sentence searches on 20 KiB final source lines. Eleven
+alternating release-build samples reduced final paragraph cursor medians from
+4,513 to 1,100 microseconds and final sentence cursor medians from 4,479 to
+1,078 microseconds while preserving CRLF, empty buffers, Unicode combining
+marks, family emoji, regional-indicator flags, CJK, and final grapheme
+boundaries.
 
 Shared Vim paragraph objects were independently measured across 128 inner and
 128 around selections spanning 768-line paragraphs. Eleven alternating
