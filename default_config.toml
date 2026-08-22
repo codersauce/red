@@ -246,10 +246,14 @@ waiting = "steady_underscore"
 #
 # Apply language changes without restarting using `:languages reload`.
 
-# Manual comment formatting targets 100 source columns by default.
+# Manual and insert-mode comment formatting target 100 source columns by default.
 # A language definition can override this with its own text_width.
+# Set text_width to 0 to disable automatic wrapping and make gq use the viewport.
 [commenting]
 text_width = 100
+auto_wrap = true
+continue_on_enter = true
+continue_on_open_line = true
 
 # Comment templates use Neovim's commentstring format. The single %s is
 # replaced with each selected line. Add or override languages and extensions

@@ -18646,6 +18646,9 @@ impl Editor {
                         self.indentation_decision(line, crate::syntax_indent::IndentReason::Typed);
                     self.apply_indentation_to_line(line, decision);
                 }
+                if !c.is_whitespace() {
+                    self.auto_wrap_current_comment_line();
+                }
                 self.notify_change(runtime).await?;
                 self.refresh_cursor_goal();
                 if started_transaction {
@@ -19081,6 +19084,12 @@ impl Editor {
                 let cursor_char = grapheme_to_char(current_line_for_split, self.cx);
                 let before_cursor = char_prefix(current_line_for_split, cursor_char).to_string();
                 let after_cursor = char_suffix(current_line_for_split, cursor_char).to_string();
+                let comment_prefix = self
+                    .config
+                    .commenting
+                    .continue_on_enter
+                    .then(|| self.comment_continuation_prefix(&before_cursor))
+                    .flatten();
 
                 let split_pair = if let Some(language) =
                     self.highlight_language_id_for_buffer_index(self.buffer_manager.active_index())
@@ -19102,16 +19111,32 @@ impl Editor {
 
                 let line = self.buffer_line();
                 let fallback_indent = self.indentation().whitespace_for_columns(fallback_columns);
-                let replacement = if split_pair {
-                    format!(
-                        "{}\n{}\n{}{}",
-                        before_cursor.trim_end(),
-                        fallback_indent,
-                        fallback_indent,
-                        after_cursor.trim_start()
+                let (replacement, inserted_prefix) = if split_pair {
+                    (
+                        format!(
+                            "{}\n{}\n{}{}",
+                            before_cursor.trim_end(),
+                            fallback_indent,
+                            fallback_indent,
+                            after_cursor.trim_start()
+                        ),
+                        fallback_indent.as_str(),
+                    )
+                } else if let Some(comment_prefix) = comment_prefix.as_deref() {
+                    (
+                        format!(
+                            "{}\n{}{}",
+                            before_cursor,
+                            comment_prefix,
+                            after_cursor.trim_start()
+                        ),
+                        comment_prefix,
                     )
                 } else {
-                    format!("{}\n{}{}", before_cursor, fallback_indent, after_cursor)
+                    (
+                        format!("{}\n{}{}", before_cursor, fallback_indent, after_cursor),
+                        fallback_indent.as_str(),
+                    )
                 };
                 self.replace_range(
                     TextRange::new(
@@ -19121,7 +19146,7 @@ impl Editor {
                     &replacement,
                 );
 
-                self.cx = grapheme_len(&fallback_indent);
+                self.cx = grapheme_len(inserted_prefix);
                 self.cy += 1;
 
                 let target_line = line + 1;
@@ -19460,6 +19485,17 @@ impl Editor {
                 let leading_columns = self.indentation_columns_for_line(self.buffer_line());
                 let line = self.buffer_line();
                 let fallback_indent = self.indentation().whitespace_for_columns(leading_columns);
+                let comment_prefix = self
+                    .config
+                    .commenting
+                    .continue_on_open_line
+                    .then(|| {
+                        self.current_buffer()
+                            .get(line)
+                            .and_then(|contents| self.comment_continuation_prefix(&contents))
+                    })
+                    .flatten();
+                let inserted_prefix = comment_prefix.as_deref().unwrap_or(&fallback_indent);
 
                 log!(
                     "InsertLineBelowCursor - line: {}, leading_columns: {}, current cx: {}, cy: {}",
@@ -19475,10 +19511,10 @@ impl Editor {
                 }
                 self.replace_range(
                     TextRange::insertion(TextPosition::new(line + 1, 0)),
-                    &format!("{fallback_indent}\n"),
+                    &format!("{inserted_prefix}\n"),
                 );
                 self.cy += 1;
-                self.cx = grapheme_len(&fallback_indent);
+                self.cx = grapheme_len(inserted_prefix);
                 self.mode = Mode::Insert;
                 self.insert_entry_cursor = Some(self.cursor_snapshot());
                 let target_line = line + 1;
@@ -19511,15 +19547,26 @@ impl Editor {
 
                 let line = self.buffer_line();
                 let fallback_indent = self.indentation().whitespace_for_columns(leading_columns);
+                let comment_prefix = self
+                    .config
+                    .commenting
+                    .continue_on_open_line
+                    .then(|| {
+                        self.current_buffer()
+                            .get(line)
+                            .and_then(|contents| self.comment_continuation_prefix(&contents))
+                    })
+                    .flatten();
+                let inserted_prefix = comment_prefix.as_deref().unwrap_or(&fallback_indent);
                 let started_transaction = !self.transaction_active();
                 if started_transaction {
                     self.begin_transaction("insert line above");
                 }
                 self.replace_range(
                     TextRange::insertion(TextPosition::new(line, 0)),
-                    &format!("{fallback_indent}\n"),
+                    &format!("{inserted_prefix}\n"),
                 );
-                self.cx = grapheme_len(&fallback_indent);
+                self.cx = grapheme_len(inserted_prefix);
                 self.mode = Mode::Insert;
                 self.insert_entry_cursor = Some(self.cursor_snapshot());
                 let decision = self.indentation_decision_for_line(line);
@@ -24431,17 +24478,74 @@ impl Editor {
         Some(syntax)
     }
 
-    fn comment_text_width(&self) -> usize {
-        let configured = self
-            .current_language_id()
+    fn configured_comment_text_width(&self) -> usize {
+        self.current_language_id()
             .and_then(|language| self.config.languages.get(&language))
             .and_then(|language| language.text_width)
-            .unwrap_or(self.config.commenting.text_width);
+            .unwrap_or(self.config.commenting.text_width)
+    }
+
+    fn comment_text_width(&self) -> usize {
+        let configured = self.configured_comment_text_width();
         if configured == 0 {
-            self.active_content_width().min(79).max(1)
+            self.active_content_width().clamp(1, 79)
         } else {
             configured
         }
+    }
+
+    fn comment_continuation_prefix(&self, line: &str) -> Option<String> {
+        let line = trim_line_ending(line);
+        self.configured_comment_syntax()?.continuation_prefix(line)
+    }
+
+    /// Reflows an over-width line comment inside the active insert transaction.
+    fn auto_wrap_current_comment_line(&mut self) -> bool {
+        if !self.config.commenting.auto_wrap {
+            return false;
+        }
+        let width = self.configured_comment_text_width();
+        if width == 0 {
+            return false;
+        }
+        let Some(syntax) = self.configured_comment_syntax() else {
+            return false;
+        };
+        let line = self.buffer_line();
+        let Some(original_line) = self.current_buffer().get(line) else {
+            return false;
+        };
+        let source = trim_line_ending(&original_line);
+        if self.cx != grapheme_len(source)
+            || syntax.continuation_prefix(source).is_none()
+            || display_width_with_tabs(source, self.active_tab_width()) <= width
+        {
+            return false;
+        }
+
+        let range = if line < self.current_buffer().len() {
+            TextRange::new(TextPosition::new(line, 0), TextPosition::new(line + 1, 0))
+        } else {
+            TextRange::new(
+                TextPosition::new(line, 0),
+                TextPosition::new(line, source.chars().count()),
+            )
+        };
+        let original = self.current_buffer().text_in_range(range);
+        let formatted = reflow_text(&original, width, self.active_tab_width(), |line| {
+            syntax.reflow_line(line).unwrap_or_else(|| plain_line(line))
+        });
+        if formatted == original {
+            return false;
+        }
+
+        let cursor_text = formatted.trim_end_matches(&['\r', '\n'][..]);
+        let last_line = cursor_text.rsplit('\n').next().unwrap_or_default();
+        let cursor_line = line + cursor_text.lines().count().saturating_sub(1);
+        let cursor_character = last_line.trim_end_matches('\r').chars().count();
+        self.replace_range(range, &formatted);
+        self.move_to_insert_text_position(TextPosition::new(cursor_line, cursor_character));
+        true
     }
 
     fn comment_text_object_range(&mut self) -> Option<TextRange> {

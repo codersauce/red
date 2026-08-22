@@ -679,6 +679,15 @@ pub struct CommentingConfig {
     /// Preferred source width for manual and automatic comment formatting.
     #[serde(default = "default_comment_text_width")]
     pub text_width: usize,
+    /// Wrap line comments as insert-mode typing crosses `text_width`.
+    #[serde(default = "default_true")]
+    pub auto_wrap: bool,
+    /// Continue a recognized line-comment leader after Enter in Insert mode.
+    #[serde(default = "default_true")]
+    pub continue_on_enter: bool,
+    /// Continue a recognized line-comment leader for Normal-mode `o` and `O`.
+    #[serde(default = "default_true")]
+    pub continue_on_open_line: bool,
     /// Templates containing one placeholder for the original line contents.
     #[serde(default = "default_comment_templates")]
     pub languages: HashMap<String, String>,
@@ -688,6 +697,9 @@ impl Default for CommentingConfig {
     fn default() -> Self {
         Self {
             text_width: default_comment_text_width(),
+            auto_wrap: true,
+            continue_on_enter: true,
+            continue_on_open_line: true,
             languages: default_comment_templates(),
         }
     }
@@ -2263,7 +2275,14 @@ fn known_schema_path(path: &[String]) -> bool {
             matches!(*field, "name" | "command" | "args" | "root_markers" | "env")
         }
         ["languages", _, "formatter", "env", _] => true,
-        ["commenting", field] => matches!(*field, "text_width" | "languages"),
+        ["commenting", field] => matches!(
+            *field,
+            "text_width"
+                | "auto_wrap"
+                | "continue_on_enter"
+                | "continue_on_open_line"
+                | "languages"
+        ),
         ["commenting", "languages", _] => true,
         ["matchit", field] => matches!(*field, "enabled" | "pairs" | "languages"),
         ["matchit", "languages", _] | ["matchit", "languages", _, "groups"] => true,
@@ -4116,6 +4135,9 @@ input_position = "left"
         let config = Config::default();
 
         assert_eq!(config.commenting.text_width, 100);
+        assert!(config.commenting.auto_wrap);
+        assert!(config.commenting.continue_on_enter);
+        assert!(config.commenting.continue_on_open_line);
         assert_eq!(config.commenting.languages["fish"], "# %s");
         assert_eq!(config.commenting.languages["rust"], "// %s");
         assert!(!config.commenting.languages.contains_key("python"));
@@ -4126,16 +4148,35 @@ input_position = "left"
     }
 
     #[test]
-    fn comment_text_width_supports_global_and_language_overrides() {
+    fn comment_formatting_supports_global_and_language_overrides() {
         let loaded = Config::load_user_toml(
-            "[commenting]\ntext_width = 88\n[languages.rust]\ntext_width = 92\n",
+            "[commenting]\ntext_width = 88\nauto_wrap = false\ncontinue_on_enter = false\ncontinue_on_open_line = false\n[languages.rust]\ntext_width = 92\n",
             Path::new("/tmp/config.toml"),
             &[],
         )
         .unwrap();
 
         assert_eq!(loaded.config.commenting.text_width, 88);
+        assert!(!loaded.config.commenting.auto_wrap);
+        assert!(!loaded.config.commenting.continue_on_enter);
+        assert!(!loaded.config.commenting.continue_on_open_line);
         assert_eq!(loaded.config.languages["rust"].text_width, Some(92));
+    }
+
+    #[test]
+    fn invalid_comment_formatting_field_recovers_independently() {
+        let loaded = Config::load_user_toml(
+            "[commenting]\nauto_wrap = \"yes\"\ncontinue_on_enter = false\n",
+            Path::new("/tmp/config.toml"),
+            &[],
+        )
+        .unwrap();
+
+        assert!(loaded.config.commenting.auto_wrap);
+        assert!(!loaded.config.commenting.continue_on_enter);
+        assert!(loaded.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "CFG102" && diagnostic.path == "commenting.auto_wrap"
+        }));
     }
 
     #[test]

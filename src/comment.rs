@@ -58,14 +58,7 @@ impl CommentSyntax {
             ));
         }
 
-        let marker_character = left_marker.chars().last();
-        let extra_marker_len = after_left
-            .char_indices()
-            .take_while(|(_, character)| Some(*character) == marker_character || *character == '!')
-            .map(|(offset, character)| offset + character.len_utf8())
-            .last()
-            .unwrap_or_default();
-        let (extra_marker, body) = after_left.split_at(extra_marker_len);
+        let (extra_marker, body) = self.line_comment_suffix(after_left);
         let body = body.trim();
         if body.is_empty() {
             return Some(ReflowLine::Literal(line.to_string()));
@@ -76,6 +69,32 @@ impl CommentSyntax {
             body,
             "",
         ))
+    }
+
+    /// Returns the leader to insert when continuing a line comment.
+    pub(crate) fn continuation_prefix(&self, line: &str) -> Option<String> {
+        if !self.right.trim().is_empty() {
+            return None;
+        }
+
+        let content = line.trim_start_matches(char::is_whitespace);
+        let indent = &line[..line.len() - content.len()];
+        let left_marker = self.left.trim_end();
+        let after_left = content.strip_prefix(left_marker)?;
+        let (extra_marker, _) = self.line_comment_suffix(after_left);
+        let padding = self.left.strip_prefix(left_marker).unwrap_or_default();
+        Some(format!("{indent}{left_marker}{extra_marker}{padding}"))
+    }
+
+    fn line_comment_suffix<'a>(&self, after_left: &'a str) -> (&'a str, &'a str) {
+        let marker_character = self.left.trim_end().chars().last();
+        let extra_marker_len = after_left
+            .char_indices()
+            .take_while(|(_, character)| Some(*character) == marker_character || *character == '!')
+            .map(|(offset, character)| offset + character.len_utf8())
+            .last()
+            .unwrap_or_default();
+        after_left.split_at(extra_marker_len)
     }
 
     /// Reports a wrapping-comment opener that cannot be represented line-by-line.
@@ -278,5 +297,33 @@ mod tests {
         );
         assert!(syntax.reflow_line("  /* comment body").is_none());
         assert!(syntax.is_unclosed_wrapping_start("  /* comment body"));
+    }
+
+    #[test]
+    fn continues_line_and_documentation_leaders_but_not_wrapping_comments() {
+        let syntax = CommentSyntax::parse("// %s").unwrap();
+
+        assert_eq!(
+            syntax.continuation_prefix("    // prose"),
+            Some("    // ".to_string())
+        );
+        assert_eq!(
+            syntax.continuation_prefix("    /// docs"),
+            Some("    /// ".to_string())
+        );
+        assert_eq!(
+            syntax.continuation_prefix("    //! module docs"),
+            Some("    //! ".to_string())
+        );
+        assert_eq!(
+            syntax.continuation_prefix("    // - list item"),
+            Some("    // ".to_string())
+        );
+        assert_eq!(
+            CommentSyntax::parse("/* %s */")
+                .unwrap()
+                .continuation_prefix("/* prose */"),
+            None
+        );
     }
 }

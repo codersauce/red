@@ -835,6 +835,96 @@ async fn format_gqq_reflows_plain_text_without_a_comment_language() {
 }
 
 #[tokio::test]
+async fn insert_mode_wraps_line_comments_and_undoes_the_session_atomically() {
+    let mut config = default_key_config();
+    config.commenting.text_width = 24;
+    let original = "// alpha beta gamma delta epsilon";
+    let buffer = Buffer::new(Some("main.rs".to_string()), original.to_string());
+    let mut harness = EditorHarness::with_config(buffer, config);
+
+    type_normal_keys(&mut harness, "A").await;
+    harness.type_text(" zeta").await.unwrap();
+
+    harness.assert_buffer_contents("// alpha beta gamma\n// delta epsilon zeta");
+    harness.assert_cursor_at(21, 1);
+    command_key(&mut harness, KeyCode::Esc).await;
+    type_normal_keys(&mut harness, "u").await;
+    harness.assert_buffer_contents(original);
+}
+
+#[tokio::test]
+async fn enter_continues_documentation_comment_leaders() {
+    let original = "    /// alpha beta";
+    let mut harness = comment_harness("main.rs", original);
+
+    type_normal_keys(&mut harness, "A").await;
+    command_key(&mut harness, KeyCode::Enter).await;
+    harness.type_text("gamma").await.unwrap();
+
+    harness.assert_buffer_contents("    /// alpha beta\n    /// gamma");
+    harness.assert_cursor_at(13, 1);
+    command_key(&mut harness, KeyCode::Esc).await;
+    type_normal_keys(&mut harness, "u").await;
+    harness.assert_buffer_contents(original);
+}
+
+#[tokio::test]
+async fn open_line_commands_continue_comment_leaders() {
+    let mut below = comment_harness("main.rs", "    //! parent\nnext");
+
+    type_normal_keys(&mut below, "o").await;
+    below.type_text("child").await.unwrap();
+    command_key(&mut below, KeyCode::Esc).await;
+    below.assert_buffer_contents("    //! parent\n    //! child\nnext");
+
+    let mut above = comment_harness("main.rs", "    // parent\nnext");
+    type_normal_keys(&mut above, "O").await;
+    above.type_text("before").await.unwrap();
+    command_key(&mut above, KeyCode::Esc).await;
+    above.assert_buffer_contents("    // before\n    // parent\nnext");
+}
+
+#[tokio::test]
+async fn automatic_comment_formatting_respects_language_width_and_opt_outs() {
+    let mut language_width = default_key_config();
+    language_width.commenting.text_width = 12;
+    language_width.languages.insert(
+        "rust".to_string(),
+        LanguageConfig {
+            text_width: Some(40),
+            ..LanguageConfig::default()
+        },
+    );
+    let buffer = Buffer::new(
+        Some("main.rs".to_string()),
+        "// alpha beta gamma".to_string(),
+    );
+    let mut harness = EditorHarness::with_config(buffer, language_width);
+    type_normal_keys(&mut harness, "A").await;
+    harness.type_text(" delta").await.unwrap();
+    harness.assert_buffer_contents("// alpha beta gamma delta");
+
+    let mut disabled = default_key_config();
+    disabled.commenting.text_width = 12;
+    disabled.commenting.auto_wrap = false;
+    disabled.commenting.continue_on_enter = false;
+    disabled.commenting.continue_on_open_line = false;
+    let buffer = Buffer::new(Some("main.rs".to_string()), "    // alpha beta".to_string());
+    let mut harness = EditorHarness::with_config(buffer, disabled);
+    type_normal_keys(&mut harness, "A").await;
+    harness.type_text(" gamma").await.unwrap();
+    command_key(&mut harness, KeyCode::Enter).await;
+    harness.type_text("plain").await.unwrap();
+    command_key(&mut harness, KeyCode::Esc).await;
+    harness.assert_buffer_contents("    // alpha beta gamma\n    plain");
+
+    type_normal_keys(&mut harness, "O").await;
+    harness.type_text("above").await.unwrap();
+    command_key(&mut harness, KeyCode::Esc).await;
+    harness.assert_buffer_contents("    // alpha beta gamma\n    above\n    plain");
+}
+
+#[tokio::test]
 async fn comment_unknown_language_leaves_the_buffer_unchanged() {
     let mut harness = comment_harness("data.json", "{\"value\": 1}");
 

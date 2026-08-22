@@ -377,7 +377,7 @@ impl TextArea {
         event: &Event,
         layout: LayoutOptions,
     ) -> TextAreaOutcome {
-        self.format_width = layout.width.min(79).max(1);
+        self.format_width = layout.width.clamp(1, 79);
         self.format_tab_width = layout.tab_width;
         match event {
             Event::Paste(text) => {
