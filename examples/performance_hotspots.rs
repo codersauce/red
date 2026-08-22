@@ -71,6 +71,7 @@ const RECOVERY_RESTORES: usize = 8;
 const WORKSPACE_SEARCH_DIRECTORIES: usize = 8;
 const WORKSPACE_SEARCH_FILES_PER_DIRECTORY: usize = 32;
 const WORKSPACE_SEARCH_LISTINGS: usize = 8;
+const WORKSPACE_CONTENT_SEARCHES: usize = 4;
 
 fn main() -> Result<()> {
     let scenario = std::env::args().nth(1).unwrap_or_else(|| "all".into());
@@ -171,6 +172,9 @@ fn main() -> Result<()> {
     }
     if scenario == "all" || scenario == "workspace-files" {
         results.push(benchmark_workspace_file_discovery()?);
+    }
+    if scenario == "all" || scenario == "workspace-search" {
+        results.push(benchmark_workspace_content_search()?);
     }
 
     anyhow::ensure!(
@@ -998,28 +1002,8 @@ fn benchmark_session_buffer_restoration() -> Result<serde_json::Value> {
 }
 
 fn benchmark_workspace_file_discovery() -> Result<serde_json::Value> {
-    let directory = tempfile::tempdir()?;
+    let directory = workspace_search_fixture()?;
     let root = directory.path();
-    std::fs::create_dir(root.join(".git"))?;
-    std::fs::write(root.join(".git/config"), "private = true\n")?;
-    std::fs::write(root.join(".gitignore"), "ignored.rs\n")?;
-    std::fs::write(root.join("ignored.rs"), "ignored\n")?;
-    std::fs::write(root.join(".env"), "TOKEN=private\n")?;
-    std::fs::create_dir(root.join("secrets"))?;
-    std::fs::write(root.join("secrets/token.rs"), "private\n")?;
-    for directory_index in 0..WORKSPACE_SEARCH_DIRECTORIES {
-        let child = root.join(format!("module-{directory_index:02}"));
-        std::fs::create_dir(&child)?;
-        for file_index in 0..WORKSPACE_SEARCH_FILES_PER_DIRECTORY {
-            std::fs::write(
-                child.join(format!("source-{file_index:03}.rs")),
-                format!("fn source_{directory_index}_{file_index}() {{}}\n"),
-            )?;
-        }
-    }
-    #[cfg(unix)]
-    std::os::unix::fs::symlink(root.join("module-00/source-000.rs"), root.join("link.rs"))?;
-
     let expected_files = WORKSPACE_SEARCH_DIRECTORIES * WORKSPACE_SEARCH_FILES_PER_DIRECTORY + 1;
     let started = Instant::now();
     for _ in 0..WORKSPACE_SEARCH_LISTINGS {
@@ -1051,6 +1035,58 @@ fn benchmark_workspace_file_discovery() -> Result<serde_json::Value> {
         started,
         WORKSPACE_SEARCH_LISTINGS,
     ))
+}
+
+fn benchmark_workspace_content_search() -> Result<serde_json::Value> {
+    let directory = workspace_search_fixture()?;
+    let root = directory.path();
+    let started = Instant::now();
+    for _ in 0..WORKSPACE_CONTENT_SEARCHES {
+        let result = red::inline_context::benchmark_workspace_content_search(
+            black_box(root),
+            black_box("source_7_31"),
+        )?;
+        let matches = result["matches"]
+            .as_array()
+            .ok_or_else(|| anyhow::anyhow!("workspace search returned invalid matches"))?;
+        anyhow::ensure!(
+            matches.len() == 1
+                && matches[0]["path"] == "module-07/source-031.rs"
+                && matches[0]["source"] == "disk",
+            "workspace search did not return its exact final source file"
+        );
+        black_box(result);
+    }
+    Ok(report(
+        "workspace_inline_content_search",
+        started,
+        WORKSPACE_CONTENT_SEARCHES,
+    ))
+}
+
+fn workspace_search_fixture() -> Result<tempfile::TempDir> {
+    let directory = tempfile::tempdir()?;
+    let root = directory.path();
+    std::fs::create_dir(root.join(".git"))?;
+    std::fs::write(root.join(".git/config"), "private = true\n")?;
+    std::fs::write(root.join(".gitignore"), "ignored.rs\n")?;
+    std::fs::write(root.join("ignored.rs"), "ignored\n")?;
+    std::fs::write(root.join(".env"), "TOKEN=private\n")?;
+    std::fs::create_dir(root.join("secrets"))?;
+    std::fs::write(root.join("secrets/token.rs"), "private\n")?;
+    for directory_index in 0..WORKSPACE_SEARCH_DIRECTORIES {
+        let child = root.join(format!("module-{directory_index:02}"));
+        std::fs::create_dir(&child)?;
+        for file_index in 0..WORKSPACE_SEARCH_FILES_PER_DIRECTORY {
+            std::fs::write(
+                child.join(format!("source-{file_index:03}.rs")),
+                format!("fn source_{directory_index}_{file_index}() {{}}\n"),
+            )?;
+        }
+    }
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(root.join("module-00/source-000.rs"), root.join("link.rs"))?;
+    Ok(directory)
 }
 
 fn decoration(line: usize, priority: i32) -> Decoration {

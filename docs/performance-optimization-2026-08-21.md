@@ -79,6 +79,7 @@ navigation baselines were frozen after rebasing to `d92777c`.
 | Long-line Vim word-end motion | 84.79% |
 | Idle plugin timer polling | 84.29% |
 | Default editor status-line rendering | 83.45% |
+| Workspace inline content search | 82.60% |
 | Long-line Vim backward word motion | 80.33% |
 | Detached incremental frame serialization | 79.06% |
 | Shared Vim sentence navigation | 74.63% |

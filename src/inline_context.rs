@@ -214,7 +214,18 @@ impl InlineContextSnapshot {
 
     fn read(&self, path: &str) -> Result<(String, FileText)> {
         let (_, relative) = resolve_path_with_policy(&self.root, path, self.allow_sensitive_paths)?;
-        let text = match self.visible.get(&relative) {
+        let text = self.file_text(&relative, || {
+            crate::codex::read_inline_workspace_file(&self.root, &relative, MAX_FILE_BYTES)
+        })?;
+        Ok((relative, text))
+    }
+
+    fn file_text(
+        &self,
+        path: &str,
+        read_disk: impl FnOnce() -> Result<Option<String>>,
+    ) -> Result<FileText> {
+        let text = match self.visible.get(path) {
             Some(Some(text)) => FileText {
                 content: text.content.clone(),
                 revision: Some(text.revision),
@@ -222,12 +233,8 @@ impl InlineContextSnapshot {
             },
             Some(None) => anyhow::bail!("open buffer exceeds the inline context limit"),
             None => {
-                let content = crate::codex::read_inline_workspace_file(
-                    &self.root,
-                    &relative,
-                    MAX_FILE_BYTES,
-                )?
-                .context("file is unavailable, binary, or exceeds the 512 KiB limit")?;
+                let content = read_disk()?
+                    .context("file is unavailable, binary, or exceeds the 512 KiB limit")?;
                 FileText {
                     content,
                     revision: None,
@@ -239,7 +246,7 @@ impl InlineContextSnapshot {
             !text.content.contains('\0'),
             "inline context cannot read binary data"
         );
-        Ok((relative, text))
+        Ok(text)
     }
 
     fn files(&self) -> Result<(BTreeSet<String>, bool)> {
@@ -309,6 +316,8 @@ impl InlineContextSnapshot {
                     "invalid search query"
                 );
                 let (files, mut truncated) = self.files()?;
+                #[cfg(unix)]
+                let reader = crate::codex::InlineWorkspaceReader::new(&self.root)?;
                 let started = Instant::now();
                 let mut files = files.into_iter().collect::<Vec<_>>();
                 files.sort_by_key(|path| !self.visible.contains_key(path));
@@ -320,7 +329,11 @@ impl InlineContextSnapshot {
                         truncated = true;
                         break;
                     }
-                    let Ok((path, text)) = self.read(&path) else {
+                    #[cfg(unix)]
+                    let text = self.file_text(&path, || reader.read(&path, MAX_FILE_BYTES));
+                    #[cfg(not(unix))]
+                    let text = self.read(&path).map(|(_, text)| text);
+                    let Ok(text) = text else {
                         truncated = true;
                         continue;
                     };
@@ -429,6 +442,19 @@ pub fn benchmark_workspace_file_listing(root: &Path) -> Result<Value> {
         allow_sensitive_paths: false,
     }
     .execute_read(InlineContextCall::ListFiles {})
+}
+
+/// Runs the production read-only workspace search for reproducible benchmarks.
+#[doc(hidden)]
+pub fn benchmark_workspace_content_search(root: &Path, query: &str) -> Result<Value> {
+    InlineContextSnapshot {
+        root: root.canonicalize()?,
+        visible: BTreeMap::new(),
+        allow_sensitive_paths: false,
+    }
+    .execute_read(InlineContextCall::SearchFiles {
+        query: query.to_string(),
+    })
 }
 
 fn bounded_text(text: &str, limit: usize) -> &str {

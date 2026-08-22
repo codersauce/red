@@ -138,6 +138,55 @@ async fn inline_context_rejects_unsafe_ignored_binary_and_oversized_files() {
             "{forbidden}"
         );
     }
+
+    let found = snapshot(root.path())
+        .execute(InlineContextCall::SearchFiles {
+            query: "needle".into(),
+        })
+        .await
+        .unwrap();
+    let matches = found["matches"].as_array().unwrap();
+    assert!(matches.iter().any(|entry| entry["path"] == "safe.c"));
+    for forbidden in [
+        "ignored.c",
+        ".env",
+        "credential.txt",
+        "private.pem",
+        "secrets/value.c",
+        ".git/config",
+        "link.c",
+    ] {
+        assert!(
+            !matches.iter().any(|entry| entry["path"] == forbidden),
+            "searched restricted path {forbidden}"
+        );
+    }
+}
+
+#[test]
+fn inline_workspace_reader_remains_anchored_and_rejects_replaced_symlinks() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("workspace");
+    std::fs::create_dir(&root).unwrap();
+    std::fs::write(root.join("source.rs"), "original\n").unwrap();
+    let reader = crate::codex::InlineWorkspaceReader::new(&root).unwrap();
+
+    let original = directory.path().join("original");
+    std::fs::rename(&root, &original).unwrap();
+    std::fs::create_dir(&root).unwrap();
+    std::fs::write(root.join("source.rs"), "replacement\n").unwrap();
+    assert_eq!(
+        reader.read("source.rs", MAX_FILE_BYTES).unwrap(),
+        Some("original\n".to_string())
+    );
+
+    let outside = directory.path().join("outside.rs");
+    std::fs::write(&outside, "private\n").unwrap();
+    std::fs::remove_file(original.join("source.rs")).unwrap();
+    symlink(&outside, original.join("source.rs")).unwrap();
+    assert!(reader.read("source.rs", MAX_FILE_BYTES).unwrap().is_none());
+    assert!(reader.read("../outside.rs", MAX_FILE_BYTES).is_err());
+    assert!(reader.read("/etc/passwd", MAX_FILE_BYTES).is_err());
 }
 
 #[tokio::test]

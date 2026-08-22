@@ -42,6 +42,7 @@ SCENARIOS = (
     "lsp-routing",
     "session-restore",
     "workspace-files",
+    "workspace-search",
     "husk-completion",
     "husk-config",
     "husk-update",

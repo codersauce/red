@@ -2214,7 +2214,7 @@ pub(crate) fn physical_workspace_root(root: &Path) -> PathBuf {
 }
 
 #[cfg(unix)]
-fn open_workspace_file(root: &Path, relative: &Path) -> Result<Option<File>> {
+fn open_workspace_directory(root: &Path) -> Result<File> {
     use std::os::fd::{AsRawFd, FromRawFd};
 
     use nix::{
@@ -2222,10 +2222,6 @@ fn open_workspace_file(root: &Path, relative: &Path) -> Result<Option<File>> {
         sys::stat::Mode,
     };
 
-    let components = relative.components().collect::<Vec<_>>();
-    if components.is_empty() {
-        return Ok(None);
-    }
     let inspected = physical_workspace_root(root);
     let descriptor = openat(
         None,
@@ -2262,16 +2258,31 @@ fn open_workspace_file(root: &Path, relative: &Path) -> Result<Option<File>> {
         // SAFETY: `openat` returned a new descriptor and `File` becomes its sole owner.
         directory = unsafe { File::from_raw_fd(descriptor) };
     }
-    for (index, component) in components.iter().enumerate() {
+    Ok(directory)
+}
+
+#[cfg(unix)]
+fn open_workspace_file_at(directory: &File, relative: &Path) -> Result<Option<File>> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+
+    use nix::{
+        fcntl::{openat, OFlag},
+        sys::stat::Mode,
+    };
+
+    let mut components = relative.components().peekable();
+    let mut opened_directory: Option<File> = None;
+    while let Some(component) = components.next() {
         let Component::Normal(name) = component else {
             anyhow::bail!("workspace walker returned a non-normal path");
         };
-        let final_component = index + 1 == components.len();
+        let final_component = components.peek().is_none();
         let mut flags = OFlag::O_RDONLY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW | OFlag::O_NONBLOCK;
         if !final_component {
             flags |= OFlag::O_DIRECTORY;
         }
-        let descriptor = match openat(Some(directory.as_raw_fd()), *name, flags, Mode::empty()) {
+        let parent = opened_directory.as_ref().unwrap_or(directory);
+        let descriptor = match openat(Some(parent.as_raw_fd()), name, flags, Mode::empty()) {
             Ok(descriptor) => descriptor,
             Err(_) => return Ok(None),
         };
@@ -2280,9 +2291,14 @@ fn open_workspace_file(root: &Path, relative: &Path) -> Result<Option<File>> {
         if final_component {
             return Ok(Some(file));
         }
-        directory = file;
+        opened_directory = Some(file);
     }
     Ok(None)
+}
+
+#[cfg(unix)]
+fn open_workspace_file(root: &Path, relative: &Path) -> Result<Option<File>> {
+    open_workspace_file_at(&open_workspace_directory(root)?, relative)
 }
 
 #[cfg(unix)]
@@ -2319,22 +2335,50 @@ pub(crate) fn read_inline_workspace_file(
         let Some(file) = open_workspace_file(root, Path::new(relative))? else {
             return Ok(None);
         };
-        let metadata = file.metadata()?;
-        if !metadata.is_file() || metadata.len() > limit as u64 {
-            return Ok(None);
-        }
-        let mut bytes = Vec::new();
-        file.take(limit as u64 + 1).read_to_end(&mut bytes)?;
-        if bytes.len() > limit || bytes.contains(&0) {
-            return Ok(None);
-        }
-        Ok(String::from_utf8(bytes).ok())
+        read_inline_workspace_handle(file, limit)
     }
     #[cfg(not(unix))]
     {
         let _ = (root, relative, limit);
         anyhow::bail!("safe on-disk inline context reads are unavailable on this platform")
     }
+}
+
+/// A validated directory handle that confines every search read with `openat`.
+#[cfg(unix)]
+pub(crate) struct InlineWorkspaceReader {
+    directory: File,
+}
+
+#[cfg(unix)]
+impl InlineWorkspaceReader {
+    pub(crate) fn new(root: &Path) -> Result<Self> {
+        validate_workspace_root(root)?;
+        Ok(Self {
+            directory: open_workspace_directory(root)?,
+        })
+    }
+
+    pub(crate) fn read(&self, relative: &str, limit: usize) -> Result<Option<String>> {
+        let Some(file) = open_workspace_file_at(&self.directory, Path::new(relative))? else {
+            return Ok(None);
+        };
+        read_inline_workspace_handle(file, limit)
+    }
+}
+
+#[cfg(unix)]
+fn read_inline_workspace_handle(file: File, limit: usize) -> Result<Option<String>> {
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.len() > limit as u64 {
+        return Ok(None);
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.take(limit as u64 + 1).read_to_end(&mut bytes)?;
+    if bytes.len() > limit || bytes.contains(&0) {
+        return Ok(None);
+    }
+    Ok(String::from_utf8(bytes).ok())
 }
 
 fn restricted_config(response: &Value, policy: &AgentRuntimePolicy) -> Option<Value> {
