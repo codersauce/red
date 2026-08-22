@@ -1287,7 +1287,12 @@ fn render_source_segment(
 
     clear(geometry.x, geometry.width, buffer);
     let mut grapheme_col = segment.start_grapheme_col;
-    for (byte_offset, grapheme) in text.grapheme_indices(true) {
+    let mut byte_offset = 0;
+    while byte_offset < text.len() {
+        let remaining = &text[byte_offset..];
+        let Some(grapheme) = remaining.graphemes(true).next() else {
+            break;
+        };
         let width = if grapheme == "\t" {
             geometry.tab_width - (grapheme_col % geometry.tab_width)
         } else {
@@ -1295,21 +1300,56 @@ fn render_source_segment(
         };
         if grapheme_col < segment.start_col {
             grapheme_col += width;
+            byte_offset += grapheme.len();
             continue;
         }
         let local_x = segment.visual_offset + grapheme_col.saturating_sub(segment.start_col);
         if local_x >= geometry.width {
             break;
         }
-        let style = styles
-            .style_at(segment.source_offset + segment.start_byte + byte_offset)
-            .unwrap_or(theme_style);
+        let source = segment.source_offset + segment.start_byte + byte_offset;
+        let style = styles.style_at(source).unwrap_or(theme_style);
+        if grapheme.len() == 1 && matches!(grapheme.as_bytes()[0], b' '..=b'~') {
+            let available = remaining.len().min(geometry.width - local_x);
+            let boundary = styles
+                .next_change()
+                .map(|boundary| boundary.saturating_sub(source).max(1))
+                .unwrap_or(available);
+            let limit = available.min(boundary);
+            let mut length = remaining.as_bytes()[..limit]
+                .iter()
+                .position(|byte| !matches!(byte, b' '..=b'~'))
+                .unwrap_or(limit);
+            // An ASCII base may become part of the following non-ASCII
+            // grapheme, such as e plus an accent or a keycap sequence.
+            if length < remaining.len()
+                && !remaining.as_bytes()[length].is_ascii()
+                && remaining[length - 1..]
+                    .graphemes(true)
+                    .next()
+                    .is_some_and(|joined| joined.len() > 1)
+            {
+                length -= 1;
+            }
+            if length > 0 {
+                buffer.set_printable_ascii(
+                    geometry.x + local_x,
+                    geometry.y,
+                    &remaining[..length],
+                    style,
+                );
+                grapheme_col += length;
+                byte_offset += length;
+                continue;
+            }
+        }
         if grapheme == "\t" {
-            buffer.set_text(geometry.x + local_x, geometry.y, &" ".repeat(width), style);
+            buffer.fill_ascii_spaces(geometry.x + local_x, geometry.y, width, style);
         } else {
             buffer.set_text(geometry.x + local_x, geometry.y, grapheme, style);
         }
         grapheme_col += width;
+        byte_offset += grapheme.len();
     }
 }
 
@@ -4675,6 +4715,63 @@ mod tests {
         assert_eq!(buffer.cells[5].style, wide_style);
         assert_eq!(buffer.cells[6].text, accented);
         assert!(buffer.cells[7..].iter().all(|cell| cell.text == " "));
+    }
+
+    #[test]
+    fn mixed_source_ascii_runs_preserve_combining_keycap_and_style_boundaries() {
+        let theme = Theme::default();
+        let line = "prefix e\u{301} middle 1\u{fe0f}\u{20e3} 👩‍💻 tail";
+        let middle = Style {
+            bold: true,
+            ..Style::default()
+        };
+        let tail = Style {
+            italic: true,
+            ..Style::default()
+        };
+        let middle_start = line.find("middle").unwrap();
+        let tail_start = line.find("tail").unwrap();
+        let spans = vec![
+            HighlightSpan {
+                start: middle_start,
+                end: middle_start + "middle".len(),
+                order: 0,
+                priority: "middle".len(),
+                style: middle.clone(),
+            },
+            HighlightSpan {
+                start: tail_start,
+                end: line.len(),
+                order: 1,
+                priority: "tail".len(),
+                style: tail.clone(),
+            },
+        ];
+        let mut cursor = StyleCursor::new(&spans);
+        let mut source = segment(0, display_width(line), true);
+        source.end_byte = line.len();
+        let mut buffer = RenderBuffer::new(40, 1, &theme.style);
+
+        render_source_segment(
+            &mut buffer,
+            &source,
+            line,
+            SourceSegmentGeometry {
+                x: 0,
+                y: 0,
+                width: 40,
+                tab_width: 4,
+            },
+            &mut cursor,
+            &theme.style,
+            &theme,
+        );
+
+        assert_eq!(buffer.cells[7].text, "e\u{301}");
+        assert!(buffer.cells[9..15].iter().all(|cell| cell.style == middle));
+        assert_eq!(buffer.cells[16].text, "1\u{fe0f}\u{20e3}");
+        assert_eq!(buffer.cells[19].text, "👩‍💻");
+        assert!(buffer.cells[22..26].iter().all(|cell| cell.style == tail));
     }
 
     fn decoration(anchor: DecorationAnchor, text: &str) -> Decoration {

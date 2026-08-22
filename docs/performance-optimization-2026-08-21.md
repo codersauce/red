@@ -228,7 +228,9 @@ navigation baselines were frozen after rebasing to `d92777c`.
 | Real-terminal line-comment edit frames | 58.19% |
 | Real-terminal YAML completion-aware edit frames | 58.12% |
 | Real-terminal Unicode and CRLF macro playback | 57.84% |
+| Real-terminal Unicode line-comment edit frames | 57.34% |
 | Real-terminal Markdown completion-aware edit frames | 56.44% |
+| Real-terminal Unicode string edit frames | 56.35% |
 | Plugin cursor-event delivery | 56.35% |
 | Real-terminal file-picker dialog and preview composition | 56.35% |
 | Complete real-terminal Markdown interactive startup | 56.22% |
@@ -584,10 +586,17 @@ Ordinary string highlighting fell from 183 to 19 microseconds, Unicode-source
 strings from 189 to 21, and CRLF strings from 187 to 18. Complete ordinary
 comment edit frames fell from 299 to 125 microseconds, CRLF comment frames
 from 286 to 118, ordinary string frames from 291 to 121, and CRLF string
-frames from 295 to 119. Unicode-source comment and string frames improved only
-46.48% and 47.22%, respectively; complete input events and action handling
-also remain below the target and are intentionally excluded from the verified
-results.
+frames from 295 to 119. At this stage, Unicode-source comment and string frames
+improved only 46.48% and 47.22%, respectively.
+
+Nine further alternating real-terminal sessions per Unicode-source token
+reduced complete comment edit frames from 354 to 151 microseconds and string
+edit frames from 362 to 158. Mixed Unicode rows now coalesce their ordinary
+ASCII runs within exact syntax-style and viewport boundaries, leaving each
+combining accent, keycap sequence, ZWJ emoji, wide-character continuation,
+tab stop, clipped segment, and wrapped line on its correct grapheme-aware
+path. Complete input events and action handling remain below the target and
+are intentionally excluded from the verified results.
 
 Editor chrome independently fell from 85 to 16 microseconds, and bundled plugin
 startup fell from 35,873 to 17,263 microseconds. Complete interactive startup
