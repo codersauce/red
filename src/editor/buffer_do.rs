@@ -1,8 +1,98 @@
-//! Safe iteration of non-interactive Ex commands over open buffers.
+//! Save-all and safe iteration of non-interactive Ex commands over open buffers.
 
 use super::*;
 
 impl Editor {
+    #[inline(never)]
+    pub(super) fn execute_write_all<'a>(
+        &'a mut self,
+        buffer: &'a mut RenderBuffer,
+        runtime: &'a mut Runtime,
+    ) -> BoxFuture<'a, anyhow::Result<()>> {
+        Box::pin(self.execute_write_all_impl(buffer, runtime))
+    }
+
+    async fn execute_write_all_impl(
+        &mut self,
+        buffer: &mut RenderBuffer,
+        runtime: &mut Runtime,
+    ) -> anyhow::Result<()> {
+        let original_id = self.current_buffer().id();
+        let original_view = (self.cx, self.cy, self.vtop, self.vleft, self.skipcol);
+        let targets = self
+            .buffer_manager
+            .iter()
+            .filter(|source| source.is_dirty())
+            .map(Buffer::id)
+            .collect::<Vec<_>>();
+        let practice_buffer_id = self
+            .tutorial_controller
+            .as_ref()
+            .map(|tutorial| tutorial.practice_buffer_id);
+        let mut first_error = None;
+        let mut operation_error = None;
+
+        for target in targets {
+            let Some(index) = self
+                .buffer_manager
+                .iter()
+                .position(|source| source.id() == target)
+            else {
+                continue;
+            };
+            if practice_buffer_id == Some(target) {
+                first_error.get_or_insert_with(|| {
+                    "the Red tutorial practice buffer cannot be saved".to_string()
+                });
+                continue;
+            }
+            if self.buffer_manager[index].file.is_none() {
+                first_error
+                    .get_or_insert_with(|| format!("No file name for buffer {}", target.as_u64()));
+                continue;
+            }
+
+            self.select_buffer_for_lsp_edit(index);
+            match self.save_action(buffer, runtime).await {
+                Ok(_) => {
+                    if self.current_buffer().is_dirty()
+                        && !self.buffer_has_pending_format_save(target)
+                    {
+                        first_error.get_or_insert_with(|| {
+                            self.last_error.clone().unwrap_or_else(|| {
+                                format!("Could not write buffer {}", target.as_u64())
+                            })
+                        });
+                    }
+                }
+                Err(error) => {
+                    operation_error = Some(error);
+                    break;
+                }
+            }
+        }
+
+        if let Some(index) = self
+            .buffer_manager
+            .iter()
+            .position(|source| source.id() == original_id)
+        {
+            self.select_buffer_for_lsp_edit(index);
+        }
+        (self.cx, self.cy, self.vtop, self.vleft, self.skipcol) = original_view;
+        self.check_bounds();
+        self.sync_inline_change_summaries();
+
+        if let Some(error) = operation_error {
+            return Err(error);
+        }
+        if let Some(error) = first_error {
+            self.set_notification_message(Severity::Error, Some(error));
+        }
+        self.render(buffer)?;
+        Ok(())
+    }
+
     #[inline(never)]
     pub(super) fn execute_buffer_do<'a>(
         &'a mut self,

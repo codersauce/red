@@ -19,6 +19,7 @@ pub(crate) const BUILTIN_COLON_COMMANDS: &[CommandSpec] = &[
     CommandSpec::exact("$"),
     CommandSpec::new("quit", 1),
     CommandSpec::new("write", 1),
+    CommandSpec::new("wall", 2),
     CommandSpec::exact("buffer-next"),
     CommandSpec::new("bnext", 2),
     CommandSpec::exact("buffer-prev"),
@@ -559,6 +560,15 @@ fn builtin_commands() -> Vec<BuiltinCommand> {
             Some(":w"),
             &[":write"],
             Action::Save,
+        ),
+        builtin(
+            "file.save_all",
+            "Save all files",
+            "File",
+            "Write every modified file buffer",
+            Some(":wa"),
+            &[":wall"],
+            Action::SaveAll,
         ),
         builtin(
             "file.save_and_quit",
@@ -1444,6 +1454,7 @@ fn action_label(action: &Action) -> String {
         Action::OpenStatuslineManager => "Configure status line".to_string(),
         Action::PluginCommand(name) => humanize_identifier(name),
         Action::Save => "Save file".to_string(),
+        Action::SaveAll => "Save all files".to_string(),
         Action::NewBuffer => "New buffer".to_string(),
         Action::ListBuffers => "List buffers".to_string(),
         Action::Quit(_) => "Quit".to_string(),
@@ -1712,6 +1723,21 @@ mod tests {
         ] {
             assert!(aliases.iter().any(|alias| alias == name), "{name}");
         }
+    }
+
+    #[test]
+    fn palette_exposes_save_all() {
+        let entries = entries(&default_keys(), &[]);
+        let entry = entries
+            .iter()
+            .find(|entry| entry.id == "file.save_all")
+            .unwrap();
+
+        assert_eq!(entry.colon.as_deref(), Some(":wa"));
+        assert_eq!(entry.action, Action::SaveAll);
+        assert!(colon_completion_names(&[])
+            .iter()
+            .any(|name| name == "wall"));
     }
 
     #[test]

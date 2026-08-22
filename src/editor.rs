@@ -2320,6 +2320,7 @@ impl PickerCallback {
 pub enum Action {
     Quit(bool),
     Save,
+    SaveAll,
     SaveAs(String),
     EnterMode(Mode),
     RestoreLastVisualSelection,
@@ -7789,6 +7790,7 @@ impl Editor {
                 | Action::PluginCommand(_)
                 | Action::Quit(_)
                 | Action::Save
+                | Action::SaveAll
                 | Action::SaveAs(_)
                 | Action::DumpHistory
                 | Action::DumpBuffer
@@ -16035,6 +16037,14 @@ impl Editor {
                 }
             }
 
+            if cmd == "wall" {
+                if parsed.file_argument().is_some() {
+                    self.set_legacy_message(Some("usage: wall".to_string()));
+                    return Vec::new();
+                }
+                actions.push(Action::SaveAll);
+            }
+
             if cmd == "saveas" {
                 let Some(file) = parsed.file_argument() else {
                     self.set_legacy_message(Some("usage: saveas <file>".to_string()));
@@ -21110,6 +21120,9 @@ impl Editor {
                 }
                 self.sync_inline_change_summaries();
                 self.render(buffer)?;
+            }
+            Action::SaveAll => {
+                self.execute_write_all(buffer, runtime).await?;
             }
             Action::SaveAs(new_file_name) => {
                 if !self.save_as_action(new_file_name, buffer, runtime).await? {

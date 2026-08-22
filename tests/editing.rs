@@ -2696,6 +2696,163 @@ async fn bufdo_uses_stable_buffer_id_ranges_and_rejects_interactive_commands() {
 }
 
 #[tokio::test]
+async fn wall_saves_modified_file_buffers_and_preserves_the_active_buffer() {
+    let directory = tempfile::tempdir().unwrap();
+    let first_path = directory.path().join("first.txt");
+    let second_path = directory.path().join("second.txt");
+    let clean_path = directory.path().join("clean.txt");
+    fs::write(&first_path, "first old\n").unwrap();
+    fs::write(&second_path, "second old\n").unwrap();
+    let buffers = vec![
+        Buffer::new(
+            Some(first_path.to_string_lossy().into_owned()),
+            "first old\n".to_string(),
+        ),
+        Buffer::new(
+            Some(second_path.to_string_lossy().into_owned()),
+            "second old\n".to_string(),
+        ),
+        Buffer::new(
+            Some(clean_path.to_string_lossy().into_owned()),
+            "clean\n".to_string(),
+        ),
+    ];
+    let ids = buffers.iter().map(Buffer::id).collect::<Vec<_>>();
+    let mut editor = Editor::test_with_size(
+        Box::new(MockLsp),
+        /*width*/ 80,
+        /*height*/ 24,
+        Config::default(),
+        Theme::default(),
+        buffers,
+    )
+    .unwrap();
+    editor.test_disable_terminal_output();
+    let mut harness = EditorHarness { editor };
+
+    harness
+        .execute_action(Action::InsertCharAtCursorPos('1'))
+        .await
+        .unwrap();
+    harness
+        .execute_action(Action::OpenBufferById(ids[1].as_u64()))
+        .await
+        .unwrap();
+    harness
+        .execute_action(Action::InsertCharAtCursorPos('2'))
+        .await
+        .unwrap();
+    harness
+        .execute_action(Action::OpenBufferById(ids[0].as_u64()))
+        .await
+        .unwrap();
+
+    harness
+        .execute_action(Action::Command("wa".to_string()))
+        .await
+        .unwrap();
+
+    assert_eq!(harness.editor.test_current_buffer().id(), ids[0]);
+    assert_eq!(fs::read_to_string(&first_path).unwrap(), "1first old\n");
+    assert_eq!(fs::read_to_string(&second_path).unwrap(), "2second old\n");
+    assert!(!clean_path.exists());
+    assert!(!harness.is_dirty());
+    harness
+        .execute_action(Action::OpenBufferById(ids[1].as_u64()))
+        .await
+        .unwrap();
+    assert!(!harness.is_dirty());
+}
+
+#[tokio::test]
+async fn wall_saves_named_buffers_before_reporting_a_dirty_unnamed_buffer() {
+    let directory = tempfile::tempdir().unwrap();
+    let first_path = directory.path().join("first.txt");
+    let second_path = directory.path().join("second.txt");
+    fs::write(&first_path, "first old\n").unwrap();
+    fs::write(&second_path, "second old\n").unwrap();
+    let buffers = vec![
+        Buffer::new(
+            Some(first_path.to_string_lossy().into_owned()),
+            "first old\n".to_string(),
+        ),
+        Buffer::new(/*file*/ None, "unnamed\n".to_string()),
+        Buffer::new(
+            Some(second_path.to_string_lossy().into_owned()),
+            "second old\n".to_string(),
+        ),
+    ];
+    let ids = buffers.iter().map(Buffer::id).collect::<Vec<_>>();
+    let mut editor = Editor::test_with_size(
+        Box::new(MockLsp),
+        /*width*/ 80,
+        /*height*/ 24,
+        Config::default(),
+        Theme::default(),
+        buffers,
+    )
+    .unwrap();
+    editor.test_disable_terminal_output();
+    let mut harness = EditorHarness { editor };
+
+    for (id, character) in [(ids[0], '1'), (ids[1], 'u'), (ids[2], '2')] {
+        harness
+            .execute_action(Action::OpenBufferById(id.as_u64()))
+            .await
+            .unwrap();
+        harness
+            .execute_action(Action::InsertCharAtCursorPos(character))
+            .await
+            .unwrap();
+    }
+    harness
+        .execute_action(Action::OpenBufferById(ids[0].as_u64()))
+        .await
+        .unwrap();
+
+    harness
+        .execute_action(Action::Command("wall".to_string()))
+        .await
+        .unwrap();
+
+    assert_eq!(harness.editor.test_current_buffer().id(), ids[0]);
+    assert_eq!(fs::read_to_string(&first_path).unwrap(), "1first old\n");
+    assert_eq!(fs::read_to_string(&second_path).unwrap(), "2second old\n");
+    let expected_error = format!("No file name for buffer {}", ids[1].as_u64());
+    assert_eq!(harness.last_error(), Some(expected_error.as_str()));
+    harness
+        .execute_action(Action::OpenBufferById(ids[1].as_u64()))
+        .await
+        .unwrap();
+    assert!(harness.is_dirty());
+}
+
+#[tokio::test]
+async fn wall_rejects_file_arguments_without_writing() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("notes.txt");
+    fs::write(&path, "old\n").unwrap();
+    let buffer = Buffer::new(
+        Some(path.to_string_lossy().into_owned()),
+        "old\n".to_string(),
+    );
+    let mut harness = EditorHarness::with_buffer(buffer);
+    harness
+        .execute_action(Action::InsertCharAtCursorPos('x'))
+        .await
+        .unwrap();
+
+    harness
+        .execute_action(Action::Command("wall elsewhere".to_string()))
+        .await
+        .unwrap();
+
+    assert_eq!(fs::read_to_string(&path).unwrap(), "old\n");
+    assert!(harness.is_dirty());
+    assert_eq!(harness.last_error(), Some("usage: wall"));
+}
+
+#[tokio::test]
 async fn buffer_listing_aliases_show_stable_numbers_without_opening_splits() {
     for command in ["ls", "buffers", "files", "b", "buffer"] {
         let mut harness = EditorHarness::with_content("contents\n");
