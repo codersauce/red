@@ -72,6 +72,7 @@ navigation baselines were frozen after rebasing to `d92777c`.
 | Long transcript cursor lookup | 97.35% |
 | Git workspace row navigation | 96.35% |
 | LSP absolute-document routing | 94.68% |
+| Workspace inline file discovery | 92.65% |
 | Shared modal editor backward word motion | 87.58% |
 | Shared modal editor forward word motion | 87.01% |
 | Printable ASCII frame rendering | 85.25% |

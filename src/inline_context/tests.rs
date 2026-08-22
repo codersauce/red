@@ -141,6 +141,69 @@ async fn inline_context_rejects_unsafe_ignored_binary_and_oversized_files() {
 }
 
 #[tokio::test]
+async fn inline_context_listing_preserves_nested_ignores_and_path_boundaries() {
+    let root = tempfile::tempdir().unwrap();
+    git(root.path(), &["init", "-q"]);
+    std::fs::write(root.path().join(".gitignore"), "*.tmp\n!kept.tmp\n").unwrap();
+    std::fs::write(root.path().join("ignored.tmp"), "ignored\n").unwrap();
+    std::fs::write(root.path().join("kept.tmp"), "visible\n").unwrap();
+    std::fs::create_dir(root.path().join("nested")).unwrap();
+    std::fs::write(root.path().join("nested/.ignore"), "ignored.rs\n").unwrap();
+    std::fs::write(root.path().join("nested/ignored.rs"), "ignored\n").unwrap();
+    std::fs::write(root.path().join("nested/visible.rs"), "visible\n").unwrap();
+    std::fs::create_dir(root.path().join("Credentials")).unwrap();
+    std::fs::write(root.path().join("Credentials/value.rs"), "private\n").unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    std::fs::write(outside.path().join("outside.rs"), "private\n").unwrap();
+    symlink(outside.path(), root.path().join("outside-link")).unwrap();
+    symlink(
+        outside.path().join("outside.rs"),
+        root.path().join("outside.rs"),
+    )
+    .unwrap();
+
+    let files = snapshot(root.path())
+        .execute(InlineContextCall::ListFiles {})
+        .await
+        .unwrap();
+    let files = files["files"].as_array().unwrap();
+    for allowed in ["kept.tmp", "nested/visible.rs"] {
+        assert!(files.contains(&json!(allowed)), "missing {allowed}");
+    }
+    for forbidden in [
+        "ignored.tmp",
+        "nested/ignored.rs",
+        "Credentials/value.rs",
+        ".git/config",
+        ".GIT/config",
+        "outside-link/outside.rs",
+        "outside.rs",
+    ] {
+        assert!(!files.contains(&json!(forbidden)), "disclosed {forbidden}");
+    }
+}
+
+#[tokio::test]
+async fn inline_context_listing_rejects_symlinked_workspace_roots() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("workspace");
+    std::fs::create_dir(&root).unwrap();
+    let alias = directory.path().join("alias");
+    symlink(&root, &alias).unwrap();
+    let context = InlineContextSnapshot {
+        root: alias,
+        visible: BTreeMap::new(),
+        allow_sensitive_paths: false,
+    };
+
+    let error = context
+        .execute(InlineContextCall::ListFiles {})
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("symlink"), "{error}");
+}
+
+#[tokio::test]
 async fn inline_context_can_read_sensitive_workspace_files_after_explicit_consent() {
     let root = tempfile::tempdir().unwrap();
     std::fs::write(root.path().join(".env"), "TOKEN=example\n").unwrap();

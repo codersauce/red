@@ -68,6 +68,9 @@ const STATUSLINE_FRAMES: usize = 1_000;
 const LSP_DOCUMENT_RESOLVES: usize = 1_000;
 const RECOVERY_BUFFERS: usize = 32;
 const RECOVERY_RESTORES: usize = 8;
+const WORKSPACE_SEARCH_DIRECTORIES: usize = 8;
+const WORKSPACE_SEARCH_FILES_PER_DIRECTORY: usize = 32;
+const WORKSPACE_SEARCH_LISTINGS: usize = 8;
 
 fn main() -> Result<()> {
     let scenario = std::env::args().nth(1).unwrap_or_else(|| "all".into());
@@ -165,6 +168,9 @@ fn main() -> Result<()> {
     }
     if scenario == "all" || scenario == "session-restore" {
         results.push(benchmark_session_buffer_restoration()?);
+    }
+    if scenario == "all" || scenario == "workspace-files" {
+        results.push(benchmark_workspace_file_discovery()?);
     }
 
     anyhow::ensure!(
@@ -988,6 +994,62 @@ fn benchmark_session_buffer_restoration() -> Result<serde_json::Value> {
         "crash_recovery_buffer_restoration",
         started,
         RECOVERY_RESTORES,
+    ))
+}
+
+fn benchmark_workspace_file_discovery() -> Result<serde_json::Value> {
+    let directory = tempfile::tempdir()?;
+    let root = directory.path();
+    std::fs::create_dir(root.join(".git"))?;
+    std::fs::write(root.join(".git/config"), "private = true\n")?;
+    std::fs::write(root.join(".gitignore"), "ignored.rs\n")?;
+    std::fs::write(root.join("ignored.rs"), "ignored\n")?;
+    std::fs::write(root.join(".env"), "TOKEN=private\n")?;
+    std::fs::create_dir(root.join("secrets"))?;
+    std::fs::write(root.join("secrets/token.rs"), "private\n")?;
+    for directory_index in 0..WORKSPACE_SEARCH_DIRECTORIES {
+        let child = root.join(format!("module-{directory_index:02}"));
+        std::fs::create_dir(&child)?;
+        for file_index in 0..WORKSPACE_SEARCH_FILES_PER_DIRECTORY {
+            std::fs::write(
+                child.join(format!("source-{file_index:03}.rs")),
+                format!("fn source_{directory_index}_{file_index}() {{}}\n"),
+            )?;
+        }
+    }
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(root.join("module-00/source-000.rs"), root.join("link.rs"))?;
+
+    let expected_files = WORKSPACE_SEARCH_DIRECTORIES * WORKSPACE_SEARCH_FILES_PER_DIRECTORY + 1;
+    let started = Instant::now();
+    for _ in 0..WORKSPACE_SEARCH_LISTINGS {
+        let listed = red::inline_context::benchmark_workspace_file_listing(black_box(root))?;
+        let files = listed["files"]
+            .as_array()
+            .ok_or_else(|| anyhow::anyhow!("workspace benchmark returned invalid files"))?;
+        anyhow::ensure!(
+            files.len() == expected_files,
+            "workspace benchmark returned {} files instead of {expected_files}",
+            files.len()
+        );
+        for forbidden in [
+            "ignored.rs",
+            ".env",
+            "secrets/token.rs",
+            ".git/config",
+            "link.rs",
+        ] {
+            anyhow::ensure!(
+                !files.iter().any(|file| file.as_str() == Some(forbidden)),
+                "workspace benchmark disclosed restricted file {forbidden}"
+            );
+        }
+        black_box(listed);
+    }
+    Ok(report(
+        "workspace_inline_file_discovery",
+        started,
+        WORKSPACE_SEARCH_LISTINGS,
     ))
 }
 

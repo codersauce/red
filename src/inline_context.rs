@@ -243,6 +243,7 @@ impl InlineContextSnapshot {
     }
 
     fn files(&self) -> Result<(BTreeSet<String>, bool)> {
+        crate::codex::validate_workspace_root(&self.root)?;
         let started = Instant::now();
         let mut files = BTreeSet::new();
         let mut truncated = false;
@@ -261,11 +262,23 @@ impl InlineContextSnapshot {
             }
             let Ok(entry) = entry else { continue };
             if entry.file_type().is_some_and(|kind| kind.is_file()) {
-                if let Some(path) = entry.path().to_str() {
-                    if let Ok((_, relative)) =
-                        resolve_path_with_policy(&self.root, path, self.allow_sensitive_paths)
-                    {
-                        files.insert(relative);
+                let Ok(relative) = entry.path().strip_prefix(&self.root) else {
+                    continue;
+                };
+                // The walker already enforces nested ignores and never follows
+                // symlinks; retain only the inline-specific component policy.
+                let allowed = relative.components().all(|component| {
+                    let name = Path::new(component.as_os_str());
+                    !component
+                        .as_os_str()
+                        .to_string_lossy()
+                        .eq_ignore_ascii_case(".git")
+                        && (self.allow_sensitive_paths
+                            || !crate::editor::agent_context_path_is_sensitive(name))
+                });
+                if allowed {
+                    if let Some(relative) = relative.to_str() {
+                        files.insert(relative.replace('\\', "/"));
                     }
                 }
             }
@@ -405,6 +418,17 @@ impl InlineContextSnapshot {
         )
         }).await.context("inline diff failed")
     }
+}
+
+/// Runs the production read-only workspace listing for reproducible benchmarks.
+#[doc(hidden)]
+pub fn benchmark_workspace_file_listing(root: &Path) -> Result<Value> {
+    InlineContextSnapshot {
+        root: root.canonicalize()?,
+        visible: BTreeMap::new(),
+        allow_sensitive_paths: false,
+    }
+    .execute_read(InlineContextCall::ListFiles {})
 }
 
 fn bounded_text(text: &str, limit: usize) -> &str {
