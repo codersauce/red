@@ -5,7 +5,7 @@ use unicode_segmentation::UnicodeSegmentation;
 use crate::{
     buffer::Buffer,
     undo::{TextPosition, TextRange},
-    unicode_utils::{char_prefix, char_suffix, trim_line_ending},
+    unicode_utils::trim_line_ending,
 };
 
 /// Direction and inclusion policy for Vim's single-character search motions.
@@ -606,24 +606,30 @@ impl<'buffer> MotionResolver<'buffer> {
         count: u16,
         backward: bool,
     ) -> Option<TextPosition> {
-        let line = self.buffer.get(self.cursor.line)?;
-        let line = trim_line_ending(&line);
+        let contents = self.buffer.contents_snapshot();
+        let source = contents.get_line(self.cursor.line)?;
+        let mut length = source.len_chars();
+        if source.get_char(length.saturating_sub(1)) == Some('\n') {
+            length -= 1;
+        }
+        if source.get_char(length.saturating_sub(1)) == Some('\r') {
+            length -= 1;
+        }
+        let line = source.slice(..length);
         if backward {
-            let prefix = char_prefix(line, self.cursor.character);
-            let target_byte = prefix
-                .match_indices(character)
-                .rev()
-                .nth(usize::from(count.saturating_sub(1)))?
-                .0;
-            return Some(TextPosition::new(
-                self.cursor.line,
-                prefix[..target_byte].chars().count(),
-            ));
+            let end = self.cursor.character.min(length);
+            let offset = line
+                .chars_at(end)
+                .reversed()
+                .enumerate()
+                .filter_map(|(offset, candidate)| (candidate == character).then_some(offset))
+                .nth(usize::from(count.saturating_sub(1)))?;
+            return Some(TextPosition::new(self.cursor.line, end - offset - 1));
         }
 
-        let search_start = self.cursor.character.saturating_add(1);
-        let offset = char_suffix(line, search_start)
-            .chars()
+        let search_start = self.cursor.character.saturating_add(1).min(length);
+        let offset = line
+            .chars_at(search_start)
             .enumerate()
             .filter_map(|(offset, candidate)| (candidate == character).then_some(offset))
             .nth(usize::from(count.saturating_sub(1)))?;
@@ -1200,6 +1206,66 @@ mod tests {
             buffer.text_in_range(resolver.word_range(1, false, true).unwrap()),
             "e\u{301}cho,  "
         );
+    }
+
+    #[test]
+    fn indexed_character_search_preserves_unicode_counts_directions_and_line_endings() {
+        for text in [
+            "aXaXaX trailing",
+            "λ終λ終λ終 source",
+            "e\u{301}cho 👋 e\u{301}clair\r\nsecond aXaX",
+            "\r\nnext",
+            "",
+        ] {
+            let buffer = Buffer::new(None, text.to_string());
+            for line in [0, 1, 2, 9] {
+                let source = buffer.get(line);
+                let characters = source
+                    .as_deref()
+                    .map(crate::unicode_utils::trim_line_ending)
+                    .map(|line| line.chars().collect::<Vec<_>>());
+                for cursor in [0, 1, 2, 5, 12, usize::MAX] {
+                    let resolver = MotionResolver::new(&buffer, TextPosition::new(line, cursor));
+                    for target in ['a', 'X', '終', '👋', '\n', '\r', '\u{301}'] {
+                        for count in [0_u16, 1, 2, 3, 7] {
+                            for backward in [false, true] {
+                                let expected = characters.as_ref().and_then(|characters| {
+                                    let matching = usize::from(count.saturating_sub(1));
+                                    if backward {
+                                        characters
+                                            .iter()
+                                            .take(cursor.min(characters.len()))
+                                            .enumerate()
+                                            .rev()
+                                            .filter_map(|(index, candidate)| {
+                                                (*candidate == target).then_some(index)
+                                            })
+                                            .nth(matching)
+                                    } else {
+                                        let start = cursor.saturating_add(1).min(characters.len());
+                                        characters
+                                            .iter()
+                                            .enumerate()
+                                            .skip(start)
+                                            .filter_map(|(index, candidate)| {
+                                                (*candidate == target).then_some(index)
+                                            })
+                                            .nth(matching)
+                                    }
+                                });
+                                assert_eq!(
+                                    resolver
+                                        .character_match(target, count, backward)
+                                        .map(|position| (position.line, position.character)),
+                                    expected.map(|character| (line, character)),
+                                    "{text:?} line={line} cursor={cursor} target={target:?} count={count} backward={backward}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]

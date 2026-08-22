@@ -188,6 +188,26 @@ fn main() -> Result<()> {
     if scenario == "all" || scenario == "resolver-count-delete" {
         results.push(benchmark_counted_word_operator(/*change_word*/ false)?);
     }
+    if scenario == "all" || scenario == "resolver-find-forward-ascii" {
+        results.push(benchmark_shared_character_search(
+            /*unicode*/ false, /*backward*/ false,
+        )?);
+    }
+    if scenario == "all" || scenario == "resolver-find-backward-ascii" {
+        results.push(benchmark_shared_character_search(
+            /*unicode*/ false, /*backward*/ true,
+        )?);
+    }
+    if scenario == "all" || scenario == "resolver-find-forward-unicode" {
+        results.push(benchmark_shared_character_search(
+            /*unicode*/ true, /*backward*/ false,
+        )?);
+    }
+    if scenario == "all" || scenario == "resolver-find-backward-unicode" {
+        results.push(benchmark_shared_character_search(
+            /*unicode*/ true, /*backward*/ true,
+        )?);
+    }
     if scenario == "all" || scenario == "editor-word-end-backward" {
         results.push(benchmark_editor_word_end_operator(/*backward*/ true)?);
     }
@@ -1013,6 +1033,39 @@ fn benchmark_counted_word_operator(change_word: bool) -> Result<serde_json::Valu
         },
         started,
         WORD_OPERATOR_LOOKUPS,
+    ))
+}
+
+fn benchmark_shared_character_search(unicode: bool, backward: bool) -> Result<serde_json::Value> {
+    let (prefix, target, suffix) = if unicode {
+        ("λ終λ終λ終 ", '終', "identifiant_λ👋 ".repeat(1_024))
+    } else {
+        ("aXaXaX ", 'X', "ordinary_identifier ".repeat(1_024))
+    };
+    let buffer = Buffer::new(None, format!("{prefix}{suffix}"));
+    let cursor = if backward { 6 } else { 0 };
+    let expected = if backward { 1 } else { 5 };
+    let resolver = MotionResolver::new(&buffer, TextPosition::new(/*line*/ 0, cursor));
+    let started = Instant::now();
+    for _ in 0..TEXTAREA_VIM_MOTIONS {
+        let position = resolver
+            .character_match(target, /*count*/ 3, backward)
+            .ok_or_else(|| anyhow::anyhow!("Vim character search lost its repeated target"))?;
+        anyhow::ensure!(
+            position.line == 0 && position.character == expected,
+            "Vim character search changed its count, direction, or Unicode scalar position"
+        );
+        black_box(position);
+    }
+    Ok(report(
+        match (unicode, backward) {
+            (false, false) => "shared_vim_ascii_forward_character_search",
+            (false, true) => "shared_vim_ascii_backward_character_search",
+            (true, false) => "shared_vim_unicode_forward_character_search",
+            (true, true) => "shared_vim_unicode_backward_character_search",
+        },
+        started,
+        TEXTAREA_VIM_MOTIONS,
     ))
 }
 

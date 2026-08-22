@@ -117,6 +117,7 @@ navigation baselines were frozen after rebasing to `d92777c`.
 | Unicode scalar line boundaries | 89.12% |
 | Sparse Unicode full-buffer regex searching | 89.12% |
 | Shared Vim escaped-quote text objects | 88.86% |
+| Shared Vim ASCII backward character search | 88.82% |
 | Shared Vim long-line paragraph operators | 88.15% |
 | Shared modal editor backward word motion | 87.58% |
 | Shared modal editor forward word motion | 87.01% |
@@ -124,6 +125,7 @@ navigation baselines were frozen after rebasing to `d92777c`.
 | Startup user-configuration loading | 84.04% |
 | Embedded undo cursor restoration | 84.17% |
 | Long-line Vim word-end motion | 84.79% |
+| Shared Vim ASCII forward character search | 84.55% |
 | Idle plugin timer polling | 84.29% |
 | Default editor status-line rendering | 83.45% |
 | Workspace inline content search | 82.60% |
@@ -133,6 +135,8 @@ navigation baselines were frozen after rebasing to `d92777c`.
 | Theme hexadecimal color parsing | 79.71% |
 | Detached incremental frame serialization | 79.06% |
 | Embedded forward Delete-key editing | 75.72% |
+| Shared Vim Unicode forward character search | 75.52% |
+| Shared Vim Unicode backward character search | 75.26% |
 | Embedded Ctrl-Backspace word deletion | 74.86% |
 | Shared Vim sentence navigation | 74.63% |
 | LSP incremental large-document changes | 74.61% |
@@ -338,6 +342,15 @@ to 718 microseconds, and Unicode indentation from 2,474 to 707 microseconds.
 Indexed prefix reads preserve tabs, Unicode whitespace, all-whitespace rows,
 LF/CRLF endings, empty and missing lines, cursor saturation, Vim scalar ranges,
 and viewport offsets.
+
+Shared Vim character-search motions were independently measured across 2,048
+counted forward and backward searches on ASCII and Unicode source lines. Eleven
+alternating release-build samples reduced ASCII forward medians from 3,858 to
+596 microseconds and backward medians from 5,312 to 594 microseconds; Unicode
+forward medians fell from 2,394 to 586 microseconds and backward medians from
+2,421 to 599 microseconds. Indexed bidirectional Rope traversal preserves
+repeated-target counts, excluded cursor characters, scalar boundaries, missing
+lines, cursor saturation, LF/CRLF endings, combining marks, CJK, and emoji.
 
 Shared Vim paragraph objects were independently measured across 128 inner and
 128 around selections spanning 768-line paragraphs. Eleven alternating
