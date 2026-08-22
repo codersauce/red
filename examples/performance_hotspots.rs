@@ -403,6 +403,10 @@ fn main() -> Result<()> {
         ("markdown-fenced-rust-string", "rust", "string"),
         ("markdown-fenced-rust-unicode", "rust", "unicode"),
         ("markdown-fenced-rust-crlf", "rust", "crlf"),
+        ("markdown-fenced-husk-comment", "husk", "comment"),
+        ("markdown-fenced-husk-string", "husk", "string"),
+        ("markdown-fenced-husk-unicode", "husk", "unicode"),
+        ("markdown-fenced-husk-crlf", "husk", "crlf"),
         (
             "markdown-fenced-javascript-comment",
             "javascript",
@@ -1889,7 +1893,7 @@ fn benchmark_markdown_fenced_token_highlighting(
     } else {
         (0..96)
             .map(|index| match language {
-                "rust" => format!(
+                "rust" | "husk" => format!(
                     "fn value_{index:03}() {{ let value = \"retained{unicode} string contents\"; }} // retained{unicode} comment contents{newline}"
                 ),
                 "javascript" | "jsx" | "typescript" | "tsx" => format!(

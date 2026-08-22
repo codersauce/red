@@ -998,7 +998,7 @@ impl Highlighter {
         Some(styles)
     }
 
-    /// Preserve both Markdown and its injected tree for one stable fenced token.
+    /// Preserve Markdown and an optional injected tree for one stable fenced token.
     fn reuse_markdown_injected_token_highlight(
         &mut self,
         language_id: &str,
@@ -1060,7 +1060,11 @@ impl Highlighter {
             self.language_id_for_name(language_name)?.to_string()
         };
         let definition = self.registry.languages.get(&injected_language)?;
-        if !bundled_highlight_definition(definition, &injected_language)
+        let specialized_husk = injected_language == "husk"
+            && matches!(definition.specialized, Some(SpecializedHighlighter::Husk))
+            && definition.grammar.is_none()
+            && definition.highlight_queries.is_empty();
+        if (!specialized_husk && !bundled_highlight_definition(definition, &injected_language))
             || definition.injection_query.is_some()
         {
             return None;
@@ -1074,22 +1078,67 @@ impl Highlighter {
         let new_content_end = old_content_end.checked_add_signed(delta)?;
         let old_contents = cached.code.get(content_start..old_content_end)?;
         let new_contents = code.get(content_start..new_content_end)?;
-        let nested = self
-            .highlighters
-            .get(&injected_language)?
-            .cached_tree
-            .as_ref()?;
-        if nested.source != old_contents {
-            return None;
-        }
-        let nested_edit = crate::syntax_indent::replacement_edit(old_contents, new_contents);
-        stable_bundled_token(
-            &injected_language,
-            old_contents,
-            new_contents,
-            nested,
-            &nested_edit,
-        )?;
+        let nested_edit = if specialized_husk {
+            let covering = cached.styles.iter().find(|style| {
+                style.start >= content_start
+                    && style.end <= old_content_end
+                    && style.start < outer_edit.start_byte
+                    && style.end > outer_edit.old_end_byte
+                    && (self
+                        .husk_styles
+                        .comment
+                        .as_ref()
+                        .is_some_and(|expected| *expected == style.style)
+                        || self
+                            .husk_styles
+                            .string
+                            .as_ref()
+                            .is_some_and(|expected| *expected == style.style))
+            })?;
+            let token = cached.code.get(covering.start..covering.end)?;
+            let comment = self
+                .husk_styles
+                .comment
+                .as_ref()
+                .is_some_and(|style| *style == covering.style)
+                && token.starts_with("//")
+                && !token.contains('\n')
+                && outer_edit.start_byte > covering.start.saturating_add(2);
+            let string = self
+                .husk_styles
+                .string
+                .as_ref()
+                .is_some_and(|style| *style == covering.style)
+                && token.starts_with('"')
+                && token.ends_with('"')
+                && !token.contains(['\r', '\n'])
+                && !inserted
+                    .chars()
+                    .chain(removed.chars())
+                    .any(|character| matches!(character, '"' | '\\'));
+            if !comment && !string {
+                return None;
+            }
+            None
+        } else {
+            let nested = self
+                .highlighters
+                .get(&injected_language)?
+                .cached_tree
+                .as_ref()?;
+            if nested.source != old_contents {
+                return None;
+            }
+            let nested_edit = crate::syntax_indent::replacement_edit(old_contents, new_contents);
+            stable_bundled_token(
+                &injected_language,
+                old_contents,
+                new_contents,
+                nested,
+                &nested_edit,
+            )?;
+            Some(nested_edit)
+        };
 
         let mut styles = cached.styles.clone();
         for style in &mut styles {
@@ -1114,14 +1163,16 @@ impl Highlighter {
         outer.tree.edit(&outer_edit);
         outer.source.clear();
         outer.source.push_str(code);
-        let nested = self
-            .highlighters
-            .get_mut(&injected_language)?
-            .cached_tree
-            .as_mut()?;
-        nested.tree.edit(&nested_edit);
-        nested.source.clear();
-        nested.source.push_str(new_contents);
+        if let Some(nested_edit) = nested_edit {
+            let nested = self
+                .highlighters
+                .get_mut(&injected_language)?
+                .cached_tree
+                .as_mut()?;
+            nested.tree.edit(&nested_edit);
+            nested.source.clear();
+            nested.source.push_str(new_contents);
+        }
         let cached = self.cached_highlight.as_mut()?;
         cached.code.clear();
         cached.code.push_str(code);
@@ -2923,6 +2974,112 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn markdown_fenced_husk_tokens_preserve_fresh_specialized_lexer_captures() {
+        for sources in [
+            vec![
+                "## outer heading\n\n```husk\npub fn value() { let text = \"retained string\"; } // retained comment\n```\n\n```rust\nfn sibling() {}\n```\n",
+                "## outer heading\n\n```husk\npub fn value() { let text = \"retained string\"; } // retained. λ comment\n```\n\n```rust\nfn sibling() {}\n```\n",
+                "## outer heading\n\n```husk\npub fn value() { let text = \"retained. λ string\"; } // retained. λ comment\n```\n\n```rust\nfn sibling() {}\n```\n",
+            ],
+            vec![
+                "## outer 世界\r\n\r\n```hk\r\npub fn value() { let text = \"retained 世界 string\"; } // retained 世界 comment\r\n```\r\n",
+                "## outer 世界\r\n\r\n```hk\r\npub fn value() { let text = \"retained 世界 string\"; } // retained. λ 世界 comment\r\n```\r\n",
+                "## outer 世界\r\n\r\n```hk\r\npub fn value() { let text = \"retained. λ 世界 string\"; } // retained. λ 世界 comment\r\n```\r\n",
+            ],
+            vec![
+                "```husk\n// retained comment\n```\n\n```husk\n// later comment\n```\n",
+                "```husk\n// retained. λ comment\n```\n\n```husk\n// later comment\n```\n",
+            ],
+        ] {
+            let mut incremental = highlighter();
+            incremental.highlight("markdown", sources[0]).unwrap();
+            for source in &sources[1..] {
+                let actual = incremental.highlight("markdown", source).unwrap();
+                let expected = highlighter().highlight("markdown", source).unwrap();
+                let shape = |styles: &[StyleInfo]| {
+                    styles
+                        .iter()
+                        .map(|style| (style.start, style.end, style.style.clone()))
+                        .collect::<Vec<_>>()
+                };
+                assert_eq!(shape(&actual), shape(&expected), "{source}");
+                assert!(incremental.highlighters["markdown"]
+                    .cached_tree
+                    .as_ref()
+                    .unwrap()
+                    .tree
+                    .root_node()
+                    .has_changes());
+                assert!(!incremental.highlighters.contains_key("husk"));
+            }
+        }
+    }
+
+    #[test]
+    fn markdown_fenced_husk_boundaries_and_custom_definitions_reparse() {
+        for (before, after) in [
+            (
+                "```husk\n// retained comment\n```\n",
+                "```husk\n// retained\n comment\n```\n",
+            ),
+            (
+                "```husk\n// retained comment\n```\n",
+                "```husk\n// retained` comment\n```\n",
+            ),
+            (
+                "```husk\nlet value = \"retained string\";\n```\n",
+                "```husk\nlet value = \"retained\\ string\";\n```\n",
+            ),
+            (
+                "```husk\nlet value = \"retained string\";\n```\n",
+                "```husk\nlet value = \"retained\" string\";\n```\n",
+            ),
+        ] {
+            let mut incremental = highlighter();
+            incremental.highlight("markdown", before).unwrap();
+            let actual = incremental.highlight("markdown", after).unwrap();
+            let expected = highlighter().highlight("markdown", after).unwrap();
+            let shape = |styles: &[StyleInfo]| {
+                styles
+                    .iter()
+                    .map(|style| (style.start, style.end, style.style.clone()))
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(shape(&actual), shape(&expected), "{after}");
+            assert!(!incremental.highlighters["markdown"]
+                .cached_tree
+                .as_ref()
+                .unwrap()
+                .tree
+                .root_node()
+                .has_changes());
+        }
+
+        let mut registry = LanguageRegistry::bundled();
+        registry
+            .languages
+            .get_mut("husk")
+            .unwrap()
+            .highlight_queries
+            .push("customized specialized definition".to_string());
+        let theme = parse_vscode_theme("themes/mocha.json").unwrap();
+        let mut customized = Highlighter::with_registry(&theme, Arc::new(registry)).unwrap();
+        customized
+            .highlight("markdown", "```husk\n// retained comment\n```\n")
+            .unwrap();
+        customized
+            .highlight("markdown", "```husk\n// retained. λ comment\n```\n")
+            .unwrap();
+        assert!(!customized.highlighters["markdown"]
+            .cached_tree
+            .as_ref()
+            .unwrap()
+            .tree
+            .root_node()
+            .has_changes());
     }
 
     #[test]

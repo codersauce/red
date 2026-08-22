@@ -71,8 +71,12 @@ navigation baselines were frozen after rebasing to `d92777c`.
 | Shared display-column-to-grapheme conversion | 99.46% |
 | Shared grapheme-to-display-column conversion | 99.45% |
 | Embedded text-area ASCII typing | 99.29% |
+| Markdown fenced CRLF Husk line-comment highlighting | 99.29% |
+| Markdown fenced Husk line-comment highlighting | 99.23% |
+| Markdown fenced Husk string highlighting | 99.21% |
 | Agent streamed transcript updates | 99.18% |
 | Shared modal editor word operators | 99.17% |
+| Markdown fenced Unicode Husk line-comment highlighting | 99.17% |
 | Long-line Vim forward word motion | 99.05% |
 | Plugin preference persistence | 99.38% |
 | Husk completion ranking | 99.42% |
@@ -165,13 +169,17 @@ navigation baselines were frozen after rebasing to `d92777c`.
 | Editor final-cell boundary lookup | 96.24% |
 | TOML string punctuation and Unicode highlighting | 95.93% |
 | Real-terminal Markdown fenced CRLF Rust line-comment highlighting | 95.88% |
+| Real-terminal Markdown fenced Husk string highlighting | 95.88% |
 | Real-terminal Markdown fenced Rust line-comment highlighting | 95.84% |
+| Real-terminal Markdown fenced Husk line-comment highlighting | 95.83% |
 | Real-terminal Markdown fenced Unicode Rust line-comment highlighting | 95.82% |
+| Real-terminal Markdown fenced Unicode Husk line-comment highlighting | 95.42% |
 | Real-terminal Markdown fenced JSX line-comment highlighting | 95.17% |
 | Real-terminal Markdown fenced Rust string highlighting | 95.15% |
 | Real-terminal Markdown fenced TypeScript string highlighting | 95.15% |
 | Real-terminal Markdown fenced JavaScript line-comment highlighting | 95.11% |
 | Real-terminal Markdown fenced TSX line-comment highlighting | 95.11% |
+| Real-terminal Markdown fenced CRLF Husk line-comment highlighting | 95.08% |
 | Real-terminal cursor-moved plugin delivery | 95.05% |
 | Real-terminal file-picker query resolution | 95.00% |
 | Real-terminal Markdown fenced PowerShell line-comment highlighting | 95.00% |
@@ -269,6 +277,7 @@ navigation baselines were frozen after rebasing to `d92777c`.
 | Real-terminal Markdown fenced Rust line-comment edit frames | 77.36% |
 | Real-terminal Markdown fenced Rust string edit frames | 76.91% |
 | Real-terminal Markdown fenced Unicode Rust line-comment edit frames | 76.70% |
+| Real-terminal Markdown fenced Husk string edit frames | 76.12% |
 | Shared Vim final sentence cursor boundary | 75.93% |
 | Real-terminal Markdown fenced JSX line-comment edit frames | 75.85% |
 | Real-terminal typing action handling | 75.81% |
@@ -288,11 +297,14 @@ navigation baselines were frozen after rebasing to `d92777c`.
 | Shared Vim ASCII around quoted text objects | 74.66% |
 | Shared Vim sentence navigation | 74.63% |
 | LSP incremental large-document changes | 74.61% |
+| Real-terminal Markdown fenced Husk line-comment edit frames | 74.40% |
 | Real-terminal text-insertion events | 74.32% |
 | Shared Vim Unicode inner quoted text objects | 74.07% |
 | Real-terminal Husk CRLF line-comment highlighting | 73.33% |
+| Real-terminal Markdown fenced Unicode Husk line-comment edit frames | 73.33% |
 | Real-terminal Markdown fenced PowerShell line-comment edit frames | 72.98% |
 | Real-terminal Husk string highlighting | 72.92% |
+| Real-terminal Markdown fenced CRLF Husk line-comment edit frames | 72.67% |
 | Embedded Vim long-line end motions | 72.63% |
 | Real-terminal Unicode counted character deletion | 72.58% |
 | Shared Vim paragraph navigation | 72.60% |
@@ -397,6 +409,7 @@ navigation baselines were frozen after rebasing to `d92777c`.
 | Real-terminal Markdown fenced Rust line-comment input events | 50.98% |
 | Real-terminal Markdown fenced TypeScript string input events | 50.86% |
 | Real-terminal JSX line-comment edit frames | 50.79% |
+| Real-terminal Markdown fenced Husk string typing actions | 50.78% |
 | Real-terminal TypeScript line-comment edit frames | 50.57% |
 | Real-terminal Lua line-comment edit frames | 50.21% |
 | Real-terminal Markdown fenced TSX line-comment typing actions | 50.14% |
@@ -875,6 +888,26 @@ fell from 365 to 105, 344 to 101, 355 to 103, 352 to 120, 353 to 114, 396 to
 107, 403 to 114, and 414 to 117 microseconds. Seven complete typing-action
 paths improved 50.14% to 53.50%, and four complete input events improved
 50.86% to 51.42%; every action or event below 50% remains excluded.
+
+Nine alternating release-build samples applied 128 punctuation and Unicode
+edits to the specialized Husk lexer inside 96-line Markdown code fences. Husk
+comment, string, Unicode-comment, and CRLF-comment medians fell from 162,415
+to 1,254, 162,993 to 1,280, 174,673 to 1,451, and 162,207 to 1,155
+microseconds. The exact bundled Husk definition must have no custom grammar,
+highlight query, or injection query. Existing lexer spans must remain inside
+the active fence, match the current theme, and preserve ordinary `//` comment
+or plain quoted-string delimiters. Outer Markdown syntax, specialized
+captures, sibling injections, `.hk` aliases, repeated Husk fences, and every
+UTF-8 byte range remain synchronized; quotes, escapes, fence markers,
+newlines, and customized definitions retain complete parsing.
+
+Seven alternating real-terminal sessions per fenced Husk token applied 32
+punctuation and Unicode edits. Comment, string, Unicode-comment, and CRLF-
+comment highlighting fell from 360 to 15, 364 to 15, 393 to 18, and 366 to
+18 microseconds. Their complete editor-window frames fell from 457 to 117,
+469 to 112, 510 to 136, and 472 to 129 microseconds. Complete fenced-string
+typing actions fell from 707 to 348 microseconds; all other action and input-
+event paths remained below 50% and are excluded.
 
 Seven alternating release-build samples across 96-line Markdown heading
 fixtures applied 128 punctuation and Unicode edits per heading. H1, H2, and
