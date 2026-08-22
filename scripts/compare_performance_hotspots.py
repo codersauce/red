@@ -58,6 +58,8 @@ SCENARIOS = (
     "git-status-index",
     "git-status-refresh",
     "git-status-outside",
+    "buffer-last-line",
+    "buffer-line-count",
     "layout-grapheme-cursor",
     "layout-word-cursor",
     "textarea-vim-word",

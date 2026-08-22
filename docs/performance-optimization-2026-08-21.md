@@ -88,6 +88,8 @@ navigation baselines were frozen after rebasing to `d92777c`.
 | Shared ASCII grapheme counting | 94.94% |
 | LSP absolute-document routing | 94.68% |
 | Workspace inline file discovery | 92.65% |
+| Shared buffer final-line lookup | 91.46% |
+| Shared buffer navigable-line counting | 91.38% |
 | Embedded redo cursor restoration | 91.33% |
 | Embedded text-area document loading | 91.26% |
 | Embedded Vim nested delimiter matching | 90.03% |
@@ -149,6 +151,13 @@ builds for 2,048 changed files across nested crate directories. Eleven alternati
 samples reduced the median from 54,699 to 21,726 microseconds while preserving
 conflict precedence, ignored-directory boundaries, tracked children, Windows
 path separators, filesystem-root repositories, and out-of-repository filtering.
+
+Shared buffer line boundaries were independently measured across 4,096
+production final-line lookups and navigable-line counts on a 53 KiB
+unterminated source line. Eleven alternating release-build samples reduced
+final-line medians from 12,954 to 1,106 microseconds and line-count medians from
+12,798 to 1,103 microseconds while preserving empty named and unnamed buffers,
+trailing LF/CRLF separators, repeated blank lines, and Unicode scalar contents.
 
 Wrapped cursor hit-testing was measured over 2,048 production lookups across
 more than 256 visual rows. Eleven alternating release-build samples reduced

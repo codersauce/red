@@ -597,7 +597,7 @@ impl Buffer {
     /// Returns the last line that can hold an editor cursor.
     pub fn last_navigable_line(&self) -> usize {
         let last_line = self.len();
-        if last_line > 0 && self.get(last_line).is_some_and(|line| line.is_empty()) {
+        if last_line > 0 && self.content.line(last_line).len_chars() == 0 {
             last_line - 1
         } else {
             last_line
@@ -1777,6 +1777,34 @@ mod test {
         assert!(buffer.line_is_empty(3));
         assert!(!buffer.line_is_empty(4));
         assert!(!buffer.line_is_empty(5));
+    }
+
+    #[test]
+    fn navigable_line_boundaries_preserve_trailing_breaks_and_unicode() {
+        for (contents, expected_line, expected_count) in [
+            ("", 0, 1),
+            ("\n", 0, 1),
+            ("\n\n", 1, 2),
+            ("alpha", 0, 1),
+            ("alpha\n", 0, 1),
+            ("alpha\n\n", 1, 2),
+            ("alpha\nfinal", 1, 2),
+            ("alpha\r\n", 0, 1),
+            ("alpha\r\n\r\n", 1, 2),
+            ("alpha\r\n漢字 👨‍👩‍👧 e\u{301}", 1, 2),
+        ] {
+            let buffer = Buffer::new(Some("source.txt".to_string()), contents.to_string());
+            assert_eq!(buffer.last_navigable_line(), expected_line, "{contents:?}");
+            assert_eq!(
+                buffer.navigable_line_count(),
+                expected_count,
+                "{contents:?}"
+            );
+        }
+
+        let unnamed = Buffer::new(None, String::new());
+        assert_eq!(unnamed.last_navigable_line(), 0);
+        assert_eq!(unnamed.navigable_line_count(), 1);
     }
 
     #[test]

@@ -97,6 +97,7 @@ const TEXTAREA_DOCUMENT_LOADS: usize = 128;
 const GIT_STATUS_FILES: usize = 2_048;
 const GIT_STATUS_INDEX_BUILDS: usize = 32;
 const GIT_STATUS_REFRESHES: usize = 32;
+const BUFFER_LINE_LOOKUPS: usize = 4_096;
 const LAYOUT_CURSOR_LOOKUPS: usize = 2_048;
 const TEXTAREA_VIM_MOTIONS: usize = 2_048;
 const TEXTAREA_DELIMITER_MOTIONS: usize = 1_024;
@@ -250,6 +251,12 @@ fn main() -> Result<()> {
     }
     if scenario == "all" || scenario == "git-status-outside" {
         results.push(benchmark_git_status_refresh(/*repository*/ false)?);
+    }
+    if scenario == "all" || scenario == "buffer-last-line" {
+        results.push(benchmark_buffer_line_boundary(/*count*/ false)?);
+    }
+    if scenario == "all" || scenario == "buffer-line-count" {
+        results.push(benchmark_buffer_line_boundary(/*count*/ true)?);
     }
     if scenario == "all" || scenario == "layout-grapheme-cursor" {
         results.push(benchmark_layout_cursor_lookup(WrapMode::Grapheme)?);
@@ -1751,6 +1758,33 @@ fn benchmark_git_status_refresh(repository: bool) -> Result<serde_json::Value> {
         },
         started,
         GIT_STATUS_REFRESHES,
+    ))
+}
+
+fn benchmark_buffer_line_boundary(count: bool) -> Result<serde_json::Value> {
+    let final_line = "ordinary source identifier and retained editor words ".repeat(1_024);
+    let buffer = Buffer::new(None, format!("first line\n{final_line}"));
+    let started = Instant::now();
+    for _ in 0..BUFFER_LINE_LOOKUPS {
+        let line = if count {
+            black_box(&buffer).navigable_line_count()
+        } else {
+            black_box(&buffer).last_navigable_line()
+        };
+        anyhow::ensure!(
+            line == if count { 2 } else { 1 },
+            "buffer line lookup changed its final-line boundary"
+        );
+        black_box(line);
+    }
+    Ok(report(
+        if count {
+            "shared_buffer_navigable_line_count"
+        } else {
+            "shared_buffer_last_navigable_line"
+        },
+        started,
+        BUFFER_LINE_LOOKUPS,
     ))
 }
 
