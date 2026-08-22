@@ -80,6 +80,7 @@ navigation baselines were frozen after rebasing to `d92777c`.
 | LSP completion filtering | 67.58% |
 | Structured picker ranking | 64.81% |
 | In-buffer search navigation | 55.98% |
+| Owned Husk JSON boundary conversion | 54.49% |
 | Bundled plugin startup | 51.22% |
 
 Real detached-terminal coverage separately exercised editing, 32 KiB of Unicode
@@ -97,9 +98,6 @@ objective.
 
 ## Remaining gaps
 
-- Owned Husk JSON conversion improves by approximately 42%. Moving strings and
-  inserting sorted object fields directly avoids duplicate string clones and
-  temporary sort buffers, but the runtime object representation still allocates.
 - Broad process startup, full-frame typing, crash recovery, Git integration,
   Neo-tree memory, broader Vim editing, platform-specific paths,
   and several other areas above still require dedicated before/after fixtures
