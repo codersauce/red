@@ -54,6 +54,12 @@ navigation baselines were frozen after rebasing to `d92777c`.
 
 | Runtime path | Median improvement |
 | --- | ---: |
+| Real-terminal fenced PowerShell variable highlighting | 89.97% |
+| Real-terminal fenced TOML key highlighting | 82.64% |
+| Real-terminal fenced Bash assignment highlighting | 78.57% |
+| Real-terminal fenced YAML mapping-key highlighting | 78.29% |
+| Real-terminal fenced PowerShell variable edit frames | 68.89% |
+| Real-terminal fenced TOML key edit frames | 50.86% |
 | Real-terminal PowerShell variable highlighting | 94.55% |
 | Real-terminal YAML mapping-key highlighting | 88.41% |
 | Real-terminal TOML bare-key highlighting | 83.75% |
@@ -795,6 +801,19 @@ cached tree by the exact edit. The shortcut excludes token boundaries, reserved
 keywords, uppercase-sensitive names, non-identifier Unicode, custom queries,
 and source or span cache-limit violations; Unicode edits, comments, YAML
 context, Markdown language injections, and fresh-parser parity remain covered.
+
+Five alternating real-terminal sessions per deeply scrolled Markdown fence
+applied 24 lowercase identifier edits after the opening marker left the
+viewport. Fenced TOML, YAML, Bash, and PowerShell highlighting respectively
+fell from 144 to 25, 129 to 28, 112 to 24, and 299 to 30 microseconds.
+Complete fenced TOML editor-window frames fell from 232 to 114 microseconds,
+and fenced PowerShell editor-window frames fell from 389 to 121 microseconds.
+A single bounded Rope extraction recovers an eligible opening backtick or
+tilde fence across at most 256 preceding lines and 64 KiB, restoring the
+previously missing injected-language colors and preserving nested token reuse.
+Closed fences, excessive indentation, oversized prefixes, deep unbounded
+documents, whole input events, other editor-window frames, and Fish edits do
+not contribute qualifying results.
 
 Seven alternating real-terminal sessions per configuration and shell language
 applied 24 lowercase identifier edits to production editor viewports. TOML,

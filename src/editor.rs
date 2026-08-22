@@ -239,6 +239,7 @@ const AGENT_EVENTS_PER_TICK: usize = 64;
 const GUTTER_SIGN_COLUMN_WIDTH: usize = 2;
 const DIAGNOSTIC_GUTTER_NAMESPACE: &str = "diagnostics";
 const MAX_HIGHLIGHT_SLICE_BYTES: usize = 512 * 1024;
+const MAX_MARKDOWN_FENCE_LOOKBACK_LINES: usize = 256;
 const MAX_SEARCH_HISTORY_ENTRIES: usize = 6;
 const MAX_SEARCH_HISTORY_MATCHES_PER_ENTRY: usize = 16_384;
 const MAX_PLUGIN_VIEWPORT_LINE_CHARS: usize = 64 * 1024;
@@ -7026,6 +7027,11 @@ impl Editor {
             } else {
                 vtop.saturating_sub(margin)
             };
+            if language_id.as_deref() == Some("markdown") {
+                if let Some(fence_start) = Self::markdown_fence_start(buffer, vtop) {
+                    parse_start = parse_start.min(fence_start);
+                }
+            }
             let mut parse_end = (vtop + height + margin).min(line_count);
 
             if buffer.line_range_byte_len(parse_start, parse_end) > MAX_HIGHLIGHT_SLICE_BYTES {
@@ -7075,6 +7081,41 @@ impl Editor {
                 style: span.style.clone(),
             })
             .collect())
+    }
+
+    fn markdown_fence_start(buffer: &Buffer, viewport_start: usize) -> Option<usize> {
+        let earliest = viewport_start.saturating_sub(MAX_MARKDOWN_FENCE_LOOKBACK_LINES);
+        if buffer.line_range_byte_len(earliest, viewport_start) > 64 * 1024 {
+            return None;
+        }
+        let (source, offsets) = buffer.line_range_contents_with_offsets(earliest, viewport_start);
+        for (line_index, bounds) in offsets.windows(2).enumerate().rev() {
+            let trimmed = source[bounds[0]..bounds[1]].trim_end_matches(['\r', '\n']);
+            let indentation = trimmed.len() - trimmed.trim_start_matches(' ').len();
+            if indentation > 3 {
+                continue;
+            }
+            let marker = &trimmed[indentation..];
+            let Some(character @ ('`' | '~')) = marker.chars().next() else {
+                continue;
+            };
+            let marker_length = marker
+                .bytes()
+                .take_while(|byte| *byte == character as u8)
+                .count();
+            if marker_length < 3 {
+                continue;
+            }
+            let information = marker[marker_length..].trim();
+            if information.is_empty() {
+                return None;
+            }
+            if character == '`' && information.contains('`') {
+                continue;
+            }
+            return Some(earliest + line_index);
+        }
+        None
     }
 
     pub fn draw_line_diagnostics(&mut self, buffer: &mut RenderBuffer, line_num: usize) {
@@ -35990,6 +36031,65 @@ builtin = "rust"
         let disabled = editor.viewport_highlight_spans(0, 10, 20).unwrap();
         assert!(disabled.is_empty());
         assert_eq!(editor.highlight_cache[&0].language_id, None);
+    }
+
+    #[test]
+    fn markdown_viewport_preserves_offscreen_fenced_language_after_edit() {
+        for marker in ["```powershell", "~~~powershell", "   ```powershell"] {
+            let config = Config::default();
+            let lsp = Box::new(crate::lsp::LspManager::new(config.lsp.clone()));
+            let theme = parse_vscode_theme("themes/mocha.json").unwrap();
+            let contents = format!(
+                "## heading\n\n{marker}\n{}\n```\n",
+                "$retainedvalue = 123456789; \"retained\"\n".repeat(160)
+            );
+            let buffer = Buffer::new(Some("fenced-source.md".to_string()), contents);
+            let mut editor = Editor::with_size(lsp, 120, 22, config, theme, vec![buffer]).unwrap();
+            editor.test_disable_terminal_output();
+
+            let before = editor.viewport_highlight_spans(0, 100, 20).unwrap();
+            assert_eq!(editor.highlight_cache[&0].start_line, 2);
+            assert!(
+                before.iter().any(|span| span.start == 28 && span.end == 38),
+                "offscreen {marker} lost its injected PowerShell string"
+            );
+
+            editor.current_buffer_mut().insert_str(7, 100, "xy");
+            let after = editor.viewport_highlight_spans(0, 100, 20).unwrap();
+            assert_eq!(editor.highlight_cache[&0].start_line, 2);
+            assert!(
+                after.iter().any(|span| span.start == 30 && span.end == 40),
+                "edited offscreen {marker} lost its injected PowerShell string"
+            );
+        }
+    }
+
+    #[test]
+    fn markdown_fence_lookback_stops_at_closing_markers_and_bounds_deep_documents() {
+        let config = Config::default();
+        let lsp = Box::new(crate::lsp::LspManager::new(config.lsp.clone()));
+        let theme = parse_vscode_theme("themes/mocha.json").unwrap();
+        let contents = format!(
+            "```powershell\n$retainedvalue = 1;\n```\n{}",
+            "ordinary retained markdown text\n".repeat(120)
+        );
+        let buffer = Buffer::new(Some("closed-source.md".to_string()), contents);
+        let mut editor = Editor::with_size(lsp, 120, 22, config, theme, vec![buffer]).unwrap();
+        editor.viewport_highlight_spans(0, 80, 20).unwrap();
+        assert_eq!(editor.highlight_cache[&0].start_line, 60);
+
+        let config = Config::default();
+        let lsp = Box::new(crate::lsp::LspManager::new(config.lsp.clone()));
+        let theme = parse_vscode_theme("themes/mocha.json").unwrap();
+        let contents = format!(
+            "```powershell\n{}",
+            "$retainedvalue = 123456789; \"retained\"\n"
+                .repeat(MAX_MARKDOWN_FENCE_LOOKBACK_LINES + 80)
+        );
+        let buffer = Buffer::new(Some("deep-source.md".to_string()), contents);
+        let mut editor = Editor::with_size(lsp, 120, 22, config, theme, vec![buffer]).unwrap();
+        editor.viewport_highlight_spans(0, 300, 20).unwrap();
+        assert_eq!(editor.highlight_cache[&0].start_line, 280);
     }
 
     #[test]
