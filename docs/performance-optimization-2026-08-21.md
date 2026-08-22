@@ -72,6 +72,8 @@ navigation baselines were frozen after rebasing to `d92777c`.
 | Gutter namespace updates | 97.94% |
 | Decoration namespace updates | 97.48% |
 | Long transcript cursor lookup | 97.35% |
+| Character-wrapped layout cursor lookup | 97.29% |
+| Word-wrapped layout cursor lookup | 96.61% |
 | Git workspace row navigation | 96.35% |
 | Shared ASCII grapheme counting | 94.94% |
 | LSP absolute-document routing | 94.68% |
@@ -119,6 +121,14 @@ builds for 2,048 changed files across nested crate directories. Eleven alternati
 samples reduced the median from 54,699 to 21,726 microseconds while preserving
 conflict precedence, ignored-directory boundaries, tracked children, Windows
 path separators, filesystem-root repositories, and out-of-repository filtering.
+
+Wrapped cursor hit-testing was measured over 2,048 production lookups across
+more than 256 visual rows. Eleven alternating release-build samples reduced
+character-wrapped lookup medians from 13,148 to 356 microseconds and word-wrapped
+lookup medians from 12,941 to 439 microseconds. Both paths retain existing
+duplicate-position and equidistant-column tie-breaking, omitted soft-wrap
+separators, Unicode graphemes, wide characters, tabs, hard breaks, blank rows,
+and zero-width view behavior.
 
 Multi-file startup uses the same production loader as the executable. Across
 four startup passes over 128 distinct source files, seven alternating samples

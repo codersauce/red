@@ -20,6 +20,7 @@ use red::{
     },
     preferences::PreferencesStore,
     session::SessionStore,
+    text_layout::{LayoutOptions, TextLayout, WrapMode},
     theme::{parse_vscode_theme, parse_vscode_theme_contents, Style, Theme},
     ui::{CompletionUI, Picker, PickerItem, PickerOptions},
     undo::{CursorSnapshot, TextPosition, TextRange, UndoHistory},
@@ -94,6 +95,7 @@ const ASCII_GRAPHEME_COUNTS: usize = 1_024;
 const TEXTAREA_DOCUMENT_LOADS: usize = 128;
 const GIT_STATUS_FILES: usize = 2_048;
 const GIT_STATUS_INDEX_BUILDS: usize = 32;
+const LAYOUT_CURSOR_LOOKUPS: usize = 2_048;
 
 fn main() -> Result<()> {
     let scenario = std::env::args().nth(1).unwrap_or_else(|| "all".into());
@@ -236,6 +238,12 @@ fn main() -> Result<()> {
     }
     if scenario == "all" || scenario == "git-status-index" {
         results.push(benchmark_git_status_indexing()?);
+    }
+    if scenario == "all" || scenario == "layout-grapheme-cursor" {
+        results.push(benchmark_layout_cursor_lookup(WrapMode::Grapheme)?);
+    }
+    if scenario == "all" || scenario == "layout-word-cursor" {
+        results.push(benchmark_layout_cursor_lookup(WrapMode::Word)?);
     }
 
     anyhow::ensure!(
@@ -1611,6 +1619,35 @@ fn benchmark_git_status_indexing() -> Result<serde_json::Value> {
         "git_workspace_status_directory_indexing",
         started,
         GIT_STATUS_INDEX_BUILDS,
+    ))
+}
+
+fn benchmark_layout_cursor_lookup(mode: WrapMode) -> Result<serde_json::Value> {
+    let contents = "ordinary editor word and wrapped composer text ".repeat(512);
+    let options = match mode {
+        WrapMode::Grapheme => LayoutOptions::grapheme(64),
+        WrapMode::Word => LayoutOptions::word(64),
+    };
+    let layout = TextLayout::new(&contents, options);
+    anyhow::ensure!(layout.rows().len() > 256, "layout benchmark did not wrap");
+
+    let started = Instant::now();
+    for index in 0..LAYOUT_CURSOR_LOOKUPS {
+        let row = (index * 17) % layout.rows().len();
+        let column = (index * 13) % 64;
+        let offset = layout
+            .nearest_offset_on_row(black_box(row), black_box(column))
+            .ok_or_else(|| anyhow::anyhow!("layout cursor lookup lost a visible row"))?;
+        black_box(offset);
+    }
+    Ok(report(
+        if mode == WrapMode::Grapheme {
+            "grapheme_wrapped_layout_cursor_lookup"
+        } else {
+            "word_wrapped_layout_cursor_lookup"
+        },
+        started,
+        LAYOUT_CURSOR_LOOKUPS,
     ))
 }
 

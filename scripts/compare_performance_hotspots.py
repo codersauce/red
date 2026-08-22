@@ -56,6 +56,8 @@ SCENARIOS = (
     "ascii-graphemes",
     "textarea-open",
     "git-status-index",
+    "layout-grapheme-cursor",
+    "layout-word-cursor",
     "husk-completion",
     "husk-config",
     "husk-update",
