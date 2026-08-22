@@ -136,7 +136,11 @@ impl LspManager {
         let server = self.config.servers.get(&selector.server_name)?;
 
         let path = Path::new(file);
-        let path = path.absolutize().ok()?.to_path_buf();
+        let path = if path.is_absolute() {
+            path.absolutize_from(path).ok()?.into_owned()
+        } else {
+            path.absolutize().ok()?.into_owned()
+        };
         let workspace_root = find_workspace_root(&path, server);
         let uri = file_uri(&path).ok()?;
 

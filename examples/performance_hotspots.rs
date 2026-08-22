@@ -65,6 +65,7 @@ const WORKSPACE_NAVIGATIONS: usize = 1_000;
 const INLINE_CONVERSATIONS: usize = 4_096;
 const INLINE_ANSWER_DELTAS: usize = 1_000;
 const STATUSLINE_FRAMES: usize = 1_000;
+const LSP_DOCUMENT_RESOLVES: usize = 1_000;
 
 fn main() -> Result<()> {
     let scenario = std::env::args().nth(1).unwrap_or_else(|| "all".into());
@@ -156,6 +157,9 @@ fn main() -> Result<()> {
     }
     if scenario == "all" || scenario == "statusline" {
         results.push(benchmark_statusline_rendering()?);
+    }
+    if scenario == "all" || scenario == "lsp-routing" {
+        results.push(benchmark_lsp_document_routing()?);
     }
 
     anyhow::ensure!(
@@ -911,6 +915,34 @@ fn benchmark_statusline_rendering() -> Result<serde_json::Value> {
         "default_editor_statusline_rendering",
         started,
         frames,
+    ))
+}
+
+fn benchmark_lsp_document_routing() -> Result<serde_json::Value> {
+    let directory = tempfile::tempdir()?;
+    std::fs::write(
+        directory.path().join("Cargo.toml"),
+        "[package]\nname = 'bench'\n",
+    )?;
+    let source = directory.path().join("src");
+    std::fs::create_dir(&source)?;
+    let path = source.join("main.rs");
+    std::fs::write(&path, "fn main() {}\n")?;
+    let path = path.to_string_lossy();
+    let manager = LspManager::new(Config::default().lsp);
+    anyhow::ensure!(
+        manager.resolve_document(&path).is_some(),
+        "LSP routing benchmark could not resolve its Rust document"
+    );
+
+    let started = Instant::now();
+    for _ in 0..LSP_DOCUMENT_RESOLVES {
+        black_box(manager.resolve_document(black_box(&path)));
+    }
+    Ok(report(
+        "lsp_absolute_document_routing",
+        started,
+        LSP_DOCUMENT_RESOLVES,
     ))
 }
 

@@ -70,6 +70,7 @@ navigation baselines were frozen after rebasing to `d92777c`.
 | Decoration namespace updates | 97.48% |
 | Long transcript cursor lookup | 97.35% |
 | Git workspace row navigation | 96.35% |
+| LSP absolute-document routing | 94.68% |
 | Shared modal editor backward word motion | 87.58% |
 | Shared modal editor forward word motion | 87.01% |
 | Printable ASCII frame rendering | 85.25% |

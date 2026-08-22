@@ -39,6 +39,7 @@ SCENARIOS = (
     "workspace-navigation",
     "inline-stream",
     "statusline",
+    "lsp-routing",
     "husk-completion",
     "husk-config",
     "husk-update",
