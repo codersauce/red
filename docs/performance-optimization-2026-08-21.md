@@ -147,12 +147,16 @@ navigation baselines were frozen after rebasing to `d92777c`.
 | ASCII LSP rename-symbol extraction | 94.70% |
 | LSP absolute-document routing | 94.68% |
 | Real-terminal redundant full-frame publication | 93.65% |
+| Husk CRLF line-comment highlighting | 93.65% |
 | Real-terminal edit-invalidated Rust highlighting | 93.42% |
 | Shared display-column-to-scalar conversion | 93.33% |
+| Husk line-comment highlighting | 93.26% |
 | Unicode Vim line-end operators | 93.21% |
+| Husk Unicode line-comment highlighting | 93.02% |
 | Editor scalar-to-grapheme cursor conversion | 92.82% |
 | Workspace inline file discovery | 92.65% |
 | Editor backward word-end boundary operators | 92.63% |
+| Husk string highlighting | 92.52% |
 | Real-terminal PowerShell line-comment highlighting | 91.97% |
 | Shared buffer final-line lookup | 91.46% |
 | Real-terminal PowerShell string highlighting | 91.43% |
@@ -223,15 +227,19 @@ navigation baselines were frozen after rebasing to `d92777c`.
 | Embedded forward Delete-key editing | 75.72% |
 | Shared Vim final paragraph cursor boundary | 75.63% |
 | Shared Vim Unicode forward character search | 75.52% |
+| Real-terminal Husk line-comment highlighting | 75.51% |
 | Shared Vim Unicode backward character search | 75.26% |
 | Shared Vim Unicode around quoted text objects | 75.15% |
 | Shared Vim ASCII inner quoted text objects | 75.00% |
+| Real-terminal Husk Unicode line-comment highlighting | 75.00% |
 | Embedded Ctrl-Backspace word deletion | 74.86% |
 | Shared Vim ASCII around quoted text objects | 74.66% |
 | Shared Vim sentence navigation | 74.63% |
 | LSP incremental large-document changes | 74.61% |
 | Real-terminal text-insertion events | 74.32% |
 | Shared Vim Unicode inner quoted text objects | 74.07% |
+| Real-terminal Husk CRLF line-comment highlighting | 73.33% |
+| Real-terminal Husk string highlighting | 72.92% |
 | Embedded Vim long-line end motions | 72.63% |
 | Real-terminal Unicode counted character deletion | 72.58% |
 | Shared Vim paragraph navigation | 72.60% |
@@ -247,11 +255,14 @@ navigation baselines were frozen after rebasing to `d92777c`.
 | Real-terminal edited-window painting | 69.23% |
 | Real-terminal counted character deletion | 68.43% |
 | Real-terminal split-window counted character deletion | 67.94% |
+| Git commit line-comment highlighting | 67.66% |
 | LSP completion filtering | 67.58% |
 | Real-terminal full-document-LSP macro playback | 66.77% |
+| Git commit diff highlighting | 66.62% |
 | Real-terminal split-window macro playback | 66.25% |
 | Real-terminal CRLF macro playback | 66.13% |
 | Real-terminal bundled-plugin counted character deletion | 65.77% |
+| Git commit CRLF highlighting | 65.26% |
 | Real-terminal split-window substitution | 64.83% |
 | Vim first-nonblank line-start operators | 64.81% |
 | Structured picker ranking | 64.81% |
@@ -265,8 +276,11 @@ navigation baselines were frozen after rebasing to `d92777c`.
 | Real-terminal CRLF substitution | 63.42% |
 | Real-terminal incremental-LSP macro playback | 63.12% |
 | Shared Vim inner paragraph text objects | 63.01% |
+| Git commit Unicode highlighting | 62.50% |
 | Real-terminal Markdown text-insertion events | 62.37% |
+| Git commit branch highlighting | 61.81% |
 | Real-terminal JSON string edit frames | 61.51% |
+| Git commit subject highlighting | 61.47% |
 | Real-terminal Unicode and CRLF substitution | 61.37% |
 | Complete real-terminal interactive startup | 60.80% |
 | Real-terminal bundled-plugin macro playback | 60.71% |
@@ -280,6 +294,7 @@ navigation baselines were frozen after rebasing to `d92777c`.
 | Real-terminal Unicode substitution | 59.09% |
 | Real-terminal CRLF line-comment edit frames | 58.74% |
 | Git repository discovery and branch refresh | 58.73% |
+| Git commit path highlighting | 58.73% |
 | Real-terminal string edit frames | 58.42% |
 | Real-terminal Unicode macro playback | 58.36% |
 | Real-terminal line-comment edit frames | 58.19% |
@@ -721,6 +736,33 @@ Complete YAML comment and string edit frames fell from 290 to 116 and 290 to
 118 microseconds; PowerShell frames fell from 233 to 106 and 239 to 113; and
 Lua comment frames fell from 233 to 116. TOML, Bash, Fish, and Lua string
 frames plus complete input events remain below the target and are excluded.
+
+Nine alternating release-build samples across 96-line Husk and Git commit
+fixtures applied 128 punctuation and Unicode edits to each specialized syntax
+path. Husk comment and string highlighting fell from 7,655 to 516 and 7,554
+to 565 microseconds; Unicode comments fell from 8,080 to 564, and CRLF
+comments from 7,641 to 485. Git commit comment, branch, path, diff, and
+ordinary subject highlighting fell from 569 to 184, 720 to 275, 756 to 312,
+707 to 236, and 737 to 284 microseconds; Unicode comment highlighting fell
+from 672 to 252, and CRLF comment highlighting from 567 to 197. Both shortcuts
+require their exact specialized language definitions without custom grammars
+or highlight queries, existing bounded source and capture caches, and edits
+that cannot cross line boundaries. Husk preserves an existing ordinary `//`
+comment or plain quoted-string span only when its delimiters, active theme
+style, Unicode byte ranges, and unchanged lexer boundaries remain valid;
+newline, control, quote, and escape changes retain complete lexing. Git
+commit highlighting independently recomputes the changed line and shifts all
+unaffected capture ranges, preserving ordinary unstyled subjects and semantic
+transitions involving headings, branch names, paths, references, and added or
+deleted diff lines.
+
+Five alternating real-terminal sessions per Husk or Git commit variant applied
+32 punctuation and Unicode edits to 240-line documents. Husk comment, string,
+Unicode-comment, and CRLF-comment highlighting respectively fell from 49 to
+12, 48 to 13, 48 to 12, and 45 to 12 microseconds. Actual Git commit viewport
+highlighting already took only eight to 11 microseconds before optimization;
+its real-terminal improvements, complete Husk edit frames, and all complete
+input events remain below the 50% target and are excluded.
 
 Seven alternating release-build samples across 96-line Markdown heading
 fixtures applied 128 punctuation and Unicode edits per heading. H1, H2, and

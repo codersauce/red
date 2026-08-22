@@ -140,6 +140,7 @@ def run(args):
                     ".ps1",
                     ".psm1",
                     ".psd1",
+                    ".gitcommit",
                 }:
                     marker = b"#"
                 else:

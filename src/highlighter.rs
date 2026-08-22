@@ -852,6 +852,10 @@ impl Highlighter {
             }
         }
 
+        if let Some(styles) = self.reuse_specialized_token_highlight(language_id, code) {
+            return Ok(styles);
+        }
+
         if let Some(styles) = self.reuse_stable_token_highlight(language_id, code) {
             return Ok(styles);
         }
@@ -869,6 +873,125 @@ impl Highlighter {
             None
         };
         Ok(styles)
+    }
+
+    /// Recompute one independent commit line or preserve one stable Husk token.
+    fn reuse_specialized_token_highlight(
+        &mut self,
+        language_id: &str,
+        code: &str,
+    ) -> Option<Vec<StyleInfo>> {
+        if code.len() > MAX_CACHED_HIGHLIGHT_BYTES {
+            return None;
+        }
+        let definition = self.registry.languages.get(language_id)?;
+        let specialized = definition.specialized?;
+        if definition.grammar.is_some() || !definition.highlight_queries.is_empty() {
+            return None;
+        }
+        let cached = self.cached_highlight.as_mut()?;
+        if cached.language_id != language_id {
+            return None;
+        }
+        let edit = crate::syntax_indent::replacement_edit(&cached.code, code);
+        let inserted = &code[edit.start_byte..edit.new_end_byte];
+        let removed = &cached.code[edit.start_byte..edit.old_end_byte];
+        if inserted.contains(['\r', '\n']) || removed.contains(['\r', '\n']) {
+            return None;
+        }
+        let delta = isize::try_from(edit.new_end_byte)
+            .ok()?
+            .checked_sub(isize::try_from(edit.old_end_byte).ok()?)?;
+
+        let styles = match (language_id, specialized) {
+            ("gitcommit", SpecializedHighlighter::GitCommit) => {
+                let line_start = cached.code[..edit.start_byte]
+                    .rfind('\n')
+                    .map_or(0, |position| position + 1);
+                let old_line_end = cached.code[edit.old_end_byte..]
+                    .find('\n')
+                    .map_or(cached.code.len(), |offset| edit.old_end_byte + offset);
+                let new_line_end = old_line_end.checked_add_signed(delta)?;
+                let mut updated = Vec::with_capacity(cached.styles.len() + 4);
+                updated.extend(
+                    cached
+                        .styles
+                        .iter()
+                        .filter(|style| style.end <= line_start)
+                        .cloned(),
+                );
+                for mut style in
+                    highlight_git_commit(&code[line_start..new_line_end], &self.git_commit_styles)
+                {
+                    style.start += line_start;
+                    style.end += line_start;
+                    updated.push(style);
+                }
+                for style in cached
+                    .styles
+                    .iter()
+                    .filter(|style| style.start >= old_line_end)
+                {
+                    let mut style = style.clone();
+                    style.start = style.start.checked_add_signed(delta)?;
+                    style.end = style.end.checked_add_signed(delta)?;
+                    updated.push(style);
+                }
+                updated
+            }
+            ("husk", SpecializedHighlighter::Husk) => {
+                let covering = cached
+                    .styles
+                    .iter()
+                    .find(|style| style.start < edit.start_byte && style.end > edit.old_end_byte)?;
+                let token = cached.code.get(covering.start..covering.end)?;
+                let comment = self
+                    .husk_styles
+                    .comment
+                    .as_ref()
+                    .is_some_and(|style| *style == covering.style)
+                    && token.starts_with("//")
+                    && !token.contains('\n')
+                    && edit.start_byte > covering.start.saturating_add(2);
+                let string =
+                    self.husk_styles
+                        .string
+                        .as_ref()
+                        .is_some_and(|style| *style == covering.style)
+                        && token.starts_with('"')
+                        && token.ends_with('"')
+                        && !token.contains(['\r', '\n'])
+                        && !inserted.chars().chain(removed.chars()).any(|character| {
+                            character.is_control() || matches!(character, '"' | '\\')
+                        });
+                if !comment && !string {
+                    return None;
+                }
+                let mut updated = cached.styles.clone();
+                for style in &mut updated {
+                    if style.end <= edit.start_byte {
+                        continue;
+                    }
+                    if style.start >= edit.old_end_byte {
+                        style.start = style.start.checked_add_signed(delta)?;
+                        style.end = style.end.checked_add_signed(delta)?;
+                    } else if style.start < edit.start_byte && style.end >= edit.old_end_byte {
+                        style.end = style.end.checked_add_signed(delta)?;
+                    } else {
+                        return None;
+                    }
+                }
+                updated
+            }
+            _ => return None,
+        };
+        if styles.len() > MAX_CACHED_HIGHLIGHT_SPANS {
+            return None;
+        }
+        cached.code.clear();
+        cached.code.push_str(code);
+        cached.styles.clone_from(&styles);
+        Some(styles)
     }
 
     /// Preserve exact bundled captures when an edit cannot change one token's
@@ -2411,6 +2534,107 @@ mod tests {
                     "safe {language} token edit should reuse its existing syntax tree"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn specialized_husk_token_edits_match_fresh_lexer_captures() {
+        for sources in [
+            vec![
+                "pub fn activate() { let value = \"retained string\"; } // retained comment\n",
+                "pub fn activate() { let value = \"retained string\"; } // retained. λ comment\n",
+                "pub fn activate() { let value = \"retained. λ string\"; } // retained. λ comment\n",
+            ],
+            vec![
+                "pub fn activate() { let value = \"retained 世界 string\"; } // retained 世界 comment\r\n",
+                "pub fn activate() { let value = \"retained 世界 string\"; } // retained. λ 世界 comment\r\n",
+            ],
+        ] {
+            let mut incremental = highlighter();
+            incremental.highlight("husk", sources[0]).unwrap();
+            for source in &sources[1..] {
+                let actual = incremental.highlight("husk", source).unwrap();
+                let expected = highlighter().highlight("husk", source).unwrap();
+                let shape = |styles: &[StyleInfo]| {
+                    styles
+                        .iter()
+                        .map(|style| (style.start, style.end, style.style.clone()))
+                        .collect::<Vec<_>>()
+                };
+                assert_eq!(shape(&actual), shape(&expected), "{source}");
+            }
+        }
+    }
+
+    #[test]
+    fn specialized_git_commit_line_edits_preserve_semantic_fresh_parser_captures() {
+        let cases = [
+            (
+                "retained subject\n# existing comment\n",
+                "retained. λ subject\n# existing comment\n",
+            ),
+            (
+                "# retained comment\n# next comment\n",
+                "# retained. λ comment\n# next comment\n",
+            ),
+            (
+                "# On branch retained_branch\n# modified: retained/path.rs\n",
+                "# On branch retained.λ_branch\n# modified: retained/path.rs\n",
+            ),
+            (
+                "# modified: retained/path.rs\r\n# +retained diff\r\n",
+                "# modified: retained.λ/path.rs\r\n# +retained diff\r\n",
+            ),
+            ("# ordinary body\n", "# On branch ordinary body\n"),
+            ("# +retained diff\n", "# -retained diff\n"),
+            ("# plain path\n", "# 'plain' path\n"),
+        ];
+        for (before, after) in cases {
+            let mut incremental = highlighter();
+            incremental.highlight("gitcommit", before).unwrap();
+            let actual = incremental.highlight("gitcommit", after).unwrap();
+            let expected = highlighter().highlight("gitcommit", after).unwrap();
+            let shape = |styles: &[StyleInfo]| {
+                styles
+                    .iter()
+                    .map(|style| (style.start, style.end, style.style.clone()))
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(shape(&actual), shape(&expected), "{after}");
+        }
+    }
+
+    #[test]
+    fn specialized_husk_and_commit_syntax_boundaries_fall_back_safely() {
+        for (language, before, after) in [
+            (
+                "husk",
+                "let value = \"retained string\";\n",
+                "let value = \"retained\\ string\";\n",
+            ),
+            (
+                "husk",
+                "let value = \"retained string\";\n",
+                "let value = \"retained\" string\";\n",
+            ),
+            ("husk", "// retained comment\n", "// retained\n comment\n"),
+            (
+                "gitcommit",
+                "# retained comment\n# later comment\n",
+                "# retained\n comment\n# later comment\n",
+            ),
+        ] {
+            let mut incremental = highlighter();
+            incremental.highlight(language, before).unwrap();
+            let actual = incremental.highlight(language, after).unwrap();
+            let expected = highlighter().highlight(language, after).unwrap();
+            let shape = |styles: &[StyleInfo]| {
+                styles
+                    .iter()
+                    .map(|style| (style.start, style.end, style.style.clone()))
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(shape(&actual), shape(&expected), "{language}: {after}");
         }
     }
 

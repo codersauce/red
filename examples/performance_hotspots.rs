@@ -398,6 +398,23 @@ fn main() -> Result<()> {
             )?);
         }
     }
+    for (name, language, variant) in [
+        ("husk-comment", "husk", "comment"),
+        ("husk-string", "husk", "string"),
+        ("husk-comment-unicode", "husk", "unicode"),
+        ("husk-comment-crlf", "husk", "crlf"),
+        ("gitcommit-comment", "gitcommit", "comment"),
+        ("gitcommit-branch", "gitcommit", "branch"),
+        ("gitcommit-path", "gitcommit", "path"),
+        ("gitcommit-diff", "gitcommit", "diff"),
+        ("gitcommit-subject", "gitcommit", "subject"),
+        ("gitcommit-unicode", "gitcommit", "unicode"),
+        ("gitcommit-crlf", "gitcommit", "crlf"),
+    ] {
+        if scenario == "all" || scenario == name {
+            results.push(benchmark_specialized_token_highlighting(language, variant)?);
+        }
+    }
     if scenario == "all" || scenario == "tree-selection" {
         results.push(benchmark_tree_panel_selection()?);
     }
@@ -1800,6 +1817,80 @@ fn benchmark_markdown_heading_highlighting(
         (2, false, true, false) => "markdown_crlf_heading_highlighting",
         (2, false, false, true) => "markdown_injected_heading_highlighting",
         _ => unreachable!("benchmark uses a supported Markdown heading scenario"),
+    };
+    Ok(report(scenario, started, RUST_TOKEN_HIGHLIGHT_EDITS))
+}
+
+fn benchmark_specialized_token_highlighting(
+    language: &str,
+    variant: &str,
+) -> Result<serde_json::Value> {
+    let theme = parse_vscode_theme("themes/mocha.json")?;
+    let mut highlighter = Highlighter::new(&theme)?;
+    let newline = if variant == "crlf" { "\r\n" } else { "\n" };
+    let unicode = if variant == "unicode" {
+        " 世界😀"
+    } else {
+        ""
+    };
+    let mut source = (0..96)
+        .map(|index| match (language, variant) {
+            ("husk", _) => format!(
+                "pub fn value_{index:03}() {{ let value = \"retained{unicode} string\"; }} // retained{unicode} comment{newline}"
+            ),
+            ("gitcommit", "branch") => format!("# On branch retained_branch_{index:03}{newline}"),
+            ("gitcommit", "path") => format!("# modified: retained/path_{index:03}.rs{newline}"),
+            ("gitcommit", "diff") => format!("# +retained diff contents {index:03}{newline}"),
+            ("gitcommit", "subject") => {
+                format!("retained subject {index:03}{newline}# existing comment {index:03}{newline}")
+            }
+            ("gitcommit", _) => format!("# retained{unicode} comment {index:03}{newline}"),
+            _ => unreachable!("specialized benchmark language"),
+        })
+        .collect::<String>();
+    let marker = if language == "husk" && variant != "string" {
+        "// retained"
+    } else {
+        "retained"
+    };
+    let mut cursor = source.find(marker).expect("specialized token marker") + marker.len();
+    black_box(highlighter.highlight(language, &source)?);
+
+    let started = Instant::now();
+    for index in 0..RUST_TOKEN_HIGHLIGHT_EDITS {
+        let inserted = if index % 2 == 0 { "." } else { "λ" };
+        source.insert_str(cursor, inserted);
+        cursor += inserted.len();
+        let spans = highlighter.highlight(black_box(language), black_box(&source))?;
+        if variant == "subject" {
+            anyhow::ensure!(
+                !spans.is_empty() && spans.iter().all(|span| span.start >= cursor),
+                "Git commit subject edit lost its later comment styles"
+            );
+        } else {
+            anyhow::ensure!(
+                spans
+                    .iter()
+                    .any(|span| span.start < cursor && span.end >= cursor),
+                "{language} {variant} edit lost its retained style"
+            );
+        }
+        black_box(spans);
+    }
+
+    let scenario = match (language, variant) {
+        ("husk", "comment") => "husk_line_comment_highlighting",
+        ("husk", "string") => "husk_string_highlighting",
+        ("husk", "unicode") => "husk_unicode_line_comment_highlighting",
+        ("husk", "crlf") => "husk_crlf_line_comment_highlighting",
+        ("gitcommit", "comment") => "git_commit_line_comment_highlighting",
+        ("gitcommit", "branch") => "git_commit_branch_highlighting",
+        ("gitcommit", "path") => "git_commit_path_highlighting",
+        ("gitcommit", "diff") => "git_commit_diff_highlighting",
+        ("gitcommit", "subject") => "git_commit_subject_highlighting",
+        ("gitcommit", "unicode") => "git_commit_unicode_highlighting",
+        ("gitcommit", "crlf") => "git_commit_crlf_highlighting",
+        _ => unreachable!("specialized benchmark scenario"),
     };
     Ok(report(scenario, started, RUST_TOKEN_HIGHLIGHT_EDITS))
 }
