@@ -87,6 +87,7 @@ const LSP_DOCUMENT_LINES: usize = 4_096;
 const LSP_INCREMENTAL_CHANGES: usize = 256;
 const TEXTAREA_INITIAL_BYTES: usize = 32 * 1024;
 const TEXTAREA_INSERTIONS: usize = 256;
+const STARTUP_CONFIG_LOADS: usize = 24;
 
 fn main() -> Result<()> {
     let scenario = std::env::args().nth(1).unwrap_or_else(|| "all".into());
@@ -211,6 +212,9 @@ fn main() -> Result<()> {
     }
     if scenario == "all" || scenario == "textarea-typing" {
         results.push(benchmark_embedded_textarea_typing()?);
+    }
+    if scenario == "all" || scenario == "startup-config" {
+        results.push(benchmark_startup_configuration_loading()?);
     }
 
     anyhow::ensure!(
@@ -1411,6 +1415,69 @@ fn benchmark_embedded_textarea_typing() -> Result<serde_json::Value> {
         "embedded_text_area_ascii_typing",
         started,
         TEXTAREA_INSERTIONS,
+    ))
+}
+
+fn benchmark_startup_configuration_loading() -> Result<serde_json::Value> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("config.toml");
+    std::fs::write(
+        &path,
+        r#"wrap = false
+scrolloff = 4
+
+[search]
+incsearch = true
+hlsearch = true
+wrapscan = true
+ignorecase = true
+smartcase = false
+
+[completion]
+enabled = true
+auto_trigger = false
+min_prefix_length = 3
+debounce_ms = 40
+buffer_words = true
+max_buffer_words = 2048
+
+[signature_help]
+auto_trigger = false
+debounce_ms = 120
+show_documentation = false
+
+[formatting]
+on_save = false
+trim_trailing_whitespace = false
+
+[key_hints]
+enabled = false
+delay_ms = 75
+
+[clipboard]
+enabled = false
+sync_on_yank = false
+sync_on_paste = false
+"#,
+    )?;
+
+    let started = Instant::now();
+    for _ in 0..STARTUP_CONFIG_LOADS {
+        let loaded = Config::load_user_file(black_box(&path), &[])?;
+        anyhow::ensure!(
+            loaded.is_clean()
+                && loaded.config.scrolloff == Some(4)
+                && !loaded.config.completion.auto_trigger
+                && loaded.config.completion.max_buffer_words == 2048
+                && !loaded.config.clipboard.enabled,
+            "startup configuration benchmark lost a valid user setting"
+        );
+        black_box(loaded);
+    }
+    Ok(report(
+        "startup_user_configuration_loading",
+        started,
+        STARTUP_CONFIG_LOADS,
     ))
 }
 

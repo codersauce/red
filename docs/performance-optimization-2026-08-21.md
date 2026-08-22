@@ -78,6 +78,7 @@ navigation baselines were frozen after rebasing to `d92777c`.
 | Shared modal editor backward word motion | 87.58% |
 | Shared modal editor forward word motion | 87.01% |
 | Printable ASCII frame rendering | 85.25% |
+| Startup user-configuration loading | 84.04% |
 | Long-line Vim word-end motion | 84.79% |
 | Idle plugin timer polling | 84.29% |
 | Default editor status-line rendering | 83.45% |
@@ -122,6 +123,13 @@ Embedded agent-composer and panel editing was measured over 256 ASCII insertions
 into a 32 KiB production `TextArea`. Eleven alternating samples reduced the median
 from 132,870 to 950 microseconds while preserving multiline cursor snapshots,
 undo/redo, byte limits, newline normalization, and Unicode grapheme transitions.
+
+Startup configuration loading was measured across 24 production user-file loads
+containing valid editor, search, completion, formatting, signature-help,
+key-hint, and clipboard settings. Eleven alternating samples reduced the median
+from 93,056 to 14,854 microseconds while preserving invalid-field diagnostics,
+unknown-field recovery, strict overrides, plugin quarantine, agent boundaries,
+and language-server capability validation.
 
 Real detached-terminal coverage separately exercised editing, 32 KiB of Unicode
 paste, repeated resizes, reattachment, and owner shutdown. Detached-frame median

@@ -50,6 +50,7 @@ SCENARIOS = (
     "startup-files",
     "lsp-changes",
     "textarea-typing",
+    "startup-config",
     "husk-completion",
     "husk-config",
     "husk-update",
