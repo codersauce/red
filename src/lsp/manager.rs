@@ -367,6 +367,8 @@ fn cargo_workspace_root(
 
 fn discover_cargo_workspace(manifest: &Path, document_directory: &Path) -> Option<PathBuf> {
     let _span = perf::PerfSpan::start("lsp:cargo_workspace_manifest_scan");
+    let document_directory = std::fs::canonicalize(document_directory)
+        .unwrap_or_else(|_| document_directory.to_path_buf());
     let member_manifest = read_cargo_manifest(manifest)?;
     if member_manifest
         .package
@@ -400,7 +402,7 @@ fn discover_cargo_workspace(manifest: &Path, document_directory: &Path) -> Optio
             continue;
         };
         if ancestor == member_root {
-            return validated_cargo_workspace_root(ancestor, document_directory);
+            return validated_cargo_workspace_root(ancestor, &document_directory);
         }
 
         let relative_member = member_root.strip_prefix(ancestor).ok()?;
@@ -414,12 +416,12 @@ fn discover_cargo_workspace(manifest: &Path, document_directory: &Path) -> Optio
             .iter()
             .any(|member| relative_member == Path::new(member))
         {
-            return validated_cargo_workspace_root(ancestor, document_directory);
+            return validated_cargo_workspace_root(ancestor, &document_directory);
         }
         return None;
     }
 
-    validated_cargo_workspace_root(member_root, document_directory)
+    validated_cargo_workspace_root(member_root, &document_directory)
 }
 
 fn read_cargo_manifest(path: &Path) -> Option<CargoManifest> {
@@ -1306,7 +1308,7 @@ mod tests {
             .resolve_document(file.to_string_lossy().as_ref())
             .unwrap();
 
-        assert_eq!(document.workspace_root, member);
+        assert_eq!(document.workspace_root, fs::canonicalize(member).unwrap());
     }
 
     #[test]

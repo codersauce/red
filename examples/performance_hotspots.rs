@@ -1894,14 +1894,14 @@ fn benchmark_identifier_highlighting(language: &str, fenced: bool) -> Result<ser
         contents
     };
     let outer_language = if fenced { "markdown" } else { language };
-    let mut cursor = source.find("retainedvalue").expect("identifier marker") + 5;
+    let cursor = source.find("retainedvalue").expect("identifier marker") + 5;
     black_box(highlighter.highlight(outer_language, &source)?);
 
     let started = Instant::now();
-    for index in 0..RUST_TOKEN_HIGHLIGHT_EDITS {
+    for (index, cursor) in (0..RUST_TOKEN_HIGHLIGHT_EDITS).zip(cursor..) {
         let character = if index % 2 == 0 { 'x' } else { 'y' };
         source.insert(cursor, character);
-        cursor += 1;
+        let cursor = cursor + 1;
         let spans = highlighter.highlight(black_box(outer_language), black_box(&source))?;
         anyhow::ensure!(
             spans
@@ -1956,14 +1956,14 @@ fn benchmark_numeric_literal_highlighting(
         contents
     };
     let outer_language = if fenced { "markdown" } else { language };
-    let mut cursor = source.find("123456789").expect("numeric token marker") + 4;
+    let cursor = source.find("123456789").expect("numeric token marker") + 4;
     black_box(highlighter.highlight(outer_language, &source)?);
 
     let started = Instant::now();
-    for index in 0..RUST_TOKEN_HIGHLIGHT_EDITS {
+    for (index, cursor) in (0..RUST_TOKEN_HIGHLIGHT_EDITS).zip(cursor..) {
         let digit = if index % 2 == 0 { '7' } else { '8' };
         source.insert(cursor, digit);
-        cursor += 1;
+        let cursor = cursor + 1;
         let spans = highlighter.highlight(black_box(outer_language), black_box(&source))?;
         anyhow::ensure!(
             spans
