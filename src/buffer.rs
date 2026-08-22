@@ -726,8 +726,13 @@ impl Buffer {
     pub fn text_in_range(&self, range: TextRange) -> String {
         let start_char = self.position_to_char_idx(range.start);
         let end_char = self.position_to_char_idx(range.end);
+        self.text_in_char_range(start_char, end_char)
+    }
+
+    /// Returns an exact scalar range without repeating line-to-Rope conversion.
+    pub(crate) fn text_in_char_range(&self, start: usize, end: usize) -> String {
         self.content
-            .get_slice(start_char..end_char)
+            .get_slice(start..end)
             .map(|slice| slice.to_string())
             .unwrap_or_default()
     }
@@ -746,8 +751,13 @@ impl Buffer {
     pub fn replace_range_raw(&mut self, range: TextRange, text: &str) {
         let start_char = self.position_to_char_idx(range.start);
         let end_char = self.position_to_char_idx(range.end);
-        self.content.remove(start_char..end_char);
-        self.content.insert(start_char, text);
+        self.replace_char_range_raw(start_char, end_char, text);
+    }
+
+    /// Applies an already-resolved scalar range beneath the transactional boundary.
+    pub(crate) fn replace_char_range_raw(&mut self, start: usize, end: usize, text: &str) {
+        self.content.remove(start..end);
+        self.content.insert(start, text);
         self.mark_changed();
     }
 
@@ -784,15 +794,22 @@ impl Buffer {
     /// Converts a canonical position to an LSP UTF-16 position without flattening
     /// the document. Canonical ranges cannot split a Unicode scalar or CRLF.
     pub(crate) fn position_to_lsp(&self, position: TextPosition) -> crate::lsp::Position {
-        let index = self.position_to_char_idx(position);
-        let line = self.content.char_to_line(index);
-        let start = self.content.line_to_char(line);
-        let character = self
-            .content
-            .slice(start..index)
-            .chars()
-            .map(char::len_utf16)
-            .sum();
+        let line_count = self.content.len_lines();
+        let line = position.line.min(line_count.saturating_sub(1));
+        let contents = self.content.line(line);
+        let scalar = if position.line >= line_count {
+            contents.len_chars()
+        } else {
+            position
+                .character
+                .min(self.line_char_len_without_ending(line))
+        };
+        let prefix = contents.slice(..scalar);
+        let character = if prefix.len_bytes() == scalar {
+            scalar
+        } else {
+            prefix.chars().map(char::len_utf16).sum()
+        };
         crate::lsp::Position { line, character }
     }
 
@@ -1987,6 +2004,32 @@ mod test {
         assert_eq!(buffer.column_to_char_index(3, 0), 3);
         assert_eq!(buffer.char_index_to_column(3, 0), 3);
         assert_eq!(buffer.position_to_char_idx(TextPosition::new(0, 99)), 3);
+    }
+
+    #[test]
+    fn lsp_positions_preserve_unicode_crlf_and_clamped_boundaries() {
+        let buffer = Buffer::new(None, "😀abc\r\nnext".to_string());
+        assert_eq!(
+            buffer.position_to_lsp(TextPosition::new(0, 1)),
+            crate::lsp::Position {
+                line: 0,
+                character: 2,
+            }
+        );
+        assert_eq!(
+            buffer.position_to_lsp(TextPosition::new(0, usize::MAX)),
+            crate::lsp::Position {
+                line: 0,
+                character: 5,
+            }
+        );
+        assert_eq!(
+            buffer.position_to_lsp(TextPosition::new(usize::MAX, 0)),
+            crate::lsp::Position {
+                line: 1,
+                character: 4,
+            }
+        );
     }
 
     #[test]

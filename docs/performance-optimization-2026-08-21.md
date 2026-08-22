@@ -172,20 +172,28 @@ navigation baselines were frozen after rebasing to `d92777c`.
 | ASCII automatic indentation columns | 71.81% |
 | Unicode automatic indentation columns | 71.42% |
 | Real-terminal YAML typing action handling | 71.04% |
+| Real-terminal full-document-LSP substitution | 70.47% |
 | Real-terminal YAML text-insertion events | 69.78% |
 | Real-terminal edited-window painting | 69.23% |
 | LSP completion filtering | 67.58% |
+| Real-terminal split-window substitution | 64.83% |
 | Vim first-nonblank line-start operators | 64.81% |
 | Structured picker ranking | 64.81% |
 | Real-terminal Markdown typing action handling | 64.30% |
 | Real-terminal incremental search window painting | 64.00% |
+| Real-terminal large-document substitution | 63.93% |
 | Shared Vim around paragraph text objects | 63.73% |
 | Shared Vim paragraph boundary operators | 63.42% |
+| Real-terminal CRLF substitution | 63.42% |
 | Shared Vim inner paragraph text objects | 63.01% |
 | Real-terminal Markdown text-insertion events | 62.37% |
+| Real-terminal Unicode and CRLF substitution | 61.37% |
 | Complete real-terminal interactive startup | 60.80% |
+| Real-terminal whole-document substitution | 60.66% |
+| Real-terminal bundled-plugin substitution | 60.34% |
 | Git workspace status directory indexing | 60.28% |
 | Real-terminal overlay and cursor composition | 60.00% |
+| Real-terminal Unicode substitution | 59.09% |
 | Git repository discovery and branch refresh | 58.73% |
 | Real-terminal YAML completion-aware edit frames | 58.12% |
 | Real-terminal Markdown completion-aware edit frames | 56.44% |
@@ -196,6 +204,7 @@ navigation baselines were frozen after rebasing to `d92777c`.
 | Real-terminal edit-invalidated YAML highlighting | 55.94% |
 | Real-terminal file-picker window painting | 55.56% |
 | Complete real-terminal file-picker frames | 55.42% |
+| Real-terminal incremental-LSP substitution | 54.67% |
 | Owned Husk JSON boundary conversion | 54.49% |
 | Complete real-terminal YAML interactive startup | 54.08% |
 | Bundled theme startup loading | 53.81% |
@@ -603,6 +612,27 @@ window contents, exact saved Unicode/CRLF bytes, and one undo transaction all
 remain intact. Every terminal run verified one completed render and one buffer
 notification; both language-server modes additionally verified one document
 notification and the exact synchronized source.
+
+Seven alternating real-terminal sessions per substitution scenario replaced
+every occurrence across 2,000 lines, with a separate 8,000-line fixture.
+Ordinary substitution fell from 7,423 to 2,920 microseconds, Unicode from
+7,933 to 3,245, CRLF from 8,001 to 2,927, and combined Unicode/CRLF from
+8,563 to 3,308. Bundled plugins fell from 7,587 to 3,009 microseconds,
+shared-buffer splits from 8,374 to 2,945, incremental LSP from 11,085 to
+5,025, full-document LSP from 10,483 to 3,096, and the 8,000-line fixture
+from 26,843 to 9,683. Line planning borrows contiguous Rope chunks, keeps
+scalar-coordinate ranges, and skips capture expansion for literal replacements.
+The shared transactional seam resolves each scalar range once; empty history,
+annotation, and mark bookkeeping avoids intermediate work while preserving
+real marks, jumps, and their fallback coordinates. Recognized substitute
+commands publish one completed frame instead of three, while bundled callbacks
+may legitimately publish one additional frame. Incremental LSP retains one
+original snapshot and all 2,000 exact changes inside one notification; known
+full-sync servers bypass unused incremental bookkeeping altogether. Regex
+captures, escaped delimiters, confirmations, visual ranges, Unicode UTF-16,
+CRLF, named marks, undo/redo, diagnostics, and external plugin barriers retain
+their original behavior. Substitute-command classification stays outside the
+recursive dispatcher so visual-block dot-repeat remains safe on a 2 MiB stack.
 
 Eleven alternating real-terminal runs reduced overlay and cursor composition
 from five to two microseconds. Each frame resolves cursor geometry once for

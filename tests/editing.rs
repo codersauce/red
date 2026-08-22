@@ -1691,6 +1691,38 @@ async fn substitute_does_not_match_the_carriage_return_in_crlf_buffers() {
 }
 
 #[tokio::test]
+async fn substitute_preserves_unicode_marks_across_undo_and_redo() {
+    let source = "😀 value one\r\n😀 value two\r\n😀 value three\r\n";
+    let replacement = "longer_value";
+    let mut harness =
+        EditorHarness::with_config(Buffer::new(None, source.to_string()), default_key_config());
+
+    harness.execute_action(Action::MoveDown).await.unwrap();
+    for _ in 0..8 {
+        harness.execute_action(Action::MoveRight).await.unwrap();
+    }
+    harness.execute_action(Action::SetMark('a')).await.unwrap();
+    harness
+        .execute_action(Action::Command(format!("%s/value/{replacement}/g")))
+        .await
+        .unwrap();
+
+    harness.assert_buffer_contents(&source.replace("value", replacement));
+    type_normal_keys(&mut harness, "`a").await;
+    harness.assert_cursor_at(8 + replacement.len() - "value".len(), 1);
+
+    harness.execute_action(Action::Undo).await.unwrap();
+    harness.assert_buffer_contents(source);
+    type_normal_keys(&mut harness, "`a").await;
+    harness.assert_cursor_at(8, 1);
+
+    harness.execute_action(Action::Redo).await.unwrap();
+    harness.assert_buffer_contents(&source.replace("value", replacement));
+    type_normal_keys(&mut harness, "`a").await;
+    harness.assert_cursor_at(8 + replacement.len() - "value".len(), 1);
+}
+
+#[tokio::test]
 async fn format_on_save_restores_save_as_identity_and_insert_transaction_after_sync_failure() {
     let temp = tempfile::tempdir().unwrap();
     let source = temp.path().join("source.rs");

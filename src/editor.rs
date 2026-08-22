@@ -1033,7 +1033,7 @@ pub enum SubstituteDecision {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PlannedSubstitution {
     start_char: usize,
-    end_char: usize,
+    range: TextRange,
     replacement: String,
 }
 
@@ -16014,30 +16014,68 @@ impl Editor {
             .build()
             .map_err(|error| anyhow::anyhow!("invalid substitute pattern: {error}"))?;
         let mut substitutions = Vec::new();
-        for line_index in command.start_line..=end_line {
-            let line = self.current_buffer().get(line_index).unwrap_or_default();
-            let line = line
+        let snapshot = self.current_buffer().contents_snapshot();
+        let mut line_start = snapshot.line_to_char(command.start_line);
+        for (offset, contents) in snapshot
+            .lines_at(command.start_line)
+            .take(end_line - command.start_line + 1)
+            .enumerate()
+        {
+            let line_index = command.start_line + offset;
+            let next_line_start = line_start + contents.len_chars();
+            let contents = contents
+                .as_str()
+                .map(Cow::Borrowed)
+                .unwrap_or_else(|| Cow::Owned(contents.to_string()));
+            let line = contents
                 .strip_suffix("\r\n")
-                .or_else(|| line.strip_suffix('\n'))
-                .unwrap_or(&line);
-            let line_start = self
-                .current_buffer()
-                .position_to_char_idx(TextPosition::new(line_index, /*character*/ 0));
-            for captures in regex.captures_iter(line) {
-                let matched = captures
-                    .get(/*index*/ 0)
-                    .expect("regex captures always include the full match");
-                let mut replacement = String::new();
-                captures.expand(&command.replacement, &mut replacement);
+                .or_else(|| contents.strip_suffix('\n'))
+                .unwrap_or(&contents);
+            let mut append = |matched: regex::Match<'_>, replacement: String| {
+                let prefix = &line[..matched.start()];
+                let start_character = if prefix.is_ascii() {
+                    prefix.len()
+                } else {
+                    prefix.chars().count()
+                };
+                let matched_text = &line[matched.start()..matched.end()];
+                let end_character = start_character
+                    + if matched_text.is_ascii() {
+                        matched_text.len()
+                    } else {
+                        matched_text.chars().count()
+                    };
                 substitutions.push(PlannedSubstitution {
-                    start_char: line_start + line[..matched.start()].chars().count(),
-                    end_char: line_start + line[..matched.end()].chars().count(),
+                    start_char: line_start + start_character,
+                    range: TextRange::new(
+                        TextPosition::new(line_index, start_character),
+                        TextPosition::new(line_index, end_character),
+                    ),
                     replacement,
                 });
-                if !command.replace_all {
-                    break;
+            };
+
+            if command.replacement.contains('$') {
+                for captures in regex.captures_iter(line) {
+                    let matched = captures
+                        .get(/*index*/ 0)
+                        .expect("regex captures always include the full match");
+                    let mut replacement = String::new();
+                    captures.expand(&command.replacement, &mut replacement);
+                    append(matched, replacement);
+                    if !command.replace_all {
+                        break;
+                    }
+                }
+            } else {
+                for matched in regex.find_iter(line) {
+                    append(matched, command.replacement.clone());
+                    if !command.replace_all {
+                        break;
+                    }
                 }
             }
+            line_start = next_line_start;
         }
         Ok(substitutions)
     }
@@ -16050,10 +16088,7 @@ impl Editor {
         let Some(substitution) = confirmation.substitutions.get(confirmation.current) else {
             return Ok(());
         };
-        let position = self
-            .current_buffer()
-            .char_idx_to_position(substitution.start_char);
-        self.move_to_text_position(position);
+        self.move_to_text_position(substitution.range.start);
         self.refresh_cursor_goal();
         self.set_legacy_message(Some(format!(
             "replace with {:?}? (y/n/a/q/l)",
@@ -16076,13 +16111,7 @@ impl Editor {
         substitutions.sort_by_key(|substitution| substitution.start_char);
         self.begin_transaction("substitute");
         for substitution in substitutions.into_iter().rev() {
-            let range = TextRange::new(
-                self.current_buffer()
-                    .char_idx_to_position(substitution.start_char),
-                self.current_buffer()
-                    .char_idx_to_position(substitution.end_char),
-            );
-            self.replace_range(range, &substitution.replacement);
+            self.replace_range(substitution.range, &substitution.replacement);
         }
         self.commit_transaction(self.cursor_snapshot());
         self.notify_change(runtime).await?;
@@ -24792,19 +24821,52 @@ impl Editor {
     }
 
     fn update_anchors_for_edit(&mut self, edit: AppliedTextEdit) {
-        self.transform_inline_history_for_edit(edit);
+        if !self.inline_history.conversations.is_empty()
+            || !self.inline_jobs.is_empty()
+            || self.inline_history_browser.is_some()
+        {
+            self.transform_inline_history_for_edit(edit);
+        }
         self.transform_snippet_anchors(edit);
         let buffer_id = self.current_buffer().id();
-        let buffer = &self.buffer_manager[self.buffer_manager.active_index()];
-        for comment in &mut self.inline_comments {
-            if comment.anchor.buffer_id != buffer_id {
-                continue;
+        if !self.inline_comments.is_empty() {
+            let buffer = &self.buffer_manager[self.buffer_manager.active_index()];
+            for comment in &mut self.inline_comments {
+                if comment.anchor.buffer_id != buffer_id {
+                    continue;
+                }
+                Self::transform_inline_comment_anchor(&mut comment.anchor, edit, buffer);
+                Self::transform_inline_comment_anchor(&mut comment.end_anchor, edit, buffer);
+                comment.refresh_staleness(buffer);
             }
-            Self::transform_inline_comment_anchor(&mut comment.anchor, edit, buffer);
-            Self::transform_inline_comment_anchor(&mut comment.end_anchor, edit, buffer);
-            comment.refresh_staleness(buffer);
+            self.refresh_history_annotation_states();
         }
-        self.refresh_history_annotation_states();
+
+        let has_marks = self
+            .local_marks
+            .get(&buffer_id)
+            .is_some_and(|marks| !marks.is_empty())
+            || self
+                .global_marks
+                .values()
+                .any(|anchor| anchor.buffer_id == buffer_id)
+            || self
+                .special_marks
+                .keys()
+                .any(|(id, mark)| *id == buffer_id && *mark != '.')
+            || self.window_manager.windows().into_iter().any(|window| {
+                window
+                    .jump_list
+                    .entries
+                    .iter()
+                    .any(|entry| entry.buffer_id == buffer_id)
+            });
+        // Every caller replaces the last-change mark immediately after this
+        // method, so its old anchor never needs an intermediate transformation.
+        if !has_marks {
+            return;
+        }
+
         if let Some(marks) = self.local_marks.get_mut(&buffer_id) {
             for anchor in marks.values_mut() {
                 Self::transform_anchor_for_edit(
@@ -24825,8 +24887,8 @@ impl Editor {
                 );
             }
         }
-        for ((anchor_buffer_id, _), anchor) in &mut self.special_marks {
-            if *anchor_buffer_id == buffer_id {
+        for ((anchor_buffer_id, mark), anchor) in &mut self.special_marks {
+            if *anchor_buffer_id == buffer_id && *mark != '.' {
                 Self::transform_anchor_for_edit(
                     anchor,
                     edit.start_char,
@@ -24870,7 +24932,9 @@ impl Editor {
             .chain(
                 self.special_marks
                     .iter()
-                    .filter(|((anchor_buffer_id, _), _)| *anchor_buffer_id == buffer_id)
+                    .filter(|((anchor_buffer_id, mark), _)| {
+                        *anchor_buffer_id == buffer_id && *mark != '.'
+                    })
                     .map(|(_, anchor)| anchor),
             )
             .map(|anchor| anchor.char_index)
@@ -24898,7 +24962,7 @@ impl Editor {
             .for_each(update_fallback);
         self.special_marks
             .iter_mut()
-            .filter(|((anchor_buffer_id, _), _)| *anchor_buffer_id == buffer_id)
+            .filter(|((anchor_buffer_id, mark), _)| *anchor_buffer_id == buffer_id && *mark != '.')
             .map(|(_, anchor)| anchor)
             .for_each(update_fallback);
         for window in self.window_manager.windows_mut() {
@@ -24931,19 +24995,40 @@ impl Editor {
                     )
                 })
             });
-        let pending =
-            (self.config.lsp.enabled && self.current_buffer().file.is_some()).then(|| {
-                let source = self.current_buffer();
-                (
-                    source.id(),
-                    source.revision(),
-                    source.contents_snapshot(),
-                    crate::lsp::Range {
-                        start: source.position_to_lsp(range.start),
-                        end: source.position_to_lsp(range.end),
-                    },
-                )
-            });
+        let pending = if self.config.lsp.enabled {
+            let source = self.current_buffer();
+            source.file.as_deref().and_then(|file| {
+                let requires_snapshot = self
+                    .lsp_coordinator
+                    .requires_before_snapshot(source.id(), source.revision());
+                let full_sync = requires_snapshot
+                    && self
+                        .lsp
+                        .server_capabilities_for_file(file)
+                        .is_some_and(|capabilities| {
+                            !matches!(
+                                capabilities
+                                    .text_document_sync
+                                    .as_ref()
+                                    .and_then(|sync| sync.change_kind()),
+                                Some(crate::lsp::TextDocumentSyncKind::Incremental)
+                            )
+                        });
+                (!full_sync).then(|| {
+                    (
+                        source.id(),
+                        source.revision(),
+                        requires_snapshot.then(|| source.contents_snapshot()),
+                        crate::lsp::Range {
+                            start: source.position_to_lsp(range.start),
+                            end: source.position_to_lsp(range.end),
+                        },
+                    )
+                })
+            })
+        } else {
+            None
+        };
         let Some(edit) =
             apply_transactional_replacement(self.current_buffer_mut(), range, new_text)
         else {

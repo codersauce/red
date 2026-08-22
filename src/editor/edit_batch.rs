@@ -120,6 +120,8 @@ impl Editor {
                     | Action::ReplaceCharsAtCursor { .. }
                     | Action::ReplaceLineAt(_, _)
                     | Action::ReplaceSelection(_)
+                    | Action::Substitute(_)
+                    | Action::ConfirmSubstitute(_)
                     | Action::JoinLines(_)
                     | Action::JoinLinesKeepSpaces(_)
                     | Action::JoinLinesInRange { .. }
@@ -318,6 +320,15 @@ impl Editor {
         })
     }
 
+    // Keep parsing temporaries out of recursive action futures and their 2 MiB stack.
+    #[inline(never)]
+    fn action_is_local_substitute_command(&self, action: &Action) -> bool {
+        let Action::Command(command) = action else {
+            return false;
+        };
+        matches!(self.parse_substitute_command(command), Ok(Some(_)))
+    }
+
     #[async_recursion::async_recursion]
     pub(super) async fn execute_with_tracking(
         &mut self,
@@ -326,7 +337,8 @@ impl Editor {
         runtime: &mut Runtime,
         tracking: bool,
     ) -> anyhow::Result<bool> {
-        let local = Self::action_is_batch_local(action);
+        let local =
+            Self::action_is_batch_local(action) || self.action_is_local_substitute_command(action);
         let barrier = self.edit_batch.is_active() && !local;
         if barrier {
             self.publish_edit_batch(buffer, runtime).await?;
@@ -548,6 +560,25 @@ mod tests {
             (h.editor.cx, h.editor.buffer_line()),
             (inserted.len() - 1, 0)
         );
+
+        h.keys("u").await;
+        assert_eq!(h.editor.current_buffer().contents(), source);
+        h.event(KeyCode::Char('r'), KeyModifiers::CONTROL).await;
+        assert_eq!(h.editor.current_buffer().contents(), expected);
+    }
+
+    #[tokio::test]
+    async fn substitute_publishes_one_unicode_crlf_frame_and_preserves_undo() {
+        let source = "fn value_😀() {}\r\nfn value_2() {}\r\n";
+        let expected = source.replace("value", "replacement");
+        let mut h = Harness::new(source);
+        h.keys(":%s/value/replacement/g").await;
+        let before = h.counts();
+
+        h.event(KeyCode::Enter, KeyModifiers::NONE).await;
+
+        h.assert_one_publication(before);
+        assert_eq!(h.editor.current_buffer().contents(), expected);
 
         h.keys("u").await;
         assert_eq!(h.editor.current_buffer().contents(), source);
