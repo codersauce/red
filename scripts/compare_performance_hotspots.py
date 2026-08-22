@@ -51,6 +51,8 @@ SCENARIOS = (
     "lsp-changes",
     "textarea-typing",
     "startup-config",
+    "startup-theme",
+    "theme-colors",
     "husk-completion",
     "husk-config",
     "husk-update",

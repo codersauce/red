@@ -20,7 +20,7 @@ use red::{
     },
     preferences::PreferencesStore,
     session::SessionStore,
-    theme::{parse_vscode_theme, Style, Theme},
+    theme::{parse_vscode_theme, parse_vscode_theme_contents, Style, Theme},
     ui::{CompletionUI, Picker, PickerItem, PickerOptions},
     undo::{CursorSnapshot, TextPosition, TextRange, UndoHistory},
 };
@@ -88,6 +88,8 @@ const LSP_INCREMENTAL_CHANGES: usize = 256;
 const TEXTAREA_INITIAL_BYTES: usize = 32 * 1024;
 const TEXTAREA_INSERTIONS: usize = 256;
 const STARTUP_CONFIG_LOADS: usize = 24;
+const STARTUP_THEME_LOADS: usize = 256;
+const THEME_COLOR_PARSES: usize = 16_384;
 
 fn main() -> Result<()> {
     let scenario = std::env::args().nth(1).unwrap_or_else(|| "all".into());
@@ -215,6 +217,12 @@ fn main() -> Result<()> {
     }
     if scenario == "all" || scenario == "startup-config" {
         results.push(benchmark_startup_configuration_loading()?);
+    }
+    if scenario == "all" || scenario == "startup-theme" {
+        results.push(benchmark_startup_theme_loading()?);
+    }
+    if scenario == "all" || scenario == "theme-colors" {
+        results.push(benchmark_theme_color_parsing()?);
     }
 
     anyhow::ensure!(
@@ -1478,6 +1486,42 @@ sync_on_paste = false
         "startup_user_configuration_loading",
         started,
         STARTUP_CONFIG_LOADS,
+    ))
+}
+
+fn benchmark_startup_theme_loading() -> Result<serde_json::Value> {
+    let contents = red::assets::bundled_theme("red.json")
+        .ok_or_else(|| anyhow::anyhow!("embedded default theme is missing"))?;
+
+    let started = Instant::now();
+    for _ in 0..STARTUP_THEME_LOADS {
+        let theme = parse_vscode_theme_contents(black_box(contents))?;
+        anyhow::ensure!(
+            theme.name == "red" && !theme.token_styles.is_empty() && !theme.colors.is_empty(),
+            "startup theme benchmark lost bundled workbench or syntax colors"
+        );
+        black_box(theme);
+    }
+    Ok(report(
+        "startup_bundled_theme_loading",
+        started,
+        STARTUP_THEME_LOADS,
+    ))
+}
+
+fn benchmark_theme_color_parsing() -> Result<serde_json::Value> {
+    let colors = ["#101014", "#D8D8DE", "#E5484D", "#2B2B36C0"];
+
+    let started = Instant::now();
+    for index in 0..THEME_COLOR_PARSES {
+        black_box(red::color::parse_rgb(black_box(
+            colors[index % colors.len()],
+        ))?);
+    }
+    Ok(report(
+        "theme_hex_color_parsing",
+        started,
+        THEME_COLOR_PARSES,
     ))
 }
 

@@ -72,8 +72,8 @@ pub fn parse_vscode_theme(file: &str) -> anyhow::Result<Theme> {
 }
 
 pub fn parse_vscode_theme_contents(contents: &str) -> anyhow::Result<Theme> {
-    let contents = StripComments::new(contents.as_bytes());
-    let vscode_theme: VsCodeTheme = serde_json::from_reader(contents)?;
+    let vscode_theme: VsCodeTheme = serde_json::from_str(contents)
+        .or_else(|_| serde_json::from_reader(StripComments::new(contents.as_bytes())))?;
     let default_theme = Theme::default();
 
     let error_style = vscode_theme.style_from("editorError.foreground", "editorError.background");
@@ -84,24 +84,13 @@ pub fn parse_vscode_theme_contents(contents: &str) -> anyhow::Result<Theme> {
         });
 
     let gutter_style = Style {
-        fg: vscode_theme
-            .colors
-            .iter()
-            .find(|(c, _)| **c == "editorLineNumber.foreground")
-            .and_then(|(_, hex)| parse_color_value(hex).ok()),
-        bg: vscode_theme
-            .colors
-            .iter()
-            .find(|(c, _)| **c == "editorLineNumber.background")
-            .and_then(|(_, hex)| parse_color_value(hex).ok()),
+        fg: vscode_theme.color_from("editorLineNumber.foreground"),
+        bg: vscode_theme.color_from("editorLineNumber.background"),
         ..Default::default()
     };
 
     let line_highlight_style = vscode_theme
-        .colors
-        .iter()
-        .find(|(c, _)| **c == "editor.lineHighlightBackground")
-        .and_then(|(_, hex)| parse_color_value(hex).ok())
+        .color_from("editor.lineHighlightBackground")
         .map(|color| Style {
             bg: Some(color),
             ..Default::default()
@@ -126,20 +115,14 @@ pub fn parse_vscode_theme_contents(contents: &str) -> anyhow::Result<Theme> {
         });
 
     let find_match_style = vscode_theme
-        .colors
-        .iter()
-        .find(|(c, _)| **c == "editor.findMatchBackground")
-        .and_then(|(_, hex)| parse_color_value(hex).ok())
+        .color_from("editor.findMatchBackground")
         .map(|color| Style {
             bg: Some(color),
             ..Default::default()
         });
 
     let find_match_highlight_style = vscode_theme
-        .colors
-        .iter()
-        .find(|(c, _)| **c == "editor.findMatchHighlightBackground")
-        .and_then(|(_, hex)| parse_color_value(hex).ok())
+        .color_from("editor.findMatchHighlightBackground")
         .map(|color| Style {
             bg: Some(color),
             ..Default::default()
@@ -180,17 +163,10 @@ pub fn parse_vscode_theme_contents(contents: &str) -> anyhow::Result<Theme> {
     };
     let ui_style = vscode_theme.ui_style(&editor_style, selection_style.as_ref());
 
-    // partition token_colors into a collection of the ones that have scope and the ones that don't
-    let (token_colors_with_scope, _token_colors_without_scope): (
-        Vec<VsCodeTokenColor>,
-        Vec<VsCodeTokenColor>,
-    ) = vscode_theme
+    let token_styles = vscode_theme
         .token_colors
         .into_iter()
-        .partition(|tc| tc.scope.is_some());
-
-    let token_styles = token_colors_with_scope
-        .into_iter()
+        .filter(|token| token.scope.is_some())
         .map(|tc| tc.try_into())
         .collect::<Result<Vec<TokenStyle>, _>>()?;
     let colors = vscode_theme
@@ -980,6 +956,43 @@ mod test {
     #[test]
     fn test_theme_with_comments() {
         parse_vscode_theme("src/fixtures/nord.json").unwrap();
+    }
+
+    #[test]
+    fn direct_json_theme_loading_preserves_comment_markers_and_commented_files() {
+        for (contents, expected_name) in [
+            (
+                r##"{
+                    "name": "https://example.test/theme/*literal*/",
+                    "colors": { "editor.background": "#102030" },
+                    "tokenColors": []
+                }"##,
+                "https://example.test/theme/*literal*/",
+            ),
+            (
+                r##"{
+                    // VS Code permits line comments.
+                    "name": "commented",
+                    "colors": {
+                        /* Workbench colors also allow block comments. */
+                        "editor.background": "#102030"
+                    },
+                    "tokenColors": []
+                }"##,
+                "commented",
+            ),
+        ] {
+            let theme = parse_vscode_theme_contents(contents).unwrap();
+            assert_eq!(theme.name, expected_name);
+            assert_eq!(
+                theme.style.bg,
+                Some(Color::Rgb {
+                    r: 16,
+                    g: 32,
+                    b: 48,
+                })
+            );
+        }
     }
 
     #[test]

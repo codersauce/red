@@ -84,6 +84,7 @@ navigation baselines were frozen after rebasing to `d92777c`.
 | Default editor status-line rendering | 83.45% |
 | Workspace inline content search | 82.60% |
 | Long-line Vim backward word motion | 80.33% |
+| Theme hexadecimal color parsing | 79.71% |
 | Detached incremental frame serialization | 79.06% |
 | Shared Vim sentence navigation | 74.63% |
 | LSP incremental large-document changes | 74.61% |
@@ -95,6 +96,7 @@ navigation baselines were frozen after rebasing to `d92777c`.
 | Plugin cursor-event delivery | 56.35% |
 | In-buffer search navigation | 55.98% |
 | Owned Husk JSON boundary conversion | 54.49% |
+| Bundled theme startup loading | 53.81% |
 | Complete editor frame composition | 52.88% |
 | Bundled plugin startup | 51.22% |
 
@@ -130,6 +132,14 @@ key-hint, and clipboard settings. Eleven alternating samples reduced the median
 from 93,056 to 14,854 microseconds while preserving invalid-field diagnostics,
 unknown-field recovery, strict overrides, plugin quarantine, agent boundaries,
 and language-server capability validation.
+
+Bundled-theme loading was measured across 256 complete parses of the embedded
+default theme. Eleven alternating samples reduced the median from 16,878 to
+7,796 microseconds while retaining VS Code line and block comments, literal
+comment markers inside JSON strings, scoped token styles, and workbench-color
+fallbacks. The underlying hexadecimal color parser separately improved from
+488 to 99 microseconds over 16,384 six- and eight-digit colors while preserving
+shorthand, named colors, transparency, alpha channels, and invalid-input errors.
 
 Real detached-terminal coverage separately exercised editing, 32 KiB of Unicode
 paste, repeated resizes, reattachment, and owner shutdown. Detached-frame median
