@@ -351,6 +351,13 @@ impl Buffer {
         (text, offsets)
     }
 
+    /// Borrows complete lines before `line` in reverse without flattening the rope.
+    pub(crate) fn preceding_lines(&self, line: usize) -> ropey::iter::Lines<'_> {
+        self.content
+            .lines_at(line.min(self.content.len_lines()))
+            .reversed()
+    }
+
     /// Returns at most `max_chars` Unicode scalar values from one line.
     pub(crate) fn line_prefix_contents(&self, line: usize, max_chars: usize) -> String {
         let line_count = self.content.len_lines();
@@ -2072,6 +2079,22 @@ mod test {
         assert_eq!(unicode.line_prefix_contents(0, 2), "αβ");
         assert_eq!(unicode.line_prefix_contents(1, 99), "終わり");
         assert_eq!(unicode.line_prefix_contents(2, 99), "");
+        assert_eq!(
+            unicode
+                .preceding_lines(2)
+                .map(|line| line.to_string())
+                .collect::<Vec<_>>(),
+            vec!["終わり", "αβγ\r\n"]
+        );
+        assert!(unicode.preceding_lines(0).next().is_none());
+        assert_eq!(
+            unicode
+                .preceding_lines(usize::MAX)
+                .next()
+                .unwrap()
+                .to_string(),
+            "終わり"
+        );
     }
 
     #[test]

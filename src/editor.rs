@@ -7084,13 +7084,24 @@ impl Editor {
     }
 
     fn markdown_fence_start(buffer: &Buffer, viewport_start: usize) -> Option<usize> {
-        let earliest = viewport_start.saturating_sub(MAX_MARKDOWN_FENCE_LOOKBACK_LINES);
-        if buffer.line_range_byte_len(earliest, viewport_start) > 64 * 1024 {
-            return None;
-        }
-        let (source, offsets) = buffer.line_range_contents_with_offsets(earliest, viewport_start);
-        for (line_index, bounds) in offsets.windows(2).enumerate().rev() {
-            let trimmed = source[bounds[0]..bounds[1]].trim_end_matches(['\r', '\n']);
+        let mut inspected_bytes = 0_usize;
+        for (offset, line) in buffer
+            .preceding_lines(viewport_start)
+            .take(MAX_MARKDOWN_FENCE_LOOKBACK_LINES)
+            .enumerate()
+        {
+            inspected_bytes = inspected_bytes.saturating_add(line.len_bytes());
+            if inspected_bytes > 64 * 1024 {
+                return None;
+            }
+            let joined;
+            let source = if let Some(source) = line.as_str() {
+                source
+            } else {
+                joined = line.to_string();
+                &joined
+            };
+            let trimmed = source.trim_end_matches(['\r', '\n']);
             let indentation = trimmed.len() - trimmed.trim_start_matches(' ').len();
             if indentation > 3 {
                 continue;
@@ -7113,7 +7124,7 @@ impl Editor {
             if character == '`' && information.contains('`') {
                 continue;
             }
-            return Some(earliest + line_index);
+            return Some(viewport_start - offset - 1);
         }
         None
     }
