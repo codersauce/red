@@ -96,6 +96,9 @@ impl<'buffer> MotionResolver<'buffer> {
     /// Computes the range consumed by `w` or `W`, preserving Vim's `cw` semantics.
     #[must_use]
     pub fn word_range(&self, count: u16, change_word: bool, big_word: bool) -> Option<TextRange> {
+        if count == 1 && self.buffer.is_ascii() {
+            return self.ascii_word_range(change_word, big_word);
+        }
         let start = self.cursor;
         let start_index = self.buffer.position_to_char_idx(start);
         let snapshot = self.buffer.contents_snapshot();
@@ -184,6 +187,53 @@ impl<'buffer> MotionResolver<'buffer> {
         }
 
         let end = self.buffer.char_idx_to_position(start_index + end);
+        (start != end || change_word).then(|| TextRange::new(start, end))
+    }
+
+    fn ascii_word_range(&self, change_word: bool, big_word: bool) -> Option<TextRange> {
+        let start = self.cursor;
+        let start_index = self.buffer.position_to_char_idx(start);
+        let snapshot = self.buffer.contents_snapshot();
+        let mut characters = snapshot.chars_at(start_index).peekable();
+        let first = *characters.peek()?;
+        let mut length = 0;
+
+        if matches!(first, '\r' | '\n') {
+            if !change_word {
+                characters.next();
+                length += 1;
+                if first == '\r' && characters.peek() == Some(&'\n') {
+                    length += 1;
+                }
+            }
+        } else {
+            let kind = |character: char| {
+                if character.is_whitespace() {
+                    0
+                } else if big_word || character.is_alphanumeric() || character == '_' {
+                    1
+                } else {
+                    2
+                }
+            };
+            let first_kind = kind(first);
+            while characters.peek().is_some_and(|character| {
+                !matches!(character, '\r' | '\n') && kind(*character) == first_kind
+            }) {
+                characters.next();
+                length += 1;
+            }
+            if !change_word || first.is_whitespace() {
+                while characters.peek().is_some_and(|character| {
+                    character.is_whitespace() && !matches!(character, '\r' | '\n')
+                }) {
+                    characters.next();
+                    length += 1;
+                }
+            }
+        }
+
+        let end = self.buffer.char_idx_to_position(start_index + length);
         (start != end || change_word).then(|| TextRange::new(start, end))
     }
 
@@ -1130,6 +1180,59 @@ mod tests {
                 .word_target(1, true, false, true),
             Some(TextPosition::new(0, offset))
         );
+    }
+
+    #[test]
+    fn indexed_ascii_word_operators_match_unicode_reference_semantics() {
+        for text in [
+            "",
+            "word",
+            "word  next",
+            "  next",
+            "\tword",
+            "word,next",
+            ",,word",
+            "word\r\nnext",
+            "\r\nnext",
+            "\nnext",
+            "word  \nnext",
+        ] {
+            let ascii = Buffer::new(Some("ascii.txt".to_string()), text.to_string());
+            let unicode = Buffer::new(Some("unicode.txt".to_string()), format!("λ\n{text}"));
+            for character in [0, 1, text.len().saturating_sub(1), text.len(), usize::MAX] {
+                for change_word in [false, true] {
+                    for big_word in [false, true] {
+                        let actual = MotionResolver::new(&ascii, TextPosition::new(0, character))
+                            .word_range(1, change_word, big_word)
+                            .map(|range| {
+                                (
+                                    range.start.line,
+                                    range.start.character,
+                                    range.end.line,
+                                    range.end.character,
+                                    ascii.text_in_range(range),
+                                )
+                            });
+                        let expected =
+                            MotionResolver::new(&unicode, TextPosition::new(1, character))
+                                .word_range(1, change_word, big_word)
+                                .map(|range| {
+                                    (
+                                        range.start.line - 1,
+                                        range.start.character,
+                                        range.end.line - 1,
+                                        range.end.character,
+                                        unicode.text_in_range(range),
+                                    )
+                                });
+                        assert_eq!(
+                            actual, expected,
+                            "{text:?} column={character} change={change_word} big={big_word}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]

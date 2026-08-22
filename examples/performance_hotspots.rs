@@ -99,6 +99,7 @@ const GIT_STATUS_INDEX_BUILDS: usize = 32;
 const GIT_STATUS_REFRESHES: usize = 32;
 const BUFFER_LINE_LOOKUPS: usize = 4_096;
 const SPARSE_REGEX_SEARCHES: usize = 128;
+const WORD_OPERATOR_LOOKUPS: usize = 512;
 const LAYOUT_CURSOR_LOOKUPS: usize = 2_048;
 const TEXTAREA_VIM_MOTIONS: usize = 2_048;
 const TEXTAREA_DELIMITER_MOTIONS: usize = 1_024;
@@ -171,6 +172,12 @@ fn main() -> Result<()> {
     }
     if scenario == "all" || scenario == "resolver-range" {
         results.push(benchmark_shared_word_operator());
+    }
+    if scenario == "all" || scenario == "resolver-change-word" {
+        results.push(benchmark_prefix_word_operator(/*change_word*/ true)?);
+    }
+    if scenario == "all" || scenario == "resolver-delete-word" {
+        results.push(benchmark_prefix_word_operator(/*change_word*/ false)?);
     }
     if scenario == "all" || scenario == "paragraph" {
         results.push(benchmark_paragraph_motion());
@@ -848,6 +855,32 @@ fn benchmark_shared_word_operator() -> serde_json::Value {
         ));
     }
     report("shared_word_operator_motion", started, WORD_MOTION_LOOKUPS)
+}
+
+fn benchmark_prefix_word_operator(change_word: bool) -> Result<serde_json::Value> {
+    let suffix = "ordinary_identifier and retained editor source ".repeat(512);
+    let buffer = Buffer::new(None, format!("target_word  {suffix}"));
+    let resolver = MotionResolver::new(&buffer, TextPosition::new(0, 0));
+    let started = Instant::now();
+    for _ in 0..WORD_OPERATOR_LOOKUPS {
+        let range = resolver
+            .word_range(/*count*/ 1, change_word, /*big_word*/ false)
+            .ok_or_else(|| anyhow::anyhow!("Vim word operator lost its selected range"))?;
+        anyhow::ensure!(
+            range.end.character == if change_word { 11 } else { 13 },
+            "Vim word operator changed its trailing-whitespace semantics"
+        );
+        black_box(range);
+    }
+    Ok(report(
+        if change_word {
+            "shared_vim_ascii_change_word_operator"
+        } else {
+            "shared_vim_ascii_delete_word_operator"
+        },
+        started,
+        WORD_OPERATOR_LOOKUPS,
+    ))
 }
 
 fn benchmark_paragraph_motion() -> serde_json::Value {

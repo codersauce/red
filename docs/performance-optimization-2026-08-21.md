@@ -57,6 +57,8 @@ navigation baselines were frozen after rebasing to `d92777c`.
 | Husk unchanged configuration refresh | 99.99% |
 | Neo-tree repeated row selection | 99.98% |
 | Shared Vim keyword word text objects | 99.89% |
+| Shared Vim ASCII change-word operators | 99.88% |
+| Shared Vim ASCII delete-word operators | 99.87% |
 | Shared Vim whitespace-delimited WORD objects | 99.80% |
 | Crash-recovery buffer restoration | 99.77% |
 | Repeated themed syntax highlighting | 99.61% |
@@ -236,6 +238,13 @@ alternating release-build samples reduced keyword-object medians from 1,698,623
 to 1,816 microseconds and WORD-object medians from 1,181,118 to 2,416
 microseconds while preserving punctuation groups, leading/trailing whitespace,
 tabs, out-of-range cursors, inner/around semantics, and Unicode grapheme rules.
+
+Shared Vim change-word and delete-word operators were independently measured
+across 512 production selections before a long untouched ASCII document tail.
+Eleven alternating release-build samples reduced change medians from 134,874 to
+167 microseconds and delete medians from 134,737 to 172 microseconds while
+preserving keyword versus WORD groups, punctuation, leading and trailing
+whitespace, CRLF, counts, out-of-range cursors, and Unicode grapheme fallback.
 
 Shared Vim paragraph objects were independently measured across 128 inner and
 128 around selections spanning 768-line paragraphs. Eleven alternating
