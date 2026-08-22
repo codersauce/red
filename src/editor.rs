@@ -6771,6 +6771,9 @@ impl Editor {
     }
 
     fn grapheme_to_char_on_line(&self, x: usize, y: usize) -> usize {
+        if x == 0 {
+            return 0;
+        }
         let buffer = self.current_buffer();
         if buffer.is_ascii() {
             let contents = buffer.contents_snapshot();
@@ -17597,34 +17600,28 @@ impl Editor {
 
     fn symbol_under_cursor(&self) -> String {
         let position = self.cursor_text_position();
-        let Some(line) = self.current_buffer().get(position.line) else {
+        let contents = self.current_buffer().contents_snapshot();
+        let Some(line) = contents.get_line(position.line) else {
             return String::new();
         };
-        let characters = line.chars().collect::<Vec<_>>();
         let is_symbol = |character: char| character.is_alphanumeric() || character == '_';
-        let mut cursor = position.character.min(characters.len());
-        if cursor == characters.len()
-            || !characters
-                .get(cursor)
-                .is_some_and(|value| is_symbol(*value))
-        {
+        let length = line.len_chars();
+        let mut cursor = position.character.min(length);
+        if cursor == length || !line.get_char(cursor).is_some_and(is_symbol) {
             cursor = cursor.saturating_sub(1);
         }
-        if !characters
-            .get(cursor)
-            .is_some_and(|value| is_symbol(*value))
-        {
+        if !line.get_char(cursor).is_some_and(is_symbol) {
             return String::new();
         }
         let mut start = cursor;
-        while start > 0 && is_symbol(characters[start - 1]) {
+        while start > 0 && line.get_char(start - 1).is_some_and(is_symbol) {
             start -= 1;
         }
         let mut end = cursor + 1;
-        while end < characters.len() && is_symbol(characters[end]) {
+        while end < length && line.get_char(end).is_some_and(is_symbol) {
             end += 1;
         }
-        characters[start..end].iter().collect()
+        line.slice(start..end).to_string()
     }
 
     fn word_motion_range(
@@ -17751,10 +17748,18 @@ impl Editor {
     }
 
     fn line_character_len(&self, line: usize) -> usize {
-        self.current_buffer()
-            .get(line)
-            .map(|contents| trim_line_ending(&contents).chars().count())
-            .unwrap_or(0)
+        let contents = self.current_buffer().contents_snapshot();
+        let Some(line) = contents.get_line(line) else {
+            return 0;
+        };
+        let mut length = line.len_chars();
+        if line.get_char(length.saturating_sub(1)) == Some('\n') {
+            length -= 1;
+        }
+        if line.get_char(length.saturating_sub(1)) == Some('\r') {
+            length -= 1;
+        }
+        length
     }
 
     fn line_end_motion_range(&self, count: u16) -> TextRange {
@@ -29645,6 +29650,22 @@ impl Editor {
         }
     }
 
+    /// Reads the scalar boundary used directly or by Vim line-end operators.
+    #[doc(hidden)]
+    pub fn benchmark_scalar_line_boundary(&self, operator: bool) -> usize {
+        if operator {
+            self.line_end_motion_range(/*count*/ 1).end.character
+        } else {
+            self.line_character_len(self.buffer_line())
+        }
+    }
+
+    /// Extracts the production initial symbol used by language-server rename.
+    #[doc(hidden)]
+    pub fn benchmark_rename_symbol(&self) -> String {
+        self.symbol_under_cursor()
+    }
+
     #[doc(hidden)]
     pub fn test_cx(&self) -> usize {
         self.cx
@@ -36834,6 +36855,85 @@ builtin = "rust"
                         column,
                         "missing buffer {contents:?} line={line} column={column}"
                     );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn indexed_scalar_line_boundaries_and_symbols_preserve_unicode_and_crlf() {
+        for contents in [
+            "alpha beta\nsecond",
+            "name_42! next\r\n\r\nfinal",
+            "λvariable終 e\u{301}clair 👋\nnext",
+            "\n",
+            "punctuation!? _done",
+        ] {
+            let mut editor = test_editor(/*width*/ 80, /*height*/ 24);
+            editor
+                .buffer_manager
+                .replace_buffers(vec![Buffer::new(None, contents.to_string())]);
+            for line in [0, 1, 2, 9] {
+                let source = editor.current_buffer().get(line);
+                let expected_length = source
+                    .as_deref()
+                    .map(|text| trim_line_ending(text).chars().count())
+                    .unwrap_or_default();
+                assert_eq!(
+                    editor.line_character_len(line),
+                    expected_length,
+                    "scalar length {contents:?} line={line}"
+                );
+                for column in [0, 1, 2, 5, 9, 30, usize::MAX] {
+                    editor.test_set_viewport_cursor(line, column, /*cy*/ 0);
+                    let character = source
+                        .as_deref()
+                        .map(|text| grapheme_to_char(text.trim_end_matches('\n'), column))
+                        .unwrap_or(column);
+                    let expected_symbol = source
+                        .as_deref()
+                        .map(|text| {
+                            let characters = text.chars().collect::<Vec<_>>();
+                            let is_symbol = |value: char| value.is_alphanumeric() || value == '_';
+                            let mut cursor = character.min(characters.len());
+                            if cursor == characters.len()
+                                || !characters.get(cursor).copied().is_some_and(is_symbol)
+                            {
+                                cursor = cursor.saturating_sub(1);
+                            }
+                            if !characters.get(cursor).copied().is_some_and(is_symbol) {
+                                return String::new();
+                            }
+                            let mut start = cursor;
+                            while start > 0 && is_symbol(characters[start - 1]) {
+                                start -= 1;
+                            }
+                            let mut end = cursor + 1;
+                            while end < characters.len() && is_symbol(characters[end]) {
+                                end += 1;
+                            }
+                            characters[start..end].iter().collect()
+                        })
+                        .unwrap_or_default();
+                    assert_eq!(
+                        editor.benchmark_rename_symbol(),
+                        expected_symbol,
+                        "symbol {contents:?} line={line} column={column}"
+                    );
+                    if source.is_some() {
+                        let end_line = line.min(editor.last_navigable_line());
+                        let expected_end = editor
+                            .current_buffer()
+                            .get(end_line)
+                            .map(|text| trim_line_ending(&text).chars().count())
+                            .unwrap_or_default();
+                        let range = editor.line_end_motion_range(/*count*/ 1);
+                        assert_eq!(
+                            (range.end.line, range.end.character),
+                            (end_line, expected_end),
+                            "line end {contents:?} line={line} column={column}"
+                        );
+                    }
                 }
             }
         }

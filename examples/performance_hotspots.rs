@@ -222,6 +222,32 @@ fn main() -> Result<()> {
             /*language_server*/ true, /*window_snapshot*/ true,
         )?);
     }
+    if scenario == "all" || scenario == "editor-line-scalar-ascii" {
+        results.push(benchmark_editor_scalar_line_boundary(
+            /*unicode*/ false, /*operator*/ false,
+        )?);
+    }
+    if scenario == "all" || scenario == "editor-line-scalar-unicode" {
+        results.push(benchmark_editor_scalar_line_boundary(
+            /*unicode*/ true, /*operator*/ false,
+        )?);
+    }
+    if scenario == "all" || scenario == "editor-line-end-ascii" {
+        results.push(benchmark_editor_scalar_line_boundary(
+            /*unicode*/ false, /*operator*/ true,
+        )?);
+    }
+    if scenario == "all" || scenario == "editor-line-end-unicode" {
+        results.push(benchmark_editor_scalar_line_boundary(
+            /*unicode*/ true, /*operator*/ true,
+        )?);
+    }
+    if scenario == "all" || scenario == "editor-rename-ascii" {
+        results.push(benchmark_editor_rename_symbol(/*unicode*/ false)?);
+    }
+    if scenario == "all" || scenario == "editor-rename-unicode" {
+        results.push(benchmark_editor_rename_symbol(/*unicode*/ true)?);
+    }
     if scenario == "all" || scenario == "paragraph" {
         results.push(benchmark_paragraph_motion());
     }
@@ -1099,6 +1125,86 @@ fn benchmark_editor_cursor_position(
         },
         started,
         TEXTAREA_VIM_MOTIONS,
+    ))
+}
+
+fn benchmark_editor_scalar_line_boundary(
+    unicode: bool,
+    operator: bool,
+) -> Result<serde_json::Value> {
+    let contents = if unicode {
+        "identifiant_λ👋 ".repeat(1_024)
+    } else {
+        "ordinary_identifier ".repeat(1_024)
+    };
+    let expected = contents.chars().count();
+    let mut config = Config::default();
+    config.lsp.enabled = false;
+    let editor = Editor::with_size(
+        Box::new(LspManager::new(config.lsp.clone())),
+        120,
+        40,
+        config,
+        Theme::default(),
+        vec![Buffer::new(None, contents)],
+    )?;
+    let started = Instant::now();
+    for _ in 0..TEXTAREA_VIM_MOTIONS {
+        let boundary = editor.benchmark_scalar_line_boundary(operator);
+        anyhow::ensure!(
+            boundary == expected,
+            "editor scalar boundary changed its Unicode position or Vim line-end range"
+        );
+        black_box(boundary);
+    }
+    Ok(report(
+        match (unicode, operator) {
+            (false, false) => "editor_ascii_scalar_line_length",
+            (true, false) => "editor_unicode_scalar_line_length",
+            (false, true) => "editor_ascii_vim_line_end_operator",
+            (true, true) => "editor_unicode_vim_line_end_operator",
+        },
+        started,
+        TEXTAREA_VIM_MOTIONS,
+    ))
+}
+
+fn benchmark_editor_rename_symbol(unicode: bool) -> Result<serde_json::Value> {
+    let symbol = if unicode {
+        "λvariable終"
+    } else {
+        "ordinary_identifier"
+    };
+    let contents = format!("{symbol} ").repeat(1_024);
+    let cursor = symbol.chars().count().saturating_sub(1);
+    let mut config = Config::default();
+    config.lsp.enabled = false;
+    let mut editor = Editor::with_size(
+        Box::new(LspManager::new(config.lsp.clone())),
+        120,
+        40,
+        config,
+        Theme::default(),
+        vec![Buffer::new(None, contents)],
+    )?;
+    editor.test_set_viewport_cursor(/*vtop*/ 0, cursor, /*cy*/ 0);
+    let started = Instant::now();
+    for _ in 0..WORD_OPERATOR_LOOKUPS {
+        let actual = editor.benchmark_rename_symbol();
+        anyhow::ensure!(
+            actual == symbol,
+            "editor rename extraction changed its symbol or Unicode character boundaries"
+        );
+        black_box(actual);
+    }
+    Ok(report(
+        if unicode {
+            "editor_unicode_lsp_rename_symbol_extraction"
+        } else {
+            "editor_ascii_lsp_rename_symbol_extraction"
+        },
+        started,
+        WORD_OPERATOR_LOOKUPS,
     ))
 }
 

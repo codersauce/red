@@ -96,7 +96,9 @@ navigation baselines were frozen after rebasing to `d92777c`.
 | Editor logical line-length lookup | 96.33% |
 | Editor final-cell boundary lookup | 96.24% |
 | Shared ASCII grapheme counting | 94.94% |
+| ASCII LSP rename-symbol extraction | 94.70% |
 | LSP absolute-document routing | 94.68% |
+| Unicode Vim line-end operators | 93.21% |
 | Editor scalar-to-grapheme cursor conversion | 92.82% |
 | Workspace inline file discovery | 92.65% |
 | Editor backward word-end boundary operators | 92.63% |
@@ -106,6 +108,9 @@ navigation baselines were frozen after rebasing to `d92777c`.
 | Embedded text-area document loading | 91.26% |
 | Sparse ASCII full-buffer regex searching | 90.87% |
 | Embedded Vim nested delimiter matching | 90.03% |
+| ASCII Vim line-end operators | 89.83% |
+| ASCII Unicode-scalar line boundaries | 89.78% |
+| Unicode scalar line boundaries | 89.12% |
 | Sparse Unicode full-buffer regex searching | 89.12% |
 | Shared Vim escaped-quote text objects | 88.86% |
 | Shared Vim long-line paragraph operators | 88.15% |
@@ -118,6 +123,7 @@ navigation baselines were frozen after rebasing to `d92777c`.
 | Idle plugin timer polling | 84.29% |
 | Default editor status-line rendering | 83.45% |
 | Workspace inline content search | 82.60% |
+| Unicode LSP rename-symbol extraction | 82.49% |
 | Editor forward word-end boundary operators | 81.94% |
 | Long-line Vim backward word motion | 80.33% |
 | Theme hexadecimal color parsing | 79.71% |
@@ -293,6 +299,18 @@ to 378 microseconds, and window-snapshot coordinates from 325,746 to 356
 microseconds while preserving tabs, ASCII control characters, LF/CRLF endings,
 missing lines and buffers, viewport offsets, cursor saturation, combining
 marks, emoji, CJK, Unicode grapheme boundaries, and UTF-16 positions.
+
+Editor Unicode-scalar boundaries and real Vim line-end operators were
+independently measured across 2,048 ASCII and Unicode source-line lookups.
+Eleven alternating release-build samples reduced ASCII scalar medians from
+3,847 to 393 microseconds, Unicode scalar medians from 3,723 to 405
+microseconds, ASCII Vim line-end ranges from 4,160 to 423 microseconds, and
+Unicode line-end ranges from 6,124 to 416 microseconds. Across 512 real rename
+symbol extractions, ASCII medians fell from 6,036 to 320 microseconds and
+Unicode medians fell from 4,101 to 718 microseconds. The shared indexed paths
+preserve LF/CRLF endings, missing lines, scalar versus grapheme boundaries,
+cursor saturation, punctuation, underscores, combining marks, emoji, CJK,
+Unicode symbols, and viewport offsets.
 
 Shared Vim paragraph objects were independently measured across 128 inner and
 128 around selections spanning 768-line paragraphs. Eleven alternating
