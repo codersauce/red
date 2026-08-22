@@ -13,7 +13,7 @@ use crate::{
     editor::{render_buffer::RenderBuffer, Point},
     theme::Style,
     ui::{spinner_frame, SPINNER_FRAME_INTERVAL_MS},
-    unicode_utils::display_width,
+    unicode_utils::{display_width, truncate_display_width_with_marker, TruncationSide},
 };
 
 #[derive(Debug, Clone, Deserialize)]
@@ -24,6 +24,14 @@ pub enum OverlayAlignment {
     AvoidCursor,
 }
 
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum OverlayOverflow {
+    TruncateRight,
+    #[default]
+    TruncateLeft,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct OverlayConfig {
@@ -31,6 +39,12 @@ pub struct OverlayConfig {
     pub x_padding: usize,
     pub y_padding: usize,
     pub relative: String, // "editor" or "window"
+    #[serde(default)]
+    pub max_width: usize,
+    #[serde(default)]
+    pub overflow: OverlayOverflow,
+    #[serde(default = "default_truncate_marker")]
+    pub truncate_marker: String,
 }
 
 impl Default for OverlayConfig {
@@ -40,8 +54,15 @@ impl Default for OverlayConfig {
             x_padding: 1,
             y_padding: 0,
             relative: "editor".to_string(),
+            max_width: 0,
+            overflow: OverlayOverflow::TruncateLeft,
+            truncate_marker: default_truncate_marker(),
         }
     }
+}
+
+fn default_truncate_marker() -> String {
+    "…".to_string()
 }
 
 #[derive(Debug)]
@@ -94,16 +115,19 @@ impl PluginOverlay {
 
     fn update_dimensions(&mut self) {
         self.height = self.content.lines.len();
-        self.width = self
+        let content_width = self
             .content
             .lines
             .iter()
             .map(|(text, _)| display_width(text))
             .max()
             .unwrap_or(0);
-        if self.busy_since.is_some() && self.has_content() {
-            self.width = self.width.saturating_add(2);
-        }
+        let busy_width = usize::from(self.busy_since.is_some() && self.has_content()) * 2;
+        let natural_width = content_width.saturating_add(busy_width);
+        self.width = match self.config.max_width {
+            0 => natural_width,
+            max_width => natural_width.min(max_width),
+        };
     }
 
     /// Enables or disables host-driven spinner animation for this overlay.
@@ -142,6 +166,11 @@ impl PluginOverlay {
         editor_height: usize,
         cursor_pos: Option<Point>,
     ) -> Point {
+        let previous_width = self.width;
+        self.update_dimensions();
+        self.width = self
+            .width
+            .min(editor_width.saturating_sub(self.config.x_padding));
         let x = if self.width + self.config.x_padding > editor_width {
             0
         } else {
@@ -178,7 +207,7 @@ impl PluginOverlay {
         };
 
         let position = Point::new(x, y);
-        if self.position != Some(position) {
+        if self.position != Some(position) || self.width != previous_width {
             self.content.dirty = true;
         }
         self.position = Some(position);
@@ -196,18 +225,25 @@ impl PluginOverlay {
                     break;
                 }
 
-                let rendered = if i == 0 {
-                    self.busy_since
-                        .map(|started| {
-                            format!(
-                                "{} {text}",
-                                spinner_frame(started.elapsed().as_millis() as u64)
-                            )
-                        })
-                        .unwrap_or_else(|| text.clone())
+                let spinner = if i == 0 {
+                    self.busy_since.map(|started| {
+                        format!("{} ", spinner_frame(started.elapsed().as_millis() as u64))
+                    })
                 } else {
-                    text.clone()
+                    None
                 };
+                let spinner_width = spinner.as_deref().map(display_width).unwrap_or(0);
+                let text_width = self.width.saturating_sub(spinner_width);
+                let text = truncate_display_width_with_marker(
+                    text,
+                    text_width,
+                    &self.config.truncate_marker,
+                    match self.config.overflow {
+                        OverlayOverflow::TruncateRight => TruncationSide::Right,
+                        OverlayOverflow::TruncateLeft => TruncationSide::Left,
+                    },
+                );
+                let rendered = spinner.unwrap_or_default() + &text;
                 let text_width = display_width(&rendered);
                 let text_x = pos.x.saturating_add(self.width.saturating_sub(text_width));
                 buffer.set_text(text_x, y, &rendered, style);
@@ -316,7 +352,7 @@ mod tests {
         theme::Style,
     };
 
-    use super::{OverlayManager, PluginOverlay, SPINNER_FRAME_INTERVAL_MS};
+    use super::{OverlayManager, OverlayOverflow, PluginOverlay, SPINNER_FRAME_INTERVAL_MS};
 
     fn render_row(buffer: &RenderBuffer, y: usize) -> String {
         buffer.cells[y * buffer.width..(y + 1) * buffer.width]
@@ -401,6 +437,50 @@ mod tests {
 
         assert_eq!(row(0), "...long.");
         assert_eq!(row(1), ".....👋 .");
+    }
+
+    #[test]
+    fn overlay_max_width_left_truncates_by_display_width() {
+        let mut overlay = PluginOverlay::new(
+            "progress".to_string(),
+            OverlayConfig {
+                align: OverlayAlignment::Top,
+                x_padding: 0,
+                max_width: 6,
+                overflow: OverlayOverflow::TruncateLeft,
+                ..OverlayConfig::default()
+            },
+        );
+        overlay.update_content(vec![("prefix/👋end".to_string(), Style::default())]);
+        overlay.calculate_position(10, 6, None);
+
+        let mut buffer = RenderBuffer::new(10, 6, &Style::default());
+        overlay.render(&mut buffer);
+
+        assert_eq!(overlay.width, 6);
+        assert_eq!(render_row(&buffer, 0), "    …👋 end");
+    }
+
+    #[test]
+    fn overlay_width_recovers_after_a_narrow_terminal_resize() {
+        let mut overlay = PluginOverlay::new(
+            "progress".to_string(),
+            OverlayConfig {
+                align: OverlayAlignment::Top,
+                max_width: 60,
+                ..OverlayConfig::default()
+            },
+        );
+        overlay.update_content(vec![(
+            "a reasonably long progress message".into(),
+            Style::default(),
+        )]);
+
+        overlay.calculate_position(12, 6, None);
+        assert_eq!(overlay.width, 11);
+
+        overlay.calculate_position(80, 6, None);
+        assert_eq!(overlay.width, 34);
     }
 
     #[test]

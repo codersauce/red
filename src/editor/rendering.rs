@@ -4289,6 +4289,7 @@ mod tests {
                     x_padding: 0,
                     y_padding: top + 2,
                     relative: "editor".into(),
+                    ..crate::plugin::OverlayConfig::default()
                 },
             )
             .update_content(vec![("Z".repeat(60), Style::default())]);

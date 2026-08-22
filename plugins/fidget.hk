@@ -97,6 +97,9 @@ fn info_loaded(info: FidgetEditorInfo) {
         x_padding: 1,
         y_padding: 0,
         relative: "editor",
+        max_width: 60,
+        overflow: "truncate_left",
+        truncate_marker: "…",
     });
     refresh();
 }
@@ -325,30 +328,16 @@ fn refresh() {
                 if red::string(item.title, "") != "" {
                     text = text + " " + item.title;
                 }
-                lines = red::push(lines, (truncate_line(text), message_style()));
+                lines = red::push(lines, (text, message_style()));
                 count = count + 1;
             }
         }
     }
     let rendered: [(String, Style)] = [];
     for line in red::reverse(lines) {
-        rendered = red::push(rendered, (truncate_line(red::string(line[0], "")), line[1]));
+        rendered = red::push(rendered, (red::string(line[0], ""), line[1]));
     }
     red::execute("UpdateOverlay", "fidget-progress", rendered);
-}
-
-fn truncate_line(text: String) -> String {
-    let Some(info) = state().info else {
-        return text;
-    };
-    let width = red::int(info.size[0], 80) - 2;
-    if width <= 0 {
-        return "";
-    }
-    if red::len(text) <= width {
-        return text;
-    }
-    return red::slice(text, 0, width);
 }
 
 fn group_active(group: String) -> bool {
@@ -375,6 +364,7 @@ fn header_style() -> Style {
     if style == red::null() {
         return Style { fg: red::null(), bg: red::null(), bold: false, italic: false };
     }
+    style.bg = red::null();
     return style;
 }
 
@@ -386,6 +376,7 @@ fn message_style() -> Style {
     if style == red::null() {
         return Style { fg: red::null(), bg: red::null(), bold: false, italic: false };
     }
+    style.bg = red::null();
     return style;
 }
 
