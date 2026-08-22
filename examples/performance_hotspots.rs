@@ -271,6 +271,21 @@ fn main() -> Result<()> {
             /*grapheme*/ true, /*reverse*/ true,
         )?);
     }
+    if scenario == "all" || scenario == "editor-line-start" {
+        results.push(benchmark_editor_leading_whitespace(
+            /*unicode*/ false, /*operator*/ true,
+        )?);
+    }
+    if scenario == "all" || scenario == "editor-indent-ascii" {
+        results.push(benchmark_editor_leading_whitespace(
+            /*unicode*/ false, /*operator*/ false,
+        )?);
+    }
+    if scenario == "all" || scenario == "editor-indent-unicode" {
+        results.push(benchmark_editor_leading_whitespace(
+            /*unicode*/ true, /*operator*/ false,
+        )?);
+    }
     if scenario == "all" || scenario == "paragraph" {
         results.push(benchmark_paragraph_motion());
     }
@@ -1257,6 +1272,56 @@ fn benchmark_display_coordinate_conversion(
             (false, true) => "shared_ascii_display_column_to_scalar",
             (true, false) => "shared_ascii_grapheme_to_display_column",
             (true, true) => "shared_ascii_display_column_to_grapheme",
+        },
+        started,
+        TEXTAREA_VIM_MOTIONS,
+    ))
+}
+
+fn benchmark_editor_leading_whitespace(unicode: bool, operator: bool) -> Result<serde_json::Value> {
+    let prefix = if unicode { "\u{2003}\t  " } else { "\t    " };
+    let suffix = if unicode {
+        "identifiant_λ👋 ".repeat(1_024)
+    } else {
+        "ordinary_identifier ".repeat(1_024)
+    };
+    let contents = format!("{prefix}{suffix}");
+    let expected = if operator {
+        prefix.chars().count()
+    } else {
+        red::unicode_utils::display_width_with_tabs(prefix, /*tab_width*/ 4)
+    };
+    let mut config = Config::default();
+    config.lsp.enabled = false;
+    let mut editor = Editor::with_size(
+        Box::new(LspManager::new(config.lsp.clone())),
+        120,
+        40,
+        config,
+        Theme::default(),
+        vec![Buffer::new(None, contents)],
+    )?;
+    editor.test_set_viewport_cursor(
+        /*vtop*/ 0,
+        prefix.chars().count().saturating_add(3),
+        /*cy*/ 0,
+    );
+    let started = Instant::now();
+    for _ in 0..TEXTAREA_VIM_MOTIONS {
+        let indentation = editor.benchmark_leading_whitespace(operator);
+        anyhow::ensure!(
+            indentation == expected,
+            "leading whitespace changed its Vim scalar boundary or display indentation"
+        );
+        black_box(indentation);
+    }
+    Ok(report(
+        if operator {
+            "editor_vim_first_nonblank_line_start_operator"
+        } else if unicode {
+            "editor_unicode_automatic_indentation_columns"
+        } else {
+            "editor_ascii_automatic_indentation_columns"
         },
         started,
         TEXTAREA_VIM_MOTIONS,

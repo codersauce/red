@@ -17777,15 +17777,23 @@ impl Editor {
     fn line_start_motion_range(&self, first_non_blank: bool) -> Option<TextRange> {
         let end = self.cursor_text_position();
         let start_character = if first_non_blank {
-            self.current_buffer()
-                .get(end.line)
+            let contents = self.current_buffer().contents_snapshot();
+            contents
+                .get_line(end.line)
                 .map(|line| {
-                    trim_line_ending(&line)
+                    let mut length = line.len_chars();
+                    if line.get_char(length.saturating_sub(1)) == Some('\n') {
+                        length -= 1;
+                    }
+                    if line.get_char(length.saturating_sub(1)) == Some('\r') {
+                        length -= 1;
+                    }
+                    line.slice(..length)
                         .chars()
                         .take_while(|character| character.is_whitespace())
                         .count()
                 })
-                .unwrap_or(0)
+                .unwrap_or_default()
         } else {
             0
         };
@@ -18171,12 +18179,24 @@ impl Editor {
 
     fn indentation_columns_for_line(&self, line: usize) -> usize {
         let indentation = self.indentation();
-        self.current_buffer().get(line).map_or(0, |contents| {
-            display_width_with_tabs(
-                Self::leading_indentation_text(&contents),
-                indentation.tab_width.max(1),
-            )
-        })
+        let contents = self.current_buffer().contents_snapshot();
+        let Some(line) = contents.get_line(line) else {
+            return 0;
+        };
+        let mut length = line.len_chars();
+        while length > 0
+            && line
+                .get_char(length - 1)
+                .is_some_and(|character| matches!(character, '\r' | '\n'))
+        {
+            length -= 1;
+        }
+        let prefix = line
+            .slice(..length)
+            .chars()
+            .take_while(|character| character.is_whitespace())
+            .collect::<String>();
+        display_width_with_tabs(&prefix, indentation.tab_width.max(1))
     }
 
     fn indentation_decision_for_line(&mut self, line: usize) -> IndentDecision {
@@ -29666,6 +29686,18 @@ impl Editor {
         self.symbol_under_cursor()
     }
 
+    /// Reads leading whitespace through Vim operators or automatic indentation.
+    #[doc(hidden)]
+    pub fn benchmark_leading_whitespace(&self, operator: bool) -> usize {
+        if operator {
+            self.line_start_motion_range(/*first_non_blank*/ true)
+                .map(|range| range.start.character)
+                .unwrap_or_default()
+        } else {
+            self.indentation_columns_for_line(self.buffer_line())
+        }
+    }
+
     #[doc(hidden)]
     pub fn test_cx(&self) -> usize {
         self.cx
@@ -36932,6 +36964,72 @@ builtin = "rust"
                             (range.end.line, range.end.character),
                             (end_line, expected_end),
                             "line end {contents:?} line={line} column={column}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn indexed_leading_whitespace_preserves_unicode_tabs_line_endings_and_viewports() {
+        for contents in [
+            "\t    ordinary source\n  next",
+            "\u{2003}\t  λvariable終\r\n\tfinal",
+            " \t \r\n\t  \nfinal",
+            "\n",
+            "no-indent",
+        ] {
+            let mut editor = test_editor(/*width*/ 80, /*height*/ 24);
+            editor
+                .buffer_manager
+                .replace_buffers(vec![Buffer::new(None, contents.to_string())]);
+            for line in [0, 1, 2, 9] {
+                let source = editor.current_buffer().get(line);
+                let expected_indent = source
+                    .as_deref()
+                    .map(|text| {
+                        display_width_with_tabs(
+                            Editor::leading_indentation_text(text),
+                            editor.indentation().tab_width.max(1),
+                        )
+                    })
+                    .unwrap_or_default();
+                assert_eq!(
+                    editor.indentation_columns_for_line(line),
+                    expected_indent,
+                    "indentation {contents:?} line={line}"
+                );
+                for column in [0, 1, 2, 5, 12, usize::MAX] {
+                    editor.test_set_viewport_cursor(line, column, /*cy*/ 0);
+                    let end_character = source
+                        .as_deref()
+                        .map(|text| grapheme_to_char(text.trim_end_matches('\n'), column))
+                        .unwrap_or(column);
+                    for first_non_blank in [false, true] {
+                        let start_character = if first_non_blank {
+                            source
+                                .as_deref()
+                                .map(|text| {
+                                    trim_line_ending(text)
+                                        .chars()
+                                        .take_while(|character| character.is_whitespace())
+                                        .count()
+                                })
+                                .unwrap_or_default()
+                        } else {
+                            0
+                        };
+                        let expected = (start_character != end_character).then(|| {
+                            TextRange::new(
+                                TextPosition::new(line, start_character),
+                                TextPosition::new(line, end_character),
+                            )
+                        });
+                        assert_eq!(
+                            editor.line_start_motion_range(first_non_blank),
+                            expected,
+                            "line start {contents:?} line={line} column={column} first_non_blank={first_non_blank}"
                         );
                     }
                 }

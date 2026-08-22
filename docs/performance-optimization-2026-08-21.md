@@ -139,7 +139,10 @@ navigation baselines were frozen after rebasing to `d92777c`.
 | Embedded Vim long-line end motions | 72.63% |
 | Shared Vim paragraph navigation | 72.60% |
 | Undo history capacity pruning | 72.42% |
+| ASCII automatic indentation columns | 71.81% |
+| Unicode automatic indentation columns | 71.42% |
 | LSP completion filtering | 67.58% |
+| Vim first-nonblank line-start operators | 64.81% |
 | Structured picker ranking | 64.81% |
 | Shared Vim around paragraph text objects | 63.73% |
 | Shared Vim paragraph boundary operators | 63.42% |
@@ -326,6 +329,15 @@ microseconds. Exhaustive alignment checks preserve all 128 ASCII values,
 zero-width control characters, tab stops, LF/CRLF, Unicode byte boundaries,
 combining marks, CJK, emoji sequences, regional-indicator flags, and saturated
 cursor positions.
+
+Editor leading-whitespace paths were independently measured across 2,048 real
+Vim first-nonblank operators and ASCII/Unicode automatic-indentation lookups on
+20 KiB source lines. Eleven alternating release-build samples reduced Vim
+operator medians from 2,796 to 984 microseconds, ASCII indentation from 2,547
+to 718 microseconds, and Unicode indentation from 2,474 to 707 microseconds.
+Indexed prefix reads preserve tabs, Unicode whitespace, all-whitespace rows,
+LF/CRLF endings, empty and missing lines, cursor saturation, Vim scalar ranges,
+and viewport offsets.
 
 Shared Vim paragraph objects were independently measured across 128 inner and
 128 around selections spanning 768-line paragraphs. Eleven alternating
