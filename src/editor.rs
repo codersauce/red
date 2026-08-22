@@ -3122,6 +3122,8 @@ enum TerminalCursorState {
 
 #[derive(Debug, Default)]
 struct StatuslineGitCache {
+    /// Red selects its process working directory before constructing the editor.
+    working_directory: PathBuf,
     search_dir: Option<PathBuf>,
     repository_root: Option<PathBuf>,
     branch: Option<String>,
@@ -4838,7 +4840,10 @@ impl Editor {
             language_config_path: Config::path("config.toml"),
             language_config_overrides: Vec::new(),
             theme,
-            statusline_git_cache: StatuslineGitCache::default(),
+            statusline_git_cache: StatuslineGitCache {
+                working_directory: get_workspace_path(),
+                ..StatuslineGitCache::default()
+            },
             plugin_registry,
             plugin_catalog: BTreeMap::new(),
             plugin_catalog_url: plugin::catalog::catalog_url(),

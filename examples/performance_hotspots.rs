@@ -64,6 +64,7 @@ const WORKSPACE_ROWS: usize = 12_000;
 const WORKSPACE_NAVIGATIONS: usize = 1_000;
 const INLINE_CONVERSATIONS: usize = 4_096;
 const INLINE_ANSWER_DELTAS: usize = 1_000;
+const STATUSLINE_FRAMES: usize = 1_000;
 
 fn main() -> Result<()> {
     let scenario = std::env::args().nth(1).unwrap_or_else(|| "all".into());
@@ -152,6 +153,9 @@ fn main() -> Result<()> {
     }
     if scenario == "all" || scenario == "inline-stream" {
         results.push(benchmark_inline_answer_streaming()?);
+    }
+    if scenario == "all" || scenario == "statusline" {
+        results.push(benchmark_statusline_rendering()?);
     }
 
     anyhow::ensure!(
@@ -866,6 +870,47 @@ fn benchmark_inline_answer_streaming() -> Result<serde_json::Value> {
         "inline_assistance_answer_streaming",
         started,
         INLINE_ANSWER_DELTAS,
+    ))
+}
+
+fn benchmark_statusline_rendering() -> Result<serde_json::Value> {
+    let directory = tempfile::tempdir()?;
+    std::fs::create_dir(directory.path().join(".git"))?;
+    std::fs::write(
+        directory.path().join(".git/HEAD"),
+        "ref: refs/heads/performance-benchmark\n",
+    )?;
+    let path = directory.path().join("main.rs");
+    let contents = "fn example() { println!(\"statusline\"); }\n";
+    std::fs::write(&path, contents)?;
+    let config = Config::default();
+    let mut editor = Editor::with_size(
+        Box::new(LspManager::new(config.lsp.clone())),
+        120,
+        40,
+        config,
+        Theme::default(),
+        vec![Buffer::new(
+            Some(path.to_string_lossy().into_owned()),
+            contents.to_string(),
+        )],
+    )?;
+    let mut buffer = RenderBuffer::new(120, 40, &Style::default());
+    editor.draw_statusline(&mut buffer);
+    let frames = std::env::var("RED_STATUSLINE_BENCH_FRAMES")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(STATUSLINE_FRAMES);
+
+    let started = Instant::now();
+    for _ in 0..frames {
+        editor.draw_statusline(black_box(&mut buffer));
+    }
+    black_box(buffer.cells.len());
+    Ok(report(
+        "default_editor_statusline_rendering",
+        started,
+        frames,
     ))
 }
 

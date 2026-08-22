@@ -767,15 +767,16 @@ fn draw_statusline_segment(
 }
 
 fn statusline_git_search_dir(file: Option<&str>) -> PathBuf {
-    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let Some(file) = file else {
-        return cwd;
+        return std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     };
     let path = expand_user_path(file).unwrap_or_else(|_| PathBuf::from(file));
     let path = if path.is_absolute() {
         path
     } else {
-        cwd.join(path)
+        std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(path)
     };
     let search_dir = if path.is_dir() {
         path
@@ -3299,9 +3300,10 @@ impl Editor {
                 window.buffer_index,
                 window.vtop + window.cy,
                 window_buffer.byte_len(),
-                if window_buffer
-                    .get(0)
-                    .is_some_and(|line| line.ends_with("\r\n"))
+                if configured(StatuslineSection::LineEndings)
+                    && window_buffer
+                        .get(0)
+                        .is_some_and(|line| line.ends_with("\r\n"))
                 {
                     "CRLF"
                 } else {
@@ -3318,7 +3320,9 @@ impl Editor {
                 self.buffer_manager.active_index(),
                 self.vtop + self.cy,
                 current.byte_len(),
-                if current.get(0).is_some_and(|line| line.ends_with("\r\n")) {
+                if configured(StatuslineSection::LineEndings)
+                    && current.get(0).is_some_and(|line| line.ends_with("\r\n"))
+                {
                     "CRLF"
                 } else {
                     "LF"
@@ -3341,17 +3345,22 @@ impl Editor {
                 configured(StatuslineSection::GitChanges),
             );
         }
-        let current_folder = get_workspace_path();
-        let workspace_root = self
-            .statusline_git_cache
-            .repository_root
-            .clone()
-            .or_else(|| {
-                file_path
-                    .as_deref()
-                    .and_then(|file| self.lsp.workspace_root_for_file(file))
-            })
-            .unwrap_or_else(|| current_folder.clone());
+        let current_folder = self.statusline_git_cache.working_directory.clone();
+        let workspace_root = if configured(StatuslineSection::Workspace)
+            || configured(StatuslineSection::RelativePath)
+        {
+            self.statusline_git_cache
+                .repository_root
+                .clone()
+                .or_else(|| {
+                    file_path
+                        .as_deref()
+                        .and_then(|file| self.lsp.workspace_root_for_file(file))
+                })
+                .unwrap_or_else(|| current_folder.clone())
+        } else {
+            current_folder.clone()
+        };
         let filename = statusline_file_name(&filename, &current_folder);
         let diagnostics = configured(StatuslineSection::Diagnostics)
             .then(|| self.statusline_diagnostic_counts(buffer_index))
@@ -3406,8 +3415,11 @@ impl Editor {
             .then(|| self.highlight_language_id_for_buffer_index(buffer_index))
             .flatten();
         let show_modified_separately = configured(StatuslineSection::Modified);
-        let read_only = statusline_file_is_read_only(file_path.as_deref());
-        let relative_path = statusline_relative_path(file_path.as_deref(), &workspace_root);
+        let read_only = configured(StatuslineSection::ReadOnly)
+            && statusline_file_is_read_only(file_path.as_deref());
+        let relative_path = configured(StatuslineSection::RelativePath)
+            .then(|| statusline_relative_path(file_path.as_deref(), &workspace_root))
+            .flatten();
         let context = StatuslineContext {
             mode: if self.pane_resize_mode.is_some() {
                 "RESIZE".to_string()
@@ -3433,23 +3445,47 @@ impl Editor {
                 .as_ref()
                 .map(|recording| recording.register),
             search_matches,
-            indentation: format!("spaces:{}", self.indentation().shift_width),
+            indentation: if configured(StatuslineSection::Indentation) {
+                format!("spaces:{}", self.indentation().shift_width)
+            } else {
+                String::new()
+            },
             encoding: "utf-8",
             line_endings,
             read_only,
             modified: dirty,
-            workspace: statusline_workspace_name(&workspace_root),
+            workspace: if configured(StatuslineSection::Workspace) {
+                statusline_workspace_name(&workspace_root)
+            } else {
+                String::new()
+            },
             relative_path,
-            buffer_index: format!("{}/{}", buffer_index + 1, self.buffer_manager.len().max(1)),
-            window_index: format!(
-                "{}/{}",
-                self.window_manager.active_window_id() + 1,
-                self.window_manager.window_count().max(1)
-            ),
-            file_size: statusline_file_size(byte_len),
+            buffer_index: if configured(StatuslineSection::BufferIndex) {
+                format!("{}/{}", buffer_index + 1, self.buffer_manager.len().max(1))
+            } else {
+                String::new()
+            },
+            window_index: if configured(StatuslineSection::WindowIndex) {
+                format!(
+                    "{}/{}",
+                    self.window_manager.active_window_id() + 1,
+                    self.window_manager.window_count().max(1)
+                )
+            } else {
+                String::new()
+            },
+            file_size: if configured(StatuslineSection::FileSize) {
+                statusline_file_size(byte_len)
+            } else {
+                String::new()
+            },
             agent_activity,
             formatter,
-            clock: Local::now().format("%H:%M").to_string(),
+            clock: if configured(StatuslineSection::Clock) {
+                Local::now().format("%H:%M").to_string()
+            } else {
+                String::new()
+            },
         };
 
         let base_style = self.theme.statusline_style.inner_style.clone();
@@ -3515,6 +3551,9 @@ impl Editor {
     }
 
     fn statusline_diagnostic_counts(&self, buffer_index: usize) -> Option<(usize, usize)> {
+        if self.diagnostics.is_empty() {
+            return None;
+        }
         let uri = self
             .buffer_manager
             .get(buffer_index)?

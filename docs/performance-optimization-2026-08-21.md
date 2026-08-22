@@ -75,6 +75,7 @@ navigation baselines were frozen after rebasing to `d92777c`.
 | Printable ASCII frame rendering | 85.25% |
 | Long-line Vim word-end motion | 84.79% |
 | Idle plugin timer polling | 84.29% |
+| Default editor status-line rendering | 83.45% |
 | Long-line Vim backward word motion | 80.33% |
 | Detached incremental frame serialization | 79.06% |
 | Shared Vim sentence navigation | 74.63% |
@@ -103,6 +104,12 @@ workspace path also improves end-to-end behavior: median file-list input fell
 from 516 to 368 microseconds, full-frame rendering fell from 373 to 264
 microseconds, and diff navigation fell from 372 to 319 microseconds. File-list
 churn spawned one Git process and core-owned diff navigation spawned none.
+
+A real typing PTY run separately confirmed that status-line and editor chrome
+fell from 80 to 24 microseconds per frame, while complete frame rendering fell
+from 315 to 263 microseconds. The editor captures its fixed working directory
+once, avoids resolving absolute paths against the current directory, and skips
+diagnostic URI conversion when no diagnostics exist.
 
 Five alternating real typing runs showed 6.04% faster median input events,
 7.44% faster median full-frame rendering, 9.27% faster process-to-first-paint
