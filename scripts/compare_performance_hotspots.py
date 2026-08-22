@@ -35,6 +35,8 @@ SCENARIOS = (
     "resolver-delete-word",
     "resolver-count-change",
     "resolver-count-delete",
+    "editor-word-end-backward",
+    "editor-word-end-forward",
     "paragraph",
     "sentence",
     "undo-prune",

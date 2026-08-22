@@ -6758,7 +6758,19 @@ impl Editor {
     }
 
     fn grapheme_to_char_on_line(&self, x: usize, y: usize) -> usize {
-        self.current_buffer()
+        let buffer = self.current_buffer();
+        if buffer.is_ascii() {
+            let contents = buffer.contents_snapshot();
+            return contents
+                .get_line(y)
+                .map(|line| {
+                    let length = line.len_chars();
+                    let newline = line.get_char(length.saturating_sub(1)) == Some('\n');
+                    x.min(length.saturating_sub(usize::from(newline)))
+                })
+                .unwrap_or(x);
+        }
+        buffer
             .get(y)
             .map(|line| grapheme_to_char(line.trim_end_matches('\n'), x))
             .unwrap_or(x)
@@ -17580,9 +17592,9 @@ impl Editor {
         let start = self
             .word_motion_target(count, true, true, big_word)
             .or_else(|| {
-                let characters = self.current_buffer().contents().chars().collect::<Vec<_>>();
+                let characters = self.current_buffer().contents_snapshot();
                 let mut index = self.current_buffer().position_to_char_idx(cursor);
-                let current = *characters.get(index)?;
+                let current = characters.get_char(index)?;
                 if index == 0 || current.is_whitespace() {
                     return None;
                 }
@@ -17596,7 +17608,7 @@ impl Editor {
                     }
                 };
                 let current_kind = kind(current);
-                while index > 0 && kind(characters[index - 1]) == current_kind {
+                while index > 0 && kind(characters.char(index - 1)) == current_kind {
                     index -= 1;
                 }
                 Some(self.current_buffer().char_idx_to_position(index))
@@ -17612,9 +17624,8 @@ impl Editor {
             .or_else(|| {
                 let index = self.current_buffer().position_to_char_idx(start);
                 self.current_buffer()
-                    .contents()
-                    .chars()
-                    .nth(index)
+                    .contents_snapshot()
+                    .get_char(index)
                     .filter(|character| !character.is_whitespace())
                     .map(|_| start)
             })?;
@@ -29509,6 +29520,16 @@ fn adjust_color_brightness(color: Option<Color>, percentage: i32) -> Option<Colo
 
 // These methods are made public for test utilities but hidden from docs.
 impl Editor {
+    /// Resolves the production pending-operator word-end boundary for benchmarks.
+    #[doc(hidden)]
+    pub fn benchmark_word_end_operator(&self, backward: bool, big_word: bool) -> Option<TextRange> {
+        if backward {
+            self.previous_end_word_motion_range(/*count*/ 1, big_word)
+        } else {
+            self.end_word_motion_range(/*count*/ 1, big_word)
+        }
+    }
+
     #[doc(hidden)]
     pub fn test_cx(&self) -> usize {
         self.cx
@@ -36517,6 +36538,34 @@ builtin = "rust"
         let guide = &render_buffer.cells[30 + content_start + 4];
         assert_eq!(guide.c, '│');
         assert_eq!(guide.style.fg, Some(active_color));
+    }
+
+    #[test]
+    fn indexed_word_end_operators_preserve_unicode_groups_and_document_edges() {
+        for (contents, line, column, backward, big_word, expected) in [
+            ("alpha remaining", 0, 2, true, false, Some("alp")),
+            ("αβγ remaining", 0, 2, true, false, Some("αβγ")),
+            ("symbol-parts remaining", 0, 5, true, true, Some("symbol")),
+            ("remaining alpha", 0, 14, false, false, Some("a")),
+            ("remaining 終わり", 0, 12, false, false, Some("り")),
+            ("prefix\r\n終わり", 1, 2, false, false, Some("り")),
+            ("alpha", 0, 0, true, false, None),
+            (" ", 0, 0, false, false, None),
+        ] {
+            let mut editor = test_editor(/*width*/ 80, /*height*/ 24);
+            editor
+                .buffer_manager
+                .replace_buffers(vec![Buffer::new(None, contents.to_string())]);
+            editor.test_set_viewport_cursor(/*vtop*/ 0, column, line);
+            let actual = editor
+                .benchmark_word_end_operator(backward, big_word)
+                .map(|range| editor.current_buffer().text_in_range(range));
+            assert_eq!(
+                actual.as_deref(),
+                expected,
+                "{contents:?} line={line} column={column} backward={backward} big={big_word}"
+            );
+        }
     }
 
     #[test]

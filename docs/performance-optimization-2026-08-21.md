@@ -92,6 +92,7 @@ navigation baselines were frozen after rebasing to `d92777c`.
 | Shared ASCII grapheme counting | 94.94% |
 | LSP absolute-document routing | 94.68% |
 | Workspace inline file discovery | 92.65% |
+| Editor backward word-end boundary operators | 92.63% |
 | Shared buffer final-line lookup | 91.46% |
 | Shared buffer navigable-line counting | 91.38% |
 | Embedded redo cursor restoration | 91.33% |
@@ -110,6 +111,7 @@ navigation baselines were frozen after rebasing to `d92777c`.
 | Idle plugin timer polling | 84.29% |
 | Default editor status-line rendering | 83.45% |
 | Workspace inline content search | 82.60% |
+| Editor forward word-end boundary operators | 81.94% |
 | Long-line Vim backward word motion | 80.33% |
 | Theme hexadecimal color parsing | 79.71% |
 | Detached incremental frame serialization | 79.06% |
@@ -254,6 +256,13 @@ tail. Eleven alternating release-build samples reduced counted change medians
 from 132,566 to 196 microseconds and counted delete medians from 132,823 to 201
 microseconds while preserving multiline traversal, CRLF, punctuation, WORD
 groups, whitespace retention, exhaustion, and Unicode grapheme fallback.
+
+Editor word-end boundary operators were independently measured across 512 real
+backward first-word and forward final-word selections on 20 KiB documents.
+Eleven alternating release-build samples reduced backward medians from 8,245
+to 608 microseconds and forward medians from 3,849 to 695 microseconds while
+preserving pending-operator ranges, ASCII cursor bounds, CRLF, keyword versus
+WORD grouping, Unicode scalar positions, and empty or whitespace boundaries.
 
 Shared Vim paragraph objects were independently measured across 128 inner and
 128 around selections spanning 768-line paragraphs. Eleven alternating

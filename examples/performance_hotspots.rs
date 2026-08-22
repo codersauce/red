@@ -185,6 +185,12 @@ fn main() -> Result<()> {
     if scenario == "all" || scenario == "resolver-count-delete" {
         results.push(benchmark_counted_word_operator(/*change_word*/ false)?);
     }
+    if scenario == "all" || scenario == "editor-word-end-backward" {
+        results.push(benchmark_editor_word_end_operator(/*backward*/ true)?);
+    }
+    if scenario == "all" || scenario == "editor-word-end-forward" {
+        results.push(benchmark_editor_word_end_operator(/*backward*/ false)?);
+    }
     if scenario == "all" || scenario == "paragraph" {
         results.push(benchmark_paragraph_motion());
     }
@@ -909,6 +915,47 @@ fn benchmark_counted_word_operator(change_word: bool) -> Result<serde_json::Valu
             "shared_vim_counted_change_word_operator"
         } else {
             "shared_vim_counted_delete_word_operator"
+        },
+        started,
+        WORD_OPERATOR_LOOKUPS,
+    ))
+}
+
+fn benchmark_editor_word_end_operator(backward: bool) -> Result<serde_json::Value> {
+    let surrounding = "ordinary_identifier ".repeat(1_024);
+    let contents = if backward {
+        format!("target_identifier {surrounding}")
+    } else {
+        format!("{surrounding}target_identifier")
+    };
+    let cursor = if backward { 5 } else { contents.len() - 1 };
+    let mut config = Config::default();
+    config.lsp.enabled = false;
+    let mut editor = Editor::with_size(
+        Box::new(LspManager::new(config.lsp.clone())),
+        120,
+        40,
+        config,
+        Theme::default(),
+        vec![Buffer::new(None, contents)],
+    )?;
+    editor.test_set_viewport_cursor(/*vtop*/ 0, cursor, /*cy*/ 0);
+    let started = Instant::now();
+    for _ in 0..WORD_OPERATOR_LOOKUPS {
+        let range = editor
+            .benchmark_word_end_operator(backward, /*big_word*/ false)
+            .ok_or_else(|| anyhow::anyhow!("editor word-end operator lost its range"))?;
+        anyhow::ensure!(
+            range.end.character == cursor + 1 && (!backward || range.start.character == 0),
+            "editor word-end operator changed its document boundary"
+        );
+        black_box(range);
+    }
+    Ok(report(
+        if backward {
+            "editor_backward_word_end_boundary_operator"
+        } else {
+            "editor_forward_word_end_boundary_operator"
         },
         started,
         WORD_OPERATOR_LOOKUPS,
