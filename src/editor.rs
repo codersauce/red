@@ -43890,6 +43890,115 @@ while True:
         ));
     }
 
+    #[tokio::test]
+    async fn insert_mode_neotree_shortcut_commits_edits_and_toggles_panel_focus() {
+        drain_plugin_requests();
+        let mut editor = test_editor(/*width*/ 80, /*height*/ 24);
+        editor.config = toml::from_str(include_str!("../default_config.toml")).unwrap();
+        let mut render_buffer =
+            RenderBuffer::new(/*width*/ 80, /*height*/ 24, &Style::default());
+        let mut runtime = Runtime::new();
+        runtime
+            .load_plugin(
+                "navigation",
+                r#"
+                    pub fn activate() {
+                        red::state_set("open", false);
+                        red::add_command("NeoTree", toggle, Json { scope: "global" });
+                    }
+
+                    fn toggle() {
+                        if red::bool(red::state("open"), false) {
+                            red::execute("ClosePanel", "neotree");
+                            red::execute("FocusEditor");
+                            red::state_set("open", false);
+                        } else {
+                            red::execute("CreatePanel", "neotree", PanelConfig {
+                                side: "left",
+                                width: 20,
+                            });
+                            red::execute("FocusPanel", "neotree");
+                            red::state_set("open", true);
+                        }
+                    }
+                "#,
+            )
+            .await
+            .unwrap();
+
+        editor
+            .process_editor_event(
+                Event::Key(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE)),
+                &mut render_buffer,
+                &mut runtime,
+                EventRenderMode::Immediate,
+            )
+            .await
+            .unwrap();
+        editor
+            .process_editor_event(
+                Event::Key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE)),
+                &mut render_buffer,
+                &mut runtime,
+                EventRenderMode::Immediate,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(editor.mode, Mode::Insert);
+        assert_eq!(editor.current_buffer().contents(), "xhello");
+        assert!(editor.current_buffer().undo_history.is_transaction_active());
+
+        editor
+            .process_editor_event(
+                Event::Key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL)),
+                &mut render_buffer,
+                &mut runtime,
+                EventRenderMode::Immediate,
+            )
+            .await
+            .unwrap();
+        editor
+            .service_background(&mut render_buffer, &mut runtime)
+            .await
+            .unwrap();
+
+        assert_eq!(editor.mode, Mode::Normal);
+        assert_eq!(editor.current_buffer().contents(), "xhello");
+        assert!(!editor.current_buffer().undo_history.is_transaction_active());
+        assert_eq!(editor.panel_manager.focused_panel_id(), Some("neotree"));
+
+        editor
+            .process_editor_event(
+                Event::Key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL)),
+                &mut render_buffer,
+                &mut runtime,
+                EventRenderMode::Immediate,
+            )
+            .await
+            .unwrap();
+        editor
+            .service_background(&mut render_buffer, &mut runtime)
+            .await
+            .unwrap();
+
+        assert_eq!(editor.mode, Mode::Normal);
+        assert_eq!(editor.panel_manager.focused_panel_id(), None);
+        assert_eq!(editor.panel_manager.panel_layout("neotree"), None);
+        assert_eq!(editor.current_buffer().contents(), "xhello");
+
+        editor
+            .process_editor_event(
+                Event::Key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE)),
+                &mut render_buffer,
+                &mut runtime,
+                EventRenderMode::Immediate,
+            )
+            .await
+            .unwrap();
+        assert_eq!(editor.current_buffer().contents(), "hello");
+    }
+
     #[test]
     fn focused_panel_repaints_the_editor_cursor_cell() {
         let mut editor = test_editor(40, 10);

@@ -295,6 +295,7 @@ Tab = "InsertTab"
 "Ctrl-Space" = "RequestCompletion"
 "Alt-\\" = "RequestInlineCompletion"
 "Ctrl-k" = "SignatureHelp"
+"Ctrl-e" = [ { EnterMode = "Normal" }, { PluginCommand = "NeoTree" } ]
 Esc = { EnterMode = "Normal" }
 
 [keys.normal]

@@ -4689,6 +4689,25 @@ max_buffer_words = 20
     }
 
     #[test]
+    fn default_config_maps_ctrl_e_to_neotree_in_normal_and_insert_modes() {
+        let config: Config = toml::from_str(include_str!("../default_config.toml")).unwrap();
+
+        assert_eq!(
+            config.keys.normal.get("Ctrl-e"),
+            Some(&KeyAction::Single(Action::PluginCommand(
+                "NeoTree".to_string()
+            )))
+        );
+        assert_eq!(
+            config.keys.insert.get("Ctrl-e"),
+            Some(&KeyAction::Multiple(vec![
+                Action::EnterMode(Mode::Normal),
+                Action::PluginCommand("NeoTree".to_string()),
+            ]))
+        );
+    }
+
+    #[test]
     fn default_config_maps_alt_a_to_agent_toggle() {
         let config: Config = toml::from_str(include_str!("../default_config.toml")).unwrap();
 
