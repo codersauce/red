@@ -362,12 +362,22 @@ fn main() -> Result<()> {
         ("numeric-typescript", "typescript", false),
         ("numeric-tsx", "tsx", false),
         ("numeric-json", "json", false),
+        ("numeric-toml", "toml", false),
+        ("numeric-yaml", "yaml", false),
+        ("numeric-lua", "lua", false),
+        ("numeric-powershell", "powershell", false),
+        ("numeric-husk", "husk", false),
         ("markdown-fenced-numeric-rust", "rust", true),
         ("markdown-fenced-numeric-javascript", "javascript", true),
         ("markdown-fenced-numeric-jsx", "jsx", true),
         ("markdown-fenced-numeric-typescript", "typescript", true),
         ("markdown-fenced-numeric-tsx", "tsx", true),
         ("markdown-fenced-numeric-json", "json", true),
+        ("markdown-fenced-numeric-toml", "toml", true),
+        ("markdown-fenced-numeric-yaml", "yaml", true),
+        ("markdown-fenced-numeric-lua", "lua", true),
+        ("markdown-fenced-numeric-powershell", "powershell", true),
+        ("markdown-fenced-numeric-husk", "husk", true),
     ] {
         if scenario == "all" || scenario == name {
             results.push(benchmark_numeric_literal_highlighting(language, fenced)?);
@@ -1851,12 +1861,16 @@ fn benchmark_numeric_literal_highlighting(
         )
     } else {
         (0..96)
-            .map(|index| {
-                if language == "rust" {
-                    format!("fn value_{index:03}() -> usize {{ 123456789 }}\n")
-                } else {
-                    format!("function value_{index:03}() {{ return 123456789; }}\n")
+            .map(|index| match language {
+                "rust" => format!("fn value_{index:03}() -> usize {{ 123456789 }}\n"),
+                "toml" => format!("value_{index:03} = 123456789\n"),
+                "yaml" => format!("value_{index:03}: 123456789\n"),
+                "lua" => format!("local value_{index:03} = 123456789\n"),
+                "powershell" => {
+                    format!("$value_{index:03} = 123456789; \"retained\"\n")
                 }
+                "husk" => format!("let value_{index:03} = 123456789;\n"),
+                _ => format!("function value_{index:03}() {{ return 123456789; }}\n"),
             })
             .collect::<String>()
     };

@@ -947,18 +947,19 @@ impl Highlighter {
                 let covering = cached
                     .styles
                     .iter()
-                    .find(|style| style.start < edit.start_byte && style.end > edit.old_end_byte)?;
-                let token = cached.code.get(covering.start..covering.end)?;
-                let comment = self
-                    .husk_styles
-                    .comment
-                    .as_ref()
-                    .is_some_and(|style| *style == covering.style)
-                    && token.starts_with("//")
-                    && !token.contains('\n')
-                    && edit.start_byte > covering.start.saturating_add(2);
-                let string =
-                    self.husk_styles
+                    .find(|style| style.start < edit.start_byte && style.end > edit.old_end_byte);
+                let (comment, string) = if let Some(covering) = covering {
+                    let token = cached.code.get(covering.start..covering.end)?;
+                    let comment = self
+                        .husk_styles
+                        .comment
+                        .as_ref()
+                        .is_some_and(|style| *style == covering.style)
+                        && token.starts_with("//")
+                        && !token.contains('\n')
+                        && edit.start_byte > covering.start.saturating_add(2);
+                    let string = self
+                        .husk_styles
                         .string
                         .as_ref()
                         .is_some_and(|style| *style == covering.style)
@@ -968,7 +969,17 @@ impl Highlighter {
                         && !inserted.chars().chain(removed.chars()).any(|character| {
                             character.is_control() || matches!(character, '"' | '\\')
                         });
-                if !comment && !string {
+                    (comment, string)
+                } else {
+                    (false, false)
+                };
+                let numeric = stable_husk_numeric_token(
+                    &cached.code,
+                    edit.start_byte,
+                    edit.old_end_byte,
+                    inserted,
+                );
+                if !comment && !string && !numeric {
                     return None;
                 }
                 let mut updated = cached.styles.clone();
@@ -1093,30 +1104,46 @@ impl Highlighter {
                             .husk_styles
                             .string
                             .as_ref()
+                            .is_some_and(|expected| *expected == style.style)
+                        || self
+                            .husk_styles
+                            .numeric
+                            .as_ref()
                             .is_some_and(|expected| *expected == style.style))
-            })?;
-            let token = cached.code.get(covering.start..covering.end)?;
-            let comment = self
-                .husk_styles
-                .comment
-                .as_ref()
-                .is_some_and(|style| *style == covering.style)
-                && token.starts_with("//")
-                && !token.contains('\n')
-                && outer_edit.start_byte > covering.start.saturating_add(2);
-            let string = self
-                .husk_styles
-                .string
-                .as_ref()
-                .is_some_and(|style| *style == covering.style)
-                && token.starts_with('"')
-                && token.ends_with('"')
-                && !token.contains(['\r', '\n'])
-                && !inserted
-                    .chars()
-                    .chain(removed.chars())
-                    .any(|character| matches!(character, '"' | '\\'));
-            if !comment && !string {
+            });
+            let (comment, string) = if let Some(covering) = covering {
+                let token = cached.code.get(covering.start..covering.end)?;
+                let comment = self
+                    .husk_styles
+                    .comment
+                    .as_ref()
+                    .is_some_and(|style| *style == covering.style)
+                    && token.starts_with("//")
+                    && !token.contains('\n')
+                    && outer_edit.start_byte > covering.start.saturating_add(2);
+                let string = self
+                    .husk_styles
+                    .string
+                    .as_ref()
+                    .is_some_and(|style| *style == covering.style)
+                    && token.starts_with('"')
+                    && token.ends_with('"')
+                    && !token.contains(['\r', '\n'])
+                    && !inserted
+                        .chars()
+                        .chain(removed.chars())
+                        .any(|character| matches!(character, '"' | '\\'));
+                (comment, string)
+            } else {
+                (false, false)
+            };
+            let numeric = stable_husk_numeric_token(
+                old_contents,
+                outer_edit.start_byte.checked_sub(content_start)?,
+                outer_edit.old_end_byte.checked_sub(content_start)?,
+                inserted,
+            );
+            if !comment && !string && !numeric {
                 return None;
             }
             None
@@ -1394,6 +1421,28 @@ impl Highlighter {
     }
 }
 
+fn stable_husk_numeric_token(source: &str, start: usize, end: usize, inserted: &str) -> bool {
+    if !inserted.bytes().all(|byte| byte.is_ascii_digit()) {
+        return false;
+    }
+    let line_start = source[..start].rfind('\n').map_or(0, |index| index + 1);
+    let line_end = source[end..]
+        .find('\n')
+        .map_or(source.len(), |offset| end + offset);
+    let line = &source[line_start..line_end];
+    Lexer::new(line).any(|token| {
+        let range = token.span.range;
+        let token_start = line_start + range.start;
+        let token_end = line_start + range.end;
+        matches!(token.kind, TokenKind::IntLiteral(_))
+            && token_start < start
+            && token_end > end
+            && line.get(range).is_some_and(|text| {
+                !text.starts_with('0') && text.bytes().all(|byte| byte.is_ascii_digit())
+            })
+    })
+}
+
 fn bundled_highlight_definition(definition: &RuntimeLanguageDefinition, language_id: &str) -> bool {
     let expected_queries = match language_id {
         "rust" => &[tree_sitter_rust::HIGHLIGHTS_QUERY][..],
@@ -1443,12 +1492,15 @@ fn stable_bundled_token(
         .checked_sub(isize::try_from(edit.old_end_byte).ok()?)?;
     let inserted = source.get(edit.start_byte..edit.new_end_byte)?;
     match token.kind() {
-        "integer_literal" | "number" => {
+        "integer_literal" | "decimal_integer_literal" | "integer" | "integer_scalar" | "number" => {
             let supported = match token.kind() {
                 "integer_literal" => language_id == "rust",
+                "decimal_integer_literal" => language_id == "powershell",
+                "integer" => language_id == "toml",
+                "integer_scalar" => language_id == "yaml",
                 "number" => matches!(
                     language_id,
-                    "javascript" | "jsx" | "typescript" | "tsx" | "json"
+                    "javascript" | "jsx" | "typescript" | "tsx" | "json" | "lua"
                 ),
                 _ => false,
             };
@@ -2697,6 +2749,11 @@ mod tests {
             ("typescript", "const value: number = 123456789;\n"),
             ("tsx", "const value: number = 123456789;\n"),
             ("json", "{\"value\": 123456789}\n"),
+            ("toml", "value = 123456789\n"),
+            ("yaml", "value: 123456789\n"),
+            ("lua", "local value = 123456789\n"),
+            ("powershell", "$value = 123456789; \"retained\"\n"),
+            ("husk", "let value = 123456789;\n"),
         ] {
             for fenced in [false, true] {
                 let before = if fenced {
@@ -2719,14 +2776,19 @@ mod tests {
                             .collect::<Vec<_>>()
                     };
                     assert_eq!(shape(&actual), shape(&expected), "{language}: {source}");
-                    assert!(incremental.highlighters[outer]
-                        .cached_tree
-                        .as_ref()
-                        .unwrap()
-                        .tree
-                        .root_node()
-                        .has_changes());
-                    if fenced {
+                    if outer != "husk" {
+                        assert!(
+                            incremental.highlighters[outer]
+                                .cached_tree
+                                .as_ref()
+                                .unwrap()
+                                .tree
+                                .root_node()
+                                .has_changes(),
+                            "{language} outer numeric tree was not reused (fenced={fenced})"
+                        );
+                    }
+                    if fenced && language != "husk" {
                         assert!(incremental.highlighters[language]
                             .cached_tree
                             .as_ref()
@@ -2757,6 +2819,14 @@ mod tests {
                 "const value = 1237456n;",
             ),
             ("json", "{\"value\": 123456}", "{\"value\": 123.456}"),
+            ("toml", "value = 123456\n", "value = 123_456\n"),
+            ("yaml", "value: 123456\n", "value: 123.456\n"),
+            ("lua", "local value = 0x123456", "local value = 0x1237456"),
+            (
+                "powershell",
+                "$value = 123456; \"retained\"",
+                "$value = 123.456; \"retained\"",
+            ),
         ] {
             let mut incremental = highlighter();
             incremental.highlight(language, before).unwrap();

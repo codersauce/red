@@ -54,6 +54,16 @@ navigation baselines were frozen after rebasing to `d92777c`.
 
 | Runtime path | Median improvement |
 | --- | ---: |
+| Markdown fenced PowerShell numeric-literal highlighting | 99.30% |
+| PowerShell numeric-literal highlighting | 99.09% |
+| Markdown fenced Husk numeric-literal highlighting | 99.01% |
+| Markdown fenced YAML numeric-literal highlighting | 99.01% |
+| YAML numeric-literal highlighting | 98.88% |
+| Markdown fenced Lua numeric-literal highlighting | 98.79% |
+| Markdown fenced TOML numeric-literal highlighting | 98.65% |
+| Lua numeric-literal highlighting | 97.75% |
+| TOML numeric-literal highlighting | 97.03% |
+| Husk numeric-literal highlighting | 91.45% |
 | Markdown fenced JSON numeric-literal highlighting | 99.12% |
 | Markdown fenced Rust numeric-literal highlighting | 99.03% |
 | Markdown fenced TypeScript numeric-literal highlighting | 98.93% |
@@ -756,6 +766,20 @@ cached tree by the exact edit. The shortcut excludes token boundaries, reserved
 keywords, uppercase-sensitive names, non-identifier Unicode, custom queries,
 and source or span cache-limit violations; Unicode edits, comments, YAML
 context, Markdown language injections, and fresh-parser parity remain covered.
+
+Seven additional alternating release-build samples per configuration, shell,
+Lua, and Husk numeric scenario applied 128 interior ASCII-digit edits to
+96-line documents. Direct TOML, YAML, Lua, PowerShell, and Husk medians fell
+from 10,918 to 324, 27,300 to 305, 14,695 to 331, 43,842 to 399, and 3,218 to
+275 microseconds. Their Markdown-fenced equivalents respectively fell from
+45,935 to 622, 59,840 to 594, 55,285 to 669, 108,442 to 763, and 46,730 to
+461 microseconds. Each Tree-sitter grammar validates its exact decimal node
+kind, complete bundled queries, non-zero-leading ASCII digits, and strict
+interior edit bounds. Husk's current theme does not color numeric tokens;
+its real lexer instead validates only the edited physical line before shifting
+later themed captures and outer Markdown spans. Floats, hexadecimal prefixes,
+digit separators, custom queries, token boundaries, comments, and quoted
+strings retain complete parsing.
 
 Seven alternating release-build samples per numeric scenario applied 128
 plain decimal-digit edits inside six bundled languages and their Markdown
