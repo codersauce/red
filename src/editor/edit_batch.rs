@@ -586,6 +586,42 @@ mod tests {
         assert_eq!(h.editor.current_buffer().contents(), expected);
     }
 
+    #[test]
+    fn first_line_replay_bounds_match_ordinary_wrapped_viewports() {
+        let long_source = format!("{}\nnext\n", "z".repeat(2_000));
+        for (source, cursor, scrolloff) in [
+            ("ordinary text\nnext line\n", 5, 3),
+            ("😀 tabs\there and wrapped text\nnext\n", 8, 3),
+            ("    indented wrapped source text\nnext\n", 20, 6),
+            (long_source.as_str(), 1_500, 3),
+        ] {
+            let mut ordinary = Harness::new(source);
+            let mut replay = Harness::new(source);
+            ordinary.editor.config.scrolloff = Some(scrolloff);
+            replay.editor.config.scrolloff = Some(scrolloff);
+            ordinary.editor.cx = cursor;
+            replay.editor.cx = cursor;
+            replay.editor.begin_edit_batch();
+
+            assert_eq!(replay.editor.check_bounds(), ordinary.editor.check_bounds());
+            assert_eq!(
+                (
+                    replay.editor.cx,
+                    replay.editor.cy,
+                    replay.editor.vtop,
+                    replay.editor.skipcol,
+                ),
+                (
+                    ordinary.editor.cx,
+                    ordinary.editor.cy,
+                    ordinary.editor.vtop,
+                    ordinary.editor.skipcol,
+                ),
+                "replay bounds diverged for cursor {cursor}, scrolloff {scrolloff}: {source:?}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn an_external_action_observes_the_latest_revision() {
         let mut h = Harness::new("value\n");

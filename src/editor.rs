@@ -8027,6 +8027,29 @@ impl Editor {
         let has_display_row_margin = scrolloff > 0
             && (self.wrap || has_comments)
             && self.active_window_with_editor_view().is_some_and(|window| {
+                if self.edit_batch.is_active()
+                    && self.wrap
+                    && !has_comments
+                    && buffer_line == 0
+                    && self.vtop == 0
+                    && self.skipcol == 0
+                    && self.visible_inline_suggestion().is_none()
+                {
+                    let width = self.window_content_width(&window);
+                    let rows = viewport_height.saturating_sub(scrolloff);
+                    // Break-indent always retains at least 20 text cells. Reserve
+                    // another cell per row for a clipped wide grapheme, so this
+                    // only bypasses layout when the cursor provably fits above
+                    // the bottom scroll margin even in the worst case.
+                    let continuation_width = width.min(20).saturating_sub(1).max(1);
+                    let guaranteed_visible_columns = width
+                        .saturating_sub(1)
+                        .saturating_add(rows.saturating_sub(1).saturating_mul(continuation_width));
+                    if self.current_cursor_display_col() < guaranteed_visible_columns {
+                        return true;
+                    }
+                }
+
                 let layout = self.layout_for_window(&window);
                 let display_col = self.current_cursor_display_col();
                 self.viewport_cursor_row_bounds(&layout)

@@ -167,35 +167,51 @@ navigation baselines were frozen after rebasing to `d92777c`.
 | Real-terminal text-insertion events | 74.32% |
 | Shared Vim Unicode inner quoted text objects | 74.07% |
 | Embedded Vim long-line end motions | 72.63% |
+| Real-terminal Unicode counted character deletion | 72.58% |
 | Shared Vim paragraph navigation | 72.60% |
 | Undo history capacity pruning | 72.42% |
 | ASCII automatic indentation columns | 71.81% |
 | Unicode automatic indentation columns | 71.42% |
+| Real-terminal Unicode and CRLF counted character deletion | 71.09% |
 | Real-terminal YAML typing action handling | 71.04% |
+| Real-terminal CRLF counted character deletion | 70.54% |
 | Real-terminal full-document-LSP substitution | 70.47% |
+| Real-terminal full-document-LSP counted character deletion | 70.18% |
 | Real-terminal YAML text-insertion events | 69.78% |
 | Real-terminal edited-window painting | 69.23% |
+| Real-terminal counted character deletion | 68.43% |
+| Real-terminal split-window counted character deletion | 67.94% |
 | LSP completion filtering | 67.58% |
+| Real-terminal full-document-LSP macro playback | 66.77% |
+| Real-terminal split-window macro playback | 66.25% |
+| Real-terminal CRLF macro playback | 66.13% |
+| Real-terminal bundled-plugin counted character deletion | 65.77% |
 | Real-terminal split-window substitution | 64.83% |
 | Vim first-nonblank line-start operators | 64.81% |
 | Structured picker ranking | 64.81% |
+| Real-terminal incremental-LSP counted character deletion | 64.61% |
+| Real-terminal macro playback | 64.59% |
 | Real-terminal Markdown typing action handling | 64.30% |
 | Real-terminal incremental search window painting | 64.00% |
 | Real-terminal large-document substitution | 63.93% |
 | Shared Vim around paragraph text objects | 63.73% |
 | Shared Vim paragraph boundary operators | 63.42% |
 | Real-terminal CRLF substitution | 63.42% |
+| Real-terminal incremental-LSP macro playback | 63.12% |
 | Shared Vim inner paragraph text objects | 63.01% |
 | Real-terminal Markdown text-insertion events | 62.37% |
 | Real-terminal Unicode and CRLF substitution | 61.37% |
 | Complete real-terminal interactive startup | 60.80% |
+| Real-terminal bundled-plugin macro playback | 60.71% |
 | Real-terminal whole-document substitution | 60.66% |
 | Real-terminal bundled-plugin substitution | 60.34% |
 | Git workspace status directory indexing | 60.28% |
 | Real-terminal overlay and cursor composition | 60.00% |
 | Real-terminal Unicode substitution | 59.09% |
 | Git repository discovery and branch refresh | 58.73% |
+| Real-terminal Unicode macro playback | 58.36% |
 | Real-terminal YAML completion-aware edit frames | 58.12% |
+| Real-terminal Unicode and CRLF macro playback | 57.84% |
 | Real-terminal Markdown completion-aware edit frames | 56.44% |
 | Plugin cursor-event delivery | 56.35% |
 | Real-terminal file-picker dialog and preview composition | 56.35% |
@@ -633,6 +649,28 @@ captures, escaped delimiters, confirmations, visual ranges, Unicode UTF-16,
 CRLF, named marks, undo/redo, diagnostics, and external plugin barriers retain
 their original behavior. Substitute-command classification stays outside the
 recursive dispatcher so visual-block dot-repeat remains safe on a 2 MiB stack.
+
+Seven alternating real-terminal sessions per replay scenario applied 128 macro
+actions or counted character deletions inside 2,000-line fixtures. Ordinary
+macro playback fell from 6,684 to 2,367 microseconds, Unicode from 9,174 to
+3,820, CRLF from 6,611 to 2,239, and combined Unicode/CRLF from 9,119 to
+3,845. Bundled plugins fell from 7,325 to 2,878 microseconds, shared-buffer
+splits from 6,744 to 2,276, incremental LSP from 7,166 to 2,643, and
+full-document LSP from 7,542 to 2,506. Ordinary counted deletion fell from
+4,359 to 1,376 microseconds, Unicode from 5,849 to 1,604, CRLF from 4,342 to
+1,279, and combined Unicode/CRLF from 5,687 to 1,644. Bundled plugins fell
+from 4,324 to 1,480 microseconds, shared-buffer splits from 4,220 to 1,353,
+incremental LSP from 4,642 to 1,643, and full-document LSP from 4,674 to
+1,394. While a deferred replay remains on the first visible wrapped source
+line, conservative break-indent capacity and one reserved wide-grapheme cell
+per row prove that the cursor remains above the configured bottom scroll
+margin without rebuilding the viewport. Macro layout misses fell from 129 to
+two, and counted-deletion misses from 128 to one. Inline comments, predictions,
+skipped columns, scrolled origins, long wrapped lines, and exhausted visible
+capacity retain their original full-layout path. All runs preserved exact saved
+Unicode/CRLF text, bundled callbacks, shared-window contents, fairness and
+cancellation checkpoints, and one optimized buffer publication; both LSP
+modes additionally retained one exact synchronized document notification.
 
 Eleven alternating real-terminal runs reduced overlay and cursor composition
 from five to two microseconds. Each frame resolves cursor geometry once for
