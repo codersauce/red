@@ -81,6 +81,7 @@ struct InlayHintsState {
     hints_loaded: bool,
     generation: i32,
     hints_request: i32,
+    retry_count: i32,
     parameter_hints: bool,
     last_decorations: Option<[InlayDecoration]>,
 }
@@ -96,6 +97,7 @@ fn initial_state() -> InlayHintsState {
         hints_loaded: false,
         generation: 0,
         hints_request: 0,
+        retry_count: 0,
         parameter_hints: false,
         last_decorations: None,
     };
@@ -128,6 +130,7 @@ fn schedule_refresh(event: EmptyEvent) {
     if timer != "" {
         red::execute("CancelTimeout", timer);
     }
+    red::state_patch(InlayHintsState { retry_count: 0 });
     red::state_patch(InlayHintsState { timer: red::execute("SetTimeout", 120) });
 }
 
@@ -198,8 +201,10 @@ fn render_if_ready() {
     };
     if !red::bool(result.ok, false) {
         red::execute("ClearDecorations", "inlay-hints");
+        schedule_retry();
         return;
     }
+    red::state_patch(InlayHintsState { retry_count: 0 });
 
     let Some(layout) = state().layout else {
         return;
@@ -238,6 +243,19 @@ fn render_if_ready() {
         red::state_patch(InlayHintsState { last_decorations: Some(decorations) });
         red::execute("SetDecorations", "inlay-hints", decorations);
     }
+}
+
+fn schedule_retry() {
+    let retry_count = red::int(state().retry_count, 0);
+    if retry_count >= 8 {
+        return;
+    }
+    let timer = red::string(state().timer, "");
+    if timer != "" {
+        red::execute("CancelTimeout", timer);
+    }
+    red::state_patch(InlayHintsState { retry_count: retry_count + 1 });
+    red::state_patch(InlayHintsState { timer: red::execute("SetTimeout", 500) });
 }
 
 fn group_hints_by_line(hints: [InlayHint], rows: [InlayViewportRow]) -> [InlayHintGroup] {

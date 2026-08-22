@@ -11930,6 +11930,83 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn inlay_hints_retry_after_a_recoverable_lsp_error() {
+        drain_requests();
+
+        let mut runtime = Runtime::new();
+        runtime.set_snapshot(
+            "editor_info",
+            serde_json::json!({
+                "theme": {
+                    "colors": {
+                        "editorInlayHint.typeForeground": "#c8c8c8",
+                        "editor.background": "#0a141e",
+                    },
+                    "gutter_style": { "fg": null },
+                }
+            }),
+        );
+        runtime.set_snapshot("viewport_layout", sample_indent_layout());
+        runtime
+            .load_plugin("inlay_hints", include_str!("../../plugins/inlay_hints.hk"))
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::GetConfig { .. }
+        ));
+        let hints_request_id = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::InlayHints { request_id, .. } => request_id,
+            _ => panic!("expected initial inlay-hint request"),
+        };
+        runtime
+            .resolve_request(
+                hints_request_id,
+                serde_json::json!({
+                    "ok": false,
+                    "hints": [],
+                    "error": "content modified",
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::ClearDecorations { .. }
+        ));
+
+        let timer_id = {
+            let inner = runtime.inner.lock().unwrap();
+            inner
+                .host
+                .policy()
+                .typed_states
+                .get("inlay_hints")
+                .and_then(|state| match state {
+                    Value::Struct { fields, .. } => fields.get("timer"),
+                    _ => None,
+                })
+                .and_then(Value::as_str)
+                .expect("expected retry timer")
+                .to_string()
+        };
+        runtime.cancel_test_timeout(&timer_id);
+        runtime
+            .notify(
+                "timeout:callback",
+                serde_json::json!({ "timer_id": timer_id }),
+            )
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::InlayHints { .. }
+        ));
+    }
+
+    #[tokio::test]
     async fn inlay_hints_bound_pathological_same_line_results() {
         drain_requests();
 

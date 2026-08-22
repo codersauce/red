@@ -1178,6 +1178,15 @@ fn plugin_lsp_error(message: &str) -> Value {
     })
 }
 
+fn plugin_inlay_hints_error(request_id: RequestId, message: &str) -> Value {
+    json!({
+        "ok": false,
+        "hints": [],
+        "request_id": request_id.get(),
+        "error": message,
+    })
+}
+
 fn plugin_json(value: Value) -> Value {
     match value {
         Value::Array(values) => Value::Array(values.into_iter().map(plugin_json).collect()),
@@ -2653,6 +2662,12 @@ pub enum Action {
         previous_file: Option<String>,
         warning: Option<String>,
     },
+    RetryLspFormatSave {
+        buffer_id: BufferId,
+        uri: String,
+        save_as: Option<String>,
+        previous_file: Option<String>,
+    },
     RestoreLspFormatSave {
         buffer_id: BufferId,
         uri: String,
@@ -4098,6 +4113,7 @@ struct PluginDocumentTransaction {
 struct PendingLspFormatSave {
     save_as: Option<String>,
     previous_file: Option<String>,
+    retry_invalid_edits: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -13158,8 +13174,7 @@ impl Editor {
                 warning: None,
             });
         }
-        if let Some(error) = save.as_ref().and_then(|save| {
-            save.save_as.as_ref()?;
+        if let Some(error) = save.as_ref().and_then(|_| {
             let contents = self
                 .buffer_manager
                 .iter()
@@ -13167,9 +13182,30 @@ impl Editor {
                 .contents();
             crate::lsp::apply_text_edits(&contents, &edits).err()
         }) {
-            let warning = format!("invalid LSP formatting edits; Save As cancelled: {error}");
-            self.set_legacy_message(Some(warning.clone()));
             let save = save?;
+            if save.save_as.is_none() && save.retry_invalid_edits {
+                return Some(Action::RetryLspFormatSave {
+                    buffer_id: pending.buffer_id,
+                    uri: pending.uri,
+                    save_as: save.save_as,
+                    previous_file: save.previous_file,
+                });
+            }
+            let warning = if save.save_as.is_some() {
+                format!("invalid LSP formatting edits; Save As cancelled: {error}")
+            } else {
+                format!("format-on-save unavailable; saved unformatted: invalid LSP formatting edits: {error}")
+            };
+            self.set_legacy_message(Some(warning.clone()));
+            if save.save_as.is_none() {
+                return Some(Action::CompleteLspFormatSave {
+                    buffer_id: pending.buffer_id,
+                    uri: pending.uri,
+                    save_as: None,
+                    previous_file: save.previous_file,
+                    warning: Some(warning),
+                });
+            }
             return Some(Action::RestoreLspFormatSave {
                 buffer_id: pending.buffer_id,
                 uri: pending.uri,
@@ -13847,15 +13883,11 @@ impl Editor {
                 if method.as_deref() == Some("completionItem/resolve") {
                     return self.completion_resolution_failed(id, &error_msg.message);
                 }
-                if method.as_deref() == Some("textDocument/inlayHint") && error_msg.code == -32801 {
+                if method.as_deref() == Some("textDocument/inlayHint") {
                     if let Some(request_id) = self.pending_plugin_inlay_hints.remove(&id) {
                         return Some(Action::ResolvePluginRequest(
                             request_id.get(),
-                            json!({
-                                "ok": false,
-                                "hints": [],
-                                "request_id": request_id.get(),
-                            }),
+                            plugin_inlay_hints_error(request_id, &error_msg.message),
                         ));
                     }
                 }
@@ -13938,6 +13970,14 @@ impl Editor {
                 }
                 if method.as_deref() == Some("completionItem/resolve") {
                     return self.completion_resolution_failed(*id, &error.to_string());
+                }
+                if method.as_deref() == Some("textDocument/inlayHint") {
+                    if let Some(request_id) = self.pending_plugin_inlay_hints.remove(id) {
+                        return Some(Action::ResolvePluginRequest(
+                            request_id.get(),
+                            plugin_inlay_hints_error(request_id, &error.to_string()),
+                        ));
+                    }
                 }
                 if let Some(request_id) = method
                     .as_deref()
@@ -19935,6 +19975,21 @@ impl Editor {
                     save_as.as_deref(),
                     previous_file.clone(),
                     warning.as_deref(),
+                    runtime,
+                )
+                .await?;
+            }
+            Action::RetryLspFormatSave {
+                buffer_id,
+                uri,
+                save_as,
+                previous_file,
+            } => {
+                self.retry_lsp_format_save(
+                    *buffer_id,
+                    uri,
+                    save_as.clone(),
+                    previous_file.clone(),
                     runtime,
                 )
                 .await?;
@@ -27013,6 +27068,81 @@ impl Editor {
         Ok(())
     }
 
+    async fn retry_lsp_format_save(
+        &mut self,
+        buffer_id: BufferId,
+        uri: &str,
+        save_as: Option<String>,
+        previous_file: Option<String>,
+        runtime: &mut Runtime,
+    ) -> anyhow::Result<()> {
+        let Some(index) = self.buffer_manager.iter().position(|buffer| {
+            buffer.id() == buffer_id && buffer.uri().ok().flatten().as_deref() == Some(uri)
+        }) else {
+            self.set_legacy_message(Some(
+                "formatted buffer is no longer open; save cancelled".to_string(),
+            ));
+            return Ok(());
+        };
+        let original = self.buffer_manager.active_index();
+        let original_view = (self.cx, self.cy, self.vtop, self.vleft, self.skipcol);
+        self.select_buffer_for_lsp_edit(index);
+        let file = self.current_buffer().file.clone();
+        let revision = self.current_buffer().revision();
+        let indentation = self.indentation();
+        let request = match file {
+            Some(file) => {
+                self.lsp
+                    .format_document_with_options(
+                        &file,
+                        indentation.tab_width,
+                        indentation.expand_tab,
+                    )
+                    .await
+            }
+            None => Ok(0),
+        };
+        self.select_buffer_for_lsp_edit(original);
+        (self.cx, self.cy, self.vtop, self.vleft, self.skipcol) = original_view;
+        self.check_bounds();
+        match request {
+            Ok(request_id) if request_id > 0 => {
+                self.pending_lsp_edit_requests.insert(
+                    request_id,
+                    PendingLspEdit {
+                        buffer_id,
+                        revision,
+                        uri: uri.to_string(),
+                    },
+                );
+                self.pending_lsp_format_saves.insert(
+                    request_id,
+                    PendingLspFormatSave {
+                        save_as,
+                        previous_file,
+                        retry_invalid_edits: false,
+                    },
+                );
+            }
+            result => {
+                let warning = result.err().map_or_else(
+                    || "format-on-save unavailable; saved unformatted after a stale formatting response".to_string(),
+                    |error| format!("format-on-save unavailable; saved unformatted: {error}"),
+                );
+                self.complete_lsp_format_save(
+                    buffer_id,
+                    uri,
+                    save_as.as_deref(),
+                    previous_file,
+                    Some(&warning),
+                    runtime,
+                )
+                .await?;
+            }
+        }
+        Ok(())
+    }
+
     async fn restore_lsp_format_save_identity(
         &mut self,
         buffer_id: BufferId,
@@ -27785,6 +27915,7 @@ impl Editor {
             PendingLspFormatSave {
                 save_as,
                 previous_file,
+                retry_invalid_edits: true,
             },
         );
         Ok(FormatOnSaveRequest::Pending)
@@ -39197,6 +39328,7 @@ builtin = "rust"
             PendingLspFormatSave {
                 save_as: None,
                 previous_file: None,
+                retry_invalid_edits: true,
             },
         );
         let response = InboundMessage::Message(ResponseMessage {
@@ -39223,6 +39355,64 @@ builtin = "rust"
         assert!(editor.pending_lsp_format_saves.is_empty());
     }
 
+    #[test]
+    fn format_on_save_retries_one_response_computed_before_whitespace_cleanup() {
+        let path = "/tmp/red-format-retry.rs";
+        let mut editor = lsp_test_editor(vec![Buffer::new(
+            Some(path.to_string()),
+            "value\n".to_string(),
+        )]);
+        let buffer_id = editor.buffer_manager[0].id();
+        let revision = editor.buffer_manager[0].revision();
+        let uri = editor.buffer_manager[0].uri().unwrap().unwrap();
+        let response = |id| {
+            InboundMessage::Message(ResponseMessage {
+                id,
+                result: serde_json::json!([{
+                    "range": { "start": { "line": 0, "character": 5 }, "end": { "line": 0, "character": 8 } },
+                    "newText": ""
+                }]),
+                request: Some(crate::lsp::Request::new(
+                    "textDocument/formatting",
+                    serde_json::json!({}),
+                )),
+            })
+        };
+        let queue = |editor: &mut Editor, id, retry_invalid_edits| {
+            editor.pending_lsp_edit_requests.insert(
+                id,
+                PendingLspEdit {
+                    buffer_id,
+                    revision,
+                    uri: uri.clone(),
+                },
+            );
+            editor.pending_lsp_format_saves.insert(
+                id,
+                PendingLspFormatSave {
+                    save_as: None,
+                    previous_file: None,
+                    retry_invalid_edits,
+                },
+            );
+        };
+
+        queue(&mut editor, 61, true);
+        assert!(matches!(
+            editor.handle_lsp_message(&response(61), Some("textDocument/formatting".to_string())),
+            Some(Action::RetryLspFormatSave { .. })
+        ));
+
+        queue(&mut editor, 62, false);
+        assert!(matches!(
+            editor.handle_lsp_message(&response(62), Some("textDocument/formatting".to_string())),
+            Some(Action::CompleteLspFormatSave {
+                warning: Some(_),
+                ..
+            })
+        ));
+    }
+
     #[tokio::test]
     async fn format_on_save_can_create_a_named_unsaved_file_after_applying_edits() {
         let root = tempfile::tempdir().unwrap();
@@ -39245,6 +39435,7 @@ builtin = "rust"
             PendingLspFormatSave {
                 save_as: None,
                 previous_file: None,
+                retry_invalid_edits: true,
             },
         );
         let response = InboundMessage::Message(ResponseMessage {
@@ -39794,6 +39985,7 @@ while True:
                 PendingLspFormatSave {
                     save_as: None,
                     previous_file: None,
+                    retry_invalid_edits: true,
                 },
             );
             let message = match failure {
@@ -39860,6 +40052,7 @@ while True:
                     save_as: (failure == "response" || failure == "request")
                         .then(|| target_file.clone()),
                     previous_file: Some(root.path().join("source.rs").to_string_lossy().into()),
+                    retry_invalid_edits: true,
                 },
             );
             let message = match failure {
@@ -39937,6 +40130,7 @@ while True:
                 PendingLspFormatSave {
                     save_as: Some(target_file),
                     previous_file: Some(source_file.clone()),
+                    retry_invalid_edits: true,
                 },
             );
             if failure == "stale" || failure == "stale-request" {
@@ -40153,6 +40347,7 @@ while True:
             PendingLspFormatSave {
                 save_as: None,
                 previous_file: None,
+                retry_invalid_edits: true,
             },
         );
         editor.buffer_manager[0]
@@ -40201,6 +40396,7 @@ while True:
             PendingLspFormatSave {
                 save_as: None,
                 previous_file: None,
+                retry_invalid_edits: true,
             },
         );
         let message = InboundMessage::Error(crate::lsp::ResponseError {
@@ -40262,9 +40458,38 @@ while True:
                     "ok": false,
                     "hints": [],
                     "request_id": 7,
+                    "error": "content modified",
                 })
         ));
         assert!(!editor.pending_plugin_inlay_hints.contains_key(&42));
+        assert!(editor.last_error.is_none());
+    }
+
+    #[test]
+    fn timeout_resolves_inlay_hints_with_a_schema_safe_retry_payload() {
+        let mut editor = test_editor(40, 10);
+        editor
+            .pending_plugin_inlay_hints
+            .insert(42, RequestId::from_raw(7));
+        let message = InboundMessage::RequestError {
+            id: 42,
+            error: crate::lsp::LspError::RequestTimeout(std::time::Duration::from_secs(30)),
+        };
+
+        let action =
+            editor.handle_lsp_message(&message, Some("textDocument/inlayHint".to_string()));
+
+        assert!(matches!(
+            action,
+            Some(Action::ResolvePluginRequest(7, payload))
+                if payload["ok"] == false
+                    && payload["hints"] == serde_json::json!([])
+                    && payload["request_id"] == 7
+                    && payload["error"]
+                        .as_str()
+                        .is_some_and(|error| error.contains("timed out"))
+        ));
+        assert!(editor.pending_plugin_inlay_hints.is_empty());
         assert!(editor.last_error.is_none());
     }
 
