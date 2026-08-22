@@ -111,7 +111,9 @@ navigation baselines were frozen after rebasing to `d92777c`.
 | Undo history capacity pruning | 72.42% |
 | LSP completion filtering | 67.58% |
 | Structured picker ranking | 64.81% |
+| Shared Vim around paragraph text objects | 63.73% |
 | Shared Vim paragraph boundary operators | 63.42% |
+| Shared Vim inner paragraph text objects | 63.01% |
 | Git workspace status directory indexing | 60.28% |
 | Git repository discovery and branch refresh | 58.73% |
 | Plugin cursor-event delivery | 56.35% |
@@ -206,6 +208,13 @@ alternating release-build samples reduced keyword-object medians from 1,698,623
 to 1,816 microseconds and WORD-object medians from 1,181,118 to 2,416
 microseconds while preserving punctuation groups, leading/trailing whitespace,
 tabs, out-of-range cursors, inner/around semantics, and Unicode grapheme rules.
+
+Shared Vim paragraph objects were independently measured across 128 inner and
+128 around selections spanning 768-line paragraphs. Eleven alternating
+release-build samples reduced inner medians from 16,028 to 5,928 microseconds
+and around medians from 16,338 to 5,925 microseconds while preserving
+whitespace-only groups, CRLF, Unicode whitespace, empty/trailing lines,
+out-of-range cursors, and exact paragraph selection scopes.
 
 Multi-file startup uses the same production loader as the executable. Across
 four startup passes over 128 distinct source files, seven alternating samples

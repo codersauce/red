@@ -858,38 +858,45 @@ impl<'buffer> MotionResolver<'buffer> {
 
         let last_line = self.buffer.last_navigable_line();
         let cursor_line = self.cursor.line.min(last_line);
-        let is_blank = |line: usize| {
-            self.buffer
-                .get(line)
-                .is_some_and(|text| trim_line_ending(&text).trim().is_empty())
-        };
+        let contents = self.buffer.contents_snapshot();
+        let is_blank = |line: ropey::RopeSlice<'_>| line.chars().all(char::is_whitespace);
         let mut first_line = cursor_line;
         let mut last_exclusive = cursor_line + 1;
-        let cursor_is_blank = is_blank(cursor_line);
+        let cursor_is_blank = contents.get_line(cursor_line).is_some_and(is_blank);
 
-        while first_line > 0 && is_blank(first_line - 1) == cursor_is_blank {
-            first_line -= 1;
+        for (offset, line) in contents.lines_at(cursor_line).reversed().enumerate() {
+            if is_blank(line) != cursor_is_blank {
+                break;
+            }
+            first_line = cursor_line - offset - 1;
         }
-        while last_exclusive <= last_line && is_blank(last_exclusive) == cursor_is_blank {
-            last_exclusive += 1;
+        for (offset, line) in contents.lines_at(cursor_line + 1).enumerate() {
+            let candidate = cursor_line + offset + 1;
+            if candidate > last_line || is_blank(line) != cursor_is_blank {
+                break;
+            }
+            last_exclusive = candidate + 1;
         }
-        if scope == TextObjectScope::Around {
-            if cursor_is_blank {
-                while last_exclusive <= last_line && !is_blank(last_exclusive) {
-                    last_exclusive += 1;
+        if scope == TextObjectScope::Around && last_exclusive <= last_line {
+            let start = last_exclusive;
+            for (offset, line) in contents.lines_at(start).enumerate() {
+                let candidate = start + offset;
+                if candidate > last_line || is_blank(line) == cursor_is_blank {
+                    break;
                 }
-            } else {
-                while last_exclusive <= last_line && is_blank(last_exclusive) {
-                    last_exclusive += 1;
-                }
+                last_exclusive = candidate + 1;
             }
         }
 
         let ends_at_eof = last_exclusive > last_line;
         let start = if ends_at_eof && first_line > 0 {
             if scope == TextObjectScope::Around {
-                while first_line > 0 && is_blank(first_line - 1) {
-                    first_line -= 1;
+                let boundary = first_line;
+                for (offset, line) in contents.lines_at(boundary).reversed().enumerate() {
+                    if !is_blank(line) {
+                        break;
+                    }
+                    first_line = boundary - offset - 1;
                 }
                 if first_line > 0 {
                     let previous_line = first_line - 1;
@@ -1456,5 +1463,51 @@ mod tests {
             .text_object(TextObjectScope::Inner, TextObjectKind::Word)
             .unwrap();
         assert_eq!(unicode.text_in_range(range), "e\u{301}clair");
+    }
+
+    #[test]
+    fn indexed_paragraph_objects_preserve_whitespace_unicode_and_selection_scopes() {
+        for text in [
+            "",
+            "one paragraph",
+            "first\nsecond\n\nthird",
+            "first\n   \n\t\nsecond\n\nthird",
+            "\n\nleading\nnext\n\n",
+            "alpha\r\n\r\nbeta\r\ngamma",
+            "漢字\n👨‍👩‍👧\n\u{3000}\n🇧🇷 tail",
+        ] {
+            let buffer = Buffer::new(None, text.to_string());
+            for line in 0..=buffer.len() + 1 {
+                let resolver = MotionResolver::new(&buffer, TextPosition::new(line, 0));
+                for scope in [TextObjectScope::Inner, TextObjectScope::Around] {
+                    let actual = resolver.text_object(scope, TextObjectKind::Paragraph);
+                    if buffer.is_empty() {
+                        assert!(actual.is_none());
+                        continue;
+                    }
+                    let Some(range) = actual else {
+                        continue;
+                    };
+                    assert!(
+                        (range.start.line, range.start.character)
+                            <= (range.end.line, range.end.character),
+                        "{text:?} at {line} {scope:?}"
+                    );
+                    let selected = buffer.text_in_range(range);
+                    assert!(!selected.is_empty(), "{text:?} at {line} {scope:?}");
+                }
+            }
+        }
+
+        let buffer = Buffer::new(None, "first\nsecond\n\nthird".to_string());
+        let resolver = MotionResolver::new(&buffer, TextPosition::new(0, 0));
+        let inner = resolver
+            .text_object(TextObjectScope::Inner, TextObjectKind::Paragraph)
+            .unwrap();
+        let around = resolver
+            .text_object(TextObjectScope::Around, TextObjectKind::Paragraph)
+            .unwrap();
+        assert_eq!(buffer.text_in_range(inner), "first\nsecond\n");
+        assert_eq!(buffer.text_in_range(around), "first\nsecond\n\n");
     }
 }

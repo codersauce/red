@@ -298,6 +298,12 @@ fn main() -> Result<()> {
     if scenario == "all" || scenario == "text-object-big-word" {
         results.push(benchmark_word_text_object(/*big_word*/ true)?);
     }
+    if scenario == "all" || scenario == "text-object-paragraph-inner" {
+        results.push(benchmark_paragraph_text_object(TextObjectScope::Inner)?);
+    }
+    if scenario == "all" || scenario == "text-object-paragraph-around" {
+        results.push(benchmark_paragraph_text_object(TextObjectScope::Around)?);
+    }
 
     anyhow::ensure!(
         !results.is_empty(),
@@ -2023,6 +2029,33 @@ fn benchmark_word_text_object(big_word: bool) -> Result<serde_json::Value> {
         },
         started,
         TEXTAREA_VIM_MOTIONS,
+    ))
+}
+
+fn benchmark_paragraph_text_object(scope: TextObjectScope) -> Result<serde_json::Value> {
+    let line = "ordinary paragraph source line and retained editor content\n";
+    let paragraph = line.repeat(768);
+    let buffer = Buffer::new(None, format!("header\n\n{paragraph}\n\nfooter"));
+    let resolver = MotionResolver::new(&buffer, TextPosition::new(386, 4));
+    let started = Instant::now();
+    for _ in 0..TEXTAREA_UNDO_RESTORES {
+        let range = resolver
+            .text_object(scope, TextObjectKind::Paragraph)
+            .ok_or_else(|| anyhow::anyhow!("paragraph text object was not found"))?;
+        anyhow::ensure!(
+            range.start.line <= 386 && range.end.line > 386,
+            "paragraph text object lost its source cursor"
+        );
+        black_box(range);
+    }
+    Ok(report(
+        if scope == TextObjectScope::Inner {
+            "shared_vim_inner_paragraph_text_objects"
+        } else {
+            "shared_vim_around_paragraph_text_objects"
+        },
+        started,
+        TEXTAREA_UNDO_RESTORES,
     ))
 }
 

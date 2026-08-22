@@ -74,6 +74,8 @@ SCENARIOS = (
     "text-object-quoted",
     "text-object-word",
     "text-object-big-word",
+    "text-object-paragraph-inner",
+    "text-object-paragraph-around",
     "husk-completion",
     "husk-config",
     "husk-update",
