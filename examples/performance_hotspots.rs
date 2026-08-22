@@ -355,6 +355,24 @@ fn main() -> Result<()> {
             /*comment*/ false, /*unicode*/ false, /*crlf*/ true,
         )?);
     }
+    for (name, language, fenced) in [
+        ("numeric-rust", "rust", false),
+        ("numeric-javascript", "javascript", false),
+        ("numeric-jsx", "jsx", false),
+        ("numeric-typescript", "typescript", false),
+        ("numeric-tsx", "tsx", false),
+        ("numeric-json", "json", false),
+        ("markdown-fenced-numeric-rust", "rust", true),
+        ("markdown-fenced-numeric-javascript", "javascript", true),
+        ("markdown-fenced-numeric-jsx", "jsx", true),
+        ("markdown-fenced-numeric-typescript", "typescript", true),
+        ("markdown-fenced-numeric-tsx", "tsx", true),
+        ("markdown-fenced-numeric-json", "json", true),
+    ] {
+        if scenario == "all" || scenario == name {
+            results.push(benchmark_numeric_literal_highlighting(language, fenced)?);
+        }
+    }
     for (name, language, comment) in [
         ("javascript-comment", "javascript", true),
         ("javascript-string", "javascript", false),
@@ -1815,6 +1833,63 @@ fn benchmark_cross_language_token_highlighting(
         _ => unreachable!("benchmark uses a supported bundled language token"),
     };
     Ok(report(scenario, started, RUST_TOKEN_HIGHLIGHT_EDITS))
+}
+
+fn benchmark_numeric_literal_highlighting(
+    language: &str,
+    fenced: bool,
+) -> Result<serde_json::Value> {
+    let theme = parse_vscode_theme("themes/mocha.json")?;
+    let mut highlighter = Highlighter::new(&theme)?;
+    let contents = if language == "json" {
+        format!(
+            "{{\n{}\n}}\n",
+            (0..96)
+                .map(|index| format!("  \"key_{index:03}\": 123456789"))
+                .collect::<Vec<_>>()
+                .join(",\n")
+        )
+    } else {
+        (0..96)
+            .map(|index| {
+                if language == "rust" {
+                    format!("fn value_{index:03}() -> usize {{ 123456789 }}\n")
+                } else {
+                    format!("function value_{index:03}() {{ return 123456789; }}\n")
+                }
+            })
+            .collect::<String>()
+    };
+    let mut source = if fenced {
+        format!("## outer heading\n\n```{language}\n{contents}```\n")
+    } else {
+        contents
+    };
+    let outer_language = if fenced { "markdown" } else { language };
+    let mut cursor = source.find("123456789").expect("numeric token marker") + 4;
+    black_box(highlighter.highlight(outer_language, &source)?);
+
+    let started = Instant::now();
+    for index in 0..RUST_TOKEN_HIGHLIGHT_EDITS {
+        let digit = if index % 2 == 0 { '7' } else { '8' };
+        source.insert(cursor, digit);
+        cursor += 1;
+        let spans = highlighter.highlight(black_box(outer_language), black_box(&source))?;
+        anyhow::ensure!(
+            spans
+                .iter()
+                .any(|span| span.start < cursor && span.end >= cursor)
+                || spans.iter().any(|span| span.start > cursor),
+            "{language} numeric edit lost its syntax capture"
+        );
+        black_box(spans);
+    }
+    let scenario = if fenced {
+        format!("markdown_fenced_{language}_numeric_literal_highlighting")
+    } else {
+        format!("{language}_numeric_literal_highlighting")
+    };
+    Ok(report(&scenario, started, RUST_TOKEN_HIGHLIGHT_EDITS))
 }
 
 fn benchmark_markdown_heading_highlighting(

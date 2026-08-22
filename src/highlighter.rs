@@ -1443,6 +1443,27 @@ fn stable_bundled_token(
         .checked_sub(isize::try_from(edit.old_end_byte).ok()?)?;
     let inserted = source.get(edit.start_byte..edit.new_end_byte)?;
     match token.kind() {
+        "integer_literal" | "number" => {
+            let supported = match token.kind() {
+                "integer_literal" => language_id == "rust",
+                "number" => matches!(
+                    language_id,
+                    "javascript" | "jsx" | "typescript" | "tsx" | "json"
+                ),
+                _ => false,
+            };
+            let previous = previous_source.get(token.byte_range())?;
+            let end = token.end_byte().checked_add_signed(delta)?;
+            let updated = source.get(token.start_byte()..end)?;
+            if !supported
+                || previous.starts_with('0')
+                || !previous.bytes().all(|byte| byte.is_ascii_digit())
+                || !inserted.bytes().all(|byte| byte.is_ascii_digit())
+                || !updated.bytes().all(|byte| byte.is_ascii_digit())
+            {
+                return None;
+            }
+        }
         "identifier" | "type_identifier" | "field_identifier" => {
             if language_id != "rust" {
                 return None;
@@ -2665,6 +2686,120 @@ mod tests {
                 "grammar-changing Rust token edit must reparse: {after}"
             );
         }
+    }
+
+    #[test]
+    fn bundled_decimal_digit_edits_preserve_direct_and_fenced_parser_captures() {
+        for (language, contents) in [
+            ("rust", "fn value() -> usize { 123456789 }\n"),
+            ("javascript", "const value = 123456789;\n"),
+            ("jsx", "const value = 123456789;\n"),
+            ("typescript", "const value: number = 123456789;\n"),
+            ("tsx", "const value: number = 123456789;\n"),
+            ("json", "{\"value\": 123456789}\n"),
+        ] {
+            for fenced in [false, true] {
+                let before = if fenced {
+                    format!("## heading\n\n```{language}\n{contents}```\n")
+                } else {
+                    contents.to_string()
+                };
+                let outer = if fenced { "markdown" } else { language };
+                let mut incremental = highlighter();
+                incremental.highlight(outer, &before).unwrap();
+                let inserted = before.replace("123456789", "12347856789");
+                let deleted = inserted.replace("12347856789", "1234756789");
+                for source in [inserted, deleted] {
+                    let actual = incremental.highlight(outer, &source).unwrap();
+                    let expected = highlighter().highlight(outer, &source).unwrap();
+                    let shape = |styles: &[StyleInfo]| {
+                        styles
+                            .iter()
+                            .map(|style| (style.start, style.end, style.style.clone()))
+                            .collect::<Vec<_>>()
+                    };
+                    assert_eq!(shape(&actual), shape(&expected), "{language}: {source}");
+                    assert!(incremental.highlighters[outer]
+                        .cached_tree
+                        .as_ref()
+                        .unwrap()
+                        .tree
+                        .root_node()
+                        .has_changes());
+                    if fenced {
+                        assert!(incremental.highlighters[language]
+                            .cached_tree
+                            .as_ref()
+                            .unwrap()
+                            .tree
+                            .root_node()
+                            .has_changes());
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn numeric_grammar_boundaries_and_custom_queries_reparse() {
+        for (language, before, after) in [
+            ("rust", "let value = 123456;", "let value = 123.456;"),
+            ("rust", "let value = 123456;", "let value = 123_456;"),
+            ("rust", "let value = 0x123456;", "let value = 0x1237456;"),
+            (
+                "javascript",
+                "const value = 123456;",
+                "const value = 123e456;",
+            ),
+            (
+                "javascript",
+                "const value = 123456n;",
+                "const value = 1237456n;",
+            ),
+            ("json", "{\"value\": 123456}", "{\"value\": 123.456}"),
+        ] {
+            let mut incremental = highlighter();
+            incremental.highlight(language, before).unwrap();
+            let actual = incremental.highlight(language, after).unwrap();
+            let expected = highlighter().highlight(language, after).unwrap();
+            let shape = |styles: &[StyleInfo]| {
+                styles
+                    .iter()
+                    .map(|style| (style.start, style.end, style.style.clone()))
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(shape(&actual), shape(&expected), "{language}: {after}");
+            assert!(!incremental.highlighters[language]
+                .cached_tree
+                .as_ref()
+                .unwrap()
+                .tree
+                .root_node()
+                .has_changes());
+        }
+
+        let mut registry = LanguageRegistry::bundled();
+        registry
+            .languages
+            .get_mut("javascript")
+            .unwrap()
+            .highlight_queries
+            .push("((number) @function (#match? @function \"7\"))".to_string());
+        let theme = parse_vscode_theme("themes/mocha.json").unwrap();
+        let mut customized = Highlighter::with_registry(&theme, Arc::new(registry)).unwrap();
+        customized
+            .highlight("javascript", "const value = 123456;")
+            .unwrap();
+        customized
+            .highlight("javascript", "const value = 1237456;")
+            .unwrap();
+        assert!(!customized.highlighters["javascript"]
+            .cached_tree
+            .as_ref()
+            .unwrap()
+            .tree
+            .root_node()
+            .has_changes());
     }
 
     #[test]

@@ -54,6 +54,18 @@ navigation baselines were frozen after rebasing to `d92777c`.
 
 | Runtime path | Median improvement |
 | --- | ---: |
+| Markdown fenced JSON numeric-literal highlighting | 99.12% |
+| Markdown fenced Rust numeric-literal highlighting | 99.03% |
+| Markdown fenced TypeScript numeric-literal highlighting | 98.93% |
+| Markdown fenced TSX numeric-literal highlighting | 98.92% |
+| Markdown fenced JSX numeric-literal highlighting | 98.91% |
+| Markdown fenced JavaScript numeric-literal highlighting | 98.89% |
+| JavaScript numeric-literal highlighting | 97.52% |
+| TypeScript numeric-literal highlighting | 97.47% |
+| JSX numeric-literal highlighting | 97.27% |
+| TSX numeric-literal highlighting | 97.23% |
+| JSON numeric-literal highlighting | 97.18% |
+| Rust numeric-literal highlighting | 97.04% |
 | Husk unchanged configuration refresh | 99.99% |
 | Neo-tree repeated row selection | 99.98% |
 | Plugin/window LSP cursor snapshot coordinates | 99.89% |
@@ -744,6 +756,20 @@ cached tree by the exact edit. The shortcut excludes token boundaries, reserved
 keywords, uppercase-sensitive names, non-identifier Unicode, custom queries,
 and source or span cache-limit violations; Unicode edits, comments, YAML
 context, Markdown language injections, and fresh-parser parity remain covered.
+
+Seven alternating release-build samples per numeric scenario applied 128
+plain decimal-digit edits inside six bundled languages and their Markdown
+fenced-language injections. Direct Rust, JavaScript, JSX, TypeScript, TSX, and
+JSON medians respectively fell from 19,377 to 573, 23,071 to 572, 23,800 to
+649, 22,804 to 576, 22,659 to 627, and 9,860 to 278 microseconds. Their
+Markdown-fenced equivalents fell from 101,030 to 980, 96,276 to 1,065, 96,926
+to 1,057, 95,375 to 1,022, 95,569 to 1,034, and 60,564 to 531 microseconds.
+Reuse requires exact bundled grammars and complete highlight queries, an
+edit strictly inside a nonzero-leading ASCII decimal token, and exclusively
+ASCII-digit insertions. Unthemed numeric tokens still shift every later styled
+span exactly. Hexadecimal prefixes, float delimiters, exponents, underscores,
+bigint suffixes, custom query predicates, and token-boundary changes retain
+the complete parser path; nested edits update both Markdown and injected trees.
 
 Seven alternating release-build samples per Rust token scenario applied 128
 non-identifier edits to bounded 96-line documents. Ordinary line-comment
