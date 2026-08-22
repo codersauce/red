@@ -322,7 +322,12 @@ impl TextArea {
 
     /// Removes the complete extended grapheme directly under the cursor.
     pub fn delete(&mut self) -> bool {
-        if self.state.cursor >= grapheme_len(&self.text()) {
+        let length = if self.buffer.is_ascii() {
+            self.buffer.byte_len()
+        } else {
+            grapheme_len(&self.text())
+        };
+        if self.state.cursor >= length {
             return false;
         }
         let cursor = self.state.cursor;
@@ -333,6 +338,30 @@ impl TextArea {
     pub fn delete_previous_word(&mut self) -> bool {
         if self.state.cursor == 0 {
             return false;
+        }
+        if self.buffer.is_ascii() {
+            let mut start = self.state.cursor;
+            let mut seen_word = false;
+            for character in self
+                .buffer
+                .contents_snapshot()
+                .chars_at(self.state.cursor)
+                .reversed()
+            {
+                let whitespace = character.is_whitespace();
+                if seen_word && whitespace {
+                    break;
+                }
+                seen_word |= !whitespace;
+                start -= 1;
+            }
+            return self.replace_graphemes(
+                start,
+                self.state.cursor,
+                "",
+                start,
+                "delete previous word",
+            );
         }
         let text = self.text();
         let end = grapheme_to_byte(&text, self.state.cursor);
@@ -2078,6 +2107,59 @@ mod tests {
         assert!(area.undo());
         assert_eq!(area.text(), "ab");
         assert_eq!(area.cursor(), 1);
+    }
+
+    #[test]
+    fn indexed_ascii_deletion_preserves_word_whitespace_unicode_and_undo() {
+        for original in [
+            "",
+            "word",
+            "one two three",
+            "one   two   ",
+            "\tleading\twords\t",
+            "first\n\nsecond word",
+            "e\u{301}clair 👨‍👩‍👧 family",
+            "漢字\u{3000}かな",
+        ] {
+            let count = crate::unicode_utils::grapheme_len(original);
+            for cursor in 0..=count {
+                let mut area = TextArea::new(original);
+                area.set_cursor(cursor);
+                let byte = super::grapheme_to_byte(original, cursor);
+                let start = crate::unicode_utils::previous_word_start(&original[..byte]);
+                let expected = format!("{}{}", &original[..start], &original[byte..]);
+                assert_eq!(area.delete_previous_word(), cursor != 0);
+                assert_eq!(area.text(), expected, "{original:?} at cursor {cursor}");
+                assert_eq!(
+                    area.cursor(),
+                    crate::unicode_utils::grapheme_len(&original[..start]),
+                    "{original:?} at cursor {cursor}"
+                );
+                if cursor != 0 {
+                    assert!(area.undo());
+                    assert_eq!(area.text(), original);
+                    assert_eq!(area.cursor(), cursor);
+                }
+
+                let mut area = TextArea::new(original);
+                area.set_cursor(cursor);
+                if cursor == count {
+                    assert!(!area.delete());
+                } else {
+                    let end = super::grapheme_to_byte(original, cursor + 1);
+                    assert!(area.delete());
+                    assert_eq!(
+                        area.text(),
+                        format!("{}{}", &original[..byte], &original[end..]),
+                        "{original:?} at cursor {cursor}"
+                    );
+                    assert_eq!(area.cursor(), cursor);
+                    assert!(area.undo());
+                    assert_eq!(area.text(), original);
+                    assert_eq!(area.cursor(), cursor);
+                }
+            }
+        }
     }
 
     #[test]

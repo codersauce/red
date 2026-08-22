@@ -99,6 +99,7 @@ const GIT_STATUS_INDEX_BUILDS: usize = 32;
 const LAYOUT_CURSOR_LOOKUPS: usize = 2_048;
 const TEXTAREA_VIM_MOTIONS: usize = 2_048;
 const TEXTAREA_DELIMITER_MOTIONS: usize = 1_024;
+const TEXTAREA_DELETE_EVENTS: usize = 256;
 
 fn main() -> Result<()> {
     let scenario = std::env::args().nth(1).unwrap_or_else(|| "all".into());
@@ -256,6 +257,12 @@ fn main() -> Result<()> {
     }
     if scenario == "all" || scenario == "textarea-vim-match" {
         results.push(benchmark_embedded_vim_delimiter_motion()?);
+    }
+    if scenario == "all" || scenario == "textarea-delete" {
+        results.push(benchmark_embedded_textarea_deletion(/*word*/ false)?);
+    }
+    if scenario == "all" || scenario == "textarea-word-delete" {
+        results.push(benchmark_embedded_textarea_deletion(/*word*/ true)?);
     }
 
     anyhow::ensure!(
@@ -1730,6 +1737,47 @@ fn benchmark_embedded_vim_delimiter_motion() -> Result<serde_json::Value> {
         "embedded_vim_nested_delimiter_motions",
         started,
         TEXTAREA_DELIMITER_MOTIONS,
+    ))
+}
+
+fn benchmark_embedded_textarea_deletion(word: bool) -> Result<serde_json::Value> {
+    let source = "ordinary ".repeat(4_096);
+    let original = source.len();
+    let mut area = TextArea::new(source);
+    if !word {
+        area.set_cursor(0);
+    }
+    let event = if word {
+        Event::Key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::CONTROL))
+    } else {
+        Event::Key(KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE))
+    };
+
+    let started = Instant::now();
+    for _ in 0..TEXTAREA_DELETE_EVENTS {
+        anyhow::ensure!(
+            area.handle_event(black_box(&event), 120) == red::editing::TextAreaOutcome::Changed,
+            "embedded deletion event was not handled"
+        );
+        black_box(area.cursor());
+    }
+    let expected = if word {
+        original - TEXTAREA_DELETE_EVENTS * "ordinary ".len()
+    } else {
+        original - TEXTAREA_DELETE_EVENTS
+    };
+    anyhow::ensure!(
+        area.buffer().byte_len() == expected,
+        "embedded deletion event removed an unexpected amount of text"
+    );
+    Ok(report(
+        if word {
+            "embedded_ctrl_backspace_word_deletion"
+        } else {
+            "embedded_forward_delete_key_events"
+        },
+        started,
+        TEXTAREA_DELETE_EVENTS,
     ))
 }
 

@@ -93,6 +93,8 @@ navigation baselines were frozen after rebasing to `d92777c`.
 | Long-line Vim backward word motion | 80.33% |
 | Theme hexadecimal color parsing | 79.71% |
 | Detached incremental frame serialization | 79.06% |
+| Embedded forward Delete-key editing | 75.72% |
+| Embedded Ctrl-Backspace word deletion | 74.86% |
 | Shared Vim sentence navigation | 74.63% |
 | LSP incremental large-document changes | 74.61% |
 | Shared Vim paragraph navigation | 72.60% |
@@ -145,6 +147,13 @@ against a document containing nested parentheses, brackets, and braces. Eleven
 alternating samples reduced the median from 29,496 to 2,942 microseconds while
 preserving reverse searches, unmatched delimiters, multiline nesting, combining
 marks, emoji, Unicode cursor positions, and the editor's existing mode behavior.
+
+Embedded draft deletion was measured over 256 real editing events against a
+36 KiB ASCII document. Eleven alternating release-build samples reduced forward
+Delete-key medians from 4,177 to 1,014 microseconds and Ctrl-Backspace word
+deletion medians from 4,794 to 1,205 microseconds. Rope-indexed ASCII paths
+preserve whitespace-delimited words, empty buffers, tabs, multiline drafts,
+combining marks, emoji, CJK text, cursor boundaries, and undo restoration.
 
 Multi-file startup uses the same production loader as the executable. Across
 four startup passes over 128 distinct source files, seven alternating samples
