@@ -98,9 +98,14 @@ navigation baselines were frozen after rebasing to `d92777c`.
 | Shared Vim inner final-sentence text objects | 97.87% |
 | Lua line-comment punctuation and Unicode highlighting | 97.83% |
 | Real-terminal CRLF visual-block insertion | 97.82% |
+| Markdown H2 heading punctuation and Unicode highlighting | 97.81% |
 | Bash string punctuation and Unicode highlighting | 97.80% |
 | Fish line-comment punctuation and Unicode highlighting | 97.79% |
+| Markdown CRLF heading punctuation and Unicode highlighting | 97.79% |
 | Real-terminal incremental-LSP visual-block insertion | 97.73% |
+| Markdown H3 heading punctuation and Unicode highlighting | 97.73% |
+| Markdown H1 heading punctuation and Unicode highlighting | 97.72% |
+| Markdown Unicode heading punctuation and Unicode highlighting | 97.72% |
 | Real-terminal full-document-LSP visual-block insertion | 97.71% |
 | Real-terminal split-window visual-block insertion | 97.65% |
 | Lua string punctuation and Unicode highlighting | 97.64% |
@@ -117,6 +122,7 @@ navigation baselines were frozen after rebasing to `d92777c`.
 | Rust CRLF string highlighting | 97.15% |
 | Rust Unicode string highlighting | 97.13% |
 | JSON string punctuation and Unicode highlighting | 96.97% |
+| Markdown fenced-injection heading highlighting | 96.97% |
 | Embedded Home/End document navigation | 96.88% |
 | TypeScript line-comment punctuation and Unicode highlighting | 96.86% |
 | TSX line-comment punctuation and Unicode highlighting | 96.85% |
@@ -168,15 +174,19 @@ navigation baselines were frozen after rebasing to `d92777c`.
 | Real-terminal TSX line-comment highlighting | 89.38% |
 | Shared scalar-to-display-column conversion | 89.31% |
 | Real-terminal YAML line-comment highlighting | 89.29% |
+| Real-terminal Markdown CRLF heading highlighting | 89.29% |
 | Real-terminal Lua line-comment highlighting | 89.23% |
 | Unicode scalar line boundaries | 89.12% |
 | Sparse Unicode full-buffer regex searching | 89.12% |
+| Real-terminal Markdown H3 heading highlighting | 89.01% |
 | Real-terminal Unicode string highlighting | 88.89% |
 | Real-terminal Fish string highlighting | 88.89% |
 | Shared Vim escaped-quote text objects | 88.86% |
 | Shared Vim ASCII backward character search | 88.82% |
 | Real-terminal YAML string highlighting | 88.78% |
+| Real-terminal Markdown H1 heading highlighting | 88.76% |
 | Real-terminal JSX line-comment highlighting | 88.44% |
+| Real-terminal Markdown Unicode heading highlighting | 88.24% |
 | Shared Vim long-line paragraph operators | 88.15% |
 | Real-terminal TypeScript string highlighting | 88.05% |
 | Real-terminal TypeScript line-comment highlighting | 87.97% |
@@ -187,6 +197,7 @@ navigation baselines were frozen after rebasing to `d92777c`.
 | Real-terminal JavaScript string highlighting | 87.41% |
 | Real-terminal JavaScript line-comment highlighting | 87.14% |
 | Shared modal editor forward word motion | 87.01% |
+| Real-terminal Markdown H2 heading highlighting | 86.96% |
 | Printable ASCII frame rendering | 85.25% |
 | Startup user-configuration loading | 84.04% |
 | Embedded undo cursor restoration | 84.17% |
@@ -696,6 +707,27 @@ Complete YAML comment and string edit frames fell from 290 to 116 and 290 to
 Lua comment frames fell from 233 to 116. TOML, Bash, Fish, and Lua string
 frames plus complete input events remain below the target and are excluded.
 
+Seven alternating release-build samples across 96-line Markdown heading
+fixtures applied 128 punctuation and Unicode edits per heading. H1, H2, and
+H3 medians fell from 16,204 to 370, 16,463 to 360, and 16,258 to 369
+microseconds; Unicode headings fell from 16,307 to 371 and CRLF headings
+from 16,349 to 362. Headings sharing one document with both Rust and
+JavaScript fenced-code injections fell from 18,339 to 555 microseconds while
+preserving both injected capture sets after every edit. The shortcut requires
+the exact bundled Markdown grammar, highlight query, and injection query, an
+edit strictly inside an ATX heading inline node, and existing bounded source
+and capture caches. Heading markers, list/link/quote syntax, backticks,
+escapes, newline insertion, custom injection queries, and edits inside fenced
+code retain the complete parser and nested-language path.
+
+Five alternating real-terminal sessions per Markdown heading variant applied
+32 punctuation and Unicode edits using the heading-aware typing driver. H1,
+H2, and H3 highlighting fell from 89 to 10, 92 to 12, and 91 to 10
+microseconds; Unicode heading highlighting fell from 85 to 10 and CRLF
+heading highlighting from 84 to nine. Complete heading frames improved only
+43.75% to 46.59%, and input events plus action handling also remain below the
+target; all are excluded from the verified results.
+
 Nine further alternating real-terminal sessions per Unicode-source token
 reduced complete comment edit frames from 354 to 151 microseconds and string
 edit frames from 362 to 158. Mixed Unicode rows now coalesce their ordinary
@@ -843,7 +875,7 @@ filesystem effects make its samples unstable.
 ## Remaining gaps
 
 - Single-file process startup, terminal diff and flush, remaining syntax-token
-  classes and Markdown or injected-language edits, recovery snapshot writes,
+  classes and edits inside Markdown fenced-language injections, recovery snapshot writes,
   in-repository Git subprocess status refresh, broader Vim editing,
   platform-specific paths, and several other areas above do not yet meet the
   50% improvement target.

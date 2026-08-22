@@ -123,7 +123,9 @@ def run(args):
         os.write(master, b"100j")
         time.sleep(0.25)
         if args.scenario == "typing" and args.typing_context != "source":
-            if args.typing_context == "comment":
+            if args.typing_context == "heading":
+                position = b"0f 8l"
+            elif args.typing_context == "comment":
                 extension = file_path.suffix.lower()
                 if extension == ".lua":
                     marker = b"-"
@@ -251,9 +253,9 @@ def main():
     parser.add_argument("--startup-timeout", type=float, default=12)
     parser.add_argument(
         "--typing-context",
-        choices=("source", "comment", "string"),
+        choices=("source", "comment", "string", "heading"),
         default="source",
-        help="place typing inside ordinary source, a line comment, or string contents",
+        help="place typing inside ordinary source, a line comment, string, or Markdown heading",
     )
     parser.add_argument("--config-override", action="append", default=[])
     args = parser.parse_args()

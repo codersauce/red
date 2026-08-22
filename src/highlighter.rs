@@ -885,6 +885,7 @@ impl Highlighter {
 
         let expected_queries = match language_id {
             "rust" => &[tree_sitter_rust::HIGHLIGHTS_QUERY][..],
+            "markdown" => &[MARKDOWN_HIGHLIGHT_QUERY][..],
             "javascript" => JAVASCRIPT_HIGHLIGHT_QUERIES,
             "jsx" => JSX_HIGHLIGHT_QUERIES,
             "typescript" => TYPESCRIPT_HIGHLIGHT_QUERIES,
@@ -904,6 +905,8 @@ impl Highlighter {
         let definition = self.registry.languages.get(language_id)?;
         if !matches!(definition.grammar.as_ref(), Some(GrammarSource::Bundled(_)))
             || definition.highlight_queries.len() != expected_queries.len()
+            || (language_id == "markdown"
+                && definition.injection_query.as_deref() != Some(MARKDOWN_INJECTION_QUERY))
             || !definition
                 .highlight_queries
                 .iter()
@@ -957,6 +960,34 @@ impl Highlighter {
                 }
                 let end = token.end_byte().checked_add_signed(delta)?;
                 if rust_keyword(&code[token.start_byte()..end]) {
+                    return None;
+                }
+            }
+            "inline" => {
+                if language_id != "markdown" || token.parent()?.kind() != "atx_heading" {
+                    return None;
+                }
+                let removed = &cached.code[edit.start_byte..edit.old_end_byte];
+                if inserted.chars().chain(removed.chars()).any(|character| {
+                    character.is_control()
+                        || matches!(
+                            character,
+                            '#' | '\\'
+                                | '`'
+                                | '*'
+                                | '_'
+                                | '['
+                                | ']'
+                                | '!'
+                                | '>'
+                                | '|'
+                                | '~'
+                                | '='
+                                | ':'
+                                | '\u{2028}'
+                                | '\u{2029}'
+                        )
+                }) {
                     return None;
                 }
             }
@@ -2518,6 +2549,102 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn markdown_heading_edits_preserve_fresh_captures_and_fenced_injections() {
+        for sources in [
+            vec!["# retained heading\n", "# retained. λ heading\n"],
+            vec!["## retained heading\n", "## retained. λ heading\n"],
+            vec!["### retained heading\n", "### retained. λ heading\n"],
+            vec![
+                "## retained 世界😀 heading\r\n",
+                "## retained. λ 世界😀 heading\r\n",
+            ],
+            vec![
+                "## retained heading\n\n```rust\nfn greeting() {}\n```\n\n```javascript\nconst value = true;\n```\n",
+                "## retained. λ heading\n\n```rust\nfn greeting() {}\n```\n\n```javascript\nconst value = true;\n```\n",
+                "## retained. λ. λ heading\n\n```rust\nfn greeting() {}\n```\n\n```javascript\nconst value = true;\n```\n",
+            ],
+        ] {
+            let mut incremental = highlighter();
+            incremental.highlight("markdown", sources[0]).unwrap();
+
+            for source in &sources[1..] {
+                let actual = incremental.highlight("markdown", source).unwrap();
+                let expected = highlighter().highlight("markdown", source).unwrap();
+                let shape = |styles: &[StyleInfo]| {
+                    styles
+                        .iter()
+                        .map(|style| (style.start, style.end, style.style.clone()))
+                        .collect::<Vec<_>>()
+                };
+                assert_eq!(shape(&actual), shape(&expected), "{source}");
+                assert!(incremental.highlighters["markdown"]
+                    .cached_tree
+                    .as_ref()
+                    .unwrap()
+                    .tree
+                    .root_node()
+                    .has_changes());
+            }
+        }
+    }
+
+    #[test]
+    fn markdown_structural_and_fenced_edits_reparse_before_reusing_captures() {
+        for (before, after) in [
+            ("## retained heading\n", "## retained# heading\n"),
+            ("## retained heading\n", "## retained` heading\n"),
+            ("## retained heading\n", "## retained\\ heading\n"),
+            ("## retained heading\n", "## retained\n heading\n"),
+            ("## retained heading\n", "### retained heading\n"),
+            (
+                "## retained heading\n\n```rust\nfn greeting() {}\n```\n",
+                "## retained heading\n\n```rust\nfn greetλing() {}\n```\n",
+            ),
+        ] {
+            let mut incremental = highlighter();
+            incremental.highlight("markdown", before).unwrap();
+            let actual = incremental.highlight("markdown", after).unwrap();
+            let expected = highlighter().highlight("markdown", after).unwrap();
+            let shape = |styles: &[StyleInfo]| {
+                styles
+                    .iter()
+                    .map(|style| (style.start, style.end, style.style.clone()))
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(shape(&actual), shape(&expected), "{after}");
+            assert!(!incremental.highlighters["markdown"]
+                .cached_tree
+                .as_ref()
+                .unwrap()
+                .tree
+                .root_node()
+                .has_changes());
+        }
+
+        let mut registry = LanguageRegistry::bundled();
+        registry
+            .languages
+            .get_mut("markdown")
+            .unwrap()
+            .injection_query = Some(format!("{MARKDOWN_INJECTION_QUERY}\n"));
+        let theme = parse_vscode_theme("themes/mocha.json").unwrap();
+        let mut customized = Highlighter::with_registry(&theme, Arc::new(registry)).unwrap();
+        customized
+            .highlight("markdown", "## retained heading\n")
+            .unwrap();
+        customized
+            .highlight("markdown", "## retained λ heading\n")
+            .unwrap();
+        assert!(!customized.highlighters["markdown"]
+            .cached_tree
+            .as_ref()
+            .unwrap()
+            .tree
+            .root_node()
+            .has_changes());
     }
 
     #[test]

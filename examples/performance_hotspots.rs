@@ -384,6 +384,20 @@ fn main() -> Result<()> {
             )?);
         }
     }
+    for (name, level, unicode, crlf, injections) in [
+        ("markdown-heading-h1", 1, false, false, false),
+        ("markdown-heading-h2", 2, false, false, false),
+        ("markdown-heading-h3", 3, false, false, false),
+        ("markdown-heading-unicode", 2, true, false, false),
+        ("markdown-heading-crlf", 2, false, true, false),
+        ("markdown-heading-injected", 2, false, false, true),
+    ] {
+        if scenario == "all" || scenario == name {
+            results.push(benchmark_markdown_heading_highlighting(
+                level, unicode, crlf, injections,
+            )?);
+        }
+    }
     if scenario == "all" || scenario == "tree-selection" {
         results.push(benchmark_tree_panel_selection()?);
     }
@@ -1727,6 +1741,65 @@ fn benchmark_cross_language_token_highlighting(
         ("lua", true) => "lua_line_comment_highlighting",
         ("lua", false) => "lua_string_highlighting",
         _ => unreachable!("benchmark uses a supported bundled language token"),
+    };
+    Ok(report(scenario, started, RUST_TOKEN_HIGHLIGHT_EDITS))
+}
+
+fn benchmark_markdown_heading_highlighting(
+    level: usize,
+    unicode: bool,
+    crlf: bool,
+    injections: bool,
+) -> Result<serde_json::Value> {
+    let theme = parse_vscode_theme("themes/mocha.json")?;
+    let mut highlighter = Highlighter::new(&theme)?;
+    let marker = "#".repeat(level);
+    let newline = if crlf { "\r\n" } else { "\n" };
+    let suffix = if unicode { " 世界😀" } else { "" };
+    let mut source = (0..96)
+        .map(|index| format!("{marker} retained{suffix} heading contents {index:03}{newline}"))
+        .collect::<String>();
+    if injections {
+        source.push_str("\n```rust\nfn fenced_value() {}\n```\n");
+        source.push_str("\n```javascript\nconst fenced_value = true;\n```\n");
+    }
+    let mut cursor = source.find("retained").expect("Markdown heading marker") + "retained".len();
+    black_box(highlighter.highlight("markdown", &source)?);
+
+    let started = Instant::now();
+    for index in 0..RUST_TOKEN_HIGHLIGHT_EDITS {
+        let inserted = if index % 2 == 0 { "." } else { "λ" };
+        source.insert_str(cursor, inserted);
+        cursor += inserted.len();
+        let spans = highlighter.highlight(black_box("markdown"), black_box(&source))?;
+        anyhow::ensure!(
+            spans
+                .iter()
+                .any(|span| span.start < cursor && span.end >= cursor),
+            "Markdown heading edit lost its retained syntax capture"
+        );
+        if injections {
+            for token in ["fn fenced_value", "const fenced_value"] {
+                let start = source.find(token).expect("fenced language token");
+                anyhow::ensure!(
+                    spans
+                        .iter()
+                        .any(|span| span.start <= start && span.end > start),
+                    "Markdown heading edit lost its {token} injection"
+                );
+            }
+        }
+        black_box(spans);
+    }
+
+    let scenario = match (level, unicode, crlf, injections) {
+        (1, false, false, false) => "markdown_h1_heading_highlighting",
+        (2, false, false, false) => "markdown_h2_heading_highlighting",
+        (3, false, false, false) => "markdown_h3_heading_highlighting",
+        (2, true, false, false) => "markdown_unicode_heading_highlighting",
+        (2, false, true, false) => "markdown_crlf_heading_highlighting",
+        (2, false, false, true) => "markdown_injected_heading_highlighting",
+        _ => unreachable!("benchmark uses a supported Markdown heading scenario"),
     };
     Ok(report(scenario, started, RUST_TOKEN_HIGHLIGHT_EDITS))
 }
