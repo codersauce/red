@@ -40123,8 +40123,8 @@ while True:
             .await
             .expect("failed formatter initialization should fall back to an unformatted save");
 
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), "value   \n");
-        assert_eq!(editor.buffer_manager[0].contents(), "value   \n");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "value\n");
+        assert_eq!(editor.buffer_manager[0].contents(), "value\n");
         assert!(!editor.buffer_manager[0].is_dirty());
         assert!(editor.pending_lsp_edit_requests.is_empty());
         assert!(editor.pending_lsp_format_saves.is_empty());
@@ -40195,8 +40195,8 @@ while True:
                 .await
                 .expect("failed formatter initialization should not abort a new-document save");
 
-            assert_eq!(std::fs::read_to_string(&target).unwrap(), "value   \n");
-            assert_eq!(editor.current_buffer().contents(), "value   \n");
+            assert_eq!(std::fs::read_to_string(&target).unwrap(), "value\n");
+            assert_eq!(editor.current_buffer().contents(), "value\n");
             assert!(!editor.current_buffer().is_dirty());
             assert!(editor.pending_lsp_edit_requests.is_empty());
             assert!(editor.pending_lsp_format_saves.is_empty());
