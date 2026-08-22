@@ -46,6 +46,7 @@ SCENARIOS = (
     "plugin-events",
     "session-write",
     "frame-full",
+    "git-discovery",
     "husk-completion",
     "husk-config",
     "husk-update",

@@ -87,6 +87,7 @@ navigation baselines were frozen after rebasing to `d92777c`.
 | Undo history capacity pruning | 72.42% |
 | LSP completion filtering | 67.58% |
 | Structured picker ranking | 64.81% |
+| Git repository discovery and branch refresh | 58.73% |
 | Plugin cursor-event delivery | 56.35% |
 | In-buffer search navigation | 55.98% |
 | Owned Husk JSON boundary conversion | 54.49% |
@@ -98,6 +99,11 @@ calls at 160 columns by 48 rows. Eleven alternating release-build samples
 reduced the median from 28,808 to 13,575 microseconds while retaining window
 layout, gutters, source painting, syntax-style boundaries, chrome, overlays,
 cursor composition, exact Unicode-aware frame differencing, and final flush.
+
+Git repository discovery was measured over 512 expired-cache refreshes through
+16 nested directories. Eleven alternating samples reduced the median from 51,601
+to 21,297 microseconds while preserving nested repositories, linked worktrees,
+detached HEADs, symlink retargeting, and renamed physical directories.
 
 Real detached-terminal coverage separately exercised editing, 32 KiB of Unicode
 paste, repeated resizes, reattachment, and owner shutdown. Detached-frame median
@@ -133,7 +139,7 @@ objective.
 ## Remaining gaps
 
 - Broad process startup, real-terminal end-to-end typing, recovery snapshot writes,
-  repository discovery and status refresh, broader Vim editing, platform-specific paths,
+  Git subprocess status refresh, broader Vim editing, platform-specific paths,
   and several other areas above still require dedicated before/after fixtures
   before claiming a 50% improvement.
 - An eager Neo-tree row index was intentionally rejected because it increased

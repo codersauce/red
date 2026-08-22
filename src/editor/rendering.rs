@@ -766,9 +766,30 @@ fn draw_statusline_segment(
     }
 }
 
-fn statusline_git_search_dir(file: Option<&str>) -> PathBuf {
+fn statusline_directory_identity(path: &Path) -> Option<(u64, u64)> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let metadata = fs::metadata(path).ok()?;
+        Some((metadata.dev(), metadata.ino()))
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        None
+    }
+}
+
+fn statusline_git_search_dir(
+    file: Option<&str>,
+    previous: Option<&Path>,
+    previous_identity: Option<(u64, u64)>,
+) -> (PathBuf, Option<(u64, u64)>) {
     let Some(file) = file else {
-        return std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let directory = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        return (directory, None);
     };
     let path = expand_user_path(file).unwrap_or_else(|_| PathBuf::from(file));
     let path = if path.is_absolute() {
@@ -783,7 +804,15 @@ fn statusline_git_search_dir(file: Option<&str>) -> PathBuf {
     } else {
         path.parent().unwrap_or(&path).to_path_buf()
     };
-    search_dir.canonicalize().unwrap_or(search_dir)
+    let identity = statusline_directory_identity(&search_dir);
+    if let (Some(previous), Some(identity)) = (previous, identity) {
+        if Some(identity) == previous_identity
+            && (previous == search_dir || statusline_directory_identity(previous) == Some(identity))
+        {
+            return (previous.to_path_buf(), Some(identity));
+        }
+    }
+    (search_dir.canonicalize().unwrap_or(search_dir), identity)
 }
 
 fn git_head_path(search_dir: &Path) -> Option<PathBuf> {
@@ -3575,7 +3604,11 @@ impl Editor {
     fn refresh_statusline_git(&mut self, file: Option<&str>, load_changes: bool) {
         const CACHE_TTL: Duration = Duration::from_secs(2);
 
-        let search_dir = statusline_git_search_dir(file);
+        let (search_dir, search_directory_identity) = statusline_git_search_dir(
+            file,
+            self.statusline_git_cache.search_dir.as_deref(),
+            self.statusline_git_cache.search_directory_identity,
+        );
         let now = Instant::now();
         let cache_is_fresh = self.statusline_git_cache.search_dir.as_ref() == Some(&search_dir)
             && self
@@ -3588,16 +3621,28 @@ impl Editor {
         }
 
         let repository_root = git_repository_root(&search_dir);
-        let branch = git_branch_from_head(&search_dir);
+        let branch = repository_root.as_deref().and_then(git_branch_from_head);
         let changes = load_changes
             .then(|| repository_root.as_deref().and_then(git_changes_from_status))
             .flatten();
         self.statusline_git_cache.search_dir = Some(search_dir);
+        self.statusline_git_cache.search_directory_identity = search_directory_identity;
         self.statusline_git_cache.repository_root = repository_root;
         self.statusline_git_cache.branch = branch;
         self.statusline_git_cache.changes = changes;
         self.statusline_git_cache.changes_loaded = load_changes;
         self.statusline_git_cache.refreshed_at = Some(now);
+    }
+
+    /// Runs an uncached production Git refresh for reproducible performance fixtures.
+    #[doc(hidden)]
+    pub fn benchmark_git_repository_discovery(&mut self, file: &str) -> Option<(&Path, &str)> {
+        self.statusline_git_cache.refreshed_at = None;
+        self.refresh_statusline_git(Some(file), false);
+        self.statusline_git_cache
+            .repository_root
+            .as_deref()
+            .zip(self.statusline_git_cache.branch.as_deref())
     }
 
     fn statusline_diagnostic_counts(&self, buffer_index: usize) -> Option<(usize, usize)> {
@@ -5189,6 +5234,115 @@ mod tests {
             git_branch_from_head(worktree.path()).as_deref(),
             Some("01234567")
         );
+
+        let linked_source = worktree.path().join("src/main.rs");
+        fs::create_dir_all(linked_source.parent().unwrap()).unwrap();
+        fs::write(&linked_source, "fn main() {}\n").unwrap();
+        let linked_source = linked_source.to_string_lossy().into_owned();
+        let mut editor = rendering_test_editor(Buffer::new(
+            Some(linked_source.clone()),
+            "fn main() {}\n".into(),
+        ));
+        let discovered = editor
+            .benchmark_git_repository_discovery(&linked_source)
+            .unwrap();
+
+        assert_eq!(discovered.0, worktree.path().canonicalize().unwrap());
+        assert_eq!(discovered.1, "01234567");
+    }
+
+    #[test]
+    fn git_repository_refresh_detects_new_nested_repositories() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::create_dir(directory.path().join(".git")).unwrap();
+        fs::write(
+            directory.path().join(".git/HEAD"),
+            "ref: refs/heads/outer\n",
+        )
+        .unwrap();
+        let nested = directory.path().join("packages/inner");
+        let source = nested.join("src/main.rs");
+        fs::create_dir_all(source.parent().unwrap()).unwrap();
+        fs::write(&source, "fn main() {}\n").unwrap();
+        let source = source.to_string_lossy().into_owned();
+        let mut editor =
+            rendering_test_editor(Buffer::new(Some(source.clone()), "fn main() {}\n".into()));
+
+        let outer = editor.benchmark_git_repository_discovery(&source).unwrap();
+        assert_eq!(outer.0, directory.path().canonicalize().unwrap());
+        assert_eq!(outer.1, "outer");
+
+        fs::create_dir(nested.join(".git")).unwrap();
+        fs::write(nested.join(".git/HEAD"), "ref: refs/heads/inner\n").unwrap();
+        let inner = editor.benchmark_git_repository_discovery(&source).unwrap();
+
+        assert_eq!(inner.0, nested.canonicalize().unwrap());
+        assert_eq!(inner.1, "inner");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn git_repository_refresh_invalidates_retargeted_directory_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let first = directory.path().join("first");
+        let second = directory.path().join("second");
+        for (repository, branch) in [(&first, "first"), (&second, "second")] {
+            fs::create_dir_all(repository.join(".git")).unwrap();
+            fs::create_dir_all(repository.join("src")).unwrap();
+            fs::write(
+                repository.join(".git/HEAD"),
+                format!("ref: refs/heads/{branch}\n"),
+            )
+            .unwrap();
+            fs::write(repository.join("src/main.rs"), "fn main() {}\n").unwrap();
+        }
+        let alias = directory.path().join("active");
+        symlink(&first, &alias).unwrap();
+        let source = alias.join("src/main.rs").to_string_lossy().into_owned();
+        let mut editor =
+            rendering_test_editor(Buffer::new(Some(source.clone()), "fn main() {}\n".into()));
+
+        let initial = editor.benchmark_git_repository_discovery(&source).unwrap();
+        assert_eq!(initial.0, first.canonicalize().unwrap());
+        assert_eq!(initial.1, "first");
+
+        fs::remove_file(&alias).unwrap();
+        symlink(&second, &alias).unwrap();
+        let updated = editor.benchmark_git_repository_discovery(&source).unwrap();
+
+        assert_eq!(updated.0, second.canonicalize().unwrap());
+        assert_eq!(updated.1, "second");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn git_repository_refresh_invalidates_renamed_physical_directories() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let repository = directory.path().join("original");
+        fs::create_dir_all(repository.join(".git")).unwrap();
+        fs::create_dir_all(repository.join("src")).unwrap();
+        fs::write(repository.join(".git/HEAD"), "ref: refs/heads/moving\n").unwrap();
+        fs::write(repository.join("src/main.rs"), "fn main() {}\n").unwrap();
+        let alias = directory.path().join("active");
+        symlink(&repository, &alias).unwrap();
+        let source = alias.join("src/main.rs").to_string_lossy().into_owned();
+        let mut editor =
+            rendering_test_editor(Buffer::new(Some(source.clone()), "fn main() {}\n".into()));
+        let initial = editor.benchmark_git_repository_discovery(&source).unwrap();
+        assert_eq!(initial.0, repository.canonicalize().unwrap());
+
+        let renamed = directory.path().join("renamed");
+        fs::rename(&repository, &renamed).unwrap();
+        fs::remove_file(&alias).unwrap();
+        symlink(&renamed, &alias).unwrap();
+        let updated = editor.benchmark_git_repository_discovery(&source).unwrap();
+
+        assert_eq!(updated.0, renamed.canonicalize().unwrap());
+        assert_eq!(updated.1, "moving");
     }
 
     #[test]

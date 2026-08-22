@@ -79,6 +79,8 @@ const SNAPSHOT_WRITE_BUFFERS: usize = 24;
 const SNAPSHOT_WRITE_UNDO_NODES: usize = 48;
 const SNAPSHOT_WRITES: usize = 6;
 const FULL_FRAME_RENDERS: usize = 160;
+const GIT_DISCOVERY_DEPTH: usize = 16;
+const GIT_REPOSITORY_DISCOVERIES: usize = 512;
 
 fn main() -> Result<()> {
     let scenario = std::env::args().nth(1).unwrap_or_else(|| "all".into());
@@ -191,6 +193,9 @@ fn main() -> Result<()> {
     }
     if scenario == "all" || scenario == "frame-full" {
         results.push(benchmark_full_editor_frames()?);
+    }
+    if scenario == "all" || scenario == "git-discovery" {
+        results.push(benchmark_git_repository_discovery()?);
     }
 
     anyhow::ensure!(
@@ -1254,6 +1259,51 @@ fn benchmark_full_editor_frames() -> Result<serde_json::Value> {
         "complete_editor_frame_composition",
         started,
         FULL_FRAME_RENDERS,
+    ))
+}
+
+fn benchmark_git_repository_discovery() -> Result<serde_json::Value> {
+    let repository = tempfile::tempdir()?;
+    std::fs::create_dir(repository.path().join(".git"))?;
+    std::fs::write(
+        repository.path().join(".git/HEAD"),
+        "ref: refs/heads/performance-discovery\n",
+    )?;
+    let mut nested = repository.path().to_path_buf();
+    for depth in 0..GIT_DISCOVERY_DEPTH {
+        nested.push(format!("module-{depth:02}"));
+    }
+    std::fs::create_dir_all(&nested)?;
+    let file = nested.join("main.rs");
+    std::fs::write(&file, "fn main() {}\n")?;
+    let file = file.to_string_lossy().into_owned();
+    let mut config = Config::default();
+    config.lsp.enabled = false;
+    let mut editor = Editor::with_size(
+        Box::new(LspManager::new(config.lsp.clone())),
+        120,
+        40,
+        config,
+        Theme::default(),
+        vec![Buffer::new(Some(file.clone()), "fn main() {}\n".into())],
+    )?;
+    let expected = repository.path().canonicalize()?;
+    let discovered = editor
+        .benchmark_git_repository_discovery(&file)
+        .ok_or_else(|| anyhow::anyhow!("Git discovery benchmark did not find its repository"))?;
+    anyhow::ensure!(
+        discovered.0 == expected && discovered.1 == "performance-discovery",
+        "Git discovery benchmark found the wrong repository or branch"
+    );
+
+    let started = Instant::now();
+    for _ in 0..GIT_REPOSITORY_DISCOVERIES {
+        black_box(editor.benchmark_git_repository_discovery(black_box(&file)));
+    }
+    Ok(report(
+        "git_repository_discovery_and_branch_refresh",
+        started,
+        GIT_REPOSITORY_DISCOVERIES,
     ))
 }
 

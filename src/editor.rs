@@ -3166,6 +3166,7 @@ struct StatuslineGitCache {
     /// Red selects its process working directory before constructing the editor.
     working_directory: PathBuf,
     search_dir: Option<PathBuf>,
+    search_directory_identity: Option<(u64, u64)>,
     repository_root: Option<PathBuf>,
     branch: Option<String>,
     changes: Option<StatuslineGitChanges>,
