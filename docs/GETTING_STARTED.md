@@ -273,6 +273,7 @@ Enter Command mode with `:` or `;`.
 | Command | Action |
 | --- | --- |
 | `:w [file]` | Save, optionally under another name |
+| `:wa` / `:wall` | Save every modified file buffer |
 | `:wq` | Save and quit |
 | `:q` / `:q!` | Quit, or quit while discarding changes |
 | `:e <file>` / `:e!` | Open or reload a file |

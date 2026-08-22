@@ -44,6 +44,8 @@ The editor adds command-specific handling around that parser. It special-cases r
 
 `:bufdo` parses its optional range as stable buffer ids rather than line numbers, snapshots matching open-buffer ids, and reparses its nested command after activating each target so line ranges such as `%` resolve against that buffer. Traversal stops on parse, substitution, write, or reload errors and rejects nested actions that could invalidate the snapshot or open interactive UI. The outer force flag is accepted for Vim compatibility; Red already preserves dirty buffers during ordinary buffer switches [@editor-dispatch] [@buffer-do].
 
+`:wa[ll]` snapshots modified buffers, writes every named target through the ordinary save pipeline, and restores the active buffer and view. Clean buffers are skipped. Dirty unnamed buffers remain open and produce an error after the named targets have been processed [@editor-dispatch] [@buffer-do].
+
 Advertising a built-in colon form is a parser and dispatch change, not only palette metadata. A built-in command that appears in docs or `CommandPaletteEntry::colon` must also be present in the built-in command list passed to `command::parse` and must map to an `Action` in `Editor::handle_command`; otherwise the palette can describe a `:<name>` form that direct colon input still reports as unknown [@command-palette] [@editor-dispatch].
 
 ## Completion Names
