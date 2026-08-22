@@ -1115,37 +1115,71 @@ impl<'buffer> MotionResolver<'buffer> {
     }
 
     fn quote_text_object(&self, scope: TextObjectScope, quote: char) -> Option<TextRange> {
-        let line = self.buffer.get(self.cursor.line)?;
-        let line = trim_line_ending(&line);
+        let contents = self.buffer.contents_snapshot();
+        let source = contents.get_line(self.cursor.line)?;
+        let mut length = source.len_chars();
+        if source.get_char(length.saturating_sub(1)) == Some('\n') {
+            length -= 1;
+        }
+        if source.get_char(length.saturating_sub(1)) == Some('\r') {
+            length -= 1;
+        }
+        let line = source.slice(..length);
         let mut start = None;
-        for (byte, _) in line.match_indices(quote) {
-            let backslashes = line[..byte]
+        let ascii = self.buffer.is_ascii();
+        let mut chunk_start = 0usize;
+        let mut previous_backslashes = 0usize;
+        for chunk in line.chunks() {
+            for (byte, _) in chunk.match_indices(quote) {
+                let local_backslashes = chunk[..byte]
+                    .bytes()
+                    .rev()
+                    .take_while(|character| *character == b'\\')
+                    .count();
+                let backslashes = if local_backslashes == byte {
+                    previous_backslashes.saturating_add(local_backslashes)
+                } else {
+                    local_backslashes
+                };
+                if !backslashes.is_multiple_of(2) {
+                    continue;
+                }
+                let index = chunk_start
+                    + if ascii {
+                        byte
+                    } else {
+                        chunk[..byte].chars().count()
+                    };
+                if let Some(open) = start.take() {
+                    if open <= self.cursor.character && self.cursor.character <= index {
+                        let (first, last) = match scope {
+                            TextObjectScope::Inner => (open + 1, index),
+                            TextObjectScope::Around => (open, index + 1),
+                        };
+                        return Some(TextRange::new(
+                            TextPosition::new(self.cursor.line, first),
+                            TextPosition::new(self.cursor.line, last),
+                        ));
+                    }
+                } else {
+                    start = Some(index);
+                }
+            }
+            let trailing_backslashes = chunk
                 .bytes()
                 .rev()
                 .take_while(|character| *character == b'\\')
                 .count();
-            if backslashes % 2 == 1 {
-                continue;
-            }
-            let index = if self.buffer.is_ascii() {
-                byte
+            previous_backslashes = if trailing_backslashes == chunk.len() {
+                previous_backslashes.saturating_add(trailing_backslashes)
             } else {
-                line[..byte].chars().count()
+                trailing_backslashes
             };
-            if let Some(open) = start.take() {
-                if open <= self.cursor.character && self.cursor.character <= index {
-                    let (first, last) = match scope {
-                        TextObjectScope::Inner => (open + 1, index),
-                        TextObjectScope::Around => (open, index + 1),
-                    };
-                    return Some(TextRange::new(
-                        TextPosition::new(self.cursor.line, first),
-                        TextPosition::new(self.cursor.line, last),
-                    ));
-                }
+            chunk_start += if ascii {
+                chunk.len()
             } else {
-                start = Some(index);
-            }
+                chunk.chars().count()
+            };
         }
         None
     }
@@ -1319,6 +1353,59 @@ mod tests {
             resolver.last_cursor_position(),
             TextPosition::new(/*line*/ 0, /*character*/ 0)
         );
+    }
+
+    #[test]
+    fn indexed_quote_objects_preserve_escapes_across_ascii_and_unicode_rope_chunks() {
+        for prefix in ["a", "λ"] {
+            for width in [0, 511, 512, 1023, 1024, 2047, 2048] {
+                for slash_count in 0..=3 {
+                    let leading = prefix.repeat(width);
+                    let source = format!(
+                        "{leading}\"selected {}\" tail\" remainder\r\n",
+                        "\\".repeat(slash_count)
+                    );
+                    let buffer = Buffer::new(None, source.clone());
+                    let line = crate::unicode_utils::trim_line_ending(&source);
+                    let characters = line.chars().collect::<Vec<_>>();
+                    let cursor = leading.chars().count().saturating_add(1);
+                    let resolver = MotionResolver::new(&buffer, TextPosition::new(0, cursor));
+                    let quotes = characters
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(index, character)| {
+                            if *character != '"' {
+                                return None;
+                            }
+                            let escaped = characters[..index]
+                                .iter()
+                                .rev()
+                                .take_while(|value| **value == '\\')
+                                .count();
+                            escaped.is_multiple_of(2).then_some(index)
+                        })
+                        .collect::<Vec<_>>();
+                    for scope in [TextObjectScope::Inner, TextObjectScope::Around] {
+                        let expected = quotes.chunks(2).find_map(|pair| match pair {
+                            [start, end] if *start <= cursor && cursor <= *end => {
+                                Some(match scope {
+                                    TextObjectScope::Inner => (start + 1, *end),
+                                    TextObjectScope::Around => (*start, end + 1),
+                                })
+                            }
+                            _ => None,
+                        });
+                        assert_eq!(
+                            resolver
+                                .text_object(scope, TextObjectKind::Quote('"'))
+                                .map(|range| (range.start.character, range.end.character)),
+                            expected,
+                            "prefix={prefix:?} width={width} slashes={slash_count} scope={scope:?}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]

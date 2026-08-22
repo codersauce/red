@@ -453,6 +453,16 @@ fn main() -> Result<()> {
     if scenario == "all" || scenario == "text-object-quoted" {
         results.push(benchmark_text_object_selection(/*quoted*/ true)?);
     }
+    for (name, unicode, around) in [
+        ("text-object-quote-ascii-inner", false, false),
+        ("text-object-quote-ascii-around", false, true),
+        ("text-object-quote-unicode-inner", true, false),
+        ("text-object-quote-unicode-around", true, true),
+    ] {
+        if scenario == "all" || scenario == name {
+            results.push(benchmark_prefix_quote_object(unicode, around)?);
+        }
+    }
     if scenario == "all" || scenario == "text-object-word" {
         results.push(benchmark_word_text_object(/*big_word*/ false)?);
     }
@@ -2668,6 +2678,47 @@ fn benchmark_embedded_undo_restoration(redo: bool) -> Result<serde_json::Value> 
         },
         started,
         TEXTAREA_UNDO_RESTORES,
+    ))
+}
+
+fn benchmark_prefix_quote_object(unicode: bool, around: bool) -> Result<serde_json::Value> {
+    let (target, suffix) = if unicode {
+        ("\"λ \\\" 終\"", " trailing_λ👋".repeat(1_024))
+    } else {
+        (
+            "\"selected \\\" quote\"",
+            " trailing_identifier".repeat(1_024),
+        )
+    };
+    let buffer = Buffer::new(None, format!("{target}{suffix}"));
+    let resolver = MotionResolver::new(&buffer, TextPosition::new(/*line*/ 0, /*character*/ 1));
+    let scope = if around {
+        TextObjectScope::Around
+    } else {
+        TextObjectScope::Inner
+    };
+    let expected_start = usize::from(!around);
+    let expected_end = target.chars().count() - usize::from(!around);
+    let started = Instant::now();
+    for _ in 0..TEXTAREA_VIM_MOTIONS {
+        let range = resolver
+            .text_object(scope, TextObjectKind::Quote('"'))
+            .ok_or_else(|| anyhow::anyhow!("Vim quoted text object lost its escaped pair"))?;
+        anyhow::ensure!(
+            range.start.character == expected_start && range.end.character == expected_end,
+            "Vim quoted text object changed its escape parity, scope, or Unicode scalar range"
+        );
+        black_box(range);
+    }
+    Ok(report(
+        match (unicode, around) {
+            (false, false) => "shared_vim_ascii_inner_quote_object",
+            (false, true) => "shared_vim_ascii_around_quote_object",
+            (true, false) => "shared_vim_unicode_inner_quote_object",
+            (true, true) => "shared_vim_unicode_around_quote_object",
+        },
+        started,
+        TEXTAREA_VIM_MOTIONS,
     ))
 }
 

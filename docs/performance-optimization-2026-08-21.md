@@ -139,9 +139,13 @@ navigation baselines were frozen after rebasing to `d92777c`.
 | Shared Vim final paragraph cursor boundary | 75.63% |
 | Shared Vim Unicode forward character search | 75.52% |
 | Shared Vim Unicode backward character search | 75.26% |
+| Shared Vim Unicode around quoted text objects | 75.15% |
+| Shared Vim ASCII inner quoted text objects | 75.00% |
 | Embedded Ctrl-Backspace word deletion | 74.86% |
+| Shared Vim ASCII around quoted text objects | 74.66% |
 | Shared Vim sentence navigation | 74.63% |
 | LSP incremental large-document changes | 74.61% |
+| Shared Vim Unicode inner quoted text objects | 74.07% |
 | Embedded Vim long-line end motions | 72.63% |
 | Shared Vim paragraph navigation | 72.60% |
 | Undo history capacity pruning | 72.42% |
@@ -361,6 +365,17 @@ alternating release-build samples reduced final paragraph cursor medians from
 1,078 microseconds while preserving CRLF, empty buffers, Unicode combining
 marks, family emoji, regional-indicator flags, CJK, and final grapheme
 boundaries.
+
+Shared Vim quoted-text objects were independently measured across 2,048 inner
+and around selections on ASCII and Unicode source lines. Eleven alternating
+release-build samples reduced ASCII inner medians from 2,464 to 616
+microseconds, ASCII around medians from 2,443 to 619 microseconds, Unicode
+inner medians from 2,206 to 572 microseconds, and Unicode around medians from
+2,270 to 564 microseconds. A separate nine-sample existing long-prefix control
+improved from 6,737 to 1,996 microseconds, confirming chunk-level quote
+searches retain fast distant-target lookup. Regression coverage preserves quote
+pairing, odd/even escape parity across Rope chunks, Unicode scalar positions,
+CRLF, cursor inclusion, and inner versus around selection scopes.
 
 Shared Vim paragraph objects were independently measured across 128 inner and
 128 around selections spanning 768-line paragraphs. Eleven alternating
