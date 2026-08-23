@@ -112,6 +112,7 @@ are enough to begin editing.
 | `Space ?` | Discover commands and their effective keymaps |
 | `Space m` | Browse notifications and recent messages |
 | `Ctrl-p` | Find a file with fuzzy search and live preview |
+| `Ctrl-e`, then `/` | Open the file tree and search files or directories |
 | `Space G` | Open the Git status workspace |
 | `Space A` | Ask the agent with editor context |
 | `Space i` | Refactor the current line or visual selection inline |
