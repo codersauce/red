@@ -1667,12 +1667,40 @@ fn resolve_agent_tool_path_kind(
     Ok(normalized)
 }
 
-fn scoped_plugin_storage_key(plugin: &str, key: &str) -> String {
-    if plugin == "agent" && matches!(key, "transcript" | "prompt_history") {
-        format!("{key}:{}", get_workspace_path().display())
+fn scoped_plugin_storage_key_for_workspace(plugin: &str, key: &str, workspace: &Path) -> String {
+    if (plugin == "agent" && matches!(key, "transcript" | "prompt_history"))
+        || (plugin == "session_restore" && key == "latest")
+    {
+        format!("{key}:{}", workspace.display())
     } else {
         key.to_string()
     }
+}
+
+fn scoped_plugin_storage_key(plugin: &str, key: &str) -> String {
+    scoped_plugin_storage_key_for_workspace(plugin, key, &get_workspace_path())
+}
+
+fn plugin_storage_value_for_workspace<'a>(
+    preferences: &'a PreferencesStore,
+    plugin: &str,
+    key: &str,
+    workspace: &Path,
+) -> Option<&'a serde_json::Value> {
+    let scoped_key = scoped_plugin_storage_key_for_workspace(plugin, key, workspace);
+    preferences.plugin_storage(plugin, &scoped_key).or_else(|| {
+        (plugin == "session_restore" && key == "latest")
+            .then(|| preferences.plugin_storage(plugin, key))
+            .flatten()
+    })
+}
+
+fn plugin_storage_value<'a>(
+    preferences: &'a PreferencesStore,
+    plugin: &str,
+    key: &str,
+) -> Option<&'a serde_json::Value> {
+    plugin_storage_value_for_workspace(preferences, plugin, key, &get_workspace_path())
 }
 
 fn snake_case_key(key: &str) -> String {
@@ -11841,10 +11869,7 @@ impl Editor {
                     key,
                     request_id,
                 } => {
-                    let key = scoped_plugin_storage_key(&plugin, &key);
-                    let value = self
-                        .preferences
-                        .plugin_storage(&plugin, &key)
+                    let value = plugin_storage_value(&self.preferences, &plugin, &key)
                         .cloned()
                         .unwrap_or(serde_json::Value::Null);
                     self.plugin_registry
@@ -31814,7 +31839,68 @@ impl Editor {
 mod test {
     use super::*;
     use crate::lsp::DiagnosticSeverity;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn session_restore_storage_is_scoped_by_workspace() {
+        assert_eq!(
+            scoped_plugin_storage_key_for_workspace(
+                "session_restore",
+                "latest",
+                Path::new("/workspace/one"),
+            ),
+            "latest:/workspace/one"
+        );
+        assert_eq!(
+            scoped_plugin_storage_key_for_workspace(
+                "session_restore",
+                "latest",
+                Path::new("/workspace/two"),
+            ),
+            "latest:/workspace/two"
+        );
+    }
+
+    #[test]
+    fn session_restore_storage_reads_legacy_value_until_workspace_value_exists() {
+        let mut preferences = PreferencesStore::in_memory();
+        preferences
+            .set_plugin_storage("session_restore", "latest", json!({ "cwd": "/legacy" }))
+            .unwrap();
+
+        assert_eq!(
+            plugin_storage_value_for_workspace(
+                &preferences,
+                "session_restore",
+                "latest",
+                Path::new("/workspace"),
+            ),
+            Some(&json!({ "cwd": "/legacy" }))
+        );
+
+        let scoped_key = scoped_plugin_storage_key_for_workspace(
+            "session_restore",
+            "latest",
+            Path::new("/workspace"),
+        );
+        preferences
+            .set_plugin_storage(
+                "session_restore",
+                &scoped_key,
+                json!({ "cwd": "/workspace" }),
+            )
+            .unwrap();
+
+        assert_eq!(
+            plugin_storage_value_for_workspace(
+                &preferences,
+                "session_restore",
+                "latest",
+                Path::new("/workspace"),
+            ),
+            Some(&json!({ "cwd": "/workspace" }))
+        );
+    }
 
     #[test]
     fn changed_char_range_bounds_insertions_replacements_and_unicode() {

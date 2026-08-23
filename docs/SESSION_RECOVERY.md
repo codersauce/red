@@ -5,7 +5,10 @@ file-backed buffers, cursor positions, viewports, and split layout. Starting
 `red` again without file arguments in the same working directory restores that
 lightweight workspace automatically. Supplying files starts the requested
 workspace instead, and dirty buffers remain the responsibility of core crash
-recovery.
+recovery. Each canonical working directory has an independent lightweight
+snapshot, so exiting Red in another workspace does not replace its saved state.
+The former global `latest` value remains readable by its matching workspace and
+is replaced by a workspace-scoped value on the next clean exit.
 
 Red's core writes versioned recovery snapshots under `sessions/<owner>/latest.json` in the configuration directory. Each editor and named detached owner has an independent namespace, so concurrent sessions cannot replace one another's recovery point. Run `red --resume` after a crash to restore the newest valid snapshot containing dirty buffers, falling back to the newest clean snapshot when no work is pending; legacy `sessions/latest.json` snapshots remain supported. An interactive resume continues the selected owner namespace so a subsequent clean save replaces the stale dirty recovery point. Recovery is deliberately separate from opening files: restored dirty contents remain in memory and Red never writes them to disk until an explicit save. Do not resume an editor that is still running, since interactive owners do not currently hold an exclusive recovery lock.
 
