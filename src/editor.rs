@@ -2519,6 +2519,10 @@ pub enum Action {
     #[serde(skip)]
     AppendAtMultiSelectionEnd,
     #[serde(skip)]
+    DeleteMultiSelection,
+    #[serde(skip)]
+    DeleteMultiSelectionBlackHole,
+    #[serde(skip)]
     ClearMultiSelection,
 
     MoveUp,
@@ -17223,6 +17227,16 @@ impl Editor {
                     (KeyCode::Char('a'), KeyModifiers::NONE) => {
                         return Some(KeyAction::Single(Action::AppendAtMultiSelectionEnd));
                     }
+                    (KeyCode::Char('d'), KeyModifiers::NONE)
+                        if self.can_navigate_multi_cursor_occurrences() =>
+                    {
+                        return Some(KeyAction::Single(Action::DeleteMultiSelection));
+                    }
+                    (KeyCode::Char('x'), KeyModifiers::NONE)
+                        if self.can_navigate_multi_cursor_occurrences() =>
+                    {
+                        return Some(KeyAction::Single(Action::DeleteMultiSelectionBlackHole));
+                    }
                     (KeyCode::Char('n'), KeyModifiers::CONTROL) => {}
                     (KeyCode::Char('n'), KeyModifiers::NONE)
                         if self.can_navigate_multi_cursor_occurrences() =>
@@ -21472,6 +21486,20 @@ impl Editor {
             Action::AppendAtMultiSelectionEnd => {
                 add_to_history = false;
                 self.begin_multi_cursor_insert(multi_cursor::MultiCursorInsertAnchor::End);
+                self.render(buffer)?;
+            }
+            Action::DeleteMultiSelection => {
+                add_to_history = false;
+                if self.delete_multi_cursor_selections(/*preserve_register*/ false) {
+                    self.notify_change(runtime).await?;
+                }
+                self.render(buffer)?;
+            }
+            Action::DeleteMultiSelectionBlackHole => {
+                add_to_history = false;
+                if self.delete_multi_cursor_selections(/*preserve_register*/ true) {
+                    self.notify_change(runtime).await?;
+                }
                 self.render(buffer)?;
             }
             Action::ClearMultiSelection => {

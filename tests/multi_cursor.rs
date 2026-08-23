@@ -5,7 +5,7 @@ use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 use red::{
     buffer::Buffer,
     config::Config,
-    editor::{Action, Mode},
+    editor::{Action, Content, Mode},
 };
 
 async fn key(harness: &mut EditorHarness, code: KeyCode, modifiers: KeyModifiers) {
@@ -193,4 +193,87 @@ async fn multi_cursor_navigation_does_not_replace_normal_search_state() {
     key(&mut harness, KeyCode::Char('n'), KeyModifiers::NONE).await;
 
     harness.assert_cursor_at(12, 0);
+}
+
+#[tokio::test]
+async fn d_deletes_selected_occurrences_into_the_default_register_as_one_undo() {
+    let config: Config = toml::from_str(include_str!("../default_config.toml")).unwrap();
+    let buffer = Buffer::new(None, "café café café".to_string());
+    let mut harness = EditorHarness::with_config(buffer, config);
+
+    key(&mut harness, KeyCode::Char('n'), KeyModifiers::CONTROL).await;
+    key(&mut harness, KeyCode::Char('n'), KeyModifiers::CONTROL).await;
+    key(&mut harness, KeyCode::Char('d'), KeyModifiers::NONE).await;
+
+    harness.assert_mode(Mode::Normal);
+    harness.assert_buffer_contents("  café");
+    assert!(harness.statusline_row().contains("MULTI 2/2"));
+    harness.assert_cursor_at(1, 0);
+    harness
+        .execute_action(Action::PrintRegisters)
+        .await
+        .unwrap();
+    assert_eq!(harness.last_error(), Some("\": café\ncafé"));
+
+    harness.execute_action(Action::Undo).await.unwrap();
+    harness.assert_buffer_contents("café café café");
+}
+
+#[tokio::test]
+async fn x_deletes_selected_occurrences_without_replacing_the_default_register() {
+    let config: Config = toml::from_str(include_str!("../default_config.toml")).unwrap();
+    let buffer = Buffer::new(None, "foo foo".to_string());
+    let mut harness = EditorHarness::with_config(buffer, config);
+    harness
+        .editor
+        .test_set_default_register(Content::charwise("seed".to_string()));
+
+    key(&mut harness, KeyCode::Char('n'), KeyModifiers::CONTROL).await;
+    key(&mut harness, KeyCode::Char('n'), KeyModifiers::CONTROL).await;
+    key(&mut harness, KeyCode::Char('x'), KeyModifiers::NONE).await;
+
+    harness.assert_buffer_contents(" ");
+    assert!(harness.statusline_row().contains("MULTI 2/2"));
+    harness
+        .execute_action(Action::PrintRegisters)
+        .await
+        .unwrap();
+    assert_eq!(harness.last_error(), Some("\": seed"));
+}
+
+#[tokio::test]
+async fn deleting_adjacent_selections_merges_the_collapsed_cursors() {
+    let config: Config = toml::from_str(include_str!("../default_config.toml")).unwrap();
+    let buffer = Buffer::new(None, "..x".to_string());
+    let mut harness = EditorHarness::with_config(buffer, config);
+
+    key(&mut harness, KeyCode::Char('n'), KeyModifiers::CONTROL).await;
+    key(&mut harness, KeyCode::Char('n'), KeyModifiers::CONTROL).await;
+    key(&mut harness, KeyCode::Char('d'), KeyModifiers::NONE).await;
+
+    harness.assert_buffer_contents("x");
+    assert!(harness.statusline_row().contains("MULTI 1/1"));
+    harness.assert_cursor_at(0, 0);
+}
+
+#[tokio::test]
+async fn deleted_selections_leave_editable_cursors_across_lines() {
+    let config: Config = toml::from_str(include_str!("../default_config.toml")).unwrap();
+    let buffer = Buffer::new(None, "foo\nfoo\nkeep".to_string());
+    let mut harness = EditorHarness::with_config(buffer, config);
+
+    key(&mut harness, KeyCode::Char('n'), KeyModifiers::CONTROL).await;
+    key(&mut harness, KeyCode::Char('n'), KeyModifiers::CONTROL).await;
+    key(&mut harness, KeyCode::Char('d'), KeyModifiers::NONE).await;
+    key(&mut harness, KeyCode::Char('i'), KeyModifiers::NONE).await;
+    harness.type_text("x").await.unwrap();
+    key(&mut harness, KeyCode::Esc, KeyModifiers::NONE).await;
+
+    harness.assert_buffer_contents("x\nx\nkeep");
+    assert!(harness.statusline_row().contains("MULTI 2/2"));
+
+    harness.execute_action(Action::Undo).await.unwrap();
+    harness.assert_buffer_contents("\n\nkeep");
+    harness.execute_action(Action::Undo).await.unwrap();
+    harness.assert_buffer_contents("foo\nfoo\nkeep");
 }

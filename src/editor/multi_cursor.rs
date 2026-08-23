@@ -5,7 +5,7 @@ use crate::{
     window::WindowId,
 };
 
-use super::Editor;
+use super::{Content, Editor};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum MultiCursorPhase {
@@ -274,6 +274,37 @@ impl Editor {
         true
     }
 
+    pub(super) fn delete_multi_cursor_selections(&mut self, preserve_register: bool) -> bool {
+        if !self.can_navigate_multi_cursor_occurrences() {
+            return false;
+        }
+        let targets = self
+            .multi_cursor
+            .as_ref()
+            .expect("session was checked above")
+            .selections
+            .ranges()
+            .to_vec();
+        let deleted = targets
+            .iter()
+            .map(|range| {
+                self.current_buffer().text_in_range(TextRange::new(
+                    self.current_buffer().char_idx_to_position(range.start),
+                    self.current_buffer().char_idx_to_position(range.end),
+                ))
+            })
+            .collect::<Vec<_>>();
+
+        self.begin_transaction("delete multi-cursor selections");
+        if !preserve_register {
+            self.set_default_register(Content::blockwise(deleted.join("\n")));
+        }
+        self.replace_multi_cursor_targets(targets, "");
+        self.move_to_active_multi_cursor(false);
+        self.commit_transaction(self.cursor_snapshot());
+        true
+    }
+
     fn replace_multi_cursor_targets(&mut self, targets: Vec<CharRange>, replacement: &str) {
         let active_range = self
             .multi_cursor
@@ -313,6 +344,11 @@ impl Editor {
             updated.push(CharRange::new(cursor, cursor));
             shift += replacement_len as isize - (target.end - target.start) as isize;
         }
+        let active_range = updated.get(active).copied();
+        updated.dedup();
+        let active = active_range
+            .and_then(|active_range| updated.iter().position(|range| *range == active_range))
+            .unwrap_or(0);
         let revision = self.current_buffer().revision();
         let session = self
             .multi_cursor
