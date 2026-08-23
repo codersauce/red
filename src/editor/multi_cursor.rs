@@ -59,6 +59,18 @@ impl Editor {
             .is_some_and(|session| session.belongs_to(self))
     }
 
+    pub(super) fn can_navigate_multi_cursor_occurrences(&self) -> bool {
+        self.multi_cursor.as_ref().is_some_and(|session| {
+            session.belongs_to(self)
+                && session.phase == MultiCursorPhase::Selecting
+                && session
+                    .selections
+                    .ranges()
+                    .iter()
+                    .all(|range| !range.is_empty())
+        })
+    }
+
     pub(super) fn multi_cursor_is_inserting(&self) -> bool {
         self.multi_cursor.as_ref().is_some_and(|session| {
             session.belongs_to(self) && session.phase == MultiCursorPhase::Inserting
@@ -70,17 +82,7 @@ impl Editor {
     }
 
     pub(super) fn select_next_occurrence(&mut self) {
-        let valid_selecting_session = self.multi_cursor.as_ref().is_some_and(|session| {
-            session.belongs_to(self)
-                && session.phase == MultiCursorPhase::Selecting
-                && session
-                    .selections
-                    .ranges()
-                    .iter()
-                    .all(|range| !range.is_empty())
-        });
-
-        if valid_selecting_session {
+        if self.can_navigate_multi_cursor_occurrences() {
             let session = self
                 .multi_cursor
                 .as_mut()
@@ -111,6 +113,50 @@ impl Editor {
             });
         }
 
+        self.move_to_active_multi_cursor(false);
+    }
+
+    pub(super) fn select_previous_occurrence(&mut self) {
+        if !self.can_navigate_multi_cursor_occurrences() {
+            self.multi_cursor = None;
+            return;
+        }
+        let session = self
+            .multi_cursor
+            .as_mut()
+            .expect("session was checked above");
+        session.selections.select_previous();
+        self.move_to_active_multi_cursor(false);
+    }
+
+    pub(super) fn skip_multi_cursor_occurrence(&mut self) {
+        if !self.can_navigate_multi_cursor_occurrences() {
+            self.multi_cursor = None;
+            return;
+        }
+        let session = self
+            .multi_cursor
+            .as_mut()
+            .expect("session was checked above");
+        session.selections.skip_active();
+        self.move_to_active_multi_cursor(false);
+    }
+
+    pub(super) fn remove_active_multi_cursor_selection(&mut self) {
+        if !self.can_navigate_multi_cursor_occurrences() {
+            self.multi_cursor = None;
+            return;
+        }
+        let retained_selection = self
+            .multi_cursor
+            .as_mut()
+            .expect("session was checked above")
+            .selections
+            .remove_active();
+        if !retained_selection {
+            self.multi_cursor = None;
+            return;
+        }
         self.move_to_active_multi_cursor(false);
     }
 
@@ -320,5 +366,18 @@ impl Editor {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    pub(super) fn multi_cursor_status_label(&self) -> Option<String> {
+        let session = self
+            .multi_cursor
+            .as_ref()
+            .filter(|session| session.belongs_to(self))?;
+        let (current, total) = session.selections.active_selection();
+        let mode = match session.phase {
+            MultiCursorPhase::Selecting => "MULTI",
+            MultiCursorPhase::Inserting => "MULTI-I",
+        };
+        Some(format!("{mode} {current}/{total}"))
     }
 }

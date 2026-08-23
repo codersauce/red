@@ -79,10 +79,12 @@ async fn multi_cursor_i_inserts_at_each_selection_start_as_one_undo() {
     key(&mut harness, KeyCode::Char('n'), KeyModifiers::CONTROL).await;
     key(&mut harness, KeyCode::Char('n'), KeyModifiers::CONTROL).await;
     key(&mut harness, KeyCode::Char('i'), KeyModifiers::NONE).await;
+    assert!(harness.statusline_row().contains("MULTI-I 2/2"));
     harness.type_text("☕").await.unwrap();
     key(&mut harness, KeyCode::Esc, KeyModifiers::NONE).await;
 
     harness.assert_mode(Mode::Normal);
+    assert!(harness.statusline_row().contains("MULTI 2/2"));
     harness.assert_buffer_contents("☕café ☕café");
 
     harness.execute_action(Action::Undo).await.unwrap();
@@ -109,4 +111,86 @@ async fn multi_cursor_a_appends_to_each_selection_end_as_one_undo() {
 
     harness.execute_action(Action::Undo).await.unwrap();
     harness.assert_buffer_contents("foo foo");
+}
+
+#[tokio::test]
+async fn multi_cursor_navigation_wraps_and_reports_the_active_selection() {
+    let config: Config = toml::from_str(include_str!("../default_config.toml")).unwrap();
+    let buffer = Buffer::new(None, "foo foo foo foo".to_string());
+    let mut harness = EditorHarness::with_config(buffer, config);
+
+    key(&mut harness, KeyCode::Char('n'), KeyModifiers::CONTROL).await;
+    key(&mut harness, KeyCode::Char('n'), KeyModifiers::CONTROL).await;
+    assert!(harness.statusline_row().contains("MULTI 2/2"));
+    harness.assert_cursor_at(6, 0);
+
+    key(&mut harness, KeyCode::Char('N'), KeyModifiers::SHIFT).await;
+    assert!(harness.statusline_row().contains("MULTI 1/2"));
+    harness.assert_cursor_at(2, 0);
+
+    key(&mut harness, KeyCode::Char('N'), KeyModifiers::SHIFT).await;
+    assert!(harness.statusline_row().contains("MULTI 3/3"));
+    harness.assert_cursor_at(14, 0);
+
+    key(&mut harness, KeyCode::Char('n'), KeyModifiers::NONE).await;
+    assert!(harness.statusline_row().contains("MULTI 1/3"));
+    harness.assert_cursor_at(2, 0);
+}
+
+#[tokio::test]
+async fn q_skips_in_the_last_direction_and_shift_q_removes_the_active_selection() {
+    let config: Config = toml::from_str(include_str!("../default_config.toml")).unwrap();
+    let buffer = Buffer::new(None, "foo foo foo foo".to_string());
+    let mut harness = EditorHarness::with_config(buffer, config);
+
+    key(&mut harness, KeyCode::Char('n'), KeyModifiers::CONTROL).await;
+    key(&mut harness, KeyCode::Char('n'), KeyModifiers::CONTROL).await;
+    key(&mut harness, KeyCode::Char('N'), KeyModifiers::SHIFT).await;
+    key(&mut harness, KeyCode::Char('q'), KeyModifiers::NONE).await;
+    assert!(harness.statusline_row().contains("MULTI 2/2"));
+    harness.assert_cursor_at(14, 0);
+
+    key(&mut harness, KeyCode::Char('Q'), KeyModifiers::SHIFT).await;
+    assert!(harness.statusline_row().contains("MULTI 1/1"));
+    harness.assert_cursor_at(6, 0);
+
+    key(&mut harness, KeyCode::Char('Q'), KeyModifiers::SHIFT).await;
+    assert!(!harness.statusline_row().contains("MULTI"));
+}
+
+#[tokio::test]
+async fn skipped_occurrences_are_excluded_from_the_following_edit() {
+    let config: Config = toml::from_str(include_str!("../default_config.toml")).unwrap();
+    let buffer = Buffer::new(None, "foo foo foo foo".to_string());
+    let mut harness = EditorHarness::with_config(buffer, config);
+
+    key(&mut harness, KeyCode::Char('n'), KeyModifiers::CONTROL).await;
+    key(&mut harness, KeyCode::Char('n'), KeyModifiers::CONTROL).await;
+    key(&mut harness, KeyCode::Char('q'), KeyModifiers::NONE).await;
+    key(&mut harness, KeyCode::Char('c'), KeyModifiers::NONE).await;
+    harness.type_text("x").await.unwrap();
+    key(&mut harness, KeyCode::Esc, KeyModifiers::NONE).await;
+
+    harness.assert_buffer_contents("x foo x foo");
+}
+
+#[tokio::test]
+async fn multi_cursor_navigation_does_not_replace_normal_search_state() {
+    let config: Config = toml::from_str(include_str!("../default_config.toml")).unwrap();
+    let buffer = Buffer::new(None, "foo bar foo bar".to_string());
+    let mut harness = EditorHarness::with_config(buffer, config);
+
+    harness.execute_action(Action::MoveTo(4, 0)).await.unwrap();
+    harness
+        .execute_action(Action::SearchWordUnderCursor)
+        .await
+        .unwrap();
+    harness.execute_action(Action::MoveTo(0, 0)).await.unwrap();
+
+    key(&mut harness, KeyCode::Char('n'), KeyModifiers::CONTROL).await;
+    key(&mut harness, KeyCode::Char('n'), KeyModifiers::NONE).await;
+    key(&mut harness, KeyCode::Esc, KeyModifiers::NONE).await;
+    key(&mut harness, KeyCode::Char('n'), KeyModifiers::NONE).await;
+
+    harness.assert_cursor_at(12, 0);
 }

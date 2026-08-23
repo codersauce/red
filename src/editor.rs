@@ -2507,6 +2507,12 @@ pub enum Action {
     SearchWordUnderCursor,
     SelectNextOccurrence,
     #[serde(skip)]
+    SelectPreviousOccurrence,
+    #[serde(skip)]
+    SkipMultiSelection,
+    #[serde(skip)]
+    RemoveActiveMultiSelection,
+    #[serde(skip)]
     ChangeMultiSelection,
     #[serde(skip)]
     InsertAtMultiSelectionStart,
@@ -17218,6 +17224,26 @@ impl Editor {
                         return Some(KeyAction::Single(Action::AppendAtMultiSelectionEnd));
                     }
                     (KeyCode::Char('n'), KeyModifiers::CONTROL) => {}
+                    (KeyCode::Char('n'), KeyModifiers::NONE)
+                        if self.can_navigate_multi_cursor_occurrences() =>
+                    {
+                        return Some(KeyAction::Single(Action::SelectNextOccurrence));
+                    }
+                    (KeyCode::Char('N'), KeyModifiers::NONE | KeyModifiers::SHIFT)
+                        if self.can_navigate_multi_cursor_occurrences() =>
+                    {
+                        return Some(KeyAction::Single(Action::SelectPreviousOccurrence));
+                    }
+                    (KeyCode::Char('q'), KeyModifiers::NONE)
+                        if self.can_navigate_multi_cursor_occurrences() =>
+                    {
+                        return Some(KeyAction::Single(Action::SkipMultiSelection));
+                    }
+                    (KeyCode::Char('Q'), KeyModifiers::NONE | KeyModifiers::SHIFT)
+                        if self.can_navigate_multi_cursor_occurrences() =>
+                    {
+                        return Some(KeyAction::Single(Action::RemoveActiveMultiSelection));
+                    }
                     _ => self.clear_multi_cursor(),
                 }
             }
@@ -21414,6 +21440,21 @@ impl Editor {
             Action::SelectNextOccurrence => {
                 add_to_history = false;
                 self.select_next_occurrence();
+                self.render(buffer)?;
+            }
+            Action::SelectPreviousOccurrence => {
+                add_to_history = false;
+                self.select_previous_occurrence();
+                self.render(buffer)?;
+            }
+            Action::SkipMultiSelection => {
+                add_to_history = false;
+                self.skip_multi_cursor_occurrence();
+                self.render(buffer)?;
+            }
+            Action::RemoveActiveMultiSelection => {
+                add_to_history = false;
+                self.remove_active_multi_cursor_selection();
                 self.render(buffer)?;
             }
             Action::ChangeMultiSelection => {

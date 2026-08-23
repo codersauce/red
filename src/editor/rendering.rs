@@ -3660,6 +3660,8 @@ impl Editor {
         let context = StatuslineContext {
             mode: if self.pane_resize_mode.is_some() {
                 "RESIZE".to_string()
+            } else if let Some(multi_cursor) = self.multi_cursor_status_label() {
+                multi_cursor
             } else {
                 format_mode_name(&self.mode)
             },

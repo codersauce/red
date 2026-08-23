@@ -72,6 +72,9 @@ impl Editor {
                         | Mode::VisualBlock
                 ) | Action::RepeatLastChange
                     | Action::SelectNextOccurrence
+                    | Action::SelectPreviousOccurrence
+                    | Action::SkipMultiSelection
+                    | Action::RemoveActiveMultiSelection
                     | Action::ChangeMultiSelection
                     | Action::InsertAtMultiSelectionStart
                     | Action::AppendAtMultiSelectionEnd

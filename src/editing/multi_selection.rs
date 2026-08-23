@@ -28,6 +28,13 @@ pub(crate) struct SelectionSet {
     candidates: Vec<CharRange>,
     selections: Vec<CharRange>,
     active_candidate: usize,
+    direction: TraversalDirection,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TraversalDirection {
+    Forward,
+    Backward,
 }
 
 impl SelectionSet {
@@ -91,20 +98,78 @@ impl SelectionSet {
             candidates,
             selections: vec![CharRange::new(start, end)],
             active_candidate,
+            direction: TraversalDirection::Forward,
         })
     }
 
     /// Adds the next occurrence, wrapping at the end of the document.
     pub(crate) fn select_next(&mut self) {
+        self.select_in_direction(TraversalDirection::Forward);
+    }
+
+    /// Adds the previous occurrence, wrapping at the start of the document.
+    pub(crate) fn select_previous(&mut self) {
+        self.select_in_direction(TraversalDirection::Backward);
+    }
+
+    /// Drops the active occurrence and selects the next one in the current direction.
+    pub(crate) fn skip_active(&mut self) {
         if self.candidates.is_empty() {
             return;
         }
-        self.active_candidate = (self.active_candidate + 1) % self.candidates.len();
+        let active = self.active_range();
+        self.selections.retain(|range| *range != active);
+        self.advance_candidate(self.direction);
         let candidate = self.candidates[self.active_candidate];
         if !self.selections.contains(&candidate) {
             self.selections.push(candidate);
             self.selections.sort_by_key(|range| range.start);
         }
+    }
+
+    /// Removes the active selection and activates its previous selected neighbor.
+    pub(crate) fn remove_active(&mut self) -> bool {
+        let active = self.active_range();
+        let selected_index = self
+            .selections
+            .iter()
+            .position(|range| *range == active)
+            .unwrap_or(0);
+        self.selections.retain(|range| *range != active);
+        if self.selections.is_empty() {
+            return false;
+        }
+
+        let next_active = self.selections[selected_index.saturating_sub(1)];
+        self.active_candidate = self
+            .candidates
+            .iter()
+            .position(|candidate| *candidate == next_active)
+            .expect("selected ranges must remain candidates");
+        true
+    }
+
+    fn select_in_direction(&mut self, direction: TraversalDirection) {
+        if self.candidates.is_empty() {
+            return;
+        }
+        self.direction = direction;
+        self.advance_candidate(direction);
+        let candidate = self.candidates[self.active_candidate];
+        if !self.selections.contains(&candidate) {
+            self.selections.push(candidate);
+            self.selections.sort_by_key(|range| range.start);
+        }
+    }
+
+    fn advance_candidate(&mut self, direction: TraversalDirection) {
+        self.active_candidate = match direction {
+            TraversalDirection::Forward => (self.active_candidate + 1) % self.candidates.len(),
+            TraversalDirection::Backward => self
+                .active_candidate
+                .checked_sub(1)
+                .unwrap_or(self.candidates.len() - 1),
+        };
     }
 
     pub(crate) fn ranges(&self) -> &[CharRange] {
@@ -113,6 +178,18 @@ impl SelectionSet {
 
     pub(crate) fn active_range(&self) -> CharRange {
         self.candidates[self.active_candidate]
+    }
+
+    pub(crate) fn active_selection(&self) -> (usize, usize) {
+        let current = if self.candidates == self.selections {
+            self.active_candidate
+        } else {
+            self.selections
+                .iter()
+                .position(|range| *range == self.active_range())
+                .unwrap_or(0)
+        };
+        (current + 1, self.selections.len())
     }
 
     pub(crate) fn replace_ranges(&mut self, ranges: Vec<CharRange>, active: usize) {
@@ -174,6 +251,67 @@ mod tests {
 
         set.select_next();
         assert_eq!(set.active_range(), CharRange::new(0, 3));
+    }
+
+    #[test]
+    fn next_and_previous_activate_existing_or_add_wrapped_matches() {
+        let mut set = set_at("foo foo foo foo", 1, false);
+        set.select_next();
+        assert_eq!(set.active_selection(), (2, 2));
+
+        set.select_previous();
+        assert_eq!(set.active_selection(), (1, 2));
+
+        set.select_previous();
+        assert_eq!(set.active_range(), CharRange::new(12, 15));
+        assert_eq!(set.active_selection(), (3, 3));
+    }
+
+    #[test]
+    fn skip_follows_direction_and_remove_chooses_selected_neighbor() {
+        let mut set = set_at("foo foo foo foo", 1, false);
+        set.select_next();
+        set.select_previous();
+        set.skip_active();
+        assert_eq!(
+            set.ranges(),
+            &[CharRange::new(4, 7), CharRange::new(12, 15)]
+        );
+        assert_eq!(set.active_range(), CharRange::new(12, 15));
+
+        assert!(set.remove_active());
+        assert_eq!(set.ranges(), &[CharRange::new(4, 7)]);
+        assert_eq!(set.active_selection(), (1, 1));
+        assert!(!set.remove_active());
+    }
+
+    #[test]
+    fn skipping_after_selecting_every_match_reduces_the_set() {
+        let mut set = set_at("foo foo", 1, false);
+        set.select_next();
+        set.skip_active();
+        assert_eq!(set.ranges(), &[CharRange::new(0, 3)]);
+        assert_eq!(set.active_selection(), (1, 1));
+    }
+
+    #[test]
+    fn removing_the_first_selection_activates_the_next_remaining_one() {
+        let mut set = set_at("foo foo", 1, false);
+        set.select_next();
+        set.select_previous();
+
+        assert!(set.remove_active());
+        assert_eq!(set.ranges(), &[CharRange::new(4, 7)]);
+        assert_eq!(set.active_range(), CharRange::new(4, 7));
+    }
+
+    #[test]
+    fn collapsed_duplicate_cursors_keep_the_active_selection_index() {
+        let mut set = set_at("..", 0, false);
+        set.select_next();
+        set.replace_ranges(vec![CharRange::new(0, 0), CharRange::new(0, 0)], 1);
+
+        assert_eq!(set.active_selection(), (2, 2));
     }
 
     #[test]
