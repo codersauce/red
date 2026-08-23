@@ -11,7 +11,7 @@ use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
 
 use crate::{
     buffer::{BufferId, ExternalFileChange},
-    notification::Severity,
+    notification::{Notice, NotificationSource, Severity},
     plugin::Runtime,
     undo::{TextPosition, TextRange},
 };
@@ -213,6 +213,45 @@ fn existing_parent(path: &Path) -> Option<PathBuf> {
 }
 
 impl Editor {
+    fn publish_external_file_notification(
+        &mut self,
+        id: BufferId,
+        path: &str,
+        change: ExternalFileChange,
+    ) {
+        let verb = match change {
+            ExternalFileChange::Modified => "changed",
+            ExternalFileChange::Created => "was created",
+            ExternalFileChange::Deleted => "was deleted",
+        };
+        let message = format!(
+            "{path} {verb} on disk; :diffdisk compares, :e! reloads, :w <file> saves elsewhere, :w! overwrites"
+        );
+        let notice = Notice::new(NotificationSource::Editor, Severity::Warning, &message)
+            .with_key(format!("external-file:{}", id.as_u64()))
+            .with_details(&message);
+        match self.publish_notification(notice) {
+            Ok(notification_id) => {
+                self.external_file_notifications.insert(id, notification_id);
+                self.notification_fallback = None;
+            }
+            Err(error) => {
+                self.notification_fallback = Some(crate::notification::single_line(
+                    super::truncate_chars(&message, 4_096),
+                ));
+                crate::log!("could not retain external file notification: {error}");
+            }
+        }
+        self.last_error = Some(message);
+    }
+
+    pub(super) fn resolve_external_file_notification(&mut self, id: BufferId) -> bool {
+        let Some(notification_id) = self.external_file_notifications.remove(&id) else {
+            return false;
+        };
+        self.notifications.resolve(notification_id).is_ok()
+    }
+
     /// Keeps diff construction and confirmation state out of the recursive action future.
     #[inline(never)]
     pub(super) fn open_disk_conflict_dialog(&mut self, runtime: &mut Runtime) -> bool {
@@ -238,7 +277,9 @@ impl Editor {
             .header("file on disk", "editor buffer")
             .to_string();
         if diff.is_empty() {
+            let id = self.current_buffer().id();
             self.current_buffer_mut().set_external_file_change(None);
+            self.resolve_external_file_notification(id);
             self.set_notification_message(
                 Severity::Success,
                 Some("The editor buffer already matches the file on disk".to_string()),
@@ -318,22 +359,13 @@ impl Editor {
 
             let Some(change) = change else {
                 needs_render |= self.buffer_manager[index].set_external_file_change(None);
+                needs_render |= self.resolve_external_file_notification(id);
                 continue;
             };
             if self.buffer_manager[index].is_dirty() || change == ExternalFileChange::Deleted {
                 if self.buffer_manager[index].set_external_file_change(Some(change)) {
                     let path = self.buffer_manager[index].name().to_string();
-                    let verb = match change {
-                        ExternalFileChange::Modified => "changed",
-                        ExternalFileChange::Created => "was created",
-                        ExternalFileChange::Deleted => "was deleted",
-                    };
-                    self.set_notification_message(
-                        Severity::Warning,
-                        Some(format!(
-                            "{path} {verb} on disk; :diffdisk compares, :e! reloads, :w <file> saves elsewhere, :w! overwrites"
-                        )),
-                    );
+                    self.publish_external_file_notification(id, &path, change);
                     self.plugin_registry
                         .notify(
                             runtime,
@@ -357,6 +389,7 @@ impl Editor {
             }
 
             if self.reload_changed_file(index, runtime).await? {
+                self.resolve_external_file_notification(id);
                 needs_render = true;
             }
         }
@@ -565,6 +598,46 @@ mod tests {
             Some(ExternalFileChange::Deleted)
         );
         assert!(editor.test_statusline_row().contains("[DELETED]"));
+    }
+
+    #[tokio::test]
+    async fn recreating_an_unchanged_file_resolves_its_deletion_notification() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("watched.rs");
+        std::fs::write(&path, "before\n").unwrap();
+        let source = Buffer::new(Some(path.to_string_lossy().into_owned()), "before\n".into());
+        let id = source.id();
+        let mut editor = editor_with_buffers(vec![source]);
+
+        poll_editor(&mut editor).await;
+        std::fs::remove_file(&path).unwrap();
+        poll_editor(&mut editor).await;
+
+        let notification_id = *editor.external_file_notifications.get(&id).unwrap();
+        assert!(editor
+            .notifications()
+            .get(notification_id)
+            .unwrap()
+            .is_active(std::time::Instant::now()));
+
+        std::fs::write(&path, "before\n").unwrap();
+        poll_editor(&mut editor).await;
+
+        assert_eq!(editor.current_buffer().contents(), "before\n");
+        assert!(!editor.current_buffer().has_external_file_conflict());
+        assert!(!editor.external_file_notifications.contains_key(&id));
+        assert!(!editor
+            .notifications()
+            .get(notification_id)
+            .unwrap()
+            .is_active(std::time::Instant::now()));
+        assert_eq!(
+            editor
+                .notifications()
+                .counts(std::time::Instant::now())
+                .needs_acknowledgment,
+            0
+        );
     }
 
     #[tokio::test]
