@@ -3702,6 +3702,7 @@ pub struct Editor {
     /// Jumplist traversal typed while a definition request is still in flight.
     deferred_jump_navigation: VecDeque<Action>,
     pending_completion_resolutions: HashMap<i64, completion_resolve::PendingCompletionResolution>,
+    pending_completion_refreshes: HashMap<i64, completion_resolve::PendingCompletionRefresh>,
     scheduled_completion: Option<ScheduledCompletion>,
     // Keep optional AI state out of Editor values and the startup futures that own them.
     inline_completion: Box<inline_completion::InlineCompletionState>,
@@ -5167,6 +5168,7 @@ impl Editor {
             pending_definition_requests: HashSet::new(),
             deferred_jump_navigation: VecDeque::new(),
             pending_completion_resolutions: HashMap::new(),
+            pending_completion_refreshes: HashMap::new(),
             scheduled_completion: None,
             inline_completion: Box::default(),
             completion_snapshot: None,
@@ -14550,6 +14552,9 @@ impl Editor {
                     }
 
                     if method == "textDocument/completion" {
+                        if self.pending_completion_refreshes.contains_key(&msg.id) {
+                            return self.refreshed_completion_action(msg);
+                        }
                         let pending_edit = self.pending_lsp_edit_requests.remove(&msg.id);
                         let pending =
                             self.pending_completions.remove(&msg.id).unwrap_or_else(|| {
@@ -14681,6 +14686,11 @@ impl Editor {
                 if method.as_deref() == Some("completionItem/resolve") {
                     return self.completion_resolution_failed(id, &error_msg.message);
                 }
+                if method.as_deref() == Some("textDocument/completion")
+                    && self.pending_completion_refreshes.contains_key(&id)
+                {
+                    return self.completion_refresh_failed(id, &error_msg.message);
+                }
                 if method.as_deref() == Some("textDocument/inlayHint") {
                     if let Some(request_id) = self.pending_plugin_inlay_hints.remove(&id) {
                         return Some(Action::ResolvePluginRequest(
@@ -14770,6 +14780,11 @@ impl Editor {
                 }
                 if method.as_deref() == Some("completionItem/resolve") {
                     return self.completion_resolution_failed(*id, &error.to_string());
+                }
+                if method.as_deref() == Some("textDocument/completion")
+                    && self.pending_completion_refreshes.contains_key(id)
+                {
+                    return self.completion_refresh_failed(*id, &error.to_string());
                 }
                 if method.as_deref() == Some("textDocument/inlayHint") {
                     if let Some(request_id) = self.pending_plugin_inlay_hints.remove(id) {
