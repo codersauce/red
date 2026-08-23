@@ -311,6 +311,33 @@ impl Editor {
         true
     }
 
+    pub(super) fn yank_multi_cursor_selections(&mut self) -> bool {
+        if !self.can_navigate_multi_cursor_occurrences() {
+            return false;
+        }
+        let ranges = self
+            .multi_cursor
+            .as_ref()
+            .expect("session was checked above")
+            .selections
+            .ranges()
+            .to_vec();
+        let yanked = ranges
+            .iter()
+            .map(|range| {
+                self.current_buffer().text_in_range(TextRange::new(
+                    self.current_buffer().char_idx_to_position(range.start),
+                    self.current_buffer().char_idx_to_position(range.end),
+                ))
+            })
+            .collect();
+
+        self.set_default_register(Content::multi_cursor_blockwise(yanked));
+        self.collapse_multi_cursor_ranges(&ranges, |range| range.start);
+        self.move_to_active_multi_cursor(false);
+        true
+    }
+
     pub(super) fn paste_at_multi_cursors(&mut self, anchor: MultiCursorPasteAnchor) -> bool {
         if !self.has_multi_cursor_session() {
             return false;

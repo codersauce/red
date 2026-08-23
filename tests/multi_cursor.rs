@@ -432,3 +432,74 @@ async fn linewise_register_pastes_once_per_selected_region_and_merges_same_line_
     harness.execute_action(Action::Undo).await.unwrap();
     harness.assert_buffer_contents("foo foo\ntail");
 }
+
+#[tokio::test]
+async fn y_yanks_ordered_unicode_regions_and_collapses_to_their_starts() {
+    let mut config: Config = toml::from_str(include_str!("../default_config.toml")).unwrap();
+    config.search.ignorecase = true;
+    config.search.smartcase = false;
+    let buffer = Buffer::new(None, "café CAFÉ tail".to_string());
+    let mut harness = EditorHarness::with_config(buffer, config);
+    let clipboard = MemoryClipboardProvider::default();
+    let clipboard_text = clipboard.shared_text();
+    harness.editor.test_set_clipboard(Box::new(clipboard));
+
+    key(&mut harness, KeyCode::Char('n'), KeyModifiers::CONTROL).await;
+    key(&mut harness, KeyCode::Char('n'), KeyModifiers::CONTROL).await;
+    key(&mut harness, KeyCode::Char('y'), KeyModifiers::NONE).await;
+
+    harness.assert_buffer_contents("café CAFÉ tail");
+    assert!(harness.statusline_row().contains("MULTI 2/2"));
+    harness.assert_cursor_at(5, 0);
+    assert_eq!(
+        clipboard_text.lock().unwrap().as_deref(),
+        Some("café\nCAFÉ")
+    );
+    harness
+        .execute_action(Action::PrintRegisters)
+        .await
+        .unwrap();
+    assert_eq!(harness.last_error(), Some("\": café\nCAFÉ"));
+}
+
+#[tokio::test]
+async fn yanked_multi_cursor_payloads_paste_back_in_region_order() {
+    let mut config: Config = toml::from_str(include_str!("../default_config.toml")).unwrap();
+    config.search.ignorecase = true;
+    config.search.smartcase = false;
+    let buffer = Buffer::new(None, "foo FOO".to_string());
+    let mut harness = EditorHarness::with_config(buffer, config);
+
+    key(&mut harness, KeyCode::Char('n'), KeyModifiers::CONTROL).await;
+    key(&mut harness, KeyCode::Char('n'), KeyModifiers::CONTROL).await;
+    key(&mut harness, KeyCode::Char('y'), KeyModifiers::NONE).await;
+    key(&mut harness, KeyCode::Char('p'), KeyModifiers::NONE).await;
+
+    harness.assert_buffer_contents("ffoooo FFOOOO");
+    assert!(harness.statusline_row().contains("MULTI 2/2"));
+}
+
+#[tokio::test]
+async fn y_respects_skipped_regions_and_does_not_create_an_undo_entry() {
+    let config: Config = toml::from_str(include_str!("../default_config.toml")).unwrap();
+    let buffer = Buffer::new(None, "foo foo foo".to_string());
+    let mut harness = EditorHarness::with_config(buffer, config);
+
+    harness.execute_action(Action::MoveTo(10, 0)).await.unwrap();
+    key(&mut harness, KeyCode::Char('a'), KeyModifiers::NONE).await;
+    harness.type_text("!").await.unwrap();
+    key(&mut harness, KeyCode::Esc, KeyModifiers::NONE).await;
+    harness.execute_action(Action::MoveTo(0, 0)).await.unwrap();
+    key(&mut harness, KeyCode::Char('n'), KeyModifiers::CONTROL).await;
+    key(&mut harness, KeyCode::Char('n'), KeyModifiers::CONTROL).await;
+    key(&mut harness, KeyCode::Char('q'), KeyModifiers::NONE).await;
+    key(&mut harness, KeyCode::Char('y'), KeyModifiers::NONE).await;
+
+    harness
+        .execute_action(Action::PrintRegisters)
+        .await
+        .unwrap();
+    assert_eq!(harness.last_error(), Some("\": foo\nfoo"));
+    harness.execute_action(Action::Undo).await.unwrap();
+    harness.assert_buffer_contents("foo foo foo");
+}

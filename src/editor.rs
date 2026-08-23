@@ -2527,6 +2527,8 @@ pub enum Action {
     #[serde(skip)]
     PasteBeforeMultiSelection,
     #[serde(skip)]
+    YankMultiSelection,
+    #[serde(skip)]
     ClearMultiSelection,
 
     MoveUp,
@@ -17260,6 +17262,11 @@ impl Editor {
                     (KeyCode::Char('P'), KeyModifiers::NONE | KeyModifiers::SHIFT) => {
                         return Some(KeyAction::Single(Action::PasteBeforeMultiSelection));
                     }
+                    (KeyCode::Char('y'), KeyModifiers::NONE)
+                        if self.can_navigate_multi_cursor_occurrences() =>
+                    {
+                        return Some(KeyAction::Single(Action::YankMultiSelection));
+                    }
                     (KeyCode::Char('n'), KeyModifiers::CONTROL) => {}
                     (KeyCode::Char('n'), KeyModifiers::NONE)
                         if self.can_navigate_multi_cursor_occurrences() =>
@@ -21537,6 +21544,11 @@ impl Editor {
                 if self.paste_at_multi_cursors(multi_cursor::MultiCursorPasteAnchor::Before) {
                     self.notify_change(runtime).await?;
                 }
+                self.render(buffer)?;
+            }
+            Action::YankMultiSelection => {
+                add_to_history = false;
+                self.yank_multi_cursor_selections();
                 self.render(buffer)?;
             }
             Action::ClearMultiSelection => {
