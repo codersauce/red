@@ -25,12 +25,15 @@ impl Editor {
             .filter(|source| source.is_dirty())
             .map(Buffer::id)
             .collect::<Vec<_>>();
+        let target_count = targets.len();
         let practice_buffer_id = self
             .tutorial_controller
             .as_ref()
             .map(|tutorial| tutorial.practice_buffer_id);
         let mut first_error = None;
         let mut operation_error = None;
+        let mut written = 0;
+        let mut pending = 0;
 
         for target in targets {
             let Some(index) = self
@@ -38,6 +41,9 @@ impl Editor {
                 .iter()
                 .position(|source| source.id() == target)
             else {
+                first_error.get_or_insert_with(|| {
+                    "buffer list changed while :wa was saving files".to_string()
+                });
                 continue;
             };
             if practice_buffer_id == Some(target) {
@@ -55,14 +61,16 @@ impl Editor {
             self.select_buffer_for_lsp_edit(index);
             match self.save_action(buffer, runtime).await {
                 Ok(_) => {
-                    if self.current_buffer().is_dirty()
-                        && !self.buffer_has_pending_format_save(target)
-                    {
+                    if self.buffer_has_pending_format_save(target) {
+                        pending += 1;
+                    } else if self.current_buffer().is_dirty() {
                         first_error.get_or_insert_with(|| {
                             self.last_error.clone().unwrap_or_else(|| {
                                 format!("Could not write buffer {}", target.as_u64())
                             })
                         });
+                    } else {
+                        written += 1;
                     }
                 }
                 Err(error) => {
@@ -86,9 +94,49 @@ impl Editor {
         if let Some(error) = operation_error {
             return Err(error);
         }
-        if let Some(error) = first_error {
-            self.set_notification_message(Severity::Error, Some(error));
-        }
+        let buffer_count = |count: usize| if count == 1 { "buffer" } else { "buffers" };
+        let result = if let Some(error) = first_error {
+            let progress = if written == 0 {
+                String::new()
+            } else {
+                format!(
+                    "wrote {written} of {target_count} {}",
+                    buffer_count(target_count)
+                )
+            };
+            let pending = if pending == 0 {
+                String::new()
+            } else {
+                format!(
+                    "{pending} {} awaiting format-on-save",
+                    buffer_count(pending)
+                )
+            };
+            let details = [progress, pending, error]
+                .into_iter()
+                .filter(|part| !part.is_empty())
+                .collect::<Vec<_>>()
+                .join("; ");
+            (Severity::Error, format!(":wa — {details}"))
+        } else if target_count == 0 {
+            (Severity::Success, ":wa — no modified buffers".to_string())
+        } else {
+            let written =
+                (written > 0).then(|| format!("wrote {written} {}", buffer_count(written)));
+            let pending = (pending > 0).then(|| {
+                format!(
+                    "{pending} {} awaiting format-on-save",
+                    buffer_count(pending)
+                )
+            });
+            let details = [written, pending]
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>()
+                .join("; ");
+            (Severity::Success, format!(":wa — {details}"))
+        };
+        self.set_foreground_message(result.0, Some(result.1));
         self.render(buffer)?;
         Ok(())
     }

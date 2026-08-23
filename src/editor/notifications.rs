@@ -1,6 +1,8 @@
 //! Editor-owned notification adapters and message-browser coordination.
 
 use super::*;
+
+const NOTICE_AGE_THRESHOLD: Duration = Duration::from_secs(10);
 use crate::{
     notification::{MessageAction, Notification, NotificationCounts, NotificationState},
     ui::{MessageRow, MessagesPanel, MessagesView},
@@ -120,6 +122,24 @@ fn record_details(record: &Notification, now: Instant) -> String {
     )
 }
 
+pub(super) fn relative_notice_age(updated_at: SystemTime, now: SystemTime) -> Option<String> {
+    let elapsed = now.duration_since(updated_at).ok()?;
+    if elapsed < NOTICE_AGE_THRESHOLD {
+        return None;
+    }
+    let seconds = elapsed.as_secs();
+    let (value, unit) = if seconds < 60 {
+        (seconds, "s")
+    } else if seconds < 60 * 60 {
+        (seconds / 60, "m")
+    } else if seconds < 24 * 60 * 60 {
+        (seconds / (60 * 60), "h")
+    } else {
+        (seconds / (24 * 60 * 60), "d")
+    };
+    Some(format!("{value}{unit} ago"))
+}
+
 impl Editor {
     /// Transitional operation-local result plus durable notification publication.
     /// Clearing the old slot never clears notification history or active work.
@@ -133,6 +153,25 @@ impl Editor {
 
     pub(super) fn set_routine_error(&mut self, message: Option<String>) {
         self.set_message_with_attention(Severity::Error, AttentionPolicy::Quiet, message);
+    }
+
+    pub(super) fn set_foreground_message(&mut self, severity: Severity, message: Option<String>) {
+        let Some(message) = message else {
+            self.last_error = None;
+            return;
+        };
+        let notice = Notice::new(NotificationSource::Editor, severity, &message)
+            .with_display_priority(DisplayPriority::Foreground)
+            .with_details(&message);
+        if let Err(error) = self.publish_notification(notice) {
+            self.notification_fallback = Some(crate::notification::single_line(truncate_chars(
+                &message, 4_096,
+            )));
+            log!("could not retain notification: {error}");
+        } else {
+            self.notification_fallback = None;
+        }
+        self.last_error = Some(message);
     }
 
     pub(super) fn set_notification_message(&mut self, severity: Severity, message: Option<String>) {
@@ -532,6 +571,28 @@ mod tests {
     use super::*;
 
     #[test]
+    fn relative_notice_age_uses_compact_units_after_the_threshold() {
+        let now = SystemTime::now();
+        assert_eq!(relative_notice_age(now - Duration::from_secs(9), now), None);
+        assert_eq!(
+            relative_notice_age(now - Duration::from_secs(12), now).as_deref(),
+            Some("12s ago")
+        );
+        assert_eq!(
+            relative_notice_age(now - Duration::from_secs(12 * 60), now).as_deref(),
+            Some("12m ago")
+        );
+        assert_eq!(
+            relative_notice_age(now - Duration::from_secs(2 * 60 * 60), now).as_deref(),
+            Some("2h ago")
+        );
+        assert_eq!(
+            relative_notice_age(now - Duration::from_secs(3 * 24 * 60 * 60), now).as_deref(),
+            Some("3d ago")
+        );
+    }
+
+    #[test]
     fn word_backspace_updates_the_editor_owned_message_query() {
         for modifiers in [KeyModifiers::ALT, KeyModifiers::CONTROL] {
             let mut editor = editor(100, 24);
@@ -749,6 +810,61 @@ mod tests {
         assert_eq!(editor.message_ids(Instant::now()), vec![first]);
         editor.handle_message_action(&MessageAction::Acknowledge);
         assert!(editor.message_ids(Instant::now()).is_empty());
+    }
+
+    #[test]
+    fn foreground_command_result_leads_while_retained_error_stays_visible_in_badge() {
+        let mut editor = editor(120, 24);
+        editor
+            .publish_notification(Notice::new(
+                NotificationSource::Editor,
+                Severity::Error,
+                "old diagnostics failure",
+            ))
+            .unwrap();
+        editor.set_foreground_message(Severity::Success, Some(":wa — no modified buffers".into()));
+
+        let mut buffer = RenderBuffer::new(120, 24, &Style::default());
+        editor.draw_commandline(&mut buffer);
+        let row = render_text_rows(&buffer).pop().unwrap();
+
+        assert!(row.contains(":wa — no modified buffers"), "{row}");
+        assert!(row.contains("1 needs attention"), "{row}");
+        assert!(!row.contains("old diagnostics failure"), "{row}");
+    }
+
+    #[test]
+    fn resurfaced_lsp_error_shows_its_source_and_age() {
+        let mut editor = editor(120, 24);
+        let now = NotificationTime::now();
+        editor
+            .notifications
+            .publish(
+                Notice::new(
+                    NotificationSource::LanguageServer {
+                        name: "rust".into(),
+                        workspace_root: "/tmp/project".into(),
+                        generation: 0,
+                    },
+                    Severity::Error,
+                    "diagnostics failed for pull_requests_screen.rs",
+                ),
+                NotificationTime {
+                    monotonic: now.monotonic,
+                    wall: now.wall - Duration::from_secs(12 * 60),
+                },
+            )
+            .unwrap();
+
+        let mut buffer = RenderBuffer::new(120, 24, &Style::default());
+        editor.draw_commandline(&mut buffer);
+        let row = render_text_rows(&buffer).pop().unwrap();
+
+        assert!(
+            row.contains("rust: diagnostics failed for pull_requests_screen.rs"),
+            "{row}"
+        );
+        assert!(row.contains("(12m ago)"), "{row}");
     }
 
     #[test]

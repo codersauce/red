@@ -15,7 +15,7 @@ use std::{
     fs, io,
     path::{Path, PathBuf},
     process::Command,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 
 use chrono::Local;
@@ -3891,8 +3891,21 @@ impl Editor {
                         } => format!(" ({value}%)"),
                         _ => String::new(),
                     };
+                    let age = (!record.is_running())
+                        .then(|| {
+                            super::notifications::relative_notice_age(
+                                record.updated_at,
+                                SystemTime::now(),
+                            )
+                        })
+                        .flatten()
+                        .map(|age| format!(" ({age})"))
+                        .unwrap_or_default();
                     (
-                        format!("{prefix}{source}{}{percentage}", record.content.summary),
+                        format!(
+                            "{prefix}{source}{}{percentage}{age}",
+                            record.content.summary
+                        ),
                         Some(record.severity),
                         display_width(&prefix) + display_width(&source),
                     )
