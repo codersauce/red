@@ -354,7 +354,7 @@ fn show_document_symbols(result: SymbolsResult, request_id: i32) {
 
     let count = red::len(result.symbols);
     if count == 0 {
-        red::execute("Print", "No document symbols found");
+        red::execute("PrintWarning", "No document symbols found");
         return;
     }
 
@@ -606,7 +606,7 @@ fn show_references(result: ReferencesResult, request_id: i32) {
         }
         finish_symbol_flow();
         red::execute("ClosePicker", handle);
-        red::execute("Print", "No references found");
+        red::execute("PrintWarning", "No references found");
         return;
     }
     if count == 1 {

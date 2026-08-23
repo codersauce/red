@@ -5731,7 +5731,7 @@ impl Editor {
             crate::window::Direction::Left => "no window to the left",
             crate::window::Direction::Right => "no window to the right",
         };
-        self.set_legacy_message(Some(message.to_string()));
+        self.set_routine_warning(Some(message.to_string()));
         self.draw_commandline(buffer);
         Ok(())
     }
@@ -14404,15 +14404,17 @@ impl Editor {
                     }
 
                     if method == "textDocument/definition" {
-                        let result = match msg.result {
+                        let definition = match msg.result {
                             serde_json::Value::Array(ref arr) => {
-                                arr.first().and_then(|value| value.as_object())?
+                                arr.first().and_then(|value| value.as_object())
                             }
-                            serde_json::Value::Object(ref obj) => obj,
-                            _ => return None,
+                            serde_json::Value::Object(ref obj) => Some(obj),
+                            _ => None,
                         };
-
-                        return self.go_to_definition(result);
+                        return definition.map_or_else(
+                            || Some(Action::PrintWarning("No definition found".to_string())),
+                            |definition| self.go_to_definition(definition),
+                        );
                     }
 
                     if method == "textDocument/hover" {
@@ -16691,14 +16693,23 @@ impl Editor {
         self.set_legacy_message(None);
     }
 
-    fn finish_search_with_error(&mut self, session: SearchSession, error: String) {
+    fn finish_search_session(&mut self, session: SearchSession) {
         self.restore_search_origin(&session.origin, session.origin_vtop);
         self.search_term = session.draft;
         self.search_direction = session.direction;
         self.search_highlights_suppressed = false;
         self.active_search = None;
         self.mode = Mode::Normal;
+    }
+
+    fn finish_search_with_error(&mut self, session: SearchSession, error: String) {
+        self.finish_search_session(session);
         self.set_legacy_message(Some(error));
+    }
+
+    fn finish_search_without_match(&mut self, session: SearchSession, message: String) {
+        self.finish_search_session(session);
+        self.set_routine_warning(Some(message));
     }
 
     fn pattern_not_found_message(pattern: &str) -> String {
@@ -16736,7 +16747,7 @@ impl Editor {
             .to_string();
         if pattern.is_empty() {
             if self.active_search.is_none() {
-                self.set_legacy_message(Some("no previous search".to_string()));
+                self.set_routine_warning(Some("no previous search".to_string()));
                 self.draw_commandline(buffer);
             }
             return Ok(false);
@@ -16757,7 +16768,13 @@ impl Editor {
             }
         };
         if let Some(match_) = matched {
-            self.set_legacy_message(None);
+            let wrapped = self.config.search.wrapscan
+                && self.search_match_wrapped(match_, &origin, direction);
+            if wrapped {
+                self.set_search_wrap_warning(direction);
+            } else {
+                self.set_legacy_message(None);
+            }
             self.search_highlights_suppressed = false;
             self.move_to_search_match(match_);
             if let Some(active_search) = &mut self.active_search {
@@ -16766,11 +16783,33 @@ impl Editor {
             self.render(buffer)?;
             return Ok(true);
         } else {
-            self.set_legacy_message(Some(Self::pattern_not_found_message(&pattern)));
+            self.set_routine_warning(Some(Self::pattern_not_found_message(&pattern)));
             self.render(buffer)?;
         }
 
         Ok(false)
+    }
+
+    fn search_match_wrapped(
+        &self,
+        match_: SearchMatch,
+        origin: &HistoryEntry,
+        direction: SearchDirection,
+    ) -> bool {
+        let origin = (origin.y, self.grapheme_to_char_on_line(origin.x, origin.y));
+        let target = (match_.start_y, match_.start_x);
+        match direction {
+            SearchDirection::Forward => target <= origin,
+            SearchDirection::Backward => target >= origin,
+        }
+    }
+
+    fn set_search_wrap_warning(&mut self, direction: SearchDirection) {
+        let message = match direction {
+            SearchDirection::Forward => "search hit BOTTOM, continuing at TOP",
+            SearchDirection::Backward => "search hit TOP, continuing at BOTTOM",
+        };
+        self.set_routine_warning(Some(message.to_string()));
     }
 
     fn reset_command_history_navigation(&mut self) {
@@ -17741,7 +17780,7 @@ impl Editor {
                     self.vertical_motion_range(pending.count(), true),
                     "no line above cursor",
                 ),
-                '%' => self.operator_action_for_range(
+                '%' => self.operator_action_for_warning_range(
                     pending.operator,
                     self.matchit_motion_range(MatchDirection::Forward),
                     "match not found",
@@ -17846,7 +17885,7 @@ impl Editor {
             },
             PendingOperatorStep::FindForward => {
                 self.last_character_motion = Some((ForwardCharacterMotion::Find, c));
-                self.operator_action_for_range(
+                self.operator_action_for_warning_range(
                     pending.operator,
                     self.find_forward_motion_range(c, pending.count()),
                     "character not found",
@@ -17854,7 +17893,7 @@ impl Editor {
             }
             PendingOperatorStep::TillForward => {
                 self.last_character_motion = Some((ForwardCharacterMotion::Till, c));
-                self.operator_action_for_range(
+                self.operator_action_for_warning_range(
                     pending.operator,
                     self.till_forward_motion_range(c, pending.count()),
                     "character not found",
@@ -17862,7 +17901,7 @@ impl Editor {
             }
             PendingOperatorStep::FindBackward => {
                 self.last_character_motion = Some((ForwardCharacterMotion::FindBackward, c));
-                self.operator_action_for_range(
+                self.operator_action_for_warning_range(
                     pending.operator,
                     self.find_backward_motion_range(c, pending.count()),
                     "character not found",
@@ -17870,7 +17909,7 @@ impl Editor {
             }
             PendingOperatorStep::TillBackward => {
                 self.last_character_motion = Some((ForwardCharacterMotion::TillBackward, c));
-                self.operator_action_for_range(
+                self.operator_action_for_warning_range(
                     pending.operator,
                     self.till_backward_motion_range(c, pending.count()),
                     "character not found",
@@ -17979,6 +18018,21 @@ impl Editor {
             if self.last_error.is_none() {
                 self.set_navigation_boundary_warning(target);
             }
+            return Some(KeyAction::None);
+        }
+        self.operator_action_for_range(operator, range, "")
+    }
+
+    fn operator_action_for_warning_range(
+        &mut self,
+        operator: EditOperator,
+        range: Option<TextRange>,
+        warning: &str,
+    ) -> Option<KeyAction> {
+        if range.is_none() {
+            self.pending_operator = None;
+            self.waiting_command = None;
+            self.set_routine_warning(Some(warning.to_string()));
             return Some(KeyAction::None);
         }
         self.operator_action_for_range(operator, range, "")
@@ -19658,7 +19712,7 @@ impl Editor {
                     self.notify_change(runtime).await?;
                     self.finish_cursor_motion(buffer, false)?;
                 } else if self.last_error.is_none() {
-                    self.set_legacy_message(Some("adjacent text object not found".to_string()));
+                    self.set_routine_warning(Some("adjacent text object not found".to_string()));
                 }
             }
             Action::StartCommentOperator(count)
@@ -20627,6 +20681,9 @@ impl Editor {
                         .goto_definition(&file, position.character, position.line)
                         .await?;
                     self.pending_definition_requests.insert(request_id);
+                } else {
+                    self.set_routine_warning(Some("No definition found".to_string()));
+                    self.draw_commandline(buffer);
                 }
             }
             Action::Hover => {
@@ -20644,6 +20701,11 @@ impl Editor {
                     self.release_current_dialog_callbacks(runtime);
                     self.current_dialog = Some(Box::new(popup));
                     self.render(buffer)?;
+                } else {
+                    self.set_routine_warning(Some(
+                        "No diagnostics on the current line".to_string(),
+                    ));
+                    self.draw_commandline(buffer);
                 }
             }
             Action::NextDiagnostic | Action::PreviousDiagnostic => {
@@ -21312,16 +21374,23 @@ impl Editor {
                         self.config.search.wrapscan,
                     ) else {
                         let error = Self::pattern_not_found_message(&session.draft);
-                        self.finish_search_with_error(session, error);
+                        self.finish_search_without_match(session, error);
                         self.render(buffer)?;
                         return Ok(false);
                     };
+                    let wrapped = self.config.search.wrapscan
+                        && self.search_match_wrapped(match_, &session.origin, session.direction);
 
                     self.search_term = session.draft;
                     self.search_direction = session.direction;
                     self.search_highlights_suppressed = false;
                     self.active_search = None;
                     self.mode = Mode::Normal;
+                    if wrapped {
+                        self.set_search_wrap_warning(session.direction);
+                    } else {
+                        self.set_legacy_message(None);
+                    }
                     self.move_to_search_match(match_);
                     self.save_to_history(session.jump_origin);
                     self.render(buffer)?;
@@ -22369,7 +22438,7 @@ impl Editor {
                     self.remember_previous_context(self.current_jump_entry());
                     self.jump_to_entry(&entry, buffer, runtime).await?;
                 } else {
-                    self.set_legacy_message(Some("at start of jump list".to_string()));
+                    self.set_routine_warning(Some("at start of jump list".to_string()));
                     self.draw_commandline(buffer);
                 }
             }
@@ -22384,7 +22453,7 @@ impl Editor {
                     self.remember_previous_context(self.current_jump_entry());
                     self.jump_to_entry(&entry, buffer, runtime).await?;
                 } else {
-                    self.set_legacy_message(Some("at end of jump list".to_string()));
+                    self.set_routine_warning(Some("at end of jump list".to_string()));
                     self.draw_commandline(buffer);
                 }
             }
@@ -25969,7 +26038,7 @@ impl Editor {
             self.move_to_text_position(position);
             self.finish_cursor_motion(buffer, false)?;
         } else {
-            self.set_legacy_message(Some("character not found".to_string()));
+            self.set_routine_warning(Some("character not found".to_string()));
         }
         Ok(())
     }
@@ -25983,7 +26052,7 @@ impl Editor {
             self.move_to_text_position(motion.target);
             self.finish_cursor_motion(buffer, false)?;
         } else {
-            self.set_legacy_message(Some("match not found".to_string()));
+            self.set_routine_warning(Some("match not found".to_string()));
         }
         Ok(())
     }
@@ -26099,7 +26168,7 @@ impl Editor {
         buffer.refresh_dirty();
 
         let Some((cursor, edits)) = outcome else {
-            self.set_legacy_message(Some("already at oldest change".to_string()));
+            self.set_routine_warning(Some("already at oldest change".to_string()));
             self.draw_commandline(render_buffer);
             return Ok(());
         };
@@ -26131,7 +26200,7 @@ impl Editor {
         buffer.refresh_dirty();
 
         let Some((cursor, edits)) = outcome else {
-            self.set_legacy_message(Some("already at newest change".to_string()));
+            self.set_routine_warning(Some("already at newest change".to_string()));
             self.draw_commandline(render_buffer);
             return Ok(());
         };
@@ -40123,6 +40192,48 @@ builtin = "rust"
     }
 
     #[test]
+    fn empty_definition_response_returns_a_warning_action() {
+        let mut editor = test_editor(40, 10);
+
+        for result in [Value::Null, json!([])] {
+            let message = InboundMessage::Message(ResponseMessage {
+                id: 42,
+                result,
+                request: Some(crate::lsp::Request::new(
+                    "textDocument/definition",
+                    json!({}),
+                )),
+            });
+
+            assert!(matches!(
+                editor.handle_lsp_message(
+                    &message,
+                    Some("textDocument/definition".to_string())
+                ),
+                Some(Action::PrintWarning(message)) if message == "No definition found"
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn go_to_definition_warns_without_a_file_backed_buffer() {
+        let mut editor = test_editor(40, 10);
+        let mut buffer = RenderBuffer::new(40, 10, &Style::default());
+        let mut runtime = Runtime::new();
+
+        editor
+            .execute(&Action::GoToDefinition, &mut buffer, &mut runtime)
+            .await
+            .unwrap();
+
+        assert_eq!(editor.last_error.as_deref(), Some("No definition found"));
+        assert_eq!(
+            editor.notifications.records().next_back().unwrap().severity,
+            Severity::Warning
+        );
+    }
+
+    #[test]
     fn non_plugin_lsp_timeout_sets_last_error() {
         let mut editor = test_editor(40, 10);
         let message = InboundMessage::RequestError {
@@ -40642,7 +40753,7 @@ builtin = "rust"
     }
 
     #[tokio::test]
-    async fn show_line_diagnostics_is_a_safe_noop_without_a_matching_diagnostic() {
+    async fn show_line_diagnostics_warns_without_a_matching_diagnostic() {
         let root = tempfile::tempdir().unwrap();
         let file = root.path().join("main.py");
         let mut editor = lsp_test_editor(vec![Buffer::new(
@@ -40672,6 +40783,13 @@ builtin = "rust"
 
         assert!(editor.current_dialog.is_none());
         assert_eq!(editor.current_buffer().contents(), original);
+        assert_eq!(
+            editor.last_error.as_deref(),
+            Some("No diagnostics on the current line")
+        );
+        let warning = editor.notifications.records().next_back().unwrap();
+        assert_eq!(warning.severity, Severity::Warning);
+        assert_eq!(warning.attention, AttentionPolicy::Quiet);
     }
 
     #[tokio::test]

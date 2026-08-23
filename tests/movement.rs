@@ -930,7 +930,62 @@ async fn search_navigation_without_previous_search_reports_no_op() {
     ] {
         harness.execute_action(action).await.unwrap();
         assert!(harness.commandline_row().contains("no previous search"));
+        assert_eq!(
+            harness
+                .editor
+                .notifications()
+                .records()
+                .next_back()
+                .unwrap()
+                .severity,
+            Severity::Warning
+        );
     }
+}
+
+#[tokio::test]
+async fn wrapped_search_reports_the_boundary_it_crossed() {
+    let mut harness = EditorHarness::with_content("alpha beta alpha");
+
+    harness.execute_action(Action::MoveTo(11, 1)).await.unwrap();
+    harness
+        .execute_action(Action::SearchWordUnderCursor)
+        .await
+        .unwrap();
+
+    harness.assert_cursor_at(0, 0);
+    assert_eq!(
+        harness.last_error(),
+        Some("search hit BOTTOM, continuing at TOP")
+    );
+    assert_eq!(
+        harness
+            .editor
+            .notifications()
+            .records()
+            .next_back()
+            .unwrap()
+            .severity,
+        Severity::Warning
+    );
+
+    harness.execute_action(Action::FindPrevious).await.unwrap();
+
+    harness.assert_cursor_at(11, 0);
+    assert_eq!(
+        harness.last_error(),
+        Some("search hit TOP, continuing at BOTTOM")
+    );
+    assert_eq!(
+        harness
+            .editor
+            .notifications()
+            .records()
+            .next_back()
+            .unwrap()
+            .severity,
+        Severity::Warning
+    );
 }
 
 #[tokio::test]
@@ -1001,7 +1056,7 @@ async fn search_enter_commits_preview_and_n_repeats_direction() {
 }
 
 #[tokio::test]
-async fn search_enter_without_match_exits_and_reports_error() {
+async fn search_enter_without_match_exits_and_warns() {
     let mut harness = EditorHarness::with_content("alpha\nbeta");
     harness
         .execute_action(Action::SetCursor(0, 1))
@@ -1027,7 +1082,17 @@ async fn search_enter_without_match_exits_and_reports_error() {
     harness.assert_cursor_at(0, 1);
     assert!(harness
         .commandline_row()
-        .starts_with("Pattern not found: missing"));
+        .contains("Pattern not found: missing"));
+    assert_eq!(
+        harness
+            .editor
+            .notifications()
+            .records()
+            .next_back()
+            .unwrap()
+            .severity,
+        Severity::Warning
+    );
 }
 
 #[tokio::test]
@@ -1066,7 +1131,7 @@ async fn failed_search_becomes_the_most_recent_search() {
     harness.assert_cursor_at(0, 2);
     assert!(harness
         .commandline_row()
-        .starts_with("Pattern not found: missing"));
+        .contains("Pattern not found: missing"));
 }
 
 #[tokio::test]
@@ -1298,9 +1363,29 @@ async fn jump_list_boundaries_report_no_op() {
 
     harness.execute_action(Action::JumpBack).await.unwrap();
     assert!(harness.commandline_row().contains("at start of jump list"));
+    assert_eq!(
+        harness
+            .editor
+            .notifications()
+            .records()
+            .next_back()
+            .unwrap()
+            .severity,
+        Severity::Warning
+    );
 
     harness.execute_action(Action::JumpForward).await.unwrap();
     assert!(harness.commandline_row().contains("at end of jump list"));
+    assert_eq!(
+        harness
+            .editor
+            .notifications()
+            .records()
+            .next_back()
+            .unwrap()
+            .severity,
+        Severity::Warning
+    );
 }
 
 #[tokio::test]
@@ -2313,6 +2398,42 @@ async fn test_operator_delete_percent_deletes_through_match() {
 
     type_normal_keys(&mut harness, "d%").await;
     harness.assert_buffer_contents(" beta");
+}
+
+#[tokio::test]
+async fn percent_without_a_match_warns_for_motion_and_operator_forms() {
+    let mut harness = EditorHarness::with_config(
+        Buffer::new(None, "alpha beta".to_string()),
+        default_key_config(),
+    );
+
+    type_normal_keys(&mut harness, "%").await;
+    harness.assert_cursor_at(0, 0);
+    assert_eq!(harness.last_error(), Some("match not found"));
+    assert_eq!(
+        harness
+            .editor
+            .notifications()
+            .records()
+            .next_back()
+            .unwrap()
+            .severity,
+        Severity::Warning
+    );
+
+    type_normal_keys(&mut harness, "d%").await;
+    harness.assert_buffer_contents("alpha beta");
+    assert_eq!(harness.last_error(), Some("match not found"));
+    assert_eq!(
+        harness
+            .editor
+            .notifications()
+            .records()
+            .next_back()
+            .unwrap()
+            .severity,
+        Severity::Warning
+    );
 }
 
 #[tokio::test]

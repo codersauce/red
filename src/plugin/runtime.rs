@@ -15517,17 +15517,17 @@ mod tests {
             (
                 "GitHunkStage",
                 0,
-                Err("No Git hunk under cursor".to_string()),
+                Err("warning:No Git hunk under cursor".to_string()),
             ),
             (
                 "GitHunkUnstage",
                 0,
-                Err("No Git hunk under cursor".to_string()),
+                Err("warning:No Git hunk under cursor".to_string()),
             ),
             (
                 "GitHunkReset",
                 0,
-                Err("No Git hunk under cursor".to_string()),
+                Err("warning:No Git hunk under cursor".to_string()),
             ),
         ] {
             runtime.execute_command(command).await.unwrap();
@@ -17375,6 +17375,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn lsp_document_symbols_warns_when_no_symbols_are_available() {
+        drain_requests();
+        let mut runtime = Runtime::new();
+        load_lsp_symbols(&mut runtime).await;
+
+        runtime.execute_command("LspDocumentSymbols").await.unwrap();
+        let request_id = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::DocumentSymbols { request_id, .. } => request_id,
+            _ => panic!("expected document-symbol request"),
+        };
+        runtime
+            .resolve_request(request_id, sample_symbol_payload_with_count(0))
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::Action(Action::PrintWarning(message))
+                if message == "No document symbols found"
+        ));
+    }
+
+    #[tokio::test]
     async fn lsp_symbols_batches_pathological_document_symbol_results() {
         drain_requests();
 
@@ -17520,6 +17543,37 @@ mod tests {
                 include_declaration: true,
                 ..
             }
+        ));
+    }
+
+    #[tokio::test]
+    async fn lsp_references_warns_after_a_final_empty_result() {
+        drain_requests();
+        let mut runtime = Runtime::new();
+        load_lsp_symbols(&mut runtime).await;
+
+        runtime.execute_command("LspReferences").await.unwrap();
+        let handle = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::OpenCallbackPicker { handle, .. } => handle,
+            _ => panic!("expected references loading picker"),
+        };
+        let request_id = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::References { request_id, .. } => request_id,
+            _ => panic!("expected references request"),
+        };
+        runtime
+            .resolve_request(request_id, sample_reference_payload_with_count(0))
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::ClosePicker { id } if id == handle.get()
+        ));
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::Action(Action::PrintWarning(message))
+                if message == "No references found"
         ));
     }
 

@@ -4553,6 +4553,16 @@ async fn test_delete_till_missing_target_does_not_edit() {
     harness.assert_buffer_contents("alpha beta");
     harness.assert_cursor_at(0, 0);
     assert_eq!(harness.last_error(), Some("character not found"));
+    assert_eq!(
+        harness
+            .editor
+            .notifications()
+            .records()
+            .next_back()
+            .unwrap()
+            .severity,
+        Severity::Warning
+    );
 }
 
 #[tokio::test]
@@ -4658,6 +4668,16 @@ async fn missing_find_forward_target_does_not_move_or_edit() {
     harness.assert_buffer_contents("alpha beta");
     harness.assert_cursor_at(0, 0);
     assert_eq!(harness.last_error(), Some("character not found"));
+    assert_eq!(
+        harness
+            .editor
+            .notifications()
+            .records()
+            .next_back()
+            .unwrap()
+            .severity,
+        Severity::Warning
+    );
 }
 
 #[tokio::test]
@@ -5425,11 +5445,31 @@ async fn undo_and_redo_boundaries_report_no_op() {
     assert!(harness
         .commandline_row()
         .contains("already at oldest change"));
+    assert_eq!(
+        harness
+            .editor
+            .notifications()
+            .records()
+            .next_back()
+            .unwrap()
+            .severity,
+        Severity::Warning
+    );
 
     harness.execute_action(Action::Redo).await.unwrap();
     assert!(harness
         .commandline_row()
         .contains("already at newest change"));
+    assert_eq!(
+        harness
+            .editor
+            .notifications()
+            .records()
+            .next_back()
+            .unwrap()
+            .severity,
+        Severity::Warning
+    );
 }
 
 #[tokio::test]
@@ -8434,6 +8474,16 @@ async fn directional_window_boundaries_report_no_op() {
     ] {
         harness.execute_action(action).await.unwrap();
         assert!(harness.commandline_row().contains(message));
+        assert_eq!(
+            harness
+                .editor
+                .notifications()
+                .records()
+                .next_back()
+                .unwrap()
+                .severity,
+            Severity::Warning
+        );
     }
 }
 
@@ -10168,6 +10218,16 @@ async fn parameter_swaps_do_not_cross_argument_containers() {
 
     harness.assert_buffer_contents(original);
     assert_eq!(harness.last_error(), Some("adjacent text object not found"));
+    assert_eq!(
+        harness
+            .editor
+            .notifications()
+            .records()
+            .next_back()
+            .unwrap()
+            .severity,
+        Severity::Warning
+    );
 }
 
 #[tokio::test]

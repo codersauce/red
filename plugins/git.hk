@@ -3865,7 +3865,7 @@ fn hunk_cursor_loaded(cursor: GitCursorPosition) {
         selected = patch_for_hunk(patch, red::int(cursor.y, 0));
     }
     if selected == "" {
-        red::execute("Print", "No Git hunk under cursor");
+        red::execute("PrintWarning", "No Git hunk under cursor");
         return;
     }
     red::state_patch(GitPluginState { hunk_patch: selected });
