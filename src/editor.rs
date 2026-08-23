@@ -40054,6 +40054,7 @@ builtin = "rust"
         let mut editor = test_editor(80, 10);
         let path = Path::new("/tmp/project/src/pull_requests_screen.rs");
         let uri = crate::lsp::file_uri(path).unwrap();
+        let expected_document = lsp_file_path(&uri).unwrap();
         let message = InboundMessage::Error(crate::lsp::ResponseError {
             id: Some(42),
             code: -32603,
@@ -40098,7 +40099,7 @@ builtin = "rust"
         );
         assert!(details.contains("Code: -32603"), "{details}");
         assert!(
-            details.contains("Document: /tmp/project/src/pull_requests_screen.rs"),
+            details.contains(&format!("Document: {expected_document}")),
             "{details}"
         );
         assert!(
