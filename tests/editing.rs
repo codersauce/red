@@ -8188,14 +8188,39 @@ async fn terminal_resize_preserves_independent_docked_pane_preferences() {
 
 #[tokio::test]
 async fn directional_window_chords_focus_and_leave_all_four_pane_edges() {
-    for (side, enter, leave, initial_size) in [
-        (PanelSide::Left, 'h', 'l', 20),
-        (PanelSide::Right, 'l', 'h', 20),
-        (PanelSide::Top, 'k', 'j', 6),
-        (PanelSide::Bottom, 'j', 'k', 6),
+    for (side, enter, leave, initial_size, split, move_to_edge) in [
+        (
+            PanelSide::Left,
+            'h',
+            'l',
+            20,
+            Action::SplitVertical,
+            Some(Action::MoveWindowLeft),
+        ),
+        (PanelSide::Right, 'l', 'h', 20, Action::SplitVertical, None),
+        (
+            PanelSide::Top,
+            'k',
+            'j',
+            6,
+            Action::SplitHorizontal,
+            Some(Action::MoveWindowUp),
+        ),
+        (
+            PanelSide::Bottom,
+            'j',
+            'k',
+            6,
+            Action::SplitHorizontal,
+            None,
+        ),
     ] {
         let buffer = Buffer::new(None, "first\nsecond\n".to_string());
         let mut harness = EditorHarness::with_config(buffer, default_key_config());
+        harness.execute_action(split).await.unwrap();
+        if let Some(action) = move_to_edge {
+            harness.execute_action(action).await.unwrap();
+        }
         harness.editor.test_create_panel(
             "inspector",
             PanelConfig {
@@ -8210,6 +8235,62 @@ async fn directional_window_chords_focus_and_leave_all_four_pane_edges() {
 
         execute_window_chord(&mut harness, leave).await;
         assert_eq!(harness.editor.test_focused_panel_id(), None);
+    }
+}
+
+#[tokio::test]
+async fn directional_window_chords_wrap_across_opposite_edges_by_default() {
+    for (split, wrap_from_second, wrap_from_first) in [
+        (Action::SplitVertical, 'l', 'h'),
+        (Action::SplitHorizontal, 'j', 'k'),
+    ] {
+        let buffer = Buffer::new(None, "first\nsecond\n".to_string());
+        let mut harness = EditorHarness::with_config(buffer, default_key_config());
+        harness.execute_action(split).await.unwrap();
+        assert_eq!(harness.active_window_id(), 1);
+
+        execute_window_chord(&mut harness, wrap_from_second).await;
+        assert_eq!(harness.active_window_id(), 0);
+
+        execute_window_chord(&mut harness, wrap_from_first).await;
+        assert_eq!(harness.active_window_id(), 1);
+    }
+}
+
+#[tokio::test]
+async fn directional_window_chords_stop_at_edges_when_wrapping_is_disabled() {
+    for (split, second_edge, toward_first, first_edge, messages) in [
+        (
+            Action::SplitVertical,
+            'l',
+            'h',
+            'h',
+            ("no window to the right", "no window to the left"),
+        ),
+        (
+            Action::SplitHorizontal,
+            'j',
+            'k',
+            'k',
+            ("no window below", "no window above"),
+        ),
+    ] {
+        let buffer = Buffer::new(None, "first\nsecond\n".to_string());
+        let mut config = default_key_config();
+        config.wrap_window_navigation = Some(false);
+        let mut harness = EditorHarness::with_config(buffer, config);
+        harness.execute_action(split).await.unwrap();
+
+        execute_window_chord(&mut harness, second_edge).await;
+        assert_eq!(harness.active_window_id(), 1);
+        assert!(harness.commandline_row().contains(messages.0));
+
+        execute_window_chord(&mut harness, toward_first).await;
+        assert_eq!(harness.active_window_id(), 0);
+
+        execute_window_chord(&mut harness, first_edge).await;
+        assert_eq!(harness.active_window_id(), 0);
+        assert!(harness.commandline_row().contains(messages.1));
     }
 }
 

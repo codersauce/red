@@ -47,6 +47,19 @@ pub enum Direction {
     Right,
 }
 
+fn interval_gap(
+    first_start: usize,
+    first_len: usize,
+    second_start: usize,
+    second_len: usize,
+) -> usize {
+    let first_end = first_start.saturating_add(first_len);
+    let second_end = second_start.saturating_add(second_len);
+    second_start
+        .saturating_sub(first_end)
+        .max(first_start.saturating_sub(second_end))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DividerAxis {
     Vertical,
@@ -703,6 +716,39 @@ mod tests {
                     || contains_split_ratio(left, expected)
                     || contains_split_ratio(right, expected)
             }
+        }
+    }
+
+    #[test]
+    fn wrapped_navigation_uses_the_opposite_edge_and_preserves_alignment() {
+        let mut manager = nested_window_manager();
+
+        for (active, direction, expected) in [
+            (0, Direction::Left, 2),
+            (1, Direction::Left, 3),
+            (2, Direction::Right, 0),
+            (3, Direction::Right, 1),
+            (0, Direction::Up, 1),
+            (2, Direction::Up, 3),
+            (1, Direction::Down, 0),
+            (3, Direction::Down, 2),
+        ] {
+            manager.set_active(active);
+            assert_eq!(manager.find_window_across_edge(direction), Some(expected));
+        }
+    }
+
+    #[test]
+    fn wrapped_navigation_has_no_target_for_a_single_window() {
+        let manager = WindowManager::new(/*buffer_index*/ 0, (80, 26));
+
+        for direction in [
+            Direction::Left,
+            Direction::Right,
+            Direction::Up,
+            Direction::Down,
+        ] {
+            assert_eq!(manager.find_window_across_edge(direction), None);
         }
     }
 
@@ -2465,6 +2511,75 @@ impl WindowManager {
         }
 
         best_candidate.map(|(id, _)| id)
+    }
+
+    /// Find the best-aligned window on the edge opposite `direction`.
+    pub fn find_window_across_edge(&self, direction: Direction) -> Option<usize> {
+        let windows = self.root.windows();
+        let active_window = self.active_window()?;
+        let layout_left = windows.iter().map(|window| window.position.x).min()?;
+        let layout_top = windows.iter().map(|window| window.position.y).min()?;
+        let layout_right = windows
+            .iter()
+            .map(|window| window.position.x.saturating_add(window.size.0))
+            .max()?;
+        let layout_bottom = windows
+            .iter()
+            .map(|window| window.position.y.saturating_add(window.size.1))
+            .max()?;
+
+        windows
+            .iter()
+            .enumerate()
+            .filter(|(id, _)| *id != self.active_window_id)
+            .min_by_key(|(id, window)| {
+                let window_right = window.position.x.saturating_add(window.size.0);
+                let window_bottom = window.position.y.saturating_add(window.size.1);
+                let (edge_distance, orthogonal_gap, orthogonal_offset) = match direction {
+                    Direction::Left => (
+                        layout_right.saturating_sub(window_right),
+                        interval_gap(
+                            active_window.position.y,
+                            active_window.size.1,
+                            window.position.y,
+                            window.size.1,
+                        ),
+                        active_window.position.y.abs_diff(window.position.y),
+                    ),
+                    Direction::Right => (
+                        window.position.x.saturating_sub(layout_left),
+                        interval_gap(
+                            active_window.position.y,
+                            active_window.size.1,
+                            window.position.y,
+                            window.size.1,
+                        ),
+                        active_window.position.y.abs_diff(window.position.y),
+                    ),
+                    Direction::Up => (
+                        layout_bottom.saturating_sub(window_bottom),
+                        interval_gap(
+                            active_window.position.x,
+                            active_window.size.0,
+                            window.position.x,
+                            window.size.0,
+                        ),
+                        active_window.position.x.abs_diff(window.position.x),
+                    ),
+                    Direction::Down => (
+                        window.position.y.saturating_sub(layout_top),
+                        interval_gap(
+                            active_window.position.x,
+                            active_window.size.0,
+                            window.position.x,
+                            window.size.0,
+                        ),
+                        active_window.position.x.abs_diff(window.position.x),
+                    ),
+                };
+                (edge_distance, orthogonal_gap, orthogonal_offset, *id)
+            })
+            .map(|(id, _)| id)
     }
 
     /// Returns the current editor origin and dimensions without including docked panes.

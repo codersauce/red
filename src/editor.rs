@@ -5715,6 +5715,17 @@ impl Editor {
             }
         }
 
+        if self.config.wrap_window_navigation.unwrap_or(true) {
+            if let Some(target_id) = self.window_manager.find_window_across_edge(direction) {
+                if self.set_active_window(target_id) {
+                    self.panel_manager.focus_editor();
+                    self.request_diagnostics().await?;
+                    self.render(buffer)?;
+                    return Ok(());
+                }
+            }
+        }
+
         let message = match direction {
             crate::window::Direction::Up => "no window above",
             crate::window::Direction::Down => "no window below",

@@ -21,6 +21,9 @@ scrolloff = 3
 # Wrap long lines at the window edge. This matches Vim/Neovim's 'wrap'.
 wrap = true
 
+# Wrap Ctrl-w h/j/k/l focus across the opposite editor edge.
+wrap_window_navigation = true
+
 # Keep inline questions and answers in local editor recovery snapshots.
 persist_inline_history = true
 
