@@ -835,6 +835,28 @@ async fn format_gqq_reflows_plain_text_without_a_comment_language() {
 }
 
 #[tokio::test]
+async fn format_gqq_centers_a_distant_reflow_endpoint() {
+    let mut config = default_key_config();
+    config.commenting.text_width = 10;
+    config.scrolloff = Some(3);
+    config.wrap = Some(true);
+    let mut lines = (0..19)
+        .map(|line| format!("prefix-{line:02}"))
+        .collect::<Vec<_>>();
+    lines.push(vec!["word"; 80].join(" "));
+    lines.extend((0..30).map(|line| format!("suffix-{line:02}")));
+    let buffer = Buffer::new(None, lines.join("\n"));
+    let mut harness = EditorHarness::with_config_and_size(buffer, config, 80, 24);
+    harness.set_viewport_cursor(9, 0, 10);
+
+    type_normal_keys(&mut harness, "gqq").await;
+
+    assert_eq!(harness.buffer_line(), 58);
+    assert_eq!(harness.viewport_top(), 48);
+    assert_eq!(harness.buffer_line() - harness.viewport_top(), 10);
+}
+
+#[tokio::test]
 async fn insert_mode_wraps_line_comments_and_undoes_the_session_atomically() {
     let mut config = default_key_config();
     config.commenting.text_width = 24;
@@ -1658,8 +1680,11 @@ async fn confirmed_substitute_scrolls_to_an_offscreen_match() {
     type_normal_keys(&mut harness, "y").await;
 
     assert_eq!(harness.buffer_line(), 9);
-    assert_eq!(harness.viewport_top(), 9);
-    assert_eq!(harness.render_cursor_position(), Some(first_match));
+    assert_eq!(harness.viewport_top(), 7);
+    assert_eq!(
+        harness.render_cursor_position(),
+        Some((first_match.0, first_match.1 + 2))
+    );
 }
 
 #[tokio::test]
@@ -6424,6 +6449,47 @@ async fn bracketed_paste_inserts_multiline_text_once() {
     harness.assert_buffer_contents("\n");
 
     let _ = fs::remove_file(path);
+}
+
+#[tokio::test]
+async fn bracketed_paste_reveals_a_distant_endpoint_without_pin_to_top() {
+    let content = (0..80)
+        .map(|line| format!("line-{line:02}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let config = Config {
+        scrolloff: Some(3),
+        wrap: Some(true),
+        ..Default::default()
+    };
+    let buffer = Buffer::new(None, content);
+    let mut harness = EditorHarness::with_config_and_size(buffer, config, 80, 24);
+    harness.set_viewport_cursor(9, 0, 10);
+    harness
+        .execute_action(Action::EnterMode(Mode::Insert))
+        .await
+        .unwrap();
+
+    harness
+        .execute_event(Event::Paste("pasted\n".repeat(40)))
+        .await
+        .unwrap();
+
+    assert_eq!(harness.buffer_line(), 59);
+    assert_eq!(harness.viewport_top(), 49);
+    assert_eq!(harness.buffer_line() - harness.viewport_top(), 10);
+
+    harness
+        .execute_action(Action::EnterMode(Mode::Normal))
+        .await
+        .unwrap();
+    harness.execute_action(Action::Undo).await.unwrap();
+    assert_eq!(harness.buffer_line(), 19);
+    assert_eq!(harness.viewport_top(), 9);
+
+    harness.execute_action(Action::Redo).await.unwrap();
+    assert_eq!(harness.buffer_line(), 59);
+    assert_eq!(harness.viewport_top(), 49);
 }
 
 #[tokio::test]

@@ -7483,6 +7483,21 @@ impl Editor {
             .any(|segment| segment.line == line_index && segment.contains_cursor_col(display_col))
     }
 
+    fn cursor_has_display_row_margin(&self, line_index: usize, display_col: usize) -> bool {
+        let Some(window) = self.active_window_with_editor_view() else {
+            return false;
+        };
+        let layout = self.layout_for_window(&window);
+        let Some(bounds) = self.viewport_cursor_row_bounds(&layout) else {
+            return false;
+        };
+        layout.rows.iter().any(|segment| {
+            segment.line == line_index
+                && segment.contains_cursor_col(display_col)
+                && bounds.contains(&segment.row)
+        })
+    }
+
     /// Best-effort scrolloff bounds in physical rows, excluding virtual comments.
     fn viewport_cursor_row_bounds(
         &self,
@@ -7545,7 +7560,7 @@ impl Editor {
     }
 
     fn scroll_wrapped_viewport_down_one_screen_line(&mut self) -> bool {
-        if !self.wrap {
+        if !self.wrap && !self.has_inline_comments(self.current_buffer().id()) {
             return false;
         }
         let Some(window) = self.active_window_with_editor_view() else {
@@ -7562,8 +7577,17 @@ impl Editor {
     }
 
     fn scroll_wrapped_viewport_up_one_screen_line(&mut self) -> bool {
-        if !self.wrap {
+        if !self.wrap && !self.has_inline_comments(self.current_buffer().id()) {
             return false;
+        }
+
+        if !self.wrap {
+            let Some(previous_line) = self.vtop.checked_sub(1) else {
+                return false;
+            };
+            self.vtop = previous_line;
+            self.skipcol = 0;
+            return true;
         }
 
         let width = self.active_content_width();
@@ -7599,6 +7623,126 @@ impl Editor {
         self.vtop = previous_top.line;
         self.skipcol = previous_top.start_col;
         true
+    }
+
+    /// Reveals a cursor destination with the same three-stage policy used by
+    /// Vim-like editors: preserve an already-safe viewport, minimally scroll a
+    /// nearby destination into the scrolloff margin, and center a distant jump.
+    /// At EOF, centering is backfilled so the last source row sits at the bottom
+    /// instead of leaving a mostly blank viewport.
+    fn reveal_cursor_destination(&mut self, line_index: usize) {
+        let height = self.vheight().max(1);
+        let last_line = if self.is_insert() {
+            self.current_buffer().len()
+        } else {
+            self.last_navigable_line()
+        };
+
+        if !self.wrap && !self.has_inline_comments(self.current_buffer().id()) {
+            let scrolloff = self
+                .config
+                .scrolloff
+                .unwrap_or(0)
+                .min(height.saturating_sub(1) / 2);
+            let top_margin = scrolloff.min(line_index);
+            let bottom_margin = scrolloff.min(last_line.saturating_sub(line_index));
+            let safe_start = self.vtop.saturating_add(top_margin);
+            let safe_end = self
+                .vtop
+                .saturating_add(height.saturating_sub(1))
+                .saturating_sub(bottom_margin);
+            if (safe_start..=safe_end).contains(&line_index) {
+                self.cy = line_index.saturating_sub(self.vtop);
+                return;
+            }
+
+            let viewport_start = self.vtop;
+            let viewport_end = self.vtop.saturating_add(height.saturating_sub(1));
+            let distance = if line_index < viewport_start {
+                viewport_start - line_index
+            } else {
+                line_index.saturating_sub(viewport_end)
+            };
+            let max_vtop = last_line.saturating_sub(height.saturating_sub(1));
+            self.vtop = if distance >= height {
+                line_index
+                    .saturating_sub(height.saturating_sub(1) / 2)
+                    .min(max_vtop)
+            } else if line_index < safe_start {
+                line_index.saturating_sub(top_margin)
+            } else {
+                line_index
+                    .saturating_add(bottom_margin)
+                    .saturating_add(1)
+                    .saturating_sub(height)
+                    .min(max_vtop)
+            };
+            self.cy = line_index.saturating_sub(self.vtop);
+            return;
+        }
+
+        let display_col = self
+            .current_buffer()
+            .get(line_index)
+            .map(|line| {
+                grapheme_to_column_with_tabs(
+                    trim_line_ending(&line),
+                    self.cx,
+                    self.active_tab_width(),
+                )
+            })
+            .unwrap_or(self.cx);
+        if self.cursor_has_display_row_margin(line_index, display_col) {
+            self.cy = line_index.saturating_sub(self.vtop);
+            return;
+        }
+
+        let target_is_below =
+            line_index > self.vtop || (line_index == self.vtop && display_col >= self.skipcol);
+        for _ in 0..height {
+            let scrolled = if target_is_below {
+                self.scroll_wrapped_viewport_down_one_screen_line()
+            } else {
+                self.scroll_wrapped_viewport_up_one_screen_line()
+            };
+            if !scrolled {
+                break;
+            }
+            self.cy = line_index.saturating_sub(self.vtop);
+            if self.cursor_has_display_row_margin(line_index, display_col) {
+                return;
+            }
+        }
+
+        self.vtop = line_index;
+        self.skipcol = if self.wrap {
+            let width = self.active_content_width();
+            self.wrapped_line_segments_for_width(line_index, width)
+                .into_iter()
+                .find(|segment| segment.contains_cursor_col(display_col))
+                .map_or(0, |segment| segment.start_col)
+        } else {
+            0
+        };
+
+        for _ in 0..height.saturating_sub(1) / 2 {
+            if !self.scroll_wrapped_viewport_up_one_screen_line() {
+                break;
+            }
+        }
+
+        for _ in 0..height {
+            let needs_backfill = self
+                .active_window_with_editor_view()
+                .is_some_and(|window| self.layout_for_window(&window).screen_height() < height);
+            if !needs_backfill {
+                break;
+            }
+            if !self.scroll_wrapped_viewport_up_one_screen_line() {
+                break;
+            }
+        }
+        self.cy = line_index.saturating_sub(self.vtop);
     }
 
     fn ensure_wrapped_cursor_segment_visible(&mut self, delta: isize) {
@@ -26009,24 +26153,18 @@ impl Editor {
 
     fn move_to_text_position(&mut self, position: TextPosition) {
         let y = position.line.min(self.last_navigable_line());
-        if !self.is_within_viewport(y) {
-            self.vtop = y;
-        }
-        self.cy = y.saturating_sub(self.vtop);
         let char_x = position.character.min(self.line_character_len(y));
         self.cx = self.char_to_grapheme_on_line(char_x, y);
+        self.reveal_cursor_destination(y);
     }
 
     /// Insert mode permits the cursor on the empty line after a trailing
     /// newline. Normal motions intentionally clamp to the last navigable line.
     fn move_to_insert_text_position(&mut self, position: TextPosition) {
         let y = position.line.min(self.current_buffer().len());
-        if !self.is_within_viewport(y) {
-            self.vtop = y;
-        }
-        self.cy = y.saturating_sub(self.vtop);
         let char_x = position.character.min(self.line_character_len(y));
         self.cx = self.char_to_grapheme_on_line(char_x, y);
+        self.reveal_cursor_destination(y);
     }
 
     fn move_to_forward_character(

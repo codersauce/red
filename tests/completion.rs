@@ -210,6 +210,36 @@ async fn apply_completion_uses_text_edit_additional_edits_and_one_undo_step() {
 }
 
 #[tokio::test]
+async fn multiline_completion_centers_a_distant_endpoint() {
+    let mut lines = (0..80)
+        .map(|line| format!("line-{line:02}"))
+        .collect::<Vec<_>>();
+    lines[19] = "seed".to_string();
+    let (mut editor, _) = recording_editor(Buffer::new(None, lines.join("\n")));
+    let mut completion = item("expanded");
+    completion.text_edit = Some(text_edit(
+        range(19, 0, 19, 4),
+        &format!("{}done", "item\n".repeat(39)),
+    ));
+    editor
+        .test_execute_action(Action::EnterMode(Mode::Insert))
+        .await
+        .unwrap();
+    editor.test_set_viewport_cursor(9, 4, 10);
+
+    editor
+        .test_execute_action(Action::ApplyCompletion {
+            item: Box::new(completion),
+            commit_character: None,
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(editor.test_cursor_position(), (4, 58));
+    assert_eq!(editor.test_viewport_top(), 48);
+}
+
+#[tokio::test]
 async fn apply_completion_converts_utf16_main_and_additional_edits_on_crlf_text() {
     let (mut editor, _) = recording_editor(Buffer::new(None, "😀 use\r\n😀 old\r\n".to_string()));
     let mut completion = item("new");
