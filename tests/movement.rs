@@ -2150,6 +2150,134 @@ async fn test_mouse_scroll_down_at_wrapped_eof_does_not_underflow() {
 }
 
 #[tokio::test]
+async fn distant_mark_jump_centers_the_destination_like_neovim() {
+    let content = (0..100)
+        .map(|line| format!("line-{line:02}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let config = Config {
+        scrolloff: Some(3),
+        wrap: Some(true),
+        ..Default::default()
+    };
+    let buffer = Buffer::new(None, content);
+    let mut harness = EditorHarness::with_config_and_size(buffer, config, 80, 24);
+    harness
+        .execute_action(Action::SetCursor(0, 69))
+        .await
+        .unwrap();
+    harness.execute_action(Action::SetMark('a')).await.unwrap();
+    harness.set_viewport_cursor(9, 0, 10);
+
+    harness
+        .execute_action(Action::JumpToMark {
+            mark: 'a',
+            linewise: false,
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(harness.buffer_line(), 69);
+    assert_eq!(harness.viewport_top(), 59);
+    assert_eq!(harness.buffer_line() - harness.viewport_top(), 10);
+}
+
+#[tokio::test]
+async fn nearby_cursor_reveal_scrolls_only_enough_for_scrolloff() {
+    let content = (0..100)
+        .map(|line| format!("line-{line:02}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let config = Config {
+        scrolloff: Some(3),
+        wrap: Some(true),
+        ..Default::default()
+    };
+    let buffer = Buffer::new(None, content);
+    let mut harness = EditorHarness::with_config_and_size(buffer, config, 80, 24);
+    harness
+        .execute_action(Action::SetCursor(0, 31))
+        .await
+        .unwrap();
+    harness.execute_action(Action::SetMark('a')).await.unwrap();
+    harness.set_viewport_cursor(9, 0, 10);
+
+    harness
+        .execute_action(Action::JumpToMark {
+            mark: 'a',
+            linewise: false,
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(harness.buffer_line(), 31);
+    assert_eq!(harness.viewport_top(), 13);
+    assert_eq!(harness.buffer_line() - harness.viewport_top(), 18);
+}
+
+#[tokio::test]
+async fn distant_cursor_reveal_backfills_the_viewport_at_eof() {
+    let content = (0..80)
+        .map(|line| format!("line-{line:02}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let config = Config {
+        scrolloff: Some(3),
+        wrap: Some(true),
+        ..Default::default()
+    };
+    let buffer = Buffer::new(None, content);
+    let mut harness = EditorHarness::with_config_and_size(buffer, config, 80, 24);
+    harness
+        .execute_action(Action::SetCursor(0, 79))
+        .await
+        .unwrap();
+    harness.execute_action(Action::SetMark('a')).await.unwrap();
+    harness.set_viewport_cursor(9, 0, 10);
+
+    harness
+        .execute_action(Action::JumpToMark {
+            mark: 'a',
+            linewise: false,
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(harness.buffer_line(), 79);
+    assert_eq!(harness.viewport_top(), 58);
+    assert_eq!(harness.buffer_line() - harness.viewport_top(), 21);
+}
+
+#[tokio::test]
+async fn distant_insert_centers_a_wrapped_segment() {
+    let content = "\ntail".to_string();
+    let config = Config {
+        scrolloff: Some(2),
+        wrap: Some(true),
+        ..Default::default()
+    };
+    let buffer = Buffer::new(None, content);
+    let mut harness = EditorHarness::with_config_and_size(buffer, config, 30, 10);
+    harness
+        .execute_action(Action::EnterMode(Mode::Insert))
+        .await
+        .unwrap();
+    harness
+        .execute_action(Action::InsertPastedText("x".repeat(600)))
+        .await
+        .unwrap();
+
+    let (_, screen_row) = harness.render_cursor_position().unwrap();
+    assert_eq!(harness.buffer_line(), 0);
+    harness.assert_cursor_at(600, 0);
+    assert!(harness.skipcol() > 0);
+    assert!(
+        (2..=6).contains(&screen_row),
+        "wrapped destination should land away from the viewport edges, got row {screen_row}"
+    );
+}
+
+#[tokio::test]
 async fn test_move_to_specific_position() {
     let mut harness = EditorHarness::with_content("Hello\nWorld\nTest");
 
