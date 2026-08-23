@@ -177,6 +177,7 @@ pub(crate) fn practice_action_allowed(action: &Action) -> bool {
             | Action::Quit(_)
             | Action::Command(_)
             | Action::Print(_)
+            | Action::PrintWarning(_)
             | Action::EnterMode(Mode::Normal | Mode::Insert | Mode::Command)
             | Action::SetWaitingKey(_)
             | Action::Refresh

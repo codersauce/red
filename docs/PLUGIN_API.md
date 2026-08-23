@@ -28,6 +28,12 @@ Red `0.15.0` retains the complete `0.4.0`, `0.6.0`, `0.7.0`, `0.8.0`, `0.9.0`,
 `0.10.0`, `0.11.0`, `0.12.0`, and `0.14.0` contracts, so existing packages that declare those
 minors continue to load. New packages should target `"red_api_version": "^0.15.0"`.
 
+## Messages
+
+`Print(message)` publishes an informational editor message. Use
+`PrintWarning(message)` for a recoverable condition that needs transient warning
+styling, such as reaching the end of a navigation sequence.
+
 ## Buffer selection
 
 `GetEditorInfo` includes a stable process-local `id` on every buffer summary.

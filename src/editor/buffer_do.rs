@@ -277,6 +277,7 @@ impl Editor {
                 | Action::GoToLine(_)
                 | Action::MoveToBottom
                 | Action::Print(_)
+                | Action::PrintWarning(_)
                 | Action::ClearSearchHighlight
                 | Action::SetWrap(_)
                 | Action::SetRelativeLineNumbers(_)

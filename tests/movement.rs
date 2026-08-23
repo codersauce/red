@@ -7,6 +7,7 @@ use red::{
     color::Color,
     config::{Config, KeyAction},
     editor::{Action, Editor, Mode, SearchDirection},
+    notification::Severity,
     theme::Style,
 };
 use std::collections::HashMap;
@@ -2384,7 +2385,17 @@ async fn structural_motions_respect_disabled_syntax_and_no_wrap_boundaries() {
 
     type_normal_keys(&mut harness, "]f").await;
     harness.assert_cursor_at(0, 0);
-    assert_eq!(harness.last_error(), Some("text object not found"));
+    assert_eq!(harness.last_error(), Some("No more functions to move to"));
+    assert_eq!(
+        harness
+            .editor
+            .notifications()
+            .records()
+            .next_back()
+            .unwrap()
+            .severity,
+        Severity::Warning
+    );
 
     harness
         .execute_action(Action::Command("syntax off".to_string()))
@@ -2392,5 +2403,74 @@ async fn structural_motions_respect_disabled_syntax_and_no_wrap_boundaries() {
         .unwrap();
     type_normal_keys(&mut harness, "[f").await;
     harness.assert_cursor_at(0, 0);
-    assert_eq!(harness.last_error(), Some("text object not found"));
+    assert_eq!(harness.last_error(), Some("No more functions to move to"));
+}
+
+#[tokio::test]
+async fn closing_bracket_structural_motions_name_the_missing_target() {
+    for (contents, keys, expected) in [
+        ("fn only() {}", "]f", "No more functions to move to"),
+        ("struct Only {}", "]c", "No more classes to move to"),
+        (
+            "fn only() { call(); }",
+            "]m]m",
+            "No more function calls to move to",
+        ),
+    ] {
+        let mut harness = EditorHarness::with_config(
+            Buffer::new(Some("sample.rs".to_string()), contents.to_string()),
+            default_key_config(),
+        );
+
+        type_normal_keys(&mut harness, keys).await;
+
+        assert_eq!(harness.last_error(), Some(expected));
+        assert_eq!(
+            harness
+                .editor
+                .notifications()
+                .records()
+                .next_back()
+                .unwrap()
+                .severity,
+            Severity::Warning
+        );
+    }
+}
+
+#[tokio::test]
+async fn closing_bracket_matchit_motion_warns_at_the_boundary() {
+    let mut harness = EditorHarness::with_config(
+        Buffer::new(None, "(balanced)".to_string()),
+        default_key_config(),
+    );
+
+    type_normal_keys(&mut harness, "]%]%").await;
+
+    harness.assert_cursor_at(9, 0);
+    assert_eq!(harness.last_error(), Some("No more matches to move to"));
+    assert_eq!(
+        harness
+            .editor
+            .notifications()
+            .records()
+            .next_back()
+            .unwrap()
+            .severity,
+        Severity::Warning
+    );
+}
+
+#[tokio::test]
+async fn closing_bracket_operator_motion_warns_without_editing() {
+    let contents = "fn only() {}";
+    let mut harness = EditorHarness::with_config(
+        Buffer::new(Some("sample.rs".to_string()), contents.to_string()),
+        default_key_config(),
+    );
+
+    type_normal_keys(&mut harness, "d]f").await;
+
+    harness.assert_buffer_contents(contents);
+    assert_eq!(harness.last_error(), Some("No more functions to move to"));
 }

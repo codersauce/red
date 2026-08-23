@@ -1141,6 +1141,10 @@ impl RedHost {
                 let message = args.first().map(value_to_string).unwrap_or_default();
                 self.send_request(PluginRequest::Action(Action::Print(message)));
             }
+            "PrintWarning" => {
+                let message = args.first().map(value_to_string).unwrap_or_default();
+                self.send_request(PluginRequest::Action(Action::PrintWarning(message)));
+            }
             "FilePicker" => {
                 self.send_request(PluginRequest::Action(Action::FilePicker));
             }
@@ -15495,11 +15499,20 @@ mod tests {
         for (command, cursor_line, expected) in [
             ("GitHunkNext", 0, Ok((0, 13))),
             ("GitHunkPrevious", 29, Ok((0, 25))),
-            ("GitHunkNext", 25, Err("No next Git hunk".to_string())),
+            (
+                "GitHunkNext",
+                -1,
+                Err("warning:No more Git hunks to move to".to_string()),
+            ),
+            (
+                "GitHunkNext",
+                25,
+                Err("warning:No more Git hunks to move to".to_string()),
+            ),
             (
                 "GitHunkPrevious",
                 13,
-                Err("No previous Git hunk".to_string()),
+                Err("warning:No more Git hunks to move to".to_string()),
             ),
             (
                 "GitHunkStage",
@@ -15525,12 +15538,17 @@ mod tests {
                 while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
                     match request {
                         PluginRequest::GetWindows { request_id } => {
+                            let buffer_path = if cursor_line < 0 {
+                                String::new()
+                            } else {
+                                file.display().to_string()
+                            };
                             runtime
                                 .resolve_request(
                                     request_id,
                                     serde_json::json!({
                                         "windows": [{
-                                            "buffer_path": file.display().to_string(),
+                                            "buffer_path": buffer_path,
                                             "buffer_index": 7,
                                             "active": true
                                         }]
@@ -15566,6 +15584,9 @@ mod tests {
                         PluginRequest::SetCursorPosition { x, y, jump } => {
                             assert!(jump);
                             result = Some(Ok((x, y)));
+                        }
+                        PluginRequest::Action(Action::PrintWarning(message)) => {
+                            result = Some(Err(format!("warning:{message}")));
                         }
                         PluginRequest::Action(Action::Print(message)) => {
                             result = Some(Err(message));

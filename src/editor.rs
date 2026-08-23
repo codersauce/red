@@ -2766,6 +2766,7 @@ pub enum Action {
         failure_reason: Option<String>,
     },
     Print(String),
+    PrintWarning(String),
     OpenMessages,
     MessageHistory(MessageAction),
 
@@ -4470,6 +4471,15 @@ fn structural_motion_kind(key: char) -> Option<SyntaxObjectKind> {
         'f' => Some(SyntaxObjectKind::Function),
         'c' => Some(SyntaxObjectKind::Class),
         _ => None,
+    }
+}
+
+fn structural_motion_label(key: char) -> &'static str {
+    match key {
+        'm' => "function calls",
+        'f' => "functions",
+        'c' => "classes",
+        _ => unreachable!("validated structural motion key"),
     }
 }
 
@@ -7843,6 +7853,7 @@ impl Editor {
                 | Action::StartRename
                 | Action::RenameSymbol(_)
                 | Action::Print(_)
+                | Action::PrintWarning(_)
                 | Action::OpenTextPanelTurnActions
                 | Action::CopyTextPanelTurn { .. }
                 | Action::ReuseTextPanelPrompt { .. }
@@ -13475,14 +13486,12 @@ impl Editor {
                 .copied()
                 .filter(|position| *position > cursor)
                 .min()
-                .or_else(|| positions.iter().copied().min())
         } else {
             positions
                 .iter()
                 .copied()
                 .filter(|position| *position < cursor)
                 .max()
-                .or_else(|| positions.iter().copied().max())
         }?;
         let line = self.current_buffer().get(target.0)?;
         let line = line.trim_end_matches(['\r', '\n']);
@@ -17872,7 +17881,11 @@ impl Editor {
                     return self.pending_operator_invalid();
                 };
                 let range = self.syntax_motion_range(kind, backward, pending.count());
-                self.operator_action_for_range(pending.operator, range, "text object not found")
+                self.operator_action_for_navigation_range(
+                    pending.operator,
+                    range,
+                    structural_motion_label(c),
+                )
             }
             PendingOperatorStep::TextObjectScope(scope) => {
                 if let Some(kind) = SyntaxObjectKind::for_text_object_key(c) {
@@ -17952,6 +17965,23 @@ impl Editor {
         };
         self.repeater = None;
         Some(KeyAction::Single(action))
+    }
+
+    fn operator_action_for_navigation_range(
+        &mut self,
+        operator: EditOperator,
+        range: Option<TextRange>,
+        target: &str,
+    ) -> Option<KeyAction> {
+        if range.is_none() {
+            self.pending_operator = None;
+            self.waiting_command = None;
+            if self.last_error.is_none() {
+                self.set_navigation_boundary_warning(target);
+            }
+            return Some(KeyAction::None);
+        }
+        self.operator_action_for_range(operator, range, "")
     }
 
     fn operator_action_for_linewise_range(
@@ -20626,6 +20656,8 @@ impl Editor {
                         false,
                     )
                     .await?;
+                } else {
+                    self.set_navigation_boundary_warning("valid diagnostics");
                 }
             }
             Action::ExecuteLspCommand(command) => {
@@ -21146,20 +21178,22 @@ impl Editor {
             | Action::MoveToPreviousFunction
             | Action::MoveToNextClass
             | Action::MoveToPreviousClass => {
-                let (kind, backward) = match action {
-                    Action::MoveToNextCall => (SyntaxObjectKind::Call, false),
-                    Action::MoveToPreviousCall => (SyntaxObjectKind::Call, true),
-                    Action::MoveToNextFunction => (SyntaxObjectKind::Function, false),
-                    Action::MoveToPreviousFunction => (SyntaxObjectKind::Function, true),
-                    Action::MoveToNextClass => (SyntaxObjectKind::Class, false),
-                    Action::MoveToPreviousClass => (SyntaxObjectKind::Class, true),
+                let (kind, backward, label) = match action {
+                    Action::MoveToNextCall => (SyntaxObjectKind::Call, false, "function calls"),
+                    Action::MoveToPreviousCall => (SyntaxObjectKind::Call, true, "function calls"),
+                    Action::MoveToNextFunction => (SyntaxObjectKind::Function, false, "functions"),
+                    Action::MoveToPreviousFunction => {
+                        (SyntaxObjectKind::Function, true, "functions")
+                    }
+                    Action::MoveToNextClass => (SyntaxObjectKind::Class, false, "classes"),
+                    Action::MoveToPreviousClass => (SyntaxObjectKind::Class, true, "classes"),
                     _ => unreachable!(),
                 };
                 if let Some(position) = self.syntax_motion_target(kind, backward, 1) {
                     self.move_to_text_position(position);
                     self.finish_cursor_motion(buffer, false)?;
                 } else if self.last_error.is_none() {
-                    self.set_legacy_message(Some("text object not found".to_string()));
+                    self.set_navigation_boundary_warning(label);
                 }
             }
             Action::MoveToFilePercent(percent) => {
@@ -21796,6 +21830,10 @@ impl Editor {
             }
             Action::Print(msg) => {
                 self.set_legacy_message(Some(msg.clone()));
+                self.draw_commandline(buffer);
+            }
+            Action::PrintWarning(msg) => {
+                self.set_routine_warning(Some(msg.clone()));
                 self.draw_commandline(buffer);
             }
             Action::OpenMessages => {
@@ -25959,7 +25997,7 @@ impl Editor {
             self.move_to_text_position(motion.target);
             self.finish_cursor_motion(buffer, false)?;
         } else {
-            self.set_legacy_message(Some("match not found".to_string()));
+            self.set_navigation_boundary_warning("matches");
         }
         Ok(())
     }
@@ -40637,7 +40675,7 @@ builtin = "rust"
     }
 
     #[tokio::test]
-    async fn diagnostic_navigation_orders_utf16_positions_and_wraps() {
+    async fn diagnostic_navigation_orders_utf16_positions_without_wrapping() {
         let root = tempfile::tempdir().unwrap();
         let file = root.path().join("main.rs");
         let mut editor = lsp_test_editor(vec![Buffer::new(
@@ -40698,17 +40736,24 @@ builtin = "rust"
             .execute(&Action::NextDiagnostic, &mut buffer, &mut runtime)
             .await
             .unwrap();
-        assert_eq!((editor.cx, editor.buffer_line()), (0, 0));
+        assert_eq!((editor.cx, editor.buffer_line()), (0, 3));
+        assert_eq!(
+            editor.last_error.as_deref(),
+            Some("No more valid diagnostics to move to")
+        );
+        let warning = editor.notifications.records().next_back().unwrap();
+        assert_eq!(warning.severity, Severity::Warning);
+        assert_eq!(warning.attention, AttentionPolicy::Quiet);
 
         editor
             .execute(&Action::PreviousDiagnostic, &mut buffer, &mut runtime)
             .await
             .unwrap();
-        assert_eq!((editor.cx, editor.buffer_line()), (0, 3));
+        assert_eq!((editor.cx, editor.buffer_line()), (7, 1));
     }
 
     #[tokio::test]
-    async fn diagnostic_navigation_is_a_safe_noop_without_diagnostics() {
+    async fn diagnostic_navigation_warns_without_diagnostics() {
         let mut editor =
             lsp_test_editor(vec![Buffer::new(None, "first\nsecond\nthird".to_string())]);
         editor.cy = 1;
@@ -40726,7 +40771,14 @@ builtin = "rust"
             .unwrap();
 
         assert_eq!((editor.cx, editor.buffer_line()), (2, 1));
-        assert!(editor.last_error.is_none());
+        assert_eq!(
+            editor.last_error.as_deref(),
+            Some("No more valid diagnostics to move to")
+        );
+        assert_eq!(
+            editor.notifications.records().next_back().unwrap().severity,
+            Severity::Warning
+        );
     }
 
     fn diagnostic_at(

@@ -61,7 +61,7 @@ impl Editor {
                         matches!(action, Action::PreviousOverlappingInlineComment),
                     );
                 } else {
-                    self.set_legacy_message(Some("no inline item at the cursor".into()));
+                    self.set_navigation_boundary_warning("inline items");
                 }
                 self.render(buffer)?;
             }

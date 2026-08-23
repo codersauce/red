@@ -3753,7 +3753,11 @@ fn hunk_windows_loaded(result: GitWindowsResult) {
             buffer_index = red::int(window.buffer_index, -1);
         }
     }
+    let action = red::string(plugin_state().hunk_action, "");
     if path == "" {
+        if action == "next" || action == "previous" {
+            print_hunk_boundary(action == "next");
+        }
         return;
     }
     red::state_patch(GitPluginState { hunk_path: path });
@@ -3761,7 +3765,6 @@ fn hunk_windows_loaded(result: GitWindowsResult) {
     red::state_patch(GitPluginState { hunk_path: repository_path(path) });
     red::state_patch(GitPluginState { hunk_buffer: buffer_index });
     red::state_patch(GitPluginState { hunk_selection: None });
-    let action = red::string(plugin_state().hunk_action, "");
     if action == "stage" {
         red::request("GetBufferText", hunk_buffer_text);
         return;
@@ -3911,12 +3914,8 @@ fn navigate_patch(patch: String, cursor_line: i32, forward: bool) {
     red::execute("SetCursorPosition", 0, target, true);
 }
 
-fn print_hunk_boundary(forward: bool) {
-    if forward {
-        red::execute("Print", "No next Git hunk");
-    } else {
-        red::execute("Print", "No previous Git hunk");
-    }
+fn print_hunk_boundary(_forward: bool) {
+    red::execute("PrintWarning", "No more Git hunks to move to");
 }
 
 fn hunk_starts(patch: String) -> [i32] {

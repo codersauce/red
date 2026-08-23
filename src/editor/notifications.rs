@@ -174,8 +174,16 @@ impl Editor {
         self.last_error = Some(message);
     }
 
+    pub(super) fn set_routine_warning(&mut self, message: Option<String>) {
+        self.set_message_with_attention(Severity::Warning, AttentionPolicy::Quiet, message);
+    }
+
     pub(super) fn set_notification_message(&mut self, severity: Severity, message: Option<String>) {
         self.set_message_with_attention(severity, AttentionPolicy::for_severity(severity), message);
+    }
+
+    pub(super) fn set_navigation_boundary_warning(&mut self, target: &str) {
+        self.set_routine_warning(Some(format!("No more {target} to move to")));
     }
 
     fn set_message_with_attention(
@@ -810,6 +818,37 @@ mod tests {
         assert_eq!(editor.message_ids(Instant::now()), vec![first]);
         editor.handle_message_action(&MessageAction::Acknowledge);
         assert!(editor.message_ids(Instant::now()).is_empty());
+    }
+
+    #[tokio::test]
+    async fn print_warning_is_transient_and_does_not_require_acknowledgment() {
+        let mut editor = editor(100, 24);
+        let mut buffer = RenderBuffer::new(100, 24, &Style::default());
+        let mut runtime = Runtime::new();
+
+        editor
+            .execute(
+                &Action::PrintWarning("No more Git hunks to move to".to_string()),
+                &mut buffer,
+                &mut runtime,
+            )
+            .await
+            .unwrap();
+
+        let warning = editor.notifications.records().next_back().unwrap();
+        assert_eq!(warning.severity, Severity::Warning);
+        assert_eq!(warning.attention, AttentionPolicy::Quiet);
+        assert_eq!(
+            editor
+                .notifications
+                .counts(Instant::now())
+                .needs_acknowledgment,
+            0
+        );
+        assert_eq!(
+            editor.last_error.as_deref(),
+            Some("No more Git hunks to move to")
+        );
     }
 
     #[test]

@@ -2,6 +2,7 @@
   "version": "0.15.0",
   "calls": [
     { "name": "Print", "kind": "execute", "signature": "(message: String)", "introduced": "0.1.0" },
+    { "name": "PrintWarning", "kind": "execute", "signature": "(message: String)", "introduced": "0.15.0" },
     { "name": "FilePicker", "kind": "execute", "signature": "()", "introduced": "0.1.0" },
     { "name": "ClearSearchHighlight", "kind": "execute", "signature": "()", "introduced": "0.1.0" },
     { "name": "RefreshDiagnostics", "kind": "execute", "signature": "()", "introduced": "0.1.0" },

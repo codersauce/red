@@ -12,6 +12,7 @@ use crate::{
     },
     inline_assist::{InlineAssistResult, InlineCommentInput},
     lsp::LspManager,
+    notification::Severity,
     plugin::Runtime,
     theme::{Style, Theme},
     undo::{TextPosition, TextRange},
@@ -777,6 +778,30 @@ fn inline_comment_navigation_preserves_treesitter_class_motions() {
     assert_eq!(
         nested(leader, "[", "c"),
         Some(KeyAction::Single(Action::PreviousInlineComment))
+    );
+}
+
+#[tokio::test]
+async fn overlapping_inline_navigation_warns_when_nothing_is_under_the_cursor() {
+    let mut editor = editor("no comments\n", 60, 12, false);
+
+    editor
+        .test_execute_production_action(Action::NextOverlappingInlineComment)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        editor.test_last_error(),
+        Some("No more inline items to move to")
+    );
+    assert_eq!(
+        editor
+            .notifications()
+            .records()
+            .next_back()
+            .unwrap()
+            .severity,
+        Severity::Warning
     );
 }
 
