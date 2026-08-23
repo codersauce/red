@@ -2523,6 +2523,10 @@ pub enum Action {
     #[serde(skip)]
     DeleteMultiSelectionBlackHole,
     #[serde(skip)]
+    PasteAfterMultiSelection,
+    #[serde(skip)]
+    PasteBeforeMultiSelection,
+    #[serde(skip)]
     ClearMultiSelection,
 
     MoveUp,
@@ -4519,6 +4523,8 @@ fn is_keyword_char(c: char) -> bool {
 pub struct Content {
     kind: ContentKind,
     text: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    multi_cursor_segments: Vec<String>,
 }
 
 struct VisualPastePlan {
@@ -4531,6 +4537,7 @@ impl Content {
         Self {
             kind: ContentKind::Charwise,
             text,
+            multi_cursor_segments: Vec::new(),
         }
     }
 
@@ -4538,6 +4545,7 @@ impl Content {
         Self {
             kind: ContentKind::Linewise,
             text,
+            multi_cursor_segments: Vec::new(),
         }
     }
 
@@ -4545,6 +4553,15 @@ impl Content {
         Self {
             kind: ContentKind::Blockwise,
             text,
+            multi_cursor_segments: Vec::new(),
+        }
+    }
+
+    fn multi_cursor_blockwise(segments: Vec<String>) -> Self {
+        Self {
+            kind: ContentKind::Blockwise,
+            text: segments.join("\n"),
+            multi_cursor_segments: segments,
         }
     }
 }
@@ -17237,6 +17254,12 @@ impl Editor {
                     {
                         return Some(KeyAction::Single(Action::DeleteMultiSelectionBlackHole));
                     }
+                    (KeyCode::Char('p'), KeyModifiers::NONE) => {
+                        return Some(KeyAction::Single(Action::PasteAfterMultiSelection));
+                    }
+                    (KeyCode::Char('P'), KeyModifiers::NONE | KeyModifiers::SHIFT) => {
+                        return Some(KeyAction::Single(Action::PasteBeforeMultiSelection));
+                    }
                     (KeyCode::Char('n'), KeyModifiers::CONTROL) => {}
                     (KeyCode::Char('n'), KeyModifiers::NONE)
                         if self.can_navigate_multi_cursor_occurrences() =>
@@ -21502,6 +21525,20 @@ impl Editor {
                 }
                 self.render(buffer)?;
             }
+            Action::PasteAfterMultiSelection => {
+                add_to_history = false;
+                if self.paste_at_multi_cursors(multi_cursor::MultiCursorPasteAnchor::After) {
+                    self.notify_change(runtime).await?;
+                }
+                self.render(buffer)?;
+            }
+            Action::PasteBeforeMultiSelection => {
+                add_to_history = false;
+                if self.paste_at_multi_cursors(multi_cursor::MultiCursorPasteAnchor::Before) {
+                    self.notify_change(runtime).await?;
+                }
+                self.render(buffer)?;
+            }
             Action::ClearMultiSelection => {
                 add_to_history = false;
                 self.clear_multi_cursor();
@@ -23619,6 +23656,7 @@ impl Editor {
                 let content = Content {
                     kind: self.mode.into(),
                     text: selected_text.clone(),
+                    multi_cursor_segments: Vec::new(),
                 };
 
                 self.set_default_register(content.clone());
@@ -27311,6 +27349,7 @@ impl Editor {
         Some(Content {
             kind: self.mode.into(),
             text,
+            multi_cursor_segments: Vec::new(),
         })
     }
 

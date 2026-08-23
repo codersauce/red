@@ -80,6 +80,8 @@ impl Editor {
                     | Action::AppendAtMultiSelectionEnd
                     | Action::DeleteMultiSelection
                     | Action::DeleteMultiSelectionBlackHole
+                    | Action::PasteAfterMultiSelection
+                    | Action::PasteBeforeMultiSelection
                     | Action::ClearMultiSelection
                     | Action::PlayMacro(_)
                     | Action::InsertBlock

@@ -5,7 +5,7 @@ use crate::{
     window::WindowId,
 };
 
-use super::{Content, Editor};
+use super::{Content, ContentKind, Editor};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum MultiCursorPhase {
@@ -18,6 +18,12 @@ pub(super) enum MultiCursorInsertAnchor {
     Start,
     End,
     Replace,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum MultiCursorPasteAnchor {
+    Before,
+    After,
 }
 
 #[derive(Debug, Clone)]
@@ -297,12 +303,278 @@ impl Editor {
 
         self.begin_transaction("delete multi-cursor selections");
         if !preserve_register {
-            self.set_default_register(Content::blockwise(deleted.join("\n")));
+            self.set_default_register(Content::multi_cursor_blockwise(deleted));
         }
         self.replace_multi_cursor_targets(targets, "");
         self.move_to_active_multi_cursor(false);
         self.commit_transaction(self.cursor_snapshot());
         true
+    }
+
+    pub(super) fn paste_at_multi_cursors(&mut self, anchor: MultiCursorPasteAnchor) -> bool {
+        if !self.has_multi_cursor_session() {
+            return false;
+        }
+        self.refresh_default_register_from_system_clipboard();
+        let Some(content) = self.registers.get(&super::DEFAULT_REGISTER).cloned() else {
+            return false;
+        };
+        let targets = self
+            .multi_cursor
+            .as_ref()
+            .expect("session was checked above")
+            .selections
+            .ranges()
+            .to_vec();
+        if targets.is_empty() || content.text.is_empty() {
+            return false;
+        }
+
+        if content.kind == ContentKind::Linewise {
+            return self.paste_linewise_at_multi_cursors(targets, &content);
+        }
+
+        let selecting = targets.iter().any(|range| !range.is_empty());
+        let replaced = targets
+            .iter()
+            .map(|range| {
+                self.current_buffer().text_in_range(TextRange::new(
+                    self.current_buffer().char_idx_to_position(range.start),
+                    self.current_buffer().char_idx_to_position(range.end),
+                ))
+            })
+            .collect::<Vec<_>>();
+        let replacements =
+            self.multi_cursor_paste_replacements(&content, &replaced, targets.len(), selecting);
+
+        self.begin_transaction("paste at multi-cursors");
+        if selecting {
+            self.apply_multi_cursor_replacements(targets, replacements, |start, replacement| {
+                CharRange::new(start, start + replacement.chars().count())
+            });
+        } else {
+            let insertion_targets = targets
+                .iter()
+                .map(|range| {
+                    let cursor = self.normal_multi_cursor_index(range.start);
+                    let position = self.current_buffer().char_idx_to_position(cursor);
+                    let line_len = self.line_character_len(position.line);
+                    let insertion = match anchor {
+                        MultiCursorPasteAnchor::Before => cursor,
+                        MultiCursorPasteAnchor::After if line_len == 0 => cursor,
+                        MultiCursorPasteAnchor::After => cursor + 1,
+                    };
+                    CharRange::new(insertion, insertion)
+                })
+                .collect();
+            self.apply_multi_cursor_replacements(
+                insertion_targets,
+                replacements,
+                |start, replacement| {
+                    let replacement_len = replacement.chars().count();
+                    let cursor = match anchor {
+                        MultiCursorPasteAnchor::Before => start,
+                        MultiCursorPasteAnchor::After => start + replacement_len.saturating_sub(1),
+                    };
+                    CharRange::new(cursor, cursor)
+                },
+            );
+        }
+        self.move_to_active_multi_cursor(false);
+        self.commit_transaction(self.cursor_snapshot());
+        self.cancel_transaction_if_empty();
+        true
+    }
+
+    fn multi_cursor_paste_replacements(
+        &self,
+        content: &Content,
+        replaced: &[String],
+        count: usize,
+        selecting: bool,
+    ) -> Vec<String> {
+        if content.kind == ContentKind::Charwise {
+            return vec![content.text.clone(); count];
+        }
+
+        let mut replacements = if content.multi_cursor_segments.is_empty() {
+            content.text.lines().map(str::to_string).collect::<Vec<_>>()
+        } else {
+            content.multi_cursor_segments.clone()
+        };
+        replacements.truncate(count);
+        if replacements.len() < count {
+            if selecting {
+                replacements.extend(replaced.iter().skip(replacements.len()).cloned());
+            } else {
+                replacements.resize(count, String::new());
+            }
+        }
+        replacements
+    }
+
+    fn paste_linewise_at_multi_cursors(
+        &mut self,
+        targets: Vec<CharRange>,
+        content: &Content,
+    ) -> bool {
+        let lines = content.text.lines().collect::<Vec<_>>().join("\n");
+        if lines.is_empty() {
+            return false;
+        }
+        let selecting = targets.iter().any(|range| !range.is_empty());
+        let active_range = self
+            .multi_cursor
+            .as_ref()
+            .expect("session was checked above")
+            .selections
+            .active_range();
+        let active = targets
+            .iter()
+            .position(|range| *range == active_range)
+            .unwrap_or(0);
+        let source_lines = targets
+            .iter()
+            .map(|range| {
+                let cursor = self.normal_multi_cursor_index(range.start);
+                self.current_buffer().char_idx_to_position(cursor).line
+            })
+            .collect::<Vec<_>>();
+        let active_source_line = source_lines.get(active).copied();
+        let mut replacements = Vec::with_capacity(targets.len());
+        let insertion_targets = targets
+            .into_iter()
+            .map(|range| {
+                let cursor = self.normal_multi_cursor_index(range.start);
+                let position = self.current_buffer().char_idx_to_position(cursor);
+                let last_unterminated_line = position.line == self.current_buffer().len()
+                    && self
+                        .current_buffer()
+                        .get(position.line)
+                        .is_some_and(|line| !line.ends_with('\n'));
+                if last_unterminated_line {
+                    replacements.push(format!("\n{lines}"));
+                    let end = self.current_buffer().contents().chars().count();
+                    CharRange::new(end, end)
+                } else {
+                    replacements.push(format!("{lines}\n"));
+                    let start = self
+                        .current_buffer()
+                        .position_to_char_idx(crate::undo::TextPosition::new(position.line + 1, 0));
+                    CharRange::new(start, start)
+                }
+            })
+            .collect();
+
+        self.begin_transaction("paste lines at multi-cursors");
+        self.apply_multi_cursor_replacements(
+            insertion_targets,
+            replacements,
+            |start, replacement| {
+                let cursor = start + usize::from(replacement.starts_with('\n'));
+                CharRange::new(cursor, cursor)
+            },
+        );
+        if selecting {
+            let updated = self
+                .multi_cursor
+                .as_ref()
+                .expect("multi-cursor replacement requires a session")
+                .selections
+                .ranges()
+                .to_vec();
+            let mut retained_lines = Vec::new();
+            let mut retained = Vec::new();
+            let mut active = 0;
+            for (source_line, range) in source_lines.into_iter().zip(updated) {
+                if retained_lines.contains(&source_line) {
+                    continue;
+                }
+                if Some(source_line) == active_source_line {
+                    active = retained.len();
+                }
+                retained_lines.push(source_line);
+                retained.push(range);
+            }
+            self.multi_cursor
+                .as_mut()
+                .expect("multi-cursor replacement requires a session")
+                .selections
+                .replace_ranges(retained, active);
+        }
+        self.move_to_active_multi_cursor(false);
+        self.commit_transaction(self.cursor_snapshot());
+        true
+    }
+
+    fn normal_multi_cursor_index(&self, index: usize) -> usize {
+        let position = self.current_buffer().char_idx_to_position(index);
+        let line_len = self.line_character_len(position.line);
+        let character = if line_len == 0 {
+            0
+        } else {
+            position.character.min(line_len - 1)
+        };
+        self.current_buffer()
+            .position_to_char_idx(crate::undo::TextPosition::new(position.line, character))
+    }
+
+    fn apply_multi_cursor_replacements(
+        &mut self,
+        targets: Vec<CharRange>,
+        replacements: Vec<String>,
+        result_range: impl Fn(usize, &str) -> CharRange,
+    ) {
+        let active_range = self
+            .multi_cursor
+            .as_ref()
+            .expect("multi-cursor replacement requires a session")
+            .selections
+            .active_range();
+        let active = self
+            .multi_cursor
+            .as_ref()
+            .expect("multi-cursor replacement requires a session")
+            .selections
+            .ranges()
+            .iter()
+            .position(|range| *range == active_range)
+            .unwrap_or(0);
+        let edits = targets
+            .iter()
+            .zip(&replacements)
+            .map(|(range, replacement)| {
+                (
+                    TextRange::new(
+                        self.current_buffer().char_idx_to_position(range.start),
+                        self.current_buffer().char_idx_to_position(range.end),
+                    ),
+                    replacement,
+                )
+            })
+            .collect::<Vec<_>>();
+        for (range, replacement) in edits.into_iter().rev() {
+            self.replace_range(range, replacement);
+        }
+
+        let mut shift = 0isize;
+        let updated = targets
+            .into_iter()
+            .zip(replacements)
+            .map(|(target, replacement)| {
+                let start = target.start.saturating_add_signed(shift);
+                shift +=
+                    replacement.chars().count() as isize - (target.end - target.start) as isize;
+                result_range(start, &replacement)
+            })
+            .collect();
+        let revision = self.current_buffer().revision();
+        let session = self
+            .multi_cursor
+            .as_mut()
+            .expect("multi-cursor replacement requires a session");
+        session.revision = revision;
+        session.selections.replace_ranges(updated, active);
     }
 
     fn replace_multi_cursor_targets(&mut self, targets: Vec<CharRange>, replacement: &str) {

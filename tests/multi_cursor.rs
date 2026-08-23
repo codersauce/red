@@ -4,6 +4,7 @@ use common::EditorHarness;
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 use red::{
     buffer::Buffer,
+    clipboard::MemoryClipboardProvider,
     config::Config,
     editor::{Action, Content, Mode},
 };
@@ -276,4 +277,158 @@ async fn deleted_selections_leave_editable_cursors_across_lines() {
     harness.assert_buffer_contents("\n\nkeep");
     harness.execute_action(Action::Undo).await.unwrap();
     harness.assert_buffer_contents("foo\nfoo\nkeep");
+}
+
+#[tokio::test]
+async fn p_and_shift_p_replace_selected_occurrences_and_reselect_them() {
+    for (paste, modifiers) in [
+        (KeyCode::Char('p'), KeyModifiers::NONE),
+        (KeyCode::Char('P'), KeyModifiers::SHIFT),
+    ] {
+        let config: Config = toml::from_str(include_str!("../default_config.toml")).unwrap();
+        let buffer = Buffer::new(None, "foo foo".to_string());
+        let mut harness = EditorHarness::with_config(buffer, config);
+        harness
+            .editor
+            .test_set_clipboard(Box::new(MemoryClipboardProvider::with_text("X")));
+
+        key(&mut harness, KeyCode::Char('n'), KeyModifiers::CONTROL).await;
+        key(&mut harness, KeyCode::Char('n'), KeyModifiers::CONTROL).await;
+        key(&mut harness, paste, modifiers).await;
+
+        harness.assert_buffer_contents("X X");
+        assert!(harness.statusline_row().contains("MULTI 2/2"));
+        harness.assert_cursor_at(2, 0);
+
+        harness.execute_action(Action::Undo).await.unwrap();
+        harness.assert_buffer_contents("foo foo");
+    }
+}
+
+#[tokio::test]
+async fn p_and_shift_p_paste_after_and_before_collapsed_cursors() {
+    for (paste, modifiers, expected, cursor) in [
+        (KeyCode::Char('p'), KeyModifiers::NONE, " XX", (2, 0)),
+        (KeyCode::Char('P'), KeyModifiers::SHIFT, "XX ", (1, 0)),
+    ] {
+        let config: Config = toml::from_str(include_str!("../default_config.toml")).unwrap();
+        let buffer = Buffer::new(None, "foo foo".to_string());
+        let mut harness = EditorHarness::with_config(buffer, config);
+        harness
+            .editor
+            .test_set_clipboard(Box::new(MemoryClipboardProvider::with_text("X")));
+
+        key(&mut harness, KeyCode::Char('n'), KeyModifiers::CONTROL).await;
+        key(&mut harness, KeyCode::Char('n'), KeyModifiers::CONTROL).await;
+        key(&mut harness, KeyCode::Char('x'), KeyModifiers::NONE).await;
+        key(&mut harness, paste, modifiers).await;
+
+        harness.assert_buffer_contents(expected);
+        assert!(harness.statusline_row().contains("MULTI 2/2"));
+        harness.assert_cursor_at(cursor.0, cursor.1);
+    }
+}
+
+#[tokio::test]
+async fn multi_cursor_delete_payloads_survive_clipboard_sync_and_paste_in_order() {
+    let mut config: Config = toml::from_str(include_str!("../default_config.toml")).unwrap();
+    config.search.ignorecase = true;
+    config.search.smartcase = false;
+    let buffer = Buffer::new(None, "foo FOO".to_string());
+    let mut harness = EditorHarness::with_config(buffer, config);
+    let clipboard = MemoryClipboardProvider::default();
+    let clipboard_text = clipboard.shared_text();
+    harness.editor.test_set_clipboard(Box::new(clipboard));
+
+    key(&mut harness, KeyCode::Char('n'), KeyModifiers::CONTROL).await;
+    key(&mut harness, KeyCode::Char('n'), KeyModifiers::CONTROL).await;
+    key(&mut harness, KeyCode::Char('d'), KeyModifiers::NONE).await;
+    assert_eq!(clipboard_text.lock().unwrap().as_deref(), Some("foo\nFOO"));
+
+    key(&mut harness, KeyCode::Char('P'), KeyModifiers::SHIFT).await;
+
+    harness.assert_buffer_contents("fooFOO ");
+    assert!(harness.statusline_row().contains("MULTI 2/2"));
+    harness.assert_cursor_at(3, 0);
+}
+
+#[tokio::test]
+async fn blockwise_payload_mismatch_preserves_unmatched_selected_regions() {
+    let config: Config = toml::from_str(include_str!("../default_config.toml")).unwrap();
+    let buffer = Buffer::new(None, "foo foo foo".to_string());
+    let mut harness = EditorHarness::with_config(buffer, config);
+    harness
+        .editor
+        .test_set_default_register(Content::blockwise("A\nBB".to_string()));
+
+    for _ in 0..3 {
+        key(&mut harness, KeyCode::Char('n'), KeyModifiers::CONTROL).await;
+    }
+    key(&mut harness, KeyCode::Char('p'), KeyModifiers::NONE).await;
+
+    harness.assert_buffer_contents("A BB foo");
+    assert!(harness.statusline_row().contains("MULTI 3/3"));
+    harness.assert_cursor_at(7, 0);
+}
+
+#[tokio::test]
+async fn blockwise_payload_mismatch_inserts_nothing_at_extra_collapsed_cursors() {
+    let config: Config = toml::from_str(include_str!("../default_config.toml")).unwrap();
+    let buffer = Buffer::new(None, "foo foo foo".to_string());
+    let mut harness = EditorHarness::with_config(buffer, config);
+    harness
+        .editor
+        .test_set_default_register(Content::blockwise("A\nBB".to_string()));
+
+    for _ in 0..3 {
+        key(&mut harness, KeyCode::Char('n'), KeyModifiers::CONTROL).await;
+    }
+    key(&mut harness, KeyCode::Char('x'), KeyModifiers::NONE).await;
+    key(&mut harness, KeyCode::Char('p'), KeyModifiers::NONE).await;
+
+    harness.assert_buffer_contents(" A BB");
+    assert!(harness.statusline_row().contains("MULTI 3/3"));
+    harness.assert_cursor_at(4, 0);
+}
+
+#[tokio::test]
+async fn external_clipboard_changes_replace_structured_multi_cursor_payloads() {
+    let mut config: Config = toml::from_str(include_str!("../default_config.toml")).unwrap();
+    config.search.ignorecase = true;
+    config.search.smartcase = false;
+    let buffer = Buffer::new(None, "foo FOO".to_string());
+    let mut harness = EditorHarness::with_config(buffer, config);
+    let clipboard = MemoryClipboardProvider::default();
+    let clipboard_text = clipboard.shared_text();
+    harness.editor.test_set_clipboard(Box::new(clipboard));
+
+    key(&mut harness, KeyCode::Char('n'), KeyModifiers::CONTROL).await;
+    key(&mut harness, KeyCode::Char('n'), KeyModifiers::CONTROL).await;
+    key(&mut harness, KeyCode::Char('d'), KeyModifiers::NONE).await;
+    *clipboard_text.lock().unwrap() = Some("X".to_string());
+    key(&mut harness, KeyCode::Char('P'), KeyModifiers::SHIFT).await;
+
+    harness.assert_buffer_contents("XX ");
+    assert!(harness.statusline_row().contains("MULTI 2/2"));
+}
+
+#[tokio::test]
+async fn linewise_register_pastes_once_per_selected_region_and_merges_same_line_cursors() {
+    let config: Config = toml::from_str(include_str!("../default_config.toml")).unwrap();
+    let buffer = Buffer::new(None, "foo foo\ntail".to_string());
+    let mut harness = EditorHarness::with_config(buffer, config);
+    harness
+        .editor
+        .test_set_default_register(Content::linewise("AA\n".to_string()));
+
+    key(&mut harness, KeyCode::Char('n'), KeyModifiers::CONTROL).await;
+    key(&mut harness, KeyCode::Char('n'), KeyModifiers::CONTROL).await;
+    key(&mut harness, KeyCode::Char('p'), KeyModifiers::NONE).await;
+
+    harness.assert_buffer_contents("foo foo\nAA\nAA\ntail");
+    assert!(harness.statusline_row().contains("MULTI 1/1"));
+    harness.assert_cursor_at(0, 1);
+
+    harness.execute_action(Action::Undo).await.unwrap();
+    harness.assert_buffer_contents("foo foo\ntail");
 }
