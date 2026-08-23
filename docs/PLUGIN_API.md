@@ -539,6 +539,8 @@ written. `agent:model_changed` carries `{ session_id, model_info }`, where
 For name-oriented lists, `PickerOptions.item_layout: "label_first"` reserves the
 longest filtered label, then aligns annotations and descriptions in shared columns.
 Secondary fields disappear before labels are shortened; the default layout is unchanged.
+A row with a shortened filename or directory label can set `data.search_path` to its
+complete path so filtering and match highlights still include the parent directories.
 `UpdatePickerSelection(handle, item_id)` selects a currently visible item without
 resetting the query. This is useful after populating a loading picker in place.
 

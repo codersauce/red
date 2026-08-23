@@ -74,21 +74,22 @@ fn default_item_filter_score(
     item: &PickerItem,
     query: &str,
 ) -> Option<(PickerMatchKind, Reverse<i64>)> {
-    if item.kind.as_deref() != Some("FilePath") {
+    let Some(path) = picker_item_search_path(item) else {
         return default_filter_score(matcher, &item.label, query);
-    }
-
-    let path = item
-        .data
-        .get("search_path")
-        .and_then(Value::as_str)
-        .unwrap_or(&item.id);
+    };
     default_path_filter_score(
         matcher,
         PathCandidate::new(path, &item.label, item.annotation.as_deref()),
         &item.label,
         query,
     )
+}
+
+fn picker_item_search_path(item: &PickerItem) -> Option<&str> {
+    item.data
+        .get("search_path")
+        .and_then(Value::as_str)
+        .or_else(|| (item.kind.as_deref() == Some("FilePath")).then_some(item.id.as_str()))
 }
 
 fn default_path_filter_score(
@@ -403,6 +404,7 @@ pub struct Picker {
     dynamic_items: Option<Vec<PickerItem>>,
     visible_dynamic_items: Vec<usize>,
     command_column_widths: Cell<Option<CommandColumns>>,
+    label_first_column_widths: Cell<Option<LabelFirstColumns>>,
     external_filter: bool,
     status: Option<String>,
     busy_since: Option<Instant>,
@@ -584,6 +586,7 @@ impl Picker {
             dynamic_items: None,
             visible_dynamic_items: Vec::new(),
             command_column_widths: Cell::new(None),
+            label_first_column_widths: Cell::new(None),
             external_filter: false,
             status: None,
             busy_since: None,
@@ -742,29 +745,8 @@ impl Picker {
         picker.live = true;
         picker.visible_dynamic_items = (0..items.len()).collect();
         picker.list.set_item_count(items.len());
-        if items
-            .iter()
-            .any(|item| item.kind.as_deref() == Some("FilePath"))
-        {
-            let matcher = SkimMatcherV2::default();
-            picker.filter_highlight_action = Some(Box::new(move |item, query| {
-                if item.kind.as_deref() == Some("FilePath") {
-                    let path = item
-                        .data
-                        .get("search_path")
-                        .and_then(Value::as_str)
-                        .unwrap_or(&item.id);
-                    path_match_highlights(
-                        &matcher,
-                        PathCandidate::new(path, &item.label, item.annotation.as_deref()),
-                        query,
-                    )
-                } else {
-                    path_match_highlights(&matcher, PathCandidate::from_path(&item.label), query)
-                }
-            }));
-        }
         picker.dynamic_items = Some(items);
+        picker.install_path_filter_highlights();
         picker.external_filter = options.external_filter;
         picker.placeholder = options.placeholder;
         picker.status = options.status;
@@ -845,6 +827,30 @@ impl Picker {
 
     pub fn builder() -> PickerBuilder {
         PickerBuilder::new()
+    }
+
+    fn install_path_filter_highlights(&mut self) {
+        if self.filter_highlight_action.is_some()
+            || !self.dynamic_items.as_ref().is_some_and(|items| {
+                items
+                    .iter()
+                    .any(|item| picker_item_search_path(item).is_some())
+            })
+        {
+            return;
+        }
+        let matcher = SkimMatcherV2::default();
+        self.filter_highlight_action = Some(Box::new(move |item, query| {
+            if let Some(path) = picker_item_search_path(item) {
+                path_match_highlights(
+                    &matcher,
+                    PathCandidate::new(path, &item.label, item.annotation.as_deref()),
+                    query,
+                )
+            } else {
+                path_match_highlights(&matcher, PathCandidate::from_path(&item.label), query)
+            }
+        }));
     }
 
     pub fn filter(&mut self, term: &str) {
@@ -939,6 +945,7 @@ impl Picker {
             self.filtered_query = Some(term.to_string());
             self.list.set_item_count(self.visible_dynamic_items.len());
             self.command_column_widths.set(None);
+            self.label_first_column_widths.set(None);
             return;
         }
         if term.is_empty() {
@@ -994,6 +1001,7 @@ impl Picker {
         self.item_preview_root = None;
         self.items.clear();
         self.dynamic_items = Some(items);
+        self.install_path_filter_highlights();
         self.filtered_query = None;
         self.filtered_history.clear();
         let search = self.search.clone();
@@ -1011,6 +1019,7 @@ impl Picker {
                 let previous = self.selected_item();
                 let selected_id = self.selected_dynamic_item().map(|item| item.id.clone());
                 self.dynamic_items = Some(items);
+                self.install_path_filter_highlights();
                 self.filtered_query = None;
                 self.filtered_history.clear();
                 let query = self.search.clone();
@@ -2145,17 +2154,21 @@ impl Picker {
     /// Use every filtered row, not just the current page, so scrolling does not
     /// move the columns. Labels take priority over status and descriptions.
     fn label_first_columns(&self, items: &[PickerItem], content_width: usize) -> LabelFirstColumns {
-        let mut columns = LabelFirstColumns::default();
-        for index in &self.visible_dynamic_items {
-            let item = &items[*index];
-            columns.label = columns.label.max(display_width(&item.label));
-            columns.annotation = columns
-                .annotation
-                .max(item.annotation.as_deref().map_or(0, display_width));
-            columns.detail = columns
-                .detail
-                .max(item.detail.as_deref().map_or(0, display_width));
-        }
+        let mut columns = self.label_first_column_widths.get().unwrap_or_else(|| {
+            let mut columns = LabelFirstColumns::default();
+            for index in &self.visible_dynamic_items {
+                let item = &items[*index];
+                columns.label = columns.label.max(display_width(&item.label));
+                columns.annotation = columns
+                    .annotation
+                    .max(item.annotation.as_deref().map_or(0, display_width));
+                columns.detail = columns
+                    .detail
+                    .max(item.detail.as_deref().map_or(0, display_width));
+            }
+            self.label_first_column_widths.set(Some(columns));
+            columns
+        });
         columns.label = columns.label.min(content_width);
         let mut remaining = content_width.saturating_sub(columns.label);
         if columns.annotation > 0 && columns.annotation + INTRINSIC_COLUMN_GAP <= remaining {
@@ -3818,6 +3831,7 @@ pub struct PickerBuilder {
     location_preview_contents: HashMap<String, Rope>,
     content_sizing: Option<PickerContentSizing>,
     status_on_query_line: bool,
+    item_layout: PickerItemLayout,
 }
 
 impl Default for PickerBuilder {
@@ -3845,6 +3859,7 @@ impl PickerBuilder {
             location_preview_contents: HashMap::new(),
             content_sizing: None,
             status_on_query_line: false,
+            item_layout: PickerItemLayout::Default,
         }
     }
 
@@ -3861,6 +3876,12 @@ impl PickerBuilder {
     /// Supplies precomputed picker rows with stable IDs and structured display fields.
     pub fn structured_items(mut self, items: Vec<PickerItem>) -> Self {
         self.structured_items = Some(items);
+        self
+    }
+
+    /// Selects how structured rows divide space between names and metadata.
+    pub fn item_layout(mut self, item_layout: PickerItemLayout) -> Self {
+        self.item_layout = item_layout;
         self
     }
 
@@ -3984,6 +4005,7 @@ impl PickerBuilder {
         let location_preview_contents = self.location_preview_contents;
         let content_sizing = self.content_sizing;
         let status_on_query_line = self.status_on_query_line;
+        let item_layout = self.item_layout;
 
         let mut picker = Picker::new(title, editor, &items, id);
         if let Some(structured_items) = structured_items {
@@ -3998,6 +4020,7 @@ impl PickerBuilder {
         picker.incremental_filter = incremental_filter;
         picker.filter_tie_breaker = filter_tie_breaker;
         picker.filter_highlight_action = filter_highlight_action;
+        picker.install_path_filter_highlights();
         picker.placeholder = placeholder;
         picker.status = status;
         picker.set_busy(busy);
@@ -4008,6 +4031,7 @@ impl PickerBuilder {
         picker.location_preview_overrides = location_preview_contents;
         picker.content_sizing = content_sizing;
         picker.status_on_query_line = status_on_query_line;
+        picker.item_layout = item_layout;
         picker.resize_to_viewport(editor.vwidth(), editor.vheight());
 
         picker
@@ -4825,6 +4849,25 @@ mod tests {
     }
 
     #[test]
+    fn picker_builder_prioritizes_editor_owned_primary_labels() {
+        let editor = test_editor_with_theme_and_size(Theme::default(), 80, 24);
+        let label = "load_review_requested_pull_requests_for_scope";
+        let mut item = dynamic_item("symbol", label);
+        item.detail = Some("crates/editor/src/really/long/document.rs:174:10".into());
+        let picker = Picker::builder()
+            .title("Document Symbols")
+            .structured_items(vec![item])
+            .item_layout(super::PickerItemLayout::LabelFirst)
+            .build(&editor);
+        let mut buffer = RenderBuffer::new(80, 24, &Style::default());
+
+        picker.draw(&mut buffer).unwrap();
+
+        let row = render_row(&buffer, picker.layout().results.y);
+        assert!(row.contains(label), "{row:?}");
+    }
+
+    #[test]
     fn label_first_picker_keeps_model_names_and_aligns_secondary_columns() {
         let editor = test_editor_with_theme_and_size(Theme::default(), 120, 30);
         let labels = ["GPT-5.6-Sol-OAI", "GPT-5.6-Sol", "漢字 model"];
@@ -4995,7 +5038,9 @@ mod tests {
             .results
             .width
             .saturating_sub(super::PICKER_ITEM_PREFIX_WIDTH);
+        assert!(picker.label_first_column_widths.get().is_none());
         let columns = picker.label_first_columns(picker.dynamic_items.as_ref().unwrap(), width);
+        assert!(picker.label_first_column_widths.get().is_some());
         picker.list.set_selected_index(20);
         assert_eq!(
             columns,
@@ -5006,6 +5051,7 @@ mod tests {
             display_width("Longest model on the next page")
         );
         picker.filter("Model 1");
+        assert!(picker.label_first_column_widths.get().is_none());
         assert!(
             picker
                 .label_first_columns(picker.dynamic_items.as_ref().unwrap(), width)
@@ -6981,6 +7027,65 @@ mod tests {
 
         picker.filter("no name");
         assert_eq!(visible_picker_labels(&picker), ["[No Name]"]);
+    }
+
+    #[test]
+    fn named_path_rows_preserve_parent_and_position_search() {
+        let editor = test_editor();
+        let mut reference = dynamic_item("reference", "main.rs:5:4");
+        reference.kind = Some("Reference".to_string());
+        reference.annotation = Some("src/editor".to_string());
+        reference.data = json!({ "search_path": "src/editor/main.rs:5:4" });
+        let mut worktree = dynamic_item("worktree", "red.feature");
+        worktree.kind = Some("GitWorktree".to_string());
+        worktree.annotation = Some("/workspace/code".to_string());
+        worktree.data = json!({ "search_path": "/workspace/code/red.feature" });
+        let mut picker = Picker::new_dynamic(
+            Some("Locations".to_string()),
+            &editor,
+            vec![reference, worktree],
+            31,
+            PickerOptions {
+                item_layout: super::PickerItemLayout::LabelFirst,
+                ..PickerOptions::default()
+            },
+        );
+
+        picker.filter("editor/main");
+        assert_eq!(visible_picker_labels(&picker), ["main.rs:5:4"]);
+        let selected = picker.selected_dynamic_item().unwrap();
+        let highlights = picker.filter_highlight_action.as_ref().unwrap()(selected, "editor");
+        assert!(!highlights.annotation.is_empty());
+
+        picker.filter(":5:4");
+        assert_eq!(visible_picker_labels(&picker), ["main.rs:5:4"]);
+
+        picker.filter("code/red.feature");
+        assert_eq!(visible_picker_labels(&picker), ["red.feature"]);
+    }
+
+    #[test]
+    fn async_named_path_rows_install_parent_highlights() {
+        let editor = test_editor();
+        let mut picker = Picker::new_dynamic(
+            Some("References".to_string()),
+            &editor,
+            vec![],
+            32,
+            PickerOptions::default(),
+        );
+        assert!(picker.filter_highlight_action.is_none());
+        let mut reference = dynamic_item("reference", "main.rs:5:4");
+        reference.kind = Some("Reference".to_string());
+        reference.annotation = Some("src/editor".to_string());
+        reference.data = json!({ "search_path": "src/editor/main.rs:5:4" });
+
+        assert!(picker.apply_update(32, PickerUpdate::Items(vec![reference])));
+        picker.filter("editor");
+
+        let selected = picker.selected_dynamic_item().unwrap();
+        let highlights = picker.filter_highlight_action.as_ref().unwrap()(selected, "editor");
+        assert!(!highlights.annotation.is_empty());
     }
 
     #[test]

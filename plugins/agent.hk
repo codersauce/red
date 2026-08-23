@@ -2372,7 +2372,6 @@ fn permission_requested(event: AgentPermissionEvent) {
             label: option.name,
             kind: "Permission",
             annotation: red::string(option.kind, "permission") + " · " + option.option_id,
-            detail: "Codex permission option " + option.option_id,
             data: Json { option_id: option.option_id },
         });
     }
@@ -2380,6 +2379,7 @@ fn permission_requested(event: AgentPermissionEvent) {
         placeholder: "Choose an exact option from the agent",
         status: red::len(items) + " options",
         presentation: "compact",
+        item_layout: "label_first",
     }, PickerHandlers {
         selected: permission_selected,
         cancelled: permission_cancelled,
