@@ -1141,6 +1141,10 @@ impl RedHost {
                 let message = args.first().map(value_to_string).unwrap_or_default();
                 self.send_request(PluginRequest::Action(Action::Print(message)));
             }
+            "PrintWarning" => {
+                let message = args.first().map(value_to_string).unwrap_or_default();
+                self.send_request(PluginRequest::Action(Action::PrintWarning(message)));
+            }
             "FilePicker" => {
                 self.send_request(PluginRequest::Action(Action::FilePicker));
             }
@@ -15495,26 +15499,35 @@ mod tests {
         for (command, cursor_line, expected) in [
             ("GitHunkNext", 0, Ok((0, 13))),
             ("GitHunkPrevious", 29, Ok((0, 25))),
-            ("GitHunkNext", 25, Err("No next Git hunk".to_string())),
+            (
+                "GitHunkNext",
+                -1,
+                Err("warning:No more Git hunks to move to".to_string()),
+            ),
+            (
+                "GitHunkNext",
+                25,
+                Err("warning:No more Git hunks to move to".to_string()),
+            ),
             (
                 "GitHunkPrevious",
                 13,
-                Err("No previous Git hunk".to_string()),
+                Err("warning:No more Git hunks to move to".to_string()),
             ),
             (
                 "GitHunkStage",
                 0,
-                Err("No Git hunk under cursor".to_string()),
+                Err("warning:No Git hunk under cursor".to_string()),
             ),
             (
                 "GitHunkUnstage",
                 0,
-                Err("No Git hunk under cursor".to_string()),
+                Err("warning:No Git hunk under cursor".to_string()),
             ),
             (
                 "GitHunkReset",
                 0,
-                Err("No Git hunk under cursor".to_string()),
+                Err("warning:No Git hunk under cursor".to_string()),
             ),
         ] {
             runtime.execute_command(command).await.unwrap();
@@ -15525,12 +15538,17 @@ mod tests {
                 while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
                     match request {
                         PluginRequest::GetWindows { request_id } => {
+                            let buffer_path = if cursor_line < 0 {
+                                String::new()
+                            } else {
+                                file.display().to_string()
+                            };
                             runtime
                                 .resolve_request(
                                     request_id,
                                     serde_json::json!({
                                         "windows": [{
-                                            "buffer_path": file.display().to_string(),
+                                            "buffer_path": buffer_path,
                                             "buffer_index": 7,
                                             "active": true
                                         }]
@@ -15566,6 +15584,9 @@ mod tests {
                         PluginRequest::SetCursorPosition { x, y, jump } => {
                             assert!(jump);
                             result = Some(Ok((x, y)));
+                        }
+                        PluginRequest::Action(Action::PrintWarning(message)) => {
+                            result = Some(Err(format!("warning:{message}")));
                         }
                         PluginRequest::Action(Action::Print(message)) => {
                             result = Some(Err(message));
@@ -17354,6 +17375,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn lsp_document_symbols_warns_when_no_symbols_are_available() {
+        drain_requests();
+        let mut runtime = Runtime::new();
+        load_lsp_symbols(&mut runtime).await;
+
+        runtime.execute_command("LspDocumentSymbols").await.unwrap();
+        let request_id = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::DocumentSymbols { request_id, .. } => request_id,
+            _ => panic!("expected document-symbol request"),
+        };
+        runtime
+            .resolve_request(request_id, sample_symbol_payload_with_count(0))
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::Action(Action::PrintWarning(message))
+                if message == "No document symbols found"
+        ));
+    }
+
+    #[tokio::test]
     async fn lsp_symbols_batches_pathological_document_symbol_results() {
         drain_requests();
 
@@ -17499,6 +17543,37 @@ mod tests {
                 include_declaration: true,
                 ..
             }
+        ));
+    }
+
+    #[tokio::test]
+    async fn lsp_references_warns_after_a_final_empty_result() {
+        drain_requests();
+        let mut runtime = Runtime::new();
+        load_lsp_symbols(&mut runtime).await;
+
+        runtime.execute_command("LspReferences").await.unwrap();
+        let handle = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::OpenCallbackPicker { handle, .. } => handle,
+            _ => panic!("expected references loading picker"),
+        };
+        let request_id = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::References { request_id, .. } => request_id,
+            _ => panic!("expected references request"),
+        };
+        runtime
+            .resolve_request(request_id, sample_reference_payload_with_count(0))
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::ClosePicker { id } if id == handle.get()
+        ));
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::Action(Action::PrintWarning(message))
+                if message == "No references found"
         ));
     }
 

@@ -4,6 +4,12 @@
     {
       "version": "0.15.0",
       "kind": "introduced",
+      "symbols": ["PrintWarning"],
+      "migration_note": "docs/PLUGIN_API.md#messages"
+    },
+    {
+      "version": "0.15.0",
+      "kind": "introduced",
       "symbols": ["OpenBufferById", "GetEditorInfo.buffers.id"],
       "migration_note": "docs/PLUGIN_API.md#buffer-selection"
     },
