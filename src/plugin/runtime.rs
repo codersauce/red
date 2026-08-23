@@ -4661,10 +4661,14 @@ mod tests {
                 handle,
                 title,
                 items,
-                ..
+                options,
             } => {
                 assert_eq!(owner, "agent");
                 assert_eq!(title.as_deref(), Some(expected_title));
+                if expected_title == "Agent permission" {
+                    assert_eq!(options.item_layout, crate::ui::PickerItemLayout::LabelFirst);
+                    assert!(items.iter().all(|item| item.detail.is_none()));
+                }
                 (handle, items)
             }
             _ => panic!("expected callback-scoped agent picker"),
@@ -13731,6 +13735,160 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn git_log_and_worktree_pickers_prioritize_distinctive_names() {
+        async fn next_git_picker(
+            runtime: &mut Runtime,
+            expected_title: &str,
+        ) -> (PickerHandle, Vec<PickerItem>, PickerOptions) {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                pump_process_events(runtime).await.unwrap();
+                while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
+                    if let PluginRequest::OpenCallbackPicker {
+                        owner,
+                        handle,
+                        title,
+                        items,
+                        options,
+                    } = request
+                    {
+                        assert_eq!(owner, "git");
+                        assert_eq!(title.as_deref(), Some(expected_title));
+                        return (handle, items, options);
+                    }
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "{expected_title} picker did not open"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+
+        drain_requests();
+        let repository = tempfile::tempdir().unwrap();
+        let root = repository.path();
+        let subject = "preserve distinctive commit subjects in picker rows";
+        for args in [
+            vec!["init", "-q", "-b", "main"],
+            vec![
+                "-c",
+                "user.name=Red Tests",
+                "-c",
+                "user.email=red@example.com",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "--allow-empty",
+                "-qm",
+                subject,
+            ],
+        ] {
+            assert!(Command::new("git")
+                .args(args)
+                .current_dir(root)
+                .status()
+                .unwrap()
+                .success());
+        }
+        let mut runtime = load_git_runtime(root).await;
+        drain_requests();
+        let startup_deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            pump_process_events(&mut runtime).await.unwrap();
+            drain_requests();
+            if runtime
+                .inner
+                .lock()
+                .unwrap()
+                .host
+                .process_manager
+                .active_process_count("git")
+                == 0
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < startup_deadline,
+                "Git startup did not settle"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        runtime
+            .notify(
+                "workspace:event:git-dashboard",
+                serde_json::json!({ "action": "l", "row": null }),
+            )
+            .await
+            .unwrap();
+        let (log_handle, commits, options) = next_git_picker(&mut runtime, "Git log").await;
+        assert_eq!(options.item_layout, crate::ui::PickerItemLayout::LabelFirst);
+        assert!(commits.iter().any(|item| item.label.contains(subject)));
+        assert!(runtime
+            .notify_picker(log_handle, PickerCallback::Cancelled)
+            .unwrap());
+
+        runtime
+            .notify(
+                "workspace:event:git-dashboard",
+                serde_json::json!({ "action": "w", "row": null }),
+            )
+            .await
+            .unwrap();
+        let (menu_handle, list_item) = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::OpenCallbackPicker {
+                handle,
+                title,
+                items,
+                options,
+                ..
+            } => {
+                assert_eq!(title.as_deref(), Some("Worktree"));
+                assert_eq!(options.item_layout, crate::ui::PickerItemLayout::Default);
+                (
+                    handle,
+                    items.into_iter().find(|item| item.id == "List").unwrap(),
+                )
+            }
+            _ => panic!("expected worktree action menu"),
+        };
+        assert!(runtime
+            .notify_picker(menu_handle, PickerCallback::Selected(list_item))
+            .unwrap());
+        let (_, worktrees, options) = next_git_picker(&mut runtime, "Worktrees").await;
+        assert_eq!(options.item_layout, crate::ui::PickerItemLayout::LabelFirst);
+        let canonical_root = root.canonicalize().unwrap();
+        let worktree = worktrees
+            .iter()
+            .find(|item| {
+                Path::new(&item.id)
+                    .canonicalize()
+                    .is_ok_and(|path| path == canonical_root)
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "current checkout {canonical_root:?} should appear in worktree rows: {:?}",
+                    worktrees.iter().map(|item| &item.id).collect::<Vec<_>>()
+                )
+            });
+        let expected_search_path = worktree.id.replace('\\', "/");
+        let expected_parent = expected_search_path
+            .rsplit_once('/')
+            .map(|(parent, _)| parent)
+            .unwrap_or_default();
+        assert_eq!(worktree.label, root.file_name().unwrap().to_string_lossy());
+        assert_eq!(worktree.annotation.as_deref(), Some(expected_parent));
+        assert_eq!(
+            worktree
+                .data
+                .get("search_path")
+                .and_then(serde_json::Value::as_str),
+            Some(expected_search_path.as_str())
+        );
+    }
+
     #[cfg(not(windows))]
     #[tokio::test]
     async fn git_push_previews_outgoing_commits_cancels_safely_and_reports_success() {
@@ -17201,6 +17359,7 @@ mod tests {
                 assert_eq!(title.as_deref(), Some("Themes"));
                 assert_eq!(options.initial_selection.as_deref(), Some("custom.json"));
                 assert_eq!(options.presentation, PickerPresentation::Compact);
+                assert_eq!(options.item_layout, crate::ui::PickerItemLayout::LabelFirst);
                 assert_eq!(items[0].label, "Mocha");
                 assert_eq!(items[0].kind.as_deref(), Some("Theme"));
                 assert_eq!(items[1].label, "Custom");
@@ -17567,11 +17726,14 @@ mod tests {
                 handle,
                 title,
                 items,
-                ..
+                options,
             } => {
                 assert_eq!(owner, "lsp_symbols");
                 assert_eq!(title.as_deref(), Some("Document Symbols"));
+                assert_eq!(options.item_layout, crate::ui::PickerItemLayout::LabelFirst);
                 assert_eq!(items[0].label, "main");
+                assert_eq!(items[0].annotation.as_deref(), Some("fn()"));
+                assert_eq!(items[0].detail.as_deref(), Some("5:4"));
                 assert_eq!(items[0].kind.as_deref(), Some("Function"));
                 handle
             }
@@ -17632,6 +17794,7 @@ mod tests {
             } => {
                 assert!(items.is_empty());
                 assert_eq!(options.status.as_deref(), Some("Loading 0/4097 symbols"));
+                assert_eq!(options.item_layout, crate::ui::PickerItemLayout::LabelFirst);
                 handle
             }
             _ => panic!("expected empty document-symbol picker"),
@@ -17673,6 +17836,7 @@ mod tests {
 
         assert_eq!(final_items.len(), 4_096);
         assert_eq!(final_items[4_095].label, "symbol_4095");
+        assert_eq!(final_items[4_095].detail.as_deref(), Some("4096:4"));
         assert_eq!(
             final_status.as_deref(),
             Some("4096 symbols (results truncated)")
@@ -17890,6 +18054,7 @@ mod tests {
                 assert!(items.is_empty());
                 assert_eq!(options.status.as_deref(), Some("Fetching references..."));
                 assert!(options.busy);
+                assert_eq!(options.item_layout, crate::ui::PickerItemLayout::LabelFirst);
                 handle
             }
             _ => panic!("expected references loading picker"),
@@ -17959,7 +18124,15 @@ mod tests {
         }
 
         assert_eq!(final_items.len(), 4_096);
-        assert_eq!(final_items[4_095].label, "src/reference_4095.rs");
+        assert_eq!(final_items[4_095].label, "reference_4095.rs:4096:2");
+        assert_eq!(final_items[4_095].annotation.as_deref(), Some("src"));
+        assert_eq!(
+            final_items[4_095]
+                .data
+                .get("search_path")
+                .and_then(serde_json::Value::as_str),
+            Some("src/reference_4095.rs:4096:2")
+        );
         assert_eq!(
             final_status.as_deref(),
             Some("4096 references (results truncated)")
@@ -18064,6 +18237,7 @@ mod tests {
                 assert_eq!(id, handle.get());
                 assert_eq!(items[0].label, "main");
                 assert_eq!(items[0].kind.as_deref(), Some("Function"));
+                assert_eq!(items[0].detail.as_deref(), Some("src/main.rs:5:4"));
             }
             _ => panic!("unexpected plugin request"),
         }
@@ -18347,7 +18521,15 @@ mod tests {
             PluginRequest::UpdatePickerItems { id, items } => {
                 assert_eq!(id, handle.get());
                 assert_eq!(items.len(), 2);
-                assert_eq!(items[0].label, "src/lib.rs");
+                assert_eq!(items[0].label, "lib.rs:9:3");
+                assert_eq!(items[0].annotation.as_deref(), Some("src"));
+                assert_eq!(
+                    items[0]
+                        .data
+                        .get("search_path")
+                        .and_then(serde_json::Value::as_str),
+                    Some("src/lib.rs:9:3")
+                );
                 items[0].clone()
             }
             _ => panic!("expected reference picker items"),

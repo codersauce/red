@@ -114,6 +114,7 @@ fn open_picker_if_ready() {
         status: status,
         initial_selection: red::string(state().original, ""),
         presentation: "compact",
+        item_layout: "label_first",
     }, ThemePickerHandlers {
         changed: theme_changed,
         cancelled: theme_cancelled,

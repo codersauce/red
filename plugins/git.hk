@@ -2608,6 +2608,15 @@ fn open_items(title: String, items: [PickerItem]) {
     open_menu_picker(title, items, "Filter");
 }
 
+fn open_name_first_items(title: String, items: [PickerItem]) {
+    red::execute("OpenPicker", title, items, PickerOptions {
+        placeholder: "Filter",
+        item_layout: "label_first",
+    }, PickerHandlers {
+        selected: menu_selected,
+    });
+}
+
 fn open_menu_picker(title: String, items: [PickerItem], placeholder: String) {
     red::execute("OpenPicker", title, items, PickerOptions {
         placeholder: placeholder,
@@ -2898,17 +2907,27 @@ fn open_worktree_items(output: String) {
         let line = lines[index];
         if red::starts_with(line, "worktree ") {
             let path = red::slice(line, 9);
+            let normalized = red::replace_all(path, "\\", "/");
+            let parts = red::split(normalized, "/");
+            let name = red::string(parts[red::len(parts) - 1], normalized);
+            let parents = [];
+            let part_index = 0;
+            while part_index < red::len(parts) - 1 {
+                parents = red::push(parents, parts[part_index]);
+                part_index = part_index + 1;
+            }
             items = red::push(items, PickerItem {
                 id: path,
-                label: path,
+                label: name,
                 kind: "GitWorktree",
-                data: Json { menu_kind: "worktrees", value: path },
+                annotation: red::join(parents, "/"),
+                data: Json { menu_kind: "worktrees", value: path, search_path: normalized },
             });
         }
         index = index + 1;
     }
     items = red::push(items, PickerItem { id: "Cancel", label: "Cancel", kind: "Cancel" });
-    open_items("Worktrees", items);
+    open_name_first_items("Worktrees", items);
 }
 
 fn open_log_items(output: String) {
@@ -2926,7 +2945,7 @@ fn open_log_items(output: String) {
             });
         }
     }
-    open_items("Git log", items);
+    open_name_first_items("Git log", items);
 }
 
 fn start_rebase_plan(output: String) {

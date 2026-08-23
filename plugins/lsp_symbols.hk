@@ -299,6 +299,7 @@ fn references() {
         placeholder: "Filter references",
         status: status,
         busy: true,
+        item_layout: "label_first",
     }, PickerHandlers {
         selected: open_reference_selection,
         cancelled: symbol_picker_cancelled,
@@ -363,6 +364,7 @@ fn show_document_symbols(result: SymbolsResult, request_id: i32) {
         let handle = red::execute("OpenPicker", "Document Symbols", items, PickerOptions {
             placeholder: "Filter document symbols",
             status: red::len(items) + " symbols",
+            item_layout: "label_first",
         }, PickerHandlers {
             selected: open_symbol_selection,
             cancelled: symbol_picker_cancelled,
@@ -376,6 +378,7 @@ fn show_document_symbols(result: SymbolsResult, request_id: i32) {
     let handle = red::execute("OpenPicker", "Document Symbols", [], PickerOptions {
         placeholder: "Filter document symbols",
         status: "Loading 0/" + count + " symbols",
+        item_layout: "label_first",
     }, PickerHandlers {
         selected: open_symbol_selection,
         cancelled: symbol_picker_cancelled,
@@ -502,7 +505,7 @@ fn symbol_batch_timeout(event: TimerEvent) {
                 batch = red::push(batch, reference_item(value));
             }
         } else if !workspace_only || is_workspace_symbol_kind(value.kind_name) {
-            batch = red::push(batch, symbol_item(value));
+            batch = red::push(batch, symbol_item(value, workspace_only));
         }
         index = index + 1;
         processed = processed + 1;
@@ -629,22 +632,26 @@ fn symbol_items(symbols: [LspSymbol], workspace_only: bool) -> [PickerItem] {
     let items: [PickerItem] = [];
     for symbol in symbols {
         if !workspace_only || is_workspace_symbol_kind(symbol.kind_name) {
-            items = red::push(items, symbol_item(symbol));
+            items = red::push(items, symbol_item(symbol, workspace_only));
         }
     }
     return items;
 }
 
-fn symbol_item(symbol: LspSymbol) -> PickerItem {
+fn symbol_item(symbol: LspSymbol, workspace: bool) -> PickerItem {
     let line = symbol.selection_range.start.line;
     let character = symbol.selection_range.start.character;
+    let location = (line + 1) + ":" + (character + 1);
+    if workspace {
+        location = symbol.file + ":" + location;
+    }
     return PickerItem {
         id: "symbol:" + symbol.kind_name + ":" + symbol.file + ":" + line + ":" + character + ":" + symbol.name,
         icon: symbol_icon(symbol.kind_name),
         label: symbol.name,
         kind: symbol.kind_name,
         annotation: symbol.detail,
-        detail: symbol.file + ":" + (line + 1) + ":" + (character + 1),
+        detail: location,
         data: Json { symbol: symbol },
         preview: Json { path: symbol.file, line: line, column: character },
     };
@@ -653,13 +660,23 @@ fn symbol_item(symbol: LspSymbol) -> PickerItem {
 fn reference_item(location: LspLocation) -> PickerItem {
     let line = location.range.start.line;
     let character = location.range.start.character;
+    let position = (line + 1) + ":" + (character + 1);
+    let path = red::replace_all(location.file, "\\", "/");
+    let parts = red::split(path, "/");
+    let filename = red::string(parts[red::len(parts) - 1], path);
+    let parents = [];
+    let index = 0;
+    while index < red::len(parts) - 1 {
+        parents = red::push(parents, parts[index]);
+        index = index + 1;
+    }
     return PickerItem {
         id: "reference:" + location.file + ":" + line + ":" + character,
         icon: symbol_icon("Reference"),
-        label: location.file,
+        label: filename + ":" + position,
         kind: "Reference",
-        annotation: ":" + (line + 1) + ":" + (character + 1),
-        data: Json { location: location },
+        annotation: red::join(parents, "/"),
+        data: Json { location: location, search_path: path + ":" + position },
         preview: Json { path: location.file, line: line, column: character },
     };
 }

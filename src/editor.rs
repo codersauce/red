@@ -166,9 +166,9 @@ use crate::{
         AgentComposer, CompletionUI, Component, Confirmation, CopilotSignInDialog,
         CopilotSignInModel, CopilotSignInPhase, DiagnosticInfo, FilePicker, HoverInfo,
         HoverInfoFormat, InlineAssistPopup, InlineAssistPopupState, InputPrompt,
-        LegacyPickerOptions, OverlayLayout, Picker, PickerItem, PickerOptions, PickerPreview,
-        PickerUpdate, ScreenRect, StatuslineLayoutPanel, TutorialDemoKind, TutorialDemoPanel,
-        WelcomePanel, WhatsNewPanel,
+        LegacyPickerOptions, OverlayLayout, Picker, PickerItem, PickerItemLayout, PickerOptions,
+        PickerPreview, PickerUpdate, ScreenRect, StatuslineLayoutPanel, TutorialDemoKind,
+        TutorialDemoPanel, WelcomePanel, WhatsNewPanel,
     },
     undo::{AppliedTextEdit, CursorSnapshot, EditOrigin, RevertEdit, TextPosition, TextRange},
     utils::{expand_user_path, get_workspace_path, normalized_file_path, same_file_path},
@@ -4845,12 +4845,16 @@ impl Editor {
                 PickerItem {
                     id: index.to_string(),
                     icon: None,
-                    label: format!("{}  {}", diagnostic.code, diagnostic.path),
+                    label: diagnostic.message.clone(),
                     kind: Some(format!("{:?}", diagnostic.severity)),
-                    annotation: Some(location),
-                    detail: Some(diagnostic.message.clone()),
+                    annotation: Some(format!("{}  {}", diagnostic.code, diagnostic.path)),
+                    detail: Some(location.clone()),
                     data: serde_json::json!({
                         "fallback": diagnostic.fallback,
+                        "search_text": format!(
+                            "{} {} {} {}",
+                            diagnostic.message, diagnostic.code, diagnostic.path, location
+                        ),
                     }),
                     matches: Vec::new(),
                     detail_matches: Vec::new(),
@@ -4861,6 +4865,8 @@ impl Editor {
         let picker = Picker::builder()
             .title("Configuration diagnostics")
             .structured_items(items)
+            .item_layout(PickerItemLayout::LabelFirst)
+            .filter_action(diagnostics_picker::diagnostic_filter_score)
             .placeholder("Filter configuration problems")
             .history_key("config-diagnostics")
             .select_action(move |item| {
@@ -14251,6 +14257,7 @@ impl Editor {
             .title("Code actions")
             .id(CODE_ACTION_PICKER_ID)
             .structured_items(items)
+            .item_layout(PickerItemLayout::LabelFirst)
             .select_action(move |item| {
                 actions.get(&item).cloned().unwrap_or_else(|| {
                     Action::Print("code action is no longer available".to_string())
@@ -36627,7 +36634,24 @@ builtin = "rust"
 
         editor.open_config_diagnostics();
         assert!(editor.config_diagnostics_acknowledged);
-        assert!(editor.current_dialog.is_some());
+        let dialog = editor.current_dialog.as_mut().unwrap();
+        let mut picker_buffer = RenderBuffer::new(100, 8, &Style::default());
+        dialog.draw(&mut picker_buffer).unwrap();
+        assert!(render_text_rows(&picker_buffer)
+            .join("\n")
+            .contains("unknown configuration field"));
+
+        for character in "CFG101 commands".chars() {
+            dialog.handle_event(&Event::Key(KeyEvent::new(
+                KeyCode::Char(character),
+                KeyModifiers::NONE,
+            )));
+        }
+        let mut filtered = RenderBuffer::new(100, 8, &Style::default());
+        dialog.draw(&mut filtered).unwrap();
+        assert!(render_text_rows(&filtered)
+            .join("\n")
+            .contains("unknown configuration field"));
     }
 
     #[tokio::test]
@@ -42210,7 +42234,7 @@ builtin = "rust"
         let message = InboundMessage::Message(ResponseMessage {
             id: 43,
             result: serde_json::json!([{
-                "title": "Remove unused binding",
+                "title": "Remove unused binding from request handler",
                 "kind": "quickfix",
                 "isPreferred": true,
                 "edit": { "changes": { (uri.clone()): [{
@@ -42238,7 +42262,7 @@ builtin = "rust"
             .unwrap();
         let loaded_frame = render_text_rows(&loaded).join("\n");
         assert!(
-            loaded_frame.contains("Remove unused binding"),
+            loaded_frame.contains("Remove unused binding from request handler"),
             "{loaded_frame}"
         );
         assert!(
@@ -42265,7 +42289,7 @@ builtin = "rust"
                 label,
             }) if documents.len() == 1
                 && expected_revisions == &vec![(documents[0].uri.clone(), revision)]
-                && label == "Remove unused binding"
+                && label == "Remove unused binding from request handler"
         ));
     }
 
