@@ -3737,6 +3737,7 @@ pub struct Editor {
     pending_plugin_references: HashMap<i64, RequestId>,
     pending_plugin_inlay_hints: HashMap<i64, RequestId>,
     pending_lsp_edit_requests: HashMap<i64, PendingLspEdit>,
+    pending_lsp_paste_formats: HashMap<i64, PendingLspEdit>,
     /// LSP request currently owning the visible, cancellable code-action picker.
     pending_code_action_request: Option<i64>,
     pending_lsp_format_saves: HashMap<i64, PendingLspFormatSave>,
@@ -4348,6 +4349,28 @@ struct PendingLspEdit {
     buffer_id: BufferId,
     revision: u64,
     uri: String,
+}
+
+fn changed_char_range(before: &str, after: &str) -> Option<(usize, usize)> {
+    if before == after {
+        return None;
+    }
+    let prefix = before
+        .chars()
+        .zip(after.chars())
+        .take_while(|(before, after)| before == after)
+        .count();
+    let before_len = before.chars().count();
+    let after_len = after.chars().count();
+    let suffix_limit = before_len.min(after_len).saturating_sub(prefix);
+    let suffix = before
+        .chars()
+        .rev()
+        .zip(after.chars().rev())
+        .take(suffix_limit)
+        .take_while(|(before, after)| before == after)
+        .count();
+    Some((prefix, after_len.saturating_sub(suffix)))
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -5213,6 +5236,7 @@ impl Editor {
             pending_plugin_references: HashMap::new(),
             pending_plugin_inlay_hints: HashMap::new(),
             pending_lsp_edit_requests: HashMap::new(),
+            pending_lsp_paste_formats: HashMap::new(),
             pending_code_action_request: None,
             pending_lsp_format_saves: HashMap::new(),
             pending_lsp_revision_snapshots: HashMap::new(),
@@ -14115,6 +14139,38 @@ impl Editor {
         ))
     }
 
+    fn paste_formatting_action(&mut self, response: &ResponseMessage) -> Option<Action> {
+        let pending = self.pending_lsp_paste_formats.remove(&response.id)?;
+        if !self.pending_lsp_edit_is_current(&pending) || response.result.is_null() {
+            return None;
+        }
+        let edits = match serde_json::from_value::<Vec<LspTextEdit>>(response.result.clone()) {
+            Ok(edits) if !edits.is_empty() => edits,
+            Ok(_) => return None,
+            Err(error) => {
+                log!("invalid LSP paste formatting response: {error}");
+                return None;
+            }
+        };
+        let uri = pending.uri;
+        Some(self.workspace_edit_action(
+            vec![LspWorkspaceEditOperation::Document {
+                edit: LspDocumentEdit {
+                    uri: uri.clone(),
+                    version: None,
+                    edits,
+                },
+            }],
+            vec![(uri, pending.revision)],
+            None,
+            "format pasted text".to_string(),
+            None,
+            None,
+            None,
+            None,
+        ))
+    }
+
     fn code_action_loading_picker(&self) -> Picker {
         let mut picker = Picker::builder()
             .title("Code actions")
@@ -14694,6 +14750,10 @@ impl Editor {
                         return self.formatting_action(msg);
                     }
 
+                    if method == "textDocument/rangeFormatting" {
+                        return self.paste_formatting_action(msg);
+                    }
+
                     if method == "textDocument/codeAction" {
                         return self.code_action_picker(msg);
                     }
@@ -14835,6 +14895,11 @@ impl Editor {
             InboundMessage::Error(error_msg) => {
                 log!("got an error: {error_msg:?}");
                 let id = error_msg.id?;
+                if method.as_deref() == Some("textDocument/rangeFormatting")
+                    && self.pending_lsp_paste_formats.remove(&id).is_some()
+                {
+                    return None;
+                }
                 if method.as_deref() == Some("textDocument/signatureHelp") {
                     return self.signature_help_error(id);
                 }
@@ -14930,6 +14995,12 @@ impl Editor {
                 None
             }
             InboundMessage::RequestError { id, error } => {
+                if method.as_deref() == Some("textDocument/rangeFormatting")
+                    && self.pending_lsp_paste_formats.remove(id).is_some()
+                {
+                    log!("paste formatting request failed: {error}");
+                    return None;
+                }
                 if method.as_deref() == Some("textDocument/signatureHelp") {
                     return self.signature_help_error(*id);
                 }
@@ -22808,11 +22879,15 @@ impl Editor {
             }
             Action::Paste | Action::PasteBefore => {
                 log!("pasting selection");
-                if self.is_visual() && self.selection.is_some() {
-                    if self.paste_over_selection(*action == Action::PasteBefore) {
-                        self.notify_change(runtime).await?;
-                    }
-                } else if self.paste_default(*action == Action::PasteBefore) {
+                let before = self.current_buffer().contents();
+                let pasted = if self.is_visual() && self.selection.is_some() {
+                    self.paste_over_selection(*action == Action::PasteBefore)
+                } else {
+                    self.paste_default(*action == Action::PasteBefore)
+                };
+                if pasted {
+                    self.notify_change(runtime).await?;
+                    self.request_format_on_paste(&before).await;
                     self.render(buffer)?;
                 }
             }
@@ -22860,8 +22935,10 @@ impl Editor {
                 self.render_edited_window_rows(buffer)?;
             }
             Action::InsertPastedText(text) => {
+                let before = self.current_buffer().contents();
                 if self.insert_at_multi_cursors(text) {
                     self.publish_multi_cursor_edit(buffer, runtime).await?;
+                    self.request_format_on_paste(&before).await;
                     return Ok(false);
                 }
                 let line = self.buffer_line();
@@ -22881,6 +22958,7 @@ impl Editor {
                     self.commit_transaction(self.cursor_snapshot());
                 }
                 self.notify_change(runtime).await?;
+                self.request_format_on_paste(&before).await;
                 self.render(buffer)?;
             }
             Action::RequestCompletion => {
@@ -29528,6 +29606,56 @@ impl Editor {
         Box::pin(self.format_document_action_impl(buffer, runtime))
     }
 
+    async fn request_format_on_paste(&mut self, before: &str) {
+        if !self.config.formatting.on_paste
+            || !self.config.lsp.enabled
+            || self.config.formatting.provider == FormattingProvider::External
+        {
+            return;
+        }
+        let Some(file) = self.current_buffer().file.clone() else {
+            return;
+        };
+        let after = self.current_buffer().contents();
+        let Some((start, end)) = changed_char_range(before, &after) else {
+            return;
+        };
+        if let Err(error) = self.ensure_current_buffer_lsp_opened().await {
+            log!("could not open LSP document for paste formatting: {error}");
+            return;
+        }
+        if self.lsp.server_capabilities_for_file(&file).is_some()
+            && !self.lsp.supports_range_formatting(&file)
+        {
+            return;
+        }
+        let source = self.current_buffer();
+        let range = Range {
+            start: source.position_to_lsp(source.char_idx_to_position(start)),
+            end: source.position_to_lsp(source.char_idx_to_position(end)),
+        };
+        let Some(uri) = source.uri().ok().flatten() else {
+            return;
+        };
+        let pending = PendingLspEdit {
+            buffer_id: source.id(),
+            revision: source.revision(),
+            uri,
+        };
+        let indentation = self.indentation();
+        match self
+            .lsp
+            .format_range_with_options(&file, range, indentation.tab_width, indentation.expand_tab)
+            .await
+        {
+            Ok(request_id) if request_id > 0 => {
+                self.pending_lsp_paste_formats.insert(request_id, pending);
+            }
+            Ok(_) => {}
+            Err(error) => log!("paste formatting request failed: {error}"),
+        }
+    }
+
     async fn format_document_action_impl(
         &mut self,
         buffer: &mut RenderBuffer,
@@ -31687,6 +31815,15 @@ mod test {
     use super::*;
     use crate::lsp::DiagnosticSeverity;
     use std::path::PathBuf;
+
+    #[test]
+    fn changed_char_range_bounds_insertions_replacements_and_unicode() {
+        assert_eq!(changed_char_range("abc", "abc"), None);
+        assert_eq!(changed_char_range("abc", "aXYZbc"), Some((1, 4)));
+        assert_eq!(changed_char_range("abc", "ac"), Some((1, 1)));
+        assert_eq!(changed_char_range("a😀c", "aλ😀c"), Some((1, 2)));
+        assert_eq!(changed_char_range("same", "same tail"), Some((4, 9)));
+    }
 
     #[test]
     fn unit_test_editors_disable_system_clipboard() {
@@ -42290,6 +42427,200 @@ builtin = "rust"
             .last_error
             .as_deref()
             .is_some_and(|error| error.contains("stale")));
+    }
+
+    #[test]
+    fn paste_formatting_response_creates_revision_checked_workspace_edit() {
+        let path = std::env::temp_dir().join("red-paste-format.rs");
+        let mut editor = lsp_test_editor(vec![Buffer::new(
+            Some(path.to_string_lossy().into_owned()),
+            "let value=1;".to_string(),
+        )]);
+        let uri = editor.buffer_manager[0].uri().unwrap().unwrap();
+        let revision = editor.buffer_manager[0].revision();
+        editor.pending_lsp_paste_formats.insert(
+            43,
+            PendingLspEdit {
+                buffer_id: editor.buffer_manager[0].id(),
+                revision,
+                uri: uri.clone(),
+            },
+        );
+        let message = InboundMessage::Message(ResponseMessage {
+            id: 43,
+            result: serde_json::to_value(vec![lsp_edit((0, 9), (0, 9), " ")]).unwrap(),
+            request: Some(crate::lsp::Request::new(
+                "textDocument/rangeFormatting",
+                serde_json::json!({ "textDocument": { "uri": uri } }),
+            )),
+        });
+
+        let action =
+            editor.handle_lsp_message(&message, Some("textDocument/rangeFormatting".to_string()));
+
+        assert!(matches!(
+            action,
+            Some(Action::ApplyLspWorkspaceEdit {
+                documents,
+                expected_revisions,
+                command: None,
+                label,
+            }) if documents.len() == 1
+                && expected_revisions == vec![(documents[0].uri.clone(), revision)]
+                && label == "format pasted text"
+        ));
+        assert!(editor.pending_lsp_paste_formats.is_empty());
+    }
+
+    #[test]
+    fn stale_paste_formatting_response_is_silently_rejected() {
+        let path = std::env::temp_dir().join("red-stale-paste-format.rs");
+        let mut editor = lsp_test_editor(vec![Buffer::new(
+            Some(path.to_string_lossy().into_owned()),
+            "value".to_string(),
+        )]);
+        let uri = editor.buffer_manager[0].uri().unwrap().unwrap();
+        let revision = editor.buffer_manager[0].revision();
+        editor.pending_lsp_paste_formats.insert(
+            44,
+            PendingLspEdit {
+                buffer_id: editor.buffer_manager[0].id(),
+                revision,
+                uri: uri.clone(),
+            },
+        );
+        editor.buffer_manager[0]
+            .replace_range_raw(TextRange::insertion(TextPosition::new(0, 0)), "dirty ");
+        let message = InboundMessage::Message(ResponseMessage {
+            id: 44,
+            result: serde_json::to_value(vec![lsp_edit((0, 0), (0, 5), "formatted")]).unwrap(),
+            request: Some(crate::lsp::Request::new(
+                "textDocument/rangeFormatting",
+                serde_json::json!({ "textDocument": { "uri": uri } }),
+            )),
+        });
+
+        let action =
+            editor.handle_lsp_message(&message, Some("textDocument/rangeFormatting".to_string()));
+
+        assert!(action.is_none());
+        assert_eq!(editor.buffer_manager[0].contents(), "dirty value");
+        assert!(editor.last_error.is_none());
+        assert!(editor.pending_lsp_paste_formats.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pasted_text_is_formatted_by_a_range_capable_language_server() {
+        let root = tempfile::tempdir().unwrap();
+        let server = root.path().join("paste-formatter.py");
+        let request = root.path().join("range-format-request.json");
+        std::fs::write(root.path().join(".red-root"), "").unwrap();
+        std::fs::write(
+            &server,
+            r#"
+import json
+import pathlib
+import sys
+
+request_path = pathlib.Path(sys.argv[1])
+
+def read_message():
+    headers = {}
+    while True:
+        line = sys.stdin.buffer.readline()
+        if not line:
+            return None
+        if line in (b"\r\n", b"\n"):
+            break
+        key, value = line.decode().split(":", 1)
+        headers[key.lower()] = value.strip()
+    return json.loads(sys.stdin.buffer.read(int(headers["content-length"])))
+
+def send(message):
+    body = json.dumps(message).encode()
+    sys.stdout.buffer.write(b"Content-Length: %d\r\n\r\n" % len(body) + body)
+    sys.stdout.buffer.flush()
+
+while True:
+    message = read_message()
+    if message is None:
+        break
+    method = message.get("method")
+    if method == "initialize":
+        send({"jsonrpc": "2.0", "id": message["id"], "result": {"capabilities": {"documentRangeFormattingProvider": True}}})
+    elif method == "textDocument/rangeFormatting":
+        request_path.write_text(json.dumps(message["params"]))
+        send({"jsonrpc": "2.0", "id": message["id"], "result": [{"range": message["params"]["range"], "newText": "let value = 1;"}]})
+"#,
+        )
+        .unwrap();
+        let path = root.path().join("paste.rs");
+        let mut config = Config::default();
+        config.lsp.enabled = true;
+        config.lsp.servers = HashMap::from([(
+            "paste-formatter".to_string(),
+            crate::config::LanguageServerConfig {
+                command: "python3".to_string(),
+                args: vec![
+                    server.to_string_lossy().into_owned(),
+                    request.to_string_lossy().into_owned(),
+                ],
+                language_id: "rust".to_string(),
+                file_extensions: vec!["rs".to_string()],
+                filenames: Vec::new(),
+                documents: Vec::new(),
+                root_markers: vec![".red-root".to_string()],
+                env: HashMap::new(),
+                initialization_options: None,
+                settings: None,
+                workspace_name: None,
+            },
+        )]);
+        let lsp = Box::new(crate::lsp::LspManager::new(config.lsp.clone()));
+        let mut editor = Editor::with_size(
+            lsp,
+            60,
+            12,
+            config,
+            Theme::default(),
+            vec![Buffer::new(
+                Some(path.to_string_lossy().into_owned()),
+                String::new(),
+            )],
+        )
+        .unwrap();
+        editor.test_disable_terminal_output();
+
+        editor
+            .test_execute_production_action(Action::InsertPastedText("let value=1;".to_string()))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while editor.current_buffer().contents() != "let value = 1;" {
+                if let Some((message, method)) = editor.lsp.recv_response().await.unwrap() {
+                    if let Some(action) = editor.handle_lsp_message(&message, method) {
+                        editor.test_execute_production_action(action).await.unwrap();
+                    }
+                } else {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            }
+        })
+        .await
+        .expect("paste formatting response should be applied");
+
+        let request: Value =
+            serde_json::from_str(&std::fs::read_to_string(request).unwrap()).unwrap();
+        assert_eq!(
+            request["range"],
+            json!({
+                "start": { "line": 0, "character": 0 },
+                "end": { "line": 0, "character": 12 }
+            })
+        );
+        assert_eq!(editor.current_buffer().contents(), "let value = 1;");
+        assert!(editor.pending_lsp_paste_formats.is_empty());
     }
 
     #[test]

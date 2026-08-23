@@ -371,6 +371,16 @@ pub trait LspClient: std::any::Any + Send {
     ) -> Result<i64, LspError> {
         self.format_document(file).await
     }
+    /// Requests formatting for one document range with explicit indentation options.
+    async fn format_range_with_options(
+        &mut self,
+        _file: &str,
+        _range: Range,
+        _tab_size: usize,
+        _insert_spaces: bool,
+    ) -> Result<i64, LspError> {
+        Ok(0)
+    }
     /// Requests the symbol hierarchy for a document.
     async fn document_symbols(&mut self, file: &str) -> Result<i64, LspError>;
     /// Requests actions applicable to a range and its known diagnostics.
@@ -522,6 +532,11 @@ pub trait LspClient: std::any::Any + Send {
     /// Reports whether the server associated with `file` supports formatting.
     fn supports_document_formatting(&self, _file: &str) -> bool {
         true
+    }
+
+    /// Reports whether the server associated with `file` supports range formatting.
+    fn supports_range_formatting(&self, _file: &str) -> bool {
+        false
     }
 
     /// Returns the most recently published LSP document version.

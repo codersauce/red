@@ -737,6 +737,21 @@ impl LspClient for LspManager {
         Ok(0)
     }
 
+    async fn format_range_with_options(
+        &mut self,
+        file: &str,
+        range: Range,
+        tab_size: usize,
+        insert_spaces: bool,
+    ) -> Result<i64, LspError> {
+        if let Some(client) = self.client_for_file(file).await? {
+            return client
+                .format_range_with_options(file, range, tab_size, insert_spaces)
+                .await;
+        }
+        Ok(0)
+    }
+
     async fn document_symbols(&mut self, file: &str) -> Result<i64, LspError> {
         if let Some(client) = self.client_for_file(file).await? {
             return client.document_symbols(file).await;
@@ -1032,6 +1047,21 @@ impl LspClient for LspManager {
         self.clients
             .get(&client_key(&document))
             .is_some_and(|client| client.supports_document_formatting(file))
+    }
+
+    fn supports_range_formatting(&self, file: &str) -> bool {
+        if let Some(key) = self.document_clients.get(file) {
+            return self
+                .clients
+                .get(key)
+                .is_some_and(|client| client.supports_range_formatting(file));
+        }
+        let Some(document) = self.resolve_document(file) else {
+            return false;
+        };
+        self.clients
+            .get(&client_key(&document))
+            .is_some_and(|client| client.supports_range_formatting(file))
     }
 
     fn document_version(&self, file: &str) -> Option<i64> {

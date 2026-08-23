@@ -1692,6 +1692,31 @@ impl LspClient for RealLspClient {
             .await
     }
 
+    async fn format_range_with_options(
+        &mut self,
+        file: &str,
+        range: Range,
+        tab_size: usize,
+        insert_spaces: bool,
+    ) -> Result<i64, LspError> {
+        let params = json!({
+            "textDocument": {
+                "uri": file_uri(file)?,
+            },
+            "range": range,
+            "options": {
+                "tabSize": tab_size,
+                "insertSpaces": insert_spaces,
+                "trimTrailingWhitespace": true,
+                "insertFinalNewline": false,
+                "trimFinalNewlines": false
+            }
+        });
+
+        self.send_request("textDocument/rangeFormatting", params, false)
+            .await
+    }
+
     async fn document_symbols(&mut self, file: &str) -> Result<i64, LspError> {
         let params = json!({
             "textDocument": {
@@ -1908,6 +1933,18 @@ impl LspClient for RealLspClient {
             Some(
                 DocumentFormattingProviderCapability::Simple(true)
                     | DocumentFormattingProviderCapability::Options(_)
+            )
+        )
+    }
+
+    fn supports_range_formatting(&self, _file: &str) -> bool {
+        matches!(
+            self.server_capabilities.as_ref().and_then(|capabilities| {
+                capabilities.document_range_formatting_provider.as_ref()
+            }),
+            Some(
+                DocumentRangeFormattingProviderCapability::Simple(true)
+                    | DocumentRangeFormattingProviderCapability::Options(_)
             )
         )
     }
@@ -2719,6 +2756,10 @@ mod test {
             .await
             .unwrap();
         client
+            .format_range_with_options(path.as_ref(), range.clone(), 2, true)
+            .await
+            .unwrap();
+        client
             .code_action(path.as_ref(), range.clone(), vec![diagnostic])
             .await
             .unwrap();
@@ -2732,6 +2773,22 @@ mod test {
         assert_eq!(formatting.params["textDocument"]["uri"], uri);
         assert_eq!(formatting.params["options"]["tabSize"], json!(2));
         assert_eq!(formatting.params["options"]["insertSpaces"], json!(true));
+
+        let Some(OutboundMessage::Request(range_formatting)) = request_rx.recv().await else {
+            panic!("expected range-formatting request");
+        };
+        assert_eq!(range_formatting.method, "textDocument/rangeFormatting");
+        assert_eq!(range_formatting.params["textDocument"]["uri"], uri);
+        assert_eq!(range_formatting.params["range"], json!(range));
+        assert_eq!(range_formatting.params["options"]["tabSize"], json!(2));
+        assert_eq!(
+            range_formatting.params["options"]["insertSpaces"],
+            json!(true)
+        );
+        assert_eq!(
+            range_formatting.params["options"]["insertFinalNewline"],
+            json!(false)
+        );
 
         let Some(OutboundMessage::Request(code_action)) = request_rx.recv().await else {
             panic!("expected code-action request");
