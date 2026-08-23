@@ -367,6 +367,8 @@ Esc = { EnterMode = "Normal" }
 # "_" = "SplitVertical"
 "Ctrl-p" = "FilePicker"
 "Ctrl-n" = "SelectNextOccurrence"
+"Ctrl-Up" = "AddCursorUp"
+"Ctrl-Down" = "AddCursorDown"
 "Ctrl-Shift-p" = "CommandPalette"
 "Alt-a" = { PluginCommand = "AgentToggle" }
 "Alt-x" = "CommandPalette"

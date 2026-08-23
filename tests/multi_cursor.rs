@@ -17,6 +17,100 @@ async fn key(harness: &mut EditorHarness, code: KeyCode, modifiers: KeyModifiers
 }
 
 #[tokio::test]
+async fn ctrl_down_skips_shorter_lines_and_inserts_at_each_vertical_cursor() {
+    let config: Config = toml::from_str(include_str!("../default_config.toml")).unwrap();
+    let buffer = Buffer::new(None, "abcdef\nab\n\nabcdef".to_string());
+    let mut harness = EditorHarness::with_config(buffer, config);
+    harness.execute_action(Action::MoveTo(4, 0)).await.unwrap();
+
+    key(&mut harness, KeyCode::Down, KeyModifiers::CONTROL).await;
+
+    assert!(harness.statusline_row().contains("MULTI 2/2"));
+    harness.assert_cursor_at(4, 3);
+
+    key(&mut harness, KeyCode::Char('i'), KeyModifiers::NONE).await;
+    harness.type_text("X").await.unwrap();
+    key(&mut harness, KeyCode::Esc, KeyModifiers::NONE).await;
+
+    harness.assert_buffer_contents("abcdXef\nab\n\nabcdXef");
+    harness.execute_action(Action::Undo).await.unwrap();
+    harness.assert_buffer_contents("abcdef\nab\n\nabcdef");
+}
+
+#[tokio::test]
+async fn vertical_cursor_direction_changes_activate_existing_cursors_before_adding() {
+    let config: Config = toml::from_str(include_str!("../default_config.toml")).unwrap();
+    let buffer = Buffer::new(None, "abcd\nabcd\nabcd\nabcd".to_string());
+    let mut harness = EditorHarness::with_config(buffer, config);
+    harness.execute_action(Action::MoveTo(2, 2)).await.unwrap();
+    harness.assert_cursor_at(2, 1);
+
+    key(&mut harness, KeyCode::Down, KeyModifiers::CONTROL).await;
+    harness.assert_cursor_at(2, 2);
+    key(&mut harness, KeyCode::Up, KeyModifiers::CONTROL).await;
+    harness.assert_cursor_at(2, 1);
+    assert!(harness.statusline_row().contains("MULTI 1/2"));
+    key(&mut harness, KeyCode::Up, KeyModifiers::CONTROL).await;
+
+    harness.assert_cursor_at(2, 0);
+    assert!(harness.statusline_row().contains("MULTI 1/3"));
+}
+
+#[tokio::test]
+async fn ctrl_up_orders_cursors_by_document_position() {
+    let config: Config = toml::from_str(include_str!("../default_config.toml")).unwrap();
+    let buffer = Buffer::new(None, "abcd\nabcd".to_string());
+    let mut harness = EditorHarness::with_config(buffer, config);
+    harness.execute_action(Action::MoveTo(2, 2)).await.unwrap();
+
+    key(&mut harness, KeyCode::Up, KeyModifiers::CONTROL).await;
+
+    harness.assert_cursor_at(2, 0);
+    assert!(harness.statusline_row().contains("MULTI 1/2"));
+}
+
+#[tokio::test]
+async fn vertical_cursors_include_empty_lines_at_column_zero() {
+    let config: Config = toml::from_str(include_str!("../default_config.toml")).unwrap();
+    let buffer = Buffer::new(None, "a\n\nb".to_string());
+    let mut harness = EditorHarness::with_config(buffer, config);
+
+    key(&mut harness, KeyCode::Down, KeyModifiers::CONTROL).await;
+    harness.assert_cursor_at(0, 1);
+    key(&mut harness, KeyCode::Down, KeyModifiers::CONTROL).await;
+
+    harness.assert_cursor_at(0, 2);
+    assert!(harness.statusline_row().contains("MULTI 3/3"));
+}
+
+#[tokio::test]
+async fn vertical_cursors_preserve_display_columns_across_tabs_and_spaces() {
+    let config: Config = toml::from_str(include_str!("../default_config.toml")).unwrap();
+    let buffer = Buffer::new(None, "\tabc\n    abc\n\tabc".to_string());
+    let mut harness = EditorHarness::with_config(buffer, config);
+    harness.execute_action(Action::MoveTo(1, 0)).await.unwrap();
+
+    key(&mut harness, KeyCode::Down, KeyModifiers::CONTROL).await;
+    harness.assert_cursor_at(4, 1);
+    key(&mut harness, KeyCode::Down, KeyModifiers::CONTROL).await;
+
+    harness.assert_cursor_at(1, 2);
+    assert!(harness.statusline_row().contains("MULTI 3/3"));
+}
+
+#[tokio::test]
+async fn vertical_cursor_at_a_document_boundary_is_a_noop() {
+    let config: Config = toml::from_str(include_str!("../default_config.toml")).unwrap();
+    let buffer = Buffer::new(None, "only line".to_string());
+    let mut harness = EditorHarness::with_config(buffer, config);
+
+    key(&mut harness, KeyCode::Down, KeyModifiers::CONTROL).await;
+
+    assert!(!harness.statusline_row().contains("MULTI"));
+    harness.assert_cursor_at(0, 0);
+}
+
+#[tokio::test]
 async fn ctrl_n_change_types_at_each_selected_occurrence_as_one_undo() {
     let config: Config = toml::from_str(include_str!("../default_config.toml")).unwrap();
     let buffer = Buffer::new(None, "foo foo foo_bar foo".to_string());

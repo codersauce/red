@@ -2506,6 +2506,8 @@ pub enum Action {
     ClearSearchHighlight,
     SearchWordUnderCursor,
     SelectNextOccurrence,
+    AddCursorUp,
+    AddCursorDown,
     #[serde(skip)]
     SelectPreviousOccurrence,
     #[serde(skip)]
@@ -17268,6 +17270,7 @@ impl Editor {
                         return Some(KeyAction::Single(Action::YankMultiSelection));
                     }
                     (KeyCode::Char('n'), KeyModifiers::CONTROL) => {}
+                    (KeyCode::Up | KeyCode::Down, KeyModifiers::CONTROL) => {}
                     (KeyCode::Char('n'), KeyModifiers::NONE)
                         if self.can_navigate_multi_cursor_occurrences() =>
                     {
@@ -21484,6 +21487,16 @@ impl Editor {
             Action::SelectNextOccurrence => {
                 add_to_history = false;
                 self.select_next_occurrence();
+                self.render(buffer)?;
+            }
+            Action::AddCursorUp => {
+                add_to_history = false;
+                self.add_vertical_cursor(multi_cursor::VerticalCursorDirection::Up);
+                self.render(buffer)?;
+            }
+            Action::AddCursorDown => {
+                add_to_history = false;
+                self.add_vertical_cursor(multi_cursor::VerticalCursorDirection::Down);
                 self.render(buffer)?;
             }
             Action::SelectPreviousOccurrence => {

@@ -72,6 +72,8 @@ impl Editor {
                         | Mode::VisualBlock
                 ) | Action::RepeatLastChange
                     | Action::SelectNextOccurrence
+                    | Action::AddCursorUp
+                    | Action::AddCursorDown
                     | Action::SelectPreviousOccurrence
                     | Action::SkipMultiSelection
                     | Action::RemoveActiveMultiSelection

@@ -1,11 +1,20 @@
 use crate::{
     buffer::BufferId,
     editing::{CharRange, SelectionSet},
-    undo::TextRange,
+    undo::{TextPosition, TextRange},
+    unicode_utils::{
+        column_to_grapheme_with_tabs, grapheme_len, grapheme_to_column_with_tabs, trim_line_ending,
+    },
     window::WindowId,
 };
 
 use super::{Content, ContentKind, Editor};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum VerticalCursorDirection {
+    Up,
+    Down,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum MultiCursorPhase {
@@ -120,6 +129,112 @@ impl Editor {
         }
 
         self.move_to_active_multi_cursor(false);
+    }
+
+    pub(super) fn add_vertical_cursor(&mut self, direction: VerticalCursorDirection) {
+        let compatible_session = self.multi_cursor.as_ref().is_some_and(|session| {
+            session.belongs_to(self)
+                && session.phase == MultiCursorPhase::Selecting
+                && session
+                    .selections
+                    .ranges()
+                    .iter()
+                    .all(|range| range.is_empty())
+        });
+        if self.has_multi_cursor_session() && !compatible_session {
+            return;
+        }
+
+        let (origin, origin_line, display_column) = if compatible_session {
+            let session = self
+                .multi_cursor
+                .as_ref()
+                .expect("compatible session was checked above");
+            let origin = session.selections.active_range();
+            let origin_line = self
+                .current_buffer()
+                .char_idx_to_position(origin.start)
+                .line;
+            let display_column = self.current_cursor_display_col();
+            (origin, origin_line, display_column)
+        } else {
+            let position = self.cursor_text_position();
+            let index = self.current_buffer().position_to_char_idx(position);
+            (
+                CharRange::new(index, index),
+                position.line,
+                self.current_cursor_display_col(),
+            )
+        };
+
+        let Some(target) = self.vertical_cursor_target(origin_line, display_column, direction)
+        else {
+            return;
+        };
+
+        if compatible_session {
+            let session = self
+                .multi_cursor
+                .as_mut()
+                .expect("compatible session was checked above");
+            session.selections.add_or_activate(target);
+        } else {
+            let buffer_id = self.current_buffer().id();
+            let Some(window_id) = self.window_manager.active_stable_window_id() else {
+                return;
+            };
+            let revision = self.current_buffer().revision();
+            let Some(selections) = SelectionSet::from_ranges(vec![origin, target], 1) else {
+                return;
+            };
+            self.multi_cursor = Some(MultiCursorSession {
+                buffer_id,
+                window_id,
+                revision,
+                phase: MultiCursorPhase::Selecting,
+                selections,
+            });
+        }
+
+        self.move_to_active_multi_cursor(false);
+    }
+
+    fn vertical_cursor_target(
+        &self,
+        origin_line: usize,
+        display_column: usize,
+        direction: VerticalCursorDirection,
+    ) -> Option<CharRange> {
+        let last_line = self.current_buffer().len();
+        let tab_width = self.active_tab_width();
+        let mut line_index = origin_line;
+
+        loop {
+            line_index = match direction {
+                VerticalCursorDirection::Up => line_index.checked_sub(1)?,
+                VerticalCursorDirection::Down => {
+                    if line_index >= last_line {
+                        return None;
+                    }
+                    line_index + 1
+                }
+            };
+            let line = self.current_buffer().get(line_index)?;
+            let line = trim_line_ending(&line);
+            let grapheme = column_to_grapheme_with_tabs(line, display_column, tab_width);
+            let exact_column =
+                grapheme_to_column_with_tabs(line, grapheme, tab_width) == display_column;
+            let cursor_exists = display_column == 0 || grapheme < grapheme_len(line);
+            if !exact_column || !cursor_exists {
+                continue;
+            }
+
+            let character = self.grapheme_to_char_on_line(grapheme, line_index);
+            let index = self
+                .current_buffer()
+                .position_to_char_idx(TextPosition::new(line_index, character));
+            return Some(CharRange::new(index, index));
+        }
     }
 
     pub(super) fn select_previous_occurrence(&mut self) {

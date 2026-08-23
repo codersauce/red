@@ -3876,6 +3876,20 @@ enabled_codex_features = ["apps", "plugins", "orchestrator_mcp"]
     }
 
     #[test]
+    fn default_config_maps_ctrl_arrows_to_vertical_cursors() {
+        let config: Config = toml::from_str(include_str!("../default_config.toml")).unwrap();
+
+        assert_eq!(
+            config.keys.normal.get("Ctrl-Up"),
+            Some(&KeyAction::Single(Action::AddCursorUp))
+        );
+        assert_eq!(
+            config.keys.normal.get("Ctrl-Down"),
+            Some(&KeyAction::Single(Action::AddCursorDown))
+        );
+    }
+
+    #[test]
     fn default_config_maps_shift_d_to_line_diagnostics() {
         let config: Config = toml::from_str(include_str!("../default_config.toml")).unwrap();
 

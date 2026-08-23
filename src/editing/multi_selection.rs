@@ -38,6 +38,25 @@ enum TraversalDirection {
 }
 
 impl SelectionSet {
+    /// Creates a selection set from explicit ranges and activates `active`.
+    pub(crate) fn from_ranges(mut ranges: Vec<CharRange>, active: usize) -> Option<Self> {
+        if ranges.is_empty() {
+            return None;
+        }
+        let active_range = ranges[active.min(ranges.len() - 1)];
+        ranges.sort_by_key(|range| range.start);
+        let active_candidate = ranges
+            .iter()
+            .position(|range| *range == active_range)
+            .unwrap_or(0);
+        Some(Self {
+            candidates: ranges.clone(),
+            selections: ranges,
+            active_candidate,
+            direction: TraversalDirection::Forward,
+        })
+    }
+
     /// Selects the exact keyword run or single punctuation/whitespace scalar under `cursor`.
     pub(crate) fn from_cursor(
         buffer: &Buffer,
@@ -196,6 +215,20 @@ impl SelectionSet {
         self.candidates = ranges.clone();
         self.selections = ranges;
         self.active_candidate = active.min(self.candidates.len().saturating_sub(1));
+    }
+
+    /// Adds `range` in document order, or activates it if it already exists.
+    pub(crate) fn add_or_activate(&mut self, range: CharRange) {
+        if !self.selections.contains(&range) {
+            self.selections.push(range);
+            self.selections.sort_by_key(|candidate| candidate.start);
+            self.candidates = self.selections.clone();
+        }
+        self.active_candidate = self
+            .candidates
+            .iter()
+            .position(|candidate| *candidate == range)
+            .expect("added ranges must remain candidates");
     }
 
     pub(crate) fn text_ranges(&self, buffer: &Buffer) -> Vec<TextRange> {
