@@ -4931,6 +4931,8 @@ mod tests {
         serde_json::json!({
             "ok": true,
             "symbols": [{
+                "id": "root:0:main",
+                "parent_id": null,
                 "name": "main",
                 "detail": "fn()",
                 "kind": 12,
@@ -4953,6 +4955,8 @@ mod tests {
         let symbols = (0..count)
             .map(|index| {
                 serde_json::json!({
+                    "id": format!("root:{index}:symbol_{index}"),
+                    "parent_id": null,
                     "name": format!("symbol_{index}"),
                     "detail": "fn()",
                     "kind": 12,
@@ -17735,6 +17739,12 @@ mod tests {
                 assert_eq!(items[0].annotation.as_deref(), Some("fn()"));
                 assert_eq!(items[0].detail.as_deref(), Some("5:4"));
                 assert_eq!(items[0].kind.as_deref(), Some("Function"));
+                assert_eq!(items[0].data["tree"], true);
+                assert_eq!(items[0].data["symbol"]["id"], "root:0:main");
+                assert_eq!(
+                    items[0].data["symbol"]["parent_id"],
+                    serde_json::Value::Null
+                );
                 handle
             }
             _ => panic!("unexpected plugin request"),
@@ -17743,6 +17753,42 @@ mod tests {
             runtime.picker_plugin(handle).as_deref(),
             Some("lsp_symbols")
         );
+    }
+
+    #[tokio::test]
+    async fn lsp_document_symbols_preserve_nested_picker_tree_metadata() {
+        drain_requests();
+        let mut runtime = Runtime::new();
+        load_lsp_symbols(&mut runtime).await;
+
+        runtime.execute_command("LspDocumentSymbols").await.unwrap();
+        let request_id = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::DocumentSymbols { request_id, .. } => request_id,
+            _ => panic!("expected document-symbol request"),
+        };
+        let mut payload = sample_symbol_payload();
+        let mut child = payload["symbols"][0].clone();
+        child["id"] = serde_json::json!("root:0:main:0:helper");
+        child["parent_id"] = serde_json::json!("root:0:main");
+        child["name"] = serde_json::json!("helper");
+        child["depth"] = serde_json::json!(1);
+        child["selection_range"]["start"]["line"] = serde_json::json!(12);
+        payload["symbols"].as_array_mut().unwrap().push(child);
+
+        runtime.resolve_request(request_id, payload).await.unwrap();
+        match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::OpenCallbackPicker { items, .. } => {
+                assert_eq!(items.len(), 2);
+                assert_eq!(items[0].data["tree"], true);
+                assert_eq!(items[0].data["symbol"]["id"], "root:0:main");
+                assert_eq!(items[1].label, "helper");
+                assert_eq!(items[1].detail.as_deref(), Some("13:4"));
+                assert_eq!(items[1].data["tree"], true);
+                assert_eq!(items[1].data["symbol"]["id"], "root:0:main:0:helper");
+                assert_eq!(items[1].data["symbol"]["parent_id"], "root:0:main");
+            }
+            _ => panic!("expected hierarchical document-symbol picker"),
+        }
     }
 
     #[tokio::test]
@@ -18238,6 +18284,7 @@ mod tests {
                 assert_eq!(items[0].label, "main");
                 assert_eq!(items[0].kind.as_deref(), Some("Function"));
                 assert_eq!(items[0].detail.as_deref(), Some("src/main.rs:5:4"));
+                assert_eq!(items[0].data["tree"], false);
             }
             _ => panic!("unexpected plugin request"),
         }

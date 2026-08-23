@@ -45,7 +45,7 @@ The top-level schema accepts keys for editor behavior, keymaps, theme, cursor, p
 | --- | --- |
 | `[search]` | `incsearch = true`, `hlsearch = true`, `wrapscan = true`, `ignorecase = false`, `smartcase = false` [@defaults] [@config]. |
 | `[completion]` | `auto_trigger = true`, `min_prefix_length = 1`, `debounce_ms = 120`, `buffer_words = true`, `max_buffer_words = 100` [@defaults] [@config]. |
-| `[picker]` | `input_position = "bottom"` [@defaults] [@config]. |
+| `[picker]` | `input_position = "bottom"`, `tree_guides = true`; disable tree guides to hide hierarchy connectors in document-symbol pickers [@defaults] [@config]. |
 | `[picker.icons]` | `style = "nerd_font"`, `color = true`; code also accepts `unicode`, `ascii`, and `none` icon styles [@defaults] [@config]. |
 | `[diagnostics]` | `gutter_signs = true`, `icon_style = "nerd_font"`; code also accepts `unicode`, `ascii`, and `none` icon styles for diagnostic gutter signs [@defaults] [@config]. |
 | `[statusline]` | `left = ["mode", "diagnostics", "git_branch", "filename"]`, `right = ["position", "syntax"]`; the configuration schema lets supported statusline sections move between sides [@defaults] [@config]. |

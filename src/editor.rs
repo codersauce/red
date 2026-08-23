@@ -6586,6 +6586,10 @@ impl Editor {
         self.config.picker.icons
     }
 
+    pub(crate) fn picker_tree_guides(&self) -> bool {
+        self.config.picker.tree_guides
+    }
+
     pub(crate) fn statusline_config(&self) -> &StatuslineConfig {
         &self.config.statusline
     }

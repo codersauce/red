@@ -125,6 +125,8 @@ const LOCATION_PREVIEW_CACHE_CAPACITY: usize = 8;
 const COMMAND_COLUMN_GAP: usize = 2;
 const PICKER_ICON_WIDTH: usize = 2;
 const PICKER_ITEM_PREFIX_WIDTH: usize = 2 + PICKER_ICON_WIDTH;
+const MIN_TREE_GUIDE_LABEL_WIDTH: usize = 8;
+const MAX_PICKER_TREE_DEPTH: usize = 64;
 const PARALLEL_FILTER_MIN_ITEMS: usize = 1_024;
 const MAX_FILTER_HISTORY_ENTRIES: usize = 8;
 const MAX_FILTER_HISTORY_ITEMS_PER_ENTRY: usize = 16_384;
@@ -406,6 +408,7 @@ pub struct Picker {
     visible_dynamic_items: Vec<usize>,
     command_column_widths: Cell<Option<CommandColumns>>,
     label_first_column_widths: Cell<Option<LabelFirstColumns>>,
+    tree_prefixes: RefCell<Option<Arc<[String]>>>,
     external_filter: bool,
     status: Option<String>,
     busy_since: Option<Instant>,
@@ -424,6 +427,7 @@ pub struct Picker {
     history_navigation: Option<PickerHistoryNavigation>,
     input_position: PickerInputPosition,
     icons: PickerIconsConfig,
+    tree_guides: bool,
     item_layout: PickerItemLayout,
     presentation: PickerPresentation,
     viewport_width: usize,
@@ -481,6 +485,24 @@ struct LabelFirstColumns {
     label: usize,
     annotation: usize,
     detail: usize,
+    position_line: usize,
+    position_column: usize,
+}
+
+impl LabelFirstColumns {
+    fn position_width(self) -> usize {
+        if self.position_line == 0 || self.position_column == 0 {
+            0
+        } else {
+            self.position_line + 1 + self.position_column
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PickerTreeNode<'a> {
+    id: &'a str,
+    parent_id: Option<&'a str>,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -588,6 +610,7 @@ impl Picker {
             visible_dynamic_items: Vec::new(),
             command_column_widths: Cell::new(None),
             label_first_column_widths: Cell::new(None),
+            tree_prefixes: RefCell::new(None),
             external_filter: false,
             status: None,
             busy_since: None,
@@ -606,6 +629,7 @@ impl Picker {
             history_navigation: None,
             input_position: editor.picker_input_position(),
             icons: editor.picker_icons(),
+            tree_guides: editor.picker_tree_guides(),
             item_layout: PickerItemLayout::Default,
             presentation,
             viewport_width: editor.vwidth(),
@@ -976,6 +1000,7 @@ impl Picker {
         let previous = self.selected_item();
         self.item_preview_root = None;
         self.dynamic_items = None;
+        self.tree_prefixes.get_mut().take();
         self.filtered_query = None;
         self.filtered_history.clear();
         self.visible_dynamic_items.clear();
@@ -989,6 +1014,7 @@ impl Picker {
         let previous = self.selected_item();
         self.item_preview_root = Some(root);
         self.dynamic_items = None;
+        self.tree_prefixes.get_mut().take();
         self.filtered_query = None;
         self.filtered_history.clear();
         self.visible_dynamic_items.clear();
@@ -1020,6 +1046,7 @@ impl Picker {
         self.item_preview_root = preview_root;
         self.items.clear();
         self.dynamic_items = Some(items);
+        self.tree_prefixes.get_mut().take();
         self.install_path_filter_highlights();
         self.filtered_query = None;
         self.filtered_history.clear();
@@ -1043,6 +1070,7 @@ impl Picker {
                 let previous = self.selected_item();
                 let selected_id = self.selected_dynamic_item().map(|item| item.id.clone());
                 self.dynamic_items = Some(items);
+                self.tree_prefixes.get_mut().take();
                 self.install_path_filter_highlights();
                 self.filtered_query = None;
                 self.filtered_history.clear();
@@ -1474,15 +1502,131 @@ impl Picker {
             })
     }
 
+    fn tree_node(item: &PickerItem) -> Option<PickerTreeNode<'_>> {
+        if item.data.get("tree").and_then(Value::as_bool) != Some(true) {
+            return None;
+        }
+        let symbol = item.data.get("symbol")?;
+        Some(PickerTreeNode {
+            id: symbol
+                .get("id")
+                .and_then(Value::as_str)
+                .unwrap_or(item.id.as_str()),
+            parent_id: symbol.get("parent_id").and_then(Value::as_str),
+        })
+    }
+
+    /// Computes stable Snacks-style ancestry guides once per authoritative item set.
+    fn tree_prefixes(&self, items: &[PickerItem]) -> Option<Arc<[String]>> {
+        if !self.tree_guides {
+            return None;
+        }
+        if let Some(prefixes) = self.tree_prefixes.borrow().as_ref() {
+            return (!prefixes.is_empty()).then(|| Arc::clone(prefixes));
+        }
+
+        let nodes = items.iter().map(Self::tree_node).collect::<Vec<_>>();
+        if nodes.iter().all(Option::is_none) {
+            self.tree_prefixes
+                .replace(Some(Arc::<[String]>::from(Vec::<String>::new())));
+            return None;
+        }
+
+        let node_indices = nodes
+            .iter()
+            .enumerate()
+            .filter_map(|(index, node)| node.as_ref().map(|node| (node.id, index)))
+            .collect::<HashMap<_, _>>();
+        let mut last_siblings = HashMap::new();
+        for (index, node) in nodes.iter().enumerate() {
+            if let Some(node) = node {
+                last_siblings.insert(node.parent_id, index);
+            }
+        }
+        let (vertical, middle, last) = if self.icons.style == PickerIconStyle::Ascii {
+            ("| ", "|-", "`-")
+        } else {
+            ("│ ", "├╴", "└╴")
+        };
+
+        let mut prefixes = vec![String::new(); items.len()];
+        for (index, node) in nodes.iter().enumerate() {
+            let Some(mut current) = node.as_ref().copied() else {
+                continue;
+            };
+            let mut current_index = index;
+            let mut segments = Vec::new();
+            for depth in 0..MAX_PICKER_TREE_DEPTH {
+                let is_last = last_siblings.get(&current.parent_id) == Some(&current_index);
+                segments.push(if depth == 0 {
+                    if is_last {
+                        last
+                    } else {
+                        middle
+                    }
+                } else if is_last {
+                    "  "
+                } else {
+                    vertical
+                });
+                let Some(parent_id) = current.parent_id else {
+                    break;
+                };
+                let Some(parent_index) = node_indices.get(parent_id).copied() else {
+                    break;
+                };
+                if parent_index == current_index {
+                    break;
+                }
+                let Some(parent) = nodes[parent_index] else {
+                    break;
+                };
+                current = parent;
+                current_index = parent_index;
+            }
+            segments.reverse();
+            prefixes[index] = segments.concat();
+        }
+
+        let prefixes: Arc<[String]> = prefixes.into();
+        self.tree_prefixes.replace(Some(Arc::clone(&prefixes)));
+        Some(prefixes)
+    }
+
+    fn visible_tree_prefix(
+        prefixes: Option<&[String]>,
+        index: usize,
+        content_width: usize,
+    ) -> &str {
+        let Some(prefix) = prefixes.and_then(|prefixes| prefixes.get(index)) else {
+            return "";
+        };
+        let available = content_width.saturating_sub(MIN_TREE_GUIDE_LABEL_WIDTH.min(content_width));
+        display_width_tail(prefix, available)
+    }
+
+    fn tree_position(item: &PickerItem) -> Option<(&str, &str)> {
+        if item.data.get("tree").and_then(Value::as_bool) != Some(true) {
+            return None;
+        }
+        let (line, column) = item.detail.as_deref()?.split_once(':')?;
+        (!line.is_empty()
+            && !column.is_empty()
+            && line.bytes().all(|digit| digit.is_ascii_digit())
+            && column.bytes().all(|digit| digit.is_ascii_digit()))
+        .then_some((line, column))
+    }
+
     fn draw_item_prefix(
         &self,
         buffer: &mut RenderBuffer,
-        x: usize,
-        y: usize,
+        position: (usize, usize),
         item: &PickerItem,
+        tree_prefix: &str,
         row_style: &Style,
         selected: bool,
     ) {
+        let (x, y) = position;
         if selected {
             let marker_style = self.semantic_foreground(
                 row_style,
@@ -1492,9 +1636,22 @@ impl Picker {
             buffer.set_text(x, y, "›", &marker_style);
         }
 
+        let mut icon_x = x + 2;
+        if !tree_prefix.is_empty() {
+            let semantic = self
+                .color_style(&[
+                    "tree.indentGuidesStroke",
+                    "editorIndentGuide.background",
+                    "editorIndentGuide.background1",
+                ])
+                .or_else(|| Some(self.theme.ui_style.muted.clone()));
+            let guide_style = self.semantic_foreground(row_style, semantic, selected);
+            buffer.set_text(icon_x, y, tree_prefix, &guide_style);
+            icon_x += display_width(tree_prefix);
+        }
         let icon = fit_display_width(self.item_icon(item), PICKER_ICON_WIDTH);
         let icon_style = self.result_icon_style(item, row_style, selected);
-        buffer.set_text(x + 2, y, &icon, &icon_style);
+        buffer.set_text(icon_x, y, &icon, &icon_style);
     }
 
     fn result_annotation_style(&self, base: &Style, selected: bool) -> Style {
@@ -1874,6 +2031,7 @@ impl Picker {
         };
         let content_width = rect.width.saturating_sub(PICKER_ITEM_PREFIX_WIDTH);
         let command_columns = self.command_columns(items, content_width);
+        let tree_prefixes = self.tree_prefixes(items);
         let label_first_columns = (self.item_layout == PickerItemLayout::LabelFirst)
             .then(|| self.label_first_columns(items, content_width));
         let selected = self.list.selected_index();
@@ -1902,8 +2060,18 @@ impl Picker {
             let y = rect.y + offset;
             buffer.fill_ascii_spaces(rect.x, y, rect.width, &row_style);
 
-            self.draw_item_prefix(buffer, rect.x, y, item, &row_style, is_selected);
-            let x = rect.x + PICKER_ITEM_PREFIX_WIDTH;
+            let tree_prefix =
+                Self::visible_tree_prefix(tree_prefixes.as_deref(), *index, content_width);
+            let tree_width = display_width(tree_prefix);
+            self.draw_item_prefix(
+                buffer,
+                (rect.x, y),
+                item,
+                tree_prefix,
+                &row_style,
+                is_selected,
+            );
+            let x = rect.x + PICKER_ITEM_PREFIX_WIDTH + tree_width;
             if item.kind.as_deref() == Some("Command") {
                 let category = item.annotation.as_deref().unwrap_or_default().trim_end();
                 if command_columns.category > 0 {
@@ -1986,12 +2154,12 @@ impl Picker {
                     x,
                     y,
                     &item.label,
-                    columns.label,
+                    columns.label.saturating_sub(tree_width),
                     &label_style,
                     &label_match_style,
                     label_matches,
                 );
-                let mut column_x = x + columns.label;
+                let mut column_x = rect.x + PICKER_ITEM_PREFIX_WIDTH + columns.label;
                 if columns.annotation > 0 {
                     column_x += INTRINSIC_COLUMN_GAP;
                     let style = self.result_annotation_style(&row_style, is_selected);
@@ -2025,9 +2193,30 @@ impl Picker {
                         &item.detail_matches,
                     );
                 }
+                if columns.position_width() > 0 {
+                    if let Some((line, column)) = Self::tree_position(item) {
+                        let position = format!(
+                            "{line:>line_width$}:{column:>column_width$}",
+                            line_width = columns.position_line,
+                            column_width = columns.position_column,
+                        );
+                        let style = self.result_content_style(&row_style, is_selected);
+                        self.draw_text_with_matches(
+                            buffer,
+                            rect.x + rect.width - columns.position_width(),
+                            y,
+                            &position,
+                            columns.position_width(),
+                            &style,
+                            &self.result_match_style(&style),
+                            &item.detail_matches,
+                        );
+                    }
+                }
                 continue;
             }
 
+            let content_width = content_width.saturating_sub(tree_width);
             let detail_separator_width = 2;
             let min_primary_width = if item.kind.as_deref() == Some("FileMatch") {
                 let max_primary_width = content_width.saturating_sub(detail_separator_width + 8);
@@ -2176,25 +2365,47 @@ impl Picker {
     }
 
     /// Use every filtered row, not just the current page, so scrolling does not
-    /// move the columns. Labels take priority over status and descriptions.
+    /// move the columns. Labels take priority over annotations and descriptions;
+    /// document-symbol positions occupy a stable right-aligned numeric gutter.
     fn label_first_columns(&self, items: &[PickerItem], content_width: usize) -> LabelFirstColumns {
         let mut columns = self.label_first_column_widths.get().unwrap_or_else(|| {
             let mut columns = LabelFirstColumns::default();
+            let tree_prefixes = self.tree_prefixes(items);
             for index in &self.visible_dynamic_items {
                 let item = &items[*index];
-                columns.label = columns.label.max(display_width(&item.label));
+                let tree_width = tree_prefixes
+                    .as_ref()
+                    .and_then(|prefixes| prefixes.get(*index))
+                    .map_or(0, |prefix| display_width(prefix));
+                columns.label = columns
+                    .label
+                    .max(display_width(&item.label).saturating_add(tree_width));
                 columns.annotation = columns
                     .annotation
                     .max(item.annotation.as_deref().map_or(0, display_width));
-                columns.detail = columns
-                    .detail
-                    .max(item.detail.as_deref().map_or(0, display_width));
+                if let Some((line, column)) = Self::tree_position(item) {
+                    columns.position_line = columns.position_line.max(line.len());
+                    columns.position_column = columns.position_column.max(column.len());
+                } else {
+                    columns.detail = columns
+                        .detail
+                        .max(item.detail.as_deref().map_or(0, display_width));
+                }
             }
             self.label_first_column_widths.set(Some(columns));
             columns
         });
         columns.label = columns.label.min(content_width);
         let mut remaining = content_width.saturating_sub(columns.label);
+        let position_width = columns.position_width();
+        if position_width > 0 {
+            if position_width + INTRINSIC_COLUMN_GAP <= remaining {
+                remaining -= position_width + INTRINSIC_COLUMN_GAP;
+            } else {
+                columns.position_line = 0;
+                columns.position_column = 0;
+            }
+        }
         if columns.annotation > 0 && columns.annotation + INTRINSIC_COLUMN_GAP <= remaining {
             remaining -= columns.annotation + INTRINSIC_COLUMN_GAP;
         } else {
@@ -4158,6 +4369,26 @@ mod tests {
         }
     }
 
+    fn document_symbol_item(
+        id: &str,
+        parent_id: Option<&str>,
+        label: &str,
+        line: usize,
+        column: usize,
+    ) -> PickerItem {
+        let mut item = dynamic_item(id, label);
+        item.kind = Some("Function".to_string());
+        item.detail = Some(format!("{line}:{column}"));
+        item.data = json!({
+            "tree": true,
+            "symbol": {
+                "id": id,
+                "parent_id": parent_id,
+            }
+        });
+        item
+    }
+
     #[test]
     fn ctrl_h_and_ctrl_l_browse_picker_query_history() {
         let editor = test_editor();
@@ -4893,6 +5124,209 @@ mod tests {
 
         let row = render_row(&buffer, picker.layout().results.y);
         assert!(row.contains(label), "{row:?}");
+    }
+
+    #[test]
+    fn document_symbol_picker_draws_tree_guides_and_aligns_numeric_positions() {
+        let editor = test_editor_with_theme_and_size(Theme::default(), 140, 24);
+        let picker = Picker::new_dynamic(
+            Some("Document Symbols".to_string()),
+            &editor,
+            vec![
+                document_symbol_item("outer", None, "outer", 7, 2),
+                document_symbol_item("first", Some("outer"), "first_child", 28, 21),
+                document_symbol_item("second", Some("outer"), "second_child", 109, 3),
+                document_symbol_item("tail", None, "tail", 150, 5),
+            ],
+            41,
+            PickerOptions {
+                item_layout: super::PickerItemLayout::LabelFirst,
+                ..PickerOptions::default()
+            },
+        );
+        let mut buffer = RenderBuffer::new(140, 24, &Style::default());
+        picker.draw(&mut buffer).unwrap();
+
+        let rect = picker.layout().results;
+        let rows = (0..4)
+            .map(|index| render_row(&buffer, rect.y + index))
+            .collect::<Vec<_>>();
+        assert!(rows[0].contains("├╴"), "{:?}", rows[0]);
+        assert!(rows[1].contains("│ ├╴"), "{:?}", rows[1]);
+        assert!(rows[2].contains("│ └╴"), "{:?}", rows[2]);
+        assert!(rows[3].contains("└╴"), "{:?}", rows[3]);
+        for (row, expected) in rows.iter().zip(["  7: 2", " 28:21", "109: 3", "150: 5"]) {
+            assert!(row.contains(expected), "{row:?}");
+            assert_eq!(display_column(row, ":"), display_column(&rows[0], ":"));
+        }
+        assert_eq!(
+            display_column(&rows[0], ":").unwrap() + 3,
+            rect.x + rect.width
+        );
+    }
+
+    #[test]
+    fn disabled_picker_tree_guides_keep_positions_aligned() {
+        let mut config = Config::default();
+        config.picker.tree_guides = false;
+        let editor = test_editor_with_config_and_size(config, Theme::default(), 100, 20);
+        let picker = Picker::new_dynamic(
+            Some("Document Symbols".to_string()),
+            &editor,
+            vec![
+                document_symbol_item("first", None, "first_symbol", 7, 2),
+                document_symbol_item("second", None, "second_symbol", 150, 21),
+            ],
+            42,
+            PickerOptions {
+                item_layout: super::PickerItemLayout::LabelFirst,
+                ..PickerOptions::default()
+            },
+        );
+        let mut buffer = RenderBuffer::new(100, 20, &Style::default());
+        picker.draw(&mut buffer).unwrap();
+
+        let rect = picker.layout().results;
+        let first = render_row(&buffer, rect.y);
+        let second = render_row(&buffer, rect.y + 1);
+        assert!(!first.contains('├') && !first.contains('└'), "{first:?}");
+        assert_eq!(
+            display_column(&first, "first_symbol"),
+            Some(rect.x + super::PICKER_ITEM_PREFIX_WIDTH)
+        );
+        assert!(first.contains("  7: 2"), "{first:?}");
+        assert!(second.contains("150:21"), "{second:?}");
+        assert_eq!(display_column(&first, ":"), display_column(&second, ":"));
+    }
+
+    #[test]
+    fn document_symbol_positions_stop_at_the_preview_divider() {
+        let editor = test_editor_with_theme_and_size(Theme::default(), 140, 24);
+        let mut first = document_symbol_item("first", None, "first_symbol", 7, 2);
+        first.preview = Some(PickerPreview::Text {
+            text: "preview source".to_string(),
+            language: None,
+        });
+        let picker = Picker::new_dynamic(
+            Some("Document Symbols".to_string()),
+            &editor,
+            vec![
+                first,
+                document_symbol_item("second", None, "second_symbol", 150, 21),
+            ],
+            45,
+            PickerOptions {
+                item_layout: super::PickerItemLayout::LabelFirst,
+                ..PickerOptions::default()
+            },
+        );
+        let mut buffer = RenderBuffer::new(140, 24, &Style::default());
+        picker.draw(&mut buffer).unwrap();
+
+        let rect = picker.layout().results;
+        let row = render_row(&buffer, rect.y);
+        assert!(row.contains("  7: 2│preview source"), "{row:?}");
+        assert_eq!(
+            buffer.cells[rect.y * buffer.width + rect.x + rect.width].c,
+            '│'
+        );
+    }
+
+    #[test]
+    fn document_symbol_tree_guides_preserve_names_in_narrow_viewports() {
+        let editor = test_editor_with_theme_and_size(Theme::default(), 34, 18);
+        let picker = Picker::new_dynamic(
+            Some("Document Symbols".to_string()),
+            &editor,
+            vec![document_symbol_item(
+                "first",
+                None,
+                "start_structured_turn",
+                125,
+                21,
+            )],
+            46,
+            PickerOptions {
+                item_layout: super::PickerItemLayout::LabelFirst,
+                ..PickerOptions::default()
+            },
+        );
+        let mut buffer = RenderBuffer::new(34, 18, &Style::default());
+        picker.draw(&mut buffer).unwrap();
+
+        let rect = picker.layout().results;
+        let row = render_row(&buffer, rect.y);
+        assert!(row.contains("└╴"), "{row:?}");
+        assert!(row.contains("start_structured_turn"), "{row:?}");
+        assert!(!row.contains("125:21"), "{row:?}");
+        assert_eq!(
+            buffer.cells[rect.y * buffer.width + rect.x + rect.width].c,
+            '│'
+        );
+    }
+
+    #[test]
+    fn document_symbol_tree_guides_update_with_batched_items() {
+        let editor = test_editor_with_theme_and_size(Theme::default(), 100, 20);
+        let mut picker = Picker::new_dynamic(
+            Some("Document Symbols".to_string()),
+            &editor,
+            vec![document_symbol_item("first", None, "first_symbol", 7, 2)],
+            43,
+            PickerOptions {
+                item_layout: super::PickerItemLayout::LabelFirst,
+                ..PickerOptions::default()
+            },
+        );
+        let mut buffer = RenderBuffer::new(100, 20, &Style::default());
+        picker.draw(&mut buffer).unwrap();
+        assert!(render_row(&buffer, picker.layout().results.y).contains("└╴"));
+
+        assert!(picker.apply_update(
+            43,
+            PickerUpdate::Items(vec![
+                document_symbol_item("first", None, "first_symbol", 7, 2),
+                document_symbol_item("second", None, "second_symbol", 150, 21),
+            ]),
+        ));
+        let mut updated = RenderBuffer::new(100, 20, &Style::default());
+        picker.draw(&mut updated).unwrap();
+        let rect = picker.layout().results;
+        assert!(render_row(&updated, rect.y).contains("├╴"));
+        assert!(render_row(&updated, rect.y + 1).contains("└╴"));
+
+        picker.filter("second");
+        let mut filtered = RenderBuffer::new(100, 20, &Style::default());
+        picker.draw(&mut filtered).unwrap();
+        let row = render_row(&filtered, picker.layout().results.y);
+        assert!(row.contains("└╴"), "{row:?}");
+        assert!(row.contains("150:21"), "{row:?}");
+    }
+
+    #[test]
+    fn document_symbol_tree_guides_use_ascii_fallback() {
+        let mut config = Config::default();
+        config.picker.icons.style = PickerIconStyle::Ascii;
+        let editor = test_editor_with_config_and_size(config, Theme::default(), 100, 20);
+        let picker = Picker::new_dynamic(
+            Some("Document Symbols".to_string()),
+            &editor,
+            vec![
+                document_symbol_item("first", None, "first_symbol", 7, 2),
+                document_symbol_item("second", None, "second_symbol", 150, 21),
+            ],
+            44,
+            PickerOptions {
+                item_layout: super::PickerItemLayout::LabelFirst,
+                ..PickerOptions::default()
+            },
+        );
+        let mut buffer = RenderBuffer::new(100, 20, &Style::default());
+        picker.draw(&mut buffer).unwrap();
+
+        let rect = picker.layout().results;
+        assert!(render_row(&buffer, rect.y).contains("|-"));
+        assert!(render_row(&buffer, rect.y + 1).contains("`-"));
     }
 
     #[test]
