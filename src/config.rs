@@ -225,6 +225,8 @@ pub struct Config {
     pub scrolloff: Option<usize>,
     /// Whether long lines wrap to continuation rows.
     pub wrap: Option<bool>,
+    /// Wrap directional window focus across opposite editor edges. Defaults to on.
+    pub wrap_window_navigation: Option<bool>,
     /// Show the cursor line's absolute number and distances on other lines.
     /// Defaults to off.
     pub relative_line_numbers: Option<bool>,
@@ -2038,6 +2040,7 @@ fn known_top_level_field(field: &str) -> bool {
             | "mouse_scroll_lines"
             | "scrolloff"
             | "wrap"
+            | "wrap_window_navigation"
             | "relative_line_numbers"
             | "breakindent"
             | "sidescroll"
@@ -3209,6 +3212,37 @@ unknown_setting = true
         .unwrap();
         assert!(enabled.is_clean());
         assert_eq!(enabled.config.relative_line_numbers, Some(true));
+    }
+
+    #[test]
+    fn wrap_window_navigation_is_enabled_by_default_and_configurable() {
+        let defaults = Config::load_user_toml("", Path::new("/tmp/config.toml"), &[]).unwrap();
+        assert_eq!(defaults.config.wrap_window_navigation, Some(true));
+
+        let disabled = Config::load_user_toml(
+            "wrap_window_navigation = false",
+            Path::new("/tmp/config.toml"),
+            &[],
+        )
+        .unwrap();
+        assert!(disabled.is_clean());
+        assert_eq!(disabled.config.wrap_window_navigation, Some(false));
+    }
+
+    #[test]
+    fn invalid_wrap_window_navigation_falls_back_independently() {
+        let loaded = Config::load_user_toml(
+            r#"wrap_window_navigation = "yes""#,
+            Path::new("/tmp/config.toml"),
+            &[],
+        )
+        .unwrap();
+
+        assert_eq!(loaded.config.wrap_window_navigation, Some(true));
+        assert!(loaded.diagnostics.iter().any(|diagnostic| {
+            diagnostic.path == "wrap_window_navigation"
+                && diagnostic.fallback == "kept the previous valid value"
+        }));
     }
 
     #[test]
@@ -4541,7 +4575,9 @@ groups = [["\\bif\\b", "\\belse\\b", "\\bendif\\b"]]
         assert_eq!(config.show_whats_new, Some(true));
         assert_eq!(config.fetch_release_notes, Some(true));
         assert_eq!(config.persist_inline_history, Some(true));
+        assert_eq!(config.wrap_window_navigation, Some(true));
         assert!(known_top_level_field("persist_inline_history"));
+        assert!(known_top_level_field("wrap_window_navigation"));
         assert_eq!(
             config.keys.normal.get("F1"),
             Some(&KeyAction::Single(Action::KeyboardShortcuts))
