@@ -74,6 +74,14 @@ impl Editor {
                     | Action::SelectNextOccurrence
                     | Action::AddCursorUp
                     | Action::AddCursorDown
+                    | Action::ToggleMultiCursorExtendMode
+                    | Action::ExtendMultiSelectionLeft
+                    | Action::ExtendMultiSelectionRight
+                    | Action::ExtendMultiSelectionWordForward
+                    | Action::ExtendMultiSelectionWordEnd
+                    | Action::ExtendMultiSelectionLineStart
+                    | Action::ExtendMultiSelectionLineEnd
+                    | Action::InvertMultiSelection
                     | Action::SelectPreviousOccurrence
                     | Action::SkipMultiSelection
                     | Action::RemoveActiveMultiSelection

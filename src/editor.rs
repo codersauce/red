@@ -2509,6 +2509,22 @@ pub enum Action {
     AddCursorUp,
     AddCursorDown,
     #[serde(skip)]
+    ToggleMultiCursorExtendMode,
+    #[serde(skip)]
+    ExtendMultiSelectionLeft,
+    #[serde(skip)]
+    ExtendMultiSelectionRight,
+    #[serde(skip)]
+    ExtendMultiSelectionWordForward,
+    #[serde(skip)]
+    ExtendMultiSelectionWordEnd,
+    #[serde(skip)]
+    ExtendMultiSelectionLineStart,
+    #[serde(skip)]
+    ExtendMultiSelectionLineEnd,
+    #[serde(skip)]
+    InvertMultiSelection,
+    #[serde(skip)]
     SelectPreviousOccurrence,
     #[serde(skip)]
     SkipMultiSelection,
@@ -17249,12 +17265,12 @@ impl Editor {
                         return Some(KeyAction::Single(Action::AppendAtMultiSelectionEnd));
                     }
                     (KeyCode::Char('d'), KeyModifiers::NONE)
-                        if self.can_navigate_multi_cursor_occurrences() =>
+                        if self.has_multi_cursor_selections() =>
                     {
                         return Some(KeyAction::Single(Action::DeleteMultiSelection));
                     }
                     (KeyCode::Char('x'), KeyModifiers::NONE)
-                        if self.can_navigate_multi_cursor_occurrences() =>
+                        if self.has_multi_cursor_selections() =>
                     {
                         return Some(KeyAction::Single(Action::DeleteMultiSelectionBlackHole));
                     }
@@ -17265,12 +17281,58 @@ impl Editor {
                         return Some(KeyAction::Single(Action::PasteBeforeMultiSelection));
                     }
                     (KeyCode::Char('y'), KeyModifiers::NONE)
-                        if self.can_navigate_multi_cursor_occurrences() =>
+                        if self.has_multi_cursor_selections() =>
                     {
                         return Some(KeyAction::Single(Action::YankMultiSelection));
                     }
                     (KeyCode::Char('n'), KeyModifiers::CONTROL) => {}
                     (KeyCode::Up | KeyCode::Down, KeyModifiers::CONTROL) => {}
+                    (KeyCode::Tab, KeyModifiers::NONE) => {
+                        return Some(KeyAction::Single(Action::ToggleMultiCursorExtendMode));
+                    }
+                    (KeyCode::Left, KeyModifiers::SHIFT) => {
+                        return Some(KeyAction::Single(Action::ExtendMultiSelectionLeft));
+                    }
+                    (KeyCode::Right, KeyModifiers::SHIFT) => {
+                        return Some(KeyAction::Single(Action::ExtendMultiSelectionRight));
+                    }
+                    (KeyCode::Left, KeyModifiers::NONE)
+                    | (KeyCode::Char('h'), KeyModifiers::NONE)
+                        if self.multi_cursor_is_extending() =>
+                    {
+                        return Some(KeyAction::Single(Action::ExtendMultiSelectionLeft));
+                    }
+                    (KeyCode::Right, KeyModifiers::NONE)
+                    | (KeyCode::Char('l'), KeyModifiers::NONE)
+                        if self.multi_cursor_is_extending() =>
+                    {
+                        return Some(KeyAction::Single(Action::ExtendMultiSelectionRight));
+                    }
+                    (KeyCode::Char('w'), KeyModifiers::NONE)
+                        if self.multi_cursor_is_extending() =>
+                    {
+                        return Some(KeyAction::Single(Action::ExtendMultiSelectionWordForward));
+                    }
+                    (KeyCode::Char('e'), KeyModifiers::NONE)
+                        if self.multi_cursor_is_extending() =>
+                    {
+                        return Some(KeyAction::Single(Action::ExtendMultiSelectionWordEnd));
+                    }
+                    (KeyCode::Char('0'), KeyModifiers::NONE)
+                        if self.multi_cursor_is_extending() =>
+                    {
+                        return Some(KeyAction::Single(Action::ExtendMultiSelectionLineStart));
+                    }
+                    (KeyCode::Char('$'), KeyModifiers::NONE | KeyModifiers::SHIFT)
+                        if self.multi_cursor_is_extending() =>
+                    {
+                        return Some(KeyAction::Single(Action::ExtendMultiSelectionLineEnd));
+                    }
+                    (KeyCode::Char('o'), KeyModifiers::NONE)
+                        if self.multi_cursor_is_extending() =>
+                    {
+                        return Some(KeyAction::Single(Action::InvertMultiSelection));
+                    }
                     (KeyCode::Char('n'), KeyModifiers::NONE)
                         if self.can_navigate_multi_cursor_occurrences() =>
                     {
@@ -21497,6 +21559,46 @@ impl Editor {
             Action::AddCursorDown => {
                 add_to_history = false;
                 self.add_vertical_cursor(multi_cursor::VerticalCursorDirection::Down);
+                self.render(buffer)?;
+            }
+            Action::ToggleMultiCursorExtendMode => {
+                add_to_history = false;
+                self.toggle_multi_cursor_extend_mode();
+                self.render(buffer)?;
+            }
+            Action::ExtendMultiSelectionLeft => {
+                add_to_history = false;
+                self.extend_multi_cursor_selections(multi_cursor::MultiCursorMotion::Left);
+                self.render(buffer)?;
+            }
+            Action::ExtendMultiSelectionRight => {
+                add_to_history = false;
+                self.extend_multi_cursor_selections(multi_cursor::MultiCursorMotion::Right);
+                self.render(buffer)?;
+            }
+            Action::ExtendMultiSelectionWordForward => {
+                add_to_history = false;
+                self.extend_multi_cursor_selections(multi_cursor::MultiCursorMotion::WordForward);
+                self.render(buffer)?;
+            }
+            Action::ExtendMultiSelectionWordEnd => {
+                add_to_history = false;
+                self.extend_multi_cursor_selections(multi_cursor::MultiCursorMotion::WordEnd);
+                self.render(buffer)?;
+            }
+            Action::ExtendMultiSelectionLineStart => {
+                add_to_history = false;
+                self.extend_multi_cursor_selections(multi_cursor::MultiCursorMotion::LineStart);
+                self.render(buffer)?;
+            }
+            Action::ExtendMultiSelectionLineEnd => {
+                add_to_history = false;
+                self.extend_multi_cursor_selections(multi_cursor::MultiCursorMotion::LineEnd);
+                self.render(buffer)?;
+            }
+            Action::InvertMultiSelection => {
+                add_to_history = false;
+                self.invert_multi_cursor_selections();
                 self.render(buffer)?;
             }
             Action::SelectPreviousOccurrence => {

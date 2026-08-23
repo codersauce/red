@@ -1,6 +1,6 @@
 use crate::{
     buffer::BufferId,
-    editing::{CharRange, SelectionSet},
+    editing::{CharRange, MotionResolver, SelectionSet},
     undo::{TextPosition, TextRange},
     unicode_utils::{
         column_to_grapheme_with_tabs, grapheme_len, grapheme_to_column_with_tabs, trim_line_ending,
@@ -14,6 +14,31 @@ use super::{Content, ContentKind, Editor};
 pub(super) enum VerticalCursorDirection {
     Up,
     Down,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum MultiCursorMotion {
+    Left,
+    Right,
+    WordForward,
+    WordEnd,
+    LineStart,
+    LineEnd,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MultiCursorSelection {
+    anchor: usize,
+    head: usize,
+}
+
+impl MultiCursorSelection {
+    fn range(self, selection_end: Option<usize>) -> CharRange {
+        let Some(selection_end) = selection_end else {
+            return CharRange::new(self.head, self.head);
+        };
+        CharRange::new(self.anchor.min(self.head), selection_end)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -42,6 +67,8 @@ pub(super) struct MultiCursorSession {
     revision: u64,
     phase: MultiCursorPhase,
     selections: SelectionSet,
+    extend_selections: Option<Vec<MultiCursorSelection>>,
+    occurrence_navigation: bool,
 }
 
 impl MultiCursorSession {
@@ -77,12 +104,33 @@ impl Editor {
     pub(super) fn can_navigate_multi_cursor_occurrences(&self) -> bool {
         self.multi_cursor.as_ref().is_some_and(|session| {
             session.belongs_to(self)
+                && session.occurrence_navigation
                 && session.phase == MultiCursorPhase::Selecting
                 && session
                     .selections
                     .ranges()
                     .iter()
                     .all(|range| !range.is_empty())
+        })
+    }
+
+    pub(super) fn has_multi_cursor_selections(&self) -> bool {
+        self.multi_cursor.as_ref().is_some_and(|session| {
+            session.belongs_to(self)
+                && session.phase == MultiCursorPhase::Selecting
+                && session
+                    .selections
+                    .ranges()
+                    .iter()
+                    .all(|range| !range.is_empty())
+        })
+    }
+
+    pub(super) fn multi_cursor_is_extending(&self) -> bool {
+        self.multi_cursor.as_ref().is_some_and(|session| {
+            session.belongs_to(self)
+                && session.phase == MultiCursorPhase::Selecting
+                && session.extend_selections.is_some()
         })
     }
 
@@ -103,6 +151,9 @@ impl Editor {
                 .as_mut()
                 .expect("session was checked above");
             session.selections.select_next();
+            self.refresh_multi_cursor_extend_selections();
+        } else if self.has_collapsed_multi_cursor_session() {
+            self.promote_multi_cursors_to_words();
         } else {
             let buffer_id = self.current_buffer().id();
             let Some(window_id) = self.window_manager.active_stable_window_id() else {
@@ -119,11 +170,19 @@ impl Editor {
                 self.multi_cursor = None;
                 return;
             };
+            let extend_selections = selections
+                .ranges()
+                .iter()
+                .copied()
+                .map(|range| self.multi_cursor_selection_from_range(range))
+                .collect();
             self.multi_cursor = Some(MultiCursorSession {
                 buffer_id,
                 window_id,
                 revision,
                 phase: MultiCursorPhase::Selecting,
+                extend_selections: Some(extend_selections),
+                occurrence_navigation: true,
                 selections,
             });
         }
@@ -131,10 +190,58 @@ impl Editor {
         self.move_to_active_multi_cursor(false);
     }
 
+    fn has_collapsed_multi_cursor_session(&self) -> bool {
+        self.multi_cursor.as_ref().is_some_and(|session| {
+            session.belongs_to(self)
+                && session.phase == MultiCursorPhase::Selecting
+                && session
+                    .selections
+                    .ranges()
+                    .iter()
+                    .all(|range| range.is_empty())
+        })
+    }
+
+    fn promote_multi_cursors_to_words(&mut self) {
+        let session = self
+            .multi_cursor
+            .as_ref()
+            .expect("collapsed session was checked above");
+        let active_range = session.selections.active_range();
+        let active = session
+            .selections
+            .ranges()
+            .iter()
+            .position(|range| *range == active_range)
+            .unwrap_or(0);
+        let ranges = session
+            .selections
+            .ranges()
+            .iter()
+            .map(|cursor| {
+                let position = self.current_buffer().char_idx_to_position(cursor.start);
+                SelectionSet::range_at_cursor(self.current_buffer(), position).unwrap_or(*cursor)
+            })
+            .collect::<Vec<_>>();
+        let extend_selections = ranges
+            .iter()
+            .copied()
+            .map(|range| self.multi_cursor_selection_from_range(range))
+            .collect();
+        let session = self
+            .multi_cursor
+            .as_mut()
+            .expect("collapsed session was checked above");
+        session.selections.replace_ranges(ranges, active);
+        session.extend_selections = Some(extend_selections);
+        session.occurrence_navigation = false;
+    }
+
     pub(super) fn add_vertical_cursor(&mut self, direction: VerticalCursorDirection) {
         let compatible_session = self.multi_cursor.as_ref().is_some_and(|session| {
             session.belongs_to(self)
                 && session.phase == MultiCursorPhase::Selecting
+                && session.extend_selections.is_none()
                 && session
                     .selections
                     .ranges()
@@ -193,6 +300,8 @@ impl Editor {
                 revision,
                 phase: MultiCursorPhase::Selecting,
                 selections,
+                extend_selections: None,
+                occurrence_navigation: false,
             });
         }
 
@@ -237,6 +346,231 @@ impl Editor {
         }
     }
 
+    pub(super) fn toggle_multi_cursor_extend_mode(&mut self) {
+        if !self.has_multi_cursor_session() {
+            return;
+        }
+        if self.multi_cursor_is_extending() {
+            self.collapse_multi_cursor_to_heads();
+        } else {
+            self.enter_multi_cursor_extend_mode();
+        }
+        self.move_to_active_multi_cursor(false);
+    }
+
+    pub(super) fn extend_multi_cursor_selections(&mut self, motion: MultiCursorMotion) {
+        if !self.has_multi_cursor_session() {
+            return;
+        }
+        if !self.multi_cursor_is_extending() {
+            self.enter_multi_cursor_extend_mode();
+        }
+
+        let session = self
+            .multi_cursor
+            .as_ref()
+            .expect("session was checked above");
+        let active_range = session.selections.active_range();
+        let active = session
+            .selections
+            .ranges()
+            .iter()
+            .position(|range| *range == active_range)
+            .unwrap_or(0);
+        let mut selections = session
+            .extend_selections
+            .clone()
+            .expect("extend mode requires oriented selections");
+        for selection in &mut selections {
+            selection.head = self.multi_cursor_motion_target(selection.head, motion);
+        }
+        let ranges = selections
+            .iter()
+            .map(|selection| {
+                selection
+                    .range(self.multi_cursor_grapheme_end(selection.anchor.max(selection.head)))
+            })
+            .collect();
+        let session = self
+            .multi_cursor
+            .as_mut()
+            .expect("session was checked above");
+        session.selections.replace_ranges(ranges, active);
+        session.extend_selections = Some(selections);
+        session.occurrence_navigation = false;
+        self.move_to_active_multi_cursor(false);
+    }
+
+    pub(super) fn invert_multi_cursor_selections(&mut self) {
+        if !self.multi_cursor_is_extending() {
+            return;
+        }
+        let session = self
+            .multi_cursor
+            .as_mut()
+            .expect("extend session was checked above");
+        for selection in session
+            .extend_selections
+            .as_mut()
+            .expect("extend mode requires oriented selections")
+        {
+            std::mem::swap(&mut selection.anchor, &mut selection.head);
+        }
+        self.move_to_active_multi_cursor(false);
+    }
+
+    fn enter_multi_cursor_extend_mode(&mut self) {
+        let session = self
+            .multi_cursor
+            .as_ref()
+            .expect("multi-cursor extend requires a session");
+        let active_range = session.selections.active_range();
+        let active = session
+            .selections
+            .ranges()
+            .iter()
+            .position(|range| *range == active_range)
+            .unwrap_or(0);
+        let ranges = session.selections.ranges().to_vec();
+        let selections = ranges
+            .iter()
+            .map(|range| self.multi_cursor_selection_from_range(*range))
+            .collect::<Vec<_>>();
+        let ranges = selections
+            .iter()
+            .map(|selection| {
+                selection
+                    .range(self.multi_cursor_grapheme_end(selection.anchor.max(selection.head)))
+            })
+            .collect();
+        let session = self
+            .multi_cursor
+            .as_mut()
+            .expect("multi-cursor extend requires a session");
+        session.selections.replace_ranges(ranges, active);
+        session.extend_selections = Some(selections);
+    }
+
+    fn collapse_multi_cursor_to_heads(&mut self) {
+        let session = self
+            .multi_cursor
+            .as_ref()
+            .expect("multi-cursor collapse requires a session");
+        let active_range = session.selections.active_range();
+        let active = session
+            .selections
+            .ranges()
+            .iter()
+            .position(|range| *range == active_range)
+            .unwrap_or(0);
+        let cursors = session
+            .extend_selections
+            .as_ref()
+            .expect("extend mode requires oriented selections")
+            .iter()
+            .map(|selection| CharRange::new(selection.head, selection.head))
+            .collect();
+        let session = self
+            .multi_cursor
+            .as_mut()
+            .expect("multi-cursor collapse requires a session");
+        session.selections.replace_ranges(cursors, active);
+        session.extend_selections = None;
+        session.occurrence_navigation = false;
+    }
+
+    fn multi_cursor_motion_target(&self, index: usize, motion: MultiCursorMotion) -> usize {
+        let position = self.current_buffer().char_idx_to_position(index);
+        let line = position.line;
+        let line_contents = self.current_buffer().get(line).unwrap_or_default();
+        let line_contents = trim_line_ending(&line_contents);
+        let line_graphemes = grapheme_len(line_contents);
+        let current_grapheme = self.char_to_grapheme_on_line(position.character, line);
+        let last_grapheme = line_graphemes.saturating_sub(1);
+        let target = match motion {
+            MultiCursorMotion::Left => current_grapheme.saturating_sub(1),
+            MultiCursorMotion::Right => current_grapheme.saturating_add(1).min(last_grapheme),
+            MultiCursorMotion::LineStart => 0,
+            MultiCursorMotion::LineEnd => last_grapheme,
+            MultiCursorMotion::WordForward | MultiCursorMotion::WordEnd => {
+                let end = motion == MultiCursorMotion::WordEnd;
+                let target = MotionResolver::new(self.current_buffer(), position)
+                    .word_target(
+                        /*count*/ 1, /*backward*/ false, end, /*big_word*/ false,
+                    )
+                    .filter(|target| target.line == line);
+                return target
+                    .map(|target| self.current_buffer().position_to_char_idx(target))
+                    .unwrap_or_else(|| {
+                        self.current_buffer()
+                            .position_to_char_idx(TextPosition::new(
+                                line,
+                                self.grapheme_to_char_on_line(last_grapheme, line),
+                            ))
+                    });
+            }
+        };
+        self.current_buffer()
+            .position_to_char_idx(TextPosition::new(
+                line,
+                self.grapheme_to_char_on_line(target, line),
+            ))
+    }
+
+    fn multi_cursor_grapheme_end(&self, index: usize) -> Option<usize> {
+        let position = self.current_buffer().char_idx_to_position(index);
+        let line_length = self.line_character_len(position.line);
+        if position.character >= line_length {
+            return None;
+        }
+        let grapheme = self.char_to_grapheme_on_line(position.character, position.line);
+        let end = self.grapheme_to_char_on_line(grapheme + 1, position.line);
+        Some(
+            self.current_buffer()
+                .position_to_char_idx(TextPosition::new(position.line, end)),
+        )
+    }
+
+    fn multi_cursor_selection_from_range(&self, range: CharRange) -> MultiCursorSelection {
+        if range.is_empty() {
+            return MultiCursorSelection {
+                anchor: range.start,
+                head: range.start,
+            };
+        }
+        let last_character = range.end - 1;
+        let position = self.current_buffer().char_idx_to_position(last_character);
+        let grapheme = self.char_to_grapheme_on_line(position.character, position.line);
+        let head = self
+            .current_buffer()
+            .position_to_char_idx(TextPosition::new(
+                position.line,
+                self.grapheme_to_char_on_line(grapheme, position.line),
+            ));
+        MultiCursorSelection {
+            anchor: range.start,
+            head,
+        }
+    }
+
+    fn refresh_multi_cursor_extend_selections(&mut self) {
+        let Some(ranges) = self
+            .multi_cursor
+            .as_ref()
+            .map(|session| session.selections.ranges().to_vec())
+        else {
+            return;
+        };
+        let selections = ranges
+            .into_iter()
+            .map(|range| self.multi_cursor_selection_from_range(range))
+            .collect();
+        self.multi_cursor
+            .as_mut()
+            .expect("multi-cursor session was checked above")
+            .extend_selections = Some(selections);
+    }
+
     pub(super) fn select_previous_occurrence(&mut self) {
         if !self.can_navigate_multi_cursor_occurrences() {
             self.multi_cursor = None;
@@ -247,6 +581,7 @@ impl Editor {
             .as_mut()
             .expect("session was checked above");
         session.selections.select_previous();
+        self.refresh_multi_cursor_extend_selections();
         self.move_to_active_multi_cursor(false);
     }
 
@@ -260,6 +595,7 @@ impl Editor {
             .as_mut()
             .expect("session was checked above");
         session.selections.skip_active();
+        self.refresh_multi_cursor_extend_selections();
         self.move_to_active_multi_cursor(false);
     }
 
@@ -278,6 +614,7 @@ impl Editor {
             self.multi_cursor = None;
             return;
         }
+        self.refresh_multi_cursor_extend_selections();
         self.move_to_active_multi_cursor(false);
     }
 
@@ -344,6 +681,8 @@ impl Editor {
             })
             .collect();
         session.selections.replace_ranges(cursors, active);
+        session.extend_selections = None;
+        session.occurrence_navigation = false;
     }
 
     pub(super) fn insert_at_multi_cursors(&mut self, text: &str) -> bool {
@@ -390,13 +729,14 @@ impl Editor {
         self.cancel_transaction_if_empty();
         if let Some(session) = self.multi_cursor.as_mut() {
             session.phase = MultiCursorPhase::Selecting;
+            session.extend_selections = None;
         }
         self.move_to_active_multi_cursor(false);
         true
     }
 
     pub(super) fn delete_multi_cursor_selections(&mut self, preserve_register: bool) -> bool {
-        if !self.can_navigate_multi_cursor_occurrences() {
+        if !self.has_multi_cursor_selections() {
             return false;
         }
         let targets = self
@@ -427,7 +767,7 @@ impl Editor {
     }
 
     pub(super) fn yank_multi_cursor_selections(&mut self) -> bool {
-        if !self.can_navigate_multi_cursor_occurrences() {
+        if !self.has_multi_cursor_selections() {
             return false;
         }
         let ranges = self
@@ -457,6 +797,7 @@ impl Editor {
         if !self.has_multi_cursor_session() {
             return false;
         }
+        let extending = self.multi_cursor_is_extending();
         self.refresh_default_register_from_system_clipboard();
         let Some(content) = self.registers.get(&super::DEFAULT_REGISTER).cloned() else {
             return false;
@@ -521,6 +862,9 @@ impl Editor {
                     CharRange::new(cursor, cursor)
                 },
             );
+        }
+        if selecting && extending {
+            self.refresh_multi_cursor_extend_selections();
         }
         self.move_to_active_multi_cursor(false);
         self.commit_transaction(self.cursor_snapshot());
@@ -717,6 +1061,8 @@ impl Editor {
             .expect("multi-cursor replacement requires a session");
         session.revision = revision;
         session.selections.replace_ranges(updated, active);
+        session.extend_selections = None;
+        session.occurrence_navigation = false;
     }
 
     fn replace_multi_cursor_targets(&mut self, targets: Vec<CharRange>, replacement: &str) {
@@ -770,18 +1116,31 @@ impl Editor {
             .expect("multi-cursor replacement requires a session");
         session.revision = revision;
         session.selections.replace_ranges(updated, active);
+        session.extend_selections = None;
+        session.occurrence_navigation = false;
     }
 
     fn move_to_active_multi_cursor(&mut self, insert: bool) {
-        let Some(range) = self
+        let Some((range, extend_head)) = self
             .multi_cursor
             .as_ref()
             .filter(|session| session.belongs_to(self))
-            .map(|session| session.selections.active_range())
+            .map(|session| {
+                let range = session.selections.active_range();
+                let active = session.selections.active_selection().0.saturating_sub(1);
+                let extend_head = session
+                    .extend_selections
+                    .as_ref()
+                    .and_then(|selections| selections.get(active))
+                    .map(|selection| selection.head);
+                (range, extend_head)
+            })
         else {
             return;
         };
-        let index = if insert || range.is_empty() {
+        let index = if let Some(head) = extend_head {
+            head
+        } else if insert || range.is_empty() {
             range.end
         } else {
             range.end.saturating_sub(1)

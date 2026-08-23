@@ -16,6 +16,156 @@ async fn key(harness: &mut EditorHarness, code: KeyCode, modifiers: KeyModifiers
         .unwrap();
 }
 
+async fn assert_vertical_selection_change(
+    contents: &str,
+    cursor_x: usize,
+    selection_keys: &[(KeyCode, KeyModifiers)],
+    expected: &str,
+) {
+    let config: Config = toml::from_str(include_str!("../default_config.toml")).unwrap();
+    let buffer = Buffer::new(None, contents.to_string());
+    let mut harness = EditorHarness::with_config(buffer, config);
+    harness
+        .execute_action(Action::MoveTo(cursor_x, 0))
+        .await
+        .unwrap();
+    key(&mut harness, KeyCode::Down, KeyModifiers::CONTROL).await;
+    for (code, modifiers) in selection_keys {
+        key(&mut harness, *code, *modifiers).await;
+    }
+    key(&mut harness, KeyCode::Char('c'), KeyModifiers::NONE).await;
+    harness.type_text("X").await.unwrap();
+    key(&mut harness, KeyCode::Esc, KeyModifiers::NONE).await;
+
+    harness.assert_buffer_contents(expected);
+}
+
+#[tokio::test]
+async fn shift_arrows_expand_vertical_cursors_like_visual_multi() {
+    assert_vertical_selection_change(
+        "abcdef\nabcdef",
+        2,
+        &[(KeyCode::Right, KeyModifiers::SHIFT)],
+        "abXef\nabXef",
+    )
+    .await;
+    assert_vertical_selection_change(
+        "abcdef\nabcdef",
+        2,
+        &[(KeyCode::Left, KeyModifiers::SHIFT)],
+        "aXdef\naXdef",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn tab_enters_extend_mode_and_tab_again_collapses_at_each_head() {
+    assert_vertical_selection_change(
+        "abcdef\nabcdef",
+        2,
+        &[(KeyCode::Tab, KeyModifiers::NONE)],
+        "abXdef\nabXdef",
+    )
+    .await;
+
+    let config: Config = toml::from_str(include_str!("../default_config.toml")).unwrap();
+    let buffer = Buffer::new(None, "abcdef\nabcdef".to_string());
+    let mut harness = EditorHarness::with_config(buffer, config);
+    harness.execute_action(Action::MoveTo(2, 0)).await.unwrap();
+    key(&mut harness, KeyCode::Down, KeyModifiers::CONTROL).await;
+    key(&mut harness, KeyCode::Tab, KeyModifiers::NONE).await;
+    key(&mut harness, KeyCode::Char('e'), KeyModifiers::NONE).await;
+    key(&mut harness, KeyCode::Tab, KeyModifiers::NONE).await;
+    key(&mut harness, KeyCode::Char('i'), KeyModifiers::NONE).await;
+    harness.type_text("X").await.unwrap();
+    key(&mut harness, KeyCode::Esc, KeyModifiers::NONE).await;
+
+    harness.assert_buffer_contents("abcdeXf\nabcdeXf");
+}
+
+#[tokio::test]
+async fn extend_mode_supports_word_and_line_motions() {
+    assert_vertical_selection_change(
+        "abcdef\nabcdef",
+        2,
+        &[
+            (KeyCode::Tab, KeyModifiers::NONE),
+            (KeyCode::Char('e'), KeyModifiers::NONE),
+        ],
+        "abX\nabX",
+    )
+    .await;
+    assert_vertical_selection_change(
+        "foo bar\nfoo baz",
+        0,
+        &[
+            (KeyCode::Tab, KeyModifiers::NONE),
+            (KeyCode::Char('w'), KeyModifiers::NONE),
+        ],
+        "Xar\nXaz",
+    )
+    .await;
+    assert_vertical_selection_change(
+        "abcdef\nabcdef",
+        2,
+        &[
+            (KeyCode::Tab, KeyModifiers::NONE),
+            (KeyCode::Char('0'), KeyModifiers::NONE),
+        ],
+        "Xdef\nXdef",
+    )
+    .await;
+    assert_vertical_selection_change(
+        "abcdef\nabcdef",
+        2,
+        &[
+            (KeyCode::Tab, KeyModifiers::NONE),
+            (KeyCode::Char('$'), KeyModifiers::SHIFT),
+        ],
+        "abX\nabX",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn o_flips_each_extend_mode_anchor() {
+    assert_vertical_selection_change(
+        "abcdef\nabcdef",
+        2,
+        &[
+            (KeyCode::Tab, KeyModifiers::NONE),
+            (KeyCode::Char('l'), KeyModifiers::NONE),
+            (KeyCode::Char('o'), KeyModifiers::NONE),
+            (KeyCode::Char('h'), KeyModifiers::NONE),
+            (KeyCode::Char('h'), KeyModifiers::NONE),
+        ],
+        "Xef\nXef",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn ctrl_n_promotes_each_vertical_cursor_to_its_word() {
+    assert_vertical_selection_change(
+        "foo bar\nfoo baz",
+        0,
+        &[(KeyCode::Char('n'), KeyModifiers::CONTROL)],
+        "X bar\nX baz",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn extend_mode_moves_by_grapheme_and_selects_complete_unicode_clusters() {
+    assert_vertical_selection_change(
+        "a👨‍👩‍👧b\na👨‍👩‍👧b",
+        1,
+        &[(KeyCode::Right, KeyModifiers::SHIFT)],
+        "aX\naX",
+    )
+    .await;
+}
+
 #[tokio::test]
 async fn ctrl_down_skips_shorter_lines_and_inserts_at_each_vertical_cursor() {
     let config: Config = toml::from_str(include_str!("../default_config.toml")).unwrap();

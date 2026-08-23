@@ -66,22 +66,7 @@ impl SelectionSet {
     ) -> Option<Self> {
         let contents = buffer.contents();
         let characters = contents.chars().collect::<Vec<_>>();
-        let cursor_index = buffer.position_to_char_idx(cursor);
-        let current = *characters.get(cursor_index)?;
-        if is_line_ending(current) {
-            return None;
-        }
-
-        let mut start = cursor_index;
-        let mut end = cursor_index + 1;
-        if is_keyword_char(current) {
-            while start > 0 && is_keyword_char(characters[start - 1]) {
-                start -= 1;
-            }
-            while end < characters.len() && is_keyword_char(characters[end]) {
-                end += 1;
-            }
-        }
+        let CharRange { start, end } = Self::range_at_cursor(buffer, cursor)?;
 
         let needle = characters[start..end].iter().collect::<String>();
         let case_insensitive = ignorecase && !(smartcase && needle.chars().any(char::is_uppercase));
@@ -119,6 +104,28 @@ impl SelectionSet {
             active_candidate,
             direction: TraversalDirection::Forward,
         })
+    }
+
+    /// Returns the keyword run or single punctuation/whitespace scalar under `cursor`.
+    pub(crate) fn range_at_cursor(buffer: &Buffer, cursor: TextPosition) -> Option<CharRange> {
+        let characters = buffer.contents().chars().collect::<Vec<_>>();
+        let cursor_index = buffer.position_to_char_idx(cursor);
+        let current = *characters.get(cursor_index)?;
+        if is_line_ending(current) {
+            return None;
+        }
+
+        let mut start = cursor_index;
+        let mut end = cursor_index + 1;
+        if is_keyword_char(current) {
+            while start > 0 && is_keyword_char(characters[start - 1]) {
+                start -= 1;
+            }
+            while end < characters.len() && is_keyword_char(characters[end]) {
+                end += 1;
+            }
+        }
+        Some(CharRange::new(start, end))
     }
 
     /// Adds the next occurrence, wrapping at the end of the document.
