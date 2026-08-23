@@ -24,7 +24,7 @@ use crate::{
 use super::{
     picker::PickerFilterHighlights,
     picker_matching::{match_path, path_match_highlights, PathCandidate},
-    Component, Picker, PickerItem, PickerPreview,
+    Component, Picker, PickerItem,
 };
 
 pub struct FilePicker {
@@ -38,7 +38,7 @@ pub struct FilePicker {
 
 struct FilePickerLoad {
     generation: u64,
-    result: Result<Vec<String>, String>,
+    result: Result<Vec<PickerItem>, String>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -115,8 +115,9 @@ impl FilePicker {
         self.picker.set_status(visibility.status());
 
         std::thread::spawn(move || {
-            let result =
-                load_file_picker_items(&root_path, visibility).map_err(|err| err.to_string());
+            let result = load_file_picker_items(&root_path, visibility)
+                .map(prepare_file_picker_items)
+                .map_err(|err| err.to_string());
             _ = sender.send(FilePickerLoad { generation, result });
         });
     }
@@ -127,39 +128,9 @@ impl FilePicker {
         }
 
         match load.result {
-            Ok(files) => {
-                let items = files
-                    .into_iter()
-                    .map(|path| {
-                        let relative = Path::new(&path);
-                        let label = relative
-                            .file_name()
-                            .map(|name| name.to_string_lossy().into_owned())
-                            .unwrap_or_else(|| path.clone());
-                        let annotation = relative
-                            .parent()
-                            .filter(|parent| !parent.as_os_str().is_empty())
-                            .map(|parent| parent.to_string_lossy().into_owned());
-                        PickerItem {
-                            id: path.clone(),
-                            icon: None,
-                            label,
-                            kind: Some("FilePath".to_string()),
-                            annotation,
-                            detail: None,
-                            data: serde_json::Value::Null,
-                            matches: Vec::new(),
-                            detail_matches: Vec::new(),
-                            preview: Some(PickerPreview::Location {
-                                path: self.root_path.join(path).to_string_lossy().into_owned(),
-                                line: None,
-                                column: None,
-                                matches: Vec::new(),
-                            }),
-                        }
-                    })
-                    .collect();
-                self.picker.replace_structured_items(items);
+            Ok(items) => {
+                self.picker
+                    .replace_structured_items_with_preview_root(items, self.root_path.clone());
                 self.picker
                     .set_empty_message(Some("No matching files".to_string()));
             }
@@ -247,6 +218,36 @@ impl Component for FilePicker {
     fn cursor_position(&self) -> Option<(usize, usize)> {
         self.picker.cursor_position()
     }
+}
+
+/// Builds row metadata on the discovery worker; location previews remain lazy.
+fn prepare_file_picker_items(files: Vec<String>) -> Vec<PickerItem> {
+    files
+        .into_iter()
+        .map(|path| {
+            let relative = Path::new(&path);
+            let label = relative
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| path.clone());
+            let annotation = relative
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+                .map(|parent| parent.to_string_lossy().into_owned());
+            PickerItem {
+                id: path,
+                icon: None,
+                label,
+                kind: Some("FilePath".to_string()),
+                annotation,
+                detail: None,
+                data: serde_json::Value::Null,
+                matches: Vec::new(),
+                detail_matches: Vec::new(),
+                preview: None,
+            }
+        })
+        .collect()
 }
 
 fn file_match_score(matcher: &SkimMatcherV2, item: &PickerItem, query: &str) -> Option<i64> {
@@ -352,7 +353,10 @@ mod tests {
     fn send_load(picker: &FilePicker, generation: u64, result: Result<Vec<String>, String>) {
         picker
             .sender
-            .send(FilePickerLoad { generation, result })
+            .send(FilePickerLoad {
+                generation,
+                result: result.map(prepare_file_picker_items),
+            })
             .unwrap();
     }
 
@@ -819,6 +823,11 @@ mod tests {
         );
 
         assert!(picker.tick().unwrap());
+        assert!(picker
+            .picker
+            .dynamic_items_for_test()
+            .iter()
+            .all(|item| item.preview.is_none()));
         picker.draw(&mut buffer).unwrap();
 
         assert!(buffer_text(&buffer).contains("fn main() {}"));

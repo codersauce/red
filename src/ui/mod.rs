@@ -171,6 +171,11 @@ pub trait Component: Send {
         false
     }
 
+    /// Whether this surface can consume an owned completion update directly.
+    fn accepts_completion_updates(&self) -> bool {
+        false
+    }
+
     fn update_completion(&mut self, _items: Vec<CompletionResponseItem>, _filter: &str) -> bool {
         false
     }

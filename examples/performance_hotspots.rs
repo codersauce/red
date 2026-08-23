@@ -49,6 +49,7 @@ const SEARCH_LINES: usize = 20_000;
 const SEARCH_LOOKUPS: usize = 1_000;
 const COMPLETION_ITEMS: usize = 18_000;
 const COMPLETION_ROUNDS: usize = 4;
+const BUFFER_COMPLETION_ROUNDS: usize = 8;
 const ROW_PANEL_ITEMS: usize = 12_000;
 const ROW_PANEL_LOOKUPS: usize = 1_500;
 const JSON_CONVERSIONS: usize = 512;
@@ -140,6 +141,12 @@ fn main() -> Result<()> {
     }
     if scenario == "all" || scenario == "completion" {
         results.push(benchmark_completions()?);
+    }
+    if scenario == "all" || scenario == "completion-backspace" {
+        results.push(benchmark_completion_backspacing()?);
+    }
+    if scenario == "all" || scenario == "buffer-completion" {
+        results.push(benchmark_buffer_completion()?);
     }
     if scenario == "all" || scenario == "rows" {
         results.push(benchmark_panel_rows()?);
@@ -943,8 +950,8 @@ fn benchmark_search_navigation() -> Result<serde_json::Value> {
     Ok(report("search_match_navigation", started, SEARCH_LOOKUPS))
 }
 
-fn benchmark_completions() -> Result<serde_json::Value> {
-    let items = (0..COMPLETION_ITEMS)
+fn completion_benchmark_items() -> Result<Vec<red::lsp::CompletionResponseItem>> {
+    (0..COMPLETION_ITEMS)
         .map(|index| {
             let label = if index % 12 == 0 {
                 format!("needle_pipeline_{index:05}")
@@ -953,9 +960,13 @@ fn benchmark_completions() -> Result<serde_json::Value> {
             };
             serde_json::from_value(json!({ "label": label }))
         })
-        .collect::<Result<Vec<_>, _>>()?;
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(Into::into)
+}
+
+fn benchmark_completions() -> Result<serde_json::Value> {
     let mut completion = CompletionUI::new();
-    completion.show(items, 8, 4);
+    completion.show(completion_benchmark_items()?, 8, 4);
     let queries = ["n", "ne", "nee", "need", "needl", "needle", "needle_"];
 
     let started = Instant::now();
@@ -969,6 +980,55 @@ fn benchmark_completions() -> Result<serde_json::Value> {
         "lsp_completion_filter",
         started,
         COMPLETION_ROUNDS * queries.len(),
+    ))
+}
+
+fn benchmark_completion_backspacing() -> Result<serde_json::Value> {
+    let mut completion = CompletionUI::new();
+    completion.show(completion_benchmark_items()?, 8, 4);
+    completion.set_filter("needl");
+    completion.set_filter("needle");
+    let started = Instant::now();
+    for _ in 0..COMPLETION_ROUNDS * 8 {
+        completion.set_filter(black_box("needl"));
+        completion.set_filter(black_box("needle"));
+    }
+    Ok(report(
+        "lsp_completion_backspace",
+        started,
+        COMPLETION_ROUNDS * 16,
+    ))
+}
+
+fn benchmark_buffer_completion() -> Result<serde_json::Value> {
+    let source = std::env::var_os("RED_COMPLETION_BENCH_FILE")
+        .map(std::fs::read_to_string)
+        .transpose()?
+        .unwrap_or_else(|| "ordinary_token another_identifier final_value\n".repeat(12_000));
+    let config = Config::default();
+    let lsp = Box::new(LspManager::new(config.lsp.clone()));
+    let editor = Editor::with_size(
+        lsp,
+        120,
+        40,
+        config,
+        Theme::default(),
+        vec![Buffer::new(None, format!("zzzz_missing_prefix\n{source}"))],
+    )?;
+    let mut editor = editor;
+    editor.test_set_viewport_cursor(
+        /*vtop*/ 0,
+        /*cx*/ "zzzz_missing_prefix".len(),
+        /*cy*/ 0,
+    );
+    let started = Instant::now();
+    for _ in 0..BUFFER_COMPLETION_ROUNDS {
+        black_box(editor.benchmark_buffer_completion_count());
+    }
+    Ok(report(
+        "buffer_word_completion_scan",
+        started,
+        BUFFER_COMPLETION_ROUNDS,
     ))
 }
 

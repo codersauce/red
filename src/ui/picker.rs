@@ -117,6 +117,7 @@ fn default_path_filter_score(
 
 const MIN_HORIZONTAL_PREVIEW_PANE_WIDTH: usize = 40;
 const MAX_PREVIEW_HIGHLIGHT_BYTES: usize = 64 * 1024;
+const MAX_COMPLETE_LOCATION_PREVIEW_BYTES: u64 = 32 * 1024;
 const MAX_CACHED_PREVIEW_HIGHLIGHT_SPANS: usize = 4_096;
 pub(crate) const MAX_UNFOCUSED_PREVIEW_BYTES: u64 = 256 * 1024;
 const MAX_LOCATION_PREVIEW_SCAN_BYTES: usize = 8 * 1024 * 1024;
@@ -854,6 +855,7 @@ impl Picker {
     }
 
     pub fn filter(&mut self, term: &str) {
+        let _span = crate::editor::perf::PerfSpan::start("picker:filter");
         if let Some(items) = &self.dynamic_items {
             let can_reuse_history =
                 !self.external_filter && (self.incremental_filter || self.filter_action.is_none());
@@ -997,8 +999,25 @@ impl Picker {
     }
 
     pub fn replace_structured_items(&mut self, items: Vec<PickerItem>) {
+        self.replace_structured_items_with_optional_preview_root(items, None);
+    }
+
+    /// Resolves previews only for the selected row instead of allocating one per file.
+    pub(crate) fn replace_structured_items_with_preview_root(
+        &mut self,
+        items: Vec<PickerItem>,
+        root: PathBuf,
+    ) {
+        self.replace_structured_items_with_optional_preview_root(items, Some(root));
+    }
+
+    fn replace_structured_items_with_optional_preview_root(
+        &mut self,
+        items: Vec<PickerItem>,
+        preview_root: Option<PathBuf>,
+    ) {
         let previous = self.selected_item();
-        self.item_preview_root = None;
+        self.item_preview_root = preview_root;
         self.items.clear();
         self.dynamic_items = Some(items);
         self.install_path_filter_highlights();
@@ -1008,6 +1027,11 @@ impl Picker {
         self.filter(&search);
         self.resize_to_viewport(self.viewport_width, self.viewport_height);
         self.reset_preview_scroll_if_selection_changed(previous);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn dynamic_items_for_test(&self) -> &[PickerItem] {
+        self.dynamic_items.as_deref().unwrap_or_default()
     }
 
     pub fn apply_update(&mut self, id: i32, update: PickerUpdate) -> bool {
@@ -2480,7 +2504,7 @@ impl Picker {
             return result;
         }
 
-        let complete = len <= MAX_UNFOCUSED_PREVIEW_BYTES;
+        let complete = len <= MAX_COMPLETE_LOCATION_PREVIEW_BYTES;
         let checkpoint = override_contents.is_none().then(|| {
             cache
                 .iter()
@@ -3780,8 +3804,12 @@ impl Picker {
         }
 
         let root = self.item_preview_root.as_ref()?;
-        let selected = self.list.selected_index()?;
-        let item = self.list.items().get(selected)?;
+        let item = if let Some(item) = self.selected_dynamic_item() {
+            item.id.as_str()
+        } else {
+            let selected = self.list.selected_index()?;
+            self.list.items().get(selected)?.as_str()
+        };
         Some(Cow::Owned(PickerPreview::Location {
             path: root.join(item).to_string_lossy().into_owned(),
             line: None,
@@ -5967,6 +5995,34 @@ mod tests {
         assert!(!Arc::ptr_eq(&first, &evicted));
 
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn moderately_large_location_previews_only_read_visible_rows() {
+        let editor = test_editor();
+        let picker = Picker::new(/*title*/ None, &editor, &[], /*id*/ None);
+        let path = std::env::temp_dir().join(format!(
+            "red-picker-visible-preview-{}.rs",
+            uuid::Uuid::new_v4()
+        ));
+        let contents = (0..1_024)
+            .map(|line| format!("let value_{line:04} = \"{}\";\n", "x".repeat(32)))
+            .collect::<String>();
+        assert!(contents.len() > super::MAX_COMPLETE_LOCATION_PREVIEW_BYTES as usize);
+        assert!(contents.len() < super::MAX_UNFOCUSED_PREVIEW_BYTES as usize);
+        std::fs::write(&path, contents).unwrap();
+
+        let preview = picker.location_preview(
+            &path.to_string_lossy(),
+            /*focus_line*/ None,
+            /*preview_scroll*/ 0,
+            /*preview_height*/ 8,
+        );
+
+        assert!(!preview.complete);
+        assert_eq!(preview.text.lines().count(), 8);
+        assert!(preview.text.starts_with("let value_0000"));
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]

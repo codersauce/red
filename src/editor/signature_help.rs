@@ -15,7 +15,9 @@ pub(super) struct Snapshot {
 struct Scheduled {
     deadline: Instant,
     snapshot: Snapshot,
-    context: SignatureHelpContext,
+    trigger: Option<char>,
+    manual: bool,
+    dismissed_help: Option<SignatureHelp>,
 }
 
 struct Pending {
@@ -34,6 +36,12 @@ impl SignatureHelpState {
     pub(super) fn is_visible(&self) -> bool {
         self.visible.is_some()
     }
+
+    #[cfg(test)]
+    pub(super) fn show_for_test(&mut self, help: SignatureHelp) {
+        self.visible = Some(help);
+    }
+
     fn is_active(&self) -> bool {
         self.visible.is_some() || self.pending.is_some() || self.scheduled.is_some()
     }
@@ -128,20 +136,23 @@ impl Editor {
         {
             return false;
         }
-        let context = self.signature_context(trigger, completion && !active && trigger.is_none());
+        let closes_call = typed.is_some_and(|ch| matches!(ch, ')' | ']' | '}'));
+        // Preserve a dismissed inner signature for the eventual retrigger without
+        // cloning documentation and every overload for each ordinary keystroke.
+        let dismissed_help = closes_call
+            .then(|| self.signature_help.visible.take())
+            .flatten();
+        let visibility_changed = dismissed_help.is_some();
         self.signature_help.pending = None;
         self.signature_help.scheduled = Some(Scheduled {
             deadline: Instant::now()
                 + Duration::from_millis(self.config.signature_help.debounce_ms.min(5_000)),
             snapshot: after,
-            context,
+            trigger,
+            manual: completion && !active && trigger.is_none(),
+            dismissed_help,
         });
-        // A closing delimiter may return to an outer call. Hide the inner signature
-        // immediately, then let the server identify the enclosing callable.
-        if typed.is_some_and(|ch| matches!(ch, ')' | ']' | '}')) {
-            return self.signature_help.visible.take().is_some();
-        }
-        false
+        visibility_changed
     }
 
     pub(super) async fn invoke_signature_help(&mut self) -> anyhow::Result<bool> {
@@ -179,7 +190,12 @@ impl Editor {
         {
             return Ok(self.signature_help.clear());
         }
-        self.send_signature_help(scheduled.context).await
+        let mut context = self.signature_context(scheduled.trigger, scheduled.manual);
+        if let Some(help) = scheduled.dismissed_help {
+            context.is_retrigger = true;
+            context.active_signature_help = Some(help);
+        }
+        self.send_signature_help(context).await
     }
 
     async fn send_signature_help(&mut self, context: SignatureHelpContext) -> anyhow::Result<bool> {
@@ -224,7 +240,7 @@ impl Editor {
         if pending.snapshot != self.signature_snapshot() || !self.signature_context_available() {
             return None;
         }
-        let help = serde_json::from_value::<SignatureHelp>(response.result.clone())
+        let help = SignatureHelp::deserialize(&response.result)
             .ok()
             .filter(|help| !help.signatures.is_empty());
         self.signature_help.visible = help;

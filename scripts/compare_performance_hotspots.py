@@ -19,6 +19,8 @@ SCENARIOS = (
     "timers",
     "search",
     "completion",
+    "completion-backspace",
+    "buffer-completion",
     "rows",
     "json",
     "render",

@@ -4,8 +4,11 @@
 //! from the current query. It produces actions for the editor to apply; accepting an
 //! item does not itself mutate a buffer.
 
+use std::collections::VecDeque;
+
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 use fuzzy_matcher::{skim::SkimMatcherV2, FuzzyMatcher};
+use rayon::prelude::*;
 
 use crate::{
     config::KeyAction,
@@ -25,6 +28,9 @@ const PAGE_SIZE: usize = 10;
 const LEFT_PADDING: usize = 1;
 const RIGHT_PADDING: usize = 1;
 const ICON_COLUMN_WIDTH: usize = 2;
+const PARALLEL_COMPLETION_FILTER_MIN_ITEMS: usize = 1_024;
+const MAX_COMPLETION_FILTER_HISTORY_ENTRIES: usize = 8;
+const MAX_COMPLETION_FILTER_HISTORY_ITEMS: usize = 16_384;
 
 #[derive(Clone)]
 struct CompletionSelectionIdentity {
@@ -52,10 +58,11 @@ impl CompletionSelectionIdentity {
 #[derive(Default, Clone)]
 pub struct CompletionUI {
     all_items: Vec<CompletionResponseItem>,
+    item_widths: Vec<usize>,
     items: Vec<usize>,
-    matched_label_indices: Vec<Vec<usize>>,
     filter: String,
     last_filter: Option<String>,
+    filtered_history: VecDeque<(String, Vec<usize>)>,
     viewport: SelectionViewport,
     selection_manually_changed: bool,
     visible: bool,
@@ -105,12 +112,26 @@ impl CompletionUI {
         bounds_width: usize,
         bounds_height: usize,
     ) {
+        self.show_filtered_with_bounds(items, "", x, y, bounds_width, bounds_height);
+    }
+
+    /// Installs server candidates directly against the already-typed prefix.
+    pub(crate) fn show_filtered_with_bounds(
+        &mut self,
+        items: Vec<CompletionResponseItem>,
+        filter: &str,
+        x: usize,
+        y: usize,
+        bounds_width: usize,
+        bounds_height: usize,
+    ) {
         self.anchor_x = x;
         self.anchor_y = y;
         self.bounds_width = bounds_width;
         self.bounds_height = bounds_height;
         self.visible = true;
         self.filter.clear();
+        self.filter.push_str(filter);
         self.replace_items(items, None);
     }
 
@@ -151,18 +172,21 @@ impl CompletionUI {
                 })
                 .then(a.label.cmp(&b.label))
         });
+        self.item_widths = items.iter().map(Self::item_inner_width).collect();
         self.all_items = items;
         self.last_filter = None;
+        self.filtered_history.clear();
         self.refilter_items(selected);
     }
 
     pub fn hide(&mut self) {
         self.visible = false;
         self.all_items.clear();
+        self.item_widths.clear();
         self.items.clear();
-        self.matched_label_indices.clear();
         self.filter.clear();
         self.last_filter = None;
+        self.filtered_history.clear();
         self.selection_manually_changed = false;
     }
 
@@ -177,34 +201,38 @@ impl CompletionUI {
     }
 
     pub fn set_filter(&mut self, filter: &str) {
+        if self.filter == filter && self.last_filter.as_deref() == Some(filter) {
+            return;
+        }
         self.filter.clear();
         self.filter.push_str(filter);
         self.refilter_items(None);
     }
 
-    fn calculate_inner_width(&self) -> usize {
-        let max_item_width = self
-            .items
-            .iter()
-            .filter_map(|index| self.all_items.get(*index))
-            .map(|item| {
-                let label_width = display_width(Self::item_display_name(item))
-                    + item
-                        .label_details
-                        .as_ref()
-                        .and_then(|details| details.detail.as_deref())
-                        .map_or(0, display_width);
-                let description_width = item
-                    .label_details
-                    .as_ref()
-                    .and_then(|details| details.description.as_deref())
-                    .map_or(0, |description| display_width(description) + 1);
-                LEFT_PADDING + ICON_COLUMN_WIDTH + label_width + description_width + RIGHT_PADDING
-            })
-            .max()
-            .unwrap_or(MIN_INNER_WIDTH);
+    fn item_inner_width(item: &CompletionResponseItem) -> usize {
+        let label_width = display_width(Self::item_display_name(item))
+            + item
+                .label_details
+                .as_ref()
+                .and_then(|details| details.detail.as_deref())
+                .map_or(0, display_width);
+        let description_width = item
+            .label_details
+            .as_ref()
+            .and_then(|details| details.description.as_deref())
+            .map_or(0, |description| display_width(description) + 1);
+        LEFT_PADDING + ICON_COLUMN_WIDTH + label_width + description_width + RIGHT_PADDING
+    }
 
-        max_item_width.clamp(MIN_INNER_WIDTH, MAX_INNER_WIDTH)
+    fn calculate_inner_width(&self) -> usize {
+        let mut width = MIN_INNER_WIDTH;
+        for index in &self.items {
+            width = width.max(self.item_widths.get(*index).copied().unwrap_or_default());
+            if width >= MAX_INNER_WIDTH {
+                return MAX_INNER_WIDTH;
+            }
+        }
+        width.min(MAX_INNER_WIDTH)
     }
 
     fn item_filter_match(
@@ -212,40 +240,51 @@ impl CompletionUI {
         item: &CompletionResponseItem,
         filter: &str,
         normalized_filter: &str,
-    ) -> Option<(u8, i64, Vec<usize>)> {
-        if filter.is_empty() {
-            return Some((0, 0, Vec::new()));
-        }
-
-        let display_name = Self::item_display_name(item);
-        let candidate = item.filter_text.as_deref().unwrap_or(display_name);
-        let (score, candidate_indices) = matcher.fuzzy_indices(candidate, filter)?;
-        let normalized_candidate = candidate.to_lowercase();
-        let match_class = if normalized_candidate == normalized_filter {
-            3
-        } else if normalized_candidate.starts_with(normalized_filter) {
-            2
+    ) -> Option<(u8, i64)> {
+        let candidate = item
+            .filter_text
+            .as_deref()
+            .unwrap_or_else(|| Self::item_display_name(item));
+        let score = matcher.fuzzy_match(candidate, filter)?;
+        let match_class = if candidate.is_ascii() && filter.is_ascii() {
+            if candidate.eq_ignore_ascii_case(filter) {
+                3
+            } else if candidate
+                .get(..filter.len())
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case(filter))
+            {
+                2
+            } else {
+                1
+            }
         } else {
-            1
+            let normalized_candidate = candidate.to_lowercase();
+            if normalized_candidate == normalized_filter {
+                3
+            } else if normalized_candidate.starts_with(normalized_filter) {
+                2
+            } else {
+                1
+            }
         };
-        let label_indices = if display_name == candidate {
-            candidate_indices
-        } else {
-            matcher
-                .fuzzy_indices(display_name, filter)
-                .map(|(_, indices)| indices)
-                .unwrap_or_default()
-        };
-        Some((match_class, score, label_indices))
+        Some((match_class, score))
     }
 
     fn refilter_items(&mut self, selected: Option<&CompletionSelectionIdentity>) {
-        let matcher = SkimMatcherV2::default().ignore_case();
+        let _span = crate::editor::perf::PerfSpan::start("completion:filter");
+        let previous_query = self.last_filter.take();
+        let previous_matches = std::mem::take(&mut self.items);
         if self.filter.is_empty() {
-            self.items.clear();
             self.items.extend(0..self.all_items.len());
-            self.matched_label_indices = vec![Vec::new(); self.items.len()];
+        } else if let Some(cached) = self
+            .filtered_history
+            .iter()
+            .position(|(query, _)| query == &self.filter)
+            .and_then(|index| self.filtered_history.remove(index))
+        {
+            self.items = cached.1;
         } else {
+            let matcher = SkimMatcherV2::default().ignore_case();
             let normalized_filter = self.filter.to_lowercase();
             let matching_item = |index| {
                 Self::item_filter_match(
@@ -254,14 +293,30 @@ impl CompletionUI {
                     &self.filter,
                     &normalized_filter,
                 )
-                .map(|(class, score, indices)| (class, score, index, indices))
+                .map(|(class, score)| (class, score, index))
             };
-            let refines_previous = self
-                .last_filter
+            let refines_previous = previous_query
                 .as_ref()
                 .is_some_and(|previous| !previous.is_empty() && self.filter.starts_with(previous));
-            let mut matches = if refines_previous {
-                self.items
+            let candidate_count = if refines_previous {
+                previous_matches.len()
+            } else {
+                self.all_items.len()
+            };
+            let mut matches = if candidate_count >= PARALLEL_COMPLETION_FILTER_MIN_ITEMS {
+                if refines_previous {
+                    previous_matches
+                        .par_iter()
+                        .filter_map(|index| matching_item(*index))
+                        .collect::<Vec<_>>()
+                } else {
+                    (0..self.all_items.len())
+                        .into_par_iter()
+                        .filter_map(matching_item)
+                        .collect::<Vec<_>>()
+                }
+            } else if refines_previous {
+                previous_matches
                     .iter()
                     .copied()
                     .filter_map(matching_item)
@@ -271,16 +326,21 @@ impl CompletionUI {
                     .filter_map(matching_item)
                     .collect::<Vec<_>>()
             };
-            matches.sort_by(|a, b| {
-                b.0.cmp(&a.0)
-                    .then_with(|| b.1.cmp(&a.1))
-                    .then_with(|| a.2.cmp(&b.2))
+            matches.sort_unstable_by(|left, right| {
+                right
+                    .0
+                    .cmp(&left.0)
+                    .then_with(|| right.1.cmp(&left.1))
+                    .then_with(|| left.2.cmp(&right.2))
             });
-            self.items.clear();
-            self.matched_label_indices.clear();
-            for (_, _, index, indices) in matches {
-                self.items.push(index);
-                self.matched_label_indices.push(indices);
+            self.items
+                .extend(matches.into_iter().map(|(_, _, index)| index));
+        }
+        if let Some(query) = previous_query.filter(|query| !query.is_empty()) {
+            if previous_matches.len() <= MAX_COMPLETION_FILTER_HISTORY_ITEMS {
+                self.filtered_history.push_front((query, previous_matches));
+                self.filtered_history
+                    .truncate(MAX_COMPLETION_FILTER_HISTORY_ENTRIES);
             }
         }
         self.last_filter = Some(self.filter.clone());
@@ -518,6 +578,7 @@ impl CompletionUI {
             self.viewport.top()
         };
         let scroll_offset = offset.min(max_scroll_offset);
+        let matcher = SkimMatcherV2::default().ignore_case();
 
         for (visible_index, item_position) in (scroll_offset..self.items.len())
             .take(visible_count)
@@ -561,16 +622,19 @@ impl CompletionUI {
                 .saturating_sub(LEFT_PADDING + ICON_COLUMN_WIDTH + RIGHT_PADDING)
                 .saturating_sub(description_space.unwrap_or(0));
             let label = Self::ellipsize(&Self::item_label(item), label_width);
-            let matched_indices = self
-                .matched_label_indices
-                .get(item_position)
-                .map(Vec::as_slice)
-                .unwrap_or_default();
+            let matched_indices = if self.filter.is_empty() {
+                Vec::new()
+            } else {
+                matcher
+                    .fuzzy_indices(Self::item_display_name(item), &self.filter)
+                    .map(|(_, indices)| indices)
+                    .unwrap_or_default()
+            };
             output.extend(self.label_segments(
                 self.x + 1 + LEFT_PADDING + ICON_COLUMN_WIDTH,
                 y,
                 &label,
-                matched_indices,
+                &matched_indices,
                 &base_style,
             ));
 
@@ -650,6 +714,10 @@ impl Component for CompletionUI {
             buffer.set_text(x, y, &text, &style);
         }
         Ok(())
+    }
+
+    fn accepts_completion_updates(&self) -> bool {
+        true
     }
 
     fn update_completion(&mut self, items: Vec<CompletionResponseItem>, filter: &str) -> bool {
@@ -1501,6 +1569,56 @@ mod tests {
         ui.set_filter("ne");
 
         assert_eq!(ui.items.len(), 2);
+    }
+
+    #[test]
+    fn completion_reuses_recent_queries_without_retaining_oversized_results() {
+        let mut ui = CompletionUI::new();
+        ui.show(
+            vec![
+                item("needle", None),
+                item("nearby", None),
+                item("other", None),
+            ],
+            0,
+            0,
+        );
+        ui.set_filter("ne");
+        let broad_matches = ui.items.clone();
+        ui.set_filter("need");
+        assert!(ui
+            .filtered_history
+            .iter()
+            .any(|(query, matches)| query == "ne" && matches == &broad_matches));
+
+        ui.set_filter("ne");
+        assert_eq!(ui.items, broad_matches);
+        assert!(ui.filtered_history.iter().any(|(query, _)| query == "need"));
+
+        ui.update_items(vec![item("newcomer", None)], "ne");
+        assert!(ui.filtered_history.is_empty());
+        assert_eq!(ui.selected_item().unwrap().label, "newcomer");
+    }
+
+    #[test]
+    fn completion_parallel_filter_preserves_sort_order_and_visible_highlights() {
+        let items = (0..PARALLEL_COMPLETION_FILTER_MIN_ITEMS * 2)
+            .map(|index| {
+                let mut candidate = item(&format!("needle_{index:04}"), None);
+                candidate.sort_text = Some(format!("{:04}", 9_999 - index));
+                candidate
+            })
+            .collect::<Vec<_>>();
+        let mut ui = CompletionUI::new();
+        ui.show(items, 0, 0);
+        ui.set_filter("needle");
+
+        assert_eq!(ui.items.len(), PARALLEL_COMPLETION_FILTER_MIN_ITEMS * 2);
+        assert_eq!(ui.selected_item().unwrap().label, "needle_2047");
+        let rows = ui.render_completion();
+        assert!(rows
+            .iter()
+            .any(|(_, _, text, style)| text == "needle" && style.bold));
     }
 
     #[test]

@@ -1675,23 +1675,26 @@ impl Editor {
     }
 
     fn can_reuse_editor_surfaces(&self) -> bool {
+        let has_visible_overlay = self.overlay_manager.has_visible_content();
+        let has_docked_panels = (self.current_dialog.is_some() || has_visible_overlay)
+            && (self.panel_manager.reserved_left_width() > 0
+                || self.panel_manager.reserved_right_width() > 0
+                || self.panel_manager.reserved_top_height() > 0
+                || self.panel_manager.reserved_bottom_height() > 0);
         self.previous_render_buffer.is_some()
-            && !self.signature_help.is_visible()
             && self.learn_session.is_none()
             && !self.force_full_redraw
             && self.last_rendered_window == self.window_manager.active_stable_window_id()
             && self.current_dialog.as_ref().is_none_or(|dialog| {
-                dialog.allows_event_passthrough()
-                    && self.panel_manager.reserved_left_width() == 0
-                    && self.panel_manager.reserved_right_width() == 0
-                    && self.panel_manager.reserved_top_height() == 0
-                    && self.panel_manager.reserved_bottom_height() == 0
+                dialog.allows_event_passthrough() && !has_docked_panels
             })
             && self.keyboard_shortcuts.is_none()
             && !self.keymap_hints_visible
             && !self.panel_manager.has_focused_panel()
             && !self.workspace_manager.is_active()
-            && !self.overlay_manager.has_visible_content()
+            // Editor-window frames repaint overlays themselves; only preserved panes
+            // need a complete frame when a floating overlay can overlap them.
+            && (!has_visible_overlay || !has_docked_panels)
             && self.render_commands.is_empty()
             && !self.has_term()
     }
@@ -5127,6 +5130,82 @@ mod tests {
                 .any(|row| row.contains("alpha")),
             "edited window rows must repaint the active completion dialog"
         );
+    }
+
+    #[test]
+    fn edited_window_rows_preserve_signature_help_without_full_repaint() {
+        let source = Buffer::new(None, "outer(value)\nsecond line\n".to_string());
+        let mut editor = rendering_test_editor(source);
+        editor.mode = crate::editor::Mode::Insert;
+        editor.cx = "outer(".len();
+        editor.signature_help.show_for_test(
+            serde_json::from_value(serde_json::json!({
+                "signatures": [{
+                    "label": "outer(value: usize)",
+                    "parameters": [{ "label": "value: usize" }]
+                }]
+            }))
+            .unwrap(),
+        );
+        editor
+            .overlay_manager
+            .create_overlay(
+                "progress".to_string(),
+                crate::plugin::OverlayConfig {
+                    align: crate::plugin::OverlayAlignment::Bottom,
+                    ..crate::plugin::OverlayConfig::default()
+                },
+            )
+            .update_content(vec![("indexing workspace".to_string(), Style::default())]);
+        let mut buffer = RenderBuffer::new(60, 12, &Style::default());
+        editor.render(&mut buffer).unwrap();
+        let full_renders = editor.full_render_count;
+        assert!(rendered_rows(&buffer)
+            .iter()
+            .any(|row| row.contains("outer(value: usize)")));
+        assert!(rendered_rows(&buffer)
+            .iter()
+            .any(|row| row.contains("indexing workspace")));
+
+        editor.render_edited_window_rows(&mut buffer).unwrap();
+
+        assert_eq!(editor.full_render_count, full_renders);
+        assert!(rendered_rows(&buffer)
+            .iter()
+            .any(|row| row.contains("outer(value: usize)")));
+        assert!(rendered_rows(&buffer)
+            .iter()
+            .any(|row| row.contains("indexing workspace")));
+    }
+
+    #[test]
+    fn edited_window_rows_keep_full_repaint_for_overlays_over_docked_panes() {
+        let source = Buffer::new(None, "hello\nworld\n".to_string());
+        let mut editor = rendering_test_editor(source);
+        editor.panel_manager.create_panel(
+            "files".to_string(),
+            crate::plugin::PanelConfig {
+                width: 12,
+                ..crate::plugin::PanelConfig::default()
+            },
+        );
+        editor
+            .overlay_manager
+            .create_overlay(
+                "progress".to_string(),
+                crate::plugin::OverlayConfig::default(),
+            )
+            .update_content(vec![("indexing workspace".to_string(), Style::default())]);
+        let mut buffer = RenderBuffer::new(60, 12, &Style::default());
+        editor.render(&mut buffer).unwrap();
+        let full_renders = editor.full_render_count;
+
+        editor.render_edited_window_rows(&mut buffer).unwrap();
+
+        assert_eq!(editor.full_render_count, full_renders + 1);
+        assert!(rendered_rows(&buffer)
+            .iter()
+            .any(|row| row.contains("indexing workspace")));
     }
 
     #[test]

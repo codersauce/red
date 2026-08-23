@@ -153,8 +153,30 @@ fn indices_to_ranges(indices: Vec<usize>) -> Vec<[usize; 2]> {
 
 fn fuzzy_subsequence_matches(candidate: &str, query: &str) -> bool {
     let case_sensitive = query
-        .chars()
+        .bytes()
         .any(|character| character.is_ascii_uppercase());
+    if candidate.is_ascii() && query.is_ascii() {
+        let mut expected = query.bytes();
+        let Some(mut next) = expected.next() else {
+            return true;
+        };
+        for character in candidate.bytes() {
+            let matches = if case_sensitive {
+                character == next
+            } else {
+                character.eq_ignore_ascii_case(&next)
+            };
+            if !matches {
+                continue;
+            }
+            let Some(following) = expected.next() else {
+                return true;
+            };
+            next = following;
+        }
+        return false;
+    }
+
     let mut query = query.chars();
     let Some(mut expected) = query.next() else {
         return true;
