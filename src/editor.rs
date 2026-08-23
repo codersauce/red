@@ -42,6 +42,7 @@ mod inline_notifications;
 mod keyboard_shortcuts;
 mod learning;
 mod lsp_coordinator;
+mod multi_cursor;
 #[cfg(test)]
 mod navigation_perf_tests;
 mod notifications;
@@ -2504,6 +2505,49 @@ pub enum Action {
     CancelSearch,
     ClearSearchHighlight,
     SearchWordUnderCursor,
+    SelectNextOccurrence,
+    AddCursorUp,
+    AddCursorDown,
+    #[serde(skip)]
+    ToggleMultiCursorExtendMode,
+    #[serde(skip)]
+    ExtendMultiSelectionLeft,
+    #[serde(skip)]
+    ExtendMultiSelectionRight,
+    #[serde(skip)]
+    ExtendMultiSelectionWordForward,
+    #[serde(skip)]
+    ExtendMultiSelectionWordEnd,
+    #[serde(skip)]
+    ExtendMultiSelectionLineStart,
+    #[serde(skip)]
+    ExtendMultiSelectionLineEnd,
+    #[serde(skip)]
+    InvertMultiSelection,
+    #[serde(skip)]
+    SelectPreviousOccurrence,
+    #[serde(skip)]
+    SkipMultiSelection,
+    #[serde(skip)]
+    RemoveActiveMultiSelection,
+    #[serde(skip)]
+    ChangeMultiSelection,
+    #[serde(skip)]
+    InsertAtMultiSelectionStart,
+    #[serde(skip)]
+    AppendAtMultiSelectionEnd,
+    #[serde(skip)]
+    DeleteMultiSelection,
+    #[serde(skip)]
+    DeleteMultiSelectionBlackHole,
+    #[serde(skip)]
+    PasteAfterMultiSelection,
+    #[serde(skip)]
+    PasteBeforeMultiSelection,
+    #[serde(skip)]
+    YankMultiSelection,
+    #[serde(skip)]
+    ClearMultiSelection,
 
     MoveUp,
     MoveDown,
@@ -3450,6 +3494,9 @@ pub struct Editor {
 
     /// Current editor mode (normal, insert, visual, etc)
     mode: Mode,
+
+    /// Ctrl-N selections scoped to one stable buffer/window/revision owner.
+    multi_cursor: Option<multi_cursor::MultiCursorSession>,
 
     /// Captured dividers moved by directional keys while pane resize mode is active.
     pane_resize_mode: Option<PaneResizeMode>,
@@ -4506,6 +4553,8 @@ fn is_keyword_char(c: char) -> bool {
 pub struct Content {
     kind: ContentKind,
     text: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    multi_cursor_segments: Vec<String>,
 }
 
 struct VisualPastePlan {
@@ -4518,6 +4567,7 @@ impl Content {
         Self {
             kind: ContentKind::Charwise,
             text,
+            multi_cursor_segments: Vec::new(),
         }
     }
 
@@ -4525,6 +4575,7 @@ impl Content {
         Self {
             kind: ContentKind::Linewise,
             text,
+            multi_cursor_segments: Vec::new(),
         }
     }
 
@@ -4532,6 +4583,15 @@ impl Content {
         Self {
             kind: ContentKind::Blockwise,
             text,
+            multi_cursor_segments: Vec::new(),
+        }
+    }
+
+    fn multi_cursor_blockwise(segments: Vec<String>) -> Self {
+        Self {
+            kind: ContentKind::Blockwise,
+            text: segments.join("\n"),
+            multi_cursor_segments: segments,
         }
     }
 }
@@ -5013,6 +5073,7 @@ impl Editor {
             prev_highlight_y: None,
             vx,
             mode: Mode::Normal,
+            multi_cursor: None,
             pane_resize_mode: None,
             zoomed_pane: None,
             insert_entry_cursor: None,
@@ -17385,6 +17446,121 @@ impl Editor {
     }
 
     fn handle_normal_event(&mut self, ev: &event::Event) -> Option<KeyAction> {
+        if self.has_multi_cursor_session() {
+            if let Event::Key(KeyEvent {
+                code,
+                modifiers,
+                kind: KeyEventKind::Press | KeyEventKind::Repeat,
+                ..
+            }) = ev
+            {
+                match (*code, *modifiers) {
+                    (KeyCode::Esc, _) => {
+                        return Some(KeyAction::Single(Action::ClearMultiSelection));
+                    }
+                    (KeyCode::Char('c'), KeyModifiers::NONE) => {
+                        return Some(KeyAction::Single(Action::ChangeMultiSelection));
+                    }
+                    (KeyCode::Char('i'), KeyModifiers::NONE) => {
+                        return Some(KeyAction::Single(Action::InsertAtMultiSelectionStart));
+                    }
+                    (KeyCode::Char('a'), KeyModifiers::NONE) => {
+                        return Some(KeyAction::Single(Action::AppendAtMultiSelectionEnd));
+                    }
+                    (KeyCode::Char('d'), KeyModifiers::NONE)
+                        if self.has_multi_cursor_selections() =>
+                    {
+                        return Some(KeyAction::Single(Action::DeleteMultiSelection));
+                    }
+                    (KeyCode::Char('x'), KeyModifiers::NONE)
+                        if self.has_multi_cursor_selections() =>
+                    {
+                        return Some(KeyAction::Single(Action::DeleteMultiSelectionBlackHole));
+                    }
+                    (KeyCode::Char('p'), KeyModifiers::NONE) => {
+                        return Some(KeyAction::Single(Action::PasteAfterMultiSelection));
+                    }
+                    (KeyCode::Char('P'), KeyModifiers::NONE | KeyModifiers::SHIFT) => {
+                        return Some(KeyAction::Single(Action::PasteBeforeMultiSelection));
+                    }
+                    (KeyCode::Char('y'), KeyModifiers::NONE)
+                        if self.has_multi_cursor_selections() =>
+                    {
+                        return Some(KeyAction::Single(Action::YankMultiSelection));
+                    }
+                    (KeyCode::Char('n'), KeyModifiers::CONTROL) => {}
+                    (KeyCode::Up | KeyCode::Down, KeyModifiers::CONTROL) => {}
+                    (KeyCode::Tab, KeyModifiers::NONE) => {
+                        return Some(KeyAction::Single(Action::ToggleMultiCursorExtendMode));
+                    }
+                    (KeyCode::Left, KeyModifiers::SHIFT) => {
+                        return Some(KeyAction::Single(Action::ExtendMultiSelectionLeft));
+                    }
+                    (KeyCode::Right, KeyModifiers::SHIFT) => {
+                        return Some(KeyAction::Single(Action::ExtendMultiSelectionRight));
+                    }
+                    (KeyCode::Left, KeyModifiers::NONE)
+                    | (KeyCode::Char('h'), KeyModifiers::NONE)
+                        if self.multi_cursor_is_extending() =>
+                    {
+                        return Some(KeyAction::Single(Action::ExtendMultiSelectionLeft));
+                    }
+                    (KeyCode::Right, KeyModifiers::NONE)
+                    | (KeyCode::Char('l'), KeyModifiers::NONE)
+                        if self.multi_cursor_is_extending() =>
+                    {
+                        return Some(KeyAction::Single(Action::ExtendMultiSelectionRight));
+                    }
+                    (KeyCode::Char('w'), KeyModifiers::NONE)
+                        if self.multi_cursor_is_extending() =>
+                    {
+                        return Some(KeyAction::Single(Action::ExtendMultiSelectionWordForward));
+                    }
+                    (KeyCode::Char('e'), KeyModifiers::NONE)
+                        if self.multi_cursor_is_extending() =>
+                    {
+                        return Some(KeyAction::Single(Action::ExtendMultiSelectionWordEnd));
+                    }
+                    (KeyCode::Char('0'), KeyModifiers::NONE)
+                        if self.multi_cursor_is_extending() =>
+                    {
+                        return Some(KeyAction::Single(Action::ExtendMultiSelectionLineStart));
+                    }
+                    (KeyCode::Char('$'), KeyModifiers::NONE | KeyModifiers::SHIFT)
+                        if self.multi_cursor_is_extending() =>
+                    {
+                        return Some(KeyAction::Single(Action::ExtendMultiSelectionLineEnd));
+                    }
+                    (KeyCode::Char('o'), KeyModifiers::NONE)
+                        if self.multi_cursor_is_extending() =>
+                    {
+                        return Some(KeyAction::Single(Action::InvertMultiSelection));
+                    }
+                    (KeyCode::Char('n'), KeyModifiers::NONE)
+                        if self.can_navigate_multi_cursor_occurrences() =>
+                    {
+                        return Some(KeyAction::Single(Action::SelectNextOccurrence));
+                    }
+                    (KeyCode::Char('N'), KeyModifiers::NONE | KeyModifiers::SHIFT)
+                        if self.can_navigate_multi_cursor_occurrences() =>
+                    {
+                        return Some(KeyAction::Single(Action::SelectPreviousOccurrence));
+                    }
+                    (KeyCode::Char('q'), KeyModifiers::NONE)
+                        if self.can_navigate_multi_cursor_occurrences() =>
+                    {
+                        return Some(KeyAction::Single(Action::SkipMultiSelection));
+                    }
+                    (KeyCode::Char('Q'), KeyModifiers::NONE | KeyModifiers::SHIFT)
+                        if self.can_navigate_multi_cursor_occurrences() =>
+                    {
+                        return Some(KeyAction::Single(Action::RemoveActiveMultiSelection));
+                    }
+                    _ => self.clear_multi_cursor(),
+                }
+            }
+        }
+
         if self.pending_replace {
             return self.handle_replace_event(ev);
         }
@@ -19497,6 +19673,14 @@ impl Editor {
             }
             Action::EnterMode(new_mode) => {
                 add_to_history = false;
+                if matches!(new_mode, Mode::Normal) && self.finish_multi_cursor_insert() {
+                    self.render(buffer)?;
+                    self.flush_edit_batch_events(runtime).await?;
+                    self.flush_edit_batch_changes(runtime).await?;
+                    self.request_diagnostics().await?;
+                    self.draw_statusline(buffer);
+                    return Ok(false);
+                }
                 let old_mode = self.mode;
                 if !matches!(new_mode, Mode::Insert) {
                     self.snippet_session = None;
@@ -19585,6 +19769,11 @@ impl Editor {
                 self.draw_statusline(buffer);
             }
             Action::InsertCharAtCursorPos(c) => {
+                if self.insert_at_multi_cursors(&c.to_string()) {
+                    self.notify_change(runtime).await?;
+                    self.render(buffer)?;
+                    return Ok(false);
+                }
                 let completion_dialog_open = self
                     .current_dialog
                     .as_ref()
@@ -20577,6 +20766,11 @@ impl Editor {
                 self.render(buffer)?;
             }
             Action::DeletePreviousChar => {
+                if self.delete_before_multi_cursors() {
+                    self.notify_change(runtime).await?;
+                    self.render(buffer)?;
+                    return Ok(false);
+                }
                 let completion_dialog_open = self
                     .current_dialog
                     .as_ref()
@@ -21610,6 +21804,131 @@ impl Editor {
                     }
                 }
             }
+            Action::SelectNextOccurrence => {
+                add_to_history = false;
+                self.select_next_occurrence();
+                self.render(buffer)?;
+            }
+            Action::AddCursorUp => {
+                add_to_history = false;
+                self.add_vertical_cursor(multi_cursor::VerticalCursorDirection::Up);
+                self.render(buffer)?;
+            }
+            Action::AddCursorDown => {
+                add_to_history = false;
+                self.add_vertical_cursor(multi_cursor::VerticalCursorDirection::Down);
+                self.render(buffer)?;
+            }
+            Action::ToggleMultiCursorExtendMode => {
+                add_to_history = false;
+                self.toggle_multi_cursor_extend_mode();
+                self.render(buffer)?;
+            }
+            Action::ExtendMultiSelectionLeft => {
+                add_to_history = false;
+                self.extend_multi_cursor_selections(multi_cursor::MultiCursorMotion::Left);
+                self.render(buffer)?;
+            }
+            Action::ExtendMultiSelectionRight => {
+                add_to_history = false;
+                self.extend_multi_cursor_selections(multi_cursor::MultiCursorMotion::Right);
+                self.render(buffer)?;
+            }
+            Action::ExtendMultiSelectionWordForward => {
+                add_to_history = false;
+                self.extend_multi_cursor_selections(multi_cursor::MultiCursorMotion::WordForward);
+                self.render(buffer)?;
+            }
+            Action::ExtendMultiSelectionWordEnd => {
+                add_to_history = false;
+                self.extend_multi_cursor_selections(multi_cursor::MultiCursorMotion::WordEnd);
+                self.render(buffer)?;
+            }
+            Action::ExtendMultiSelectionLineStart => {
+                add_to_history = false;
+                self.extend_multi_cursor_selections(multi_cursor::MultiCursorMotion::LineStart);
+                self.render(buffer)?;
+            }
+            Action::ExtendMultiSelectionLineEnd => {
+                add_to_history = false;
+                self.extend_multi_cursor_selections(multi_cursor::MultiCursorMotion::LineEnd);
+                self.render(buffer)?;
+            }
+            Action::InvertMultiSelection => {
+                add_to_history = false;
+                self.invert_multi_cursor_selections();
+                self.render(buffer)?;
+            }
+            Action::SelectPreviousOccurrence => {
+                add_to_history = false;
+                self.select_previous_occurrence();
+                self.render(buffer)?;
+            }
+            Action::SkipMultiSelection => {
+                add_to_history = false;
+                self.skip_multi_cursor_occurrence();
+                self.render(buffer)?;
+            }
+            Action::RemoveActiveMultiSelection => {
+                add_to_history = false;
+                self.remove_active_multi_cursor_selection();
+                self.render(buffer)?;
+            }
+            Action::ChangeMultiSelection => {
+                add_to_history = false;
+                if self.begin_multi_cursor_insert(multi_cursor::MultiCursorInsertAnchor::Replace) {
+                    self.notify_change(runtime).await?;
+                }
+                self.render(buffer)?;
+            }
+            Action::InsertAtMultiSelectionStart => {
+                add_to_history = false;
+                self.begin_multi_cursor_insert(multi_cursor::MultiCursorInsertAnchor::Start);
+                self.render(buffer)?;
+            }
+            Action::AppendAtMultiSelectionEnd => {
+                add_to_history = false;
+                self.begin_multi_cursor_insert(multi_cursor::MultiCursorInsertAnchor::End);
+                self.render(buffer)?;
+            }
+            Action::DeleteMultiSelection => {
+                add_to_history = false;
+                if self.delete_multi_cursor_selections(/*preserve_register*/ false) {
+                    self.notify_change(runtime).await?;
+                }
+                self.render(buffer)?;
+            }
+            Action::DeleteMultiSelectionBlackHole => {
+                add_to_history = false;
+                if self.delete_multi_cursor_selections(/*preserve_register*/ true) {
+                    self.notify_change(runtime).await?;
+                }
+                self.render(buffer)?;
+            }
+            Action::PasteAfterMultiSelection => {
+                add_to_history = false;
+                if self.paste_at_multi_cursors(multi_cursor::MultiCursorPasteAnchor::After) {
+                    self.notify_change(runtime).await?;
+                }
+                self.render(buffer)?;
+            }
+            Action::PasteBeforeMultiSelection => {
+                add_to_history = false;
+                if self.paste_at_multi_cursors(multi_cursor::MultiCursorPasteAnchor::Before) {
+                    self.notify_change(runtime).await?;
+                }
+                self.render(buffer)?;
+            }
+            Action::YankMultiSelection => {
+                add_to_history = false;
+                self.yank_multi_cursor_selections();
+                self.render(buffer)?;
+            }
+            Action::ClearMultiSelection => {
+                add_to_history = false;
+                self.clear_multi_cursor();
+                self.render(buffer)?;
+            }
             Action::DeleteWord => {
                 if let Some(range) = self.word_motion_range(1, false, false) {
                     self.begin_transaction("delete word");
@@ -22403,6 +22722,11 @@ impl Editor {
                 self.render_edited_window_rows(buffer)?;
             }
             Action::InsertPastedText(text) => {
+                if self.insert_at_multi_cursors(text) {
+                    self.notify_change(runtime).await?;
+                    self.render(buffer)?;
+                    return Ok(false);
+                }
                 let line = self.buffer_line();
                 let char_cx = self.grapheme_to_char_on_line(self.cx, line);
                 let start = TextPosition::new(line, char_cx);
@@ -23721,6 +24045,7 @@ impl Editor {
                 let content = Content {
                     kind: self.mode.into(),
                     text: selected_text.clone(),
+                    multi_cursor_segments: Vec::new(),
                 };
 
                 self.set_default_register(content.clone());
@@ -27407,6 +27732,7 @@ impl Editor {
         Some(Content {
             kind: self.mode.into(),
             text,
+            multi_cursor_segments: Vec::new(),
         })
     }
 

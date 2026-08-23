@@ -71,6 +71,29 @@ impl Editor {
                         | Mode::VisualLine
                         | Mode::VisualBlock
                 ) | Action::RepeatLastChange
+                    | Action::SelectNextOccurrence
+                    | Action::AddCursorUp
+                    | Action::AddCursorDown
+                    | Action::ToggleMultiCursorExtendMode
+                    | Action::ExtendMultiSelectionLeft
+                    | Action::ExtendMultiSelectionRight
+                    | Action::ExtendMultiSelectionWordForward
+                    | Action::ExtendMultiSelectionWordEnd
+                    | Action::ExtendMultiSelectionLineStart
+                    | Action::ExtendMultiSelectionLineEnd
+                    | Action::InvertMultiSelection
+                    | Action::SelectPreviousOccurrence
+                    | Action::SkipMultiSelection
+                    | Action::RemoveActiveMultiSelection
+                    | Action::ChangeMultiSelection
+                    | Action::InsertAtMultiSelectionStart
+                    | Action::AppendAtMultiSelectionEnd
+                    | Action::DeleteMultiSelection
+                    | Action::DeleteMultiSelectionBlackHole
+                    | Action::PasteAfterMultiSelection
+                    | Action::PasteBeforeMultiSelection
+                    | Action::YankMultiSelection
+                    | Action::ClearMultiSelection
                     | Action::PlayMacro(_)
                     | Action::InsertBlock
                     | Action::MoveToLineEnd
