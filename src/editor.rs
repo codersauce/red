@@ -28,6 +28,7 @@ mod diagnostics;
 mod diagnostics_picker;
 mod display_layout;
 mod edit_batch;
+mod file_watch;
 mod inline_actions;
 mod inline_agent_outcomes;
 mod inline_changes;
@@ -106,7 +107,7 @@ use crate::{
         EditorOpenTarget, EditorSelectionKind, EditorToolCall, EditorToolHost, EditorToolRequest,
         PendingEditorToolResponse, MAX_AGENT_READ_BYTES,
     },
-    buffer::{Buffer, BufferId, SearchMatch, SyntaxSelection},
+    buffer::{Buffer, BufferId, ExternalFileChange, SearchMatch, SyntaxSelection},
     clipboard::{ClipboardProvider, DisabledClipboardProvider, NativeClipboardProvider},
     codex::{
         start_codex, AgentRuntimePolicy, CodexBridge, CodexCommand, CodexEvent, CodexProcessSpec,
@@ -2389,8 +2390,14 @@ impl PickerCallback {
 pub enum Action {
     Quit(bool),
     Save,
+    /// Overwrites the backing file after an explicit `:w!` or conflict confirmation.
+    ForceSave,
     SaveAll,
     SaveAs(String),
+    /// Overwrites an explicitly selected destination after `:w! {file}`.
+    ForceSaveAs(String),
+    /// Shows the backing file beside the current buffer as a unified conflict diff.
+    CompareFileOnDisk,
     EnterMode(Mode),
     RestoreLastVisualSelection,
     /// Opens a bounded inline edit for the enclosing function or exact selection.
@@ -3326,6 +3333,9 @@ pub struct Editor {
 
     /// Plugin-owned scratch buffers and the commands that finish their workflows.
     scratch_buffers: HashMap<BufferId, ScratchBufferCommands>,
+
+    /// Native open-buffer watches plus a bounded fallback for dropped or unavailable events.
+    open_file_watcher: Box<file_watch::OpenFileWatcher>,
 
     /// Domain sub-controller managing session recovery and snapshots
     session_manager: session_manager::SessionManager,
@@ -5030,6 +5040,7 @@ impl Editor {
         Ok(Editor {
             buffer_manager,
             scratch_buffers: HashMap::new(),
+            open_file_watcher: Box::default(),
             session_manager,
             lsp_coordinator,
             agent_manager,
@@ -8086,8 +8097,11 @@ impl Editor {
                 | Action::PluginCommand(_)
                 | Action::Quit(_)
                 | Action::Save
+                | Action::ForceSave
                 | Action::SaveAll
                 | Action::SaveAs(_)
+                | Action::ForceSaveAs(_)
+                | Action::CompareFileOnDisk
                 | Action::DumpHistory
                 | Action::DumpBuffer
                 | Action::DumpDiagnostics
@@ -9345,6 +9359,34 @@ impl Editor {
             !contents.contains('\0'),
             "agent file contents cannot contain NUL bytes"
         );
+        if self.current_buffer().is_dirty()
+            && !self.current_buffer().preserves_unsaved_edits(&contents)
+        {
+            return Ok(json!({
+                "ok": false,
+                "applied": false,
+                "saved": false,
+                "error": format!(
+                    "Refusing to overwrite unsaved editor changes in {:?}; ask the user to save or discard them before retrying",
+                    path.display().to_string()
+                ),
+                "path": path,
+                "revision": current_revision,
+            }));
+        }
+        if let Err(error) = self.current_buffer().ensure_backing_file_unchanged(path) {
+            if let Ok(change) = self.current_buffer().detect_external_file_change() {
+                self.current_buffer_mut().set_external_file_change(change);
+                return Ok(json!({
+                    "ok": false,
+                    "applied": false,
+                    "saved": false,
+                    "error": format!("{error}; reread the file before retrying"),
+                    "path": path,
+                    "revision": current_revision,
+                }));
+            }
+        }
         let before = self.current_buffer().contents();
         let created = !path.exists();
         self.check_inline_agent_receipt_capacity(session_id, &before, &contents)?;
@@ -10292,6 +10334,7 @@ impl Editor {
         buffer: &mut RenderBuffer,
         runtime: &mut Runtime,
     ) -> anyhow::Result<()> {
+        self.service_open_file_changes(buffer, runtime).await?;
         if let Some(completed) = self
             .agent_manager
             .take_ready_playback_response(Instant::now())
@@ -16484,10 +16527,26 @@ impl Editor {
 
             if cmd == "write" {
                 if let Some(file) = parsed.file_argument() {
-                    actions.push(Action::SaveAs(file));
+                    actions.push(if parsed.is_forced() {
+                        Action::ForceSaveAs(file)
+                    } else {
+                        Action::SaveAs(file)
+                    });
                 } else {
-                    actions.push(Action::Save);
+                    actions.push(if parsed.is_forced() {
+                        Action::ForceSave
+                    } else {
+                        Action::Save
+                    });
                 }
+            }
+
+            if cmd == "diffdisk" {
+                if parsed.file_argument().is_some() {
+                    self.set_legacy_message(Some("usage: diffdisk".to_string()));
+                    return Vec::new();
+                }
+                actions.push(Action::CompareFileOnDisk);
             }
 
             if cmd == "wall" {
@@ -16503,7 +16562,11 @@ impl Editor {
                     self.set_legacy_message(Some("usage: saveas <file>".to_string()));
                     return Vec::new();
                 };
-                actions.push(Action::SaveAs(file));
+                actions.push(if parsed.is_forced() {
+                    Action::ForceSaveAs(file)
+                } else {
+                    Action::SaveAs(file)
+                });
             }
 
             if cmd == "file" {
@@ -19495,11 +19558,13 @@ impl Editor {
         if self.intercept_learn_action(action, buffer, runtime)? {
             return Ok(false);
         }
-        if matches!(action, Action::Save | Action::SaveAs(_))
-            && self
-                .tutorial_controller
-                .as_ref()
-                .is_some_and(|tutorial| tutorial.practice_buffer_id == self.current_buffer().id())
+        if matches!(
+            action,
+            Action::Save | Action::ForceSave | Action::SaveAs(_) | Action::ForceSaveAs(_)
+        ) && self
+            .tutorial_controller
+            .as_ref()
+            .is_some_and(|tutorial| tutorial.practice_buffer_id == self.current_buffer().id())
         {
             self.last_error = Some("the Red tutorial practice buffer cannot be saved".to_string());
             self.render(buffer)?;
@@ -21823,6 +21888,13 @@ impl Editor {
                 self.sync_inline_change_summaries();
                 self.render(buffer)?;
             }
+            Action::ForceSave => {
+                if !self.force_save_action(buffer, runtime).await? {
+                    return Ok(false);
+                }
+                self.sync_inline_change_summaries();
+                self.render(buffer)?;
+            }
             Action::SaveAll => {
                 self.execute_write_all(buffer, runtime).await?;
             }
@@ -21832,6 +21904,23 @@ impl Editor {
                 }
                 self.sync_inline_change_summaries();
                 self.render(buffer)?;
+            }
+            Action::ForceSaveAs(new_file_name) => {
+                if !self
+                    .force_save_as_action(new_file_name, buffer, runtime)
+                    .await?
+                {
+                    return Ok(false);
+                }
+                self.sync_inline_change_summaries();
+                self.render(buffer)?;
+            }
+            Action::CompareFileOnDisk => {
+                let opened = self.open_disk_conflict_dialog(runtime);
+                self.render(buffer)?;
+                if !opened {
+                    return Ok(false);
+                }
             }
             Action::CommitSearch => {
                 add_to_history = false;
@@ -29096,13 +29185,23 @@ impl Editor {
         buffer: &'a mut RenderBuffer,
         runtime: &'a mut Runtime,
     ) -> BoxFuture<'a, anyhow::Result<bool>> {
-        Box::pin(self.save_action_impl(buffer, runtime))
+        Box::pin(self.save_action_impl(buffer, runtime, /*force*/ false))
+    }
+
+    #[inline(never)]
+    fn force_save_action<'a>(
+        &'a mut self,
+        buffer: &'a mut RenderBuffer,
+        runtime: &'a mut Runtime,
+    ) -> BoxFuture<'a, anyhow::Result<bool>> {
+        Box::pin(self.save_action_impl(buffer, runtime, /*force*/ true))
     }
 
     async fn save_action_impl(
         &mut self,
         buffer: &mut RenderBuffer,
         runtime: &mut Runtime,
+        force: bool,
     ) -> anyhow::Result<bool> {
         let scratch_command = self
             .scratch_buffers
@@ -29113,7 +29212,7 @@ impl Editor {
             return Ok(false);
         }
         let resume_insert_transaction = self.commit_active_transaction_before_save();
-        let format_on_save = self.config.formatting.on_save;
+        let format_on_save = self.config.formatting.on_save && !force;
         let mut format_warning = None;
         let mut use_lsp = format_on_save;
         if format_on_save {
@@ -29164,7 +29263,11 @@ impl Editor {
                 }
             }
         }
-        let save_result = self.current_buffer_mut().save();
+        let save_result = if force {
+            self.current_buffer_mut().force_save()
+        } else {
+            self.current_buffer_mut().save()
+        };
         self.resume_insert_transaction_after_save(resume_insert_transaction);
 
         match save_result {
@@ -29203,7 +29306,17 @@ impl Editor {
         buffer: &'a mut RenderBuffer,
         runtime: &'a mut Runtime,
     ) -> BoxFuture<'a, anyhow::Result<bool>> {
-        Box::pin(self.save_as_action_impl(new_file_name, buffer, runtime))
+        Box::pin(self.save_as_action_impl(new_file_name, buffer, runtime, /*force*/ false))
+    }
+
+    #[inline(never)]
+    fn force_save_as_action<'a>(
+        &'a mut self,
+        new_file_name: &'a str,
+        buffer: &'a mut RenderBuffer,
+        runtime: &'a mut Runtime,
+    ) -> BoxFuture<'a, anyhow::Result<bool>> {
+        Box::pin(self.save_as_action_impl(new_file_name, buffer, runtime, /*force*/ true))
     }
 
     async fn save_as_action_impl(
@@ -29211,6 +29324,7 @@ impl Editor {
         new_file_name: &str,
         buffer: &mut RenderBuffer,
         runtime: &mut Runtime,
+        force: bool,
     ) -> anyhow::Result<bool> {
         if self
             .scratch_buffers
@@ -29243,7 +29357,7 @@ impl Editor {
         let previous_uri = self.current_buffer().uri()?;
         let previous_file = self.current_buffer().file.clone();
         let resume_insert_transaction = self.commit_active_transaction_before_save();
-        let format_on_save = self.config.formatting.on_save;
+        let format_on_save = self.config.formatting.on_save && !force;
         let mut format_warning = None;
         let mut use_lsp = format_on_save;
         if format_on_save {
@@ -29296,7 +29410,11 @@ impl Editor {
                 }
             }
         }
-        let save_result = self.current_buffer_mut().save_as(new_file_name);
+        let save_result = if force {
+            self.current_buffer_mut().force_save_as(new_file_name)
+        } else {
+            self.current_buffer_mut().save_as(new_file_name)
+        };
         self.resume_insert_transaction_after_save(resume_insert_transaction);
 
         match save_result {
@@ -30314,6 +30432,7 @@ pub struct BufferInfo {
     path: Option<String>,
     display_path: Option<String>,
     dirty: bool,
+    conflict: bool,
     active: bool,
     alternate: bool,
     line: usize,
@@ -30365,6 +30484,7 @@ impl From<&Editor> for EditorInfo {
                     path: buffer.file.clone(),
                     display_path,
                     dirty: buffer.is_dirty(),
+                    conflict: buffer.has_external_file_conflict(),
                     active,
                     alternate: Some(buffer.id()) == alternate_id,
                     line,
@@ -33036,12 +33156,59 @@ mod test {
             .await
             .unwrap();
 
+        assert_eq!(result["applied"], false);
         assert_eq!(result["saved"], false);
         assert!(result["error"]
             .as_str()
             .is_some_and(|error| error.contains("changed on disk")));
         assert_eq!(fs::read_to_string(&path).unwrap(), "external\n");
-        assert_eq!(editor.current_buffer().contents(), "agent edit\n");
+        assert_eq!(editor.current_buffer().contents(), "original\n");
+        assert!(!editor.current_buffer().is_dirty());
+        assert!(editor.current_buffer().has_external_file_conflict());
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn agent_file_writes_never_replace_unsaved_human_edits() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("document.rs");
+        fs::write(&path, "original\n").unwrap();
+        let mut editor = test_editor(/*width*/ 80, /*height*/ 24);
+        editor.test_set_agent_root(root.path());
+        let request = |call| EditorToolRequest {
+            session_id: "unsaved-human-edit".to_string(),
+            call,
+        };
+        let read = editor
+            .test_run_agent_editor_tool(request(EditorToolCall::ReadFile {
+                path: "document.rs".to_string(),
+                start_line: 1,
+                line_count: 20,
+            }))
+            .await
+            .unwrap();
+        editor
+            .current_buffer_mut()
+            .replace_range_raw(TextRange::insertion(TextPosition::new(0, 0)), "human ");
+        let revision = editor.current_buffer().revision();
+        assert_ne!(read["revision"].as_u64().unwrap(), revision);
+
+        let result = editor
+            .test_run_agent_editor_tool(request(EditorToolCall::WriteFile {
+                path: "document.rs".to_string(),
+                expected_revision: revision,
+                content: "agent edit\n".to_string(),
+            }))
+            .await
+            .unwrap();
+
+        assert_eq!(result["applied"], false);
+        assert_eq!(result["saved"], false);
+        assert!(result["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("unsaved editor changes")));
+        assert_eq!(fs::read_to_string(&path).unwrap(), "original\n");
+        assert_eq!(editor.current_buffer().contents(), "human original\n");
         assert!(editor.current_buffer().is_dirty());
     }
 

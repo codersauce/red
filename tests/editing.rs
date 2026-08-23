@@ -2972,6 +2972,129 @@ async fn wall_preserves_external_changes_while_saving_other_modified_buffers() {
 }
 
 #[tokio::test]
+async fn forced_write_explicitly_resolves_an_external_file_conflict() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("document.txt");
+    fs::write(&path, "original\n").unwrap();
+    let source = Buffer::new(
+        Some(path.to_string_lossy().into_owned()),
+        "original\n".to_string(),
+    );
+    let mut harness = EditorHarness::with_buffer(source);
+    harness
+        .execute_action(Action::InsertCharAtCursorPos('!'))
+        .await
+        .unwrap();
+    fs::write(&path, "external\n").unwrap();
+
+    harness
+        .execute_action(Action::Command("w".to_string()))
+        .await
+        .unwrap();
+    assert_eq!(fs::read_to_string(&path).unwrap(), "external\n");
+    assert!(harness
+        .editor
+        .test_current_buffer()
+        .has_external_file_conflict());
+
+    harness
+        .execute_action(Action::Command("w!".to_string()))
+        .await
+        .unwrap();
+
+    assert_eq!(fs::read_to_string(&path).unwrap(), "!original\n");
+    assert!(!harness.is_dirty());
+    assert!(!harness
+        .editor
+        .test_current_buffer()
+        .has_external_file_conflict());
+}
+
+#[tokio::test]
+async fn forced_write_with_a_filename_overwrites_only_the_requested_destination() {
+    let directory = tempfile::tempdir().unwrap();
+    let source_path = directory.path().join("source.txt");
+    let destination = directory.path().join("destination.txt");
+    fs::write(&source_path, "original\n").unwrap();
+    fs::write(&destination, "destination\n").unwrap();
+    let source = Buffer::new(
+        Some(source_path.to_string_lossy().into_owned()),
+        "original\n".to_string(),
+    );
+    let mut harness = EditorHarness::with_buffer(source);
+    harness
+        .execute_action(Action::InsertCharAtCursorPos('!'))
+        .await
+        .unwrap();
+
+    harness
+        .execute_action(Action::Command(format!("w {}", destination.display())))
+        .await
+        .unwrap();
+    assert_eq!(fs::read_to_string(&destination).unwrap(), "destination\n");
+
+    harness
+        .execute_action(Action::Command(format!("w! {}", destination.display())))
+        .await
+        .unwrap();
+
+    assert_eq!(fs::read_to_string(&source_path).unwrap(), "original\n");
+    assert_eq!(fs::read_to_string(&destination).unwrap(), "!original\n");
+    assert!(!harness.is_dirty());
+}
+
+#[tokio::test]
+async fn disk_conflict_comparison_defaults_to_preserving_both_versions() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("document.txt");
+    fs::write(&path, "original\n").unwrap();
+    let source = Buffer::new(
+        Some(path.to_string_lossy().into_owned()),
+        "original\n".to_string(),
+    );
+    let mut harness = EditorHarness::with_buffer(source);
+    harness
+        .execute_action(Action::InsertCharAtCursorPos('!'))
+        .await
+        .unwrap();
+    fs::write(&path, "external\n").unwrap();
+
+    harness
+        .execute_action(Action::Command("diffdisk".to_string()))
+        .await
+        .unwrap();
+    let rows = (0..24)
+        .map(|row| harness.editor.test_render_row(row).unwrap())
+        .collect::<Vec<_>>();
+    assert!(rows.iter().any(|row| row.contains("File changed on disk")));
+
+    harness
+        .execute_event(Event::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )))
+        .await
+        .unwrap();
+    assert_eq!(fs::read_to_string(&path).unwrap(), "external\n");
+    assert_eq!(harness.buffer_contents(), "!original\n");
+    assert!(harness.is_dirty());
+
+    harness
+        .execute_action(Action::Command("diffdisk".to_string()))
+        .await
+        .unwrap();
+    harness
+        .execute_event(Event::Key(KeyEvent::new(
+            KeyCode::Char('y'),
+            KeyModifiers::NONE,
+        )))
+        .await
+        .unwrap();
+    assert_eq!(fs::read_to_string(&path).unwrap(), "!original\n");
+    assert!(!harness.is_dirty());
+}
+
+#[tokio::test]
 async fn wall_saves_named_buffers_before_reporting_a_dirty_unnamed_buffer() {
     let directory = tempfile::tempdir().unwrap();
     let first_path = directory.path().join("first.txt");

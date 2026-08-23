@@ -195,6 +195,7 @@ struct StatuslineContext<'a> {
     line_endings: &'static str,
     read_only: bool,
     modified: bool,
+    external_file_change: Option<super::ExternalFileChange>,
     workspace: String,
     relative_path: Option<String>,
     buffer_index: String,
@@ -228,7 +229,37 @@ fn statusline_segment(
             };
             (statusline_icon_label(glyph, branch), Vec::new())
         }
-        StatuslineSection::Filename => (format!(" {} ", context.filename), Vec::new()),
+        StatuslineSection::Filename => {
+            let text = format!(" {} ", context.filename);
+            let accents = context
+                .external_file_change
+                .and_then(|change| {
+                    let marker = if change == super::ExternalFileChange::Deleted {
+                        "[DELETED]"
+                    } else {
+                        "[CONFLICT]"
+                    };
+                    let offset = text.find(marker)?;
+                    let color = theme
+                        .colors
+                        .get("editorWarning.foreground")
+                        .copied()
+                        .unwrap_or(Color::Rgb {
+                            r: 213,
+                            g: 164,
+                            b: 88,
+                        });
+                    Some(StatuslineAccent {
+                        column: display_width(&text[..offset]),
+                        text: marker.to_string(),
+                        color,
+                        minimum_contrast: None,
+                    })
+                })
+                .into_iter()
+                .collect();
+            (text, accents)
+        }
         StatuslineSection::Syntax => {
             let syntax = context.syntax.as_deref()?;
             let icon = IconCatalog::file(
@@ -343,13 +374,18 @@ fn statusline_segment(
             )
         }
         StatuslineSection::Modified => {
-            if !context.modified {
+            if !context.modified && context.external_file_change.is_none() {
                 return None;
             }
+            let label = match context.external_file_change {
+                Some(super::ExternalFileChange::Deleted) => "deleted on disk",
+                Some(_) => "conflict",
+                None => "modified",
+            };
             (
                 statusline_icon_label(
                     statusline_section_icon(StatuslineSection::Modified, icon_style),
-                    "modified",
+                    label,
                 ),
                 Vec::new(),
             )
@@ -3506,6 +3542,7 @@ impl Editor {
             filename,
             file_path,
             dirty,
+            external_file_change,
             position,
             buffer_index,
             cursor_line,
@@ -3529,6 +3566,7 @@ impl Editor {
                 window_buffer.name().to_string(),
                 window_buffer.file.clone(),
                 dirty,
+                window_buffer.external_file_change(),
                 format!(
                     " {}:{}{}",
                     window.vtop + window.cy + 1,
@@ -3554,6 +3592,7 @@ impl Editor {
                 current.name().to_string(),
                 current.file.clone(),
                 current.is_dirty(),
+                current.external_file_change(),
                 format!(" {}:{} ", self.vtop + self.cy + 1, self.cx + 1),
                 self.buffer_manager.active_index(),
                 self.vtop + self.cy,
@@ -3598,7 +3637,14 @@ impl Editor {
         } else {
             current_folder.clone()
         };
-        let filename = statusline_file_name(&filename, &current_folder);
+        let mut filename = statusline_file_name(&filename, &current_folder);
+        if let Some(change) = external_file_change {
+            filename.push_str(if change == super::ExternalFileChange::Deleted {
+                " [DELETED]"
+            } else {
+                " [CONFLICT]"
+            });
+        }
         let diagnostics = configured(StatuslineSection::Diagnostics)
             .then(|| self.statusline_diagnostic_counts(buffer_index))
             .flatten();
@@ -3693,6 +3739,7 @@ impl Editor {
             line_endings,
             read_only,
             modified: dirty,
+            external_file_change,
             workspace: if configured(StatuslineSection::Workspace) {
                 statusline_workspace_name(&workspace_root)
             } else {
@@ -4230,7 +4277,7 @@ fn format_mode_name(mode: &Mode) -> String {
 mod tests {
     use super::*;
     use crate::{
-        buffer::Buffer,
+        buffer::{Buffer, ExternalFileChange},
         config::Config,
         editor::{display_layout::LineSegment, HighlightSpan},
         lsp::{LspManager, Position, Range},
@@ -5232,6 +5279,54 @@ mod tests {
 
         assert!(row.contains(&relative.to_string_lossy().into_owned()));
         assert!(!row.contains(&current_folder.to_string_lossy().into_owned()));
+    }
+
+    #[test]
+    fn rendered_statusline_marks_external_conflicts_with_the_warning_color() {
+        const WIDTH: usize = 80;
+        const HEIGHT: usize = 5;
+
+        let mut source = Buffer::new(Some("document.rs".to_string()), "before\n".to_string());
+        source.set_external_file_change(Some(ExternalFileChange::Modified));
+        let mut config = Config::default();
+        config.statusline.left = vec![StatuslineSection::Filename, StatuslineSection::Modified];
+        config.statusline.right.clear();
+        let mut theme = Theme::default();
+        let warning = Color::Rgb {
+            r: 242,
+            g: 181,
+            b: 75,
+        };
+        theme
+            .colors
+            .insert("editorWarning.foreground".to_string(), warning);
+        let lsp = Box::new(LspManager::new(config.lsp.clone()));
+        let mut editor =
+            Editor::with_size(lsp, WIDTH, HEIGHT, config, theme, vec![source]).unwrap();
+
+        let frame = rendered_statusline(&mut editor, WIDTH, HEIGHT);
+        let row = editor.test_statusline_row();
+
+        assert!(row.contains("[CONFLICT]"));
+        assert!(row.contains("conflict"));
+        assert_eq!(statusline_cell(&frame, HEIGHT, "[").style.fg, Some(warning));
+    }
+
+    #[test]
+    fn rendered_statusline_marks_clean_deleted_files() {
+        let mut source = Buffer::new(Some("document.rs".to_string()), "before\n".to_string());
+        source.set_external_file_change(Some(ExternalFileChange::Deleted));
+        let mut config = Config::default();
+        config.statusline.left = vec![StatuslineSection::Filename, StatuslineSection::Modified];
+        config.statusline.right.clear();
+        let lsp = Box::new(LspManager::new(config.lsp.clone()));
+        let mut editor =
+            Editor::with_size(lsp, 80, 5, config, Theme::default(), vec![source]).unwrap();
+
+        let row = editor.test_statusline_row();
+
+        assert!(row.contains("[DELETED]"));
+        assert!(row.contains("deleted on disk"));
     }
 
     #[test]
