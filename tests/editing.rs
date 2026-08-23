@@ -2912,6 +2912,66 @@ async fn wall_saves_modified_file_buffers_and_preserves_the_active_buffer() {
 }
 
 #[tokio::test]
+async fn wall_preserves_external_changes_while_saving_other_modified_buffers() {
+    let directory = tempfile::tempdir().unwrap();
+    let first_path = directory.path().join("first.txt");
+    let second_path = directory.path().join("second.txt");
+    fs::write(&first_path, "first old\n").unwrap();
+    fs::write(&second_path, "second old\n").unwrap();
+    let buffers = vec![
+        Buffer::new(
+            Some(first_path.to_string_lossy().into_owned()),
+            "first old\n".to_string(),
+        ),
+        Buffer::new(
+            Some(second_path.to_string_lossy().into_owned()),
+            "second old\n".to_string(),
+        ),
+    ];
+    let ids = buffers.iter().map(Buffer::id).collect::<Vec<_>>();
+    let mut editor = Editor::test_with_size(
+        Box::new(MockLsp),
+        /*width*/ 80,
+        /*height*/ 24,
+        Config::default(),
+        Theme::default(),
+        buffers,
+    )
+    .unwrap();
+    editor.test_disable_terminal_output();
+    let mut harness = EditorHarness { editor };
+
+    for (id, character) in [(ids[0], '1'), (ids[1], '2')] {
+        harness
+            .execute_action(Action::OpenBufferById(id.as_u64()))
+            .await
+            .unwrap();
+        harness
+            .execute_action(Action::InsertCharAtCursorPos(character))
+            .await
+            .unwrap();
+    }
+    harness
+        .execute_action(Action::OpenBufferById(ids[0].as_u64()))
+        .await
+        .unwrap();
+    fs::write(&first_path, "external\n").unwrap();
+
+    harness
+        .execute_action(Action::Command("wall".to_string()))
+        .await
+        .unwrap();
+
+    assert_eq!(fs::read_to_string(&first_path).unwrap(), "external\n");
+    assert_eq!(fs::read_to_string(&second_path).unwrap(), "2second old\n");
+    assert_eq!(harness.buffer_contents(), "1first old\n");
+    assert!(harness.is_dirty());
+    assert!(harness
+        .last_error()
+        .is_some_and(|error| error.contains("changed on disk")));
+}
+
+#[tokio::test]
 async fn wall_saves_named_buffers_before_reporting_a_dirty_unnamed_buffer() {
     let directory = tempfile::tempdir().unwrap();
     let first_path = directory.path().join("first.txt");
@@ -3318,8 +3378,12 @@ async fn command_tab_writes_completed_paths_with_spaces() {
     let command_path = format!("{command_directory}/name  with spaces.txt!");
 
     for command in ["w", "wr", "wri", "write", "w!", "write!"] {
-        fs::write(&path, "old contents\n").unwrap();
-        let mut harness = EditorHarness::with_content("saved contents\n");
+        fs::write(&path, "contents\n").unwrap();
+        let mut buffer = Buffer::load_or_create(Some(path.to_string_lossy().into_owned()))
+            .await
+            .unwrap();
+        buffer.insert_str(/*x*/ 0, /*y*/ 0, "saved ");
+        let mut harness = EditorHarness::with_buffer(buffer);
         harness.set_commandline(
             Mode::Command,
             &format!("{command} {command_directory}/name"),

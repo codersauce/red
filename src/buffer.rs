@@ -23,10 +23,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::undo::{TextPosition, TextRange, UndoHistory};
 use crate::unicode_utils::{char_to_column, column_to_char, display_width, trim_line_ending};
-use crate::utils::{expand_user_path, normalized_file_path};
-
-#[cfg(not(unix))]
-use crate::utils::same_file_path;
+use crate::utils::{expand_user_path, normalized_file_path, same_file_path};
 
 const FIRST_BUFFER_ID: u64 = 1;
 static NEXT_BUFFER_ID: AtomicU64 = AtomicU64::new(FIRST_BUFFER_ID);
@@ -131,6 +128,13 @@ pub enum SyntaxSelection {
     Language(String),
 }
 
+/// Exact disk state last observed for the file associated with a buffer.
+#[derive(Debug)]
+struct BackingFileSnapshot {
+    path: PathBuf,
+    contents: Option<Rope>,
+}
+
 /// Buffer represents an editable text buffer, which may be associated with a file.
 /// It maintains the text content as a rope data structure for efficient editing operations.
 #[derive(Debug)]
@@ -146,6 +150,9 @@ pub struct Buffer {
 
     /// Last loaded or successfully saved text. Unknown recovered baselines stay dirty.
     saved_content: Option<Rope>,
+
+    /// Last known disk contents; `None` contents represent a file that did not exist.
+    backing_file: Option<BackingFileSnapshot>,
 
     /// Content revision for which `dirty` was last computed.
     dirty_revision: u64,
@@ -182,10 +189,18 @@ impl Buffer {
     }
 
     fn with_content(file: Option<String>, content: Rope) -> Self {
+        let backing_file = file.as_ref().map(|file| {
+            let path = PathBuf::from(file);
+            BackingFileSnapshot {
+                contents: path.exists().then(|| content.clone()),
+                path,
+            }
+        });
         Self {
             id: BufferId::next(),
             file,
             saved_content: Some(content.clone()),
+            backing_file,
             content,
             dirty_revision: 0,
             dirty: false,
@@ -412,6 +427,11 @@ impl Buffer {
         buffer.saved_content = saved_contents
             .map(|contents| Rope::from_str(&contents))
             .or_else(|| (!dirty).then(|| buffer.content.clone()));
+        if let Some(backing_file) = &mut buffer.backing_file {
+            if backing_file.contents.is_some() {
+                backing_file.contents.clone_from(&buffer.saved_content);
+            }
+        }
         buffer.revision = revision;
         buffer.dirty_revision = revision.wrapping_sub(1);
         buffer.undo_history = undo_history;
@@ -533,11 +553,68 @@ impl Buffer {
         self.refresh_dirty();
     }
 
+    /// Rejects writes when the destination no longer matches its last known disk state.
+    pub(crate) fn ensure_backing_file_unchanged(&self, path: &Path) -> anyhow::Result<()> {
+        let disk_contents = match std::fs::read(path) {
+            Ok(contents) => Some(contents),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error.into()),
+        };
+
+        let Some(backing_file) = self
+            .backing_file
+            .as_ref()
+            .filter(|backing_file| same_file_path(&backing_file.path, path))
+        else {
+            anyhow::ensure!(
+                disk_contents.is_none(),
+                "Refusing to overwrite existing file {:?}; it was not opened or saved by Red",
+                path.display().to_string()
+            );
+            return Ok(());
+        };
+
+        let unchanged = match (&backing_file.contents, disk_contents.as_deref()) {
+            (None, None) => true,
+            (Some(expected), Some(actual)) if expected.len_bytes() == actual.len() => {
+                let mut remaining = actual;
+                expected.chunks().all(|chunk| {
+                    let Some(rest) = remaining.strip_prefix(chunk.as_bytes()) else {
+                        return false;
+                    };
+                    remaining = rest;
+                    true
+                }) && remaining.is_empty()
+            }
+            _ => false,
+        };
+
+        anyhow::ensure!(
+            unchanged,
+            "File changed on disk since Red last read or saved it: {:?}; save your changes to another file or reload",
+            path.display().to_string()
+        );
+        Ok(())
+    }
+
+    /// Keeps the last known contents attached to a file moved by Red or an LSP server.
+    pub(crate) fn rename_backing_file(&mut self, path: &Path) {
+        if let Some(backing_file) = &mut self.backing_file {
+            backing_file.path = path.to_path_buf();
+        }
+    }
+
+    /// Drops the backing identity when a removed file becomes an unnamed scratch buffer.
+    pub(crate) fn detach_backing_file(&mut self) {
+        self.backing_file = None;
+    }
+
     /// Saves the buffer contents to its associated file
     pub fn save(&mut self) -> anyhow::Result<String> {
         if let Some(file) = self.file.clone() {
             let path = normalized_file_path(&file)?;
             let file = path.to_string_lossy().into_owned();
+            self.ensure_backing_file_unchanged(&path)?;
             let contents = self.contents();
             std::fs::write(&path, &contents)?;
             self.file = Some(file.clone());
@@ -553,6 +630,7 @@ impl Buffer {
     pub fn save_as(&mut self, new_file_name: &str) -> anyhow::Result<String> {
         let path = normalized_file_path(new_file_name)?;
         let file = path.to_string_lossy().into_owned();
+        self.ensure_backing_file_unchanged(&path)?;
         let contents = self.contents();
         std::fs::write(&path, &contents)?;
         self.file = Some(file.clone());
@@ -1229,6 +1307,10 @@ impl Buffer {
     /// Records the current contents and history revision as the saved state.
     pub fn mark_saved(&mut self) {
         self.saved_content = Some(self.content.clone());
+        self.backing_file = self.file.as_ref().map(|file| BackingFileSnapshot {
+            path: PathBuf::from(file),
+            contents: Some(self.content.clone()),
+        });
         self.undo_history.mark_saved();
         self.dirty = false;
         self.dirty_revision = self.revision;
@@ -1505,6 +1587,137 @@ mod test {
         assert!(!buffer.is_dirty());
         assert_eq!(fs::read_to_string(first).unwrap(), "def");
         assert_eq!(fs::read_to_string(second).unwrap(), "abc");
+    }
+
+    #[tokio::test]
+    async fn save_refuses_same_size_external_changes_and_preserves_local_edits() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("document.txt");
+        fs::write(&path, "first\n").unwrap();
+        let mut buffer = Buffer::load_or_create(Some(path.to_string_lossy().into_owned()))
+            .await
+            .unwrap();
+
+        replace_all(&mut buffer, "local\n");
+        fs::write(&path, "other\n").unwrap();
+        let error = buffer.save().unwrap_err();
+
+        assert!(error.to_string().contains("changed on disk"));
+        assert_eq!(fs::read_to_string(&path).unwrap(), "other\n");
+        assert_eq!(buffer.contents(), "local\n");
+        assert!(buffer.is_dirty());
+    }
+
+    #[tokio::test]
+    async fn save_refuses_files_created_or_deleted_outside_red() {
+        let directory = tempfile::tempdir().unwrap();
+        let created_path = directory.path().join("created.txt");
+        let mut created = Buffer::load_or_create(Some(created_path.to_string_lossy().into_owned()))
+            .await
+            .unwrap();
+        replace_all(&mut created, "local\n");
+        fs::write(&created_path, "external\n").unwrap();
+
+        assert!(created
+            .save()
+            .unwrap_err()
+            .to_string()
+            .contains("changed on disk"));
+        assert_eq!(fs::read_to_string(&created_path).unwrap(), "external\n");
+        assert!(created.is_dirty());
+
+        let deleted_path = directory.path().join("deleted.txt");
+        fs::write(&deleted_path, "original\n").unwrap();
+        let mut deleted = Buffer::from_file(Some(deleted_path.to_string_lossy().into_owned()))
+            .await
+            .unwrap();
+        replace_all(&mut deleted, "local\n");
+        fs::remove_file(&deleted_path).unwrap();
+
+        assert!(deleted
+            .save()
+            .unwrap_err()
+            .to_string()
+            .contains("changed on disk"));
+        assert!(!deleted_path.exists());
+        assert!(deleted.is_dirty());
+    }
+
+    #[tokio::test]
+    async fn successful_saves_advance_the_disk_baseline() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("document.txt");
+        fs::write(&path, "first\n").unwrap();
+        let mut buffer = Buffer::load_or_create(Some(path.to_string_lossy().into_owned()))
+            .await
+            .unwrap();
+
+        replace_all(&mut buffer, "second\n");
+        buffer.save().unwrap();
+        replace_all(&mut buffer, "third\n");
+        buffer.save().unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "third\n");
+
+        replace_all(&mut buffer, "local\n");
+        fs::write(&path, "other\n").unwrap();
+
+        assert!(buffer
+            .save()
+            .unwrap_err()
+            .to_string()
+            .contains("changed on disk"));
+        assert_eq!(fs::read_to_string(&path).unwrap(), "other\n");
+    }
+
+    #[tokio::test]
+    async fn save_as_preserves_existing_destinations_and_external_source_changes() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source.txt");
+        let existing = directory.path().join("existing.txt");
+        let recovered = directory.path().join("recovered.txt");
+        fs::write(&source, "source\n").unwrap();
+        fs::write(&existing, "existing\n").unwrap();
+        let mut buffer = Buffer::load_or_create(Some(source.to_string_lossy().into_owned()))
+            .await
+            .unwrap();
+        replace_all(&mut buffer, "local\n");
+
+        let error = buffer.save_as(&existing.to_string_lossy()).unwrap_err();
+        assert!(error.to_string().contains("Refusing to overwrite"));
+        assert_eq!(fs::read_to_string(&existing).unwrap(), "existing\n");
+        assert_eq!(buffer.file.as_deref(), source.to_str());
+        assert!(buffer.is_dirty());
+
+        fs::write(&source, "external\n").unwrap();
+        buffer.save_as(&recovered.to_string_lossy()).unwrap();
+
+        assert_eq!(fs::read_to_string(&source).unwrap(), "external\n");
+        assert_eq!(fs::read_to_string(&recovered).unwrap(), "local\n");
+        assert_eq!(buffer.file.as_deref(), recovered.to_str());
+        assert!(!buffer.is_dirty());
+    }
+
+    #[test]
+    fn recovered_buffers_preserve_their_original_saved_disk_baseline() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("recovered.txt");
+        fs::write(&path, "external\n").unwrap();
+        let mut buffer = Buffer::from_session_snapshot(
+            Some(path.to_string_lossy().into_owned()),
+            "local\n".into(),
+            Some("saved\n".into()),
+            true,
+            1,
+            UndoHistory::default(),
+        );
+
+        assert!(buffer
+            .save()
+            .unwrap_err()
+            .to_string()
+            .contains("changed on disk"));
+        assert_eq!(fs::read_to_string(&path).unwrap(), "external\n");
+        assert!(buffer.is_dirty());
     }
 
     #[test]

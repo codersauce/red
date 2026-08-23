@@ -40,7 +40,7 @@ async fn did_save_follows_successful_save_and_save_as_but_not_failed_writes() {
     let source = root.path().join("source.rs");
     let target = root.path().join("target.rs");
     let text = "fn main() {}\n";
-    std::fs::write(&source, "old").unwrap();
+    std::fs::write(&source, text).unwrap();
     let (mut editor, saves) = editor(root.path(), &source, text);
     editor.test_execute_action(Action::Save).await.unwrap();
     editor
@@ -58,6 +58,39 @@ async fn did_save_follows_successful_save_and_save_as_but_not_failed_writes() {
         assert_eq!(saved.text, text);
         assert_eq!(saved.disk_text.as_deref(), Some(text));
     }
+}
+
+#[tokio::test]
+async fn externally_modified_file_is_preserved_and_not_reported_to_lsp() {
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("source.rs");
+    let recovered = root.path().join("recovered.rs");
+    std::fs::write(&source, "base\n").unwrap();
+    let (mut editor, saves) = editor(root.path(), &source, "base\n");
+
+    editor.test_type_text("local ").await.unwrap();
+    std::fs::write(&source, "disk\n").unwrap();
+    editor.test_execute_action(Action::Save).await.unwrap();
+
+    assert_eq!(std::fs::read_to_string(&source).unwrap(), "disk\n");
+    assert_eq!(editor.test_buffer_contents(), "local base\n");
+    assert!(editor.test_current_buffer().is_dirty());
+    assert!(editor
+        .test_last_error()
+        .is_some_and(|error| error.contains("changed on disk")));
+    assert!(saves.lock().unwrap().is_empty());
+
+    editor
+        .test_execute_action(Action::SaveAs(recovered.to_string_lossy().into_owned()))
+        .await
+        .unwrap();
+
+    assert_eq!(std::fs::read_to_string(&source).unwrap(), "disk\n");
+    assert_eq!(std::fs::read_to_string(&recovered).unwrap(), "local base\n");
+    assert!(!editor.test_current_buffer().is_dirty());
+    let saves = saves.lock().unwrap();
+    assert_eq!(saves.len(), 1);
+    assert_eq!(Path::new(&saves[0].file), recovered);
 }
 
 #[tokio::test]

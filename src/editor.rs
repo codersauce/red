@@ -9266,7 +9266,16 @@ impl Editor {
         #[cfg(unix)]
         let result = {
             let contents = self.current_buffer().contents();
-            crate::lsp::workspace_edit::secure_write_workspace_file(root, path, contents.as_bytes())
+            self.current_buffer()
+                .ensure_backing_file_unchanged(path)
+                .and_then(|()| {
+                    crate::lsp::workspace_edit::secure_write_workspace_file(
+                        root,
+                        path,
+                        contents.as_bytes(),
+                    )
+                    .map_err(anyhow::Error::new)
+                })
                 .map(|()| {
                     self.current_buffer_mut().mark_saved();
                     format!(
@@ -9276,7 +9285,6 @@ impl Editor {
                         contents.len()
                     )
                 })
-                .map_err(anyhow::Error::new)
         };
         #[cfg(not(unix))]
         let result = {
@@ -24943,6 +24951,7 @@ impl Editor {
                 })
             });
             if let Some(destination) = renamed {
+                self.buffer_manager[index].rename_backing_file(&destination);
                 self.buffer_manager[index].file = Some(destination.to_string_lossy().into_owned());
                 identity_changes.push((index, previous_uri));
                 continue;
@@ -24953,6 +24962,7 @@ impl Editor {
                 .iter()
                 .any(|removed| absolute == *removed || absolute.starts_with(removed))
             {
+                self.buffer_manager[index].detach_backing_file();
                 self.buffer_manager[index].file = None;
                 identity_changes.push((index, previous_uri));
                 self.set_legacy_message(Some(
@@ -28738,6 +28748,7 @@ impl Editor {
             });
             if let Some(original_uri) = &document.original_uri {
                 if original_uri != &document.uri {
+                    self.buffer_manager[index].rename_backing_file(Path::new(&file));
                     renamed.push((original_uri.clone(), file.clone(), index));
                 }
             }
@@ -32991,6 +33002,47 @@ mod test {
             fs::read_to_string(root.path().join("other/nested/main.go")).unwrap(),
             "package main\n"
         );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn agent_file_writes_preserve_external_changes_to_open_buffers() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("document.rs");
+        fs::write(&path, "original\n").unwrap();
+        let mut editor = test_editor(/*width*/ 80, /*height*/ 24);
+        editor.test_set_agent_root(root.path());
+        let request = |call| EditorToolRequest {
+            session_id: "external-change".to_string(),
+            call,
+        };
+
+        let read = editor
+            .test_run_agent_editor_tool(request(EditorToolCall::ReadFile {
+                path: "document.rs".to_string(),
+                start_line: 1,
+                line_count: 20,
+            }))
+            .await
+            .unwrap();
+        fs::write(&path, "external\n").unwrap();
+
+        let result = editor
+            .test_run_agent_editor_tool(request(EditorToolCall::WriteFile {
+                path: "document.rs".to_string(),
+                expected_revision: read["revision"].as_u64().unwrap(),
+                content: "agent edit\n".to_string(),
+            }))
+            .await
+            .unwrap();
+
+        assert_eq!(result["saved"], false);
+        assert!(result["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("changed on disk")));
+        assert_eq!(fs::read_to_string(&path).unwrap(), "external\n");
+        assert_eq!(editor.current_buffer().contents(), "agent edit\n");
+        assert!(editor.current_buffer().is_dirty());
     }
 
     #[tokio::test]
@@ -40995,7 +41047,7 @@ builtin = "rust"
 
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("document.testfmt");
-        std::fs::write(&path, "disk\n").unwrap();
+        std::fs::write(&path, "hello  \n").unwrap();
         let formatter = root.path().join("reject-trailing-whitespace");
         std::fs::write(
             &formatter,
@@ -41134,7 +41186,7 @@ builtin = "rust"
 
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("document.testfmt");
-        std::fs::write(&path, "disk\n").unwrap();
+        std::fs::write(&path, "unformatted\n").unwrap();
         let formatter = root.path().join("failing-format");
         std::fs::write(&formatter, "#!/bin/sh\necho 'invalid syntax' >&2\nexit 7\n").unwrap();
         let mut permissions = std::fs::metadata(&formatter).unwrap().permissions();
@@ -42862,8 +42914,12 @@ builtin = "rust"
         let old = root.path().join("old.rs");
         let new = root.path().join("new.rs");
         std::fs::write(&old, "disk contents\n").unwrap();
-        let mut editor = workspace_lsp_test_editor(root.path(), &old, "unsaved contents\n");
-        editor.buffer_manager[0].dirty = true;
+        let mut editor = workspace_lsp_test_editor(root.path(), &old, "disk contents\n");
+        let end = editor.buffer_manager[0].char_idx_to_position(usize::MAX);
+        editor.buffer_manager[0].replace_range_raw(
+            TextRange::new(TextPosition::new(0, 0), end),
+            "unsaved contents\n",
+        );
         let operations = workspace_edit_operations(&serde_json::json!({
             "documentChanges": [{ "kind": "rename", "oldUri": crate::lsp::file_uri(&old).unwrap(), "newUri": crate::lsp::file_uri(&new).unwrap() }]
         }))
@@ -42891,6 +42947,15 @@ builtin = "rust"
         );
         assert_eq!(editor.buffer_manager[0].contents(), "unsaved contents\n");
         assert!(editor.buffer_manager[0].is_dirty());
+
+        editor.config.formatting.on_save = false;
+        editor
+            .test_execute_production_action(Action::Save)
+            .await
+            .unwrap();
+
+        assert_eq!(std::fs::read_to_string(&new).unwrap(), "unsaved contents\n");
+        assert!(!editor.buffer_manager[0].is_dirty());
     }
 
     #[cfg(not(unix))]
@@ -43019,6 +43084,61 @@ builtin = "rust"
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "value\n");
         assert_eq!(editor.buffer_manager[0].contents(), "value\n");
         assert!(!editor.buffer_manager[0].is_dirty());
+        assert!(editor.pending_lsp_edit_requests.is_empty());
+        assert!(editor.pending_lsp_format_saves.is_empty());
+    }
+
+    #[tokio::test]
+    async fn format_on_save_preserves_external_changes_while_formatting_is_pending() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("format.rs");
+        std::fs::write(&path, "value   \n").unwrap();
+        let mut editor = lsp_test_editor(vec![Buffer::new(
+            Some(path.to_string_lossy().into_owned()),
+            "value   \n".to_string(),
+        )]);
+        let uri = editor.buffer_manager[0].uri().unwrap().unwrap();
+        editor.pending_lsp_edit_requests.insert(
+            62,
+            PendingLspEdit {
+                buffer_id: editor.buffer_manager[0].id(),
+                revision: editor.buffer_manager[0].revision(),
+                uri,
+            },
+        );
+        editor.pending_lsp_format_saves.insert(
+            62,
+            PendingLspFormatSave {
+                save_as: None,
+                previous_file: None,
+                retry_invalid_edits: true,
+            },
+        );
+        std::fs::write(&path, "external\n").unwrap();
+        let response = InboundMessage::Message(ResponseMessage {
+            id: 62,
+            result: serde_json::json!([{
+                "range": { "start": { "line": 0, "character": 5 }, "end": { "line": 0, "character": 8 } },
+                "newText": ""
+            }]),
+            request: Some(crate::lsp::Request::new(
+                "textDocument/formatting",
+                serde_json::json!({}),
+            )),
+        });
+        let action = editor
+            .handle_lsp_message(&response, Some("textDocument/formatting".to_string()))
+            .expect("format response should produce an action");
+
+        editor.test_execute_production_action(action).await.unwrap();
+
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "external\n");
+        assert_eq!(editor.buffer_manager[0].contents(), "value\n");
+        assert!(editor.buffer_manager[0].is_dirty());
+        assert!(editor
+            .last_error
+            .as_deref()
+            .is_some_and(|error| error.contains("changed on disk")));
         assert!(editor.pending_lsp_edit_requests.is_empty());
         assert!(editor.pending_lsp_format_saves.is_empty());
     }
@@ -43343,7 +43463,7 @@ while True:
     async fn format_on_save_waits_for_delayed_lsp_initialize_and_saves_once() {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("delayed.rs");
-        std::fs::write(&path, "disk value\n").unwrap();
+        std::fs::write(&path, "value   \n").unwrap();
         let file = path.to_string_lossy().into_owned();
         let (mut editor, ready, release, events) = delayed_formatter_editor(
             root.path(),
@@ -43362,7 +43482,7 @@ while True:
             .unwrap();
         std::fs::write(&release, "release").unwrap();
 
-        assert_eq!(disk_before_release, "disk value\n");
+        assert_eq!(disk_before_release, "value   \n");
         assert!(editor
             .last_error
             .as_deref()
@@ -43513,7 +43633,7 @@ while True:
     async fn format_on_save_falls_back_when_lsp_initialization_failed_before_save() {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("failed-initialize.rs");
-        std::fs::write(&path, "disk value\n").unwrap();
+        std::fs::write(&path, "value   \n").unwrap();
         let file = path.to_string_lossy().into_owned();
         let (mut editor, ready, release, events) = delayed_formatter_editor(
             root.path(),
@@ -43595,7 +43715,7 @@ while True:
                 "second.rs"
             });
             if !save_as {
-                std::fs::write(&target, "disk value\n").unwrap();
+                std::fs::write(&target, "value   \n").unwrap();
             }
             editor.buffer_manager.push_buffer(Buffer::new(
                 (!save_as).then(|| target.to_string_lossy().into_owned()),
@@ -43702,9 +43822,15 @@ while True:
             std::fs::write(&target, "disk target\n").unwrap();
             let target_file = target.to_string_lossy().into_owned();
             let target_uri = crate::lsp::file_uri(&target).unwrap();
+            let mut source = Buffer::new(Some(target_file.clone()), "disk target\n".to_string());
+            let end = source.char_idx_to_position(usize::MAX);
+            source.replace_range_raw(
+                TextRange::new(TextPosition::new(0, 0), end),
+                "unsaved source\n",
+            );
             let mut editor = lsp_test_editor(vec![
                 Buffer::new(Some(target_file.clone()), "decoy buffer\n".to_string()),
-                Buffer::new(Some(target_file.clone()), "unsaved source\n".to_string()),
+                source,
             ]);
             let buffer_id = editor.buffer_manager[1].id();
             editor.pending_lsp_edit_requests.insert(

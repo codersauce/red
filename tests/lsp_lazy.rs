@@ -401,7 +401,7 @@ async fn disabled_format_on_save_skips_lsp_for_save_and_save_as_but_allows_manua
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("source.rs");
     let target = root.path().join("target.rs");
-    std::fs::write(&path, "disk\n").unwrap();
+    std::fs::write(&path, "value   \n").unwrap();
     let config = Config::from_toml_with_overrides(
         "theme = \"red.json\"\n[keys]\n[lsp]\nformat_on_save = true\n[formatting]\non_save = false",
         &[],
