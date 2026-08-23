@@ -1991,6 +1991,24 @@ pub enum PluginRequest {
         id: String,
         model: plugin::TreePanelModel,
     },
+    OpenPanelSearch {
+        id: String,
+        initial: String,
+        prefix: String,
+    },
+    UpdatePanelSearch {
+        id: String,
+        status: String,
+    },
+    KeepPanelSearch {
+        id: String,
+    },
+    ClosePanelSearch {
+        id: String,
+    },
+    InvalidateWorkspacePaths {
+        path: String,
+    },
     CreateTextPanel {
         id: String,
         config: plugin::PanelConfig,
@@ -2070,6 +2088,16 @@ pub enum PluginRequest {
         request_id: RequestId,
     },
     DirectoryListed {
+        request_id: RequestId,
+        payload: Value,
+    },
+    SearchWorkspacePaths {
+        path: String,
+        query: String,
+        directories_only: bool,
+        request_id: RequestId,
+    },
+    WorkspacePathsSearched {
         request_id: RequestId,
         payload: Value,
     },
@@ -2197,6 +2225,11 @@ impl PluginRequest {
             Self::CreatePanel { .. } => "CreatePanel",
             Self::UpdatePanel { .. } => "UpdatePanel",
             Self::UpdateTreePanel { .. } => "UpdateTreePanel",
+            Self::OpenPanelSearch { .. } => "OpenPanelSearch",
+            Self::UpdatePanelSearch { .. } => "UpdatePanelSearch",
+            Self::KeepPanelSearch { .. } => "KeepPanelSearch",
+            Self::ClosePanelSearch { .. } => "ClosePanelSearch",
+            Self::InvalidateWorkspacePaths { .. } => "InvalidateWorkspacePaths",
             Self::CreateTextPanel { .. } => "CreateTextPanel",
             Self::UpdateTextPanel { .. } => "UpdateTextPanel",
             Self::AppendTextPanel { .. } => "AppendTextPanel",
@@ -2219,6 +2252,8 @@ impl PluginRequest {
             Self::CloseWindowBar { .. } => "CloseWindowBar",
             Self::ListDirectory { .. } => "ListDirectory",
             Self::DirectoryListed { .. } => "DirectoryListed",
+            Self::SearchWorkspacePaths { .. } => "SearchWorkspacePaths",
+            Self::WorkspacePathsSearched { .. } => "WorkspacePathsSearched",
             Self::GetGitStatus { .. } => "GetGitStatus",
             Self::FileOperation { .. } => "FileOperation",
             Self::WatchDirectory { .. } => "WatchDirectory",
@@ -12144,6 +12179,25 @@ impl Editor {
                     );
                     needs_render = true;
                 }
+                PluginRequest::OpenPanelSearch {
+                    id,
+                    initial,
+                    prefix,
+                } => {
+                    needs_render |= self.panel_manager.open_panel_search(&id, &initial, &prefix);
+                }
+                PluginRequest::UpdatePanelSearch { id, status } => {
+                    needs_render |= self.panel_manager.update_panel_search(&id, status);
+                }
+                PluginRequest::KeepPanelSearch { id } => {
+                    needs_render |= self.panel_manager.keep_panel_search(&id);
+                }
+                PluginRequest::ClosePanelSearch { id } => {
+                    needs_render |= self.panel_manager.close_panel_search(&id);
+                }
+                PluginRequest::InvalidateWorkspacePaths { path } => {
+                    crate::workspace_paths::invalidate_workspace_path_index(Path::new(&path));
+                }
                 PluginRequest::CreateTextPanel { id, config } => {
                     self.clear_replaced_panel_zoom(&id);
                     self.panel_manager.create_text_panel(id.clone(), config);
@@ -12313,6 +12367,45 @@ impl Editor {
                     });
                 }
                 PluginRequest::DirectoryListed {
+                    request_id,
+                    payload,
+                } => {
+                    self.plugin_registry
+                        .resolve_request(runtime, request_id, payload)
+                        .await?;
+                }
+                PluginRequest::SearchWorkspacePaths {
+                    path,
+                    query,
+                    directories_only,
+                    request_id,
+                } => {
+                    let callback_runtime = runtime.clone();
+                    std::thread::spawn(move || {
+                        let result = crate::workspace_paths::search_workspace_paths(
+                            Path::new(&path),
+                            &query,
+                            directories_only,
+                        );
+                        let payload = serde_json::to_value(result).unwrap_or_else(|error| {
+                            json!({
+                                "query": query,
+                                "directories_only": directories_only,
+                                "children": [],
+                                "expanded": ["."],
+                                "matches": [],
+                                "total": 0,
+                                "truncated": false,
+                                "error": error.to_string(),
+                            })
+                        });
+                        callback_runtime.send_request(PluginRequest::WorkspacePathsSearched {
+                            request_id,
+                            payload,
+                        });
+                    });
+                }
+                PluginRequest::WorkspacePathsSearched {
                     request_id,
                     payload,
                 } => {
@@ -15244,6 +15337,13 @@ impl Editor {
         if let Some(event) = Self::key_string_for_event(ev)
             .and_then(|key| self.panel_manager.header_shortcut_event(&key))
         {
+            return Self::panel_event_key_action(event);
+        }
+        if let Some(event) = self.panel_manager.handle_focused_row_search(
+            ev,
+            usize::from(self.size.0),
+            usize::from(self.size.1.saturating_sub(2)),
+        ) {
             return Self::panel_event_key_action(event);
         }
         if matches!(ev, Event::Key(key) if matches!(key.code, KeyCode::Tab | KeyCode::BackTab))

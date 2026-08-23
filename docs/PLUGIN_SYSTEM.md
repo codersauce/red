@@ -207,11 +207,14 @@ actions, confirmations, and panel events stay in `plugins/neotree.hk`, while
 normalized path handling, typed Git-status presentation, and compatible
 tree-row construction live in `plugins/neotree_core`. Large Neo-tree panels
 use an internal Rust-owned virtual model that shares the plugin's directory
-entry arrays and decorates only rows in the terminal viewport. Red embeds the
-pure sources and exposes small internal bridges to the compatibility shells,
-so installed builds do not depend on checkout-relative source paths. The
-bridges and virtual tree are bundled-plugin implementation details, not
-public plugin APIs.
+entry arrays and decorates only rows in the terminal viewport. The tree's
+inline search delegates recursive, ignore-aware discovery and bounded fuzzy
+ranking to a shared Rust workspace-path index; the pure core renders matching
+paths and their ancestors without granting the plugin subprocess permissions.
+Red embeds the pure sources and exposes small internal bridges to the
+compatibility shells, so installed builds do not depend on checkout-relative
+source paths. The bridges and virtual tree are bundled-plugin implementation
+details, not public plugin APIs.
 
 `buffer:changed`, cursor, mode, viewport, file, theme, window, LSP, timer, picker, composer, panel, process, filesystem, workspace, and agent events are emitted by the production runtime. Subscribe only to the events a plugin needs and debounce expensive work.
 

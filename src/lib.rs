@@ -65,6 +65,7 @@ pub mod unicode_utils;
 pub mod utils;
 pub mod whats_new;
 pub mod window;
+mod workspace_paths;
 
 // Test utilities for integration tests
 #[doc(hidden)]

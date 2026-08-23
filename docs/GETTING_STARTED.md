@@ -243,6 +243,25 @@ The command palette includes descriptions, effective keymaps, and accepted
 `:Command` invocations. Pause after a configured prefix such as `Space`,
 `Ctrl-w`, or `g` to display available continuations.
 
+### Searching the file tree
+
+Press `Ctrl-e` to open the Neo-tree sidebar, then `/` to search files and
+directories recursively. Results appear directly in the tree, including entries
+inside collapsed folders. Queries match complete workspace-relative paths, so
+`ui pick` can find `src/ui/file_picker.rs`; matching filename characters are
+highlighted.
+
+Use Up/Down or `Ctrl-p`/`Ctrl-n` to move between results and Enter to open a
+file or reveal a directory. `Ctrl-Enter` reveals the selected result without
+opening it, and Escape restores the tree as it appeared before the search.
+Press `D` instead of `/` to search directories only. Press `f` to apply a
+persistent filter, or `Shift-Enter` to keep an ordinary search visible; use
+`Ctrl-x` to clear either filter.
+
+Search respects the tree's Git ignore settings, includes its visible dotfiles,
+and never traverses `.git` metadata. It runs in the background without requiring
+`fd`, `find`, or additional plugin process permissions.
+
 ## Windows and buffers
 
 - `Ctrl-w s` splits horizontally (top/bottom); `Ctrl-w v` or `Ctrl-w d` splits
