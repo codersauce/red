@@ -2509,6 +2509,10 @@ pub enum Action {
     #[serde(skip)]
     ChangeMultiSelection,
     #[serde(skip)]
+    InsertAtMultiSelectionStart,
+    #[serde(skip)]
+    AppendAtMultiSelectionEnd,
+    #[serde(skip)]
     ClearMultiSelection,
 
     MoveUp,
@@ -17207,6 +17211,12 @@ impl Editor {
                     (KeyCode::Char('c'), KeyModifiers::NONE) => {
                         return Some(KeyAction::Single(Action::ChangeMultiSelection));
                     }
+                    (KeyCode::Char('i'), KeyModifiers::NONE) => {
+                        return Some(KeyAction::Single(Action::InsertAtMultiSelectionStart));
+                    }
+                    (KeyCode::Char('a'), KeyModifiers::NONE) => {
+                        return Some(KeyAction::Single(Action::AppendAtMultiSelectionEnd));
+                    }
                     (KeyCode::Char('n'), KeyModifiers::CONTROL) => {}
                     _ => self.clear_multi_cursor(),
                 }
@@ -21408,9 +21418,19 @@ impl Editor {
             }
             Action::ChangeMultiSelection => {
                 add_to_history = false;
-                if self.begin_multi_cursor_change() {
+                if self.begin_multi_cursor_insert(multi_cursor::MultiCursorInsertAnchor::Replace) {
                     self.notify_change(runtime).await?;
                 }
+                self.render(buffer)?;
+            }
+            Action::InsertAtMultiSelectionStart => {
+                add_to_history = false;
+                self.begin_multi_cursor_insert(multi_cursor::MultiCursorInsertAnchor::Start);
+                self.render(buffer)?;
+            }
+            Action::AppendAtMultiSelectionEnd => {
+                add_to_history = false;
+                self.begin_multi_cursor_insert(multi_cursor::MultiCursorInsertAnchor::End);
                 self.render(buffer)?;
             }
             Action::ClearMultiSelection => {

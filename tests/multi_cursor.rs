@@ -69,3 +69,44 @@ async fn multi_cursor_insert_supports_backspace_and_paste() {
 
     harness.assert_buffer_contents("aZ aZ");
 }
+
+#[tokio::test]
+async fn multi_cursor_i_inserts_at_each_selection_start_as_one_undo() {
+    let config: Config = toml::from_str(include_str!("../default_config.toml")).unwrap();
+    let buffer = Buffer::new(None, "café café".to_string());
+    let mut harness = EditorHarness::with_config(buffer, config);
+
+    key(&mut harness, KeyCode::Char('n'), KeyModifiers::CONTROL).await;
+    key(&mut harness, KeyCode::Char('n'), KeyModifiers::CONTROL).await;
+    key(&mut harness, KeyCode::Char('i'), KeyModifiers::NONE).await;
+    harness.type_text("☕").await.unwrap();
+    key(&mut harness, KeyCode::Esc, KeyModifiers::NONE).await;
+
+    harness.assert_mode(Mode::Normal);
+    harness.assert_buffer_contents("☕café ☕café");
+
+    harness.execute_action(Action::Undo).await.unwrap();
+    harness.assert_buffer_contents("café café");
+}
+
+#[tokio::test]
+async fn multi_cursor_a_appends_to_each_selection_end_as_one_undo() {
+    let config: Config = toml::from_str(include_str!("../default_config.toml")).unwrap();
+    let buffer = Buffer::new(None, "foo foo".to_string());
+    let mut harness = EditorHarness::with_config(buffer, config);
+
+    key(&mut harness, KeyCode::Char('n'), KeyModifiers::CONTROL).await;
+    key(&mut harness, KeyCode::Char('n'), KeyModifiers::CONTROL).await;
+    key(&mut harness, KeyCode::Char('a'), KeyModifiers::NONE).await;
+    harness
+        .execute_event(Event::Paste("_id".to_string()))
+        .await
+        .unwrap();
+    key(&mut harness, KeyCode::Esc, KeyModifiers::NONE).await;
+
+    harness.assert_mode(Mode::Normal);
+    harness.assert_buffer_contents("foo_id foo_id");
+
+    harness.execute_action(Action::Undo).await.unwrap();
+    harness.assert_buffer_contents("foo foo");
+}

@@ -13,6 +13,13 @@ pub(super) enum MultiCursorPhase {
     Inserting,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum MultiCursorInsertAnchor {
+    Start,
+    End,
+    Replace,
+}
+
 #[derive(Debug, Clone)]
 pub(super) struct MultiCursorSession {
     buffer_id: BufferId,
@@ -107,7 +114,7 @@ impl Editor {
         self.move_to_active_multi_cursor(false);
     }
 
-    pub(super) fn begin_multi_cursor_change(&mut self) -> bool {
+    pub(super) fn begin_multi_cursor_insert(&mut self, anchor: MultiCursorInsertAnchor) -> bool {
         if !self.has_multi_cursor_session() {
             self.multi_cursor = None;
             return false;
@@ -123,8 +130,21 @@ impl Editor {
             return false;
         }
 
-        self.begin_transaction("multi-cursor change");
-        self.replace_multi_cursor_targets(ranges, "");
+        let label = match anchor {
+            MultiCursorInsertAnchor::Start => "multi-cursor insert",
+            MultiCursorInsertAnchor::End => "multi-cursor append",
+            MultiCursorInsertAnchor::Replace => "multi-cursor change",
+        };
+        self.begin_transaction(label);
+        match anchor {
+            MultiCursorInsertAnchor::Start => {
+                self.collapse_multi_cursor_ranges(&ranges, |range| range.start);
+            }
+            MultiCursorInsertAnchor::End => {
+                self.collapse_multi_cursor_ranges(&ranges, |range| range.end);
+            }
+            MultiCursorInsertAnchor::Replace => self.replace_multi_cursor_targets(ranges, ""),
+        }
         if let Some(session) = self.multi_cursor.as_mut() {
             session.phase = MultiCursorPhase::Inserting;
         }
@@ -133,6 +153,30 @@ impl Editor {
         self.generated_indent = None;
         self.move_to_active_multi_cursor(true);
         true
+    }
+
+    fn collapse_multi_cursor_ranges(
+        &mut self,
+        ranges: &[CharRange],
+        position: impl Fn(CharRange) -> usize,
+    ) {
+        let session = self
+            .multi_cursor
+            .as_mut()
+            .expect("multi-cursor collapse requires a session");
+        let active_range = session.selections.active_range();
+        let active = ranges
+            .iter()
+            .position(|range| *range == active_range)
+            .unwrap_or(0);
+        let cursors = ranges
+            .iter()
+            .map(|range| {
+                let position = position(*range);
+                CharRange::new(position, position)
+            })
+            .collect();
+        session.selections.replace_ranges(cursors, active);
     }
 
     pub(super) fn insert_at_multi_cursors(&mut self, text: &str) -> bool {

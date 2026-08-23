@@ -73,6 +73,8 @@ impl Editor {
                 ) | Action::RepeatLastChange
                     | Action::SelectNextOccurrence
                     | Action::ChangeMultiSelection
+                    | Action::InsertAtMultiSelectionStart
+                    | Action::AppendAtMultiSelectionEnd
                     | Action::ClearMultiSelection
                     | Action::PlayMacro(_)
                     | Action::InsertBlock
