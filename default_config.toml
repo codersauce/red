@@ -189,12 +189,14 @@ waiting = "steady_underscore"
 # [lsp]
 # format_on_save = false # Legacy alias for formatting.on_save.
 #
-# Supported documents are formatted on save by default. Set on_save to false
-# to disable it. The modern setting wins over the legacy alias in the same
-# config layer; command-line overrides still take precedence over the user file.
+# Supported pasted ranges and documents are formatted by default. Set on_paste
+# or on_save to false to disable the corresponding behavior. The modern save
+# setting wins over the legacy alias in the same config layer; command-line
+# overrides still take precedence over the user file.
 # Select an external language-pack formatter, LSP formatting, or automatic fallback:
 #
 # [formatting]
+# on_paste = true # Requires language-server range formatting support.
 # on_save = false
 # trim_trailing_whitespace = true
 # trim_trailing_whitespace_exclude = ["gitcommit", "markdown"]

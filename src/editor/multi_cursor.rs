@@ -173,13 +173,17 @@ impl Editor {
                     }
                 }
                 Action::PasteAfterMultiSelection => {
+                    let before = self.current_buffer().contents();
                     if self.paste_at_multi_cursors(MultiCursorPasteAnchor::After) {
                         self.notify_change(runtime).await?;
+                        self.request_format_on_paste(&before).await;
                     }
                 }
                 Action::PasteBeforeMultiSelection => {
+                    let before = self.current_buffer().contents();
                     if self.paste_at_multi_cursors(MultiCursorPasteAnchor::Before) {
                         self.notify_change(runtime).await?;
+                        self.request_format_on_paste(&before).await;
                     }
                 }
                 Action::YankMultiSelection => {

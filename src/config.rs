@@ -1022,6 +1022,9 @@ pub enum FormattingProvider {
 #[serde(deny_unknown_fields)]
 /// Global document formatting behavior.
 pub struct FormattingConfig {
+    /// Format pasted text when the language server supports range formatting. Defaults to on.
+    #[serde(default = "default_true")]
+    pub on_paste: bool,
     /// Format supported documents immediately before saving them. Defaults to on.
     #[serde(default = "default_true")]
     pub on_save: bool,
@@ -1043,6 +1046,7 @@ fn default_trailing_whitespace_exclusions() -> Vec<String> {
 impl Default for FormattingConfig {
     fn default() -> Self {
         Self {
+            on_paste: true,
             on_save: true,
             trim_trailing_whitespace: true,
             trim_trailing_whitespace_exclude: default_trailing_whitespace_exclusions(),
@@ -2251,7 +2255,8 @@ fn known_schema_path(path: &[String]) -> bool {
         ["lsp", field] => matches!(*field, "enabled" | "format_on_save" | "servers"),
         ["formatting", field] => matches!(
             *field,
-            "on_save"
+            "on_paste"
+                | "on_save"
                 | "trim_trailing_whitespace"
                 | "trim_trailing_whitespace_exclude"
                 | "provider"
@@ -5009,6 +5014,7 @@ workspace_name = "frontend"
 
     #[test]
     fn formatting_defaults_to_on_for_missing_fields_and_files() {
+        assert!(Config::default().formatting.on_paste);
         assert!(Config::default().formatting.on_save);
         assert!(Config::default().formatting.trim_trailing_whitespace);
         assert_eq!(
@@ -5017,17 +5023,35 @@ workspace_name = "frontend"
                 .trim_trailing_whitespace_exclude,
             ["gitcommit", "markdown"]
         );
-        assert!(toml::from_str::<FormattingConfig>("").unwrap().on_save);
+        let formatting = toml::from_str::<FormattingConfig>("").unwrap();
+        assert!(formatting.on_paste);
+        assert!(formatting.on_save);
         let config: Config = toml::from_str("theme = \"red.json\"\n[keys]").unwrap();
+        assert!(config.formatting.on_paste);
         assert!(config.formatting.on_save);
         let config: Config = toml::from_str(assets::DEFAULT_CONFIG).unwrap();
+        assert!(config.formatting.on_paste);
         assert!(config.formatting.on_save);
         assert_eq!(config.formatting.provider, FormattingProvider::Auto);
 
         let directory = tempfile::tempdir().unwrap();
         let loaded = Config::load_user_file(&directory.path().join("missing.toml"), &[]).unwrap();
         assert!(loaded.is_clean());
+        assert!(loaded.config.formatting.on_paste);
         assert!(loaded.config.formatting.on_save);
+    }
+
+    #[test]
+    fn formatting_on_paste_can_be_disabled_and_overridden() {
+        let loaded = Config::load_user_toml(
+            "[formatting]\non_paste = false",
+            Path::new("/tmp/config.toml"),
+            &["formatting.on_paste = true".to_string()],
+        )
+        .unwrap();
+
+        assert!(loaded.is_clean());
+        assert!(loaded.config.formatting.on_paste);
     }
 
     #[test]
