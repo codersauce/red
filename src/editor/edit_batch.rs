@@ -71,6 +71,9 @@ impl Editor {
                         | Mode::VisualLine
                         | Mode::VisualBlock
                 ) | Action::RepeatLastChange
+                    | Action::SelectNextOccurrence
+                    | Action::ChangeMultiSelection
+                    | Action::ClearMultiSelection
                     | Action::PlayMacro(_)
                     | Action::InsertBlock
                     | Action::MoveToLineEnd

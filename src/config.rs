@@ -3866,6 +3866,16 @@ enabled_codex_features = ["apps", "plugins", "orchestrator_mcp"]
     }
 
     #[test]
+    fn default_config_maps_ctrl_n_to_next_occurrence() {
+        let config: Config = toml::from_str(include_str!("../default_config.toml")).unwrap();
+
+        assert_eq!(
+            config.keys.normal.get("Ctrl-n"),
+            Some(&KeyAction::Single(Action::SelectNextOccurrence))
+        );
+    }
+
+    #[test]
     fn default_config_maps_shift_d_to_line_diagnostics() {
         let config: Config = toml::from_str(include_str!("../default_config.toml")).unwrap();
 

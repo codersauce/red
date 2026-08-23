@@ -42,6 +42,7 @@ mod inline_notifications;
 mod keyboard_shortcuts;
 mod learning;
 mod lsp_coordinator;
+mod multi_cursor;
 #[cfg(test)]
 mod navigation_perf_tests;
 mod notifications;
@@ -2504,6 +2505,11 @@ pub enum Action {
     CancelSearch,
     ClearSearchHighlight,
     SearchWordUnderCursor,
+    SelectNextOccurrence,
+    #[serde(skip)]
+    ChangeMultiSelection,
+    #[serde(skip)]
+    ClearMultiSelection,
 
     MoveUp,
     MoveDown,
@@ -3449,6 +3455,9 @@ pub struct Editor {
 
     /// Current editor mode (normal, insert, visual, etc)
     mode: Mode,
+
+    /// Ctrl-N selections scoped to one stable buffer/window/revision owner.
+    multi_cursor: Option<multi_cursor::MultiCursorSession>,
 
     /// Captured dividers moved by directional keys while pane resize mode is active.
     pane_resize_mode: Option<PaneResizeMode>,
@@ -5003,6 +5012,7 @@ impl Editor {
             prev_highlight_y: None,
             vx,
             mode: Mode::Normal,
+            multi_cursor: None,
             pane_resize_mode: None,
             zoomed_pane: None,
             insert_entry_cursor: None,
@@ -17182,6 +17192,27 @@ impl Editor {
     }
 
     fn handle_normal_event(&mut self, ev: &event::Event) -> Option<KeyAction> {
+        if self.has_multi_cursor_session() {
+            if let Event::Key(KeyEvent {
+                code,
+                modifiers,
+                kind: KeyEventKind::Press | KeyEventKind::Repeat,
+                ..
+            }) = ev
+            {
+                match (*code, *modifiers) {
+                    (KeyCode::Esc, _) => {
+                        return Some(KeyAction::Single(Action::ClearMultiSelection));
+                    }
+                    (KeyCode::Char('c'), KeyModifiers::NONE) => {
+                        return Some(KeyAction::Single(Action::ChangeMultiSelection));
+                    }
+                    (KeyCode::Char('n'), KeyModifiers::CONTROL) => {}
+                    _ => self.clear_multi_cursor(),
+                }
+            }
+        }
+
         if self.pending_replace {
             return self.handle_replace_event(ev);
         }
@@ -19258,6 +19289,14 @@ impl Editor {
             }
             Action::EnterMode(new_mode) => {
                 add_to_history = false;
+                if matches!(new_mode, Mode::Normal) && self.finish_multi_cursor_insert() {
+                    self.render(buffer)?;
+                    self.flush_edit_batch_events(runtime).await?;
+                    self.flush_edit_batch_changes(runtime).await?;
+                    self.request_diagnostics().await?;
+                    self.draw_statusline(buffer);
+                    return Ok(false);
+                }
                 let old_mode = self.mode;
                 if !matches!(new_mode, Mode::Insert) {
                     self.snippet_session = None;
@@ -19346,6 +19385,11 @@ impl Editor {
                 self.draw_statusline(buffer);
             }
             Action::InsertCharAtCursorPos(c) => {
+                if self.insert_at_multi_cursors(&c.to_string()) {
+                    self.notify_change(runtime).await?;
+                    self.render(buffer)?;
+                    return Ok(false);
+                }
                 let completion_dialog_open = self
                     .current_dialog
                     .as_ref()
@@ -20338,6 +20382,11 @@ impl Editor {
                 self.render(buffer)?;
             }
             Action::DeletePreviousChar => {
+                if self.delete_before_multi_cursors() {
+                    self.notify_change(runtime).await?;
+                    self.render(buffer)?;
+                    return Ok(false);
+                }
                 let completion_dialog_open = self
                     .current_dialog
                     .as_ref()
@@ -21352,6 +21401,23 @@ impl Editor {
                     }
                 }
             }
+            Action::SelectNextOccurrence => {
+                add_to_history = false;
+                self.select_next_occurrence();
+                self.render(buffer)?;
+            }
+            Action::ChangeMultiSelection => {
+                add_to_history = false;
+                if self.begin_multi_cursor_change() {
+                    self.notify_change(runtime).await?;
+                }
+                self.render(buffer)?;
+            }
+            Action::ClearMultiSelection => {
+                add_to_history = false;
+                self.clear_multi_cursor();
+                self.render(buffer)?;
+            }
             Action::DeleteWord => {
                 if let Some(range) = self.word_motion_range(1, false, false) {
                     self.begin_transaction("delete word");
@@ -22141,6 +22207,11 @@ impl Editor {
                 self.render_edited_window_rows(buffer)?;
             }
             Action::InsertPastedText(text) => {
+                if self.insert_at_multi_cursors(text) {
+                    self.notify_change(runtime).await?;
+                    self.render(buffer)?;
+                    return Ok(false);
+                }
                 let line = self.buffer_line();
                 let char_cx = self.grapheme_to_char_on_line(self.cx, line);
                 let start = TextPosition::new(line, char_cx);

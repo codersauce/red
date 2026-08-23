@@ -2813,6 +2813,46 @@ impl Editor {
         self.render_search_highlights_in_window(buffer, window)?;
         self.render_matching_brackets_in_window(buffer, window, None);
 
+        let multi_cursor_ranges = self
+            .multi_cursor_render_ranges(self.buffer_manager[window.buffer_index].id(), window.id);
+        for (range, collapsed) in multi_cursor_ranges {
+            let Some(line) = self.buffer_manager[window.buffer_index].get(range.start.line) else {
+                continue;
+            };
+            let line = trim_line_ending(&line);
+            let tab_width = self.tab_width_for_buffer_index(window.buffer_index);
+            let start_col =
+                display_width_with_tabs(char_prefix(line, range.start.character), tab_width);
+            let end_col = if collapsed {
+                let next_character = (range.start.character + 1).min(line.chars().count());
+                display_width_with_tabs(char_prefix(line, next_character), tab_width)
+                    .max(start_col + 1)
+            } else {
+                display_width_with_tabs(char_prefix(line, range.end.character), tab_width)
+            };
+            let points = self.display_col_range_points_in_window(
+                window,
+                range.start.line,
+                start_col,
+                end_col,
+            );
+            if collapsed {
+                for point in points {
+                    let position = point.y * buffer.width + point.x;
+                    if let Some(cell) = buffer.cells.get_mut(position) {
+                        cell.style = self.theme.synthetic_cursor_style(&cell.style);
+                    }
+                }
+            } else {
+                buffer.apply_selection_for_points(
+                    points,
+                    &self.theme.editor_selection_style(),
+                    &self.theme,
+                    SelectionForegroundPriority::Selection,
+                );
+            }
+        }
+
         if let Some(range) = self.selected_snippet_range() {
             let selection_style = self.theme.editor_selection_style();
             for line_index in range.start.line..=range.end.line {
