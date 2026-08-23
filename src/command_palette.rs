@@ -20,6 +20,7 @@ pub(crate) const BUILTIN_COLON_COMMANDS: &[CommandSpec] = &[
     CommandSpec::new("quit", 1),
     CommandSpec::new("write", 1),
     CommandSpec::new("wall", 2),
+    CommandSpec::exact("diffdisk"),
     CommandSpec::exact("buffer-next"),
     CommandSpec::new("bnext", 2),
     CommandSpec::exact("buffer-prev"),
@@ -569,6 +570,15 @@ fn builtin_commands() -> Vec<BuiltinCommand> {
             Some(":wa"),
             &[":wall"],
             Action::SaveAll,
+        ),
+        builtin(
+            "file.compare_on_disk",
+            "Compare with file on disk",
+            "File",
+            "Inspect external file changes and explicitly resolve a save conflict",
+            Some(":diffdisk"),
+            &["external changes", "save conflict", "overwrite"],
+            Action::CompareFileOnDisk,
         ),
         builtin(
             "file.save_and_quit",
@@ -1454,7 +1464,10 @@ fn action_label(action: &Action) -> String {
         Action::OpenStatuslineManager => "Configure status line".to_string(),
         Action::PluginCommand(name) => humanize_identifier(name),
         Action::Save => "Save file".to_string(),
+        Action::ForceSave => "Overwrite file on disk".to_string(),
         Action::SaveAll => "Save all files".to_string(),
+        Action::ForceSaveAs(_) => "Overwrite selected file".to_string(),
+        Action::CompareFileOnDisk => "Compare with file on disk".to_string(),
         Action::NewBuffer => "New buffer".to_string(),
         Action::ListBuffers => "List buffers".to_string(),
         Action::Quit(_) => "Quit".to_string(),
@@ -1738,6 +1751,21 @@ mod tests {
         assert!(colon_completion_names(&[])
             .iter()
             .any(|name| name == "wall"));
+    }
+
+    #[test]
+    fn palette_exposes_disk_conflict_comparison() {
+        let entries = entries(&default_keys(), &[]);
+        let entry = entries
+            .iter()
+            .find(|entry| entry.id == "file.compare_on_disk")
+            .unwrap();
+
+        assert_eq!(entry.colon.as_deref(), Some(":diffdisk"));
+        assert_eq!(entry.action, Action::CompareFileOnDisk);
+        assert!(colon_completion_names(&[])
+            .iter()
+            .any(|name| name == "diffdisk"));
     }
 
     #[test]

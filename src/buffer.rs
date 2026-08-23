@@ -128,6 +128,17 @@ pub enum SyntaxSelection {
     Language(String),
 }
 
+/// How the on-disk file diverged from the buffer's last loaded or saved version.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExternalFileChange {
+    /// The existing file now contains different bytes.
+    Modified,
+    /// A file appeared where the buffer originally represented a missing path.
+    Created,
+    /// The file was removed after the buffer loaded or saved it.
+    Deleted,
+}
+
 /// Exact disk state last observed for the file associated with a buffer.
 #[derive(Debug)]
 struct BackingFileSnapshot {
@@ -153,6 +164,9 @@ pub struct Buffer {
 
     /// Last known disk contents; `None` contents represent a file that did not exist.
     backing_file: Option<BackingFileSnapshot>,
+
+    /// An observed external change that still needs an explicit user decision.
+    external_file_change: Option<ExternalFileChange>,
 
     /// Content revision for which `dirty` was last computed.
     dirty_revision: u64,
@@ -201,6 +215,7 @@ impl Buffer {
             file,
             saved_content: Some(content.clone()),
             backing_file,
+            external_file_change: None,
             content,
             dirty_revision: 0,
             dirty: false,
@@ -553,13 +568,113 @@ impl Buffer {
         self.refresh_dirty();
     }
 
+    /// Returns the unresolved way this buffer's backing file changed on disk.
+    pub fn external_file_change(&self) -> Option<ExternalFileChange> {
+        self.external_file_change
+    }
+
+    /// Returns whether an external change needs to be reloaded, saved elsewhere, or overwritten.
+    pub fn has_external_file_conflict(&self) -> bool {
+        self.external_file_change.is_some()
+    }
+
+    /// Accepts only proposed edits that leave every unsaved user-edited range intact.
+    ///
+    /// Comparing both edit scripts in current-buffer coordinates lets an agent keep
+    /// working beside unsaved human changes without silently replacing those changes.
+    pub(crate) fn preserves_unsaved_edits(&self, proposed: &str) -> bool {
+        if !self.is_dirty() || self.content == proposed {
+            return true;
+        }
+        let Some(saved) = self.saved_content.as_ref() else {
+            return false;
+        };
+        let saved = saved.to_string();
+        let current = self.contents();
+        let user_diff = similar::TextDiff::configure()
+            .timeout(std::time::Duration::from_millis(250))
+            .diff_chars(saved.as_str(), current.as_str());
+        let proposed_diff = similar::TextDiff::configure()
+            .timeout(std::time::Duration::from_millis(250))
+            .diff_chars(current.as_str(), proposed);
+
+        !user_diff
+            .ops()
+            .iter()
+            .filter(|operation| operation.tag() != similar::DiffTag::Equal)
+            .any(|user_change| {
+                let protected = user_change.new_range();
+                proposed_diff
+                    .ops()
+                    .iter()
+                    .filter(|operation| operation.tag() != similar::DiffTag::Equal)
+                    .any(|agent_change| {
+                        let changed = agent_change.old_range();
+                        match (protected.is_empty(), changed.is_empty()) {
+                            (true, true) => protected.start == changed.start,
+                            (true, false) => {
+                                changed.start <= protected.start && protected.start < changed.end
+                            }
+                            (false, true) => {
+                                protected.start < changed.start && changed.start < protected.end
+                            }
+                            (false, false) => {
+                                protected.start < changed.end && changed.start < protected.end
+                            }
+                        }
+                    })
+            })
+    }
+
+    /// Compares the backing file's exact bytes with its last loaded or saved baseline.
+    pub(crate) fn detect_external_file_change(&self) -> anyhow::Result<Option<ExternalFileChange>> {
+        let Some(backing_file) = self.backing_file.as_ref() else {
+            return Ok(None);
+        };
+        let disk_contents = Self::read_disk_contents(&backing_file.path)?;
+        Ok(match (&backing_file.contents, disk_contents.as_deref()) {
+            (None, None) => None,
+            (None, Some(_)) => Some(ExternalFileChange::Created),
+            (Some(_), None) => Some(ExternalFileChange::Deleted),
+            (Some(expected), Some(actual)) => (!Self::rope_matches_disk_contents(expected, actual))
+                .then_some(ExternalFileChange::Modified),
+        })
+    }
+
+    /// Updates conflict state without mutating the text, history, or saved baseline.
+    pub(crate) fn set_external_file_change(&mut self, change: Option<ExternalFileChange>) -> bool {
+        if self.external_file_change == change {
+            return false;
+        }
+        self.external_file_change = change;
+        true
+    }
+
+    fn read_disk_contents(path: &Path) -> anyhow::Result<Option<Vec<u8>>> {
+        match std::fs::read(path) {
+            Ok(contents) => Ok(Some(contents)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    fn rope_matches_disk_contents(expected: &Rope, actual: &[u8]) -> bool {
+        if expected.len_bytes() != actual.len() {
+            return false;
+        }
+        let mut remaining = actual;
+        expected.chunks().all(|chunk| {
+            let Some(rest) = remaining.strip_prefix(chunk.as_bytes()) else {
+                return false;
+            };
+            remaining = rest;
+            true
+        }) && remaining.is_empty()
+    }
+
     /// Rejects writes when the destination no longer matches its last known disk state.
     pub(crate) fn ensure_backing_file_unchanged(&self, path: &Path) -> anyhow::Result<()> {
-        let disk_contents = match std::fs::read(path) {
-            Ok(contents) => Some(contents),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-            Err(error) => return Err(error.into()),
-        };
+        let disk_contents = Self::read_disk_contents(path)?;
 
         let Some(backing_file) = self
             .backing_file
@@ -576,22 +691,13 @@ impl Buffer {
 
         let unchanged = match (&backing_file.contents, disk_contents.as_deref()) {
             (None, None) => true,
-            (Some(expected), Some(actual)) if expected.len_bytes() == actual.len() => {
-                let mut remaining = actual;
-                expected.chunks().all(|chunk| {
-                    let Some(rest) = remaining.strip_prefix(chunk.as_bytes()) else {
-                        return false;
-                    };
-                    remaining = rest;
-                    true
-                }) && remaining.is_empty()
-            }
+            (Some(expected), Some(actual)) => Self::rope_matches_disk_contents(expected, actual),
             _ => false,
         };
 
         anyhow::ensure!(
             unchanged,
-            "File changed on disk since Red last read or saved it: {:?}; save your changes to another file or reload",
+            "File changed on disk since Red last read or saved it: {:?}; use :diffdisk to compare, :e! to reload, :w <file> to save elsewhere, or :w! to overwrite",
             path.display().to_string()
         );
         Ok(())
@@ -602,25 +708,28 @@ impl Buffer {
         if let Some(backing_file) = &mut self.backing_file {
             backing_file.path = path.to_path_buf();
         }
+        self.external_file_change = None;
     }
 
     /// Drops the backing identity when a removed file becomes an unnamed scratch buffer.
     pub(crate) fn detach_backing_file(&mut self) {
         self.backing_file = None;
+        self.external_file_change = None;
     }
 
     /// Saves the buffer contents to its associated file
     pub fn save(&mut self) -> anyhow::Result<String> {
         if let Some(file) = self.file.clone() {
-            let path = normalized_file_path(&file)?;
-            let file = path.to_string_lossy().into_owned();
-            self.ensure_backing_file_unchanged(&path)?;
-            let contents = self.contents();
-            std::fs::write(&path, &contents)?;
-            self.file = Some(file.clone());
-            self.mark_saved();
-            let message = format!("{:?} {}L, {}B written", file, self.len(), contents.len());
-            Ok(message)
+            self.save_to_path(&file, /*force*/ false)
+        } else {
+            Err(anyhow::anyhow!("No file name"))
+        }
+    }
+
+    /// Overwrites the associated file only after an explicit forced-save action.
+    pub fn force_save(&mut self) -> anyhow::Result<String> {
+        if let Some(file) = self.file.clone() {
+            self.save_to_path(&file, /*force*/ true)
         } else {
             Err(anyhow::anyhow!("No file name"))
         }
@@ -628,9 +737,31 @@ impl Buffer {
 
     /// Saves the buffer contents to a new file path
     pub fn save_as(&mut self, new_file_name: &str) -> anyhow::Result<String> {
+        self.save_to_path(new_file_name, /*force*/ false)
+    }
+
+    /// Overwrites an explicitly requested destination after a forced Save As command.
+    pub fn force_save_as(&mut self, new_file_name: &str) -> anyhow::Result<String> {
+        self.save_to_path(new_file_name, /*force*/ true)
+    }
+
+    fn save_to_path(&mut self, new_file_name: &str, force: bool) -> anyhow::Result<String> {
         let path = normalized_file_path(new_file_name)?;
         let file = path.to_string_lossy().into_owned();
-        self.ensure_backing_file_unchanged(&path)?;
+        if !force {
+            if let Err(error) = self.ensure_backing_file_unchanged(&path) {
+                if self
+                    .backing_file
+                    .as_ref()
+                    .is_some_and(|backing_file| same_file_path(&backing_file.path, &path))
+                {
+                    if let Ok(change) = self.detect_external_file_change() {
+                        self.set_external_file_change(change);
+                    }
+                }
+                return Err(error);
+            }
+        }
         let contents = self.contents();
         std::fs::write(&path, &contents)?;
         self.file = Some(file.clone());
@@ -1311,6 +1442,7 @@ impl Buffer {
             path: PathBuf::from(file),
             contents: Some(self.content.clone()),
         });
+        self.external_file_change = None;
         self.undo_history.mark_saved();
         self.dirty = false;
         self.dirty_revision = self.revision;
@@ -1606,6 +1738,110 @@ mod test {
         assert_eq!(fs::read_to_string(&path).unwrap(), "other\n");
         assert_eq!(buffer.contents(), "local\n");
         assert!(buffer.is_dirty());
+        assert_eq!(
+            buffer.external_file_change(),
+            Some(ExternalFileChange::Modified)
+        );
+        assert!(buffer.has_external_file_conflict());
+    }
+
+    #[tokio::test]
+    async fn backing_file_change_distinguishes_modification_creation_and_deletion() {
+        let directory = tempfile::tempdir().unwrap();
+        let existing_path = directory.path().join("existing.txt");
+        fs::write(&existing_path, "first\n").unwrap();
+        let existing = Buffer::load_or_create(Some(existing_path.to_string_lossy().into_owned()))
+            .await
+            .unwrap();
+
+        assert_eq!(existing.detect_external_file_change().unwrap(), None);
+        fs::write(&existing_path, "other\n").unwrap();
+        assert_eq!(
+            existing.detect_external_file_change().unwrap(),
+            Some(ExternalFileChange::Modified)
+        );
+        fs::write(&existing_path, "first\n").unwrap();
+        assert_eq!(existing.detect_external_file_change().unwrap(), None);
+        fs::remove_file(&existing_path).unwrap();
+        assert_eq!(
+            existing.detect_external_file_change().unwrap(),
+            Some(ExternalFileChange::Deleted)
+        );
+
+        let missing_path = directory.path().join("created.txt");
+        let missing = Buffer::load_or_create(Some(missing_path.to_string_lossy().into_owned()))
+            .await
+            .unwrap();
+        assert_eq!(missing.detect_external_file_change().unwrap(), None);
+        fs::write(&missing_path, "created\n").unwrap();
+        assert_eq!(
+            missing.detect_external_file_change().unwrap(),
+            Some(ExternalFileChange::Created)
+        );
+    }
+
+    #[tokio::test]
+    async fn forced_save_explicitly_overwrites_and_refreshes_the_disk_baseline() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("document.txt");
+        fs::write(&path, "first\n").unwrap();
+        let mut buffer = Buffer::load_or_create(Some(path.to_string_lossy().into_owned()))
+            .await
+            .unwrap();
+        replace_all(&mut buffer, "local\n");
+        fs::write(&path, "other\n").unwrap();
+
+        assert!(buffer.save().is_err());
+        assert!(buffer.has_external_file_conflict());
+        buffer.force_save().unwrap();
+
+        assert_eq!(fs::read_to_string(&path).unwrap(), "local\n");
+        assert!(!buffer.is_dirty());
+        assert!(!buffer.has_external_file_conflict());
+        fs::write(&path, "again\n").unwrap();
+        assert!(buffer.save().is_err());
+    }
+
+    #[tokio::test]
+    async fn forced_save_as_overwrites_only_the_explicit_destination() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source.txt");
+        let destination = directory.path().join("destination.txt");
+        fs::write(&source, "source\n").unwrap();
+        fs::write(&destination, "destination\n").unwrap();
+        let mut buffer = Buffer::load_or_create(Some(source.to_string_lossy().into_owned()))
+            .await
+            .unwrap();
+        replace_all(&mut buffer, "local\n");
+
+        assert!(buffer.save_as(&destination.to_string_lossy()).is_err());
+        buffer
+            .force_save_as(&destination.to_string_lossy())
+            .unwrap();
+
+        assert_eq!(fs::read_to_string(&source).unwrap(), "source\n");
+        assert_eq!(fs::read_to_string(&destination).unwrap(), "local\n");
+        assert_eq!(buffer.file.as_deref(), destination.to_str());
+        assert!(!buffer.has_external_file_conflict());
+    }
+
+    #[test]
+    fn agent_edits_can_extend_but_cannot_replace_unsaved_human_changes() {
+        let mut buffer = Buffer::new(None, "first\nsecond\n".to_string());
+        replace_all(&mut buffer, "human first\nsecond\n");
+
+        assert!(buffer.preserves_unsaved_edits("human first\nagent second\n"));
+        assert!(!buffer.preserves_unsaved_edits("agent first\nsecond\n"));
+        assert!(!buffer.preserves_unsaved_edits("first\nsecond\n"));
+    }
+
+    #[test]
+    fn agent_edits_do_not_reinsert_text_deleted_by_the_user() {
+        let mut buffer = Buffer::new(None, "remove\nkeep\n".to_string());
+        replace_all(&mut buffer, "keep\n");
+
+        assert!(!buffer.preserves_unsaved_edits("remove\nkeep\n"));
+        assert!(buffer.preserves_unsaved_edits("keep\nagent\n"));
     }
 
     #[tokio::test]

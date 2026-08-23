@@ -235,8 +235,8 @@ impl Editor {
                     }
                 }
 
-                let save_without_file =
-                    matches!(action, Action::Save) && self.current_buffer().file.is_none();
+                let save_without_file = matches!(action, Action::Save | Action::ForceSave)
+                    && self.current_buffer().file.is_none();
                 let invalid_syntax = matches!(
                     &action,
                     Action::SetSyntax(syntax)
@@ -252,7 +252,7 @@ impl Editor {
                 if blocked_reload || blocked_delete || save_without_file || invalid_syntax {
                     return Ok(());
                 }
-                if matches!(action, Action::Save)
+                if matches!(action, Action::Save | Action::ForceSave)
                     && dirty_before
                     && self.current_buffer().is_dirty()
                     && !self.buffer_has_pending_format_save(target)
@@ -269,6 +269,7 @@ impl Editor {
         matches!(
             action,
             Action::Save
+                | Action::ForceSave
                 | Action::ReloadFile(_)
                 | Action::Substitute(SubstituteCommand { confirm: false, .. })
                 | Action::JoinLines(_)
