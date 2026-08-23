@@ -7,17 +7,21 @@ Examples:
     python3 scripts/interaction_bench.py picker --root ../codex \
         --file ../codex/codex-rs/tui/src/bottom_pane/chat_composer.rs \
         --query chat_composer.rs
+    python3 scripts/interaction_bench.py signature --root ../codex \
+        --file ../codex/codex-rs/tui/src/bottom_pane/chat_composer.rs
 """
 
 import argparse
 from collections import defaultdict
 import fcntl
+import json
 import os
 from pathlib import Path
 import pty
 import re
 import struct
 import subprocess
+import sys
 import tempfile
 import termios
 import threading
@@ -56,10 +60,26 @@ def run(args):
         config_dir = temp / "red"
         config_dir.mkdir()
         log = temp / "red.log"
-        (config_dir / "config.toml").write_text(
-            f'log_file = "{log}"\nshow_whats_new = false\nfetch_release_notes = false\n',
-            encoding="utf-8",
+        signature_events = temp / "signature-events.jsonl"
+        config_text = (
+            f"log_file = {json.dumps(str(log))}\n"
+            "show_whats_new = false\nfetch_release_notes = false\n"
         )
+        if args.scenario == "signature":
+            server_args = [
+                str(ROOT / "tests" / "fixtures" / "signature_help_lsp.py"),
+                str(signature_events),
+            ]
+            config_text += (
+                "disable_ai = true\n"
+                "[completion]\nauto_trigger = false\nbuffer_words = false\n"
+                "[signature_help]\ndebounce_ms = 120\n"
+                "[lsp.servers.rust]\n"
+                f"command = {json.dumps(sys.executable)}\n"
+                f"args = {json.dumps(server_args)}\n"
+                'language_id = "rust"\nfile_extensions = ["rs"]\nroot_markers = []\n'
+            )
+        (config_dir / "config.toml").write_text(config_text, encoding="utf-8")
 
         master, slave = pty.openpty()
         fcntl.ioctl(
@@ -72,7 +92,7 @@ def run(args):
             "--root",
             str(root),
             "--config-override",
-            "lsp.enabled = false",
+            "lsp.enabled = true" if args.scenario == "signature" else "lsp.enabled = false",
         ]
         for override in args.config_override:
             argv.extend(["--config-override", override])
@@ -120,8 +140,38 @@ def run(args):
 
         first_paint_ms = (time.monotonic() - launched) * 1000
         time.sleep(0.4)
-        os.write(master, b"100j")
-        time.sleep(0.25)
+        if args.scenario != "signature":
+            os.write(master, b"100j")
+            time.sleep(0.25)
+        if args.scenario == "signature":
+            deadline = time.monotonic() + args.startup_timeout
+            while time.monotonic() < deadline:
+                if signature_events.exists() and (
+                    '"method": "initialized"'
+                    in signature_events.read_text(encoding="utf-8", errors="replace")
+                ):
+                    break
+                if process.poll() is not None:
+                    raise SystemExit("editor exited before signature server initialized")
+                time.sleep(0.02)
+            else:
+                process.kill()
+                process.wait(timeout=5)
+                raise SystemExit("signature benchmark server did not initialize")
+            os.write(master, b"ggiouter(")
+            deadline = time.monotonic() + args.startup_timeout
+            while time.monotonic() < deadline:
+                if signature_events.exists() and (
+                    '"method": "textDocument/signatureHelp"'
+                    in signature_events.read_text(encoding="utf-8", errors="replace")
+                ):
+                    break
+                time.sleep(0.02)
+            else:
+                process.kill()
+                process.wait(timeout=5)
+                raise SystemExit("signature benchmark did not display parameter help")
+            time.sleep(0.2)
         if args.scenario == "typing" and args.typing_context != "source":
             if args.typing_context == "heading":
                 position = b"0f 8l"
@@ -160,10 +210,11 @@ def run(args):
         started = time.monotonic()
         delay = args.delay_ms / 1000
 
-        if args.scenario == "typing":
-            os.write(master, b"i")
+        if args.scenario in ("typing", "signature"):
+            if args.scenario == "typing":
+                os.write(master, b"i")
             for index in range(args.cycles):
-                if args.typing_context == "identifier":
+                if args.scenario == "signature" or args.typing_context == "identifier":
                     inserted = b"x" if index % 2 == 0 else b"y"
                 else:
                     punctuation = b"." if args.typing_context != "source" else b"a"
@@ -222,7 +273,7 @@ def run(args):
                     label = f"{label} {detail.split()[0]}"
                 samples[label].append(micros)
 
-        if args.scenario == "typing":
+        if args.scenario in ("typing", "signature"):
             observed_edits = len(samples.get("edit:replace_char", []))
             if observed_edits < args.cycles:
                 raise SystemExit(
@@ -250,7 +301,7 @@ def run(args):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", default=str(BIN), help="editor binary to benchmark")
-    parser.add_argument("scenario", choices=("typing", "search", "picker"))
+    parser.add_argument("scenario", choices=("typing", "search", "picker", "signature"))
     parser.add_argument("--file", default=str(ROOT / "src" / "editor.rs"))
     parser.add_argument("--root", default=str(ROOT))
     parser.add_argument("--query", default=None)
@@ -274,7 +325,9 @@ def main():
     parser.add_argument("--config-override", action="append", default=[])
     args = parser.parse_args()
     if args.cycles is None:
-        args.cycles = {"typing": 200, "search": 20, "picker": 15}[args.scenario]
+        args.cycles = {"typing": 200, "search": 20, "picker": 15, "signature": 40}[
+            args.scenario
+        ]
     if args.query is None:
         args.query = "self" if args.scenario == "search" else "src/editor.rs"
     if not args.query:

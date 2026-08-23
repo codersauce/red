@@ -14748,7 +14748,7 @@ impl Editor {
                             }
                         }
 
-                        match serde_json::from_value::<CompletionResponse>(msg.result.clone()) {
+                        match CompletionResponse::deserialize(&msg.result) {
                             Ok(completion_response) => {
                                 let items = Self::merge_completion_items(
                                     completion_response.items(),
@@ -28156,29 +28156,25 @@ impl Editor {
         let line_index = self.buffer_line();
         let line = self.current_buffer().get(line_index)?;
         let line = line.trim_end_matches(['\r', '\n']);
-        let characters = line.chars().collect::<Vec<_>>();
-        let end = self
-            .grapheme_to_char_on_line(self.cx, line_index)
-            .min(characters.len());
-        let mut start = end;
-        while start > 0 && is_keyword_char(characters[start - 1]) {
-            start -= 1;
+        let cursor = self.grapheme_to_char_on_line(self.cx, line_index);
+        let mut start_byte = 0;
+        let mut end_byte = 0;
+        let mut start_utf16 = 0;
+        let mut end_utf16 = 0;
+        for (byte, character) in line.char_indices().take(cursor) {
+            end_byte = byte + character.len_utf8();
+            end_utf16 += character.len_utf16();
+            if !is_keyword_char(character) {
+                start_byte = end_byte;
+                start_utf16 = end_utf16;
+            }
         }
-        if start == end {
+        if start_byte == end_byte {
             return None;
         }
 
-        let prefix = characters[start..end].iter().collect::<String>();
-        let start_utf16 = characters[..start]
-            .iter()
-            .map(|character| character.len_utf16())
-            .sum();
-        let end_utf16 = characters[..end]
-            .iter()
-            .map(|character| character.len_utf16())
-            .sum();
         Some((
-            prefix,
+            line[start_byte..end_byte].to_string(),
             Range {
                 start: crate::lsp::Position {
                     line: line_index,
@@ -28193,6 +28189,7 @@ impl Editor {
     }
 
     fn buffer_completion_items(&self) -> Vec<CompletionResponseItem> {
+        let _span = perf::PerfSpan::start("completion:buffer_words");
         if !self.config.completion.buffer_words || self.config.completion.max_buffer_words == 0 {
             return Vec::new();
         }
@@ -28201,6 +28198,7 @@ impl Editor {
         };
         let prefix_lower = prefix.to_lowercase();
         let prefix_char_len = prefix.chars().count();
+        let prefix_is_ascii = prefix.is_ascii();
         let active_buffer_id = self.current_buffer().id();
         let mut buffers = self.buffer_manager.iter().collect::<Vec<_>>();
         buffers.sort_by_key(|buffer| buffer.id() != active_buffer_id);
@@ -28213,7 +28211,8 @@ impl Editor {
             let scan_chars = contents.len_chars().min(remaining_scan_chars);
             let mut word = String::new();
             for character in contents
-                .chars()
+                .chunks()
+                .flat_map(str::chars)
                 .take(scan_chars)
                 .chain(std::iter::once(' '))
             {
@@ -28221,9 +28220,18 @@ impl Editor {
                     word.push(character);
                     continue;
                 }
-                if word.chars().count() > prefix_char_len {
+                let matches_prefix = if prefix_is_ascii && word.len() <= prefix.len() {
+                    false
+                } else if prefix_is_ascii && word.is_ascii() {
+                    word.get(..prefix.len())
+                        .is_some_and(|start| start.eq_ignore_ascii_case(&prefix))
+                } else {
+                    word.chars().count() > prefix_char_len
+                        && word.to_lowercase().starts_with(&prefix_lower)
+                };
+                if matches_prefix {
                     let normalized = word.to_lowercase();
-                    if normalized.starts_with(&prefix_lower) && seen.insert(normalized) {
+                    if seen.insert(normalized) {
                         items.push(CompletionResponseItem {
                             label: word.clone(),
                             label_details: Some(CompletionItemLabelDetails {
@@ -28342,9 +28350,17 @@ impl Editor {
             .cloned();
         if self
             .current_dialog
-            .as_mut()
-            .is_some_and(|dialog| dialog.update_completion(items.clone(), &filter))
+            .as_ref()
+            .is_some_and(|dialog| dialog.accepts_completion_updates())
         {
+            let updated = self
+                .current_dialog
+                .as_mut()
+                .expect("completion surface cannot disappear while updating")
+                .update_completion(items, &filter);
+            if !updated {
+                return false;
+            }
             self.completion_snapshot = Some(if snapshot.original_range.is_some() {
                 snapshot
             } else if let Some(active_snapshot) = active_snapshot {
@@ -28358,14 +28374,14 @@ impl Editor {
         let (completion_x, completion_y) =
             self.render_cursor_position().unwrap_or((self.cx, self.cy));
         let mut completion = CompletionUI::with_theme(&self.theme);
-        completion.show_with_bounds(
+        completion.show_filtered_with_bounds(
             items,
+            &filter,
             completion_x,
             completion_y,
             self.size.0 as usize,
             self.size.1 as usize,
         );
-        completion.set_filter(&filter);
         self.current_dialog = Some(Box::new(completion));
         self.completion_snapshot = Some(if snapshot.original_range.is_some() {
             snapshot
@@ -31139,6 +31155,12 @@ impl Editor {
         } else {
             self.length_for_line(line)
         }
+    }
+
+    /// Runs production buffer-word discovery without exposing completion payload ownership.
+    #[doc(hidden)]
+    pub fn benchmark_buffer_completion_count(&self) -> usize {
+        self.buffer_completion_items().len()
     }
 
     /// Reads the display column used by production cursor positioning.
@@ -39362,6 +39384,44 @@ builtin = "rust"
     }
 
     #[test]
+    fn buffer_completion_preserves_unicode_casefolding_and_ascii_case() {
+        let config = Config::default();
+        let lsp = Box::new(crate::lsp::LspManager::new(config.lsp.clone()));
+        let buffer = Buffer::new(None, "KelvinValue KelvinSymbol\nke".to_string());
+        let mut editor =
+            Editor::with_size(lsp, 60, 12, config, Theme::default(), vec![buffer]).unwrap();
+        editor.mode = Mode::Insert;
+        editor.cy = 1;
+        editor.cx = 2;
+
+        let labels = editor
+            .buffer_completion_items()
+            .into_iter()
+            .map(|item| item.label)
+            .collect::<Vec<_>>();
+
+        assert!(labels.contains(&"KelvinValue".to_string()));
+        assert!(labels.contains(&"KelvinSymbol".to_string()));
+    }
+
+    #[test]
+    fn completion_prefix_handles_unicode_before_the_cursor_without_line_allocations() {
+        let config = Config::default();
+        let lsp = Box::new(crate::lsp::LspManager::new(config.lsp.clone()));
+        let buffer = Buffer::new(None, "🙂 value rest".to_string());
+        let mut editor =
+            Editor::with_size(lsp, 60, 12, config, Theme::default(), vec![buffer]).unwrap();
+        editor.mode = Mode::Insert;
+        editor.cx = "🙂 value".chars().count();
+
+        let (prefix, range) = editor.completion_prefix().unwrap();
+
+        assert_eq!(prefix, "value");
+        assert_eq!(range.start.character, 3);
+        assert_eq!(range.end.character, 8);
+    }
+
+    #[test]
     fn buffer_completion_items_include_other_open_buffers() {
         let config = Config::default();
         let lsp = Box::new(crate::lsp::LspManager::new(config.lsp.clone()));
@@ -39639,6 +39699,31 @@ builtin = "rust"
         assert_eq!(editor.current_buffer().contents(), "torch.manual_seed");
         assert!(editor.current_dialog.is_none());
         assert_eq!(editor.mode, Mode::Insert);
+    }
+
+    #[test]
+    fn refreshing_open_completion_moves_large_payloads_without_cloning() {
+        let mut editor = completion_typing_editor();
+        let initial_snapshot = editor.completion_snapshot();
+        assert!(
+            editor.show_completion_items(vec![completion_item("manual_seed")], initial_snapshot)
+        );
+
+        let mut replacement = completion_item("manual_seed");
+        replacement.detail = Some("large language-server documentation ".repeat(256));
+        let payload = replacement.detail.as_ref().unwrap().as_ptr();
+        let snapshot = editor.completion_snapshot();
+
+        assert!(editor.show_completion_items(vec![replacement], snapshot));
+        assert_eq!(
+            editor
+                .current_dialog
+                .as_ref()
+                .and_then(|dialog| dialog.selected_completion())
+                .and_then(|item| item.detail.as_ref())
+                .map(|detail| detail.as_ptr()),
+            Some(payload),
+        );
     }
 
     #[tokio::test]

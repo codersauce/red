@@ -65,6 +65,7 @@ python3 scripts/detach_bench.py 50 120 120 1536
 python3 scripts/interaction_bench.py typing
 python3 scripts/interaction_bench.py search --query self
 python3 scripts/interaction_bench.py picker --query src/editor.rs
+python3 scripts/interaction_bench.py signature --cycles 40
 python3 scripts/git_workspace_bench.py --files 80 --presses 120
 ```
 
@@ -87,6 +88,15 @@ python3 scripts/interaction_bench.py picker \
   --root ../codex \
   --file ../codex/codex-rs/tui/src/bottom_pane/chat_composer.rs \
   --query chat_composer.rs
+python3 scripts/interaction_bench.py signature \
+  --root ../codex \
+  --file ../codex/codex-rs/tui/src/bottom_pane/chat_composer.rs
+RED_FILE_PICKER_BENCH_ROOT=../codex \
+  cargo test --release --lib file_picker_large_workspace_performance -- --ignored --nocapture
+cargo run --release --example performance_hotspots -- completion
+cargo run --release --example performance_hotspots -- completion-backspace
+RED_COMPLETION_BENCH_FILE=../codex/codex-rs/tui/src/bottom_pane/chat_composer.rs \
+  cargo run --release --example performance_hotspots -- buffer-completion
 ```
 
 For an interactive detach audit with real plugins/background updates, start an owner
@@ -115,7 +125,12 @@ and records:
 - wall time plus terminal output volume for the scrolling window.
 
 The interaction driver additionally records launch-to-first-paint (which includes file/config
-loading before `startup:interactive`), typing/search/picker p50/p95/p99/max, and log volume.
+loading before `startup:interactive`), typing/search/picker/signature p50/p95/p99/max, and
+log volume. The signature scenario starts a deterministic local LSP fixture, displays an
+actual parameter popup, and verifies that every requested character reached the document.
+`completion-backspace` measures bounded query-history reuse, while `buffer-completion`
+measures a complete no-match scan of either its synthetic document or
+`RED_COMPLETION_BENCH_FILE`.
 
 Release thresholds are relative to the most recent baseline on the same machine:
 
