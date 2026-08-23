@@ -138,6 +138,8 @@ excluded_patterns = [".env", ".env.*", "*.pem", "*.key", "**/.git/**"]
 # Query input position in picker dialogs. Supported values are "bottom" and
 # "top". Bottom matches the default command-line-oriented picker layout.
 input_position = "bottom"
+# Draw hierarchy connectors before icons in tree-aware picker rows.
+tree_guides = true
 
 # Picker icons use nvim-web-devicons-compatible glyphs and colors by default
 # and require Nerd Font 3.3+. "unicode" and "ascii" are portable fallbacks;

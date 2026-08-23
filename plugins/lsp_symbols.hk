@@ -652,7 +652,7 @@ fn symbol_item(symbol: LspSymbol, workspace: bool) -> PickerItem {
         kind: symbol.kind_name,
         annotation: symbol.detail,
         detail: location,
-        data: Json { symbol: symbol },
+        data: Json { symbol: symbol, tree: !workspace },
         preview: Json { path: symbol.file, line: line, column: character },
     };
 }

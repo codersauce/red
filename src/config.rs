@@ -408,11 +408,14 @@ impl Default for DiagnosticsConfig {
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
-/// Picker input placement.
+/// Picker layout and hierarchy presentation.
 pub struct PickerConfig {
     /// Whether the query row appears above or below results.
     #[serde(default)]
     pub input_position: PickerInputPosition,
+    /// Draw hierarchy connectors for picker rows that expose tree metadata.
+    #[serde(default = "default_true")]
+    pub tree_guides: bool,
     #[serde(default)]
     pub icons: PickerIconsConfig,
 }
@@ -473,6 +476,7 @@ impl Default for PickerConfig {
     fn default() -> Self {
         Self {
             input_position: PickerInputPosition::Bottom,
+            tree_guides: true,
             icons: PickerIconsConfig::default(),
         }
     }
@@ -2236,7 +2240,7 @@ fn known_schema_path(path: &[String]) -> bool {
             *field,
             "enabled" | "command" | "args" | "debounce_ms" | "max_file_bytes" | "excluded_patterns"
         ),
-        ["picker", "input_position"] => true,
+        ["picker", field] => matches!(*field, "input_position" | "tree_guides"),
         ["picker", "icons", field] => matches!(*field, "style" | "color"),
         ["statusline", field] => matches!(*field, "left" | "right" | "icons"),
         ["statusline", "icons", field] => matches!(*field, "style" | "color"),
@@ -3993,8 +3997,22 @@ theme = "mocha.json"
         .unwrap();
 
         assert_eq!(config.picker.input_position, PickerInputPosition::Bottom);
+        assert!(config.picker.tree_guides);
         assert_eq!(config.picker.icons.style, PickerIconStyle::NerdFont);
         assert!(config.picker.icons.color);
+    }
+
+    #[test]
+    fn picker_tree_guides_can_be_disabled() {
+        let loaded = Config::load_user_toml(
+            "[picker]\ntree_guides = false\n",
+            Path::new("/tmp/config.toml"),
+            &[],
+        )
+        .unwrap();
+
+        assert!(!loaded.config.picker.tree_guides);
+        assert!(loaded.diagnostics.is_empty(), "{:?}", loaded.diagnostics);
     }
 
     #[test]
