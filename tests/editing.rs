@@ -556,6 +556,75 @@ async fn rust_syntax_indentation_open_above_closer() {
 }
 
 #[tokio::test]
+async fn rust_syntax_indentation_open_below_compound_closers() {
+    let source = "        let isolated_client = Self {\n            state: Arc::new(ModelClientState {\n            }),\n        };";
+    let mut harness = comment_harness("main.rs", source);
+    harness.execute_action(Action::MoveDown).await.unwrap();
+    harness.execute_action(Action::MoveDown).await.unwrap();
+
+    harness
+        .execute_action(Action::InsertLineBelowCursor)
+        .await
+        .unwrap();
+
+    harness.assert_cursor_at(12, 3);
+    harness.assert_buffer_contents(
+        "        let isolated_client = Self {\n            state: Arc::new(ModelClientState {\n            }),\n            \n        };",
+    );
+    harness.type_text("next: true,").await.unwrap();
+    harness
+        .execute_action(Action::EnterMode(Mode::Normal))
+        .await
+        .unwrap();
+    harness.execute_action(Action::Undo).await.unwrap();
+    harness.assert_buffer_contents(source);
+}
+
+#[tokio::test]
+async fn rust_syntax_indentation_enter_after_compound_closers() {
+    let mut harness = comment_harness(
+        "main.rs",
+        "        let isolated_client = Self {\n            state: Arc::new(ModelClientState {\n            }),\n        };",
+    );
+    harness
+        .execute_action(Action::EnterMode(Mode::Insert))
+        .await
+        .unwrap();
+    harness
+        .execute_action(Action::SetCursor(15, 2))
+        .await
+        .unwrap();
+
+    harness.execute_action(Action::InsertNewLine).await.unwrap();
+
+    harness.assert_cursor_at(12, 3);
+    harness.assert_buffer_contents(
+        "        let isolated_client = Self {\n            state: Arc::new(ModelClientState {\n            }),\n            \n        };",
+    );
+}
+
+#[tokio::test]
+async fn rust_syntax_indentation_open_above_after_compound_closers() {
+    let mut harness = comment_harness(
+        "main.rs",
+        "        let isolated_client = Self {\n            state: Arc::new(ModelClientState {\n            }),\n        };",
+    );
+    for _ in 0..3 {
+        harness.execute_action(Action::MoveDown).await.unwrap();
+    }
+
+    harness
+        .execute_action(Action::InsertLineAtCursor)
+        .await
+        .unwrap();
+
+    harness.assert_cursor_at(12, 3);
+    harness.assert_buffer_contents(
+        "        let isolated_client = Self {\n            state: Arc::new(ModelClientState {\n            }),\n            \n        };",
+    );
+}
+
+#[tokio::test]
 async fn comment_gcc_toggles_the_current_line() {
     let mut harness = comment_harness("main.rs", "    let value = 1;");
 

@@ -7,8 +7,9 @@ use crate::{
     },
     window::WindowId,
 };
+use futures::future::BoxFuture;
 
-use super::{Content, ContentKind, Editor};
+use super::{Action, Content, ContentKind, Editor, RenderBuffer, Runtime};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum VerticalCursorDirection {
@@ -95,6 +96,103 @@ impl MultiCursorSession {
 }
 
 impl Editor {
+    // These async paths are reached through the recursive action dispatcher. Boxing them here
+    // keeps multi-cursor support from increasing every nested dispatch frame.
+    #[inline(never)]
+    pub(super) fn publish_multi_cursor_edit<'a>(
+        &'a mut self,
+        buffer: &'a mut RenderBuffer,
+        runtime: &'a mut Runtime,
+    ) -> BoxFuture<'a, anyhow::Result<()>> {
+        Box::pin(async move {
+            self.notify_change(runtime).await?;
+            self.render(buffer)
+        })
+    }
+
+    #[inline(never)]
+    pub(super) fn execute_multi_cursor_action<'a>(
+        &'a mut self,
+        action: &'a Action,
+        buffer: &'a mut RenderBuffer,
+        runtime: &'a mut Runtime,
+    ) -> BoxFuture<'a, anyhow::Result<()>> {
+        Box::pin(async move {
+            match action {
+                Action::SelectNextOccurrence => self.select_next_occurrence(),
+                Action::AddCursorUp => {
+                    self.add_vertical_cursor(VerticalCursorDirection::Up);
+                }
+                Action::AddCursorDown => {
+                    self.add_vertical_cursor(VerticalCursorDirection::Down);
+                }
+                Action::ToggleMultiCursorExtendMode => self.toggle_multi_cursor_extend_mode(),
+                Action::ExtendMultiSelectionLeft => {
+                    self.extend_multi_cursor_selections(MultiCursorMotion::Left);
+                }
+                Action::ExtendMultiSelectionRight => {
+                    self.extend_multi_cursor_selections(MultiCursorMotion::Right);
+                }
+                Action::ExtendMultiSelectionWordForward => {
+                    self.extend_multi_cursor_selections(MultiCursorMotion::WordForward);
+                }
+                Action::ExtendMultiSelectionWordEnd => {
+                    self.extend_multi_cursor_selections(MultiCursorMotion::WordEnd);
+                }
+                Action::ExtendMultiSelectionLineStart => {
+                    self.extend_multi_cursor_selections(MultiCursorMotion::LineStart);
+                }
+                Action::ExtendMultiSelectionLineEnd => {
+                    self.extend_multi_cursor_selections(MultiCursorMotion::LineEnd);
+                }
+                Action::InvertMultiSelection => self.invert_multi_cursor_selections(),
+                Action::SelectPreviousOccurrence => self.select_previous_occurrence(),
+                Action::SkipMultiSelection => self.skip_multi_cursor_occurrence(),
+                Action::RemoveActiveMultiSelection => {
+                    self.remove_active_multi_cursor_selection();
+                }
+                Action::ChangeMultiSelection => {
+                    if self.begin_multi_cursor_insert(MultiCursorInsertAnchor::Replace) {
+                        self.notify_change(runtime).await?;
+                    }
+                }
+                Action::InsertAtMultiSelectionStart => {
+                    self.begin_multi_cursor_insert(MultiCursorInsertAnchor::Start);
+                }
+                Action::AppendAtMultiSelectionEnd => {
+                    self.begin_multi_cursor_insert(MultiCursorInsertAnchor::End);
+                }
+                Action::DeleteMultiSelection => {
+                    if self.delete_multi_cursor_selections(/*preserve_register*/ false) {
+                        self.notify_change(runtime).await?;
+                    }
+                }
+                Action::DeleteMultiSelectionBlackHole => {
+                    if self.delete_multi_cursor_selections(/*preserve_register*/ true) {
+                        self.notify_change(runtime).await?;
+                    }
+                }
+                Action::PasteAfterMultiSelection => {
+                    if self.paste_at_multi_cursors(MultiCursorPasteAnchor::After) {
+                        self.notify_change(runtime).await?;
+                    }
+                }
+                Action::PasteBeforeMultiSelection => {
+                    if self.paste_at_multi_cursors(MultiCursorPasteAnchor::Before) {
+                        self.notify_change(runtime).await?;
+                    }
+                }
+                Action::YankMultiSelection => {
+                    self.yank_multi_cursor_selections();
+                }
+                Action::ClearMultiSelection => self.clear_multi_cursor(),
+                _ => unreachable!("non-multi-cursor action reached multi-cursor dispatcher"),
+            }
+            self.render(buffer)?;
+            Ok(())
+        })
+    }
+
     pub(super) fn has_multi_cursor_session(&self) -> bool {
         self.multi_cursor
             .as_ref()

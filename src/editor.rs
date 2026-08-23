@@ -19227,6 +19227,112 @@ impl Editor {
         self.commit_transaction(self.cursor_snapshot())
     }
 
+    // Mode transitions can recursively execute pending visual-block actions. Keep their async
+    // state out of the main action-dispatch future so dot-repeat fits the normal thread stack.
+    #[inline(never)]
+    fn execute_enter_mode<'a>(
+        &'a mut self,
+        new_mode: Mode,
+        buffer: &'a mut RenderBuffer,
+        runtime: &'a mut Runtime,
+    ) -> BoxFuture<'a, anyhow::Result<bool>> {
+        Box::pin(async move {
+            if matches!(new_mode, Mode::Normal) && self.finish_multi_cursor_insert() {
+                self.render(buffer)?;
+                self.flush_edit_batch_events(runtime).await?;
+                self.flush_edit_batch_changes(runtime).await?;
+                self.request_diagnostics().await?;
+                self.draw_statusline(buffer);
+                return Ok(true);
+            }
+            let old_mode = self.mode;
+            if !matches!(new_mode, Mode::Insert) {
+                self.snippet_session = None;
+            }
+            if matches!(
+                old_mode,
+                Mode::Visual | Mode::VisualLine | Mode::VisualBlock
+            ) && !matches!(
+                new_mode,
+                Mode::Visual | Mode::VisualLine | Mode::VisualBlock
+            ) {
+                self.capture_last_visual_selection();
+            }
+            self.selection = None;
+            self.pending_visual_text_object_scope = None;
+            self.pending_operator = None;
+            self.pending_character_motion = None;
+
+            let pending_select_action = self.pending_select_action.clone();
+            if let Some(select_action) = pending_select_action {
+                self.execute(&select_action.action, buffer, runtime).await?;
+            }
+
+            if matches!(old_mode, Mode::Normal) && matches!(new_mode, Mode::Insert) {
+                self.insert_entry_cursor = Some(self.cursor_snapshot());
+                self.begin_transaction("insert");
+            }
+
+            if matches!(old_mode, Mode::Insert) && matches!(new_mode, Mode::Normal) {
+                let cleaned_generated_indent = self.cleanup_generated_indent();
+                if self.insert_entry_cursor.is_some_and(|entry| {
+                    let y = self.buffer_line();
+                    y > entry.y || (y == entry.y && self.cx > entry.x)
+                }) {
+                    self.cx = self.cx.saturating_sub(1);
+                }
+                self.cx = self.cx.min(self.line_length().saturating_sub(1));
+                // EnterMode renders before the generic post-action cursor-goal refresh.
+                self.refresh_cursor_goal();
+                self.insert_entry_cursor = None;
+                let after_cursor = self.cursor_snapshot();
+                self.commit_transaction(after_cursor);
+                self.cancel_transaction_if_empty();
+                if cleaned_generated_indent {
+                    self.notify_change(runtime).await?;
+                }
+            }
+
+            if matches!(new_mode, Mode::Search) {
+                self.begin_search(SearchDirection::Forward);
+                self.render(buffer)?;
+                return Ok(true);
+            }
+
+            if matches!(new_mode, Mode::Command) {
+                self.reset_command_history_navigation();
+                self.reset_command_completion();
+                if matches!(
+                    old_mode,
+                    Mode::Visual | Mode::VisualLine | Mode::VisualBlock
+                ) {
+                    self.command = "'<,'>".to_string();
+                }
+            }
+
+            self.flush_edit_batch_events(runtime).await?;
+            self.mode = new_mode;
+
+            if matches!(
+                new_mode,
+                Mode::Visual | Mode::VisualLine | Mode::VisualBlock
+            ) {
+                self.start_selection();
+            } else {
+                self.selection = None;
+            }
+            self.render(buffer)?;
+
+            if !matches!(old_mode, Mode::Normal) && matches!(new_mode, Mode::Normal) {
+                self.flush_edit_batch_changes(runtime).await?;
+                self.request_diagnostics().await?;
+            }
+
+            self.draw_statusline(buffer);
+            Ok(false)
+        })
+    }
+
     /// Executes a single editor action
     ///
     /// This is the core action dispatcher that:
@@ -19673,105 +19779,13 @@ impl Editor {
             }
             Action::EnterMode(new_mode) => {
                 add_to_history = false;
-                if matches!(new_mode, Mode::Normal) && self.finish_multi_cursor_insert() {
-                    self.render(buffer)?;
-                    self.flush_edit_batch_events(runtime).await?;
-                    self.flush_edit_batch_changes(runtime).await?;
-                    self.request_diagnostics().await?;
-                    self.draw_statusline(buffer);
+                if self.execute_enter_mode(*new_mode, buffer, runtime).await? {
                     return Ok(false);
                 }
-                let old_mode = self.mode;
-                if !matches!(new_mode, Mode::Insert) {
-                    self.snippet_session = None;
-                }
-                if matches!(
-                    old_mode,
-                    Mode::Visual | Mode::VisualLine | Mode::VisualBlock
-                ) && !matches!(
-                    new_mode,
-                    Mode::Visual | Mode::VisualLine | Mode::VisualBlock
-                ) {
-                    self.capture_last_visual_selection();
-                }
-                self.selection = None;
-                self.pending_visual_text_object_scope = None;
-                self.pending_operator = None;
-                self.pending_character_motion = None;
-
-                // check for a pending action to be executed on the selection
-                let pending_select_action = self.pending_select_action.clone();
-                if let Some(select_action) = pending_select_action {
-                    self.execute(&select_action.action, buffer, runtime).await?;
-                }
-
-                if matches!(old_mode, Mode::Normal) && matches!(new_mode, Mode::Insert) {
-                    self.insert_entry_cursor = Some(self.cursor_snapshot());
-                    self.begin_transaction("insert");
-                }
-
-                if matches!(old_mode, Mode::Insert) && matches!(new_mode, Mode::Normal) {
-                    let cleaned_generated_indent = self.cleanup_generated_indent();
-                    if self.insert_entry_cursor.is_some_and(|entry| {
-                        let y = self.buffer_line();
-                        y > entry.y || (y == entry.y && self.cx > entry.x)
-                    }) {
-                        self.cx = self.cx.saturating_sub(1);
-                    }
-                    self.cx = self.cx.min(self.line_length().saturating_sub(1));
-                    // EnterMode renders before the generic post-action cursor-goal refresh.
-                    self.refresh_cursor_goal();
-                    self.insert_entry_cursor = None;
-                    let after_cursor = self.cursor_snapshot();
-                    self.commit_transaction(after_cursor);
-                    self.cancel_transaction_if_empty();
-                    if cleaned_generated_indent {
-                        self.notify_change(runtime).await?;
-                    }
-                }
-
-                if matches!(new_mode, Mode::Search) {
-                    self.begin_search(SearchDirection::Forward);
-                    self.render(buffer)?;
-                    return Ok(false);
-                }
-
-                if matches!(new_mode, Mode::Command) {
-                    self.reset_command_history_navigation();
-                    self.reset_command_completion();
-                    if matches!(
-                        old_mode,
-                        Mode::Visual | Mode::VisualLine | Mode::VisualBlock
-                    ) {
-                        self.command = "'<,'>".to_string();
-                    }
-                }
-
-                self.flush_edit_batch_events(runtime).await?;
-                self.mode = *new_mode;
-
-                if matches!(
-                    new_mode,
-                    Mode::Visual | Mode::VisualLine | Mode::VisualBlock
-                ) {
-                    self.start_selection();
-                    self.render(buffer)?;
-                } else {
-                    self.selection = None;
-                    self.render(buffer)?;
-                }
-
-                if !matches!(old_mode, Mode::Normal) && matches!(new_mode, Mode::Normal) {
-                    self.flush_edit_batch_changes(runtime).await?;
-                    self.request_diagnostics().await?;
-                }
-
-                self.draw_statusline(buffer);
             }
             Action::InsertCharAtCursorPos(c) => {
                 if self.insert_at_multi_cursors(&c.to_string()) {
-                    self.notify_change(runtime).await?;
-                    self.render(buffer)?;
+                    self.publish_multi_cursor_edit(buffer, runtime).await?;
                     return Ok(false);
                 }
                 let completion_dialog_open = self
@@ -20767,8 +20781,7 @@ impl Editor {
             }
             Action::DeletePreviousChar => {
                 if self.delete_before_multi_cursors() {
-                    self.notify_change(runtime).await?;
-                    self.render(buffer)?;
+                    self.publish_multi_cursor_edit(buffer, runtime).await?;
                     return Ok(false);
                 }
                 let completion_dialog_open = self
@@ -21804,130 +21817,32 @@ impl Editor {
                     }
                 }
             }
-            Action::SelectNextOccurrence => {
+            Action::SelectNextOccurrence
+            | Action::AddCursorUp
+            | Action::AddCursorDown
+            | Action::ToggleMultiCursorExtendMode
+            | Action::ExtendMultiSelectionLeft
+            | Action::ExtendMultiSelectionRight
+            | Action::ExtendMultiSelectionWordForward
+            | Action::ExtendMultiSelectionWordEnd
+            | Action::ExtendMultiSelectionLineStart
+            | Action::ExtendMultiSelectionLineEnd
+            | Action::InvertMultiSelection
+            | Action::SelectPreviousOccurrence
+            | Action::SkipMultiSelection
+            | Action::RemoveActiveMultiSelection
+            | Action::ChangeMultiSelection
+            | Action::InsertAtMultiSelectionStart
+            | Action::AppendAtMultiSelectionEnd
+            | Action::DeleteMultiSelection
+            | Action::DeleteMultiSelectionBlackHole
+            | Action::PasteAfterMultiSelection
+            | Action::PasteBeforeMultiSelection
+            | Action::YankMultiSelection
+            | Action::ClearMultiSelection => {
                 add_to_history = false;
-                self.select_next_occurrence();
-                self.render(buffer)?;
-            }
-            Action::AddCursorUp => {
-                add_to_history = false;
-                self.add_vertical_cursor(multi_cursor::VerticalCursorDirection::Up);
-                self.render(buffer)?;
-            }
-            Action::AddCursorDown => {
-                add_to_history = false;
-                self.add_vertical_cursor(multi_cursor::VerticalCursorDirection::Down);
-                self.render(buffer)?;
-            }
-            Action::ToggleMultiCursorExtendMode => {
-                add_to_history = false;
-                self.toggle_multi_cursor_extend_mode();
-                self.render(buffer)?;
-            }
-            Action::ExtendMultiSelectionLeft => {
-                add_to_history = false;
-                self.extend_multi_cursor_selections(multi_cursor::MultiCursorMotion::Left);
-                self.render(buffer)?;
-            }
-            Action::ExtendMultiSelectionRight => {
-                add_to_history = false;
-                self.extend_multi_cursor_selections(multi_cursor::MultiCursorMotion::Right);
-                self.render(buffer)?;
-            }
-            Action::ExtendMultiSelectionWordForward => {
-                add_to_history = false;
-                self.extend_multi_cursor_selections(multi_cursor::MultiCursorMotion::WordForward);
-                self.render(buffer)?;
-            }
-            Action::ExtendMultiSelectionWordEnd => {
-                add_to_history = false;
-                self.extend_multi_cursor_selections(multi_cursor::MultiCursorMotion::WordEnd);
-                self.render(buffer)?;
-            }
-            Action::ExtendMultiSelectionLineStart => {
-                add_to_history = false;
-                self.extend_multi_cursor_selections(multi_cursor::MultiCursorMotion::LineStart);
-                self.render(buffer)?;
-            }
-            Action::ExtendMultiSelectionLineEnd => {
-                add_to_history = false;
-                self.extend_multi_cursor_selections(multi_cursor::MultiCursorMotion::LineEnd);
-                self.render(buffer)?;
-            }
-            Action::InvertMultiSelection => {
-                add_to_history = false;
-                self.invert_multi_cursor_selections();
-                self.render(buffer)?;
-            }
-            Action::SelectPreviousOccurrence => {
-                add_to_history = false;
-                self.select_previous_occurrence();
-                self.render(buffer)?;
-            }
-            Action::SkipMultiSelection => {
-                add_to_history = false;
-                self.skip_multi_cursor_occurrence();
-                self.render(buffer)?;
-            }
-            Action::RemoveActiveMultiSelection => {
-                add_to_history = false;
-                self.remove_active_multi_cursor_selection();
-                self.render(buffer)?;
-            }
-            Action::ChangeMultiSelection => {
-                add_to_history = false;
-                if self.begin_multi_cursor_insert(multi_cursor::MultiCursorInsertAnchor::Replace) {
-                    self.notify_change(runtime).await?;
-                }
-                self.render(buffer)?;
-            }
-            Action::InsertAtMultiSelectionStart => {
-                add_to_history = false;
-                self.begin_multi_cursor_insert(multi_cursor::MultiCursorInsertAnchor::Start);
-                self.render(buffer)?;
-            }
-            Action::AppendAtMultiSelectionEnd => {
-                add_to_history = false;
-                self.begin_multi_cursor_insert(multi_cursor::MultiCursorInsertAnchor::End);
-                self.render(buffer)?;
-            }
-            Action::DeleteMultiSelection => {
-                add_to_history = false;
-                if self.delete_multi_cursor_selections(/*preserve_register*/ false) {
-                    self.notify_change(runtime).await?;
-                }
-                self.render(buffer)?;
-            }
-            Action::DeleteMultiSelectionBlackHole => {
-                add_to_history = false;
-                if self.delete_multi_cursor_selections(/*preserve_register*/ true) {
-                    self.notify_change(runtime).await?;
-                }
-                self.render(buffer)?;
-            }
-            Action::PasteAfterMultiSelection => {
-                add_to_history = false;
-                if self.paste_at_multi_cursors(multi_cursor::MultiCursorPasteAnchor::After) {
-                    self.notify_change(runtime).await?;
-                }
-                self.render(buffer)?;
-            }
-            Action::PasteBeforeMultiSelection => {
-                add_to_history = false;
-                if self.paste_at_multi_cursors(multi_cursor::MultiCursorPasteAnchor::Before) {
-                    self.notify_change(runtime).await?;
-                }
-                self.render(buffer)?;
-            }
-            Action::YankMultiSelection => {
-                add_to_history = false;
-                self.yank_multi_cursor_selections();
-                self.render(buffer)?;
-            }
-            Action::ClearMultiSelection => {
-                add_to_history = false;
-                self.clear_multi_cursor();
-                self.render(buffer)?;
+                self.execute_multi_cursor_action(action, buffer, runtime)
+                    .await?;
             }
             Action::DeleteWord => {
                 if let Some(range) = self.word_motion_range(1, false, false) {
@@ -22723,8 +22638,7 @@ impl Editor {
             }
             Action::InsertPastedText(text) => {
                 if self.insert_at_multi_cursors(text) {
-                    self.notify_change(runtime).await?;
-                    self.render(buffer)?;
+                    self.publish_multi_cursor_edit(buffer, runtime).await?;
                     return Ok(false);
                 }
                 let line = self.buffer_line();
