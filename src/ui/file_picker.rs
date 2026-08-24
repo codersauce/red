@@ -17,6 +17,7 @@ use crate::{
     config::KeyAction,
     editor::{Action, Editor, RenderBuffer},
     log,
+    plugin::{LocationColumnEncoding, OpenLocationTarget, PluginLocation},
     theme::Theme,
     workspace_paths::{discover_workspace_paths, WorkspacePathOptions},
 };
@@ -39,6 +40,34 @@ pub struct FilePicker {
 struct FilePickerLoad {
     generation: u64,
     result: Result<Vec<PickerItem>, String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FilePickerQuery<'a> {
+    path: &'a str,
+    line: Option<usize>,
+}
+
+impl<'a> FilePickerQuery<'a> {
+    fn parse(query: &'a str) -> Self {
+        let Some((path, line)) = query.rsplit_once(':') else {
+            return Self {
+                path: query,
+                line: None,
+            };
+        };
+        if path.is_empty() || !line.bytes().all(|character| character.is_ascii_digit()) {
+            return Self {
+                path: query,
+                line: None,
+            };
+        }
+
+        Self {
+            path,
+            line: (!line.is_empty()).then(|| line.parse().unwrap_or(usize::MAX)),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -200,7 +229,37 @@ impl Component for FilePicker {
             self.start_load();
             return Some(KeyAction::Single(Action::Refresh));
         }
-        self.picker.handle_event(ev)
+        let line = match ev {
+            event::Event::Key(key) if key.code == event::KeyCode::Enter => {
+                FilePickerQuery::parse(self.picker.query()).line
+            }
+            _ => None,
+        };
+        let action = self.picker.handle_event(ev)?;
+        let Some(line) = line else {
+            return Some(action);
+        };
+        let KeyAction::Multiple(actions) = action else {
+            return Some(action);
+        };
+
+        Some(KeyAction::Multiple(
+            actions
+                .into_iter()
+                .map(|action| match action {
+                    Action::OpenFile(path) => Action::OpenLocation(
+                        PluginLocation {
+                            path,
+                            line: line.saturating_sub(1),
+                            column: 0,
+                            column_encoding: LocationColumnEncoding::Utf8Byte,
+                        },
+                        OpenLocationTarget::Current,
+                    ),
+                    action => action,
+                })
+                .collect(),
+        ))
     }
 
     fn draw(&self, buffer: &mut RenderBuffer) -> anyhow::Result<()> {
@@ -251,6 +310,7 @@ fn prepare_file_picker_items(files: Vec<String>) -> Vec<PickerItem> {
 }
 
 fn file_match_score(matcher: &SkimMatcherV2, item: &PickerItem, query: &str) -> Option<i64> {
+    let query = FilePickerQuery::parse(query).path;
     match_path(
         matcher,
         PathCandidate::new(&item.id, &item.label, item.annotation.as_deref()),
@@ -264,6 +324,7 @@ fn file_match_highlights(
     item: &PickerItem,
     query: &str,
 ) -> PickerFilterHighlights {
+    let query = FilePickerQuery::parse(query).path;
     path_match_highlights(
         matcher,
         PathCandidate::new(&item.id, &item.label, item.annotation.as_deref()),
@@ -536,6 +597,42 @@ mod tests {
     }
 
     #[test]
+    fn file_picker_query_extracts_numeric_line_suffixes() {
+        assert_eq!(
+            FilePickerQuery::parse("sona:123"),
+            FilePickerQuery {
+                path: "sona",
+                line: Some(123),
+            }
+        );
+        assert_eq!(
+            FilePickerQuery::parse("sona:"),
+            FilePickerQuery {
+                path: "sona",
+                line: None,
+            }
+        );
+        assert_eq!(
+            FilePickerQuery::parse("sona:0"),
+            FilePickerQuery {
+                path: "sona",
+                line: Some(0),
+            }
+        );
+        for query in ["sona", "sona:abc", "sona:12x", ":123"] {
+            assert_eq!(
+                FilePickerQuery::parse(query),
+                FilePickerQuery {
+                    path: query,
+                    line: None,
+                }
+            );
+        }
+        let oversized = format!("sona:{}0", usize::MAX);
+        assert_eq!(FilePickerQuery::parse(&oversized).line, Some(usize::MAX));
+    }
+
+    #[test]
     fn file_picker_draws_loading_message_before_files_arrive() {
         let editor = test_editor();
         let picker = FilePicker::loading(&editor);
@@ -570,6 +667,154 @@ mod tests {
                 Action::OpenFile("src/main.rs".to_string()),
             ]))
         );
+    }
+
+    #[test]
+    fn file_picker_keeps_matches_while_typing_a_line_suffix() {
+        let editor = test_editor();
+        let mut picker = FilePicker::loading(&editor);
+        let mut buffer = RenderBuffer::new(80, 24, &Style::default());
+        send_load(
+            &picker,
+            picker.load_generation,
+            Ok(vec![
+                "src/source_name.rs".to_string(),
+                "src/other.rs".to_string(),
+            ]),
+        );
+        assert!(picker.tick().unwrap());
+
+        for character in "sona:123".chars() {
+            picker.handle_event(&key(KeyCode::Char(character)));
+            picker.draw(&mut buffer).unwrap();
+            assert!(
+                buffer_text(&buffer).contains("source_name.rs"),
+                "matching file disappeared while typing {:?}",
+                picker.picker.query(),
+            );
+        }
+
+        assert_eq!(
+            picker.handle_event(&key(KeyCode::Enter)),
+            Some(KeyAction::Multiple(vec![
+                Action::RecordPickerHistory {
+                    key: "find_files".to_string(),
+                    query: "sona:123".to_string(),
+                },
+                Action::CloseDialog,
+                Action::OpenLocation(
+                    PluginLocation {
+                        path: "src/source_name.rs".to_string(),
+                        line: 122,
+                        column: 0,
+                        column_encoding: LocationColumnEncoding::Utf8Byte,
+                    },
+                    OpenLocationTarget::Current,
+                ),
+            ]))
+        );
+    }
+
+    #[test]
+    fn file_picker_opens_files_normally_for_an_incomplete_line_suffix() {
+        let editor = test_editor();
+        let mut picker = FilePicker::loading(&editor);
+        send_load(
+            &picker,
+            picker.load_generation,
+            Ok(vec!["src/source_name.rs".to_string()]),
+        );
+        assert!(picker.tick().unwrap());
+
+        for character in "sona:".chars() {
+            picker.handle_event(&key(KeyCode::Char(character)));
+        }
+
+        assert_eq!(
+            picker.handle_event(&key(KeyCode::Enter)),
+            Some(KeyAction::Multiple(vec![
+                Action::RecordPickerHistory {
+                    key: "find_files".to_string(),
+                    query: "sona:".to_string(),
+                },
+                Action::CloseDialog,
+                Action::OpenFile("src/source_name.rs".to_string()),
+            ]))
+        );
+    }
+
+    #[test]
+    fn file_picker_preserves_filename_ranking_with_a_line_suffix() {
+        let editor = test_editor();
+        let mut picker = FilePicker::loading(&editor);
+        send_load(
+            &picker,
+            picker.load_generation,
+            Ok(vec![
+                "main/lib.rs".to_string(),
+                "deep/src/main.rs".to_string(),
+            ]),
+        );
+        assert!(picker.tick().unwrap());
+
+        for character in "main:7".chars() {
+            picker.handle_event(&key(KeyCode::Char(character)));
+        }
+
+        assert_eq!(
+            picker.handle_event(&key(KeyCode::Enter)),
+            Some(KeyAction::Multiple(vec![
+                Action::RecordPickerHistory {
+                    key: "find_files".to_string(),
+                    query: "main:7".to_string(),
+                },
+                Action::CloseDialog,
+                Action::OpenLocation(
+                    PluginLocation {
+                        path: "deep/src/main.rs".to_string(),
+                        line: 6,
+                        column: 0,
+                        column_encoding: LocationColumnEncoding::Utf8Byte,
+                    },
+                    OpenLocationTarget::Current,
+                ),
+            ]))
+        );
+    }
+
+    #[tokio::test]
+    async fn file_picker_line_suffix_opens_and_clamps_the_requested_line() {
+        let mut editor = test_editor();
+        let root = TestDir::new("line-suffix");
+        let path = root.path().join("source_name.rs");
+        let contents = (1..=130)
+            .map(|line| format!("line {line}\n"))
+            .collect::<String>();
+        fs::write(&path, contents).unwrap();
+
+        for (query, expected_line) in [("sona:123", 122), ("sona:999", 129), ("sona:0", 0)] {
+            let mut picker = FilePicker::loading(&editor);
+            send_load(
+                &picker,
+                picker.load_generation,
+                Ok(vec![path.to_string_lossy().into_owned()]),
+            );
+            assert!(picker.tick().unwrap());
+            for character in query.chars() {
+                picker.handle_event(&key(KeyCode::Char(character)));
+            }
+            let Some(KeyAction::Multiple(actions)) = picker.handle_event(&key(KeyCode::Enter))
+            else {
+                panic!("expected file picker selection actions");
+            };
+            let action = actions
+                .into_iter()
+                .find(|action| matches!(action, Action::OpenLocation(_, _)))
+                .expect("line suffix should select a file location");
+            editor.test_execute_production_action(action).await.unwrap();
+
+            assert_eq!(editor.test_buffer_line(), expected_line, "query {query}");
+        }
     }
 
     #[test]
@@ -702,6 +947,18 @@ mod tests {
         );
 
         assert_eq!(highlights.label, vec![[0, 4]]);
+        assert!(highlights.annotation.is_empty());
+    }
+
+    #[test]
+    fn file_match_highlights_ignore_the_line_suffix() {
+        let highlights = file_match_highlights(
+            &SkimMatcherV2::default(),
+            &picker_item("src/source_name.rs"),
+            "sona:123",
+        );
+
+        assert_eq!(highlights.label, vec![[0, 2], [7, 9]]);
         assert!(highlights.annotation.is_empty());
     }
 
