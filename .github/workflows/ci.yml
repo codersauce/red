@@ -6,10 +6,19 @@ on:
   pull_request:
     branches: [main, develop]
   workflow_dispatch:
+    inputs:
+      validation_scope:
+        description: Paid test coverage to run
+        required: true
+        default: full
+        type: choice
+        options:
+          - full
+          - smoke
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
@@ -21,6 +30,35 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
+  plan:
+    name: Plan validation
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+      mode: ${{ steps.plan.outputs.mode }}
+    steps:
+      - name: Checkout repository history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Collect pull request paths
+        if: github.event_name == 'pull_request'
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: git diff --name-only --diff-filter=ACMR "$BASE_SHA" "$HEAD_SHA" > "$RUNNER_TEMP/changed-paths.txt"
+
+      - name: Select paid test coverage
+        id: plan
+        env:
+          MANUAL_SCOPE: ${{ inputs.validation_scope || 'full' }}
+        run: >-
+          python3 scripts/ci_matrix.py
+          --event "$GITHUB_EVENT_NAME"
+          --changed-paths "$RUNNER_TEMP/changed-paths.txt"
+          --manual-scope "$MANUAL_SCOPE"
+
   workflow-lint:
     name: Workflow lint
     runs-on: ubuntu-latest
@@ -36,33 +74,30 @@ jobs:
       - name: Verify README release version
         run: python3 scripts/readme_release.py --check
 
+      - name: Validate main branch ruleset recipe
+        run: python3 -m json.tool .github/rulesets/main.json > /dev/null
+
       - name: Test Discord release announcements
         run: python3 -m unittest tests.test_discord_release
 
       - name: Test validation helpers
-        run: python3 -m unittest tests.test_doctest_packages tests.test_test_performance
+        run: python3 -m unittest tests.test_ci_policy tests.test_doctest_packages tests.test_test_performance
 
   test:
-    name: Test Suite (${{ matrix.platform.standard }}, ${{ matrix.rust }})
+    name: Test Suite (${{ matrix.name }}, stable)
+    needs: plan
+    if: needs.plan.outputs.mode != 'docs'
     runs-on: >-
       ${{
         (
           github.event_name != 'pull_request' ||
           github.event.pull_request.head.repo.full_name == github.repository
-        ) && matrix.platform.warp || matrix.platform.standard
+        ) && matrix.warp || matrix.standard
       }}
     timeout-minutes: 30
     strategy:
       fail-fast: false
-      matrix:
-        platform:
-          - standard: ubuntu-latest
-            warp: warp-ubuntu-latest-x64-32x
-          - standard: macos-latest
-            warp: warp-macos-latest-arm64-12x
-          - standard: windows-latest
-            warp: warp-windows-latest-x64-32x
-        rust: [stable]
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -70,7 +105,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: ${{ matrix.rust }}
+          toolchain: stable
 
       - name: Install ripgrep
         uses: ./.github/actions/install-ripgrep
@@ -290,3 +325,31 @@ jobs:
         run: |
           python3 scripts/check_markdown_links.py --self-test
           python3 scripts/check_markdown_links.py
+
+  gate:
+    name: CI Gate
+    if: always()
+    needs:
+      - plan
+      - workflow-lint
+      - test
+      - clippy
+      - fmt
+      - self-check
+      - changelog
+      - build
+      - docs
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Require the planned terminal results
+        env:
+          NEEDS_JSON: ${{ toJSON(needs) }}
+          VALIDATION_MODE: ${{ needs.plan.outputs.mode }}
+        run: >-
+          python3 scripts/ci_gate.py
+          --event "$GITHUB_EVENT_NAME"
+          --mode "$VALIDATION_MODE"
+          --needs-json "$NEEDS_JSON"
