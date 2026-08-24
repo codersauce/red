@@ -3704,6 +3704,7 @@ pub struct Editor {
     notification_fallback: Option<String>,
     config_notification: Option<NotificationId>,
     session_notification: Option<NotificationId>,
+    external_file_notifications: HashMap<BufferId, NotificationId>,
     persistent_notification_messages: [Option<String>; 2],
 
     /// Compatibility display slot while existing producers are migrated.
@@ -5235,6 +5236,7 @@ impl Editor {
             notification_fallback: None,
             config_notification: None,
             session_notification: None,
+            external_file_notifications: HashMap::new(),
             persistent_notification_messages: [None, None],
             last_error: None,
             current_dialog: None,
@@ -22253,6 +22255,8 @@ impl Editor {
                         self.sync_to_window();
                         self.commit_transaction(self.cursor_snapshot());
                         self.current_buffer_mut().mark_saved();
+                        let id = self.current_buffer().id();
+                        self.resolve_external_file_notification(id);
                         self.set_legacy_message(Some(format!(
                             "{file:?} {}L, {}B read",
                             self.current_buffer().len(),
@@ -24808,6 +24812,7 @@ impl Editor {
 
         self.sync_to_window();
         let removed_id = self.current_buffer().id();
+        self.resolve_external_file_notification(removed_id);
         self.detach_inline_history_buffer(removed_id);
         self.inline_comments
             .retain(|comment| comment.anchor.buffer_id != removed_id);
@@ -29402,6 +29407,8 @@ impl Editor {
 
         match save_result {
             Ok(msg) => {
+                let id = self.current_buffer().id();
+                self.resolve_external_file_notification(id);
                 let severity = if format_warning.is_some() {
                     Severity::Warning
                 } else {
@@ -29549,6 +29556,8 @@ impl Editor {
 
         match save_result {
             Ok(msg) => {
+                let id = self.current_buffer().id();
+                self.resolve_external_file_notification(id);
                 let severity = if format_warning.is_some() {
                     Severity::Warning
                 } else {
