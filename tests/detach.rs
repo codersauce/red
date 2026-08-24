@@ -251,3 +251,137 @@ async fn shell_command_survives_disconnect_without_blocking_detach_ipc() {
     let (server_result, ()) = tokio::join!(server, client);
     server_result.unwrap();
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn shell_filter_applies_to_its_buffer_after_client_disconnects() {
+    let directory = tempfile::tempdir().unwrap();
+    let gate = directory.path().join("filter-gate");
+    let marker = directory.path().join("filter-completed");
+    let document = directory.path().join("filter.txt");
+    std::fs::write(&gate, "waiting").unwrap();
+    std::fs::write(&document, "bravo\nalpha\n").unwrap();
+    let config = Config::from_user_toml_with_overrides("", &[]).unwrap();
+    let editor = Editor::test_with_size(
+        Box::new(LspManager::new(config.lsp.clone())),
+        /*width*/ 100,
+        /*height*/ 24,
+        config,
+        Theme::default(),
+        vec![Buffer::new(
+            Some(document.display().to_string()),
+            "bravo\nalpha\n".to_string(),
+        )],
+    )
+    .unwrap();
+    let core = DetachedEditorCore::new(editor).await.unwrap();
+    let session = bind_session(directory.path(), "filter-work").unwrap();
+
+    let server = serve_editor_session(&session, core);
+    let client = async {
+        let mut first = connect_session(directory.path(), "filter-work", None, (100, 24))
+            .await
+            .unwrap();
+        first
+            .input(InputEvent::Key {
+                code: KeyCode::Character(':'),
+                modifiers: Vec::new(),
+                key_kind: red::headless::KeyKind::Press,
+            })
+            .await
+            .unwrap();
+        first
+            .input(InputEvent::Paste {
+                text: format!(
+                    "%!sh -c 'while test -f \"{}\"; do sleep 0.01; done; sort; printf done > \"{}\"'",
+                    gate.display(),
+                    marker.display()
+                ),
+            })
+            .await
+            .unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            first.input(InputEvent::Key {
+                code: KeyCode::Enter,
+                modifiers: Vec::new(),
+                key_kind: red::headless::KeyKind::Press,
+            }),
+        )
+        .await
+        .expect("launching a shell filter blocked its detach IPC response")
+        .unwrap();
+        drop(first);
+        std::fs::remove_file(&gate).unwrap();
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !marker.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("shell filter did not continue after disconnect");
+
+        let mut second = connect_session(directory.path(), "filter-work", None, (100, 24))
+            .await
+            .unwrap();
+        let mut finished = second
+            .initial_render
+            .lines
+            .iter()
+            .any(|line| line.text.contains("Shell finished"));
+        for _ in 0..50 {
+            if finished {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            finished = second
+                .heartbeat()
+                .await
+                .unwrap()
+                .lines
+                .iter()
+                .any(|line| line.text.contains("Shell finished"));
+        }
+        assert!(finished, "reattach did not expose shell filter completion");
+        second
+            .input(InputEvent::Key {
+                code: KeyCode::Escape,
+                modifiers: Vec::new(),
+                key_kind: red::headless::KeyKind::Press,
+            })
+            .await
+            .unwrap();
+        second
+            .input(InputEvent::Key {
+                code: KeyCode::Character(':'),
+                modifiers: Vec::new(),
+                key_kind: red::headless::KeyKind::Press,
+            })
+            .await
+            .unwrap();
+        second
+            .input(InputEvent::Paste {
+                text: "w".to_string(),
+            })
+            .await
+            .unwrap();
+        second
+            .input(InputEvent::Key {
+                code: KeyCode::Enter,
+                modifiers: Vec::new(),
+                key_kind: red::headless::KeyKind::Press,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&document).unwrap(),
+            "alpha\nbravo\n"
+        );
+
+        stop_session(directory.path(), "filter-work").await.unwrap();
+        drop(second);
+    };
+
+    let (server_result, ()) = tokio::join!(server, client);
+    server_result.unwrap();
+}

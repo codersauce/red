@@ -48,10 +48,13 @@ Red keeps the previous Visual area as buffer-local state, separate from the text
 
 The supported Ex shell subset includes `:!{command}`, previous-command repeat
 with `:!!`, current and alternate filename expansion with `%` and `#`, and
-backslash-escaped special characters. Commands use the user's non-interactive
-shell, stream bounded output into Messages, support cancellation, and continue
-inside detached owners. Interactive terminal programs and range filters such as
-`:%!sort` remain outside the supported subset [@vim-doc] [@editor].
+backslash-escaped special characters. `:%!{command}`, numeric line ranges, and
+`:'<,'>!{command}` filter the selected text through the user's shell and replace
+it with complete stdout in one undoable transaction. Every command streams
+bounded diagnostics into Messages, supports cancellation, and continues inside
+detached owners. Unlike Neovim, failed or outdated filters do not overwrite the
+original buffer. Interactive terminal programs and Normal-mode filter operators
+remain outside the supported subset [@vim-doc] [@editor].
 
 Visual indentation is a line-range operation even for characterwise and blockwise selections. `>` and `<` capture the current Visual area for later `gv`, shift every covered line by `count * shiftwidth`, leave empty lines unchanged, saturate unindentation at column zero, commit the shift as one undo transaction, notify normal change consumers when content changes, and then return to Normal mode [@editor] [@editing-tests]. The compatibility matrix records this as supported for `[count]>` and `[count]<`, with `gv` reselecting the shifted range [@vim-doc].
 

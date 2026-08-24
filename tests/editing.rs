@@ -2595,7 +2595,456 @@ async fn shell_command_rejects_missing_context_and_unsafe_bufdo_execution() {
 #[test]
 fn shell_actions_cannot_be_deserialized_from_external_action_configuration() {
     assert!(serde_json::from_str::<Action>(r#"{"RunShell":"echo unsafe"}"#).is_err());
+    assert!(serde_json::from_str::<Action>(
+        r#"{"RunShellFilter":{"command":"cat","start_line":0,"end_line":0}}"#
+    )
+    .is_err());
     assert!(serde_json::from_str::<Action>(r#""CancelShellCommand""#).is_err());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn shell_filter_replaces_the_whole_buffer_as_one_undoable_transaction() {
+    let _cwd_guard = protected_current_dir();
+    let mut harness = EditorHarness::with_content("charlie\nbravo\nalpha\n");
+    harness
+        .execute_action(Action::Command("%!sort".to_string()))
+        .await
+        .unwrap();
+
+    let record = wait_for_shell_command(&mut harness).await;
+
+    assert_eq!(
+        record.state,
+        NotificationState::Finished(ProgressOutcome::Succeeded)
+    );
+    harness.assert_buffer_contents("alpha\nbravo\ncharlie\n");
+    harness.assert_cursor_at(0, 0);
+    harness.execute_action(Action::Undo).await.unwrap();
+    harness.assert_buffer_contents("charlie\nbravo\nalpha\n");
+    harness.execute_action(Action::Redo).await.unwrap();
+    harness.assert_buffer_contents("alpha\nbravo\ncharlie\n");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn shell_filter_limits_numeric_ranges_and_adds_required_line_boundaries() {
+    let _cwd_guard = protected_current_dir();
+    let mut harness = EditorHarness::with_content("before\nbravo\nalpha\nafter");
+    harness
+        .execute_action(Action::Command("2,3!sort".to_string()))
+        .await
+        .unwrap();
+    wait_for_shell_command(&mut harness).await;
+    harness.assert_buffer_contents("before\nalpha\nbravo\nafter");
+    harness.assert_cursor_at(0, 1);
+
+    harness
+        .execute_action(Action::Command("2!printf replaced".to_string()))
+        .await
+        .unwrap();
+    wait_for_shell_command(&mut harness).await;
+    harness.assert_buffer_contents("before\nreplaced\nbravo\nafter");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn shell_filters_share_previous_command_history_with_ordinary_shell_commands() {
+    let _cwd_guard = protected_current_dir();
+    let mut harness = EditorHarness::with_content("bravo\nalpha\n");
+    harness
+        .execute_action(Action::Command("!sort".to_string()))
+        .await
+        .unwrap();
+    wait_for_shell_command(&mut harness).await;
+    harness.assert_buffer_contents("bravo\nalpha\n");
+
+    harness
+        .execute_action(Action::Command("%!!".to_string()))
+        .await
+        .unwrap();
+    let record = wait_for_shell_command(&mut harness).await;
+
+    assert_eq!(
+        record.state,
+        NotificationState::Finished(ProgressOutcome::Succeeded)
+    );
+    harness.assert_buffer_contents("alpha\nbravo\n");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn shell_filter_uses_visual_ranges_from_every_selection_mode() {
+    let _cwd_guard = protected_current_dir();
+    for mode in [Mode::Visual, Mode::VisualLine, Mode::VisualBlock] {
+        let mut harness = EditorHarness::with_config(
+            Buffer::new(None, "before\nbravo\nalpha\nafter".to_string()),
+            default_key_config(),
+        );
+        harness.execute_action(Action::MoveDown).await.unwrap();
+        harness
+            .execute_action(Action::EnterMode(mode))
+            .await
+            .unwrap();
+        harness.execute_action(Action::MoveDown).await.unwrap();
+        command_key(&mut harness, KeyCode::Char(':')).await;
+        type_normal_keys(&mut harness, "!sort").await;
+        command_key(&mut harness, KeyCode::Enter).await;
+
+        wait_for_shell_command(&mut harness).await;
+
+        harness.assert_buffer_contents("before\nalpha\nbravo\nafter");
+        harness.execute_action(Action::Undo).await.unwrap();
+        harness.assert_buffer_contents("before\nbravo\nalpha\nafter");
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn shell_filter_preserves_exact_stdin_and_document_line_endings() {
+    let _cwd_guard = protected_current_dir();
+    let mut harness = EditorHarness::with_content("first\nlast");
+    harness
+        .execute_action(Action::Command(
+            "%!python3 -c 'import sys; print(repr(sys.stdin.read()), end=\"\")'".to_string(),
+        ))
+        .await
+        .unwrap();
+    wait_for_shell_command(&mut harness).await;
+    harness.assert_buffer_contents("'first\\nlast'");
+
+    let mut harness = EditorHarness::with_content("before\r\nmiddle\r\nafter\r\n");
+    harness
+        .execute_action(Action::Command("2!tr a-z A-Z".to_string()))
+        .await
+        .unwrap();
+    wait_for_shell_command(&mut harness).await;
+    harness.assert_buffer_contents("before\r\nMIDDLE\r\nafter\r\n");
+
+    let mut harness = EditorHarness::with_content("préface\n😀 café\nfin");
+    harness
+        .execute_action(Action::Command(
+            "2!python3 -c 'import sys; print(sys.stdin.read().replace(\"café\", \"λ\"), end=\"\")'"
+                .to_string(),
+        ))
+        .await
+        .unwrap();
+    wait_for_shell_command(&mut harness).await;
+    harness.assert_buffer_contents("préface\n😀 λ\nfin");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn shell_filter_publishes_one_lsp_document_change() {
+    let _cwd_guard = protected_current_dir();
+    let path = temp_file_path("shell-filter-lsp");
+    let lsp = RecordingLsp::default();
+    let events = lsp.events();
+    let mut editor = Editor::test_with_size(
+        Box::new(lsp),
+        /*width*/ 80,
+        /*height*/ 24,
+        Config::default(),
+        Theme::default(),
+        vec![Buffer::new(
+            Some(path.clone()),
+            "bravo\nalpha\n".to_string(),
+        )],
+    )
+    .unwrap();
+    editor.test_disable_terminal_output();
+    let mut harness = EditorHarness { editor };
+    harness
+        .execute_action(Action::Command("%!sort".to_string()))
+        .await
+        .unwrap();
+
+    wait_for_shell_command(&mut harness).await;
+
+    let changes = events
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|event| matches!(event, LspEvent::DidChange(file) if file == &path))
+        .count();
+    assert_eq!(changes, 1, "a filter must publish one document change");
+    harness.assert_buffer_contents("alpha\nbravo\n");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn shell_filter_empty_output_removes_only_selected_lines() {
+    let _cwd_guard = protected_current_dir();
+    for (original, command, expected) in [
+        ("before\nremove\nafter", "2!true", "before\nafter"),
+        ("before\nremove", "2!true", "before"),
+        ("before\nremove\n", "2!true", "before\n"),
+        ("remove\nall", "%!true", ""),
+    ] {
+        let mut harness = EditorHarness::with_content(original);
+        harness
+            .execute_action(Action::Command(command.to_string()))
+            .await
+            .unwrap();
+
+        wait_for_shell_command(&mut harness).await;
+
+        harness.assert_buffer_contents(expected);
+        harness.execute_action(Action::Undo).await.unwrap();
+        harness.assert_buffer_contents(original);
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn shell_filter_retains_complete_raw_output_while_bounding_message_history() {
+    let _cwd_guard = protected_current_dir();
+    let mut harness = EditorHarness::with_content("input");
+    harness
+        .execute_action(Action::Command(
+            "%!python3 -c 'import sys; sys.stdout.write(\"x\"*70000+\"\\x1b[31mRAW\\x1b[0m\")'"
+                .to_string(),
+        ))
+        .await
+        .unwrap();
+
+    let record = wait_for_shell_command(&mut harness).await;
+
+    assert_eq!(harness.buffer_contents().len(), 70_012);
+    assert!(harness
+        .buffer_contents()
+        .ends_with("\u{1b}[31mRAW\u{1b}[0m"));
+    let details = record.content.details.as_deref().unwrap();
+    assert!(details.len() < 64 * 1024);
+    assert!(details.contains("[Earlier output truncated by Red]"));
+    assert!(!details.contains("\u{1b}"));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn shell_filter_rejects_invalid_utf8_without_changing_the_buffer() {
+    let _cwd_guard = protected_current_dir();
+    let mut harness = EditorHarness::with_content("keep me");
+    harness
+        .execute_action(Action::Command(
+            "%!python3 -c 'import sys; sys.stdout.buffer.write(bytes([255]))'".to_string(),
+        ))
+        .await
+        .unwrap();
+
+    let record = wait_for_shell_command(&mut harness).await;
+
+    assert_eq!(
+        record.state,
+        NotificationState::Finished(ProgressOutcome::Failed)
+    );
+    assert!(record.content.summary.contains("not valid UTF-8"));
+    harness.assert_buffer_contents("keep me");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn shell_filter_failed_process_preserves_input_and_reports_stderr() {
+    let _cwd_guard = protected_current_dir();
+    let mut harness = EditorHarness::with_content("keep me\n");
+    harness
+        .execute_action(Action::Command(
+            "%!sh -c 'cat; printf problem >&2; exit 7'".to_string(),
+        ))
+        .await
+        .unwrap();
+
+    let record = wait_for_shell_command(&mut harness).await;
+
+    assert_eq!(
+        record.state,
+        NotificationState::Finished(ProgressOutcome::Failed)
+    );
+    assert!(record.content.summary.contains('7'));
+    assert!(record
+        .content
+        .details
+        .as_deref()
+        .unwrap()
+        .contains("problem"));
+    harness.assert_buffer_contents("keep me\n");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn shell_filter_cancellation_preserves_the_original_buffer() {
+    let _cwd_guard = protected_current_dir();
+    let mut harness = EditorHarness::with_content("still here\n");
+    harness
+        .execute_action(Action::Command("%!sleep 30".to_string()))
+        .await
+        .unwrap();
+    harness
+        .execute_event(Event::Key(KeyEvent::new(
+            KeyCode::Char('c'),
+            KeyModifiers::CONTROL,
+        )))
+        .await
+        .unwrap();
+
+    let record = wait_for_shell_command(&mut harness).await;
+
+    assert_eq!(
+        record.state,
+        NotificationState::Finished(ProgressOutcome::Cancelled)
+    );
+    harness.assert_buffer_contents("still here\n");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn shell_filter_rejects_results_when_the_target_buffer_changes() {
+    let _cwd_guard = protected_current_dir();
+    let directory = tempfile::tempdir().unwrap();
+    let gate = directory.path().join("filter-gate");
+    fs::write(&gate, "waiting").unwrap();
+    let mut harness = EditorHarness::with_content("original\n");
+    harness
+        .execute_action(Action::Command(format!(
+            "%!sh -c 'while test -f \"{}\"; do sleep 0.01; done; tr a-z A-Z'",
+            gate.display()
+        )))
+        .await
+        .unwrap();
+    harness
+        .execute_action(Action::EnterMode(Mode::Insert))
+        .await
+        .unwrap();
+    harness
+        .execute_action(Action::InsertCharAtCursorPos('!'))
+        .await
+        .unwrap();
+    harness
+        .execute_action(Action::EnterMode(Mode::Normal))
+        .await
+        .unwrap();
+    fs::remove_file(&gate).unwrap();
+
+    let record = wait_for_shell_command(&mut harness).await;
+
+    assert_eq!(
+        record.state,
+        NotificationState::Finished(ProgressOutcome::Failed)
+    );
+    assert!(record.content.summary.contains("buffer changed"));
+    harness.assert_buffer_contents("!original\n");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn shell_filter_updates_its_original_buffer_without_switching_the_active_buffer() {
+    let _cwd_guard = protected_current_dir();
+    let directory = tempfile::tempdir().unwrap();
+    let gate = directory.path().join("filter-gate");
+    fs::write(&gate, "waiting").unwrap();
+    let lsp = Box::new(MockLsp) as Box<dyn LspClient + Send>;
+    let mut editor = Editor::test_with_size(
+        lsp,
+        /*width*/ 100,
+        /*height*/ 24,
+        Config::default(),
+        Theme::default(),
+        vec![
+            Buffer::new(Some("filter.rs".to_string()), "bravo\nalpha\n".to_string()),
+            Buffer::new(Some("visible.rs".to_string()), "stay visible\n".to_string()),
+        ],
+    )
+    .unwrap();
+    editor.test_disable_terminal_output();
+    let mut harness = EditorHarness { editor };
+    harness
+        .execute_action(Action::Command(format!(
+            "%!sh -c 'while test -f \"{}\"; do sleep 0.01; done; sort'",
+            gate.display()
+        )))
+        .await
+        .unwrap();
+    harness.execute_action(Action::NextBuffer).await.unwrap();
+    fs::remove_file(&gate).unwrap();
+
+    let record = wait_for_shell_command(&mut harness).await;
+
+    assert_eq!(
+        record.state,
+        NotificationState::Finished(ProgressOutcome::Succeeded)
+    );
+    harness.assert_buffer_contents("stay visible\n");
+    assert_eq!(
+        harness.editor.test_current_buffer().file.as_deref(),
+        Some("visible.rs")
+    );
+    harness
+        .execute_action(Action::PreviousBuffer)
+        .await
+        .unwrap();
+    harness.assert_buffer_contents("alpha\nbravo\n");
+    harness.execute_action(Action::Undo).await.unwrap();
+    harness.assert_buffer_contents("bravo\nalpha\n");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn shell_filter_rejects_results_after_its_target_buffer_is_closed() {
+    let _cwd_guard = protected_current_dir();
+    let directory = tempfile::tempdir().unwrap();
+    let gate = directory.path().join("filter-gate");
+    fs::write(&gate, "waiting").unwrap();
+    let mut harness = EditorHarness::with_content("discarded\n");
+    harness
+        .execute_action(Action::Command(format!(
+            "%!sh -c 'while test -f \"{}\"; do sleep 0.01; done; cat'",
+            gate.display()
+        )))
+        .await
+        .unwrap();
+    harness
+        .execute_action(Action::DeleteBuffer(/*force*/ false))
+        .await
+        .unwrap();
+    fs::remove_file(&gate).unwrap();
+
+    let record = wait_for_shell_command(&mut harness).await;
+
+    assert_eq!(
+        record.state,
+        NotificationState::Finished(ProgressOutcome::Failed)
+    );
+    assert!(record.content.summary.contains("no longer open"));
+    assert!(harness.editor.test_current_buffer().is_blank());
+}
+
+#[tokio::test]
+async fn shell_filter_rejects_invalid_ranges_and_untrusted_action_paths() {
+    let mut harness = EditorHarness::with_content("one\ntwo");
+    for (command, expected) in [
+        ("%!", "usage: !{shell command}"),
+        ("3!cat", "starts past the end"),
+        ("2,1!cat", "range start exceeds its end"),
+        ("'<,'>!cat", "last visual range is not set"),
+    ] {
+        harness
+            .execute_action(Action::Command(command.to_string()))
+            .await
+            .unwrap();
+        assert!(
+            harness.last_error().unwrap().contains(expected),
+            "{command}: {:?}",
+            harness.last_error()
+        );
+    }
+    harness
+        .execute_action(Action::Command("bufdo %!cat".to_string()))
+        .await
+        .unwrap();
+    assert!(harness
+        .last_error()
+        .unwrap()
+        .contains("outside its supported non-interactive subset"));
 }
 
 #[tokio::test]
