@@ -391,10 +391,24 @@ impl Editor {
         self.refresh_message_browser();
     }
 
+    pub(super) fn open_message_notification(&mut self, id: NotificationId) {
+        self.open_messages();
+        if let Some(browser) = &mut self.message_browser {
+            browser.selected = Some(id);
+        }
+        self.refresh_message_browser();
+    }
+
     pub(super) fn close_messages(&mut self) {
         if let Some(browser) = self.message_browser.take() {
             self.current_dialog = browser.return_dialog;
         }
+    }
+
+    pub(super) fn selected_message_notification(&self) -> Option<NotificationId> {
+        self.message_browser
+            .as_ref()
+            .and_then(|browser| browser.selected)
     }
 
     pub(super) fn refresh_message_browser(&mut self) {
@@ -461,6 +475,9 @@ impl Editor {
             searching: browser.searching,
             filter: browser.filter.label(),
             counts,
+            can_cancel: browser
+                .selected
+                .is_some_and(|id| self.shell_commands.has_notification(id)),
             feedback: browser.feedback.clone().or_else(|| {
                 self.notification_fallback
                     .as_ref()

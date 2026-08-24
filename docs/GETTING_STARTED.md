@@ -299,6 +299,7 @@ Enter Command mode with `:` or `;`.
 | `:<number>` / `:$` | Jump to a line or the last line |
 | `:bn` / `:bd` | Select the next buffer or delete a buffer |
 | `:bufdo {command}` | Run a non-interactive Ex command in every open buffer |
+| `:!{command}` / `:!!` | Run a shell command or repeat the previous one |
 | `:sp [file]` / `:vs [file]` | Open a horizontal or vertical split |
 | `:close` / `:only` | Close the window or keep only the current window |
 | `:wrap` / `:nowrap` | Enable or disable wrapping |
@@ -307,6 +308,15 @@ Enter Command mode with `:` or `;`.
 | `:join [count]` / `:join! [count]` | Join with normalized or preserved spacing |
 | `:commands` | Open the command palette |
 | `:messages` | Browse active notifications and recent messages |
+
+Shell commands run asynchronously in Red's working directory using `$SHELL -c`
+on Unix or `COMSPEC /C` on Windows. Output streams into the Messages view while
+the editor, language servers, and detached sessions remain responsive. Press
+`Ctrl-c` in the selected running command to cancel it, or `Esc` to return to
+editing while it continues. `%` expands to the current file, `#` to the
+alternate file, and `!` to the previous shell command; prefix those characters
+with `\` when they should remain literal. Shell jobs do not provide interactive
+stdin, and range filters such as `:%!sort` are not supported.
 
 The bottom line shows the current notification. Routine feedback such as saves
 and copies fades away without leaving a badge. The badge counts warnings or

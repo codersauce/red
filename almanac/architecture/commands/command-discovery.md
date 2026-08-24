@@ -18,6 +18,9 @@ sources:
   - id: buffer-do
     type: file
     path: src/editor/buffer_do.rs
+  - id: shell-command
+    type: file
+    path: src/editor/shell_command.rs
   - id: default-config
     type: file
     path: default_config.toml
@@ -41,6 +44,19 @@ Command discovery is the set of paths that let Red users find and execute editor
 The low-level parser in `src/command.rs` receives authoritative built-in command specifications, including each command's stable minimum abbreviation length. It parses a trailing `!` as `CommandFlag::Force`, splits arguments on spaces without shell quoting, prioritizes exact command names and existing initial-based aliases such as `bn` for `buffer-next`, explicitly recognizes the `wq` save-and-quit chain, and resolves unambiguous Vim-style prefixes such as `ene` for `enew` [@command-parser]. Ambiguous, too-short, and unknown names are rejected instead of being decomposed into unrelated commands, preventing accidental buffer deletion, reloads, or writes [@command-parser]. The command inventory has a regression test that rejects duplicate names and conflicting executable prefixes [@command-palette].
 
 The editor adds command-specific handling around that parser. It special-cases register and join commands, uses parsed canonical names for syntax, set, and messages commands, and maps the remaining parsed command names to semantic `Action` values such as save, quit, buffer movement, deletion, edit/reload, split, and wrap [@editor-dispatch]. If built-in parsing fails but the runtime has a registered plugin command with the exact input name, the editor returns `Action::PluginCommand`; otherwise it records an unknown-command error [@editor-dispatch].
+
+`:!{command}` is recognized before the ordinary command parser so shell quotes,
+whitespace, pipelines, redirects, and trailing force-like characters remain
+intact. Red expands `%` and `#` to the current and alternate filenames and `!`
+to the previous external command; escaped special characters remain literal,
+and `:!!` repeats the previous command. An editor-owned Tokio subprocess runs
+the user's shell with null stdin and bounded, sanitized stdout/stderr. The
+editor's normal background tick streams its result into a cancellable Messages
+progress record, so detachable owners continue execution without an IPC change
+or terminal-mode handoff. Shell actions are excluded from serialized actions,
+plugin host APIs, agent action allowlists, and `:bufdo`; plugin process
+permissions retain their existing no-shell boundary [@shell-command]
+[@editor-dispatch].
 
 `:bufdo` parses its optional range as stable buffer ids rather than line numbers, snapshots matching open-buffer ids, and reparses its nested command after activating each target so line ranges such as `%` resolve against that buffer. Stable identities let `:bufdo bd` safely delete each snapshotted target without visiting the replacement blank buffer; an unforced delete stops at the first dirty buffer. Traversal also stops on parse, substitution, write, or reload errors and rejects other nested actions that could invalidate the snapshot or open interactive UI. The outer force flag is accepted for Vim compatibility; Red already preserves dirty buffers during ordinary buffer switches [@editor-dispatch] [@buffer-do].
 
@@ -89,6 +105,11 @@ Reference-only and other-context bindings are readable but not executable.
 
 Plugins register command discovery data through the runtime's `CommandMetadata`, which carries optional title, category, description, aliases, visibility, panel key-dispatch scope, and opt-in argument/completion metadata [@plugin-runtime]. Declarative `#[red::command]` metadata accepts `scope = "editor"` or `scope = "global"` and defaults to editor scope, while imperative `red::add_command` metadata is deserialized into the same runtime structure [@plugin-api] [@plugin-runtime]. `Runtime::registered_commands` returns active command records with command name, owning plugin, callback, and metadata sorted by command name for stable discovery UI, and `Runtime::command_scope` is the editor's lookup path when deciding whether a plugin command may run from focused panels [@plugin-runtime] [@editor-dispatch]. Because palette entries retain the owning plugin in their ids, duplicate command names have deterministic runtime behavior before discovery surfaces display them [@plugin-runtime].
 
-This command system does not make colon syntax a general shell. Arguments are split simply, command names are case-sensitive where plugin names are involved, and plugin command execution stays behind the plugin host boundary [@command-parser] [@editor-dispatch]. The CLI-level command surface is documented in [Red Command](../../reference/cli/red-command), and exact default keymaps and plugin command bindings belong in [Default Config](../../reference/configuration/default-config).
+Only the explicit `:!` form grants access to the user's shell. Ordinary Ex
+arguments are still split simply, command names are case-sensitive where plugin
+names are involved, and plugin command execution stays behind the plugin host
+boundary [@command-parser] [@editor-dispatch]. The CLI-level command surface is
+documented in [Red Command](../../reference/cli/red-command), and exact default
+keymaps and plugin command bindings belong in [Default Config](../../reference/configuration/default-config).
 
 Plugin commands may opt in with `arguments = true` and positional `completions = [["enable", "disable"]]`. They receive one `CommandInvocation` record containing the registered name, split arguments, and raw argument text. Legacy callbacks still receive no arguments; exact registered names and built-in precedence are preserved. See [Plugin Host API](../../reference/plugins/host-api) for compatibility requirements [@plugin-api] [@plugin-runtime].

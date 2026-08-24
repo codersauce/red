@@ -15,7 +15,10 @@ use red::{
     config::{Config, KeyAction, LanguageConfig, MatchitLanguageConfig},
     editor::{Action, Content, Editor, Mode, SearchDirection},
     lsp::LspClient,
-    notification::{MessageAction, Notice, NotificationSource, Severity},
+    notification::{
+        MessageAction, Notice, Notification, NotificationSource, NotificationState,
+        ProgressOutcome, Severity,
+    },
     plugin::{
         PanelConfig, PanelRow, PanelRowKind, PanelSegment, PanelSide, Runtime, TextPanelBlock,
         TextPanelBlockFormat, TextPanelBlockKind, TextPanelComposerConfig,
@@ -29,7 +32,7 @@ use std::{
     env, fs,
     path::PathBuf,
     sync::{Arc, Mutex, MutexGuard},
-    time::{Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 static COMMAND_COMPLETION_CWD_LOCK: Mutex<()> = Mutex::new(());
@@ -2230,22 +2233,369 @@ impl Drop for CurrentDirGuard {
     }
 }
 
-fn command_completion_temp_dir(name: &str) -> (PathBuf, CurrentDirGuard) {
+fn protected_current_dir() -> CurrentDirGuard {
     let lock = COMMAND_COMPLETION_CWD_LOCK.lock().unwrap();
-    let original = env::current_dir().unwrap();
+    CurrentDirGuard {
+        original: env::current_dir().unwrap(),
+        _lock: lock,
+    }
+}
+
+fn command_completion_temp_dir(name: &str) -> (PathBuf, CurrentDirGuard) {
+    let guard = protected_current_dir();
     let root = env::temp_dir().join(format!(
         "red-command-completion-{name}-{}",
         uuid::Uuid::new_v4()
     ));
     fs::create_dir_all(&root).unwrap();
     env::set_current_dir(&root).unwrap();
-    (
-        root,
-        CurrentDirGuard {
-            original,
-            _lock: lock,
-        },
+    (root, guard)
+}
+
+async fn wait_for_shell_command(harness: &mut EditorHarness) -> Notification {
+    let result = tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            harness.editor.test_service_background().await.unwrap();
+            if let Some(record) = harness
+                .editor
+                .notifications()
+                .records()
+                .rfind(|record| record.content.summary.starts_with("Shell "))
+                .filter(|record| !record.is_running())
+            {
+                return record.clone();
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    match result {
+        Ok(record) => record,
+        Err(_) => panic!(
+            "shell command did not complete; error: {:?}; notifications: {:?}",
+            harness.last_error(),
+            harness
+                .editor
+                .notifications()
+                .records()
+                .map(|record| (&record.content.summary, record.state))
+                .collect::<Vec<_>>()
+        ),
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn shell_command_streams_pipeline_output_into_message_history() {
+    let _cwd_guard = protected_current_dir();
+    let mut harness = EditorHarness::with_content("unchanged");
+    harness
+        .execute_action(Action::Command(
+            "!printf 'hello world' | tr a-z A-Z".to_string(),
+        ))
+        .await
+        .unwrap();
+
+    let record = wait_for_shell_command(&mut harness).await;
+
+    assert_eq!(
+        record.state,
+        NotificationState::Finished(ProgressOutcome::Succeeded)
+    );
+    assert!(record
+        .content
+        .details
+        .as_deref()
+        .unwrap()
+        .contains("HELLO WORLD"));
+    harness.assert_buffer_contents("unchanged");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn shell_command_reports_stdout_stderr_and_exit_status() {
+    let _cwd_guard = protected_current_dir();
+    let mut harness = EditorHarness::with_content("");
+    harness
+        .execute_action(Action::Command(
+            "!sh -c 'printf standard; printf problem >&2; exit 7'".to_string(),
+        ))
+        .await
+        .unwrap();
+
+    let record = wait_for_shell_command(&mut harness).await;
+    let details = record.content.details.as_deref().unwrap();
+
+    assert_eq!(
+        record.state,
+        NotificationState::Finished(ProgressOutcome::Failed)
+    );
+    assert!(record.content.summary.contains('7'));
+    assert!(details.contains("standard"), "{details}");
+    assert!(details.contains("problem"), "{details}");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn shell_command_repeats_previous_command_with_double_bang() {
+    let _cwd_guard = protected_current_dir();
+    let mut harness = EditorHarness::with_content("");
+    harness
+        .execute_action(Action::Command("!printf repeated".to_string()))
+        .await
+        .unwrap();
+    let first = wait_for_shell_command(&mut harness).await;
+
+    harness
+        .execute_action(Action::Command("!!".to_string()))
+        .await
+        .unwrap();
+    let second = wait_for_shell_command(&mut harness).await;
+
+    assert_ne!(first.id, second.id);
+    assert_eq!(
+        second.state,
+        NotificationState::Finished(ProgressOutcome::Succeeded)
+    );
+    assert!(second
+        .content
+        .details
+        .as_deref()
+        .unwrap()
+        .contains("repeated"));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn shell_command_expands_current_and_alternate_file_names() {
+    let _cwd_guard = protected_current_dir();
+    let lsp = Box::new(MockLsp) as Box<dyn LspClient + Send>;
+    let mut editor = Editor::test_with_size(
+        lsp,
+        /*width*/ 100,
+        /*height*/ 24,
+        Config::default(),
+        Theme::default(),
+        vec![
+            Buffer::new(Some("first file.rs".to_string()), "first".to_string()),
+            Buffer::new(Some("second file.rs".to_string()), "second".to_string()),
+        ],
     )
+    .unwrap();
+    editor.test_disable_terminal_output();
+    let mut harness = EditorHarness { editor };
+    harness.execute_action(Action::NextBuffer).await.unwrap();
+
+    harness
+        .execute_action(Action::Command("!echo '%' '#'".to_string()))
+        .await
+        .unwrap();
+    let record = wait_for_shell_command(&mut harness).await;
+    let details = record.content.details.as_deref().unwrap();
+
+    assert!(
+        details.contains("second file.rs first file.rs"),
+        "{details}"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn shell_command_uses_the_editor_working_directory() {
+    let (root, _guard) = command_completion_temp_dir("shell-command");
+    let mut harness = EditorHarness::with_content("");
+    harness
+        .execute_action(Action::Command("!pwd".to_string()))
+        .await
+        .unwrap();
+
+    let record = wait_for_shell_command(&mut harness).await;
+
+    let reported = record
+        .content
+        .details
+        .as_deref()
+        .unwrap()
+        .lines()
+        .last()
+        .unwrap();
+    assert_eq!(
+        fs::canonicalize(reported).unwrap(),
+        fs::canonicalize(root).unwrap()
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn shell_command_bounds_output_and_repairs_invalid_utf8() {
+    let _cwd_guard = protected_current_dir();
+    let mut harness = EditorHarness::with_content("");
+    harness
+        .execute_action(Action::Command(
+            "!python3 -c 'import sys; sys.stdout.buffer.write(b\"x\"*70000+b\"TAIL\"+bytes([255]))'"
+                .to_string(),
+        ))
+        .await
+        .unwrap();
+
+    let record = wait_for_shell_command(&mut harness).await;
+    let details = record.content.details.as_deref().unwrap();
+
+    assert!(details.len() <= 64 * 1024);
+    assert!(details.contains("[Earlier output truncated by Red]"));
+    assert!(details.ends_with("TAIL�"), "{}", details.len());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn shell_command_does_not_inherit_interactive_stdin() {
+    let _cwd_guard = protected_current_dir();
+    let mut harness = EditorHarness::with_content("");
+    harness
+        .execute_action(Action::Command(
+            "!sh -c 'if read value; then printf unexpected; else printf stdin-closed; fi'"
+                .to_string(),
+        ))
+        .await
+        .unwrap();
+
+    let record = wait_for_shell_command(&mut harness).await;
+
+    assert!(record
+        .content
+        .details
+        .as_deref()
+        .unwrap()
+        .ends_with("stdin-closed"));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn shell_command_reconciles_external_edits_without_overwriting_dirty_buffers() {
+    let _cwd_guard = protected_current_dir();
+    for dirty in [false, true] {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("watched.txt");
+        fs::write(&path, "before\n").unwrap();
+        let source = Buffer::new(
+            Some(path.to_string_lossy().into_owned()),
+            "before\n".to_string(),
+        );
+        let mut harness = EditorHarness::with_buffer(source);
+        harness.editor.test_service_background().await.unwrap();
+        if dirty {
+            harness
+                .execute_action(Action::InsertCharAtCursorPos('!'))
+                .await
+                .unwrap();
+        }
+        harness
+            .execute_action(Action::Command(
+                "!sh -c 'printf outside > \"%\"'".to_string(),
+            ))
+            .await
+            .unwrap();
+        let record = wait_for_shell_command(&mut harness).await;
+        assert_eq!(
+            record.state,
+            NotificationState::Finished(ProgressOutcome::Succeeded)
+        );
+
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                harness.editor.test_service_background().await.unwrap();
+                if dirty {
+                    if harness
+                        .editor
+                        .test_current_buffer()
+                        .has_external_file_conflict()
+                    {
+                        break;
+                    }
+                } else if harness.buffer_contents() == "outside" {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("shell-written file was not reconciled");
+
+        if dirty {
+            assert_eq!(harness.buffer_contents(), "!before\n");
+            assert_eq!(fs::read_to_string(&path).unwrap(), "outside");
+        } else {
+            harness.assert_buffer_contents("outside");
+            assert!(!harness.is_dirty());
+        }
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn shell_command_ctrl_c_cancels_the_selected_running_process() {
+    let _cwd_guard = protected_current_dir();
+    let mut harness = EditorHarness::with_content("still here");
+    harness
+        .execute_action(Action::Command("!sleep 30".to_string()))
+        .await
+        .unwrap();
+    harness
+        .execute_event(Event::Key(KeyEvent::new(
+            KeyCode::Char('c'),
+            KeyModifiers::CONTROL,
+        )))
+        .await
+        .unwrap();
+
+    let record = wait_for_shell_command(&mut harness).await;
+
+    assert_eq!(
+        record.state,
+        NotificationState::Finished(ProgressOutcome::Cancelled)
+    );
+    harness.assert_buffer_contents("still here");
+}
+
+#[tokio::test]
+async fn shell_command_rejects_missing_context_and_unsafe_bufdo_execution() {
+    let mut harness = EditorHarness::with_content("");
+    for (command, expected) in [
+        ("!", "usage: !{shell command}"),
+        ("!!", "No previous shell command"),
+        ("!echo %", "No current file name"),
+        ("!echo #", "No alternate file name"),
+    ] {
+        harness
+            .execute_action(Action::Command(command.to_string()))
+            .await
+            .unwrap();
+        assert!(
+            harness.last_error().unwrap().contains(expected),
+            "{command}: {:?}",
+            harness.last_error()
+        );
+    }
+    harness
+        .execute_action(Action::Command("bufdo !echo forbidden".to_string()))
+        .await
+        .unwrap();
+
+    assert!(harness
+        .last_error()
+        .unwrap()
+        .contains("outside its supported non-interactive subset"));
+    assert!(harness
+        .editor
+        .notifications()
+        .records()
+        .all(|record| !record.content.summary.starts_with("Shell running:")));
+}
+
+#[test]
+fn shell_actions_cannot_be_deserialized_from_external_action_configuration() {
+    assert!(serde_json::from_str::<Action>(r#"{"RunShell":"echo unsafe"}"#).is_err());
+    assert!(serde_json::from_str::<Action>(r#""CancelShellCommand""#).is_err());
 }
 
 #[tokio::test]
