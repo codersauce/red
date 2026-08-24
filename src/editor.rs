@@ -54,6 +54,7 @@ pub mod rendering;
 #[cfg(test)]
 mod resize_tests;
 mod session_manager;
+mod shell_command;
 mod signature_help;
 mod snippet;
 
@@ -2883,6 +2884,12 @@ pub enum Action {
     PrintWarning(String),
     OpenMessages,
     MessageHistory(MessageAction),
+    /// Executes an explicit user-entered Ex shell command outside plugin APIs.
+    #[serde(skip)]
+    RunShell(String),
+    /// Interrupts the shell command currently selected in message history.
+    #[serde(skip)]
+    CancelShellCommand,
 
     OpenTextPanelTurnActions,
     CopyTextPanelTurn {
@@ -3695,6 +3702,8 @@ pub struct Editor {
 
     /// Session-local notification records, independent of the legacy display slot.
     notifications: NotificationCenter,
+    /// Explicit user-owned shell jobs and their bounded background output.
+    shell_commands: shell_command::ShellCommandState,
     message_browser: Option<notifications::MessageBrowser>,
     notification_presentation: notifications::NotificationPresentation,
     notification_frame_candidate: Option<notifications::NotificationExposureKey>,
@@ -5227,6 +5236,7 @@ impl Editor {
             search_match_history: VecDeque::new(),
             search_highlights_suppressed: false,
             notifications: NotificationCenter::default(),
+            shell_commands: shell_command::ShellCommandState::default(),
             message_browser: None,
             notification_presentation: notifications::NotificationPresentation::default(),
             notification_frame_candidate: None,
@@ -10190,6 +10200,7 @@ impl Editor {
 
     async fn shutdown_services(&mut self, runtime: &mut Runtime) {
         let _shutdown = perf::PerfSpan::start("shutdown:services");
+        self.shell_commands.cancel_all();
         // Closing the command channel starts agent shutdown immediately. Its
         // process can exit while we persist state and deactivate plugins.
         drop(self.agent_manager.take_bridge());
@@ -12678,6 +12689,7 @@ impl Editor {
                 }
             }
         }
+        needs_render |= self.service_shell_commands();
         self.sync_persistent_notifications();
         needs_render |= self.notification_presentation_changed();
         let background_render = if needs_render {
@@ -16313,11 +16325,25 @@ impl Editor {
     }
 
     fn handle_command(&mut self, cmd: &str, runtime: &Runtime) -> Vec<Action> {
-        log!("handle_command called with: {}", cmd);
+        if cmd.starts_with('!') {
+            log!("handle_command called with: [shell command]");
+        } else {
+            log!("handle_command called with: {}", cmd);
+        }
         self.command = String::new();
         self.waiting_command = None;
         self.repeater = None;
         self.set_legacy_message(None);
+
+        if let Some(raw) = cmd.strip_prefix('!') {
+            return match self.parse_shell_command(raw) {
+                Ok(command) => vec![Action::RunShell(command)],
+                Err(error) => {
+                    self.set_routine_error(Some(error.to_string()));
+                    Vec::new()
+                }
+            };
+        }
 
         if cmd == "Copilot" || cmd.starts_with("Copilot ") {
             let command = cmd.strip_prefix("Copilot").unwrap_or_default().trim();
@@ -19679,17 +19705,18 @@ impl Editor {
             self.render(buffer)?;
             return Ok(false);
         }
-        let sensitive_action = matches!(action, Action::NotifyPlugin(_, _, _))
-            || matches!(
-                action,
-                Action::CopilotFinishSignIn(_)
-                    | Action::CopilotEnableAndSignIn
-                    | Action::CopilotCopySignInCode(_)
-                    | Action::CopilotRetrySignIn
-                    | Action::CopilotDismissSignIn
-                    | Action::CopilotRespond { .. }
-            )
-            || matches!(action, Action::SubmitInlineAssist(_))
+        let sensitive_action = matches!(
+            action,
+            Action::NotifyPlugin(_, _, _) | Action::RunShell(_)
+        ) || matches!(
+            action,
+            Action::CopilotFinishSignIn(_)
+                | Action::CopilotEnableAndSignIn
+                | Action::CopilotCopySignInCode(_)
+                | Action::CopilotRetrySignIn
+                | Action::CopilotDismissSignIn
+                | Action::CopilotRespond { .. }
+        ) || matches!(action, Action::SubmitInlineAssist(_))
             || matches!(action, Action::StageInlineAssistHandoff { .. })
             || matches!(action, Action::NotifyPlugins(method, _) if method.starts_with("composer:"));
         if !sensitive_action {
@@ -21266,7 +21293,11 @@ impl Editor {
                 self.execute_package_action(action, buffer, runtime).await?;
             }
             Action::Command(cmd) => {
-                log!("Handling command: {cmd}");
+                if cmd.starts_with('!') {
+                    log!("Handling command: [shell command]");
+                } else {
+                    log!("Handling command: {cmd}");
+                }
                 let actions = self.handle_command(cmd, runtime);
                 // Even a small preferences write can stall on the filesystem.
                 // An accepted quit flushes this history with exit-hook storage,
@@ -22625,6 +22656,20 @@ impl Editor {
             Action::MessageHistory(action) => {
                 add_to_history = false;
                 self.handle_message_action(action);
+                self.render(buffer)?;
+            }
+            Action::RunShell(command) => {
+                add_to_history = false;
+                if let Err(error) = self.start_shell_command(command) {
+                    self.set_foreground_message(Severity::Error, Some(error.to_string()));
+                }
+                self.render(buffer)?;
+            }
+            Action::CancelShellCommand => {
+                add_to_history = false;
+                if self.cancel_selected_shell_command() {
+                    self.refresh_message_browser();
+                }
                 self.render(buffer)?;
             }
             Action::OpenTextPanelTurnActions => {
@@ -31807,6 +31852,19 @@ impl Editor {
         self.execute(&action, &mut render_buffer, &mut runtime)
             .await?;
         Ok(())
+    }
+
+    /// Pumps production-owned background work for asynchronous integration tests.
+    #[doc(hidden)]
+    pub async fn test_service_background(&mut self) -> anyhow::Result<()> {
+        let mut render_buffer = RenderBuffer::new(
+            self.size.0 as usize,
+            self.size.1 as usize,
+            &Style::default(),
+        );
+        let mut runtime = Runtime::new();
+        self.service_background(&mut render_buffer, &mut runtime)
+            .await
     }
 
     #[doc(hidden)]

@@ -29,6 +29,7 @@ pub(crate) struct MessagesView {
     pub searching: bool,
     pub filter: &'static str,
     pub counts: NotificationCounts,
+    pub can_cancel: bool,
     pub feedback: Option<String>,
 }
 
@@ -68,7 +69,7 @@ impl Component for MessagesPanel {
                 essential("clear", "Esc", "clear"),
             ];
         }
-        vec![
+        let mut actions = vec![
             UiAction::new("browse", "j/k", "browse"),
             UiAction::new("search", "/", "search"),
             UiAction::new("filter", "f", "filter"),
@@ -77,7 +78,11 @@ impl Component for MessagesPanel {
             UiAction::new("clear", "D", "clear inactive").with_priority(ActionPriority::Secondary),
             UiAction::new("scroll", "Ctrl-d/u", "details").with_priority(ActionPriority::Secondary),
             essential("close", "Esc", "return"),
-        ]
+        ];
+        if self.view.can_cancel {
+            actions.insert(0, essential("cancel", "Ctrl-c", "cancel command"));
+        }
+        actions
     }
 
     fn draw(&self, buffer: &mut RenderBuffer) -> anyhow::Result<()> {
@@ -250,6 +255,9 @@ impl Component for MessagesPanel {
         };
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             return match key.code {
+                KeyCode::Char('c') if self.view.can_cancel => {
+                    Some(KeyAction::Single(Action::CancelShellCommand))
+                }
                 KeyCode::Char('d') => Self::action(MessageAction::ScrollDown),
                 KeyCode::Char('u') => Self::action(MessageAction::ScrollUp),
                 _ => None,
@@ -288,6 +296,7 @@ mod tests {
                 searching: true,
                 filter: "all",
                 counts: NotificationCounts::default(),
+                can_cancel: false,
                 feedback: None,
             },
             80,
@@ -321,6 +330,42 @@ mod tests {
     }
 
     #[test]
+    fn control_c_only_cancels_a_selected_running_shell_command() {
+        let mut panel = MessagesPanel::new(
+            MessagesView {
+                rows: vec![],
+                selected: 0,
+                detail: String::new(),
+                scroll: 0,
+                query: String::new(),
+                searching: false,
+                filter: "all",
+                counts: NotificationCounts::default(),
+                can_cancel: false,
+                feedback: None,
+            },
+            80,
+            24,
+            &Theme::default(),
+        );
+        let event = Event::Key(crossterm::event::KeyEvent::new(
+            KeyCode::Char('c'),
+            KeyModifiers::CONTROL,
+        ));
+
+        assert_eq!(panel.handle_event(&event), None);
+        panel.view.can_cancel = true;
+        assert_eq!(
+            panel.handle_event(&event),
+            Some(KeyAction::Single(Action::CancelShellCommand))
+        );
+        assert!(panel
+            .surface_actions()
+            .iter()
+            .any(|action| action.id == "cancel"));
+    }
+
+    #[test]
     fn selection_fills_both_lines_without_crossing_pane_boundary() {
         let mut theme = Theme::default();
         theme.ui_style.picker_selected_item.bg = Some(Color::Rgb {
@@ -350,6 +395,7 @@ mod tests {
                     searching: false,
                     filter: "all",
                     counts: NotificationCounts::default(),
+                    can_cancel: false,
                     feedback: None,
                 },
                 viewport_width,

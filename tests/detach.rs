@@ -155,3 +155,99 @@ async fn running_codex_process_survives_disconnect_and_reattach() {
     let (server_result, ()) = tokio::join!(server, client);
     server_result.unwrap();
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn shell_command_survives_disconnect_without_blocking_detach_ipc() {
+    let directory = tempfile::tempdir().unwrap();
+    let gate = directory.path().join("shell-gate");
+    let marker = directory.path().join("shell-completed");
+    std::fs::write(&gate, "waiting").unwrap();
+    let config = Config::from_user_toml_with_overrides("", &[]).unwrap();
+    let editor = Editor::test_with_size(
+        Box::new(LspManager::new(config.lsp.clone())),
+        /*width*/ 100,
+        /*height*/ 24,
+        config,
+        Theme::default(),
+        vec![Buffer::new(None, "owner remains alive\n".to_string())],
+    )
+    .unwrap();
+    let core = DetachedEditorCore::new(editor).await.unwrap();
+    let session = bind_session(directory.path(), "shell-work").unwrap();
+
+    let server = serve_editor_session(&session, core);
+    let client = async {
+        let mut first = connect_session(directory.path(), "shell-work", None, (100, 24))
+            .await
+            .unwrap();
+        first
+            .input(InputEvent::Key {
+                code: KeyCode::Character(':'),
+                modifiers: Vec::new(),
+                key_kind: red::headless::KeyKind::Press,
+            })
+            .await
+            .unwrap();
+        first
+            .input(InputEvent::Paste {
+                text: format!(
+                    "!sh -c 'while test -f \"{}\"; do sleep 0.01; done; printf completed > \"{}\"'",
+                    gate.display(),
+                    marker.display()
+                ),
+            })
+            .await
+            .unwrap();
+
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            first.input(InputEvent::Key {
+                code: KeyCode::Enter,
+                modifiers: Vec::new(),
+                key_kind: red::headless::KeyKind::Press,
+            }),
+        )
+        .await
+        .expect("launching a shell command blocked its detach IPC response")
+        .unwrap();
+        drop(first);
+        std::fs::remove_file(&gate).unwrap();
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !marker.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("shell command did not continue after disconnect");
+        assert_eq!(std::fs::read_to_string(&marker).unwrap(), "completed");
+
+        let mut second = connect_session(directory.path(), "shell-work", None, (100, 24))
+            .await
+            .unwrap();
+        let mut found_completion = second
+            .initial_render
+            .lines
+            .iter()
+            .any(|line| line.text.contains("Shell finished"));
+        for _ in 0..25 {
+            if found_completion {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            found_completion = second
+                .heartbeat()
+                .await
+                .unwrap()
+                .lines
+                .iter()
+                .any(|line| line.text.contains("Shell finished"));
+        }
+        assert!(found_completion, "reattach did not expose shell completion");
+        stop_session(directory.path(), "shell-work").await.unwrap();
+        drop(second);
+    };
+
+    let (server_result, ()) = tokio::join!(server, client);
+    server_result.unwrap();
+}
