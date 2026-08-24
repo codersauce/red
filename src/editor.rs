@@ -2887,6 +2887,13 @@ pub enum Action {
     /// Executes an explicit user-entered Ex shell command outside plugin APIs.
     #[serde(skip)]
     RunShell(String),
+    /// Filters an explicitly selected Ex line range through the user's shell.
+    #[serde(skip)]
+    RunShellFilter {
+        command: String,
+        start_line: usize,
+        end_line: usize,
+    },
     /// Interrupts the shell command currently selected in message history.
     #[serde(skip)]
     CancelShellCommand,
@@ -12689,7 +12696,7 @@ impl Editor {
                 }
             }
         }
-        needs_render |= self.service_shell_commands();
+        needs_render |= self.service_shell_commands(runtime).await;
         self.sync_persistent_notifications();
         needs_render |= self.notification_presentation_changed();
         let background_render = if needs_render {
@@ -16212,6 +16219,14 @@ impl Editor {
         command.split_at(end)
     }
 
+    fn is_shell_ex_command(command: &str) -> bool {
+        if command.starts_with('!') {
+            return true;
+        }
+        let (range, command) = Self::split_ex_line_range(command);
+        !range.is_empty() && command.trim_start().starts_with('!')
+    }
+
     fn resolve_ex_line_range(&self, range: &str, operation: &str) -> anyhow::Result<ExLineRange> {
         let (start_line, end_line) = if range == "%" {
             (0, self.last_navigable_line())
@@ -16325,7 +16340,7 @@ impl Editor {
     }
 
     fn handle_command(&mut self, cmd: &str, runtime: &Runtime) -> Vec<Action> {
-        if cmd.starts_with('!') {
+        if Self::is_shell_ex_command(cmd) {
             log!("handle_command called with: [shell command]");
         } else {
             log!("handle_command called with: {}", cmd);
@@ -16343,6 +16358,28 @@ impl Editor {
                     Vec::new()
                 }
             };
+        }
+
+        let (range, ranged_command) = Self::split_ex_line_range(cmd);
+        if !range.is_empty() {
+            if let Some(raw) = ranged_command.trim_start().strip_prefix('!') {
+                return match self
+                    .resolve_ex_line_range(range, "shell filter")
+                    .and_then(|lines| {
+                        self.parse_shell_command(raw)
+                            .map(|command| Action::RunShellFilter {
+                                command,
+                                start_line: lines.start_line,
+                                end_line: lines.end_line,
+                            })
+                    }) {
+                    Ok(action) => vec![action],
+                    Err(error) => {
+                        self.set_routine_error(Some(error.to_string()));
+                        Vec::new()
+                    }
+                };
+            }
         }
 
         if cmd == "Copilot" || cmd.starts_with("Copilot ") {
@@ -19707,7 +19744,7 @@ impl Editor {
         }
         let sensitive_action = matches!(
             action,
-            Action::NotifyPlugin(_, _, _) | Action::RunShell(_)
+            Action::NotifyPlugin(_, _, _) | Action::RunShell(_) | Action::RunShellFilter { .. }
         ) || matches!(
             action,
             Action::CopilotFinishSignIn(_)
@@ -21293,7 +21330,7 @@ impl Editor {
                 self.execute_package_action(action, buffer, runtime).await?;
             }
             Action::Command(cmd) => {
-                if cmd.starts_with('!') {
+                if Self::is_shell_ex_command(cmd) {
                     log!("Handling command: [shell command]");
                 } else {
                     log!("Handling command: {cmd}");
@@ -22661,6 +22698,17 @@ impl Editor {
             Action::RunShell(command) => {
                 add_to_history = false;
                 if let Err(error) = self.start_shell_command(command) {
+                    self.set_foreground_message(Severity::Error, Some(error.to_string()));
+                }
+                self.render(buffer)?;
+            }
+            Action::RunShellFilter {
+                command,
+                start_line,
+                end_line,
+            } => {
+                add_to_history = false;
+                if let Err(error) = self.start_shell_filter(command, *start_line, *end_line) {
                     self.set_foreground_message(Severity::Error, Some(error.to_string()));
                 }
                 self.render(buffer)?;

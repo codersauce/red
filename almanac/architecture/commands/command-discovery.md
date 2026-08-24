@@ -45,17 +45,21 @@ The low-level parser in `src/command.rs` receives authoritative built-in command
 
 The editor adds command-specific handling around that parser. It special-cases register and join commands, uses parsed canonical names for syntax, set, and messages commands, and maps the remaining parsed command names to semantic `Action` values such as save, quit, buffer movement, deletion, edit/reload, split, and wrap [@editor-dispatch]. If built-in parsing fails but the runtime has a registered plugin command with the exact input name, the editor returns `Action::PluginCommand`; otherwise it records an unknown-command error [@editor-dispatch].
 
-`:!{command}` is recognized before the ordinary command parser so shell quotes,
-whitespace, pipelines, redirects, and trailing force-like characters remain
-intact. Red expands `%` and `#` to the current and alternate filenames and `!`
-to the previous external command; escaped special characters remain literal,
-and `:!!` repeats the previous command. An editor-owned Tokio subprocess runs
-the user's shell with null stdin and bounded, sanitized stdout/stderr. The
-editor's normal background tick streams its result into a cancellable Messages
-progress record, so detachable owners continue execution without an IPC change
-or terminal-mode handoff. Shell actions are excluded from serialized actions,
-plugin host APIs, agent action allowlists, and `:bufdo`; plugin process
-permissions retain their existing no-shell boundary [@shell-command]
+`:!{command}` and explicit ranged forms such as `:%!{command}` are recognized
+before the ordinary command parser so shell quotes, whitespace, pipelines,
+redirects, and trailing force-like characters remain intact. Red expands `%`
+and `#` to the current and alternate filenames and `!` to the previous external
+command; escaped special characters remain literal, and `:!!` repeats the
+previous command. An editor-owned Tokio subprocess runs the user's shell with
+null stdin for ordinary commands or the exact selected lines on stdin for range
+filters. Sanitized Messages details stay bounded while complete raw filter
+stdout is spooled separately and applied through the canonical undo, mark, and
+LSP edit boundary only if the original buffer revision still matches. The normal
+background tick owns cancellation and completion, so detachable owners continue
+without an IPC change or terminal-mode handoff. Shell actions are excluded from
+serialized actions, plugin host APIs, agent action allowlists, and `:bufdo`;
+plugin process permissions retain their existing no-shell boundary
+[@shell-command]
 [@editor-dispatch].
 
 `:bufdo` parses its optional range as stable buffer ids rather than line numbers, snapshots matching open-buffer ids, and reparses its nested command after activating each target so line ranges such as `%` resolve against that buffer. Stable identities let `:bufdo bd` safely delete each snapshotted target without visiting the replacement blank buffer; an unforced delete stops at the first dirty buffer. Traversal also stops on parse, substitution, write, or reload errors and rejects other nested actions that could invalidate the snapshot or open interactive UI. The outer force flag is accepted for Vim compatibility; Red already preserves dirty buffers during ordinary buffer switches [@editor-dispatch] [@buffer-do].
@@ -105,7 +109,8 @@ Reference-only and other-context bindings are readable but not executable.
 
 Plugins register command discovery data through the runtime's `CommandMetadata`, which carries optional title, category, description, aliases, visibility, panel key-dispatch scope, and opt-in argument/completion metadata [@plugin-runtime]. Declarative `#[red::command]` metadata accepts `scope = "editor"` or `scope = "global"` and defaults to editor scope, while imperative `red::add_command` metadata is deserialized into the same runtime structure [@plugin-api] [@plugin-runtime]. `Runtime::registered_commands` returns active command records with command name, owning plugin, callback, and metadata sorted by command name for stable discovery UI, and `Runtime::command_scope` is the editor's lookup path when deciding whether a plugin command may run from focused panels [@plugin-runtime] [@editor-dispatch]. Because palette entries retain the owning plugin in their ids, duplicate command names have deterministic runtime behavior before discovery surfaces display them [@plugin-runtime].
 
-Only the explicit `:!` form grants access to the user's shell. Ordinary Ex
+Only explicit `:!` and ranged `:{range}!` forms grant access to the user's shell.
+Ordinary Ex
 arguments are still split simply, command names are case-sensitive where plugin
 names are involved, and plugin command execution stays behind the plugin host
 boundary [@command-parser] [@editor-dispatch]. The CLI-level command surface is

@@ -2,9 +2,10 @@
 
 On Linux and macOS, Red can keep the editor, unsaved buffers, LSP servers, plugins, and
 running Codex app-server process alive after a terminal or SSH connection disappears.
-Asynchronous `:!` shell commands are also owned by the live session and continue
-after an attached terminal disconnects; reconnect to inspect their output in
-`:messages`.
+Asynchronous `:!` shell commands and ranged filters such as `:%!sort` are also
+owned by the live session and continue after an attached terminal disconnects.
+Successful filters update their original buffer safely; reconnect to inspect
+the result or shell output in `:messages`.
 
 Start a named session and open files normally:
 
