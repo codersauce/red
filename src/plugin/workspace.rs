@@ -1261,7 +1261,11 @@ impl PluginWorkspace {
             );
             actions
                 .push(UiAction::new("?", "?", "actions").with_priority(ActionPriority::Essential));
-            actions.push(UiAction::new("q", "q", "close").with_priority(ActionPriority::Essential));
+            if !actions.iter().any(|action| action.id == "q") {
+                actions.push(
+                    UiAction::new("q", "q", "close").with_priority(ActionPriority::Essential),
+                );
+            }
             actions.extend(crate::ui::reference_actions(&[
                 ("Navigation", "j / k / ↑ / ↓", "Move down / up"),
                 ("Navigation", "Ctrl+u / Ctrl+d", "Move half a page"),
@@ -2847,6 +2851,29 @@ mod tests {
         assert_eq!(stage.focus, WorkspaceFocus::Rows);
         assert_eq!(stage.row.unwrap().id, "untracked:new-file.txt");
         assert!(stage.detail_line.is_none());
+    }
+
+    #[test]
+    fn workspace_preserves_plugin_owned_back_action() {
+        let mut workspace = PluginWorkspace::new("git".to_string(), WorkspaceConfig::default());
+        let mut model = model_with_document();
+        model.actions = vec![WorkspaceAction {
+            hint: UiAction::new("q", "q", "back"),
+            focus: String::new(),
+            sections: Vec::new(),
+            selection: String::new(),
+            change_only: false,
+            hunk_only: false,
+        }];
+        workspace.update(model, &Theme::default());
+
+        let actions = workspace.actions();
+        let quit_actions = actions
+            .iter()
+            .filter(|action| action.id == "q")
+            .collect::<Vec<_>>();
+        assert_eq!(quit_actions.len(), 1);
+        assert_eq!(quit_actions[0].label, "back");
     }
 
     #[test]
