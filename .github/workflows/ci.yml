@@ -128,12 +128,10 @@ jobs:
           python3 scripts/test_keyboard_protocol.py
 
   clippy:
-    name: Clippy (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: ${{ github.event_name == 'pull_request' && fromJSON('["ubuntu-latest"]') || fromJSON('["ubuntu-latest", "macos-latest", "windows-latest"]') }}
+    name: Clippy
+    needs: plan
+    if: github.event_name != 'push' && needs.plan.outputs.mode != 'docs'
+    runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4

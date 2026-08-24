@@ -9,6 +9,8 @@ three-platform test matrix after every merge.
   requests skip the paid test matrix.
 - Pushes to `main` or `develop` run one Ubuntu smoke suite.
 - Manual CI runs can select either the full matrix or the smoke suite.
+- Clippy runs once on Ubuntu for code pull requests and manual runs. It is
+  skipped for documentation-only pull requests and post-merge pushes.
 - Newer runs cancel older work in the same workflow and branch or pull request.
 - `CI Gate` is the stable terminal check for branch rules. It fails unless all
   jobs required by the selected mode reach their expected conclusions.

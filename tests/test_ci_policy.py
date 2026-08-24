@@ -54,8 +54,11 @@ class CiMatrixTest(unittest.TestCase):
 
 class CiGateTest(unittest.TestCase):
     @staticmethod
-    def successful_needs(*, test: str, build: str) -> dict[str, dict[str, str]]:
+    def successful_needs(
+        *, clippy: str = "success", test: str, build: str
+    ) -> dict[str, dict[str, str]]:
         needs = {job: {"result": "success"} for job in ALWAYS_REQUIRED}
+        needs["clippy"] = {"result": clippy}
         needs["test"] = {"result": test}
         needs["build"] = {"result": build}
         return needs
@@ -75,15 +78,29 @@ class CiGateTest(unittest.TestCase):
             gate_errors(
                 event="pull_request",
                 mode="docs",
-                needs=self.successful_needs(test="skipped", build="skipped"),
+                needs=self.successful_needs(
+                    clippy="skipped", test="skipped", build="skipped"
+                ),
             ),
             [],
         )
 
-    def test_push_gate_requires_smoke_tests_and_builds(self) -> None:
+    def test_push_gate_accepts_skipped_clippy_and_requires_tests_and_builds(self) -> None:
         self.assertEqual(
             gate_errors(
                 event="push",
+                mode="smoke",
+                needs=self.successful_needs(
+                    clippy="skipped", test="success", build="success"
+                ),
+            ),
+            [],
+        )
+
+    def test_manual_gate_requires_one_clippy_job(self) -> None:
+        self.assertEqual(
+            gate_errors(
+                event="workflow_dispatch",
                 mode="smoke",
                 needs=self.successful_needs(test="success", build="success"),
             ),
@@ -91,7 +108,9 @@ class CiGateTest(unittest.TestCase):
         )
 
     def test_gate_reports_every_failed_or_missing_job(self) -> None:
-        needs = self.successful_needs(test="failure", build="success")
+        needs = self.successful_needs(
+            clippy="skipped", test="failure", build="success"
+        )
         needs["docs"] = {"result": "cancelled"}
         del needs["fmt"]
 

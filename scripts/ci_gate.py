@@ -20,6 +20,9 @@ ALWAYS_REQUIRED = (
 
 def gate_errors(*, event: str, mode: str, needs: dict[str, dict[str, object]]) -> list[str]:
     expected = {job: "success" for job in ALWAYS_REQUIRED}
+    expected["clippy"] = (
+        "skipped" if event == "push" or mode == "docs" else "success"
+    )
     expected["test"] = "skipped" if mode == "docs" else "success"
     expected["build"] = "skipped" if event == "pull_request" else "success"
 
