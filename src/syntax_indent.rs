@@ -145,6 +145,44 @@ impl SyntaxIndentation {
         self.try_indent(request).unwrap_or(IndentDecision::Keep)
     }
 
+    /// Reports whether a line's first non-whitespace byte is inside an ignored syntax node.
+    pub(crate) fn line_is_ignored(
+        &mut self,
+        id: BufferId,
+        revision: u64,
+        language: &str,
+        source: &str,
+        line: usize,
+    ) -> bool {
+        if source.len() > MAX_BYTES {
+            return false;
+        }
+
+        let mut start = 0;
+        let Some(target) = source.split('\n').enumerate().find_map(|(index, text)| {
+            if index == line {
+                Some(text)
+            } else {
+                start += text.len() + 1;
+                None
+            }
+        }) else {
+            return false;
+        };
+        let first = start + target.len() - target.trim_start().len();
+
+        self.events(id, revision, language, source, start + target.len())
+            .ok()
+            .flatten()
+            .is_some_and(|events| {
+                events.iter().any(|event| {
+                    event.kind == Kind::Ignore
+                        && event.bytes.start < first
+                        && first < event.bytes.end
+                })
+            })
+    }
+
     fn try_indent(&mut self, request: IndentRequest<'_>) -> anyhow::Result<IndentDecision> {
         let IndentRequest {
             id,

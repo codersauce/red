@@ -6708,6 +6708,347 @@ async fn bracketed_paste_inserts_multiline_text_once() {
 }
 
 #[tokio::test]
+async fn rust_linewise_paste_reindents_multiline_clipboard_without_range_formatting() {
+    let original = concat!(
+        "impl Recap {\n",
+        "    fn note_focus_gained(&mut self) {\n",
+        "        if let Some(task) = self.scheduled_check.take() {\n",
+        "            task.abort();\n",
+        "        }\n",
+        "\n",
+        "        self.retry_revision = None;\n",
+        "        self.in_flight_request_id = None;\n",
+        "    }\n",
+        "}\n",
+    );
+    let clipboard = concat!(
+        "self.retry_revision = None;\n",
+        "if self.in_flight_trigger == Some(RecapTrigger::Automatic) {\n",
+        "    self.clear_in_flight_request();\n",
+        "}\n",
+    );
+    let mut harness = comment_harness("main.rs", original);
+    harness
+        .editor
+        .test_set_default_register(Content::linewise(clipboard.to_string()));
+    harness
+        .execute_action(Action::SetCursor(8, 6))
+        .await
+        .unwrap();
+
+    harness.execute_action(Action::PasteBefore).await.unwrap();
+
+    harness.assert_buffer_contents(concat!(
+        "impl Recap {\n",
+        "    fn note_focus_gained(&mut self) {\n",
+        "        if let Some(task) = self.scheduled_check.take() {\n",
+        "            task.abort();\n",
+        "        }\n",
+        "\n",
+        "        self.retry_revision = None;\n",
+        "        if self.in_flight_trigger == Some(RecapTrigger::Automatic) {\n",
+        "            self.clear_in_flight_request();\n",
+        "        }\n",
+        "        self.retry_revision = None;\n",
+        "        self.in_flight_request_id = None;\n",
+        "    }\n",
+        "}\n",
+    ));
+    harness.assert_cursor_at(8, 6);
+
+    harness.execute_action(Action::Undo).await.unwrap();
+    harness.assert_buffer_contents(original);
+}
+
+#[tokio::test]
+async fn rust_bracketed_paste_dedents_a_whole_file_with_a_leading_doc_comment() {
+    let clipboard = concat!(
+        "    //! Manual recap progress presentation for `ChatWidget`.\n",
+        "\n",
+        "    use super::*;\n",
+        "\n",
+        "    impl ChatWidget {\n",
+        "        pub(crate) fn show_recap_loading(&mut self) {\n",
+        "            self.flush_active_cell();\n",
+        "            self.request_redraw();\n",
+        "        }\n",
+        "    }\n",
+    );
+    let mut harness = comment_harness("recap.rs", "");
+    harness
+        .execute_action(Action::EnterMode(Mode::Insert))
+        .await
+        .unwrap();
+
+    harness
+        .execute_event(Event::Paste(clipboard.to_string()))
+        .await
+        .unwrap();
+
+    harness.assert_buffer_contents(concat!(
+        "//! Manual recap progress presentation for `ChatWidget`.\n",
+        "\n",
+        "use super::*;\n",
+        "\n",
+        "impl ChatWidget {\n",
+        "    pub(crate) fn show_recap_loading(&mut self) {\n",
+        "        self.flush_active_cell();\n",
+        "        self.request_redraw();\n",
+        "    }\n",
+        "}\n",
+    ));
+
+    harness
+        .execute_action(Action::EnterMode(Mode::Normal))
+        .await
+        .unwrap();
+    harness.execute_action(Action::Undo).await.unwrap();
+    harness.assert_buffer_contents("");
+}
+
+#[tokio::test]
+async fn rust_whole_file_paste_dedents_code_without_changing_raw_string_contents() {
+    let clipboard = concat!(
+        "    //! A module containing an intentionally indented raw string.\n",
+        "    const MESSAGE: &str = r#\"first\n",
+        "    literal indentation\n",
+        "    \"#;\n",
+    );
+    let mut harness = comment_harness("recap.rs", "");
+    harness
+        .editor
+        .test_set_default_register(Content::linewise(clipboard.to_string()));
+
+    harness.execute_action(Action::PasteBefore).await.unwrap();
+
+    harness.assert_buffer_contents(concat!(
+        "//! A module containing an intentionally indented raw string.\n",
+        "const MESSAGE: &str = r#\"first\n",
+        "    literal indentation\n",
+        "    \"#;\n",
+    ));
+}
+
+#[tokio::test]
+async fn rust_bracketed_paste_reindents_following_lines_without_range_formatting() {
+    let original = concat!(
+        "impl Recap {\n",
+        "    fn note_focus_gained(&mut self) {\n",
+        "        \n",
+        "        self.in_flight_request_id = None;\n",
+        "    }\n",
+        "}\n",
+    );
+    let clipboard = concat!(
+        "self.retry_revision = None;\n",
+        "if self.in_flight_trigger == Some(RecapTrigger::Automatic) {\n",
+        "    self.clear_in_flight_request();\n",
+        "}",
+    );
+    let mut harness = comment_harness("main.rs", original);
+    harness
+        .execute_action(Action::EnterMode(Mode::Insert))
+        .await
+        .unwrap();
+    harness
+        .execute_action(Action::SetCursor(8, 2))
+        .await
+        .unwrap();
+
+    harness
+        .execute_event(Event::Paste(clipboard.to_string()))
+        .await
+        .unwrap();
+
+    harness.assert_buffer_contents(concat!(
+        "impl Recap {\n",
+        "    fn note_focus_gained(&mut self) {\n",
+        "        self.retry_revision = None;\n",
+        "        if self.in_flight_trigger == Some(RecapTrigger::Automatic) {\n",
+        "            self.clear_in_flight_request();\n",
+        "        }\n",
+        "        self.in_flight_request_id = None;\n",
+        "    }\n",
+        "}\n",
+    ));
+    harness.assert_cursor_at(9, 5);
+
+    harness
+        .execute_action(Action::EnterMode(Mode::Normal))
+        .await
+        .unwrap();
+    harness.execute_action(Action::Undo).await.unwrap();
+    harness.assert_buffer_contents(original);
+}
+
+#[tokio::test]
+async fn rust_system_clipboard_paste_reindents_multiline_code() {
+    let original = "fn update() {\n    existing();\n}\n";
+    let clipboard = "if ready() {\n    update();\n}\n";
+    let mut harness = comment_harness("main.rs", original);
+    harness
+        .editor
+        .test_set_clipboard(Box::new(MemoryClipboardProvider::with_text(clipboard)));
+    harness
+        .execute_action(Action::SetCursor(0, 1))
+        .await
+        .unwrap();
+
+    harness.execute_action(Action::PasteBefore).await.unwrap();
+
+    harness.assert_buffer_contents(concat!(
+        "fn update() {\n",
+        "    if ready() {\n",
+        "        update();\n",
+        "    }\n",
+        "    existing();\n",
+        "}\n",
+    ));
+    harness.assert_cursor_at(4, 1);
+
+    harness.execute_action(Action::Undo).await.unwrap();
+    harness.assert_buffer_contents(original);
+}
+
+#[tokio::test]
+async fn rust_visual_line_paste_reindents_multiline_code() {
+    let original = "fn update() {\n    replace();\n    existing();\n}\n";
+    let clipboard = "if ready() {\n    update();\n}";
+    let mut harness = comment_harness("main.rs", original);
+    harness
+        .editor
+        .test_set_clipboard(Box::new(MemoryClipboardProvider::with_text(clipboard)));
+    harness
+        .execute_action(Action::SetCursor(0, 1))
+        .await
+        .unwrap();
+    harness
+        .execute_action(Action::EnterMode(Mode::VisualLine))
+        .await
+        .unwrap();
+
+    harness.execute_action(Action::Paste).await.unwrap();
+
+    harness.assert_buffer_contents(concat!(
+        "fn update() {\n",
+        "    if ready() {\n",
+        "        update();\n",
+        "    }\n",
+        "    existing();\n",
+        "}\n",
+    ));
+    harness.assert_cursor_at(4, 1);
+
+    harness.execute_action(Action::Undo).await.unwrap();
+    harness.assert_buffer_contents(original);
+}
+
+#[tokio::test]
+async fn rust_paste_rebases_existing_clipboard_indentation() {
+    let original = "impl Recap {\n    fn update(&mut self) {\n        existing();\n    }\n}\n";
+    let clipboard = "    if ready() {\n        update();\n    }\n";
+    let mut harness = comment_harness("main.rs", original);
+    harness
+        .editor
+        .test_set_default_register(Content::linewise(clipboard.to_string()));
+    harness
+        .execute_action(Action::SetCursor(0, 2))
+        .await
+        .unwrap();
+
+    harness.execute_action(Action::PasteBefore).await.unwrap();
+
+    harness.assert_buffer_contents(concat!(
+        "impl Recap {\n",
+        "    fn update(&mut self) {\n",
+        "        if ready() {\n",
+        "            update();\n",
+        "        }\n",
+        "        existing();\n",
+        "    }\n",
+        "}\n",
+    ));
+}
+
+#[tokio::test]
+async fn rust_paste_preserves_multiline_raw_string_contents() {
+    let original = "fn update() {\n    existing();\n}\n";
+    let clipboard = "let message = r#\"first\nraw text\n\"#;\n";
+    let mut harness = comment_harness("main.rs", original);
+    harness
+        .editor
+        .test_set_default_register(Content::linewise(clipboard.to_string()));
+    harness
+        .execute_action(Action::SetCursor(0, 1))
+        .await
+        .unwrap();
+
+    harness.execute_action(Action::PasteBefore).await.unwrap();
+
+    harness.assert_buffer_contents(concat!(
+        "fn update() {\n",
+        "    let message = r#\"first\n",
+        "raw text\n",
+        "\"#;\n",
+        "    existing();\n",
+        "}\n",
+    ));
+}
+
+#[tokio::test]
+async fn rust_paste_preserves_raw_indentation_when_format_on_paste_is_disabled() {
+    let mut config = default_key_config();
+    config.formatting.on_paste = false;
+    let buffer = Buffer::new(
+        Some("main.rs".to_string()),
+        "fn update() {\n    existing();\n}\n".to_string(),
+    );
+    let mut harness = EditorHarness::with_config(buffer, config);
+    harness.editor.test_set_default_register(Content::linewise(
+        "if ready() {\n    update();\n}\n".to_string(),
+    ));
+    harness
+        .execute_action(Action::SetCursor(0, 1))
+        .await
+        .unwrap();
+
+    harness.execute_action(Action::PasteBefore).await.unwrap();
+
+    harness.assert_buffer_contents(
+        "fn update() {\nif ready() {\n    update();\n}\n    existing();\n}\n",
+    );
+}
+
+#[tokio::test]
+async fn rust_paste_reindents_when_lsp_is_disabled() {
+    let mut config = default_key_config();
+    config.lsp.enabled = false;
+    let buffer = Buffer::new(
+        Some("main.rs".to_string()),
+        "fn update() {\n    existing();\n}\n".to_string(),
+    );
+    let mut harness = EditorHarness::with_config(buffer, config);
+    harness.editor.test_set_default_register(Content::linewise(
+        "if ready() {\n    update();\n}\n".to_string(),
+    ));
+    harness
+        .execute_action(Action::SetCursor(0, 1))
+        .await
+        .unwrap();
+
+    harness.execute_action(Action::PasteBefore).await.unwrap();
+
+    harness.assert_buffer_contents(concat!(
+        "fn update() {\n",
+        "    if ready() {\n",
+        "        update();\n",
+        "    }\n",
+        "    existing();\n",
+        "}\n",
+    ));
+}
+
+#[tokio::test]
 async fn bracketed_paste_reveals_a_distant_endpoint_without_pin_to_top() {
     let content = (0..80)
         .map(|line| format!("line-{line:02}"))
