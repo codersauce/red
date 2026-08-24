@@ -1,0 +1,53 @@
+schema_version = 1
+# Release preparation replaces "next" with the selected semantic version.
+version = "next"
+headline = "A modal editor with an agent that understands your code"
+summary = "Source-linked agent walkthroughs, focused inline assistance, Vim-style multi-cursor editing, and a faster workspace."
+website = "https://getred.dev"
+
+[[stories]]
+id = "agent-source-walkthroughs"
+title = "Ask your agent to explain code and jump to the exact source"
+summary = "Agent answers can link directly to source annotations in your editor."
+status = "new"
+pull_requests = [282, 283]
+channels = ["github", "discord", "x", "bluesky", "in_app"]
+
+[[stories]]
+id = "inline-agent"
+title = "Review or refactor code without leaving your editor"
+summary = "Press Space i for focused assistance on the enclosing function or an exact visual selection."
+status = "improved"
+channels = ["github", "discord", "x", "bluesky", "in_app"]
+
+[[stories]]
+id = "vim-multicursor"
+title = "Edit multiple occurrences with Vim-style Ctrl-n"
+summary = "Add successive occurrences and edit all selections together."
+status = "new"
+pull_requests = [326]
+channels = ["github", "discord", "x", "bluesky", "in_app"]
+
+[[stories]]
+id = "agent-model-selection"
+title = "Choose the model and reasoning effort per Agent conversation"
+summary = "Change your active conversation's model directly from the Agent panel."
+status = "new"
+pull_requests = [273]
+channels = ["github", "discord", "bluesky", "in_app"]
+
+[[stories]]
+id = "large-repositories"
+title = "Move through large repositories without slowing down"
+summary = "Faster file trees, file searches, editor interactions, and plugin hot paths."
+status = "improved"
+pull_requests = [289, 298, 309, 332]
+channels = ["github", "discord", "bluesky", "in_app"]
+
+[[stories]]
+id = "external-file-conflicts"
+title = "Protect unsaved work when files change outside the editor"
+summary = "Detect external modifications and resolve conflicts without silently overwriting work."
+status = "new"
+pull_requests = [330]
+channels = ["github", "discord", "bluesky", "in_app"]
