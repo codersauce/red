@@ -71,6 +71,11 @@ pub struct GitState {
     truncated: bool,
 }
 
+pub struct GitCommitFiles {
+    entries: [GitEntry],
+    truncated: bool,
+}
+
 pub struct DisplayEntry {
     entry: GitEntry,
     filename: String,
@@ -97,6 +102,58 @@ pub fn display_entries(entries: [GitEntry]) -> [DisplayEntry] {
 
 pub fn parse_status(output: String) -> GitState {
     status_view(parse_porcelain(output, 500))
+}
+
+pub fn parse_commit_files(output: String) -> GitCommitFiles {
+    let records = output.split("\0");
+    let mut entries = [];
+    let mut index = 0;
+    let mut truncated = false;
+
+    while index < records.len() {
+        let status = records[index];
+        if status.is_empty() {
+            index += 1;
+            continue;
+        }
+        if entries.len() >= 500 {
+            truncated = true;
+            break;
+        }
+
+        let code = status.char_at(0);
+        if index + 1 >= records.len() {
+            break;
+        }
+        let mut path = records[index + 1];
+        let mut original_path = None;
+        let mut kind = "changed";
+        index += 2;
+
+        if code == "R" || code == "C" {
+            if index >= records.len() {
+                break;
+            }
+            original_path = Some(path);
+            path = records[index];
+            index += 1;
+            if code == "R" {
+                kind = "renamed";
+            } else {
+                kind = "copied";
+            }
+        }
+
+        entries.push(GitEntry {
+            path: path,
+            original_path: original_path,
+            x: code,
+            y: ".",
+            kind: kind,
+        });
+    }
+
+    GitCommitFiles { entries: entries, truncated: truncated }
 }
 
 fn parse_porcelain(output: String, limit: i32) -> GitStatus {
@@ -352,6 +409,21 @@ fn parses_branch_changed_renamed_untracked_and_conflicted_records() {
     assert(state.untracked[0].path == "notes/todo.txt");
     assert(state.untracked[0].original_path == None);
     assert(state.conflicted[0].path == "src/conflict.rs");
+}
+
+#[test]
+fn parses_nul_delimited_commit_changes_and_rename_paths() {
+    let files = parse_commit_files("M\0src/changed file.rs\0A\0notes/new\tfile.txt\0R100\0src/old name.rs\0src/new name.rs\0D\0removed.rs\0");
+
+    assert(!files.truncated);
+    assert(files.entries.len() == 4);
+    assert(files.entries[0].path == "src/changed file.rs");
+    assert(files.entries[0].x == "M");
+    assert(files.entries[1].path == "notes/new\tfile.txt");
+    assert(files.entries[2].kind == "renamed");
+    assert(files.entries[2].original_path == Some("src/old name.rs"));
+    assert(files.entries[2].path == "src/new name.rs");
+    assert(files.entries[3].x == "D");
 }
 
 #[test]

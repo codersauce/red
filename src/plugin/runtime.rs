@@ -2759,6 +2759,7 @@ impl RedHost {
                 let value = self.call_git_core(operation, &args[1..])?;
                 let record = match operation {
                     "parse_status" => Some("GitState"),
+                    "parse_commit_files" => Some("GitCommitFiles"),
                     "detail_document" => Some("GitWorkspaceDocument"),
                     _ => None,
                 };
@@ -2798,6 +2799,7 @@ impl RedHost {
         let args = preview.as_ref().map_or(args, |(args, _)| args.as_slice());
         let function = match operation {
             "parse_status" => "status::parse_status",
+            "parse_commit_files" => "status::parse_commit_files",
             "display_entries" => "status::display_entries",
             "sign_hunks" => "patch::sign_hunks",
             "detail_document" => "patch::detail_document",
@@ -5175,6 +5177,168 @@ mod tests {
         runtime
     }
 
+    #[cfg(not(windows))]
+    async fn next_git_callback_picker(
+        runtime: &mut Runtime,
+        expected_title: &str,
+    ) -> (PickerHandle, Vec<PickerItem>) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            pump_process_events(runtime).await.unwrap();
+            while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
+                if let PluginRequest::OpenCallbackPicker {
+                    owner,
+                    handle,
+                    title,
+                    items,
+                    ..
+                } = request
+                {
+                    assert_eq!(owner, "git");
+                    assert_eq!(title.as_deref(), Some(expected_title));
+                    return (handle, items);
+                }
+            }
+            assert!(Instant::now() < deadline, "{expected_title} did not open");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    #[cfg(not(windows))]
+    async fn wait_for_git_dashboard_model(
+        runtime: &mut Runtime,
+        predicate: impl Fn(&WorkspaceModel) -> bool,
+        failure: &str,
+    ) -> WorkspaceModel {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut observed = "no workspace update".to_string();
+        loop {
+            pump_process_events(runtime).await.unwrap();
+            while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
+                if let PluginRequest::UpdateWorkspace { id, model } = request {
+                    assert_eq!(id, "git-dashboard");
+                    if predicate(&model) {
+                        return model;
+                    }
+                    observed = format!(
+                        "rows={:?}, detail={:?}, status={:?}",
+                        model
+                            .rows
+                            .iter()
+                            .map(|row| {
+                                (
+                                    &row.id,
+                                    row.segments
+                                        .iter()
+                                        .map(|segment| &segment.text)
+                                        .collect::<Vec<_>>(),
+                                )
+                            })
+                            .collect::<Vec<_>>(),
+                        model
+                            .detail_document
+                            .as_ref()
+                            .map(|document| &document.path),
+                        model.status
+                    );
+                }
+            }
+            assert!(Instant::now() < deadline, "{failure}: {observed}");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    #[cfg(not(windows))]
+    async fn open_git_dashboard_commit(runtime: &mut Runtime, subject: &str) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            pump_process_events(runtime).await.unwrap();
+            drain_requests();
+            if runtime
+                .inner
+                .lock()
+                .unwrap()
+                .host
+                .process_manager
+                .active_process_count("git")
+                == 0
+            {
+                break;
+            }
+            assert!(Instant::now() < deadline, "Git dashboard did not settle");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        runtime
+            .notify(
+                "workspace:event:git-dashboard",
+                serde_json::json!({ "action": "l", "focus": "rows", "row": null }),
+            )
+            .await
+            .unwrap();
+        let (log_handle, commits) = next_git_callback_picker(runtime, "Git log").await;
+        let commit = commits
+            .iter()
+            .find(|item| item.label.contains(subject))
+            .cloned()
+            .unwrap_or_else(|| {
+                panic!(
+                    "commit {subject:?} did not appear in the Git log: {:?}",
+                    commits.iter().map(|item| &item.label).collect::<Vec<_>>()
+                )
+            });
+        let title = commit.label.clone();
+        assert!(runtime
+            .notify_picker(log_handle, PickerCallback::Selected(commit))
+            .unwrap());
+        let (action_handle, actions) = next_git_callback_picker(runtime, &title).await;
+        assert_eq!(actions.first().map(|item| item.id.as_str()), Some("Open"));
+        assert!(actions.iter().any(|item| item.id == "Cherry-pick"));
+        assert!(actions.iter().any(|item| item.id == "Revert"));
+        assert!(actions.iter().all(|item| item.id != "Show details"));
+        let open = actions.into_iter().find(|item| item.id == "Open").unwrap();
+        assert!(runtime
+            .notify_picker(action_handle, PickerCallback::Selected(open))
+            .unwrap());
+    }
+
+    #[cfg(not(windows))]
+    async fn select_git_dashboard_commit_file(
+        runtime: &mut Runtime,
+        row: &crate::plugin::WorkspaceRow,
+    ) -> WorkspaceModel {
+        runtime
+            .notify(
+                "workspace:event:git-dashboard",
+                serde_json::json!({ "action": "down", "focus": "rows", "row": row }),
+            )
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(70)).await;
+        for callback in runtime.poll_timer_callbacks() {
+            if let PluginRequest::TimeoutCallback { timer_id } = callback {
+                runtime
+                    .notify(
+                        "timeout:callback",
+                        serde_json::json!({ "timer_id": timer_id }),
+                    )
+                    .await
+                    .unwrap();
+            }
+        }
+        let path = row.path.as_deref().unwrap();
+        wait_for_git_dashboard_model(
+            runtime,
+            |model| {
+                model
+                    .detail_document
+                    .as_ref()
+                    .is_some_and(|document| document.path == path)
+            },
+            "selected commit file did not render a structured diff",
+        )
+        .await
+    }
+
     #[test]
     fn embedded_git_core_compiles_as_a_native_multi_file_package_and_normalizes_options() {
         let program = git_core_program().unwrap();
@@ -5195,6 +5359,21 @@ mod tests {
         assert_eq!(status["head"], "native");
         assert_eq!(status["untracked"][0]["path"], "src/new file.rs");
         assert!(status["untracked"][0]["original_path"].is_null());
+
+        let commit = host
+            .call_git_core(
+                "parse_commit_files",
+                &[Value::String(
+                    "M\0changed.rs\0R100\0old name.rs\0new name.rs\0D\0removed.rs\0".to_string(),
+                )],
+            )
+            .unwrap()
+            .to_json();
+        assert_eq!(commit["entries"].as_array().unwrap().len(), 3);
+        assert_eq!(commit["entries"][1]["path"], "new name.rs");
+        assert_eq!(commit["entries"][1]["original_path"], "old name.rs");
+        assert_eq!(commit["entries"][2]["x"], "D");
+        assert_eq!(commit["truncated"], false);
 
         let document = host
             .call_git_core(
@@ -13830,6 +14009,14 @@ mod tests {
         let (log_handle, commits, options) = next_git_picker(&mut runtime, "Git log").await;
         assert_eq!(options.item_layout, crate::ui::PickerItemLayout::LabelFirst);
         assert!(commits.iter().any(|item| item.label.contains(subject)));
+        assert!(commits.iter().all(|item| {
+            item.data
+                .get("oid")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|oid| {
+                    oid.len() == 40 && oid.bytes().all(|character| character.is_ascii_hexdigit())
+                })
+        }));
         assert!(runtime
             .notify_picker(log_handle, PickerCallback::Cancelled)
             .unwrap());
@@ -13891,6 +14078,375 @@ mod tests {
                 .and_then(serde_json::Value::as_str),
             Some(expected_search_path.as_str())
         );
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn git_dashboard_opens_commits_as_read_only_file_and_diff_views() {
+        drain_requests();
+        let repository = tempfile::tempdir().unwrap();
+        let root = repository.path();
+        let git = |args: &[&str]| {
+            let output = Command::new("git")
+                .args(args)
+                .current_dir(root)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        let commit = |subject: &str| {
+            git(&[
+                "-c",
+                "user.name=Red Test",
+                "-c",
+                "user.email=red@example.test",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-qm",
+                subject,
+            ]);
+        };
+
+        git(&["init", "-q", "-b", "main"]);
+        fs::write(root.join("changed.rs"), "before\n").unwrap();
+        fs::write(root.join("old name.rs"), "renamed contents\n").unwrap();
+        fs::write(root.join("removed.rs"), "deleted contents\n").unwrap();
+        fs::write(root.join("binary.bin"), b"\0before").unwrap();
+        git(&["add", "."]);
+        commit("initial files");
+
+        fs::write(root.join("changed.rs"), "after\n").unwrap();
+        fs::rename(root.join("old name.rs"), root.join("new name.rs")).unwrap();
+        fs::remove_file(root.join("removed.rs")).unwrap();
+        fs::write(root.join("added.rs"), "new commit contents\n").unwrap();
+        fs::write(root.join("binary.bin"), b"\0after").unwrap();
+        git(&["add", "-A"]);
+        commit("inspect committed file changes");
+        fs::write(root.join("pending.rs"), "live working tree contents\n").unwrap();
+
+        let mut runtime = load_git_runtime(root).await;
+        runtime.execute_command("GitDashboard").await.unwrap();
+        wait_for_git_dashboard_model(
+            &mut runtime,
+            |model| {
+                model
+                    .rows
+                    .iter()
+                    .any(|row| row.id == "untracked:pending.rs")
+            },
+            "live working-tree change did not render before opening the commit",
+        )
+        .await;
+
+        open_git_dashboard_commit(&mut runtime, "inspect committed file changes").await;
+        let model = wait_for_git_dashboard_model(
+            &mut runtime,
+            |model| {
+                let changed = model.rows.iter().find(|row| row.id == "commit:changed.rs");
+                let binary = model.rows.iter().find(|row| row.id == "commit:binary.bin");
+                changed.is_some_and(|row| {
+                    row.right_segments
+                        .iter()
+                        .any(|segment| segment.text.contains("+1 −1"))
+                }) && binary.is_some_and(|row| {
+                    row.right_segments
+                        .iter()
+                        .any(|segment| segment.text.contains("binary"))
+                }) && model
+                    .detail_document
+                    .as_ref()
+                    .is_some_and(|document| document.path == "added.rs")
+            },
+            "commit files, statistics, and initial structured diff did not render",
+        )
+        .await;
+
+        for path in [
+            "added.rs",
+            "binary.bin",
+            "changed.rs",
+            "new name.rs",
+            "removed.rs",
+        ] {
+            assert!(
+                model
+                    .rows
+                    .iter()
+                    .any(|row| row.id == format!("commit:{path}")),
+                "commit file {path:?} was missing"
+            );
+        }
+        assert!(model
+            .header
+            .iter()
+            .any(|segment| segment.text.contains("inspect committed file changes")));
+        assert!(model
+            .rows
+            .iter()
+            .all(|row| row.id != "untracked:pending.rs"));
+        let renamed = model
+            .rows
+            .iter()
+            .find(|row| row.id == "commit:new name.rs")
+            .unwrap();
+        assert_eq!(
+            renamed.data["entry"]["original_path"].as_str(),
+            Some("old name.rs")
+        );
+        assert!(
+            renamed
+                .segments
+                .iter()
+                .any(|segment| segment.text.contains("old name.rs")),
+            "rename segments {:?} did not contain the original path; entry {:?}",
+            renamed.segments,
+            renamed.data["entry"]
+        );
+        assert!(model
+            .actions
+            .iter()
+            .any(|action| action.hint.id == "q" && action.hint.label == "back"));
+        assert!(model.actions.iter().all(|action| {
+            !matches!(
+                action.hint.id.as_str(),
+                "s" | "u" | "x" | "S" | "U" | "X" | "c"
+            )
+        }));
+
+        let changed = model
+            .rows
+            .iter()
+            .find(|row| row.id == "commit:changed.rs")
+            .unwrap()
+            .clone();
+        let changed_model = select_git_dashboard_commit_file(&mut runtime, &changed).await;
+        let changed_document = changed_model.detail_document.unwrap();
+        assert!(changed_document
+            .lines
+            .iter()
+            .any(|line| line.kind == "removed" && line.text == "before"));
+        assert!(changed_document
+            .lines
+            .iter()
+            .any(|line| line.kind == "added" && line.text == "after"));
+
+        let removed = model
+            .rows
+            .iter()
+            .find(|row| row.id == "commit:removed.rs")
+            .unwrap()
+            .clone();
+        let removed_model = select_git_dashboard_commit_file(&mut runtime, &removed).await;
+        assert!(removed_model
+            .detail_document
+            .unwrap()
+            .lines
+            .iter()
+            .any(|line| line.kind == "removed" && line.text == "deleted contents"));
+
+        let status_before = Command::new("git")
+            .args(["status", "--porcelain=v1", "-z"])
+            .current_dir(root)
+            .output()
+            .unwrap()
+            .stdout;
+        for action in ["s", "u", "x", "S", "U", "X", "c"] {
+            runtime
+                .notify(
+                    "workspace:event:git-dashboard",
+                    serde_json::json!({
+                        "action": action,
+                        "focus": "rows",
+                        "row": changed,
+                    }),
+                )
+                .await
+                .unwrap();
+        }
+        pump_process_events(&mut runtime).await.unwrap();
+        let status_after = Command::new("git")
+            .args(["status", "--porcelain=v1", "-z"])
+            .current_dir(root)
+            .output()
+            .unwrap()
+            .stdout;
+        assert_eq!(status_after, status_before);
+
+        runtime
+            .notify(
+                "workspace:event:git-dashboard",
+                serde_json::json!({ "action": "q", "focus": "rows", "row": removed }),
+            )
+            .await
+            .unwrap();
+        let restored = wait_for_git_dashboard_model(
+            &mut runtime,
+            |model| {
+                model
+                    .rows
+                    .iter()
+                    .any(|row| row.id == "untracked:pending.rs")
+            },
+            "leaving commit view did not restore the working-tree dashboard",
+        )
+        .await;
+        assert!(restored
+            .rows
+            .iter()
+            .all(|row| !row.id.starts_with("commit:")));
+        assert!(restored.actions.iter().any(|action| action.hint.id == "s"));
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn git_dashboard_commit_view_includes_root_commit_files() {
+        drain_requests();
+        let repository = tempfile::tempdir().unwrap();
+        let root = repository.path();
+        assert!(Command::new("git")
+            .args(["init", "-q", "-b", "main"])
+            .current_dir(root)
+            .status()
+            .unwrap()
+            .success());
+        fs::write(root.join("root-file.rs"), "initial commit contents\n").unwrap();
+        assert!(Command::new("git")
+            .args(["add", "root-file.rs"])
+            .current_dir(root)
+            .status()
+            .unwrap()
+            .success());
+        assert!(Command::new("git")
+            .args([
+                "-c",
+                "user.name=Red Test",
+                "-c",
+                "user.email=red@example.test",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-qm",
+                "root commit changes",
+            ])
+            .current_dir(root)
+            .status()
+            .unwrap()
+            .success());
+
+        let mut runtime = load_git_runtime(root).await;
+        runtime.execute_command("GitDashboard").await.unwrap();
+        wait_for_git_dashboard_model(
+            &mut runtime,
+            |model| model.rows.iter().any(|row| row.id == "clean"),
+            "clean working-tree dashboard did not open",
+        )
+        .await;
+        open_git_dashboard_commit(&mut runtime, "root commit changes").await;
+        let model = wait_for_git_dashboard_model(
+            &mut runtime,
+            |model| {
+                model.rows.iter().any(|row| row.id == "commit:root-file.rs")
+                    && model.detail_document.is_some()
+            },
+            "root commit file and structured diff did not render",
+        )
+        .await;
+        assert!(model
+            .detail_document
+            .unwrap()
+            .lines
+            .iter()
+            .any(|line| line.kind == "added" && line.text == "initial commit contents"));
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn git_dashboard_commit_view_compares_merge_commits_with_the_first_parent() {
+        drain_requests();
+        let repository = tempfile::tempdir().unwrap();
+        let root = repository.path();
+        let git = |args: &[&str]| {
+            let output = Command::new("git")
+                .args(args)
+                .current_dir(root)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        let commit = |subject: &str| {
+            git(&[
+                "-c",
+                "user.name=Red Test",
+                "-c",
+                "user.email=red@example.test",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-qm",
+                subject,
+            ]);
+        };
+
+        git(&["init", "-q", "-b", "main"]);
+        fs::write(root.join("base.rs"), "shared history\n").unwrap();
+        git(&["add", "."]);
+        commit("shared baseline");
+        git(&["switch", "-qc", "side"]);
+        fs::write(root.join("side.rs"), "merged branch contents\n").unwrap();
+        git(&["add", "."]);
+        commit("side change");
+        git(&["switch", "-q", "main"]);
+        fs::write(root.join("main.rs"), "first parent contents\n").unwrap();
+        git(&["add", "."]);
+        commit("main change");
+        git(&[
+            "-c",
+            "user.name=Red Test",
+            "-c",
+            "user.email=red@example.test",
+            "-c",
+            "commit.gpgsign=false",
+            "merge",
+            "--no-ff",
+            "-qm",
+            "merge side changes",
+            "side",
+        ]);
+
+        let mut runtime = load_git_runtime(root).await;
+        runtime.execute_command("GitDashboard").await.unwrap();
+        wait_for_git_dashboard_model(
+            &mut runtime,
+            |model| model.rows.iter().any(|row| row.id == "clean"),
+            "clean merge working-tree dashboard did not open",
+        )
+        .await;
+        open_git_dashboard_commit(&mut runtime, "merge side changes").await;
+        let model = wait_for_git_dashboard_model(
+            &mut runtime,
+            |model| {
+                model.rows.iter().any(|row| row.id == "commit:side.rs")
+                    && model.detail_document.is_some()
+            },
+            "merge commit did not show changes relative to its first parent",
+        )
+        .await;
+        assert!(model.rows.iter().all(|row| row.id != "commit:main.rs"));
+        assert!(model
+            .detail_document
+            .unwrap()
+            .lines
+            .iter()
+            .any(|line| line.kind == "added" && line.text == "merged branch contents"));
     }
 
     #[cfg(not(windows))]
