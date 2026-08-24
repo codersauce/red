@@ -1022,7 +1022,7 @@ pub enum FormattingProvider {
 #[serde(deny_unknown_fields)]
 /// Global document formatting behavior.
 pub struct FormattingConfig {
-    /// Format pasted text when the language server supports range formatting. Defaults to on.
+    /// Reindent pasted code and request language-server range formatting when available.
     #[serde(default = "default_true")]
     pub on_paste: bool,
     /// Format supported documents immediately before saving them. Defaults to on.

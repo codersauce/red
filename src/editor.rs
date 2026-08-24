@@ -19478,6 +19478,102 @@ impl Editor {
         columns
     }
 
+    /// Aligns pasted source with its destination without discarding its relative indentation.
+    ///
+    /// This runs inside the paste transaction because many language servers, including
+    /// rust-analyzer, support whole-document formatting but not range formatting.
+    fn reindent_pasted_lines(&mut self, first_line: usize, text: &str) {
+        const MAX_PASTE_REINDENT_BYTES: usize = 256 * 1024;
+        const MAX_PASTE_REINDENT_LINES: usize = 512;
+
+        if !self.config.formatting.on_paste || text.len() > MAX_PASTE_REINDENT_BYTES {
+            return;
+        }
+
+        let lines = text.lines().collect::<Vec<_>>();
+        if lines.len() > MAX_PASTE_REINDENT_LINES {
+            return;
+        }
+        let Some((anchor_offset, anchor)) = lines
+            .iter()
+            .enumerate()
+            .find(|(_, line)| !line.trim().is_empty())
+        else {
+            return;
+        };
+        let anchor_line = first_line + anchor_offset;
+        let starts_document = (0..anchor_line).all(|line| {
+            self.current_buffer()
+                .get(line)
+                .is_none_or(|contents| contents.trim().is_empty())
+        });
+        let language =
+            self.highlight_language_id_for_buffer_index(self.buffer_manager.active_index());
+        let has_syntax_indentation = language.as_deref().is_some_and(|language| {
+            self.highlighter
+                .registry()
+                .indentation_language(language)
+                .is_some()
+        });
+        let destination_columns = match self.indentation_decision_for_line(anchor_line) {
+            IndentDecision::Columns(columns) => columns,
+            IndentDecision::Keep if starts_document && has_syntax_indentation => 0,
+            IndentDecision::Keep => return,
+        };
+
+        let tab_width = self.indentation().tab_width.max(1);
+        let anchor_columns =
+            display_width_with_tabs(Self::leading_indentation_text(anchor), tab_width);
+        let source = starts_document.then(|| self.current_buffer().contents());
+        let buffer_id = self.current_buffer().id();
+        let revision = self.current_buffer().revision();
+
+        // Classify every line against the same unmodified syntax snapshot so
+        // multiline strings and other ignored captures retain their exact bytes.
+        let lines_to_indent = lines
+            .into_iter()
+            .enumerate()
+            .filter_map(|(offset, line)| {
+                if line.trim().is_empty() {
+                    return None;
+                }
+
+                let source_columns =
+                    display_width_with_tabs(Self::leading_indentation_text(line), tab_width);
+                let columns = if source_columns >= anchor_columns {
+                    destination_columns.saturating_add(source_columns - anchor_columns)
+                } else {
+                    destination_columns.saturating_sub(anchor_columns - source_columns)
+                };
+                let destination_line = first_line + offset;
+                if offset != anchor_offset
+                    && self.indentation_columns_for_line(destination_line) != columns
+                    && self.indentation_decision_for_line(destination_line) == IndentDecision::Keep
+                    && (!starts_document
+                        || !has_syntax_indentation
+                        || source.as_deref().zip(language.as_deref()).is_some_and(
+                            |(source, language)| {
+                                self.syntax_indentation.line_is_ignored(
+                                    buffer_id,
+                                    revision,
+                                    language,
+                                    source,
+                                    destination_line,
+                                )
+                            },
+                        ))
+                {
+                    return None;
+                }
+                Some((destination_line, columns))
+            })
+            .collect::<Vec<_>>();
+
+        for (line, columns) in lines_to_indent {
+            self.apply_indentation_to_line(line, IndentDecision::Columns(columns));
+        }
+    }
+
     fn mark_generated_indent(&mut self, line: usize, columns: usize) {
         self.generated_indent = (columns > 0).then(|| GeneratedIndent {
             buffer_id: self.current_buffer().id(),
@@ -23076,6 +23172,9 @@ impl Editor {
                     .unwrap_or_else(|| TextRange::insertion(start));
                 self.replace_range(range, text);
                 self.move_to_insert_text_position(end);
+                if text.contains('\n') {
+                    self.reindent_pasted_lines(line, text);
+                }
                 if started_transaction {
                     self.commit_transaction(self.cursor_snapshot());
                 }
@@ -24466,6 +24565,12 @@ impl Editor {
         self.selection = None;
         self.move_to_text_position(plan.cursor);
         self.fix_cursor_pos();
+        if source.kind == ContentKind::Linewise
+            || self.mode == Mode::VisualLine
+            || (source.kind == ContentKind::Charwise && source.text.contains('\n'))
+        {
+            self.reindent_pasted_lines(plan.cursor.line, &source.text);
+        }
         if !preserve_default_register {
             self.set_default_register(replaced);
         }
@@ -24651,7 +24756,14 @@ impl Editor {
         if started_transaction {
             self.begin_transaction("paste");
         }
+        let first_line =
+            self.buffer_line() + usize::from(content.kind == ContentKind::Linewise && !before);
         self.insert_content(self.cx, self.buffer_line(), content, before);
+        if content.kind == ContentKind::Linewise
+            || (content.kind == ContentKind::Charwise && content.text.contains('\n'))
+        {
+            self.reindent_pasted_lines(first_line, &content.text);
+        }
         if started_transaction {
             self.commit_transaction(self.cursor_snapshot());
         }
