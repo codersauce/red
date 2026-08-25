@@ -12,9 +12,16 @@ REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 class CiMatrixTest(unittest.TestCase):
     def test_internal_pull_requests_keep_the_cross_platform_matrix(self) -> None:
         self.assertEqual(select_mode("pull_request", ["src/main.rs"], "full"), "full")
+        matrix = matrix_for("full")["include"]
         self.assertEqual(
-            [entry["name"] for entry in matrix_for("full")["include"]],
+            [entry["name"] for entry in matrix],
             ["ubuntu-latest", "macos-latest", "windows-latest"],
+        )
+        self.assertEqual(
+            next(entry for entry in matrix if entry["name"] == "macos-latest")[
+                "warp"
+            ],
+            "warp-macos-latest-arm64-6x",
         )
 
     def test_documentation_only_pull_requests_skip_paid_tests(self) -> None:

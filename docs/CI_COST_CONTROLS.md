@@ -15,9 +15,10 @@ three-platform test matrix after every merge.
 - `CI Gate` is the stable terminal check for branch rules. It fails unless all
   jobs required by the selected mode reach their expected conclusions.
 
-The normal Ubuntu test runner is `warp-ubuntu-latest-x64-8x`. macOS remains on
-12x and Windows remains on 32x until paired benchmarks demonstrate that their
-smaller candidates reduce billed cost without hurting reliability.
+The normal test runners are `warp-ubuntu-latest-x64-8x` and
+`warp-macos-latest-arm64-6x`. Windows remains on 32x until a paired benchmark
+demonstrates that its smaller candidate reduces billed cost without hurting
+reliability or memory headroom.
 
 ## Runner sizing benchmark
 
@@ -32,6 +33,15 @@ Compare billed cost, p90 duration, CPU, memory, and failures in WarpBuild
 Reports. Keep the smaller runner only when its cost per successful run falls.
 Windows must also show safe memory headroom; the initial 32x sample was already
 near its reported memory ceiling.
+
+The August 24, 2026 macOS benchmark completed all three replicas on both runner
+sizes. The 12x replicas took 1:26-1:37 and cost $0.96 in total; the 6x replicas
+took 1:45-3:04 and cost $0.64 in total. The slow 6x replica spent 78 seconds
+restoring the cache rather than running tests, while the other two replicas
+finished in 1:45 with roughly 53% memory use. Based on that result, normal
+macOS validation uses 6x. Re-run the paired benchmark and revert to 12x if the
+rolling p90 reaches four billed minutes, platform-only failures increase, or
+cost per successful macOS job is no longer below the 12x baseline.
 
 ## Main branch ruleset
 
