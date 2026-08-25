@@ -1,7 +1,7 @@
 ---
 title: "Default Config"
 summary: "Red's default configuration defines the embedded baseline for editor behavior, keymaps, bundled plugins, LSP routing, diagnostics, completion, search, picker UI, cursor shapes, AI, and permissions."
-topics: [reference, configuration, defaults]
+topics: [reference, configuration, defaults, ai-completion]
 sources:
   - id: defaults
     type: file
@@ -79,7 +79,8 @@ Comment templates are keyed by language or extension and use a single `%s` place
 ## Agent Configuration
 
 `[copilot]` configures optional inline AI completion separately from the Codex
-agent. It defaults to disabled; `disable_ai = true` also blocks it. See
+agent. It defaults to disabled; `disable_ai = true` also blocks it [@defaults]
+[@config]. See
 [Copilot Inline Completion](../../guides/agent/copilot-completion) for setup,
 privacy controls, commands, and key bindings.
 
