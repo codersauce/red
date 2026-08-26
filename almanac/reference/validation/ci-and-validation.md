@@ -9,6 +9,9 @@ sources:
   - id: ci-matrix
     type: file
     path: scripts/ci_matrix.py
+  - id: ci-gate
+    type: file
+    path: scripts/ci_gate.py
   - id: ci-cost-controls
     type: file
     path: docs/CI_COST_CONTROLS.md
@@ -42,6 +45,9 @@ sources:
   - id: agents
     type: file
     path: AGENTS.md
+  - id: pr-344-trigger-diagnosis
+    type: conversation
+    path: /Users/fcoury/.codex/sessions/2026/08/24/rollout-2026-08-24T20-33-04-01a0361e-d26f-7740-9ac1-d9b12eb81cb7.jsonl
 ---
 
 Red's validation contract spans local commands and GitHub Actions workflows. CI
@@ -93,7 +99,7 @@ The paid test job uses the `warp` runner labels from the selected matrix for
 internal pull requests, pushes, and manual runs, but falls back to the
 `standard` GitHub-hosted labels when a pull request comes from a fork [@ci].
 The current paid runner labels are `warp-ubuntu-latest-x64-8x`,
-`warp-macos-latest-arm64-12x`, and `warp-windows-latest-x64-32x`; the standard
+`warp-macos-latest-arm64-6x`, and `warp-windows-latest-x64-32x`; the standard
 fallback labels are `ubuntu-latest`, `macos-latest`, and `windows-latest`
 [@ci-matrix]. The non-test CI jobs named `Plan validation`, `Workflow lint`,
 `Rustfmt`, `Bundled Runtime Self-Check`, `Changelog`, `Documentation`, and
@@ -107,7 +113,22 @@ installs it with Homebrew [@ci].
 
 The CI cost-control runbook treats `CI Gate` as the stable branch-protection
 check and says runner-size changes should be kept only when cost per successful
-run falls without reliability or memory regressions [@ci-cost-controls].
+run falls without reliability or memory regressions [@ci-cost-controls]. Its
+August 2026 macOS benchmark kept three successful 6x replicas cheaper than
+three 12x replicas even with one slow cache-restore outlier, and it names
+four-minute rolling p90, platform-only failures, or worse cost per successful
+macOS job as reasons to revert to 12x [@ci-cost-controls].
+
+If a pull request has no `CI` workflow run or `CI` check suite for its head
+commit, the matrix selector did not run. Documentation-only classification is
+not silent: `Plan validation`, `Workflow lint`, `Rustfmt`, `Bundled Runtime
+Self-Check`, `Changelog`, `Documentation`, and `CI Gate` still appear while
+`test` and `clippy` are expected to skip [@ci] [@ci-gate]. A separate
+path-filtered workflow such as `Husk Plugin Check` can appear independently, so
+its presence does not prove the main CI workflow was triggered [@plugin-check].
+In that state, inspect workflow enablement and GitHub trigger delivery first;
+rebase or otherwise synchronize the branch to emit a fresh pull-request event
+before changing `scripts/ci_matrix.py` [@pr-344-trigger-diagnosis].
 
 ## Plugin Check Workflow
 
