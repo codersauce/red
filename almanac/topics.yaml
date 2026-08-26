@@ -167,6 +167,10 @@ topics:
     title: Completion
     description: LSP completion requests, completion UI, and completion edit application.
     parents: [lsp]
+  - slug: ai-completion
+    title: AI Completion
+    description: Optional inline AI completion surfaces that run beside ordinary language-server completion.
+    parents: [configuration, editor]
   - slug: workspace-edits
     title: Workspace Edits
     description: LSP workspace edit preparation, resource operations, and failure handling.
@@ -246,7 +250,7 @@ topics:
   - slug: navigation
     title: Navigation
     description: Wiki and editor navigation entry points.
-    parents: [onboarding]
+    parents: [wiki]
   - slug: wiki
     title: Wiki
     description: CodeAlmanac wiki structure and maintenance conventions.

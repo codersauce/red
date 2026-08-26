@@ -1,0 +1,90 @@
+name: Runner Sizing
+
+on:
+  workflow_dispatch:
+    inputs:
+      platform:
+        description: Baseline and candidate runner pair to compare
+        required: true
+        default: ubuntu
+        type: choice
+        options:
+          - ubuntu
+          - macos
+          - windows
+      confirm_paid_benchmark:
+        description: Run six paid jobs (two sizes with three replicas each)
+        required: true
+        default: false
+        type: boolean
+
+concurrency:
+  group: runner-sizing-${{ inputs.platform }}-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+  CARGO_PROFILE_TEST_DEBUG: line-tables-only
+  RUST_BACKTRACE: 1
+
+jobs:
+  benchmark:
+    name: ${{ matrix.runner }} replica ${{ matrix.replica }}
+    if: inputs.confirm_paid_benchmark
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: >-
+          ${{ fromJSON(
+            inputs.platform == 'ubuntu' && '["warp-ubuntu-latest-x64-32x","warp-ubuntu-latest-x64-8x"]' ||
+            inputs.platform == 'macos' && '["warp-macos-latest-arm64-12x","warp-macos-latest-arm64-6x"]' ||
+            '["warp-windows-latest-x64-32x","warp-windows-latest-x64-16x"]'
+          ) }}
+        replica: [1, 2, 3]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable
+
+      - name: Install ripgrep
+        uses: ./.github/actions/install-ripgrep
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: validation-${{ runner.os }}
+          save-if: false
+
+      - name: Run tests
+        run: cargo test --all-targets --all-features --verbose
+
+      - name: Test platform keyboard decoder
+        run: cargo test --locked --manifest-path vendor/crossterm/Cargo.toml --lib red_
+
+      - name: Test terminal keyboard protocol
+        if: runner.os != 'Windows'
+        run: |
+          cargo build --locked --bin red
+          python3 scripts/test_keyboard_protocol.py
+
+      - name: Record comparison metadata
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "### Runner sizing sample"
+            echo "- Platform: ${{ inputs.platform }}"
+            echo "- Runner: ${{ matrix.runner }}"
+            echo "- Replica: ${{ matrix.replica }}"
+            echo "- Commit: $GITHUB_SHA"
+          } >> "$GITHUB_STEP_SUMMARY"

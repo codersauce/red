@@ -1,5 +1,6 @@
 ---
 title: CodeAlmanac Wiki
+summary: "Landing page for the Red CodeAlmanac wiki, with the notability bar, topic taxonomy note, and link conventions."
 topics: [wiki]
 sources: []
 ---

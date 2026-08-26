@@ -15,6 +15,12 @@ sources:
   - id: tools
     type: file
     path: src/agent_tools.rs
+  - id: copilot
+    type: file
+    path: src/copilot.rs
+  - id: inline-completion
+    type: file
+    path: src/editor/inline_completion.rs
 ---
 
 Agent-attributed edits are Red's current safety model for Codex-assisted changes. Codex does not receive a shell or native patch tool in the full Agent workflow; it runs in a read-only sandbox with native approvals denied and must use Red's dynamic tools to read, navigate, edit, and save [@workflow] [@codex]. Red then turns accepted tool output into ordinary editor transactions with `EditOrigin::Agent`, so undo history and agent history can identify the session and turn that changed the buffer [@editor].
@@ -27,10 +33,12 @@ Red makes the work visible before it happens. For file tools, the editor opens t
 
 ## Full Agent Versus Inline Assist
 
-The full Agent workflow starts from `Space A` or `:Agent` and uses the nine-tool Codex surface documented in the workflow [@workflow]. Successful full-agent edits are revision-checked, applied as agent-origin transactions, and saved to disk through Red [@workflow] [@editor].
+The full Agent workflow starts from `Space A` or `:Agent` and uses the ten-tool Codex surface documented in the workflow [@workflow]. Successful full-agent edits are revision-checked, applied as agent-origin transactions, and saved to disk through Red, while directory creation is workspace-confined and does not change an editor buffer [@workflow] [@editor] [@tools].
 
 Inline assist starts from `Space i` and has a smaller contract. Codex receives one immutable target range plus bounded surrounding context and can only call `submit_replacement`; Red then verifies that the active buffer, window, revision, and original target text still match before applying the replacement [@workflow] [@codex] [@editor]. Inline replacements are agent-attributed but deliberately unsaved, giving the user local keep, undo, refine, and promote controls [@workflow] [@editor].
 
+Copilot inline completion is a separate AI-assisted editing path, not an agent-attributed edit. Its transport starts the official GitHub Copilot language server only after opt-in configuration, while the editor owns consent, document snapshots, and text mutation [@copilot]. Accepting a visible Copilot suggestion commits an `accept Copilot completion` transaction, not a Codex app-server turn or an `EditOrigin::Agent` transaction [@inline-completion]. Use that distinction when debugging history, undo behavior, or provider setup: Codex agent and inline-assist changes belong to the agent history model, while Copilot belongs to the completion surface.
+
 ## What To Read Next
 
-Use [Followed editing](../architecture/agent/followed-editing) for the full-agent mutation path, [Dynamic tools and editor tools](../architecture/agent/dynamic-tools-and-editor-tools) for the strict tool schemas, and [Inspect agent history](../guides/agent/inspect-agent-history) when you need to review or revert agent-origin transactions.
+Use [Followed editing](../architecture/agent/followed-editing) for the full-agent mutation path, [Dynamic tools and editor tools](../architecture/agent/dynamic-tools-and-editor-tools) for the strict tool schemas, and [Inspect agent history](../guides/agent/inspect-agent-history) when you need to review or revert agent-origin transactions. Use [Copilot inline completion](../guides/agent/copilot-completion) for opt-in ghost-text suggestions and provider setup.

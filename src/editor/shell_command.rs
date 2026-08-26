@@ -8,12 +8,14 @@
 use std::{
     collections::BTreeMap,
     ffi::OsString,
+    io::SeekFrom,
     process::{ExitStatus, Stdio},
     time::Duration,
 };
 
 use tokio::{
-    io::{AsyncRead, AsyncReadExt},
+    fs::File,
+    io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
     process::Command,
     sync::{mpsc, oneshot},
 };
@@ -43,7 +45,18 @@ enum ShellEvent {
         job_id: u64,
         status: Result<ExitStatus, String>,
         cancelled: bool,
+        filter_output: Option<Result<Vec<u8>, String>>,
     },
+}
+
+#[derive(Clone, Debug)]
+struct ShellFilterTarget {
+    buffer_id: BufferId,
+    revision: u64,
+    range: TextRange,
+    line_ending: &'static str,
+    followed_by_content: bool,
+    source_ends_with_newline: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -118,6 +131,7 @@ struct ShellJob {
     stdout: OutputSanitizer,
     stderr: OutputSanitizer,
     cancellation: Option<oneshot::Sender<()>>,
+    filter: Option<ShellFilterTarget>,
 }
 
 impl ShellJob {
@@ -257,13 +271,21 @@ async fn forward_output(
     job_id: u64,
     stream: OutputStream,
     sender: mpsc::Sender<ShellEvent>,
-) {
+    mut capture: Option<File>,
+) -> Result<Option<Vec<u8>>, String> {
     let mut buffer = [0; SHELL_READ_BYTES];
     loop {
         let count = match reader.read(&mut buffer).await {
-            Ok(0) | Err(_) => break,
+            Ok(0) => break,
             Ok(count) => count,
+            Err(error) => return Err(format!("could not read shell output: {error}")),
         };
+        if let Some(capture) = capture.as_mut() {
+            capture
+                .write_all(&buffer[..count])
+                .await
+                .map_err(|error| format!("could not retain shell filter output: {error}"))?;
+        }
         if sender
             .send(ShellEvent::Output {
                 job_id,
@@ -276,6 +298,37 @@ async fn forward_output(
             break;
         }
     }
+
+    let Some(mut capture) = capture else {
+        return Ok(None);
+    };
+    capture
+        .seek(SeekFrom::Start(0))
+        .await
+        .map_err(|error| format!("could not rewind shell filter output: {error}"))?;
+    let mut output = Vec::new();
+    capture
+        .read_to_end(&mut output)
+        .await
+        .map_err(|error| format!("could not load shell filter output: {error}"))?;
+    Ok(Some(output))
+}
+
+fn filter_replacement(
+    output: Vec<u8>,
+    line_ending: &str,
+    followed_by_content: bool,
+) -> anyhow::Result<String> {
+    let output = String::from_utf8(output)
+        .map_err(|_| anyhow::anyhow!("shell filter output is not valid UTF-8"))?;
+    let mut replacement = output.replace("\r\n", "\n");
+    if line_ending == "\r\n" {
+        replacement = replacement.replace('\n', "\r\n");
+    }
+    if followed_by_content && !replacement.is_empty() && !replacement.ends_with('\n') {
+        replacement.push_str(line_ending);
+    }
+    Ok(replacement)
 }
 
 async fn cancel_child(child: &mut tokio::process::Child) -> std::io::Result<ExitStatus> {
@@ -316,18 +369,66 @@ impl Editor {
     }
 
     pub(super) fn start_shell_command(&mut self, command: &str) -> anyhow::Result<()> {
+        self.start_shell_job(command, None)
+    }
+
+    pub(super) fn start_shell_filter(
+        &mut self,
+        command: &str,
+        start_line: usize,
+        end_line: usize,
+    ) -> anyhow::Result<()> {
+        let buffer = self.current_buffer();
+        let input = buffer.line_range_contents(start_line, end_line.saturating_add(1));
+        let line_ending = if buffer.get(0).is_some_and(|line| line.ends_with("\r\n")) {
+            "\r\n"
+        } else {
+            "\n"
+        };
+        let range_end = if end_line < buffer.len() {
+            TextPosition::new(end_line + 1, 0)
+        } else {
+            TextPosition::new(end_line, self.line_character_len(end_line))
+        };
+        let target = ShellFilterTarget {
+            buffer_id: buffer.id(),
+            revision: buffer.revision(),
+            range: TextRange::new(TextPosition::new(start_line, 0), range_end),
+            line_ending,
+            followed_by_content: end_line < buffer.last_navigable_line(),
+            source_ends_with_newline: input.ends_with('\n'),
+        };
+        self.start_shell_job(command, Some((target, input.into_bytes())))
+    }
+
+    fn start_shell_job(
+        &mut self,
+        command: &str,
+        filter: Option<(ShellFilterTarget, Vec<u8>)>,
+    ) -> anyhow::Result<()> {
         #[cfg(windows)]
         let environment_shell = std::env::var_os("COMSPEC");
         #[cfg(not(windows))]
         let environment_shell = std::env::var_os("SHELL");
 
+        let capture = if filter.is_some() {
+            Some(File::from_std(tempfile::tempfile().map_err(|error| {
+                anyhow::anyhow!("could not create shell filter output file: {error}")
+            })?))
+        } else {
+            None
+        };
         let (shell, flag) = shell_invocation(environment_shell);
         let mut process = Command::new(&shell);
         process
             .arg(flag)
             .arg(command)
             .current_dir(&self.statusline_git_cache.working_directory)
-            .stdin(Stdio::null())
+            .stdin(if filter.is_some() {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
@@ -345,6 +446,20 @@ impl Editor {
             .stderr
             .take()
             .ok_or_else(|| anyhow::anyhow!("shell did not provide stderr"))?;
+        let stdin = if filter.is_some() {
+            Some(
+                child
+                    .stdin
+                    .take()
+                    .ok_or_else(|| anyhow::anyhow!("shell did not provide stdin"))?,
+            )
+        } else {
+            None
+        };
+        let (filter, input) = match filter {
+            Some((target, input)) => (Some(target), Some(input)),
+            None => (None, None),
+        };
 
         self.shell_commands.next_id = self.shell_commands.next_id.saturating_add(1);
         let job_id = self.shell_commands.next_id;
@@ -367,6 +482,7 @@ impl Editor {
                 stdout: OutputSanitizer::default(),
                 stderr: OutputSanitizer::default(),
                 cancellation: Some(cancellation),
+                filter,
             },
         );
 
@@ -377,23 +493,48 @@ impl Editor {
                 job_id,
                 OutputStream::Stdout,
                 sender.clone(),
+                capture,
             ));
             let stderr_task = tokio::spawn(forward_output(
                 stderr,
                 job_id,
                 OutputStream::Stderr,
                 sender.clone(),
+                None,
             ));
+            let stdin_task = stdin.zip(input).map(|(mut stdin, input)| {
+                tokio::spawn(async move {
+                    match stdin.write_all(&input).await {
+                        Ok(()) => Ok(()),
+                        Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+                        Err(error) => Err(format!("could not write shell filter input: {error}")),
+                    }
+                })
+            });
             let (status, cancelled) = tokio::select! {
                 status = child.wait() => (status, false),
                 _ = &mut cancellation_requested => (cancel_child(&mut child).await, true),
             };
-            let _ = tokio::join!(stdout_task, stderr_task);
+            let (stdout_result, _, stdin_result) = tokio::join!(stdout_task, stderr_task, async {
+                match stdin_task {
+                    Some(task) => task
+                        .await
+                        .map_err(|error| format!("shell filter input task failed: {error}"))?,
+                    None => Ok(()),
+                }
+            });
+            let filter_output = match stdout_result {
+                Ok(Ok(Some(output))) => Some(stdin_result.map(|()| output)),
+                Ok(Ok(None)) => None,
+                Ok(Err(error)) => Some(Err(error)),
+                Err(error) => Some(Err(format!("shell output task failed: {error}"))),
+            };
             let _ = sender
                 .send(ShellEvent::Finished {
                     job_id,
                     status: status.map_err(|error| error.to_string()),
                     cancelled,
+                    filter_output,
                 })
                 .await;
         });
@@ -419,7 +560,60 @@ impl Editor {
             .is_some_and(|cancellation| cancellation.send(()).is_ok())
     }
 
-    pub(super) fn service_shell_commands(&mut self) -> bool {
+    async fn apply_shell_filter(
+        &mut self,
+        target: ShellFilterTarget,
+        output: Vec<u8>,
+        runtime: &mut Runtime,
+    ) -> anyhow::Result<()> {
+        let index = self
+            .buffer_manager
+            .iter()
+            .position(|buffer| buffer.id() == target.buffer_id)
+            .ok_or_else(|| anyhow::anyhow!("shell filter target buffer is no longer open"))?;
+        anyhow::ensure!(
+            self.buffer_manager[index].revision() == target.revision,
+            "shell filter result is stale; buffer changed while the command was running"
+        );
+        let replacement =
+            filter_replacement(output, target.line_ending, target.followed_by_content)?;
+
+        let original_index = self.buffer_manager.active_index();
+        let original_view = (self.cx, self.cy, self.vtop, self.vleft, self.skipcol);
+        if index != original_index {
+            self.select_buffer_for_lsp_edit(index);
+        }
+
+        let mut range = target.range;
+        if replacement.is_empty()
+            && !target.followed_by_content
+            && !target.source_ends_with_newline
+            && range.start.line > 0
+        {
+            let previous_line = range.start.line - 1;
+            range.start = TextPosition::new(previous_line, self.line_character_len(previous_line));
+        }
+
+        if self.transaction_active() {
+            self.commit_transaction(self.cursor_snapshot());
+        }
+        self.begin_transaction("shell filter");
+        self.replace_range(range, &replacement);
+        self.move_to_text_position(range.start);
+        let changed = self.commit_transaction(self.cursor_snapshot());
+
+        if index != original_index {
+            self.select_buffer_for_lsp_edit(original_index);
+            (self.cx, self.cy, self.vtop, self.vleft, self.skipcol) = original_view;
+            self.check_bounds();
+        }
+        if changed {
+            self.notify_buffer_change(index, runtime).await?;
+        }
+        Ok(())
+    }
+
+    pub(super) async fn service_shell_commands(&mut self, runtime: &mut Runtime) -> bool {
         let mut changed = false;
         for _ in 0..SHELL_EVENTS_PER_TICK {
             let Ok(event) = self.shell_commands.receiver.try_recv() else {
@@ -448,6 +642,7 @@ impl Editor {
                     job_id,
                     status,
                     cancelled,
+                    filter_output,
                 } => {
                     let Some(job) = self.shell_commands.jobs.remove(&job_id) else {
                         continue;
@@ -459,10 +654,31 @@ impl Editor {
                         )
                     } else {
                         match status {
-                            Ok(status) if status.success() => (
-                                ProgressOutcome::Succeeded,
-                                format!("Shell finished: {}", job.command),
-                            ),
+                            Ok(status) if status.success() => {
+                                let result = if let Some(target) = job.filter.clone() {
+                                    match filter_output {
+                                        Some(Ok(output)) => {
+                                            self.apply_shell_filter(target, output, runtime).await
+                                        }
+                                        Some(Err(error)) => Err(anyhow::anyhow!(error)),
+                                        None => Err(anyhow::anyhow!(
+                                            "shell filter did not capture command output"
+                                        )),
+                                    }
+                                } else {
+                                    Ok(())
+                                };
+                                match result {
+                                    Ok(()) => (
+                                        ProgressOutcome::Succeeded,
+                                        format!("Shell finished: {}", job.command),
+                                    ),
+                                    Err(error) => (
+                                        ProgressOutcome::Failed,
+                                        format!("Shell failed ({error}): {}", job.command),
+                                    ),
+                                }
+                            }
                             Ok(status) => (
                                 ProgressOutcome::Failed,
                                 format!("Shell failed ({status}): {}", job.command),
@@ -537,6 +753,35 @@ mod tests {
         sanitizer.append(b"first\r", &mut output);
         sanitizer.append(b"\nsecond\rthird\n", &mut output);
         assert_eq!(output, b"first\nsecond\nthird\n");
+    }
+
+    #[test]
+    fn filter_output_preserves_document_line_endings_and_line_boundaries() {
+        assert_eq!(
+            filter_replacement(b"first\r\nsecond".to_vec(), "\n", true).unwrap(),
+            "first\nsecond\n"
+        );
+        assert_eq!(
+            filter_replacement(b"first\nsecond\r\n".to_vec(), "\r\n", false).unwrap(),
+            "first\r\nsecond\r\n"
+        );
+        assert_eq!(filter_replacement(Vec::new(), "\n", true).unwrap(), "");
+    }
+
+    #[test]
+    fn filter_output_rejects_invalid_utf8_without_lossy_document_changes() {
+        let error = filter_replacement(vec![0xff], "\n", false).unwrap_err();
+        assert!(error.to_string().contains("not valid UTF-8"));
+    }
+
+    #[test]
+    fn shell_command_detection_includes_explicit_ex_filter_ranges() {
+        for command in ["!echo hello", "%!sort", "2,5!sort", "'<,'>!sort"] {
+            assert!(Editor::is_shell_ex_command(command), "{command}");
+        }
+        for command in ["w!", "%s/a/b/", "bufdo !echo nope"] {
+            assert!(!Editor::is_shell_ex_command(command), "{command}");
+        }
     }
 
     #[test]

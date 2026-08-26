@@ -35,3 +35,5 @@ Move through the rows with the workspace navigation keys. When the selected row 
 Press `r` on a history row to request `RevertTransaction` for that transaction id [@agent-plugin]. The command is intentionally routed through Red rather than through plugin-side buffer mutation, so reversion remains part of the editor-owned transaction and undo model [@editor]. After the request, the plugin refreshes the history workspace [@agent-plugin].
 
 If a user reports that an agent edit cannot be reverted from history, inspect the editor transaction path and undo history first.
+
+For the surrounding model, read [Agent-attributed edits](../../concepts/agent-attributed-edits), [Agent Architecture](../../architecture/agent), and [Followed Editing](../../architecture/agent/followed-editing).

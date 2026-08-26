@@ -1,7 +1,7 @@
 ---
 title: "Default Config"
 summary: "Red's default configuration defines the embedded baseline for editor behavior, keymaps, bundled plugins, LSP routing, diagnostics, completion, search, picker UI, cursor shapes, AI, and permissions."
-topics: [reference, configuration, defaults]
+topics: [reference, configuration, defaults, ai-completion]
 sources:
   - id: defaults
     type: file
@@ -44,7 +44,7 @@ The top-level schema accepts keys for editor behavior, keymaps, theme, cursor, p
 | Section | Defaults |
 | --- | --- |
 | `[search]` | `incsearch = true`, `hlsearch = true`, `wrapscan = true`, `ignorecase = false`, `smartcase = false` [@defaults] [@config]. |
-| `[completion]` | `auto_trigger = true`, `min_prefix_length = 1`, `debounce_ms = 120`, `buffer_words = true`, `max_buffer_words = 100` [@defaults] [@config]. |
+| `[completion]` | `enabled = true`, `inline_mode = "popup_first"`, `auto_trigger = true`, `min_prefix_length = 1`, `debounce_ms = 0`, `buffer_words = true`, `max_buffer_words = 100` [@defaults] [@config]. |
 | `[picker]` | `input_position = "bottom"`, `tree_guides = true`; disable tree guides to hide hierarchy connectors in document-symbol pickers [@defaults] [@config]. |
 | `[picker.icons]` | `style = "nerd_font"`, `color = true`; code also accepts `unicode`, `ascii`, and `none` icon styles [@defaults] [@config]. |
 | `[diagnostics]` | `gutter_signs = true`, `icon_style = "nerd_font"`; code also accepts `unicode`, `ascii`, and `none` icon styles for diagnostic gutter signs [@defaults] [@config]. |
@@ -72,14 +72,15 @@ The default `[plugins]` table enables bundled Husk plugins: `agent`, `barbecue`,
 
 ## LSP And Commenting
 
-`[lsp]` defaults to enabled, with built-in server definitions for Rust, Husk, TypeScript/JavaScript, Python, Markdown, JSON, TOML, YAML, Lua, and Fish [@config]. Formatting on save is enabled by default through `formatting.on_save`; set it to `false` to disable automatic formatting. `formatting.provider` defaults to `"auto"`, which prefers an installed language-pack formatter and otherwise uses LSP. The legacy `lsp.format_on_save` setting remains an alias, with the modern key winning within the same config layer [@config]. The default file documents both legacy single-language server configuration and preferred multi-document selectors [@defaults]. User server tables merge into the built-in server map rather than replacing the entire map [@config]. Use [LSP Configuration](../lsp/configuration) for the exact built-in server table and per-server fields.
+`[lsp]` defaults to enabled, with built-in server definitions for Rust, Husk, TypeScript/JavaScript, Markdown, JSON, TOML, YAML, Lua, and Fish [@config]. Formatting on save is enabled by default through `formatting.on_save`; set it to `false` to disable automatic formatting. `formatting.provider` defaults to `"auto"`, which prefers an installed language-pack formatter and otherwise uses LSP. The legacy `lsp.format_on_save` setting remains an alias, with the modern key winning within the same config layer [@config]. The default file documents both legacy single-language server configuration and preferred multi-document selectors [@defaults]. User server tables merge into the built-in server map rather than replacing the entire map [@config]. Use [LSP Configuration](../lsp/configuration) for the exact built-in server table and per-server fields.
 
-Comment templates are keyed by language or extension and use a single `%s` placeholder [@defaults] [@config]. The shipped defaults cover Bash, C-family extensions, CSS/SCSS, Go, HTML/XML, Husk, Java, JavaScript/TypeScript/JSX/TSX, JSONC, Lua, Markdown, PowerShell, Python, Rust, SQL, TOML, and YAML [@defaults] [@config].
+Comment templates are keyed by language or extension and use a single `%s` placeholder [@defaults] [@config]. The shipped defaults cover Bash, C-family extensions, CSS/SCSS, Go, HTML/XML, Husk, Java, JavaScript/TypeScript/JSX/TSX, JSONC, Lua, Markdown, PowerShell, Rust, SQL, TOML, and YAML [@defaults] [@config].
 
 ## Agent Configuration
 
 `[copilot]` configures optional inline AI completion separately from the Codex
-agent. It defaults to disabled; `disable_ai = true` also blocks it. See
+agent. It defaults to disabled; `disable_ai = true` also blocks it [@defaults]
+[@config]. See
 [Copilot Inline Completion](../../guides/agent/copilot-completion) for setup,
 privacy controls, commands, and key bindings.
 

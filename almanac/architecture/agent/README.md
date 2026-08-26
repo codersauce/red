@@ -32,15 +32,17 @@ Red's agent architecture is a direct Codex app-server integration wrapped in edi
 
 ## Reading Order
 
-Start with [Codex App-Server Workflow](codex-app-server-workflow) for process launch, app-server initialization, account checks, turn dispatch, event polling, and fail-closed behavior. It is the runtime path that turns `Space A` or `:Agent` into a Codex thread and streamed assistant updates [@workflow] [@codex].
+Start with [Codex App-Server Workflow](codex-app-server-workflow) for process launch, app-server initialization, account checks, turn dispatch, conversation-scoped model selection, activity presentation, event polling, and fail-closed behavior. It is the runtime path that turns `Space A` or `:Agent` into a Codex thread and streamed assistant updates [@workflow] [@codex].
 
-Read [Dynamic Tools And Editor Tools](dynamic-tools-and-editor-tools) when work touches the tool surface Codex can call. That page covers the four workspace dynamic tools, the five strict editor-tool schemas, UTF-16 editor coordinates, allow-listed editor actions, and the bounded channel that routes editor tools back through Red [@codex] [@tools].
+Read [Dynamic Tools And Editor Tools](dynamic-tools-and-editor-tools) when work touches the tool surface Codex can call. That page covers the app-server tool definitions, the six strict editor-tool schemas, UTF-16 editor coordinates, directory creation, allow-listed editor actions, and the bounded channel that routes editor tools back through Red [@codex] [@tools].
 
 Use [Followed Editing](followed-editing) for the full-agent write path: Red reveals the target file, checks the visible revision, applies an agent-attributed editor transaction, and saves through the editor [@workflow] [@editor].
 
 [Agent-Attributed Edits](../../concepts/agent-attributed-edits) is the safety model behind the architecture. Read it before changing whether Codex can inspect state, edit text, or cross the editor transaction boundary [@workflow] [@editor].
 
 For task-oriented operation, use [Inspect Agent History](../../guides/agent/inspect-agent-history). For inline AI suggestions that run beside language-server completion rather than through Codex turns, use [Copilot Inline Completion](../../guides/agent/copilot-completion) [@copilot-guide]. For prerequisites and offline readiness checks, use [Agent Check](../../reference/agent/agent-check). For the accepted integration decision, use [Direct Codex App-Server](../../decisions/agent/direct-codex-app-server).
+
+Keep that Copilot route out of the Codex app-server reading path. Copilot is a completion provider with opt-in source transmission and ghost-text acceptance semantics, while this architecture hub covers Codex threads, dynamic tools, followed edits, and agent-attributed history [@copilot-guide] [@workflow] [@codex].
 
 ## Boundaries To Preserve
 

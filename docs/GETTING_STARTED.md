@@ -303,6 +303,8 @@ Enter Command mode with `:` or `;`.
 | `:bn` / `:bd` | Select the next buffer or delete a buffer |
 | `:bufdo {command}` | Run a non-interactive Ex command in every open buffer |
 | `:!{command}` / `:!!` | Run a shell command or repeat the previous one |
+| `:%!{command}` / `:2,5!{command}` | Filter the whole buffer or selected lines through a command |
+| `:'<,'>!{command}` | Filter the lines from the last Visual selection |
 | `:sp [file]` / `:vs [file]` | Open a horizontal or vertical split |
 | `:close` / `:only` | Close the window or keep only the current window |
 | `:wrap` / `:nowrap` | Enable or disable wrapping |
@@ -318,8 +320,11 @@ the editor, language servers, and detached sessions remain responsive. Press
 `Ctrl-c` in the selected running command to cancel it, or `Esc` to return to
 editing while it continues. `%` expands to the current file, `#` to the
 alternate file, and `!` to the previous shell command; prefix those characters
-with `\` when they should remain literal. Shell jobs do not provide interactive
-stdin, and range filters such as `:%!sort` are not supported.
+with `\` when they should remain literal. Ordinary `:!` jobs do not provide
+interactive stdin. Range filters such as `:%!sort` pipe the selected text into
+the command and replace it with stdout as one undoable edit; Visual `:` already
+prefills the `'<,'>` range. Failed, cancelled, or outdated filters leave the
+buffer unchanged, and stderr remains visible in Messages.
 
 The bottom line shows the current notification. Routine feedback such as saves
 and copies fades away without leaving a badge. The badge counts warnings or
