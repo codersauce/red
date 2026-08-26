@@ -17,7 +17,7 @@ UBUNTU = {
 MACOS = {
     "name": "macos-latest",
     "standard": "macos-latest",
-    "warp": "warp-macos-latest-arm64-12x",
+    "warp": "warp-macos-latest-arm64-6x",
 }
 WINDOWS = {
     "name": "windows-latest",
