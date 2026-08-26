@@ -1197,7 +1197,7 @@ fn literal_matches(expected: &str, actual: &str) -> bool {
     match expected {
         "String" => actual == "string",
         "bool" => actual == "boolean",
-        "i32" | "u32" | "usize" => actual == "number",
+        "i32" | "i64" | "u32" | "usize" => actual == "number",
         ty if ty.starts_with('[') => actual == "array",
         ty if ty.starts_with("fn(") => false,
         "Json" => true,

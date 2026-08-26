@@ -86,6 +86,12 @@ struct Children {
     path: String,
     entries: [DirectoryEntry],
     truncated: bool,
+    notice: String,
+}
+
+struct PendingDirectory {
+    path: String,
+    request_id: i64,
 }
 
 struct Watch {
@@ -183,6 +189,15 @@ struct NeoTreeState {
     watches: [Watch],
     status: GitStatusResult,
     status_entries: [NeoTreeStatusEntry],
+    git_request: i64,
+    git_timer: String,
+    git_refresh_timer: String,
+    git_refresh_pending: bool,
+    git_elapsed: i32,
+    git_status_shown: bool,
+    pending_directories: [PendingDirectory],
+    cwd_request: i64,
+    windows_request: i64,
     cwd: String,
     current_file: String,
     selected: [String],
@@ -224,6 +239,15 @@ fn initial_state() -> NeoTreeState {
             status_index: Json {},
         },
         status_entries: [],
+        git_request: 0,
+        git_timer: "",
+        git_refresh_timer: "",
+        git_refresh_pending: false,
+        git_elapsed: 0,
+        git_status_shown: false,
+        pending_directories: [],
+        cwd_request: 0,
+        windows_request: 0,
         cwd: ".",
         current_file: "",
         selected: [],
@@ -296,8 +320,8 @@ fn show_panel(focus: bool) {
         red::execute("FocusPanel", "neotree");
     }
 
-    red::request("GetConfig", cwd_loaded, "cwd");
-    red::request("GetWindows", windows_loaded);
+    red::state_patch(NeoTreeState { cwd_request: red::request("GetConfig", cwd_loaded, "cwd") });
+    red::state_patch(NeoTreeState { windows_request: red::request("GetWindows", windows_loaded) });
     request_directory(".");
     request_git_status();
 }
@@ -337,6 +361,8 @@ fn close() {
     red::execute("ClosePanel", "neotree");
     red::execute("FocusEditor");
     red::state_patch(NeoTreeState { created: false });
+    cancel_git_status();
+    red::state_patch(NeoTreeState { pending_directories: [] });
 }
 
 #[red::lifecycle("deactivate")]
@@ -429,6 +455,8 @@ fn panel_event(event: NeoTreePanelEvent) {
     let Some(row) = event.row else {
         return;
     };
+    let row_id = red::string(row.id, "");
+    if row_id == "loading" || row_id.starts_with("notice:") { return; }
 
     if event.action == "activate" || event.action == "toggle" {
         if row.kind == "directory" {
@@ -963,6 +991,7 @@ fn reset_tree_revealing(path: String) {
     }
     red::state_patch(NeoTreeState { watches: [] });
     red::state_patch(NeoTreeState { children: [] });
+    red::state_patch(NeoTreeState { pending_directories: [] });
     red::state_patch(NeoTreeState { expanded: ["."] });
     clear_reveal();
     if path != "" {
@@ -1004,16 +1033,47 @@ fn reload_visible_tree() {
 }
 
 fn request_directory(path: String) {
-    red::request("ListDirectory", directory_loaded, path);
+    let pending: [PendingDirectory] = [];
+    for entry in state().pending_directories {
+        if entry.path != path { pending.push(entry); }
+    }
+    let request_id = red::request("ListDirectory", directory_loaded, path);
+    red::state_patch(NeoTreeState {
+        pending_directories: red::push(pending, PendingDirectory { path: path, request_id: request_id }),
+    });
 }
 
 fn request_git_status() {
-    red::request("GetGitStatus", git_status_loaded, ".");
+    if !state().created { return; }
+    if state().git_request != (0 as i64) {
+        red::state_patch(NeoTreeState { git_refresh_pending: true });
+        return;
+    }
+    red::execute("CancelTimeout", state().git_refresh_timer);
+    red::state_patch(NeoTreeState {
+        git_request: red::request("GetGitStatus", git_status_loaded, "."),
+        git_timer: red::execute("SetTimeout", 1000),
+        git_refresh_timer: "",
+        git_refresh_pending: false,
+        git_elapsed: 0,
+    });
+    if state().git_status_shown {
+        red::execute("SetPanelStatus", "neotree", "Updating Git status…");
+    }
 }
 
-fn directory_loaded(listing: DirectoryListing) {
+fn directory_loaded(listing: DirectoryListing, request_id: i64) {
+    let current = false;
+    let pending: [PendingDirectory] = [];
+    for entry in state().pending_directories {
+        if entry.request_id == request_id { current = true; }
+        else { pending.push(entry); }
+    }
+    if !state().created || !current { return; }
+    red::state_patch(NeoTreeState { pending_directories: pending });
     if let Some(error) = listing.error {
-        set_children(listing.path, [], false);
+        set_children_notice(listing.path, children_for(listing.path), false, "Cannot read · R retry");
+        red::execute("PrintWarning", "Cannot read " + listing.path + ": " + error);
     } else {
         set_children(listing.path, listing.entries, red::bool(listing.truncated, false));
         watch_directory(listing.path);
@@ -1026,16 +1086,73 @@ fn directory_loaded(listing: DirectoryListing) {
     }
 }
 
-fn git_status_loaded(result: GitStatusResult) {
+fn git_status_loaded(result: GitStatusResult, request_id: i64) {
+    if !state().created || request_id != state().git_request { return; }
+    red::execute("CancelTimeout", state().git_timer);
+    red::state_patch(NeoTreeState { git_request: 0, git_timer: "" });
+    if let Some(error) = result.error {
+        // Keep the last successful decorations, but never present them as fresh.
+        red::state_patch(NeoTreeState { git_refresh_pending: false, git_status_shown: true });
+        let label = "Git unavailable · R retry";
+        if state().status.root != None { label = "Git stale · R retry"; }
+        red::execute("SetPanelStatus", "neotree", label);
+        red::log("Neo-tree Git status: " + error);
+        return;
+    }
     red::state_patch(NeoTreeState { status: result });
     red::state_patch(NeoTreeState { status_entries: red::neotree_core("status_entries", result.status_index) });
     render();
+    if state().git_status_shown {
+        red::execute("SetPanelStatus", "neotree", "");
+        red::state_patch(NeoTreeState { git_status_shown: false });
+    }
+    if state().git_refresh_pending { schedule_git_refresh(); }
+}
+
+fn schedule_git_refresh() {
+    if !state().created { return; }
+    if state().git_request != (0 as i64) {
+        red::state_patch(NeoTreeState { git_refresh_pending: true });
+        return;
+    }
+    if state().git_refresh_timer != "" { return; }
+    red::state_patch(NeoTreeState { git_refresh_timer: red::execute("SetTimeout", 250) });
+}
+
+#[red::on("timeout:callback")]
+fn git_status_timeout(event: TreeSearchTimer) {
+    if !state().created { return; }
+    if event.timer_id == state().git_refresh_timer && event.timer_id != "" {
+        red::state_patch(NeoTreeState { git_refresh_timer: "" });
+        request_git_status();
+    } else if event.timer_id == state().git_timer && event.timer_id != "" {
+        let elapsed = state().git_elapsed + 1;
+        red::state_patch(NeoTreeState {
+            git_elapsed: elapsed,
+            git_status_shown: true,
+            git_timer: red::execute("SetTimeout", 1000),
+        });
+        red::execute("SetPanelStatus", "neotree", "Updating Git status… " + elapsed + "s");
+    }
+}
+
+fn cancel_git_status() {
+    if state().git_request != (0 as i64) {
+        red::execute("CancelGitStatus", state().git_request);
+    }
+    red::execute("CancelTimeout", state().git_timer);
+    red::execute("CancelTimeout", state().git_refresh_timer);
+    red::state_patch(NeoTreeState {
+        git_request: 0, git_timer: "", git_refresh_timer: "",
+        git_refresh_pending: false, git_status_shown: false,
+    });
 }
 
 fn directory_changed(event: DirectoryChangedEvent) {
+    if !state().created || !is_watched(event.path) { return; }
     red::execute("InvalidateWorkspacePaths", red::string(state().cwd, "."));
     request_directory(event.path);
-    request_git_status();
+    schedule_git_refresh();
     if state().search_query != "" {
         run_tree_search();
     }
@@ -1065,13 +1182,26 @@ fn is_watched(path: String) -> bool {
     return false;
 }
 
-fn cwd_loaded(event: CwdValueEvent) {
+fn cwd_loaded(event: CwdValueEvent, request_id: i64) {
+    if !state().created || request_id != state().cwd_request { return; }
     let cwd = red::string(event.value, ".");
+    if state().cwd != "." && state().cwd != normalize_path(cwd) {
+        cancel_git_status();
+        for watch in state().watches { red::execute("UnwatchDirectory", watch.id); }
+        red::state_patch(NeoTreeState {
+            watches: [], children: [], expanded: ["."], selected: [],
+            pending_directories: [], status: initial_state().status, status_entries: [],
+        });
+        clear_reveal();
+        request_directory(".");
+        request_git_status();
+    }
     red::state_patch(NeoTreeState { cwd: normalize_path(cwd) });
     try_reveal_current_file();
 }
 
-fn windows_loaded(result: TreeWindowsResult) {
+fn windows_loaded(result: TreeWindowsResult, request_id: i64) {
+    if !state().created || request_id != state().windows_request { return; }
     let path = "";
     for window in result.windows {
         if red::bool(window.active, false) {
@@ -1181,6 +1311,10 @@ fn find_child(entries: [DirectoryEntry], name: String, kind: String) -> Option<D
 }
 
 fn set_children(path: String, entries: [DirectoryEntry], truncated: bool) {
+    set_children_notice(path, entries, truncated, "");
+}
+
+fn set_children_notice(path: String, entries: [DirectoryEntry], truncated: bool, notice: String) {
     let children: [Children] = [];
     for child in state().children {
         if child.path != path {
@@ -1191,6 +1325,7 @@ fn set_children(path: String, entries: [DirectoryEntry], truncated: bool) {
         path: path,
         entries: entries,
         truncated: truncated,
+        notice: notice,
     });
     red::state_patch(NeoTreeState { children: children });
 }

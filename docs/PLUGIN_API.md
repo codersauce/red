@@ -162,6 +162,22 @@ These calls were introduced in host API `0.6.0`.
 
 ## Row-panel search and workspace path discovery
 
+Host API `0.16.0` adds `CancelGitStatus` and `SetPanelStatus`.
+`GetGitStatus(callback, path)` runs repository discovery, Git, and status
+indexing in the background. Git is stopped after 30 seconds; failures arrive in
+the result's `error` field. `CancelGitStatus(request_id)` cancels the calling
+plugin's request and discards its callback. The ID returned by `red::request`
+is also supplied as the callback's optional second argument, so plugins can
+reject responses from an earlier panel session. Background Git does not write
+the optional index refresh.
+
+`SetPanelStatus(id, status)` displays nonselectable footer text independently of
+row contents and the search prompt. An empty string clears it. Neo-tree uses
+this for slow Git refreshes and errors; `R` retries, and existing decorations
+remain visible but are labelled stale after a failed refresh. Directory watcher
+events are debounced, with at most one Neo-tree Git scan in flight and one
+follow-up refresh queued.
+
 Host API `0.15.0` supports an inline search prompt owned by an existing row
 panel. `OpenPanelSearch(id, initial, prefix)` focuses that prompt,
 `UpdatePanelSearch(id, status)` replaces its compact result indicator,

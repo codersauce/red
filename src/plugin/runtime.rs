@@ -1794,6 +1794,27 @@ impl RedHost {
                 let status = red_required_string(args, 1, "UpdatePanelSearch")?.to_string();
                 self.send_request(PluginRequest::UpdatePanelSearch { id, status });
             }
+            "SetPanelStatus" => {
+                let id = red_required_string(args, 0, "SetPanelStatus")?.to_string();
+                let status = red_required_string(args, 1, "SetPanelStatus")?.to_string();
+                self.send_request(PluginRequest::SetPanelStatus { id, status });
+            }
+            "CancelGitStatus" => {
+                let request_id = RequestId::from_raw(
+                    args.first()
+                        .and_then(value_to_u64)
+                        .and_then(|value| i64::try_from(value).ok())
+                        .ok_or_else(|| anyhow::anyhow!("CancelGitStatus requires a request id"))?,
+                );
+                if let Some(callback) = self.policy().pending_requests.get(&request_id) {
+                    anyhow::ensure!(
+                        callback.plugin() == plugin,
+                        "cannot cancel another plugin's request"
+                    );
+                    self.policy_mut().pending_requests.remove(&request_id);
+                    self.send_request(PluginRequest::CancelGitStatus { request_id });
+                }
+            }
             "KeepPanelSearch" => {
                 let id = red_required_string(args, 0, "KeepPanelSearch")?.to_string();
                 self.send_request(PluginRequest::KeepPanelSearch { id });
@@ -4492,6 +4513,7 @@ fn _keep_config_used(_: &Config) {}
 
 #[cfg(test)]
 mod tests {
+    use serde_json::json;
     use std::{
         path::{Path, PathBuf},
         process::Command,
@@ -16690,6 +16712,110 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn neotree_coalesces_refreshes_and_preserves_stale_status_on_error() {
+        let mut runtime = Runtime::new();
+        runtime
+            .load_plugin("neotree", include_str!("../../plugins/neotree.hk"))
+            .await
+            .unwrap();
+        runtime.execute_command("NeoTree").await.unwrap();
+        let state = |runtime: &Runtime| {
+            let inner = runtime.inner.lock().unwrap();
+            value_to_json(inner.host.policy().typed_states.get("neotree").unwrap())
+        };
+        let request = RequestId::from_raw(state(&runtime)["git_request"].as_i64().unwrap());
+        drain_requests();
+        for _ in 0..5 {
+            runtime
+                .notify("panel:event:neotree", json!({"action":"refresh"}))
+                .await
+                .unwrap();
+        }
+        while let Some(request) = runtime.try_recv_request() {
+            assert!(!matches!(request, PluginRequest::GetGitStatus { .. }));
+        }
+        let timer = state(&runtime)["git_timer"].clone();
+        runtime
+            .notify("timeout:callback", json!({"timer_id":timer}))
+            .await
+            .unwrap();
+        assert!(
+            matches!(runtime.try_recv_request(), Some(PluginRequest::SetPanelStatus { status, .. }) if status.contains("1s"))
+        );
+        runtime.resolve_request(request, json!({
+            "root":"/repo", "statuses":[], "status_index":{"/repo/a.rs":"modified"}, "error":null
+        })).await.unwrap();
+        let previous = state(&runtime)["status_entries"].clone();
+        assert!(!previous.as_array().unwrap().is_empty());
+        let refresh_timer = state(&runtime)["git_refresh_timer"].clone();
+        assert_ne!(refresh_timer, "");
+        drain_requests();
+        runtime
+            .notify("timeout:callback", json!({"timer_id":refresh_timer}))
+            .await
+            .unwrap();
+        let next = match runtime.try_recv_request().unwrap() {
+            PluginRequest::GetGitStatus { request_id, .. } => request_id,
+            _ => panic!("expected one follow-up scan"),
+        };
+        assert!(runtime.try_recv_request().is_none());
+        runtime
+            .resolve_request(
+                next,
+                json!({"root":null,"statuses":[],"status_index":{},"error":"timed out"}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(state(&runtime)["status_entries"], previous);
+        assert!(
+            matches!(runtime.try_recv_request(), Some(PluginRequest::SetPanelStatus { status, .. }) if status == "Git stale · R retry")
+        );
+        assert_eq!(state(&runtime)["git_refresh_timer"], "");
+        runtime
+            .notify("panel:event:neotree", json!({"action":"refresh"}))
+            .await
+            .unwrap();
+        assert_ne!(state(&runtime)["git_request"], 0);
+    }
+
+    #[tokio::test]
+    async fn neotree_discards_late_results_after_close_and_reopen() {
+        let mut runtime = Runtime::new();
+        runtime
+            .load_plugin("neotree", include_str!("../../plugins/neotree.hk"))
+            .await
+            .unwrap();
+        runtime.execute_command("NeoTree").await.unwrap();
+        let mut git_request = None;
+        let mut directory_request = None;
+        while let Some(request) = runtime.try_recv_request() {
+            match request {
+                PluginRequest::GetGitStatus { request_id, .. } => git_request = Some(request_id),
+                PluginRequest::ListDirectory { request_id, .. } => {
+                    directory_request = Some(request_id)
+                }
+                _ => {}
+            }
+        }
+        runtime.execute_command("NeoTree").await.unwrap();
+        assert!(std::iter::from_fn(|| runtime.try_recv_request())
+            .any(|request| matches!(request, PluginRequest::CancelGitStatus { .. })));
+        runtime.execute_command("NeoTree").await.unwrap();
+        drain_requests();
+        assert!(!runtime
+            .resolve_request(git_request.unwrap(), json!({}))
+            .await
+            .unwrap());
+        runtime.resolve_request(directory_request.unwrap(), json!({
+            "path":".", "entries":[{"name":"old.rs","path":"./old.rs","kind":"file"}], "error":null
+        })).await.unwrap();
+        assert!(
+            runtime.try_recv_request().is_none(),
+            "late listing must not render or install a watch"
+        );
+    }
+
+    #[tokio::test]
     async fn neotree_renders_a_panel_expands_directories_and_opens_files() {
         drain_requests();
 
@@ -16821,7 +16947,8 @@ mod tests {
         match ACTION_DISPATCHER.recv_request() {
             PluginRequest::UpdatePanel { id, rows } => {
                 assert_eq!(id, "neotree");
-                assert_eq!(rows.len(), 3);
+                assert_eq!(rows.len(), 4);
+                assert_eq!(rows[2].id, "notice:./src");
             }
             _ => panic!("unexpected plugin request"),
         }
@@ -17254,6 +17381,20 @@ mod tests {
             .load_plugin("neotree", include_str!("../../plugins/neotree.hk"))
             .await
             .unwrap();
+        runtime.execute_command("NeoTree").await.unwrap();
+        while let Some(request) = runtime.try_recv_request() {
+            if let PluginRequest::GetGitStatus { request_id, .. } = request {
+                runtime
+                    .resolve_request(
+                        request_id,
+                        json!({
+                            "root":null,"statuses":[],"status_index":{},"error":null
+                        }),
+                    )
+                    .await
+                    .unwrap();
+            }
+        }
 
         runtime
             .notify(
@@ -17345,6 +17486,10 @@ mod tests {
             }
             _ => panic!("expected created file parent refresh"),
         };
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::UpdatePanel { .. }
+        ));
 
         runtime
             .resolve_request(
@@ -17362,6 +17507,10 @@ mod tests {
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
             PluginRequest::WatchDirectory { path, .. } if path == "./src"
+        ));
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::UpdatePanel { .. }
         ));
         match ACTION_DISPATCHER.recv_request() {
             PluginRequest::SelectPanelRow { id, row_id } => {
@@ -17526,8 +17675,9 @@ mod tests {
         match ACTION_DISPATCHER.recv_request() {
             PluginRequest::UpdatePanel { id, rows } => {
                 assert_eq!(id, "neotree");
-                assert_eq!(rows.len(), 2);
+                assert_eq!(rows.len(), 3);
                 assert!(rows[1].expanded.unwrap_or(false));
+                assert_eq!(rows[2].id, "notice:./src");
             }
             _ => panic!("unexpected plugin request"),
         }
