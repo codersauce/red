@@ -61,8 +61,6 @@ The schema's call list is the exact lookup source for current signatures. Exampl
 
 Plugin packages may declare a semver range in `red_api_version`; Red checks that range before activation and quarantines malformed or incompatible packages without stopping unrelated plugins [@api-doc]. The registry accepts `0.4.0`, `0.6.0`, `0.7.0`, `0.8.0`, `0.9.0`, `0.10.0`, `0.11.0`, `0.12.0`, `0.14.0`, and the current `0.15.0` host API version, so existing packages can remain on earlier supported minors while new packages should target `^0.15.0` unless they intentionally avoid newer host calls [@registry] [@api-doc]. Because pre-1.0 caret ranges do not cross minor versions, compatibility checks test the declared range against every supported host API version instead of only the current version [@registry]. The documented pre-1.0 policy is:
 
-There is a current code/documentation mismatch around `0.13.0`: the migration guide says Red `0.14.0` retains the complete `0.13.0` contract, but `SUPPORTED_HOST_API_VERSIONS` does not include `0.13.0` [@api-doc] [@registry]. Until that is reconciled, treat `src/plugin/registry.rs` as the activation authority and do not assume packages declaring only `^0.13.0` will load [@registry].
-
 | Release kind | Compatibility rule |
 | --- | --- |
 | Patch | Fix behavior without intentionally changing signatures [@api-doc]. |

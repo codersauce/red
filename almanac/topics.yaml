@@ -250,7 +250,7 @@ topics:
   - slug: navigation
     title: Navigation
     description: Wiki and editor navigation entry points.
-    parents: [onboarding]
+    parents: [wiki]
   - slug: wiki
     title: Wiki
     description: CodeAlmanac wiki structure and maintenance conventions.

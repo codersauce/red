@@ -33,7 +33,7 @@ The editor resolves that buffer setting before rendering. `Auto` asks the highli
 
 ## Highlight Production
 
-The highlighter owns the parser and query cache for tree-sitter languages. It builds `LanguageHighlighter` entries lazily, combining bundled highlight queries, compiling an optional injection query, and mapping capture names to theme styles [@highlighter]. Supported tree-sitter-backed languages include Rust, Markdown, JavaScript, JSX, TypeScript, TSX, JSON, TOML, YAML, Python, Bash, Fish, PowerShell, and Lua [@highlighter].
+The highlighter owns the parser and query cache for tree-sitter languages. It builds `LanguageHighlighter` entries lazily, combining bundled highlight queries, compiling an optional injection query, and mapping capture names to theme styles [@highlighter]. Supported bundled tree-sitter-backed languages include Rust, Markdown, JavaScript, JSX, TypeScript, TSX, JSON, TOML, YAML, Bash, Fish, PowerShell, and Lua [@highlighter].
 
 Husk is a special path. The `husk` language id maps `.hk` and `.husk` files, but `highlight_with_depth` bypasses tree-sitter and calls the Husk lexer, assigning theme scopes to comments, keywords, numeric and string literals, builtin types, builtin constants, builtin variables, and operators [@highlighter]. This keeps plugin-language highlighting available even though Husk syntax is not represented by a tree-sitter grammar in this module [@highlighter].
 

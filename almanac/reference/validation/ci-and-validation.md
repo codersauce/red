@@ -1,6 +1,6 @@
 ---
 title: "CI And Validation"
-summary: "Red's validation surface combines GitHub Actions jobs for tests, clippy, formatting, performance, runtime self-check, plugin checks, nightly Rust, and release archives with the local clippy policy in AGENTS.md."
+summary: "Red's validation surface combines GitHub Actions jobs for tests, clippy, formatting, runtime self-check, plugin checks, performance, installers, security audit, nightly Rust, and release archives with the local clippy policy in AGENTS.md."
 topics: [reference, validation, ci, release]
 sources:
   - id: ci
@@ -24,9 +24,21 @@ sources:
   - id: test-performance
     type: file
     path: .github/workflows/test-performance.yml
+  - id: runner-sizing
+    type: file
+    path: .github/workflows/runner-sizing.yml
+  - id: keyboard-protocol
+    type: file
+    path: scripts/test_keyboard_protocol.py
   - id: release
     type: file
     path: .github/workflows/release.yml
+  - id: installers
+    type: file
+    path: .github/workflows/installers.yml
+  - id: security-audit
+    type: file
+    path: .github/workflows/security-audit.yml
   - id: agents
     type: file
     path: AGENTS.md
@@ -36,10 +48,11 @@ Red's validation contract spans local commands and GitHub Actions workflows. CI
 runs workflow lint, cross-platform tests, clippy with warnings denied,
 formatting, the bundled runtime self-check, documentation checks, and
 changelog checks [@ci]. Separate workflows validate bundled Husk plugins, run
-a deterministic performance gate, test nightly Rust, benchmark test runners on
-demand, build and smoke-test release archives, publish draft GitHub releases,
-and update the Homebrew tap after a release is published [@plugin-check]
-[@performance] [@nightly] [@test-performance] [@release]. For runtime context,
+a deterministic performance gate, test installers, audit Rust dependencies,
+test nightly Rust, benchmark test runners on demand, build and smoke-test
+release archives, publish draft GitHub releases, and update the Homebrew tap
+after a release is published [@plugin-check] [@performance] [@installers]
+[@security-audit] [@nightly] [@test-performance] [@release]. For runtime context,
 the bundled self-check is also part of the
 [runtime assets](../../architecture/runtime/runtime-assets) area.
 
@@ -68,7 +81,7 @@ operating system; release builds use separate target-specific caches [@ci].
 | Job | Main checks |
 | --- | --- |
 | `workflow-lint` | Validates GitHub Actions workflows, checks the README release version, and runs Discord release announcement and test-tooling unit tests [@ci]. |
-| `test` | Runs `cargo test --all-targets --all-features --verbose` with stable Rust and checksum-verified ripgrep on Ubuntu, macOS, and Windows [@ci]. |
+| `test` | Runs `cargo test --all-targets --all-features --verbose` with stable Rust and checksum-verified ripgrep on Ubuntu, macOS, and Windows; then runs the vendored Crossterm keyboard decoder tests and, outside Windows, builds `red` and exercises the terminal keyboard protocol in a Unix PTY [@ci] [@keyboard-protocol]. |
 | `clippy` | Denies every all-target, all-feature clippy warning on Ubuntu for code pull requests and manual runs; post-merge pushes and documentation-only pull requests skip it [@ci]. |
 | `fmt` | Runs `cargo fmt --all -- --check` [@ci]. |
 | `self-check` | Runs `cargo run --locked -- --self-check` to initialize and validate bundled runtime state [@ci]. |
@@ -118,6 +131,29 @@ records Cargo build timings and JSON results, uploads optional nextest JUnit
 reports, and supports explicit `sccache` and Linux `mold` experiments
 [@test-performance]. Normal validation keeps `cargo test` as its default
 because separate nextest processes are slower for Red's many short tests.
+
+Runner sizing is a separate paid benchmark workflow rather than a normal CI
+gate. It runs only when `confirm_paid_benchmark` is set, selects one platform's
+baseline and candidate WarpBuild labels, runs three replicas per label, and
+uses the same Rust test plus keyboard validation steps as the main paid test
+job [@runner-sizing]. The cost-control runbook requires comparing billed cost,
+p90 duration, CPU, memory, and failures before keeping a smaller runner
+[@ci-cost-controls].
+
+## Installer And Security Workflows
+
+The Installers workflow is path-filtered to installer scripts, installer tests,
+the installer workflow, and release-facing documentation or workflow changes on
+pull requests; pushes trigger it for installer files, installer tests, or the
+installer workflow itself [@installers]. It lint-checks the shell and
+PowerShell installers, runs Unix installer fixtures on Ubuntu and macOS, and
+installs the latest release on Ubuntu, macOS Intel, macOS Apple Silicon, and
+Windows [@installers].
+
+The Security Audit workflow runs on dependency and audit-workflow changes,
+weekly, and manually [@security-audit]. It uses `rustsec/audit-check` on
+Ubuntu and writes check results with the repository `GITHUB_TOKEN`
+[@security-audit].
 
 ## Nightly Rust Workflow
 

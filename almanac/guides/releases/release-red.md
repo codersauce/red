@@ -21,6 +21,12 @@ sources:
   - id: plugin-check
     type: file
     path: .github/workflows/plugin-check.yml
+  - id: performance
+    type: file
+    path: .github/workflows/performance.yml
+  - id: security-audit
+    type: file
+    path: .github/workflows/security-audit.yml
   - id: readme-release
     type: file
     path: scripts/readme_release.py
@@ -57,7 +63,7 @@ Review the release PR as a normal ready-for-review PR. The release docs call out
 
 ## Tag The Merge Commit
 
-After merging the release PR, update local `main`, verify the merge commit, and then create an annotated tag from that commit. Before tagging, confirm that `main` contains the release merge commit and that the post-merge CI surface has completed for that exact commit. The main-branch CI run covers workflow lint, README release-version validation, Discord announcement tests, cross-platform tests, Clippy, formatting, bundled runtime self-check, changelog checks, performance, release binary builds, documentation, and security audit jobs; the separate Husk plugin check covers Red and Husk package tests plus bundled plugin tests [@ci] [@plugin-check]. This matters because the tag push immediately starts archive creation, and the draft release should be built from the same commit whose merge validation passed [@release].
+After merging the release PR, update local `main`, verify the merge commit, and then create an annotated tag from that commit. Before tagging, confirm that `main` contains the release merge commit and that the post-merge validation surface has completed for that exact commit. The main CI workflow covers workflow lint, README release-version validation, Discord announcement tests, cross-platform tests, formatting, bundled runtime self-check, changelog checks, release binary builds, documentation, and the selected paid test mode [@ci]. Separate path-filtered workflows cover Husk plugin checks, deterministic performance, and Rust dependency audit when their trigger paths match the release merge [@plugin-check] [@performance] [@security-audit]. This matters because the tag push immediately starts archive creation, and the draft release should be built from the same commit whose merge validation passed [@release].
 
 ```shell
 git checkout main
