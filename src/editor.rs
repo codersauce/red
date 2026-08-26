@@ -69,7 +69,6 @@ use std::{
     io::Write as _,
     num::NonZeroUsize,
     path::{Path, PathBuf},
-    process::Command,
     sync::Arc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -2135,6 +2134,17 @@ pub enum PluginRequest {
         path: String,
         request_id: RequestId,
     },
+    GitStatusLoaded {
+        request_id: RequestId,
+        payload: Value,
+    },
+    CancelGitStatus {
+        request_id: RequestId,
+    },
+    SetPanelStatus {
+        id: String,
+        status: String,
+    },
     FileOperation {
         operation: Value,
         request_id: RequestId,
@@ -2285,6 +2295,9 @@ impl PluginRequest {
             Self::SearchWorkspacePaths { .. } => "SearchWorkspacePaths",
             Self::WorkspacePathsSearched { .. } => "WorkspacePathsSearched",
             Self::GetGitStatus { .. } => "GetGitStatus",
+            Self::GitStatusLoaded { .. } => "GitStatusLoaded",
+            Self::CancelGitStatus { .. } => "CancelGitStatus",
+            Self::SetPanelStatus { .. } => "SetPanelStatus",
             Self::FileOperation { .. } => "FileOperation",
             Self::WatchDirectory { .. } => "WatchDirectory",
             Self::UnwatchDirectory { .. } => "UnwatchDirectory",
@@ -3364,6 +3377,15 @@ struct StatuslineGitChanges {
     deleted: usize,
 }
 
+/// Dropping a request (including on editor shutdown) stops its Git subprocess.
+struct PendingGitStatus(tokio::task::JoinHandle<()>);
+
+impl Drop for PendingGitStatus {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 /// Single-task owner of Red's interactive application state.
 ///
 /// The editor coordinates buffers, windows, rendering, LSP, plugins,
@@ -3420,6 +3442,7 @@ pub struct Editor {
 
     /// Short-lived Git metadata used by configurable status-line sections.
     statusline_git_cache: StatuslineGitCache,
+    pending_git_status: HashMap<RequestId, PendingGitStatus>,
 
     /// Plugin system registry
     plugin_registry: PluginRegistry,
@@ -5139,6 +5162,7 @@ impl Editor {
                 ..StatuslineGitCache::default()
             },
             plugin_registry,
+            pending_git_status: HashMap::new(),
             plugin_catalog: BTreeMap::new(),
             plugin_catalog_url: plugin::catalog::catalog_url(),
             companion_manager: Arc::new(tokio::sync::Mutex::new(
@@ -12489,9 +12513,10 @@ impl Editor {
                 }
                 PluginRequest::ListDirectory { path, request_id } => {
                     let callback_runtime = runtime.clone();
+                    let scan_path = std::path::absolute(&path)?;
                     tokio::task::spawn_blocking(move || {
                         let _span = perf::PerfSpan::with_detail("neotree:directory_scan", &path);
-                        let payload = directory_listing(&path);
+                        let payload = directory_listing_from(&path, &scan_path);
                         callback_runtime.send_request(PluginRequest::DirectoryListed {
                             request_id,
                             payload,
@@ -12546,10 +12571,33 @@ impl Editor {
                         .await?;
                 }
                 PluginRequest::GetGitStatus { path, request_id } => {
-                    let payload = git_status_listing(&path);
+                    let callback_runtime = runtime.clone();
+                    // Resolve relative paths before the workspace can change.
+                    let path = std::path::absolute(&path)?.to_string_lossy().into_owned();
+                    let task = tokio::spawn(async move {
+                        let payload = git_status_listing(&path).await;
+                        callback_runtime.send_request(PluginRequest::GitStatusLoaded {
+                            request_id,
+                            payload,
+                        });
+                    });
+                    self.pending_git_status
+                        .insert(request_id, PendingGitStatus(task));
+                }
+                PluginRequest::GitStatusLoaded {
+                    request_id,
+                    payload,
+                } => {
+                    self.pending_git_status.remove(&request_id);
                     self.plugin_registry
                         .resolve_request(runtime, request_id, payload)
                         .await?;
+                }
+                PluginRequest::CancelGitStatus { request_id } => {
+                    self.pending_git_status.remove(&request_id);
+                }
+                PluginRequest::SetPanelStatus { id, status } => {
+                    needs_render |= self.panel_manager.set_panel_status(&id, status);
                 }
                 PluginRequest::FileOperation {
                     operation,
@@ -30912,7 +30960,11 @@ struct DirectoryListingEntry {
 }
 
 fn directory_listing(path: &str) -> Value {
-    match std::fs::metadata(path) {
+    directory_listing_from(path, Path::new(path))
+}
+
+fn directory_listing_from(path: &str, scan_path: &Path) -> Value {
+    match std::fs::metadata(scan_path) {
         Ok(metadata) if metadata.is_dir() => {}
         Ok(_) => {
             return json!({
@@ -30932,7 +30984,7 @@ fn directory_listing(path: &str) -> Value {
         }
     }
 
-    let mut builder = ignore::WalkBuilder::new(path);
+    let mut builder = ignore::WalkBuilder::new(scan_path);
     builder
         .max_depth(Some(1))
         .hidden(false)
@@ -30946,7 +30998,16 @@ fn directory_listing(path: &str) -> Value {
         });
 
     let mut entries = Vec::new();
-    for entry in builder.build().filter_map(Result::ok).skip(1) {
+    let mut scan_error = None;
+    for result in builder.build() {
+        let entry = match result {
+            Ok(entry) if entry.depth() > 0 => entry,
+            Ok(_) => continue,
+            Err(error) => {
+                scan_error.get_or_insert_with(|| error.to_string());
+                continue;
+            }
+        };
         let kind = match entry.file_type() {
             Some(file_type) if file_type.is_dir() => "directory",
             Some(file_type) if file_type.is_file() => "file",
@@ -30970,7 +31031,10 @@ fn directory_listing(path: &str) -> Value {
         entries.push(DirectoryListingEntry {
             sort_name: name.to_lowercase(),
             name,
-            path: entry.path().to_string_lossy().into_owned(),
+            path: Path::new(path)
+                .join(entry.path().strip_prefix(scan_path).unwrap_or(entry.path()))
+                .to_string_lossy()
+                .into_owned(),
             kind,
         });
     }
@@ -30989,7 +31053,7 @@ fn directory_listing(path: &str) -> Value {
             "kind": entry.kind,
         })).collect::<Vec<_>>(),
         "truncated": false,
-        "error": null,
+        "error": scan_error,
     })
 }
 
@@ -31085,31 +31149,29 @@ fn directory_snapshot(path: &str, recursive: bool) -> Value {
 }
 
 #[doc(hidden)]
-pub fn git_status_listing(path: &str) -> Value {
-    let search_dir = git_search_dir(path);
-    let Some(root) = Path::new(&search_dir)
-        .canonicalize()
-        .ok()
-        .and_then(|directory| {
-            directory
-                .ancestors()
-                .find(|ancestor| ancestor.join(".git").exists())
-                .map(|ancestor| ancestor.to_string_lossy().into_owned())
-        })
-    else {
-        return json!({
-            "root": null,
-            "statuses": [],
-            "status_index": {},
-            "error": null,
-        });
+pub async fn git_status_listing(path: &str) -> Value {
+    // Root discovery, cache validation, and parsing may all touch substantial
+    // filesystem or status data. None of them runs on the editor task.
+    let path = path.to_string();
+    let prepared = tokio::task::spawn_blocking(move || {
+        let root = git_status_root(&path);
+        let cached = root.as_deref().and_then(cached_git_status_listing);
+        (root, cached)
+    })
+    .await;
+    let (root, cached) = match prepared {
+        Ok(value) => value,
+        Err(error) => return git_status_error(error.to_string()),
+    };
+    if let Some(cached) = cached {
+        return cached;
+    }
+    let Some(root) = root else {
+        return json!({"root": null, "statuses": [], "status_index": {}, "error": null});
     };
 
-    if let Some(listing) = cached_git_status_listing(&root) {
-        return listing;
-    }
-
-    let status_output = Command::new("git")
+    let mut command = tokio::process::Command::new("git");
+    command
         .arg("-C")
         .arg(&root)
         .args([
@@ -31119,36 +31181,71 @@ pub fn git_status_listing(path: &str) -> Value {
             "--ignored=matching",
             "--untracked-files=normal",
         ])
-        .output();
-
-    let listing = match status_output {
-        Ok(output) if output.status.success() => {
-            let statuses = parse_git_status_records(&output.stdout, &root);
-            let status_index = git_status_index(&statuses, &root);
-            json!({
-                "root": normalize_plugin_path(&root),
-                "statuses": statuses,
-                "status_index": status_index,
-                "error": null,
-            })
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .stdin(std::process::Stdio::null());
+    let output = match git_status_output(command, Duration::from_secs(30)).await {
+        Ok(output) => output,
+        Err(error) => return git_status_error(error.to_string()),
+    };
+    tokio::task::spawn_blocking(move || {
+        let listing = git_status_payload(&root, output);
+        if listing["error"].is_null() {
+            cache_git_status_listing(&root, &listing);
         }
-        Ok(output) => json!({
-            "root": normalize_plugin_path(&root),
+        listing
+    })
+    .await
+    .unwrap_or_else(|error| git_status_error(error.to_string()))
+}
+
+fn git_status_error(error: String) -> Value {
+    json!({"root": null, "statuses": [], "status_index": {}, "error": error})
+}
+
+/// The owned output future kills Git when cancelled or timed out. Tokio reaps
+/// the child; callers must not merely detach a blocking Command::output task.
+async fn git_status_output(
+    mut command: tokio::process::Command,
+    timeout: Duration,
+) -> anyhow::Result<std::process::Output> {
+    command.kill_on_drop(true);
+    tokio::time::timeout(timeout, command.output())
+        .await
+        .map_err(|_| anyhow::anyhow!("Git status timed out"))?
+        .map_err(Into::into)
+}
+
+fn git_status_root(path: &str) -> Option<String> {
+    let search_dir = git_search_dir(path);
+    Path::new(&search_dir)
+        .canonicalize()
+        .ok()
+        .and_then(|directory| {
+            directory
+                .ancestors()
+                .find(|ancestor| ancestor.join(".git").exists())
+                .map(|ancestor| ancestor.to_string_lossy().into_owned())
+        })
+}
+
+fn git_status_payload(root: &str, output: std::process::Output) -> Value {
+    if output.status.success() {
+        let statuses = parse_git_status_records(&output.stdout, root);
+        let status_index = git_status_index(&statuses, root);
+        json!({
+            "root": normalize_plugin_path(root),
+            "statuses": statuses,
+            "status_index": status_index,
+            "error": null,
+        })
+    } else {
+        json!({
+            "root": normalize_plugin_path(root),
             "statuses": [],
             "status_index": {},
             "error": String::from_utf8_lossy(&output.stderr).trim(),
-        }),
-        Err(err) => json!({
-            "root": normalize_plugin_path(&root),
-            "statuses": [],
-            "status_index": {},
-            "error": err.to_string(),
-        }),
-    };
-    if listing["error"].is_null() {
-        cache_git_status_listing(&root, &listing);
+        })
     }
-    listing
 }
 
 struct CachedGitStatus {
@@ -32067,6 +32164,7 @@ mod test {
     use super::*;
     use crate::lsp::DiagnosticSeverity;
     use std::path::{Path, PathBuf};
+    use std::process::Command;
 
     #[test]
     fn session_restore_storage_is_scoped_by_workspace() {
@@ -39566,11 +39664,76 @@ builtin = "rust"
         assert!(index.get("").is_none());
     }
 
-    #[test]
-    fn git_status_listing_includes_an_empty_index_outside_a_repository() {
+    #[tokio::test]
+    async fn git_status_output_reports_success_and_spawn_errors() {
+        let mut command = tokio::process::Command::new("git");
+        command.arg("--version");
+        let output = git_status_output(command, Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert!(output.status.success());
+
+        let mut missing = tokio::process::Command::new("red-nonexistent-git-test");
+        missing.arg("status");
+        assert!(git_status_output(missing, Duration::from_secs(5))
+            .await
+            .is_err());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn git_status_timeout_and_cancellation_stop_the_child() {
+        use nix::{errno::Errno, sys::signal::kill, unistd::Pid};
+        for cancel in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let pid_file = directory.path().join("pid");
+            let mut command = tokio::process::Command::new("sh");
+            command
+                .args(["-c", "echo $$ > \"$1\"; exec sleep 60", "red-git-test"])
+                .arg(&pid_file);
+            let timeout = if cancel {
+                Duration::from_secs(30)
+            } else {
+                Duration::from_millis(250)
+            };
+            let task = tokio::spawn(async move {
+                let error = git_status_output(command, timeout).await.unwrap_err();
+                assert!(error.to_string().contains("timed out"));
+            });
+            // This timer runs on the same single-thread runtime as the subprocess.
+            // A synchronous output() would prevent the readiness check from running.
+            let pid = tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    if let Ok(text) = fs::read_to_string(&pid_file) {
+                        if let Ok(pid) = text.trim().parse::<i32>() {
+                            break Pid::from_raw(pid);
+                        }
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+            if cancel {
+                drop(PendingGitStatus(task));
+            } else {
+                task.await.unwrap();
+            }
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while kill(pid, None) != Err(Errno::ESRCH) {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("Git child should be killed and reaped");
+        }
+    }
+
+    #[tokio::test]
+    async fn git_status_listing_includes_an_empty_index_outside_a_repository() {
         let root = tempfile::tempdir().unwrap();
 
-        let listing = git_status_listing(root.path().to_str().unwrap());
+        let listing = git_status_listing(root.path().to_str().unwrap()).await;
 
         assert!(listing["root"].is_null());
         assert!(listing["statuses"].as_array().unwrap().is_empty());
@@ -39578,8 +39741,8 @@ builtin = "rust"
         assert!(listing["error"].is_null());
     }
 
-    #[test]
-    fn git_status_cache_invalidates_worktree_ignored_and_index_changes() {
+    #[tokio::test]
+    async fn git_status_cache_invalidates_worktree_ignored_and_index_changes() {
         let root = tempfile::tempdir().unwrap();
         assert!(Command::new("git")
             .args(["init", "--quiet"])
@@ -39614,11 +39777,11 @@ builtin = "rust"
             .success());
 
         let path = root.path().to_str().unwrap();
-        let initial = git_status_listing(path);
-        assert_eq!(git_status_listing(path), initial);
+        let initial = git_status_listing(path).await;
+        assert_eq!(git_status_listing(path).await, initial);
 
         fs::write(root.path().join("tracked.rs"), "changed\n").unwrap();
-        let changed = git_status_listing(path);
+        let changed = git_status_listing(path).await;
         assert_ne!(changed, initial);
         assert!(changed["statuses"]
             .as_array()
@@ -39628,7 +39791,7 @@ builtin = "rust"
 
         fs::write(root.path().join("untracked.rs"), "untracked\n").unwrap();
         fs::write(root.path().join("ignored.log"), "ignored\n").unwrap();
-        let expanded = git_status_listing(path);
+        let expanded = git_status_listing(path).await;
         assert!(expanded["statuses"]
             .as_array()
             .unwrap()
@@ -39647,10 +39810,10 @@ builtin = "rust"
             .status()
             .unwrap()
             .success());
-        let staged = git_status_listing(path);
+        let staged = git_status_listing(path).await;
         assert_ne!(staged, expanded);
         fs::remove_file(root.path().join("ignored.log")).unwrap();
-        assert!(!git_status_listing(path)["statuses"]
+        assert!(!git_status_listing(path).await["statuses"]
             .as_array()
             .unwrap()
             .iter()
@@ -39666,8 +39829,8 @@ builtin = "rust"
         assert!(git_status_fingerprint(root.path()).is_none());
     }
 
-    #[test]
-    fn git_status_listing_discovers_nested_repositories_and_retains_statuses() {
+    #[tokio::test]
+    async fn git_status_listing_discovers_nested_repositories_and_retains_statuses() {
         let root = tempfile::tempdir().unwrap();
         assert!(Command::new("git")
             .args(["init", "--quiet"])
@@ -39707,7 +39870,7 @@ builtin = "rust"
         let source = nested.join("new.rs");
         fs::write(&source, "untracked\n").unwrap();
 
-        let listing = git_status_listing(source.to_str().unwrap());
+        let listing = git_status_listing(source.to_str().unwrap()).await;
         assert_eq!(
             listing["root"],
             normalize_plugin_path(
@@ -39734,7 +39897,7 @@ builtin = "rust"
             .unwrap()
             .success());
         fs::write(linked.join("linked.rs"), "linked source\n").unwrap();
-        let linked_listing = git_status_listing(linked.join("linked.rs").to_str().unwrap());
+        let linked_listing = git_status_listing(linked.join("linked.rs").to_str().unwrap()).await;
         assert_eq!(
             linked_listing["root"],
             normalize_plugin_path(linked.canonicalize().unwrap().to_string_lossy().as_ref())
@@ -39752,7 +39915,7 @@ builtin = "rust"
             .status()
             .unwrap()
             .success());
-        let nested_listing = git_status_listing(source.to_str().unwrap());
+        let nested_listing = git_status_listing(source.to_str().unwrap()).await;
         assert_eq!(
             nested_listing["root"],
             normalize_plugin_path(inner.canonicalize().unwrap().to_string_lossy().as_ref())
@@ -39765,8 +39928,8 @@ builtin = "rust"
     }
 
     #[cfg(unix)]
-    #[test]
-    fn git_status_listing_follows_retargeted_repository_symlinks() {
+    #[tokio::test]
+    async fn git_status_listing_follows_retargeted_repository_symlinks() {
         use std::os::unix::fs::symlink;
 
         let root = tempfile::tempdir().unwrap();
@@ -39783,7 +39946,7 @@ builtin = "rust"
         }
         let alias = root.path().join("active");
         symlink(&first, &alias).unwrap();
-        let first_listing = git_status_listing(alias.to_str().unwrap());
+        let first_listing = git_status_listing(alias.to_str().unwrap()).await;
         assert_eq!(
             first_listing["root"],
             first.canonicalize().unwrap().to_string_lossy().into_owned()
@@ -39791,7 +39954,7 @@ builtin = "rust"
 
         fs::remove_file(&alias).unwrap();
         symlink(&second, &alias).unwrap();
-        let second_listing = git_status_listing(alias.to_str().unwrap());
+        let second_listing = git_status_listing(alias.to_str().unwrap()).await;
         assert_eq!(
             second_listing["root"],
             second

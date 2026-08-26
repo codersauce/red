@@ -3117,6 +3117,7 @@ fn benchmark_git_status_indexing() -> Result<serde_json::Value> {
 }
 
 fn benchmark_git_status_refresh(repository: bool) -> Result<serde_json::Value> {
+    let runtime = tokio::runtime::Runtime::new()?;
     let directory = tempfile::tempdir()?;
     let nested = directory.path().join("src/workspace/nested");
     std::fs::create_dir_all(&nested)?;
@@ -3144,7 +3145,7 @@ fn benchmark_git_status_refresh(repository: bool) -> Result<serde_json::Value> {
     let path = nested.to_string_lossy();
     let started = Instant::now();
     for _ in 0..GIT_STATUS_REFRESHES {
-        let listing = red::editor::git_status_listing(black_box(&path));
+        let listing = runtime.block_on(red::editor::git_status_listing(black_box(&path)));
         if repository {
             anyhow::ensure!(
                 listing["root"].is_string()

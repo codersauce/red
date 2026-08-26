@@ -39,12 +39,14 @@ const FILE_NAME_STYLE: &[&str] = &["sideBar.foreground", "editor.foreground"];
 #[derive(Debug, Clone)]
 struct TreeDirectory {
     entries: Arc<Vec<Value>>,
+    notice: String,
 }
 
 #[derive(Debug, Clone, Copy)]
 enum TreeRowSource {
     Root,
     Entry { directory: u32, entry: u32 },
+    Notice { directory: Option<u32> },
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -232,6 +234,9 @@ impl TreePanelModel {
             directory_indices.insert(path.to_string(), directories.len());
             directories.push(TreeDirectory {
                 entries: Arc::clone(entries),
+                notice: value_field_string(child, "notice")
+                    .unwrap_or_default()
+                    .to_string(),
             });
         }
 
@@ -254,6 +259,8 @@ impl TreePanelModel {
         if root_expanded {
             if let Some(&root) = directory_indices.get(".") {
                 model.append_directory(root, 0, &directory_indices, &expanded)?;
+            } else {
+                model.append_notice(0, None)?;
             }
         }
         Ok(model)
@@ -299,9 +306,26 @@ impl TreePanelModel {
             if open {
                 if let Some(&child) = directory_indices.get(path) {
                     self.append_directory(child, row_index, directory_indices, expanded)?;
+                } else {
+                    self.append_notice(row_index, None)?;
                 }
             }
         }
+        if !self.directories[directory].notice.is_empty() {
+            self.append_notice(parent, Some(directory))?;
+        }
+        Ok(())
+    }
+
+    fn append_notice(&mut self, parent: usize, directory: Option<usize>) -> anyhow::Result<()> {
+        self.rows.push(TreeRow {
+            source: TreeRowSource::Notice {
+                directory: directory.map(u32::try_from).transpose()?,
+            },
+            parent: Some(u32::try_from(parent)?),
+            last: true,
+            expanded: false,
+        });
         Ok(())
     }
 
@@ -331,6 +355,7 @@ impl TreePanelModel {
     fn row_id_matches(&self, row: &TreeRow, id: &str) -> bool {
         match row.source {
             TreeRowSource::Root => id == ".",
+            TreeRowSource::Notice { .. } => false,
             TreeRowSource::Entry { directory, entry } => {
                 self.directories[directory as usize]
                     .entries
@@ -345,6 +370,23 @@ impl TreePanelModel {
         let row = self.rows.get(index)?;
         match row.source {
             TreeRowSource::Root => Some(self.root_row(row.expanded)),
+            TreeRowSource::Notice { directory } => {
+                let parent = self.row(row.parent? as usize)?;
+                let text = directory.map_or("Loading…", |directory| {
+                    self.directories[directory as usize].notice.as_str()
+                });
+                let mut segments = Vec::new();
+                self.append_branch_segments(index, &mut segments);
+                segments.push(segment(text, INDENT_STYLE, false));
+                Some(PanelRow {
+                    id: format!("notice:{}", parent.id),
+                    path: parent.path,
+                    kind: PanelRowKind::Directory,
+                    expanded: Some(false),
+                    segments,
+                    right_segments: Vec::new(),
+                })
+            }
             TreeRowSource::Entry { directory, entry } => {
                 let entry = self
                     .directories
@@ -652,6 +694,32 @@ mod tests {
             Value::from_json(serde_json::json!([])),
         ])
         .unwrap()
+    }
+
+    #[test]
+    fn expanded_directories_show_loading_and_read_errors_without_hiding_cached_entries() {
+        let loading = model(
+            serde_json::json!([{
+                "path":".", "entries":[{"path":"./src","name":"src","kind":"directory"}]
+            }]),
+            serde_json::json!([".", "./src"]),
+        );
+        assert_eq!(
+            loading.row(2).unwrap().segments.last().unwrap().text,
+            "Loading…"
+        );
+        let failed = model(
+            serde_json::json!([{
+                "path":".", "notice":"Cannot read · R retry",
+                "entries":[{"path":"./cached.rs","name":"cached.rs","kind":"file"}]
+            }]),
+            serde_json::json!(["."]),
+        );
+        assert_eq!(failed.row(1).unwrap().id, "./cached.rs");
+        assert_eq!(
+            failed.row(2).unwrap().segments.last().unwrap().text,
+            "Cannot read · R retry"
+        );
     }
 
     #[test]

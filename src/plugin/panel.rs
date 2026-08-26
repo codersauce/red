@@ -2282,6 +2282,7 @@ pub struct PluginPanel {
     pub selected: usize,
     pub scroll: usize,
     search: Option<RowPanelSearch>,
+    status: String,
 }
 
 struct RowPanelSearch {
@@ -2308,6 +2309,7 @@ impl PluginPanel {
             selected: 0,
             scroll: 0,
             search: None,
+            status: String::new(),
         }
     }
 
@@ -2470,6 +2472,7 @@ impl PluginPanel {
         panel_height
             .saturating_sub(self.rows_start())
             .saturating_sub(usize::from(self.search.is_some()))
+            .saturating_sub(usize::from(!self.status.is_empty()))
             .max(1)
     }
 
@@ -3002,6 +3005,18 @@ impl PanelManager {
             return false;
         }
         search.status = status;
+        true
+    }
+
+    /// Updates nonselectable footer text without rebuilding the filesystem tree.
+    pub fn set_panel_status(&mut self, id: &str, status: String) -> bool {
+        let Some(panel) = self.panels.get_mut(id) else {
+            return false;
+        };
+        if panel.status == status {
+            return false;
+        }
+        panel.status = status;
         true
     }
 
@@ -4541,6 +4556,13 @@ impl PanelManager {
 
         let panel = self.panels.get_mut(&placement.id)?;
         let screen_row = y.saturating_sub(placement.y);
+        let content_end = placement
+            .height
+            .saturating_sub(usize::from(panel.search.is_some()))
+            .saturating_sub(usize::from(!panel.status.is_empty()));
+        if screen_row >= content_end {
+            return None;
+        }
         panel.select_screen_row(screen_row);
 
         let clicked_row = screen_row
@@ -4989,7 +5011,8 @@ fn render_panel_at(
     let rows_start = if panel.config.title.is_some() { 1 } else { 0 };
     let visible_rows = height
         .saturating_sub(rows_start)
-        .saturating_sub(usize::from(panel.search.is_some()));
+        .saturating_sub(usize::from(panel.search.is_some()))
+        .saturating_sub(usize::from(!panel.status.is_empty()));
     let mut paint_row = |screen_row: usize, row: &PanelRow| {
         let y = position.y.saturating_add(rows_start + screen_row);
         let index = panel.scroll + screen_row;
@@ -5024,6 +5047,15 @@ fn render_panel_at(
         {
             paint_row(screen_row, row);
         }
+    }
+    let search_height = usize::from(panel.search.is_some());
+    if !panel.status.is_empty() && height > search_height {
+        buffer.set_text(
+            position.x,
+            position.y + height - search_height - 1,
+            &fit_display_width(&panel.status, width),
+            &surface_style,
+        );
     }
     if let Some(search) = &panel.search {
         let row = position.y.saturating_add(height.saturating_sub(1));
@@ -9629,6 +9661,26 @@ mod tests {
             Some(crate::editor::Mode::Normal)
         );
         assert!(manager.close_panel_search("tree"));
+    }
+
+    #[test]
+    fn row_panel_status_preserves_rows_and_cannot_activate_hidden_files() {
+        let mut manager = PanelManager::default();
+        manager.create_panel("tree".to_string(), PanelConfig::default());
+        manager.update_panel("tree", vec![row("first"), row("second"), row("third")]);
+        manager.set_panel_status("tree", "Updating Git status…".to_string());
+        manager.open_panel_search("tree", "pick", "/");
+        let mut buffer = RenderBuffer::new(30, 5, &Style::default());
+        manager.render(&mut buffer, &Theme::default());
+        assert_eq!(row_text(&buffer, 0).trim(), "first");
+        assert_eq!(row_text(&buffer, 1).trim(), "Updating Git status…");
+        assert!(row_text(&buffer, 2).starts_with("/pick"));
+        assert!(manager.focus_panel_at_position(1, 1, 30, 5).is_none());
+        assert!(manager.focus_panel_at_position(1, 1, 30, 5).is_none());
+        assert_eq!(manager.panels["tree"].selected, 0);
+        manager.set_panel_status("tree", String::new());
+        manager.render(&mut buffer, &Theme::default());
+        assert_eq!(row_text(&buffer, 1).trim(), "second");
     }
 
     #[test]
