@@ -472,7 +472,9 @@ I completed three independent, release-ready workstreams without publishing anyt
 
 **Branch:** `fcoury/release-campaign`
 
-Created a shared [release campaign manifest](../../red.fcoury-release-campaign/release/campaign.toml) that controls messaging across:
+Created a shared release campaign manifest
+(`release/campaign.toml` in the `red.fcoury-release-campaign` sibling worktree)
+that controls messaging across:
 
 - GitHub release introductions.
 - Discord announcements.
@@ -483,7 +485,11 @@ The campaign highlights source-linked Agent walkthroughs, inline assistance, Vim
 
 GitHub releases now lead with curated highlights while retaining the complete changelog. Discord uses the same editorial priorities.
 
-The new [social publisher](../../red.fcoury-release-campaign/scripts/social_release.py) supports X and Bluesky, including images, X videos, and accessibility descriptions. **It defaults to preview mode; posting requires an explicit `--publish`.**
+The new social publisher
+(`scripts/social_release.py` in the `red.fcoury-release-campaign` sibling
+worktree) supports X and Bluesky, including images, X videos, and accessibility
+descriptions. **It defaults to preview mode; posting requires an explicit
+`--publish`.**
 
 Example X preview:
 
@@ -516,7 +522,9 @@ Corrected misleading safety descriptions: **full Agent changes are saved to disk
 
 **Branch:** `fcoury/release-refresh`
 
-Refreshed the [homepage](../../red-website.fcoury-release-refresh/app/page.tsx), [documentation](../../red-website.fcoury-release-refresh/app/docs/page.tsx), and added a dedicated [release-highlights page](../../red-website.fcoury-release-refresh/app/releases/page.tsx).
+Refreshed the homepage (`app/page.tsx`), documentation (`app/docs/page.tsx`),
+and added a dedicated release-highlights page (`app/releases/page.tsx`) in the
+`red-website.fcoury-release-refresh` sibling worktree.
 
 Changes include:
 
