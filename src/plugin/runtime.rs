@@ -9246,6 +9246,94 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bundled_agent_threads_show_and_stop_running_delegate_activity() {
+        drain_requests();
+        let mut runtime = Runtime::new();
+        runtime
+            .load_plugin("agent", include_str!("../../plugins/agent.hk"))
+            .await
+            .unwrap();
+
+        runtime.execute_command("AgentThreads").await.unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::OpenWorkspace { id, .. } if id == "agent-threads"
+        ));
+        let request_id = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::AgentListThreads { request_id } => request_id,
+            _ => panic!("expected thread list request"),
+        };
+        let thread = serde_json::json!({
+            "thread_id": "delegate-1",
+            "cwd": "/workspace/red.delegate-tests",
+            "mode": "delegate",
+            "title": "Run the test suite",
+            "branch": "red/delegate/tests",
+            "base_cwd": "/workspace/red",
+            "model_info": {},
+            "items": [],
+            "selected": false,
+            "live": true,
+            "status": "Running",
+            "status_detail": null,
+            "activity": {
+                "title": "Running cargo test",
+                "full_title": "Running cargo test in .",
+                "status": "in_progress",
+                "detail": "",
+            },
+        });
+        runtime
+            .resolve_request(
+                request_id,
+                serde_json::json!({ "threads": [thread.clone()] }),
+            )
+            .await
+            .unwrap();
+        match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::UpdateWorkspace { id, model } => {
+                assert_eq!(id, "agent-threads");
+                let labels = model
+                    .rows
+                    .iter()
+                    .flat_map(|row| row.segments.iter())
+                    .map(|segment| segment.text.as_str())
+                    .collect::<String>();
+                assert!(labels.contains("Running cargo test"));
+                assert!(model.actions.iter().any(|action| action.hint.id == "x"));
+            }
+            _ => panic!("expected thread workspace update"),
+        }
+
+        runtime
+            .notify(
+                "workspace:event:agent-threads",
+                serde_json::json!({"action":"x", "row":{"data":thread}}),
+            )
+            .await
+            .unwrap();
+        let mut cancelled = false;
+        while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
+            cancelled |= matches!(
+                request,
+                PluginRequest::AgentCancel { session_id } if session_id == "delegate-1"
+            );
+        }
+        assert!(cancelled);
+
+        runtime
+            .notify(
+                "agent:cancelled",
+                serde_json::json!({"session_id":"delegate-1"}),
+            )
+            .await
+            .unwrap();
+        while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
+            assert!(!matches!(request, PluginRequest::AgentCloseSession { .. }));
+        }
+    }
+
+    #[tokio::test]
     async fn host_accepts_explicit_agent_context_and_exposes_context_requests() {
         drain_requests();
         let source = r#"

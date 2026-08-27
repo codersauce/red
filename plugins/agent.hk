@@ -79,6 +79,14 @@ struct AgentThread {
     live: bool,
     status: String,
     status_detail: Option<String>,
+    activity: Option<AgentThreadActivity>,
+}
+
+struct AgentThreadActivity {
+    title: String,
+    full_title: String,
+    status: String,
+    detail: String,
 }
 
 struct AgentThreadsResult { threads: [AgentThread] }
@@ -300,12 +308,14 @@ struct AgentState {
     thought: String,
     threads_open: bool,
     thread_detail: [[PanelSegment]],
+    thread_detail_id: String,
     delegate_task: String,
     delegate_base_cwd: String,
     delegate_branch: String,
     delegate_worktree: String,
     delegate_process: String,
     delegate_error: String,
+    dashboard_cancel_session: String,
 }
 
 #[red::state]
@@ -364,12 +374,14 @@ fn initial_state() -> AgentState {
         thought: "",
         threads_open: false,
         thread_detail: [[PanelSegment { text: "Select a thread", style: muted_style() }]],
+        thread_detail_id: "",
         delegate_task: "",
         delegate_base_cwd: "",
         delegate_branch: "",
         delegate_worktree: "",
         delegate_process: "",
         delegate_error: "",
+        dashboard_cancel_session: "",
     };
 }
 
@@ -1103,14 +1115,22 @@ fn render_status() {
 
 #[red::on("agent:activity")]
 fn activity(event: AgentActivityEvent) {
-    if !is_current_session(event.session_id) {
-        return;
-    }
+    let current = is_current_session(event.session_id);
     match event.update {
-        AgentActivityUpdate::AgentThoughtChunk(update) => thought_activity(update),
-        AgentActivityUpdate::ToolCall(update) => tool_activity(update),
-        AgentActivityUpdate::ToolCallUpdate(update) => update_tool_activity(update),
-        AgentActivityUpdate::Plan => set_phase("working", "Planning…"),
+        AgentActivityUpdate::AgentThoughtChunk(update) => {
+            if current { thought_activity(update); }
+        }
+        AgentActivityUpdate::ToolCall(update) => {
+            refresh_threads();
+            if current { tool_activity(update); }
+        }
+        AgentActivityUpdate::ToolCallUpdate(update) => {
+            refresh_threads();
+            if current { update_tool_activity(update); }
+        }
+        AgentActivityUpdate::Plan => {
+            if current { set_phase("working", "Planning…"); }
+        }
         AgentActivityUpdate::Unknown(update) => {},
     }
 }
@@ -2005,6 +2025,16 @@ fn submit_next_queued() {
 
 #[red::on("agent:cancelled")]
 fn cancelled(event: AgentSessionEvent) {
+    refresh_threads();
+    if event.session_id == state().dashboard_cancel_session {
+        red::state_patch(AgentState { dashboard_cancel_session: "" });
+        red::execute("Print", "Stopping delegated work…");
+        if is_current_session(event.session_id) {
+            red::execute("SetTextPanelStatus", "agent-conversation");
+            set_phase("stopping", "Stopping…");
+        }
+        return;
+    }
     if !is_current_session(event.session_id) {
         return;
     }
@@ -2542,14 +2572,25 @@ fn append_thread_section(rows: [AgentThreadRow], threads: [AgentThread], status:
         if thread.selected { marker = "● "; }
         let mode = "Pair";
         if thread.mode == "delegate" { mode = "Delegate"; }
+        let segments = [
+            PanelSegment { text: marker, style: success_style() },
+            PanelSegment { text: title, style: normal_style() },
+        ];
+        if thread.status == "Running" {
+            if let Some(activity) = thread.activity {
+                if activity.title != "" {
+                    segments = red::push(segments, PanelSegment {
+                        text: " · " + activity.title,
+                        style: muted_style(),
+                    });
+                }
+            }
+        }
         rows = red::push(rows, AgentThreadRow {
             id: "thread:" + thread.thread_id,
             selectable: true,
             depth: 1,
-            segments: [
-                PanelSegment { text: marker, style: success_style() },
-                PanelSegment { text: title, style: normal_style() },
-            ],
+            segments: segments,
             right_segments: [PanelSegment { text: mode, style: muted_style() }],
             data: Some(thread),
         });
@@ -2559,11 +2600,17 @@ fn append_thread_section(rows: [AgentThreadRow], threads: [AgentThread], status:
 
 fn render_threads(result: AgentThreadsResult) {
     if !state().threads_open { return; }
+    for thread in result.threads {
+        if thread.thread_id == state().thread_detail_id {
+            red::state_patch(AgentState { thread_detail: thread_detail(thread) });
+        }
+    }
     let rows: [AgentThreadRow] = [];
     rows = append_thread_section(rows, result.threads, "Needs you", "Needs you");
     rows = append_thread_section(rows, result.threads, "Failed", "Failed");
     rows = append_thread_section(rows, result.threads, "Running", "Running");
     rows = append_thread_section(rows, result.threads, "Ready to review", "Ready to review");
+    rows = append_thread_section(rows, result.threads, "Stopped", "Stopped");
     rows = append_thread_section(rows, result.threads, "Current", "Current");
     rows = append_thread_section(rows, result.threads, "History", "History");
     if red::len(rows) == 0 {
@@ -2577,6 +2624,7 @@ fn render_threads(result: AgentThreadsResult) {
         detail: state().thread_detail,
         actions: [
             AgentWorkspaceAction { hint: AgentWorkspaceActionHint { id: "activate", key: "enter", label: "open", priority: "essential" } },
+            AgentWorkspaceAction { hint: AgentWorkspaceActionHint { id: "x", key: "x", label: "stop", priority: "essential" } },
             AgentWorkspaceAction { hint: AgentWorkspaceActionHint { id: "n", key: "n", label: "new…", priority: "secondary" } },
             AgentWorkspaceAction { hint: AgentWorkspaceActionHint { id: "r", key: "r", label: "refresh", priority: "secondary" } },
         ],
@@ -2598,6 +2646,14 @@ fn thread_detail(thread: AgentThread) -> [[PanelSegment]] {
         detail = red::push(detail, [PanelSegment { text: "Branch  " + branch, style: normal_style() }]);
     }
     detail = red::push(detail, [PanelSegment { text: "Worktree  " + thread.cwd, style: muted_style() }]);
+    if let Some(activity) = thread.activity {
+        detail = red::push(detail, []);
+        detail = red::push(detail, [PanelSegment { text: "Activity", style: heading_style() }]);
+        detail = red::push(detail, [PanelSegment { text: activity.full_title, style: normal_style() }]);
+        let activity_detail = activity.status;
+        if activity.detail != "" { activity_detail = activity_detail + " · " + activity.detail; }
+        detail = red::push(detail, [PanelSegment { text: activity_detail, style: muted_style() }]);
+    }
     detail = red::push(detail, []);
     for item in thread.items {
         let label = "Agent";
@@ -2622,7 +2678,20 @@ fn threads_event(event: AgentThreadWorkspaceEvent) {
     if event.action == "r" { refresh_threads(); return; }
     let row = event.row;
     if row == red::null() || row.data.thread_id == red::null() { return; }
-    red::state_patch(AgentState { thread_detail: thread_detail(row.data) });
+    red::state_patch(AgentState {
+        thread_detail: thread_detail(row.data),
+        thread_detail_id: row.data.thread_id,
+    });
+    if event.action == "x" {
+        if row.data.mode != "delegate" || row.data.status != "Running" {
+            red::execute("Print", "Only running delegated work can be stopped");
+            return;
+        }
+        red::state_patch(AgentState { dashboard_cancel_session: row.data.thread_id });
+        red::execute("AgentCancel", row.data.thread_id);
+        red::execute("Print", "Stopping delegated work…");
+        return;
+    }
     if event.action == "activate" {
         red::execute("AgentSelectThread", row.data.thread_id);
         return;

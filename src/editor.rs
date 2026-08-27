@@ -10840,6 +10840,12 @@ impl Editor {
                 {
                     self.agent_manager.complete_agent_message(session_id, text);
                 }
+                CodexEvent::Activity { session_id, update }
+                    if self.agent_manager.is_session_active(session_id) =>
+                {
+                    self.agent_manager
+                        .record_thread_activity(session_id, update);
+                }
                 _ => {}
             }
             match &event {
@@ -10882,6 +10888,9 @@ impl Editor {
                 }
                 CodexEvent::Completed { session_id, .. } => {
                     self.agent_manager.mark_session_finished(session_id);
+                }
+                CodexEvent::Cancelled { session_id } => {
+                    self.agent_manager.mark_session_cancelled(session_id);
                 }
                 CodexEvent::Failed {
                     session_id: Some(session_id),
@@ -11210,6 +11219,7 @@ impl Editor {
                                 "live": self.agent_manager.is_session_live(&thread_id),
                                 "status": status,
                                 "status_detail": detail,
+                                "activity": self.agent_manager.thread_activity(&thread_id),
                             })
                         })
                         .collect::<Vec<_>>();
@@ -11314,7 +11324,7 @@ impl Editor {
                         continue;
                     };
                     if bridge
-                        .send(CodexCommand::NewSession { cwd: cwd.clone() })
+                        .send(CodexCommand::NewDelegateSession { cwd: cwd.clone() })
                         .await
                         .is_err()
                     {
@@ -11359,14 +11369,18 @@ impl Editor {
                     let Some(bridge) = self.agent_manager.bridge() else {
                         continue;
                     };
-                    if bridge
-                        .send(CodexCommand::ResumeSession {
+                    let command = if self.agent_manager.is_delegate(&session_id) {
+                        CodexCommand::ResumeDelegateSession {
                             cwd,
                             session_id: session_id.clone(),
-                        })
-                        .await
-                        .is_err()
-                    {
+                        }
+                    } else {
+                        CodexCommand::ResumeSession {
+                            cwd,
+                            session_id: session_id.clone(),
+                        }
+                    };
+                    if bridge.send(command).await.is_err() {
                         let message = self
                             .finish_agent_bridge(
                                 runtime,

@@ -11,6 +11,7 @@ use crate::{
     agent_tools::{PendingEditorTool, PendingEditorToolResponse},
     codex::CodexBridge,
 };
+use serde::Serialize;
 
 /// Encapsulates background AI agent task state, active turn metrics, and tool channels.
 #[derive(Default)]
@@ -36,7 +37,9 @@ pub struct AgentManager {
     live_sessions: HashSet<String>,
     attention_sessions: HashSet<String>,
     review_ready_sessions: HashSet<String>,
+    cancelled_sessions: HashSet<String>,
     failed_sessions: HashMap<String, String>,
+    thread_activity: HashMap<String, AgentThreadActivity>,
     pending_delegate: Option<PendingDelegate>,
     forgotten_conversations: HashSet<String>,
 }
@@ -47,6 +50,14 @@ pub struct PendingDelegate {
     pub title: String,
     pub branch: String,
     pub base_cwd: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct AgentThreadActivity {
+    pub title: String,
+    pub full_title: String,
+    pub status: String,
+    pub detail: String,
 }
 
 impl AgentManager {
@@ -164,7 +175,13 @@ impl AgentManager {
 
     /// Marks a session as active.
     pub fn mark_session_active(&mut self, session_id: impl Into<String>) {
-        self.active_sessions.insert(session_id.into());
+        let session_id = session_id.into();
+        self.attention_sessions.remove(&session_id);
+        self.review_ready_sessions.remove(&session_id);
+        self.cancelled_sessions.remove(&session_id);
+        self.failed_sessions.remove(&session_id);
+        self.thread_activity.remove(&session_id);
+        self.active_sessions.insert(session_id);
     }
 
     /// Marks a session as inactive.
@@ -420,10 +437,11 @@ impl AgentManager {
     pub fn mark_session_finished(&mut self, session_id: &str) {
         self.attention_sessions.remove(session_id);
         self.failed_sessions.remove(session_id);
-        if self
-            .conversations
-            .get(session_id)
-            .is_some_and(|conversation| conversation.mode == AgentThreadMode::Delegate)
+        if !self.cancelled_sessions.contains(session_id)
+            && self
+                .conversations
+                .get(session_id)
+                .is_some_and(|conversation| conversation.mode == AgentThreadMode::Delegate)
         {
             self.review_ready_sessions.insert(session_id.to_string());
         }
@@ -432,8 +450,63 @@ impl AgentManager {
     pub fn mark_session_failed(&mut self, session_id: &str, message: impl Into<String>) {
         self.attention_sessions.remove(session_id);
         self.review_ready_sessions.remove(session_id);
+        self.cancelled_sessions.remove(session_id);
         self.failed_sessions
             .insert(session_id.to_string(), message.into());
+    }
+
+    pub fn mark_session_cancelled(&mut self, session_id: &str) {
+        self.attention_sessions.remove(session_id);
+        self.review_ready_sessions.remove(session_id);
+        self.failed_sessions.remove(session_id);
+        self.cancelled_sessions.insert(session_id.to_string());
+        if let Some(activity) = self.thread_activity.get_mut(session_id) {
+            activity.status = "cancelled".to_string();
+            activity.detail = "Stopped by user".to_string();
+        }
+    }
+
+    pub fn record_thread_activity(&mut self, session_id: &str, update: &serde_json::Value) {
+        if !matches!(
+            update
+                .get("session_update")
+                .and_then(serde_json::Value::as_str),
+            Some("tool_call" | "tool_call_update")
+        ) {
+            return;
+        }
+        let existing = self.thread_activity.get(session_id);
+        let field = |name: &str| {
+            update
+                .get(name)
+                .and_then(serde_json::Value::as_str)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+        };
+        let title = field("title").or_else(|| existing.map(|activity| activity.title.clone()));
+        let Some(title) = title else { return };
+        let full_title = field("full_title")
+            .or_else(|| existing.map(|activity| activity.full_title.clone()))
+            .unwrap_or_else(|| title.clone());
+        let status = field("status")
+            .or_else(|| existing.map(|activity| activity.status.clone()))
+            .unwrap_or_else(|| "in_progress".to_string());
+        let detail = field("detail")
+            .or_else(|| existing.map(|activity| activity.detail.clone()))
+            .unwrap_or_default();
+        self.thread_activity.insert(
+            session_id.to_string(),
+            AgentThreadActivity {
+                title,
+                full_title,
+                status,
+                detail,
+            },
+        );
+    }
+
+    pub fn thread_activity(&self, session_id: &str) -> Option<&AgentThreadActivity> {
+        self.thread_activity.get(session_id)
     }
 
     pub fn thread_status(&self, session_id: &str) -> (&'static str, Option<&str>) {
@@ -448,6 +521,9 @@ impl AgentManager {
         }
         if self.review_ready_sessions.contains(session_id) {
             return ("Ready to review", None);
+        }
+        if self.cancelled_sessions.contains(session_id) {
+            return ("Stopped", Some("Stopped by user"));
         }
         if self.selected_conversation.as_deref() == Some(session_id) {
             return ("Current", None);
@@ -479,7 +555,9 @@ impl AgentManager {
         self.live_sessions.remove(session_id);
         self.attention_sessions.remove(session_id);
         self.review_ready_sessions.remove(session_id);
+        self.cancelled_sessions.remove(session_id);
         self.failed_sessions.remove(session_id);
+        self.thread_activity.remove(session_id);
         if self.selected_conversation.as_deref() == Some(session_id) {
             self.selected_conversation = self.conversation_order.last().cloned();
         }
@@ -595,6 +673,19 @@ mod tests {
 
         manager.mark_session_active("delegate");
         assert_eq!(manager.thread_status("delegate").0, "Running");
+        manager.record_thread_activity(
+            "delegate",
+            &json!({
+                "session_update": "tool_call",
+                "title": "Running cargo test",
+                "full_title": "Running cargo test in .",
+                "status": "in_progress",
+            }),
+        );
+        assert_eq!(
+            manager.thread_activity("delegate").unwrap().title,
+            "Running cargo test"
+        );
         manager.mark_session_inactive("delegate");
         manager.mark_session_finished("delegate");
         assert_eq!(manager.thread_status("delegate").0, "Ready to review");
@@ -604,6 +695,27 @@ mod tests {
             "delegate"
         );
         assert_eq!(manager.selected_conversation_id(), Some("delegate"));
+    }
+
+    #[test]
+    fn stopped_delegate_does_not_become_ready_when_interruption_finishes() {
+        let mut manager = AgentManager::new();
+        manager.register_delegate(
+            "/workspace.delegate-task".into(),
+            "Run tests".to_string(),
+            "red/delegate/tests".to_string(),
+            "/workspace".into(),
+        );
+        manager.begin_conversation("delegate", Path::new("/workspace.delegate-task"));
+        manager.mark_session_active("delegate");
+        manager.mark_session_cancelled("delegate");
+        manager.mark_session_inactive("delegate");
+        manager.mark_session_finished("delegate");
+
+        assert_eq!(
+            manager.thread_status("delegate"),
+            ("Stopped", Some("Stopped by user"))
+        );
     }
 
     #[tokio::test]

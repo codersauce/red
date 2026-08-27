@@ -10,6 +10,7 @@ pub(super) fn item_update(item: &Value, completed: bool, cwd: &Path) -> Option<V
             return Some(json!({"session_update": "agent_thought_chunk"}));
         }
         "dynamicToolCall" => {}
+        "commandExecution" => return command_update(item, completed, cwd),
         _ => return None,
     }
     let id = item["id"].as_str().filter(|id| !id.is_empty())?;
@@ -48,6 +49,62 @@ pub(super) fn item_update(item: &Value, completed: bool, cwd: &Path) -> Option<V
         "tool_call_id": id,
         "kind": kind,
         "title": label(&title, 72),
+        "full_title": full_title,
+        "status": status,
+        "detail": detail,
+    }))
+}
+
+fn command_update(item: &Value, completed: bool, cwd: &Path) -> Option<Value> {
+    let id = item["id"].as_str().filter(|id| !id.is_empty())?;
+    let command = label(item["command"].as_str().unwrap_or("command"), 2048);
+    let short_command = label(command.lines().next().unwrap_or("command"), 96);
+    let command_cwd = item["cwd"].as_str().unwrap_or_default();
+    let compact_cwd = compact_path(command_cwd, cwd);
+    let compact_cwd = if compact_cwd.is_empty() {
+        ".".to_string()
+    } else {
+        compact_cwd
+    };
+    let status = if !completed {
+        "in_progress"
+    } else {
+        match item["status"].as_str() {
+            Some("failed") => "failed",
+            Some("declined") => "cancelled",
+            _ => "completed",
+        }
+    };
+    let title = if completed {
+        format!("Ran {short_command}")
+    } else {
+        format!("Running {short_command}")
+    };
+    let full_title = if command_cwd.is_empty() {
+        title.clone()
+    } else {
+        format!("{title} in {compact_cwd}")
+    };
+    let detail = if !completed {
+        String::new()
+    } else {
+        let mut parts = Vec::new();
+        if let Some(exit_code) = item["exitCode"].as_i64() {
+            parts.push(format!("exit {exit_code}"));
+        }
+        if let Some(duration_ms) = item["durationMs"].as_i64() {
+            parts.push(format!("{duration_ms} ms"));
+        }
+        if parts.is_empty() && status == "failed" {
+            parts.push("Command failed".to_string());
+        }
+        parts.join(" · ")
+    };
+    Some(json!({
+        "session_update": if completed { "tool_call_update" } else { "tool_call" },
+        "tool_call_id": id,
+        "kind": "command",
+        "title": label(&title, 112),
         "full_title": full_title,
         "status": status,
         "detail": detail,
@@ -195,5 +252,26 @@ mod tests {
         assert_eq!(update["title"], "Creating go/");
         assert_eq!(update["kind"], "create");
         assert_eq!(update["full_title"], "Creating /workspace/go/");
+    }
+
+    #[test]
+    fn command_execution_reports_bounded_progress_without_output() {
+        let item = json!({
+            "id": "exec",
+            "type": "commandExecution",
+            "command": "cargo test --all-targets",
+            "cwd": "/workspace/project",
+            "status": "completed",
+            "exitCode": 0,
+            "durationMs": 1234,
+            "aggregatedOutput": "private test output",
+        });
+        let start = item_update(&item, false, Path::new("/workspace/project")).unwrap();
+        assert_eq!(start["title"], "Running cargo test --all-targets");
+        assert_eq!(start["status"], "in_progress");
+        let completed = item_update(&item, true, Path::new("/workspace/project")).unwrap();
+        assert_eq!(completed["title"], "Ran cargo test --all-targets");
+        assert_eq!(completed["detail"], "exit 0 · 1234 ms");
+        assert!(!completed.to_string().contains("private test output"));
     }
 }
