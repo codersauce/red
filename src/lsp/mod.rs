@@ -529,6 +529,25 @@ pub trait LspClient: std::any::Any + Send {
         None
     }
 
+    /// Read-only lifecycle status; this must not start a server.
+    fn server_status_for_file(&self, file: &str) -> &'static str {
+        if self.server_capabilities_for_file(file).is_some() {
+            "ready"
+        } else {
+            "not_started"
+        }
+    }
+
+    /// Identity of a ready server instance, invalidated on replacement or failure.
+    fn server_instance_for_file(&self, file: &str) -> Option<u64> {
+        self.server_capabilities_for_file(file).map(|_| 0)
+    }
+
+    /// Best-effort cancellation, routed to the same server as the original request.
+    async fn cancel_request_for_file(&mut self, _file: &str, _id: i64) -> Result<(), LspError> {
+        Ok(())
+    }
+
     /// Reports whether the server associated with `file` supports formatting.
     fn supports_document_formatting(&self, _file: &str) -> bool {
         true

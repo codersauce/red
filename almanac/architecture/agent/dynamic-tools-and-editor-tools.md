@@ -17,7 +17,7 @@ sources:
     path: docs/AGENT_WORKFLOW.md
 ---
 
-Dynamic tools and editor tools are Red's app-server capability layer for Codex. The Codex worker publishes four workspace dynamic tools directly, extends them with eight strict editor-tool schemas, and routes editor-aware reads, writes, annotations, selections, and safe actions through the editor owner task [@codex] [@tools]. This layer is where the [Codex App-Server Workflow](codex-app-server-workflow) becomes editor-aware: Codex can list, search, read, open, select, annotate, run allow-listed editor actions, and request edits, but each operation is bounded, schema-checked, session-scoped, and mediated by Red [@workflow] [@editor].
+Dynamic tools and editor tools are Red's app-server capability layer for Codex. The Codex worker publishes four workspace dynamic tools directly, extends them with thirteen strict editor-tool schemas, and routes editor-aware reads, writes, annotations, selections, and safe actions through the editor owner task [@codex] [@tools]. This layer is where the [Codex App-Server Workflow](codex-app-server-workflow) becomes editor-aware: Codex can list, search, read, open, select, annotate, run allow-listed editor actions, and request edits, but each operation is bounded, schema-checked, session-scoped, and mediated by Red [@workflow] [@editor].
 
 ## Tool Surface
 
@@ -27,7 +27,7 @@ The app-server worker publishes `list_files`, `search_files`, `read_file`, and `
 
 `create_directory` is the one editor tool that mutates the workspace without opening or changing an editor buffer. It creates a directory and missing parents inside the workspace, accepts an existing directory as success, and remains subject to the same workspace, ignore, protected-path, symlink, and platform support checks described by the workflow [@tools] [@workflow].
 
-The workflow documentation describes the same twelve-tool contract and its expected behavior, including bounded file listing, bounded search, Red-mediated reads, revision-checked writes, directory creation, editor state snapshots, file opening, UTF-16 selections, revision-checked edits, source annotations, and allow-listed navigation or LSP actions [@workflow].
+The workflow documentation describes the same seventeen-tool contract and its expected behavior, including bounded file listing, bounded search, Red-mediated reads, revision-checked writes, directory creation, editor state snapshots, file opening, UTF-16 selections, revision-checked edits, source annotations, and allow-listed navigation or LSP actions [@workflow].
 
 ## Strict Editor Schemas
 
@@ -42,6 +42,30 @@ a visible Agent-owned annotation, switches to the owning buffer, selects the
 tracked source anchor, and opens the shared inline-comment card. Missing or
 dismissed IDs produce a quiet unavailable message without any fallback to
 filesystem or external-link behavior [@editor].
+
+## Structured LSP Tools
+
+The full Agent also receives `lsp_status`, `lsp_diagnostics`,
+`lsp_prepare_rename`, `lsp_preview_rename`, and `lsp_apply_edit`. Their strict
+schemas live beside the other editor tools; `src/editor/agent_lsp.rs` owns the
+pending responses, deadlines, diagnostic metadata, and expiring rename plans.
+Agent requests share existing servers but are correlated separately from UI and
+plugin requests, so they return data without opening dialogs or moving focus.
+
+Rename preparation and disk validation run on blocking workers. The editor
+rechecks session/turn ownership, server identity, source and target revisions,
+and access policy before committing text through its normal mutation boundary.
+Resource operations are rejected. Previews are bounded and expire after 120
+seconds or when their active turn or source state changes. Applying a plan never
+saves files; changes have Agent-origin undo transactions and participate in
+inline-to-Agent edit receipts. Query and application failures are returned to
+the caller rather than merely printed in the command line.
+
+Diagnostics are collected independently of display settings. Results distinguish
+known-report coverage from project-wide verification and provisional, stale,
+unversioned, or absent reports. File refresh uses a diagnostic pull when supported
+or a bounded wait for push reports. See the [Agent workflow](../../../docs/AGENT_WORKFLOW.md)
+for filters, pagination, limits, and the explicit unsaved-edit contract.
 
 ## UTF-16 Editor Boundary
 

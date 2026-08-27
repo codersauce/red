@@ -91,6 +91,8 @@ for line in sys.stdin:
             "get_editor_state", "open_file", "select_text", "apply_edits",
             "run_editor_action", "create_directory", "add_annotations",
             "dismiss_annotations",
+            "lsp_status", "lsp_diagnostics", "lsp_prepare_rename",
+            "lsp_preview_rename", "lsp_apply_edit",
         }
         tool_names = [tool["name"] for tool in message["params"]["dynamicTools"]]
         assert len(tool_names) == len(expected_tools) and set(tool_names) == expected_tools, tool_names

@@ -1,5 +1,7 @@
 use std::{
+    collections::VecDeque,
     path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
     sync::{Arc, Mutex},
 };
 
@@ -72,12 +74,19 @@ pub struct SavedDocument {
     pub disk_text: Option<String>,
 }
 
+type InboundQueue = Arc<Mutex<VecDeque<(InboundMessage, Option<String>)>>>;
+
 #[derive(Clone, Default)]
 pub struct RecordingLsp {
     saves: Arc<Mutex<Vec<SavedDocument>>>,
     events: Arc<Mutex<Vec<LspEvent>>>,
     reconfigurations: Arc<Mutex<Vec<LspConfig>>>,
     workspace_root: Option<PathBuf>,
+    capabilities: Option<ServerCapabilities>,
+    instance: Arc<AtomicU64>,
+    scripted: Arc<Mutex<VecDeque<(String, Value)>>>,
+    responses: InboundQueue,
+    last_request: Arc<Mutex<Option<red::lsp::Request>>>,
     fail_next_did_open: bool,
     fail_next_did_change: bool,
 }
@@ -91,8 +100,46 @@ impl RecordingLsp {
             workspace_root: Some(root.to_path_buf()),
             fail_next_did_open: false,
             fail_next_did_change: false,
+            ..Self::default()
         }
     }
+    pub fn with_capabilities(mut self, capabilities: Value) -> Self {
+        self.capabilities = Some(serde_json::from_value(capabilities).unwrap());
+        self.instance.store(1, Ordering::SeqCst);
+        self
+    }
+
+    pub fn queue_result(&self, method: &str, result: Value) {
+        self.scripted
+            .lock()
+            .unwrap()
+            .push_back((method.to_string(), result));
+    }
+
+    pub fn queue_message(&self, message: InboundMessage) {
+        let method = match &message {
+            InboundMessage::Message(response) => response
+                .request
+                .as_ref()
+                .map(|request| request.method.clone()),
+            _ => None,
+        };
+        self.responses.lock().unwrap().push_back((message, method));
+    }
+
+    pub fn reply_to_last(&self, result: Value) {
+        let request = self.last_request.lock().unwrap().clone().unwrap();
+        self.queue_message(InboundMessage::Message(red::lsp::ResponseMessage {
+            id: request.id,
+            result,
+            request: Some(request),
+        }));
+    }
+
+    pub fn restart(&self) {
+        self.instance.fetch_add(1, Ordering::SeqCst);
+    }
+
     pub fn saves(&self) -> Arc<Mutex<Vec<SavedDocument>>> {
         Arc::clone(&self.saves)
     }
@@ -466,9 +513,27 @@ impl LspClient for RecordingLsp {
     ) -> Result<i64, LspError> {
         self.record(LspEvent::SendRequest {
             method: method.to_string(),
-            params,
+            params: params.clone(),
         });
-        Ok(0)
+        if self.capabilities.is_none() {
+            return Ok(0);
+        }
+        let request = red::lsp::Request::new(method, params);
+        let id = request.id;
+        *self.last_request.lock().unwrap() = Some(request.clone());
+        let mut scripted = self.scripted.lock().unwrap();
+        if let Some(index) = scripted.iter().position(|(name, _)| name == method) {
+            let (_, result) = scripted.remove(index).unwrap();
+            self.responses.lock().unwrap().push_back((
+                InboundMessage::Message(red::lsp::ResponseMessage {
+                    id,
+                    result,
+                    request: Some(request),
+                }),
+                Some(method.to_string()),
+            ));
+        }
+        Ok(id)
     }
 
     async fn send_notification(
@@ -499,11 +564,17 @@ impl LspClient for RecordingLsp {
     async fn recv_response(
         &mut self,
     ) -> Result<Option<(InboundMessage, Option<String>)>, LspError> {
-        Ok(None)
+        Ok(self.responses.lock().unwrap().pop_front())
     }
 
     fn get_server_capabilities(&self) -> Option<&ServerCapabilities> {
-        None
+        self.capabilities.as_ref()
+    }
+
+    fn server_instance_for_file(&self, _file: &str) -> Option<u64> {
+        self.capabilities
+            .as_ref()
+            .map(|_| self.instance.load(Ordering::SeqCst))
     }
 
     fn workspace_root_for_file(&self, _file: &str) -> Option<PathBuf> {

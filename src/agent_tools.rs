@@ -66,6 +66,23 @@ pub struct EditorTextEdit {
     pub new_text: String,
 }
 
+/// Scope of a bounded diagnostic query; workspace means known reports, not a scan.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum LspDiagnosticScope {
+    File,
+    OpenBuffers,
+    Workspace,
+}
+
+/// A half-open UTF-16 range used to filter diagnostics in one file.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct EditorLspRange {
+    pub start: EditorPosition,
+    pub end: EditorPosition,
+}
+
 /// The visual-selection mode requested by an agent.
 #[derive(Debug, Default, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -113,6 +130,40 @@ pub enum EditorActionName {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "tool", rename_all = "snake_case", deny_unknown_fields)]
 pub enum EditorToolCall {
+    /// Inspect routing and negotiated capabilities without moving editor focus.
+    LspStatus { path: String },
+    /// Read known diagnostics, optionally refreshing one already-open file.
+    LspDiagnostics {
+        scope: LspDiagnosticScope,
+        path: Option<String>,
+        severity: Option<u8>,
+        source: Option<String>,
+        code: Option<String>,
+        range: Option<EditorLspRange>,
+        #[serde(default)]
+        offset: usize,
+        limit: usize,
+        expected_generation: Option<u64>,
+        #[serde(default)]
+        refresh: bool,
+        #[serde(default)]
+        wait_ms: u64,
+    },
+    /// Check rename eligibility at a revision-checked UTF-16 position.
+    LspPrepareRename {
+        path: String,
+        position: EditorPosition,
+        expected_revision: u64,
+    },
+    /// Compute, validate, and retain a text-only rename without applying it.
+    LspPreviewRename {
+        path: String,
+        position: EditorPosition,
+        expected_revision: u64,
+        new_name: String,
+    },
+    /// Apply a session-owned preview to buffers, without saving any files.
+    LspApplyEdit { plan_id: String },
     /// Internal, request-bound read-only inspection for an inline provider.
     #[serde(skip)]
     InlineContext {
@@ -218,13 +269,33 @@ impl EditorToolCall {
     #[must_use]
     /// Returns whether the call changes text.
     pub fn is_edit(&self) -> bool {
-        matches!(self, Self::WriteFile { .. } | Self::ApplyEdits { .. })
+        matches!(
+            self,
+            Self::WriteFile { .. } | Self::ApplyEdits { .. } | Self::LspApplyEdit { .. }
+        )
+    }
+
+    /// LSP calls retain their response while the editor continues polling servers.
+    pub fn is_lsp(&self) -> bool {
+        matches!(
+            self,
+            Self::LspStatus { .. }
+                | Self::LspDiagnostics { .. }
+                | Self::LspPrepareRename { .. }
+                | Self::LspPreviewRename { .. }
+                | Self::LspApplyEdit { .. }
+        )
     }
 
     #[must_use]
     /// Formats a bounded user-facing description of the in-progress call.
     pub fn activity_title(&self) -> String {
         match self {
+            Self::LspStatus { path } => format!("Inspecting language server for {path}"),
+            Self::LspDiagnostics { .. } => "Reading language-server diagnostics".to_string(),
+            Self::LspPrepareRename { path, .. } => format!("Checking rename in {path}"),
+            Self::LspPreviewRename { path, .. } => format!("Previewing rename in {path}"),
+            Self::LspApplyEdit { .. } => "Applying language-server rename (unsaved)".to_string(),
             Self::InlineContext { .. } => "Inspecting inline context".to_string(),
             Self::ReadFile { path, .. } => format!("Reading {path}"),
             Self::WriteFile { path, .. } => format!("Writing {path}"),
@@ -519,7 +590,7 @@ pub fn editor_tool_schemas(schema_key: &str) -> Vec<Value> {
             }),
         ),
     ];
-    definitions
+    let mut tools = definitions
         .into_iter()
         .map(|(name, description, schema)| {
             let mut tool = Map::from_iter([
@@ -530,7 +601,29 @@ pub fn editor_tool_schemas(schema_key: &str) -> Vec<Value> {
             tool.insert(schema_key.to_string(), schema);
             Value::Object(tool)
         })
-        .collect()
+        .collect::<Vec<_>>();
+    let lsp_definitions = [
+        ("lsp_status", "Inspect a file's language-server status and supported operations. Does not start a server. Use read_file first to open and synchronize a document.", json!({"path": {"type": "string"}}), vec!["path"]),
+        ("lsp_diagnostics", "Read bounded diagnostics for a file, open buffers, or known workspace reports. Workspace results are not a complete project check. For refresh, scope must be file and read_file must have opened it. wait_ms (0..20000) waits for a new push-only report; it never saves. Continue using expected_generation; restart at offset 0 if it changes.", json!({
+            "scope": {"type": "string", "enum": ["file", "open_buffers", "workspace"]},
+            "path": {"type": ["string", "null"]},
+            "severity": {"type": ["integer", "null"], "enum": [1, 2, 3, 4, null]},
+            "source": {"type": ["string", "null"]}, "code": {"type": ["string", "null"]},
+            "range": {"anyOf": [{"type": "null"}, {"type": "object", "properties": {"start": position, "end": position}, "required": ["start", "end"], "additionalProperties": false}]},
+            "offset": {"type": "integer", "minimum": 0}, "limit": {"type": "integer", "minimum": 1, "maximum": 100},
+            "expected_generation": {"type": ["integer", "null"], "minimum": 0},
+            "refresh": {"type": "boolean"}, "wait_ms": {"type": "integer", "minimum": 0, "maximum": 20000}
+        }), vec!["scope", "path", "severity", "source", "code", "range", "offset", "limit", "expected_generation", "refresh", "wait_ms"]),
+        ("lsp_prepare_rename", "Check whether an already-read symbol can be renamed. Positions are zero-based UTF-16. An unsupported prepare operation does not necessarily mean rename is unsupported.", json!({"path": {"type": "string"}, "position": position, "expected_revision": {"type": "integer", "minimum": 0}}), vec!["path", "position", "expected_revision"]),
+        ("lsp_preview_rename", "Preview a semantic rename across workspace files. Read the source first and pass its revision. Returns a bounded diff and a session-owned plan_id valid for 120 seconds while captured documents remain unchanged. Does not edit or save.", json!({"path": {"type": "string"}, "position": position, "expected_revision": {"type": "integer", "minimum": 0}, "new_name": {"type": "string", "minLength": 1, "maxLength": 256}}), vec!["path", "position", "expected_revision", "new_name"]),
+        ("lsp_apply_edit", "Apply a previously returned rename plan once, after revalidating all targets. Updates visible buffers and undo history but NEVER saves files. Report unsaved changes to the user. Expired or stale plans require a new preview.", json!({"plan_id": {"type": "string"}}), vec!["plan_id"]),
+    ];
+    for (name, description, properties, required) in lsp_definitions {
+        let mut tool = json!({"type": "function", "name": name, "description": description});
+        tool[schema_key] = json!({"type": "object", "properties": properties, "required": required, "additionalProperties": false});
+        tools.push(tool);
+    }
+    tools
 }
 
 /// Validate and atomically apply half-open UTF-16 edits to text.
@@ -613,7 +706,7 @@ mod tests {
     fn tool_schemas_are_strict_and_bounded() {
         for schema_key in ["parameters", "inputSchema"] {
             let tools = editor_tool_schemas(schema_key);
-            assert_eq!(tools.len(), 8);
+            assert_eq!(tools.len(), 13);
             assert!(tools
                 .iter()
                 .all(|tool| tool[schema_key]["additionalProperties"] == false));

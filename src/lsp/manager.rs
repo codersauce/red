@@ -1034,6 +1034,42 @@ impl LspClient for LspManager {
         Some(server_name.to_string())
     }
 
+    fn server_status_for_file(&self, file: &str) -> &'static str {
+        let Some(key) = self.document_clients.get(file).cloned().or_else(|| {
+            self.resolve_document(file)
+                .map(|document| client_key(&document))
+        }) else {
+            return "unsupported";
+        };
+        if self.failed_clients.contains(&key) {
+            return "failed";
+        }
+        self.clients
+            .get(&key)
+            .map_or("not_started", |client| client.server_status_for_file(file))
+    }
+
+    fn server_instance_for_file(&self, file: &str) -> Option<u64> {
+        let key = self.document_clients.get(file).cloned().or_else(|| {
+            self.resolve_document(file)
+                .map(|document| client_key(&document))
+        })?;
+        self.clients.get(&key)?.server_instance_for_file(file)
+    }
+
+    async fn cancel_request_for_file(&mut self, file: &str, id: i64) -> Result<(), LspError> {
+        // Cancellation must never lazily start another process.
+        if let Some(key) = self.document_clients.get(file).cloned().or_else(|| {
+            self.resolve_document(file)
+                .map(|document| client_key(&document))
+        }) {
+            if let Some(client) = self.clients.get_mut(&key) {
+                client.cancel_request_for_file(file, id).await?;
+            }
+        }
+        Ok(())
+    }
+
     fn supports_document_formatting(&self, file: &str) -> bool {
         if let Some(key) = self.document_clients.get(file) {
             return self
