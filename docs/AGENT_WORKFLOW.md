@@ -506,7 +506,7 @@ protocol is unavailable; it does not fall back to `codex exec` or native edits.
 
 | Command | Purpose |
 | --- | --- |
-| `Space i` | Edit the current line or visual selection in a bounded popup. |
+| `Space i` | Review, explain, or edit the enclosing function, current-line fallback, or exact visual selection in a bounded popup. |
 | `:Agent` / `:AgentPrompt` | Open the prompt composer. |
 | `:AgentOpen` | Show and focus the conversation pane without opening a prompt. |
 | `:AgentModel` / `Alt+m` in the Agent pane | Choose this conversation’s model and reasoning effort. |

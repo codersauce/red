@@ -69,7 +69,7 @@ pub enum TutorialLesson {
     Completion,
     /// Inspect a simulated Git diff without touching the real repository.
     Git,
-    /// Inspect and accept or reject a simulated agent proposal.
+    /// Inspect a simulated editor-owned agent change without launching Codex.
     Agent,
     /// Preview an installed theme and explicitly decide whether to keep it.
     Themes,
@@ -101,7 +101,7 @@ impl TutorialLesson {
             Self::Navigation => "Find files and search projects",
             Self::Completion => "Code intelligence, immediately",
             Self::Git => "Git without leaving Red",
-            Self::Agent => "The agent asks permission",
+            Self::Agent => "An agent that knows your editor",
             Self::Themes => "Make Red yours",
         }
     }
@@ -154,10 +154,13 @@ impl TutorialLesson {
             (Self::Git, 0) => format!("Press {} to inspect a safe sample diff.", key("Space G")),
             (Self::Git, _) => "Inspect the sample diff, then press Esc to continue.".to_string(),
             (Self::Agent, 0) => {
-                format!("Press {} to inspect a simulated proposal.", key("Space A"))
+                format!(
+                    "Press {} to inspect a safe Agent demonstration.",
+                    key("Space A")
+                )
             }
             (Self::Agent, _) => {
-                "Press a to accept or r to reject the practice-only proposal.".to_string()
+                "Press a to apply the practice edit, or r to continue without it.".to_string()
             }
             (Self::Themes, 0) => format!("Press {} to browse installed themes.", key("Space t")),
             (Self::Themes, _) => {
@@ -175,7 +178,7 @@ impl TutorialLesson {
             Self::Navigation => "Fuzzy previews and project search keep your hands on the keys.",
             Self::Completion => "Open buffers supply suggestions even without a language server.",
             Self::Git => "Real Git changes always remain under your control.",
-            Self::Agent => "Nothing changes on disk until you review and accept it.",
+            Self::Agent => "Agent writes save through Red; inline edits stay unsaved and undoable.",
             Self::Themes => "Bundled themes and plugins work without a config file.",
         }
     }
@@ -393,6 +396,20 @@ mod tests {
                 TutorialLesson::Agent,
             ]
         );
+    }
+
+    #[test]
+    fn agent_lesson_describes_real_editor_save_boundaries() {
+        assert_eq!(
+            TutorialLesson::Agent.title(),
+            "An agent that knows your editor"
+        );
+        assert!(TutorialLesson::Agent
+            .explanation()
+            .contains("Agent writes save through Red"));
+        assert!(TutorialLesson::Agent
+            .explanation()
+            .contains("inline edits stay unsaved"));
     }
 
     #[test]
