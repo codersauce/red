@@ -248,7 +248,6 @@ impl Component for FilePicker {
                 .then(|| self.picker.selected_item())
                 .flatten()
                 .and_then(|path| result.selection(&path));
-            self.preserve_selection = true;
             self.loading = !result.done;
             self.query_pending = false;
             if !self.first_results && !result.order.is_empty() {
@@ -357,7 +356,13 @@ impl Component for FilePicker {
             }
             _ => None,
         };
+        let selected_before = self.picker.selected_item();
         let action = self.picker.handle_event(ev);
+        // Follow the best match as batches arrive until the user navigates.
+        // Pinning the initial automatic selection can hide later exact matches.
+        if self.picker.selected_item() != selected_before {
+            self.preserve_selection = true;
+        }
         if let Some(search) = &self.search {
             let generation = search.request(self.picker.query());
             if generation != self.query_generation {
@@ -850,6 +855,33 @@ mod tests {
             eprintln!("file-picker complete file-set parity: passed ({count} files)");
             eprintln!("file-picker serial discovery baseline: {serial_elapsed:?}");
         }
+    }
+
+    #[test]
+    fn background_picker_only_preserves_selection_after_navigation() {
+        let editor = test_editor();
+        let root = TestDir::new("manual-selection");
+        fs::write(root.path().join("alpha.py"), "").unwrap();
+        fs::write(root.path().join("beta.py"), "").unwrap();
+        let mut picker = FilePicker::new(&editor, root.path().to_path_buf()).unwrap();
+        wait_for_load(&mut picker);
+        assert_eq!(picker.picker.selected_item().as_deref(), Some("alpha.py"));
+        assert!(!picker.preserve_selection);
+
+        picker.handle_event(&key(KeyCode::Down));
+        assert_eq!(picker.picker.selected_item().as_deref(), Some("beta.py"));
+        assert!(picker.preserve_selection);
+
+        picker.handle_event(&key(KeyCode::Char('a')));
+        assert!(!picker.preserve_selection);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while picker.query_pending {
+            picker.tick().unwrap();
+            assert!(Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(picker.picker.selected_item().as_deref(), Some("alpha.py"));
+        assert!(!picker.preserve_selection);
     }
 
     #[test]

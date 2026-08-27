@@ -117,6 +117,8 @@ shows partial results and progress until discovery completes; errors retain any
 partial results with an explicit incomplete status. Enter waits for the current
 query rather than selecting a row from an older query. `Ctrl+r` refreshes the index;
 `Ctrl+e` changes hidden/ignored visibility and starts a separate scan.
+Automatic selection follows the best match as files arrive. Once the user navigates
+the results, updates preserve the selected path until the query changes.
 
 Completed file indexes are shared within an editor, keyed by canonical root and
 visibility. They expire after 30 seconds and refresh on the next open, keeping the
