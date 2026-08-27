@@ -61,6 +61,11 @@ const PLUGIN_INSTRUCTION_BUDGET: usize = 100_000;
 static NEXT_PLUGIN_VM_GENERATION: AtomicU64 = AtomicU64::new(1);
 static GIT_CORE_PROGRAM: OnceLock<Result<CompiledProgram, String>> = OnceLock::new();
 static NEOTREE_CORE_PROGRAM: OnceLock<Result<CompiledProgram, String>> = OnceLock::new();
+static MONOTONIC_EPOCH: OnceLock<Instant> = OnceLock::new();
+
+#[cfg(all(test, unix))]
+#[path = "git_refresh_tests.rs"]
+mod git_refresh_tests;
 
 /// User-facing metadata attached to a registered Red plugin command.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1993,6 +1998,17 @@ impl RedHost {
                     .ok_or_else(|| anyhow::anyhow!("ClosePanel requires a panel id"))?
                     .to_string();
                 self.send_request(PluginRequest::ClosePanel { id });
+            }
+            "MonotonicTime" => {
+                return Ok(Value::Int(
+                    i64::try_from(
+                        MONOTONIC_EPOCH
+                            .get_or_init(Instant::now)
+                            .elapsed()
+                            .as_millis(),
+                    )
+                    .unwrap_or(i64::MAX),
+                ));
             }
             "SpawnProcess" => {
                 anyhow::ensure!(
@@ -4526,8 +4542,23 @@ mod tests {
     use super::*;
     use crate::{color::Color, editor::PluginRequest, ui::PickerPresentation};
 
-    fn drain_requests() {
+    pub(super) fn drain_requests() {
         while ACTION_DISPATCHER.try_recv_request().is_some() {}
+    }
+
+    #[test]
+    fn monotonic_time_uses_a_shared_millisecond_clock() {
+        let mut first_host = RedHost::new(HashMap::new());
+        let mut second_host = RedHost::new(HashMap::new());
+        let Value::Int(first) = first_host.execute("clock", "MonotonicTime", &[]).unwrap() else {
+            panic!("MonotonicTime must return an integer");
+        };
+        std::thread::sleep(Duration::from_millis(2));
+        let Value::Int(second) = second_host.execute("clock", "MonotonicTime", &[]).unwrap() else {
+            panic!("MonotonicTime must return an integer");
+        };
+        assert!(first >= 0);
+        assert!(second >= first + 2);
     }
 
     #[test]
@@ -5071,7 +5102,7 @@ mod tests {
             .unwrap();
     }
 
-    async fn pump_process_events(runtime: &mut Runtime) -> anyhow::Result<()> {
+    pub(super) async fn pump_process_events(runtime: &mut Runtime) -> anyhow::Result<()> {
         for event in runtime.poll_process_events() {
             let Some(process_id) = event
                 .get("process_id")
@@ -5140,16 +5171,21 @@ mod tests {
     }
 
     async fn load_git_runtime(root: &Path) -> Runtime {
+        load_git_runtime_source(root, include_str!("../../plugins/git.hk"), "git").await
+    }
+
+    pub(super) async fn load_git_runtime_source(
+        root: &Path,
+        source: &str,
+        command: &str,
+    ) -> Runtime {
         let mut runtime = Runtime::new_with_permissions(HashMap::from([(
             "git".to_string(),
             PluginPermissions {
-                process: vec!["git".to_string()],
+                process: vec![command.to_string()],
             },
         )]));
-        runtime
-            .load_plugin("git", include_str!("../../plugins/git.hk"))
-            .await
-            .unwrap();
+        runtime.load_plugin("git", source).await.unwrap();
         let mut cwd_request_id = None;
         let mut config_request_id = None;
         let mut info_request_id = None;
