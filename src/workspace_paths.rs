@@ -8,12 +8,17 @@ use std::{
     cmp::Ordering,
     collections::{BTreeMap, HashMap},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicBool, Ordering as AtomicOrdering},
+        mpsc::{self, SyncSender},
+        Arc, Mutex,
+    },
+    time::{Duration, Instant},
 };
 
 use anyhow::Context;
 use fuzzy_matcher::{skim::SkimMatcherV2, FuzzyMatcher};
-use ignore::{DirEntry, WalkBuilder};
+use ignore::{DirEntry, WalkBuilder, WalkState};
 use once_cell::sync::Lazy;
 use serde::Serialize;
 
@@ -76,16 +81,7 @@ pub(crate) fn discover_workspace_paths(
     root: &Path,
     options: WorkspacePathOptions,
 ) -> anyhow::Result<(Vec<WorkspacePath>, bool)> {
-    let honor_ignores = !options.ignored;
-    let mut builder = WalkBuilder::new(root);
-    builder
-        .hidden(!options.hidden)
-        .ignore(honor_ignores)
-        .git_ignore(honor_ignores)
-        .git_global(honor_ignores)
-        .git_exclude(honor_ignores)
-        .follow_links(false)
-        .filter_entry(not_vcs_metadata);
+    let builder = workspace_walker(root, options);
 
     let mut entries = Vec::new();
     let mut truncated = false;
@@ -122,6 +118,149 @@ pub(crate) fn discover_workspace_paths(
     }
     entries.sort_unstable_by(|left, right| left.path.cmp(&right.path));
     Ok((entries, truncated))
+}
+
+fn workspace_walker(root: &Path, options: WorkspacePathOptions) -> WalkBuilder {
+    let honor_ignores = !options.ignored;
+    let mut builder = WalkBuilder::new(root);
+    builder
+        .hidden(!options.hidden)
+        .ignore(honor_ignores)
+        .git_ignore(honor_ignores)
+        .git_global(honor_ignores)
+        .git_exclude(honor_ignores)
+        .follow_links(false)
+        .filter_entry(not_vcs_metadata);
+    builder
+}
+
+/// Publishes all eligible files in bounded batches without waiting for a final sort.
+///
+/// Uses the same policy as tree discovery, but never applies its path-count cap.
+/// Ordering is intentionally unspecified; consumers rank by path rather than arrival
+/// order. Returning `false` from `publish`, or setting `cancelled`, stops the walk.
+/// The caller runs this on a worker: joining walkers must never block the UI.
+pub(crate) fn stream_workspace_files(
+    root: &Path,
+    hidden: bool,
+    ignored: bool,
+    cancelled: &AtomicBool,
+    mut publish: impl FnMut(Vec<WorkspacePath>) -> bool,
+) -> anyhow::Result<bool> {
+    let mut builder = workspace_walker(
+        root,
+        WorkspacePathOptions {
+            hidden,
+            ignored,
+            directories: false,
+            max_entries: None,
+        },
+    );
+    builder.threads(
+        std::thread::available_parallelism()
+            .map_or(2, usize::from)
+            .min(8),
+    );
+    let walker = builder.build_parallel();
+    let (sender, receiver) = mpsc::sync_channel(8);
+    std::thread::scope(|scope| {
+        let worker = scope.spawn(move || {
+            walker.run(|| {
+                let mut batch = DiscoveryBatch {
+                    sender: sender.clone(),
+                    entries: Vec::new(),
+                    last_sent: Instant::now(),
+                    cancelled,
+                };
+                Box::new(move |result| {
+                    if cancelled.load(AtomicOrdering::Relaxed) {
+                        return WalkState::Quit;
+                    }
+                    let entry = match result {
+                        Ok(entry) => entry,
+                        Err(error) => {
+                            let _ = batch.sender.send(Err(error.to_string()));
+                            cancelled.store(true, AtomicOrdering::Relaxed);
+                            return WalkState::Quit;
+                        }
+                    };
+                    if entry.depth() > 0 && entry_kind(&entry) == Some("file") {
+                        if let Ok(relative) = entry.path().strip_prefix(root) {
+                            batch.entries.push(WorkspacePath {
+                                name: entry.file_name().to_string_lossy().into_owned(),
+                                path: relative.to_string_lossy().replace('\\', "/"),
+                                kind: "file",
+                            });
+                        }
+                    }
+                    if batch.entries.len() >= 512
+                        || batch.last_sent.elapsed() >= Duration::from_millis(25)
+                    {
+                        batch.flush();
+                    }
+                    WalkState::Continue
+                })
+            });
+        });
+        let mut error = None;
+        for message in &receiver {
+            match message {
+                Ok(entries) => {
+                    // A walker error can be queued behind successful batches.
+                    // Drain those batches so cancellation cannot hide the error.
+                    if cancelled.load(AtomicOrdering::Relaxed) {
+                        continue;
+                    }
+                    if !publish(entries) {
+                        cancelled.store(true, AtomicOrdering::Relaxed);
+                        break;
+                    }
+                }
+                Err(reason) => {
+                    error = Some(reason);
+                    cancelled.store(true, AtomicOrdering::Relaxed);
+                    break;
+                }
+            }
+        }
+        // Disconnect before joining, releasing producers blocked on a full queue.
+        drop(receiver);
+        worker
+            .join()
+            .map_err(|_| anyhow::anyhow!("file discovery worker panicked"))?;
+        if let Some(error) = error {
+            anyhow::bail!(error);
+        }
+        Ok(!cancelled.load(AtomicOrdering::Relaxed))
+    })
+}
+
+struct DiscoveryBatch<'a> {
+    sender: SyncSender<Result<Vec<WorkspacePath>, String>>,
+    entries: Vec<WorkspacePath>,
+    last_sent: Instant,
+    cancelled: &'a AtomicBool,
+}
+
+impl DiscoveryBatch<'_> {
+    fn flush(&mut self) {
+        if !self.entries.is_empty()
+            && !self.cancelled.load(AtomicOrdering::Relaxed)
+            && self
+                .sender
+                .send(Ok(std::mem::take(&mut self.entries)))
+                .is_err()
+        {
+            self.cancelled.store(true, AtomicOrdering::Relaxed);
+        }
+        self.last_sent = Instant::now();
+    }
+}
+
+impl Drop for DiscoveryBatch<'_> {
+    fn drop(&mut self) {
+        self.flush();
+    }
 }
 
 fn entry_kind(entry: &DirEntry) -> Option<&'static str> {
@@ -325,6 +464,97 @@ fn filename_match_ranges(matcher: &SkimMatcherV2, name: &str, tokens: &[&str]) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parallel_file_discovery_preserves_serial_file_set() {
+        let root = tempfile::tempdir().unwrap();
+        for directory in [".git", ".bare", ".hidden", "nested", "ignored"] {
+            std::fs::create_dir(root.path().join(directory)).unwrap();
+        }
+        std::fs::write(root.path().join(".gitignore"), "ignored/\n*.tmp\n").unwrap();
+        std::fs::write(root.path().join("nested/.gitignore"), "!keep.tmp\n").unwrap();
+        for file in [
+            "file.py",
+            "é space.py",
+            ".hidden/file.py",
+            "ignored/file.py",
+            "nested/drop.tmp",
+            "nested/keep.tmp",
+            ".git/config",
+            ".bare/config",
+        ] {
+            std::fs::write(root.path().join(file), "").unwrap();
+        }
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(root.path().join("file.py"), root.path().join("linked.py"))
+                .unwrap();
+            std::os::unix::fs::symlink(root.path(), root.path().join("loop")).unwrap();
+        }
+        for (hidden, ignored) in [(false, false), (true, false), (true, true)] {
+            let (expected, _) = discover_workspace_paths(
+                root.path(),
+                WorkspacePathOptions {
+                    hidden,
+                    ignored,
+                    directories: false,
+                    max_entries: None,
+                },
+            )
+            .unwrap();
+            let mut actual = Vec::new();
+            assert!(stream_workspace_files(
+                root.path(),
+                hidden,
+                ignored,
+                &AtomicBool::new(false),
+                |batch| {
+                    actual.extend(batch);
+                    true
+                }
+            )
+            .unwrap());
+            actual.sort_unstable_by(|left, right| left.path.cmp(&right.path));
+            assert_eq!(actual, expected);
+        }
+    }
+
+    #[test]
+    fn streaming_can_be_cancelled_after_the_first_bounded_batch() {
+        let root = tempfile::tempdir().unwrap();
+        for index in 0..1200 {
+            std::fs::write(root.path().join(format!("file-{index}.py")), "").unwrap();
+        }
+        let mut received = 0;
+        let completed = stream_workspace_files(
+            root.path(),
+            false,
+            false,
+            &AtomicBool::new(false),
+            |batch| {
+                assert!(!batch.is_empty());
+                assert!(batch.len() <= 512);
+                received += batch.len();
+                false
+            },
+        )
+        .unwrap();
+        assert!(!completed);
+        assert!(received > 0 && received < 1200);
+    }
+
+    #[test]
+    fn parallel_discovery_reports_missing_roots() {
+        let root = tempfile::tempdir().unwrap();
+        assert!(stream_workspace_files(
+            &root.path().join("missing"),
+            false,
+            false,
+            &AtomicBool::new(false),
+            |_| true
+        )
+        .is_err());
+    }
 
     #[test]
     fn discovers_hidden_paths_but_excludes_git_metadata_and_ignored_entries() {

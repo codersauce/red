@@ -5,9 +5,18 @@
 //! entries follow the configured walker policy; this feature is discovery UI rather than
 //! a security boundary for opening paths.
 
+mod index;
+mod search;
+
+pub(crate) use index::FilePickerCache;
+use index::ScanLease;
+use search::FileSearch;
+
+#[cfg(test)]
+use std::sync::mpsc::{self, Receiver};
 use std::{
     path::{Path, PathBuf},
-    sync::mpsc::{self, Receiver, TryRecvError},
+    sync::Arc,
 };
 
 use crossterm::event::{self};
@@ -16,9 +25,13 @@ use fuzzy_matcher::skim::SkimMatcherV2;
 use crate::{
     config::KeyAction,
     editor::{Action, Editor, RenderBuffer},
-    log,
     plugin::{LocationColumnEncoding, OpenLocationTarget, PluginLocation},
     theme::Theme,
+};
+
+#[cfg(test)]
+use crate::{
+    log,
     workspace_paths::{discover_workspace_paths, WorkspacePathOptions},
 };
 
@@ -30,13 +43,25 @@ use super::{
 
 pub struct FilePicker {
     picker: Picker,
+    cache: Arc<FilePickerCache>,
+    lease: Option<ScanLease>,
+    search: Option<FileSearch>,
+    query_generation: u64,
+    loading: bool,
+    query_pending: bool,
+    preserve_selection: bool,
+    load_started: std::time::Instant,
+    first_results: bool,
+    #[cfg(test)]
     receiver: Receiver<FilePickerLoad>,
+    #[cfg(test)]
     sender: mpsc::Sender<FilePickerLoad>,
     root_path: PathBuf,
     visibility: FilePickerVisibility,
     load_generation: u64,
 }
 
+#[cfg(test)]
 struct FilePickerLoad {
     generation: u64,
     result: Result<Vec<PickerItem>, String>,
@@ -70,7 +95,7 @@ impl<'a> FilePickerQuery<'a> {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 struct FilePickerVisibility {
     hidden: bool,
     ignored: bool,
@@ -89,24 +114,19 @@ impl FilePickerVisibility {
 
 impl FilePicker {
     pub fn new(editor: &Editor, root_path: PathBuf) -> anyhow::Result<Self> {
-        let (sender, receiver) = mpsc::channel();
-        let mut picker = Self::loading_with_root(editor, root_path, sender, receiver);
-        picker.start_load();
+        let mut picker = Self::loading_with_root(editor, root_path);
+        picker.start_load(false);
         Ok(picker)
     }
 
     #[cfg(test)]
     fn loading(editor: &Editor) -> Self {
-        let (sender, receiver) = mpsc::channel();
-        Self::loading_with_root(editor, PathBuf::from("."), sender, receiver)
+        Self::loading_with_root(editor, PathBuf::from("."))
     }
 
-    fn loading_with_root(
-        editor: &Editor,
-        root_path: PathBuf,
-        sender: mpsc::Sender<FilePickerLoad>,
-        receiver: Receiver<FilePickerLoad>,
-    ) -> Self {
+    fn loading_with_root(editor: &Editor, root_path: PathBuf) -> Self {
+        #[cfg(test)]
+        let (sender, receiver) = mpsc::channel();
         let score_matcher = SkimMatcherV2::default();
         let highlight_matcher = SkimMatcherV2::default();
         let mut picker = Picker::builder()
@@ -125,7 +145,18 @@ impl FilePicker {
 
         FilePicker {
             picker,
+            cache: Arc::clone(&editor.file_picker_cache),
+            lease: None,
+            search: None,
+            query_generation: 0,
+            loading: true,
+            query_pending: false,
+            preserve_selection: false,
+            load_started: std::time::Instant::now(),
+            first_results: false,
+            #[cfg(test)]
             receiver,
+            #[cfg(test)]
             sender,
             root_path,
             visibility: FilePickerVisibility::default(),
@@ -133,29 +164,43 @@ impl FilePicker {
         }
     }
 
-    fn start_load(&mut self) {
+    fn start_load(&mut self, refresh: bool) {
         self.load_generation = self.load_generation.wrapping_add(1);
-        let generation = self.load_generation;
-        let root_path = self.root_path.clone();
-        let visibility = self.visibility;
-        let sender = self.sender.clone();
+        // Dropping the old query never joins its worker on the UI thread.
+        self.search = None;
+        self.lease = None;
+        let lease = self
+            .cache
+            .acquire(&self.root_path, self.visibility, refresh);
+        let search = FileSearch::new(&lease);
+        self.query_generation = search.request(self.picker.query());
+        self.search = Some(search);
+        self.lease = Some(lease);
+        self.loading = true;
+        self.query_pending = true;
+        self.preserve_selection = false;
+        self.load_started = std::time::Instant::now();
+        self.first_results = false;
+        self.picker.enable_background_filter();
         self.picker
             .set_empty_message(Some("Loading files...".to_string()));
-        self.picker.set_status(visibility.status());
-
-        std::thread::spawn(move || {
-            let result = load_file_picker_items(&root_path, visibility)
-                .map(prepare_file_picker_items)
-                .map_err(|err| err.to_string());
-            _ = sender.send(FilePickerLoad { generation, result });
-        });
+        self.picker.set_status(Some(format!(
+            "Scanning...{}",
+            self.visibility
+                .status()
+                .map(|status| format!(" {status}"))
+                .unwrap_or_default()
+        )));
+        self.picker.set_busy(true);
     }
 
+    #[cfg(test)]
     fn apply_load(&mut self, load: FilePickerLoad) -> bool {
         if load.generation != self.load_generation {
             return false;
         }
 
+        self.loading = false;
         match load.result {
             Ok(items) => {
                 self.picker
@@ -182,25 +227,92 @@ impl Component for FilePicker {
         let mut actions = self.picker.surface_actions();
         actions.extend(super::reference_actions(&[
             ("Files", "Ctrl+e", "Toggle hidden files"),
+            ("Files", "Ctrl+r", "Refresh file index"),
             ("Files", ">", "Open commands when the query is empty"),
         ]));
         actions
     }
 
     fn tick(&mut self) -> anyhow::Result<bool> {
-        let mut changed = false;
-        loop {
-            match self.receiver.try_recv() {
-                Ok(load) => changed |= self.apply_load(load),
-                Err(TryRecvError::Empty) => return Ok(changed),
-                Err(TryRecvError::Disconnected) => {
-                    self.picker.replace_structured_items(vec![]);
-                    self.picker
-                        .set_empty_message(Some("Failed to load files".to_string()));
-                    return Ok(true);
+        let mut changed = self.picker.tick()?;
+        #[cfg(test)]
+        while let Ok(load) = self.receiver.try_recv() {
+            changed |= self.apply_load(load);
+        }
+        if let Some(result) = self.search.as_ref().and_then(FileSearch::take_result) {
+            if result.generation != self.query_generation {
+                return Ok(changed);
+            }
+            let selected = self
+                .preserve_selection
+                .then(|| self.picker.selected_item())
+                .flatten()
+                .and_then(|path| result.selection(&path));
+            self.preserve_selection = true;
+            self.loading = !result.done;
+            self.query_pending = false;
+            if !self.first_results && !result.order.is_empty() {
+                crate::log!(
+                    "[file-picker] first visible results after {:?}",
+                    self.load_started.elapsed()
+                );
+                self.first_results = true;
+            }
+            let failed = result.error.is_some();
+            if result.done && !failed {
+                if let Some(retired) = self.lease.as_mut().and_then(|lease| lease.fallback.take()) {
+                    rayon::spawn(move || drop(retired));
                 }
             }
+            let status = if let Some(error) = result.error {
+                Some(format!("Incomplete: {error}"))
+            } else if !result.done {
+                Some(format!(
+                    "{} {} files",
+                    if result.refreshing {
+                        "Refreshing..."
+                    } else {
+                        "Scanning..."
+                    },
+                    result.discovered
+                ))
+            } else {
+                self.visibility.status()
+            };
+            self.picker.apply_background_items(
+                result.items,
+                result.order,
+                self.root_path.clone(),
+                selected,
+            );
+            let status = if !result.done {
+                status.map(|status| {
+                    format!(
+                        "{status}{}",
+                        self.visibility
+                            .status()
+                            .map(|visibility| format!(" {visibility}"))
+                            .unwrap_or_default()
+                    )
+                })
+            } else {
+                status
+            };
+            self.picker.set_status(status);
+            self.picker.set_busy(!result.done);
+            self.picker.set_empty_message(Some(
+                if failed {
+                    "Failed to load files"
+                } else if result.done {
+                    "No matching files"
+                } else {
+                    "Loading files..."
+                }
+                .to_string(),
+            ));
+            changed = true;
         }
+        Ok(changed)
     }
 
     fn handle_event(&mut self, ev: &event::Event) -> Option<KeyAction> {
@@ -226,7 +338,17 @@ impl Component for FilePicker {
                     && key.modifiers.contains(event::KeyModifiers::CONTROL)
         ) {
             self.visibility.toggle_all();
-            self.start_load();
+            self.start_load(false);
+            return Some(KeyAction::Single(Action::Refresh));
+        }
+        if matches!(ev, event::Event::Key(key) if key.code == event::KeyCode::Char('r') && key.modifiers.contains(event::KeyModifiers::CONTROL))
+        {
+            self.start_load(true);
+            return Some(KeyAction::Single(Action::Refresh));
+        }
+        if self.query_pending
+            && matches!(ev, event::Event::Key(key) if key.code == event::KeyCode::Enter)
+        {
             return Some(KeyAction::Single(Action::Refresh));
         }
         let line = match ev {
@@ -235,7 +357,18 @@ impl Component for FilePicker {
             }
             _ => None,
         };
-        let action = self.picker.handle_event(ev)?;
+        let action = self.picker.handle_event(ev);
+        if let Some(search) = &self.search {
+            let generation = search.request(self.picker.query());
+            if generation != self.query_generation {
+                self.query_generation = generation;
+                self.query_pending = true;
+                self.preserve_selection = false;
+                self.picker.set_status(Some("Searching...".to_string()));
+                self.picker.set_busy(true);
+            }
+        }
+        let action = action?;
         let Some(line) = line else {
             return Some(action);
         };
@@ -332,6 +465,7 @@ fn file_match_highlights(
     )
 }
 
+#[cfg(test)]
 fn load_file_picker_items(
     root_path: &Path,
     visibility: FilePickerVisibility,
@@ -423,7 +557,8 @@ mod tests {
 
     fn wait_for_load(picker: &mut FilePicker) {
         for _ in 0..100 {
-            if picker.tick().unwrap() {
+            picker.tick().unwrap();
+            if !picker.loading {
                 return;
             }
             thread::sleep(Duration::from_millis(10));
@@ -543,9 +678,7 @@ mod tests {
         let mut slowest_keystrokes = Vec::with_capacity(SAMPLES);
 
         for _ in 0..SAMPLES {
-            let (sender, receiver) = mpsc::channel();
-            let mut picker =
-                FilePicker::loading_with_root(&editor, benchmark_root.clone(), sender, receiver);
+            let mut picker = FilePicker::loading_with_root(&editor, benchmark_root.clone());
             send_load(&picker, picker.load_generation, Ok(files.clone()));
             let started = Instant::now();
             assert!(picker.tick().expect("benchmark load should succeed"));
@@ -594,6 +727,163 @@ mod tests {
                 median(&mut draw_samples[index]),
             );
         }
+    }
+
+    #[test]
+    #[ignore = "manual streaming benchmark against a large read-only checkout"]
+    fn file_picker_streaming_large_workspace_performance() {
+        use sha2::{Digest, Sha256};
+        let root = PathBuf::from(
+            std::env::var_os("RED_FILE_PICKER_BENCH_ROOT").expect("set RED_FILE_PICKER_BENCH_ROOT"),
+        );
+        let editor = test_editor();
+        let mut buffer = RenderBuffer::new(100, 36, &Style::default());
+        let mut ticks = Vec::new();
+        let mut draws = Vec::new();
+        let mut pump = |picker: &mut FilePicker| {
+            let started = Instant::now();
+            let changed = picker.tick().unwrap();
+            ticks.push(started.elapsed().as_micros() as u64);
+            if changed {
+                let started = Instant::now();
+                picker.draw(&mut buffer).unwrap();
+                draws.push(started.elapsed().as_micros() as u64);
+            }
+        };
+        let started = Instant::now();
+        let mut picker = FilePicker::new(&editor, root.clone()).unwrap();
+        let mut first = None;
+        loop {
+            pump(&mut picker);
+            if first.is_none() && picker.first_results {
+                first = Some(started.elapsed());
+            }
+            if !picker.loading {
+                break;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(180),
+                "discovery timed out"
+            );
+            thread::sleep(Duration::from_millis(2));
+        }
+        let discovery = started.elapsed();
+        let snapshot = picker.lease.as_ref().unwrap().scan.snapshot();
+        assert!(snapshot.error.is_none(), "{:?}", snapshot.error);
+        let count = snapshot.items.len();
+        let mut digest = Sha256::new();
+        for index in snapshot.empty_order.as_ref().unwrap().iter() {
+            digest.update(snapshot.items[*index].id.as_bytes());
+            digest.update([0]);
+        }
+        let digest = format!("{:x}", digest.finalize());
+        let mut inputs = Vec::new();
+        let mut queries = Vec::new();
+        for query in [
+            "kafka.py",
+            "worker.py",
+            "chatgpt/chatgpt-code-worker",
+            "kafka.py:42",
+        ] {
+            while !picker.picker.query().is_empty() {
+                picker.handle_event(&key(KeyCode::Backspace));
+            }
+            let started = Instant::now();
+            for character in query.chars() {
+                let input = Instant::now();
+                picker.handle_event(&key(KeyCode::Char(character)));
+                inputs.push(input.elapsed().as_micros() as u64);
+            }
+            while picker.query_pending {
+                pump(&mut picker);
+                assert!(
+                    started.elapsed() < Duration::from_secs(30),
+                    "query timed out"
+                );
+                thread::sleep(Duration::from_millis(2));
+            }
+            queries.push(started.elapsed().as_millis() as u64);
+        }
+        drop(picker);
+        let mut reopen = Vec::new();
+        for _ in 0..3 {
+            let started = Instant::now();
+            let mut picker = FilePicker::new(&editor, root.clone()).unwrap();
+            while !picker.first_results {
+                pump(&mut picker);
+                assert!(
+                    started.elapsed() < Duration::from_secs(30),
+                    "cached reopen timed out"
+                );
+                thread::sleep(Duration::from_millis(2));
+            }
+            reopen.push(started.elapsed().as_millis() as u64);
+        }
+        let mut picker = FilePicker::new(&editor, root.clone()).unwrap();
+        picker.handle_event(&ctrl_key('r'));
+        let cancelled = Instant::now();
+        drop(picker);
+        let cancel_us = cancelled.elapsed().as_micros() as u64;
+        let p95 = |samples: &mut Vec<u64>| {
+            samples.sort_unstable();
+            samples[(samples.len() - 1) * 95 / 100]
+        };
+        eprintln!(
+            "file-picker streaming benchmark: {}",
+            serde_json::json!({
+                "files": count, "path_sha256": digest, "first_results_ms": first.unwrap().as_millis(),
+                "complete_ms": discovery.as_millis(), "reopen_ms": reopen, "query_ms": queries,
+                "input_p95_us": p95(&mut inputs), "tick_p95_us": p95(&mut ticks), "draw_p95_us": p95(&mut draws), "cancel_us": cancel_us,
+            })
+        );
+        if std::env::var_os("RED_FILE_PICKER_VERIFY_PARITY").is_some() {
+            let serial_started = Instant::now();
+            let serial = load_file_picker_items(&root, FilePickerVisibility::default()).unwrap();
+            let serial_elapsed = serial_started.elapsed();
+            let mut expected = Sha256::new();
+            for path in &serial {
+                expected.update(path.as_bytes());
+                expected.update([0]);
+            }
+            assert_eq!(count, serial.len());
+            assert_eq!(digest, format!("{:x}", expected.finalize()));
+            eprintln!("file-picker complete file-set parity: passed ({count} files)");
+            eprintln!("file-picker serial discovery baseline: {serial_elapsed:?}");
+        }
+    }
+
+    #[test]
+    fn background_picker_waits_for_the_current_query_before_accepting() {
+        let editor = test_editor();
+        let root = TestDir::new("pending-query");
+        fs::write(root.path().join("alpha.py"), "").unwrap();
+        fs::write(root.path().join("beta.py"), "").unwrap();
+        let mut picker = FilePicker::new(&editor, root.path().to_path_buf()).unwrap();
+        wait_for_load(&mut picker);
+        picker.handle_event(&key(KeyCode::Char('b')));
+        assert_eq!(
+            picker.handle_event(&key(KeyCode::Enter)),
+            Some(KeyAction::Single(Action::Refresh))
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while picker.query_pending {
+            picker.tick().unwrap();
+            assert!(Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(selected_file(&mut picker), "beta.py");
+    }
+
+    #[test]
+    fn background_picker_missing_root_leaves_loading_state() {
+        let editor = test_editor();
+        let root = TestDir::new("missing-root");
+        let mut picker = FilePicker::new(&editor, root.path().join("missing")).unwrap();
+        wait_for_load(&mut picker);
+        let mut buffer = RenderBuffer::new(80, 24, &Style::default());
+        picker.draw(&mut buffer).unwrap();
+        assert!(buffer_text(&buffer).contains("Failed to load files"));
+        assert!(!picker.loading);
     }
 
     #[test]
@@ -1068,9 +1358,7 @@ mod tests {
         let root = TestDir::new("preview");
         fs::create_dir_all(root.path().join("src")).unwrap();
         fs::write(root.path().join("src/main.rs"), "fn main() {}\n").unwrap();
-        let (sender, receiver) = mpsc::channel();
-        let mut picker =
-            FilePicker::loading_with_root(&editor, root.path().to_path_buf(), sender, receiver);
+        let mut picker = FilePicker::loading_with_root(&editor, root.path().to_path_buf());
         let mut buffer = RenderBuffer::new(80, 24, &Style::default());
 
         send_load(

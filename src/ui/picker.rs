@@ -8,6 +8,8 @@
 //! terminal display columns. Selection actions are returned to the editor or plugin
 //! owner and never applied directly by this module.
 
+use super::picker_items::PickerItems;
+
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use fuzzy_matcher::skim::SkimMatcherV2;
 use rayon::prelude::*;
@@ -404,7 +406,8 @@ pub struct Picker {
     empty_message: Option<String>,
     theme: Theme,
     live: bool,
-    dynamic_items: Option<Vec<PickerItem>>,
+    dynamic_items: Option<PickerItems>,
+    background_filter: bool,
     visible_dynamic_items: Vec<usize>,
     command_column_widths: Cell<Option<CommandColumns>>,
     label_first_column_widths: Cell<Option<LabelFirstColumns>>,
@@ -607,6 +610,7 @@ impl Picker {
             theme: editor.theme.clone(),
             live: false,
             dynamic_items: None,
+            background_filter: false,
             visible_dynamic_items: Vec::new(),
             command_column_widths: Cell::new(None),
             label_first_column_widths: Cell::new(None),
@@ -655,7 +659,7 @@ impl Picker {
                 let item_count = self
                     .dynamic_items
                     .as_ref()
-                    .map(Vec::len)
+                    .map(PickerItems::len)
                     .unwrap_or_else(|| self.items.len());
                 let rows = item_count.clamp(4, sizing.max_rows.max(4));
                 let height = rows.saturating_add(3).min(total_height.saturating_sub(1));
@@ -770,7 +774,7 @@ impl Picker {
         picker.live = true;
         picker.visible_dynamic_items = (0..items.len()).collect();
         picker.list.set_item_count(items.len());
-        picker.dynamic_items = Some(items);
+        picker.dynamic_items = Some(items.into());
         picker.install_path_filter_highlights();
         picker.external_filter = options.external_filter;
         picker.placeholder = options.placeholder;
@@ -880,6 +884,9 @@ impl Picker {
 
     pub fn filter(&mut self, term: &str) {
         let _span = crate::editor::perf::PerfSpan::start("picker:filter");
+        if self.background_filter {
+            return;
+        }
         if let Some(items) = &self.dynamic_items {
             let can_reuse_history =
                 !self.external_filter && (self.incremental_filter || self.filter_action.is_none());
@@ -1024,11 +1031,38 @@ impl Picker {
         self.reset_preview_scroll_if_selection_changed(previous);
     }
 
+    /// File-picker queries are fulfilled by a worker; keystrokes only edit text.
+    pub(crate) fn enable_background_filter(&mut self) {
+        self.background_filter = true;
+    }
+
+    pub(crate) fn apply_background_items(
+        &mut self,
+        items: PickerItems,
+        order: Vec<usize>,
+        root: PathBuf,
+        selected: Option<usize>,
+    ) {
+        let previous = self.selected_item();
+        self.item_preview_root = Some(root);
+        let retired = self.dynamic_items.replace(items);
+        if let Some(retired) = retired {
+            rayon::spawn(move || drop(retired));
+        }
+        self.visible_dynamic_items = order;
+        self.list.set_item_count(self.visible_dynamic_items.len());
+        self.list.set_selected_index(selected.unwrap_or(0));
+        self.command_column_widths.set(None);
+        self.label_first_column_widths.set(None);
+        self.reset_preview_scroll_if_selection_changed(previous);
+    }
+
     pub fn replace_structured_items(&mut self, items: Vec<PickerItem>) {
         self.replace_structured_items_with_optional_preview_root(items, None);
     }
 
     /// Resolves previews only for the selected row instead of allocating one per file.
+    #[cfg(test)]
     pub(crate) fn replace_structured_items_with_preview_root(
         &mut self,
         items: Vec<PickerItem>,
@@ -1045,7 +1079,7 @@ impl Picker {
         let previous = self.selected_item();
         self.item_preview_root = preview_root;
         self.items.clear();
-        self.dynamic_items = Some(items);
+        self.dynamic_items = Some(items.into());
         self.tree_prefixes.get_mut().take();
         self.install_path_filter_highlights();
         self.filtered_query = None;
@@ -1057,8 +1091,11 @@ impl Picker {
     }
 
     #[cfg(test)]
-    pub(crate) fn dynamic_items_for_test(&self) -> &[PickerItem] {
-        self.dynamic_items.as_deref().unwrap_or_default()
+    pub(crate) fn dynamic_items_for_test(&self) -> Vec<&PickerItem> {
+        self.dynamic_items
+            .as_ref()
+            .map(|items| items.iter().collect())
+            .unwrap_or_default()
     }
 
     pub fn apply_update(&mut self, id: i32, update: PickerUpdate) -> bool {
@@ -1069,7 +1106,7 @@ impl Picker {
             PickerUpdate::Items(items) => {
                 let previous = self.selected_item();
                 let selected_id = self.selected_dynamic_item().map(|item| item.id.clone());
-                self.dynamic_items = Some(items);
+                self.dynamic_items = Some(items.into());
                 self.tree_prefixes.get_mut().take();
                 self.install_path_filter_highlights();
                 self.filtered_query = None;
@@ -1132,7 +1169,7 @@ impl Picker {
         self.preview_text_cache.borrow_mut().clear();
     }
 
-    fn set_busy(&mut self, busy: bool) {
+    pub(crate) fn set_busy(&mut self, busy: bool) {
         if busy {
             if self.busy_since.is_none() {
                 self.busy_since = Some(Instant::now());
@@ -1148,7 +1185,7 @@ impl Picker {
         &self.search
     }
 
-    fn selected_item(&self) -> Option<String> {
+    pub(crate) fn selected_item(&self) -> Option<String> {
         if let Some(item) = self.selected_dynamic_item() {
             return Some(item.id.clone());
         }
@@ -1517,7 +1554,10 @@ impl Picker {
     }
 
     /// Computes stable Snacks-style ancestry guides once per authoritative item set.
-    fn tree_prefixes(&self, items: &[PickerItem]) -> Option<Arc<[String]>> {
+    fn tree_prefixes(&self, items: &PickerItems) -> Option<Arc<[String]>> {
+        if self.background_filter {
+            return None;
+        }
         if !self.tree_guides {
             return None;
         }
@@ -1936,7 +1976,7 @@ impl Picker {
                     .get("description")
                     .and_then(Value::as_str)
                     .unwrap_or_default();
-                let total = self.dynamic_items.as_ref().map_or(0, Vec::len);
+                let total = self.dynamic_items.as_ref().map_or(0, PickerItems::len);
                 let visible = self.visible_dynamic_items.len();
                 if description.is_empty() {
                     format!("{visible}/{total} commands")
@@ -1948,7 +1988,7 @@ impl Picker {
             .selected_dynamic_item()
             .filter(|item| item.kind.as_deref() == Some("FilePath"))
             .map(|_| {
-                let total = self.dynamic_items.as_ref().map_or(0, Vec::len);
+                let total = self.dynamic_items.as_ref().map_or(0, PickerItems::len);
                 let visible = self.visible_dynamic_items.len();
                 format!("{visible}/{total}")
             });
@@ -2367,11 +2407,19 @@ impl Picker {
     /// Use every filtered row, not just the current page, so scrolling does not
     /// move the columns. Labels take priority over annotations and descriptions;
     /// document-symbol positions occupy a stable right-aligned numeric gutter.
-    fn label_first_columns(&self, items: &[PickerItem], content_width: usize) -> LabelFirstColumns {
+    fn label_first_columns(&self, items: &PickerItems, content_width: usize) -> LabelFirstColumns {
         let mut columns = self.label_first_column_widths.get().unwrap_or_else(|| {
             let mut columns = LabelFirstColumns::default();
             let tree_prefixes = self.tree_prefixes(items);
-            for index in &self.visible_dynamic_items {
+            for index in self
+                .visible_dynamic_items
+                .iter()
+                .take(if self.background_filter {
+                    256
+                } else {
+                    usize::MAX
+                })
+            {
                 let item = &items[*index];
                 let tree_width = tree_prefixes
                     .as_ref()
@@ -2420,7 +2468,12 @@ impl Picker {
         columns
     }
 
-    fn command_columns(&self, items: &[PickerItem], content_width: usize) -> CommandColumns {
+    fn command_columns(&self, items: &PickerItems, content_width: usize) -> CommandColumns {
+        // File indexes contain only FilePath rows. Do not scan a million rows
+        // on the UI thread looking for command metadata that cannot be present.
+        if self.background_filter {
+            return CommandColumns::default();
+        }
         let mut columns = self.command_column_widths.get().unwrap_or_else(|| {
             let mut columns = CommandColumns::default();
             for item in self
@@ -4250,7 +4303,7 @@ impl PickerBuilder {
         if let Some(structured_items) = structured_items {
             picker.visible_dynamic_items = (0..structured_items.len()).collect();
             picker.list.set_item_count(structured_items.len());
-            picker.dynamic_items = Some(structured_items);
+            picker.dynamic_items = Some(structured_items.into());
         }
         if let Some(select_action) = select_action {
             picker.select_action = Some(select_action);

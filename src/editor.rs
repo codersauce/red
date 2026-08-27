@@ -3402,6 +3402,8 @@ pub struct Editor {
     /// Native open-buffer watches plus a bounded fallback for dropped or unavailable events.
     open_file_watcher: Box<file_watch::OpenFileWatcher>,
 
+    pub(crate) file_picker_cache: Arc<crate::ui::FilePickerCache>,
+
     /// Domain sub-controller managing session recovery and snapshots
     session_manager: session_manager::SessionManager,
 
@@ -5140,6 +5142,7 @@ impl Editor {
             buffer_manager,
             scratch_buffers: HashMap::new(),
             open_file_watcher: Box::default(),
+            file_picker_cache: Arc::default(),
             session_manager,
             lsp_coordinator,
             agent_manager,
@@ -9369,6 +9372,7 @@ impl Editor {
         let Some(file) = self.current_buffer().file.clone() else {
             return;
         };
+        self.file_picker_cache.file_saved(Path::new(&file));
         let contents = self.current_buffer().contents();
         if let Err(error) = self.lsp.did_save(&file, &contents).await {
             log!("[lsp] saved {file}, but didSave failed: {error}");
@@ -12374,6 +12378,7 @@ impl Editor {
                 }
                 PluginRequest::InvalidateWorkspacePaths { path } => {
                     crate::workspace_paths::invalidate_workspace_path_index(Path::new(&path));
+                    self.file_picker_cache.invalidate(Path::new(&path));
                 }
                 PluginRequest::CreateTextPanel { id, config } => {
                     self.clear_replaced_panel_zoom(&id);
@@ -29228,6 +29233,12 @@ impl Editor {
                 .await?;
             }
             return Ok(());
+        }
+
+        if !prepared.resource_operations.is_empty() {
+            if let Ok(root) = std::env::current_dir() {
+                self.file_picker_cache.invalidate(&root);
+            }
         }
 
         let original_index = self.buffer_manager.active_index();
