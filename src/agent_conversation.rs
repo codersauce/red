@@ -10,6 +10,14 @@ const EDITOR_CONTEXT_MARKER: &str = "\n\nActive editor context from ";
 /// Maximum source annotations retained with one Agent conversation.
 pub const MAX_AGENT_ANNOTATIONS: usize = 512;
 
+#[derive(Debug, Default, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentThreadMode {
+    #[default]
+    Pair,
+    Delegate,
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentTranscriptRole {
@@ -45,6 +53,14 @@ pub struct AgentAnnotationRecord {
 pub struct AgentConversationSnapshot {
     pub thread_id: String,
     pub cwd: String,
+    #[serde(default)]
+    pub mode: AgentThreadMode,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub title: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_cwd: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_info: Option<crate::codex::AgentModelInfo>,
     #[serde(default)]
@@ -94,6 +110,10 @@ impl AgentConversationSnapshot {
         Self {
             thread_id: thread_id.into(),
             cwd: cwd.into(),
+            mode: AgentThreadMode::Pair,
+            title: String::new(),
+            branch: None,
+            base_cwd: None,
             model_info: None,
             items: Vec::new(),
             annotations: Vec::new(),
@@ -102,11 +122,15 @@ impl AgentConversationSnapshot {
 
     pub fn append_user(&mut self, turn_id: impl Into<String>, text: impl Into<String>) {
         let turn_id = turn_id.into();
+        let text = text.into();
+        if self.title.is_empty() {
+            self.title = concise_thread_title(&text);
+        }
         self.items.push(AgentTranscriptItem {
             id: format!("red-user-{turn_id}"),
             turn_id: Some(turn_id),
             role: AgentTranscriptRole::User,
-            text: text.into(),
+            text,
         });
         self.enforce_limits();
     }
@@ -181,6 +205,21 @@ impl AgentConversationSnapshot {
         if removed > 0 {
             self.items.drain(..removed);
         }
+    }
+}
+
+fn concise_thread_title(text: &str) -> String {
+    const MAX_TITLE_CHARS: usize = 72;
+    let title = text.lines().next().unwrap_or_default().trim();
+    let mut characters = title.chars();
+    let compact = characters
+        .by_ref()
+        .take(MAX_TITLE_CHARS)
+        .collect::<String>();
+    if characters.next().is_some() {
+        format!("{}…", compact.trim_end())
+    } else {
+        compact
     }
 }
 
@@ -325,6 +364,22 @@ mod tests {
             .reconciled_with_thread(&thread);
 
         assert_eq!(restored.items[1].text, "First\n\nSecond");
+    }
+
+    #[test]
+    fn first_user_message_supplies_a_bounded_thread_title() {
+        let mut conversation = AgentConversationSnapshot::new("thread-1", "/workspace");
+        conversation.append_user(
+            "turn-1",
+            "Implement delegated conversations with a deliberately long first line that exceeds the navigation title limit\nMore detail",
+        );
+
+        assert!(conversation.title.ends_with('…'));
+        assert!(conversation.title.chars().count() <= 73);
+        conversation.append_user("turn-2", "This must not replace the title");
+        assert!(conversation
+            .title
+            .starts_with("Implement delegated conversations"));
     }
 
     #[test]

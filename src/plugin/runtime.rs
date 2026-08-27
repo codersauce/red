@@ -1193,6 +1193,32 @@ impl RedHost {
                     .map_or_else(|| PathBuf::from("."), PathBuf::from);
                 self.send_request(PluginRequest::AgentNewSession { cwd });
             }
+            "AgentNewDelegateSession" => {
+                let cwd = args
+                    .first()
+                    .and_then(Value::as_str)
+                    .map_or_else(|| PathBuf::from("."), PathBuf::from);
+                let title = args.get(1).map(value_to_string).unwrap_or_default();
+                let branch = args.get(2).map(value_to_string).unwrap_or_default();
+                let base_cwd = args
+                    .get(3)
+                    .and_then(Value::as_str)
+                    .map_or_else(|| PathBuf::from("."), PathBuf::from);
+                self.send_request(PluginRequest::AgentNewDelegateSession {
+                    cwd,
+                    title,
+                    branch,
+                    base_cwd,
+                });
+            }
+            "AgentSelectThread" => {
+                let session_id = args
+                    .first()
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("AgentSelectThread requires a session id"))?
+                    .to_string();
+                self.send_request(PluginRequest::AgentSelectThread { session_id });
+            }
             "AgentResumeSession" => {
                 let cwd = args
                     .first()
@@ -2098,6 +2124,7 @@ impl RedHost {
             }
             "GetEditorInfo" => PluginRequest::EditorInfo(request_id),
             "EditHistory" => PluginRequest::EditHistory { request_id },
+            "AgentListThreads" => PluginRequest::AgentListThreads { request_id },
             "AgentReadDefaultModel" => PluginRequest::AgentModelRequest {
                 request_id,
                 request: crate::codex::ModelRequest::ReadDefault {
@@ -7999,7 +8026,7 @@ mod tests {
                     && config.side == crate::plugin::PanelSide::Right
                     && config.width == 62
                     && config.title.as_deref() == Some("Agent")
-                    && config.header_actions.iter().map(|action| action.id.as_str()).eq(["activity", "clear", "new", "close"])
+                    && config.header_actions.iter().map(|action| action.id.as_str()).eq(["threads", "activity", "clear", "new", "close"])
         ));
         resolve_prompt_history(&mut runtime, serde_json::json!([])).await;
         expect_agent_model_header();
@@ -8987,7 +9014,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bundled_agent_close_reopens_without_recreating_and_new_resets_the_session() {
+    async fn bundled_agent_close_reopens_and_new_pair_preserves_the_previous_session() {
         drain_requests();
         let mut runtime = Runtime::new();
         runtime
@@ -9048,6 +9075,17 @@ mod tests {
         assert!(ACTION_DISPATCHER.try_recv_request().is_none());
 
         runtime.execute_command("AgentNew").await.unwrap();
+        let (mode_picker, modes) = recv_agent_picker("New agent conversation");
+        assert_eq!(
+            modes
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect::<Vec<_>>(),
+            ["pair", "delegate"]
+        );
+        runtime
+            .notify_picker(mode_picker, PickerCallback::Selected(modes[0].clone()))
+            .unwrap();
         let mut closed = false;
         let mut cleared = false;
         let mut reset_storage = false;
@@ -9086,7 +9124,10 @@ mod tests {
                 _ => {}
             }
         }
-        assert!(closed);
+        assert!(
+            !closed,
+            "starting a pair thread keeps the previous thread available"
+        );
         assert!(cleared);
         assert!(reset_storage);
         assert!(reset_draft);
@@ -9141,6 +9182,67 @@ mod tests {
             .await
             .unwrap();
         assert!(ACTION_DISPATCHER.try_recv_request().is_none());
+    }
+
+    #[tokio::test]
+    async fn bundled_agent_delegate_previews_an_isolated_worktree() {
+        drain_requests();
+        let mut runtime = Runtime::new();
+        runtime
+            .load_plugin("agent", include_str!("../../plugins/agent.hk"))
+            .await
+            .unwrap();
+
+        runtime.execute_command("AgentNew").await.unwrap();
+        let (mode_picker, modes) = recv_agent_picker("New agent conversation");
+        runtime
+            .notify_picker(mode_picker, PickerCallback::Selected(modes[1].clone()))
+            .unwrap();
+        let (composer, title, _, _) = recv_agent_composer();
+        assert_eq!(title.as_deref(), Some("Delegate a task"));
+        runtime
+            .notify_composer(
+                composer,
+                ComposerCallback::Submitted("Implement thread navigation".to_string()),
+            )
+            .unwrap();
+        let cwd_request = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::GetConfig { request_id, key } => {
+                assert_eq!(key.as_deref(), Some("cwd"));
+                request_id
+            }
+            _ => panic!("expected delegate cwd request"),
+        };
+        runtime
+            .resolve_request(
+                cwd_request,
+                serde_json::json!({ "value": "/workspace/red" }),
+            )
+            .await
+            .unwrap();
+
+        match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::OpenCallbackConfirmation {
+                owner,
+                title,
+                message,
+                options,
+                ..
+            } => {
+                assert_eq!(owner, "agent");
+                assert_eq!(title, "Start delegated work");
+                assert!(message.contains("isolated worktree"));
+                let preview = options
+                    .rows
+                    .iter()
+                    .flatten()
+                    .map(|segment| segment.text.as_str())
+                    .collect::<String>();
+                assert!(preview.contains("red/delegate/implement-thread-navigation"));
+                assert!(preview.contains("/workspace/red.delegate-implement-thread-navigation"));
+            }
+            _ => panic!("expected delegate confirmation"),
+        }
     }
 
     #[tokio::test]

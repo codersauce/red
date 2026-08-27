@@ -51,6 +51,9 @@ impl DiffHighlightMode {
 pub struct WorkspaceConfig {
     #[serde(default)]
     pub title: String,
+    /// Label for the selectable row pane.
+    #[serde(default = "default_rows_title")]
+    pub rows_title: String,
     #[serde(default = "default_detail_ratio")]
     pub detail_ratio: u8,
     #[serde(default = "default_min_two_pane_width")]
@@ -75,6 +78,10 @@ fn default_detail_ratio() -> u8 {
     55
 }
 
+fn default_rows_title() -> String {
+    "Changes".to_string()
+}
+
 fn default_min_two_pane_width() -> usize {
     100
 }
@@ -95,6 +102,7 @@ impl Default for WorkspaceConfig {
     fn default() -> Self {
         Self {
             title: String::new(),
+            rows_title: default_rows_title(),
             detail_ratio: default_detail_ratio(),
             min_two_pane_width: default_min_two_pane_width(),
             min_stacked_height: default_min_stacked_height(),
@@ -1727,12 +1735,17 @@ fn render_row_pane(
     title_style.bold = active;
     let title = if workspace.filtering || !workspace.filter.is_empty() {
         format!(
-            "{} Changes /{}",
+            "{} {} /{}",
             if active { "›" } else { " " },
+            workspace.config.rows_title,
             workspace.filter
         )
     } else {
-        format!("{} Changes", if active { "›" } else { " " })
+        format!(
+            "{} {}",
+            if active { "›" } else { " " },
+            workspace.config.rows_title
+        )
     };
     buffer.set_text(
         x + 1,

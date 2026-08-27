@@ -119,6 +119,9 @@ pub struct SessionSnapshot {
     /// Persisted Codex thread binding and Red's clean model-visible projection.
     #[serde(default)]
     pub agent_conversation: Option<AgentConversationSnapshot>,
+    /// All known pair and delegate conversations, in navigation order.
+    #[serde(default)]
+    pub agent_threads: Vec<AgentConversationSnapshot>,
     /// Source-linked inline questions and results, independent of provider threads.
     #[serde(default)]
     pub inline_history: crate::inline_history::InlineHistory,
@@ -2328,6 +2331,7 @@ mod tests {
             last_visual_selections: Vec::new(),
             agent_transcript: None,
             agent_conversation: None,
+            agent_threads: Vec::new(),
             inline_history: Default::default(),
             legacy_agent_workspace: None,
             agent_session_resumable: false,
@@ -2394,6 +2398,25 @@ mod tests {
 
         assert_eq!(restored.agent_conversation, Some(conversation));
         assert!(restored.agent_session_resumable);
+    }
+
+    #[test]
+    fn persisted_agent_threads_keep_pair_and_delegate_metadata() {
+        let mut snapshot = snapshot("source");
+        let pair = AgentConversationSnapshot::new("pair", "/workspace");
+        let mut delegate = AgentConversationSnapshot::new("delegate", "/workspace.delegate-task");
+        delegate.mode = crate::agent_conversation::AgentThreadMode::Delegate;
+        delegate.title = "Implement task".to_string();
+        delegate.branch = Some("red/delegate/task".to_string());
+        delegate.base_cwd = Some("/workspace".to_string());
+        snapshot.agent_conversation = Some(pair.clone());
+        snapshot.agent_threads = vec![pair, delegate.clone()];
+
+        let encoded = serde_json::to_vec(&snapshot).unwrap();
+        let restored: SessionSnapshot = serde_json::from_slice(&encoded).unwrap();
+
+        assert_eq!(restored.agent_threads.len(), 2);
+        assert_eq!(restored.agent_threads[1], delegate);
     }
 
     #[test]

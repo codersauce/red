@@ -274,6 +274,8 @@ pub enum CodexEvent {
     SessionCreated {
         /// Red session identifier.
         session_id: String,
+        /// Workspace root supplied when the thread was started.
+        cwd: PathBuf,
     },
     /// A hidden commit-message generation request finished.
     CommitMessageGenerated {
@@ -1653,7 +1655,7 @@ async fn handle_response(
                     session_id.clone(),
                     Session {
                         model_info: AgentModelInfo::from_response(&message["result"]),
-                        cwd,
+                        cwd: cwd.clone(),
                         active_turn: None,
                         pending_interrupt_turn_id: None,
                         cancelled: Arc::new(AtomicBool::new(false)),
@@ -1672,7 +1674,7 @@ async fn handle_response(
                 match launch {
                     Some(SessionLaunch::New) => {
                         events
-                            .send(CodexEvent::SessionCreated { session_id })
+                            .send(CodexEvent::SessionCreated { session_id, cwd })
                             .await
                             .ok();
                     }

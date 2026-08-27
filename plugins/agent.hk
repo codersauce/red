@@ -7,6 +7,7 @@
 
 struct AgentSessionEvent {
     session_id: String,
+    cwd: Option<String>,
 }
 
 struct AgentTextEvent {
@@ -61,7 +62,41 @@ struct AgentConversationEvent {
     cwd: String,
     model_info: Json,
     items: [AgentConversationItem],
+    live: Option<bool>,
+    status: Option<String>,
 }
+
+struct AgentThread {
+    thread_id: String,
+    cwd: String,
+    mode: String,
+    title: String,
+    branch: Option<String>,
+    base_cwd: Option<String>,
+    model_info: Json,
+    items: [AgentConversationItem],
+    selected: bool,
+    live: bool,
+    status: String,
+    status_detail: Option<String>,
+}
+
+struct AgentThreadsResult { threads: [AgentThread] }
+struct AgentThreadRow {
+    id: String,
+    selectable: bool,
+    depth: i32,
+    segments: [PanelSegment],
+    right_segments: [PanelSegment],
+    data: Option<AgentThread>,
+}
+struct AgentThreadWorkspaceRow { data: AgentThread }
+struct AgentThreadWorkspaceEvent {
+    action: String,
+    row: AgentThreadWorkspaceRow,
+}
+
+struct AgentDelegateFailedEvent { message: String, cwd: String }
 
 struct AgentStringValueEvent {
     value: String,
@@ -263,6 +298,14 @@ struct AgentState {
     activity_inspector_detail: [[PanelSegment]],
     activity_block_id: String,
     thought: String,
+    threads_open: bool,
+    thread_detail: [[PanelSegment]],
+    delegate_task: String,
+    delegate_base_cwd: String,
+    delegate_branch: String,
+    delegate_worktree: String,
+    delegate_process: String,
+    delegate_error: String,
 }
 
 #[red::state]
@@ -319,6 +362,14 @@ fn initial_state() -> AgentState {
         activity_inspector_detail: [],
         activity_block_id: "",
         thought: "",
+        threads_open: false,
+        thread_detail: [[PanelSegment { text: "Select a thread", style: muted_style() }]],
+        delegate_task: "",
+        delegate_base_cwd: "",
+        delegate_branch: "",
+        delegate_worktree: "",
+        delegate_process: "",
+        delegate_error: "",
     };
 }
 
@@ -627,6 +678,18 @@ fn cwd_loaded(result: AgentStringValueEvent) {
 #[red::on("agent:session_created")]
 fn session_created(event: AgentSessionEvent) {
     red::state_patch(AgentState { session_starting: false });
+    let event_cwd = "";
+    if let Some(cwd) = event.cwd { event_cwd = cwd; }
+    if state().delegate_worktree != "" && event_cwd == state().delegate_worktree {
+        let task = state().delegate_task;
+        red::state_patch(AgentState {
+            delegate_task: "", delegate_base_cwd: "", delegate_branch: "", delegate_worktree: "",
+        });
+        red::execute("AgentPrompt", event.session_id, task);
+        red::execute("Print", "Delegated thread started · open Threads to follow it");
+        refresh_threads();
+        return;
+    }
     let previous_session_id = red::string(state().session_id, "");
     let pending = red::string(state().pending_prompt, "");
     let pending_block_id = red::string(state().pending_prompt_block_id, "");
@@ -755,6 +818,7 @@ fn ensure_conversation_panel() {
             title: "Agent",
             composer: TextPanelComposerConfig { placeholder: "Ask a follow-up…", rows: 3 },
             header_actions: [
+                TextPanelHeaderAction { id: "threads", label: "Threads", compact_label: "T" },
                 TextPanelHeaderAction { id: "activity", label: "Activity", compact_label: "A" },
                 TextPanelHeaderAction { id: "clear", label: "Clear", compact_label: "C" },
                 TextPanelHeaderAction { id: "new", label: "New", compact_label: "N" },
@@ -1387,6 +1451,8 @@ fn panel_event(event: AgentPanelEvent) {
         choose_model();
     } else if event.action == "activity" {
         toggle_activity();
+    } else if event.action == "threads" {
+        threads();
     } else if event.action == "activate_block" {
         activate_activity_block(event.text);
     } else if event.action == "clear" {
@@ -1539,17 +1605,46 @@ fn close_conversation() {
     scope = "global",
 )]
 fn new_conversation() {
+    if state().session_starting || state().delegate_task != "" || state().delegate_process != "" {
+        red::execute("Print", "An agent conversation is still starting");
+        return;
+    }
+    red::execute("OpenPicker", "New agent conversation", [
+        PickerItem {
+            id: "pair", label: "Pair in this workspace",
+            detail: "Work interactively with the active buffer and workspace", kind: "Conversation",
+        },
+        PickerItem {
+            id: "delegate", label: "Delegate in a worktree",
+            detail: "Run isolated work in the background and review it later", kind: "Conversation",
+        },
+    ], PickerOptions {
+        placeholder: "Choose how to work…", status: "Pair stays here · Delegate creates an isolated worktree",
+        presentation: "compact", item_layout: "label_first",
+    }, PickerHandlers { selected: new_mode_selected });
+}
+
+fn new_mode_selected(item: PickerItem) {
+    if item.id == "delegate" {
+        if state().delegate_task != "" || state().delegate_process != "" {
+            red::execute("Print", "A delegated thread is still starting");
+            return;
+        }
+        red::execute("OpenComposer", "Delegate a task", "", state().prompt_history, ComposerHandlers {
+            submitted: delegate_task_submitted,
+            cancelled: delegate_task_cancelled,
+        });
+    } else if item.id == "pair" {
+        start_pair_conversation();
+    }
+}
+
+fn start_pair_conversation() {
     if state().session_starting && state().session_id == "" {
         open_conversation();
         return;
     }
     let session_id = red::string(state().session_id, "");
-    if session_id != "" {
-        if !state().restoring {
-            red::execute("AgentCloseSession", session_id);
-        }
-    }
-    red::execute("AgentForgetSession", session_id);
     red::state_patch(AgentState { session_id: "" });
     reset_model_state();
     red::state_patch(AgentState { restoring: false });
@@ -1571,6 +1666,148 @@ fn new_conversation() {
     load_default_model();
     set_phase("waiting", "Starting agent…");
     start();
+}
+
+fn delegate_task_cancelled(event: ComposerCancelled) {}
+
+fn delegate_task_submitted(text: String) {
+    let task = red::trim(text);
+    if task == "" { return; }
+    red::state_patch(AgentState { delegate_task: task });
+    red::request("GetConfig", delegate_cwd_loaded, "cwd");
+}
+
+fn delegate_cwd_loaded(result: AgentStringValueEvent) {
+    let base = red::replace_all(red::string(result.value, "."), "\\", "/");
+    let parts = red::split(base, "/");
+    if red::len(parts) == 0 {
+        red::execute("Print", "Could not determine the workspace path");
+        return;
+    }
+    let repository = parts[red::len(parts) - 1];
+    let parent_parts = [];
+    let index = 0;
+    while index + 1 < red::len(parts) {
+        parent_parts = red::push(parent_parts, parts[index]);
+        index = index + 1;
+    }
+    let parent = red::join(parent_parts, "/");
+    if parent == "" { parent = "."; }
+    let slug = delegate_slug(state().delegate_task);
+    let branch = "red/delegate/" + slug;
+    let worktree = parent + "/" + repository + ".delegate-" + slug;
+    red::state_patch(AgentState {
+        delegate_base_cwd: base,
+        delegate_branch: branch,
+        delegate_worktree: worktree,
+    });
+    red::execute("OpenConfirm", "Start delegated work",
+        "Create an isolated worktree and start this task in the background.",
+        PickerHandlers { selected: delegate_confirmed, cancelled: delegate_confirm_cancelled },
+        Json {
+            accept_label: "Delegate",
+            cancel_label: "Cancel",
+            rows: [
+                [Json { text: "Branch    ", style: muted_style() }, Json { text: branch, style: normal_style() }],
+                [Json { text: "Worktree  ", style: muted_style() }, Json { text: worktree, style: normal_style() }],
+            ],
+        });
+}
+
+fn delegate_slug(task: String) -> String {
+    let slug = red::lower(red::trim(red::split(task, "\n")[0]));
+    for separator in [
+        " ", "_", "/", "\\", ":", ".", ",", "(", ")", "[", "]", "?", "*", "^", "~", "{", "}",
+        "'", "\"", "|", "<", ">", "=", "+", ";",
+    ] {
+        slug = red::replace_all(slug, separator, "-");
+    }
+    while red::len(red::split(slug, "--")) > 1 {
+        slug = red::replace_all(slug, "--", "-");
+    }
+    if red::len(slug) > 40 { slug = red::slice(slug, 0, 40); }
+    if slug == "" { slug = "task"; }
+    return slug;
+}
+
+fn delegate_confirm_cancelled(event: PickerCancelled) {
+    clear_delegate_start();
+}
+
+fn clear_delegate_start() {
+    red::state_patch(AgentState {
+        delegate_task: "", delegate_base_cwd: "", delegate_branch: "", delegate_worktree: "",
+    });
+}
+
+fn delegate_confirmed(item: PickerItem) {
+    if item.id != "accept" {
+        clear_delegate_start();
+        return;
+    }
+    let process_id = red::execute("SpawnProcess", Process {
+        command: "git",
+        args: ["worktree", "add", "-b", state().delegate_branch, state().delegate_worktree, "HEAD"],
+        cwd: state().delegate_base_cwd,
+        env: Json { LC_ALL: "C" },
+    });
+    red::state_patch(AgentState { delegate_process: process_id, delegate_error: "" });
+    red::on("process:" + process_id, delegate_worktree_event);
+    red::execute("Print", "Creating delegated worktree…");
+}
+
+fn delegate_worktree_event(event: ProcessEvent) {
+    match event {
+        ProcessEvent::Stdout { process_id, line, plugin_name } => {
+            if process_id == state().delegate_process {
+                red::state_patch(AgentState { delegate_error: state().delegate_error + line + "\n" });
+            }
+        }
+        ProcessEvent::Stderr { process_id, line, plugin_name } => {
+            if process_id == state().delegate_process {
+                red::state_patch(AgentState { delegate_error: state().delegate_error + line + "\n" });
+            }
+        }
+        ProcessEvent::Error { process_id, message, plugin_name } => {
+            if process_id == state().delegate_process { delegate_worktree_finished(false, message); }
+        }
+        ProcessEvent::Exit { process_id, code, plugin_name } => {
+            if process_id != state().delegate_process { return; }
+            let exit_code = 1;
+            if let Some(value) = code { exit_code = value; }
+            delegate_worktree_finished(exit_code == 0, "git exited with code " + exit_code);
+        }
+    }
+}
+
+fn delegate_worktree_finished(succeeded: bool, fallback: String) {
+    let details = red::trim(state().delegate_error);
+    red::state_patch(AgentState { delegate_process: "", delegate_error: "" });
+    if !succeeded {
+        if details == "" { details = fallback; }
+        red::state_patch(AgentState {
+            delegate_task: "", delegate_base_cwd: "", delegate_branch: "", delegate_worktree: "",
+        });
+        red::execute("Print", "Could not create delegated worktree: " + details);
+        return;
+    }
+    let title = red::split(state().delegate_task, "\n")[0];
+    red::execute(
+        "AgentNewDelegateSession",
+        state().delegate_worktree,
+        title,
+        state().delegate_branch,
+        state().delegate_base_cwd
+    );
+    red::execute("Print", "Delegated work is starting in " + state().delegate_worktree);
+}
+
+#[red::on("agent:delegate_failed")]
+fn delegate_failed(event: AgentDelegateFailedEvent) {
+    red::state_patch(AgentState {
+        delegate_task: "", delegate_base_cwd: "", delegate_branch: "", delegate_worktree: "",
+    });
+    red::execute("Print", "Could not start delegated work: " + event.message);
 }
 
 fn prompt_cancelled(event: ComposerCancelled) {}
@@ -1711,6 +1948,7 @@ fn flat_transcript(blocks: [AgentTextBlock]) -> String {
 
 #[red::on("agent:completed")]
 fn completed(event: AgentCompletedEvent) {
+    refresh_threads();
     if !is_current_session(event.session_id) {
         return;
     }
@@ -1792,6 +2030,7 @@ fn cancelled(event: AgentSessionEvent) {
 
 #[red::on("agent:error")]
 fn failed(event: AgentErrorEvent) {
+    refresh_threads();
     if !is_current_session(red::string(event.session_id, "")) {
         return;
     }
@@ -2263,6 +2502,167 @@ fn legacy_transcript_blocks(transcript: String) -> [AgentTextBlock] {
 }
 
 #[red::command(
+    name = "AgentThreads",
+    title = "Show agent threads",
+    category = "Agent",
+    description = "Inspect pair and delegated conversations",
+    aliases = ["agent sessions", "delegated work"],
+    scope = "global",
+)]
+fn threads() {
+    red::state_patch(AgentState { threads_open: true });
+    red::execute("OpenWorkspace", "agent-threads", WorkspaceConfig {
+        title: "Agent threads",
+        rows_title: "Threads",
+        detail_ratio: 62,
+        min_two_pane_width: 88,
+    });
+    refresh_threads();
+}
+
+fn refresh_threads() {
+    if state().threads_open { red::request("AgentListThreads", render_threads); }
+}
+
+fn append_thread_section(rows: [AgentThreadRow], threads: [AgentThread], status: String, title: String) -> [AgentThreadRow] {
+    let count = 0;
+    for thread in threads {
+        if thread.status == status { count = count + 1; }
+    }
+    if count == 0 { return rows; }
+    rows = red::push(rows, AgentThreadRow {
+        id: "section:" + status,
+        selectable: false,
+        segments: [PanelSegment { text: title + "  " + count, style: heading_style() }],
+    });
+    for thread in threads {
+        if thread.status != status { continue; }
+        let title = red::string(thread.title, "Untitled conversation");
+        let marker = "  ";
+        if thread.selected { marker = "● "; }
+        let mode = "Pair";
+        if thread.mode == "delegate" { mode = "Delegate"; }
+        rows = red::push(rows, AgentThreadRow {
+            id: "thread:" + thread.thread_id,
+            selectable: true,
+            depth: 1,
+            segments: [
+                PanelSegment { text: marker, style: success_style() },
+                PanelSegment { text: title, style: normal_style() },
+            ],
+            right_segments: [PanelSegment { text: mode, style: muted_style() }],
+            data: Some(thread),
+        });
+    }
+    return rows;
+}
+
+fn render_threads(result: AgentThreadsResult) {
+    if !state().threads_open { return; }
+    let rows: [AgentThreadRow] = [];
+    rows = append_thread_section(rows, result.threads, "Needs you", "Needs you");
+    rows = append_thread_section(rows, result.threads, "Failed", "Failed");
+    rows = append_thread_section(rows, result.threads, "Running", "Running");
+    rows = append_thread_section(rows, result.threads, "Ready to review", "Ready to review");
+    rows = append_thread_section(rows, result.threads, "Current", "Current");
+    rows = append_thread_section(rows, result.threads, "History", "History");
+    if red::len(rows) == 0 {
+        rows = red::push(rows, AgentThreadRow {
+            id: "empty", selectable: false,
+            segments: [PanelSegment { text: "No agent conversations yet", style: muted_style() }],
+        });
+    }
+    red::execute("UpdateWorkspace", "agent-threads", WorkspaceModel {
+        rows: rows,
+        detail: state().thread_detail,
+        actions: [
+            AgentWorkspaceAction { hint: AgentWorkspaceActionHint { id: "activate", key: "enter", label: "open", priority: "essential" } },
+            AgentWorkspaceAction { hint: AgentWorkspaceActionHint { id: "n", key: "n", label: "new…", priority: "secondary" } },
+            AgentWorkspaceAction { hint: AgentWorkspaceActionHint { id: "r", key: "r", label: "refresh", priority: "secondary" } },
+        ],
+    });
+}
+
+fn thread_detail(thread: AgentThread) -> [[PanelSegment]] {
+    let title = red::string(thread.title, "Untitled conversation");
+    let detail = [
+        [PanelSegment { text: title, style: heading_style() }],
+        [PanelSegment { text: thread.status + " · " + thread.mode, style: muted_style() }],
+    ];
+    let status_detail = red::string(thread.status_detail, "");
+    if status_detail != "" {
+        detail = red::push(detail, [PanelSegment { text: status_detail, style: warning_style() }]);
+    }
+    let branch = red::string(thread.branch, "");
+    if branch != "" {
+        detail = red::push(detail, [PanelSegment { text: "Branch  " + branch, style: normal_style() }]);
+    }
+    detail = red::push(detail, [PanelSegment { text: "Worktree  " + thread.cwd, style: muted_style() }]);
+    detail = red::push(detail, []);
+    for item in thread.items {
+        let label = "Agent";
+        let style = normal_style();
+        if item.role == "user" { label = "You"; style = heading_style(); }
+        detail = red::push(detail, [PanelSegment { text: label + ": " + item.text, style: style }]);
+    }
+    if red::len(thread.items) == 0 {
+        detail = red::push(detail, [PanelSegment { text: "Waiting for the first message…", style: muted_style() }]);
+    }
+    return detail;
+}
+
+#[red::on("workspace:event:agent-threads")]
+fn threads_event(event: AgentThreadWorkspaceEvent) {
+    if event.action == "q" || event.action == "escape" {
+        red::state_patch(AgentState { threads_open: false });
+        red::execute("CloseWorkspace", "agent-threads");
+        return;
+    }
+    if event.action == "n" { new_conversation(); return; }
+    if event.action == "r" { refresh_threads(); return; }
+    let row = event.row;
+    if row == red::null() || row.data.thread_id == red::null() { return; }
+    red::state_patch(AgentState { thread_detail: thread_detail(row.data) });
+    if event.action == "activate" {
+        red::execute("AgentSelectThread", row.data.thread_id);
+        return;
+    }
+    refresh_threads();
+}
+
+#[red::on("agent:thread_selected")]
+fn thread_selected(event: AgentConversationEvent) {
+    load_conversation(event);
+    red::state_patch(AgentState {
+        session_id: event.thread_id,
+        model_info: event.model_info,
+        accepted_model: Json {},
+        turn_model_info: Json {},
+        prompt_queue: [],
+        cancelled_session_id: "",
+    });
+    let live = false;
+    if let Some(value) = event.live { live = value; }
+    let status = "History";
+    if let Some(value) = event.status { status = value; }
+    red::state_patch(AgentState { turn_active: status == "Running", restoring: !live });
+    red::state_patch(AgentState { threads_open: false });
+    red::execute("CloseWorkspace", "agent-threads");
+    ensure_conversation_panel();
+    red::execute("SetPanelVisible", "agent-conversation", true);
+    if live {
+        set_phase(if status == "Running" { "waiting" } else { "idle" }, if status == "Running" { "Working in delegated worktree…" } else { "" });
+        red::execute("SetTextPanelComposerState", "agent-conversation", true, "");
+    } else {
+        set_phase("restoring", "Restoring session…");
+        red::execute("SetTextPanelComposerState", "agent-conversation", false, "Restoring agent session…");
+        red::execute("AgentResumeSession", event.cwd, event.thread_id);
+    }
+    refresh_model_header();
+    red::execute("FocusTextPanelComposer", "agent-conversation");
+}
+
+#[red::command(
     name = "AgentHistory",
     title = "Show agent history",
     category = "Agent",
@@ -2361,6 +2761,7 @@ fn history_event(event: AgentHistoryEvent) {
 
 #[red::on("agent:permission_requested")]
 fn permission_requested(event: AgentPermissionEvent) {
+    refresh_threads();
     if !is_current_session(event.session_id) {
         return;
     }
