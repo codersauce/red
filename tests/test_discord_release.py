@@ -63,6 +63,30 @@ class DiscordReleaseTest(unittest.TestCase):
         self.assertEqual(payload["allowed_mentions"], {"parse": []})
         self.assertNotIn("content", payload)
 
+    def test_reviewed_campaign_stories_override_commit_ranking(self) -> None:
+        campaign = {
+            "version": "0.2.4",
+            "summary": "Editor-aware agents and Vim-style editing.",
+            "stories": [
+                {"title": "Jump from agent explanations into source", "channels": ["discord"]},
+                {"title": "Review an exact visual selection inline", "channels": ["discord"]},
+                {"title": "Internal detail", "channels": ["github"]},
+            ],
+        }
+
+        payload = build_payload(RELEASE, campaign=campaign)
+        embed = payload["embeds"][0]
+        highlights = embed["fields"][0]["value"]
+
+        self.assertTrue(embed["description"].startswith(campaign["summary"]))
+        self.assertIn("2 new features and 1 fix", embed["description"])
+        self.assertLess(highlights.index("agent explanations"), highlights.index("selection inline"))
+        self.assertNotIn("Internal detail", highlights)
+
+    def test_rejects_a_campaign_for_another_release(self) -> None:
+        with self.assertRaisesRegex(ValueError, "campaign version"):
+            build_payload(RELEASE, campaign={"version": "0.9.0"})
+
     def test_everyone_mention_must_be_enabled_explicitly(self) -> None:
         payload = build_payload(RELEASE, mention_everyone=True)
 

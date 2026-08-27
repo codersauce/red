@@ -77,8 +77,11 @@ jobs:
       - name: Validate main branch ruleset recipe
         run: python3 -m json.tool .github/rulesets/main.json > /dev/null
 
-      - name: Test Discord release announcements
-        run: python3 -m unittest tests.test_discord_release
+      - name: Validate reviewed release campaign
+        run: python3 scripts/release_campaign.py validate
+
+      - name: Test release campaign and Discord announcements
+        run: python3 -m unittest tests.test_release_campaign tests.test_discord_release tests.test_social_release
 
       - name: Test validation helpers
         run: python3 -m unittest tests.test_ci_policy tests.test_doctest_packages tests.test_test_performance
@@ -216,6 +219,12 @@ jobs:
         env:
           HEAD_REF: ${{ github.head_ref }}
         run: echo "version=${HEAD_REF#release/v}" >> "$GITHUB_OUTPUT"
+
+      - name: Validate release PR campaign version
+        if: startsWith(github.head_ref, 'release/v')
+        env:
+          VERSION: ${{ steps.release.outputs.version }}
+        run: python3 scripts/release_campaign.py validate --version "$VERSION"
 
       - name: Regenerate release PR changelog
         if: startsWith(github.head_ref, 'release/v')

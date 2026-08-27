@@ -260,6 +260,24 @@ jobs:
           GITHUB_REPO: ${{ github.repository }}
           GITHUB_TOKEN: ${{ github.token }}
 
+      - name: Add reviewed release highlights
+        env:
+          TAG_NAME: ${{ github.event_name == 'workflow_dispatch' && inputs.tag_name || github.ref_name }}
+        run: |
+          set -euo pipefail
+          version="${TAG_NAME#v}"
+          python3 scripts/release_campaign.py validate --version "$version"
+          python3 scripts/release_campaign.py render \
+            --channel github \
+            --version "$version" \
+            --output "$RUNNER_TEMP/release-introduction.md"
+          {
+            cat "$RUNNER_TEMP/release-introduction.md"
+            printf '\n'
+            cat RELEASE_NOTES.md
+          } > "$RUNNER_TEMP/release-notes.md"
+          mv "$RUNNER_TEMP/release-notes.md" RELEASE_NOTES.md
+
       - name: Generate checksums
         run: |
           set -euo pipefail

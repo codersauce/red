@@ -12,6 +12,7 @@ use semver::Version;
 use serde::Deserialize;
 
 const EMBEDDED_CHANGELOG: &str = include_str!("../CHANGELOG.md");
+const EMBEDDED_RELEASE_CAMPAIGN: &str = include_str!("../release/campaign.toml");
 const REPOSITORY: &str = "codersauce/red";
 const MAX_RELEASE_NOTES_BYTES: usize = 128 * 1024;
 const RELEASE_REQUEST_TIMEOUT: Duration = Duration::from_secs(4);
@@ -34,6 +35,18 @@ pub struct ReleaseNotes {
 struct ChangelogSection {
     version: Version,
     markdown: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ReleaseCampaign {
+    version: String,
+    stories: Vec<ReleaseCampaignStory>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ReleaseCampaignStory {
+    title: String,
+    channels: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -127,10 +140,37 @@ impl ReleaseNotes {
             }
         }
 
+        if let Some(highlights) = self.campaign_highlights(EMBEDDED_RELEASE_CAMPAIGN) {
+            sections.insert(0, highlights);
+        }
+
         if sections.is_empty() {
             self.markdown.clone()
         } else {
             sections.join("\n\n")
+        }
+    }
+
+    fn campaign_highlights(&self, contents: &str) -> Option<String> {
+        let campaign = toml::from_str::<ReleaseCampaign>(contents).ok()?;
+        if campaign.version != self.version {
+            return None;
+        }
+
+        let highlights = campaign
+            .stories
+            .into_iter()
+            .filter(|story| story.channels.iter().any(|channel| channel == "in_app"))
+            .take(MAX_HIGHLIGHTS_PER_SECTION)
+            .map(|story| format!("- {}", story.title))
+            .collect::<Vec<_>>();
+        if highlights.is_empty() {
+            None
+        } else {
+            Some(format!(
+                "## Release highlights\n\n{}",
+                highlights.join("\n")
+            ))
         }
     }
 
@@ -325,6 +365,31 @@ mod tests {
         assert!(highlights.contains("## Fixes"));
         assert!(highlights.contains("issues/2"));
         assert!(!highlights.contains("commit/abcdef"));
+    }
+
+    #[test]
+    fn campaign_highlights_require_an_exact_release_match() {
+        let notes = ReleaseNotes::from_changelog(CHANGELOG, "0.5.0", None);
+        let campaign = "version = \"0.5.0\"\n\n[[stories]]\ntitle = \"Jump to annotated source\"\nchannels = [\"in_app\"]\n\n[[stories]]\ntitle = \"Social only\"\nchannels = [\"x\"]\n";
+
+        let highlights = notes.campaign_highlights(campaign).unwrap();
+
+        assert!(highlights.contains("Jump to annotated source"));
+        assert!(!highlights.contains("Social only"));
+    }
+
+    #[test]
+    fn unresolved_mismatched_or_invalid_campaigns_keep_changelog_fallback() {
+        let notes = ReleaseNotes::from_changelog(CHANGELOG, "0.5.0", None);
+
+        for campaign in [
+            "version = \"next\"\nstories = []",
+            "version = \"0.6.0\"\nstories = []",
+            "not valid toml = [",
+        ] {
+            assert!(notes.campaign_highlights(campaign).is_none());
+        }
+        assert!(notes.highlights_markdown().contains("New thing"));
     }
 
     #[test]

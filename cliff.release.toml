@@ -5,7 +5,7 @@ header = """
 """
 body = """
 {% for group, commits in commits | group_by(attribute="group") %}
-### {{ group | upper_first }}
+### {{ group | striptags | trim | upper_first }}
 {% for commit in commits %}
 {% set message = commit.message | split(pat="\n") | first | trim -%}
 {% if commit.remote.pr_number -%}
@@ -34,18 +34,18 @@ conventional_commits = true
 filter_unconventional = false
 split_commits = false
 tag_pattern = "v[0-9].*"
-sort_commits = "oldest"
+sort_commits = "newest"
 
 commit_parsers = [
   { message = "^Merge", skip = true },
   { message = "^chore\\(release\\): prepare v", skip = true },
   { message = "^almanac", skip = true },
-  { message = "^feat", group = "Features" },
-  { message = "^fix", group = "Bug Fixes" },
-  { message = "^perf", group = "Performance" },
-  { message = "^refactor", group = "Refactoring" },
-  { message = "^docs", group = "Documentation" },
-  { message = "^test", group = "Tests" },
-  { message = "^chore", group = "Maintenance" },
-  { message = ".*", group = "Other" },
+  { message = "^feat", group = "<!-- 00 -->Features" },
+  { message = "^perf", group = "<!-- 01 -->Performance" },
+  { message = "^fix", group = "<!-- 02 -->Bug Fixes" },
+  { message = "^refactor", group = "<!-- 03 -->Refactoring" },
+  { message = "^docs", group = "<!-- 04 -->Documentation" },
+  { message = "^test", group = "<!-- 05 -->Tests" },
+  { message = "^chore", group = "<!-- 06 -->Maintenance" },
+  { message = ".*", group = "<!-- 07 -->Other" },
 ]
