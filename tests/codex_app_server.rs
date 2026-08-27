@@ -67,6 +67,8 @@ assert "orchestrator.mcp.enabled=false" in sys.argv
 def send(value):
     print(json.dumps(value), flush=True)
 
+delegate = os.environ.get("RED_MOCK_DELEGATE") == "true"
+
 for line in sys.stdin:
     message = json.loads(line)
     method = message.get("method")
@@ -83,9 +85,14 @@ for line in sys.stdin:
         requirements = json.loads(os.environ.get("RED_MOCK_REQUIREMENTS", "null"))
         send({"id": ident, "result": {"requirements": requirements}})
     elif method == "thread/start":
-        assert message["params"]["sandbox"] == "read-only"
+        expected_sandbox = "workspace-write" if delegate else "read-only"
+        assert message["params"]["sandbox"] == expected_sandbox
         assert message["params"]["approvalPolicy"] == "never"
         assert message["params"]["ephemeral"] is False
+        if delegate:
+            assert "delegated coding agent" in message["params"]["baseInstructions"]
+        else:
+            assert "no shell" in message["params"]["baseInstructions"]
         expected_tools = {
             "list_files", "search_files", "read_file", "write_file",
             "get_editor_state", "open_file", "select_text", "apply_edits",
@@ -121,6 +128,31 @@ for line in sys.stdin:
             }]
         }}})
     elif method == "turn/start":
+        if delegate:
+            assert message["params"]["input"][0]["text"] == "run tests"
+            policy = message["params"]["sandboxPolicy"]
+            assert policy["type"] == "workspaceWrite"
+            assert policy["writableRoots"] == [os.environ["RED_MOCK_DELEGATE_CWD"]]
+            assert policy["networkAccess"] is False
+            assert policy["excludeTmpdirEnvVar"] is True
+            assert policy["excludeSlashTmp"] is True
+            send({"id": ident, "result": {"turn": {"id": "turn-red"}}})
+            send({"method": "item/started", "params": {
+                "threadId": "thread-red", "turnId": "turn-red",
+                "item": {"id": "exec-red", "type": "commandExecution",
+                         "command": "cargo test", "cwd": policy["writableRoots"][0],
+                         "status": "inProgress"}
+            }})
+            send({"method": "item/completed", "params": {
+                "threadId": "thread-red", "turnId": "turn-red",
+                "item": {"id": "exec-red", "type": "commandExecution",
+                         "command": "cargo test", "cwd": policy["writableRoots"][0],
+                         "status": "completed", "exitCode": 0, "durationMs": 45}
+            }})
+            send({"method": "turn/completed", "params": {
+                "threadId": "thread-red", "turn": {"id": "turn-red", "status": "completed"}
+            }})
+            continue
         assert message["params"]["input"][0]["text"] == "update the file"
         context = message["params"]["input"][1]["text"]
         assert "Active editor context from red-buffer://active:" in context
@@ -453,6 +485,67 @@ async fn direct_app_server_streams_and_routes_writes_to_the_host() {
         *writes.lock().unwrap(),
         vec![("src/main.rs".to_string(), "updated\n".to_string())]
     );
+
+    drop(bridge);
+    task.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn delegated_app_server_uses_workspace_write_and_reports_command_activity() {
+    let _serial = MOCK_CODEX_TEST_LOCK.lock().await;
+    let directory = tempfile::tempdir().unwrap();
+    let codex = mock_codex(directory.path());
+    let host = RecordingHost {
+        writes: Arc::new(Mutex::new(Vec::new())),
+    };
+    let mut spec = CodexProcessSpec::new(codex, directory.path());
+    spec.environment
+        .insert("RED_MOCK_DELEGATE".into(), "true".into());
+    spec.environment.insert(
+        "RED_MOCK_DELEGATE_CWD".into(),
+        directory.path().as_os_str().to_owned(),
+    );
+    let (mut bridge, mut task) = start_codex(spec, host, NonZeroUsize::new(32).unwrap()).unwrap();
+
+    bridge
+        .send(CodexCommand::NewDelegateSession {
+            cwd: directory.path().to_path_buf(),
+        })
+        .await
+        .unwrap();
+    let session_id = match next_event(&mut bridge, &mut task).await {
+        CodexEvent::SessionCreated { session_id, cwd } => {
+            assert_eq!(cwd, directory.path());
+            session_id
+        }
+        other => panic!("expected delegated session, got {other:?}"),
+    };
+    bridge
+        .send(CodexCommand::Prompt {
+            session_id,
+            text: "run tests".to_string(),
+        })
+        .await
+        .unwrap();
+
+    let mut activity = Vec::new();
+    loop {
+        match next_event(&mut bridge, &mut task).await {
+            CodexEvent::Activity { update, .. } => activity.push(update),
+            CodexEvent::Completed { stop_reason, .. } => {
+                assert_eq!(stop_reason, "completed");
+                break;
+            }
+            CodexEvent::Failed { message, .. } => panic!("{message}"),
+            _ => {}
+        }
+    }
+    assert_eq!(activity.len(), 2);
+    assert_eq!(activity[0]["title"], "Running cargo test");
+    assert_eq!(activity[0]["status"], "in_progress");
+    assert_eq!(activity[1]["title"], "Ran cargo test");
+    assert_eq!(activity[1]["status"], "completed");
+    assert_eq!(activity[1]["detail"], "exit 0 · 45 ms");
 
     drop(bridge);
     task.await.unwrap().unwrap();

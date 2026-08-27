@@ -433,6 +433,7 @@ mod tests {
             pending_interrupt_turn_id: None,
             cancelled: Arc::new(AtomicBool::new(false)),
             allow_sensitive_paths: false,
+            mode: AgentSessionMode::Pair,
             kind,
         }
     }
