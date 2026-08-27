@@ -234,7 +234,7 @@ async fn excluded_agent_context_redacts_annotation_messages() {
         .current_buffer_mut()
         .save_as(&sensitive.to_string_lossy())
         .unwrap();
-    let state = editor.agent_editor_state();
+    let state = editor.agent_editor_state(root.path());
 
     assert_eq!(state["context"]["included"], false);
     assert_eq!(state["annotations"]["visible_count"], 0);

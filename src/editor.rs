@@ -1380,9 +1380,9 @@ fn agent_event_payload(event: CodexEvent) -> (&'static str, Value) {
             "agent:model_changed",
             json!({ "session_id": session_id, "model_info": model_info }),
         ),
-        CodexEvent::SessionCreated { session_id } => (
+        CodexEvent::SessionCreated { session_id, cwd } => (
             "agent:session_created",
-            json!({ "session_id": session_id.to_string() }),
+            json!({ "session_id": session_id.to_string(), "cwd": cwd }),
         ),
         CodexEvent::CommitMessageGenerated { request_id, result } => (
             "agent:error",
@@ -1741,6 +1741,18 @@ pub enum PluginRequest {
     },
     AgentNewSession {
         cwd: PathBuf,
+    },
+    AgentNewDelegateSession {
+        cwd: PathBuf,
+        title: String,
+        branch: String,
+        base_cwd: PathBuf,
+    },
+    AgentListThreads {
+        request_id: RequestId,
+    },
+    AgentSelectThread {
+        session_id: String,
     },
     AgentResumeSession {
         cwd: PathBuf,
@@ -2194,6 +2206,9 @@ impl PluginRequest {
             Self::AgentModelRequest { .. } => "AgentModelRequest",
             Self::SetTextPanelHeaderDetail { .. } => "SetTextPanelHeaderDetail",
             Self::AgentNewSession { .. } => "AgentNewSession",
+            Self::AgentNewDelegateSession { .. } => "AgentNewDelegateSession",
+            Self::AgentListThreads { .. } => "AgentListThreads",
+            Self::AgentSelectThread { .. } => "AgentSelectThread",
             Self::AgentResumeSession { .. } => "AgentResumeSession",
             Self::AgentPrompt { .. } => "AgentPrompt",
             Self::AgentPromptWithContext { .. } => "AgentPromptWithContext",
@@ -3409,7 +3424,7 @@ pub struct Editor {
     lsp_coordinator: lsp_coordinator::LspCoordinator,
 
     /// Domain sub-controller managing background AI agent state and tool channels
-    agent_manager: agent_manager::AgentManager,
+    agent_manager: Box<agent_manager::AgentManager>,
 
     /// One editor-owned bounded inline edit, including stale-response guards.
     inline_assist: Option<InlineAssistSession>,
@@ -5131,7 +5146,7 @@ impl Editor {
         let lsp_coordinator = lsp_coordinator::LspCoordinator::with_buffers(&buffers);
         let buffer_manager = buffer_manager::BufferManager::with_buffers(buffers);
         let session_manager = session_manager::SessionManager::new();
-        let agent_manager = agent_manager::AgentManager::new();
+        let agent_manager = Box::new(agent_manager::AgentManager::new());
         let whats_new_startup_pending = preferences.is_persistent()
             && config.show_whats_new.unwrap_or(true)
             && preferences.last_seen_version() != Some(env!("CARGO_PKG_VERSION"));
@@ -8592,16 +8607,21 @@ impl Editor {
     }
 
     fn agent_context_payload(&self) -> Value {
+        let root = self
+            .agent_manager
+            .conversation_snapshot()
+            .map(|conversation| PathBuf::from(conversation.cwd))
+            .or_else(|| self.agent_manager.root().map(Path::to_path_buf))
+            .unwrap_or_else(get_workspace_path);
+        self.agent_context_payload_for_root(&root)
+    }
+
+    fn agent_context_payload_for_root(&self, root: &Path) -> Value {
         const CONTEXT_LINES: usize = 40;
         const MAX_CONTEXT_CHARS: usize = 40_000;
         const MAX_DIAGNOSTICS: usize = 20;
 
         let buffer = self.current_buffer();
-        let root = self
-            .agent_manager
-            .root()
-            .map(Path::to_path_buf)
-            .unwrap_or_else(get_workspace_path);
         let path = buffer.file.as_deref().and_then(|file| {
             Path::new(file)
                 .absolutize()
@@ -8615,7 +8635,7 @@ impl Editor {
             .unwrap_or_else(|| "red-buffer://active".to_string());
         let file = path
             .as_ref()
-            .and_then(|path| path.strip_prefix(&root).ok())
+            .and_then(|path| path.strip_prefix(root).ok())
             .unwrap_or_else(|| path.as_deref().unwrap_or_else(|| Path::new("[No Name]")))
             .to_string_lossy()
             .into_owned();
@@ -8637,16 +8657,16 @@ impl Editor {
 
         let unsafe_reason = path.as_ref().and_then(|path| {
             let physical_path = fs::canonicalize(path).ok();
-            let physical_root = fs::canonicalize(&root).ok();
+            let physical_root = fs::canonicalize(root).ok();
             let escapes_root = physical_path
                 .as_ref()
                 .zip(physical_root.as_ref())
                 .is_some_and(|(path, root)| !path.starts_with(root));
-            if !path.starts_with(&root) || escapes_root {
+            if !path.starts_with(root) || escapes_root {
                 Some("outside the workspace")
             } else if agent_context_path_is_sensitive(path) {
                 Some("a sensitive file")
-            } else if agent_context_path_is_ignored(path, &root, /*is_dir*/ false) {
+            } else if agent_context_path_is_ignored(path, root, /*is_dir*/ false) {
                 Some("an ignored file")
             } else {
                 None
@@ -9204,8 +9224,8 @@ impl Editor {
         Ok(())
     }
 
-    fn agent_editor_state(&self) -> Value {
-        let context = self.agent_context_payload();
+    fn agent_editor_state(&self, root: &Path) -> Value {
+        let context = self.agent_context_payload_for_root(root);
         let included = context
             .get("included")
             .and_then(Value::as_bool)
@@ -9240,15 +9260,13 @@ impl Editor {
             .as_array()
             .cloned()
             .unwrap_or_default();
-        if let Some(root) = self.agent_manager.root() {
-            windows.retain(|window| {
-                window
-                    .get("file")
-                    .and_then(Value::as_str)
-                    .and_then(|path| resolve_agent_tool_path(root, path).ok())
-                    .is_some()
-            });
-        }
+        windows.retain(|window| {
+            window
+                .get("file")
+                .and_then(Value::as_str)
+                .and_then(|path| resolve_agent_tool_path(root, path).ok())
+                .is_some()
+        });
         json!({
             "ok": true,
             "file": included.then(|| context.get("file").cloned()).flatten(),
@@ -9520,7 +9538,7 @@ impl Editor {
             .map(|transaction| transaction.id.clone());
         let root = self
             .agent_manager
-            .root()
+            .root_for_session(session_id)
             .ok_or_else(|| anyhow::anyhow!("no agent workspace is active"))?
             .to_path_buf();
         let notification_error = self.notify_change(runtime).await.err();
@@ -9567,7 +9585,7 @@ impl Editor {
         );
         let root = self
             .agent_manager
-            .root()
+            .root_for_session(&request.session_id)
             .ok_or_else(|| anyhow::anyhow!("no agent workspace is active"))?
             .to_path_buf();
 
@@ -9696,7 +9714,7 @@ impl Editor {
                 )
                 .await
             }
-            EditorToolCall::GetEditorState {} => Ok(self.agent_editor_state()),
+            EditorToolCall::GetEditorState {} => Ok(self.agent_editor_state(&root)),
             EditorToolCall::OpenFile {
                 path,
                 line,
@@ -9723,7 +9741,7 @@ impl Editor {
                     runtime,
                 )
                 .await?;
-                Ok(self.agent_editor_state())
+                Ok(self.agent_editor_state(&root))
             }
             EditorToolCall::SelectText {
                 path,
@@ -9784,7 +9802,7 @@ impl Editor {
                         runtime,
                     )
                     .await?;
-                    return Ok(self.agent_editor_state());
+                    return Ok(self.agent_editor_state(&root));
                 }
                 self.mode = match kind {
                     EditorSelectionKind::Character => Mode::Visual,
@@ -9799,7 +9817,7 @@ impl Editor {
                     runtime,
                 )
                 .await?;
-                Ok(self.agent_editor_state())
+                Ok(self.agent_editor_state(&root))
             }
             EditorToolCall::ApplyEdits {
                 path,
@@ -9845,7 +9863,7 @@ impl Editor {
                     }
                 };
                 self.execute(&action, render_buffer, runtime).await?;
-                Ok(self.agent_editor_state())
+                Ok(self.agent_editor_state(&root))
             }
         }
     }
@@ -9856,7 +9874,11 @@ impl Editor {
         render_buffer: &mut RenderBuffer,
         runtime: &mut Runtime,
     ) -> anyhow::Result<Duration> {
-        let Some(root) = self.agent_manager.root().map(Path::to_path_buf) else {
+        let Some(root) = self
+            .agent_manager
+            .root_for_session(&request.session_id)
+            .map(Path::to_path_buf)
+        else {
             anyhow::bail!("no agent workspace is active");
         };
         let (path, position, create, delay) = match &request.call {
@@ -10305,6 +10327,7 @@ impl Editor {
             task.abort();
         }
         self.agent_manager.clear_active_sessions();
+        self.agent_manager.clear_live_sessions();
         self.agent_manager.clear_turns();
         self.agent_manager.clear_tool_requests();
         self.agent_manager.set_root(None);
@@ -10315,14 +10338,6 @@ impl Editor {
             anyhow::bail!("agent support is disabled by `disable_ai = true`");
         }
         let cwd = cwd.absolutize()?.into_owned();
-        if let Some(root) = self.agent_manager.root() {
-            anyhow::ensure!(
-                root == cwd,
-                "Codex session root `{}` does not match the active agent workspace `{}`",
-                cwd.display(),
-                root.display()
-            );
-        }
         if self.agent_manager.has_bridge() {
             return Ok(());
         }
@@ -10418,6 +10433,7 @@ impl Editor {
         self.stop_inline_agent_outcomes(fallback);
         drop(self.agent_manager.take_bridge());
         self.agent_manager.clear_active_sessions();
+        self.agent_manager.clear_live_sessions();
         self.agent_manager.clear_turns();
         self.agent_manager.clear_tool_requests();
         self.agent_manager.set_root(None);
@@ -10471,7 +10487,9 @@ impl Editor {
                     self.dispatch_inline_context_request(pending);
                 } else if pending.request.call.is_lsp() {
                     self.dispatch_agent_lsp(pending, buffer, runtime).await;
-                } else if self.config.agent.follow_tool_calls {
+                } else if self.config.agent.follow_tool_calls
+                    && !self.agent_manager.is_delegate(&pending.request.session_id)
+                {
                     match self
                         .prepare_agent_follow_step(&pending.request, buffer, runtime)
                         .await
@@ -10490,19 +10508,21 @@ impl Editor {
             }
         }
         if let Some(pending) = self.agent_manager.take_ready_playback_tool(Instant::now()) {
-            let post_delay =
-                if self.config.agent.follow_tool_calls && pending.request.call.is_edit() {
-                    Duration::from_millis(700)
-                } else {
-                    Duration::ZERO
-                };
-            let restore_buffer = (!self.config.agent.follow_tool_calls
-                && !matches!(
-                    &pending.request.call,
-                    EditorToolCall::OpenFile { .. }
-                        | EditorToolCall::SelectText { .. }
-                        | EditorToolCall::RunEditorAction { .. }
-                ))
+            let delegated = self.agent_manager.is_delegate(&pending.request.session_id);
+            let follows_tool = self.config.agent.follow_tool_calls && !delegated;
+            let post_delay = if follows_tool && pending.request.call.is_edit() {
+                Duration::from_millis(700)
+            } else {
+                Duration::ZERO
+            };
+            let restore_buffer = (!follows_tool
+                && (delegated
+                    || !matches!(
+                        &pending.request.call,
+                        EditorToolCall::OpenFile { .. }
+                            | EditorToolCall::SelectText { .. }
+                            | EditorToolCall::RunEditorAction { .. }
+                    )))
             .then(|| self.buffer_manager.active_index());
             let mut result = self
                 .dispatch_agent_editor_tool(pending.request, buffer, runtime)
@@ -10776,14 +10796,9 @@ impl Editor {
                     self.agent_manager
                         .set_conversation_model(session_id, model_info.clone());
                 }
-                CodexEvent::SessionCreated { session_id } => {
+                CodexEvent::SessionCreated { session_id, cwd } => {
                     self.agent_manager.take_next_model();
-                    let root = self
-                        .agent_manager
-                        .root()
-                        .map(Path::to_path_buf)
-                        .unwrap_or_default();
-                    self.agent_manager.begin_conversation(session_id, &root);
+                    self.agent_manager.begin_conversation(session_id, cwd);
                 }
                 CodexEvent::SessionRestored { session_id, thread } => {
                     if self.agent_manager.take_forgotten_conversation(session_id) {
@@ -10796,13 +10811,14 @@ impl Editor {
                     }
                     let root = self
                         .agent_manager
-                        .root()
+                        .root_for_session(session_id)
                         .map(Path::to_path_buf)
                         .unwrap_or_default();
                     let conversation = self
                         .agent_manager
                         .reconcile_conversation(session_id, &root, thread)
                         .cloned();
+                    self.agent_manager.mark_session_live(session_id.clone());
                     if let Some(conversation) = conversation {
                         self.plugin_registry
                             .notify(
@@ -10855,6 +10871,26 @@ impl Editor {
             } = &event
             {
                 self.agent_manager.mark_session_inactive(session_id);
+            }
+            match &event {
+                CodexEvent::PermissionRequested { session_id, .. } => {
+                    self.agent_manager
+                        .mark_session_attention(session_id.clone());
+                }
+                CodexEvent::Update { session_id, .. } => {
+                    self.agent_manager.clear_session_attention(session_id);
+                }
+                CodexEvent::Completed { session_id, .. } => {
+                    self.agent_manager.mark_session_finished(session_id);
+                }
+                CodexEvent::Failed {
+                    session_id: Some(session_id),
+                    message,
+                } => {
+                    self.agent_manager
+                        .mark_session_failed(session_id, message.clone());
+                }
+                _ => {}
             }
             match &event {
                 CodexEvent::Update { session_id, .. }
@@ -11152,6 +11188,49 @@ impl Editor {
                     self.handle_agent_model_request(runtime, request_id, request)
                         .await?;
                 }
+                PluginRequest::AgentListThreads { request_id } => {
+                    let selected = self.agent_manager.selected_conversation_id();
+                    let threads = self
+                        .agent_manager
+                        .conversation_snapshots()
+                        .into_iter()
+                        .map(|conversation| {
+                            let thread_id = conversation.thread_id.clone();
+                            let (status, detail) = self.agent_manager.thread_status(&thread_id);
+                            json!({
+                                "thread_id": thread_id.clone(),
+                                "cwd": conversation.cwd,
+                                "mode": conversation.mode,
+                                "title": conversation.title,
+                                "branch": conversation.branch,
+                                "base_cwd": conversation.base_cwd,
+                                "model_info": conversation.model_info,
+                                "items": conversation.items,
+                                "selected": selected == Some(thread_id.as_str()),
+                                "live": self.agent_manager.is_session_live(&thread_id),
+                                "status": status,
+                                "status_detail": detail,
+                            })
+                        })
+                        .collect::<Vec<_>>();
+                    self.plugin_registry
+                        .resolve_request(runtime, request_id, json!({ "threads": threads }))
+                        .await?;
+                }
+                PluginRequest::AgentSelectThread { session_id } => {
+                    if let Some(conversation) = self.agent_manager.select_conversation(&session_id)
+                    {
+                        let live = self.agent_manager.is_session_live(&session_id);
+                        let (status, status_detail) = self.agent_manager.thread_status(&session_id);
+                        let mut payload = serde_json::to_value(conversation)?;
+                        payload["live"] = json!(live);
+                        payload["status"] = json!(status);
+                        payload["status_detail"] = json!(status_detail);
+                        self.plugin_registry
+                            .notify(runtime, "agent:thread_selected", plugin_json(payload))
+                            .await?;
+                    }
+                }
                 PluginRequest::SetTextPanelHeaderDetail { id, detail } => {
                     needs_render |= self.panel_manager.set_text_panel_header_detail(&id, detail);
                 }
@@ -11201,6 +11280,56 @@ impl Editor {
                             .await?;
                         self.plugin_registry
                             .notify(runtime, "agent:session_lost", json!({ "message": message }))
+                            .await?;
+                    }
+                }
+                PluginRequest::AgentNewDelegateSession {
+                    cwd,
+                    title,
+                    branch,
+                    base_cwd,
+                } => {
+                    if self.agent_manager.is_task_finished() {
+                        let _ = self
+                            .finish_agent_bridge(
+                                runtime,
+                                "Codex app-server stopped before starting delegated work",
+                            )
+                            .await?;
+                    }
+                    self.agent_manager.mark_conversation_requested();
+                    self.agent_manager
+                        .register_delegate(cwd.clone(), title, branch, base_cwd);
+                    if let Err(error) = self.ensure_agent_bridge(&cwd) {
+                        self.plugin_registry
+                            .notify(
+                                runtime,
+                                "agent:delegate_failed",
+                                json!({ "message": error.to_string(), "cwd": cwd }),
+                            )
+                            .await?;
+                        continue;
+                    }
+                    let Some(bridge) = self.agent_manager.bridge() else {
+                        continue;
+                    };
+                    if bridge
+                        .send(CodexCommand::NewSession { cwd: cwd.clone() })
+                        .await
+                        .is_err()
+                    {
+                        let message = self
+                            .finish_agent_bridge(
+                                runtime,
+                                "Codex app-server stopped while starting delegated work",
+                            )
+                            .await?;
+                        self.plugin_registry
+                            .notify(
+                                runtime,
+                                "agent:delegate_failed",
+                                json!({ "message": message, "cwd": cwd }),
+                            )
                             .await?;
                     }
                 }
@@ -11254,14 +11383,22 @@ impl Editor {
                     }
                 }
                 PluginRequest::AgentPrompt { session_id, text } => {
-                    let context = self.agent_context_payload();
-                    let uri = context["uri"]
-                        .as_str()
-                        .unwrap_or("red-buffer://active")
-                        .to_string();
-                    let context = context["text"].as_str().unwrap_or_default().to_string();
+                    let context = (!self.agent_manager.is_delegate(&session_id)).then(|| {
+                        let root = self
+                            .agent_manager
+                            .root_for_session(&session_id)
+                            .map(Path::to_path_buf)
+                            .unwrap_or_else(get_workspace_path);
+                        let context = self.agent_context_payload_for_root(&root);
+                        let uri = context["uri"]
+                            .as_str()
+                            .unwrap_or("red-buffer://active")
+                            .to_string();
+                        let text = context["text"].as_str().unwrap_or_default().to_string();
+                        (uri, text)
+                    });
                     needs_render |= self
-                        .dispatch_agent_prompt(runtime, session_id, text, Some((uri, context)))
+                        .dispatch_agent_prompt(runtime, session_id, text, context)
                         .await?;
                 }
                 PluginRequest::AgentPromptWithContext {
@@ -27479,8 +27616,18 @@ impl Editor {
         }
         self.agent_manager
             .set_root(Some(PathBuf::from(snapshot.cwd.clone())));
-        if let Some(conversation) = snapshot.agent_conversation.clone() {
-            self.agent_manager.restore_conversation(conversation);
+        if snapshot.agent_threads.is_empty() {
+            if let Some(conversation) = snapshot.agent_conversation.clone() {
+                self.agent_manager.restore_conversation(conversation);
+            }
+        } else {
+            self.agent_manager.restore_conversations(
+                snapshot.agent_threads.clone(),
+                snapshot
+                    .agent_conversation
+                    .as_ref()
+                    .map(|conversation| conversation.thread_id.as_str()),
+            );
         }
         if self.config.persist_inline_history.unwrap_or(true) {
             self.inline_history = snapshot.inline_history.clone();
@@ -27810,7 +27957,8 @@ impl Editor {
             .and_then(Value::as_str)
             .map(str::to_string);
         let agent_conversation = self.agent_manager.conversation_snapshot();
-        let agent_session_resumable = agent_conversation.is_some();
+        let agent_threads = self.agent_manager.conversation_snapshots();
+        let agent_session_resumable = !agent_threads.is_empty();
 
         (
             SessionSnapshot {
@@ -27832,6 +27980,7 @@ impl Editor {
                 last_visual_selections,
                 agent_transcript,
                 agent_conversation,
+                agent_threads,
                 inline_history: if self.config.persist_inline_history.unwrap_or(true) {
                     self.inline_history.clone()
                 } else {

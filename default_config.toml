@@ -571,6 +571,9 @@ process = ["rg"]
 [plugin_permissions.git]
 process = ["git"]
 
+[plugin_permissions.agent]
+process = ["git"]
+
 # Git signs use the same glyphs as the default Red/Neovim setup. Each value
 # must occupy one or two terminal cells.
 [plugin_config.git.signs]

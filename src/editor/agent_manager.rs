@@ -7,7 +7,7 @@ use std::{
 };
 
 use crate::{
-    agent_conversation::{AgentAnnotationRecord, AgentConversationSnapshot},
+    agent_conversation::{AgentAnnotationRecord, AgentConversationSnapshot, AgentThreadMode},
     agent_tools::{PendingEditorTool, PendingEditorToolResponse},
     codex::CodexBridge,
 };
@@ -30,8 +30,23 @@ pub struct AgentManager {
     pending_model_requests: HashSet<i64>,
     model_only_bridge: bool,
     next_model: Option<crate::codex::AgentModelSelection>,
-    conversation: Option<AgentConversationSnapshot>,
+    conversations: HashMap<String, AgentConversationSnapshot>,
+    conversation_order: Vec<String>,
+    selected_conversation: Option<String>,
+    live_sessions: HashSet<String>,
+    attention_sessions: HashSet<String>,
+    review_ready_sessions: HashSet<String>,
+    failed_sessions: HashMap<String, String>,
+    pending_delegate: Option<PendingDelegate>,
     forgotten_conversations: HashSet<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PendingDelegate {
+    pub cwd: PathBuf,
+    pub title: String,
+    pub branch: String,
+    pub base_cwd: PathBuf,
 }
 
 impl AgentManager {
@@ -253,11 +268,7 @@ impl AgentManager {
         session_id: &str,
         model_info: crate::codex::AgentModelInfo,
     ) {
-        if let Some(conversation) = self
-            .conversation
-            .as_mut()
-            .filter(|conversation| conversation.thread_id == session_id)
-        {
+        if let Some(conversation) = self.conversations.get_mut(session_id) {
             conversation.model_info = Some(model_info);
         }
     }
@@ -265,15 +276,55 @@ impl AgentManager {
     pub fn begin_conversation(&mut self, thread_id: impl Into<String>, cwd: &Path) {
         let thread_id = thread_id.into();
         self.forgotten_conversations.remove(&thread_id);
-        self.conversation = Some(AgentConversationSnapshot::new(
-            thread_id,
-            cwd.to_string_lossy(),
-        ));
+        let mut conversation =
+            AgentConversationSnapshot::new(thread_id.clone(), cwd.to_string_lossy());
+        let delegate = if self
+            .pending_delegate
+            .as_ref()
+            .is_some_and(|delegate| delegate.cwd == cwd)
+        {
+            self.pending_delegate.take()
+        } else {
+            None
+        };
+        let select = delegate.is_none();
+        if let Some(delegate) = delegate {
+            conversation.mode = AgentThreadMode::Delegate;
+            conversation.title = delegate.title;
+            conversation.branch = Some(delegate.branch);
+            conversation.base_cwd = Some(delegate.base_cwd.to_string_lossy().into_owned());
+        }
+        self.insert_conversation(conversation, select);
+        self.live_sessions.insert(thread_id);
     }
 
     pub fn restore_conversation(&mut self, conversation: AgentConversationSnapshot) {
         self.root = Some(PathBuf::from(&conversation.cwd));
-        self.conversation = Some(conversation);
+        self.insert_conversation(conversation, /*select*/ true);
+    }
+
+    pub fn restore_conversations(
+        &mut self,
+        conversations: Vec<AgentConversationSnapshot>,
+        selected: Option<&str>,
+    ) {
+        self.conversations.clear();
+        self.conversation_order.clear();
+        self.selected_conversation = None;
+        for conversation in conversations {
+            self.insert_conversation(conversation, /*select*/ false);
+        }
+        if let Some(selected) = selected.filter(|id| self.conversations.contains_key(*id)) {
+            self.selected_conversation = Some(selected.to_string());
+        } else {
+            self.selected_conversation = self.conversation_order.last().cloned();
+        }
+        if let Some(cwd) = self
+            .conversation_snapshot()
+            .map(|conversation| PathBuf::from(conversation.cwd))
+        {
+            self.root = Some(cwd);
+        }
     }
 
     pub fn reconcile_conversation(
@@ -283,33 +334,154 @@ impl AgentManager {
         thread: &serde_json::Value,
     ) -> Option<&AgentConversationSnapshot> {
         let cached = self
-            .conversation
-            .take()
-            .filter(|conversation| conversation.thread_id == thread_id)
+            .conversations
+            .remove(thread_id)
             .unwrap_or_else(|| AgentConversationSnapshot::new(thread_id, cwd.to_string_lossy()));
-        self.conversation = Some(cached.reconciled_with_thread(thread));
-        self.conversation.as_ref()
+        self.conversations
+            .insert(thread_id.to_string(), cached.reconciled_with_thread(thread));
+        self.conversations.get(thread_id)
     }
 
     pub fn conversation_snapshot(&self) -> Option<AgentConversationSnapshot> {
-        self.conversation.clone()
+        self.selected_conversation
+            .as_deref()
+            .and_then(|id| self.conversations.get(id))
+            .cloned()
+    }
+
+    pub fn conversation_snapshots(&self) -> Vec<AgentConversationSnapshot> {
+        self.conversation_order
+            .iter()
+            .filter_map(|id| self.conversations.get(id).cloned())
+            .collect()
+    }
+
+    pub fn select_conversation(&mut self, session_id: &str) -> Option<AgentConversationSnapshot> {
+        let conversation = self.conversations.get(session_id)?.clone();
+        self.selected_conversation = Some(session_id.to_string());
+        self.review_ready_sessions.remove(session_id);
+        Some(conversation)
+    }
+
+    pub fn selected_conversation_id(&self) -> Option<&str> {
+        self.selected_conversation.as_deref()
+    }
+
+    pub fn register_delegate(
+        &mut self,
+        cwd: PathBuf,
+        title: String,
+        branch: String,
+        base_cwd: PathBuf,
+    ) {
+        self.pending_delegate = Some(PendingDelegate {
+            cwd,
+            title,
+            branch,
+            base_cwd,
+        });
+    }
+
+    pub fn root_for_session(&self, session_id: &str) -> Option<&Path> {
+        self.conversations
+            .get(session_id)
+            .map(|conversation| Path::new(&conversation.cwd))
+            .or_else(|| self.root())
+    }
+
+    pub fn is_session_live(&self, session_id: &str) -> bool {
+        self.live_sessions.contains(session_id)
+    }
+
+    pub fn mark_session_live(&mut self, session_id: impl Into<String>) {
+        self.live_sessions.insert(session_id.into());
+    }
+
+    pub fn clear_live_sessions(&mut self) {
+        self.live_sessions.clear();
+    }
+
+    pub fn is_delegate(&self, session_id: &str) -> bool {
+        self.conversations
+            .get(session_id)
+            .is_some_and(|conversation| conversation.mode == AgentThreadMode::Delegate)
+    }
+
+    pub fn mark_session_attention(&mut self, session_id: impl Into<String>) {
+        let session_id = session_id.into();
+        self.attention_sessions.insert(session_id.clone());
+        self.review_ready_sessions.remove(&session_id);
+    }
+
+    pub fn clear_session_attention(&mut self, session_id: &str) {
+        self.attention_sessions.remove(session_id);
+    }
+
+    pub fn mark_session_finished(&mut self, session_id: &str) {
+        self.attention_sessions.remove(session_id);
+        self.failed_sessions.remove(session_id);
+        if self
+            .conversations
+            .get(session_id)
+            .is_some_and(|conversation| conversation.mode == AgentThreadMode::Delegate)
+        {
+            self.review_ready_sessions.insert(session_id.to_string());
+        }
+    }
+
+    pub fn mark_session_failed(&mut self, session_id: &str, message: impl Into<String>) {
+        self.attention_sessions.remove(session_id);
+        self.review_ready_sessions.remove(session_id);
+        self.failed_sessions
+            .insert(session_id.to_string(), message.into());
+    }
+
+    pub fn thread_status(&self, session_id: &str) -> (&'static str, Option<&str>) {
+        if let Some(message) = self.failed_sessions.get(session_id) {
+            return ("Failed", Some(message));
+        }
+        if self.attention_sessions.contains(session_id) {
+            return ("Needs you", None);
+        }
+        if self.active_sessions.contains(session_id) {
+            return ("Running", None);
+        }
+        if self.review_ready_sessions.contains(session_id) {
+            return ("Ready to review", None);
+        }
+        if self.selected_conversation.as_deref() == Some(session_id) {
+            return ("Current", None);
+        }
+        ("History", None)
     }
 
     pub fn replace_annotation_records(&mut self, annotations: Vec<AgentAnnotationRecord>) {
-        if let Some(conversation) = self.conversation.as_mut() {
-            conversation.annotations = annotations;
+        for conversation in self.conversations.values_mut() {
+            conversation.annotations.clear();
+        }
+        for annotation in annotations {
+            let session_id = if annotation.session_id.is_empty() {
+                self.selected_conversation.as_deref()
+            } else {
+                Some(annotation.session_id.as_str())
+            };
+            if let Some(conversation) = session_id.and_then(|id| self.conversations.get_mut(id)) {
+                conversation.annotations.push(annotation);
+            }
         }
     }
 
     pub fn forget_conversation(&mut self, session_id: &str) {
         self.next_model = None;
         self.forgotten_conversations.insert(session_id.to_string());
-        if self
-            .conversation
-            .as_ref()
-            .is_some_and(|conversation| conversation.thread_id == session_id)
-        {
-            self.conversation = None;
+        self.conversations.remove(session_id);
+        self.conversation_order.retain(|id| id != session_id);
+        self.live_sessions.remove(session_id);
+        self.attention_sessions.remove(session_id);
+        self.review_ready_sessions.remove(session_id);
+        self.failed_sessions.remove(session_id);
+        if self.selected_conversation.as_deref() == Some(session_id) {
+            self.selected_conversation = self.conversation_order.last().cloned();
         }
     }
 
@@ -318,11 +490,7 @@ impl AgentManager {
     }
 
     pub fn record_user_message(&mut self, session_id: &str, turn_id: &str, text: &str) {
-        if let Some(conversation) = self
-            .conversation
-            .as_mut()
-            .filter(|conversation| conversation.thread_id == session_id)
-        {
+        if let Some(conversation) = self.conversations.get_mut(session_id) {
             conversation.append_user(turn_id, text);
         }
     }
@@ -331,11 +499,7 @@ impl AgentManager {
         let Some(turn_id) = self.active_turn_ids.get(session_id) else {
             return;
         };
-        if let Some(conversation) = self
-            .conversation
-            .as_mut()
-            .filter(|conversation| conversation.thread_id == session_id)
-        {
+        if let Some(conversation) = self.conversations.get_mut(session_id) {
             conversation.append_agent_delta(turn_id, text);
         }
     }
@@ -344,11 +508,7 @@ impl AgentManager {
         let Some(turn_id) = self.active_turn_ids.get(session_id) else {
             return;
         };
-        let Some(conversation) = self
-            .conversation
-            .as_mut()
-            .filter(|conversation| conversation.thread_id == session_id)
-        else {
+        let Some(conversation) = self.conversations.get_mut(session_id) else {
             return;
         };
         if let Some(item) = conversation.items.iter_mut().rev().find(|item| {
@@ -360,11 +520,22 @@ impl AgentManager {
             conversation.append_agent_delta(turn_id, text);
         }
     }
+
+    fn insert_conversation(&mut self, conversation: AgentConversationSnapshot, select: bool) {
+        let thread_id = conversation.thread_id.clone();
+        self.conversation_order.retain(|id| id != &thread_id);
+        self.conversation_order.push(thread_id.clone());
+        self.conversations.insert(thread_id.clone(), conversation);
+        if select || self.selected_conversation.is_none() {
+            self.selected_conversation = Some(thread_id);
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::AgentManager;
+    use crate::agent_conversation::AgentThreadMode;
     use crate::agent_tools::PendingEditorToolResponse;
     use serde_json::json;
     use std::{
@@ -395,6 +566,44 @@ mod tests {
         assert!(manager.conversation_snapshot().is_none());
         assert!(manager.take_forgotten_conversation("session-1"));
         assert!(!manager.take_forgotten_conversation("session-1"));
+    }
+
+    #[test]
+    fn delegate_threads_keep_the_pair_selected_and_use_their_own_root() {
+        let mut manager = AgentManager::new();
+        manager.begin_conversation("pair", Path::new("/workspace"));
+        manager.register_delegate(
+            "/workspace.delegate-task".into(),
+            "Implement task".to_string(),
+            "red/delegate/task".to_string(),
+            "/workspace".into(),
+        );
+        manager.begin_conversation("delegate", Path::new("/workspace.delegate-task"));
+
+        assert_eq!(manager.selected_conversation_id(), Some("pair"));
+        assert_eq!(
+            manager.root_for_session("delegate"),
+            Some(Path::new("/workspace.delegate-task"))
+        );
+        let delegate = manager
+            .conversation_snapshots()
+            .into_iter()
+            .find(|conversation| conversation.thread_id == "delegate")
+            .unwrap();
+        assert_eq!(delegate.mode, AgentThreadMode::Delegate);
+        assert_eq!(delegate.branch.as_deref(), Some("red/delegate/task"));
+
+        manager.mark_session_active("delegate");
+        assert_eq!(manager.thread_status("delegate").0, "Running");
+        manager.mark_session_inactive("delegate");
+        manager.mark_session_finished("delegate");
+        assert_eq!(manager.thread_status("delegate").0, "Ready to review");
+
+        assert_eq!(
+            manager.select_conversation("delegate").unwrap().thread_id,
+            "delegate"
+        );
+        assert_eq!(manager.selected_conversation_id(), Some("delegate"));
     }
 
     #[tokio::test]

@@ -206,7 +206,7 @@ impl Editor {
         );
         let root = self
             .agent_manager
-            .root()
+            .root_for_session(&request.session_id)
             .ok_or_else(|| anyhow::anyhow!("no agent workspace is active"))?
             .to_path_buf();
         anyhow::ensure!(
@@ -545,7 +545,7 @@ impl Editor {
             "agent turn changed"
         );
         anyhow::ensure!(
-            self.agent_manager.root() == Some(context.root.as_path()),
+            self.agent_manager.root_for_session(&context.session) == Some(context.root.as_path()),
             "agent workspace changed"
         );
         anyhow::ensure!(

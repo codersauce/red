@@ -419,7 +419,10 @@ async fn direct_app_server_streams_and_routes_writes_to_the_host() {
         .await
         .unwrap();
     let session_id = match next_event(&mut bridge, &mut task).await {
-        CodexEvent::SessionCreated { session_id } => session_id,
+        CodexEvent::SessionCreated { session_id, cwd } => {
+            assert_eq!(cwd, directory.path());
+            session_id
+        }
         other => panic!("expected created session, got {other:?}"),
     };
     assert_eq!(session_id, "thread-red");
@@ -588,7 +591,7 @@ async fn direct_app_server_starts_without_managed_feature_requirements() {
         let event = next_event(&mut bridge, &mut task).await;
 
         assert!(
-            matches!(event, CodexEvent::SessionCreated { session_id } if session_id == "thread-red")
+            matches!(event, CodexEvent::SessionCreated { session_id, .. } if session_id == "thread-red")
         );
         drop(bridge);
         task.await.unwrap().unwrap();
@@ -626,7 +629,7 @@ async fn direct_app_server_starts_with_required_hooks() {
     let event = next_event(&mut bridge, &mut task).await;
 
     assert!(
-        matches!(event, CodexEvent::SessionCreated { session_id } if session_id == "thread-red")
+        matches!(event, CodexEvent::SessionCreated { session_id, .. } if session_id == "thread-red")
     );
     drop(bridge);
     task.await.unwrap().unwrap();
@@ -780,7 +783,7 @@ async fn direct_app_server_lists_and_changes_conversation_models() {
         .await
         .unwrap();
     assert!(
-        matches!(next_event(&mut bridge, &mut task).await, CodexEvent::SessionCreated { session_id } if session_id == "model-thread")
+        matches!(next_event(&mut bridge, &mut task).await, CodexEvent::SessionCreated { session_id, .. } if session_id == "model-thread")
     );
     assert!(
         matches!(next_event(&mut bridge, &mut task).await, CodexEvent::SessionModelChanged { model_info, .. } if model_info.model == "first" && model_info.effort.as_deref() == Some("high"))
