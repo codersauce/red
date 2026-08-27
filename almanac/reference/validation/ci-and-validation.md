@@ -86,7 +86,7 @@ operating system; release builds use separate target-specific caches [@ci].
 
 | Job | Main checks |
 | --- | --- |
-| `workflow-lint` | Validates GitHub Actions workflows, checks the README release version, and runs Discord release announcement and test-tooling unit tests [@ci]. |
+| `workflow-lint` | Validates GitHub Actions workflows, checks the README release version, validates the reviewed release campaign, and runs release-campaign, Discord announcement, social-release, and test-tooling unit tests [@ci]. |
 | `test` | Runs `cargo test --all-targets --all-features --verbose` with stable Rust and checksum-verified ripgrep on Ubuntu, macOS, and Windows; then runs the vendored Crossterm keyboard decoder tests and, outside Windows, builds `red` and exercises the terminal keyboard protocol in a Unix PTY [@ci] [@keyboard-protocol]. |
 | `clippy` | Denies every all-target, all-feature clippy warning on Ubuntu for code pull requests and manual runs; post-merge pushes and documentation-only pull requests skip it [@ci]. |
 | `fmt` | Runs `cargo fmt --all -- --check` [@ci]. |
@@ -197,4 +197,4 @@ When a GitHub release is published, the `homebrew` job requires `HOMEBREW_TAP_TO
 
 ## Related Pages
 
-Use [Build, Test, And Validate](../../guides/development/build-test-and-validate) for the local maintainer workflow, [Release Red](../../guides/releases/release-red) for release operations, [Performance Checks](../../guides/performance/performance-checks) for benchmark procedures, and [Self Check](../runtime/self-check) for the runtime diagnostic that CI and release smoke tests exercise.
+Use [Build, Test, And Validate](../../guides/development/build-test-and-validate) for the local maintainer workflow, [Release Red](../../guides/releases/release-red) for release operations, [Release Campaign](../releases/release-campaign) for the reviewed campaign manifest and social-preview boundary, [Performance Checks](../../guides/performance/performance-checks) for benchmark procedures, and [Self Check](../runtime/self-check) for the runtime diagnostic that CI and release smoke tests exercise.

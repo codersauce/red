@@ -12,6 +12,9 @@ sources:
   - id: editor
     type: file
     path: src/editor.rs
+  - id: agent-manager
+    type: file
+    path: src/editor/agent_manager.rs
   - id: tools
     type: file
     path: src/agent_tools.rs
@@ -29,11 +32,15 @@ The tool host is a bounded channel from the Codex worker into the editor loop. `
 
 The editor serializes tool execution through `service_background`. By default, it dispatches the next tool immediately and restores the user's active buffer after incidental file tools. Explicit navigation tools still change focus. With `agent.follow_tool_calls = true`, it first resolves and opens the target when relevant, moves the cursor to the first affected range for `apply_edits`, renders, and uses the configured dwell period before dispatch [@workflow] [@editor].
 
+Follow playback also gates the response after an edit. When a followed mutating tool completes, `service_background` holds the `PendingEditorToolResponse` for 700 milliseconds and `AgentManager::has_playback_work` remains true until that deadline, so the next tool is not dequeued until the user has had a chance to see the completed edit state [@editor] [@agent-manager].
+
 Path resolution stays fail-closed. Agent tool paths must be non-empty, remain under the active workspace root after lexical normalization, avoid symlink components, and avoid ignored workspace paths. Secret-like filenames require the explicit `agent.allow_sensitive_paths` grant [@editor]. `list_files` and `search_files` apply the same policy, avoid symlink-following workspace walks, and use bounded safe reads for content search on Unix [@codex] [@workflow].
 
 ## Mutation And Saving
 
-`write_file` replaces a complete file, while `apply_edits` computes a complete replacement by applying up to 128 non-overlapping UTF-16 edits to the current buffer contents [@tools] [@editor]. Both paths call `apply_agent_contents`, which opens or creates the target buffer, checks the expected revision against the current buffer revision, rejects NUL bytes, starts an agent-origin transaction with the active session and turn id, replaces the buffer contents, commits the transaction, notifies change consumers, renders, and saves through `save_current_agent_buffer` [@editor].
+`write_file` replaces a complete file, while `apply_edits` computes a complete replacement by applying up to 128 non-overlapping UTF-16 edits to the current buffer contents [@tools] [@editor]. Both paths call `apply_agent_contents`, which opens or creates the target buffer, checks the expected revision against the current buffer revision, and rejects NUL bytes before any transaction starts [@editor]. It also refuses to overwrite a dirty buffer unless the replacement preserves the unsaved editor changes, and it records a detected external file change before returning a non-applied result that tells Codex to reread the file [@editor].
+
+After those preflight checks pass, `apply_agent_contents` starts an agent-origin transaction with the active session and turn id, replaces the buffer contents, commits the transaction, notifies change consumers, renders, and saves through `save_current_agent_buffer` [@editor].
 
 The save step is part of the full-agent contract. On Unix, Red writes through the secure workspace writer, marks the buffer saved on success, and emits `file:saved`; on other platforms it uses the buffer save path [@editor]. The tool result reports whether the edit was applied, whether the save succeeded, the new revision, and any persistence or notification error [@editor].
 
