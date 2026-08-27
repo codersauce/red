@@ -1206,15 +1206,73 @@ fn short_activity_row(row: AgentActivityRow) -> String {
         else if red::starts_with(title, "Editing ") { title = "Edited " + red::slice(title, 8); }
         else if red::starts_with(title, "Creating ") { title = "Created " + red::slice(title, 9); }
         else if red::starts_with(title, "Searching for ") { title = "Searched for " + red::slice(title, 14); }
+        else if red::starts_with(title, "Checking language-server status for ") {
+            title = "Checked language-server status for " + red::slice(title, 36);
+        }
+        else if red::starts_with(title, "Checking diagnostics for ") {
+            title = "Checked diagnostics for " + red::slice(title, 25);
+        }
+        else if red::starts_with(title, "Checking rename support for ") {
+            title = "Checked rename support for " + red::slice(title, 28);
+        }
+        else if red::starts_with(title, "Previewing rename in ") {
+            title = "Previewed rename in " + red::slice(title, 21);
+        }
+        else if red::starts_with(title, "Applying language-server edits") {
+            title = "Applied language-server edits";
+        }
     }
     let reason = "";
     if row.status == "failed" {
-        reason = "failed";
-        if red::len(red::split(row.detail, "outside workspace")) > 1 { reason = "outside workspace"; }
-        else if red::len(red::split(row.detail, "not found")) > 1 { reason = "not found"; }
+        reason = failed_activity_reason(row.detail);
         title = title + " — " + reason;
     }
     return "  " + activity_glyph(row.status) + " " + title;
+}
+
+/// Turn bounded tool errors into a useful one-line recovery hint.
+///
+/// Keep the original detail in the activity inspector; this only controls the
+/// compact conversation preview. Matching is case-insensitive so errors from
+/// the editor and language servers present consistently.
+fn failed_activity_reason(detail: String) -> String {
+    let detail = red::lower(detail);
+    if red::len(red::split(detail, "outside workspace")) > 1 {
+        return "outside workspace";
+    }
+    if red::len(red::split(detail, "not found")) > 1 {
+        return "not found";
+    }
+    if red::len(red::split(detail, "stale revision")) > 1
+        || red::len(red::split(detail, "file changed")) > 1
+        || red::len(red::split(detail, "changed since")) > 1
+        || red::len(red::split(detail, "revision mismatch")) > 1
+        || red::len(red::split(detail, "revision changed")) > 1 {
+        return "file changed; reread";
+    }
+    if red::len(red::split(detail, "timed out")) > 1
+        || red::len(red::split(detail, "timeout")) > 1
+        || red::len(red::split(detail, "deadline exceeded")) > 1 {
+        return "timed out; retry";
+    }
+    if red::len(red::split(detail, "not ready")) > 1
+        || red::len(red::split(detail, "still starting")) > 1
+        || red::len(red::split(detail, "server is starting")) > 1 {
+        return "not ready; retry";
+    }
+    if red::len(red::split(detail, "invalid range")) > 1
+        || red::len(red::split(detail, "line range")) > 1
+        || red::len(red::split(detail, "out of bounds")) > 1
+        || red::len(red::split(detail, "must be between")) > 1
+        || red::len(red::split(detail, "must be >=")) > 1 {
+        return "invalid range";
+    }
+    if red::len(red::split(detail, "invalid argument")) > 1
+        || red::len(red::split(detail, "invalid parameter")) > 1
+        || red::len(red::split(detail, "invalid scope")) > 1 {
+        return "invalid argument";
+    }
+    return "failed";
 }
 
 /// Keep disclosure small even when the full turn used many tools.

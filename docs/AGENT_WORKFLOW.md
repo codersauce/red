@@ -363,13 +363,13 @@ Every Codex thread is started with:
 Native command, file-change, and permission escalation requests are denied.
 Red never asks Codex to edit the workspace directly.
 
-Codex receives twelve dynamic tools:
+Codex receives these bounded dynamic tools:
 
 | Tool | Behavior |
 | --- | --- |
 | `list_files` | Lists sorted workspace files in pages of up to 4,096 while respecting ignore and sensitive-path policy; `next_offset` continues the walk result. |
 | `search_files` | Searches bounded text content, reports truncation, and returns at most 200 matches. |
-| `read_file` | Reads an authoritative Red-buffer page of up to 1,000 lines and 256 KiB, returning its revision and `next_line`. Continuations must pass the first page's revision and restart if it changes; a single line over 256 KiB returns an explicit error rather than partial source. |
+| `read_file` | Reads an authoritative Red-buffer page of up to 1,000 lines and 256 KiB, using one-based file line numbers and returning its revision and `next_line`. Any valid page may start a fresh read without `expected_revision`; continuations that must share one snapshot pass the first page's revision and restart if it changes. A single line over 256 KiB returns an explicit error rather than partial source. |
 | `write_file` | Replaces revision-checked contents through Red, creates missing parent directories, and saves the buffer. |
 | `create_directory` | Creates a workspace directory and missing parents; an existing directory is a successful no-op. |
 | `get_editor_state` | Returns bounded active-file, cursor, selection, window, diagnostic, and current-annotation state. |
@@ -387,8 +387,10 @@ Codex receives twelve dynamic tools:
 
 ### Language-server tools
 
-Start a new Agent conversation after upgrading to register the new tools.
-Resuming an older conversation does not update its app-server tool list.
+Each saved conversation records the dynamic-tool contract version used to create
+its app-server thread. After an upgrade changes that contract, Red keeps the old
+transcript visible but does not resume it against an incompatible tool list; the
+next message starts a new compatible session automatically.
 
 Read the source with `read_file` before requesting diagnostics refresh or rename.
 That opens the authoritative buffer and starts its configured language server.

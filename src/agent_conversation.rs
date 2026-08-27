@@ -7,6 +7,13 @@ const MAX_TRANSCRIPT_ITEMS: usize = 512;
 const MAX_TRANSCRIPT_CHARS: usize = 1_048_576;
 const EDITOR_CONTEXT_MARKER: &str = "\n\nActive editor context from ";
 
+/// Version of the dynamic-tool contract registered for new full-Agent threads.
+///
+/// Codex app-server does not accept a replacement dynamic-tool catalog when a
+/// persisted thread is resumed. A recovered conversation created by another
+/// version must therefore remain readable but start a fresh compatible thread.
+pub const AGENT_TOOL_CONTRACT_VERSION: u32 = 1;
+
 /// Maximum source annotations retained with one Agent conversation.
 pub const MAX_AGENT_ANNOTATIONS: usize = 512;
 
@@ -45,6 +52,9 @@ pub struct AgentAnnotationRecord {
 pub struct AgentConversationSnapshot {
     pub thread_id: String,
     pub cwd: String,
+    /// Dynamic-tool contract registered when this Codex thread was created.
+    #[serde(default)]
+    pub tool_contract_version: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_info: Option<crate::codex::AgentModelInfo>,
     #[serde(default)]
@@ -94,6 +104,7 @@ impl AgentConversationSnapshot {
         Self {
             thread_id: thread_id.into(),
             cwd: cwd.into(),
+            tool_contract_version: AGENT_TOOL_CONTRACT_VERSION,
             model_info: None,
             items: Vec::new(),
             annotations: Vec::new(),
@@ -306,6 +317,22 @@ mod tests {
         assert_eq!(restored.items[0].text, "Fix the parser");
         assert_eq!(restored.items[1].id, "native-agent");
         assert_eq!(restored.items[1].turn_id.as_deref(), Some("native-turn"));
+    }
+
+    #[test]
+    fn old_conversations_default_to_an_incompatible_tool_contract() {
+        let restored: AgentConversationSnapshot = serde_json::from_value(json!({
+            "thread_id": "old-thread",
+            "cwd": "/workspace"
+        }))
+        .unwrap();
+
+        assert_eq!(restored.tool_contract_version, 0);
+        assert_ne!(restored.tool_contract_version, AGENT_TOOL_CONTRACT_VERSION);
+        assert_eq!(
+            AgentConversationSnapshot::new("new-thread", "/workspace").tool_contract_version,
+            AGENT_TOOL_CONTRACT_VERSION
+        );
     }
 
     #[test]

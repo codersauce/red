@@ -295,6 +295,14 @@ impl AgentManager {
         self.conversation.clone()
     }
 
+    /// Returns the tool-contract version retained for a particular conversation.
+    pub fn conversation_tool_contract_version(&self, session_id: &str) -> Option<u32> {
+        self.conversation
+            .as_ref()
+            .filter(|conversation| conversation.thread_id == session_id)
+            .map(|conversation| conversation.tool_contract_version)
+    }
+
     pub fn replace_annotation_records(&mut self, annotations: Vec<AgentAnnotationRecord>) {
         if let Some(conversation) = self.conversation.as_mut() {
             conversation.annotations = annotations;
@@ -365,7 +373,10 @@ impl AgentManager {
 #[cfg(test)]
 mod tests {
     use super::AgentManager;
-    use crate::agent_tools::PendingEditorToolResponse;
+    use crate::{
+        agent_conversation::{AgentConversationSnapshot, AGENT_TOOL_CONTRACT_VERSION},
+        agent_tools::PendingEditorToolResponse,
+    };
     use serde_json::json;
     use std::{
         path::Path,
@@ -395,6 +406,22 @@ mod tests {
         assert!(manager.conversation_snapshot().is_none());
         assert!(manager.take_forgotten_conversation("session-1"));
         assert!(!manager.take_forgotten_conversation("session-1"));
+    }
+
+    #[test]
+    fn retained_conversations_expose_their_tool_contract_version() {
+        let mut manager = AgentManager::new();
+        manager.begin_conversation("current", Path::new("/workspace"));
+        assert_eq!(
+            manager.conversation_tool_contract_version("current"),
+            Some(AGENT_TOOL_CONTRACT_VERSION)
+        );
+
+        let mut old = AgentConversationSnapshot::new("old", "/workspace");
+        old.tool_contract_version = 0;
+        manager.restore_conversation(old);
+        assert_eq!(manager.conversation_tool_contract_version("old"), Some(0));
+        assert_eq!(manager.conversation_tool_contract_version("other"), None);
     }
 
     #[tokio::test]

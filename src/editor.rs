@@ -11206,6 +11206,25 @@ impl Editor {
                 }
                 PluginRequest::AgentResumeSession { cwd, session_id } => {
                     self.agent_manager.mark_conversation_requested();
+                    if self
+                        .agent_manager
+                        .conversation_tool_contract_version(&session_id)
+                        .is_some_and(|version| {
+                            version != crate::agent_conversation::AGENT_TOOL_CONTRACT_VERSION
+                        })
+                    {
+                        self.plugin_registry
+                            .notify(
+                                runtime,
+                                "agent:session_restore_failed",
+                                json!({
+                                    "session_id": session_id,
+                                    "message": "Agent tools changed after this conversation was saved; the transcript remains available and the next message will start a compatible session"
+                                }),
+                            )
+                            .await?;
+                        continue;
+                    }
                     if self.agent_manager.is_task_finished() {
                         let _ = self
                             .finish_agent_bridge(
