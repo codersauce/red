@@ -1754,6 +1754,9 @@ impl Editor {
     }
 
     fn active_buffer_has_diagnostics(&self) -> bool {
+        if !self.config.show_diagnostics {
+            return false;
+        }
         let Ok(Some(uri)) = self.current_buffer().uri() else {
             return false;
         };
@@ -3301,6 +3304,9 @@ impl Editor {
         buffer: &mut RenderBuffer,
         window: &crate::window::Window,
     ) -> anyhow::Result<()> {
+        if !self.config.show_diagnostics {
+            return Ok(());
+        }
         // Get the buffer for this window
         let window_buffer = &self.buffer_manager[window.buffer_index];
 
@@ -3856,7 +3862,7 @@ impl Editor {
     }
 
     fn statusline_diagnostic_counts(&self, buffer_index: usize) -> Option<(usize, usize)> {
-        if self.diagnostics.is_empty() {
+        if !self.config.show_diagnostics || self.diagnostics.is_empty() {
             return None;
         }
         let uri = self
@@ -4923,6 +4929,7 @@ mod tests {
             format!("{line}\nfollowing source\n"),
         );
         let mut editor = rendering_test_editor(source);
+        editor.config.show_diagnostics = true;
         let uri = editor.current_buffer().uri().unwrap().unwrap();
         editor
             .diagnostics
@@ -5246,6 +5253,7 @@ mod tests {
             "first\nsecond\nthird\n".to_string(),
         );
         let mut editor = rendering_test_editor(source);
+        editor.config.show_diagnostics = true;
         let uri = editor.current_buffer().uri().unwrap().unwrap();
         let first = diagnostic("first visible diagnostic");
         let mut second = diagnostic("second visible diagnostic");
@@ -5599,6 +5607,7 @@ mod tests {
         let source = Buffer::new(Some("zeta.py".to_string()), "value = 1\n".to_string());
         let mut editor =
             Editor::with_size(lsp, WIDTH, HEIGHT, config, theme.clone(), vec![source]).unwrap();
+        editor.config.show_diagnostics = true;
         let uri = editor.current_buffer().uri().unwrap().unwrap();
 
         let clean = rendered_statusline(&mut editor, WIDTH, HEIGHT);
@@ -5661,6 +5670,7 @@ mod tests {
         let source = Buffer::new(Some("zeta.py".to_string()), "value = 1\n".to_string());
         let mut editor =
             Editor::with_size(lsp, WIDTH, HEIGHT, config, theme.clone(), vec![source]).unwrap();
+        editor.config.show_diagnostics = true;
         let uri = editor.current_buffer().uri().unwrap().unwrap();
 
         let clean = rendered_statusline(&mut editor, WIDTH, HEIGHT);

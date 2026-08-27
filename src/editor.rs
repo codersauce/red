@@ -16,6 +16,7 @@
 //! model.
 
 mod agent_annotations;
+mod agent_lsp;
 mod agent_manager;
 mod agent_models;
 mod buffer_actions;
@@ -3773,6 +3774,7 @@ pub struct Editor {
     /// Map of diagnostics per file uri
     diagnostics: HashMap<String, Vec<Diagnostic>>,
     diagnostic_reports: diagnostics::DiagnosticReports,
+    agent_lsp: agent_lsp::AgentLsp,
     diagnostic_cache: Option<diagnostic_cache::DiagnosticCache>,
 
     /// Indentation rules per file type
@@ -5291,6 +5293,7 @@ impl Editor {
             clipboard,
             diagnostics: HashMap::new(),
             diagnostic_reports: diagnostics::DiagnosticReports::default(),
+            agent_lsp: agent_lsp::AgentLsp::default(),
             diagnostic_cache: None,
             indentation,
             render_commands: VecDeque::new(),
@@ -9574,6 +9577,13 @@ impl Editor {
         };
 
         match request.call {
+            EditorToolCall::LspStatus { .. }
+            | EditorToolCall::LspDiagnostics { .. }
+            | EditorToolCall::LspPrepareRename { .. }
+            | EditorToolCall::LspPreviewRename { .. }
+            | EditorToolCall::LspApplyEdit { .. } => {
+                anyhow::bail!("LSP calls require the asynchronous dispatcher")
+            }
             EditorToolCall::InlineContext { .. } => {
                 anyhow::bail!("inline context must use its request-bound dispatcher")
             }
@@ -9850,7 +9860,12 @@ impl Editor {
             anyhow::bail!("no agent workspace is active");
         };
         let (path, position, create, delay) = match &request.call {
-            EditorToolCall::InlineContext { .. }
+            EditorToolCall::LspStatus { .. }
+            | EditorToolCall::LspDiagnostics { .. }
+            | EditorToolCall::LspPrepareRename { .. }
+            | EditorToolCall::LspPreviewRename { .. }
+            | EditorToolCall::LspApplyEdit { .. }
+            | EditorToolCall::InlineContext { .. }
             | EditorToolCall::CreateDirectory { .. }
             | EditorToolCall::DismissAnnotations { .. } => return Ok(Duration::ZERO),
             EditorToolCall::ReadFile { path, .. } => {
@@ -10441,6 +10456,9 @@ impl Editor {
         runtime: &mut Runtime,
     ) -> anyhow::Result<()> {
         self.service_open_file_changes(buffer, runtime).await?;
+        if self.agent_lsp.has_work() {
+            self.service_agent_lsp(buffer, runtime).await?;
+        }
         if let Some(completed) = self
             .agent_manager
             .take_ready_playback_response(Instant::now())
@@ -10451,6 +10469,8 @@ impl Editor {
             if let Some(pending) = self.agent_manager.try_recv_tool_request() {
                 if matches!(pending.request.call, EditorToolCall::InlineContext { .. }) {
                     self.dispatch_inline_context_request(pending);
+                } else if pending.request.call.is_lsp() {
+                    self.dispatch_agent_lsp(pending, buffer, runtime).await;
                 } else if self.config.agent.follow_tool_calls {
                     match self
                         .prepare_agent_follow_step(&pending.request, buffer, runtime)
@@ -11255,6 +11275,7 @@ impl Editor {
                         .await?;
                 }
                 PluginRequest::AgentCancel { session_id } => {
+                    self.agent_manager.mark_session_inactive(&session_id);
                     let Some(bridge) = self.agent_manager.bridge() else {
                         continue;
                     };
@@ -13932,6 +13953,7 @@ impl Editor {
             .and_then(|path| crate::lsp::file_uri(path).ok())
             .unwrap_or_else(|| uri.to_string());
         log!("Adding diagnostics for {uri}: {diagnostics:#?}");
+        self.record_agent_diagnostic_report(&uri);
         let merged = self.diagnostic_reports.update(&uri, kind, diagnostics);
         self.diagnostics.insert(uri, merged);
         self.mark_diagnostic_cache_dirty();
@@ -14759,6 +14781,9 @@ impl Editor {
         msg: &InboundMessage,
         method: Option<String>,
     ) -> Option<Action> {
+        if self.handle_agent_lsp_message(msg) {
+            return None;
+        }
         fn parse_diagnostics(msg: &ResponseMessage) -> Option<(String, Vec<Diagnostic>)> {
             let req = msg.request.as_ref()?;
             let params = req.params.as_object()?;
@@ -14782,7 +14807,7 @@ impl Editor {
                         return Some(Action::RefreshDiagnostics);
                     }
 
-                    if method == "textDocument/diagnostic" && self.config.show_diagnostics {
+                    if method == "textDocument/diagnostic" {
                         if let Some((uri, diagnostics)) = parse_diagnostics(msg) {
                             return self.update_diagnostics(
                                 Some(&uri),
@@ -14956,11 +14981,7 @@ impl Editor {
             }
             InboundMessage::Notification(msg) => match msg {
                 ParsedNotification::PublishDiagnostics(msg) => {
-                    if self.config.show_diagnostics {
-                        self.add_diagnostics(msg.uri.as_deref(), &msg.diagnostics)
-                    } else {
-                        None
-                    }
+                    self.add_diagnostics(msg.uri.as_deref(), &msg.diagnostics)
                 }
                 ParsedNotification::Progress(progress_params) => {
                     // self.plugin_registry
@@ -31802,6 +31823,33 @@ impl Editor {
             &Style::default(),
         );
         let mut runtime = Runtime::new();
+        if request.call.is_lsp() {
+            let (response, mut receiver) = tokio::sync::oneshot::channel();
+            self.dispatch_agent_lsp(
+                crate::agent_tools::PendingEditorTool { request, response },
+                &mut render_buffer,
+                &mut runtime,
+            )
+            .await;
+            loop {
+                match receiver.try_recv() {
+                    Ok(result) => return result.map_err(anyhow::Error::msg),
+                    Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
+                        anyhow::bail!("LSP dispatcher dropped response")
+                    }
+                    Err(tokio::sync::oneshot::error::TryRecvError::Empty) => (),
+                }
+                if let Some((message, method)) = self.lsp.recv_response().await? {
+                    if let Some(action) = self.handle_lsp_message(&message, method) {
+                        self.execute(&action, &mut render_buffer, &mut runtime)
+                            .await?;
+                    }
+                }
+                self.service_agent_lsp(&mut render_buffer, &mut runtime)
+                    .await?;
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        }
         self.dispatch_agent_editor_tool(request, &mut render_buffer, &mut runtime)
             .await
     }

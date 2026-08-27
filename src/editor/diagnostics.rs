@@ -23,6 +23,7 @@ struct DocumentReports {
 #[derive(Default)]
 pub(super) struct DiagnosticReports {
     documents: HashMap<String, DocumentReports>,
+    generation: u64,
 }
 
 impl DiagnosticReports {
@@ -32,6 +33,7 @@ impl DiagnosticReports {
         kind: DiagnosticReportKind,
         diagnostics: &[Diagnostic],
     ) -> Vec<Diagnostic> {
+        self.generation = self.generation.wrapping_add(1);
         let reports = self.documents.entry(uri.to_string()).or_default();
         if reports.provisional {
             reports.push.clear();
@@ -52,6 +54,7 @@ impl DiagnosticReports {
         push: Vec<Diagnostic>,
         pull: Vec<Diagnostic>,
     ) -> Vec<Diagnostic> {
+        self.generation = self.generation.wrapping_add(1);
         let reports = DocumentReports {
             push,
             pull,
@@ -78,6 +81,16 @@ impl DiagnosticReports {
         self.documents.values().any(|reports| reports.provisional)
     }
 
+    pub(super) fn is_provisional(&self, uri: &str) -> bool {
+        self.documents
+            .get(uri)
+            .is_some_and(|reports| reports.provisional)
+    }
+
+    pub(super) fn generation(&self) -> u64 {
+        self.generation
+    }
+
     /// Move untouched diagnostic ranges with their text and discard edited ranges.
     ///
     /// Both channels must move together so a later update from one producer cannot
@@ -89,6 +102,7 @@ impl DiagnosticReports {
         replacement: &str,
     ) -> Option<Vec<Diagnostic>> {
         let reports = self.documents.get_mut(uri)?;
+        self.generation = self.generation.wrapping_add(1);
         for diagnostics in [&mut reports.push, &mut reports.pull] {
             diagnostics.retain_mut(|diagnostic| {
                 let Some(range) = rebase_range(&diagnostic.range, edit, replacement) else {
@@ -102,10 +116,12 @@ impl DiagnosticReports {
     }
 
     pub(super) fn remove(&mut self, uri: &str) {
+        self.generation = self.generation.wrapping_add(1);
         self.documents.remove(uri);
     }
 
     pub(super) fn rename(&mut self, previous: &str, current: Option<&str>) {
+        self.generation = self.generation.wrapping_add(1);
         if let Some(reports) = self.documents.remove(previous) {
             if let Some(current) = current {
                 self.documents.insert(current.to_string(), reports);

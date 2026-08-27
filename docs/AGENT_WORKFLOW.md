@@ -379,6 +379,61 @@ Codex receives twelve dynamic tools:
 | `add_annotations` | Adds up to 16 revision-checked source annotation cards without editing or saving the file. |
 | `dismiss_annotations` | Hides visible annotation cards by stable ID without deleting source or conversation history. |
 | `run_editor_action` | Runs an allow-listed navigation or LSP action, including annotation traversal and overlap cycling. |
+| `lsp_status` | Reports a file's server, workspace, readiness, and negotiated capabilities without starting a server. |
+| `lsp_diagnostics` | Reads paginated diagnostics for a file, open buffers, or known workspace reports; supports severity, source, code, and UTF-16 range filters. |
+| `lsp_prepare_rename` | Checks rename eligibility at a revision-checked UTF-16 position when the server supports preparation. |
+| `lsp_preview_rename` | Computes a semantic rename and returns affected files, a bounded diff, and an expiring edit-plan ID without changing text. |
+| `lsp_apply_edit` | Applies a previously returned plan to buffers with agent attribution and per-file undo. **Never saves files.** |
+
+### Language-server tools
+
+Start a new Agent conversation after upgrading to register the new tools.
+Resuming an older conversation does not update its app-server tool list.
+
+Read the source with `read_file` before requesting diagnostics refresh or rename.
+That opens the authoritative buffer and starts its configured language server.
+Use `lsp_status` to distinguish `ready`, `starting`, `not_started`, `failed`, and
+`unsupported`; retry requests after initialization rather than interpreting a
+missing server as an empty result. Rename positions are zero-based UTF-16, and
+`expected_revision` must match the preceding read. A server that supports rename
+without `prepareRename` can still provide a rename preview.
+
+`lsp_diagnostics` returns at most 100 items per page. File scope requires `path`;
+other scopes require a null path. Optional `severity` is 1 (error), 2 (warning),
+3 (information), or 4 (hint); `source`, `code`, and file-only `range` narrow the
+results. Pass null for unused filters. Continue at `next_offset` with the returned
+`generation` as `expected_generation`, restarting at offset 0 if reports or their
+rebased positions change. Diagnostic messages and related information are bounded;
+server-specific `data` remains internal and related paths obey agent access policy.
+
+Workspace scope means known reports, not a scan or a complete project check.
+Responses expose coverage, report receipt times, observed revisions, and freshness:
+`provisional` for restored reports, `stale` after a known buffer change,
+`unversioned` when exact server-version freshness cannot be proved, and
+`not_received` before a report exists. An empty provisional or unversioned result
+is not proof that compilation passed. Collection continues when diagnostic display
+is disabled. Refresh uses document diagnostic pulls where supported; for push-only
+servers, `wait_ms` can wait up to 20 seconds for a new report. A timeout is explicit.
+The tool never saves a file to trigger compiler diagnostics.
+
+Rename previews are scoped to the active agent turn and server instance, last at
+most 120 seconds, and can be applied once. Changes to the source or affected open
+buffers invalidate a plan; unopened targets are checked against pinned disk
+snapshots before application. All targets must satisfy both the agent workspace
+policy and the originating LSP workspace boundary. Symlinks, protected paths,
+invalid edits, and file create/rename/delete operations are rejected before text
+changes. At most four previews are retained, with 64 document operations and an
+8 MiB source/prepared-content budget per request; displayed diffs are capped at
+64 KiB and report truncation.
+
+`lsp_apply_edit` changes buffers, preserves unrelated unsaved text, records one
+undo transaction per changed file, and reports `saved: false`. Review or save the
+changed buffers explicitly in Red. This differs from `apply_edits` and `write_file`,
+which save. LSP tools do not move the cursor, open pickers, or use followed-edit
+playback delays. Cancelling a turn cancels pending queries and prevents delayed
+responses from applying changes. Code actions, formatting tools, general symbol
+queries, and resource operations remain follow-up work; existing editor commands
+are unchanged.
 
 Agent annotations use zero-based, inclusive file line ranges. They share inline
 assist's source anchors, overlap projection, stale-source indicator, cards, and

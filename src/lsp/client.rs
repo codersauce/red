@@ -240,6 +240,7 @@ impl RealLspClient {
         workspace_root: PathBuf,
     ) -> Self {
         Self {
+            instance_id: crate::lsp::next_id() as u64,
             request_tx,
             response_rx,
             files_versions: HashMap::new(),
@@ -382,6 +383,7 @@ impl RealLspClient {
         });
 
         Ok(RealLspClient {
+            instance_id: crate::lsp::next_id() as u64,
             request_tx,
             response_rx,
             files_versions: HashMap::new(),
@@ -628,6 +630,7 @@ async fn process_lsp_message(
 }
 
 pub struct RealLspClient {
+    instance_id: u64,
     request_tx: mpsc::Sender<OutboundMessage>,
     response_rx: mpsc::Receiver<InboundMessage>,
     files_versions: HashMap<String, usize>,
@@ -1921,6 +1924,25 @@ impl LspClient for RealLspClient {
             .await
     }
 
+    fn server_status_for_file(&self, _file: &str) -> &'static str {
+        if self.initialize_failed {
+            "failed"
+        } else if self.initialized {
+            "ready"
+        } else {
+            "starting"
+        }
+    }
+
+    fn server_instance_for_file(&self, file: &str) -> Option<u64> {
+        (self.server_status_for_file(file) == "ready").then_some(self.instance_id)
+    }
+
+    async fn cancel_request_for_file(&mut self, _file: &str, id: i64) -> Result<(), LspError> {
+        self.send_notification("$/cancelRequest", json!({"id": id}), false)
+            .await
+    }
+
     fn get_server_capabilities(&self) -> Option<&ServerCapabilities> {
         self.server_capabilities.as_ref()
     }
@@ -2350,6 +2372,7 @@ mod test {
             timestamp: Instant::now(),
         };
         let mut client = RealLspClient {
+            instance_id: crate::lsp::next_id() as u64,
             request_tx,
             response_rx,
             files_versions: HashMap::new(),
@@ -2623,6 +2646,7 @@ mod test {
             "flat.key": "literal"
         }));
         let mut client = RealLspClient {
+            instance_id: crate::lsp::next_id() as u64,
             request_tx,
             response_rx,
             files_versions: HashMap::new(),
@@ -2704,6 +2728,7 @@ mod test {
         let (request_tx, mut request_rx) = mpsc::channel(5);
         let (_response_tx, response_rx) = mpsc::channel(1);
         let mut client = RealLspClient {
+            instance_id: crate::lsp::next_id() as u64,
             request_tx,
             response_rx,
             files_versions: HashMap::new(),
@@ -2828,6 +2853,7 @@ mod test {
         let (request_tx, mut request_rx) = mpsc::channel(2);
         let (response_tx, response_rx) = mpsc::channel(2);
         let mut client = RealLspClient {
+            instance_id: crate::lsp::next_id() as u64,
             request_tx,
             response_rx,
             files_versions: HashMap::new(),
@@ -2888,6 +2914,7 @@ mod test {
         let (request_tx, mut request_rx) = mpsc::channel(4);
         let (response_tx, response_rx) = mpsc::channel(4);
         let mut client = RealLspClient {
+            instance_id: crate::lsp::next_id() as u64,
             request_tx,
             response_rx,
             files_versions: HashMap::new(),
@@ -2948,6 +2975,7 @@ mod test {
             timestamp: Instant::now(),
         };
         let mut client = RealLspClient {
+            instance_id: crate::lsp::next_id() as u64,
             request_tx,
             response_rx,
             files_versions: HashMap::new(),
@@ -3010,6 +3038,7 @@ mod test {
             timestamp: Instant::now(),
         };
         let mut client = RealLspClient {
+            instance_id: crate::lsp::next_id() as u64,
             request_tx,
             response_rx,
             files_versions: HashMap::new(),
@@ -3072,6 +3101,7 @@ mod test {
         let (request_tx, _request_rx) = mpsc::channel(1);
         let (_response_tx, response_rx) = mpsc::channel(1);
         let mut client = RealLspClient {
+            instance_id: crate::lsp::next_id() as u64,
             request_tx,
             response_rx,
             files_versions: HashMap::new(),
@@ -3133,6 +3163,7 @@ mod test {
             timestamp: Instant::now(),
         };
         let mut client = RealLspClient {
+            instance_id: crate::lsp::next_id() as u64,
             request_tx,
             response_rx,
             files_versions: HashMap::new(),
@@ -3592,6 +3623,7 @@ mod test {
         let (request_tx, mut request_rx) = mpsc::channel(4);
         let (_response_tx, response_rx) = mpsc::channel(1);
         let mut client = RealLspClient {
+            instance_id: crate::lsp::next_id() as u64,
             request_tx,
             response_rx,
             files_versions: HashMap::new(),
@@ -3655,6 +3687,7 @@ mod test {
         let (request_tx, mut request_rx) = mpsc::channel(8);
         let (_response_tx, response_rx) = mpsc::channel(1);
         let mut client = RealLspClient {
+            instance_id: crate::lsp::next_id() as u64,
             request_tx,
             response_rx,
             files_versions: HashMap::new(),
