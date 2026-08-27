@@ -1,5 +1,5 @@
 {
-  "version": "0.16.0",
+  "version": "0.17.0",
   "calls": [
     { "name": "Print", "kind": "execute", "signature": "(message: String)", "introduced": "0.1.0" },
     { "name": "PrintWarning", "kind": "execute", "signature": "(message: String)", "introduced": "0.15.0" },
@@ -94,6 +94,7 @@
     { "name": "RecordSearchHighlighted", "kind": "execute", "signature": "(event: Json)", "introduced": "0.1.0" },
     { "name": "RecordSearchCleared", "kind": "execute", "signature": "(event: Json)", "introduced": "0.1.0" },
     { "name": "SetTimeout", "kind": "execute", "signature": "(delay_ms: i32)", "introduced": "0.1.0" },
+    { "name": "MonotonicTime", "kind": "execute", "signature": "()", "introduced": "0.17.0" },
     { "name": "CancelTimeout", "kind": "execute", "signature": "(timer_id: String)", "introduced": "0.1.0" },
     { "name": "GetViewportLayout", "kind": "request", "signature": "(callback: fn(Json))", "introduced": "0.1.0" },
     { "name": "InlayHints", "kind": "request", "signature": "(callback: fn(Json), range: Json)", "introduced": "0.1.0" },

@@ -7,6 +7,8 @@
 // watchers, processes, timers, panels, workspace state, and gutter namespaces.
 // Picker callbacks are owner-scoped: each menu item carries its flow context, while the
 // active prompt handle is retained only so query changes update the correct picker.
+// Status refreshes never replace an in-flight scan. Polls start after completion,
+// while explicit refreshes coalesce into one follow-up and idle work backs off.
 
 struct GitEntry {
     path: String,
@@ -270,6 +272,12 @@ struct GitPluginState {
     process: String,
     status_initialized: bool,
     status_output: String,
+    status_pending_output: String,
+    status_error: String,
+    status_started_ms: i64,
+    status_forced: bool,
+    refresh_pending: bool,
+    poll_delay_ms: i64,
     refresh_forced: bool,
     idle_polls: i32,
     refresh_timer: String,
@@ -317,6 +325,7 @@ struct GitPluginState {
     prompt_kind: String,
     prompt_picker: Option<i32>,
     capture_kind: String,
+    capture_process: String,
     capture_output: String,
     operation: String,
     operation_jobs: [OperationJob],
@@ -391,6 +400,12 @@ fn initial_state() -> GitPluginState {
         process: "",
         status_initialized: false,
         status_output: "",
+        status_pending_output: "",
+        status_error: "",
+        status_started_ms: 0,
+        status_forced: false,
+        refresh_pending: false,
+        poll_delay_ms: 5000,
         refresh_forced: true,
         idle_polls: 0,
         refresh_timer: "",
@@ -449,6 +464,7 @@ fn initial_state() -> GitPluginState {
         prompt_kind: "",
         prompt_picker: None,
         capture_kind: "",
+        capture_process: "",
         capture_output: "",
         operation: "",
         operation_jobs: [],
@@ -600,7 +616,10 @@ fn close_dashboard() {
 }
 
 fn schedule_poll() {
-    red::state_patch(GitPluginState { poll_timer: red::execute("SetTimeout", 5000) });
+    red::execute("CancelTimeout", plugin_state().poll_timer);
+    red::state_patch(GitPluginState {
+        poll_timer: red::execute("SetTimeout", plugin_state().poll_delay_ms),
+    });
 }
 
 #[red::on("filesystem:changed:1502")]
@@ -653,10 +672,9 @@ fn timeout_callback(event: TimerEvent) {
         refresh();
         return;
     }
-    if event.timer_id == plugin_state().poll_timer {
+    if event.timer_id != "" && event.timer_id == plugin_state().poll_timer {
         red::state_patch(GitPluginState { poll_timer: "" });
-        refresh();
-        schedule_poll();
+        if plugin_state().process == "" { refresh(); }
     }
 }
 
@@ -673,10 +691,25 @@ fn force_refresh() {
 }
 
 fn refresh() {
-    let previous = red::string(plugin_state().process, "");
-    if previous != "" {
-        red::execute("KillProcess", previous);
+    if plugin_state().process != "" {
+        red::state_patch(GitPluginState { refresh_pending: true });
+        return;
     }
+    red::execute("CancelTimeout", plugin_state().refresh_timer);
+    red::state_patch(GitPluginState {
+        refresh_timer: "",
+        refresh_pending: false,
+        status_pending_output: "",
+        status_started_ms: red::execute("MonotonicTime"),
+        status_forced: plugin_state().refresh_forced || plugin_state().status_error != "",
+        refresh_forced: false,
+    });
+    // Keep a bounded retry armed if SpawnProcess throws before returning an ID.
+    let retry_delay = plugin_state().poll_delay_ms * (2 as i64);
+    let retry_limit = 60000 as i64;
+    if retry_delay > retry_limit { retry_delay = retry_limit; }
+    red::state_patch(GitPluginState { poll_delay_ms: retry_delay });
+    schedule_poll();
     let process_id = red::execute("SpawnProcess", Process {
         command: "git",
         args: red::git_core("status_args"),
@@ -689,13 +722,27 @@ fn refresh() {
         raw_output: true,
         cwd: red::string(plugin_state().root, "."),
     });
-    red::state_patch(GitPluginState { process: process_id });
+    red::execute("CancelTimeout", plugin_state().poll_timer);
+    red::state_patch(GitPluginState { process: process_id, poll_timer: "", status_error: "" });
     red::on("process:" + process_id, status_event);
 }
 
 #[red::config("cwd")]
 fn git_cwd_loaded(event: GitStringValueEvent) {
     let cwd = red::string(event.value, ".");
+    if cwd != plugin_state().root {
+        cancel_status();
+        if plugin_state().capture_process != "" {
+            red::execute("KillProcess", plugin_state().capture_process);
+            red::state_patch(GitPluginState { capture_process: "" });
+        }
+        red::execute("UnwatchDirectory", 1502);
+        red::state_patch(GitPluginState {
+            state: empty_state(), status_initialized: false, status_output: "",
+            refresh_forced: true, poll_delay_ms: 5000, watch_path: "",
+        });
+        schedule_poll();
+    }
     red::state_patch(GitPluginState { root: cwd });
     capture_git("root", ["rev-parse", "--show-toplevel"]);
 }
@@ -798,37 +845,77 @@ fn status_event(event: ProcessEvent) {
     match event {
         ProcessEvent::Stdout { process_id, line, plugin_name } => {
             if process_id == plugin_state().process {
-                update_status(line);
+                red::state_patch(GitPluginState { status_pending_output: line });
             }
         }
         ProcessEvent::Error { process_id, message, plugin_name } => {
             if process_id == plugin_state().process {
-                render_error(message);
+                red::state_patch(GitPluginState { status_error: message });
             }
         }
         ProcessEvent::Exit { process_id, code, plugin_name } => {
             if process_id != plugin_state().process {
                 return;
             }
-            red::state_patch(GitPluginState { process: "" });
-            let exit_code = 0;
+            let exit_code = -1;
             if let Some(value) = code {
                 exit_code = value;
             }
-            if exit_code != 0 {
-                render_error("git status exited with " + exit_code);
-            }
+            finish_status(exit_code);
         }
         ProcessEvent::Stderr { process_id, line, plugin_name } => {}
     }
 }
 
-fn update_status(output: String) {
+fn finish_status(exit_code: i32) {
+    let current = plugin_state();
+    let now: i64 = red::execute("MonotonicTime");
+    let elapsed = now - current.status_started_ms;
+    let successful = exit_code == 0 && current.status_error == "";
+    let changed = !current.status_initialized || current.status_pending_output != current.status_output;
+    let delay = 5000 as i64;
+    if !successful || (!changed && !current.status_forced) {
+        delay = current.poll_delay_ms;
+    }
+    // Nine milliseconds of cooldown per millisecond spent scanning targets a
+    // 10% background duty cycle, independent of repository size or CPU count.
+    let cost_delay = elapsed * (9 as i64);
+    if delay < cost_delay { delay = cost_delay; }
+    red::state_patch(GitPluginState { process: "", poll_delay_ms: delay });
+    // Rendering or follow-up work can fail independently of the scan. Keep
+    // polling alive even if one of those callbacks throws.
+    schedule_poll();
+    red::log("[git-status] completed elapsed_ms=" + elapsed + " success=" + successful + " next_poll_ms=" + delay);
+    if successful {
+        update_status(current.status_pending_output, current.status_forced);
+    } else {
+        let error = current.status_error;
+        if error == "" { error = "git status exited with " + exit_code; }
+        red::state_patch(GitPluginState { status_error: error });
+        if current.status_initialized { render_dashboard(); } else { render_error(error); }
+    }
+    // A callback such as safe-sync can already have started the next scan.
+    if plugin_state().process != "" { return; }
+    if plugin_state().refresh_pending {
+        refresh();
+    }
+}
+
+fn cancel_status() {
+    red::execute("CancelTimeout", plugin_state().refresh_timer);
+    red::execute("CancelTimeout", plugin_state().poll_timer);
+    let process = plugin_state().process;
+    red::state_patch(GitPluginState {
+        process: "", refresh_pending: false, status_pending_output: "", status_error: "",
+        refresh_timer: "", poll_timer: "",
+    });
+    if process != "" { red::execute("KillProcess", process); }
+}
+
+fn update_status(output: String, forced: bool) {
     let initialized = plugin_state().status_initialized;
     let changed = !initialized || output != red::string(plugin_state().status_output, "");
-    let forced = plugin_state().refresh_forced;
     red::state_patch(GitPluginState { status_initialized: true });
-    red::state_patch(GitPluginState { refresh_forced: false });
     if changed {
         red::state_patch(GitPluginState { status_output: output });
         red::state_patch(GitPluginState { state: parse_status(output) });
@@ -1372,13 +1459,17 @@ fn render_dashboard() {
             });
         }
     }
+    let status = plugin_state().detail_status;
+    if plugin_state().status_error != "" {
+        status = "Git status stale: " + bounded_git_error(plugin_state().status_error);
+    }
     red::execute("UpdateWorkspace", "git-dashboard", GitWorkspaceModel {
         header: header_segments(state),
         rows: rows,
         detail: plugin_state().detail,
         detail_document: plugin_state().detail_document,
         actions: dashboard_actions(),
-        status: plugin_state().detail_status,
+        status: status,
         detail_title: plugin_state().detail_path,
     });
 }
@@ -1483,12 +1574,15 @@ fn entry_stat_segments(display: GitDisplayEntry, section: String, status_style: 
 
 fn refresh_stats() {
     if plugin_state().stats_process != "" { red::execute("KillProcess", plugin_state().stats_process); }
-    red::state_patch(GitPluginState { stats: Json {} });
+    red::state_patch(GitPluginState { stats: Json {}, stats_process: "" });
     if plugin_state().commit_view_oid != "" {
         start_commit_stats();
         return;
     }
-    start_stats("staged");
+    // A full worktree diff can be as expensive as status. Only scan sections
+    // with tracked changes whose statistics can actually appear in the list.
+    if red::len(plugin_state().state.staged) > 0 { start_stats("staged"); }
+    else if red::len(plugin_state().state.unstaged) > 0 { start_stats("unstaged"); }
 }
 
 fn start_commit_stats() {
@@ -1541,7 +1635,7 @@ fn stats_event(event: ProcessEvent) {
                 index = index + 1;
             }
             red::state_patch(GitPluginState { stats: stats, stats_process: "" });
-            if section == "staged" && plugin_state().dashboard_open && plugin_state().commit_view_oid == "" { start_stats("unstaged"); }
+            if section == "staged" && plugin_state().dashboard_open && plugin_state().commit_view_oid == "" && red::len(plugin_state().state.unstaged) > 0 { start_stats("unstaged"); }
             else { render_dashboard(); }
         }
         ProcessEvent::Error { process_id, message, plugin_name } => {
@@ -2853,6 +2947,9 @@ fn prompt_submitted(item: PickerItem) {
 }
 
 fn capture_git(kind: String, args: [String]) {
+    if plugin_state().capture_process != "" {
+        red::execute("KillProcess", plugin_state().capture_process);
+    }
     red::state_patch(GitPluginState { capture_kind: kind });
     red::state_patch(GitPluginState { capture_output: "" });
     record_command(args);
@@ -2862,17 +2959,23 @@ fn capture_git(kind: String, args: [String]) {
         raw_output: true,
         cwd: red::string(plugin_state().root, "."),
     });
+    red::state_patch(GitPluginState { capture_process: process_id });
     red::on("process:" + process_id, capture_event);
 }
 
 fn capture_event(event: ProcessEvent) {
     match event {
         ProcessEvent::Stdout { process_id, line, plugin_name } => {
+            if process_id != plugin_state().capture_process { return; }
             red::state_patch(GitPluginState {
                 capture_output: plugin_state().capture_output + line,
             });
         }
-        ProcessEvent::Exit { process_id, code, plugin_name } => capture_finished(),
+        ProcessEvent::Exit { process_id, code, plugin_name } => {
+            if process_id != plugin_state().capture_process { return; }
+            red::state_patch(GitPluginState { capture_process: "" });
+            capture_finished();
+        }
         ProcessEvent::Stderr { process_id, line, plugin_name } => {}
         ProcessEvent::Error { process_id, message, plugin_name } => {}
     }
@@ -4243,19 +4346,12 @@ fn apply_hunk_check_finished(event: ProcessEvent) {
 
 #[red::lifecycle("deactivate")]
 fn deactivate() {
+    cancel_status();
     cancel_detail_timer();
     for job in plugin_state().operation_jobs {
         red::execute("KillProcess", job.id);
     }
     red::state_patch(GitPluginState { operation_jobs: [] });
-    let refresh_timer = red::string(plugin_state().refresh_timer, "");
-    if refresh_timer != "" {
-        red::execute("CancelTimeout", refresh_timer);
-    }
-    let poll_timer = red::string(plugin_state().poll_timer, "");
-    if poll_timer != "" {
-        red::execute("CancelTimeout", poll_timer);
-    }
     let push_done_timer = red::string(plugin_state().push_done_timer, "");
     if push_done_timer != "" {
         red::execute("CancelTimeout", push_done_timer);
@@ -4269,6 +4365,7 @@ fn deactivate() {
         red::execute("CancelTimeout", git_task_done_timer);
     }
     for process_id in [
+        plugin_state().capture_process,
         red::string(plugin_state().git_task_process, ""),
         red::string(plugin_state().commit_process, ""),
         red::string(plugin_state().commit_context_process, ""),
@@ -4285,8 +4382,6 @@ fn deactivate() {
     if push_process != "" {
         red::execute("KillProcess", push_process);
     }
-    red::state_patch(GitPluginState { refresh_timer: "" });
-    red::state_patch(GitPluginState { poll_timer: "" });
     red::state_patch(GitPluginState { push_done_timer: "" });
     red::state_patch(GitPluginState { git_task_busy_timer: "" });
     red::state_patch(GitPluginState { git_task_done_timer: "" });

@@ -1,6 +1,6 @@
 # Husk plugin compatibility
 
-Red host API version `0.15.0` is defined by
+Red host API version `0.17.0` is defined by
 [`src/plugin/host_api.json`](../src/plugin/host_api.json). That file is the canonical,
 machine-readable list of execute actions, request actions, signatures, and introduction
 versions. Runtime dispatch and the bundled-plugin corpus are checked against it in tests.
@@ -24,9 +24,25 @@ required/optional arity (`HUSK-A0002`) and obvious literal argument types
 annotations use `HUSK-A0004`. `--no-typecheck` is an unsupported development
 escape hatch; compatibility guarantees do not apply while it is enabled.
 
-Red `0.15.0` retains the complete `0.4.0`, `0.6.0`, `0.7.0`, `0.8.0`, `0.9.0`,
-`0.10.0`, `0.11.0`, `0.12.0`, and `0.14.0` contracts, so existing packages that declare those
-minors continue to load. New packages should target `"red_api_version": "^0.15.0"`.
+Red `0.17.0` retains the complete `0.4.0`, `0.6.0`, `0.7.0`, `0.8.0`, `0.9.0`,
+`0.10.0`, `0.11.0`, `0.12.0`, `0.14.0`, and `0.16.0` contracts, so existing packages that declare those
+minors continue to load. New packages should target `"red_api_version": "^0.17.0"`.
+
+## Monotonic timing
+
+Host API `0.17.0` adds `red::execute("MonotonicTime")`, returning an `i64`
+millisecond count from an arbitrary process-local monotonic origin. Subtract two
+readings to measure elapsed time; never persist a reading or compare it across
+editor processes. Wall-clock changes do not affect it.
+
+The bundled Git plugin uses this clock to schedule idle status polls after each
+scan finishes. It waits at least five seconds and nine times the scan duration,
+targeting a 10% background scan duty cycle. Unchanged results and failures also
+back off the minimum delay up to 60 seconds. Explicit refreshes bypass the idle
+cooldown, but requests received during a scan coalesce into one follow-up rather
+than cancelling work. Failed scans retain the last successful status.
+Working-tree diff statistics run only for staged or unstaged sections that
+contain tracked changes.
 
 ## Messages
 
