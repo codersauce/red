@@ -120,7 +120,7 @@ use crate::{
         PendingEditorTool, PendingEditorToolResponse, MAX_AGENT_READ_BYTES,
     },
     buffer::{Buffer, BufferId, ExternalFileChange, SearchMatch, SyntaxSelection},
-    clipboard::{ClipboardProvider, DisabledClipboardProvider, NativeClipboardProvider},
+    clipboard::{ClipboardProvider, CopyOutcome, DisabledClipboardProvider, SessionClipboard},
     codex::{
         start_codex, AgentRuntimePolicy, CodexBridge, CodexCommand, CodexEvent, CodexProcessSpec,
     },
@@ -4012,6 +4012,7 @@ pub struct Editor {
 
     /// System clipboard bridge for the default register.
     clipboard: Box<dyn ClipboardProvider>,
+    clipboard_notice: Option<String>,
 
     /// Map of diagnostics per file uri
     diagnostics: HashMap<String, Vec<Diagnostic>>,
@@ -4086,6 +4087,8 @@ pub struct Editor {
 /// process while replaceable clients only send normalized input and paint rows.
 pub struct DetachedEditorCore {
     editor: Editor,
+    client_clipboard: crate::clipboard::ClientClipboard,
+    clipboard_writes: Vec<String>,
     runtime: Runtime,
     render_buffer: RenderBuffer,
     revision: u64,
@@ -4106,6 +4109,8 @@ impl DetachedEditorCore {
     /// while retaining all editor, LSP, recovery, and Codex state.
     pub async fn new(mut editor: Editor) -> anyhow::Result<Self> {
         editor.terminal_output_enabled = false;
+        let client_clipboard = crate::clipboard::ClientClipboard::default();
+        editor.clipboard = Box::new(client_clipboard.clone());
         editor.notification_exposure = None;
         let mut runtime =
             Runtime::try_new_with_permissions(editor.config.plugin_permissions.clone())?;
@@ -4143,6 +4148,8 @@ impl DetachedEditorCore {
         let serialized_width = render_buffer.width;
         Ok(Self {
             editor,
+            client_clipboard,
+            clipboard_writes: Vec::new(),
             runtime,
             render_buffer,
             revision: 0,
@@ -4191,49 +4198,102 @@ impl DetachedEditorCore {
         &mut self,
         event: crate::headless::InputEvent,
     ) -> anyhow::Result<crate::headless::RenderDelta> {
-        let event = match event {
-            crate::headless::InputEvent::PasteChunk { text, final_chunk } => {
-                let next_size = self.pending_paste.len().saturating_add(text.len());
-                if next_size > crate::headless::MAX_PENDING_PASTE_BYTES {
-                    self.pending_paste.clear();
-                    anyhow::bail!(
-                        "detach paste exceeds {} bytes before completion",
-                        crate::headless::MAX_PENDING_PASTE_BYTES
-                    );
-                }
-                self.pending_paste.push_str(&text);
-                if !final_chunk {
-                    return Ok(self.snapshot(Some(self.revision)));
-                }
-                Event::Paste(std::mem::take(&mut self.pending_paste))
-            }
-            event => {
-                self.pending_paste.clear();
-                detached_input_to_crossterm(event)
-            }
-        };
-        let processed = self
-            .editor
-            .process_editor_event(
-                event,
-                &mut self.render_buffer,
-                &mut self.runtime,
-                EventRenderMode::CoalescedNavigation,
-            )
-            .await?;
-        self.stopped = processed.quit;
-        if processed.navigation_deferred {
-            self.editor
-                .finish_navigation_batch(&mut self.render_buffer, &mut self.runtime)
-                .await?;
-            self.stopped |= self.editor.take_deferred_quit();
-        } else {
-            self.service_background().await?;
+        self.input_with_clipboard(event, None).await
+    }
+
+    /// Clipboard snapshots and effects belong only to this input, never to a reconnect.
+    pub async fn input_with_clipboard(
+        &mut self,
+        event: crate::headless::InputEvent,
+        clipboard: Option<String>,
+    ) -> anyhow::Result<crate::headless::RenderDelta> {
+        self.client_clipboard.begin_input(clipboard);
+        let result = self.process_input(event).await;
+        self.clipboard_writes = self.client_clipboard.finish_input();
+        if result.is_err() {
+            self.clipboard_writes.clear();
         }
-        if self.editor.persist_session_snapshot(/*force*/ false) {
-            self.editor.render(&mut self.render_buffer)?;
-        }
+        result
+    }
+
+    pub fn take_clipboard_writes(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.clipboard_writes)
+    }
+
+    #[cfg(unix)]
+    pub(crate) async fn input_with_clipboard_reader(
+        &mut self,
+        event: crate::headless::InputEvent,
+        reader: tokio::sync::mpsc::UnboundedSender<crate::clipboard::ClipboardReadRequest>,
+    ) -> anyhow::Result<crate::headless::RenderDelta> {
+        self.client_clipboard.set_reader(reader);
+        self.input_with_clipboard(event, None).await
+    }
+
+    pub fn clipboard_config(&self) -> crate::config::ClipboardConfig {
+        self.editor.config.clipboard.clone()
+    }
+
+    pub fn clipboard_result(
+        &mut self,
+        message: String,
+    ) -> anyhow::Result<crate::headless::RenderDelta> {
+        self.editor.set_quiet_message(Some(message));
+        self.editor.render(&mut self.render_buffer)?;
         self.finish_render()
+    }
+
+    // Keep the production input future off the connection handler's stack.
+    #[inline(never)]
+    fn process_input(
+        &mut self,
+        event: crate::headless::InputEvent,
+    ) -> futures::future::LocalBoxFuture<'_, anyhow::Result<crate::headless::RenderDelta>> {
+        Box::pin(async move {
+            let event = match event {
+                crate::headless::InputEvent::PasteChunk { text, final_chunk } => {
+                    let next_size = self.pending_paste.len().saturating_add(text.len());
+                    if next_size > crate::headless::MAX_PENDING_PASTE_BYTES {
+                        self.pending_paste.clear();
+                        anyhow::bail!(
+                            "detach paste exceeds {} bytes before completion",
+                            crate::headless::MAX_PENDING_PASTE_BYTES
+                        );
+                    }
+                    self.pending_paste.push_str(&text);
+                    if !final_chunk {
+                        return Ok(self.snapshot(Some(self.revision)));
+                    }
+                    Event::Paste(std::mem::take(&mut self.pending_paste))
+                }
+                event => {
+                    self.pending_paste.clear();
+                    detached_input_to_crossterm(event)
+                }
+            };
+            let processed = self
+                .editor
+                .process_editor_event(
+                    event,
+                    &mut self.render_buffer,
+                    &mut self.runtime,
+                    EventRenderMode::CoalescedNavigation,
+                )
+                .await?;
+            self.stopped = processed.quit;
+            if processed.navigation_deferred {
+                self.editor
+                    .finish_navigation_batch(&mut self.render_buffer, &mut self.runtime)
+                    .await?;
+                self.stopped |= self.editor.take_deferred_quit();
+            } else {
+                self.service_background().await?;
+            }
+            if self.editor.persist_session_snapshot(/*force*/ false) {
+                self.editor.render(&mut self.render_buffer)?;
+            }
+            self.finish_render()
+        })
     }
 
     pub async fn resize(
@@ -4309,6 +4369,8 @@ impl DetachedEditorCore {
 
     pub fn clear_pending_paste(&mut self) {
         self.pending_paste.clear();
+        self.clipboard_writes.clear();
+        self.client_clipboard.finish_input();
     }
 
     #[doc(hidden)]
@@ -5553,13 +5615,7 @@ impl Editor {
             return Box::new(DisabledClipboardProvider);
         }
 
-        match NativeClipboardProvider::new() {
-            Ok(provider) => Box::new(provider),
-            Err(error) => {
-                log!("system clipboard disabled: {error}");
-                Box::new(DisabledClipboardProvider)
-            }
-        }
+        Box::new(SessionClipboard::new(&config.clipboard))
     }
 
     #[doc(hidden)]
@@ -5876,6 +5932,7 @@ impl Editor {
             mouse_selection: mouse::MouseSelectionState::default(),
             registers: HashMap::new(),
             clipboard,
+            clipboard_notice: None,
             diagnostics: HashMap::new(),
             diagnostic_reports: diagnostics::DiagnosticReports::default(),
             agent_lsp: agent_lsp::AgentLsp::default(),
@@ -26152,7 +26209,6 @@ impl Editor {
 
     fn yank(&mut self, register: char) -> bool {
         if let Some(content) = self.selected_content() {
-            log!("selected_content: {content:#?}");
             let count = content.text.lines().count();
             let mut needs_update = false;
             self.move_to_first_selected_line(&self.selection.unwrap());
@@ -26190,21 +26246,24 @@ impl Editor {
             return;
         }
 
-        if let Err(error) = self.clipboard.set_text(text) {
-            log!("failed to write system clipboard: {error}");
+        match self.clipboard.copy(text, &mut self.stdout) {
+            Ok(CopyOutcome::Written | CopyOutcome::Deferred) => {}
+            result => self.clipboard_notice = Some(SessionClipboard::report(result)),
         }
     }
 
-    fn refresh_default_register_from_system_clipboard(&mut self) {
+    async fn refresh_default_register_from_system_clipboard(&mut self) {
         if !self.config.clipboard.enabled || !self.config.clipboard.sync_on_paste {
             return;
         }
 
-        let text = match self.clipboard.get_text() {
+        let text = match self.clipboard.read_text().await {
             Ok(Some(text)) => text,
             Ok(None) => return,
             Err(error) => {
-                log!("failed to read system clipboard: {error}");
+                self.clipboard_notice = Some(format!(
+                    "clipboard read failed: {error}; using Red's register"
+                ));
                 return;
             }
         };
@@ -26302,7 +26361,6 @@ impl Editor {
     }
 
     fn paste_default(&mut self, before: bool) -> bool {
-        self.refresh_default_register_from_system_clipboard();
         let contents = self.registers.get(&DEFAULT_REGISTER).cloned();
 
         if let Some(contents) = contents {
@@ -26314,7 +26372,6 @@ impl Editor {
     }
 
     fn paste_over_selection(&mut self, preserve_default_register: bool) -> bool {
-        self.refresh_default_register_from_system_clipboard();
         let Some(source) = self.registers.get(&DEFAULT_REGISTER).cloned() else {
             return false;
         };

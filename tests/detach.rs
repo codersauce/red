@@ -57,6 +57,102 @@ for line in sys.stdin:
     path
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn clipboard_delivery_is_transient_and_paste_uses_the_current_client() {
+    struct CountingClipboard {
+        reads: usize,
+    }
+    impl red::clipboard::ClipboardProvider for CountingClipboard {
+        fn get_text(&mut self) -> anyhow::Result<Option<String>> {
+            self.reads += 1;
+            Ok(None)
+        }
+        fn set_text(&mut self, _text: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+    let directory = tempfile::tempdir().unwrap();
+    let config = Config::from_user_toml_with_overrides("", &[]).unwrap();
+    let editor = Editor::test_with_size(
+        Box::new(LspManager::new(config.lsp.clone())),
+        80,
+        24,
+        config,
+        Theme::default(),
+        vec![Buffer::new(None, "alpha 👻\nbeta\n".into())],
+    )
+    .unwrap();
+    let core = DetachedEditorCore::new(editor).await.unwrap();
+    let session = bind_session(directory.path(), "clipboard").unwrap();
+    let key = |character| InputEvent::Key {
+        code: KeyCode::Character(character),
+        modifiers: Vec::new(),
+        key_kind: red::headless::KeyKind::Press,
+    };
+    let client = async {
+        let mut clipboard = CountingClipboard { reads: 0 };
+        let mut first = connect_session(directory.path(), "clipboard", None, (80, 24))
+            .await
+            .unwrap();
+        assert!(first.take_clipboard_writes().is_empty());
+        first
+            .input_with_provider(key('y'), &mut clipboard)
+            .await
+            .unwrap();
+        first
+            .input_with_provider(key('y'), &mut clipboard)
+            .await
+            .unwrap();
+        assert_eq!(
+            clipboard.reads, 0,
+            "yanking must not read the user's clipboard"
+        );
+        assert_eq!(first.take_clipboard_writes(), vec!["alpha 👻\n"]);
+        first.heartbeat().await.unwrap();
+        assert!(first.take_clipboard_writes().is_empty());
+        let feedback = first
+            .clipboard_result("clipboard permission denied; text kept in Red's register".into())
+            .await
+            .unwrap();
+        assert!(feedback
+            .lines
+            .iter()
+            .any(|line| line.text.contains("permission denied")));
+        first.detach().await.unwrap();
+        drop(first);
+        let mut second = connect_session(directory.path(), "clipboard", None, (80, 24))
+            .await
+            .unwrap();
+        assert!(second.take_clipboard_writes().is_empty());
+        second
+            .input_with_provider(key('p'), &mut clipboard)
+            .await
+            .unwrap();
+        assert_eq!(
+            clipboard.reads, 1,
+            "read only in response to the actual paste action"
+        );
+        second
+            .input_with_clipboard(key('P'), Some("from this client ".into()))
+            .await
+            .unwrap();
+        second.detach().await.unwrap();
+        drop(second);
+        let mut third = connect_session(directory.path(), "clipboard", None, (80, 24))
+            .await
+            .unwrap();
+        assert!(third
+            .initial_render
+            .lines
+            .iter()
+            .any(|line| line.text.contains("from this client")));
+        assert!(third.take_clipboard_writes().is_empty());
+        third.stop().await.unwrap();
+    };
+    let (server, ()) = tokio::join!(serve_editor_session(&session, core), client);
+    server.unwrap();
+}
+
 async fn wait_for_pid(path: &Path) -> i32 {
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {

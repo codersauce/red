@@ -22,7 +22,7 @@ use tokio::{
 use tokio::net::{UnixListener, UnixStream};
 
 /// First stable version of Red's detachable-core IPC protocol.
-pub const IPC_PROTOCOL_VERSION: u32 = 3;
+pub const IPC_PROTOCOL_VERSION: u32 = 4;
 
 const MAX_FRAME_BYTES: usize = 2 * 1024 * 1024;
 /// Maximum aggregate size accepted for a chunked paste operation.
@@ -173,6 +173,12 @@ pub enum ClientMessage {
         /// Normalized input payload.
         event: InputEvent,
     },
+    /// Reply to a clipboard read requested by the currently executing paste action.
+    ClipboardReadResult {
+        result: Result<Option<String>, String>,
+    },
+    /// Delivery feedback from this terminal; clipboard contents are never part of the message.
+    ClipboardResult { message: String },
     /// Update the client's viewport dimensions.
     Resize {
         /// Viewport width.
@@ -249,7 +255,13 @@ pub enum ServerMessage {
         protocol_version: u32,
         /// Initial full or revision-aware render.
         render: RenderDelta,
+        /// Owner's clipboard policy, interpreted using the current attachment's environment.
+        clipboard: crate::config::ClipboardConfig,
     },
+    /// Read only in response to an explicit paste action; no polling or reconnect reads.
+    ClipboardRead,
+    /// Transient input effect, sent before its Render response and never included in snapshots.
+    ClipboardWrite { text: String, final_chunk: bool },
     /// Render response correlated with an input sequence.
     Render {
         /// Sequence from the triggering [`ClientMessage::Input`].
@@ -857,12 +869,14 @@ async fn serve_editor_connection(
         core.prepare_startup_whats_new()?
     };
     let render = core.lock().await.snapshot(last_revision);
+    let clipboard = core.lock().await.clipboard_config();
     let mut client_revision = render.revision;
     write_frame(
         &mut writer,
         &ServerMessage::Connected {
             protocol_version: IPC_PROTOCOL_VERSION,
             render,
+            clipboard,
         },
     )
     .await?;
@@ -882,10 +896,15 @@ async fn serve_editor_connection(
         match message {
             ClientMessage::Input { sequence, event } => {
                 let mut core = core.lock().await;
-                let delta = core.input(event).await?;
+                let delta =
+                    input_with_client_clipboard(&mut core, event, &mut reader, &mut writer).await?;
+                let clipboard_writes = core.take_clipboard_writes();
                 client_revision = delta.revision;
                 let stopped = core.stopped();
                 drop(core);
+                for text in clipboard_writes {
+                    write_clipboard_effect(&mut writer, &text).await?;
+                }
                 write_frame(&mut writer, &ServerMessage::Render { sequence, delta }).await?;
                 if stopped {
                     return Ok(true);
@@ -903,6 +922,12 @@ async fn serve_editor_connection(
                     },
                 )
                 .await?;
+            }
+            ClientMessage::ClipboardResult { message } => {
+                anyhow::ensure!(message.len() <= 4096, "clipboard result message too large");
+                let delta = core.lock().await.clipboard_result(message)?;
+                client_revision = delta.revision;
+                write_frame(&mut writer, &ServerMessage::Render { sequence: 0, delta }).await?;
             }
             ClientMessage::Focus { focused } => {
                 let delta = core.lock().await.focus(focused).await?;
@@ -936,7 +961,7 @@ async fn serve_editor_connection(
                 write_frame(&mut writer, &ServerMessage::Stopped).await?;
                 return Ok(true);
             }
-            ClientMessage::Connect { .. } => {
+            ClientMessage::Connect { .. } | ClientMessage::ClipboardReadResult { .. } => {
                 write_frame(
                     &mut writer,
                     &ServerMessage::Error {
@@ -1038,6 +1063,62 @@ pub async fn stop_session(directory: &Path, name: &str) -> anyhow::Result<()> {
     }
 }
 
+#[cfg(unix)]
+async fn input_with_client_clipboard(
+    core: &mut crate::editor::DetachedEditorCore,
+    event: InputEvent,
+    reader: &mut (impl AsyncBufRead + Unpin),
+    writer: &mut (impl AsyncWrite + Unpin),
+) -> anyhow::Result<RenderDelta> {
+    let (requests, mut reads) = tokio::sync::mpsc::unbounded_channel();
+    let input = core.input_with_clipboard_reader(event, requests);
+    tokio::pin!(input);
+    loop {
+        tokio::select! {
+            result = &mut input => return result,
+            Some(reply) = reads.recv() => {
+                write_frame(writer, &ServerMessage::ClipboardRead).await?;
+                let response = read_frame_with_timeout(reader, Duration::from_secs(3), "clipboard client read timed out").await?;
+                let Some(ClientMessage::ClipboardReadResult { result }) = response else { anyhow::bail!("expected clipboard read response"); };
+                match &result {
+                    Ok(Some(text)) => anyhow::ensure!(text.len() <= crate::clipboard::MAX_CLIPBOARD_BYTES, "clipboard read exceeds 256 KiB"),
+                    Err(message) => anyhow::ensure!(message.len() <= 4096, "clipboard read error too large"),
+                    _ => {}
+                }
+                let _ = reply.send(result);
+            }
+        }
+    }
+}
+
+/// Send one complete copy in bounded IPC frames. The client reassembles it before delivery.
+#[cfg(any(unix, test))]
+async fn write_clipboard_effect(
+    writer: &mut (impl AsyncWrite + Unpin),
+    text: &str,
+) -> anyhow::Result<()> {
+    let mut remaining = text;
+    loop {
+        let mut end = remaining.len().min(128 * 1024);
+        while !remaining.is_char_boundary(end) {
+            end -= 1;
+        }
+        let final_chunk = end == remaining.len();
+        write_frame(
+            writer,
+            &ServerMessage::ClipboardWrite {
+                text: remaining[..end].to_owned(),
+                final_chunk,
+            },
+        )
+        .await?;
+        if final_chunk {
+            return Ok(());
+        }
+        remaining = &remaining[end..];
+    }
+}
+
 /// Serve one attached client over any ordered local byte stream.
 ///
 /// # Errors
@@ -1076,6 +1157,7 @@ where
         &ServerMessage::Connected {
             protocol_version: IPC_PROTOCOL_VERSION,
             render,
+            clipboard: crate::config::ClipboardConfig::default(),
         },
     )
     .await?;
@@ -1088,12 +1170,14 @@ where
     .await?
     {
         match message {
-            ClientMessage::Input { sequence, event } => {
+            ClientMessage::Input {
+                sequence, event, ..
+            } => {
                 let delta = owner.lock().await.apply(event)?;
                 client_revision = delta.revision;
                 write_frame(&mut writer, &ServerMessage::Render { sequence, delta }).await?;
             }
-            ClientMessage::Connect { .. } => {
+            ClientMessage::Connect { .. } | ClientMessage::ClipboardReadResult { .. } => {
                 write_frame(
                     &mut writer,
                     &ServerMessage::Error {
@@ -1136,7 +1220,7 @@ where
                 )
                 .await?;
             }
-            ClientMessage::Heartbeat => {
+            ClientMessage::Heartbeat | ClientMessage::ClipboardResult { .. } => {
                 let delta = owner.lock().await.snapshot(Some(client_revision));
                 client_revision = delta.revision;
                 write_frame(
@@ -1171,6 +1255,8 @@ where
     next_sequence: u64,
     /// Render returned by the successful connection handshake.
     pub initial_render: RenderDelta,
+    pub clipboard_config: crate::config::ClipboardConfig,
+    clipboard_writes: Vec<String>,
 }
 
 impl<S> HeadlessClient<S>
@@ -1212,7 +1298,7 @@ where
         )
         .await?;
         let mut reader = BufReader::new(reader);
-        let (protocol_version, render) = match read_frame_with_timeout(
+        let (protocol_version, render, clipboard_config) = match read_frame_with_timeout(
             &mut reader,
             CLIENT_HANDSHAKE_TIMEOUT,
             "detach IPC connect response timed out",
@@ -1222,7 +1308,8 @@ where
             Some(ServerMessage::Connected {
                 protocol_version,
                 render,
-            }) => (protocol_version, render),
+                clipboard,
+            }) => (protocol_version, render, clipboard),
             Some(ServerMessage::Error { message }) => anyhow::bail!(message),
             _ => anyhow::bail!("detach owner did not return a connect response"),
         };
@@ -1235,6 +1322,8 @@ where
             writer,
             next_sequence: 1,
             initial_render: render,
+            clipboard_config,
+            clipboard_writes: Vec::new(),
         })
     }
 
@@ -1244,22 +1333,100 @@ where
     ///
     /// Returns an error for transport failure or an invalid/out-of-order reply.
     pub async fn input(&mut self, event: InputEvent) -> anyhow::Result<RenderDelta> {
+        self.input_with_clipboard(event, None).await
+    }
+
+    pub fn take_clipboard_writes(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.clipboard_writes)
+    }
+
+    pub async fn clipboard_result(&mut self, message: String) -> anyhow::Result<RenderDelta> {
+        write_frame(
+            &mut self.writer,
+            &ClientMessage::ClipboardResult { message },
+        )
+        .await?;
+        self.expect_control_render().await
+    }
+
+    pub async fn input_with_clipboard(
+        &mut self,
+        event: InputEvent,
+        clipboard: Option<String>,
+    ) -> anyhow::Result<RenderDelta> {
+        let mut provider = crate::clipboard::MemoryClipboardProvider::from(Arc::new(
+            std::sync::Mutex::new(clipboard),
+        ));
+        self.input_with_provider(event, &mut provider).await
+    }
+
+    /// Service clipboard requests only while the owner is executing this input.
+    pub async fn input_with_provider(
+        &mut self,
+        event: InputEvent,
+        clipboard: &mut dyn crate::clipboard::ClipboardProvider,
+    ) -> anyhow::Result<RenderDelta> {
         let sequence = self.next_sequence;
         self.next_sequence = self.next_sequence.saturating_add(1);
+        self.clipboard_writes.clear();
         write_frame(&mut self.writer, &ClientMessage::Input { sequence, event }).await?;
-        match read_frame_with_timeout(
-            &mut self.reader,
-            CLIENT_RESPONSE_TIMEOUT,
-            "detach IPC input response timed out",
-        )
-        .await?
-        {
-            Some(ServerMessage::Render {
-                sequence: response_sequence,
-                delta,
-            }) if response_sequence == sequence => Ok(delta),
-            Some(ServerMessage::Error { message }) => anyhow::bail!(message),
-            response => anyhow::bail!("unexpected detach response: {response:?}"),
+        let mut pending_copy = String::new();
+        let mut copy_in_progress = false;
+        loop {
+            match read_frame_with_timeout(
+                &mut self.reader,
+                CLIENT_RESPONSE_TIMEOUT,
+                "detach IPC input response timed out",
+            )
+            .await?
+            {
+                Some(ServerMessage::ClipboardRead) => {
+                    let result = clipboard
+                        .read_text()
+                        .await
+                        .and_then(|text| {
+                            anyhow::ensure!(
+                                text.as_ref().is_none_or(
+                                    |text| text.len() <= crate::clipboard::MAX_CLIPBOARD_BYTES
+                                ),
+                                "clipboard read exceeds 256 KiB"
+                            );
+                            Ok(text)
+                        })
+                        .map_err(|error| error.to_string());
+                    write_frame(
+                        &mut self.writer,
+                        &ClientMessage::ClipboardReadResult { result },
+                    )
+                    .await?;
+                }
+                Some(ServerMessage::Render {
+                    sequence: response_sequence,
+                    delta,
+                }) if response_sequence == sequence => {
+                    anyhow::ensure!(!copy_in_progress, "incomplete clipboard effect");
+                    return Ok(delta);
+                }
+                Some(ServerMessage::ClipboardWrite { text, final_chunk }) => {
+                    anyhow::ensure!(
+                        self.clipboard_writes.is_empty(),
+                        "multiple clipboard effects for one input"
+                    );
+                    anyhow::ensure!(
+                        pending_copy.len().saturating_add(text.len())
+                            <= crate::clipboard::MAX_CLIPBOARD_BYTES,
+                        "clipboard effect exceeds 256 KiB"
+                    );
+                    pending_copy.push_str(&text);
+                    copy_in_progress = !final_chunk;
+                    if final_chunk {
+                        self.clipboard_writes
+                            .push(std::mem::take(&mut pending_copy));
+                    }
+                }
+                Some(ServerMessage::Error { message }) => anyhow::bail!(message),
+                _ => anyhow::bail!("unexpected detach input response"),
+            }
         }
     }
 
@@ -1510,6 +1677,7 @@ mod tests {
         let rows = MAX_TERMINAL_CELLS / row_width;
         let message = ServerMessage::Connected {
             protocol_version: IPC_PROTOCOL_VERSION,
+            clipboard: crate::config::ClipboardConfig::default(),
             render: RenderDelta {
                 revision: 1,
                 lines: (0..rows)
@@ -1534,6 +1702,34 @@ mod tests {
 
         assert_eq!(row_width * rows, MAX_TERMINAL_CELLS);
         assert!(serde_json::to_vec(&message).unwrap().len() < MAX_FRAME_BYTES);
+    }
+
+    #[tokio::test]
+    async fn clipboard_ipc_chunks_reassemble_unicode_without_repeating_writes() {
+        let text = "👻\n".repeat(40_000);
+        let (mut writer, reader) = tokio::io::duplex(1024);
+        let mut reader = BufReader::new(reader);
+        let receive = async {
+            let mut assembled = String::new();
+            let mut chunks = 0;
+            loop {
+                let Some(ServerMessage::ClipboardWrite { text, final_chunk }) =
+                    read_frame(&mut reader).await.unwrap()
+                else {
+                    panic!("expected clipboard chunk")
+                };
+                assert!(text.len() <= 128 * 1024);
+                assembled.push_str(&text);
+                chunks += 1;
+                if final_chunk {
+                    break;
+                }
+            }
+            assert_eq!(assembled, text);
+            assert_eq!(chunks, 2);
+        };
+        let (sent, ()) = tokio::join!(write_clipboard_effect(&mut writer, &text), receive);
+        sent.unwrap();
     }
 
     #[test]

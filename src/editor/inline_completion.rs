@@ -579,8 +579,9 @@ impl Editor {
         if !self.config.clipboard.enabled || !self.clipboard.is_available() {
             return false;
         }
-        match self.clipboard.set_text(code) {
-            Ok(()) => true,
+        match self.clipboard.copy(code, &mut self.stdout) {
+            Ok(crate::clipboard::CopyOutcome::Written) => true,
+            Ok(_) => false,
             Err(error) => {
                 log!("failed to copy Copilot device code: {error}");
                 false
