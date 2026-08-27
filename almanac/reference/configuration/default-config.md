@@ -19,7 +19,7 @@ sources:
 
 The sample/default file says user configuration is read from `$XDG_CONFIG_HOME/red/config.toml` or `$HOME/.config/red/config.toml` [@defaults]. The code computes the same config directory, preferring a non-empty `XDG_CONFIG_HOME` and otherwise using `$HOME/.config/red` [@config]. Runtime paths such as logs, preferences, sessions, plugins, and themes are resolved below that directory unless a setting explicitly uses an absolute or expanded path [@config].
 
-The top-level schema accepts keys for editor behavior, keymaps, theme, cursor, plugins, disabled plugins, plugin permissions, plugin config, logging, search, completion, picker, statusline, key hints, clipboard, LSP, commenting, matchit, AI, diagnostics, and ASCII window borders [@config]. Unknown top-level fields are ignored with diagnostics during recoverable user loading rather than becoming part of the effective configuration [@config].
+The top-level schema accepts keys for editor behavior, keymaps, theme, cursor, plugins, disabled plugins, plugin permissions, plugin config, logging, search, completion, signature help, picker, statusline, key hints, clipboard, LSP, formatting, language definitions, commenting, matchit, AI, diagnostics, and ASCII window borders [@config]. Unknown top-level fields are ignored with diagnostics during recoverable user loading rather than becoming part of the effective configuration [@config].
 
 ## Top-Level Defaults
 
@@ -29,10 +29,15 @@ The top-level schema accepts keys for editor behavior, keymaps, theme, cursor, p
 | `mouse_scroll_lines` | `3` | Terminal mouse-wheel scroll amount [@defaults]. |
 | `scrolloff` | `3` | Minimum visible lines above and below the cursor when possible [@defaults]. |
 | `wrap` | `true` | Wrap long lines at the window edge [@defaults]. |
+| `wrap_window_navigation` | `true` | Wrap `Ctrl-w h/j/k/l` focus across the opposite editor edge [@defaults] [@config]. |
+| `relative_line_numbers` | `false` | Show the cursor line as an absolute line number and other visible lines as distances from it [@defaults] [@config]. |
 | `breakindent` | `true` | Indent wrapped continuation rows to leading whitespace, keeping at least 20 text columns [@defaults]. |
 | `sidescroll` | `1` | Horizontal scroll step when wrapping is off [@defaults]. |
 | `sidescrolloff` | `0` | Preferred visible columns beside the cursor [@defaults]. |
 | `splash` | `true` | Show the startup splash when Red opens without file arguments [@defaults]. |
+| `show_whats_new` | `true` | Present a themed release announcement once after a newly installed version starts interactively [@defaults] [@config]. |
+| `fetch_release_notes` | `true` | Refresh bundled release notes from GitHub without blocking editor startup [@defaults] [@config]. |
+| `persist_inline_history` | `true` | Keep inline questions and answers in local editor recovery snapshots [@defaults] [@config]. |
 | `log_file` | `"red.log"` | Default log file name under the config directory [@defaults]. |
 | `disabled_plugins` | `[]` | Plugin IDs removed from activation [@defaults] [@config]. |
 | `disable_ai` | `false` | When true, removes the agent plugin and rejects Codex launches [@defaults] [@config]. |
@@ -45,6 +50,7 @@ The top-level schema accepts keys for editor behavior, keymaps, theme, cursor, p
 | --- | --- |
 | `[search]` | `incsearch = true`, `hlsearch = true`, `wrapscan = true`, `ignorecase = false`, `smartcase = false` [@defaults] [@config]. |
 | `[completion]` | `enabled = true`, `inline_mode = "popup_first"`, `auto_trigger = true`, `min_prefix_length = 1`, `debounce_ms = 0`, `buffer_words = true`, `max_buffer_words = 100` [@defaults] [@config]. |
+| `[signature_help]` | `auto_trigger = true`, `debounce_ms = 120`, `show_documentation = true`; `Ctrl-k` invokes signature help explicitly even when automatic triggering is disabled [@defaults] [@config]. |
 | `[picker]` | `input_position = "bottom"`, `tree_guides = true`; disable tree guides to hide hierarchy connectors in document-symbol pickers [@defaults] [@config]. |
 | `[picker.icons]` | `style = "nerd_font"`, `color = true`; code also accepts `unicode`, `ascii`, and `none` icon styles [@defaults] [@config]. |
 | `[diagnostics]` | `gutter_signs = true`, `icon_style = "nerd_font"`; code also accepts `unicode`, `ascii`, and `none` icon styles for diagnostic gutter signs [@defaults] [@config]. |
@@ -84,6 +90,6 @@ agent. It defaults to disabled; `disable_ai = true` also blocks it [@defaults]
 [Copilot Inline Completion](../../guides/agent/copilot-completion) for setup,
 privacy controls, commands, and key bindings.
 
-`[agent]` contains an optional `command` override, plus optional `args` and `env` fields in the code schema [@config]. When `command` is absent, the agent check and runtime Codex integration use `codex` from `PATH` [@config]. Setting `disable_ai = true` removes the bundled agent plugin, resets agent configuration during recovered loading paths, and prevents Red from launching Codex [@defaults] [@config].
+`[agent]` contains an optional `command` override, optional `args` and `env` additions, and policy fields for tool playback, exact-target inline edit application, sensitive-path access, named MCP servers, and Codex feature categories [@defaults] [@config]. When `command` is absent, the agent check and runtime Codex integration use `codex` from `PATH` [@config]. The shipped defaults run file tools without deliberate playback pauses, auto-apply exact inline edits, reject sensitive-path access until opted in, and enable no MCP servers or Codex feature categories [@defaults] [@config]. Setting `disable_ai = true` removes the bundled agent plugin, resets agent configuration during recovered loading paths, and prevents Red from launching Codex [@defaults] [@config].
 
 See [Agent Check](../agent/agent-check) for the command-line readiness report that reads these agent settings.
