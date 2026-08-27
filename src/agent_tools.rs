@@ -21,6 +21,13 @@ pub const MAX_AGENT_READ_LINES: usize = 1_000;
 /// Maximum source bytes returned by one full-Agent file read.
 pub const MAX_AGENT_READ_BYTES: usize = 256 * 1024;
 
+/// Default number of diagnostics returned by one LSP diagnostics page.
+pub const DEFAULT_LSP_DIAGNOSTIC_LIMIT: usize = 100;
+
+fn default_lsp_diagnostic_limit() -> usize {
+    DEFAULT_LSP_DIAGNOSTIC_LIMIT
+}
+
 /// Maximum annotations accepted in one Agent tool call.
 pub const MAX_AGENT_ANNOTATIONS_PER_CALL: usize = crate::inline_assist::MAX_COMMENTS;
 
@@ -135,14 +142,21 @@ pub enum EditorToolCall {
     /// Read known diagnostics, optionally refreshing one already-open file.
     LspDiagnostics {
         scope: LspDiagnosticScope,
+        #[serde(default)]
         path: Option<String>,
+        #[serde(default)]
         severity: Option<u8>,
+        #[serde(default)]
         source: Option<String>,
+        #[serde(default)]
         code: Option<String>,
+        #[serde(default)]
         range: Option<EditorLspRange>,
         #[serde(default)]
         offset: usize,
+        #[serde(default = "default_lsp_diagnostic_limit")]
         limit: usize,
+        #[serde(default)]
         expected_generation: Option<u64>,
         #[serde(default)]
         refresh: bool,
@@ -468,11 +482,11 @@ pub fn editor_tool_schemas(schema_key: &str) -> Vec<Value> {
                 "type": "object",
                 "properties": {
                     "path": {"type": "string"},
-                    "line": {"type": "integer", "minimum": 0},
-                    "character": {"type": "integer", "minimum": 0},
-                    "target": {"type": "string", "enum": ["current", "horizontal", "vertical"]}
+                    "line": {"type": "integer", "minimum": 0, "default": 0},
+                    "character": {"type": "integer", "minimum": 0, "default": 0},
+                    "target": {"type": "string", "enum": ["current", "horizontal", "vertical"], "default": "current"}
                 },
-                "required": ["path", "line", "character", "target"],
+                "required": ["path"],
                 "additionalProperties": false
             }),
         ),
@@ -485,9 +499,9 @@ pub fn editor_tool_schemas(schema_key: &str) -> Vec<Value> {
                     "path": {"type": "string"},
                     "start": position,
                     "end": position,
-                    "kind": {"type": "string", "enum": ["character", "line", "block"]}
+                    "kind": {"type": "string", "enum": ["character", "line", "block"], "default": "character"}
                 },
-                "required": ["path", "start", "end", "kind"],
+                "required": ["path", "start", "end"],
                 "additionalProperties": false
             }),
         ),
@@ -610,10 +624,10 @@ pub fn editor_tool_schemas(schema_key: &str) -> Vec<Value> {
             "severity": {"type": ["integer", "null"], "enum": [1, 2, 3, 4, null]},
             "source": {"type": ["string", "null"]}, "code": {"type": ["string", "null"]},
             "range": {"anyOf": [{"type": "null"}, {"type": "object", "properties": {"start": position, "end": position}, "required": ["start", "end"], "additionalProperties": false}]},
-            "offset": {"type": "integer", "minimum": 0}, "limit": {"type": "integer", "minimum": 1, "maximum": 100},
+            "offset": {"type": "integer", "minimum": 0, "default": 0}, "limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": DEFAULT_LSP_DIAGNOSTIC_LIMIT},
             "expected_generation": {"type": ["integer", "null"], "minimum": 0},
-            "refresh": {"type": "boolean"}, "wait_ms": {"type": "integer", "minimum": 0, "maximum": 20000}
-        }), vec!["scope", "path", "severity", "source", "code", "range", "offset", "limit", "expected_generation", "refresh", "wait_ms"]),
+            "refresh": {"type": "boolean", "default": false}, "wait_ms": {"type": "integer", "minimum": 0, "maximum": 20000, "default": 0}
+        }), vec!["scope"]),
         ("lsp_prepare_rename", "Check whether an already-read symbol can be renamed. Positions are zero-based UTF-16. An unsupported prepare operation does not necessarily mean rename is unsupported.", json!({"path": {"type": "string"}, "position": position, "expected_revision": {"type": "integer", "minimum": 0}}), vec!["path", "position", "expected_revision"]),
         ("lsp_preview_rename", "Preview a semantic rename across workspace files. Read the source first and pass its revision. Returns a bounded diff and a session-owned plan_id valid for 120 seconds while captured documents remain unchanged. Does not edit or save.", json!({"path": {"type": "string"}, "position": position, "expected_revision": {"type": "integer", "minimum": 0}, "new_name": {"type": "string", "minLength": 1, "maxLength": 256}}), vec!["path", "position", "expected_revision", "new_name"]),
         ("lsp_apply_edit", "Apply a previously returned rename plan once, after revalidating all targets. Updates visible buffers and undo history but NEVER saves files. Report unsaved changes to the user. Expired or stale plans require a new preview.", json!({"plan_id": {"type": "string"}}), vec!["plan_id"]),
@@ -719,15 +733,79 @@ mod tests {
                 tools[7][schema_key]["properties"]["annotation_ids"]["maxItems"],
                 MAX_AGENT_ANNOTATIONS_PER_CALL
             );
-            assert_eq!(
-                tools[1][schema_key]["required"],
-                json!(["path", "line", "character", "target"])
-            );
+            assert_eq!(tools[1][schema_key]["required"], json!(["path"]));
             assert_eq!(
                 tools[2][schema_key]["required"],
-                json!(["path", "start", "end", "kind"])
+                json!(["path", "start", "end"])
+            );
+            let diagnostics = tools
+                .iter()
+                .find(|tool| tool["name"] == "lsp_diagnostics")
+                .expect("lsp_diagnostics schema");
+            assert_eq!(diagnostics[schema_key]["required"], json!(["scope"]));
+            assert_eq!(
+                diagnostics[schema_key]["properties"]["offset"]["default"],
+                json!(0)
+            );
+            assert_eq!(
+                diagnostics[schema_key]["properties"]["limit"]["default"],
+                json!(DEFAULT_LSP_DIAGNOSTIC_LIMIT)
+            );
+            assert_eq!(
+                diagnostics[schema_key]["properties"]["refresh"]["default"],
+                json!(false)
+            );
+            assert_eq!(
+                diagnostics[schema_key]["properties"]["wait_ms"]["default"],
+                json!(0)
             );
         }
+    }
+
+    #[test]
+    fn minimal_tool_calls_use_declared_defaults() {
+        assert_eq!(
+            EditorToolCall::parse("open_file", json!({"path": "main.rs"})).unwrap(),
+            EditorToolCall::OpenFile {
+                path: "main.rs".to_string(),
+                line: 0,
+                character: 0,
+                target: EditorOpenTarget::Current,
+            }
+        );
+        assert_eq!(
+            EditorToolCall::parse(
+                "select_text",
+                json!({
+                    "path": "main.rs",
+                    "start": {"line": 1, "character": 0},
+                    "end": {"line": 1, "character": 3}
+                })
+            )
+            .unwrap(),
+            EditorToolCall::SelectText {
+                path: "main.rs".to_string(),
+                start: position(1, 0),
+                end: position(1, 3),
+                kind: EditorSelectionKind::Character,
+            }
+        );
+        assert_eq!(
+            EditorToolCall::parse("lsp_diagnostics", json!({"scope": "workspace"})).unwrap(),
+            EditorToolCall::LspDiagnostics {
+                scope: LspDiagnosticScope::Workspace,
+                path: None,
+                severity: None,
+                source: None,
+                code: None,
+                range: None,
+                offset: 0,
+                limit: DEFAULT_LSP_DIAGNOSTIC_LIMIT,
+                expected_generation: None,
+                refresh: false,
+                wait_ms: 0,
+            }
+        );
     }
 
     #[test]
