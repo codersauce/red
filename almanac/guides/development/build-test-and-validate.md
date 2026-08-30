@@ -24,9 +24,21 @@ sources:
   - id: editor
     type: file
     path: src/editor.rs
+  - id: config
+    type: file
+    path: src/config.rs
+  - id: language-doc
+    type: file
+    path: docs/LANGUAGES.md
+  - id: cargo-toml
+    type: file
+    path: Cargo.toml
   - id: terminal-cleanup-session
     type: conversation
     path: /Users/fcoury/.codex/sessions/2026/08/08/rollout-2026-08-08T00-33-51-019fdf6f-2571-7d91-8f8d-8c7dc3fe8803.jsonl
+  - id: binary-skew-session
+    type: conversation
+    path: /Users/fcoury/.codex/sessions/2026/08/30/rollout-2026-08-30T13-02-03-01a053d5-ecd3-7762-bf3f-af5ec83a4051.jsonl
 ---
 
 Use this guide when a Red change needs local confidence before review, push, or release preparation. A complete validation pass starts with the smallest command that matches the changed area, then finishes with the repository policy command for Rust changes, the relevant plugin or runtime self-checks, and any workflow-specific checks that CI will enforce [@agents] [@ci] [@plugin-check]. CI is the full contract, and the local commands here help catch the same classes of failure before waiting for GitHub Actions.
@@ -164,6 +176,28 @@ cargo run --all-features -- --self-check
 ```
 
 Run only the relevant subset while iterating, then run the whole workflow-equivalent set when a plugin or Husk change is ready for review. The final self-check matters because Red embeds the editor defaults, plugins, themes, and runtime assets into the executable [@readme]. The startup path behind that check is described in [Runtime Lifecycle](../../architecture/startup/runtime-lifecycle).
+
+## Confirm The Binary Under Test
+
+When a freshly built or installed Red rejects an installed language-pack
+manifest, first prove which executable the shell starts before changing package
+manifests. On 2026-08-30, `red` resolved to `/opt/homebrew/bin/red` even after
+`cargo install --path .` replaced `~/.cargo/bin/red`; the Homebrew binary failed
+on `languages.go.grammar.indents`, while `/Users/fcoury/.cargo/bin/red plugin
+list` parsed the same installed packs as compatible [@binary-skew-session].
+Current source accepts `LanguageGrammarConfig.indents`, and the language guide
+defines that field as the Host API `^0.12.0` language-pack indentation contract
+[@config] [@language-doc]. A manifest error that reports `unknown field` for
+`indents` is therefore a binary-skew signal before it is a pack schema bug.
+
+Use `which -a red` or `whence -a red`, then run the intended binary by absolute
+path. `red --version` is not enough during unreleased `main` work: `Cargo.toml`
+still reports package version `0.6.0`, and the incident showed older
+Homebrew/local binaries and the newly installed Cargo binary all presenting
+`red 0.6.0` [@cargo-toml] [@binary-skew-session]. Prefer
+`cargo run --locked -- ...` for source-tree validation, or make
+`~/.cargo/bin` precede Homebrew and local installer directories before testing
+an installed build.
 
 ## Release-Adjacent Validation
 
