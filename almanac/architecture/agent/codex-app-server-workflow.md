@@ -1,7 +1,7 @@
 ---
 title: "Codex App-Server Workflow"
 summary: "Red runs Codex as a direct app-server worker while keeping all edits behind Red-owned dynamic tools, followed application, and agent attribution."
-topics: [architecture, agent, codex, agent-edits]
+topics: [architecture, agent, codex, agent-edits, persistence]
 sources:
   - id: codex
     type: file

@@ -1,7 +1,7 @@
 ---
 title: "Copilot Inline Completion"
 summary: "Enable, authenticate, and use optional GitHub Copilot ghost-text suggestions without replacing ordinary language-server completion."
-topics: [guides, ai-completion, configuration]
+topics: [guides, ai-completion, configuration, completion]
 sources:
   - id: defaults
     type: file
@@ -22,7 +22,9 @@ sources:
 Copilot is optional and disabled by default. Enabling it permits the official
 GitHub Copilot language server to process eligible source code. It runs beside
 the normal language server; it does not replace rust-analyzer, TypeScript's
-server, or other language intelligence [@transport] [@editor].
+server, or other language intelligence [@transport] [@editor]. For the ordinary
+popup-completion request, filtering, and edit path that Copilot coordinates
+with, read [LSP Completion](../../architecture/lsp/completion).
 
 ## Set Up
 

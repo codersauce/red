@@ -12,9 +12,6 @@ sources:
   - id: editor
     type: file
     path: src/editor.rs
-  - id: website-direction
-    type: conversation
-    path: /Users/fcoury/.claude/projects/-Users-fcoury-code-red/acaa6873-03ae-4f92-a325-63c9b68fef5b.jsonl
 ---
 
 Red is a modal terminal editor built as a Rust application with embedded defaults, themes, plugins, language tooling, crash recovery, Unix detachable sessions, and a review-before-apply Codex workflow. The product documentation presents it as a fast Vim-inspired editor whose files remain under the user's control, while the entrypoint and editor coordinator show how the implementation divides startup lifecycle selection from the central input, rendering, LSP, plugin, recovery, and agent loop [@readme] [@main] [@editor].
@@ -37,8 +34,4 @@ Red's agent feature is part of the editor model, not a separate file writer. The
 
 Husk plugins are also first-class editor runtime assets. The README names bundled Husk plugins for the file tree, project search, Git workspace, progress, inlay hints, symbols, themes, and agent UI, and it describes typechecking against a versioned Husk host contract before activation [@readme]. For the language side, read [Husk language](husk-language); for runtime activation, read [Plugin lifecycle and reload](../architecture/plugins/lifecycle-and-reload).
 
-## Website Positioning
-
-The current external-site direction targets developers who already know code editors, especially Neovim users who need their Vim muscle memory to transfer [@website-direction]. The site should lead with Red's AI-native work model and batteries-included runtime, but production copy must verify the exact shipped shortcuts and names against repository docs: the current README documents `Space A` for the full Agent, `Space i` for inline assist, `Space t` for theme browsing, bundled plugins and themes, language packs, and detachable sessions [@readme].
-
-Visual work for `getred.dev` should be evidence-first. The selected direction calls for screenshots and videos of real Red project workflows rather than placeholder editor mockups, and one prototype intentionally made the page behave like Red with Normal-mode navigation, live theme switching, and scripted Pair and Delegate demos [@website-direction]. Treat that prototype as design direction, not runtime truth: features or keys that are not supported by the current code or docs, such as a dedicated `Space D` Delegate entry point, need to stay marked as proposed until implementation catches up [@website-direction] [@readme].
+For external-site product copy and media direction, use [Website Positioning](website-positioning). That page keeps `getred.dev` guidance separate from this runtime product model.

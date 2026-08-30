@@ -21,6 +21,9 @@ sources:
   - id: arborium-decision
     type: file
     path: almanac/decisions/plugins/arborium-language-source.md
+  - id: preferences-store
+    type: file
+    path: almanac/architecture/preferences/preferences-store.md
 ---
 
 # Plugin Architecture
@@ -36,6 +39,8 @@ Use [Resource Ownership](resource-ownership) when plugin work touches panels, wo
 [Command Discovery](../commands/command-discovery) covers plugin command metadata, palette rows, colon command collisions, keymap shortcuts, and panel-global command scope.
 
 [Bundled Husk Plugins](../../concepts/plugins/bundled-husk-plugins) explains how shipped plugins relate to embedded runtime assets and pure Husk packages. [Callback-Scoped Dialogs](../../concepts/plugins/callback-scoped-dialogs) explains the handle-based picker and composer model used by plugin callbacks.
+
+Use [Preferences Store](../preferences/preferences-store) when plugin work persists user or plugin JSON state, because plugin storage is a plugin-owned namespace inside the shared preferences file rather than crash-recovery state [@preferences-store].
 
 Use [Official Language Pack Distribution](../../decisions/plugins/language-pack-distribution) when external plugin work touches first-party language-pack cataloging, release artifact boundaries, or native grammar approval. Use [Arborium Language Pack Source](../../decisions/plugins/arborium-language-source) when the question is grammar-inventory import, generated query overlays, or why Arborium remains a build-time source rather than a runtime aggregate package [@arborium-decision].
 

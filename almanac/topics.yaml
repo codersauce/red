@@ -23,6 +23,10 @@ topics:
     title: Red Editor
     description: The product-level editor model and its main reader entry points.
     parents: [concepts]
+  - slug: website
+    title: Website
+    description: External Red website positioning, media evidence, and runtime-claim boundaries.
+    parents: [red-editor]
   - slug: editor
     title: Editor Core
     description: Modal editing state, buffers, windows, rendering, and input handling.
@@ -170,7 +174,7 @@ topics:
   - slug: ai-completion
     title: AI Completion
     description: Optional inline AI completion surfaces that run beside ordinary language-server completion.
-    parents: [configuration, editor]
+    parents: [configuration, completion]
   - slug: workspace-edits
     title: Workspace Edits
     description: LSP workspace edit preparation, resource operations, and failure handling.
@@ -209,7 +213,7 @@ topics:
     parents: [detach]
   - slug: operations
     title: Operations
-    description: Task-oriented operational workflows for sessions and maintenance.
+    description: Task-oriented session operations for detach and crash recovery.
     parents: [guides]
   - slug: development
     title: Development

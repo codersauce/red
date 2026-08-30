@@ -9,6 +9,9 @@ sources:
   - id: red-editor
     type: file
     path: almanac/concepts/red-editor.md
+  - id: website-positioning
+    type: file
+    path: almanac/concepts/website-positioning.md
   - id: coordinates
     type: file
     path: almanac/concepts/editor/coordinate-systems.md
@@ -53,6 +56,9 @@ Start with [Red editor](red-editor) for the product-level model: Red combines a
 modal terminal editor, embedded runtime assets, language tooling, Husk plugins,
 crash recovery, detachable sessions, and followed Codex editing
 [@red-editor].
+Use [Website positioning](website-positioning) only when working on external
+`getred.dev` product copy or media direction; it keeps prototype ideas separate
+from runtime support claims [@website-positioning].
 
 For editor internals, read [Editor coordinate systems](editor/coordinate-systems)
 before changing byte, scalar, grapheme, terminal-column, or UTF-16 boundaries

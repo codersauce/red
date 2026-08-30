@@ -32,7 +32,7 @@ The Plugin Host API reference identifies the files that define Red's Husk plugin
 | `docs/PLUGIN_API.md` | Human compatibility guide, migration notes, and behavioral descriptions for plugin authors [@api-doc]. |
 | `docs/plugin_api_changes.json` | Versioned change manifest that records introduced symbols and migration note anchors through `0.17.0` [@changes]. |
 
-Use code as the authority for runtime behavior and the schema as the authority for the public host call inventory. The prose guide is useful for compatibility intent and migration guidance, but it should not be treated as a replacement for the schema and validator [@api] [@api-doc].
+Use code as the authority for runtime behavior and the schema as the authority for the public host call inventory. The prose guide is useful for compatibility intent and migration guidance, but when its stated host version or target range conflicts with `src/plugin/host_api.json` or `src/plugin/registry.rs`, use the schema and registry until the guide is refreshed [@schema] [@registry] [@api-doc].
 
 ## Schema Shape
 

@@ -6,6 +6,18 @@ sources:
   - id: plugins-dir
     type: file
     path: plugins/
+  - id: git-plugin
+    type: file
+    path: plugins/git.hk
+  - id: neotree-plugin
+    type: file
+    path: plugins/neotree.hk
+  - id: git-core
+    type: file
+    path: plugins/git_core/
+  - id: neotree-core
+    type: file
+    path: plugins/neotree_core/
   - id: default-config
     type: file
     path: default_config.toml
@@ -20,7 +32,7 @@ sources:
     path: src/plugin/tree.rs
 ---
 
-Bundled Husk plugins are the Husk feature layer that ships with Red itself. The repository embeds the `plugins/` tree into the binary as runtime assets, while `default_config.toml` selects the default configured plugin set by mapping plugin names to `.hk` files [@assets] [@default-config]. Most bundled behavior lives in single `.hk` compatibility shells, but Git and Neo-tree also call embedded pure Husk packages for typed parsing, path handling, row construction, and command argument construction [@plugins-dir] [@runtime]. This distinction matters when changing plugin behavior: the shell owns editor events and host calls, while the core package owns deterministic logic that can be compiled and tested as Husk code.
+Bundled Husk plugins are the Husk feature layer that ships with Red itself. The repository embeds the `plugins/` tree into the binary as runtime assets, while `default_config.toml` selects the default configured plugin set by mapping plugin names to `.hk` files [@assets] [@default-config]. Most bundled behavior lives in single `.hk` compatibility shells, but Git and Neo-tree also call embedded pure Husk packages for typed parsing, path handling, row construction, and command argument construction [@git-plugin] [@neotree-plugin] [@git-core] [@neotree-core] [@runtime]. This distinction matters when changing plugin behavior: the shell owns editor events and host calls, while the core package owns deterministic logic that can be compiled and tested as Husk code.
 
 ## Bundled Versus Enabled
 
@@ -30,17 +42,17 @@ Default enablement is a separate configuration decision. The `[plugins]` table i
 
 ## Shells And Core Packages
 
-Most bundled plugins are `.hk` shells that register commands, listen to events, request editor state, and update editor-owned UI resources through the Red host API [@plugins-dir]. Examples include buffer picking, theme browsing, search decoration, breadcrumbs, inlay hints, project search, LSP symbol pickers, agent UI, and Git or Neo-tree panels [@plugins-dir].
+Most bundled plugins are `.hk` shells that register commands, listen to events, request editor state, and update editor-owned UI resources through the Red host API [@plugins-dir]. Examples include buffer picking, theme browsing, search decoration, breadcrumbs, inlay hints, project search, LSP symbol pickers, agent UI, and Git or Neo-tree panels [@plugins-dir] [@git-plugin] [@neotree-plugin].
 
-Git and Neo-tree have an extra split. `plugins/git.hk` remains the editor-facing plugin, but `plugins/git_core/` contains a Husk package with separate modules for status parsing, patch modeling, and Git command arguments [@plugins-dir]. `plugins/neotree.hk` stays responsible for panel events and filesystem actions, while `plugins/neotree_core/` contains pure path, status, and compatibility tree-row modules [@plugins-dir]. Large Neo-tree panels use a Rust-owned virtual model that shares Husk directory-entry arrays, indexes every expanded entry, and decorates only visible terminal rows [@tree-model]. The runtime embeds both package source sets with `ResolvedPackage::from_sources`, compiles them under the native semantic profile, caches their compiled programs, and exposes them only through internal `red::git_core` and `red::neotree_core` operations [@runtime].
+Git and Neo-tree have an extra split. `plugins/git.hk` remains the editor-facing plugin, but `plugins/git_core/` contains a Husk package with separate modules for status parsing, patch modeling, and Git command arguments [@git-plugin] [@git-core]. `plugins/neotree.hk` stays responsible for panel events and filesystem actions, while `plugins/neotree_core/` contains pure path, status, and compatibility tree-row modules [@neotree-plugin] [@neotree-core]. Large Neo-tree panels use a Rust-owned virtual model that shares Husk directory-entry arrays, indexes every expanded entry, and decorates only visible terminal rows [@tree-model]. The runtime embeds both package source sets with `ResolvedPackage::from_sources`, compiles them under the native semantic profile, caches their compiled programs, and exposes them only through internal `red::git_core` and `red::neotree_core` operations [@runtime].
 
 That split keeps public plugin compatibility small. A shell can continue to use Red events and UI calls, while pure package code can use typed data models without becoming a public host API. The user-facing host contract for plugin authors belongs in [Plugin host API](../../reference/plugins/host-api), not in the internal bridge operation names [@runtime].
 
-The Git shell owns the user-facing operation workflow around those pure helpers. User-triggered mutating operations such as commit, pull, merge, rebase, cherry-pick, revert, and safe-sync branches display transient progress through a plugin overlay, use host-managed busy animation, and then show bounded success or failure text [@plugins-dir]. Background refresh and hunk application stay quiet, while the safe-sync ahead branch routes into the normal push menu instead of bypassing its existing confirmation and progress flow [@plugins-dir].
+The Git shell owns the user-facing operation workflow around those pure helpers. User-triggered mutating operations such as commit, pull, merge, rebase, cherry-pick, revert, and safe-sync branches display transient progress through a plugin overlay, use host-managed busy animation, and then show bounded success or failure text [@git-plugin]. Background refresh and hunk application stay quiet, while the safe-sync ahead branch routes into the normal push menu instead of bypassing its existing confirmation and progress flow [@git-plugin].
 
-The Git commit flow opens an editor-owned scratch buffer named `[Git Commit].gitcommit` with `GitSubmitMessage` as its submit command and `GitCancelMessage` as its cancel command [@plugins-dir]. The scratch text contains a marker line, and only text above that marker becomes the commit message; the generated context below it is ignored before `git commit` receives stdin [@plugins-dir]. The scratch buffer text tells users that `:w` or `:wq` submits and `:q` cancels, while the default Space command neighborhood also binds `Space c c` to `GitSubmitMessage` and `Space c q` to `GitCancelMessage` [@plugins-dir] [@default-config].
+The Git commit flow opens an editor-owned scratch buffer named `[Git Commit].gitcommit` with `GitSubmitMessage` as its submit command and `GitCancelMessage` as its cancel command [@git-plugin]. The scratch text contains a marker line, and only text above that marker becomes the commit message; the generated context below it is ignored before `git commit` receives stdin [@git-plugin]. The scratch buffer text tells users that `:w` or `:wq` submits and `:q` cancels, while the default Space command neighborhood also binds `Space c c` to `GitSubmitMessage` and `Space c q` to `GitCancelMessage` [@git-plugin] [@default-config].
 
-Neo-tree's shell also owns the user-facing create/reveal flow. A successful file create records that the result should be selected, waits for the `FileOperation` result's canonical `created` path, resets the tree through its existing reveal machinery, expands parent directories as needed, and finally calls `SelectPanelRow` for the created file [@plugins-dir] [@runtime]. Directory creation, cancelled prompts, and failed file operations clear the pending selection intent so a later refresh cannot highlight a stale row [@plugins-dir] [@runtime].
+Neo-tree's shell also owns the user-facing create/reveal flow. A successful file create records that the result should be selected, waits for the `FileOperation` result's canonical `created` path, resets the tree through its existing reveal machinery, expands parent directories as needed, and finally calls `SelectPanelRow` for the created file [@neotree-plugin] [@runtime]. Directory creation, cancelled prompts, and failed file operations clear the pending selection intent so a later refresh cannot highlight a stale row [@neotree-plugin] [@runtime].
 
 ## Relationship To Runtime Assets
 

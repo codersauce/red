@@ -1,6 +1,6 @@
 ---
 title: "Dynamic Tools And Editor Tools"
-summary: "Red exposes a strict Codex dynamic-tool surface that separates workspace search from editor-owned reads, navigation, UTF-16 edits, saves, and safe actions."
+summary: "Red exposes a strict Codex dynamic-tool surface that separates workspace search from editor-owned reads, navigation, UTF-16 edits, saves, safe actions, and session-owned LSP diagnostics or rename plans."
 topics: [architecture, agent, codex, editor, unicode, agent-edits]
 sources:
   - id: codex
@@ -12,16 +12,19 @@ sources:
   - id: editor
     type: file
     path: src/editor.rs
+  - id: agent-lsp
+    type: file
+    path: src/editor/agent_lsp.rs
   - id: workflow
     type: file
     path: docs/AGENT_WORKFLOW.md
 ---
 
-Dynamic tools and editor tools are Red's app-server capability layer for Codex. The Codex worker publishes four workspace dynamic tools directly, extends them with thirteen strict editor-tool schemas, and routes editor-aware reads, writes, annotations, selections, and safe actions through the editor owner task [@codex] [@tools]. This layer is where the [Codex App-Server Workflow](codex-app-server-workflow) becomes editor-aware: Codex can list, search, read, open, select, annotate, run allow-listed editor actions, and request edits, but each operation is bounded, schema-checked, session-scoped, and mediated by Red [@workflow] [@editor].
+Dynamic tools and editor tools are Red's app-server capability layer for Codex. The Codex worker publishes four workspace dynamic tools directly, extends them with thirteen strict editor-tool schemas, and routes editor-aware reads, writes, annotations, selections, safe actions, diagnostics, and semantic rename plans through the editor owner task [@codex] [@tools]. This layer is where the [Codex App-Server Workflow](codex-app-server-workflow) becomes editor-aware: Codex can list, search, read, open, select, annotate, run allow-listed editor actions, inspect language-server state, and request edits, but each operation is bounded, schema-checked, session-scoped, and mediated by Red [@workflow] [@editor].
 
 ## Tool Surface
 
-The app-server worker publishes `list_files`, `search_files`, `read_file`, and `write_file` itself, then appends editor schemas for `get_editor_state`, `open_file`, `select_text`, `apply_edits`, `run_editor_action`, `create_directory`, `add_annotations`, and `dismiss_annotations` [@codex] [@tools]. `list_files` walks without following links, respects ignore and sensitive-path policy, sorts results, and returns pages plus truncation metadata within Red's entry and time bounds [@codex]. On Unix, `search_files` reads through descriptor-relative, no-follow, nonblocking filesystem operations and reports bounded-scan truncation; platforms without that safe read boundary must use `read_file` [@codex] [@workflow].
+The app-server worker publishes `list_files`, `search_files`, `read_file`, and `write_file` itself, then appends non-LSP editor schemas for `get_editor_state`, `open_file`, `select_text`, `apply_edits`, `run_editor_action`, `create_directory`, `add_annotations`, and `dismiss_annotations`; the structured LSP schemas are covered below [@codex] [@tools]. `list_files` walks without following links, respects ignore and sensitive-path policy, sorts results, and returns pages plus truncation metadata within Red's entry and time bounds [@codex]. On Unix, `search_files` reads through descriptor-relative, no-follow, nonblocking filesystem operations and reports bounded-scan truncation; platforms without that safe read boundary must use `read_file` [@codex] [@workflow].
 
 `read_file` and `write_file` are editor-tool-host operations. `read_file` opens the safe workspace file through Red when needed and returns a bounded editor-visible page, current revision, existence, line range, and continuation metadata. Continuations must carry the first page's revision and fail if the buffer changes; an individual source line beyond the byte limit fails explicitly rather than returning an unrecoverable prefix [@codex] [@editor]. `write_file` requires the first page's revision, replaces the complete buffer through an agent-origin editor transaction, and saves through Red [@tools] [@editor].
 
@@ -47,25 +50,27 @@ filesystem or external-link behavior [@editor].
 
 The full Agent also receives `lsp_status`, `lsp_diagnostics`,
 `lsp_prepare_rename`, `lsp_preview_rename`, and `lsp_apply_edit`. Their strict
-schemas live beside the other editor tools; `src/editor/agent_lsp.rs` owns the
-pending responses, deadlines, diagnostic metadata, and expiring rename plans.
-Agent requests share existing servers but are correlated separately from UI and
-plugin requests, so they return data without opening dialogs or moving focus.
+schemas live beside the other editor tools, and tests assert that these LSP
+tools are exposed only to full-agent sessions, not inline-assist sessions
+[@tools] [@codex]. `src/editor/agent_lsp.rs` owns pending responses, deadlines,
+diagnostic metadata, and expiring rename plans, while the editor rechecks the
+active agent session before starting each request [@agent-lsp].
 
-Rename preparation and disk validation run on blocking workers. The editor
-rechecks session/turn ownership, server identity, source and target revisions,
-and access policy before committing text through its normal mutation boundary.
-Resource operations are rejected. Previews are bounded and expire after 120
-seconds or when their active turn or source state changes. Applying a plan never
-saves files; changes have Agent-origin undo transactions and participate in
-inline-to-Agent edit receipts. Query and application failures are returned to
-the caller rather than merely printed in the command line.
+Agent LSP requests share existing language servers but are correlated separately
+from UI and plugin requests, so they return data without opening dialogs or
+moving focus [@agent-lsp]. Rename preparation and disk validation run on
+blocking workers. The editor rechecks session ownership, server identity,
+source and target revisions, and access policy before committing text through
+its normal mutation boundary [@agent-lsp]. Resource operations are rejected
+before text changes apply, previews are bounded and expire after 120 seconds,
+and applying a plan never saves files [@agent-lsp] [@workflow].
 
 Diagnostics are collected independently of display settings. Results distinguish
 known-report coverage from project-wide verification and provisional, stale,
-unversioned, or absent reports. File refresh uses a diagnostic pull when supported
-or a bounded wait for push reports. See the [Agent workflow](../../../docs/AGENT_WORKFLOW.md)
-for filters, pagination, limits, and the explicit unsaved-edit contract.
+unversioned, or absent reports [@workflow] [@agent-lsp]. File refresh uses a
+diagnostic pull when supported or a bounded wait for push reports, and the
+workflow documentation records filters, pagination, limits, and the explicit
+unsaved-edit contract [@workflow].
 
 ## UTF-16 Editor Boundary
 

@@ -27,6 +27,12 @@ sources:
   - id: file-picker
     type: file
     path: src/ui/file_picker.rs
+  - id: keyboard
+    type: file
+    path: src/keyboard.rs
+  - id: prompt-buffer
+    type: file
+    path: src/ui/prompt_buffer.rs
 ---
 
 Red's modal UI components implement a common `Component` trait above the editor and plugin surfaces. The trait defines drawing into a `RenderBuffer`, optional ticking, live picker updates, plugin-owned picker and composer handles, resizing, theme updates, event handling, event passthrough, sensitive-input reporting, and cursor placement [@ui-core]. Components return `KeyAction` values instead of mutating editor state directly, so the editor remains the owner of action execution and resource cleanup [@ui-core].
@@ -78,7 +84,8 @@ on either platform when the terminal reports the modifier. Selected initial
 values in single-line prompts are cleared as a whole. Composers retain
 `Ctrl-W`; active search fields edit their own query instead of the underlying
 draft. Word boundaries remain whitespace-delimited, including punctuation
-and paths within a word.
+and paths within a word [@keyboard] [@prompt-buffer] [@input-prompt]
+[@agent-composer] [@picker].
 
 ## Resource Ownership
 

@@ -1,7 +1,7 @@
 ---
 title: "Sessions Architecture"
 summary: "Sessions architecture routes readers through Red's detachable live owner, crash-recovery snapshots, detach/recovery distinction, IPC contract, guides, and boundary decision."
-topics: [architecture, sessions, detach, recovery]
+topics: [architecture, sessions, detach, recovery, persistence]
 sources:
   - id: main
     type: file
