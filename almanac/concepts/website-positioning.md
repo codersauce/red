@@ -74,7 +74,12 @@ search, visual selection, a command line, live theme switching from bundled
 theme colors, and scripted Pair and Delegate demos [@website-direction]. Keep
 those artifacts as design direction. Before implementing them, reopen the
 website repository and verify the current stack, worktree, browser console,
-install routes, and shipped Red shortcuts [@website-direction].
+install routes, and shipped Red shortcuts [@website-direction]. At the time of
+the design pass, the implementation starting point was `../red-website-new`,
+described as a Vinext and Tailwind site deployed as a Cloudflare Worker that
+also served `/install.sh`, `/install.ps1`, and `/installers.json`; treat that as
+a pointer to verify, not proof that the adjacent repository is still current
+[@website-direction].
 
 Installer URLs are a site constraint, not just marketing copy. The README
 installation commands fetch `https://getred.dev/install.sh` and
