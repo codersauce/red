@@ -984,8 +984,26 @@ struct KeySignature {
 }
 
 #[derive(Debug, Clone)]
-struct SemanticChange {
-    events: Vec<Event>,
+enum SemanticChange {
+    Input(Vec<Event>),
+    Recipe(Vec<SemanticChangeStep>),
+}
+
+#[derive(Debug, Clone)]
+enum SemanticChangeStep {
+    Input(Event),
+    Action(Action),
+    VisualLineShift {
+        direction: VisualLineShiftDirection,
+        line_count: usize,
+        count: u16,
+    },
+}
+
+#[derive(Debug, Clone, Copy)]
+enum VisualLineShiftDirection {
+    Right,
+    Left,
 }
 
 #[derive(Debug)]
@@ -993,6 +1011,21 @@ struct PendingSemanticChange {
     buffer_id: BufferId,
     base_revision: u64,
     events: Vec<Event>,
+    repeat_recipe: Option<PendingSemanticRecipe>,
+}
+
+#[derive(Debug)]
+struct PendingSemanticRecipe {
+    // These steps replace the recorded inputs through `consumed_events`; later inputs are
+    // appended when the semantic change completes.
+    steps: Vec<SemanticChangeStep>,
+    consumed_events: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PendingSemanticRecipeToken {
+    consumed_events: usize,
+    step_count: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -13321,6 +13354,7 @@ impl Editor {
                 buffer_id: self.current_buffer().id(),
                 base_revision: self.current_buffer().revision(),
                 events: Vec::new(),
+                repeat_recipe: None,
             });
         }
 
@@ -13380,9 +13414,83 @@ impl Editor {
             .take()
             .expect("completed semantic change must exist");
         if self.current_buffer().revision() != change.base_revision && !change.events.is_empty() {
-            self.last_semantic_change = Some(SemanticChange {
-                events: change.events,
+            self.last_semantic_change = Some(if let Some(mut recipe) = change.repeat_recipe {
+                recipe.steps.extend(
+                    change
+                        .events
+                        .into_iter()
+                        .skip(recipe.consumed_events)
+                        .map(SemanticChangeStep::Input),
+                );
+                SemanticChange::Recipe(recipe.steps)
+            } else {
+                SemanticChange::Input(change.events)
             });
+        }
+    }
+
+    fn replace_pending_semantic_change_event(&mut self, step: SemanticChangeStep) {
+        let Some(pending) = &mut self.pending_semantic_change else {
+            return;
+        };
+        let event_count = pending.events.len();
+        if event_count == 0 {
+            return;
+        }
+
+        let Some(recipe) = &mut pending.repeat_recipe else {
+            pending.repeat_recipe = Some(PendingSemanticRecipe {
+                steps: vec![step],
+                consumed_events: event_count,
+            });
+            return;
+        };
+
+        let current_event_index = event_count - 1;
+        if recipe.consumed_events < current_event_index {
+            recipe.steps.extend(
+                pending.events[recipe.consumed_events..current_event_index]
+                    .iter()
+                    .cloned()
+                    .map(SemanticChangeStep::Input),
+            );
+        }
+        recipe.steps.push(step);
+        recipe.consumed_events = event_count;
+    }
+
+    fn pending_semantic_recipe_token(&self) -> Option<PendingSemanticRecipeToken> {
+        let pending = self.pending_semantic_change.as_ref()?;
+        let recipe = pending.repeat_recipe.as_ref()?;
+        (recipe.consumed_events == pending.events.len()).then_some(PendingSemanticRecipeToken {
+            consumed_events: recipe.consumed_events,
+            step_count: recipe.steps.len(),
+        })
+    }
+
+    fn append_pending_semantic_action(
+        &mut self,
+        token: Option<PendingSemanticRecipeToken>,
+        action: &Action,
+    ) {
+        let Some(token) = token else {
+            return;
+        };
+        let Some(pending) = &mut self.pending_semantic_change else {
+            return;
+        };
+        let Some(recipe) = &mut pending.repeat_recipe else {
+            return;
+        };
+        // The snapshot also prevents an action that installed its own replacement step from
+        // being recorded a second time as a raw action.
+        if pending.events.len() == token.consumed_events
+            && recipe.consumed_events == token.consumed_events
+            && recipe.steps.len() == token.step_count
+        {
+            recipe
+                .steps
+                .push(SemanticChangeStep::Action(action.clone()));
         }
     }
 
@@ -13638,11 +13746,19 @@ impl Editor {
     ) -> anyhow::Result<bool> {
         let quit = match action {
             KeyAction::None => false,
-            KeyAction::Single(action) => self.execute(action, buffer, runtime).await?,
+            KeyAction::Single(action) => {
+                let recipe_token = self.pending_semantic_recipe_token();
+                let quit = self.execute(action, buffer, runtime).await?;
+                self.append_pending_semantic_action(recipe_token, action);
+                quit
+            }
             KeyAction::Multiple(actions) => {
                 let mut quit = false;
                 for action in actions {
-                    if self.execute(action, buffer, runtime).await? {
+                    let recipe_token = self.pending_semantic_recipe_token();
+                    let action_quit = self.execute(action, buffer, runtime).await?;
+                    self.append_pending_semantic_action(recipe_token, action);
+                    if action_quit {
                         quit = true;
                         break;
                     }
@@ -13702,17 +13818,69 @@ impl Editor {
             self.pending_semantic_change = None;
             self.replaying_semantic_change = true;
             let result = async {
-                for event in &change.events {
-                    if let Some(action) = self.handle_event_with_runtime(event, Some(runtime))? {
-                        if self
-                            .handle_resolved_key_action(event, &action, buffer, runtime)
-                            .await?
-                        {
-                            anyhow::bail!("repeated change attempted to quit the editor");
+                match change {
+                    SemanticChange::Input(events) => {
+                        for event in &events {
+                            if let Some(action) =
+                                self.handle_event_with_runtime(event, Some(runtime))?
+                            {
+                                if self
+                                    .handle_resolved_key_action(event, &action, buffer, runtime)
+                                    .await?
+                                {
+                                    anyhow::bail!("repeated change attempted to quit the editor");
+                                }
+                            }
+                            if self.replay_checkpoint(buffer, runtime).await? {
+                                break;
+                            }
                         }
                     }
-                    if self.replay_checkpoint(buffer, runtime).await? {
-                        break;
+                    SemanticChange::Recipe(steps) => {
+                        for step in &steps {
+                            match step {
+                                SemanticChangeStep::Input(event) => {
+                                    if let Some(action) =
+                                        self.handle_event_with_runtime(event, Some(runtime))?
+                                    {
+                                        if self
+                                            .handle_resolved_key_action(
+                                                event, &action, buffer, runtime,
+                                            )
+                                            .await?
+                                        {
+                                            anyhow::bail!(
+                                                "repeated change attempted to quit the editor"
+                                            );
+                                        }
+                                    }
+                                }
+                                SemanticChangeStep::Action(action) => {
+                                    if self.execute(action, buffer, runtime).await? {
+                                        anyhow::bail!(
+                                            "repeated change attempted to quit the editor"
+                                        );
+                                    }
+                                }
+                                SemanticChangeStep::VisualLineShift {
+                                    direction,
+                                    line_count,
+                                    count,
+                                } => {
+                                    self.replay_visual_line_shift(
+                                        *direction,
+                                        *line_count,
+                                        *count,
+                                        buffer,
+                                        runtime,
+                                    )
+                                    .await?;
+                                }
+                            }
+                            if self.replay_checkpoint(buffer, runtime).await? {
+                                break;
+                            }
+                        }
                     }
                 }
                 Ok(())
@@ -13720,6 +13888,35 @@ impl Editor {
             .await;
             self.replaying_semantic_change = false;
             result
+        })
+    }
+
+    #[inline(never)]
+    fn replay_visual_line_shift<'a>(
+        &'a mut self,
+        direction: VisualLineShiftDirection,
+        line_count: usize,
+        count: u16,
+        buffer: &'a mut RenderBuffer,
+        runtime: &'a mut Runtime,
+    ) -> BoxFuture<'a, anyhow::Result<()>> {
+        Box::pin(async move {
+            let first_line = self.buffer_line();
+            let last_line = first_line
+                .saturating_add(line_count.saturating_sub(1))
+                .min(self.current_buffer().len().saturating_sub(1));
+            let changed = match direction {
+                VisualLineShiftDirection::Right => {
+                    self.indent_line_range(first_line, last_line, count)
+                }
+                VisualLineShiftDirection::Left => {
+                    self.unindent_line_range(first_line, last_line, count)
+                }
+            };
+            if changed {
+                self.notify_change(runtime).await?;
+            }
+            self.render(buffer)
         })
     }
 
@@ -19713,12 +19910,16 @@ impl Editor {
         Self::leading_indentation(&self.current_line_contents().unwrap_or_default())
     }
 
-    fn indent_selection(&mut self, count: u16) -> bool {
-        let Some(selection) = self.selection else {
-            return false;
-        };
+    fn indent_selection(&mut self, count: u16) -> Option<usize> {
+        let selection = self.selection?;
         let first_line = selection.y0.min(selection.y1);
         let last_line = selection.y0.max(selection.y1);
+        let line_count = last_line.saturating_sub(first_line).saturating_add(1);
+        self.indent_line_range(first_line, last_line, count)
+            .then_some(line_count)
+    }
+
+    fn indent_line_range(&mut self, first_line: usize, last_line: usize, count: u16) -> bool {
         let indentation = self.indentation();
         let columns = indentation
             .shift_width
@@ -19741,12 +19942,16 @@ impl Editor {
         self.commit_transaction(self.cursor_snapshot())
     }
 
-    fn unindent_selection(&mut self, count: u16) -> bool {
-        let Some(selection) = self.selection else {
-            return false;
-        };
+    fn unindent_selection(&mut self, count: u16) -> Option<usize> {
+        let selection = self.selection?;
         let first_line = selection.y0.min(selection.y1);
         let last_line = selection.y0.max(selection.y1);
+        let line_count = last_line.saturating_sub(first_line).saturating_add(1);
+        self.unindent_line_range(first_line, last_line, count)
+            .then_some(line_count)
+    }
+
+    fn unindent_line_range(&mut self, first_line: usize, last_line: usize, count: u16) -> bool {
         let indentation = self.indentation();
         let columns = indentation
             .shift_width
@@ -19777,6 +19982,34 @@ impl Editor {
         self.selection = None;
         self.selection_start = None;
         self.commit_transaction(self.cursor_snapshot())
+    }
+
+    #[inline(never)]
+    fn execute_visual_line_shift<'a>(
+        &'a mut self,
+        direction: VisualLineShiftDirection,
+        count: u16,
+        buffer: &'a mut RenderBuffer,
+        runtime: &'a mut Runtime,
+    ) -> BoxFuture<'a, anyhow::Result<()>> {
+        Box::pin(async move {
+            self.capture_last_visual_selection();
+            let line_count = match direction {
+                VisualLineShiftDirection::Right => self.indent_selection(count),
+                VisualLineShiftDirection::Left => self.unindent_selection(count),
+            };
+            if let Some(line_count) = line_count {
+                self.replace_pending_semantic_change_event(SemanticChangeStep::VisualLineShift {
+                    direction,
+                    line_count,
+                    count: count.max(1),
+                });
+                self.notify_change(runtime).await?;
+            }
+            self.execute(&Action::EnterMode(Mode::Normal), buffer, runtime)
+                .await?;
+            Ok(())
+        })
     }
 
     // Mode transitions can recursively execute pending visual-block actions. Keep their async
@@ -23406,13 +23639,13 @@ impl Editor {
                 self.render(buffer)?;
             }
             Action::IndentSelection(count) => {
-                self.capture_last_visual_selection();
-                let changed = self.indent_selection(*count);
-                if changed {
-                    self.notify_change(runtime).await?;
-                }
-                self.execute(&Action::EnterMode(Mode::Normal), buffer, runtime)
-                    .await?;
+                self.execute_visual_line_shift(
+                    VisualLineShiftDirection::Right,
+                    *count,
+                    buffer,
+                    runtime,
+                )
+                .await?;
             }
             Action::UnindentLine => {
                 let spaces = self.current_line_indentation();
@@ -23432,13 +23665,13 @@ impl Editor {
                 self.render(buffer)?;
             }
             Action::UnindentSelection(count) => {
-                self.capture_last_visual_selection();
-                let changed = self.unindent_selection(*count);
-                if changed {
-                    self.notify_change(runtime).await?;
-                }
-                self.execute(&Action::EnterMode(Mode::Normal), buffer, runtime)
-                    .await?;
+                self.execute_visual_line_shift(
+                    VisualLineShiftDirection::Left,
+                    *count,
+                    buffer,
+                    runtime,
+                )
+                .await?;
             }
             Action::JumpBack => {
                 add_to_history = false;
