@@ -1,4 +1,5 @@
 use regex::RegexBuilder;
+use unicode_segmentation::UnicodeSegmentation;
 
 use crate::{
     buffer::Buffer,
@@ -99,6 +100,16 @@ impl SelectionSet {
             .build()
             .ok()?;
         let keyword = whole_keyword && needle.chars().all(is_keyword_char);
+        let literal_grapheme_boundaries = (!whole_keyword).then(|| {
+            let mut boundaries = vec![false; characters.len() + 1];
+            let mut character = 0;
+            boundaries[0] = true;
+            for grapheme in contents.graphemes(true) {
+                character += grapheme.chars().count();
+                boundaries[character] = true;
+            }
+            boundaries
+        });
         let mut candidates = buffer
             .regex_matches(&regex)
             .into_iter()
@@ -115,7 +126,10 @@ impl SelectionSet {
                         || characters
                             .get(end)
                             .is_some_and(|character| is_keyword_char(*character)));
-                (!has_keyword_neighbor).then_some(CharRange::new(start, end))
+                let splits_grapheme = literal_grapheme_boundaries
+                    .as_ref()
+                    .is_some_and(|boundaries| !boundaries[start] || !boundaries[end]);
+                (!has_keyword_neighbor && !splits_grapheme).then_some(CharRange::new(start, end))
             })
             .collect::<Vec<_>>();
         if !whole_keyword {
@@ -445,5 +459,29 @@ mod tests {
 
         assert_eq!(set.ranges(), &[CharRange::new(1, 3)]);
         assert_eq!(set.active_range(), CharRange::new(1, 3));
+    }
+
+    #[test]
+    fn explicit_ranges_skip_matches_that_end_inside_a_grapheme() {
+        let buffer = Buffer::new(None, "a a\u{301} a".to_string());
+        let mut set =
+            SelectionSet::from_literal_range(&buffer, CharRange::new(0, 1), false, false).unwrap();
+
+        set.select_next();
+
+        assert_eq!(set.ranges(), &[CharRange::new(0, 1), CharRange::new(5, 6)]);
+        assert_eq!(set.active_range(), CharRange::new(5, 6));
+    }
+
+    #[test]
+    fn explicit_ranges_skip_matches_that_start_inside_a_grapheme() {
+        let buffer = Buffer::new(None, "👩 👨‍👩‍👧 👩".to_string());
+        let mut set =
+            SelectionSet::from_literal_range(&buffer, CharRange::new(0, 1), false, false).unwrap();
+
+        set.select_next();
+
+        assert_eq!(set.ranges(), &[CharRange::new(0, 1), CharRange::new(8, 9)]);
+        assert_eq!(set.active_range(), CharRange::new(8, 9));
     }
 }

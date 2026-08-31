@@ -303,6 +303,27 @@ async fn visual_ctrl_n_uses_the_exact_selection_and_adds_the_next_occurrence() {
 }
 
 #[tokio::test]
+async fn visual_ctrl_n_skips_literal_matches_that_split_graphemes() {
+    let config: Config = toml::from_str(include_str!("../default_config.toml")).unwrap();
+    let buffer = Buffer::new(None, "a a\u{301} a".to_string());
+    let mut harness = EditorHarness::with_config(buffer, config);
+
+    key(&mut harness, KeyCode::Char('v'), KeyModifiers::NONE).await;
+    key(&mut harness, KeyCode::Char('n'), KeyModifiers::CONTROL).await;
+
+    harness.assert_mode(Mode::Normal);
+    assert!(harness.statusline_row().contains("MULTI 2/2"));
+
+    key(&mut harness, KeyCode::Char('c'), KeyModifiers::NONE).await;
+    harness.type_text("X").await.unwrap();
+    key(&mut harness, KeyCode::Esc, KeyModifiers::NONE).await;
+
+    harness.assert_buffer_contents("X a\u{301} X");
+    harness.execute_action(Action::Undo).await.unwrap();
+    harness.assert_buffer_contents("a a\u{301} a");
+}
+
+#[tokio::test]
 async fn visual_ctrl_n_preserves_the_visual_seed_for_gv() {
     let config: Config = toml::from_str(include_str!("../default_config.toml")).unwrap();
     let buffer = Buffer::new(None, "foo foo".to_string());
