@@ -13550,18 +13550,22 @@ impl Editor {
         )
     }
 
-    fn action_is_visual_inherited(action: &Action) -> bool {
+    fn action_is_visual_inherited(action: &Action, mode: Mode) -> bool {
         Self::action_is_selection_motion(action)
             || matches!(action, Action::EnterMode(Mode::Command))
+            || matches!((mode, action), (Mode::Visual, Action::SelectNextOccurrence))
     }
 
-    fn visual_inherited_subset(action: &KeyAction) -> Option<KeyAction> {
+    fn visual_inherited_subset(action: &KeyAction, mode: Mode) -> Option<KeyAction> {
         match action {
-            KeyAction::Single(action) if Self::action_is_visual_inherited(action) => {
+            KeyAction::Single(action) if Self::action_is_visual_inherited(action, mode) => {
                 Some(KeyAction::Single(action.clone()))
             }
             KeyAction::Multiple(actions)
-                if !actions.is_empty() && actions.iter().all(Self::action_is_visual_inherited) =>
+                if !actions.is_empty()
+                    && actions
+                        .iter()
+                        .all(|action| Self::action_is_visual_inherited(action, mode)) =>
             {
                 Some(KeyAction::Multiple(actions.clone()))
             }
@@ -13569,12 +13573,13 @@ impl Editor {
                 let mappings = mappings
                     .iter()
                     .filter_map(|(key, action)| {
-                        Self::visual_inherited_subset(action).map(|action| (key.clone(), action))
+                        Self::visual_inherited_subset(action, mode)
+                            .map(|action| (key.clone(), action))
                     })
                     .collect::<HashMap<_, _>>();
                 (!mappings.is_empty()).then_some(KeyAction::Nested(mappings))
             }
-            KeyAction::Repeating(times, action) => Self::visual_inherited_subset(action)
+            KeyAction::Repeating(times, action) => Self::visual_inherited_subset(action, mode)
                 .map(|action| KeyAction::Repeating(*times, Box::new(action))),
             KeyAction::None | KeyAction::Single(_) | KeyAction::Multiple(_) => None,
         }
@@ -13606,7 +13611,7 @@ impl Editor {
             .normal
             .iter()
             .filter_map(|(key, action)| {
-                Self::visual_inherited_subset(action).map(|action| (key.clone(), action))
+                Self::visual_inherited_subset(action, mode).map(|action| (key.clone(), action))
             })
             .collect::<HashMap<_, _>>();
 

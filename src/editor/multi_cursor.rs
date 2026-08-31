@@ -9,7 +9,7 @@ use crate::{
 };
 use futures::future::BoxFuture;
 
-use super::{Action, Content, ContentKind, Editor, RenderBuffer, Runtime};
+use super::{Action, Content, ContentKind, Editor, Mode, RenderBuffer, Runtime};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum VerticalCursorDirection {
@@ -119,7 +119,19 @@ impl Editor {
     ) -> BoxFuture<'a, anyhow::Result<()>> {
         Box::pin(async move {
             match action {
-                Action::SelectNextOccurrence => self.select_next_occurrence(),
+                Action::SelectNextOccurrence => match self.mode {
+                    Mode::Visual => {
+                        if self.select_next_occurrence_from_visual() {
+                            self.execute_enter_mode(Mode::Normal, buffer, runtime)
+                                .await?;
+                            self.move_to_active_multi_cursor(false);
+                        }
+                    }
+                    Mode::VisualLine | Mode::VisualBlock => {}
+                    Mode::Normal | Mode::Insert | Mode::Command | Mode::Search => {
+                        self.select_next_occurrence();
+                    }
+                },
                 Action::AddCursorUp => {
                     self.add_vertical_cursor(VerticalCursorDirection::Up);
                 }
@@ -257,11 +269,6 @@ impl Editor {
         } else if self.has_collapsed_multi_cursor_session() {
             self.promote_multi_cursors_to_words();
         } else {
-            let buffer_id = self.current_buffer().id();
-            let Some(window_id) = self.window_manager.active_stable_window_id() else {
-                return;
-            };
-            let revision = self.current_buffer().revision();
             let cursor = self.cursor_text_position();
             let Some(selections) = SelectionSet::from_cursor(
                 self.current_buffer(),
@@ -272,24 +279,69 @@ impl Editor {
                 self.multi_cursor = None;
                 return;
             };
-            let extend_selections = selections
-                .ranges()
-                .iter()
-                .copied()
-                .map(|range| self.multi_cursor_selection_from_range(range))
-                .collect();
-            self.multi_cursor = Some(MultiCursorSession {
-                buffer_id,
-                window_id,
-                revision,
-                phase: MultiCursorPhase::Selecting,
-                extend_selections: Some(extend_selections),
-                occurrence_navigation: true,
-                selections,
-            });
+            if !self.begin_multi_cursor_occurrence_session(selections) {
+                self.multi_cursor = None;
+                return;
+            }
         }
 
         self.move_to_active_multi_cursor(false);
+    }
+
+    fn select_next_occurrence_from_visual(&mut self) -> bool {
+        let Some(selection) = self.selection else {
+            return false;
+        };
+        let (x0, y0, x1, y1): (usize, usize, usize, usize) = selection.into();
+        let start = TextPosition::new(y0, self.grapheme_to_char_on_line(x0, y0));
+        let end = self.visual_selection_end_position(x1, y1);
+        if start.line != end.line {
+            self.set_legacy_message(Some(
+                "multi-cursor occurrence selection requires a single-line Visual selection"
+                    .to_string(),
+            ));
+            return false;
+        }
+
+        let range = CharRange::new(
+            self.current_buffer().position_to_char_idx(start),
+            self.current_buffer().position_to_char_idx(end),
+        );
+        let Some(mut selections) = SelectionSet::from_literal_range(
+            self.current_buffer(),
+            range,
+            self.config.search.ignorecase,
+            self.config.search.smartcase,
+        ) else {
+            return false;
+        };
+        selections.select_next();
+
+        self.begin_multi_cursor_occurrence_session(selections)
+    }
+
+    fn begin_multi_cursor_occurrence_session(&mut self, selections: SelectionSet) -> bool {
+        let buffer_id = self.current_buffer().id();
+        let Some(window_id) = self.window_manager.active_stable_window_id() else {
+            return false;
+        };
+        let revision = self.current_buffer().revision();
+        let extend_selections = selections
+            .ranges()
+            .iter()
+            .copied()
+            .map(|range| self.multi_cursor_selection_from_range(range))
+            .collect();
+        self.multi_cursor = Some(MultiCursorSession {
+            buffer_id,
+            window_id,
+            revision,
+            phase: MultiCursorPhase::Selecting,
+            extend_selections: Some(extend_selections),
+            occurrence_navigation: true,
+            selections,
+        });
+        true
     }
 
     fn has_collapsed_multi_cursor_session(&self) -> bool {

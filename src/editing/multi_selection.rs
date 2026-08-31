@@ -1,4 +1,5 @@
 use regex::RegexBuilder;
+use unicode_segmentation::UnicodeSegmentation;
 
 use crate::{
     buffer::Buffer,
@@ -64,9 +65,33 @@ impl SelectionSet {
         ignorecase: bool,
         smartcase: bool,
     ) -> Option<Self> {
+        let range = Self::range_at_cursor(buffer, cursor)?;
+        Self::from_seed_range(buffer, range, ignorecase, smartcase, true)
+    }
+
+    /// Creates a selection set from an explicit literal range.
+    pub(crate) fn from_literal_range(
+        buffer: &Buffer,
+        range: CharRange,
+        ignorecase: bool,
+        smartcase: bool,
+    ) -> Option<Self> {
+        Self::from_seed_range(buffer, range, ignorecase, smartcase, false)
+    }
+
+    fn from_seed_range(
+        buffer: &Buffer,
+        range: CharRange,
+        ignorecase: bool,
+        smartcase: bool,
+        whole_keyword: bool,
+    ) -> Option<Self> {
         let contents = buffer.contents();
         let characters = contents.chars().collect::<Vec<_>>();
-        let CharRange { start, end } = Self::range_at_cursor(buffer, cursor)?;
+        let CharRange { start, end } = range;
+        if start >= end || end > characters.len() {
+            return None;
+        }
 
         let needle = characters[start..end].iter().collect::<String>();
         let case_insensitive = ignorecase && !(smartcase && needle.chars().any(char::is_uppercase));
@@ -74,8 +99,18 @@ impl SelectionSet {
             .case_insensitive(case_insensitive)
             .build()
             .ok()?;
-        let keyword = needle.chars().all(is_keyword_char);
-        let candidates = buffer
+        let keyword = whole_keyword && needle.chars().all(is_keyword_char);
+        let literal_grapheme_boundaries = (!whole_keyword).then(|| {
+            let mut boundaries = vec![false; characters.len() + 1];
+            let mut character = 0;
+            boundaries[0] = true;
+            for grapheme in contents.graphemes(true) {
+                character += grapheme.chars().count();
+                boundaries[character] = true;
+            }
+            boundaries
+        });
+        let mut candidates = buffer
             .regex_matches(&regex)
             .into_iter()
             .filter_map(|match_| {
@@ -91,16 +126,24 @@ impl SelectionSet {
                         || characters
                             .get(end)
                             .is_some_and(|character| is_keyword_char(*character)));
-                (!has_keyword_neighbor).then_some(CharRange::new(start, end))
+                let splits_grapheme = literal_grapheme_boundaries
+                    .as_ref()
+                    .is_some_and(|boundaries| !boundaries[start] || !boundaries[end]);
+                (!has_keyword_neighbor && !splits_grapheme).then_some(CharRange::new(start, end))
             })
             .collect::<Vec<_>>();
+        if !whole_keyword {
+            candidates.retain(|candidate| candidate.end <= start || candidate.start >= end);
+            candidates.push(range);
+            candidates.sort_by_key(|candidate| candidate.start);
+        }
         let active_candidate = candidates
             .iter()
-            .position(|candidate| *candidate == CharRange::new(start, end))?;
+            .position(|candidate| *candidate == range)?;
 
         Some(Self {
             candidates,
-            selections: vec![CharRange::new(start, end)],
+            selections: vec![range],
             active_candidate,
             direction: TraversalDirection::Forward,
         })
@@ -392,5 +435,53 @@ mod tests {
         let mut set = set_at("café café", 2, false);
         set.select_next();
         assert_eq!(set.ranges(), &[CharRange::new(0, 4), CharRange::new(5, 9)]);
+    }
+
+    #[test]
+    fn explicit_ranges_match_literal_text_instead_of_expanding_to_words() {
+        let buffer = Buffer::new(None, "foobar foo".to_string());
+        let mut set =
+            SelectionSet::from_literal_range(&buffer, CharRange::new(0, 3), false, false).unwrap();
+
+        set.select_next();
+
+        assert_eq!(set.ranges(), &[CharRange::new(0, 3), CharRange::new(7, 10)]);
+        assert_eq!(set.active_range(), CharRange::new(7, 10));
+    }
+
+    #[test]
+    fn explicit_ranges_remain_the_seed_when_an_earlier_match_overlaps_them() {
+        let buffer = Buffer::new(None, "aaa".to_string());
+        let mut set =
+            SelectionSet::from_literal_range(&buffer, CharRange::new(1, 3), false, false).unwrap();
+
+        set.select_next();
+
+        assert_eq!(set.ranges(), &[CharRange::new(1, 3)]);
+        assert_eq!(set.active_range(), CharRange::new(1, 3));
+    }
+
+    #[test]
+    fn explicit_ranges_skip_matches_that_end_inside_a_grapheme() {
+        let buffer = Buffer::new(None, "a a\u{301} a".to_string());
+        let mut set =
+            SelectionSet::from_literal_range(&buffer, CharRange::new(0, 1), false, false).unwrap();
+
+        set.select_next();
+
+        assert_eq!(set.ranges(), &[CharRange::new(0, 1), CharRange::new(5, 6)]);
+        assert_eq!(set.active_range(), CharRange::new(5, 6));
+    }
+
+    #[test]
+    fn explicit_ranges_skip_matches_that_start_inside_a_grapheme() {
+        let buffer = Buffer::new(None, "👩 👨‍👩‍👧 👩".to_string());
+        let mut set =
+            SelectionSet::from_literal_range(&buffer, CharRange::new(0, 1), false, false).unwrap();
+
+        set.select_next();
+
+        assert_eq!(set.ranges(), &[CharRange::new(0, 1), CharRange::new(8, 9)]);
+        assert_eq!(set.active_range(), CharRange::new(8, 9));
     }
 }
