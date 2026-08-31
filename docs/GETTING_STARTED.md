@@ -122,6 +122,11 @@ editing without an extra plugin. In Normal mode:
 | `d`, `x`, `y`, `p`, `P` | Delete, yank, or paste across the selected ranges |
 | `Esc` | Finish an insertion or clear the active multi-cursor session |
 
+From characterwise Visual mode, `Ctrl-n` uses the exact selected text as the
+seed, adds its next literal occurrence, and enters Normal-mode multi-cursor
+selection. The seed must stay on one line; multiline, Visual Line, and Visual
+Block selections remain unchanged.
+
 For example, press `Ctrl-n` twice over `foo`, type `cbar`, and press `Esc` to
 replace both selected occurrences with `bar`. One `u` undoes the entire edit.
 Selections respect complete Unicode graphemes, and vertical cursors preserve

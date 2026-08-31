@@ -280,6 +280,65 @@ async fn ctrl_n_change_types_at_each_selected_occurrence_as_one_undo() {
 }
 
 #[tokio::test]
+async fn visual_ctrl_n_uses_the_exact_selection_and_adds_the_next_occurrence() {
+    let config: Config = toml::from_str(include_str!("../default_config.toml")).unwrap();
+    let buffer = Buffer::new(None, "foobar foo foobar".to_string());
+    let mut harness = EditorHarness::with_config(buffer, config);
+
+    key(&mut harness, KeyCode::Char('v'), KeyModifiers::NONE).await;
+    key(&mut harness, KeyCode::Char('l'), KeyModifiers::NONE).await;
+    key(&mut harness, KeyCode::Char('l'), KeyModifiers::NONE).await;
+    key(&mut harness, KeyCode::Char('n'), KeyModifiers::CONTROL).await;
+
+    harness.assert_mode(Mode::Normal);
+    assert!(harness.statusline_row().contains("MULTI 2/2"));
+
+    key(&mut harness, KeyCode::Char('c'), KeyModifiers::NONE).await;
+    harness.type_text("X").await.unwrap();
+    key(&mut harness, KeyCode::Esc, KeyModifiers::NONE).await;
+
+    harness.assert_buffer_contents("Xbar X foobar");
+    harness.execute_action(Action::Undo).await.unwrap();
+    harness.assert_buffer_contents("foobar foo foobar");
+}
+
+#[tokio::test]
+async fn visual_ctrl_n_preserves_the_visual_seed_for_gv() {
+    let config: Config = toml::from_str(include_str!("../default_config.toml")).unwrap();
+    let buffer = Buffer::new(None, "foo foo".to_string());
+    let mut harness = EditorHarness::with_config(buffer, config);
+
+    key(&mut harness, KeyCode::Char('v'), KeyModifiers::NONE).await;
+    key(&mut harness, KeyCode::Char('l'), KeyModifiers::NONE).await;
+    key(&mut harness, KeyCode::Char('l'), KeyModifiers::NONE).await;
+    key(&mut harness, KeyCode::Char('n'), KeyModifiers::CONTROL).await;
+    key(&mut harness, KeyCode::Esc, KeyModifiers::NONE).await;
+    key(&mut harness, KeyCode::Char('g'), KeyModifiers::NONE).await;
+    key(&mut harness, KeyCode::Char('v'), KeyModifiers::NONE).await;
+
+    harness.assert_mode(Mode::Visual);
+    key(&mut harness, KeyCode::Char('c'), KeyModifiers::NONE).await;
+    harness.type_text("X").await.unwrap();
+    key(&mut harness, KeyCode::Esc, KeyModifiers::NONE).await;
+
+    harness.assert_buffer_contents("X foo");
+}
+
+#[tokio::test]
+async fn visual_ctrl_n_keeps_multiline_selections_in_visual_mode() {
+    let config: Config = toml::from_str(include_str!("../default_config.toml")).unwrap();
+    let buffer = Buffer::new(None, "foo\nfoo".to_string());
+    let mut harness = EditorHarness::with_config(buffer, config);
+
+    key(&mut harness, KeyCode::Char('v'), KeyModifiers::NONE).await;
+    key(&mut harness, KeyCode::Down, KeyModifiers::NONE).await;
+    key(&mut harness, KeyCode::Char('n'), KeyModifiers::CONTROL).await;
+
+    harness.assert_mode(Mode::Visual);
+    assert!(!harness.statusline_row().contains("MULTI"));
+}
+
+#[tokio::test]
 async fn ctrl_n_wraps_without_adding_duplicate_selections() {
     let config: Config = toml::from_str(include_str!("../default_config.toml")).unwrap();
     let buffer = Buffer::new(None, "foo foo".to_string());
