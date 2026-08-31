@@ -6915,6 +6915,45 @@ async fn visual_indent_supports_character_block_and_counted_selections() {
 }
 
 #[tokio::test]
+async fn dot_repeats_visual_indent_by_line_count_for_forward_and_reverse_selections() {
+    let buffer = Buffer::new(None, "one\ntwo\nthree\nfour\nfive\nsix".to_string());
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+
+    type_normal_keys(&mut harness, "Vjj>.").await;
+
+    harness.assert_buffer_contents("        one\n        two\n        three\nfour\nfive\nsix");
+
+    let buffer = Buffer::new(None, "one\ntwo\nthree\nfour\nfive\nsix".to_string());
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+
+    type_normal_keys(&mut harness, "5GVkk>.").await;
+
+    harness.assert_buffer_contents("one\ntwo\n        three\n        four\n        five\nsix");
+}
+
+#[tokio::test]
+async fn dot_repeats_visual_indent_span_from_the_current_line_and_preserves_count() {
+    let buffer = Buffer::new(
+        None,
+        "one\ntwo\nthree\nfour\nfive\nsix\nseven\neight".to_string(),
+    );
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+
+    type_normal_keys(&mut harness, "Vjj>5G.").await;
+
+    harness.assert_buffer_contents(
+        "    one\n    two\n    three\nfour\n    five\n    six\n    seven\neight",
+    );
+
+    let buffer = Buffer::new(None, "one\ntwo\nthree".to_string());
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+
+    type_normal_keys(&mut harness, "Vj2>.").await;
+
+    harness.assert_buffer_contents("                one\n                two\nthree");
+}
+
+#[tokio::test]
 async fn visual_unindent_shifts_all_selected_lines_as_one_change() {
     let buffer = Buffer::new(None, "    one\n\n      two\n       ".to_string());
     let mut harness = EditorHarness::with_config(buffer, default_key_config());
@@ -6949,6 +6988,26 @@ async fn visual_unindent_supports_character_block_and_counted_selections() {
     harness.assert_buffer_contents("one\ntwo");
     harness.execute_action(Action::Undo).await.unwrap();
     harness.assert_buffer_contents("        one\n    two");
+}
+
+#[tokio::test]
+async fn dot_repeats_visual_unindent_by_line_count_and_preserves_prior_change_on_noop() {
+    let buffer = Buffer::new(
+        None,
+        "                one\n                two\n                three\nfour\nfive".to_string(),
+    );
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+
+    type_normal_keys(&mut harness, "3GVkk2<.").await;
+
+    harness.assert_buffer_contents("one\ntwo\nthree\nfour\nfive");
+
+    let buffer = Buffer::new(None, "ab\ncd\nef".to_string());
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+
+    type_normal_keys(&mut harness, "xjVj<.").await;
+
+    harness.assert_buffer_contents("b\nd\nef");
 }
 
 #[tokio::test]

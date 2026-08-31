@@ -984,8 +984,19 @@ struct KeySignature {
 }
 
 #[derive(Debug, Clone)]
-struct SemanticChange {
-    events: Vec<Event>,
+enum SemanticChange {
+    Input(Vec<Event>),
+    VisualLineShift {
+        direction: VisualLineShiftDirection,
+        line_count: usize,
+        count: u16,
+    },
+}
+
+#[derive(Debug, Clone, Copy)]
+enum VisualLineShiftDirection {
+    Right,
+    Left,
 }
 
 #[derive(Debug)]
@@ -993,6 +1004,7 @@ struct PendingSemanticChange {
     buffer_id: BufferId,
     base_revision: u64,
     events: Vec<Event>,
+    repeat_override: Option<SemanticChange>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -13321,6 +13333,7 @@ impl Editor {
                 buffer_id: self.current_buffer().id(),
                 base_revision: self.current_buffer().revision(),
                 events: Vec::new(),
+                repeat_override: None,
             });
         }
 
@@ -13380,9 +13393,17 @@ impl Editor {
             .take()
             .expect("completed semantic change must exist");
         if self.current_buffer().revision() != change.base_revision && !change.events.is_empty() {
-            self.last_semantic_change = Some(SemanticChange {
-                events: change.events,
-            });
+            self.last_semantic_change = Some(
+                change
+                    .repeat_override
+                    .unwrap_or(SemanticChange::Input(change.events)),
+            );
+        }
+    }
+
+    fn override_pending_semantic_change(&mut self, change: SemanticChange) {
+        if let Some(pending) = &mut self.pending_semantic_change {
+            pending.repeat_override = Some(change);
         }
     }
 
@@ -13702,17 +13723,33 @@ impl Editor {
             self.pending_semantic_change = None;
             self.replaying_semantic_change = true;
             let result = async {
-                for event in &change.events {
-                    if let Some(action) = self.handle_event_with_runtime(event, Some(runtime))? {
-                        if self
-                            .handle_resolved_key_action(event, &action, buffer, runtime)
-                            .await?
-                        {
-                            anyhow::bail!("repeated change attempted to quit the editor");
+                match change {
+                    SemanticChange::Input(events) => {
+                        for event in &events {
+                            if let Some(action) =
+                                self.handle_event_with_runtime(event, Some(runtime))?
+                            {
+                                if self
+                                    .handle_resolved_key_action(event, &action, buffer, runtime)
+                                    .await?
+                                {
+                                    anyhow::bail!("repeated change attempted to quit the editor");
+                                }
+                            }
+                            if self.replay_checkpoint(buffer, runtime).await? {
+                                break;
+                            }
                         }
                     }
-                    if self.replay_checkpoint(buffer, runtime).await? {
-                        break;
+                    SemanticChange::VisualLineShift {
+                        direction,
+                        line_count,
+                        count,
+                    } => {
+                        self.replay_visual_line_shift(
+                            direction, line_count, count, buffer, runtime,
+                        )
+                        .await?;
                     }
                 }
                 Ok(())
@@ -13720,6 +13757,35 @@ impl Editor {
             .await;
             self.replaying_semantic_change = false;
             result
+        })
+    }
+
+    #[inline(never)]
+    fn replay_visual_line_shift<'a>(
+        &'a mut self,
+        direction: VisualLineShiftDirection,
+        line_count: usize,
+        count: u16,
+        buffer: &'a mut RenderBuffer,
+        runtime: &'a mut Runtime,
+    ) -> BoxFuture<'a, anyhow::Result<()>> {
+        Box::pin(async move {
+            let first_line = self.buffer_line();
+            let last_line = first_line
+                .saturating_add(line_count.saturating_sub(1))
+                .min(self.current_buffer().len().saturating_sub(1));
+            let changed = match direction {
+                VisualLineShiftDirection::Right => {
+                    self.indent_line_range(first_line, last_line, count)
+                }
+                VisualLineShiftDirection::Left => {
+                    self.unindent_line_range(first_line, last_line, count)
+                }
+            };
+            if changed {
+                self.notify_change(runtime).await?;
+            }
+            self.render(buffer)
         })
     }
 
@@ -19713,12 +19779,16 @@ impl Editor {
         Self::leading_indentation(&self.current_line_contents().unwrap_or_default())
     }
 
-    fn indent_selection(&mut self, count: u16) -> bool {
-        let Some(selection) = self.selection else {
-            return false;
-        };
+    fn indent_selection(&mut self, count: u16) -> Option<usize> {
+        let selection = self.selection?;
         let first_line = selection.y0.min(selection.y1);
         let last_line = selection.y0.max(selection.y1);
+        let line_count = last_line.saturating_sub(first_line).saturating_add(1);
+        self.indent_line_range(first_line, last_line, count)
+            .then_some(line_count)
+    }
+
+    fn indent_line_range(&mut self, first_line: usize, last_line: usize, count: u16) -> bool {
         let indentation = self.indentation();
         let columns = indentation
             .shift_width
@@ -19741,12 +19811,16 @@ impl Editor {
         self.commit_transaction(self.cursor_snapshot())
     }
 
-    fn unindent_selection(&mut self, count: u16) -> bool {
-        let Some(selection) = self.selection else {
-            return false;
-        };
+    fn unindent_selection(&mut self, count: u16) -> Option<usize> {
+        let selection = self.selection?;
         let first_line = selection.y0.min(selection.y1);
         let last_line = selection.y0.max(selection.y1);
+        let line_count = last_line.saturating_sub(first_line).saturating_add(1);
+        self.unindent_line_range(first_line, last_line, count)
+            .then_some(line_count)
+    }
+
+    fn unindent_line_range(&mut self, first_line: usize, last_line: usize, count: u16) -> bool {
         let indentation = self.indentation();
         let columns = indentation
             .shift_width
@@ -19777,6 +19851,34 @@ impl Editor {
         self.selection = None;
         self.selection_start = None;
         self.commit_transaction(self.cursor_snapshot())
+    }
+
+    #[inline(never)]
+    fn execute_visual_line_shift<'a>(
+        &'a mut self,
+        direction: VisualLineShiftDirection,
+        count: u16,
+        buffer: &'a mut RenderBuffer,
+        runtime: &'a mut Runtime,
+    ) -> BoxFuture<'a, anyhow::Result<()>> {
+        Box::pin(async move {
+            self.capture_last_visual_selection();
+            let line_count = match direction {
+                VisualLineShiftDirection::Right => self.indent_selection(count),
+                VisualLineShiftDirection::Left => self.unindent_selection(count),
+            };
+            if let Some(line_count) = line_count {
+                self.override_pending_semantic_change(SemanticChange::VisualLineShift {
+                    direction,
+                    line_count,
+                    count: count.max(1),
+                });
+                self.notify_change(runtime).await?;
+            }
+            self.execute(&Action::EnterMode(Mode::Normal), buffer, runtime)
+                .await?;
+            Ok(())
+        })
     }
 
     // Mode transitions can recursively execute pending visual-block actions. Keep their async
@@ -23406,13 +23508,13 @@ impl Editor {
                 self.render(buffer)?;
             }
             Action::IndentSelection(count) => {
-                self.capture_last_visual_selection();
-                let changed = self.indent_selection(*count);
-                if changed {
-                    self.notify_change(runtime).await?;
-                }
-                self.execute(&Action::EnterMode(Mode::Normal), buffer, runtime)
-                    .await?;
+                self.execute_visual_line_shift(
+                    VisualLineShiftDirection::Right,
+                    *count,
+                    buffer,
+                    runtime,
+                )
+                .await?;
             }
             Action::UnindentLine => {
                 let spaces = self.current_line_indentation();
@@ -23432,13 +23534,13 @@ impl Editor {
                 self.render(buffer)?;
             }
             Action::UnindentSelection(count) => {
-                self.capture_last_visual_selection();
-                let changed = self.unindent_selection(*count);
-                if changed {
-                    self.notify_change(runtime).await?;
-                }
-                self.execute(&Action::EnterMode(Mode::Normal), buffer, runtime)
-                    .await?;
+                self.execute_visual_line_shift(
+                    VisualLineShiftDirection::Left,
+                    *count,
+                    buffer,
+                    runtime,
+                )
+                .await?;
             }
             Action::JumpBack => {
                 add_to_history = false;
