@@ -165,6 +165,8 @@ cargo test --all-features -p red --lib --bin red -- \
   husk \
   plugin::runtime::tests::lsp_symbols_ \
   plugin::runtime::tests::git_ \
+  plugin::runtime::git_refresh_tests:: \
+  plugin::runtime::tests::monotonic_time_ \
   plugin::runtime::tests::embedded_git_core_ \
   plugin::runtime::tests::neotree_ \
   plugin::runtime::tests::embedded_neotree_core_

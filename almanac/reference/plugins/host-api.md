@@ -12,6 +12,9 @@ sources:
   - id: registry
     type: file
     path: src/plugin/registry.rs
+  - id: package
+    type: file
+    path: src/plugin/package.rs
   - id: api-doc
     type: file
     path: docs/PLUGIN_API.md
@@ -29,6 +32,7 @@ The Plugin Host API reference identifies the files that define Red's Husk plugin
 | `src/plugin/host_api.json` | Canonical machine-readable list of host `execute` and `request` calls, signatures, and introduction versions [@schema]. |
 | `src/plugin/api.rs` | Embedded schema loader, static validator, diagnostic families, and schema coverage tests [@api]. |
 | `src/plugin/registry.rs` | Runtime compatibility gate; `RED_HOST_API_VERSION` is `0.17.0`, and `0.4.0`, `0.6.0`, `0.7.0`, `0.8.0`, `0.9.0`, `0.10.0`, `0.11.0`, `0.12.0`, `0.14.0`, and `0.16.0` remain accepted compatibility targets for existing packages [@registry]. |
+| `src/plugin/package.rs` | Current `red-plugin.toml` schema, package validation, and package-to-registry metadata adaptation [@package]. |
 | `docs/PLUGIN_API.md` | Human compatibility guide, migration notes, and behavioral descriptions for plugin authors [@api-doc]. |
 | `docs/plugin_api_changes.json` | Versioned change manifest that records introduced symbols and migration note anchors through `0.17.0` [@changes]. |
 
@@ -59,7 +63,7 @@ The schema's call list is the exact lookup source for current signatures. Exampl
 
 ## Compatibility Rules
 
-Plugin packages may declare a semver range in `red_api_version`; Red checks that range before activation and quarantines malformed or incompatible packages without stopping unrelated plugins [@api-doc]. The registry accepts `0.4.0`, `0.6.0`, `0.7.0`, `0.8.0`, `0.9.0`, `0.10.0`, `0.11.0`, `0.12.0`, `0.14.0`, `0.16.0`, and the current `0.17.0` host API version, so existing packages can remain on those supported minors while new packages should target `^0.17.0` unless they intentionally avoid newer host calls [@registry] [@api-doc]. Because pre-1.0 caret ranges do not cross minor versions, compatibility checks test the declared range against every supported host API version instead of only the current version [@registry]. The documented pre-1.0 policy is:
+Current external packages declare a semver range as `[plugin].red_api` in `red-plugin.toml`; Red validates that range when loading the package and adapts it into the registry's legacy `red_api_version` metadata field before activation [@package] [@registry]. Older adjacent `package.json` metadata can still provide `red_api_version` directly, and malformed or incompatible ranges quarantine only the owner while unrelated plugins continue [@registry] [@api-doc]. The registry accepts `0.4.0`, `0.6.0`, `0.7.0`, `0.8.0`, `0.9.0`, `0.10.0`, `0.11.0`, `0.12.0`, `0.14.0`, `0.16.0`, and the current `0.17.0` host API version, so existing packages can remain on those supported minors while new packages should target `^0.17.0` unless they intentionally avoid newer host calls [@registry] [@api-doc]. Because pre-1.0 caret ranges do not cross minor versions, compatibility checks test the declared range against every supported host API version instead of only the current version [@registry]. The documented pre-1.0 policy is:
 
 | Release kind | Compatibility rule |
 | --- | --- |

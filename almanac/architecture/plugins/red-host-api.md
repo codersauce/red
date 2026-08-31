@@ -12,6 +12,9 @@ sources:
   - id: registry
     type: file
     path: src/plugin/registry.rs
+  - id: package
+    type: file
+    path: src/plugin/package.rs
   - id: runtime
     type: file
     path: src/plugin/runtime.rs
@@ -42,6 +45,6 @@ Many host actions translate directly into `PluginRequest` messages, such as pane
 
 ## Compatibility Policy
 
-Plugin metadata may declare a semver `red_api_version` range. The registry rejects malformed or incompatible ranges before activation, and it checks a requirement against every supported host API version because pre-1.0 caret ranges do not cross minor versions [@registry] [@api-doc]. While Red remains pre-1.0, the documented policy is that patch releases fix behavior without intentional signature changes, minor releases may add or deprecate calls and fields, and removals or incompatible call changes require a host-API minor bump, a change manifest entry, and a migration note [@api-doc].
+Current external package metadata declares the compatibility range as `[plugin].red_api` in `red-plugin.toml`; Red validates it during package load and then adapts the package into the registry metadata shape used for activation [@package] [@registry]. Legacy adjacent `package.json` metadata may still declare `red_api_version` directly. The registry rejects malformed or incompatible ranges before activation, and it checks a requirement against every supported host API version because pre-1.0 caret ranges do not cross minor versions [@registry] [@api-doc]. While Red remains pre-1.0, the documented policy is that patch releases fix behavior without intentional signature changes, minor releases may add or deprecate calls and fields, and removals or incompatible call changes require a host-API minor bump, a change manifest entry, and a migration note [@api-doc].
 
 Callback-scoped pickers and composers illustrate how compatibility shapes dispatch. The API guide keeps legacy numeric picker and composer calls available for compatibility while directing new plugins to handler-record APIs [@api-doc]. For the current version, accepted compatibility targets, and introduced-call inventory, use [Plugin host API](../../reference/plugins/host-api). For lifecycle consequences of incompatible calls, use [Plugin lifecycle and reload](lifecycle-and-reload).

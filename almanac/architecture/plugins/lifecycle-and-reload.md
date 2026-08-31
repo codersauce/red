@@ -6,6 +6,9 @@ sources:
   - id: registry
     type: file
     path: src/plugin/registry.rs
+  - id: package
+    type: file
+    path: src/plugin/package.rs
   - id: runtime
     type: file
     path: src/plugin/runtime.rs
@@ -21,9 +24,9 @@ Plugin lifecycle and reload is the boundary between configured Husk plugin sourc
 
 ## Discovery And Compatibility
 
-Configured plugins enter the registry through `add(name, path)`. The registry records the source path, marks the plugin `Pending`, snapshots source and metadata modification times, and then discovers metadata from the nearest matching external `red-plugin.toml` package before falling back to legacy adjacent `package.json` metadata or minimal single-file metadata [@registry]. A metadata load failure quarantines that plugin immediately, but the registry still inserts minimal metadata so discovery of unrelated plugins can continue [@registry].
+Configured plugins enter the registry through `add(name, path)`. The registry records the source path, marks the plugin `Pending`, snapshots source and metadata modification times, and then discovers metadata from the nearest matching external `red-plugin.toml` package before falling back to legacy adjacent `package.json` metadata or minimal single-file metadata [@registry] [@package]. A metadata load failure quarantines that plugin immediately, but the registry still inserts minimal metadata so discovery of unrelated plugins can continue [@registry].
 
-Activation checks are staged before Husk code runs. Dependencies must exist, required dependency versions must satisfy the dependent's semver requirements, and an optional `red_api_version` range must match at least one Red host API version supported by this release [@registry]. The compatibility guide documents the same policy for plugin packages: malformed or incompatible ranges quarantine the owner while editor startup and unrelated plugins continue [@api-doc].
+Activation checks are staged before Husk code runs. Dependencies must exist, required dependency versions must satisfy the dependent's semver requirements, and the compatibility range must match at least one Red host API version supported by this release [@registry]. Current packages express that range as `[plugin].red_api`; legacy `package.json` metadata expresses it as `red_api_version` [@package] [@registry]. The compatibility guide documents the same policy for plugin packages: malformed or incompatible ranges quarantine the owner while editor startup and unrelated plugins continue [@api-doc].
 
 ## Activation Order And States
 

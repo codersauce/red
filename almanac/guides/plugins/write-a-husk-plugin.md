@@ -6,12 +6,18 @@ sources:
   - id: example-source
     type: file
     path: examples/example-plugin/index.hk
-  - id: example-package
+  - id: external-example
     type: file
-    path: examples/example-plugin/package.json
+    path: examples/external-hello-plugin/red-plugin.toml
+  - id: package-code
+    type: file
+    path: src/plugin/package.rs
   - id: system-doc
     type: file
     path: docs/PLUGIN_SYSTEM.md
+  - id: external-doc
+    type: file
+    path: docs/EXTERNAL_PLUGINS.md
   - id: api-doc
     type: file
     path: docs/PLUGIN_API.md
@@ -23,19 +29,23 @@ sources:
     path: src/plugin/registry.rs
 ---
 
-Use this guide when adding or revising a Red plugin written in Husk. A complete plugin has Husk source that registers commands or events, optional package metadata that declares compatibility, host calls that match the current Red API, and any process permissions needed by its runtime behavior [@system-doc] [@api-doc]. By the end, the plugin should load through Red's plugin lifecycle, expose only the resources it needs, and pass the same validation commands used for bundled plugin work.
+Use this guide when adding or revising a Red plugin written in Husk. A complete plugin has Husk source that declares commands or events, optional `red-plugin.toml` package metadata that declares compatibility, host calls that match the current Red API, and any process permissions needed by its runtime behavior [@system-doc] [@external-doc] [@api-doc]. By the end, the plugin should load through Red's plugin lifecycle, expose only the resources it needs, and pass the same validation commands used for bundled plugin work.
 
 ## Start From A Minimal Source File
 
-Create or update the plugin's `.hk` entry file first. The example plugin defines `pub fn activate()`, registers `ExampleCommand` with `red::add_command`, subscribes to `editor:ready` with `red::on`, and implements callbacks that call `red::execute("Print", ...)` and `red::log(...)` [@example-source]. That shape matches the lifecycle described in the plugin system guide: `activate` runs when Red initializes plugins, while `before_exit` and `deactivate` are optional hooks [@system-doc].
+Create or update the plugin's `.hk` entry file first. The example plugin declares `ExampleCommand` with `#[red::command]`, subscribes to `editor:ready` with `#[red::on]`, and implements handlers that call `red::execute("Print", ...)` and `red::log(...)` [@example-source]. That shape matches the current plugin-system guide, which prefers declaration-local attributes for fixed commands, events, state, configuration, and lifecycle behavior while keeping imperative registration and conventionally named lifecycle functions compatible [@system-doc].
 
 Keep the first version small enough to prove the lifecycle. Register one command, one event subscription, or one request callback, then expand. Direct `:Name` invocation requires the exact, case-sensitive registered command name, and built-in commands take precedence over plugin commands with the same name [@system-doc].
 
 ## Add Metadata And API Compatibility
 
-Add a `package.json` beside filesystem-backed plugin source when the plugin needs metadata. The example metadata includes `name`, `version`, `description`, `author`, `license`, `main`, `keywords`, repository information, Red engine information, `red_api_version`, capabilities, activation events, and a simple configuration schema [@example-package]. Red checks `red_api_version` before activation and quarantines malformed or incompatible packages while startup and unrelated plugins continue [@api-doc].
+Add a `red-plugin.toml` at the package root when the plugin should be installed, updated, managed, or distributed as an external package. The package manifest has `schema_version`, a `[plugin]` table with `id`, `name`, `version`, `red_api`, and either `husk_manifest` or `entry`, plus optional activation, keymaps, companion, language, and migration sections [@package-code] [@external-doc]. The external hello fixture points `husk_manifest` at `Husk.toml`, declares `HelloPanel` as an activation command, and contributes a normal-mode keymap [@external-example].
+
+Red loads `red-plugin.toml` with `PluginPackageManifest::load`, rejects unknown fields, unsupported schema versions, missing entrypoint or language declarations, unsafe package paths, and unsupported host API ranges, then adapts the package into the legacy metadata view used by the registry [@package-code] [@registry]. Adjacent `package.json` metadata remains a fallback for older filesystem plugins, but new installable packages should use `red-plugin.toml` so package lifecycle, language definitions, companion artifacts, and migration declarations share one schema [@registry] [@package-code].
 
 For this codebase, target the current host API unless there is a clear compatibility reason not to. `src/plugin/host_api.json` declares the current schema version, and the registry keeps the supported compatibility targets for existing packages [@schema] [@registry]. New metadata should use the current version range from [Plugin host API](../../reference/plugins/host-api) unless it intentionally needs to stay compatible with an older Red host API; choose an older supported minor only when the plugin avoids newer calls listed in that reference. Use [Red host API](../../architecture/plugins/red-host-api) for how validation and dispatch work.
+
+Language-only packages can omit Husk code, but they still use the same package manifest. If a language package contributes indentation queries under `languages.<id>.grammar.indents`, the package validator requires `red_api = "^0.12.0"` or later [@package-code]. If an installed pack fails with an `unknown field` error for a manifest key that current source accepts, first verify the binary under test in [Build, Test, And Validate](../development/build-test-and-validate) before changing the package.
 
 ## Choose Host Calls Deliberately
 
