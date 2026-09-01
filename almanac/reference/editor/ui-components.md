@@ -33,9 +33,6 @@ sources:
   - id: prompt-buffer
     type: file
     path: src/ui/prompt_buffer.rs
-  - id: ctrl-t-tab-session
-    type: conversation
-    path: /Users/fcoury/.codex/sessions/2026/08/31/rollout-2026-08-31T18-03-49-01a05a10-8f88-7f70-9850-f35913a6ac1b.jsonl
 ---
 
 Red's modal UI components implement a common `Component` trait above the editor and plugin surfaces. The trait defines drawing into a `RenderBuffer`, optional ticking, live picker updates, plugin-owned picker and composer handles, resizing, theme updates, event handling, event passthrough, sensitive-input reporting, and cursor placement [@ui-core]. Components return `KeyAction` values instead of mutating editor state directly, so the editor remains the owner of action execution and resource cleanup [@ui-core].
@@ -61,7 +58,7 @@ Red's modal UI components implement a common `Component` trait above the editor 
 
 `Picker` is the structured fuzzy picker. Its component implementation accepts `PickerUpdate` values for the matching id, exposes both legacy picker ids and callback handles, resizes to the viewport, applies theme updates, edits its query from key and paste events, navigates history and result lists, and returns either editor actions or plugin callback notifications on selection and cancellation [@picker]. Query editing is grapheme-aware, while query cursor placement uses display width so the terminal cursor follows visible text width [@picker].
 
-Picker preview panes do not use the normal window text renderer. They clip preview lines, paint optional syntax spans, and paint query-match overlays inside `src/ui/picker.rs`, so preview fixes must keep all three passes on the same terminal-column mapping [@picker]. The 2026-08-31 `Ctrl-t` Go-symbol investigation reproduced a small-terminal corruption caused by raw tab bytes in preview cells; the repair direction is to expand tabs before painting preview cells and reuse that tab-aware mapping for syntax and match overlays [@ctrl-t-tab-session].
+Picker preview panes do not use the normal window text renderer. They clip preview lines, paint optional syntax spans, and paint query-match overlays inside `src/ui/picker.rs`, so preview fixes must keep all three passes on the same terminal-column mapping [@picker]. The raw-tab preview incident and terminal-cell invariant are covered by [Rendering Pipeline](../../architecture/editor/rendering-pipeline).
 
 `FilePicker` wraps `Picker` with asynchronous workspace discovery. Its `tick` method drains a channel of file-loading results, ignores stale generations, and updates the underlying picker; `Ctrl-E` toggles hidden and ignored entries and starts a new load, while an empty-query `>` opens the command palette [@file-picker]. Drawing, resize, theme updates, and cursor position delegate to the embedded picker [@file-picker].
 

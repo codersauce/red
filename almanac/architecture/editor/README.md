@@ -1,6 +1,6 @@
 ---
 title: "Editor Architecture"
-summary: "Editor architecture routes readers through Red's single-owner event loop, buffer and window model, mutation boundary, rendering pipeline, LSP sync, plugin request handling, and syntax services for highlighting, matchit, and structural text objects."
+summary: "Editor architecture routes readers through Red's single-owner event loop, buffer and window model, mutation boundary, rendering pipeline, LSP sync, plugin request handling, syntax services, and editor-native onboarding."
 topics: [architecture, editor, red-editor]
 sources:
   - id: editor
@@ -21,11 +21,14 @@ sources:
   - id: textobjects
     type: file
     path: src/textobjects.rs
+  - id: learning
+    type: file
+    path: almanac/architecture/editor/learning-and-tutorial.md
 ---
 
 # Editor Architecture
 
-Red's editor core is the single-owner runtime for interactive state. `Editor` owns buffer selection, window layout, session snapshots, LSP coordination, agent state, plugin registry state, syntax highlighting, render caches, terminal output, dialogs, overlays, and background service polling on one async task [@editor]. The surrounding pages in this folder split that large owner into the boundaries a maintainer normally needs to change: input and background service order, text mutation, view state, rendering, LSP sync, plugin requests, and syntax services.
+Red's editor core is the single-owner runtime for interactive state. `Editor` owns buffer selection, window layout, session snapshots, LSP coordination, agent state, plugin registry state, syntax highlighting, render caches, terminal output, dialogs, overlays, onboarding practice buffers, and background service polling on one async task [@editor] [@learning]. The surrounding pages in this folder split that large owner into the boundaries a maintainer normally needs to change: input and background service order, text mutation, view state, rendering, LSP sync, plugin requests, syntax services, and editor-native learning flows.
 
 ## Reading Order
 
@@ -46,6 +49,8 @@ Read [Plugin Host Requests](plugin-host-requests) when Husk plugin calls need ed
 Use [Syntax Services](syntax-services) for language selection, viewport highlight caching, Tree-sitter and Husk highlighting, Markdown injections, matchit navigation, and Tree-sitter structural text objects or swaps. `Highlighter` maps filenames, extensions, language names, queries, and Husk lexer tokens into byte-range style spans, while `SyntaxTextObjectService` turns structural captures into editor positions without mutating buffers directly [@highlighter] [@textobjects] [@editor].
 
 Use [Vim Compatibility](../../reference/vim/vim-compatibility) as the lookup page for supported Vim-inspired behavior, intentional differences, and unsupported surface before changing modal editing semantics.
+
+Use [Learning And Tutorial](learning-and-tutorial) when changing the `:learn` hub, `:tutorial` command routing, practice-buffer safety, onboarding progress preferences, or recovery boundaries around teaching flows [@learning].
 
 ## Boundaries To Preserve
 

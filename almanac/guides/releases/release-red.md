@@ -51,12 +51,6 @@ sources:
   - id: whats-new
     type: file
     path: src/whats_new.rs
-  - id: markdown-links
-    type: file
-    path: scripts/check_markdown_links.py
-  - id: pr-351-doc-links
-    type: conversation
-    path: /Users/fcoury/.codex/sessions/2026/08/24/rollout-2026-08-24T20-33-04-01a0361e-d26f-7740-9ac1-d9b12eb81cb7.jsonl
 ---
 
 Use this guide to publish a Red release without mixing up release preparation, reviewed campaign resolution, the tag build, draft release review, Homebrew publication, installer smoke tests, and announcement. The release process is split on purpose: a prepare workflow opens a normal release PR, an annotated tag builds and smoke-tests archives into a draft GitHub release, publishing that release updates Homebrew, and a separate Discord workflow announces only published non-prerelease releases unless manually invoked [@prepare-release] [@release] [@announce-discord]. The reviewed campaign is the shared editorial source for GitHub release introductions, Discord and in-app highlights, and preview-only X and Bluesky copy [@campaign] [@release-campaign] [@social-release].
@@ -116,4 +110,4 @@ The Discord announcement workflow runs on published releases and manual dispatch
 
 The in-app What's New panel uses the embedded `CHANGELOG.md` as an immediate offline fallback, then can replace the current version's notes with the matching published GitHub release body when it is available [@whats-new]. It keeps contributor bullets in the full release notes but excludes them from the short highlight extraction, so first-time contributor credit remains visible without becoming a product-change highlight [@whats-new].
 
-When release documentation mentions branch-local or sibling-worktree artifacts, do not turn those references into Markdown links unless the targets exist in the checked-out repository. The Markdown checker accepts external URLs but reports unresolved or out-of-repository local links [@markdown-links]. PR #351 failed documentation CI because archived release communication linked to sibling worktrees unavailable to CI; the fix used code-formatted path descriptions instead of links [@pr-351-doc-links].
+When release documentation mentions branch-local or sibling-worktree artifacts, follow the checked-repository link rule in [Release Campaign](../../reference/releases/release-campaign) rather than linking to sibling worktrees.

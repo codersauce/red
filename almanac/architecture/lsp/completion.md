@@ -1,7 +1,7 @@
 ---
 title: "LSP Completion"
 summary: "Red completion combines automatic and manual insert-mode requests, open-buffer fallback items, UTF-16-aware filtering, active-session stale guards, terminal UI pass-through, atomic edit application, interactive snippets, and optional follow-up LSP commands."
-topics: [architecture, lsp, completion]
+topics: [architecture, lsp, completion, editing]
 sources:
   - id: completion-ui
     type: file

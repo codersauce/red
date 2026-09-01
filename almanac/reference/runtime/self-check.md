@@ -42,7 +42,7 @@ After `registry.initialize(&mut runtime).await`, the check collects plugin statu
 
 `SelfCheckReport::format` prints one line per plugin in sorted order, using `plugin <name>: <status>` [@self-check]. Status labels are `pending`, `active`, `active (reload rejected)`, `disabled`, and `quarantined` [@self-check]. Main appends a final success line, `red self-check ok`, only after the report was produced successfully [@main].
 
-The integration test requires self-check output to contain no ANSI escape sequences under `NO_COLOR`, end with `red self-check ok`, list at least two plugin status lines, and report the bundled plugins `agent`, `barbecue`, `buffer_picker`, `cool_search`, `fidget`, `git`, `indent_guides`, `inlay_hints`, `lsp_symbols`, `neotree`, `project_search`, and `theme_browser` as active [@tests]. The same test fails if any reported plugin status is not active [@tests].
+The integration test requires self-check output to contain no ANSI escape sequences under `NO_COLOR`, end with `red self-check ok`, list at least two plugin status lines, and report the bundled plugins `agent`, `barbecue`, `buffer_picker`, `cool_search`, `fidget`, `git`, `indent_guides`, `inlay_hints`, `lsp_symbols`, `neotree`, `project_search`, `session_restore`, and `theme_browser` as active [@tests]. The same test fails if any reported plugin status is not active [@tests].
 
 ## Debugging Use
 

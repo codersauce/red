@@ -1,7 +1,7 @@
 ---
 title: "Debugging LSP Failures"
 summary: "This guide shows how to diagnose Red LSP failures by separating startup and routing problems from transport, diagnostics, completion, and fail-closed workspace edit handling."
-topics: [guides, lsp, debugging, workspace-edits]
+topics: [guides, lsp, diagnostics, debugging, workspace-edits]
 sources:
   - id: debugging
     type: file

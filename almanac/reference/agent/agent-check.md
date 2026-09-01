@@ -45,7 +45,7 @@ The `--strict` flag is valid only with `--agent-check`; the Clap definition mark
 | `command` | The configured executable name or path, defaulting to `codex` [@agent-check]. |
 | `minimum Codex version` | The minimum accepted semantic version, currently `0.144.1` [@agent-check]. |
 | `authentication` | The authentication expectation; it says `installed Codex CLI (`codex login`)` when agent support is enabled [@agent-check]. |
-| `reviewable-edit readiness` | Legacy report label; it prints `ready` when executable discovery and version checks pass, otherwise `not ready` [@agent-check]. |
+| `agent-edit readiness` | Prints `ready` when executable discovery and version checks pass, otherwise `not ready` [@agent-check]. |
 | `executable` | Printed only when the command resolves to a path [@agent-check]. |
 | `installed version` | Printed only when `<executable> --version` succeeds [@agent-check]. |
 | message lines | Actionable findings prefixed with `- ` [@agent-check]. |
