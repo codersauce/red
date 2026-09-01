@@ -6,6 +6,9 @@ sources:
   - id: debugging
     type: file
     path: docs/DEBUGGING.md
+  - id: manager
+    type: file
+    path: src/lsp/manager.rs
   - id: client
     type: file
     path: src/lsp/client.rs
@@ -15,6 +18,9 @@ sources:
   - id: workspace-edit
     type: file
     path: src/lsp/workspace_edit.rs
+  - id: go-lsp-session
+    type: conversation
+    path: /Users/fcoury/.codex/sessions/2026/08/31/rollout-2026-08-31T18-03-49-01a05a10-8f88-7f70-9850-f35913a6ac1b.jsonl
 ---
 
 Use this guide when language-server behavior is missing, delayed, stale, or rejected in Red. The fastest path is to identify which LSP boundary owns the failed invariant: startup and routing, JSON-RPC transport, document synchronization, diagnostics, completion, or workspace edit preparation [@debugging] [@client] [@workspace-edit]. Red intentionally keeps editor mutation outside the LSP background tasks, so server output is evidence for the editor to interpret rather than proof that visible buffers changed [@debugging].
@@ -28,6 +34,8 @@ Then search the log for `[lsp]`. The debugging guide identifies `src/lsp/manager
 ## Startup And Transport Failures
 
 If the server never becomes usable, inspect the process and initialization path before looking at editor UI. `RealLspClient::start` spawns the configured command directly with its args and environment, opens stdin/stdout/stderr, and uses bounded channels between reader, writer, and editor-side polling [@client]. Requests and notifications sent before successful initialization are queued only within the documented message and byte budgets; exceeding that queue marks initialization as failed [@client].
+
+A missing server executable is a process-start problem. Because the command is launched directly rather than through a shell, check `red --check-config`, the configured `command`, `command -v` in the same launch environment, the live process tree, and `[lsp] failed to start client ... os error 2` log entries before debugging completion or diagnostics UI [@client] [@go-lsp-session]. When `LspManager` catches a startup or initialization error it inserts the `(server, workspace)` key into `failed_clients`; later requests for that key return no client, and status reports `failed` until Red restarts or an LSP reconfiguration clears the affected key [@manager]. The 2026-08-31 Go diagnosis followed this pattern: the installed Go pack configured a bare `gopls` command, no `gopls` child existed, and installing the binary required restarting the active Red process before the Go workspace could retry [@go-lsp-session].
 
 Transport failures usually show up as one of these owners:
 

@@ -9,6 +9,9 @@ sources:
   - id: render-buffer
     type: file
     path: src/editor/render_buffer.rs
+  - id: picker
+    type: file
+    path: src/ui/picker.rs
   - id: display-layout
     type: file
     path: src/editor/display_layout.rs
@@ -27,6 +30,9 @@ sources:
   - id: rio-cursor-session
     type: conversation
     path: /Users/fcoury/.codex/sessions/2026/08/06/rollout-2026-08-06T13-38-01-019fd7f0-5a30-7af2-b391-9e17d6eee593.jsonl
+  - id: ctrl-t-tab-session
+    type: conversation
+    path: /Users/fcoury/.codex/sessions/2026/08/31/rollout-2026-08-31T18-03-49-01a05a10-8f88-7f70-9850-f35913a6ac1b.jsonl
 ---
 
 The rendering pipeline composes Red's logical editor state into an in-memory terminal-cell frame before writing to the terminal. `rendering.rs` draws windows, gutters, text, separators, panels, workspace views, dialogs, plugin render commands, overlays, diagnostics, search highlights, matching brackets, cursor styling, and frame diffs [@rendering]. `RenderBuffer` is the frame model: it stores grapheme text, width, continuation cells, and style for each terminal cell so wide graphemes and styled spans can be diffed without treating a row as a byte string [@render-buffer].
@@ -36,6 +42,8 @@ The rendering pipeline composes Red's logical editor state into an in-memory ter
 Window text rendering starts with [display layout](../../concepts/editor/display-layout). `DisplayLayout` maps buffer lines to visible screen-row segments using grapheme boundaries and terminal-cell widths, and it owns wrapping, horizontal offsets, continuation indentation, and cursor hit-testing for a specific viewport configuration [@display-layout]. Its cache key must include layout-affecting inputs such as buffer revision, viewport width, wrap mode, and indentation because reusing a layout across those changes would yield wrong cursor or hit-test positions [@display-layout].
 
 The renderer asks for a layout per window, fills each visible content row, then walks graphemes from the segment's byte range while tracking display columns, tab expansion, visual offsets, and syntax highlight spans [@rendering]. This is the point where the editor's coordinate systems converge: buffer text is sliced by byte offsets from the layout, graphemes become terminal cells, tabs expand to spaces using indentation width, and styles come from a forward-only syntax style cursor [@rendering].
+
+RenderBuffer cells must contain terminal-printable text, not raw control characters. `RenderBuffer::set_text` uses the printable-ASCII fast path only after `is_printable_ascii` rejects control bytes such as tabs, while `set_printable_ascii` skips that scan and writes bytes directly into cells [@render-buffer]. The diff flush later concatenates each changed cell's `text` and sends it to the terminal with `Print`, so any raw tab that enters a cell moves the terminal cursor independently of Red's computed cell positions [@rendering]. The window renderer expands buffer tabs before paint; picker preview paths are separate and must preserve that invariant when clipping source lines and overlaying syntax or match spans [@rendering] [@picker]. A 2026-08-31 `Ctrl-t` Go-symbol reproduction at 80x21 confirmed the failure mode: tab-indented preview lines emitted literal `0x09` bytes and corrupted the dialog, while the same fixture with spaces emitted no tab bytes and rendered cleanly [@ctrl-t-tab-session].
 
 ## Full Frame Construction
 
