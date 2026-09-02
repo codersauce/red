@@ -1,7 +1,7 @@
 ---
 title: "Dynamic Tools And Editor Tools"
 summary: "Red exposes a strict Codex dynamic-tool surface that separates workspace search from editor-owned reads, navigation, UTF-16 edits, saves, safe actions, and session-owned LSP diagnostics or rename plans."
-topics: [architecture, agent, codex, editor, unicode, agent-edits]
+topics: [architecture, agent, codex, editor, unicode, agent-edits, safety]
 sources:
   - id: codex
     type: file

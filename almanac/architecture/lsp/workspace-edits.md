@@ -1,7 +1,7 @@
 ---
 title: "LSP Workspace Edits"
 summary: "Red parses workspace edits fail-closed, validates every target before mutation, applies resource operations transactionally when supported, and lets the editor own buffer changes."
-topics: [architecture, lsp, editing, workspace-edits]
+topics: [architecture, lsp, editing, workspace-edits, safety]
 sources:
   - id: edit
     type: file

@@ -11,7 +11,7 @@ sources:
     path: src/lsp/mod.rs
 ---
 
-The LSP transport is the process and JSON-RPC boundary for one language server. `RealLspClient` owns the child process, stdin writer, stdout reader, stderr monitor, request id table, initialized state, pending message queue, document versions, server capabilities, and diagnostics debounce map [@client]. The editor receives typed `InboundMessage` values from this boundary and remains responsible for applying state changes, so transport failures and protocol errors do not directly mutate buffers [@lsp-mod].
+The LSP transport is the process and JSON-RPC boundary for one language server selected by [Client Lifecycle And Routing](client-lifecycle-and-routing). `RealLspClient` owns the child process, stdin writer, stdout reader, stderr monitor, request id table, initialized state, pending message queue, document versions, server capabilities, and diagnostics debounce map [@client]. The editor receives typed `InboundMessage` values from this boundary and remains responsible for applying state changes, so transport failures and protocol errors do not directly mutate buffers [@lsp-mod].
 
 ## Process IO And Framing
 
@@ -34,4 +34,3 @@ Document changes schedule diagnostics instead of requesting them immediately. `d
 ## Shutdown And Server Requests
 
 Unsupported server-initiated requests are answered with JSON-RPC method-not-found errors, except `workspace/applyEdit`, which is allowed through to the editor for validated handling by [workspace edits](workspace-edits) [@client]. Shutdown sends `shutdown`, waits briefly for the response, sends `exit`, and then waits for the child to exit before killing it if needed [@client]. This keeps the transport boundary orderly without requiring the editor to know about process details.
-

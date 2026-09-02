@@ -18,13 +18,13 @@ Red's LSP manager is the routing layer between editor actions and language-serve
 
 ## Selector And Workspace Resolution
 
-The configuration model has a global LSP switch, a format-on-save option, and named server definitions with command, arguments, environment, root markers, initialization options, workspace name, and document selectors [@config]. A server can use explicit `documents` entries or legacy `language_id` plus `file_extensions`; the `documents()` helper normalizes both forms into selector records [@config].
+The configuration model has a global LSP switch, a format-on-save option, and named server definitions with command, arguments, environment, root markers, initialization options, workspace name, and document selectors [@config]. A server can use explicit `documents` entries or legacy `language_id` plus `file_extensions`; the `documents()` helper normalizes both forms into selector records [@config]. Use [LSP Configuration](../../reference/lsp/configuration) for exact field lookup.
 
 `LspManager::new` sorts configured servers by name and registers the first selector for each lowercased extension, so extension collisions are deterministic [@manager]. `resolve_document` returns no document when LSP is disabled, the extension is not selected, or the path and URI cannot be normalized [@manager]. When a selector matches, workspace discovery walks ancestors from the file's parent and returns the first directory containing any configured root marker; if no marker is found, it falls back to the current working directory or the file's starting directory [@manager].
 
 ## Lazy Process Lifecycle
 
-The manager starts no server during construction [@manager]. Opening or changing a routed document calls `client_for_document`, which starts `RealLspClient`, sends `initialize`, and records the client only after successful startup and initialization [@manager]. If startup or initialization fails, the client key is added to `failed_clients`, and future requests for that key return `Ok(None)` instead of repeatedly trying the broken process [@manager].
+The manager starts no server during construction [@manager]. Opening or changing a routed document calls `client_for_document`, which starts `RealLspClient`, sends `initialize`, and records the client only after successful startup and initialization [@manager]. If startup or initialization fails, the client key is added to `failed_clients`, and future requests for that key return `Ok(None)` instead of repeatedly trying the broken process [@manager]. The process and JSON-RPC details for that client are covered by [LSP Transport](transport).
 
 Document identity is tracked separately from client lifetime. `did_open` skips duplicate opens for the same file, records the owning client key, and remembers the full `(server, workspace, URI)` document key so a reopened view can reuse the same managed lifecycle [@manager]. The editor-side lazy tests enforce that constructing an editor does not open inactive LSP buffers, activating a buffer opens it once, switching away and back does not reopen it, and deleting then reopening a buffer sends close followed by a fresh open [@lazy-tests].
 
@@ -36,5 +36,4 @@ Inbound polling is round-robin across sorted client keys. If the stored poll ord
 
 ## Relationship To Capabilities And Document Sync
 
-The lifecycle layer depends on the advertised [LSP capabilities](../../concepts/lsp/capabilities) being truthful: it can route static requests and workspace edits, but it does not implement dynamic registration or broad client-side server-management features. It also sits above editor document synchronization; the tests show user-visible actions open the active buffer before hover, symbols, references, formatting, code actions, signature help, and rename requests [@lazy-tests].
-
+The lifecycle layer depends on the advertised [LSP capabilities](../../concepts/lsp/capabilities) being truthful: it can route static requests and workspace edits, but it does not implement dynamic registration or broad client-side server-management features. It also sits above [LSP Document Sync](../editor/lsp-document-sync); the tests show user-visible actions open the active buffer before hover, symbols, references, formatting, code actions, signature help, and rename requests [@lazy-tests].

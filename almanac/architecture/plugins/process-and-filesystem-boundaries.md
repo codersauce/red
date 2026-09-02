@@ -1,7 +1,7 @@
 ---
 title: "Plugin Process And Filesystem Boundaries"
 summary: "Plugin process and filesystem boundaries keep Husk plugin side effects permissioned, bounded, workspace-confined, and reconciled through editor-owned requests."
-topics: [architecture, plugins, host-api, filesystem]
+topics: [architecture, plugins, host-api, filesystem, safety]
 sources:
   - id: process
     type: file

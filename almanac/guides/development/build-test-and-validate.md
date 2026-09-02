@@ -183,14 +183,15 @@ Run only the relevant subset while iterating, then run the whole workflow-equiva
 
 When a freshly built or installed Red rejects an installed language-pack
 manifest, first prove which executable the shell starts before changing package
-manifests. On 2026-08-30, `red` resolved to `/opt/homebrew/bin/red` even after
-`cargo install --path .` replaced `~/.cargo/bin/red`; the Homebrew binary failed
-on `languages.go.grammar.indents`, while `/Users/fcoury/.cargo/bin/red plugin
+manifests. Treat `unknown field` errors as binary-skew evidence when current
+source accepts the reported field. For example, source accepts
+`LanguageGrammarConfig.indents`, and the language guide defines `indents` as
+the Host API `^0.12.0` language-pack indentation contract [@config]
+[@language-doc]. In the recorded skew case, `red` resolved to
+`/opt/homebrew/bin/red` even after `cargo install --path .` replaced
+`~/.cargo/bin/red`; the Homebrew binary rejected
+`languages.go.grammar.indents`, while `/Users/fcoury/.cargo/bin/red plugin
 list` parsed the same installed packs as compatible [@binary-skew-session].
-Current source accepts `LanguageGrammarConfig.indents`, and the language guide
-defines that field as the Host API `^0.12.0` language-pack indentation contract
-[@config] [@language-doc]. A manifest error that reports `unknown field` for
-`indents` is therefore a binary-skew signal before it is a pack schema bug.
 
 Use `which -a red` or `whence -a red`, then run the intended binary by absolute
 path. `red --version` is not enough during unreleased `main` work: `Cargo.toml`

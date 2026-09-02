@@ -150,7 +150,7 @@ topics:
   - slug: locks
     title: Locks
     description: Lock files and reproducible package or extension state.
-    parents: [packages]
+    parents: [packages, persistence]
   - slug: extensions
     title: Extensions
     description: Husk static native modules, WebAssembly Components, and extension bundles.
@@ -253,7 +253,7 @@ topics:
     parents: [red-editor]
   - slug: navigation
     title: Navigation
-    description: Wiki and editor navigation entry points.
+    description: Wiki reading-order, hub, and reader-routing entry points.
     parents: [wiki]
   - slug: wiki
     title: Wiki
