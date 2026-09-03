@@ -1,6 +1,12 @@
 {
-  "api_version": "0.17.0",
+  "api_version": "0.18.0",
   "changes": [
+    {
+      "version": "0.18.0",
+      "kind": "introduced",
+      "symbols": ["UpdateTreePanel", "TreePanelSpec", "TreePanelChildren"],
+      "migration_note": "docs/PLUGIN_API.md#native-tree-panels"
+    },
     {
       "version": "0.17.0",
       "kind": "introduced",

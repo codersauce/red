@@ -1,6 +1,6 @@
 # Husk plugin compatibility
 
-Red host API version `0.17.0` is defined by
+Red host API version `0.18.0` is defined by
 [`src/plugin/host_api.json`](../src/plugin/host_api.json). That file is the canonical,
 machine-readable list of execute actions, request actions, signatures, and introduction
 versions. Runtime dispatch and the bundled-plugin corpus are checked against it in tests.
@@ -24,9 +24,34 @@ required/optional arity (`HUSK-A0002`) and obvious literal argument types
 annotations use `HUSK-A0004`. `--no-typecheck` is an unsupported development
 escape hatch; compatibility guarantees do not apply while it is enabled.
 
-Red `0.17.0` retains the complete `0.4.0`, `0.6.0`, `0.7.0`, `0.8.0`, `0.9.0`,
-`0.10.0`, `0.11.0`, `0.12.0`, `0.14.0`, and `0.16.0` contracts, so existing packages that declare those
-minors continue to load. New packages should target `"red_api_version": "^0.17.0"`.
+Host API `0.18.0` retains the complete `0.4.0`, `0.6.0`, `0.7.0`, `0.8.0`, `0.9.0`,
+`0.10.0`, `0.11.0`, `0.12.0`, `0.14.0`, `0.16.0`, and `0.17.0` contracts, so existing
+packages that declare those minors continue to load. New packages should target
+`"red_api_version": "^0.18.0"`.
+
+## Native tree panels
+
+Host API `0.18.0` adds `UpdateTreePanel(id, tree: TreePanelSpec)` for panels
+created with `CreatePanel`. A tree has a `root: PanelRow`, a `children` array of
+`TreePanelChildren { parent: String, rows: [PanelRow] }`, and an `expanded`
+array of node IDs. IDs are unique, opaque strings; the `notice:` prefix is
+reserved for loading rows. `path` remains optional.
+Each child listing names a directory node and preserves the caller's row order.
+An empty listing represents a loaded, empty directory. An expanded directory
+without a listing shows `Loading…` until the caller supplies its children.
+
+Callers supply row labels, icons, semantic styles, and right-hand decorations.
+Rust indexes the hierarchy and adds ancestry guides only when a row is displayed.
+The panel retains selection by node ID across updates and uses the existing
+keyboard, mouse, inline-search, and `panel:event:<id>` action handling. Callers
+respond to expand/collapse actions by updating `expanded` and supplying any
+newly loaded children. Duplicate node IDs, duplicate listings, and invalid
+parents are rejected before replacing the displayed model.
+
+Rust callers can construct `TreePanelModel::new(TreePanelSpec { ... })` and
+pass it to `PanelManager::update_tree_panel`. Neo-tree's filesystem adapter
+uses the same Rust layout for browsing and search, including match highlights;
+tree row construction no longer executes in the Husk interpreter.
 
 ## Monotonic timing
 

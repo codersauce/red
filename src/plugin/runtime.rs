@@ -47,7 +47,7 @@ use crate::{
 
 use super::{
     Decoration, GutterSign, OverlayConfig, PanelConfig, PanelRow, TextPanelBlock, TextPanelStatus,
-    TreePanelModel, WindowBarConfig, WindowBarSegment,
+    TreePanelModel, TreePanelSpec, WindowBarConfig, WindowBarSegment,
 };
 use super::{WorkspaceConfig, WorkspaceModel};
 
@@ -1784,6 +1784,15 @@ impl RedHost {
                     .unwrap_or_default();
                 self.send_request(PluginRequest::UpdatePanel { id, rows });
             }
+            "UpdateTreePanel" => {
+                let id = red_required_string(args, 0, "UpdateTreePanel")?.to_string();
+                let spec = args
+                    .get(1)
+                    .ok_or_else(|| anyhow::anyhow!("UpdateTreePanel requires a tree"))?;
+                let spec = serde_json::from_value::<TreePanelSpec>(value_to_json(spec))?;
+                let model = TreePanelModel::new(spec)?;
+                self.send_request(PluginRequest::UpdateTreePanel { id, model });
+            }
             "OpenPanelSearch" => {
                 let id = red_required_string(args, 0, "OpenPanelSearch")?.to_string();
                 let initial = red_required_string(args, 1, "OpenPanelSearch")?.to_string();
@@ -2892,6 +2901,13 @@ impl RedHost {
         if operation == "status_entries" {
             return neotree_status_entries(args.first());
         }
+        if matches!(operation, "build_rows" | "build_search_rows") {
+            let model = TreePanelModel::from_husk_values(args)?;
+            let rows = (0..model.len())
+                .filter_map(|index| model.row(index))
+                .collect::<Vec<_>>();
+            return Ok(Value::from_json(serde_json::to_value(rows)?));
+        }
         if operation == "update_panel" {
             const EAGER_TREE_ROWS: usize = 192;
             let id = args
@@ -2922,8 +2938,6 @@ impl RedHost {
             "basename" => "path::basename",
             "tree_path" => "path::tree_path",
             "reveal_parts" => "path::reveal_parts",
-            "build_rows" => "tree::build_rows",
-            "build_search_rows" => "tree::build_search_rows",
             _ => anyhow::bail!("unknown Neo-tree core operation `{operation}`"),
         };
 
@@ -2939,15 +2953,7 @@ impl RedHost {
             .as_mut()
             .ok_or_else(|| anyhow::anyhow!("Neo-tree core VM did not initialize"))?;
         let mut host = NativeCoreHost;
-        // A deep, decorated tree can emit several segments per row. Only this
-        // trusted core operation receives extra fuel. Normal trees are
-        // virtualized, while search projections are capped before rendering.
-        if matches!(operation, "build_rows" | "build_search_rows") {
-            vm.set_instruction_budget(PLUGIN_INSTRUCTION_BUDGET * 4);
-        }
-        let result = vm.call_export("red-neotree-core", function, args.to_vec(), &mut host);
-        vm.set_instruction_budget(PLUGIN_INSTRUCTION_BUDGET);
-        let result = result?;
+        let result = vm.call_export("red-neotree-core", function, args.to_vec(), &mut host)?;
         Ok(normalize_native_core_value(result))
     }
 }
@@ -3043,14 +3049,6 @@ fn neotree_core_program() -> anyhow::Result<CompiledProgram> {
                 (
                     "src/path.hk",
                     include_str!("../../plugins/neotree_core/src/path.hk"),
-                ),
-                (
-                    "src/status.hk",
-                    include_str!("../../plugins/neotree_core/src/status.hk"),
-                ),
-                (
-                    "src/tree.hk",
-                    include_str!("../../plugins/neotree_core/src/tree.hk"),
                 ),
             ],
             PackageLimits::default(),
@@ -5482,11 +5480,11 @@ mod tests {
     }
 
     #[test]
-    fn embedded_neotree_core_compiles_as_a_native_multi_file_package_and_renders_typed_rows() {
+    fn neotree_keeps_path_helpers_in_husk_and_renders_rows_in_rust() {
         let program = neotree_core_program().unwrap();
         assert_eq!(program.semantic_profile(), SemanticProfile::Native);
-        assert_eq!(program.source_map().sources().len(), 4);
-        assert_eq!(program.module_semantic_results().len(), 4);
+        assert_eq!(program.source_map().sources().len(), 2);
+        assert_eq!(program.module_semantic_results().len(), 2);
 
         let mut host = RedHost::new(HashMap::new());
         let statuses = host
@@ -5520,8 +5518,8 @@ mod tests {
                             { "name": "src", "path": "./src", "kind": "directory" },
                             { "name": "main.rs", "path": "./main.rs", "kind": "file" }
                         ],
-                        "truncated": true
-                    }])),
+                        "notice": "Cannot read · R retry"
+                    }, { "path": "./src", "entries": [] }])),
                     Value::from_json(serde_json::json!([".", "./src"])),
                     Value::from_json(serde_json::json!(["./main.rs"])),
                     Value::from_json(serde_json::json!([{
@@ -5555,7 +5553,11 @@ mod tests {
             rows[2]["segments"][3]["semantic"]["foreground"][0],
             "gitDecoration.modifiedResourceForeground"
         );
-        assert!(rows[3]["path"].is_null());
+        assert_eq!(rows[3]["id"], "notice:.");
+        assert_eq!(
+            rows[3]["segments"].as_array().unwrap().last().unwrap()["text"],
+            "Cannot read · R retry"
+        );
 
         let error = host
             .call_neotree_core("status_entries", &[Value::String("invalid".to_string())])
@@ -5571,6 +5573,34 @@ mod tests {
                 .contains("unknown Neo-tree core operation"),
             "{error}"
         );
+    }
+
+    #[tokio::test]
+    async fn plugins_can_publish_a_native_tree_without_neotree() {
+        drain_requests();
+        let mut runtime = Runtime::new();
+        runtime.load_plugin("outline", r#"
+            #[red::command(name = "Outline")]
+            fn outline() {
+                red::execute("UpdateTreePanel", "outline", TreePanelSpec {
+                    root: PanelRow { id: "symbols", kind: "directory", segments: [PanelSegment {text: "Symbols"}] },
+                    children: [TreePanelChildren {
+                        parent: "symbols",
+                        rows: [PanelRow { id: "fn:main", kind: "file", segments: [PanelSegment {text: "main"}] }],
+                    }],
+                    expanded: ["symbols"],
+                });
+            }
+        "#).await.unwrap();
+        runtime.execute_command("Outline").await.unwrap();
+        let PluginRequest::UpdateTreePanel { id, model } = ACTION_DISPATCHER.recv_request() else {
+            panic!("expected a native tree update");
+        };
+        assert_eq!(id, "outline");
+        assert_eq!(model.len(), 2);
+        assert_eq!(model.row(1).unwrap().id, "fn:main");
+        assert_eq!(model.row(1).unwrap().path, None);
+        assert_eq!(model.row(1).unwrap().segments.last().unwrap().text, "main");
     }
 
     #[test]
@@ -17166,6 +17196,96 @@ mod tests {
             ACTION_DISPATCHER.recv_request(),
             PluginRequest::SelectPanelRow { row_id, .. }
                 if row_id == "./src/ui/file_picker.rs"
+        ));
+    }
+
+    #[tokio::test]
+    async fn neotree_search_virtualizes_deep_results_without_husk_rendering() {
+        drain_requests();
+        let root = tempfile::tempdir().unwrap();
+        for index in 0..80 {
+            let directory = root.path().join(format!(
+                "group-{index:03}/src/components/features/editor/sidebar/tests"
+            ));
+            std::fs::create_dir_all(&directory).unwrap();
+            std::fs::write(directory.join(format!("needle-{index:03}.rs")), "").unwrap();
+        }
+        let mut runtime = Runtime::new();
+        runtime
+            .load_plugin("neotree", include_str!("../../plugins/neotree.hk"))
+            .await
+            .unwrap();
+        runtime.execute_command("NeoTree").await.unwrap();
+        drain_requests();
+        runtime
+            .notify(
+                "panel:event:neotree",
+                serde_json::json!({"action":"/", "row":null}),
+            )
+            .await
+            .unwrap();
+        runtime
+            .notify(
+                "panel:event:neotree",
+                serde_json::json!({"action":"search_query", "text":"needle", "row":null}),
+            )
+            .await
+            .unwrap();
+        drain_requests();
+        std::thread::sleep(Duration::from_millis(75));
+        for callback in runtime.poll_timer_callbacks() {
+            if let PluginRequest::TimeoutCallback { timer_id } = callback {
+                runtime
+                    .notify("timeout:callback", serde_json::json!({"timer_id":timer_id}))
+                    .await
+                    .unwrap();
+            }
+        }
+        let PluginRequest::SearchWorkspacePaths { request_id, .. } =
+            ACTION_DISPATCHER.recv_request()
+        else {
+            panic!("expected workspace search");
+        };
+        let result = crate::workspace_paths::search_workspace_paths(root.path(), "needle", false);
+        runtime
+            .resolve_request(request_id, serde_json::to_value(result).unwrap())
+            .await
+            .unwrap();
+        assert!(
+            matches!(ACTION_DISPATCHER.recv_request(), PluginRequest::UpdatePanelSearch { status, .. } if status == "80+")
+        );
+        let PluginRequest::UpdateTreePanel { model, .. } = ACTION_DISPATCHER.recv_request() else {
+            panic!("deep search must use the native virtual tree");
+        };
+        assert_eq!(model.len(), 1 + 48 * 8);
+        let first_file = model.row(8).unwrap();
+        assert!(first_file.id.ends_with("needle-000.rs"));
+        assert!(first_file
+            .segments
+            .iter()
+            .any(|segment| segment.text == "needle"
+                && segment
+                    .semantic
+                    .as_ref()
+                    .is_some_and(|style| style.bold == Some(true))));
+        assert!(model
+            .row(model.len() - 1)
+            .unwrap()
+            .id
+            .ends_with("needle-047.rs"));
+        assert!(
+            matches!(ACTION_DISPATCHER.recv_request(), PluginRequest::SelectPanelRow { row_id, .. } if row_id == first_file.id)
+        );
+        runtime
+            .notify(
+                "panel:event:neotree",
+                serde_json::json!({"action":"search_cancel", "row":null}),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::ClosePanelSearch { .. }
         ));
     }
 

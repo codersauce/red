@@ -1,5 +1,5 @@
 {
-  "version": "0.17.0",
+  "version": "0.18.0",
   "calls": [
     { "name": "Print", "kind": "execute", "signature": "(message: String)", "introduced": "0.1.0" },
     { "name": "PrintWarning", "kind": "execute", "signature": "(message: String)", "introduced": "0.15.0" },
@@ -66,6 +66,7 @@
     { "name": "CloseWorkspace", "kind": "execute", "signature": "(id: String)", "introduced": "0.1.0" },
     { "name": "CreatePanel", "kind": "execute", "signature": "(id: String, config: PanelConfig)", "introduced": "0.1.0" },
     { "name": "UpdatePanel", "kind": "execute", "signature": "(id: String, rows: [PanelRow])", "introduced": "0.1.0" },
+    { "name": "UpdateTreePanel", "kind": "execute", "signature": "(id: String, tree: TreePanelSpec)", "introduced": "0.18.0" },
     { "name": "SetPanelStatus", "kind": "execute", "signature": "(id: String, status: String)", "introduced": "0.16.0" },
     { "name": "CancelGitStatus", "kind": "execute", "signature": "(request_id: i64)", "introduced": "0.16.0" },
     { "name": "OpenPanelSearch", "kind": "execute", "signature": "(id: String, initial: String, prefix: String)", "introduced": "0.15.0" },

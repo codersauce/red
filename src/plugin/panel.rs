@@ -9785,6 +9785,33 @@ mod tests {
     }
 
     #[test]
+    fn custom_tree_updates_preserve_selection_and_existing_panel_actions() {
+        let mut spec = super::super::TreePanelSpec {
+            root: PanelRow {
+                kind: PanelRowKind::Directory,
+                ..row("symbols")
+            },
+            children: vec![super::super::TreePanelChildren {
+                parent: "symbols".into(),
+                rows: vec![row("fn:first"), row("fn:second")],
+            }],
+            expanded: vec!["symbols".into()],
+        };
+        let mut manager = PanelManager::default();
+        manager.create_panel("outline".into(), PanelConfig::default());
+        manager.update_tree_panel("outline", TreePanelModel::new(spec.clone()).unwrap());
+        manager.focus_panel("outline");
+        manager.handle_focused_key("bottom", 5, 40, 0).unwrap();
+        spec.children[0].rows.reverse();
+        manager.update_tree_panel("outline", TreePanelModel::new(spec).unwrap());
+        let event = manager.handle_focused_key("activate", 5, 40, 0).unwrap();
+        assert_eq!(event.row.unwrap().id, "fn:second");
+        assert_eq!(event.selected_index, 1);
+        let click = manager.focus_panel_at_position(1, 2, 40, 7).unwrap();
+        assert_eq!(click.row.unwrap().id, "fn:first");
+    }
+
+    #[test]
     fn virtual_tree_rows_remain_selectable_and_render_only_the_viewport() {
         let entries = (0..1_024)
             .map(|index| {

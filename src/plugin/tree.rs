@@ -1,4 +1,4 @@
-//! Compact, lazily decorated row models for large filesystem tree panels.
+//! Rust-owned tree layout shared by custom panels and filesystem trees.
 //!
 //! Directory entries remain shared with the Husk plugin state. The flattened model
 //! retains only entry coordinates and ancestry, and creates rich [`PanelRow`] values
@@ -11,6 +11,7 @@ use std::{
 };
 
 use husk_runtime::Value;
+use serde::{Deserialize, Serialize};
 
 use crate::theme::ThemeStyleSpec;
 
@@ -38,8 +39,63 @@ const FILE_NAME_STYLE: &[&str] = &["sideBar.foreground", "editor.foreground"];
 
 #[derive(Debug, Clone)]
 struct TreeDirectory {
-    entries: Arc<Vec<Value>>,
+    entries: TreeEntries,
     notice: String,
+}
+
+#[derive(Debug, Clone)]
+enum TreeEntries {
+    Filesystem(Arc<Vec<Value>>),
+    Rows(Arc<Vec<PanelRow>>),
+}
+
+impl TreeEntries {
+    fn len(&self) -> usize {
+        match self {
+            Self::Filesystem(entries) => entries.len(),
+            Self::Rows(rows) => rows.len(),
+        }
+    }
+
+    fn entry(&self, index: usize) -> Option<(&str, bool)> {
+        match self {
+            Self::Filesystem(entries) => {
+                let entry = entries.get(index)?;
+                let kind = value_field_string(entry, "kind")?;
+                matches!(kind, "file" | "directory")
+                    .then_some((value_field_string(entry, "path")?, kind == "directory"))
+            }
+            Self::Rows(rows) => rows
+                .get(index)
+                .map(|row| (row.id.as_str(), row.kind == PanelRowKind::Directory)),
+        }
+    }
+}
+
+/// An ordered, caller-decorated tree. IDs are opaque and need not be file paths.
+/// Rust supplies ancestry guides, expansion layout, scrolling, and selection.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TreePanelSpec {
+    pub root: PanelRow,
+    pub children: Vec<TreePanelChildren>,
+    #[serde(default)]
+    pub expanded: Vec<String>,
+}
+
+/// Authoritative children of one node, in display order. An empty list is loaded;
+/// an omitted list displays a loading notice when its parent is expanded.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TreePanelChildren {
+    pub parent: String,
+    pub rows: Vec<PanelRow>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PathMatch {
+    path: String,
+    ranges: Vec<[usize; 2]>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -165,9 +221,11 @@ enum ClipboardAction {
     Move,
 }
 
-/// A complete flattened filesystem tree with viewport-only row decoration.
+/// A complete tree index with viewport-only row decoration. Both custom nodes
+/// and the filesystem adapter use the same layout and panel interaction path.
 #[derive(Debug, Clone)]
 pub struct TreePanelModel {
+    root: Option<PanelRow>,
     cwd: String,
     status_root: String,
     directories: Vec<TreeDirectory>,
@@ -176,14 +234,80 @@ pub struct TreePanelModel {
     statuses: HashMap<String, GitStatus>,
     selected: HashSet<String>,
     clipboard: HashMap<String, ClipboardAction>,
+    matches: HashMap<String, Vec<[usize; 2]>>,
 }
 
 impl TreePanelModel {
+    /// Builds a reusable tree without filesystem or Neo-tree conventions.
+    pub fn new(spec: TreePanelSpec) -> anyhow::Result<Self> {
+        let mut ids = HashMap::from([(spec.root.id.as_str(), &spec.root.kind)]);
+        for children in &spec.children {
+            for row in &children.rows {
+                anyhow::ensure!(
+                    ids.insert(&row.id, &row.kind).is_none(),
+                    "duplicate tree node id `{}`",
+                    row.id
+                );
+            }
+        }
+        anyhow::ensure!(
+            ids.keys().all(|id| !id.starts_with("notice:")),
+            "tree node ids starting with `notice:` are reserved for loading rows"
+        );
+        for children in &spec.children {
+            anyhow::ensure!(
+                ids.get(children.parent.as_str()) == Some(&&PanelRowKind::Directory),
+                "tree parent `{}` must name a directory node",
+                children.parent
+            );
+        }
+        let expanded = spec
+            .expanded
+            .iter()
+            .map(String::as_str)
+            .collect::<HashSet<_>>();
+        let root_expanded =
+            spec.root.kind == PanelRowKind::Directory && expanded.contains(spec.root.id.as_str());
+        let mut directory_indices = HashMap::new();
+        let mut directories = Vec::new();
+        for children in spec.children {
+            anyhow::ensure!(
+                directory_indices
+                    .insert(children.parent, directories.len())
+                    .is_none(),
+                "duplicate tree child listing"
+            );
+            directories.push(TreeDirectory {
+                entries: TreeEntries::Rows(Arc::new(children.rows)),
+                notice: String::new(),
+            });
+        }
+        let mut model = Self {
+            root: Some(spec.root),
+            cwd: String::new(),
+            status_root: String::new(),
+            directories,
+            rows: vec![TreeRow {
+                source: TreeRowSource::Root,
+                parent: None,
+                last: true,
+                expanded: root_expanded,
+            }],
+            last_position: Cell::new(None),
+            statuses: HashMap::new(),
+            selected: HashSet::new(),
+            clipboard: HashMap::new(),
+            matches: HashMap::new(),
+        };
+        model.index_children(&directory_indices, &expanded)?;
+        Ok(model)
+    }
+
     /// Builds a complete index while borrowing shared directory-entry arrays from Husk.
     pub fn from_husk_values(args: &[Value]) -> anyhow::Result<Self> {
         anyhow::ensure!(
-            args.len() == 7,
-            "a tree panel model requires seven arguments"
+            matches!(args.len(), 7 | 8),
+            "a filesystem tree requires seven arguments and optional match ranges"
         );
         let cwd = args[0]
             .as_str()
@@ -233,7 +357,7 @@ impl TreePanelModel {
             };
             directory_indices.insert(path.to_string(), directories.len());
             directories.push(TreeDirectory {
-                entries: Arc::clone(entries),
+                entries: TreeEntries::Filesystem(Arc::clone(entries)),
                 notice: value_field_string(child, "notice")
                     .unwrap_or_default()
                     .to_string(),
@@ -242,6 +366,7 @@ impl TreePanelModel {
 
         let root_expanded = expanded.contains(".");
         let mut model = Self {
+            root: None,
             cwd,
             status_root,
             directories,
@@ -255,15 +380,36 @@ impl TreePanelModel {
             statuses,
             selected,
             clipboard,
+            matches: args
+                .get(7)
+                .map(|value| serde_json::from_value::<Vec<PathMatch>>(value.to_json()))
+                .transpose()?
+                .unwrap_or_default()
+                .into_iter()
+                .map(|entry| (entry.path, entry.ranges))
+                .collect(),
         };
-        if root_expanded {
-            if let Some(&root) = directory_indices.get(".") {
-                model.append_directory(root, 0, &directory_indices, &expanded)?;
+        model.index_children(&directory_indices, &expanded)?;
+        Ok(model)
+    }
+
+    fn root_id(&self) -> &str {
+        self.root.as_ref().map_or(".", |row| row.id.as_str())
+    }
+
+    fn index_children(
+        &mut self,
+        directory_indices: &HashMap<String, usize>,
+        expanded: &HashSet<&str>,
+    ) -> anyhow::Result<()> {
+        if self.rows[0].expanded {
+            if let Some(&root) = directory_indices.get(self.root_id()) {
+                self.append_directory(root, 0, directory_indices, expanded)?;
             } else {
-                model.append_notice(0, None)?;
+                self.append_notice(0, None)?;
             }
         }
-        Ok(model)
+        Ok(())
     }
 
     fn append_directory(
@@ -273,46 +419,51 @@ impl TreePanelModel {
         directory_indices: &HashMap<String, usize>,
         expanded: &HashSet<&str>,
     ) -> anyhow::Result<()> {
-        let entries = Arc::clone(&self.directories[directory].entries);
-        let last = entries.iter().rposition(|entry| {
-            matches!(
-                value_field_string(entry, "kind"),
-                Some("file" | "directory")
-            )
-        });
-        for (index, entry) in entries.iter().enumerate() {
-            let Some(kind @ ("file" | "directory")) = value_field_string(entry, "kind") else {
+        // Use a heap stack so a deep, valid tree cannot overflow the native stack.
+        let mut visited = HashSet::from([directory]);
+        let mut stack = vec![(directory, parent, 0)];
+        while let Some((directory, parent, next)) = stack.last_mut() {
+            let entries = &self.directories[*directory].entries;
+            if *next == entries.len() {
+                let (directory, parent, _) = stack.pop().unwrap();
+                if !self.directories[directory].notice.is_empty() {
+                    self.append_notice(parent, Some(directory))?;
+                }
+                continue;
+            }
+            let index = *next;
+            *next += 1;
+            let Some((path, is_directory)) = entries.entry(index) else {
                 continue;
             };
-            let Some(path) = value_field_string(entry, "path") else {
-                continue;
-            };
-            let open = kind == "directory" && expanded.contains(path);
+            let open = is_directory && expanded.contains(path);
+            let child = open.then(|| directory_indices.get(path).copied()).flatten();
             let row_index = self.rows.len();
             self.rows.push(TreeRow {
                 source: TreeRowSource::Entry {
-                    directory: u32::try_from(directory)
+                    directory: u32::try_from(*directory)
                         .map_err(|_| anyhow::anyhow!("tree directory index exceeds u32"))?,
                     entry: u32::try_from(index)
                         .map_err(|_| anyhow::anyhow!("tree directory entry index exceeds u32"))?,
                 },
                 parent: Some(
-                    u32::try_from(parent)
+                    u32::try_from(*parent)
                         .map_err(|_| anyhow::anyhow!("tree parent index exceeds u32"))?,
                 ),
-                last: Some(index) == last,
+                last: (index + 1..entries.len()).all(|index| entries.entry(index).is_none()),
                 expanded: open,
             });
             if open {
-                if let Some(&child) = directory_indices.get(path) {
-                    self.append_directory(child, row_index, directory_indices, expanded)?;
+                if let Some(child) = child {
+                    anyhow::ensure!(
+                        visited.insert(child),
+                        "tree contains a cycle or repeated branch"
+                    );
+                    stack.push((child, row_index, 0));
                 } else {
                     self.append_notice(row_index, None)?;
                 }
             }
-        }
-        if !self.directories[directory].notice.is_empty() {
-            self.append_notice(parent, Some(directory))?;
         }
         Ok(())
     }
@@ -329,8 +480,12 @@ impl TreePanelModel {
         Ok(())
     }
 
-    pub(crate) fn len(&self) -> usize {
+    pub fn len(&self) -> usize {
         self.rows.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.rows.is_empty()
     }
 
     pub(crate) fn position(&self, id: &str) -> Option<usize> {
@@ -354,24 +509,42 @@ impl TreePanelModel {
 
     fn row_id_matches(&self, row: &TreeRow, id: &str) -> bool {
         match row.source {
-            TreeRowSource::Root => id == ".",
+            TreeRowSource::Root => id == self.root_id(),
             TreeRowSource::Notice { .. } => false,
             TreeRowSource::Entry { directory, entry } => {
                 self.directories[directory as usize]
                     .entries
-                    .get(entry as usize)
-                    .and_then(|value| value_field_string(value, "path"))
+                    .entry(entry as usize)
+                    .map(|(path, _)| path)
                     == Some(id)
             }
         }
     }
 
-    pub(crate) fn row(&self, index: usize) -> Option<PanelRow> {
+    pub fn row(&self, index: usize) -> Option<PanelRow> {
         let row = self.rows.get(index)?;
         match row.source {
             TreeRowSource::Root => Some(self.root_row(row.expanded)),
             TreeRowSource::Notice { directory } => {
-                let parent = self.row(row.parent? as usize)?;
+                let parent = &self.rows[row.parent? as usize];
+                let (parent_id, parent_path) = match parent.source {
+                    TreeRowSource::Root => (
+                        self.root_id(),
+                        self.root
+                            .as_ref()
+                            .map_or(Some("."), |root| root.path.as_deref()),
+                    ),
+                    TreeRowSource::Entry { directory, entry } => {
+                        let entries = &self.directories[directory as usize].entries;
+                        let (id, _) = entries.entry(entry as usize)?;
+                        let path = match entries {
+                            TreeEntries::Filesystem(_) => Some(id),
+                            TreeEntries::Rows(rows) => rows[entry as usize].path.as_deref(),
+                        };
+                        (id, path)
+                    }
+                    TreeRowSource::Notice { .. } => return None,
+                };
                 let text = directory.map_or("Loading…", |directory| {
                     self.directories[directory as usize].notice.as_str()
                 });
@@ -379,8 +552,8 @@ impl TreePanelModel {
                 self.append_branch_segments(index, &mut segments);
                 segments.push(segment(text, INDENT_STYLE, false));
                 Some(PanelRow {
-                    id: format!("notice:{}", parent.id),
-                    path: parent.path,
+                    id: format!("notice:{parent_id}"),
+                    path: parent_path.map(str::to_string),
                     kind: PanelRowKind::Directory,
                     expanded: Some(false),
                     segments,
@@ -388,17 +561,30 @@ impl TreePanelModel {
                 })
             }
             TreeRowSource::Entry { directory, entry } => {
-                let entry = self
-                    .directories
-                    .get(directory as usize)?
-                    .entries
-                    .get(entry as usize)?;
-                self.entry_row(index, row, entry)
+                match &self.directories.get(directory as usize)?.entries {
+                    TreeEntries::Filesystem(entries) => {
+                        self.entry_row(index, row, entries.get(entry as usize)?)
+                    }
+                    TreeEntries::Rows(rows) => {
+                        let mut result = rows.get(entry as usize)?.clone();
+                        let mut segments = Vec::new();
+                        self.append_branch_segments(index, &mut segments);
+                        segments.append(&mut result.segments);
+                        result.segments = segments;
+                        result.expanded = Some(row.expanded);
+                        Some(result)
+                    }
+                }
             }
         }
     }
 
     fn root_row(&self, expanded: bool) -> PanelRow {
+        if let Some(root) = &self.root {
+            let mut root = root.clone();
+            root.expanded = Some(expanded);
+            return root;
+        }
         let name = self.cwd.rsplit('/').next().unwrap_or(&self.cwd);
         let status = self.status_for_path(".");
         PanelRow {
@@ -441,7 +627,12 @@ impl TreePanelModel {
             entry_icon_style(name, status, directory),
             false,
         ));
-        segments.push(segment(name, entry_name_style(status, directory), false));
+        append_name_segments(
+            name,
+            self.matches.get(path).map(Vec::as_slice),
+            entry_name_style(status, directory),
+            &mut segments,
+        );
         Some(PanelRow {
             id: path.to_string(),
             path: Some(path.to_string()),
@@ -523,6 +714,49 @@ fn value_array<'a>(value: &'a Value, name: &str) -> anyhow::Result<&'a [Value]> 
     match value {
         Value::Array(values) => Ok(values.as_slice()),
         _ => anyhow::bail!("tree panel {name} must be an array"),
+    }
+}
+
+fn append_name_segments(
+    name: &str,
+    matches: Option<&[[usize; 2]]>,
+    style: &[&str],
+    segments: &mut Vec<PanelSegment>,
+) {
+    let Some(ranges) = matches.filter(|ranges| !ranges.is_empty()) else {
+        segments.push(segment(name, style, false));
+        return;
+    };
+    // Search ranges use Unicode scalar offsets, while Rust string slices use bytes.
+    let offsets = name
+        .char_indices()
+        .map(|(offset, _)| offset)
+        .chain(std::iter::once(name.len()))
+        .collect::<Vec<_>>();
+    let mut cursor = 0;
+    for &[start, end] in ranges {
+        let (Some(&start), Some(&end)) = (offsets.get(start), offsets.get(end)) else {
+            continue;
+        };
+        if start < cursor || end <= start {
+            continue;
+        }
+        if start > cursor {
+            segments.push(segment(&name[cursor..start], style, false));
+        }
+        segments.push(segment(
+            &name[start..end],
+            &[
+                "list.highlightForeground",
+                "editor.findMatchHighlightForeground",
+                "editor.foreground",
+            ],
+            true,
+        ));
+        cursor = end;
+    }
+    if cursor < name.len() {
+        segments.push(segment(&name[cursor..], style, false));
     }
 }
 
@@ -682,6 +916,85 @@ fn segment(text: impl Into<String>, foreground: &[&str], bold: bool) -> PanelSeg
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn custom_trees_preserve_order_decoration_and_opaque_ids() {
+        let spec: TreePanelSpec = serde_json::from_value(serde_json::json!({
+            "root": { "id": "outline", "kind": "directory", "segments": [{"text":"Symbols"}] },
+            "children": [
+                { "parent":"outline", "rows":[
+                    {"id":"type:Zoo", "kind":"directory", "segments":[{"text":"Zoo"}]},
+                    {"id":"fn:alpha", "kind":"file", "segments":[{"text":"alpha"}]}
+                ]},
+                { "parent":"type:Zoo", "rows":[
+                    {"id":"method:new", "kind":"file", "segments":[{"text":"new", "semantic":{"foreground":["scope:entity.name.function"]}}], "right_segments":[{"text":"public"}]}
+                ]}
+            ],
+            "expanded":["outline", "type:Zoo"]
+        })).unwrap();
+        let tree = TreePanelModel::new(spec.clone()).unwrap();
+        assert_eq!(
+            (0..tree.len())
+                .map(|index| tree.row(index).unwrap().id)
+                .collect::<Vec<_>>(),
+            ["outline", "type:Zoo", "method:new", "fn:alpha"]
+        );
+        let method = tree.row(2).unwrap();
+        assert_eq!(method.path, None);
+        assert_eq!(method.segments[1].text, "└ ");
+        assert_eq!(
+            method.segments[2].semantic.as_ref().unwrap().foreground,
+            ["scope:entity.name.function"]
+        );
+        assert_eq!(method.right_segments[0].text, "public");
+        let mut collapsed = spec.clone();
+        collapsed.expanded.pop();
+        assert_eq!(TreePanelModel::new(collapsed).unwrap().len(), 3);
+
+        let mut duplicate = spec.clone();
+        duplicate.children[0].rows[0].id = "outline".into();
+        assert!(TreePanelModel::new(duplicate)
+            .unwrap_err()
+            .to_string()
+            .contains("duplicate"));
+        let mut reserved = spec.clone();
+        reserved.children[0].rows[1].id = "notice:type:Zoo".into();
+        assert!(TreePanelModel::new(reserved).is_err());
+        let mut invalid_parent = spec;
+        invalid_parent.children[0].parent = "fn:alpha".into();
+        assert!(TreePanelModel::new(invalid_parent).is_err());
+    }
+
+    #[test]
+    fn search_highlights_preserve_unicode_and_filename_styles() {
+        let mut segments = Vec::new();
+        append_name_segments(
+            "é界picker.rs",
+            Some(&[[99, 100], [4, 3], [2, 6], [3, 4]]),
+            FILE_NAME_STYLE,
+            &mut segments,
+        );
+        assert_eq!(
+            segments
+                .iter()
+                .map(|segment| segment.text.as_str())
+                .collect::<Vec<_>>(),
+            ["é界", "pick", "er.rs"]
+        );
+        assert_eq!(
+            segments[0].semantic.as_ref().unwrap().foreground,
+            FILE_NAME_STYLE
+        );
+        assert_eq!(
+            segments[1].semantic.as_ref().unwrap().foreground[0],
+            "list.highlightForeground"
+        );
+        assert_eq!(segments[1].semantic.as_ref().unwrap().bold, Some(true));
+        assert_eq!(
+            segments[2].semantic.as_ref().unwrap().foreground,
+            FILE_NAME_STYLE
+        );
+    }
 
     fn model(children: serde_json::Value, expanded: serde_json::Value) -> TreePanelModel {
         TreePanelModel::from_husk_values(&[

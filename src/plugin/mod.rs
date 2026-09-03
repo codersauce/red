@@ -50,7 +50,7 @@ pub use runtime::{
     CommandMetadata, CommandScope, ComposerHandle, PickerHandle, RegisteredPluginCommand,
     RequestId, Runtime,
 };
-pub use tree::TreePanelModel;
+pub use tree::{TreePanelChildren, TreePanelModel, TreePanelSpec};
 
 pub(crate) fn husk_lsp_declarations() -> &'static str {
     runtime::RED_HOST_DECLARATIONS
