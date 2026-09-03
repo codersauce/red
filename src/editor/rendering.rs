@@ -628,11 +628,12 @@ fn statusline_segments(
 ) -> Vec<StatuslineSegment> {
     sections
         .into_iter()
-        .filter_map(|section| statusline_segment(section, context, theme, icon_style, color_icons))
+        // Hidden sections must not shift the remaining sections into different color slots.
         .enumerate()
-        .map(|(index, mut segment)| {
+        .filter_map(|(index, section)| {
+            let mut segment = statusline_segment(section, context, theme, icon_style, color_icons)?;
             segment.style = statusline_slot_style(theme, index);
-            segment
+            Some(segment)
         })
         .collect()
 }
@@ -5591,7 +5592,7 @@ mod tests {
     }
 
     #[test]
-    fn hidden_left_statusline_sections_reassign_visible_slot_styles() {
+    fn hidden_left_statusline_sections_preserve_configured_slot_styles() {
         const WIDTH: usize = 80;
         const HEIGHT: usize = 12;
 
@@ -5613,8 +5614,8 @@ mod tests {
         let clean = rendered_statusline(&mut editor, WIDTH, HEIGHT);
         assert_eq!(
             statusline_cell(&clean, HEIGHT, "z").style,
-            statusline_slot_style(&theme, 1),
-            "filename should occupy the second visible slot when diagnostics are absent"
+            statusline_slot_style(&theme, 2),
+            "filename should keep its configured style when diagnostics are absent"
         );
 
         editor.diagnostics.insert(
@@ -5628,7 +5629,7 @@ mod tests {
         assert_eq!(
             statusline_cell(&diagnosed, HEIGHT, "z").style,
             statusline_slot_style(&theme, 2),
-            "filename should occupy the third visible slot when diagnostics are present"
+            "filename should keep its configured style when diagnostics are present"
         );
 
         let diagnostic_style = statusline_slot_style(&theme, 1);
@@ -5651,10 +5652,15 @@ mod tests {
             statusline_cell(&diagnosed, HEIGHT, "").style.fg,
             Some(expected_warning)
         );
+
+        editor.diagnostics.clear();
+        let mut cleared = diagnosed;
+        editor.draw_statusline(&mut cleared);
+        assert_eq!(cleared.cells, clean.cells);
     }
 
     #[test]
-    fn hidden_right_statusline_sections_reassign_visible_slot_styles() {
+    fn hidden_right_statusline_sections_preserve_configured_slot_styles() {
         const WIDTH: usize = 80;
         const HEIGHT: usize = 12;
 
@@ -5676,7 +5682,7 @@ mod tests {
         let clean = rendered_statusline(&mut editor, WIDTH, HEIGHT);
         assert_eq!(
             statusline_cell(&clean, HEIGHT, "z").style,
-            statusline_slot_style(&theme, 1)
+            statusline_slot_style(&theme, 2)
         );
 
         editor.diagnostics.insert(
@@ -5691,6 +5697,63 @@ mod tests {
             statusline_cell(&diagnosed, HEIGHT, "z").style,
             statusline_slot_style(&theme, 2)
         );
+
+        editor.diagnostics.clear();
+        let mut cleared = diagnosed;
+        editor.draw_statusline(&mut cleared);
+        assert_eq!(cleared.cells, clean.cells);
+    }
+
+    #[test]
+    fn hidden_git_statusline_sections_leave_no_color_band_or_separator() {
+        const WIDTH: usize = 80;
+        const HEIGHT: usize = 5;
+
+        let directory = tempfile::tempdir().unwrap();
+        let directory = directory.path().canonicalize().unwrap();
+        let filename = directory.join("zeta.md").to_string_lossy().into_owned();
+        let mut theme = statusline_test_theme();
+        theme.statusline_style.outer_chars = [' ', '>', '<', ' '];
+
+        for right in [false, true] {
+            let mut config = Config::default();
+            config.statusline.left.clear();
+            config.statusline.right.clear();
+            let sections = vec![
+                StatuslineSection::Mode,
+                StatuslineSection::Diagnostics,
+                StatuslineSection::GitBranch,
+                StatuslineSection::Filename,
+            ];
+            if right {
+                config.statusline.right = sections;
+            } else {
+                config.statusline.left = sections;
+            }
+            let lsp = Box::new(LspManager::new(config.lsp.clone()));
+            let source = Buffer::new(Some(filename.clone()), String::new());
+            let mut editor =
+                Editor::with_size(lsp, WIDTH, HEIGHT, config, theme.clone(), vec![source]).unwrap();
+            editor.statusline_git_cache.working_directory = directory.clone();
+
+            let frame = rendered_statusline(&mut editor, WIDTH, HEIGHT);
+            assert!(editor.statusline_git_cache.branch.is_none());
+            assert_eq!(
+                statusline_cell(&frame, HEIGHT, "z").style,
+                theme.statusline_style.inner_style
+            );
+            let separator = statusline_cell(&frame, HEIGHT, if right { "<" } else { ">" });
+            assert_eq!(separator.style.fg, theme.statusline_style.outer_style.bg);
+            assert_eq!(separator.style.bg, theme.statusline_style.inner_style.bg);
+            assert_eq!(
+                editor.test_statusline_row().trim(),
+                if right {
+                    "zeta.md < NORMAL"
+                } else {
+                    "NORMAL > zeta.md"
+                }
+            );
+        }
     }
 
     #[test]
