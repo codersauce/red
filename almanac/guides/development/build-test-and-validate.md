@@ -15,6 +15,9 @@ sources:
   - id: plugin-check
     type: file
     path: .github/workflows/plugin-check.yml
+  - id: performance
+    type: file
+    path: .github/workflows/performance.yml
   - id: test-performance
     type: file
     path: .github/workflows/test-performance.yml
@@ -107,7 +110,7 @@ The workflow lint job validates GitHub Actions, checks the README release
 version, and runs Discord announcement and validation-helper tests [@ci]. The
 CI `fmt` and `self-check` jobs run rustfmt and
 `cargo run --locked -- --self-check`; the separate path-filtered Performance
-workflow runs the release-mode Husk cursor benchmark with `--assert`. The paid
+workflow runs the release-mode Husk cursor benchmark with `--assert` [@performance]. The paid
 test job also validates the vendored Crossterm keyboard decoder and, on Unix
 runners, drives `red keys` through a PTY to cover legacy, Kitty CSI-u, xterm,
 fragmented, repeat, release, and automatic negotiation cases [@ci]
