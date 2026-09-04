@@ -65,9 +65,10 @@ class ReleaseCampaignTest(unittest.TestCase):
     def test_renders_github_intro_with_prerequisites_and_ordered_stories(self) -> None:
         output = render(self.campaign, "github")
 
-        self.assertIn("### Release highlights", output)
+        self.assertIn("### Three things to try", output)
+        self.assertIn("### More in this release", output)
         self.assertIn("codex login", output)
-        self.assertLess(output.index("jump to the exact source"), output.index("Vim-style Ctrl-n"))
+        self.assertLess(output.index("Follow an Agent explanation"), output.index("Ctrl-n"))
 
     def test_social_previews_are_bounded_and_include_destination(self) -> None:
         for channel, limit in SOCIAL_LIMITS.items():
@@ -75,8 +76,14 @@ class ReleaseCampaignTest(unittest.TestCase):
                 output = render(self.campaign, channel)
 
                 self.assertLessEqual(len(output.rstrip("\n")), limit)
-                self.assertIn("https://getred.dev", output)
-                self.assertIn("jump to the exact source", output)
+                self.assertIn("https://github.com/codersauce/red/releases/latest", output)
+                self.assertIn("source", output)
+
+        resolved = copy.deepcopy(self.campaign)
+        resolved["version"] = "0.7.0"
+        for channel, limit in SOCIAL_LIMITS.items():
+            self.assertLessEqual(len(render(resolved, channel).rstrip("\n")), limit)
+            self.assertIn("Red v0.7.0 is out", render(resolved, channel))
 
     def test_channel_specific_stories_do_not_leak_into_x_preview(self) -> None:
         output = render(self.campaign, "x")

@@ -59,6 +59,17 @@ def validate_campaign(
             raise CampaignError(f"{key} must be a nonempty string")
     if not campaign["website"].startswith("https://"):
         raise CampaignError("website must be an HTTPS URL")
+    if "discord_image" in campaign and (
+        not isinstance(campaign["discord_image"], str)
+        or not campaign["discord_image"].startswith("https://")
+    ):
+        raise CampaignError("discord_image must be a direct HTTPS URL")
+    for channel in SOCIAL_LIMITS:
+        template = campaign.get(f"{channel}_post")
+        if not isinstance(template, str) or not all(
+            placeholder in template for placeholder in ("{launch}", "{url}")
+        ):
+            raise CampaignError(f"{channel}_post must contain {{launch}} and {{url}}")
 
     stories = campaign.get("stories")
     if not isinstance(stories, list) or not stories:
@@ -116,8 +127,12 @@ def render_github(campaign: Mapping[str, Any]) -> str:
         if version != "next"
         else f"## Red: {campaign['headline']}"
     )
-    lines = [heading, "", campaign["summary"], "", "### Release highlights", ""]
-    for story in stories_for_channel(campaign, "github"):
+    stories = stories_for_channel(campaign, "github")
+    lines = [heading, "", campaign["summary"], "", "### Three things to try", ""]
+    for number, story in enumerate(stories[:3], start=1):
+        lines.append(f"{number}. **{story['title']}.** {story['summary']}")
+    lines.extend(("", "### More in this release", ""))
+    for story in stories[3:]:
         label = "New" if story["status"] == "new" else "Improved"
         lines.append(f"- **{label}: {story['title']}.** {story['summary']}")
     lines.extend(("", "Agent support requires an installed Codex CLI and `codex login`."))
@@ -132,23 +147,17 @@ def render_bullets(campaign: Mapping[str, Any], channel: str) -> str:
 
 
 def render_social(campaign: Mapping[str, Any], channel: str) -> str:
-    """Build a bounded, preview-only social post without publishing anything."""
+    """Render reviewed platform copy without publishing anything."""
     limit = SOCIAL_LIMITS[channel]
     version = campaign["version"]
-    introduction = "Red: a modal editor with an editor-aware coding agent"
-    if version != "next":
-        introduction = f"Red v{version}: modal editing meets editor-aware agents"
-    ending = "\n\n" + campaign["website"]
-    lines = [introduction]
-    for story in stories_for_channel(campaign, channel):
-        candidate = "\n".join([*lines, f"- {story['title']}"]) + ending
-        if len(candidate) <= limit:
-            lines.append(f"- {story['title']}")
-    result = "\n".join(lines) + ending
-    if len(lines) == 1:
-        raise CampaignError(f"no campaign stories fit within the {channel} limit")
+    launch = f"Red v{version} is out" if version != "next" else "Red's next release"
+    result = (
+        campaign[f"{channel}_post"]
+        .replace("{launch}", launch)
+        .replace("{url}", campaign["website"])
+    )
     if len(result) > limit:
-        raise CampaignError(f"{channel} preview exceeds {limit} characters")
+        raise CampaignError(f"{channel} post exceeds {limit} characters")
     return result + "\n"
 
 
