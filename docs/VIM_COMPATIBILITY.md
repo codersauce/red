@@ -1,13 +1,12 @@
 # Red Vim compatibility matrix
 
 **Matrix version:** 1.10
-**Tracked against:** Red `main`, August 2026; the latest published release is 0.6.0
+**Tracked against:** Red v0.7.0
 **Status vocabulary:** **supported**, **intentional difference**, **not yet supported**
 
 “Real Vim keys” means the rows marked **supported** below. It does not mean complete
 Vim emulation. Every release that changes editing behavior must update this document and
-the corresponding integration tests. Rows explicitly marked **next release**
-describe tested behavior on `main`, not the currently published v0.6.0 binary.
+the corresponding integration tests.
 
 ## Normal editing
 
@@ -50,7 +49,7 @@ describe tested behavior on `main`, not the currently published v0.6.0 binary.
 | Visual character | **supported** | Motions, supported text objects, yank/delete/change/paste, and Unicode selections. |
 | Visual line | **supported** | Linewise yank/delete/change/paste, including whole-document and interior replacements. |
 | Visual block | **supported** | Block delete/change/insert, one-transaction replay, undo/redo, and dot-repeat for block insert. |
-| Multi-cursor selections (**next release**) | **supported** | In Normal mode, `Ctrl-n` selects successive whole-word occurrences; from a single-line characterwise Visual selection, it uses the exact selected text and immediately adds the next literal occurrence. `Ctrl-Up` / `Ctrl-Down` add vertical cursors while preserving display columns. `n` / `N` navigate matches, `q` skips, and `Q` removes the active selection. `Tab` toggles extend mode; Shift-arrows and `h`, `l`, `w`, `e`, `0`, and `$` extend complete Unicode graphemes, and `o` reverses each anchor. `c`, `i`, `a`, `d`, `x`, `y`, `p`, and `P` apply across selections. Insert, change, delete, and paste are grouped into one undoable edit. |
+| Multi-cursor selections | **supported** | In Normal mode, `Ctrl-n` selects successive whole-word occurrences; from a single-line characterwise Visual selection, it uses the exact selected text and immediately adds the next literal occurrence. `Ctrl-Up` / `Ctrl-Down` add vertical cursors while preserving display columns. `n` / `N` navigate matches, `q` skips, and `Q` removes the active selection. `Tab` toggles extend mode; Shift-arrows and `h`, `l`, `w`, `e`, `0`, and `$` extend complete Unicode graphemes, and `o` reverses each anchor. `c`, `i`, `a`, `d`, `x`, `y`, `p`, and `P` apply across selections. Insert, change, delete, and paste are grouped into one undoable edit. |
 | Restore Visual selection | **supported** | `gv` restores the previous buffer-local Visual area with its character, line, or block shape and original direction. In Visual mode it exchanges the current and previous areas. Selection metadata survives session recovery, while `<` and `>` continue to track edits. |
 | Visual indent | **supported** | `[count]>` and `[count]<` shift every covered line right or left by `count × shiftwidth` in one undoable transaction for character, line, and block selections. Empty lines remain empty, indentation saturates at column zero, `.` repeats the shift over the same number of lines from the current line, and `gv` restores the shifted range. |
 | Visual `r` replace and case changes | **supported** | Visual `r{char}`, `u`, `U`, and `~` replace/change the selection in one transaction, including shifted terminal key events and Visual-line/block selections. |

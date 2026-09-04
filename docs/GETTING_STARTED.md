@@ -1,8 +1,6 @@
 # Getting started with Red
 
-This guide covers the day-to-day editor workflow on the current development
-branch. The latest published release is v0.6.0; features labeled **coming in
-the next release** are available on `main` but not in that published binary.
+This guide covers the day-to-day editor workflow in Red v0.7.0.
 For installation, see the [README](../README.md#install).
 
 ## First launch
@@ -20,9 +18,8 @@ Set an explicit workspace root with `-r`:
 red -r path/to/project src/main.rs
 ```
 
-**Coming in the next release:** The first interactive launch opens a
-keyboard-first welcome screen inside the editor. Start its guided tour, press
-`i` for a shorter tour, view release
+The first interactive launch opens a keyboard-first welcome screen inside the
+editor. Start its guided tour, press `i` for a shorter tour, view release
 highlights, or press `Esc` to begin editing immediately. Use `:welcome` to
 reopen it later.
 
@@ -105,8 +102,8 @@ pair.
 
 ## Multi-cursor editing
 
-**Coming in the next release:** Red supports built-in, Vim-style multi-cursor
-editing without an extra plugin. In Normal mode:
+Red supports built-in, Vim-style multi-cursor editing without an extra plugin.
+In Normal mode:
 
 | Key | Action |
 | --- | --- |
@@ -182,10 +179,10 @@ Ctrl-Space and language-server trigger characters. To stop only identifier-prefi
 popups, use `auto_trigger = false` instead; Ctrl-Space and language-server trigger
 characters remain available. Neither setting enables or disables Copilot.
 
-**Coming in the next release:** Supported documents are formatted on save by
-default, and pasted ranges are formatted when the active language server
-supports range formatting. Red prefers an installed language-pack formatter
-for whole-document formatting and otherwise uses LSP. Disable either behavior
+Supported documents are formatted on save by default, and pasted ranges are
+formatted when the active language server supports range formatting. Red
+prefers an installed language-pack formatter for whole-document formatting and
+otherwise uses LSP. Disable either behavior
 in `~/.config/red/config.toml`:
 
 ```toml
@@ -378,10 +375,10 @@ the current Red session, subject to the history limit.
 
 ## Files changed outside Red
 
-**Coming in the next release:** Red watches open files and protects your work
-when another editor, formatter, Git operation, or agent changes them on disk.
-A clean buffer reloads automatically. A dirty buffer remains unchanged, and Red
-marks the conflict instead of overwriting either version. Deleted files stay
+Red watches open files and protects your work when another editor, formatter,
+Git operation, or agent changes them on disk. A clean buffer reloads
+automatically. A dirty buffer remains unchanged, and Red marks the conflict
+instead of overwriting either version. Deleted files stay
 open and receive their own conflict indicator.
 
 Run `:diffdisk` to compare the disk and buffer versions in a unified diff.
@@ -452,11 +449,10 @@ request such as `extract the condition into a named boolean` or `review this
 function for edge cases`.
 
 Inline code changes are one **unsaved, undoable editor transaction**. Comments
-and explanations never modify source. The published v0.6.0 release requires
-explicit review for every code change. **Coming in the next release:** Exact
-foreground results apply immediately by default; set
-`[agent] auto_apply_inline_edits = false` to review them first. Background
-results and wider same-file edits always require explicit approval. In a review
+and explanations never modify source. Exact foreground results apply
+immediately by default; set `[agent] auto_apply_inline_edits = false` to review
+them first. Background results and wider same-file edits always require
+explicit approval. In a review
 diff, `a` approves, `d` declines, and `Enter` does not apply the change.
 
 Use `u` to undo an applied result, `r` to refine it, `Space H` to inspect retained
@@ -471,14 +467,13 @@ Codex reads and changes files through Red's workspace-confined editor tools;
 revision-checked Agent writes are attributed to the conversation and **saved
 to disk**. This differs intentionally from unsaved inline edits.
 
-The published v0.6.0 release follows every file tool visually. **Coming in the
-next release:** Tool calls run without forced playback pauses by default; set
+Tool calls run without forced playback pauses by default; set
 `[agent] follow_tool_calls = true` to reveal each target and pause before it runs.
 
-**Also coming in the next release:** Ask the Agent to explain a subsystem and
-follow links in its answer directly to source-anchored annotations. Click the
-model in the Agent header, press `Alt+m`, or run `:AgentModel` to choose the
-model and reasoning effort for this conversation without modifying global Codex
+Ask the Agent to explain a subsystem and follow links in its answer directly
+to source-anchored annotations. Click the model in the Agent header, press
+`Alt+m`, or run `:AgentModel` to choose the model and reasoning effort for this
+conversation without modifying global Codex
 configuration.
 
 See the [agent workflow and safety contract](AGENT_WORKFLOW.md) for the full
