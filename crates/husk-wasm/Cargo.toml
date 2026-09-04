@@ -14,7 +14,7 @@ husk-value.workspace = true
 semver = "1.0"
 serde_json = "1.0.113"
 thiserror = "1.0"
-wasmtime = { version = "46.0.2", default-features = false, features = [
+wasmtime = { version = "46.0.3", default-features = false, features = [
     "anyhow",
     "component-model",
     "cranelift",
