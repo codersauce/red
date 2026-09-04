@@ -70,7 +70,7 @@ Integration coverage matches that contract. Movement tests cover the default key
 
 ## Intentional Differences
 
-Red implements a documented Ex subset and does not implement Vimscript [@vim-doc]. Its default keys intentionally diverge in several places: `;` is an additional command-line entry key, `W` toggles wrapping, and `Ctrl-e` opens NeoTree, though defaults can be remapped [@vim-doc]. Multi-window compatibility is also scoped to Red's published `Ctrl-w` subset rather than arbitrary Vim layouts and every resizing command [@vim-doc].
+Red implements a documented Ex subset and does not implement Vimscript [@vim-doc]. Its default keys intentionally diverge in several places: `gW` toggles wrapping and `Ctrl-e` opens NeoTree, while `:` enters command-line mode and `;` and `W` retain their Vim meanings as repeat character search and big-word motion [@default-config] [@vim-doc]. Multi-window compatibility is also scoped to Red's published `Ctrl-w` subset rather than arbitrary Vim layouts and every resizing command [@vim-doc].
 
 Regex syntax is the most visible editing-language difference. Search and substitute use Rust `regex`, including capture expansion and escaped delimiters for substitution, so behavior can be compatible at the command level while differing in pattern dialect [@vim-doc]. Future compatibility work must preserve this distinction unless the underlying parser and tests change [@vim-doc].
 

@@ -9,6 +9,9 @@ sources:
   - id: config
     type: file
     path: src/config.rs
+  - id: editor
+    type: file
+    path: src/editor.rs
 ---
 
 # Default Config
@@ -78,7 +81,7 @@ The default `[plugins]` table enables bundled Husk plugins: `agent`, `barbecue`,
 
 ## LSP And Commenting
 
-`[lsp]` defaults to enabled, with built-in server definitions for Rust, Husk, TypeScript/JavaScript, Markdown, JSON, TOML, YAML, Lua, and Fish [@config]. Formatting on save is enabled by default through `formatting.on_save`; set it to `false` to disable automatic formatting. `formatting.provider` defaults to `"auto"`, which prefers an installed language-pack formatter and otherwise uses LSP. The legacy `lsp.format_on_save` setting remains an alias, with the modern key winning within the same config layer [@config]. The default file documents both legacy single-language server configuration and preferred multi-document selectors [@defaults]. User server tables merge into the built-in server map rather than replacing the entire map [@config]. Use [LSP Configuration](../lsp/configuration) for the exact built-in server table and per-server fields.
+`[lsp]` defaults to enabled, with built-in server definitions for Rust, Husk, TypeScript/JavaScript, Markdown, JSON, TOML, YAML, Lua, and Fish [@config]. Formatting on paste and save is enabled by default through `formatting.on_paste` and `formatting.on_save`; paste formatting reindents locally and can request LSP range formatting for the changed range when available [@defaults] [@config] [@editor]. `formatting.provider` defaults to `"auto"`, which prefers an installed language-pack formatter and otherwise uses LSP. The legacy `lsp.format_on_save` setting remains an alias, with the modern key winning within the same config layer [@config]. The default file documents both legacy single-language server configuration and preferred multi-document selectors [@defaults]. User server tables merge into the built-in server map rather than replacing the entire map [@config]. Use [LSP Configuration](../lsp/configuration) for the exact built-in server table and per-server fields.
 
 Comment templates are keyed by language or extension and use a single `%s` placeholder [@defaults] [@config]. The shipped defaults cover Bash, C-family extensions, CSS/SCSS, Go, HTML/XML, Husk, Java, JavaScript/TypeScript/JSX/TSX, JSONC, Lua, Markdown, PowerShell, Rust, SQL, TOML, and YAML [@defaults] [@config].
 

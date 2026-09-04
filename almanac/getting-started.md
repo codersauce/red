@@ -15,6 +15,12 @@ sources:
   - id: learning
     type: file
     path: almanac/architecture/editor/learning-and-tutorial.md
+  - id: agent-hub
+    type: file
+    path: almanac/architecture/agent/README.md
+  - id: sessions-hub
+    type: file
+    path: almanac/architecture/sessions/README.md
 ---
 
 Red is a modal terminal editor with a self-contained Rust binary, embedded runtime assets, optional Codex agent integration, Husk plugins, language tooling, crash recovery, and Unix detachable sessions. The quickest path through this wiki is to start with the [Red editor concept](concepts/red-editor), then follow the architecture page for the subsystem you need to change. The repository README describes Red as "the modal editor for the agent era" and highlights its bundled defaults, safer agent workflow, Husk runtime, recovery, and detach support [@readme].
@@ -37,7 +43,7 @@ Read [Plugin architecture](architecture/plugins) when changing bundled plugins o
 
 ## Agent Work
 
-Read [Agent-attributed edits](concepts/agent-attributed-edits) before changing agent behavior. The README states the user-facing contract: Codex receives editor context, Red reveals each tool call, and edits apply and save through the editor [@readme]. The deeper reading order starts at [Agent architecture](architecture/agent), then continues through the Codex app-server flow, followed editing, dynamic tools, and history guide.
+Read [Agent-attributed edits](concepts/agent-attributed-edits) before changing agent behavior. The README states the user-facing contract: Codex receives editor context, Red reveals each tool call, and edits apply and save through the editor [@readme]. The deeper reading order starts at [Agent architecture](architecture/agent), then continues through Codex app-server process control, dynamic tool definitions, followed editing, attributed edit history, and operational inspection [@agent-hub].
 
 ## Husk Work
 
@@ -46,6 +52,7 @@ Read [Husk language](concepts/husk-language) before touching the scripting langu
 ## Sessions And Recovery
 
 Read [Detach versus recovery](concepts/sessions/detach-vs-recovery) when deciding whether a problem concerns a live owner process or a persisted snapshot. The README distinguishes Unix detach/attach sessions, which preserve live editor state across terminal or SSH disconnects, from atomic crash recovery, which restores persisted work after an editor crash or restart [@readme].
+Then use [Sessions architecture](architecture/sessions) for the implementation split, [Detach and reattach](guides/sessions/detach-reattach) when the owner process is still alive, and [Resume after crash](guides/sessions/resume-after-crash) when the task is persisted snapshot recovery [@sessions-hub].
 
 ## Development Path
 

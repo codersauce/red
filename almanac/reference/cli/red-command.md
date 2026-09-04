@@ -1,6 +1,6 @@
 ---
 title: "Red Command"
-summary: "The `red` command exposes editor startup, utility checks, plugin management, language grammar checks, runtime asset operations, detach control, config overrides, and internal hidden boundaries."
+summary: "The `red` command exposes editor startup, utility checks, keyboard diagnostics, plugin management, language grammar checks, runtime asset operations, detach control, config overrides, and internal hidden boundaries."
 topics: [reference, cli, startup, plugins]
 sources:
   - id: cli
@@ -9,6 +9,9 @@ sources:
   - id: main
     type: file
     path: src/main.rs
+  - id: keyboard
+    type: file
+    path: src/keyboard.rs
   - id: readme
     type: file
     path: README.md
@@ -19,7 +22,7 @@ sources:
 
 # Red Command
 
-The `red` command is the public entrypoint for opening the editor, forwarding Husk subcommands, running non-interactive diagnostics, managing external plugins and native grammar checks, managing Unix detachable sessions, and copying runtime assets into user configuration [@cli] [@main]. Its argument parser is defined in `src/cli.rs`, while `src/main.rs` selects the lifecycle branch for each parsed mode before editor state is constructed [@cli] [@main].
+The `red` command is the public entrypoint for opening the editor, forwarding Husk subcommands, running non-interactive diagnostics, inspecting terminal keyboard input, managing external plugins and native grammar checks, managing Unix detachable sessions, and copying runtime assets into user configuration [@cli] [@main]. Its argument parser is defined in `src/cli.rs`, while `src/main.rs` selects the lifecycle branch for each parsed mode before editor state is constructed [@cli] [@main].
 
 ## Invocation Forms
 
@@ -27,6 +30,7 @@ The `red` command is the public entrypoint for opening the editor, forwarding Hu
 | --- | --- |
 | `red [OPTIONS] [FILES]...` | Starts the interactive editor unless a utility or detach-control flag exits earlier [@cli] [@main]. |
 | `red husk ...` | Forwards arguments to the bundled Husk CLI by rewriting the program name to `red husk` and returning through `husk_cli::run_from` [@main]. |
+| `red keys [--protocol auto|legacy|kitty|xterm] [--count <N>]` | Runs the terminal keyboard diagnostic without starting the editor; it negotiates the selected protocol, prints decoded Enter, Backspace, modified shortcuts, and hidden-key summaries, and exits on `Esc`, `Ctrl-C`, or after the optional count [@cli] [@main] [@keyboard]. |
 | `red plugin ...` | Runs non-interactive external plugin package management without starting the editor [@cli] [@main]. |
 | `red language ...` | Approves or revokes native grammar trust, or checks indentation fixtures against the effective language configuration, without starting the editor [@cli] [@main]. |
 | `red --version` | Uses Clap's generated version output [@cli]. |
@@ -56,7 +60,7 @@ The README and getting-started guide present `red path/to/file`, multiple files,
 | `--eject <ASSET>` | Copies a bundled or runtime asset into the user config directory without overwriting an existing user file [@cli] [@main]. |
 | `--eject-force <ASSET>` | Copies the asset and allows overwrite of an existing user file [@cli] [@main]. |
 
-`Args::utility_requested` includes `--runtime-files`, `--check-config`, `--agent-check`, hidden `--self-check`, `--eject`, `--eject-force`, and hidden process-editor replacement [@cli]. `Args::validate_utility_args` rejects utility modes combined with files to edit, except the hidden process-editor replacement mode, which requires exactly one target file [@cli].
+`Args::utility_requested` treats any root subcommand as a utility, and also includes `--runtime-files`, `--check-config`, `--agent-check`, hidden `--self-check`, `--eject`, `--eject-force`, and hidden process-editor replacement [@cli]. `Args::validate_utility_args` rejects utility modes combined with files to edit, except the hidden process-editor replacement mode, which requires exactly one target file [@cli].
 
 ## Plugin And Language Subcommands
 

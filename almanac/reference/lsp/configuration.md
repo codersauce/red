@@ -6,6 +6,9 @@ sources:
   - id: config
     type: file
     path: src/config.rs
+  - id: editor
+    type: file
+    path: src/editor.rs
   - id: defaults
     type: file
     path: default_config.toml
@@ -14,13 +17,14 @@ sources:
     path: docs/HUSK_LSP.md
 ---
 
-LSP configuration in Red is the TOML-backed contract for enabling language-server support, formatting on save, and routing file extensions to named server definitions. The `Config` type contains `lsp: LspConfig`, and `LspConfig` has three fields: `enabled`, `format_on_save`, and `servers` [@config]. Server definitions describe process launch, document selectors, workspace-root discovery, environment additions, initialization options, and optional workspace names [@config]. Runtime routing for these fields is described by [LSP Client Lifecycle And Routing](../../architecture/lsp/client-lifecycle-and-routing), while capability expectations are summarized by [LSP Capabilities](../../concepts/lsp/capabilities).
+LSP configuration in Red is the TOML-backed contract for enabling language-server support, formatting on paste or save, and routing file extensions to named server definitions. The `Config` type contains both `lsp: LspConfig` and `formatting: FormattingConfig`; `LspConfig` owns server enablement and routing, while `FormattingConfig` owns paste, save, whitespace, and backend selection [@config]. Server definitions describe process launch, document selectors, workspace-root discovery, environment additions, initialization options, and optional workspace names [@config]. Runtime routing for these fields is described by [LSP Client Lifecycle And Routing](../../architecture/lsp/client-lifecycle-and-routing), while capability expectations are summarized by [LSP Capabilities](../../concepts/lsp/capabilities).
 
 ## Top-Level Fields
 
 | Field | Type | Default | Meaning |
 | --- | --- | --- | --- |
 | `lsp.enabled` | boolean | `true` | Master switch for language-server activity [@config]. |
+| `formatting.on_paste` | boolean | `true` | Reindents pasted code locally and permits LSP range formatting for the changed range when LSP formatting is enabled and available [@config] [@editor]. |
 | `formatting.on_save` | boolean | `true` | Formats supported documents before saving; set to `false` to disable [@config]. |
 | `formatting.trim_trailing_whitespace` | boolean | `true` | Removes trailing spaces and tabs before save-time formatting [@config]. |
 | `formatting.trim_trailing_whitespace_exclude` | array of strings | `["gitcommit", "markdown"]` | Language ids that preserve trailing whitespace during save-time formatting [@config]. |
