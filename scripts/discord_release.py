@@ -162,7 +162,10 @@ def build_payload(
     if count_summary:
         description = f"A new release of **Red** is available with {count_summary}."
     if campaign is not None:
-        description = f"{campaign['summary']}\n\n{description}"
+        description = campaign["summary"]
+        if count_summary:
+            description += f"\n\nThe full release notes cover {count_summary}."
+        description += "\n\nWhat part of your editing workflow should Red make agent-aware next?"
 
     fields: list[dict[str, Any]] = []
     if campaign is None:
@@ -173,9 +176,13 @@ def build_payload(
             for story in campaign["stories"]
             if "discord" in story["channels"]
         ]
-        feature_highlights = limited_bullets(reviewed, 5, preserve_order=True)
+        feature_highlights = limited_bullets(reviewed[:3], 3, preserve_order=True)
     if feature_highlights:
         fields.append({"name": "✨ Highlights", "value": feature_highlights, "inline": False})
+    if campaign is not None:
+        more = limited_bullets(reviewed[3:], 4, preserve_order=True)
+        if more:
+            fields.append({"name": "More to explore", "value": more, "inline": False})
 
     polish = [*performance, *fixes]
     polish_highlights = limited_bullets(polish, 3)
@@ -200,18 +207,23 @@ def build_payload(
         f"{len(features)} {plural(len(features), 'feature')}",
         f"{len(fixes)} {plural(len(fixes), 'fix', 'fixes')}",
     ]
+    image_url = select_image(sections) if campaign is None else campaign.get("discord_image")
     payload: dict[str, Any] = {
         "username": "Red Releases",
         "avatar_url": "https://github.com/codersauce.png",
         "allowed_mentions": {"parse": ["everyone"] if mention_everyone else []},
         "embeds": [
             {
-                "title": f"🚀 Red Editor {tag} is out!",
+                "title": (
+                    f"🚀 Red {tag}: {campaign['headline']}"
+                    if campaign is not None
+                    else f"🚀 Red Editor {tag} is out!"
+                ),
                 "url": release["url"],
                 "description": description,
                 "color": RED,
                 "fields": fields,
-                "image": {"url": select_image(sections)},
+                **({"image": {"url": image_url}} if image_url else {}),
                 "footer": {"text": " • ".join(footer_parts)},
                 **(
                     {"timestamp": release["publishedAt"]}
@@ -231,7 +243,9 @@ def markdown_preview(payload: dict[str, Any]) -> str:
     lines = [f"# {embed['title']}", "", embed["description"], ""]
     for field in embed["fields"]:
         lines.extend((f"## {field['name']}", "", field["value"], ""))
-    lines.extend((f"Image: {embed['image']['url']}", "", f"Release: {embed['url']}", ""))
+    if "image" in embed:
+        lines.extend((f"Image: {embed['image']['url']}", ""))
+    lines.extend((f"Release: {embed['url']}", ""))
     return "\n".join(lines)
 
 

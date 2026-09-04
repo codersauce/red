@@ -1,53 +1,90 @@
 schema_version = 1
 # Release preparation replaces "next" with the selected semantic version.
 version = "next"
-headline = "A modal editor with an agent that understands your code"
-summary = "Source-linked agent walkthroughs, focused inline assistance, Vim-style multi-cursor editing, and a faster workspace."
-website = "https://getred.dev"
+headline = "Your agent can point to the code it means"
+summary = "Red is a Vim-style terminal editor with a persistent Agent panel and focused inline help. This release turns explanations into source-linked walkthroughs, adds real multi-cursor editing, and makes large workspaces faster and safer."
+# Use the release page until getred.dev shows the current version and Agent workflow.
+website = "https://github.com/codersauce/red/releases/latest"
+# After recording the release-candidate demo, set a direct HTTPS poster-frame URL.
+# discord_image = "https://..."
+x_post = """{launch}: a Vim-style terminal editor where the agent can point to the code it means.
+
+Ask for a walkthrough → jump into annotated source. Select code + Space i → scoped review or edit. Ctrl-n → edit matches.
+
+{url}"""
+bluesky_post = """{launch}: a Vim-style terminal editor with a coding agent in the editor.
+
+Agent walkthroughs link to source annotations. Space i keeps reviews and refactors scoped to a function or selection. Ctrl-n edits matches in one undo.
+
+{url}"""
 
 [[stories]]
 id = "agent-source-walkthroughs"
-title = "Ask your agent to explain code and jump to the exact source"
-summary = "Agent answers can link directly to source annotations in your editor."
+title = "Follow an Agent explanation into the source"
+summary = "Press `Space A` and ask for a code walkthrough. Agent can annotate exact locations and link its answer to those cards, even across files."
 status = "new"
 pull_requests = [282, 283]
 channels = ["github", "discord", "x", "bluesky", "in_app"]
 
 [[stories]]
 id = "inline-agent"
-title = "Review or refactor code without leaving your editor"
-summary = "Press Space i for focused assistance on the enclosing function or an exact visual selection."
+title = "Ask inline about the code in front of you"
+summary = "Select code and press `Space i` for a scoped review, explanation, or refactor. Inline edits stay unsaved and undoable; wider or background changes require review."
 status = "improved"
 channels = ["github", "discord", "x", "bluesky", "in_app"]
 
 [[stories]]
 id = "vim-multicursor"
-title = "Edit multiple occurrences with Vim-style Ctrl-n"
-summary = "Add successive occurrences and edit all selections together."
+title = "Edit repeated matches with Ctrl-n and one undo"
+summary = "Select successive occurrences or add vertical cursors, then change every selection in one undoable edit."
 status = "new"
 pull_requests = [326]
 channels = ["github", "discord", "x", "bluesky", "in_app"]
 
 [[stories]]
+id = "agent-lsp"
+title = "Give Agent language-server diagnostics and a rename preview"
+summary = "Agent can inspect diagnostics and preview a cross-file semantic rename. Applied edits stay unsaved and undoable; start a new Agent conversation to load these tools."
+status = "new"
+pull_requests = [345]
+channels = ["github", "discord", "in_app"]
+
+[[stories]]
 id = "agent-model-selection"
-title = "Choose the model and reasoning effort per Agent conversation"
-summary = "Change your active conversation's model directly from the Agent panel."
+title = "Pick a model for the conversation you're in"
+summary = "Change the model and reasoning effort in the Agent panel without changing your global Codex configuration."
 status = "new"
 pull_requests = [273]
 channels = ["github", "discord", "bluesky", "in_app"]
 
 [[stories]]
 id = "large-repositories"
-title = "Move through large repositories without slowing down"
-summary = "Faster file trees, file searches, editor interactions, and plugin hot paths."
+title = "Find a file before a large workspace finishes scanning"
+summary = "File results stream in as discovery runs; completed indexes are cached. File trees and editor interactions also received targeted speedups."
 status = "improved"
 pull_requests = [289, 298, 309, 332]
 channels = ["github", "discord", "bluesky", "in_app"]
 
 [[stories]]
 id = "external-file-conflicts"
-title = "Protect unsaved work when files change outside the editor"
-summary = "Detect external modifications and resolve conflicts without silently overwriting work."
+title = "Keep your edits when another tool changes the file"
+summary = "Clean buffers reload; dirty buffers show a conflict and keep both versions available to compare before you choose what to save."
 status = "new"
 pull_requests = [330]
 channels = ["github", "discord", "bluesky", "in_app"]
+
+[[stories]]
+id = "vim-shell-filters"
+title = "Run Vim-style shell commands and range filters"
+summary = "Run `:!` commands or filter a visual range through a shell command; successful output becomes one undoable edit."
+status = "new"
+pull_requests = [338, 340]
+channels = ["github", "in_app"]
+
+[[stories]]
+id = "guided-onboarding"
+title = "Try Red in a guided, disposable practice buffer"
+summary = "A new first-run welcome offers a hands-on tour of editing, navigation, Git, and the Agent workflow without changing your project."
+status = "new"
+pull_requests = [275]
+channels = ["github", "in_app"]

@@ -66,6 +66,7 @@ class DiscordReleaseTest(unittest.TestCase):
     def test_reviewed_campaign_stories_override_commit_ranking(self) -> None:
         campaign = {
             "version": "0.2.4",
+            "headline": "Your agent can point to the code it means",
             "summary": "Editor-aware agents and Vim-style editing.",
             "stories": [
                 {"title": "Jump from agent explanations into source", "channels": ["discord"]},
@@ -79,9 +80,16 @@ class DiscordReleaseTest(unittest.TestCase):
         highlights = embed["fields"][0]["value"]
 
         self.assertTrue(embed["description"].startswith(campaign["summary"]))
+        self.assertIn(campaign["headline"], embed["title"])
+        self.assertNotIn("image", embed)
         self.assertIn("2 new features and 1 fix", embed["description"])
+        self.assertIn("make agent-aware next?", embed["description"])
         self.assertLess(highlights.index("agent explanations"), highlights.index("selection inline"))
         self.assertNotIn("Internal detail", highlights)
+
+        campaign["discord_image"] = "https://example.test/release-poster.png"
+        embed = build_payload(RELEASE, campaign=campaign)["embeds"][0]
+        self.assertEqual(embed["image"]["url"], campaign["discord_image"])
 
     def test_rejects_a_campaign_for_another_release(self) -> None:
         with self.assertRaisesRegex(ValueError, "campaign version"):
