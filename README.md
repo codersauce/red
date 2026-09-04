@@ -19,9 +19,9 @@ configuration; optional agent support requires an installed, authenticated Codex
 [Documentation](#documentation) ·
 [Community](https://discord.gg/5PWvAUNRHU)
 
-<!-- current-release: 0.6.0 -->
+<!-- current-release: 0.7.0 -->
 The current documented release is
-[v0.6.0](https://github.com/codersauce/red/releases/tag/v0.6.0).
+[v0.7.0](https://github.com/codersauce/red/releases/tag/v0.7.0).
 
 ![Red editing its Rust rendering pipeline with the project tree open](docs/images/editor-overview.jpg)
 
@@ -55,7 +55,7 @@ The PowerShell installer verifies the release checksum, installs to
 To pin a release or choose another directory:
 
 ```shell
-RED_VERSION=0.6.0 RED_INSTALL_DIR="$HOME/bin" \
+RED_VERSION=0.7.0 RED_INSTALL_DIR="$HOME/bin" \
   sh -c "$(curl --proto '=https' --tlsv1.2 -fsSL https://getred.dev/install.sh)"
 ```
 

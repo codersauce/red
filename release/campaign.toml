@@ -1,6 +1,6 @@
 schema_version = 1
 # Release preparation replaces "next" with the selected semantic version.
-version = "next"
+version = "0.7.0"
 headline = "Your agent can point to the code it means"
 summary = "Red is a Vim-style terminal editor with a persistent Agent panel and focused inline help. This release turns explanations into source-linked walkthroughs, adds real multi-cursor editing, and makes large workspaces faster and safer."
 # Use the release page until getred.dev shows the current version and Agent workflow.
