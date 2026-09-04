@@ -1386,20 +1386,17 @@ fn render() {
         return;
     }
     if state().search_query != "" {
-        red::execute(
-            "UpdatePanel",
+        red::neotree_core(
+            "update_panel",
             "neotree",
-            red::neotree_core(
-                "build_search_rows",
-                red::string(state().cwd, "."),
-                state().search_children,
-                state().search_expanded,
-                state().selected,
-                state().clipboard,
-                optional_text(state().status.root, ""),
-                state().status_entries,
-                state().search_matches
-            )
+            red::string(state().cwd, "."),
+            state().search_children,
+            state().search_expanded,
+            state().selected,
+            state().clipboard,
+            optional_text(state().status.root, ""),
+            state().status_entries,
+            state().search_matches
         );
         return;
     }

@@ -204,17 +204,17 @@ The Git plugin keeps its event, picker, and permissioned-process shell in
 logic, and Git argument construction live in the native, multi-file
 `plugins/git_core` Husk package. Neo-tree follows the same split: filesystem
 actions, confirmations, and panel events stay in `plugins/neotree.hk`, while
-normalized path handling, typed Git-status presentation, and compatible
-tree-row construction live in `plugins/neotree_core`. Large Neo-tree panels
-use an internal Rust-owned virtual model that shares the plugin's directory
-entry arrays and decorates only rows in the terminal viewport. The tree's
-inline search delegates recursive, ignore-aware discovery and bounded fuzzy
-ranking to a shared Rust workspace-path index; the pure core renders matching
-paths and their ancestors without granting the plugin subprocess permissions.
+normalized path handling lives in `plugins/neotree_core`. Tree layout,
+Git-status presentation, and search-match highlights are owned by Rust. Large
+Neo-tree panels share the plugin's directory entry arrays and decorate only
+rows in the terminal viewport. Inline search delegates recursive, ignore-aware
+discovery and bounded fuzzy ranking to a shared Rust workspace-path index;
+matching paths and their ancestors use that same Rust tree renderer.
 Red embeds the pure sources and exposes small internal bridges to the
 compatibility shells, so installed builds do not depend on checkout-relative
-source paths. The bridges and virtual tree are bundled-plugin implementation
-details, not public plugin APIs.
+source paths. The filesystem bridge remains a bundled-plugin implementation
+detail. Other plugins can reuse the tree through `UpdateTreePanel` with custom
+node IDs and styled rows; see [the tree API](PLUGIN_API.md#native-tree-panels).
 
 `buffer:changed`, cursor, mode, viewport, file, theme, window, LSP, timer, picker, composer, panel, process, filesystem, workspace, and agent events are emitted by the production runtime. Subscribe only to the events a plugin needs and debounce expensive work.
 

@@ -15609,7 +15609,7 @@ impl Editor {
             if let Some(action) = self.panel_command_mode_key_action(ev) {
                 return Ok(Some(action));
             }
-            if !self.panel_manager.focused_text_input_active() && self.handle_repeater(ev) {
+            if self.handle_repeater(ev) {
                 return Ok(None);
             }
             if let Some(action) = self.handle_panel_event(ev, runtime) {
@@ -16457,6 +16457,11 @@ impl Editor {
     }
 
     fn handle_repeater(&mut self, ev: &event::Event) -> bool {
+        if self.panel_manager.focused_text_input_active()
+            || self.panel_manager.focused_row_search_active()
+        {
+            return false;
+        }
         if let Event::Key(KeyEvent {
             code: KeyCode::Char(c),
             ..
@@ -47467,6 +47472,33 @@ while True:
         }
 
         assert_eq!(editor.current_buffer().contents(), "xxhello");
+    }
+
+    #[test]
+    fn panel_search_accepts_digits_without_starting_a_vim_repeat_count() {
+        let mut editor = test_editor(40, 10);
+        editor
+            .panel_manager
+            .create_panel("tree".into(), plugin::PanelConfig::default());
+        editor.panel_manager.open_panel_search("tree", "", "/");
+        for expected in ["7", "70", "709"] {
+            let event = Event::Key(KeyEvent::new(
+                KeyCode::Char(expected.chars().last().unwrap()),
+                KeyModifiers::NONE,
+            ));
+            let Some(KeyAction::Multiple(actions)) = editor.handle_event(&event).unwrap() else {
+                panic!("search input must emit a panel event");
+            };
+            assert!(
+                matches!(actions.first(), Some(Action::NotifyPlugins(topic, payload))
+                if topic == "panel:event:tree" && payload["text"] == expected)
+            );
+            assert_eq!(editor.repeater, None);
+        }
+        editor.panel_manager.keep_panel_search("tree");
+        let event = Event::Key(KeyEvent::new(KeyCode::Char('7'), KeyModifiers::NONE));
+        assert!(editor.handle_event(&event).unwrap().is_none());
+        assert_eq!(editor.repeater, Some(7));
     }
 
     #[test]
