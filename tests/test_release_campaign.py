@@ -48,8 +48,10 @@ class ReleaseCampaignTest(unittest.TestCase):
             validate_campaign(campaign)
 
     def test_requires_exact_release_version_when_requested(self) -> None:
+        campaign = copy.deepcopy(self.campaign)
+        campaign["version"] = "0.7.0"
         with self.assertRaisesRegex(CampaignError, "does not match"):
-            validate_campaign(self.campaign, expected_version="0.7.0")
+            validate_campaign(campaign, expected_version="0.8.0")
 
     def test_updates_only_the_resolved_campaign_version(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
