@@ -82,10 +82,9 @@ completed `codex login`.
   sessions retain buffers, plugins, LSP state, and running agents across
   terminal or SSH disconnects.
 
-## Coming in the next release
+## New in v0.7.0
 
-The following capabilities are available on `main` and are **not included in
-the published v0.6.0 release**:
+The v0.7.0 release adds:
 
 - **An agent that points to the code it means.** Ask Agent to explain a
   subsystem, then follow links in its answer directly to source-anchored
@@ -105,9 +104,6 @@ the published v0.6.0 release**:
   coordinate LSP and optional Copilot completions, and format supported
   pasted ranges.
 
-These features become part of the supported release after the next version is
-published. Until then, [build from source](#development) to try them.
-
 ## First five minutes
 
 Open a file:
@@ -116,12 +112,11 @@ Open a file:
 red path/to/file
 ```
 
-On `main`, the first interactive launch offers a guided tour, release
+The first interactive launch offers a guided tour, release
 highlights, and an immediate exit into the editor. The tour uses a disposable
 practice buffer and safe Git/agent demonstrations; reopen it with `:welcome` or
-`:tutorial`. This guided onboarding is coming in the next release.
-Starter configuration remains optional: embedded defaults, plugins, and themes
-are enough to begin editing.
+`:tutorial`. Starter configuration remains optional: embedded defaults,
+plugins, and themes are enough to begin editing.
 
 | Key | Action |
 | --- | --- |
@@ -151,13 +146,12 @@ versioned behavior contract.
    Red's workspace-confined, revision-checked editor tools. Agent edits are
    attributed to their conversation and **saved to disk** through Red.
 3. **Keep the conversation.** Follow tool progress, queue another request, and
-   resume the same conversation without losing editor context. On `main`,
-   source-linked annotations turn explanations into navigable code walkthroughs.
+   resume the same conversation without losing editor context. Source-linked
+   annotations turn explanations into navigable code walkthroughs.
 
-In v0.6.0, Red follows each file tool visually. On `main`, playback is optional
-and disabled by default; set `[agent] follow_tool_calls = true` to reveal each
-target and pause before the operation. Full Agent writes still save to disk in
-both versions.
+In v0.7.0, file-tool playback is optional and disabled by default; set
+`[agent] follow_tool_calls = true` to reveal each target and pause before the
+operation. Full Agent writes still save to disk.
 
 ### Focused inline assistance
 
@@ -167,8 +161,7 @@ mode, the target is exactly the selected text. Requests use an ephemeral Codex
 thread with bounded read-only project context; visual-block targets are not
 supported. Inline code edits form one **unsaved, undoable editor transaction**.
 
-In v0.6.0, every inline code change requires explicit review. On `main`, an
-exact-target edit may apply immediately when its original popup is in the
+An exact-target edit may apply immediately when its original popup is in the
 foreground; set `[agent] auto_apply_inline_edits = false` to review it first.
 Background results and wider same-file proposals always require an explicit
 review and approval. Use `Space H` to revisit inline history or `A` to prepare
