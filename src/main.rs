@@ -198,6 +198,15 @@ fn run_editor(args: Args) -> impl std::future::Future<Output = anyhow::Result<()
     Box::pin(run_editor_inner(args))
 }
 
+fn session_root(config_dir: &Path) -> PathBuf {
+    // The config directory may be a user-managed symlink. Resolve it before
+    // the snapshot store's no-follow traversal of the sessions directory.
+    config_dir
+        .canonicalize()
+        .unwrap_or_else(|_| config_dir.to_path_buf())
+        .join("sessions")
+}
+
 async fn run_editor_inner(args: Args) -> anyhow::Result<()> {
     let config_file = Config::path("config.toml");
     let preferences_file = Config::path("preferences.json");
@@ -219,7 +228,7 @@ async fn run_editor_inner(args: Args) -> anyhow::Result<()> {
         std::env::set_current_dir(root)?;
     }
 
-    let session_root = Config::path("sessions");
+    let session_root = session_root(&Config::config_dir());
     let (resumed_store, resumed_session) = if args.resume {
         let (store, snapshot) = SessionStore::load_latest_with_store(&session_root)?;
         if !snapshot.cwd.is_empty() {
@@ -1198,6 +1207,21 @@ async fn load_startup_buffers(files: &[String]) -> anyhow::Result<Vec<Buffer>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn session_root_resolves_a_symlinked_config_directory() {
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("config-target");
+        fs::create_dir(&target).unwrap();
+        let link = directory.path().join("red");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        assert_eq!(
+            session_root(&link),
+            target.canonicalize().unwrap().join("sessions")
+        );
+    }
 
     #[test]
     fn startup_dispatch_future_stays_small() {
