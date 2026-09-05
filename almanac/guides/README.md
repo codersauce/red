@@ -12,6 +12,9 @@ sources:
   - id: plugin-guide
     type: file
     path: almanac/guides/plugins/write-a-husk-plugin.md
+  - id: language-pack-release
+    type: file
+    path: almanac/guides/plugins/release-language-pack.md
   - id: lsp-guide
     type: file
     path: almanac/guides/lsp/debugging-lsp-failures.md
@@ -46,7 +49,7 @@ Guide pages are the task-oriented shelf for Red maintainers. The topic graph kee
 
 Start with [Build, Test, And Validate](development/build-test-and-validate) when preparing ordinary code changes for review, push, or CI parity. It orders local Rust tests, clippy, formatting, self-checks, plugin checks, performance gates, and release-adjacent validation by changed area [@validation-guide].
 
-Use [Write A Husk Plugin](plugins/write-a-husk-plugin) when adding or updating a plugin package, host API usage, resource registration, permissions, or plugin validation [@plugin-guide]. Use [Debugging LSP Failures](lsp/debugging-lsp-failures) when a language-server issue may involve startup, routing, transport, diagnostics, completion, or workspace edits [@lsp-guide].
+Use [Write A Husk Plugin](plugins/write-a-husk-plugin) when adding or updating a plugin package, host API usage, resource registration, permissions, or plugin validation [@plugin-guide]. Use [Release A Language Pack](plugins/release-language-pack) when publishing one first-party language pack and verifying the catalog entry Red consumes [@language-pack-release]. Use [Debugging LSP Failures](lsp/debugging-lsp-failures) when a language-server issue may involve startup, routing, transport, diagnostics, completion, or workspace edits [@lsp-guide].
 
 ## Agent And Session Operations
 
@@ -58,4 +61,4 @@ For live sessions, use [Detach And Reattach](sessions/detach-reattach) when the 
 
 Use [Performance Checks](performance/performance-checks) for deterministic CI performance gates and workstation benchmarks that catch editor, detach, interaction, and Git workspace regressions [@performance-guide].
 
-For publication work, [Release Red](releases/release-red) covers the release flow from prepare-release through tag publishing, archive smoke tests, Homebrew update, installer verification, and Discord announcement [@release-guide]. [Release Installers](installers/release-installers) narrows that to Unix and Windows installer verification, checksum handling, self-check execution, fixture tests, and latest-release smoke tests [@installers-guide].
+For publication work, [Release Red](releases/release-red) covers the editor release flow from prepare-release through tag publishing, archive smoke tests, Homebrew update, installer verification, and Discord announcement [@release-guide]. [Release A Language Pack](plugins/release-language-pack) covers the separate first-party language-pack tag, packaging, catalog update, and Red-side install verification path [@language-pack-release]. [Release Installers](installers/release-installers) narrows Red's Unix and Windows installer verification, checksum handling, self-check execution, fixture tests, and latest-release smoke tests [@installers-guide].

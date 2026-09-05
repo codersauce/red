@@ -21,6 +21,9 @@ sources:
   - id: arborium-decision
     type: file
     path: almanac/decisions/plugins/arborium-language-source.md
+  - id: language-pack-release
+    type: file
+    path: almanac/guides/plugins/release-language-pack.md
   - id: preferences-store
     type: file
     path: almanac/architecture/preferences/preferences-store.md
@@ -42,6 +45,6 @@ Use [Resource Ownership](resource-ownership) when plugin work touches panels, wo
 
 Use [Preferences Store](../preferences/preferences-store) when plugin work persists user or plugin JSON state, because plugin storage is a plugin-owned namespace inside the shared preferences file rather than crash-recovery state [@preferences-store].
 
-Use [Official Language Pack Distribution](../../decisions/plugins/language-pack-distribution) when external plugin work touches first-party language-pack cataloging, release artifact boundaries, or native grammar approval. Use [Arborium Language Pack Source](../../decisions/plugins/arborium-language-source) when the question is grammar-inventory import, generated query overlays, or why Arborium remains a build-time source rather than a runtime aggregate package [@arborium-decision].
+Use [Official Language Pack Distribution](../../decisions/plugins/language-pack-distribution) when external plugin work touches first-party language-pack cataloging, release artifact boundaries, or native grammar approval. Use [Release A Language Pack](../../guides/plugins/release-language-pack) for the operational tag, packaging, catalog-publication, and Red install verification path [@language-pack-release]. Use [Arborium Language Pack Source](../../decisions/plugins/arborium-language-source) when the question is grammar-inventory import, generated query overlays, or why Arborium remains a build-time source rather than a runtime aggregate package [@arborium-decision].
 
 For exact lookup, use [Host API](../../reference/plugins/host-api). For a task-oriented workflow, use [Write A Husk Plugin](../../guides/plugins/write-a-husk-plugin).
