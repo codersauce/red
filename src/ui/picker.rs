@@ -290,6 +290,7 @@ struct PreviewHighlightSpan {
 }
 
 struct CachedPreviewHighlights {
+    detection_prefix: String,
     key: String,
     location: bool,
     source: String,
@@ -312,7 +313,12 @@ impl PreviewHighlighter {
         }
     }
 
-    fn highlight(&self, preview: &PickerPreview, text: &str) -> Vec<PreviewHighlightSpan> {
+    fn highlight(
+        &self,
+        preview: &PickerPreview,
+        text: &str,
+        detection_prefix: &str,
+    ) -> Vec<PreviewHighlightSpan> {
         let mut highlighter = self.highlighter.borrow_mut();
         let Some(highlighter) = highlighter.as_mut() else {
             return Vec::new();
@@ -331,7 +337,13 @@ impl PreviewHighlighter {
             }
             PickerPreview::Text { language: None, .. } => Ok(Vec::new()),
             PickerPreview::Location { path, .. } => {
-                highlighter.highlight_for_file(Some(path), text)
+                let Some(language) = highlighter
+                    .language_id_for_source(Some(path), detection_prefix)
+                    .map(str::to_owned)
+                else {
+                    return Vec::new();
+                };
+                highlighter.highlight(&language, text)
             }
         }
         .unwrap_or_default();
@@ -2660,7 +2672,12 @@ impl Picker {
             || preview_lines(text, start, preview_height),
             |line_starts| preview_lines_with_starts(text, line_starts, start, preview_height),
         );
-        let highlight_spans = self.preview_highlight_spans(preview, text, &lines);
+        let highlight_spans = self.preview_highlight_spans(
+            preview,
+            text,
+            &lines,
+            window_first_line.unwrap_or_default() == 0,
+        );
         for (offset, line) in lines.iter().enumerate() {
             let line_index = window_first_line.unwrap_or_default() + start + offset;
             let focused = focus_line == Some(line_index);
@@ -2840,6 +2857,7 @@ impl Picker {
         preview: &PickerPreview,
         text: &str,
         lines: &[PreviewLine<'_>],
+        starts_document: bool,
     ) -> Arc<[PreviewHighlightSpan]> {
         let Some(first) = lines.first() else {
             return Arc::from([]);
@@ -2865,9 +2883,17 @@ impl Picker {
             PickerPreview::Text { language: None, .. } => return Arc::from([]),
             PickerPreview::Location { path, .. } => (path.as_str(), true),
         };
+        let detection_prefix = if starts_document {
+            text.chars()
+                .take(crate::highlighter::MAX_SHEBANG_CHARS + 1)
+                .collect::<String>()
+        } else {
+            String::new()
+        };
         let source = &text[start..end];
         if let Some(cached) = self.preview_highlight_cache.borrow().as_ref() {
-            if cached.key == key
+            if cached.detection_prefix == detection_prefix
+                && cached.key == key
                 && cached.location == location
                 && cached.source_start == start
                 && cached.source == source
@@ -2876,7 +2902,9 @@ impl Picker {
             }
         }
 
-        let mut spans = self.preview_highlighter.highlight(preview, source);
+        let mut spans = self
+            .preview_highlighter
+            .highlight(preview, source, &detection_prefix);
         for span in &mut spans {
             span.start += start;
             span.end += start;
@@ -2884,6 +2912,7 @@ impl Picker {
         let spans: Arc<[PreviewHighlightSpan]> = Arc::from(spans);
         if spans.len() <= MAX_CACHED_PREVIEW_HIGHLIGHT_SPANS {
             *self.preview_highlight_cache.borrow_mut() = Some(CachedPreviewHighlights {
+                detection_prefix,
                 key: key.to_string(),
                 location,
                 source: source.to_string(),
@@ -6838,12 +6867,47 @@ mod tests {
         };
         let lines = super::preview_lines(&text, /*start_line*/ 0, /*max_lines*/ 1);
 
-        let spans = picker.preview_highlight_spans(&preview, &text, &lines);
+        let spans = picker.preview_highlight_spans(&preview, &text, &lines, true);
 
         assert!(!spans.is_empty());
         assert!(spans
             .iter()
             .all(|span| span.end <= super::MAX_PREVIEW_HIGHLIGHT_BYTES));
+    }
+
+    #[test]
+    fn shebang_preview_uses_document_prefix_and_invalidates_cached_language() {
+        let mut theme = Theme::default();
+        theme.token_styles.push(TokenStyle {
+            name: Some("keyword".into()),
+            scope: vec!["keyword".into()],
+            style: Style {
+                bold: true,
+                ..Style::default()
+            },
+        });
+        let editor = test_editor_with_theme_and_size(theme, 120, 24);
+        let picker = Picker::new(None, &editor, &[], None);
+        let preview = PickerPreview::Location {
+            path: "script".into(),
+            line: None,
+            column: None,
+            matches: vec![],
+        };
+        let text = "#!/bin/bash\nif true; then echo hi; fi\n";
+        let lines = super::preview_lines(text, 1, 1);
+        assert!(!picker
+            .preview_highlight_spans(&preview, text, &lines, true)
+            .is_empty());
+        let changed = text.replacen("#!/bin/bash", "# plain txt", 1);
+        let lines = super::preview_lines(&changed, 1, 1);
+        assert!(picker
+            .preview_highlight_spans(&preview, &changed, &lines, true)
+            .is_empty());
+        let lines = super::preview_lines(text, 0, 2);
+        assert!(picker
+            .preview_highlight_spans(&preview, text, &lines, false)
+            .is_empty());
     }
 
     #[test]
@@ -6866,7 +6930,7 @@ mod tests {
         };
         let lines = super::preview_lines(text, /*start_line*/ 1, /*max_lines*/ 1);
 
-        let spans = picker.preview_highlight_spans(&preview, text, &lines);
+        let spans = picker.preview_highlight_spans(&preview, text, &lines, true);
 
         let keyword_start = text.find("let").unwrap();
         assert!(spans
@@ -6894,8 +6958,8 @@ mod tests {
         };
         let lines = super::preview_lines(text, /*start_line*/ 0, /*max_lines*/ 1);
 
-        let first = picker.preview_highlight_spans(&preview, text, &lines);
-        let repeated = picker.preview_highlight_spans(&preview, text, &lines);
+        let first = picker.preview_highlight_spans(&preview, text, &lines, true);
+        let repeated = picker.preview_highlight_spans(&preview, text, &lines, true);
         assert!(!first.is_empty());
         assert!(Arc::ptr_eq(&first, &repeated));
 
@@ -6906,12 +6970,14 @@ mod tests {
         };
         let updated_lines =
             super::preview_lines(updated, /*start_line*/ 0, /*max_lines*/ 1);
-        let changed = picker.preview_highlight_spans(&updated_preview, updated, &updated_lines);
+        let changed =
+            picker.preview_highlight_spans(&updated_preview, updated, &updated_lines, true);
         assert!(!Arc::ptr_eq(&first, &changed));
 
         picker.apply_theme(&theme);
         assert!(picker.preview_highlight_cache.borrow().is_none());
-        let rethemed = picker.preview_highlight_spans(&updated_preview, updated, &updated_lines);
+        let rethemed =
+            picker.preview_highlight_spans(&updated_preview, updated, &updated_lines, true);
         assert!(!Arc::ptr_eq(&changed, &rethemed));
     }
 

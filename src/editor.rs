@@ -7278,7 +7278,10 @@ impl Editor {
         match buffer.syntax_selection() {
             SyntaxSelection::Auto => self
                 .highlighter
-                .language_id_for_file(buffer.file.as_deref())
+                .language_id_for_source(
+                    buffer.file.as_deref(),
+                    &buffer.line_prefix_contents(0, crate::highlighter::MAX_SHEBANG_CHARS + 1),
+                )
                 .map(ToString::to_string),
             SyntaxSelection::Off => None,
             SyntaxSelection::Language(language) => self
@@ -19424,7 +19427,12 @@ impl Editor {
         }
 
         self.highlighter
-            .language_id_for_file(self.current_buffer().file.as_deref())
+            .language_id_for_source(
+                self.current_buffer().file.as_deref(),
+                &self
+                    .current_buffer()
+                    .line_prefix_contents(0, crate::highlighter::MAX_SHEBANG_CHARS + 1),
+            )
             .map(str::to_string)
             .or_else(|| self.current_buffer().file_type())
     }
@@ -34480,6 +34488,33 @@ builtin = "rust"
     }
 
     #[tokio::test]
+    async fn shebang_reload_updates_open_unsaved_buffer() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[languages.custom]\nshebangs = ['custom']\ncomment = '# %s'\nindent_width = 2\n",
+        )
+        .unwrap();
+        let mut editor = test_editor(80, 12);
+        editor.buffer_manager[0] = Buffer::new(None, "#!/bin/custom\nhello\n".into());
+        editor.current_buffer_mut().insert_str(0, 1, "changed ");
+        let contents = editor.current_buffer().contents();
+        let revision = editor.current_buffer().revision();
+        editor.set_language_reload_source(path.clone(), Vec::new());
+        editor.reload_languages().await.unwrap();
+        assert_eq!(editor.current_language_id().as_deref(), Some("custom"));
+        assert_eq!(editor.indentation().shift_width, 2);
+        assert!(editor.configured_comment_syntax().is_some());
+        assert_eq!(editor.current_buffer().contents(), contents);
+        assert_eq!(editor.current_buffer().revision(), revision);
+        assert!(editor.current_buffer().is_dirty());
+        std::fs::write(&path, "[languages.custom]\nshebangs = ['other']\n").unwrap();
+        editor.reload_languages().await.unwrap();
+        assert_eq!(editor.current_language_id(), None);
+    }
+
+    #[tokio::test]
     async fn rejected_language_reload_keeps_previous_registry_and_configuration() {
         let directory = tempfile::tempdir().unwrap();
         let config_path = directory.path().join("config.toml");
@@ -38117,6 +38152,46 @@ builtin = "rust"
 
         assert_ne!(span_shape(&original), span_shape(&reopened));
         assert_eq!(span_shape(&reopened), span_shape(&expected));
+    }
+
+    #[test]
+    fn shebang_follows_edits_offscreen_and_manual_selection() {
+        let mut editor = rust_test_editor(100, 120, 22);
+        let text = format!(
+            "#!/bin/bash\n{}",
+            "if true; then echo hello; fi\n".repeat(100)
+        );
+        editor.buffer_manager[0] = Buffer::new(Some("script".into()), text);
+        assert!(!editor
+            .viewport_highlight_spans(0, 60, 20)
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            editor.highlight_cache[&0].language_id.as_deref(),
+            Some("bash")
+        );
+        assert_eq!(editor.current_language_id().as_deref(), Some("bash"));
+        assert!(editor.configured_comment_syntax().is_some());
+        editor.current_buffer_mut().insert_str(0, 0, "#");
+        assert!(editor
+            .viewport_highlight_spans(0, 60, 20)
+            .unwrap()
+            .is_empty());
+        editor
+            .current_buffer_mut()
+            .set_syntax_selection(SyntaxSelection::Language("fish".into()));
+        editor.viewport_highlight_spans(0, 60, 20).unwrap();
+        assert_eq!(
+            editor.highlight_cache[&0].language_id.as_deref(),
+            Some("fish")
+        );
+        editor
+            .current_buffer_mut()
+            .set_syntax_selection(SyntaxSelection::Off);
+        assert!(editor
+            .viewport_highlight_spans(0, 60, 20)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]

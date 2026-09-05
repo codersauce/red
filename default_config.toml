@@ -232,6 +232,7 @@ waiting = "steady_underscore"
 # extensions = ["build"]
 # filenames = ["Buildfile"]
 # aliases = ["build-script"]
+# shebangs = ["build-script"]
 # comment = "# %s"
 # indent_width = 2
 #

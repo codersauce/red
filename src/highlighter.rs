@@ -64,6 +64,7 @@ struct RuntimeLanguageDefinition {
     extensions: Vec<String>,
     filenames: Vec<String>,
     aliases: Vec<String>,
+    shebangs: Vec<String>,
     grammar: Option<GrammarSource>,
     highlight_queries: Vec<String>,
     textobject_queries: Vec<String>,
@@ -79,6 +80,7 @@ pub struct LanguageRegistry {
     extensions: HashMap<String, String>,
     filenames: HashMap<String, String>,
     aliases: HashMap<String, String>,
+    shebangs: HashMap<String, String>,
 }
 
 impl LanguageRegistry {
@@ -90,6 +92,7 @@ impl LanguageRegistry {
             extensions: HashMap::new(),
             filenames: HashMap::new(),
             aliases: HashMap::new(),
+            shebangs: HashMap::new(),
         };
         for definition in language_definitions() {
             registry.insert(RuntimeLanguageDefinition {
@@ -103,6 +106,10 @@ impl LanguageRegistry {
                     .filenames
                     .iter()
                     .map(ToString::to_string)
+                    .collect(),
+                shebangs: bundled_shebangs(definition.id)
+                    .iter()
+                    .map(|name| (*name).to_string())
                     .collect(),
                 aliases: LANGUAGE_NAMES
                     .iter()
@@ -166,6 +173,7 @@ impl LanguageRegistry {
             extensions: Vec::new(),
             filenames: Vec::new(),
             aliases: Vec::new(),
+            shebangs: Vec::new(),
             grammar: None,
             highlight_queries: Vec::new(),
             textobject_queries: Vec::new(),
@@ -184,6 +192,15 @@ impl LanguageRegistry {
             definition.filenames.clone_from(&config.filenames);
         }
         definition.aliases.extend(config.aliases.iter().cloned());
+        if !config.shebangs.is_empty() {
+            anyhow::ensure!(
+                config.shebangs.iter().all(|name| !name.is_empty()
+                    && !name.contains(['/', '\\'])
+                    && !name.chars().any(char::is_whitespace)),
+                "language `{id}` has an invalid shebang interpreter"
+            );
+            definition.shebangs.clone_from(&config.shebangs);
+        }
 
         if let Some(grammar) = &config.grammar {
             if let Some(builtin) = &grammar.builtin {
@@ -304,12 +321,16 @@ impl LanguageRegistry {
             self.filenames
                 .retain(|_, language| language != &previous.id);
             self.aliases.retain(|_, language| language != &previous.id);
+            self.shebangs.retain(|_, language| language != &previous.id);
         }
         for extension in &definition.extensions {
             self.extensions.insert(extension.clone(), id.clone());
         }
         for filename in &definition.filenames {
             self.filenames.insert(filename.clone(), id.clone());
+        }
+        for interpreter in &definition.shebangs {
+            self.shebangs.insert(interpreter.clone(), id.clone());
         }
         self.aliases.insert(id.clone(), id.clone());
         for alias in &definition.aliases {
@@ -766,6 +787,27 @@ impl Highlighter {
         self.language_id_for_extension(&extension)
     }
 
+    /// Detects from a known filename first, then the document's first line.
+    /// Callers supplying a viewport or fragment must resolve using the full document instead.
+    pub fn language_id_for_source(&self, file: Option<&str>, source: &str) -> Option<&str> {
+        self.language_id_for_file(file).or_else(|| {
+            let interpreter = shebang_interpreter(source)?;
+            self.registry
+                .shebangs
+                .get(interpreter)
+                .or_else(|| {
+                    // Accept versioned interpreters only when the entire suffix is numeric.
+                    let version = interpreter.find(|ch: char| ch.is_ascii_digit())?;
+                    interpreter[version..]
+                        .bytes()
+                        .all(|ch| ch.is_ascii_digit() || ch == b'.')
+                        .then(|| self.registry.shebangs.get(&interpreter[..version]))
+                        .flatten()
+                })
+                .map(String::as_str)
+        })
+    }
+
     /// Whether highlighting a language requires all text before the visible slice.
     ///
     /// YAML structure is indentation-sensitive, so parsing an arbitrary indented
@@ -838,7 +880,7 @@ impl Highlighter {
         file: Option<&str>,
         code: &str,
     ) -> anyhow::Result<Vec<StyleInfo>> {
-        let Some(language_id) = self.language_id_for_file(file) else {
+        let Some(language_id) = self.language_id_for_source(file, code) else {
             return Ok(Vec::new());
         };
         let language_id = language_id.to_string();
@@ -2128,6 +2170,58 @@ fn collect_injections(
     }
 
     injections
+}
+
+// Bound detection even for a buffer whose first line is enormous.
+pub(crate) const MAX_SHEBANG_CHARS: usize = 512;
+
+fn bundled_shebangs(id: &str) -> &'static [&'static str] {
+    match id {
+        "bash" => &["sh", "bash", "dash", "ash", "zsh"],
+        "fish" => &["fish"],
+        "powershell" => &["pwsh", "powershell"],
+        "javascript" => &["node", "nodejs"],
+        "lua" => &["lua", "luajit"],
+        "husk" => &["husk"],
+        _ => &[],
+    }
+}
+
+fn shebang_interpreter(source: &str) -> Option<&str> {
+    let end = source
+        .char_indices()
+        .nth(MAX_SHEBANG_CHARS)
+        .map_or(source.len(), |(index, _)| index);
+    let prefix = &source[..end];
+    let line = prefix.split(['\n', '\r']).next()?;
+    // Never interpret a truncated token as a complete executable name.
+    if end < source.len() && line.len() == prefix.len() {
+        return None;
+    }
+    // ponytail: whitespace-only env parsing; add quoting if real scripts require it.
+    let mut words = line
+        .strip_prefix('\u{feff}')
+        .unwrap_or(line)
+        .strip_prefix("#!")?
+        .split_ascii_whitespace();
+    let executable = words.next()?.rsplit('/').next()?;
+    if executable != "env" {
+        return Some(executable);
+    }
+    while let Some(word) = words.next() {
+        match word {
+            "-S" | "--split-string" | "-i" | "--ignore-environment" => continue,
+            "-u" | "--unset" | "-C" | "--chdir" => {
+                words.next()?;
+            }
+            "--" => return words.next()?.rsplit('/').next(),
+            _ if word.starts_with("--unset=") || word.starts_with("--chdir=") => continue,
+            _ if word.starts_with('-') => return None,
+            _ if word.contains('=') => continue,
+            _ => return word.rsplit('/').next(),
+        }
+    }
+    None
 }
 
 fn file_extension(file: &str) -> Option<String> {
@@ -4340,6 +4434,103 @@ mod tests {
         highlighter.highlight("rust", &source).unwrap();
         assert!(highlighter.cached_highlight.is_none());
         assert!(highlighter.highlighters["rust"].cached_tree.is_none());
+    }
+
+    #[test]
+    fn shebang_detection_uses_interpreters_and_preserves_path_precedence() {
+        let mut highlighter = highlighter();
+        for (source, expected) in [
+            ("#!/bin/bash\necho hello", Some("bash")),
+            ("#!/bin/zsh -f", Some("bash")),
+            ("#!/usr/bin/env fish", Some("fish")),
+            ("#!/usr/bin/env -S bash -eu", Some("bash")),
+            (
+                "#!/usr/bin/env --split-string pwsh -NoProfile",
+                Some("powershell"),
+            ),
+            (
+                "#!/usr/bin/env -i -u OLD --chdir=/tmp MODE=test node",
+                Some("javascript"),
+            ),
+            ("#!/usr/bin/env -- /bin/dash", Some("bash")),
+            ("\u{feff}#! /usr/bin/lua5.4\r\nprint(1)", Some("lua")),
+            ("#!/usr/bin/env python3.12", None),
+            ("#!/usr/bin/env missing bash", None),
+            ("#!/usr/bin/env --unknown bash", None),
+            ("#!/usr/bin/env -u", None),
+            ("#!/usr/bin/env", None),
+            ("#!", None),
+            ("\n#!/bin/bash", None),
+            (" #!/bin/bash", None),
+            ("#!/bin/bashful", None),
+            ("#!/bin/lua5bad", None),
+            ("#!/bin/csh", None),
+        ] {
+            assert_eq!(
+                highlighter.language_id_for_source(Some("script"), source),
+                expected,
+                "{source:?}"
+            );
+        }
+        assert_eq!(
+            highlighter.language_id_for_source(Some("script.rs"), "#!/bin/bash"),
+            Some("rust")
+        );
+        assert_eq!(
+            highlighter.language_id_for_source(Some("COMMIT_EDITMSG"), "#!/bin/bash"),
+            Some("gitcommit")
+        );
+        assert_eq!(
+            highlighter.language_id_for_source(None, "#!/bin/fish"),
+            Some("fish")
+        );
+        let long = format!("#!{}bash", " ".repeat(MAX_SHEBANG_CHARS));
+        assert_eq!(highlighter.language_id_for_source(None, &long), None);
+        assert!(!highlighter
+            .highlight_for_file(
+                Some("script"),
+                "#!/bin/bash\nif true; then echo hello; fi\n"
+            )
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn shebang_configuration_is_registered_and_replaced() {
+        let directory = tempfile::tempdir().unwrap();
+        let definition: LanguageConfig =
+            toml::from_str("shebangs = ['python', 'python3']").unwrap();
+        let mut registry = LanguageRegistry::bundled();
+        registry
+            .insert_configured("python", &definition, directory.path())
+            .unwrap();
+        let configured =
+            Highlighter::with_registry(&theme_with_scopes(&[]), Arc::new(registry.clone()))
+                .unwrap();
+        assert_eq!(
+            configured.language_id_for_source(None, "#!/usr/bin/env python3.12"),
+            Some("python")
+        );
+        registry
+            .insert_configured(
+                "python",
+                &LanguageConfig {
+                    shebangs: vec!["pypy".into()],
+                    ..definition
+                },
+                directory.path(),
+            )
+            .unwrap();
+        let configured =
+            Highlighter::with_registry(&theme_with_scopes(&[]), Arc::new(registry)).unwrap();
+        assert_eq!(
+            configured.language_id_for_source(None, "#!/bin/python3"),
+            None
+        );
+        assert_eq!(
+            configured.language_id_for_source(None, "#!/bin/pypy"),
+            Some("python")
+        );
     }
 
     #[test]

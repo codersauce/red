@@ -119,7 +119,7 @@ pub struct SearchMatch {
 /// Buffer-local syntax-highlighting selection.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum SyntaxSelection {
-    /// Detect syntax from the buffer's file name.
+    /// Detect syntax from the file name, then the first-line shebang.
     #[default]
     Auto,
     /// Disable syntax highlighting.

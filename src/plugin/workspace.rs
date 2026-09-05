@@ -1687,8 +1687,21 @@ fn highlight_document_projection(
         })
         .collect::<Vec<_>>();
     let source = source_lines.join("\n");
-    let spans = highlighter
-        .highlight_for_file(Some(&document.path), &source)
+    let first_line = document.lines.iter().find(|line| {
+        if new_side {
+            line.new_line == Some(1)
+        } else {
+            line.old_line == Some(1)
+        }
+    });
+    let language = highlighter
+        .language_id_for_source(
+            Some(&document.path),
+            first_line.map_or("", |line| line.text.as_str()),
+        )
+        .map(str::to_owned);
+    let spans = language
+        .and_then(|language| highlighter.highlight(&language, &source).ok())
         .unwrap_or_default();
     let mut result = (0..document.lines.len())
         .map(|_| Vec::new())

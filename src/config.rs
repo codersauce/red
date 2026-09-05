@@ -1065,6 +1065,9 @@ pub struct LanguageConfig {
     /// Case-sensitive exact file names, such as `Dockerfile` or `Makefile`.
     #[serde(default)]
     pub filenames: Vec<String>,
+    /// Interpreter basenames recognized in a first-line shebang.
+    #[serde(default)]
+    pub shebangs: Vec<String>,
     /// Additional names accepted by syntax selection and injected fenced blocks.
     #[serde(default)]
     pub aliases: Vec<String>,
@@ -2285,6 +2288,7 @@ fn known_schema_path(path: &[String]) -> bool {
             "extensions"
                 | "filenames"
                 | "aliases"
+                | "shebangs"
                 | "comment"
                 | "text_width"
                 | "indent_width"
