@@ -1,7 +1,7 @@
 # Language extensions
 
 Red uses one language definition for syntax highlighting, exact filename and
-extension detection, comment templates, indentation, and language-server
+extension and shebang detection, comment templates, indentation, and language-server
 routing. Definitions can live in your configuration or in an installable
 external plugin package.
 
@@ -32,7 +32,32 @@ validate = true
 ```
 
 Extensions are case-insensitive and may start with a dot. Exact filenames are
-case-sensitive and take precedence over extensions. Aliases are accepted by
+case-sensitive and take precedence over extensions. When no filename or extension matches, Red reads up to 512 characters from the
+first line and checks its shebang. Bundled interpreters include `sh`, `bash`,
+`dash`, `ash`, `zsh` (using Bash syntax), `fish`, `pwsh`, `powershell`, `node`,
+`nodejs`, `lua`, `luajit`, and `husk`. No executable permission is required.
+
+Add interpreter basenames to any language definition or language-pack manifest:
+
+```toml
+[languages.python]
+shebangs = ["python", "python3", "pypy", "pypy3"]
+```
+
+This registers detection; Python highlighting still requires its language pack.
+Direct paths and common `env` forms are supported, including `env -S bash -eu`,
+`-i`, `-u NAME`, `-C DIR`, `--`, and environment assignments. Numeric interpreter
+versions such as `python3.12` fall back to the registered base name. Quoted
+commands, shell expansion, and arbitrary wrapper commands are not interpreted.
+An unknown or overlong shebang leaves the language undetected.
+
+Detection uses the current buffer, so editing the first line updates syntax even
+when it is offscreen. `:syntax <language>` overrides detection and `:syntax off`
+disables highlighting and structural operations. Shebang detection also applies
+to full-source previews. LSP routing still requires a filename or extension
+selector; this feature does not attach language servers to extensionless files.
+
+Aliases are accepted by
 `:syntax build-script`, syntax completion, and Markdown code fences.
 
 Every field is optional. A grammar-free language can still provide syntax

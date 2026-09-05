@@ -713,7 +713,7 @@ pub(crate) fn render_code_lines_with_highlighter(
     }
     let language = highlighter
         .as_ref()
-        .and_then(|value| value.language_id_for_file(Some(file)))
+        .and_then(|value| value.language_id_for_source(Some(file), source))
         .unwrap_or_default()
         .to_owned();
     highlighted_code_lines(&language, source, highlighter)
@@ -736,11 +736,15 @@ pub(crate) fn render_diff_lines_with_highlighter(
     if width == 0 {
         return Vec::new();
     }
-    let language = highlighter
-        .as_ref()
-        .and_then(|value| value.language_id_for_file(Some(file)))
-        .unwrap_or_default()
-        .to_owned();
+    let detect = |source: &str| {
+        highlighter
+            .as_ref()
+            .and_then(|value| value.language_id_for_source(Some(file), source))
+            .unwrap_or_default()
+            .to_owned()
+    };
+    let old_language = detect(before);
+    let new_language = detect(after);
     let diff = similar::TextDiff::from_lines(before, after);
     let mut old_lines = BTreeSet::new();
     let mut new_lines = BTreeSet::new();
@@ -756,12 +760,12 @@ pub(crate) fn render_diff_lines_with_highlighter(
     // Parse complete programs separately for correct multiline syntax, but
     // materialize spans only for source lines actually displayed in the diff.
     let old = highlighted_code_lines_selected(
-        &language,
+        &old_language,
         before,
         highlighter.as_deref_mut(),
         Some(&old_lines),
     );
-    let new = highlighted_code_lines_selected(&language, after, highlighter, Some(&new_lines));
+    let new = highlighted_code_lines_selected(&new_language, after, highlighter, Some(&new_lines));
     let palette = DiffPalette::new(theme);
     let span = |text: String, style: Style| RenderedTextSpan {
         text,
