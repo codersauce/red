@@ -2209,8 +2209,9 @@ fn shebang_interpreter(source: &str) -> Option<&str> {
         return Some(executable);
     }
     while let Some(word) = words.next() {
+        let word = word.strip_prefix("--split-string=").unwrap_or(word);
         match word {
-            "-S" | "--split-string" | "-i" | "--ignore-environment" => continue,
+            "" | "-S" | "--split-string" | "-i" | "--ignore-environment" => continue,
             "-u" | "--unset" | "-C" | "--chdir" => {
                 words.next()?;
             }
@@ -4444,6 +4445,12 @@ mod tests {
             ("#!/bin/zsh -f", Some("bash")),
             ("#!/usr/bin/env fish", Some("fish")),
             ("#!/usr/bin/env -S bash -eu", Some("bash")),
+            ("#!/usr/bin/env --split-string=bash -eu", Some("bash")),
+            ("#!/usr/bin/env --split-string=/bin/fish", Some("fish")),
+            ("#!/usr/bin/env --split-string=-i bash", Some("bash")),
+            ("#!/usr/bin/env --split-string= bash", Some("bash")),
+            ("#!/usr/bin/env --split-string=missing bash", None),
+            ("#!/usr/bin/env --split-string=", None),
             (
                 "#!/usr/bin/env --split-string pwsh -NoProfile",
                 Some("powershell"),
