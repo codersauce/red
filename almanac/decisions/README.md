@@ -1,6 +1,6 @@
 ---
 title: "Decisions"
-summary: "Decision pages record accepted or planned architectural choices for agent integration, configuration recovery, Husk semantics and extension boundaries, plugin language-pack distribution, runtime assets, and sessions."
+summary: "Decision pages record accepted architectural choices for agent integration, configuration recovery, Husk semantics and extension boundaries, plugin language-pack distribution, runtime assets, and sessions."
 topics: [decisions, navigation]
 sources:
   - id: topics
