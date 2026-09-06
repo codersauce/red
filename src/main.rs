@@ -208,6 +208,7 @@ fn session_root(config_dir: &Path) -> PathBuf {
 }
 
 async fn run_editor_inner(args: Args) -> anyhow::Result<()> {
+    fs::create_dir_all(Config::config_dir())?;
     let config_file = Config::path("config.toml");
     let preferences_file = Config::path("preferences.json");
     let first_launch = !config_file.exists() && !preferences_file.exists();
