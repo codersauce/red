@@ -1,7 +1,7 @@
 ---
 title: "Inspect Agent History"
 summary: "Use `:AgentHistory` to review and safely revert agent-attributed edit transactions after Codex changes have entered Red's undo history."
-topics: [guides, agent, agent-edits, history, safety]
+topics: [guides, agent, agent-edits, history, operations, safety]
 sources:
   - id: agent-plugin
     type: file
