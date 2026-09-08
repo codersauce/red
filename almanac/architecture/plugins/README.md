@@ -27,6 +27,18 @@ sources:
   - id: preferences-store
     type: file
     path: almanac/architecture/preferences/preferences-store.md
+  - id: host-api-reference
+    type: file
+    path: almanac/reference/plugins/host-api.md
+  - id: plugin-host-requests
+    type: file
+    path: almanac/architecture/editor/plugin-host-requests.md
+  - id: resource-ownership
+    type: file
+    path: almanac/architecture/plugins/resource-ownership.md
+  - id: callback-dialogs
+    type: file
+    path: almanac/concepts/plugins/callback-scoped-dialogs.md
 ---
 
 # Plugin Architecture
@@ -42,6 +54,12 @@ Use [Resource Ownership](resource-ownership) when plugin work touches panels, wo
 [Command Discovery](../commands/command-discovery) covers plugin command metadata, palette rows, colon command collisions, keymap shortcuts, and panel-global command scope.
 
 [Bundled Husk Plugins](../../concepts/plugins/bundled-husk-plugins) explains how shipped plugins relate to embedded runtime assets and pure Husk packages. [Callback-Scoped Dialogs](../../concepts/plugins/callback-scoped-dialogs) explains the handle-based picker and composer model used by plugin callbacks.
+
+## Host API Reading Map
+
+Use [Red Host API](red-host-api) for the architecture of `red::execute` and `red::request`: schema validation, runtime dispatch, compatibility checks, and why plugin effects return to editor-owned requests [@host-api] [@runtime]. Use [Plugin Host API](../../reference/plugins/host-api) when you need exact host API versions, call names, signatures, introduction versions, and accepted compatibility targets [@host-api-reference].
+
+The host API does not make plugins direct editor mutators. [Plugin Host Requests](../editor/plugin-host-requests) explains the typed editor message boundary that receives runtime requests, while [Resource Ownership](resource-ownership) explains how editor managers own long-lived UI resources after plugins describe them [@plugin-host-requests] [@resource-ownership]. [Callback-Scoped Dialogs](../../concepts/plugins/callback-scoped-dialogs) is the concept page for handle-based picker, composer, input, and confirmation callbacks inside that broader host API surface [@callback-dialogs].
 
 Use [Preferences Store](../preferences/preferences-store) when plugin work persists user or plugin JSON state, because plugin storage is a plugin-owned namespace inside the shared preferences file rather than crash-recovery state [@preferences-store].
 
