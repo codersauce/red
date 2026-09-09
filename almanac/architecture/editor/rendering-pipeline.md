@@ -49,6 +49,8 @@ RenderBuffer cells must contain terminal-printable text, not raw control charact
 
 `Editor::render` is the full-frame entrypoint. It updates gutter width, applies panel layout, fixes cursor position, checks bounds, synchronizes editor fields back to the active window, renders each window, draws window separators, renders the startup splash if eligible, renders panels and global chrome, overlays modal workspaces and dialogs, drains plugin render commands, updates overlays, paints the cursor cell, diffs the frame, flushes changes, and advances `render_generation` [@rendering]. The [buffers and windows](buffers-and-windows) page explains the window state consumed by these steps.
 
+Statusline sections use their configured slot positions for color bands. The renderer enumerates configured left and right sections before hidden optional sections are filtered, so a filename after `diagnostics` or `git_branch` keeps the same slot style whether those optional sections have visible content or not [@rendering]. Hidden sections take no width, and absent Git or diagnostics segments do not leave a stale color band or separator in the row [@rendering].
+
 The startup splash is render-only. `splash.rs` defines the splash model and states that it is drawn during the normal render pass and never touches buffer contents [@splash]. `render_splash` only draws it over a pristine single unnamed blank buffer when splash configuration and startup-file conditions allow it, and latches it off after the pristine state first fails [@rendering].
 
 ## Overlays, Dialogs, And Plugin Paint
