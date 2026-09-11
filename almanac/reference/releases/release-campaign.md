@@ -33,9 +33,6 @@ sources:
   - id: markdown-links
     type: file
     path: scripts/check_markdown_links.py
-  - id: pr-351-doc-links
-    type: conversation
-    path: /Users/fcoury/.codex/sessions/2026/08/24/rollout-2026-08-24T20-33-04-01a0361e-d26f-7740-9ac1-d9b12eb81cb7.jsonl
 ---
 
 # Release Campaign
@@ -66,6 +63,6 @@ The Discord announcement workflow is the automated external posting path. On a p
 
 The main CI workflow validates the current reviewed campaign during workflow lint and runs unit tests for the release campaign, Discord release, social release, CI policy, doctest package, and test-performance helpers [@ci]. Release-campaign changes therefore affect the normal documentation and workflow-lint surface even when no Rust code changes.
 
-Markdown links in release documentation must resolve inside the checked repository. The Markdown checker ignores external URLs but reports unresolved local links and links that escape the repository root [@markdown-links]. A PR #351 documentation failure came from archived release-communication Markdown linking to sibling local worktrees that CI could not see; the repair converted those references into code-formatted path descriptions instead of Markdown links [@pr-351-doc-links]. Use that pattern when recording branch or sibling-worktree artifacts that are not part of the checked-out repository.
+Markdown links in release documentation must resolve inside the checked repository. The Markdown checker ignores external URLs but reports unresolved local links and links that escape the repository root [@markdown-links]. When recording branch-local or sibling-worktree artifacts that are not part of the checked-out repository, write them as code-formatted path descriptions instead of Markdown links.
 
 Use [Release Red](../../guides/releases/release-red) for the full release procedure and [CI and validation](../validation/ci-and-validation) for the jobs that enforce this contract.
