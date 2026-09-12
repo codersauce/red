@@ -29,7 +29,7 @@ sources:
     path: src/plugin/registry.rs
 ---
 
-Use this guide when adding or revising a Red plugin written in Husk. A complete plugin has Husk source that declares commands or events, optional `red-plugin.toml` package metadata that declares compatibility, host calls that match the current Red API, and any process permissions needed by its runtime behavior [@system-doc] [@external-doc] [@api-doc]. By the end, the plugin should load through Red's plugin lifecycle, expose only the resources it needs, and pass the same validation commands used for bundled plugin work.
+Use this guide when adding or revising a Red plugin written in Husk. A complete plugin has Husk source that declares commands or events, optional `red-plugin.toml` package metadata that declares compatibility, host calls that match the current Red API, and any process permissions needed by its runtime behavior [@system-doc] [@external-doc] [@schema]. By the end, the plugin should load through Red's plugin lifecycle, expose only the resources it needs, and pass the same validation commands used for bundled plugin work.
 
 ## Start From A Minimal Source File
 
