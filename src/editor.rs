@@ -44,6 +44,7 @@ mod inline_notifications;
 mod keyboard_shortcuts;
 mod learning;
 mod lsp_coordinator;
+mod mouse;
 mod multi_cursor;
 #[cfg(test)]
 mod navigation_perf_tests;
@@ -2464,6 +2465,18 @@ impl PickerCallback {
 /// serializes their execution through its event loop and canonical edit
 /// transaction boundary.
 pub enum Action {
+    /// Starts an editor-owned pointer gesture in terminal-cell coordinates.
+    MousePress {
+        column: u16,
+        row: u16,
+        modifiers: KeyModifiers,
+    },
+    /// Extends or releases the editor's captured pointer gesture.
+    MouseDrag {
+        column: u16,
+        row: u16,
+        finish: bool,
+    },
     Quit(bool),
     Save,
     /// Overwrites the backing file after an explicit `:w!` or conflict confirmation.
@@ -3800,6 +3813,9 @@ pub struct Editor {
     /// Current selection rectangle
     selection: Option<Rect>,
 
+    /// Pointer capture and the originating mode of a mouse-created selection.
+    mouse_selection: mouse::MouseSelectionState,
+
     /// Named registers for storing text (like vim registers)
     registers: HashMap<char, Content>,
 
@@ -4143,6 +4159,8 @@ impl DetachedEditorCore {
     }
 
     pub fn client_disconnected(&mut self) {
+        self.editor.mouse_selection.gesture = None;
+        self.editor.mouse_selection.last_click = None;
         self.editor.notification_client_attached = false;
         self.editor.notification_exposure = None;
     }
@@ -5325,6 +5343,7 @@ impl Editor {
             repeater: None,
             selection_start: None,
             selection: None,
+            mouse_selection: mouse::MouseSelectionState::default(),
             registers: HashMap::new(),
             clipboard,
             diagnostics: HashMap::new(),
@@ -6522,6 +6541,8 @@ impl Editor {
     }
 
     fn resize_terminal_surface(&mut self, width: u16, height: u16, buffer: &mut RenderBuffer) {
+        self.mouse_selection.gesture = None;
+        self.mouse_selection.last_click = None;
         self.size = (width, height);
         self.divider_drag = None;
         self.pane_resize_mode = None;
@@ -7590,7 +7611,7 @@ impl Editor {
     }
 
     fn max_cursor_x_for_line_length(&self, line_length: usize) -> usize {
-        if self.is_insert() {
+        if self.is_insert() || self.mouse_visual_allows_line_end() {
             line_length
         } else {
             line_length.saturating_sub(1)
@@ -10495,6 +10516,7 @@ impl Editor {
         buffer: &mut RenderBuffer,
         runtime: &mut Runtime,
     ) -> anyhow::Result<()> {
+        self.service_mouse_selection(buffer, runtime).await?;
         self.service_open_file_changes(buffer, runtime).await?;
         if self.agent_lsp.has_work() {
             self.service_agent_lsp(buffer, runtime).await?;
@@ -15472,6 +15494,11 @@ impl Editor {
         ev: &event::Event,
         runtime: Option<&Runtime>,
     ) -> anyhow::Result<Option<KeyAction>> {
+        self.validate_mouse_selection_owner();
+        if matches!(ev, Event::Key(_) | Event::Paste(_)) {
+            self.mouse_selection.gesture = None;
+            self.mouse_selection.last_click = None;
+        }
         if let Some(action) = self.handle_keyboard_shortcuts_event(ev, runtime) {
             return Ok(Some(action));
         }
@@ -15603,6 +15630,9 @@ impl Editor {
         }
 
         if let Event::Mouse(mouse) = ev {
+            if let Some(action) = self.handle_captured_mouse_selection(mouse) {
+                return Ok(Some(action));
+            }
             if let Some(action) = self.handle_divider_mouse_event(mouse) {
                 return Ok(Some(action));
             }
@@ -15771,6 +15801,8 @@ impl Editor {
     ) -> anyhow::Result<bool> {
         match ev {
             Event::FocusLost => {
+                self.mouse_selection.gesture = None;
+                self.mouse_selection.last_click = None;
                 let divider_was_active = self.divider_drag.take().is_some();
                 let resize_mode_was_active = self.pane_resize_mode.take().is_some();
                 self.suppress_reactivation_click = false;
@@ -20044,6 +20076,9 @@ impl Editor {
                 return Ok(true);
             }
             let old_mode = self.mode;
+            let insert_return_cursor = self
+                .take_mouse_insert_return(new_mode)
+                .then(|| self.cursor_snapshot());
             if !matches!(new_mode, Mode::Insert) {
                 self.snippet_session = None;
             }
@@ -20127,6 +20162,16 @@ impl Editor {
             }
 
             self.draw_statusline(buffer);
+            if let Some(cursor) = insert_return_cursor {
+                // Normal-mode rendering clamps the virtual line-ending cell. The
+                // resumed insertion and its undo transaction retain the mouse's
+                // actual endpoint, including insertion immediately after the line.
+                self.vtop = cursor.vtop;
+                self.cy = cursor.y.saturating_sub(cursor.vtop);
+                self.cx = cursor.x;
+                self.refresh_cursor_goal();
+                return self.execute_enter_mode(Mode::Insert, buffer, runtime).await;
+            }
             Ok(false)
         })
     }
@@ -20261,6 +20306,22 @@ impl Editor {
             .and_then(|dialog| dialog.composer_handle());
 
         match action {
+            Action::MousePress {
+                column,
+                row,
+                modifiers,
+            } => {
+                self.execute_mouse_press(*column, *row, *modifiers, buffer, runtime)
+                    .await?;
+            }
+            Action::MouseDrag {
+                column,
+                row,
+                finish,
+            } => {
+                self.execute_mouse_drag(*column, *row, *finish, buffer, runtime)
+                    .await?;
+            }
             Action::Quit(force) => {
                 let scratch_command = self
                     .scratch_buffers
@@ -26106,113 +26167,11 @@ impl Editor {
                 } = mev;
                 match kind {
                     MouseEventKind::Down(MouseButton::Left) => {
-                        let click_x = *column as usize;
-                        let click_y = *row as usize;
-
-                        // Check if click is in a window
-                        if let Some((window_id, window)) =
-                            self.window_manager.window_at_position(click_x, click_y)
-                        {
-                            // Clone window data to avoid borrowing issues
-                            let window = window.clone();
-                            let window_buffer_index = window.buffer_index;
-                            let window_vtop = window.vtop;
-
-                            // Switch to the clicked window if it's not already active
-                            self.set_active_window(window_id);
-
-                            let local_y = click_y.saturating_sub(window.position.y);
-                            if local_y < self.window_content_top(&window) {
-                                let local_x = click_x.saturating_sub(window.position.x);
-                                if let Some(rendered) = self
-                                    .window_bar_manager
-                                    .render(window.id, window.inner_width())
-                                {
-                                    if let Some(region) =
-                                        rendered.hit_regions.iter().find(|region| {
-                                            local_x >= region.start_column
-                                                && local_x < region.end_column
-                                        })
-                                    {
-                                        return Some(KeyAction::Single(Action::NotifyPlugins(
-                                            format!("window_bar:action:{}", rendered.bar_id),
-                                            json!({
-                                                "window_id": window.id.0,
-                                                "segment_id": region.segment_id,
-                                                "action": region.action,
-                                            }),
-                                        )));
-                                    }
-                                }
-                                return Some(KeyAction::None);
-                            }
-
-                            // Convert terminal coordinates to window-local coordinates
-                            if let Some((local_x, local_y)) =
-                                window.terminal_to_local(click_x, click_y)
-                            {
-                                let local_y = local_y - self.window_content_top(&window);
-                                // Adjust for the clicked window's gutter, not the active buffer's.
-                                let gutter_width = self.gutter_width_for_window(&window);
-                                let content_x = local_x.saturating_sub(gutter_width + 1);
-                                let layout = self.layout_for_window(&window);
-                                let (buffer_x, buffer_y) = if let Some(segment) =
-                                    layout.row(local_y)
-                                {
-                                    // Clicks inside the break-indent area
-                                    // snap to the row's first character.
-                                    let display_col = segment.start_col
-                                        + content_x.saturating_sub(segment.visual_offset);
-                                    let line = self.buffer_manager[window_buffer_index]
-                                        .get(segment.line)
-                                        .unwrap_or_default();
-                                    (
-                                        column_to_grapheme_with_tabs(
-                                            line.trim_end_matches('\n'),
-                                            display_col,
-                                            self.tab_width_for_buffer_index(window_buffer_index),
-                                        ),
-                                        segment.line,
-                                    )
-                                } else if let Some(comment) = layout.inline_comment_row(local_y) {
-                                    if let Some(action) =
-                                        self.inline_comment_click_action(comment, content_x)
-                                    {
-                                        return Some(KeyAction::Single(action));
-                                    }
-                                    if let Some(group) =
-                                        self.inline_job_on_comment_line(comment.line)
-                                    {
-                                        return Some(KeyAction::Single(Action::OpenInlineJob(
-                                            group,
-                                        )));
-                                    }
-                                    (0, comment.line)
-                                } else {
-                                    (content_x, window_vtop + local_y)
-                                };
-
-                                // Ensure y is within buffer bounds
-                                let window_buffer = &self.buffer_manager[window_buffer_index];
-                                let y = if buffer_y >= window_buffer.len() {
-                                    window_buffer.len().saturating_sub(1)
-                                } else {
-                                    buffer_y
-                                };
-
-                                return Some(KeyAction::Single(Action::SetCursor(buffer_x, y)));
-                            }
-                        }
-
-                        // Fallback to global click handling if not in a window
-                        let x = (*column as usize).saturating_sub(self.gutter_width() + 1);
-                        let mut y = *row as usize + self.vtop;
-
-                        if y >= self.current_buffer().len() {
-                            y = self.current_buffer().len().saturating_sub(1);
-                        }
-
-                        Some(KeyAction::Single(Action::SetCursor(x, y)))
+                        Some(KeyAction::Single(Action::MousePress {
+                            column: *column,
+                            row: *row,
+                            modifiers: mev.modifiers,
+                        }))
                     }
                     MouseEventKind::ScrollUp => {
                         let click_x = *column as usize;
@@ -26494,6 +26453,7 @@ impl Editor {
         };
 
         self.mode = selection.mode;
+        self.restore_mouse_visual_line_end(start, end);
         self.selection_start = Some(anchor);
         self.set_selection(start, end);
         self.move_to_text_position(if selection.anchor_at_start {
@@ -28533,10 +28493,13 @@ impl Editor {
     }
 
     fn visual_selection_end_position(&self, column: usize, line: usize) -> TextPosition {
-        let is_empty_line_with_ending = self.current_buffer().get(line).is_some_and(|contents| {
-            trim_line_ending(&contents).is_empty() && contents.ends_with('\n')
+        let includes_line_ending = self.current_buffer().get(line).is_some_and(|contents| {
+            let text = trim_line_ending(&contents);
+            contents.ends_with('\n')
+                && (text.is_empty()
+                    || line < self.last_navigable_line() && column >= grapheme_len(text))
         });
-        if is_empty_line_with_ending {
+        if includes_line_ending {
             TextPosition::new(line + 1, 0)
         } else {
             TextPosition::new(line, self.grapheme_to_char_on_line(column + 1, line))
