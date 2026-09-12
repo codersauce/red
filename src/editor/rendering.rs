@@ -37,7 +37,7 @@ use crate::{
     ui::IconCatalog,
     undo::{TextPosition, TextRange},
     unicode_utils::{
-        char_prefix, display_width, display_width_with_tabs, fit_display_width,
+        char_prefix, display_width, display_width_with_tabs, fit_display_width, grapheme_len,
         grapheme_to_column_with_tabs, is_printable_ascii, trim_line_ending, truncate_display_width,
         truncate_display_width_with_marker, TruncationSide,
     },
@@ -3427,7 +3427,10 @@ impl Editor {
                     }
                 }
                 Mode::VisualLine => (0, self.last_cell_for_line(y)),
-                Mode::VisualBlock => (selection.x0, selection.x1),
+                Mode::VisualBlock => (
+                    selection.x0.min(selection.x1),
+                    selection.x0.max(selection.x1),
+                ),
                 _ => unreachable!(),
             };
 
@@ -3439,8 +3442,25 @@ impl Editor {
             let start_col = grapheme_to_column_with_tabs(line, start_x, tab_width);
             let end_col = grapheme_to_column_with_tabs(line, end_x.saturating_add(1), tab_width);
             cells.extend(self.display_col_range_points_in_window(window, y, start_col, end_col));
-            if line.is_empty() && start_x == 0 && end_x == 0 {
-                cells.extend(self.display_col_range_points_in_window(window, y, 0, 1));
+            if (line.is_empty() && start_x == 0 && end_x == 0)
+                || (self.mode == Mode::Visual && end_x >= grapheme_len(line))
+            {
+                // Source segments stop before their line-ending cell. Paint that
+                // cell explicitly when the inclusive selection reaches it.
+                let column = display_width_with_tabs(line, tab_width);
+                let layout = self.layout_for_window(window);
+                if let Some(segment) = layout.segment_for_cursor(y, column) {
+                    let local_x = segment.visual_offset + column.saturating_sub(segment.start_col);
+                    if local_x < self.window_content_width(window) {
+                        cells.push(Point::new(
+                            self.window_to_terminal_x(
+                                window,
+                                self.gutter_width_for_window(window) + 1 + local_x,
+                            ),
+                            self.window_to_terminal_y(window, segment.row),
+                        ));
+                    }
+                }
             }
         }
 

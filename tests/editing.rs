@@ -450,6 +450,849 @@ fn default_key_config() -> Config {
     toml::from_str(include_str!("../default_config.toml")).unwrap()
 }
 
+fn mouse_selection_config() -> Config {
+    Config {
+        scrolloff: Some(0),
+        splash: Some(false),
+        ..default_key_config()
+    }
+}
+
+fn mouse_selection_harness(content: &str) -> EditorHarness {
+    let mut harness = EditorHarness::with_config(
+        Buffer::new(None, content.to_string()),
+        mouse_selection_config(),
+    );
+    harness
+        .editor
+        .test_set_clipboard(Box::new(MemoryClipboardProvider::default()));
+    harness
+}
+
+async fn mouse_selection_event(
+    harness: &mut EditorHarness,
+    kind: MouseEventKind,
+    position: (u16, u16),
+) {
+    modified_mouse_selection_event(harness, kind, position, KeyModifiers::NONE).await;
+}
+
+async fn modified_mouse_selection_event(
+    harness: &mut EditorHarness,
+    kind: MouseEventKind,
+    (column, row): (u16, u16),
+    modifiers: KeyModifiers,
+) {
+    harness
+        .execute_event(Event::Mouse(MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers,
+        }))
+        .await
+        .unwrap();
+}
+
+async fn select_with_mouse(harness: &mut EditorHarness, start: (u16, u16), end: (u16, u16)) {
+    for (kind, position) in [
+        (MouseEventKind::Down(MouseButton::Left), start),
+        (MouseEventKind::Drag(MouseButton::Left), end),
+        (MouseEventKind::Up(MouseButton::Left), end),
+    ] {
+        mouse_selection_event(harness, kind, position).await;
+    }
+}
+
+#[tokio::test]
+async fn mouse_selection_preserves_inclusive_forward_reverse_and_multiline_ranges_for_yank() {
+    for (start, end, selection, expected) in [
+        ((5, 0), (7, 0), (1, 0, 3, 0), "bcd"),
+        ((7, 0), (5, 0), (1, 0, 3, 0), "bcd"),
+        ((5, 0), (6, 2), (1, 0, 2, 2), "bcdef\n\nwxy"),
+        ((6, 2), (5, 0), (1, 0, 2, 2), "bcdef\n\nwxy"),
+    ] {
+        let mut harness = mouse_selection_harness("abcdef\n\nwxyz");
+        let clipboard = MemoryClipboardProvider::default();
+        let clipboard_text = clipboard.shared_text();
+        harness.editor.test_set_clipboard(Box::new(clipboard));
+
+        mouse_selection_event(&mut harness, MouseEventKind::Down(MouseButton::Left), start).await;
+        harness.assert_mode(Mode::Normal);
+        mouse_selection_event(&mut harness, MouseEventKind::Drag(MouseButton::Left), end).await;
+        harness.assert_mode(Mode::Visual);
+        assert_eq!(harness.selection(), Some(selection));
+        mouse_selection_event(&mut harness, MouseEventKind::Up(MouseButton::Left), end).await;
+        harness.assert_mode(Mode::Visual);
+        assert_eq!(harness.selection(), Some(selection));
+        harness.assert_buffer_contents("abcdef\n\nwxyz");
+
+        type_normal_keys(&mut harness, "y").await;
+        harness.assert_mode(Mode::Normal);
+        assert_eq!(clipboard_text.lock().unwrap().as_deref(), Some(expected));
+    }
+}
+
+#[tokio::test]
+async fn mouse_selection_uses_the_release_position_even_without_a_drag_event() {
+    let mut harness = mouse_selection_harness("abcdef");
+    mouse_selection_event(
+        &mut harness,
+        MouseEventKind::Down(MouseButton::Left),
+        (5, 0),
+    )
+    .await;
+    mouse_selection_event(&mut harness, MouseEventKind::Up(MouseButton::Left), (7, 0)).await;
+
+    harness.assert_mode(Mode::Visual);
+    assert_eq!(harness.selection(), Some((1, 0, 3, 0)));
+
+    mouse_selection_event(
+        &mut harness,
+        MouseEventKind::Drag(MouseButton::Left),
+        (9, 0),
+    )
+    .await;
+    assert_eq!(harness.selection(), Some((1, 0, 3, 0)));
+}
+
+#[tokio::test]
+async fn mouse_selection_ignores_strays_and_keeps_an_unmoved_click_in_normal_mode() {
+    let mut harness = mouse_selection_harness("abcdef");
+    for kind in [
+        MouseEventKind::Moved,
+        MouseEventKind::Drag(MouseButton::Left),
+        MouseEventKind::Up(MouseButton::Left),
+    ] {
+        mouse_selection_event(&mut harness, kind, (7, 0)).await;
+        harness.assert_cursor_at(0, 0);
+        harness.assert_mode(Mode::Normal);
+        assert_eq!(harness.selection(), None);
+    }
+
+    select_with_mouse(&mut harness, (6, 0), (6, 0)).await;
+    harness.assert_cursor_at(2, 0);
+    harness.assert_mode(Mode::Normal);
+    assert_eq!(harness.selection(), None);
+
+    type_normal_keys(&mut harness, "vl").await;
+    mouse_selection_event(
+        &mut harness,
+        MouseEventKind::Down(MouseButton::Left),
+        (4, 0),
+    )
+    .await;
+    mouse_selection_event(&mut harness, MouseEventKind::Up(MouseButton::Left), (4, 0)).await;
+    harness.assert_cursor_at(0, 0);
+    harness.assert_mode(Mode::Normal);
+    assert_eq!(harness.selection(), None);
+}
+
+#[tokio::test]
+async fn mouse_selection_highlight_survives_release_and_keyboard_adjustment_and_gv() {
+    let mut harness = mouse_selection_harness("abcdefgh");
+    let unselected = harness.render_cell_bg(7, 0).unwrap();
+    select_with_mouse(&mut harness, (8, 0), (6, 0)).await;
+    assert_ne!(harness.render_cell_bg(7, 0).unwrap(), unselected);
+    assert_eq!(harness.render_cell_bg(10, 0).unwrap(), unselected);
+
+    type_normal_keys(&mut harness, "h").await;
+    harness.assert_cursor_at(1, 0);
+    assert_eq!(harness.selection(), Some((1, 0, 4, 0)));
+    execute_unmodified_key(&mut harness, KeyCode::Esc).await;
+    harness.assert_mode(Mode::Normal);
+    assert_eq!(harness.render_cell_bg(7, 0).unwrap(), unselected);
+
+    type_normal_keys(&mut harness, "Ggv").await;
+    harness.assert_mode(Mode::Visual);
+    harness.assert_cursor_at(1, 0);
+    assert_eq!(harness.selection(), Some((1, 0, 4, 0)));
+}
+
+#[tokio::test]
+async fn mouse_selection_delete_and_change_use_visual_operators_and_undo() {
+    for (operator, expected) in [('d', "aef"), ('c', "aXef")] {
+        let mut harness = mouse_selection_harness("abcdef");
+        select_with_mouse(&mut harness, (5, 0), (7, 0)).await;
+        execute_unmodified_key(&mut harness, KeyCode::Char(operator)).await;
+        if operator == 'c' {
+            harness.assert_mode(Mode::Insert);
+            harness.type_text("X").await.unwrap();
+            execute_unmodified_key(&mut harness, KeyCode::Esc).await;
+        }
+        harness.assert_mode(Mode::Normal);
+        harness.assert_buffer_contents(expected);
+
+        type_normal_keys(&mut harness, "u").await;
+        harness.assert_buffer_contents("abcdef");
+    }
+}
+
+#[tokio::test]
+async fn mouse_selection_started_in_insert_resumes_insert_with_separate_undo_groups() {
+    for (finish, expected_cursor, expected_text) in [
+        (KeyCode::Esc, (3, 0), "XabYcdef"),
+        (KeyCode::Char('y'), (2, 0), "XaYbcdef"),
+    ] {
+        let mut harness = mouse_selection_harness("abcdef");
+        type_normal_keys(&mut harness, "i").await;
+        harness.type_text("X").await.unwrap();
+        select_with_mouse(&mut harness, (6, 0), (7, 0)).await;
+        harness.assert_mode(Mode::Visual);
+        execute_unmodified_key(&mut harness, finish).await;
+        harness.assert_mode(Mode::Insert);
+        assert_eq!(harness.cursor_position(), expected_cursor);
+        harness.type_text("Y").await.unwrap();
+        execute_unmodified_key(&mut harness, KeyCode::Esc).await;
+        harness.assert_buffer_contents(expected_text);
+
+        type_normal_keys(&mut harness, "u").await;
+        harness.assert_buffer_contents("Xabcdef");
+        type_normal_keys(&mut harness, "u").await;
+        harness.assert_buffer_contents("abcdef");
+    }
+}
+
+#[tokio::test]
+async fn mouse_selection_from_insert_separates_delete_from_typing_but_keeps_change_atomic() {
+    for operator in ['d', 'c'] {
+        let mut harness = mouse_selection_harness("abcdef");
+        type_normal_keys(&mut harness, "i").await;
+        harness.type_text("X").await.unwrap();
+        select_with_mouse(&mut harness, (6, 0), (7, 0)).await;
+        execute_unmodified_key(&mut harness, KeyCode::Char(operator)).await;
+        harness.assert_mode(Mode::Insert);
+        harness.assert_cursor_at(2, 0);
+        harness.assert_buffer_contents("Xadef");
+        harness.type_text("Y").await.unwrap();
+        execute_unmodified_key(&mut harness, KeyCode::Esc).await;
+        harness.assert_buffer_contents("XaYdef");
+
+        type_normal_keys(&mut harness, "u").await;
+        if operator == 'd' {
+            harness.assert_buffer_contents("Xadef");
+            type_normal_keys(&mut harness, "u").await;
+        }
+        harness.assert_buffer_contents("Xabcdef");
+        type_normal_keys(&mut harness, "u").await;
+        harness.assert_buffer_contents("abcdef");
+    }
+}
+
+#[tokio::test]
+async fn mouse_selection_from_insert_restores_the_eol_insertion_position_after_escape_or_delete() {
+    for (start, finish, cursor, after_finish, after_typing) in [
+        ((5, 0), KeyCode::Esc, 6, "abcdef", "abcdefX"),
+        ((7, 0), KeyCode::Char('d'), 3, "abc", "abcX"),
+    ] {
+        let mut harness = mouse_selection_harness("abcdef");
+        type_normal_keys(&mut harness, "i").await;
+        select_with_mouse(&mut harness, start, (70, 0)).await;
+        execute_unmodified_key(&mut harness, finish).await;
+
+        harness.assert_mode(Mode::Insert);
+        harness.assert_cursor_at(cursor, 0);
+        harness.assert_buffer_contents(after_finish);
+        harness.type_text("X").await.unwrap();
+        execute_unmodified_key(&mut harness, KeyCode::Esc).await;
+        harness.assert_buffer_contents(after_typing);
+
+        type_normal_keys(&mut harness, "u").await;
+        harness.assert_buffer_contents(after_finish);
+        if finish == KeyCode::Char('d') {
+            type_normal_keys(&mut harness, "u").await;
+            harness.assert_buffer_contents("abcdef");
+        }
+    }
+}
+
+#[tokio::test]
+async fn mouse_selection_moving_inside_one_tab_selects_the_tab_but_an_unmoved_click_does_not() {
+    let mut harness = mouse_selection_harness("\tabc");
+    select_with_mouse(&mut harness, (5, 0), (5, 0)).await;
+    harness.assert_mode(Mode::Normal);
+    harness.assert_cursor_at(0, 0);
+    assert_eq!(harness.selection(), None);
+
+    let mut harness = mouse_selection_harness("\tabc");
+    let clipboard = MemoryClipboardProvider::default();
+    let clipboard_text = clipboard.shared_text();
+    harness.editor.test_set_clipboard(Box::new(clipboard));
+    select_with_mouse(&mut harness, (5, 0), (6, 0)).await;
+    harness.assert_mode(Mode::Visual);
+    harness.assert_cursor_at(0, 0);
+    assert_eq!(harness.selection(), Some((0, 0, 0, 0)));
+    type_normal_keys(&mut harness, "y").await;
+    assert_eq!(clipboard_text.lock().unwrap().as_deref(), Some("\t"));
+}
+
+#[tokio::test]
+async fn mouse_selection_maps_tabs_graphemes_wrapping_and_breakindent_to_source_text() {
+    for (content, width, start, end, selection, expected) in [
+        (
+            "\t界e\u{301}🙂Z",
+            40,
+            (6, 0),
+            (12, 0),
+            (0, 0, 3, 0),
+            "\t界e\u{301}🙂",
+        ),
+        (
+            "abcdefghijklmnopqrst",
+            12,
+            (10, 0),
+            (6, 1),
+            (6, 0, 10, 0),
+            "ghijk",
+        ),
+        (
+            "    abcdefghijklmnopqrstuvwxyz012345",
+            32,
+            (5, 1),
+            (10, 1),
+            (28, 0, 30, 0),
+            "yz0",
+        ),
+    ] {
+        let mut harness = EditorHarness::with_config_and_size(
+            Buffer::new(None, content.to_string()),
+            mouse_selection_config(),
+            width,
+            8,
+        );
+        let clipboard = MemoryClipboardProvider::default();
+        let clipboard_text = clipboard.shared_text();
+        harness.editor.test_set_clipboard(Box::new(clipboard));
+
+        select_with_mouse(&mut harness, start, end).await;
+
+        harness.assert_mode(Mode::Visual);
+        assert_eq!(harness.selection(), Some(selection), "{content:?}");
+        type_normal_keys(&mut harness, "y").await;
+        assert_eq!(clipboard_text.lock().unwrap().as_deref(), Some(expected));
+    }
+}
+
+#[tokio::test]
+async fn mouse_selection_uses_the_horizontal_viewport_offset() {
+    let mut config = mouse_selection_config();
+    config.wrap = Some(false);
+    let mut harness = EditorHarness::with_config_and_size(
+        Buffer::new(None, "abcdefghijklmnopqrstuvwxyz".to_string()),
+        config,
+        12,
+        8,
+    );
+    harness
+        .execute_action(Action::SetCursor(16, 0))
+        .await
+        .unwrap();
+    assert_eq!(harness.viewport_left(), 9);
+
+    select_with_mouse(&mut harness, (5, 0), (7, 0)).await;
+
+    harness.assert_mode(Mode::Visual);
+    assert_eq!(harness.selection(), Some((10, 0, 12, 0)));
+    assert_eq!(harness.viewport_left(), 9);
+}
+
+#[tokio::test]
+async fn mouse_selection_clamps_blank_space_below_eof_to_the_source_line_end() {
+    let mut harness = mouse_selection_harness("abc\n\nxy");
+    let clipboard = MemoryClipboardProvider::default();
+    let clipboard_text = clipboard.shared_text();
+    harness.editor.test_set_clipboard(Box::new(clipboard));
+
+    select_with_mouse(&mut harness, (5, 0), (70, 10)).await;
+
+    assert_eq!(harness.selection(), Some((1, 0, 2, 2)));
+    type_normal_keys(&mut harness, "y").await;
+    assert_eq!(clipboard_text.lock().unwrap().as_deref(), Some("bc\n\nxy"));
+}
+
+#[tokio::test]
+async fn mouse_selection_drag_past_a_line_end_includes_its_newline() {
+    let mut harness = mouse_selection_harness("abc\nxyz");
+    let unselected_background = harness.render_cell_bg(7, 0).unwrap();
+    let clipboard = MemoryClipboardProvider::default();
+    let clipboard_text = clipboard.shared_text();
+    harness.editor.test_set_clipboard(Box::new(clipboard));
+
+    select_with_mouse(&mut harness, (5, 0), (70, 0)).await;
+
+    assert_eq!(harness.selection(), Some((1, 0, 3, 0)));
+    let selected_background = harness.render_cell_bg(5, 0).unwrap();
+    assert_ne!(selected_background, unselected_background);
+    assert_eq!(harness.render_cell_bg(7, 0).unwrap(), selected_background);
+    assert_ne!(harness.render_cell_bg(8, 0).unwrap(), selected_background);
+    type_normal_keys(&mut harness, "y").await;
+    assert_eq!(clipboard_text.lock().unwrap().as_deref(), Some("bc\n"));
+}
+
+#[tokio::test]
+async fn mouse_selection_press_past_line_end_uses_the_normal_or_insert_cursor_boundary() {
+    for (mode, anchor_x, expected) in [(Mode::Normal, 2, "c\nxy"), (Mode::Insert, 3, "\nxy")] {
+        let mut harness = mouse_selection_harness("abc\nxyz");
+        let clipboard = MemoryClipboardProvider::default();
+        let clipboard_text = clipboard.shared_text();
+        harness.editor.test_set_clipboard(Box::new(clipboard));
+        harness
+            .execute_action(Action::EnterMode(mode))
+            .await
+            .unwrap();
+
+        mouse_selection_event(
+            &mut harness,
+            MouseEventKind::Down(MouseButton::Left),
+            (70, 0),
+        )
+        .await;
+        harness.assert_mode(mode);
+        harness.assert_cursor_at(anchor_x, 0);
+        mouse_selection_event(
+            &mut harness,
+            MouseEventKind::Drag(MouseButton::Left),
+            (5, 1),
+        )
+        .await;
+        mouse_selection_event(&mut harness, MouseEventKind::Up(MouseButton::Left), (5, 1)).await;
+
+        assert_eq!(harness.selection(), Some((anchor_x, 0, 1, 1)));
+        type_normal_keys(&mut harness, "y").await;
+        assert_eq!(clipboard_text.lock().unwrap().as_deref(), Some(expected));
+    }
+}
+
+#[tokio::test]
+async fn mouse_selection_stays_in_its_originating_split_when_dragged_over_another_window() {
+    let mut harness = mouse_selection_harness("abcdefghij");
+    harness.execute_action(Action::SplitVertical).await.unwrap();
+    let right_window_id = harness.active_window_id();
+    mouse_selection_event(
+        &mut harness,
+        MouseEventKind::Down(MouseButton::Left),
+        (5, 0),
+    )
+    .await;
+    let source_window_id = harness.active_window_id();
+    let source_bounds = harness.editor.test_active_window_bounds();
+    assert_ne!(source_window_id, right_window_id);
+
+    for kind in [
+        MouseEventKind::Drag(MouseButton::Left),
+        MouseEventKind::Up(MouseButton::Left),
+    ] {
+        mouse_selection_event(&mut harness, kind, (60, 0)).await;
+        assert_eq!(harness.active_window_id(), source_window_id);
+        assert_eq!(harness.editor.test_active_window_bounds(), source_bounds);
+        assert_eq!(harness.selection(), Some((1, 0, 10, 0)));
+    }
+}
+
+#[tokio::test]
+async fn mouse_selection_cancels_capture_on_escape_focus_loss_and_resize() {
+    for cancellation in [
+        Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+        Event::FocusLost,
+        Event::Resize(81, 24),
+    ] {
+        let mut harness = mouse_selection_harness("abcdefghij");
+        mouse_selection_event(
+            &mut harness,
+            MouseEventKind::Down(MouseButton::Left),
+            (5, 0),
+        )
+        .await;
+        mouse_selection_event(
+            &mut harness,
+            MouseEventKind::Drag(MouseButton::Left),
+            (7, 0),
+        )
+        .await;
+        harness.execute_event(cancellation).await.unwrap();
+        let mode = harness.mode();
+        let cursor = harness.cursor_position();
+        let selection = harness.selection();
+
+        for kind in [
+            MouseEventKind::Drag(MouseButton::Left),
+            MouseEventKind::Up(MouseButton::Left),
+        ] {
+            mouse_selection_event(&mut harness, kind, (9, 0)).await;
+            assert_eq!(harness.mode(), mode);
+            assert_eq!(harness.cursor_position(), cursor);
+            assert_eq!(harness.selection(), selection);
+        }
+    }
+}
+
+#[tokio::test]
+async fn mouse_selection_autoscrolls_down_on_background_ticks_and_stops_on_release() {
+    let content = (0..40)
+        .map(|line| format!("line-{line:02}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut harness = EditorHarness::with_config_and_size(
+        Buffer::new(None, content),
+        mouse_selection_config(),
+        24,
+        8,
+    );
+    mouse_selection_event(
+        &mut harness,
+        MouseEventKind::Down(MouseButton::Left),
+        (6, 1),
+    )
+    .await;
+    mouse_selection_event(
+        &mut harness,
+        MouseEventKind::Drag(MouseButton::Left),
+        (8, 7),
+    )
+    .await;
+    let first_top = harness.viewport_top();
+    let first_end = harness.selection().unwrap().3;
+    assert!(first_top > 0);
+
+    tokio::time::sleep(Duration::from_millis(60)).await;
+    harness.editor.test_service_background().await.unwrap();
+
+    assert!(harness.viewport_top() > first_top);
+    let (x0, y0, _, y1) = harness.selection().unwrap();
+    assert_eq!((x0, y0), (1, 1));
+    assert!(y1 > first_end);
+    mouse_selection_event(&mut harness, MouseEventKind::Up(MouseButton::Left), (8, 7)).await;
+    let released_top = harness.viewport_top();
+    let released_selection = harness.selection();
+
+    tokio::time::sleep(Duration::from_millis(60)).await;
+    harness.editor.test_service_background().await.unwrap();
+
+    harness.assert_mode(Mode::Visual);
+    assert_eq!(harness.viewport_top(), released_top);
+    assert_eq!(harness.selection(), released_selection);
+}
+
+#[tokio::test]
+async fn mouse_selection_autoscrolls_up_without_transferring_capture_to_the_split_above() {
+    let content = (0..40)
+        .map(|line| format!("line-{line:02}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut harness = EditorHarness::with_config_and_size(
+        Buffer::new(None, content),
+        mouse_selection_config(),
+        24,
+        12,
+    );
+    harness
+        .execute_action(Action::SplitHorizontal)
+        .await
+        .unwrap();
+    harness
+        .execute_action(Action::SetCursor(1, 20))
+        .await
+        .unwrap();
+    let source_window_id = harness.active_window_id();
+    let (position, _) = harness.editor.test_active_window_bounds().unwrap();
+    let press = (5, (position.y + 1) as u16);
+    let above_source = (5, (position.y - 1) as u16);
+    let before_drag = harness.viewport_top();
+    assert!(before_drag > 1);
+    mouse_selection_event(&mut harness, MouseEventKind::Down(MouseButton::Left), press).await;
+    let anchor_line = harness.buffer_line();
+    mouse_selection_event(
+        &mut harness,
+        MouseEventKind::Drag(MouseButton::Left),
+        above_source,
+    )
+    .await;
+    let first_top = harness.viewport_top();
+    assert!(first_top < before_drag);
+
+    tokio::time::sleep(Duration::from_millis(60)).await;
+    harness.editor.test_service_background().await.unwrap();
+
+    assert_eq!(harness.active_window_id(), source_window_id);
+    assert!(harness.viewport_top() < first_top);
+    let (_, y0, _, y1) = harness.selection().unwrap();
+    assert!(y0 < anchor_line);
+    assert_eq!(y1, anchor_line);
+}
+
+#[tokio::test]
+async fn mouse_selection_autoscrolls_horizontally_on_ticks_and_focus_loss_stops_it() {
+    let mut config = mouse_selection_config();
+    config.wrap = Some(false);
+    let mut harness = EditorHarness::with_config_and_size(
+        Buffer::new(None, "abcdefghijklmnopqrstuvwxyz0123456789".to_string()),
+        config,
+        12,
+        8,
+    );
+    mouse_selection_event(
+        &mut harness,
+        MouseEventKind::Down(MouseButton::Left),
+        (5, 0),
+    )
+    .await;
+    mouse_selection_event(
+        &mut harness,
+        MouseEventKind::Drag(MouseButton::Left),
+        (14, 0),
+    )
+    .await;
+    let first_left = harness.viewport_left();
+    let first_end = harness.selection().unwrap().2;
+    assert!(first_left > 0);
+
+    tokio::time::sleep(Duration::from_millis(60)).await;
+    harness.editor.test_service_background().await.unwrap();
+
+    assert!(harness.viewport_left() > first_left);
+    let (x0, y0, x1, y1) = harness.selection().unwrap();
+    assert_eq!((x0, y0, y1), (1, 0, 0));
+    assert!(x1 > first_end);
+    harness.execute_event(Event::FocusLost).await.unwrap();
+    let stopped_left = harness.viewport_left();
+    let stopped_selection = harness.selection();
+
+    tokio::time::sleep(Duration::from_millis(60)).await;
+    harness.editor.test_service_background().await.unwrap();
+
+    assert_eq!(harness.viewport_left(), stopped_left);
+    assert_eq!(harness.selection(), stopped_selection);
+}
+
+#[tokio::test]
+async fn mouse_selection_double_and_triple_click_select_a_word_and_a_whole_line() {
+    for (clicks, mode, expected) in [
+        (2, Mode::Visual, "beta"),
+        (3, Mode::VisualLine, "alpha beta gamma\n"),
+    ] {
+        let mut harness = mouse_selection_harness("alpha beta gamma\nsecond line");
+        let clipboard = MemoryClipboardProvider::default();
+        let clipboard_text = clipboard.shared_text();
+        harness.editor.test_set_clipboard(Box::new(clipboard));
+        for _ in 0..clicks {
+            mouse_selection_event(
+                &mut harness,
+                MouseEventKind::Down(MouseButton::Left),
+                (11, 0),
+            )
+            .await;
+            mouse_selection_event(&mut harness, MouseEventKind::Up(MouseButton::Left), (11, 0))
+                .await;
+        }
+
+        harness.assert_mode(mode);
+        type_normal_keys(&mut harness, "y").await;
+        assert_eq!(clipboard_text.lock().unwrap().as_deref(), Some(expected));
+    }
+}
+
+#[tokio::test]
+async fn mouse_selection_double_click_drag_extends_by_whole_words_in_both_directions() {
+    for (end, expected_selection, expected_text) in [
+        ((5, 0), (0, 0, 9, 0), "alpha beta"),
+        ((17, 0), (6, 0, 15, 0), "beta gamma"),
+    ] {
+        let mut harness = mouse_selection_harness("alpha beta gamma");
+        let clipboard = MemoryClipboardProvider::default();
+        let clipboard_text = clipboard.shared_text();
+        harness.editor.test_set_clipboard(Box::new(clipboard));
+        mouse_selection_event(
+            &mut harness,
+            MouseEventKind::Down(MouseButton::Left),
+            (11, 0),
+        )
+        .await;
+        mouse_selection_event(&mut harness, MouseEventKind::Up(MouseButton::Left), (11, 0)).await;
+        mouse_selection_event(
+            &mut harness,
+            MouseEventKind::Down(MouseButton::Left),
+            (11, 0),
+        )
+        .await;
+        mouse_selection_event(&mut harness, MouseEventKind::Drag(MouseButton::Left), end).await;
+        mouse_selection_event(&mut harness, MouseEventKind::Up(MouseButton::Left), end).await;
+
+        harness.assert_mode(Mode::Visual);
+        assert_eq!(harness.selection(), Some(expected_selection));
+        type_normal_keys(&mut harness, "y").await;
+        assert_eq!(
+            clipboard_text.lock().unwrap().as_deref(),
+            Some(expected_text)
+        );
+    }
+}
+
+#[tokio::test]
+async fn mouse_selection_double_click_on_a_closing_delimiter_keeps_the_live_endpoint_at_its_opening(
+) {
+    let mut harness = mouse_selection_harness("x (a + b) y");
+    let clipboard = MemoryClipboardProvider::default();
+    let clipboard_text = clipboard.shared_text();
+    harness.editor.test_set_clipboard(Box::new(clipboard));
+    for _ in 0..2 {
+        mouse_selection_event(
+            &mut harness,
+            MouseEventKind::Down(MouseButton::Left),
+            (12, 0),
+        )
+        .await;
+        mouse_selection_event(&mut harness, MouseEventKind::Up(MouseButton::Left), (12, 0)).await;
+    }
+
+    harness.assert_mode(Mode::Visual);
+    harness.assert_cursor_at(2, 0);
+    assert_eq!(harness.selection(), Some((2, 0, 8, 0)));
+    type_normal_keys(&mut harness, "h").await;
+    harness.assert_cursor_at(1, 0);
+    assert_eq!(harness.selection(), Some((1, 0, 8, 0)));
+    type_normal_keys(&mut harness, "y").await;
+    assert_eq!(clipboard_text.lock().unwrap().as_deref(), Some(" (a + b)"));
+}
+
+#[tokio::test]
+async fn mouse_selection_four_clicks_and_alt_drag_create_visual_blocks() {
+    for alt in [false, true] {
+        let mut harness =
+            mouse_selection_harness("alpha beta gamma\nABCDEFGHIJKLMNO\n0123456789ABCDE");
+        let clipboard = MemoryClipboardProvider::default();
+        let clipboard_text = clipboard.shared_text();
+        harness.editor.test_set_clipboard(Box::new(clipboard));
+        let modifiers = if alt {
+            KeyModifiers::ALT
+        } else {
+            KeyModifiers::NONE
+        };
+        if !alt {
+            for _ in 0..3 {
+                mouse_selection_event(
+                    &mut harness,
+                    MouseEventKind::Down(MouseButton::Left),
+                    (11, 0),
+                )
+                .await;
+                mouse_selection_event(&mut harness, MouseEventKind::Up(MouseButton::Left), (11, 0))
+                    .await;
+            }
+        }
+        modified_mouse_selection_event(
+            &mut harness,
+            MouseEventKind::Down(MouseButton::Left),
+            (11, 0),
+            modifiers,
+        )
+        .await;
+        for kind in [
+            MouseEventKind::Drag(MouseButton::Left),
+            MouseEventKind::Up(MouseButton::Left),
+        ] {
+            modified_mouse_selection_event(&mut harness, kind, (13, 2), modifiers).await;
+        }
+
+        harness.assert_mode(Mode::VisualBlock);
+        // Blockwise register text ends each selected row with a newline,
+        // matching the existing keyboard VisualBlock representation.
+        let (selection, expected) = if alt {
+            ((0, 0, 9, 2), "alpha beta\nABCDEFGHIJ\n0123456789\n")
+        } else {
+            ((7, 0, 9, 2), "eta\nHIJ\n789\n")
+        };
+        assert_eq!(harness.selection(), Some(selection));
+        type_normal_keys(&mut harness, "y").await;
+        assert_eq!(clipboard_text.lock().unwrap().as_deref(), Some(expected));
+    }
+}
+
+#[tokio::test]
+async fn mouse_selection_reverse_alt_block_highlights_and_yanks_the_same_rectangle() {
+    let mut harness = mouse_selection_harness("abcdefghij\nklmnopqrst");
+    let unselected_backgrounds = [
+        harness.render_cell_bg(8, 0).unwrap(),
+        harness.render_cell_bg(8, 1).unwrap(),
+    ];
+    let clipboard = MemoryClipboardProvider::default();
+    let clipboard_text = clipboard.shared_text();
+    harness.editor.test_set_clipboard(Box::new(clipboard));
+    harness
+        .execute_action(Action::SetCursor(6, 0))
+        .await
+        .unwrap();
+    for kind in [
+        MouseEventKind::Down(MouseButton::Left),
+        MouseEventKind::Drag(MouseButton::Left),
+        MouseEventKind::Up(MouseButton::Left),
+    ] {
+        modified_mouse_selection_event(&mut harness, kind, (6, 1), KeyModifiers::ALT).await;
+    }
+
+    harness.assert_mode(Mode::VisualBlock);
+    for (row, unselected_background) in unselected_backgrounds.into_iter().enumerate() {
+        assert_ne!(
+            harness.render_cell_bg(8, row).unwrap(),
+            unselected_background
+        );
+        assert_eq!(
+            harness.render_cell_bg(5, row).unwrap(),
+            unselected_background
+        );
+        assert_eq!(
+            harness.render_cell_bg(11, row).unwrap(),
+            unselected_background
+        );
+    }
+    type_normal_keys(&mut harness, "y").await;
+    assert_eq!(
+        clipboard_text.lock().unwrap().as_deref(),
+        Some("cdefg\nmnopq\n")
+    );
+}
+
+#[tokio::test]
+async fn mouse_selection_shift_click_extends_from_the_existing_cursor() {
+    let mut harness = mouse_selection_harness("abcdefghij");
+    harness
+        .execute_action(Action::SetCursor(3, 0))
+        .await
+        .unwrap();
+    for kind in [
+        MouseEventKind::Down(MouseButton::Left),
+        MouseEventKind::Up(MouseButton::Left),
+    ] {
+        modified_mouse_selection_event(&mut harness, kind, (5, 0), KeyModifiers::SHIFT).await;
+    }
+
+    harness.assert_mode(Mode::Visual);
+    harness.assert_cursor_at(1, 0);
+    assert_eq!(harness.selection(), Some((1, 0, 3, 0)));
+}
+
+#[tokio::test]
+async fn mouse_selection_shift_click_adjusts_the_nearest_endpoint_with_a_start_tie_break() {
+    for (column, expected_cursor, expected_selection) in [
+        (6, 2, (2, 0, 7, 0)),
+        (10, 6, (1, 0, 6, 0)),
+        (8, 4, (4, 0, 7, 0)),
+    ] {
+        let mut harness = mouse_selection_harness("abcdefghij");
+        select_with_mouse(&mut harness, (5, 0), (11, 0)).await;
+        for kind in [
+            MouseEventKind::Down(MouseButton::Left),
+            MouseEventKind::Up(MouseButton::Left),
+        ] {
+            modified_mouse_selection_event(&mut harness, kind, (column, 0), KeyModifiers::SHIFT)
+                .await;
+        }
+
+        harness.assert_mode(Mode::Visual);
+        harness.assert_cursor_at(expected_cursor, 0);
+        assert_eq!(harness.selection(), Some(expected_selection));
+    }
+}
+
 fn line_end_delete_key_config() -> Config {
     let mut config = default_key_config();
     config.keys.normal.insert(
