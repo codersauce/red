@@ -18,6 +18,9 @@ sources:
   - id: tools
     type: file
     path: src/agent_tools.rs
+  - id: inline-assist
+    type: file
+    path: almanac/architecture/agent/inline-assist.md
   - id: agent-plugin
     type: file
     path: plugins/agent.hk
@@ -39,6 +42,8 @@ Read [Dynamic Tools And Editor Tools](dynamic-tools-and-editor-tools) when work 
 Use [Followed Editing](followed-editing) for the full-agent write path: Red reveals the target file, checks the visible revision, applies an agent-attributed editor transaction, and saves through the editor [@workflow] [@editor].
 
 [Agent-Attributed Edits](../../concepts/agent-attributed-edits) is the safety model behind the architecture. Read it before changing whether Codex can inspect state, edit text, or cross the editor transaction boundary [@workflow] [@editor].
+
+Use [Inline Assist](inline-assist) when work starts from `Space i`, source-anchored annotations, exact-target replacements, wider same-file proposals, retained inline history, or the handoff from an inline discussion into the full Agent panel [@inline-assist].
 
 For task-oriented operation, use [Inspect Agent History](../../guides/agent/inspect-agent-history). For inline AI suggestions that run beside language-server completion rather than through Codex turns, use [Copilot Inline Completion](../../guides/agent/copilot-completion) [@copilot-guide]. For prerequisites and offline readiness checks, use [Agent Check](../../reference/agent/agent-check). For the accepted integration decision, use [Direct Codex App-Server](../../decisions/agent/direct-codex-app-server).
 

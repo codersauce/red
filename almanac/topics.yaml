@@ -191,6 +191,10 @@ topics:
     title: Agent Edits
     description: Codex edit handling through Red-owned tools, attribution, followed application, and history.
     parents: [agent, safety]
+  - slug: inline-assist
+    title: Inline Assist
+    description: Source-anchored Codex questions, annotations, exact-target edits, wider same-file proposals, and retained inline history.
+    parents: [agent-edits]
   - slug: safety
     title: Safety
     description: Fail-closed behavior, review gates, workspace confinement, and protected operations.
