@@ -33,6 +33,9 @@ sources:
   - id: release-guide
     type: file
     path: almanac/guides/releases/release-red.md
+  - id: release-campaign
+    type: file
+    path: almanac/reference/releases/release-campaign.md
   - id: installers-guide
     type: file
     path: almanac/guides/installers/release-installers.md
@@ -61,4 +64,4 @@ For live sessions, use [Detach And Reattach](sessions/detach-reattach) when the 
 
 Use [Performance Checks](performance/performance-checks) for deterministic CI performance gates and workstation benchmarks that catch editor, detach, interaction, and Git workspace regressions [@performance-guide].
 
-For publication work, [Release Red](releases/release-red) covers the editor release flow from prepare-release through tag publishing, archive smoke tests, Homebrew update, installer verification, and Discord announcement [@release-guide]. [Release A Language Pack](plugins/release-language-pack) covers the separate first-party language-pack tag, packaging, catalog update, and Red-side install verification path [@language-pack-release]. [Release Installers](installers/release-installers) narrows Red's Unix and Windows installer verification, checksum handling, self-check execution, fixture tests, and latest-release smoke tests [@installers-guide].
+For publication work, [Release Red](releases/release-red) covers the editor release flow from prepare-release through tag publishing, archive smoke tests, Homebrew update, installer verification, and Discord announcement [@release-guide]. Use [Release Campaign](../reference/releases/release-campaign) when the work is the reviewed release-message manifest, exact version resolution, or the boundary between automated Discord posting and preview-only social copy [@release-campaign]. [Release A Language Pack](plugins/release-language-pack) covers the separate first-party language-pack tag, packaging, catalog update, and Red-side install verification path [@language-pack-release]. [Release Installers](installers/release-installers) narrows Red's Unix and Windows installer verification, checksum handling, self-check execution, fixture tests, and latest-release smoke tests [@installers-guide].
