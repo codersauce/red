@@ -24,9 +24,22 @@ pub enum TruncationSide {
     Right,
 }
 
-/// Calculate the display width of a string in terminal columns
+/// Calculate the display width of a string in terminal columns.
+///
+/// Terminal control graphemes occupy no cells. Callers that want tabs expanded
+/// must use [`display_width_with_tabs`] because tabs remain context-dependent.
 pub fn display_width(s: &str) -> usize {
-    s.width()
+    if is_printable_ascii(s) {
+        return s.len();
+    }
+    if !s.chars().any(char::is_control) {
+        return s.width();
+    }
+
+    s.graphemes(true)
+        .filter(|grapheme| !grapheme.chars().all(char::is_control))
+        .map(UnicodeWidthStr::width)
+        .sum()
 }
 
 /// Returns the byte boundary before trailing whitespace and the preceding word.
@@ -469,6 +482,16 @@ mod tests {
         assert_eq!(display_width("👋"), 2); // Emoji is 2 columns
         assert_eq!(display_width("café"), 4); // Combining character
         assert_eq!(display_width(""), 0);
+    }
+
+    #[test]
+    fn control_graphemes_do_not_occupy_terminal_columns() {
+        assert_eq!(display_width("\u{1b}"), 0);
+        assert_eq!(display_width("\u{0007}"), 0);
+        assert_eq!(display_width("\u{007f}"), 0);
+        assert_eq!(display_width("\u{009b}"), 0);
+        assert_eq!(display_width("a\u{1b}b"), 2);
+        assert_eq!(display_width("👩‍💻\u{0007}界"), 4);
     }
 
     #[test]

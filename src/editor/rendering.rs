@@ -1207,8 +1207,9 @@ fn queue_diff_cells(
             if change.y != y || change.x != next_x || change.cell.style != *cell_style {
                 break;
             }
-            let cell_width = display_width(change.cell.text.as_str()).max(1);
-            text.push_str(&change.cell.text);
+            let cell_text = terminal_safe_cell_text(&change.cell.text);
+            let cell_width = display_width(cell_text).max(1);
+            text.push_str(cell_text);
             next_x += cell_width;
             i += 1;
             while cell_width > 1 && i < change_set.len() {
@@ -1236,6 +1237,14 @@ fn queue_diff_cells(
         }
     }
     Ok(())
+}
+
+fn terminal_safe_cell_text(text: &str) -> &str {
+    if !is_printable_ascii(text) && text.chars().any(char::is_control) {
+        "�"
+    } else {
+        text
+    }
 }
 
 pub(super) fn resolve_cell_colors(cell_style: &Style, theme_style: &Style) -> (Color, Color) {
@@ -4851,6 +4860,44 @@ mod tests {
     }
 
     #[test]
+    fn wireproxy_ansi_log_controls_never_enter_rendered_cells() {
+        const LINE: &str = "\u{1b}[2m2026-09-19T16:33:34Z\u{1b}[0m \
+            \u{1b}[32mINFO\u{1b}[0m starting wireproxy \
+            \u{1b}[3mlisten\u{1b}[0;2m=\u{1b}[0m127.0.0.1:27999";
+        const EXPECTED: &str = "[2m2026-09-19T16:33:34Z[0m \
+            [32mINFO[0m starting wireproxy \
+            [3mlisten[0;2m=[0m127.0.0.1:27999";
+        let theme = Theme::default();
+        let mut source = segment(0, display_width(LINE), true);
+        source.end_byte = LINE.len();
+        let mut cursor = StyleCursor::new(&[]);
+        let mut buffer = RenderBuffer::new(EXPECTED.len() + 2, 1, &theme.style);
+        let width = buffer.width;
+
+        render_source_segment(
+            &mut buffer,
+            &source,
+            LINE,
+            SourceSegmentGeometry {
+                x: 0,
+                y: 0,
+                width,
+                tab_width: 4,
+            },
+            &mut cursor,
+            &theme.style,
+            &theme,
+        );
+
+        let rendered = rendered_rows(&buffer).pop().unwrap();
+        assert_eq!(rendered.trim_end(), EXPECTED);
+        assert!(buffer
+            .cells
+            .iter()
+            .all(|cell| !cell.text.chars().any(char::is_control)));
+    }
+
+    #[test]
     fn mixed_source_ascii_runs_preserve_combining_keycap_and_style_boundaries() {
         let theme = Theme::default();
         let line = "prefix e\u{301} middle 1\u{fe0f}\u{20e3} 👩‍💻 tail";
@@ -6453,6 +6500,33 @@ mod tests {
         let output = String::from_utf8(output).unwrap();
         assert!(!output.contains("\x1b[K"));
         assert!(output.ends_with(&" ".repeat(12)));
+    }
+
+    #[test]
+    fn terminal_diff_never_prints_control_payloads_from_a_cell() {
+        let mut buffer = RenderBuffer::new(1, 1, &Style::default());
+        for payload in [
+            "\u{1b}[31m",
+            "\u{1b}]52;c;payload\u{0007}",
+            "\u{1b}Ppayload\u{1b}\\",
+            "\u{009b}31m",
+            "\u{0007}",
+        ] {
+            buffer.cells[0].c = payload.chars().next().unwrap();
+            buffer.cells[0].text = payload.to_string();
+            let changes = [Change {
+                x: 0,
+                y: 0,
+                cell: &buffer.cells[0],
+            }];
+            let mut output = Vec::new();
+
+            queue_diff_cells(&mut output, &changes, &Style::default(), buffer.width).unwrap();
+
+            let output = String::from_utf8(output).unwrap();
+            assert!(!output.contains(payload), "unsafe payload: {payload:?}");
+            assert!(output.ends_with('�'));
+        }
     }
 
     #[test]
