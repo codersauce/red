@@ -15,6 +15,9 @@ sources:
   - id: display-layout
     type: file
     path: src/editor/display_layout.rs
+  - id: unicode-utils
+    type: file
+    path: src/unicode_utils.rs
   - id: splash
     type: file
     path: src/splash.rs
@@ -43,7 +46,7 @@ Window text rendering starts with [display layout](../../concepts/editor/display
 
 The renderer asks for a layout per window, fills each visible content row, then walks graphemes from the segment's byte range while tracking display columns, tab expansion, visual offsets, and syntax highlight spans [@rendering]. This is the point where the editor's coordinate systems converge: buffer text is sliced by byte offsets from the layout, graphemes become terminal cells, tabs expand to spaces using indentation width, and styles come from a forward-only syntax style cursor [@rendering].
 
-RenderBuffer cells must contain terminal-printable text, not raw control characters. `RenderBuffer::set_text` uses the printable-ASCII fast path only after `is_printable_ascii` rejects control bytes such as tabs, while `set_printable_ascii` skips that scan and writes bytes directly into cells [@render-buffer]. The diff flush later concatenates each changed cell's `text` and sends it to the terminal with `Print`, so any raw tab that enters a cell moves the terminal cursor independently of Red's computed cell positions [@rendering]. The window renderer expands buffer tabs before paint; picker preview paths are separate and must preserve that invariant when clipping source lines and overlaying syntax or match spans [@rendering] [@picker]. The reusable failure signature is visible as literal `0x09` bytes in terminal output: a Go-symbol picker reproduction corrupted the dialog only for tab-indented preview lines, while the same fixture with spaces rendered cleanly [@ctrl-t-tab-session].
+RenderBuffer cells must contain terminal-printable text, not raw control characters. The width helper treats all-control graphemes as zero terminal columns, so an escape byte in buffer text cannot claim visible cell width while layout wraps source spans [@unicode-utils] [@display-layout]. `RenderBuffer` sanitizes character and grapheme assignments by replacing control-bearing cell text with `U+FFFD`, while `set_printable_ascii` is reserved for spans already checked as printable bytes [@render-buffer]. The final diff flush still runs `terminal_safe_cell_text` before sending a changed cell with `Print`, so a control payload that bypasses the normal `RenderBuffer` setters prints the replacement character rather than executing terminal control bytes [@rendering]. The window renderer expands buffer tabs before paint; picker preview paths are separate and must preserve the same invariant when clipping source lines and overlaying syntax or match spans [@rendering] [@picker]. The reusable older failure signature is visible as literal `0x09` bytes in terminal output: a Go-symbol picker reproduction corrupted the dialog only for tab-indented preview lines, while the same fixture with spaces rendered cleanly [@ctrl-t-tab-session].
 
 ## Full Frame Construction
 
