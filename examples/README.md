@@ -1,4 +1,10 @@
-# Red plugin examples
+# Red examples
+
+[`rust-glancer.toml`](rust-glancer.toml) configures Rust Glancer as the Rust
+language server. See the [setup guide](../docs/RUST_GLANCER.md) for installation
+and switching back to rust-analyzer.
+
+## Plugins
 
 The supported plugin example is [`example-plugin/index.hk`](example-plugin/index.hk)
 with its [`package.json`](example-plugin/package.json) metadata. Red parses and
