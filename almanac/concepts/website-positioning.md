@@ -18,6 +18,9 @@ sources:
   - id: website-direction
     type: conversation
     path: /Users/fcoury/.claude/projects/-Users-fcoury-code-red/acaa6873-03ae-4f92-a325-63c9b68fef5b.jsonl
+  - id: docs-foundation-session
+    type: conversation
+    path: /Users/fcoury/.codex/sessions/2026/09/19/rollout-2026-09-19T16-29-45-01a0bb25-67be-7920-9517-c9924483caef.jsonl
 ---
 
 # Website Positioning
@@ -89,3 +92,21 @@ with review [@readme]. This boundary keeps [Red Editor](red-editor) and
 [Agent-Attributed Edits](agent-attributed-edits) focused on current runtime
 facts while preserving the external-site audience, media plan, and prototype
 constraints for future website work.
+
+## Public Documentation Shape
+
+The public documentation direction is task-first. A September 2026 website
+foundation pass rejected copying internal architecture, CI notes, plans, and
+implementation history into public docs; the docs are organized around what a
+reader is trying to accomplish and use current Red source or versioned user
+docs as the evidence gate for commands, keybindings, defaults, product names,
+and platform support [@docs-foundation-session]. The accepted route map covers
+installation, a first session, editor navigation, search, windows, language
+support, Git, Agent, configuration, keybindings, themes, plugins, Husk,
+sessions, CLI, Vim compatibility, and troubleshooting [@docs-foundation-session].
+
+Future website work should preserve that public-docs boundary unless the site
+is intentionally redesigned. Architecture explanations belong in this Almanac
+or repository docs; getred.dev pages should publish reader tasks, verified
+commands, expected results, and only the caveats that affect using Red
+[@docs-foundation-session].
