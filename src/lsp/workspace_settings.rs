@@ -116,8 +116,17 @@ fn is_rust_analyzer(config: &LanguageServerConfig) -> bool {
         Path::new(command).file_name()?.to_str()
     }
 
+    fn matches_name(name: &str, candidates: &[&str]) -> bool {
+        candidates.iter().any(|candidate| {
+            name == *candidate || (cfg!(windows) && name.eq_ignore_ascii_case(candidate))
+        })
+    }
+
     let executable = match executable_name(&config.command) {
-        Some("rustup" | "rustup.exe") if config.args.first().is_some_and(|arg| arg == "run") => {
+        Some(name)
+            if matches_name(name, &["rustup", "rustup.exe"])
+                && config.args.first().is_some_and(|arg| arg == "run") =>
+        {
             let mut args = config.args[1..].iter().map(String::as_str);
             let toolchain = args.find(|arg| *arg != "--install");
             if toolchain.is_none() {
@@ -128,7 +137,7 @@ fn is_rust_analyzer(config: &LanguageServerConfig) -> bool {
         }
         executable => executable,
     };
-    matches!(executable, Some("rust-analyzer" | "rust-analyzer.exe"))
+    executable.is_some_and(|name| matches_name(name, &["rust-analyzer", "rust-analyzer.exe"]))
 }
 
 fn find_settings_file(workspace_root: &Path) -> Option<PathBuf> {
@@ -426,6 +435,52 @@ mod tests {
     }
 
     #[test]
+    fn mixed_case_rust_analyzer_launches_follow_platform_case_rules() {
+        let (repository, workspace) = repository();
+        write_settings(
+            repository.path(),
+            r#"{"rust-analyzer.rustfmt.extraArgs":["--edition","2024"]}"#,
+        );
+        let absolute = repository.path().join("RUST-ANALYZER.EXE");
+        let rustup = repository.path().join("Rustup.EXE");
+        for (command, args) in [
+            ("Rust-Analyzer", vec![]),
+            ("Rust-Analyzer.exe", vec![]),
+            (absolute.to_str().unwrap(), vec![]),
+            ("RUSTUP", vec!["run", "stable", "rust-analyzer"]),
+            ("rustup", vec!["run", "stable", "RUST-ANALYZER.EXE"]),
+            (
+                rustup.to_str().unwrap(),
+                vec![
+                    "run",
+                    "--install",
+                    "stable",
+                    "--",
+                    absolute.to_str().unwrap(),
+                ],
+            ),
+        ] {
+            let mut config = rust_server();
+            config.command = command.to_string();
+            config.args = args.into_iter().map(str::to_string).collect();
+            let expected = config.clone();
+            apply_workspace_settings(&mut config, &workspace, "rust");
+            apply_fast_startup_defaults(&mut config, "rust");
+            if cfg!(windows) {
+                assert_args(&config, json!(["--edition", "2024"]));
+                assert_eq!(
+                    config.initialization_options.as_ref().unwrap()["cachePriming"]["enable"],
+                    false,
+                    "{command} {:?}",
+                    config.args
+                );
+            } else {
+                assert_eq!(config, expected);
+            }
+        }
+    }
+
+    #[test]
     fn other_rust_servers_preserve_explicit_settings() {
         let (repository, workspace) = repository();
         write_settings(
@@ -436,6 +491,8 @@ mod tests {
             ("custom-rust-lsp", vec![]),
             ("rust-analyzer-wrapper", vec!["rust-analyzer"]),
             ("rustup", vec!["run", "stable", "rust-glancer", "lsp"]),
+            ("RUSTUP.EXE", vec!["run", "stable", "rust-glancer", "lsp"]),
+            ("rustup", vec!["RUN", "stable", "rust-analyzer"]),
             ("rustup", vec!["run", "stable", "other", "rust-analyzer"]),
             ("rustup", vec!["run"]),
         ] {
