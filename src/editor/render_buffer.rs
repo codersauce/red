@@ -16,6 +16,24 @@ use unicode_segmentation::UnicodeSegmentation;
 
 use super::Point;
 
+const CONTROL_REPLACEMENT: char = '\u{fffd}';
+
+fn terminal_safe_char(c: char) -> char {
+    if c.is_control() {
+        CONTROL_REPLACEMENT
+    } else {
+        c
+    }
+}
+
+fn terminal_safe_grapheme(grapheme: &str) -> &str {
+    if grapheme.chars().any(char::is_control) {
+        "�"
+    } else {
+        grapheme
+    }
+}
+
 #[derive(Debug)]
 pub struct Change<'a> {
     pub x: usize,
@@ -32,6 +50,7 @@ pub struct Cell {
 
 impl Cell {
     fn new(c: char, style: Style) -> Self {
+        let c = terminal_safe_char(c);
         Self {
             c,
             text: c.to_string(),
@@ -40,6 +59,7 @@ impl Cell {
     }
 
     fn from_grapheme(grapheme: &str, style: Style) -> Self {
+        let grapheme = terminal_safe_grapheme(grapheme);
         Self {
             c: grapheme.chars().next().unwrap_or(' '),
             text: grapheme.to_string(),
@@ -51,6 +71,7 @@ impl Cell {
     /// run thousands of times per frame, so avoiding a fresh `String` per
     /// cell matters.
     fn set_grapheme(&mut self, grapheme: &str, style: &Style) {
+        let grapheme = terminal_safe_grapheme(grapheme);
         self.c = grapheme.chars().next().unwrap_or(' ');
         self.text.clear();
         self.text.push_str(grapheme);
@@ -58,6 +79,7 @@ impl Cell {
     }
 
     fn set_char_in_place(&mut self, c: char, style: &Style) {
+        let c = terminal_safe_char(c);
         self.c = c;
         self.text.clear();
         self.text.push(c);
@@ -633,6 +655,28 @@ mod tests {
         );
         assert_eq!(buffer.cells[3].text.capacity(), capacity);
         assert!(buffer.cells[2..].iter().all(|cell| cell.style == style));
+    }
+
+    #[test]
+    fn text_writes_skip_controls_and_direct_character_writes_are_safe() {
+        let style = Style::default();
+        let mut buffer = RenderBuffer::new(12, 1, &style);
+
+        buffer.set_text(0, 0, "a\u{1b}[31mb\u{009b}c", &style);
+        buffer.set_char(9, 0, '\u{0007}', &style, &Theme::default());
+
+        assert_eq!(
+            buffer
+                .cells
+                .iter()
+                .map(|cell| cell.text.as_str())
+                .collect::<String>(),
+            "a[31mbc  �  "
+        );
+        assert!(buffer
+            .cells
+            .iter()
+            .all(|cell| !cell.text.chars().any(char::is_control)));
     }
 
     #[test]

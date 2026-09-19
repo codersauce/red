@@ -841,6 +841,18 @@ mod tests {
     }
 
     #[test]
+    fn terminal_controls_do_not_change_wrapping_columns() {
+        let line = "ab\u{1b}[31mcd";
+        let segments = wrap_line_segments(line, 0, 4, 0, BreakIndentOptions::disabled());
+
+        assert_eq!(segments.len(), 2);
+        assert_eq!((segments[0].start_col, segments[0].end_col), (0, 4));
+        assert_eq!((segments[1].start_col, segments[1].end_col), (4, 8));
+        assert_eq!(segments[0].start_byte, 0);
+        assert_eq!(segments[1].end_byte, line.len());
+    }
+
+    #[test]
     fn break_indent_aligns_continuations_to_leading_whitespace() {
         // 4-space indent, line width 40, window width 30: first row holds 30
         // cols, continuations hold 30 - 4 = 26 cols starting at screen col 4.
