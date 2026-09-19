@@ -1,0 +1,14 @@
+# Replace the complete [lsp.servers.rust] section in your Red config with this
+# example. Install rust-glancer and rust-src first; see docs/RUST_GLANCER.md.
+[lsp.servers.rust]
+command = "rust-glancer"
+args = ["lsp"]
+language_id = "rust"
+file_extensions = ["rs"]
+root_markers = ["Cargo.toml", ".git"]
+
+# Glancer disables diagnostics by default. This example runs cargo check on save.
+[lsp.servers.rust.initialization_options.diagnostics]
+onStartup = false
+onSave = true
+command = "check"

@@ -70,13 +70,16 @@ separate process. Explicit `[lsp.servers.<name>]` definitions and explicit
 `settings` values are returned to `workspace/configuration` requests; dotted
 sections select nested objects and unknown sections resolve to JSON `null`.
 
-For Rust, Red also reads `rust-analyzer.rustfmt.extraArgs` from the nearest
-project-local `.vscode/settings.json`. Settings files may contain comments and
+For rust-analyzer launches, Red also reads `rust-analyzer.rustfmt.extraArgs` from
+the nearest project-local `.vscode/settings.json`. Settings files may contain comments and
 trailing commas. Red searches upward from the Cargo workspace but never beyond
 the Git repository, and applies these arguments only to that project's language
 server. Explicit `initialization_options` or `settings` in your Red configuration
 take precedence. Other VS Code settings, including executable and environment
 overrides, are not imported.
+
+To use Rust Glancer as an alternative Rust language server, see the
+[setup guide](RUST_GLANCER.md) and [configuration example](../examples/rust-glancer.toml).
 
 ## Load a native Tree-sitter grammar
 

@@ -209,6 +209,10 @@ waiting = "steady_underscore"
 # file_extensions = ["rs"]
 # root_markers = ["Cargo.toml", ".git"]
 #
+# To use Rust Glancer instead, replace the Rust server section with the complete
+# examples/rust-glancer.toml example. See docs/RUST_GLANCER.md for installation,
+# diagnostics, and switching back to rust-analyzer.
+#
 # Servers that handle multiple language ids can use document selectors:
 #
 # [lsp.servers.typescript]

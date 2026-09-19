@@ -1324,23 +1324,36 @@ mod tests {
             "rust-analyzer".to_string(),
         ];
         rust.root_markers = vec!["Cargo.toml".to_string(), ".git".to_string()];
-        let manager = LspManager::new(LspConfig {
-            enabled: true,
-            format_on_save: false,
-            servers: HashMap::from([("rust".to_string(), rust)]),
-        });
+        let glancer = crate::config::Config::load_user_toml(
+            include_str!("../../examples/rust-glancer.toml"),
+            Path::new("/tmp/config.toml"),
+            &[],
+        )
+        .unwrap()
+        .config
+        .lsp
+        .servers
+        .remove("rust")
+        .unwrap();
+        for config in [rust, glancer] {
+            let manager = LspManager::new(LspConfig {
+                enabled: true,
+                format_on_save: false,
+                servers: HashMap::from([("rust".to_string(), config)]),
+            });
 
-        let core = manager
-            .resolve_document(files[0].to_string_lossy().as_ref())
-            .unwrap();
-        let tui = manager
-            .resolve_document(files[1].to_string_lossy().as_ref())
-            .unwrap();
-        let expected = fs::canonicalize(root.path()).unwrap();
+            let core = manager
+                .resolve_document(files[0].to_string_lossy().as_ref())
+                .unwrap();
+            let tui = manager
+                .resolve_document(files[1].to_string_lossy().as_ref())
+                .unwrap();
+            let expected = fs::canonicalize(root.path()).unwrap();
 
-        assert_eq!(core.workspace_root, expected);
-        assert_eq!(tui.workspace_root, expected);
-        assert_eq!(client_key(&core), client_key(&tui));
+            assert_eq!(core.workspace_root, expected);
+            assert_eq!(tui.workspace_root, expected);
+            assert_eq!(client_key(&core), client_key(&tui));
+        }
     }
 
     #[test]
