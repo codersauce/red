@@ -36,3 +36,17 @@ Use [LSP Document Sync](../editor/lsp-document-sync) when a change touches lazy 
 Read [Workspace Edits](workspace-edits) before changing rename, code action, resource operation, or multi-file edit behavior. It is the safety boundary that converts server edits into checked editor-owned changes.
 
 [LSP Capabilities](../../concepts/lsp/capabilities) explains the advertised client capability model. [LSP Configuration](../../reference/lsp/configuration) is the exact lookup page for defaults and server fields, including Red's embedded Husk server definition [@config]. For Husk-specific server behavior, use [Husk Language Server](../husk/language-server). For diagnosis, use [Debugging LSP Failures](../../guides/lsp/debugging-lsp-failures).
+
+## Owner Map
+
+Use the first failing boundary to choose the page and source file. If no server starts for a file, inspect selectors, root markers, disabled LSP state, and the failed-client cache in the manager before looking at process IO [@manager]. If a server starts but messages do not correlate, parse, initialize, or shut down cleanly, inspect the transport client [@client]. If diagnostics, hovers, symbols, formatting, code actions, signature help, or rename happen against the wrong document identity, inspect the editor-side document sync path because it owns lazy open state, revision snapshots, URI identity, and close notifications [@editor-sync].
+
+Completion failures usually cross two boundaries. The LSP request and response route through the client, but stale-response rejection, snippet handling, filtering, and accepted-item application live in the completion UI path and editor mutation path [@client] [@completion]. Multi-file rename, code action, formatting, or `workspace/applyEdit` failures should move to [Workspace Edits](workspace-edits), because Red parses and prepares the entire operation before any buffer or filesystem mutation occurs [@workspace-edit].
+
+## Boundaries To Preserve
+
+Do not let server output mutate editor state directly. The transport turns protocol traffic into typed inbound messages, and the editor remains the owner of diagnostics display, completion acceptance, buffer mutation, and follow-up document-sync notifications [@client] [@editor-sync] [@completion].
+
+Do not collapse completion edits, workspace edits, and raw buffer replacement into one path. Completion applies a single accepted item through completion-specific stale guards and text-edit conversion, while workspace edits validate ordered multi-document and resource operations before routing prepared contents through editor-owned mutation [@completion] [@workspace-edit].
+
+Keep advertised capabilities conservative. The capability model and configuration reference describe what Red promises to language servers; adding a capability without the matching manager, client, editor, and validation behavior creates a contract the rest of the LSP stack may not satisfy [@config].
