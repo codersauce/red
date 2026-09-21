@@ -24,6 +24,9 @@ sources:
   - id: keyboard-protocol
     type: file
     path: scripts/test_keyboard_protocol.py
+  - id: editing-tests
+    type: file
+    path: tests/editing.rs
   - id: editor
     type: file
     path: src/editor.rs
@@ -119,6 +122,32 @@ fragmented, repeat, release, and automatic negotiation cases [@ci]
 thresholds and workstation baselines, see
 [Performance Checks](../performance/performance-checks); for the runtime
 diagnostic itself, see [Self Check](../../reference/runtime/self-check).
+
+## Manually Smoke Terminal Interactions
+
+Automated tests cover many editor input contracts, including mouse-created
+visual selections, release-position handling, autoscroll during drag, double and
+triple click selection, Alt-drag visual blocks, Shift-click extension, panel
+focus, pane divider drags, mouse-wheel routing, and passive mouse events
+[@editing-tests]. Those tests are necessary, but they do not prove the user's
+terminal emulator, shell, and real `cargo run` path deliver the same interaction
+sequence to Red. Red is explicitly a terminal editor, so changes to mouse
+selection, Visual mode, pane resizing, focus handling, paste, terminal resize,
+keyboard protocol, or rendering should also get a short interactive smoke in a
+real terminal [@readme].
+
+Use the source-tree binary for that check:
+
+```shell
+cargo run --locked -- almanac/architecture/README.md
+```
+
+Then exercise the behavior that changed, not just startup. For mouse selection
+work, drag in an editor buffer until Red enters Visual mode, adjust or yank the
+selection when relevant, and confirm the highlight survives release. For pane or
+panel work, click, drag, scroll, resize the terminal, and return focus to the
+editor. Treat this as evidence for the terminal integration path; keep the
+focused Rust tests and clippy as the regression gates.
 
 ## Compare Test Runners And Build Settings
 
