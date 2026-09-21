@@ -31,7 +31,7 @@ The Plugin Host API reference identifies the files that define Red's Husk plugin
 | --- | --- |
 | `src/plugin/host_api.json` | Canonical machine-readable list of host `execute` and `request` calls, signatures, and introduction versions [@schema]. |
 | `src/plugin/api.rs` | Embedded schema loader, static validator, diagnostic families, and schema coverage tests [@api]. |
-| `src/plugin/registry.rs` | Runtime compatibility gate; `RED_HOST_API_VERSION` is `0.18.0`, and `0.4.0`, `0.6.0`, `0.7.0`, `0.8.0`, `0.9.0`, `0.10.0`, `0.11.0`, `0.12.0`, `0.14.0`, `0.16.0`, and `0.17.0` remain accepted compatibility targets for existing packages [@registry]. |
+| `src/plugin/registry.rs` | Runtime compatibility gate; `RED_HOST_API_VERSION` is `0.18.0`, and the accepted compatibility set includes `0.4.0`, `0.6.0`, `0.7.0`, `0.8.0`, `0.9.0`, `0.10.0`, `0.11.0`, `0.12.0`, `0.14.0`, `0.16.0`, `0.17.0`, and the current `0.18.0` target [@registry]. |
 | `src/plugin/package.rs` | Current `red-plugin.toml` schema, package validation, and package-to-registry metadata adaptation [@package]. |
 | `docs/PLUGIN_API.md` | Human compatibility guide, migration notes, and behavioral descriptions for plugin authors; it currently names legacy `red_api_version` package syntax rather than current `red-plugin.toml` fields [@api-doc] [@package]. |
 | `docs/plugin_api_changes.json` | Versioned change manifest that records introduced symbols and migration note anchors through `0.18.0` [@changes]. |

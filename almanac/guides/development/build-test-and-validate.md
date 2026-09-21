@@ -203,7 +203,10 @@ Homebrew/local binaries and the newly installed Cargo binary all presenting
 `red 0.6.0` [@cargo-toml] [@binary-skew-session]. Prefer
 `cargo run --locked -- ...` for source-tree validation, or make
 `~/.cargo/bin` precede Homebrew and local installer directories before testing
-an installed build.
+an installed build. When the failure is a language-pack compatibility error,
+use [Plugin Host API](../../reference/plugins/host-api) for the accepted host
+API targets and [Official Language Pack Distribution](../../decisions/plugins/language-pack-distribution)
+for the catalog/package compatibility boundary before editing a manifest.
 
 ## Release-Adjacent Validation
 
