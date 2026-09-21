@@ -15,6 +15,15 @@ sources:
   - id: preferences
     type: file
     path: src/preferences.rs
+  - id: config-reference
+    type: file
+    path: almanac/reference/configuration/default-config.md
+  - id: preferences-store
+    type: file
+    path: almanac/architecture/preferences/preferences-store.md
+  - id: agent-check
+    type: file
+    path: almanac/reference/agent/agent-check.md
 ---
 
 # Copilot Inline Completion
@@ -24,7 +33,10 @@ GitHub Copilot language server to process eligible source code. It runs beside
 the normal language server; it does not replace rust-analyzer, TypeScript's
 server, or other language intelligence [@transport] [@editor]. For the ordinary
 popup-completion request, filtering, and edit path that Copilot coordinates
-with, read [LSP Completion](../../architecture/lsp/completion).
+with, read [LSP Completion](../../architecture/lsp/completion). For exact
+configuration defaults, use [Default Config](../../reference/configuration/default-config);
+for Codex agent readiness instead of Copilot completion, use
+[Agent Check](../../reference/agent/agent-check) [@config-reference] [@agent-check].
 
 ## Set Up
 
@@ -84,8 +96,10 @@ configured `copilot-language-server` can be found [@editor] [@preferences].
 Displaying the hint records `copilot_setup_hint_seen` in preferences before the
 bridge starts. Running `:Copilot signin`, `:Copilot enable`, or
 `:Copilot disable` also records the hint as seen [@editor] [@preferences].
-The hint is onboarding state, not consent or authentication state. Detecting
-an installed server never enables it. Explicit enablement is remembered in
+The hint is onboarding state inside the broader
+[Preferences Store](../../architecture/preferences/preferences-store), not
+consent or authentication state [@preferences-store]. Detecting an installed
+server never enables it. Explicit enablement is remembered in
 `[copilot].enabled`, independently of whether authentication succeeds. Red
 leaves credential management to the language server [@defaults] [@editor].
 
@@ -133,3 +147,12 @@ This first integration supports single-line and multiline insertions at the
 cursor. Suggestions that would rewrite existing code are not accepted. Copilot
 next-edit suggestions require a separate review/preview interface and are not
 part of this feature [@editor].
+
+## Related Pages
+
+Use [Default Config](../../reference/configuration/default-config) to look up
+the `[copilot]`, `[completion]`, and `disable_ai` defaults. Use
+[LSP Completion](../../architecture/lsp/completion) when the issue is the
+ordinary popup request, filtering, or accepted-item mutation path. Use
+[Agent Check](../../reference/agent/agent-check) when the question is Codex
+app-server readiness rather than Copilot inline suggestions.
