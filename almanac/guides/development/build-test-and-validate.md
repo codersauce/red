@@ -1,7 +1,7 @@
 ---
 title: "Build, Test, And Validate"
-summary: "This guide explains the local validation path for Red changes and how to line it up with CI, plugin checks, release checks, and runtime self-checks."
-topics: [guides, development, validation, testing, ci, plugins]
+summary: "This guide explains the local validation path for Red changes and how to line it up with CI, plugin checks, release checks, terminal rendering checks, and runtime self-checks."
+topics: [guides, development, validation, testing, ci, plugins, rendering]
 sources:
   - id: readme
     type: file
@@ -30,6 +30,15 @@ sources:
   - id: editor
     type: file
     path: src/editor.rs
+  - id: rendering
+    type: file
+    path: src/editor/rendering.rs
+  - id: render-buffer
+    type: file
+    path: src/editor/render_buffer.rs
+  - id: picker
+    type: file
+    path: src/ui/picker.rs
   - id: config
     type: file
     path: src/config.rs
@@ -185,6 +194,16 @@ found that crossterm uses Windows console APIs for those commands, so byte
 buffers do not exercise the same behavior there; guard byte-sequence assertions
 to Unix or split them into platform-specific checks, then let the Windows CI job
 execute the Windows backend [@terminal-cleanup-session] [@ci].
+
+Treat rendered user text and terminal control bytes as a separate failure class
+from cleanup escape sequences. If a smoke test shows buffer text, picker
+previews, plugin paint, or syntax overlays leaking tabs, escape bytes, or other
+controls, start with [Rendering Pipeline](../../architecture/editor/rendering-pipeline):
+`RenderBuffer` stores terminal-cell text and sanitizes control-bearing cell
+contents, while the final diff path runs a terminal-safe text check before
+printing changed cells [@render-buffer] [@rendering]. Picker previews have their
+own clipping and overlay path, so a preview-only corruption can live in
+`src/ui/picker.rs` even when ordinary window text is clean [@picker].
 
 ## Validate Bundled Husk And Plugin Changes
 
