@@ -15,6 +15,9 @@ sources:
   - id: rendering
     type: file
     path: src/editor/rendering.rs
+  - id: render-buffer
+    type: file
+    path: src/editor/render_buffer.rs
   - id: highlighter
     type: file
     path: src/highlighter.rs
@@ -40,7 +43,7 @@ Read [Text Mutation Boundary](text-mutation-boundary) before adding any user, pl
 
 Use [Buffers And Windows](buffers-and-windows) for the split between editable text identity and visible split-tree presentation. Buffers own process-local text identity, while windows own stable window ids, viewport offsets, wrapping state, cursor position, active state, and split layout [@buffer] [@window].
 
-Use [Rendering Pipeline](rendering-pipeline) when changing terminal output, gutters, panels, overlays, dialogs, plugin paint, diagnostics, cursor drawing, detached frame serialization, or motion fast paths. The renderer turns editor and window state into terminal-cell frames and diffs changed cells or rows before flushing output [@rendering].
+Use [Rendering Pipeline](rendering-pipeline) when changing terminal output, gutters, panels, overlays, dialogs, plugin paint, diagnostics, cursor drawing, detached frame serialization, motion fast paths, or terminal-control text safety. The renderer turns editor and window state into terminal-cell frames, `RenderBuffer` sanitizes control-bearing cell text, and the diff path checks cell text again before flushing changed cells [@rendering] [@render-buffer].
 
 Read [LSP Document Sync](lsp-document-sync) when a change concerns editor-side document open/close state, change delivery, diagnostics URI identity, stale LSP responses, or workspace edits reaching open buffers. For server routing and process transport, continue to [LSP Architecture](../lsp).
 

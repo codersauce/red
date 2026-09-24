@@ -43,4 +43,4 @@ Selective revert is checked rather than blind replay. `UndoHistory::prepare_reve
 
 If a user reports that an agent edit cannot be reverted from history, inspect the editor transaction path and undo history first. Use [Undo tree](../../concepts/editor/undo-tree) for the branch and selective-revert model, then confirm whether later edits changed the same range or whether the user is trying to revert a transaction from another undo branch [@undo].
 
-For the surrounding model, read [Agent-attributed edits](../../concepts/agent-attributed-edits), [Agent Architecture](../../architecture/agent), and [Followed Editing](../../architecture/agent/followed-editing).
+For the surrounding model, read [Agent-attributed edits](../../concepts/agent-attributed-edits), [Inline Assist](../../architecture/agent/inline-assist), [Agent Architecture](../../architecture/agent), and [Followed Editing](../../architecture/agent/followed-editing).

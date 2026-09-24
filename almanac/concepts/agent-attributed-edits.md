@@ -41,4 +41,4 @@ Copilot inline completion is a separate AI-assisted editing path, not an agent-a
 
 ## What To Read Next
 
-Use [Followed editing](../architecture/agent/followed-editing) for the full-agent mutation path, [Dynamic tools and editor tools](../architecture/agent/dynamic-tools-and-editor-tools) for the strict tool schemas, and [Inspect agent history](../guides/agent/inspect-agent-history) when you need to review or revert agent-origin transactions. Use [Copilot inline completion](../guides/agent/copilot-completion) for opt-in ghost-text suggestions and provider setup.
+Use [Followed editing](../architecture/agent/followed-editing) for the full-agent mutation path, [Inline assist](../architecture/agent/inline-assist) for source-anchored questions and bounded same-file edits, [Dynamic tools and editor tools](../architecture/agent/dynamic-tools-and-editor-tools) for the strict tool schemas, and [Inspect agent history](../guides/agent/inspect-agent-history) when you need to review or revert agent-origin transactions. Use [Copilot inline completion](../guides/agent/copilot-completion) for opt-in ghost-text suggestions and provider setup.

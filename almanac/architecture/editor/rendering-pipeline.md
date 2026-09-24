@@ -1,7 +1,7 @@
 ---
 title: "Rendering Pipeline"
 summary: "The rendering pipeline turns editor, window, plugin, diagnostic, and dialog state into a width-aware terminal-cell frame and flushes only the changed cells or rows."
-topics: [architecture, editor, rendering, windows, plugins]
+topics: [architecture, editor, rendering, windows, plugins, safety]
 sources:
   - id: rendering
     type: file

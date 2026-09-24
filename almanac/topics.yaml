@@ -197,7 +197,7 @@ topics:
     parents: [agent-edits]
   - slug: safety
     title: Safety
-    description: Fail-closed behavior, review gates, workspace confinement, and protected operations.
+    description: Fail-closed behavior, review gates, workspace confinement, terminal-output sanitization, and protected operations.
     parents: [architecture]
   - slug: sessions
     title: Sessions
