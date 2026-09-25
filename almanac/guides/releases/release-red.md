@@ -61,7 +61,7 @@ Start only when CI is green on `main` and the release secrets are available. The
 
 Choose the next SemVer version without a leading `v`. The prepare workflow validates that the input matches SemVer, that `RELEASE_PR_TOKEN` is present, that the tag does not already exist, and that the requested version is newer than the current package version [@prepare-release].
 
-Keep `release/campaign.toml` at `version = "next"` until release preparation resolves it [@campaign] [@releasing]. The campaign is reviewed product copy: each story should be evidence-backed, ordered intentionally, and labeled as `new`, `improved`, or `existing` according to what the release actually ships [@campaign] [@releasing]. Use [Release Campaign](../../reference/releases/release-campaign) for the exact manifest and rendering contract.
+For an unresolved upcoming-release campaign, keep `release/campaign.toml` at `version = "next"` until release preparation resolves it to the exact release version [@campaign] [@releasing]. The campaign is reviewed product copy: each story should be evidence-backed, ordered intentionally, and labeled as `new`, `improved`, or `existing` according to what the release actually ships [@campaign] [@releasing]. Use [Release Campaign](../../reference/releases/release-campaign) for the exact manifest and rendering contract.
 
 ## Prepare The Release PR
 
