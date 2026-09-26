@@ -45,6 +45,9 @@ sources:
   - id: website-guide
     type: file
     path: almanac/guides/website/refresh-public-site.md
+  - id: deploy-public-site
+    type: file
+    path: almanac/guides/website/deploy-public-site.md
 ---
 
 # Guides
@@ -69,4 +72,4 @@ Use [Performance Checks](performance/performance-checks) for deterministic CI pe
 
 For publication work, [Release Red](releases/release-red) covers the editor release flow from prepare-release through tag publishing, archive smoke tests, Homebrew update, installer verification, and Discord announcement [@release-guide]. Use [Release Campaign](../reference/releases/release-campaign) when the work is the reviewed release-message manifest, exact version resolution, or the boundary between automated Discord posting and preview-only social copy [@release-campaign]. [Release A Language Pack](plugins/release-language-pack) covers the separate first-party language-pack tag, packaging, catalog update, and Red-side install verification path [@language-pack-release]. [Release Installers](installers/release-installers) narrows Red's Unix and Windows installer verification, checksum handling, self-check execution, fixture tests, and latest-release smoke tests [@installers-guide].
 
-Use [Refresh Public Site](website/refresh-public-site) when publication work touches `getred.dev` docs, media, installer routes, or interactive website concepts that must be checked against current Red behavior before publishing [@website-guide].
+Use [Refresh Public Site](website/refresh-public-site) when publication work touches `getred.dev` docs, media, installer routes, or interactive website concepts that must be checked against current Red behavior before publishing [@website-guide]. Use [Deploy Public Site](website/deploy-public-site) when the work crosses into OpenAI Sites versioning, domain checks, production deployment, or rollback [@deploy-public-site].

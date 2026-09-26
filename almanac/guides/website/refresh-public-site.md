@@ -27,6 +27,9 @@ sources:
   - id: keyboard-doc
     type: file
     path: docs/KEYBOARD.md
+  - id: deploy-public-site
+    type: file
+    path: almanac/guides/website/deploy-public-site.md
 ---
 
 # Refresh Public Site
@@ -60,7 +63,9 @@ Preserve the installer paths unless the release process and install docs are
 changed deliberately. The README sends users to
 `https://getred.dev/install.sh` and `https://getred.dev/install.ps1`, so a site
 refresh must keep those routes working or update the repository documentation
-and release workflow at the same time [@readme].
+and release workflow at the same time [@readme]. When a refresh is ready to go
+live, use [Deploy Public Site](deploy-public-site) for the OpenAI Sites version,
+domain, archive, verification, and rollback procedure [@deploy-public-site].
 
 ## Audit Before Recording
 

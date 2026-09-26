@@ -21,6 +21,9 @@ sources:
   - id: website-guide
     type: file
     path: almanac/guides/website/refresh-public-site.md
+  - id: deploy-public-site
+    type: file
+    path: almanac/guides/website/deploy-public-site.md
 ---
 
 # Website Positioning
@@ -83,4 +86,7 @@ constraints for future website work.
 
 Use [Refresh Public Site](../guides/website/refresh-public-site) for the
 operating procedure behind public docs, recording evidence, video packaging,
-AI-assisted media preparation, and shortcut source audits [@website-guide].
+AI-assisted media preparation, and shortcut source audits [@website-guide]. Use
+[Deploy Public Site](../guides/website/deploy-public-site) when that work is
+ready for OpenAI Sites versioning, production domain verification, or rollback
+planning [@deploy-public-site].
