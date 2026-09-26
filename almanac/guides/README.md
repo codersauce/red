@@ -1,6 +1,6 @@
 ---
 title: "Guides"
-summary: "Guide pages give maintainers task-oriented procedures for validation, plugins, LSP debugging, sessions, performance checks, releases, installers, agent history inspection, and Copilot inline completion."
+summary: "Guide pages give maintainers task-oriented procedures for validation, plugins, LSP debugging, sessions, performance checks, releases, installers, website refreshes, agent history inspection, and Copilot inline completion."
 topics: [guides, navigation]
 sources:
   - id: topics
@@ -42,11 +42,14 @@ sources:
   - id: performance-guide
     type: file
     path: almanac/guides/performance/performance-checks.md
+  - id: website-guide
+    type: file
+    path: almanac/guides/website/refresh-public-site.md
 ---
 
 # Guides
 
-Guide pages are the task-oriented shelf for Red maintainers. The topic graph keeps them under the `guides` root and connects individual guides to validation, plugins, LSP, sessions, release, installers, performance, agent, and operations topics [@topics]. Use this hub when you know the work you need to finish and want the procedure before reading subsystem architecture.
+Guide pages are the task-oriented shelf for Red maintainers. The topic graph keeps them under the `guides` root and connects individual guides to validation, plugins, LSP, sessions, release, installers, website, performance, agent, and operations topics [@topics]. Use this hub when you know the work you need to finish and want the procedure before reading subsystem architecture.
 
 ## Everyday Development
 
@@ -65,3 +68,5 @@ For live sessions, use [Detach And Reattach](sessions/detach-reattach) when the 
 Use [Performance Checks](performance/performance-checks) for deterministic CI performance gates and workstation benchmarks that catch editor, detach, interaction, and Git workspace regressions [@performance-guide].
 
 For publication work, [Release Red](releases/release-red) covers the editor release flow from prepare-release through tag publishing, archive smoke tests, Homebrew update, installer verification, and Discord announcement [@release-guide]. Use [Release Campaign](../reference/releases/release-campaign) when the work is the reviewed release-message manifest, exact version resolution, or the boundary between automated Discord posting and preview-only social copy [@release-campaign]. [Release A Language Pack](plugins/release-language-pack) covers the separate first-party language-pack tag, packaging, catalog update, and Red-side install verification path [@language-pack-release]. [Release Installers](installers/release-installers) narrows Red's Unix and Windows installer verification, checksum handling, self-check execution, fixture tests, and latest-release smoke tests [@installers-guide].
+
+Use [Refresh Public Site](website/refresh-public-site) when publication work touches `getred.dev` docs, media, installer routes, or interactive website concepts that must be checked against current Red behavior before publishing [@website-guide].
