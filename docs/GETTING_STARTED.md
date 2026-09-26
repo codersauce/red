@@ -507,6 +507,20 @@ of actions, define a nested chord, or invoke a plugin command:
 "Ctrl-j" = { PluginCommand = "BufferPicker" }
 ```
 
+To make `j` and `k` move through wrapped text like `gj` and `gk`,
+add this to your configuration:
+
+```toml
+[keys.normal]
+j = "MoveScreenLineDown"
+k = "MoveScreenLineUp"
+```
+
+If you already have a `[keys.normal]` section, add just the two assignments to
+it. Counts follow screen lines too: `5j` moves like `5gj`. Visual modes
+inherit these bindings unless you override them; operators such as `dj` and
+`dk` still act on logical lines.
+
 Bindings to `EnterMode = "Command"` also work in panel navigation and modal
 workspaces. Normal-mode command bindings are inherited by visual modes; an
 explicit visual-mode binding takes precedence. Text input, searches, and
