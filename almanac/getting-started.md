@@ -27,6 +27,9 @@ sources:
   - id: website-positioning
     type: file
     path: almanac/concepts/website-positioning.md
+  - id: website-operations
+    type: file
+    path: almanac/guides/website/README.md
 ---
 
 Red is a modal terminal editor with a self-contained Rust binary, embedded runtime assets, optional Codex agent integration, Husk plugins, language tooling, crash recovery, and Unix detachable sessions. The quickest path through this wiki is to start with the [Red editor concept](concepts/red-editor), then follow the architecture page for the subsystem you need to change. The repository README describes Red as "the modal editor for the agent era" and highlights its bundled defaults, safer agent workflow, Husk runtime, recovery, and detach support [@readme].
@@ -66,4 +69,4 @@ For local work, start with [Build, test, and validate](guides/development/build-
 
 For publication work, use [Release Red](guides/releases/release-red) instead of starting from the generic validation guide. The release guide keeps release preparation, reviewed campaign copy, tag publishing, archive smoke tests, Homebrew publication, installer checks, and announcement workflow in one reading path [@release-guide].
 
-For external-site work, use [Website positioning](concepts/website-positioning). That page keeps `getred.dev` audience, media, installer URL, and prototype-language constraints separate from shipped editor runtime claims [@website-positioning].
+For external-site work, start with [Website positioning](concepts/website-positioning) to keep `getred.dev` audience, media, installer URL, and prototype-language constraints separate from shipped editor runtime claims [@website-positioning]. Then use [Website operations](guides/website) for the content refresh, media, deployment, domain, and rollback reading path [@website-operations].
