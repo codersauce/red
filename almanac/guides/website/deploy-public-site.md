@@ -24,6 +24,9 @@ sources:
   - id: deployment-transcript
     type: conversation
     path: /Users/fcoury/.claude/projects/-Users-fcoury-code-red/bb9593f8-adce-4010-bc45-ad18a2bcf438.jsonl
+  - id: direction-a-deploy-transcript
+    type: conversation
+    path: /Users/fcoury/.codex/sessions/2026/09/26/rollout-2026-09-26T18-58-30-01a0dfba-17a6-7ad2-9025-e1bf987aa2f2.jsonl
 ---
 
 # Deploy Public Site
@@ -67,6 +70,15 @@ while the newer `origin/main` launch content showed Red `v0.7.0` and included
 the full docs branch content and the current release surface before deployment,
 or the site can regress by publishing one side of that split over the other
 [@deployment-transcript].
+
+The follow-up Direction A deployment fixed that split by merging the launch
+content and docs ancestry before saving a new Sites version [@direction-a-deploy-transcript].
+It published version 20 for the redesigned homepage and later version 22 for the
+primary installer-command correction [@direction-a-deploy-transcript]. Those
+version numbers are historical waypoints only. They prove the Codex Sites
+connector can perform the save-then-deploy sequence in an authorized Codex
+session, but a later deploy still has to reopen the live version, deployment ID,
+source-branch head, and host checks before changing production.
 
 ## Build The Archive
 
@@ -112,10 +124,13 @@ without rebuilding.
 Sites tools are available through the Codex connector rather than a standalone
 repo CLI. A read-only `codex exec --ephemeral -s read-only -C
 /Users/fcoury/code/red-website ...` call successfully invoked
-`sites.get_deployment_status` on 2026-09-26 [@deployment-findings]. Mutating
-`save_site_version` and `deploy_site_version` calls still require an explicitly
-authorized deployment session; the read-only audit did not perform or prove a
-future mutation path [@deployment-findings].
+`sites.get_deployment_status` on 2026-09-26 [@deployment-findings]. Later in the
+same launch sequence, an explicitly authorized Codex session used the Sites
+connector to save and publish production versions, then poll deployment status
+until success [@direction-a-deploy-transcript]. Treat that as proof of the Codex
+connector path, not as permission to deploy: every future `save_site_version`
+and `deploy_site_version` call still needs explicit production authorization and
+fresh rollback IDs.
 
 After recording the current live version for rollback, ask Codex to call
 `sites.save_site_version` with the project ID, full commit SHA, and archive path
@@ -140,6 +155,14 @@ assets [@deployment-findings] [@website-readme]. Compare installer checksums
 against the pinned `public/installers.json` values and confirm the page displays
 the intended published Red release, not a local `main` version
 [@website-readme].
+
+The homepage installer UI has a separate product contract from the raw installer
+files. The corrected live Direction A page uses `curl -fsS
+https://getred.dev/install.sh | sh` as the primary macOS/Linux command, keeps
+Homebrew as an alternative, and uses the PowerShell installer for Windows
+[@direction-a-deploy-transcript]. Include that browser-visible command ordering
+in the post-deploy check so a visual cleanup does not accidentally make
+Homebrew look like the primary cross-platform path again.
 
 Rollback redeploys an existing saved Sites version. List versions, choose the
 exact previous version ID, call `sites.deploy_site_version` for that ID, poll the
