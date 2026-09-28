@@ -46118,7 +46118,11 @@ while True:
         let root = tempfile::tempdir().unwrap();
         let nested = root.path().join("nested");
         std::fs::create_dir(&nested).unwrap();
-        let file = nested.join("two\nlines.txt");
+        #[cfg(unix)]
+        let (name, displayed) = ("two\nlines.txt", "two\\nlines.txt");
+        #[cfg(not(unix))]
+        let (name, displayed) = ("two lines.txt", "two lines.txt");
+        let file = nested.join(name);
         std::fs::write(&file, "file content\n").unwrap();
         let root_name = root.path().to_string_lossy().into_owned();
         let mut editor = test_editor(80, 24);
@@ -46190,7 +46194,7 @@ while True:
         let nested_id = editor.current_buffer().id();
         assert_eq!(
             editor.current_buffer().contents(),
-            "./\n../\ntwo\\nlines.txt\n"
+            format!("./\n../\n{displayed}\n")
         );
         editor
             .execute(&Action::MoveTo(0, 3), &mut frame, &mut runtime)

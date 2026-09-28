@@ -19,10 +19,15 @@ impl Directory {
 #[derive(Debug, Serialize)]
 pub(crate) struct DirectoryEntry {
     pub name: String,
+    #[serde(serialize_with = "serialize_path")]
     pub path: PathBuf,
     pub kind: &'static str,
     #[serde(skip)]
     sort_name: String,
+}
+
+fn serialize_path<S: serde::Serializer>(path: &Path, serializer: S) -> Result<S::Ok, S::Error> {
+    path.to_string_lossy().serialize(serializer)
 }
 
 /// NeoTree filters workspace ignores; a directory buffer shows the actual contents.
@@ -98,4 +103,28 @@ pub(crate) fn scan(
     });
 
     (entries, scan_error)
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::{ffi::OsStr, os::unix::ffi::OsStrExt};
+
+    #[test]
+    fn neotree_serialization_accepts_non_utf8_paths() {
+        let entry = DirectoryEntry {
+            name: "file-\u{fffd}.txt".into(),
+            path: Path::new("nested").join(OsStr::from_bytes(b"file-\xff.txt")),
+            kind: "file",
+            sort_name: "file-\u{fffd}.txt".into(),
+        };
+        assert_eq!(
+            serde_json::json!([entry]),
+            serde_json::json!([{
+                "name": "file-\u{fffd}.txt",
+                "path": "nested/file-\u{fffd}.txt",
+                "kind": "file"
+            }])
+        );
+    }
 }
