@@ -293,6 +293,10 @@ impl Editor {
             self.mouse_selection.return_to_insert = None;
             let local_y = pointer.y.saturating_sub(window.position.y);
             if local_y < self.window_content_top(&window) {
+                // Directory chrome replaces the plugin bar; don't invoke hidden bar actions.
+                if self.buffer_manager[window.buffer_index].directory.is_some() {
+                    return Ok(());
+                }
                 let local_x = pointer.x.saturating_sub(window.position.x);
                 if let Some(rendered) = self
                     .window_bar_manager

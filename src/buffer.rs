@@ -315,7 +315,7 @@ impl Buffer {
         if let Some(error) = error {
             anyhow::bail!(error);
         }
-        let mut text = String::new();
+        let mut text = String::from("./\n../\n");
         for entry in &entries {
             use std::fmt::Write;
             // Keep one physical row per entry, including names with newlines or controls.

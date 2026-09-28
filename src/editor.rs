@@ -6552,9 +6552,12 @@ impl Editor {
         // to an earlier buffer line. Preserve inactive split positions too.
         for window in self.window_manager.windows_mut() {
             let cursor_line = window.vtop.saturating_add(window.cy);
-            let height = window
-                .inner_height()
-                .saturating_sub(self.window_bar_manager.reserved_top_height(window.id));
+            let top = if self.buffer_manager[window.buffer_index].directory.is_some() {
+                crate::buffer::directory::Directory::header_height(window.inner_height())
+            } else {
+                self.window_bar_manager.reserved_top_height(window.id)
+            };
+            let height = window.inner_height().saturating_sub(top);
             let cursor_row = window.cy.min(height.saturating_sub(1));
             if cursor_row != window.cy {
                 window.vtop = cursor_line.saturating_sub(cursor_row);
@@ -6795,7 +6798,11 @@ impl Editor {
     }
 
     fn window_content_top(&self, window: &crate::window::Window) -> usize {
-        self.window_bar_manager.reserved_top_height(window.id)
+        if self.buffer_manager[window.buffer_index].directory.is_some() {
+            crate::buffer::directory::Directory::header_height(window.inner_height())
+        } else {
+            self.window_bar_manager.reserved_top_height(window.id)
+        }
     }
 
     fn window_content_height(&self, window: &crate::window::Window) -> usize {
@@ -7267,7 +7274,11 @@ impl Editor {
         self.buffer_manager
             .get(buffer_index)
             .map(|buffer| {
-                GUTTER_SIGN_COLUMN_WIDTH + buffer.len().saturating_add(1).to_string().len()
+                if buffer.directory.is_some() {
+                    0
+                } else {
+                    GUTTER_SIGN_COLUMN_WIDTH + buffer.len().saturating_add(1).to_string().len()
+                }
             })
             .unwrap_or(GUTTER_SIGN_COLUMN_WIDTH)
     }
@@ -18168,10 +18179,15 @@ impl Editor {
         if let (Some(directory), Event::Key(event)) = (&self.current_buffer().directory, ev) {
             if matches!(event.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
                 let action = match (event.code, event.modifiers) {
-                    (KeyCode::Enter, KeyModifiers::NONE) => directory
-                        .entries
-                        .get(self.buffer_line())
-                        .map(|entry| Action::OpenFile(entry.path.to_string_lossy().into_owned())),
+                    (KeyCode::Enter, KeyModifiers::NONE) => match self.buffer_line() {
+                        0 => Some(Action::ReloadFile(false)),
+                        1 => Path::new(&directory.path)
+                            .parent()
+                            .map(|path| Action::OpenFile(path.to_string_lossy().into_owned())),
+                        line => directory.entries.get(line - 2).map(|entry| {
+                            Action::OpenFile(entry.path.to_string_lossy().into_owned())
+                        }),
+                    },
                     (KeyCode::Char('-'), KeyModifiers::NONE) => Path::new(&directory.path)
                         .parent()
                         .map(|path| Action::OpenFile(path.to_string_lossy().into_owned())),
@@ -46106,6 +46122,7 @@ while True:
         std::fs::write(&file, "file content\n").unwrap();
         let root_name = root.path().to_string_lossy().into_owned();
         let mut editor = test_editor(80, 24);
+        editor.config.relative_line_numbers = Some(true);
         let mut frame = RenderBuffer::new(80, 24, &Style::default());
         let mut runtime = Runtime::new();
 
@@ -46118,7 +46135,14 @@ while True:
             .await
             .unwrap();
         let root_id = editor.current_buffer().id();
-        assert_eq!(editor.current_buffer().contents(), "nested/\n");
+        let rendered = render_text_rows(&frame);
+        assert!(rendered[0].contains("DIRECTORY"));
+        assert!(rendered[0].contains("ITEMS 1"));
+        assert_eq!(rendered[4].trim(), "./");
+        assert_eq!(rendered[5].trim(), "../");
+        assert_eq!(rendered[6].trim(), "nested/");
+        assert_eq!(editor.gutter_width(), 0);
+        assert_eq!(editor.current_buffer().contents(), "./\n../\nnested/\n");
         assert!(editor.current_buffer().uri().unwrap().is_none());
         // The internal text-only open path must not accept a directory as a document.
         assert!(editor.load_or_reuse_file_buffer(&root_name).await.is_err());
@@ -46138,7 +46162,7 @@ while True:
                 .unwrap();
             assert_eq!(
                 editor.current_buffer().contents(),
-                "nested/\n",
+                "./\n../\nnested/\n",
                 "{action:?}"
             );
             assert!(!editor.current_buffer().is_dirty(), "{action:?}");
@@ -46152,6 +46176,10 @@ while True:
         assert_eq!(editor.current_buffer().id(), root_id);
 
         let enter = Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        editor
+            .execute(&Action::MoveTo(0, 3), &mut frame, &mut runtime)
+            .await
+            .unwrap();
         let Some(KeyAction::Single(action)) = editor.handle_normal_event(&enter) else {
             panic!("open nested");
         };
@@ -46160,7 +46188,14 @@ while True:
             .await
             .unwrap();
         let nested_id = editor.current_buffer().id();
-        assert_eq!(editor.current_buffer().contents(), "two\\nlines.txt\n");
+        assert_eq!(
+            editor.current_buffer().contents(),
+            "./\n../\ntwo\\nlines.txt\n"
+        );
+        editor
+            .execute(&Action::MoveTo(0, 3), &mut frame, &mut runtime)
+            .await
+            .unwrap();
         let Some(KeyAction::Single(action)) = editor.handle_normal_event(&enter) else {
             panic!("open filename");
         };
@@ -46169,6 +46204,13 @@ while True:
             .await
             .unwrap();
         assert_eq!(editor.current_buffer().contents(), "file content\n");
+        assert!(
+            editor.gutter_width() > 0,
+            "file line numbers must remain enabled"
+        );
+        assert!(render_text_rows(&frame)
+            .iter()
+            .any(|row| row.contains("1 file content")));
 
         editor
             .execute(
@@ -46179,8 +46221,11 @@ while True:
             .await
             .unwrap();
         assert_eq!(editor.current_buffer().id(), nested_id);
-        let parent = Event::Key(KeyEvent::new(KeyCode::Char('-'), KeyModifiers::NONE));
-        let Some(KeyAction::Single(action)) = editor.handle_normal_event(&parent) else {
+        editor
+            .execute(&Action::MoveTo(0, 2), &mut frame, &mut runtime)
+            .await
+            .unwrap();
+        let Some(KeyAction::Single(action)) = editor.handle_normal_event(&enter) else {
             panic!("open parent");
         };
         editor
@@ -46201,8 +46246,11 @@ while True:
         assert_eq!(editor.test_window_count(), 2);
 
         std::fs::write(root.path().join(".hidden"), "new").unwrap();
-        let refresh = Event::Key(KeyEvent::new(KeyCode::Char('R'), KeyModifiers::SHIFT));
-        let Some(KeyAction::Single(action)) = editor.handle_normal_event(&refresh) else {
+        editor
+            .execute(&Action::MoveTo(0, 1), &mut frame, &mut runtime)
+            .await
+            .unwrap();
+        let Some(KeyAction::Single(action)) = editor.handle_normal_event(&enter) else {
             panic!("refresh");
         };
         editor
@@ -46210,7 +46258,10 @@ while True:
             .await
             .unwrap();
         assert_eq!(editor.current_buffer().id(), root_id);
-        assert_eq!(editor.current_buffer().contents(), "nested/\n.hidden\n");
+        assert_eq!(
+            editor.current_buffer().contents(),
+            "./\n../\nnested/\n.hidden\n"
+        );
         assert!(!editor.current_buffer().is_dirty());
     }
 
@@ -46228,7 +46279,7 @@ while True:
         .await
         .unwrap();
         assert_eq!(buffers.len(), 2);
-        assert_eq!(buffers[0].contents(), "file.txt\n");
+        assert_eq!(buffers[0].contents(), "./\n../\nfile.txt\n");
         assert_eq!(buffers[1].contents(), "ordinary\n");
 
         let mut editor = test_editor(80, 24);
@@ -46242,7 +46293,7 @@ while True:
         assert!(detect_disk_divergence(&snapshot).is_empty());
         std::fs::write(root.path().join("after.txt"), "").unwrap();
         let restored = Editor::buffers_from_session_snapshot(&snapshot);
-        assert_eq!(restored[0].contents(), "after.txt\nfile.txt\n");
+        assert_eq!(restored[0].contents(), "./\n../\nafter.txt\nfile.txt\n");
         assert_eq!(restored[0].name(), path);
         assert!(!restored[0].is_unnamed());
         assert!(!restored[0].is_dirty());

@@ -260,10 +260,12 @@ root_markers = ["go.mod", ".git"]
 
 Open a directory in an editor window with `red .`, `red path/to/dir`,
 `:e path/to/dir`, or `:vs path/to/dir`. Use normal movement and search
-keys to navigate, Enter to open the entry under the cursor, `-` to go up,
-and `R` (or `:e!`) to refresh. Listings include hidden and ignored entries;
+keys to navigate, Enter to open the entry under the cursor, `-` or `../` to
+go up, and `./`, `R` (or `:e!`) to refresh. Listings include hidden and ignored entries;
 directories end in `/`. They appear in the buffer list and can be revisited
-like any other buffer. Listings are read-only. Use Neo-tree for file operations.
+like any other buffer. Directory headers show the path and navigation help;
+listings omit line numbers, including relative numbers. Listings are read-only.
+Use Neo-tree for file operations.
 
 | Key | Action |
 | --- | --- |

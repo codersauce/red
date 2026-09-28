@@ -9,6 +9,13 @@ pub(crate) struct Directory {
     pub entries: Vec<DirectoryEntry>,
 }
 
+impl Directory {
+    /// Leave space for both navigation rows even in a very short split.
+    pub(crate) fn header_height(window_height: usize) -> usize {
+        4.min(window_height.saturating_sub(2))
+    }
+}
+
 #[derive(Debug, Serialize)]
 pub(crate) struct DirectoryEntry {
     pub name: String,
