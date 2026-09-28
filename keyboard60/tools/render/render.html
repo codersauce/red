@@ -1,0 +1,155 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>KB60 render</title>
+<style>html, body { margin: 0; background: #f3f1ec; } canvas { display: block; }</style>
+<script type="importmap">
+{ "imports": { "three": "./node_modules/three/build/three.module.js",
+               "three/addons/": "./node_modules/three/examples/jsm/" } }
+</script>
+</head>
+<body>
+<script type="module">
+import * as THREE from 'three';
+import { STLLoader } from 'three/addons/loaders/STLLoader.js';
+import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
+
+const q = new URLSearchParams(location.search);
+const viewName = q.get('view') || 'hero';
+const W = +(q.get('w') || 1600), H = +(q.get('h') || 1000);
+const K = '../../';
+
+const COL = {
+  caseL: '#3b4048', caseR: '#3b4048', plate: '#9aa3ad', pcb: '#1d4d38',
+  alpha: '#e6dfcd', mod: '#6f767f', accent: '#dd6a33', foam: '#c9b458', sw: '#26282c', bed: '#2a2c30',
+};
+
+// Part sets; positions are in model coordinates (mm, Z up). off = [dx, dy, dz]
+const ASSEMBLED = [
+  ['stl/case_left.stl', 'caseL'], ['stl/case_right.stl', 'caseR'],
+  ['preview/view_plate_left.stl', 'plate'], ['preview/view_plate_right.stl', 'plate'],
+  ['preview/view_keycaps_alphas.stl', 'alpha'], ['preview/view_keycaps_mods.stl', 'mod'],
+  ['preview/view_keycaps_accents.stl', 'accent'],
+];
+const t = 6 * Math.PI / 180, up = (d) => [0, -d * Math.sin(t), d * Math.cos(t)];
+
+const VIEWS = {
+  hero: { parts: ASSEMBLED, cam: [-95, -300, 235], at: [149, 50, 2], fov: 26, shadow: true },
+  hero_right: { parts: ASSEMBLED, cam: [420, -250, 190], at: [149, 52, 4], fov: 26, shadow: true },
+  case_top: { parts: ASSEMBLED.slice(0, 2), cam: [390, -230, 330], at: [149, 55, 0], fov: 26, shadow: true },
+  exploded: {
+    parts: [
+      ['stl/case_left.stl', 'caseL', [-14, 0, 0]], ['stl/case_right.stl', 'caseR', [14, 0, 0]],
+      ['preview/view_pcb.stl', 'pcb', up(16)],
+      ['preview/view_switches.stl', 'sw', up(34)],
+      ['preview/view_plate_left.stl', 'plate', up(34)], ['preview/view_plate_right.stl', 'plate', up(34)],
+      ['preview/view_keycaps_alphas.stl', 'alpha', up(58)], ['preview/view_keycaps_mods.stl', 'mod', up(58)],
+      ['preview/view_keycaps_accents.stl', 'accent', up(58)],
+    ], cam: [-110, -330, 300], at: [149, 50, 30], fov: 26, shadow: true },
+  underside: { parts: ASSEMBLED.slice(0, 2), cam: [40, -260, -300], at: [149, 55, 8], fov: 26, shadow: false, noGround: true },
+  seam: {
+    parts: [['stl/case_left.stl', 'caseL'], ['stl/case_right.stl', 'caseR', [0, 0, 34]]],
+    cam: [245, -105, 95], at: [152, 50, 12], fov: 30, shadow: true },
+  standoffs: { parts: [['stl/case_left.stl', 'caseL']], cam: [95, -55, 120], at: [70, 62, 8], fov: 30, shadow: true },
+  joint_keys: { parts: [['stl/case_left.stl', 'caseL']], cam: [225, -40, 70], at: [150, 52, 2], fov: 30, shadow: true },
+  joint_slots: { parts: [['stl/case_right.stl', 'caseR']], cam: [95, -45, -85], at: [157, 52, 2], fov: 30, shadow: false, noGround: true },
+  joint_lower: { parts: [['stl/case_left.stl', 'caseL'], ['stl/case_right.stl', 'caseR', [0, 0, 30]]],
+    cam: [300, -210, 150], at: [150, 55, 12], fov: 28, shadow: true },
+  usb: { parts: ASSEMBLED.slice(0, 2).concat([['preview/view_pcb.stl', 'pcb']]), cam: [10, 250, 70], at: [45, 100, 14], fov: 30, shadow: true },
+};
+
+let view = VIEWS[viewName];
+if (viewName.startsWith('bed:')) {       // top-down view of one print job on the 256 mm bed
+  const job = viewName.slice(4);
+  const lay = await (await fetch(K + 'print/layout.json')).json();
+  const colors = { case: 'caseL', plate: 'plate', foam: 'foam', test: 'accent' };
+  view = { ortho: true, bed: lay.bed, shadow: false, noGround: true, parts: lay.jobs[job].map(p => {
+    const key = Object.keys(colors).find(k => p.part.startsWith(k));
+    return ['stl/' + p.part + '.stl', colors[key],
+            [p.center[0] - p.footprint_center[0], p.center[1] - p.footprint_center[1], 0]];
+  }) };
+}
+const renderer = new THREE.WebGLRenderer({ antialias: true, preserveDrawingBuffer: true });
+renderer.setPixelRatio(1);
+renderer.setSize(W, H);
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 0.95;
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+document.body.appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color('#f3f1ec');
+const pmrem = new THREE.PMREMGenerator(renderer);
+scene.environment = pmrem.fromScene(new RoomEnvironment(), 0.04).texture;
+scene.environmentIntensity = 0.9;
+
+const root = new THREE.Group();          // model is Z-up; three.js is Y-up
+root.rotation.x = -Math.PI / 2;
+scene.add(root);
+const toThree = ([x, y, z]) => new THREE.Vector3(x, z, -y);
+
+const sun = new THREE.DirectionalLight('#ffffff', 1.6);
+sun.position.copy(toThree([60, -120, 320]));
+sun.target.position.copy(toThree([150, 55, 0]));
+sun.castShadow = !!view.shadow;
+sun.shadow.mapSize.set(2048, 2048);
+Object.assign(sun.shadow.camera, { left: -260, right: 260, top: 260, bottom: -260, near: 10, far: 900 });
+sun.shadow.bias = -0.0004;
+sun.shadow.radius = 6;
+scene.add(sun, sun.target);
+
+if (!view.noGround) {
+  const ground = new THREE.Mesh(new THREE.PlaneGeometry(3000, 3000), new THREE.ShadowMaterial({ opacity: 0.18 }));
+  ground.rotation.x = -Math.PI / 2;
+  ground.position.y = -0.01;
+  ground.receiveShadow = true;
+  scene.add(ground);
+}
+
+const loader = new STLLoader();
+await Promise.all(view.parts.map(async ([file, col, off]) => {
+  const geo = await loader.loadAsync(K + file);
+  geo.computeVertexNormals();
+  const rough = col.startsWith('case') ? 0.72 : col === 'pcb' ? 0.5 : 0.55;
+  const mat = new THREE.MeshStandardMaterial({ color: COL[col], roughness: rough, metalness: 0.0 });
+  const m = new THREE.Mesh(geo, mat);
+  if (off) m.position.set(...off);
+  m.castShadow = m.receiveShadow = true;
+  root.add(m);
+}));
+
+let cam;
+if (view.ortho) {
+  const b = view.bed, pad = 14, half = b / 2 + pad;
+  const aspect = W / H;
+  cam = new THREE.OrthographicCamera(-half * aspect, half * aspect, half, -half, 1, 2000);
+  cam.position.copy(toThree([b / 2, b / 2, 600]));
+  cam.up.set(0, 0, -1);
+  cam.lookAt(toThree([b / 2, b / 2, 0]));
+  // build plate: dark textured-PEI look with a 50 mm grid
+  const plate = new THREE.Mesh(new THREE.BoxGeometry(b, b, 2), new THREE.MeshStandardMaterial({ color: '#2b2d31', roughness: 0.9 }));
+  plate.position.set(b / 2, b / 2, -1.05);
+  root.add(plate);
+  const pts = [];
+  for (let i = 0; i <= b; i += 50) pts.push(i, 0, 0.02, i, b, 0.02, 0, i, 0.02, b, i, 0.02);
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.Float32BufferAttribute(pts, 3));
+  root.add(new THREE.LineSegments(g, new THREE.LineBasicMaterial({ color: '#4a4d53' })));
+  const edge = new THREE.LineSegments(new THREE.EdgesGeometry(new THREE.PlaneGeometry(b, b)), new THREE.LineBasicMaterial({ color: '#8a8f97' }));
+  edge.position.set(b / 2, b / 2, 0.03);
+  root.add(edge);
+  sun.position.copy(toThree([b / 2 - 60, b / 2 - 90, 400]));
+  sun.target.position.copy(toThree([b / 2, b / 2, 0]));
+} else {
+  cam = new THREE.PerspectiveCamera(view.fov, W / H, 1, 5000);
+  cam.position.copy(toThree(view.cam));
+  cam.lookAt(toThree(view.at));
+}
+renderer.render(scene, cam);
+window.__done = true;
+</script>
+</body>
+</html>
