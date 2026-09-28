@@ -151,6 +151,9 @@ pub struct SessionBufferSnapshot {
     pub index: usize,
     /// Canonical file path, or `None` for an unnamed buffer.
     pub path: Option<String>,
+    /// Directory buffers are re-enumerated on restore, never compared to disk as text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub directory: Option<String>,
     /// Full in-memory text at capture time.
     pub contents: String,
     /// Last loaded or successfully saved text, independent of later disk changes.
@@ -2291,6 +2294,7 @@ mod tests {
             cwd: "/workspace".to_string(),
             saved_at_ms: 1,
             buffers: vec![SessionBufferSnapshot {
+                directory: None,
                 index: 0,
                 path: None,
                 contents: contents.to_string(),

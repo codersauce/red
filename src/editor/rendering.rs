@@ -33,7 +33,7 @@ use crate::{
     notification::{NotificationCounts, NotificationState, Severity},
     plugin::DecorationAnchor,
     splash,
-    theme::{SelectionForegroundPriority, Style, Theme},
+    theme::{SelectionForegroundPriority, Style, SurfacePalette, Theme},
     ui::IconCatalog,
     undo::{TextPosition, TextRange},
     unicode_utils::{
@@ -1917,6 +1917,16 @@ impl Editor {
         line_count: usize,
         row: usize,
     ) {
+        if self.buffer_manager[window.buffer_index].directory.is_some() {
+            // Only the normal one-cell text inset remains in directory windows.
+            buffer.set_text(
+                window.position.x,
+                self.window_to_terminal_y(window, row),
+                " ",
+                &self.theme.style,
+            );
+            return;
+        }
         let lane_width = self.inline_comment_lane_width(window);
         let lane_x =
             window.position.x + self.gutter_width_for_buffer_index(window.buffer_index) + 1;
@@ -2340,6 +2350,10 @@ impl Editor {
     }
 
     fn render_window_bar(&self, buffer: &mut RenderBuffer, window: &crate::window::Window) {
+        if let Some(directory) = &self.buffer_manager[window.buffer_index].directory {
+            self.render_directory_header(buffer, window, directory);
+            return;
+        }
         let Some(rendered) = self
             .window_bar_manager
             .render(window.id, window.inner_width())
@@ -2364,6 +2378,81 @@ impl Editor {
             style.bg = style.bg.or(base_style.bg);
             buffer.set_text(x, window.position.y, &segment.text, &style);
             x += display_width(&segment.text);
+        }
+    }
+
+    fn render_directory_header(
+        &self,
+        buffer: &mut RenderBuffer,
+        window: &crate::window::Window,
+        directory: &crate::buffer::directory::Directory,
+    ) {
+        let width = window.inner_width();
+        let height = self.window_content_top(window);
+        if height == 0 || width == 0 {
+            return;
+        }
+        let palette = SurfacePalette::new(&self.theme, &self.theme.ui_style.dialog);
+        let (x, y) = (window.position.x, window.position.y);
+        buffer.fill_rect(x, y, width, height, ' ', &palette.surface, &self.theme);
+        let (rail, line) = if self.config.window_borders_ascii {
+            ("|", "-")
+        } else {
+            ("┃", "━")
+        };
+        let title = " red  /  DIRECTORY ";
+        let title = truncate_display_width(title, width.saturating_sub(1));
+        buffer.set_text(x, y, rail, &palette.accent);
+        buffer.set_text(x + 1, y, &title, &palette.accent);
+
+        let count = format!(" NAME ↑ · ITEMS {} ", directory.entries.len());
+        let count_width = display_width(&count);
+        let title_end = 1 + display_width(&title);
+        if width > title_end + count_width + 2 {
+            let count_x = width - count_width;
+            buffer.set_text(
+                x + title_end,
+                y,
+                &line.repeat(count_x - title_end),
+                &palette.divider,
+            );
+            buffer.set_text(x + count_x, y, &count, &palette.secondary);
+        }
+
+        if height > 1 {
+            let path = Path::new(&directory.path);
+            let path = std::env::home_dir()
+                .and_then(|home| {
+                    path.strip_prefix(home)
+                        .ok()
+                        .map(|p| format!("~/{}", p.display()))
+                })
+                .unwrap_or_else(|| directory.path.clone());
+            let path = truncate_display_width_with_marker(
+                &path.escape_debug().to_string(),
+                width.saturating_sub(3),
+                "…",
+                TruncationSide::Left,
+            );
+            buffer.set_text(x, y + 1, rail, &palette.accent);
+            buffer.set_text(x + 2, y + 1, &path, &palette.primary);
+        }
+        if height > 2 {
+            let help = if width >= 70 {
+                " Enter Open   ./ Refresh   ../ Parent   - Up   R Reload   / Search"
+            } else {
+                " ↵ Open   - Up   R Reload   / Find"
+            };
+            buffer.set_text(x, y + 2, rail, &palette.divider);
+            buffer.set_text(
+                x + 1,
+                y + 2,
+                &truncate_display_width(help, width.saturating_sub(1)),
+                &palette.secondary,
+            );
+        }
+        if height > 3 {
+            buffer.set_text(x, y + 3, &line.repeat(width), &palette.divider);
         }
     }
 
@@ -3677,6 +3766,9 @@ impl Editor {
             current_folder.clone()
         };
         let mut filename = statusline_file_name(&filename, &current_folder);
+        if filename.is_empty() && self.buffer_manager[buffer_index].directory.is_some() {
+            filename.push('.');
+        }
         if let Some(change) = external_file_change {
             filename.push_str(if change == super::ExternalFileChange::Deleted {
                 " [DELETED]"

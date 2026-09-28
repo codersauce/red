@@ -293,6 +293,10 @@ impl Editor {
             self.mouse_selection.return_to_insert = None;
             let local_y = pointer.y.saturating_sub(window.position.y);
             if local_y < self.window_content_top(&window) {
+                // Directory chrome replaces the plugin bar; don't invoke hidden bar actions.
+                if self.buffer_manager[window.buffer_index].directory.is_some() {
+                    return Ok(());
+                }
                 let local_x = pointer.x.saturating_sub(window.position.x);
                 if let Some(rendered) = self
                     .window_bar_manager
@@ -350,6 +354,17 @@ impl Editor {
                 at: Instant::now(),
                 count,
             });
+            if count == 2
+                && layout
+                    .row(local_y - self.window_content_top(&window))
+                    .is_some()
+            {
+                if let Some(action) = self.directory_open_action() {
+                    self.mouse_selection.last_click = None;
+                    self.execute(&action, buffer, runtime).await?;
+                    return Ok(());
+                }
+            }
             let unit = if modifiers.contains(KeyModifiers::ALT) {
                 SelectionUnit::Block
             } else if modifiers.contains(KeyModifiers::SHIFT) && same_window {
