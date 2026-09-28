@@ -84,7 +84,11 @@ source-branch head, and host checks before changing production.
 
 Deploy from an exact pushed commit in `red-website`. The site requires Node
 `>=22.13.0`; `npm test` runs the installer drift check, `npm run build`, and
-rendered HTML assertions [@website-package]. The README requires installers to
+rendered HTML assertions [@website-package]. Also run `npm audit --omit=dev`
+against the same export before saving a production version: the v0.8.0 website
+release found five production dependency advisories in an otherwise unchanged
+lockfile after the release page and docs were already live
+[@direction-a-deploy-transcript]. The README requires installers to
 be synced only to an actually published Red release commit, because
 `public/installers.json` feeds the release version shown in the site
 [@website-readme].
@@ -109,6 +113,7 @@ git -C "$repo" archive --format=tar "$sha" | tar -xf - -C "$release_dir"
 cd "$release_dir"
 npm ci
 npm test
+npm audit --omit=dev
 archive="/tmp/red-website-${sha}.tar.gz"
 tar -czf "$archive" -C "$release_dir" dist
 tar -tzf "$archive" | rg '^dist/(\.openai/hosting\.json|server/index\.js)$'
@@ -118,6 +123,11 @@ This command reproduces the observed archive root layout from the successful
 Sites deployment audit [@deployment-findings]. Keep the temporary export and
 archive until `save_site_version` succeeds, so a failed save can be inspected
 without rebuilding.
+
+If the dependency audit reports advisories, fix them before deployment or carry
+an explicit applicability note for the vinext Worker. The v0.8.0 release left a
+direct critical Next.js advisory unresolved because its applicability to the
+Worker deployment had not been verified [@direction-a-deploy-transcript].
 
 ## Save And Publish
 
