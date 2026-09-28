@@ -18175,19 +18175,25 @@ impl Editor {
         }
     }
 
+    fn directory_open_action(&self) -> Option<Action> {
+        let directory = self.current_buffer().directory.as_ref()?;
+        match self.buffer_line() {
+            0 => Some(Action::ReloadFile(false)),
+            1 => Path::new(&directory.path)
+                .parent()
+                .map(|path| Action::OpenFile(path.to_string_lossy().into_owned())),
+            line => directory
+                .entries
+                .get(line - 2)
+                .map(|entry| Action::OpenFile(entry.path.to_string_lossy().into_owned())),
+        }
+    }
+
     fn handle_normal_event(&mut self, ev: &event::Event) -> Option<KeyAction> {
         if let (Some(directory), Event::Key(event)) = (&self.current_buffer().directory, ev) {
             if matches!(event.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
                 let action = match (event.code, event.modifiers) {
-                    (KeyCode::Enter, KeyModifiers::NONE) => match self.buffer_line() {
-                        0 => Some(Action::ReloadFile(false)),
-                        1 => Path::new(&directory.path)
-                            .parent()
-                            .map(|path| Action::OpenFile(path.to_string_lossy().into_owned())),
-                        line => directory.entries.get(line - 2).map(|entry| {
-                            Action::OpenFile(entry.path.to_string_lossy().into_owned())
-                        }),
-                    },
+                    (KeyCode::Enter, KeyModifiers::NONE) => self.directory_open_action(),
                     (KeyCode::Char('-'), KeyModifiers::NONE) => Path::new(&directory.path)
                         .parent()
                         .map(|path| Action::OpenFile(path.to_string_lossy().into_owned())),
@@ -46308,6 +46314,58 @@ while True:
         assert!(restored[0].directory.is_some());
         assert!(restored[0].file.is_none());
         assert!(restored[0].contents().contains("Cannot read directory"));
+    }
+
+    #[tokio::test]
+    async fn directory_buffer_mouse_opens_only_double_clicked_rows() {
+        let root = tempfile::tempdir().unwrap();
+        let nested = root.path().join("nested");
+        std::fs::create_dir(&nested).unwrap();
+        std::fs::write(nested.join("file.txt"), "file content\n").unwrap();
+        let mut editor = test_editor(80, 24);
+        editor.config.relative_line_numbers = Some(true);
+        let mut frame = RenderBuffer::new(80, 24, &Style::default());
+        let mut runtime = Runtime::new();
+        editor
+            .execute(
+                &Action::OpenFile(root.path().to_string_lossy().into_owned()),
+                &mut frame,
+                &mut runtime,
+            )
+            .await
+            .unwrap();
+
+        let root_contents = "./\n../\nnested/\n";
+        let nested_contents = "./\n../\nfile.txt\n";
+        for (row, clicks, expected) in [
+            (1, 2, root_contents),   // header
+            (16, 2, root_contents),  // empty space below the last entry
+            (6, 1, root_contents),   // first click only moves the cursor
+            (6, 1, nested_contents), // second click opens the directory
+            (5, 2, root_contents),   // ../
+            (6, 2, nested_contents),
+            (6, 2, "file content\n"), // a file in the same screen position
+        ] {
+            for _ in 0..clicks {
+                for kind in [
+                    MouseEventKind::Down(MouseButton::Left),
+                    MouseEventKind::Up(MouseButton::Left),
+                ] {
+                    editor
+                        .test_execute_event(Event::Mouse(MouseEvent {
+                            kind,
+                            column: 2,
+                            row,
+                            modifiers: KeyModifiers::NONE,
+                        }))
+                        .await
+                        .unwrap();
+                }
+            }
+            assert_eq!(editor.current_buffer().contents(), expected, "row {row}");
+        }
+        assert!(editor.is_normal());
+        assert!(editor.gutter_width() > 0);
     }
 
     #[test]

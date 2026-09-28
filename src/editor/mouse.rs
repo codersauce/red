@@ -354,6 +354,17 @@ impl Editor {
                 at: Instant::now(),
                 count,
             });
+            if count == 2
+                && layout
+                    .row(local_y - self.window_content_top(&window))
+                    .is_some()
+            {
+                if let Some(action) = self.directory_open_action() {
+                    self.mouse_selection.last_click = None;
+                    self.execute(&action, buffer, runtime).await?;
+                    return Ok(());
+                }
+            }
             let unit = if modifiers.contains(KeyModifiers::ALT) {
                 SelectionUnit::Block
             } else if modifiers.contains(KeyModifiers::SHIFT) && same_window {
