@@ -82,27 +82,23 @@ completed `codex login`.
   sessions retain buffers, plugins, LSP state, and running agents across
   terminal or SSH disconnects.
 
-## New in v0.7.0
+## New in v0.8.0
 
-The v0.7.0 release adds:
+The v0.8.0 release adds:
 
-- **An agent that points to the code it means.** Ask Agent to explain a
-  subsystem, then follow links in its answer directly to source-anchored
-  annotations. Choose the conversation's model and reasoning effort without
-  changing your global Codex settings.
-- **Real Vim-style multi-cursor editing.** Press `Ctrl-n` to select repeated
-  occurrences or `Ctrl-Up` / `Ctrl-Down` for vertical cursors. Extend each
-  selection with familiar motions and apply one Unicode-aware, undoable edit.
-- **Inline help that gets out of the way.** Exact foreground edits can apply
-  immediately while remaining unsaved; background and wider same-file edits
-  always require explicit review. Keep the full history, inspect changes, or
-  continue a discussion in Agent.
-- **Your files stay protected when another tool changes them.** Clean buffers
-  reload automatically. Dirty buffers keep both versions until you compare,
-  reload, save elsewhere, or explicitly overwrite.
-- **A faster, more complete editing workspace.** Browse large file trees,
-  coordinate LSP and optional Copilot completions, and format supported
-  pasted ranges.
+- **Directory browsing in editor windows.** Run `red .` or open a directory
+  with `:e`. Move through entries with normal editor keys, press Enter to open
+  one, or press `-` to go up. Directory buffers are read-only and revisitable.
+- **Mouse selection that stays in the editor.** Drag to make a Visual selection;
+  double-click selects a word, triple-click a line, and quadruple-click a
+  block. Continue with Vim motions and editing commands.
+- **Syntax detection for extensionless scripts.** Red reads a shebang when a
+  filename has no language match. Bundled interpreters cover common shells,
+  Node, Lua, PowerShell, and Husk; language packs can register more.
+- **Familiar picker keys.** Use `Ctrl-n` and `Ctrl-p` to move through results
+  without changing the search query.
+- **Optional Rust Glancer configuration.** Rust projects can opt into Glancer
+  with a documented server configuration; rust-analyzer remains the default.
 
 ## First five minutes
 
@@ -149,7 +145,7 @@ versioned behavior contract.
    resume the same conversation without losing editor context. Source-linked
    annotations turn explanations into navigable code walkthroughs.
 
-In v0.7.0, file-tool playback is optional and disabled by default; set
+File-tool playback is optional and disabled by default; set
 `[agent] follow_tool_calls = true` to reveal each target and pause before the
 operation. Full Agent writes still save to disk.
 

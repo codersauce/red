@@ -1,6 +1,6 @@
 # Getting started with Red
 
-This guide covers the day-to-day editor workflow in Red v0.7.0.
+This guide covers the day-to-day editor workflow in Red v0.8.0.
 For installation, see the [README](../README.md#install).
 
 ## First launch
