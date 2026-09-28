@@ -1,0 +1,146 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Monaka60 render</title>
+<style>html, body { margin: 0; background: #f1efea; } canvas { display: block; }</style>
+<script type="importmap">
+{ "imports": { "three": "./node_modules/three/build/three.module.js",
+               "three/addons/": "./node_modules/three/examples/jsm/" } }
+</script>
+</head>
+<body>
+<script type="module">
+// Renders one still of the Monaka60 meshes. Serve the monaka60 folder, open
+// tools/render/render.html?view=<name>&w=1600&h=1000 (see shoot.mjs).
+import * as THREE from 'three';
+import { STLLoader } from 'three/addons/loaders/STLLoader.js';
+import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
+
+const q = new URLSearchParams(location.search);
+const viewName = q.get('view') || 'hero_hhkb';
+const W = +(q.get('w') || 1600), H = +(q.get('h') || 1000);
+const K = '../../';
+
+const COL = {
+  bottom: '#3b4048', top: '#454b54', plate: '#9aa3ad', pcb: '#1d4d38', gasket: '#d9b44a',
+  alpha: '#e6dfcd', mod: '#6f767f', accent: '#dd6a33', sw: '#26282c', udb: '#1f3f6b', foam: '#b9a860',
+};
+const t6 = 6 * Math.PI / 180, up = d => [0, -d * Math.sin(t6), d * Math.cos(t6)];
+
+function kit(lay, style, extra = {}) {
+  const o = extra.off || {};
+  const parts = [
+    ['stl/bottom_left.stl', 'bottom', o.bottomL], ['stl/bottom_right.stl', 'bottom', o.bottomR],
+    [`preview/view_top_${style}_left.stl`, 'top', o.topL], [`preview/view_top_${style}_right.stl`, 'top', o.topR],
+    [`preview/view_plate_${lay}_left.stl`, 'plate', o.plate], [`preview/view_plate_${lay}_right.stl`, 'plate', o.plate],
+    [`preview/view_keycaps_${lay}_alphas.stl`, 'alpha', o.keys], [`preview/view_keycaps_${lay}_mods.stl`, 'mod', o.keys],
+    [`preview/view_keycaps_${lay}_accents.stl`, 'accent', o.keys],
+  ];
+  if (extra.inner) parts.push(['preview/view_pcb.stl', 'pcb', o.pcb], ['preview/view_gaskets.stl', 'gasket', o.gasket],
+                              [`preview/view_switches_${lay}.stl`, 'sw', o.plate]);
+  return parts.filter(p => !(extra.drop || []).some(d => p[0].includes(d)));
+}
+const styleOf = { ansi: 'open', tsangan: 'open', wkl: 'wkl', hhkb: 'hhkb' };
+const hero = lay => ({ parts: kit(lay, styleOf[lay]), cam: [-95, -310, 245], at: [152, 52, 4], fov: 26, shadow: true });
+
+const VIEWS = {
+  hero_ansi: hero('ansi'), hero_tsangan: hero('tsangan'), hero_wkl: hero('wkl'), hero_hhkb: hero('hhkb'),
+  hero_right: { parts: kit('hhkb', 'hhkb'), cam: [430, -260, 200], at: [152, 55, 6], fov: 26, shadow: true },
+  exploded: {
+    parts: kit('hhkb', 'hhkb', { inner: true, off: {
+      bottomL: [-12, 0, 0], bottomR: [12, 0, 0], gasket: up(14), pcb: up(20), plate: up(34), topL: up(62), topR: up(62), keys: up(84) } }),
+    cam: [-120, -360, 340], at: [152, 50, 36], fov: 26, shadow: true },
+  gasket_detail: {
+    parts: [['stl/bottom_left.stl', 'bottom'], ['preview/view_gaskets.stl', 'gasket'],
+            ['preview/view_plate_hhkb_left.stl', 'plate'], ['preview/view_pcb.stl', 'pcb']],
+    cam: [30, -60, 75], at: [70, 12, 12], fov: 30, shadow: true },
+  case_open: { parts: [['stl/bottom_left.stl', 'bottom'], ['stl/bottom_right.stl', 'bottom'], ['preview/view_gaskets.stl', 'gasket']],
+    cam: [390, -240, 330], at: [152, 58, 0], fov: 26, shadow: true },
+  underside: { parts: kit('hhkb', 'hhkb', { drop: ['keycaps', 'plate'] }), cam: [40, -270, -300], at: [152, 58, 8], fov: 26, shadow: false, noGround: true },
+  top_print: { parts: [['stl/top_hhkb_left.stl', 'top']], cam: [80, -150, 150], at: [80, -55, 0], fov: 30, shadow: true },
+  udb: { parts: [['stl/bottom_left_udb.stl', 'bottom'], ['preview/view_udb.stl', 'udb']], cam: [120, 20, 110], at: [30, 100, 10], fov: 28, shadow: true },
+  joint_lower: { parts: [['stl/bottom_left.stl', 'bottom'], ['stl/bottom_right.stl', 'bottom', [0, 0, 30]]],
+    cam: [310, -215, 150], at: [152, 58, 12], fov: 28, shadow: true },
+};
+
+let view = VIEWS[viewName];
+if (viewName.startsWith('bed:')) {             // top-down view of one print job on the 256 mm bed
+  const job = viewName.slice(4);
+  const lay = await (await fetch(K + 'print/layout.json')).json();
+  const colors = { bottom: 'bottom', top: 'top', plate: 'plate', gasket: 'gasket', foam: 'foam', test: 'accent' };
+  view = { ortho: true, bed: lay.bed, shadow: false, noGround: true, parts: lay.jobs[job].map(p => {
+    const key = Object.keys(colors).find(k => p.part.startsWith(k));
+    return ['stl/' + p.part + '.stl', colors[key], [p.center[0] - p.footprint_center[0], p.center[1] - p.footprint_center[1], 0]];
+  }) };
+}
+
+const renderer = new THREE.WebGLRenderer({ antialias: true, preserveDrawingBuffer: true });
+renderer.setPixelRatio(1);
+renderer.setSize(W, H);
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 0.95;
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+document.body.appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color('#f1efea');
+scene.environment = new THREE.PMREMGenerator(renderer).fromScene(new RoomEnvironment(), 0.04).texture;
+scene.environmentIntensity = 0.9;
+const root = new THREE.Group();                 // model is Z-up; three.js is Y-up
+root.rotation.x = -Math.PI / 2;
+scene.add(root);
+const toThree = ([x, y, z]) => new THREE.Vector3(x, z, -y);
+
+const sun = new THREE.DirectionalLight('#ffffff', 1.6);
+sun.position.copy(toThree([60, -120, 320]));
+sun.target.position.copy(toThree([150, 55, 0]));
+sun.castShadow = !!view.shadow;
+sun.shadow.mapSize.set(2048, 2048);
+Object.assign(sun.shadow.camera, { left: -300, right: 300, top: 300, bottom: -300, near: 10, far: 900 });
+sun.shadow.bias = -0.0004;
+scene.add(sun, sun.target);
+if (!view.noGround) {
+  const ground = new THREE.Mesh(new THREE.PlaneGeometry(3000, 3000), new THREE.ShadowMaterial({ opacity: 0.18 }));
+  ground.rotation.x = -Math.PI / 2;
+  ground.position.y = -0.01;
+  ground.receiveShadow = true;
+  scene.add(ground);
+}
+
+const loader = new STLLoader();
+await Promise.all(view.parts.map(async ([file, col, off]) => {
+  const geo = await loader.loadAsync(K + file);
+  geo.computeVertexNormals();
+  const rough = col === 'bottom' || col === 'top' ? 0.72 : col === 'gasket' || col === 'foam' ? 0.9 : 0.55;
+  const m = new THREE.Mesh(geo, new THREE.MeshStandardMaterial({ color: COL[col], roughness: rough, metalness: 0 }));
+  if (off) m.position.set(...off);
+  m.castShadow = m.receiveShadow = true;
+  root.add(m);
+}));
+
+let cam;
+if (view.ortho) {
+  const b = view.bed, half = b / 2 + 14, aspect = W / H;
+  cam = new THREE.OrthographicCamera(-half * aspect, half * aspect, half, -half, 1, 2000);
+  cam.position.copy(toThree([b / 2, b / 2, 600]));
+  cam.up.set(0, 0, -1);
+  cam.lookAt(toThree([b / 2, b / 2, 0]));
+  const plate = new THREE.Mesh(new THREE.BoxGeometry(b, b, 2), new THREE.MeshStandardMaterial({ color: '#2b2d31', roughness: 0.9 }));
+  plate.position.set(b / 2, b / 2, -1.05);
+  root.add(plate);
+  const edge = new THREE.LineSegments(new THREE.EdgesGeometry(new THREE.PlaneGeometry(b, b)), new THREE.LineBasicMaterial({ color: '#8a8f97' }));
+  edge.position.set(b / 2, b / 2, 0.03);
+  root.add(edge);
+} else {
+  cam = new THREE.PerspectiveCamera(view.fov, W / H, 1, 5000);
+  cam.position.copy(toThree(view.cam));
+  cam.lookAt(toThree(view.at));
+}
+renderer.render(scene, cam);
+window.__done = true;
+</script>
+</body>
+</html>

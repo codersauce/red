@@ -1,0 +1,559 @@
+{
+ "bed": 256.0,
+ "jobs": {
+  "monaka60_0_fit_tests": [
+   {
+    "part": "test_switch",
+    "center": [
+     71.0,
+     128.0
+    ],
+    "footprint_center": [
+     31.575000762939453,
+     22.049999237060547
+    ],
+    "size": [
+     63.15,
+     44.1,
+     1.5
+    ]
+   },
+   {
+    "part": "test_joint",
+    "center": [
+     139.57500076293945,
+     128.0
+    ],
+    "footprint_center": [
+     7.0,
+     15.0
+    ],
+    "size": [
+     54.0,
+     30.0,
+     9.19
+    ]
+   },
+   {
+    "part": "test_gasket",
+    "center": [
+     196.57500076293945,
+     128.0
+    ],
+    "footprint_center": [
+     20.0,
+     15.0
+    ],
+    "size": [
+     40.0,
+     78.0,
+     9.99
+    ]
+   }
+  ],
+  "monaka60_1_bottom": [
+   {
+    "part": "bottom_left",
+    "center": [
+     128.0,
+     64.9640007019043
+    ],
+    "footprint_center": [
+     80.75,
+     58.0359992980957
+    ],
+    "size": [
+     161.5,
+     116.07,
+     26.78
+    ]
+   },
+   {
+    "part": "bottom_right",
+    "center": [
+     128.0,
+     191.0359992980957
+    ],
+    "footprint_center": [
+     228.75,
+     58.0359992980957
+    ],
+    "size": [
+     152.5,
+     116.07,
+     26.78
+    ]
+   }
+  ],
+  "monaka60_1_bottom_udb": [
+   {
+    "part": "bottom_left_udb",
+    "center": [
+     128.0,
+     64.9640007019043
+    ],
+    "footprint_center": [
+     80.75,
+     58.0359992980957
+    ],
+    "size": [
+     161.5,
+     116.07,
+     26.78
+    ]
+   },
+   {
+    "part": "bottom_right",
+    "center": [
+     128.0,
+     191.0359992980957
+    ],
+    "footprint_center": [
+     228.75,
+     58.0359992980957
+    ],
+    "size": [
+     152.5,
+     116.07,
+     26.78
+    ]
+   }
+  ],
+  "monaka60_2_top_open": [
+   {
+    "part": "top_open_left",
+    "center": [
+     128.0,
+     64.33562994003296
+    ],
+    "footprint_center": [
+     76.25,
+     -48.89063024520874
+    ],
+    "size": [
+     152.5,
+     117.33,
+     7.5
+    ]
+   },
+   {
+    "part": "top_open_right",
+    "center": [
+     128.0,
+     191.66437005996704
+    ],
+    "footprint_center": [
+     228.75,
+     -48.89063024520874
+    ],
+    "size": [
+     152.5,
+     117.33,
+     7.5
+    ]
+   }
+  ],
+  "monaka60_2_top_wkl": [
+   {
+    "part": "top_wkl_left",
+    "center": [
+     128.0,
+     64.33562994003296
+    ],
+    "footprint_center": [
+     76.25,
+     -48.89063024520874
+    ],
+    "size": [
+     152.5,
+     117.33,
+     7.5
+    ]
+   },
+   {
+    "part": "top_wkl_right",
+    "center": [
+     128.0,
+     191.66437005996704
+    ],
+    "footprint_center": [
+     228.75,
+     -48.89063024520874
+    ],
+    "size": [
+     152.5,
+     117.33,
+     7.5
+    ]
+   }
+  ],
+  "monaka60_2_top_hhkb": [
+   {
+    "part": "top_hhkb_left",
+    "center": [
+     128.0,
+     64.33562994003296
+    ],
+    "footprint_center": [
+     76.25,
+     -48.89063024520874
+    ],
+    "size": [
+     152.5,
+     117.33,
+     7.5
+    ]
+   },
+   {
+    "part": "top_hhkb_right",
+    "center": [
+     128.0,
+     191.66437005996704
+    ],
+    "footprint_center": [
+     228.75,
+     -48.89063024520874
+    ],
+    "size": [
+     152.5,
+     117.33,
+     7.5
+    ]
+   }
+  ],
+  "monaka60_3_plate_ansi": [
+   {
+    "part": "plate_ansi_left",
+    "center": [
+     128.0,
+     70.20000076293945
+    ],
+    "footprint_center": [
+     83.2125015258789,
+     48.29999923706055
+    ],
+    "size": [
+     157.43,
+     105.6,
+     1.5
+    ]
+   },
+   {
+    "part": "plate_ansi_right",
+    "center": [
+     128.0,
+     185.79999923706055
+    ],
+    "footprint_center": [
+     224.1685028076172,
+     48.29999923706055
+    ],
+    "size": [
+     152.66,
+     105.6,
+     1.5
+    ]
+   }
+  ],
+  "monaka60_3_plate_tsangan": [
+   {
+    "part": "plate_tsangan_left",
+    "center": [
+     128.0,
+     70.20000076293945
+    ],
+    "footprint_center": [
+     83.2125015258789,
+     48.29999923706055
+    ],
+    "size": [
+     157.43,
+     105.6,
+     1.5
+    ]
+   },
+   {
+    "part": "plate_tsangan_right",
+    "center": [
+     128.0,
+     185.79999923706055
+    ],
+    "footprint_center": [
+     212.26250076293945,
+     48.29999923706055
+    ],
+    "size": [
+     176.47,
+     105.6,
+     1.5
+    ]
+   }
+  ],
+  "monaka60_3_plate_wkl": [
+   {
+    "part": "plate_wkl_left",
+    "center": [
+     128.0,
+     70.20000076293945
+    ],
+    "footprint_center": [
+     83.2125015258789,
+     48.29999923706055
+    ],
+    "size": [
+     157.43,
+     105.6,
+     1.5
+    ]
+   },
+   {
+    "part": "plate_wkl_right",
+    "center": [
+     128.0,
+     185.79999923706055
+    ],
+    "footprint_center": [
+     212.26250076293945,
+     48.29999923706055
+    ],
+    "size": [
+     176.47,
+     105.6,
+     1.5
+    ]
+   }
+  ],
+  "monaka60_3_plate_hhkb": [
+   {
+    "part": "plate_hhkb_left",
+    "center": [
+     128.0,
+     70.20000076293945
+    ],
+    "footprint_center": [
+     83.2125015258789,
+     48.29999923706055
+    ],
+    "size": [
+     157.43,
+     105.6,
+     1.5
+    ]
+   },
+   {
+    "part": "plate_hhkb_right",
+    "center": [
+     128.0,
+     185.79999923706055
+    ],
+    "footprint_center": [
+     212.26250076293945,
+     48.29999923706055
+    ],
+    "size": [
+     176.47,
+     105.6,
+     1.5
+    ]
+   }
+  ],
+  "monaka60_4_gaskets_tpu": [
+   {
+    "part": "gaskets_tpu",
+    "center": [
+     128.0,
+     128.0
+    ],
+    "footprint_center": [
+     44.400001525878906,
+     13.300000190734863
+    ],
+    "size": [
+     88.8,
+     26.6,
+     2.0
+    ]
+   }
+  ],
+  "monaka60_5_foam_tpu": [
+   {
+    "part": "foam_left_tpu",
+    "center": [
+     128.0,
+     75.45000076293945
+    ],
+    "footprint_center": [
+     81.07499694824219,
+     48.29999923706055
+    ],
+    "size": [
+     142.65,
+     95.1,
+     2.0
+    ]
+   },
+   {
+    "part": "foam_right_tpu",
+    "center": [
+     128.0,
+     180.54999923706055
+    ],
+    "footprint_center": [
+     223.9250030517578,
+     48.29999923706055
+    ],
+    "size": [
+     142.65,
+     95.1,
+     2.0
+    ]
+   }
+  ]
+ },
+ "filament_g": {
+  "monaka60_0_fit_tests": {
+   "test_switch": {
+    "solid_cm3": 2.7,
+    "default": 3,
+    "heavy": 3
+   },
+   "test_joint": {
+    "solid_cm3": 11.0,
+    "default": 7,
+    "heavy": 12
+   },
+   "test_gasket": {
+    "solid_cm3": 15.2,
+    "default": 10,
+    "heavy": 17
+   }
+  },
+  "monaka60_1_bottom": {
+   "bottom_left": {
+    "solid_cm3": 206.6,
+    "default": 86,
+    "heavy": 166
+   },
+   "bottom_right": {
+    "solid_cm3": 206.7,
+    "default": 86,
+    "heavy": 166
+   }
+  },
+  "monaka60_1_bottom_udb": {
+   "bottom_left_udb": {
+    "solid_cm3": 209.8,
+    "default": 88,
+    "heavy": 169
+   },
+   "bottom_right": {
+    "solid_cm3": 206.7,
+    "default": 86,
+    "heavy": 166
+   }
+  },
+  "monaka60_2_top_open": {
+   "top_open_left": {
+    "solid_cm3": 27.8,
+    "default": 18,
+    "heavy": 31
+   },
+   "top_open_right": {
+    "solid_cm3": 27.4,
+    "default": 18,
+    "heavy": 31
+   }
+  },
+  "monaka60_2_top_wkl": {
+   "top_wkl_left": {
+    "solid_cm3": 29.5,
+    "default": 20,
+    "heavy": 33
+   },
+   "top_wkl_right": {
+    "solid_cm3": 29.1,
+    "default": 20,
+    "heavy": 33
+   }
+  },
+  "monaka60_2_top_hhkb": {
+   "top_hhkb_left": {
+    "solid_cm3": 30.6,
+    "default": 20,
+    "heavy": 34
+   },
+   "top_hhkb_right": {
+    "solid_cm3": 30.1,
+    "default": 20,
+    "heavy": 34
+   }
+  },
+  "monaka60_3_plate_ansi": {
+   "plate_ansi_left": {
+    "solid_cm3": 11.2,
+    "default": 14,
+    "heavy": 14
+   },
+   "plate_ansi_right": {
+    "solid_cm3": 11.2,
+    "default": 14,
+    "heavy": 14
+   }
+  },
+  "monaka60_3_plate_tsangan": {
+   "plate_tsangan_left": {
+    "solid_cm3": 10.6,
+    "default": 13,
+    "heavy": 13
+   },
+   "plate_tsangan_right": {
+    "solid_cm3": 12.0,
+    "default": 15,
+    "heavy": 15
+   }
+  },
+  "monaka60_3_plate_wkl": {
+   "plate_wkl_left": {
+    "solid_cm3": 10.9,
+    "default": 14,
+    "heavy": 14
+   },
+   "plate_wkl_right": {
+    "solid_cm3": 12.3,
+    "default": 15,
+    "heavy": 15
+   }
+  },
+  "monaka60_3_plate_hhkb": {
+   "plate_hhkb_left": {
+    "solid_cm3": 10.9,
+    "default": 14,
+    "heavy": 14
+   },
+   "plate_hhkb_right": {
+    "solid_cm3": 12.2,
+    "default": 15,
+    "heavy": 15
+   }
+  },
+  "monaka60_4_gaskets_tpu": {
+   "gaskets_tpu": {
+    "solid_cm3": 2.6,
+    "default": 3,
+    "heavy": 3
+   }
+  },
+  "monaka60_5_foam_tpu": {
+   "foam_left_tpu": {
+    "solid_cm3": 24.6,
+    "default": 29,
+    "heavy": 30
+   },
+   "foam_right_tpu": {
+    "solid_cm3": 27.1,
+    "default": 32,
+    "heavy": 34
+   }
+  }
+ }
+}
