@@ -24,11 +24,26 @@ sources:
   - id: sessions-hub
     type: file
     path: almanac/architecture/sessions/README.md
+  - id: config-fail-closed
+    type: file
+    path: almanac/decisions/configuration/fail-closed-recovery.md
+  - id: followed-editing
+    type: file
+    path: almanac/architecture/agent/followed-editing.md
+  - id: workspace-edits
+    type: file
+    path: almanac/architecture/lsp/workspace-edits.md
+  - id: plugin-boundaries
+    type: file
+    path: almanac/architecture/plugins/process-and-filesystem-boundaries.md
+  - id: rendering-pipeline
+    type: file
+    path: almanac/architecture/editor/rendering-pipeline.md
 ---
 
 # Architecture
 
-Architecture pages explain Red's runtime ownership, subsystem boundaries, and cross-file flows. The topic graph treats architecture as the parent neighborhood for editor core, startup, configuration, runtime assets, plugins, Husk, LSP, agent integration, sessions, persistence, and validation-adjacent behavior [@topics]. Use this hub when you know the kind of code you are changing but not the specific subsystem page.
+Architecture pages explain Red's runtime ownership, subsystem boundaries, and cross-file flows. The topic graph treats architecture as the parent neighborhood for editor core, startup, configuration, runtime assets, plugins, Husk, LSP, agent integration, sessions, and persistence [@topics]. Use this hub when you know the kind of code you are changing but not the specific subsystem page.
 
 ## Product And Editor Core
 
@@ -43,6 +58,12 @@ Use [Runtime lifecycle](startup/runtime-lifecycle) and [Red command](../referenc
 [Husk architecture](husk) covers the embedded and standalone scripting workspace: public embedding, packages and locks, extension tiers, and the Husk language server [@husk-hub]. [LSP architecture](lsp) covers server routing, process transport, editor document synchronization, completion, workspace edits, capabilities, configuration, and Husk LSP integration [@lsp-hub].
 
 [Agent architecture](agent) is the entry point for Codex app-server integration, dynamic tools, followed editing, agent attribution, and history operations [@agent-hub]. Keep it connected to [Agent-attributed edits](../concepts/agent-attributed-edits), because the architecture is built around Red-owned tool application rather than native Codex workspace writes.
+
+## Safety Boundaries
+
+Red's safety boundaries cut across subsystem folders, so start from the source of the risk rather than from one page type. Use [Configuration fail-closed recovery](../decisions/configuration/fail-closed-recovery) when malformed user config could otherwise leave plugins, LSP, AI, logging, or process permissions enabled [@config-fail-closed]. Use [Followed editing](agent/followed-editing) for full Codex writes, because Codex runs through Red-owned tools that check paths, revisions, dirty buffers, attribution, and saving instead of writing the workspace directly [@followed-editing].
+
+For server-originated file changes, read [LSP workspace edits](lsp/workspace-edits); it parses and prepares every document or resource operation before the editor mutates buffers or disk [@workspace-edits]. For plugin side effects, read [Process and filesystem boundaries](plugins/process-and-filesystem-boundaries), where per-plugin process allowlists, bounded child IO, owner-scoped process ids, and workspace-confined file operations are defined [@plugin-boundaries]. For terminal-output safety, read [Rendering pipeline](editor/rendering-pipeline), which keeps rendered cells terminal-printable and sanitizes control-bearing text before diff flushes write to the terminal [@rendering-pipeline].
 
 ## State, Assets, And Sessions
 

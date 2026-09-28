@@ -49,7 +49,7 @@ Without `-NoModifyPath`, the PowerShell installer appends the install directory 
 
 ## Run The Installer Workflow Equivalents
 
-The installer workflow runs on installer, installer-test, workflow, README, release-doc, and release-workflow changes, and it can also be started manually [@installer-workflow]. It has three jobs:
+The installer workflow runs on pushes to `main` or `develop` when installer scripts, installer tests, or the installer workflow file change [@installer-workflow]. Pull requests to those branches also run it for README, `docs/RELEASING.md`, and release-workflow changes, because those files can change installer instructions or publication assumptions without touching the installer scripts directly [@installer-workflow]. The workflow can also be started manually [@installer-workflow]. It has three jobs:
 
 | Job | What it proves |
 | --- | --- |
