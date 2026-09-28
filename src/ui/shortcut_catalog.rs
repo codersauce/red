@@ -179,6 +179,7 @@ pub(crate) fn picker_reference_actions() -> Vec<UiAction> {
             "↑ / ↓ / Ctrl+k / Ctrl+j",
             "Previous / next result",
         ),
+        ("Navigation", "Ctrl+p / Ctrl+n", "Previous / next result"),
         (
             "Navigation",
             "PageUp / PageDown / Ctrl+u / Ctrl+d",

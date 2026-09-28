@@ -3865,12 +3865,12 @@ impl Component for Picker {
                     return Some(action);
                 }
                 match event.code {
-                    KeyCode::Char('j') if event.modifiers.contains(KeyModifiers::CONTROL) => {
+                    KeyCode::Char('j' | 'n') if event.modifiers.contains(KeyModifiers::CONTROL) => {
                         let previous = self.selected_item();
                         self.list.move_down();
                         self.notify_selection_changed(previous)
                     }
-                    KeyCode::Char('k') if event.modifiers.contains(KeyModifiers::CONTROL) => {
+                    KeyCode::Char('k' | 'p') if event.modifiers.contains(KeyModifiers::CONTROL) => {
                         let previous = self.selected_item();
                         self.list.move_up();
                         self.notify_selection_changed(previous)
@@ -4661,29 +4661,40 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_j_moves_picker_selection_down() {
+    fn ctrl_j_and_ctrl_n_move_picker_selection_down() {
         let editor = test_editor();
-        let items = vec!["alpha".to_string(), "bravo".to_string()];
+        let items = vec![
+            "alpha".to_string(),
+            "bravo".to_string(),
+            "charlie".to_string(),
+        ];
         let mut picker = Picker::new(Some("Files".to_string()), &editor, &items, None);
 
         picker.handle_event(&key(KeyCode::Char('j'), KeyModifiers::CONTROL));
+        picker.handle_event(&key(KeyCode::Char('n'), KeyModifiers::CONTROL));
 
         assert_eq!(
             select(&mut picker),
             Some(KeyAction::Multiple(vec![
                 Action::CloseDialog,
-                Action::Picked("bravo".to_string(), None),
+                Action::Picked("charlie".to_string(), None),
             ]))
         );
     }
 
     #[test]
-    fn ctrl_k_moves_picker_selection_up() {
+    fn ctrl_k_and_ctrl_p_move_picker_selection_up() {
         let editor = test_editor();
-        let items = vec!["alpha".to_string(), "bravo".to_string()];
+        let items = vec![
+            "alpha".to_string(),
+            "bravo".to_string(),
+            "charlie".to_string(),
+        ];
         let mut picker = Picker::new(Some("Files".to_string()), &editor, &items, None);
 
         picker.handle_event(&key(KeyCode::Down, KeyModifiers::NONE));
+        picker.handle_event(&key(KeyCode::Down, KeyModifiers::NONE));
+        picker.handle_event(&key(KeyCode::Char('p'), KeyModifiers::CONTROL));
         picker.handle_event(&key(KeyCode::Char('k'), KeyModifiers::CONTROL));
 
         assert_eq!(
@@ -4803,18 +4814,24 @@ mod tests {
     }
 
     #[test]
-    fn plain_j_still_filters_picker_items() {
+    fn plain_j_n_p_still_filter_picker_items() {
         let editor = test_editor();
-        let items = vec!["kay".to_string(), "jay".to_string()];
+        let items = vec![
+            "kay".to_string(),
+            "jupiter".to_string(),
+            "juniper".to_string(),
+        ];
         let mut picker = Picker::new(Some("Files".to_string()), &editor, &items, None);
 
         picker.handle_event(&key(KeyCode::Char('j'), KeyModifiers::NONE));
+        picker.handle_event(&key(KeyCode::Char('n'), KeyModifiers::NONE));
+        picker.handle_event(&key(KeyCode::Char('p'), KeyModifiers::NONE));
 
         assert_eq!(
             select(&mut picker),
             Some(KeyAction::Multiple(vec![
                 Action::CloseDialog,
-                Action::Picked("jay".to_string(), None),
+                Action::Picked("juniper".to_string(), None),
             ]))
         );
     }
@@ -8249,23 +8266,29 @@ mod tests {
         let editor = test_editor();
         let items = vec![dynamic_item("a", "alpha")];
         let options: PickerOptions = serde_json::from_value(json!({
-            "actions": [{ "key": "c-o", "id": "openSplit" }]
+            "actions": [
+                { "key": "c-o", "id": "openSplit" },
+                { "key": "c-n", "id": "openSplit" },
+                { "key": "c-p", "id": "openSplit" }
+            ]
         }))
         .unwrap();
         let mut picker =
             Picker::new_dynamic(/*title*/ None, &editor, items, /*id*/ 13, options);
 
-        assert_eq!(
-            picker.handle_event(&key(KeyCode::Char('o'), KeyModifiers::CONTROL)),
-            Some(KeyAction::Single(Action::NotifyPlugins(
-                "picker:action:13".to_string(),
-                json!({
-                    "action": "openSplit",
-                    "item": dynamic_item("a", "alpha"),
-                    "query": "",
-                }),
-            )))
-        );
+        for character in ['o', 'n', 'p'] {
+            assert_eq!(
+                picker.handle_event(&key(KeyCode::Char(character), KeyModifiers::CONTROL)),
+                Some(KeyAction::Single(Action::NotifyPlugins(
+                    "picker:action:13".to_string(),
+                    json!({
+                        "action": "openSplit",
+                        "item": dynamic_item("a", "alpha"),
+                        "query": "",
+                    }),
+                )))
+            );
+        }
     }
 
     #[test]
