@@ -7024,8 +7024,13 @@ impl Editor {
                     "buffer_index": window.buffer_index,
                     "document_id": buffer.id(),
                     "buffer_path": buffer.file,
-                    "breadcrumb_components": buffer.file.as_deref().map(|file| {
-                        crate::utils::breadcrumb_path_components(Path::new(file), &cwd, home.as_deref())
+                    "breadcrumb_components": buffer.path().map(|file| {
+                        let parts = crate::utils::breadcrumb_path_components(Path::new(file), &cwd, home.as_deref());
+                        if parts.is_empty() && buffer.directory.is_some() {
+                            vec![".".to_string()]
+                        } else {
+                            parts
+                        }
                     }).unwrap_or_default(),
                     "file": buffer.file,
                     "name": buffer.name(),
@@ -9376,8 +9381,7 @@ impl Editor {
             .enumerate()
             .filter_map(|(index, buffer)| {
                 let basename = buffer
-                    .file
-                    .as_deref()
+                    .path()
                     .and_then(|file| Path::new(file).file_name())
                     .and_then(|file| file.to_str());
                 (buffer.name() == name || basename == Some(name)).then_some(index)
@@ -9422,6 +9426,28 @@ impl Editor {
         self.buffer_manager.push_buffer(buffer);
         self.rebind_inline_history_file(&normalized);
         Ok((self.buffer_manager.len() - 1, true, normalized))
+    }
+
+    async fn load_or_reuse_path_buffer(
+        &mut self,
+        path: &str,
+    ) -> anyhow::Result<(usize, bool, String)> {
+        let normalized = normalized_file_path(path)?;
+        if !normalized.is_dir() {
+            return self.load_or_reuse_file_buffer(path).await;
+        }
+        let name = normalized.to_string_lossy().into_owned();
+        if let Some(index) = self.buffer_manager.iter().position(|buffer| {
+            buffer
+                .directory
+                .as_ref()
+                .is_some_and(|dir| same_file_path(Path::new(&dir.path), &normalized))
+        }) {
+            return Ok((index, false, name));
+        }
+        self.buffer_manager
+            .push_buffer(Buffer::load_path(&name).await?);
+        Ok((self.buffer_manager.len() - 1, true, name))
     }
 
     /// A failed LSP notification must not turn a successful disk write into a failed save.
@@ -18139,6 +18165,26 @@ impl Editor {
     }
 
     fn handle_normal_event(&mut self, ev: &event::Event) -> Option<KeyAction> {
+        if let (Some(directory), Event::Key(event)) = (&self.current_buffer().directory, ev) {
+            if matches!(event.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
+                let action = match (event.code, event.modifiers) {
+                    (KeyCode::Enter, KeyModifiers::NONE) => directory
+                        .entries
+                        .get(self.buffer_line())
+                        .map(|entry| Action::OpenFile(entry.path.to_string_lossy().into_owned())),
+                    (KeyCode::Char('-'), KeyModifiers::NONE) => Path::new(&directory.path)
+                        .parent()
+                        .map(|path| Action::OpenFile(path.to_string_lossy().into_owned())),
+                    (KeyCode::Char('R'), KeyModifiers::NONE | KeyModifiers::SHIFT) => {
+                        Some(Action::ReloadFile(false))
+                    }
+                    _ => None,
+                };
+                if let Some(action) = action {
+                    return Some(KeyAction::Single(action));
+                }
+            }
+        }
         if self.has_multi_cursor_session() {
             if let Event::Key(KeyEvent {
                 code,
@@ -20215,6 +20261,22 @@ impl Editor {
         if self.intercept_learn_action(action, buffer, runtime)? {
             return Ok(false);
         }
+        if self.current_buffer().directory.is_some()
+            && matches!(
+                action,
+                Action::Save
+                    | Action::ForceSave
+                    | Action::SaveAs(_)
+                    | Action::ForceSaveAs(_)
+                    | Action::SetBufferName(_)
+                    | Action::EnterMode(Mode::Insert)
+                    | Action::SetSyntax(_)
+            )
+        {
+            self.set_legacy_message(Some("Directory buffers are read-only".to_string()));
+            self.render(buffer)?;
+            return Ok(false);
+        }
         if matches!(
             action,
             Action::Save | Action::ForceSave | Action::SaveAs(_) | Action::ForceSaveAs(_)
@@ -22208,7 +22270,7 @@ impl Editor {
             }
             Action::OpenLocation(location, target) => {
                 let (buffer_index, added_buffer, path) =
-                    match self.load_or_reuse_file_buffer(&location.path).await {
+                    match self.load_or_reuse_path_buffer(&location.path).await {
                         Ok(opened) => opened,
                         Err(error) => {
                             self.set_legacy_message(Some(error.to_string()));
@@ -22237,7 +22299,7 @@ impl Editor {
                     return Ok(false);
                 }
 
-                if added_buffer {
+                if added_buffer && self.current_buffer().file.is_some() {
                     self.plugin_registry
                         .notify(
                             runtime,
@@ -22784,7 +22846,7 @@ impl Editor {
                 self.delete_current_buffer(buffer, *force).await?;
             }
             Action::OpenFile(path) => {
-                let (index, added_buffer, path) = match self.load_or_reuse_file_buffer(path).await {
+                let (index, added_buffer, path) = match self.load_or_reuse_path_buffer(path).await {
                     Ok(opened) => opened,
                     Err(e) => {
                         self.set_legacy_message(Some(e.to_string()));
@@ -22792,7 +22854,7 @@ impl Editor {
                     }
                 };
                 self.set_current_buffer(buffer, index).await?;
-                if added_buffer {
+                if added_buffer && self.current_buffer().file.is_some() {
                     // Notify plugins about file open
                     let open_info = serde_json::json!({
                         "file": path,
@@ -22805,6 +22867,15 @@ impl Editor {
                 self.render(buffer)?;
             }
             Action::ReloadFile(force) => {
+                if self.current_buffer().directory.is_some() {
+                    if let Err(error) = self.current_buffer_mut().refresh_directory() {
+                        self.set_legacy_message(Some(format!("Cannot refresh directory: {error}")));
+                    }
+                    self.check_bounds();
+                    self.sync_to_window();
+                    self.render(buffer)?;
+                    return Ok(false);
+                }
                 if self.current_buffer().is_dirty() && !force {
                     self.set_legacy_message(Some(
                         "E37: No write since last change (add ! to override)".to_string(),
@@ -23839,7 +23910,7 @@ impl Editor {
                     file
                 );
                 let (new_buffer_index, added_buffer, _) =
-                    match self.load_or_reuse_file_buffer(file).await {
+                    match self.load_or_reuse_path_buffer(file).await {
                         Ok(opened) => opened,
                         Err(e) => {
                             self.set_legacy_message(Some(format!("Failed to open file: {}", e)));
@@ -23860,7 +23931,7 @@ impl Editor {
             Action::SplitVerticalWithFile(file) => {
                 log!("SplitVerticalWithFile action triggered with file: {}", file);
                 let (new_buffer_index, added_buffer, _) =
-                    match self.load_or_reuse_file_buffer(file).await {
+                    match self.load_or_reuse_path_buffer(file).await {
                         Ok(opened) => opened,
                         Err(e) => {
                             self.set_legacy_message(Some(format!("Failed to open file: {}", e)));
@@ -26657,6 +26728,10 @@ impl Editor {
     }
 
     fn replace_range(&mut self, range: TextRange, new_text: &str) {
+        if self.current_buffer().directory.is_some() {
+            self.set_legacy_message(Some("Directory buffers are read-only".to_string()));
+            return;
+        }
         let diagnostic_edit = (!self.diagnostics.is_empty())
             .then(|| self.current_buffer().uri().ok().flatten())
             .flatten()
@@ -27582,6 +27657,17 @@ impl Editor {
                     saved.revision,
                     saved.undo_history.clone(),
                 );
+                if let Some(directory) = &saved.directory {
+                    buffer = Buffer::from_directory(Path::new(directory)).unwrap_or_else(|error| {
+                        let mut buffer =
+                            Buffer::new(None, format!("Cannot read directory: {error}\n"));
+                        buffer.directory = Some(crate::buffer::directory::Directory {
+                            path: directory.clone(),
+                            entries: Vec::new(),
+                        });
+                        buffer
+                    });
+                }
                 buffer.vtop = saved.viewport_top;
                 buffer.pos = (
                     saved.cursor_x,
@@ -27932,6 +28018,10 @@ impl Editor {
                     SessionBufferSnapshot {
                         index,
                         path: buffer.file.clone(),
+                        directory: buffer
+                            .directory
+                            .as_ref()
+                            .map(|directory| directory.path.clone()),
                         // Periodic snapshots flatten the structurally shared Rope on the
                         // writer thread so large open buffers cannot stall input.
                         contents: if include_disk_contents {
@@ -31177,13 +31267,17 @@ impl From<&Editor> for EditorInfo {
                     .get(line)
                     .map(|text| grapheme_to_byte(text.trim_end_matches('\n'), grapheme_column))
                     .unwrap_or_default();
-                let display_path = buffer.file.as_deref().map(|path| {
+                let display_path = buffer.path().map(|path| {
                     let path = Path::new(path);
-                    cwd.as_deref()
+                    let relative = cwd
+                        .as_deref()
                         .and_then(|root| path.strip_prefix(root).ok())
-                        .unwrap_or(path)
-                        .to_string_lossy()
-                        .into_owned()
+                        .unwrap_or(path);
+                    if relative.as_os_str().is_empty() {
+                        ".".to_string()
+                    } else {
+                        relative.to_string_lossy().into_owned()
+                    }
                 });
                 BufferInfo {
                     id: buffer.id(),
@@ -31216,109 +31310,17 @@ impl From<&Editor> for EditorInfo {
     }
 }
 
-#[derive(Debug)]
-struct DirectoryListingEntry {
-    name: String,
-    path: String,
-    kind: &'static str,
-    sort_name: String,
-}
-
 fn directory_listing(path: &str) -> Value {
     directory_listing_from(path, Path::new(path))
 }
 
 fn directory_listing_from(path: &str, scan_path: &Path) -> Value {
-    match std::fs::metadata(scan_path) {
-        Ok(metadata) if metadata.is_dir() => {}
-        Ok(_) => {
-            return json!({
-                "path": path,
-                "entries": [],
-                "truncated": false,
-                "error": "path is not a directory",
-            });
-        }
-        Err(err) => {
-            return json!({
-                "path": path,
-                "entries": [],
-                "truncated": false,
-                "error": err.to_string(),
-            });
-        }
-    }
-
-    let mut builder = ignore::WalkBuilder::new(scan_path);
-    builder
-        .max_depth(Some(1))
-        .hidden(false)
-        .ignore(true)
-        .git_ignore(true)
-        .git_global(true)
-        .git_exclude(true)
-        .follow_links(false)
-        .filter_entry(|entry| {
-            entry.depth() == 0 || !matches!(entry.file_name().to_str(), Some(".git" | ".bare"))
-        });
-
-    let mut entries = Vec::new();
-    let mut scan_error = None;
-    for result in builder.build() {
-        let entry = match result {
-            Ok(entry) if entry.depth() > 0 => entry,
-            Ok(_) => continue,
-            Err(error) => {
-                scan_error.get_or_insert_with(|| error.to_string());
-                continue;
-            }
-        };
-        let kind = match entry.file_type() {
-            Some(file_type) if file_type.is_dir() => "directory",
-            Some(file_type) if file_type.is_file() => "file",
-            Some(file_type) if file_type.is_symlink() => {
-                // Present links as their targets without replacing the lexical path.
-                // Unresolved links remain visible as files; only directory expansion
-                // follows a link, so a listing never recursively walks a cycle.
-                match std::fs::metadata(entry.path()) {
-                    Ok(metadata) if metadata.is_dir() => "directory",
-                    Ok(metadata) if metadata.is_file() => "file",
-                    Ok(_) => "other",
-                    Err(_) => "file",
-                }
-            }
-            _ => "other",
-        };
-        if kind == "other" {
-            continue;
-        }
-        let name = entry.file_name().to_string_lossy().into_owned();
-        entries.push(DirectoryListingEntry {
-            sort_name: name.to_lowercase(),
-            name,
-            path: Path::new(path)
-                .join(entry.path().strip_prefix(scan_path).unwrap_or(entry.path()))
-                .to_string_lossy()
-                .into_owned(),
-            kind,
-        });
-    }
-
-    entries.sort_by(|a, b| {
-        (a.kind != "directory")
-            .cmp(&(b.kind != "directory"))
-            .then_with(|| a.sort_name.cmp(&b.sort_name))
-    });
-
+    let (entries, error) = crate::buffer::directory::scan(Path::new(path), scan_path, true);
     json!({
         "path": path,
-        "entries": entries.into_iter().map(|entry| json!({
-            "name": entry.name,
-            "path": entry.path,
-            "kind": entry.kind,
-        })).collect::<Vec<_>>(),
+        "entries": entries,
         "truncated": false,
-        "error": scan_error,
+        "error": error,
     })
 }
 
@@ -46093,6 +46095,164 @@ while True:
             .windows()
             .iter()
             .all(|window| window.buffer_index == 1));
+    }
+
+    #[tokio::test]
+    async fn directory_buffer_opens_navigates_reuses_and_protects_generated_rows() {
+        let root = tempfile::tempdir().unwrap();
+        let nested = root.path().join("nested");
+        std::fs::create_dir(&nested).unwrap();
+        let file = nested.join("two\nlines.txt");
+        std::fs::write(&file, "file content\n").unwrap();
+        let root_name = root.path().to_string_lossy().into_owned();
+        let mut editor = test_editor(80, 24);
+        let mut frame = RenderBuffer::new(80, 24, &Style::default());
+        let mut runtime = Runtime::new();
+
+        editor
+            .execute(
+                &Action::OpenFile(root_name.clone()),
+                &mut frame,
+                &mut runtime,
+            )
+            .await
+            .unwrap();
+        let root_id = editor.current_buffer().id();
+        assert_eq!(editor.current_buffer().contents(), "nested/\n");
+        assert!(editor.current_buffer().uri().unwrap().is_none());
+        // The internal text-only open path must not accept a directory as a document.
+        assert!(editor.load_or_reuse_file_buffer(&root_name).await.is_err());
+
+        for action in [
+            Action::Save,
+            Action::ForceSave,
+            Action::SaveAs(root.path().join("copy").to_string_lossy().into_owned()),
+            Action::ForceSaveAs(root.path().join("forced").to_string_lossy().into_owned()),
+            Action::SetBufferName("renamed".into()),
+            Action::EnterMode(Mode::Insert),
+            Action::InsertCharAtCursorPos('x'),
+        ] {
+            editor
+                .execute(&action, &mut frame, &mut runtime)
+                .await
+                .unwrap();
+            assert_eq!(
+                editor.current_buffer().contents(),
+                "nested/\n",
+                "{action:?}"
+            );
+            assert!(!editor.current_buffer().is_dirty(), "{action:?}");
+        }
+        assert!(!root.path().join("copy").exists());
+        assert!(!root.path().join("forced").exists());
+        assert!(editor
+            .current_buffer_mut()
+            .save_as(root.path().join("direct").to_str().unwrap())
+            .is_err());
+        assert_eq!(editor.current_buffer().id(), root_id);
+
+        let enter = Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let Some(KeyAction::Single(action)) = editor.handle_normal_event(&enter) else {
+            panic!("open nested");
+        };
+        editor
+            .execute(&action, &mut frame, &mut runtime)
+            .await
+            .unwrap();
+        let nested_id = editor.current_buffer().id();
+        assert_eq!(editor.current_buffer().contents(), "two\\nlines.txt\n");
+        let Some(KeyAction::Single(action)) = editor.handle_normal_event(&enter) else {
+            panic!("open filename");
+        };
+        editor
+            .execute(&action, &mut frame, &mut runtime)
+            .await
+            .unwrap();
+        assert_eq!(editor.current_buffer().contents(), "file content\n");
+
+        editor
+            .execute(
+                &Action::OpenFile(nested.to_string_lossy().into_owned()),
+                &mut frame,
+                &mut runtime,
+            )
+            .await
+            .unwrap();
+        assert_eq!(editor.current_buffer().id(), nested_id);
+        let parent = Event::Key(KeyEvent::new(KeyCode::Char('-'), KeyModifiers::NONE));
+        let Some(KeyAction::Single(action)) = editor.handle_normal_event(&parent) else {
+            panic!("open parent");
+        };
+        editor
+            .execute(&action, &mut frame, &mut runtime)
+            .await
+            .unwrap();
+        assert_eq!(editor.current_buffer().id(), root_id);
+        editor
+            .execute(
+                &Action::SplitVerticalWithFile(root_name),
+                &mut frame,
+                &mut runtime,
+            )
+            .await
+            .unwrap();
+        assert_eq!(editor.current_buffer().id(), root_id);
+        assert_eq!(editor.buffer_manager.len(), 4);
+        assert_eq!(editor.test_window_count(), 2);
+
+        std::fs::write(root.path().join(".hidden"), "new").unwrap();
+        let refresh = Event::Key(KeyEvent::new(KeyCode::Char('R'), KeyModifiers::SHIFT));
+        let Some(KeyAction::Single(action)) = editor.handle_normal_event(&refresh) else {
+            panic!("refresh");
+        };
+        editor
+            .execute(&action, &mut frame, &mut runtime)
+            .await
+            .unwrap();
+        assert_eq!(editor.current_buffer().id(), root_id);
+        assert_eq!(editor.current_buffer().contents(), "nested/\n.hidden\n");
+        assert!(!editor.current_buffer().is_dirty());
+    }
+
+    #[tokio::test]
+    async fn directory_buffer_startup_and_session_restore_keep_path_identity() {
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("file.txt");
+        std::fs::write(&file, "ordinary\n").unwrap();
+        let path = root.path().to_string_lossy().into_owned();
+        let buffers = crate::buffer::load_startup_buffers(&[
+            path.clone(),
+            file.to_string_lossy().into_owned(),
+            root.path().join(".").to_string_lossy().into_owned(),
+        ])
+        .await
+        .unwrap();
+        assert_eq!(buffers.len(), 2);
+        assert_eq!(buffers[0].contents(), "file.txt\n");
+        assert_eq!(buffers[1].contents(), "ordinary\n");
+
+        let mut editor = test_editor(80, 24);
+        editor.buffer_manager.replace_buffers(buffers);
+        let (snapshot, _) = editor.durable_session_snapshot(true);
+        assert_eq!(
+            snapshot.buffers[0].directory.as_deref(),
+            Some(path.as_str())
+        );
+        assert!(snapshot.buffers[0].path.is_none());
+        assert!(detect_disk_divergence(&snapshot).is_empty());
+        std::fs::write(root.path().join("after.txt"), "").unwrap();
+        let restored = Editor::buffers_from_session_snapshot(&snapshot);
+        assert_eq!(restored[0].contents(), "after.txt\nfile.txt\n");
+        assert_eq!(restored[0].name(), path);
+        assert!(!restored[0].is_unnamed());
+        assert!(!restored[0].is_dirty());
+        assert_eq!(restored[1].contents(), "ordinary\n");
+        // An unavailable directory stays a safe directory buffer on recovery.
+        std::fs::remove_dir_all(root.path()).unwrap();
+        let restored = Editor::buffers_from_session_snapshot(&snapshot);
+        assert!(restored[0].directory.is_some());
+        assert!(restored[0].file.is_none());
+        assert!(restored[0].contents().contains("Cannot read directory"));
     }
 
     #[test]

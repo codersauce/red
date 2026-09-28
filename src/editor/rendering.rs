@@ -3677,6 +3677,9 @@ impl Editor {
             current_folder.clone()
         };
         let mut filename = statusline_file_name(&filename, &current_folder);
+        if filename.is_empty() && self.buffer_manager[buffer_index].directory.is_some() {
+            filename.push('.');
+        }
         if let Some(change) = external_file_change {
             filename.push_str(if change == super::ExternalFileChange::Deleted {
                 " [DELETED]"

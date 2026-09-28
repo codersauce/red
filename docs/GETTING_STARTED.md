@@ -258,6 +258,13 @@ root_markers = ["go.mod", ".git"]
 
 ## Finding files, buffers, and commands
 
+Open a directory in an editor window with `red .`, `red path/to/dir`,
+`:e path/to/dir`, or `:vs path/to/dir`. Use normal movement and search
+keys to navigate, Enter to open the entry under the cursor, `-` to go up,
+and `R` (or `:e!`) to refresh. Listings include hidden and ignored entries;
+directories end in `/`. They appear in the buffer list and can be revisited
+like any other buffer. Listings are read-only. Use Neo-tree for file operations.
+
 | Key | Action |
 | --- | --- |
 | `F1`, `:keys` | Contextual keyboard-shortcut explorer |

@@ -11,6 +11,8 @@
 //! transaction boundary instead; raw replacement exists for that boundary and for
 //! controlled undo/redo replay.
 
+pub(crate) mod directory;
+
 use ropey::{Rope, RopeSlice};
 use std::{
     collections::HashSet,
@@ -72,10 +74,9 @@ pub async fn load_startup_buffers(files: &[String]) -> anyhow::Result<Vec<Buffer
     let mut buffers = Vec::with_capacity(files.len());
     let mut identities = StartupFileIdentities::default();
     for file in files {
-        let buffer = Buffer::load_or_create(Some(file.clone())).await?;
+        let buffer = Buffer::load_path(file).await?;
         let duplicate = buffer
-            .file
-            .as_deref()
+            .path()
             .is_some_and(|candidate| !identities.insert(Path::new(candidate)));
         if !duplicate {
             buffers.push(buffer);
@@ -156,6 +157,9 @@ pub struct Buffer {
     /// Optional path to the file this buffer represents
     pub file: Option<String>,
 
+    /// A generated directory listing has a name but never a backing text file.
+    pub(crate) directory: Option<directory::Directory>,
+
     /// The text content stored as a rope for efficient editing
     content: Rope,
 
@@ -213,6 +217,7 @@ impl Buffer {
         Self {
             id: BufferId::next(),
             file,
+            directory: None,
             saved_content: Some(content.clone()),
             backing_file,
             external_file_change: None,
@@ -280,6 +285,61 @@ impl Buffer {
             }
             None => Ok(Self::new(file, "\n".to_string())),
         }
+    }
+
+    /// Open paths from the user; internal consumers of text files use load_or_create.
+    pub async fn load_path(file: &str) -> anyhow::Result<Self> {
+        let path = normalized_file_path(file)?;
+        if path.is_dir() {
+            tokio::task::spawn_blocking(move || Self::from_directory(&path)).await?
+        } else {
+            Self::load_or_create(Some(file.to_string())).await
+        }
+    }
+
+    pub(crate) fn from_directory(path: &Path) -> anyhow::Result<Self> {
+        let mut buffer = Self::new(None, String::new());
+        buffer.directory = Some(directory::Directory {
+            path: path.to_string_lossy().into_owned(),
+            entries: Vec::new(),
+        });
+        buffer.refresh_directory()?;
+        Ok(buffer)
+    }
+
+    /// Replace generated contents without recording an edit or changing buffer identity.
+    pub(crate) fn refresh_directory(&mut self) -> anyhow::Result<()> {
+        let directory = self.directory.as_mut().expect("directory buffer");
+        let path = Path::new(&directory.path);
+        let (entries, error) = directory::scan(path, path, false);
+        if let Some(error) = error {
+            anyhow::bail!(error);
+        }
+        let mut text = String::new();
+        for entry in &entries {
+            use std::fmt::Write;
+            // Keep one physical row per entry, including names with newlines or controls.
+            writeln!(
+                text,
+                "{}{}",
+                entry.name.escape_debug(),
+                if entry.kind == "directory" { "/" } else { "" }
+            )?;
+        }
+        directory.entries = entries;
+        self.content = Rope::from_str(&text);
+        self.saved_content = Some(self.content.clone());
+        self.revision = self.revision.wrapping_add(1);
+        self.refresh_dirty();
+        self.syntax_selection = SyntaxSelection::Off;
+        Ok(())
+    }
+
+    /// Identity for user-facing buffer lookup, without making directories text documents.
+    pub(crate) fn path(&self) -> Option<&str> {
+        self.file
+            .as_deref()
+            .or_else(|| self.directory.as_ref().map(|dir| dir.path.as_str()))
     }
 
     /// Reads the current file contents without mutating the buffer.
@@ -746,6 +806,10 @@ impl Buffer {
     }
 
     fn save_to_path(&mut self, new_file_name: &str, force: bool) -> anyhow::Result<String> {
+        anyhow::ensure!(
+            self.directory.is_none(),
+            "Directory buffers cannot be written to disk"
+        );
         let path = normalized_file_path(new_file_name)?;
         let file = path.to_string_lossy().into_owned();
         if !force {
@@ -772,12 +836,12 @@ impl Buffer {
 
     /// Returns the display name used by buffer and status UI.
     pub fn name(&self) -> &str {
-        self.file.as_deref().unwrap_or("[No Name]")
+        self.path().unwrap_or("[No Name]")
     }
 
     /// True when the buffer has never been associated with a file.
     pub fn is_unnamed(&self) -> bool {
-        self.file.is_none()
+        self.path().is_none()
     }
 
     /// True when the buffer holds no text. Unlike [`Buffer::is_empty`], this
