@@ -9,6 +9,9 @@ sources:
   - id: main
     type: file
     path: src/main.rs
+  - id: buffer
+    type: file
+    path: src/buffer.rs
   - id: keyboard
     type: file
     path: src/keyboard.rs
@@ -35,7 +38,7 @@ The `red` command is the public entrypoint for opening the editor, forwarding Hu
 | `red language ...` | Approves or revokes native grammar trust, or checks indentation fixtures against the effective language configuration, without starting the editor [@cli] [@main]. |
 | `red --version` | Uses Clap's generated version output [@cli]. |
 
-The README and getting-started guide present `red path/to/file`, multiple files, and `red -r path/to/project src/main.rs` as ordinary editor startup examples [@readme] [@getting-started].
+The README and getting-started guide present `red path/to/file`, multiple files, and `red -r path/to/project src/main.rs` as ordinary editor startup examples [@readme] [@getting-started]. Directory arguments are also normal editor targets: `red .` or `red path/to/dir` opens a generated [directory buffer](../../architecture/editor/buffers-and-windows), while regular file arguments still open text buffers [@buffer] [@getting-started].
 
 ## General Editor Options
 
@@ -45,7 +48,7 @@ The README and getting-started guide present `red path/to/file`, multiple files,
 | `-c, --config-override <TOML>` | Applies an inline TOML config override. The flag can appear multiple times and is passed to configuration loading in order [@cli] [@main]. |
 | `--resume` | Restores the latest core-owned crash-safe session snapshot and conflicts with file arguments and `--root` [@cli] [@main]. |
 | `--no-typecheck` | Sets the runtime-only `disable_plugin_typecheck` escape hatch after configuration finalization [@cli] [@main]. |
-| `FILES...` | Opens the listed files as buffers; without files, Red starts with an empty buffer [@cli] [@main]. |
+| `FILES...` | Opens the listed file or directory targets as buffers; without targets, Red starts with an empty buffer [@cli] [@main] [@buffer]. |
 
 `--resume` changes to the snapshot working directory when one is present and reconstructs buffers from the recovered snapshot rather than opening command-line files [@main].
 
