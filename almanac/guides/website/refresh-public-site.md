@@ -42,6 +42,9 @@ sources:
   - id: prototype-readme
     type: file
     path: site/README.md
+  - id: direction-a-deploy-session
+    type: conversation
+    path: /Users/fcoury/.codex/sessions/2026/09/26/rollout-2026-09-26T18-58-30-01a0dfba-17a6-7ad2-9025-e1bf987aa2f2.jsonl
 ---
 
 # Refresh Public Site
@@ -116,6 +119,25 @@ walkthroughs for realistic tasks, and rare longer deep dives only when a
 workflow spans several Red areas [@docs-foundation-session]. Put videos on the
 relevant documentation pages, with the written page as the source of truth
 [@docs-foundation-session].
+
+## Keep Homepage Media Lazy
+
+Homepage media is part of the user experience, not only content. The Direction A
+performance investigation for issue 366 could not reproduce the reported freeze
+locally, but it did find that the page declared six 1600x900 videos and that a
+browser had enough data to play all six after load, including five recordings
+below the fold [@direction-a-deploy-session]. Treat `preload="metadata"` as an
+insufficient guard for these homepage loops: before publishing media changes,
+verify which recordings have fetched playable data, which videos are decoding,
+and whether any offscreen ticker or loop continues running [@direction-a-deploy-session].
+
+The safer homepage pattern is poster-first media. Keep posters visible at first
+paint, load recordings when they enter view or when a visitor chooses playback,
+and compare reload, largest-contentful-paint, and a real interaction under CPU
+throttling before claiming the performance issue is fixed
+[@direction-a-deploy-session]. This does not replace the recording-source
+requirements below; it adds a runtime loading check so authentic media does not
+make the public site feel broken on lower-end hardware.
 
 ## Package Media For Replacement
 
