@@ -2,6 +2,62 @@
 
 All notable changes to Red are documented in this file.
 
+## [0.8.0](https://github.com/codersauce/red/compare/v0.7.0...v0.8.0)
+
+### Features
+
+- **buffers:** Browse directories in editor windows ([#370](https://github.com/codersauce/red/issues/370)) ([195efcb](https://github.com/codersauce/red/commit/195efcb94b424adedf8cc8acdf122a653335c5b0))
+- **picker:** Support ctrl-n and ctrl-p navigation ([b7d9312](https://github.com/codersauce/red/commit/b7d93120b155895a4a4d1d200a773d95cb3b49d6))
+- **lsp:** Support an opt-in rust-glancer configuration ([#364](https://github.com/codersauce/red/issues/364)) ([3fc3548](https://github.com/codersauce/red/commit/3fc3548c0f53fc6599cb3f38e6e2ff4533c38203))
+- **editor:** Add neovim-style mouse selection ([#363](https://github.com/codersauce/red/issues/363)) ([9e09527](https://github.com/codersauce/red/commit/9e0952767d35d5b8dddd3fa3bb90087938692c52))
+- **syntax:** Detect languages from shebangs ([#360](https://github.com/codersauce/red/issues/360)) ([b17d014](https://github.com/codersauce/red/commit/b17d0146b524193d976121604d025e211bd90efc))
+
+### Bug Fixes
+
+- **deps:** Update rustls past security advisory ([0c88b25](https://github.com/codersauce/red/commit/0c88b257c5399dbba9f665784ec1189db441ac01))
+- **editor:** Prevent terminal control injection ([#365](https://github.com/codersauce/red/issues/365)) ([9a0a17b](https://github.com/codersauce/red/commit/9a0a17ba429100c21a7a155d8597942fc11025b7))
+- **startup:** Avoid first-launch config warning ([#362](https://github.com/codersauce/red/issues/362)) ([bb9bd41](https://github.com/codersauce/red/commit/bb9bd41a50b6ce11bd81a9dd746b64ba43028c85))
+- **session:** Support symlinked config directories ([#361](https://github.com/codersauce/red/issues/361)) ([b57dccf](https://github.com/codersauce/red/commit/b57dccff5936ac62ae90a02195a4fff60cd2f191))
+
+### Documentation
+
+- **editor:** Document wrapped-line navigation recipe ([0a9f01c](https://github.com/codersauce/red/commit/0a9f01cecf783ac998166933623091bf47ca5556))
+
+### Other
+
+- Record website media performance check ([1006712](https://github.com/codersauce/red/commit/10067128a5dcf19beb6f0bb596c8df18ef8cbecd))
+- Update website deployment guide ([7768311](https://github.com/codersauce/red/commit/7768311ecc5e71cb4abe468bfd0a6adcb45d64cc))
+- Add website operations hub ([a175cd4](https://github.com/codersauce/red/commit/a175cd4d1fd9c0c0e11b2a87558a09a753f1ed6b))
+- Record website asset sources ([f40427a](https://github.com/codersauce/red/commit/f40427a37811f3a97ebd3ac0014b1f02b8716216))
+- Document public site deployment ([f1ca8e3](https://github.com/codersauce/red/commit/f1ca8e324278abe32875d59d999e6f922e3ee82a))
+- Split website refresh guidance ([897d27e](https://github.com/codersauce/red/commit/897d27e9203db1365dcaeb9df88f990e559bf182))
+- Clarify release campaign version states ([e056be2](https://github.com/codersauce/red/commit/e056be273b01bfa2337410877c5c1714eb3c7834))
+- Improve safety and inline assist navigation ([91bc29a](https://github.com/codersauce/red/commit/91bc29ab7748a94b1377f59847129e96a329404c))
+- Link validation guide to rendering safety ([e359bdc](https://github.com/codersauce/red/commit/e359bdca2a90572113aadfcb060e7ac20f1a6645))
+- Document terminal interaction smoke validation ([00cb494](https://github.com/codersauce/red/commit/00cb494e0015bc90674b0cf8418668d304497dec))
+- Clarify plugin compatibility routing ([2eca5ce](https://github.com/codersauce/red/commit/2eca5ce894f07ef1f5bb70690a394e77f279e8ef))
+- Connect copilot completion guide ([efa2789](https://github.com/codersauce/red/commit/efa27890869a0b77a6d057bb469d605f32b24fa4))
+- Clarify lsp architecture routing ([7eb3ad7](https://github.com/codersauce/red/commit/7eb3ad71a58293ad2987e2431ba8ba17f1c399f6))
+- Record website video guidance ([05b4cc7](https://github.com/codersauce/red/commit/05b4cc77553f1eff8e88ac83b90df95f0cb94f1e))
+- Update lsp progress and website docs guidance ([607ead1](https://github.com/codersauce/red/commit/607ead179cf0429334ca96dde14e7e98081e7844))
+- Document terminal-safe rendering controls ([2ed85f3](https://github.com/codersauce/red/commit/2ed85f3c4db4e3e2248e3b929f365cdade15a1dd))
+- Document alternative rust lsp validation ([da05237](https://github.com/codersauce/red/commit/da05237d0013b6ac2ede81c2490df2439fe53a4e))
+- Document onboarding preferences ([edd7ca7](https://github.com/codersauce/red/commit/edd7ca76b66909cbf9d979cbad1cb6570084fb32))
+- Clarify agent history revert conflicts ([3064274](https://github.com/codersauce/red/commit/306427471d4c988eaa6868ec7b437b598174366f))
+- Improve release guide routing ([c87a980](https://github.com/codersauce/red/commit/c87a980cf9a7189fff6198b139844c37ac4f01f6))
+- Route release and website work ([ead75e8](https://github.com/codersauce/red/commit/ead75e83cddc02f9755b3680e50bad5dcb96447b))
+- Refresh plugin host api version ([d135e01](https://github.com/codersauce/red/commit/d135e01acf6179da31ec8378ea6f6e73f20e756c))
+- Document inline assist architecture ([e99fb91](https://github.com/codersauce/red/commit/e99fb910eb406e168b85a2d3fcb4210c736db4bf))
+- Clarify plugin host api metadata grounding ([12d9b0c](https://github.com/codersauce/red/commit/12d9b0c4d07086e1afebab23a4db81662203582d))
+- Generalize release link guidance ([5071ea0](https://github.com/codersauce/red/commit/5071ea02c311e2bdea55b405ddc09fc52208670b))
+- Refresh editor command references ([e539336](https://github.com/codersauce/red/commit/e539336cb670f157e62057945cd46d36859872c5))
+- Clarify plugin host api routing ([76f7592](https://github.com/codersauce/red/commit/76f7592a46ba7f27321fc9c98fc40148c7da254e))
+- Clarify agent read pagination ([617c8f3](https://github.com/codersauce/red/commit/617c8f30c322ba89654d84df9f190013e97a5950))
+- Refresh arborium language-pack decision ([c67e5eb](https://github.com/codersauce/red/commit/c67e5ebeee15405f732a7ad82975c3bf3170094f))
+- Add language-pack release guide ([7a9a5ff](https://github.com/codersauce/red/commit/7a9a5ff0ed39e7e2c6184f1fb687b3a365b5fe7d))
+- Refresh command and config references ([c99e90f](https://github.com/codersauce/red/commit/c99e90fc3e5269628c404df2f2a7c165cbd28056))
+- Refresh cli and performance references ([b8d4d9c](https://github.com/codersauce/red/commit/b8d4d9cd353935bbc5455526b3daa117cc0d6bf4))
+
 ## [0.7.0](https://github.com/codersauce/red/compare/v0.6.0...v0.7.0)
 
 ### Features

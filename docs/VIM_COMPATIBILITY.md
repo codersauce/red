@@ -1,7 +1,7 @@
 # Red Vim compatibility matrix
 
 **Matrix version:** 1.10
-**Tracked against:** Red v0.7.0
+**Tracked against:** Red v0.8.0
 **Status vocabulary:** **supported**, **intentional difference**, **not yet supported**
 
 “Real Vim keys” means the rows marked **supported** below. It does not mean complete
