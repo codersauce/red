@@ -1,7 +1,7 @@
 ---
 title: "Official Language Pack Distribution"
 summary: "Official language packs are catalog-discovered Red plugin packages; catalog provenance does not replace package lifecycle, platform artifacts, or native grammar trust."
-topics: [decisions, plugins, syntax, release, safety]
+topics: [decisions, plugins, language-packs, syntax, release, safety]
 sources:
   - id: catalog-code
     type: file

@@ -1,7 +1,7 @@
 ---
 title: "Release A Language Pack"
 summary: "Release a first-party Red language pack by validating the shared source repo, tagging one pack version, and verifying the catalog entry Red consumes."
-topics: [guides, plugins, release, syntax, validation]
+topics: [guides, plugins, language-packs, release, syntax, validation]
 sources:
   - id: red-catalog
     type: file

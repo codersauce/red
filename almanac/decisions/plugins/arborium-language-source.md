@@ -1,7 +1,7 @@
 ---
 title: "Arborium Language Pack Source"
 summary: "Red uses Arborium as build-time grammar and query material through the language-pack source repository, while keeping per-language packages and LSP tooling separate."
-topics: [decisions, plugins, syntax, lsp, release]
+topics: [decisions, plugins, language-packs, syntax, lsp, release]
 sources:
   - id: arborium-readme
     type: web

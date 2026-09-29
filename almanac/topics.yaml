@@ -123,6 +123,10 @@ topics:
     title: Plugins
     description: Husk plugins, host API integration, bundled plugin assets, and plugin-owned resources.
     parents: [architecture]
+  - slug: language-packs
+    title: Language Packs
+    description: Catalog-backed Red language packages, shared source policy, release artifacts, and native grammar trust.
+    parents: [plugins, syntax, release]
   - slug: host-api
     title: Host API
     description: Versioned Red host API calls and plugin-to-editor request contracts.
