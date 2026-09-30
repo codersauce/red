@@ -82,16 +82,21 @@ source-branch head, and host checks before changing production.
 
 ## Build The Archive
 
-Deploy from an exact pushed commit in `red-website`. The site requires Node
+Deploy from an exact pushed commit in `red-website`. The Sites save operation
+expects `commit_sha` to be the full SHA at the head of the site's configured
+remote source branch, and the uploaded archive must be built from that same
+source state [@direction-a-deploy-transcript]. This is a stricter requirement
+than "the commit exists somewhere on GitHub": a save attempt can fail when the
+public branch has the desired commit but the Sites source branch still points at
+an older head [@direction-a-deploy-transcript]. The site requires Node
 `>=22.13.0`; `npm test` runs the installer drift check, `npm run build`, and
 rendered HTML assertions [@website-package]. Also run `npm audit --omit=dev`
 against the same export before saving a production version: the v0.8.0 website
 release found five production dependency advisories in an otherwise unchanged
 lockfile after the release page and docs were already live
-[@direction-a-deploy-transcript]. The README requires installers to
-be synced only to an actually published Red release commit, because
-`public/installers.json` feeds the release version shown in the site
-[@website-readme].
+[@direction-a-deploy-transcript]. The README requires installers to be synced
+only to an actually published Red release commit, because `public/installers.json`
+feeds the release version shown in the site [@website-readme].
 
 The production artifact is the built `dist/` tree. `npm run build` runs
 `vinext build`, and the Sites Vite plugin copies `.openai/hosting.json` into
@@ -142,9 +147,11 @@ connector path, not as permission to deploy: every future `save_site_version`
 and `deploy_site_version` call still needs explicit production authorization and
 fresh rollback IDs.
 
-After recording the current live version for rollback, ask Codex to call
-`sites.save_site_version` with the project ID, full commit SHA, and archive path
-for the built `dist/` tarball [@deployment-findings]. Record the returned
+After recording the current live version for rollback, verify that the configured
+Sites source branch points at the exact commit that produced the archive. Then
+ask Codex to call `sites.save_site_version` with the project ID, that full
+commit SHA, and the archive path for the built `dist/` tarball
+[@deployment-findings] [@direction-a-deploy-transcript]. Record the returned
 version ID, version number, commit SHA, and archive metadata. Then ask Codex to
 publish that saved version with `sites.deploy_site_version`, because the site is
 currently public; use `deploy_private_site_version` only if a fresh Sites read
