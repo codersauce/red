@@ -245,10 +245,12 @@ the Host API `^0.12.0` language-pack indentation contract [@config]
 list` parsed the same installed packs as compatible [@binary-skew-session].
 
 Use `which -a red` or `whence -a red`, then run the intended binary by absolute
-path. `red --version` is not enough during unreleased `main` work: `Cargo.toml`
-still reports package version `0.6.0`, and the incident showed older
-Homebrew/local binaries and the newly installed Cargo binary all presenting
-`red 0.6.0` [@cargo-toml] [@binary-skew-session]. Prefer
+path. `red --version` is not enough during unreleased `main` work because it
+reports the package version from `Cargo.toml`, not the source commit or install
+location [@cargo-toml]. In the recorded skew case, older Homebrew/local
+binaries and the newly installed Cargo binary all presented the same package
+version while only `/Users/fcoury/.cargo/bin/red` accepted the current
+language-pack manifest fields [@binary-skew-session]. Prefer
 `cargo run --locked -- ...` for source-tree validation, or make
 `~/.cargo/bin` precede Homebrew and local installer directories before testing
 an installed build. When the failure is a language-pack compatibility error,
