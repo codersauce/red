@@ -221,7 +221,7 @@ topics:
     parents: [detach]
   - slug: operations
     title: Operations
-    description: Task-oriented procedures for operating editor state, history, detach, and crash recovery.
+    description: Task-oriented procedures for operating editor, agent, session, website, and release workflows.
     parents: [guides]
   - slug: development
     title: Development

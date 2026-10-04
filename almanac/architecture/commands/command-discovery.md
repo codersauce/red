@@ -1,6 +1,6 @@
 ---
-title: "Command Discovery"
-summary: "Red discovers commands through colon parsing, effective keymaps, command-palette metadata, and registered plugin command records."
+title: "Command Discovery And Dispatch"
+summary: "Red discovers and dispatches commands through colon parsing, effective keymaps, command-palette metadata, editor action routing, and registered plugin command records."
 topics: [architecture, commands, cli, plugins]
 sources:
   - id: command-parser
@@ -35,9 +35,9 @@ sources:
     path: plugins/neotree.hk
 ---
 
-# Command Discovery
+# Command Discovery And Dispatch
 
-Command discovery is the set of paths that let Red users find and execute editor actions: colon commands, configured keymaps, the command palette, and plugin-registered commands. Built-in colon input is parsed against an explicit command-name list, palette rows are built from built-in command metadata plus active plugin command metadata, and shortcut labels come from the effective configured keymaps rather than hard-coded defaults [@command-parser] [@command-palette]. The editor then dispatches selected built-in actions itself and routes plugin commands through the plugin registry [@editor-dispatch].
+Command discovery and dispatch are the paths that let Red users find and execute editor actions: colon commands, configured keymaps, the command palette, and plugin-registered commands. Built-in colon input is parsed against an explicit command-name list, palette rows are built from built-in command metadata plus active plugin command metadata, and shortcut labels come from the effective configured keymaps rather than hard-coded defaults [@command-parser] [@command-palette]. The editor then dispatches selected built-in actions itself and routes plugin commands through the plugin registry [@editor-dispatch].
 
 ## Colon Command Parsing
 

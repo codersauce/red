@@ -33,7 +33,7 @@ Start with [Client Lifecycle And Routing](client-lifecycle-and-routing) for docu
 
 Use [LSP Document Sync](../editor/lsp-document-sync) when a change touches lazy open, change notifications, diagnostics, path identity, or editor-side coordination. Use [Diagnostics UI](diagnostics-ui) for the editor-owned gutter, statusline, picker, and line-popup surfaces built from LSP diagnostics. Use [Completion](completion) for request context, stale-response guards, snippet handling, UI filtering, and completion edit application. Optional GitHub Copilot ghost-text suggestions live in [Copilot Inline Completion](../../guides/agent/copilot-completion), not in the LSP server lifecycle.
 
-Read [Workspace Edits](workspace-edits) before changing rename, code action, resource operation, or multi-file edit behavior. It is the safety boundary that converts server edits into checked editor-owned changes.
+Read [Navigation And Document Highlight](navigation-and-highlights) before changing go-to-definition, declaration, type-definition, implementation, jump-list interaction, or document-highlight rendering. Read [Workspace Edits](workspace-edits) before changing rename, code action, resource operation, or multi-file edit behavior. It is the safety boundary that converts server edits into checked editor-owned changes.
 
 [LSP Capabilities](../../concepts/lsp/capabilities) explains the advertised client capability model. [LSP Configuration](../../reference/lsp/configuration) is the exact lookup page for defaults and server fields, including Red's embedded Husk server definition [@config]. For Husk-specific server behavior, use [Husk Language Server](../husk/language-server). For diagnosis, use [Debugging LSP Failures](../../guides/lsp/debugging-lsp-failures).
 

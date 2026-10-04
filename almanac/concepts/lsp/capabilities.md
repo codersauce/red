@@ -38,9 +38,28 @@ Work-done progress is a display path, not a server-management path. `LspManager`
 
 ## Known Capability Gaps
 
-The definition path is narrower than the surrounding LSP navigation feature set. Red advertises only definition client capabilities for that navigation family, and the editor has a single `GoToDefinition` action that sends `textDocument/definition`, stores the request id in `pending_definition_requests`, defers jump-list traversal while that set is non-empty, and jumps to only the first returned location [@capabilities] [@editor]. Adding declaration, type-definition, implementation, or multi-result navigation is therefore an editor action, response-routing, stale-response, and picker problem, not just a new client request method.
+The location-navigation path is narrower than the advertised LSP feature set.
+Red advertises definition, declaration, type-definition, and implementation
+client capabilities with static registration and `link_support(false)`, but the
+editor has a single `GoToDefinition` action that sends
+`textDocument/definition`, stores the request id in
+`pending_definition_requests`, defers jump-list traversal while that set is
+non-empty, and jumps to only the first returned location [@capabilities]
+[@editor]. Adding declaration, type-definition, implementation, or multi-result
+navigation is therefore an editor action, response-routing, stale-response, and
+picker problem, not just a new client request method. [LSP Navigation And
+Document Highlight](../../architecture/lsp/navigation-and-highlights) records
+the current definition path and the planned generalization.
 
-`textDocument/documentHighlight` is currently an advertised and routable request without a user-visible editor consumer. The capability builder advertises document-highlight support, and the client and manager can send `textDocument/documentHighlight` for a file and position, but the editor does not request, store, stale-check, or render document-highlight ranges [@capabilities] [@client] [@manager] [@editor]. This is a contract gap: either the advertisement should be removed, or the editor needs the idle trigger, revision/cursor guards, theme colors, dirty-row invalidation, and rendering path that make server highlights visible and safe.
+`textDocument/documentHighlight` is currently an advertised and routable request
+without a user-visible editor consumer. The capability builder advertises
+document-highlight support, and the client and manager can send
+`textDocument/documentHighlight` for a file and position, but the editor does
+not request, store, stale-check, or render document-highlight ranges
+[@capabilities] [@client] [@manager] [@editor]. This is a contract gap: either
+the advertisement should be removed, or the editor needs the idle trigger,
+revision/cursor guards, theme colors, dirty-row invalidation, and rendering path
+that make server highlights visible and safe.
 
 ## Workspace Edit Boundary
 
