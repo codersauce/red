@@ -1,7 +1,7 @@
 ---
 title: "Syntax Services"
 summary: "Syntax services choose a buffer language, produce byte-range highlight spans, cache viewport parses, and feed matching-token motions without making syntax choice a text mutation."
-topics: [architecture, editor, syntax, rendering, vim]
+topics: [architecture, editor, syntax, language-packs, rendering, vim]
 sources:
   - id: highlighter
     type: file

@@ -30,6 +30,9 @@ sources:
   - id: bundled-plugins
     type: file
     path: almanac/concepts/plugins/bundled-husk-plugins.md
+  - id: language-packs
+    type: file
+    path: almanac/concepts/plugins/language-packs.md
   - id: dialogs
     type: file
     path: almanac/concepts/plugins/callback-scoped-dialogs.md
@@ -74,6 +77,11 @@ standalone CLI, packages, runtime, language server, semantic tooling, and
 extension boundary [@husk]. [Bundled Husk plugins](plugins/bundled-husk-plugins)
 then narrows that model to Red's embedded plugin assets and the native packages
 that supply pure logic for some plugins [@bundled-plugins].
+
+Use [Language packs](plugins/language-packs) when a plugin package mainly
+contributes syntax, grammar, indentation, text-object, formatter, or language
+server configuration. That concept page routes runtime effects, catalog policy,
+CLI operations, validation gotchas, and pack release work [@language-packs].
 
 Use [Callback-scoped dialogs](plugins/callback-scoped-dialogs) when plugin UI
 work needs to preserve host-owned picker and composer callback handles instead

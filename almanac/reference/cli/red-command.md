@@ -1,7 +1,7 @@
 ---
 title: "Red Command"
 summary: "The `red` command exposes editor startup, utility checks, keyboard diagnostics, plugin management, language grammar checks, runtime asset operations, detach control, config overrides, and internal hidden boundaries."
-topics: [reference, cli, startup, plugins]
+topics: [reference, cli, startup, plugins, language-packs]
 sources:
   - id: cli
     type: file

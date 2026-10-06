@@ -1,7 +1,7 @@
 ---
 title: "Build, Test, And Validate"
 summary: "This guide explains the local validation path for Red changes and how to line it up with CI, plugin checks, release checks, terminal rendering checks, and runtime self-checks."
-topics: [guides, development, validation, testing, ci, plugins, rendering]
+topics: [guides, development, validation, testing, ci, plugins, language-packs, rendering]
 sources:
   - id: readme
     type: file
