@@ -73,8 +73,9 @@ or the site can regress by publishing one side of that split over the other
 
 The follow-up Direction A deployment fixed that split by merging the launch
 content and docs ancestry before saving a new Sites version [@direction-a-deploy-transcript].
-It published version 20 for the redesigned homepage and later version 22 for the
-primary installer-command correction [@direction-a-deploy-transcript]. Those
+It published version 20 for the redesigned homepage, version 22 for the primary
+installer-command correction, and version 23 for the v0.8.0 release page and
+docs update across all five public hosts [@direction-a-deploy-transcript]. Those
 version numbers are historical waypoints only. They prove the Codex Sites
 connector can perform the save-then-deploy sequence in an authorized Codex
 session, but a later deploy still has to reopen the live version, deployment ID,
