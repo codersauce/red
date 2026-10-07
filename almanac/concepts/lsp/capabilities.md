@@ -1,6 +1,6 @@
 ---
 title: "LSP Capabilities"
-summary: "Red advertises a conservative LSP capability set that matches its transport, editor routing, completion, diagnostics, and workspace-edit safety boundaries."
+summary: "Red advertises a mostly conservative LSP capability set, with known gaps where advertised or routed features do not yet have editor consumers."
 topics: [concepts, lsp]
 sources:
   - id: capabilities
@@ -9,6 +9,9 @@ sources:
   - id: lsp-types
     type: file
     path: src/lsp/types.rs
+  - id: lsp-trait
+    type: file
+    path: src/lsp/mod.rs
   - id: manager
     type: file
     path: src/lsp/manager.rs
@@ -26,11 +29,11 @@ sources:
     path: src/lsp/fixtures/vscode-capabilities.json
 ---
 
-LSP capabilities are Red's contract with language servers during `initialize`: they say which protocol shapes the editor is prepared to receive, route, and apply. Red builds this contract in code instead of copying a broad editor profile, and the module warns that a new advertised capability must be paired with protocol and editor-path coverage [@capabilities]. The result is intentionally narrower than the captured Visual Studio Code capability fixture, especially around dynamic registration, file watching, refresh support, change annotation handling, and window requests [@vscode-fixture].
+LSP capabilities are Red's contract with language servers during `initialize`: they say which protocol shapes the editor is prepared to receive, route, and apply. Red builds this contract in code instead of copying a broad editor profile, and the module warns that a new advertised capability must be paired with protocol and editor-path coverage [@capabilities]. The result is intentionally narrower than the captured Visual Studio Code capability fixture, especially around dynamic registration, file watching, refresh support, change annotation handling, and window requests [@vscode-fixture]. The contract still has known gaps where Red advertises, parses, or routes features that do not yet reach a user-visible editor consumer [@capabilities] [@lsp-trait] [@editor].
 
 ## Conservative Advertisement
 
-Red advertises UTF-16 position encoding, static registration across text-document features, completion context support, snippets, commit characters, hover and signature documentation formats, code actions, formatting, on-type formatting, rename, folding ranges, semantic tokens, inlay hints, diagnostics, and work-done progress [@capabilities]. It also parses the server's `documentOnTypeFormattingProvider` options, including the first trigger character and optional additional trigger characters [@lsp-types]. These values match the surrounding [transport](../../architecture/lsp/transport) and editor paths: requests use JSON-RPC correlation, server responses are routed back by method, progress notifications are enriched with server identity before reaching the editor, and edits are converted before mutation [@capabilities] [@manager].
+Red advertises UTF-16 position encoding, static registration across text-document features, completion context support, snippets, commit characters, hover and signature documentation formats, code actions, formatting, on-type formatting, rename, diagnostics, and work-done progress [@capabilities]. It also parses the server's `documentOnTypeFormattingProvider` options, including the first trigger character and optional additional trigger characters [@lsp-types]. These values match the surrounding [transport](../../architecture/lsp/transport) and editor paths: requests use JSON-RPC correlation, server responses are routed back by method, progress notifications are enriched with server identity before reaching the editor, and edits are converted before mutation [@capabilities] [@manager].
 
 The advertised omissions are as important as the positive features. Dynamic registration is disabled throughout the capability tree, save lifecycle flags are disabled, `window/showDocument` is not supported, diagnostics refresh is disabled, and code-action resolve support is omitted [@capabilities]. This prevents servers from assuming Red can handle extra runtime registration flows or deferred resolution paths that are not implemented.
 
@@ -60,6 +63,18 @@ not request, store, stale-check, or render document-highlight ranges
 the advertisement should be removed, or the editor needs the idle trigger,
 revision/cursor guards, theme colors, dirty-row invalidation, and rendering path
 that make server highlights visible and safe.
+
+The same pattern applies to several lower-priority feature families. Document
+links, document colors, folding ranges, call-hierarchy preparation, and full
+semantic tokens are advertised in the client capability tree and have trait,
+client, and manager request paths, but they do not have built-in editor
+consumers comparable to completion, diagnostics, formatting, rename, references,
+document symbols, or plugin inlay hints [@capabilities] [@lsp-trait] [@client]
+[@manager] [@editor]. Code lens, selection range, linked editing, type
+hierarchy, and inline values are advertised or represented in capability/type
+structures, but they have no complete high-level request path; code lens is
+still a commented TODO at the LSP trait boundary [@capabilities] [@lsp-types]
+[@lsp-trait].
 
 ## Workspace Edit Boundary
 
