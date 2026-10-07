@@ -12,6 +12,9 @@ sources:
   - id: ci
     type: file
     path: .github/workflows/ci.yml
+  - id: main-ruleset
+    type: file
+    path: .github/rulesets/main.json
   - id: plugin-check
     type: file
     path: .github/workflows/plugin-check.yml
@@ -113,22 +116,31 @@ cargo run --locked --release --example husk_cursor_bench -- --assert
 cargo test --locked --manifest-path vendor/crossterm/Cargo.toml --lib red_
 cargo build --locked --bin red
 python3 scripts/test_keyboard_protocol.py
+RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --all-features --document-private-items
 python3 scripts/doctest_packages.py --no-default-features
+python3 scripts/check_markdown_links.py --self-test
+python3 scripts/check_markdown_links.py
 python3 scripts/readme_release.py --check
-python3 -m unittest tests.test_discord_release tests.test_ci_policy tests.test_doctest_packages tests.test_test_performance
+python3 -m json.tool .github/rulesets/main.json > /dev/null
+python3 -m unittest tests.test_release_campaign tests.test_discord_release tests.test_social_release
+python3 -m unittest tests.test_ci_policy tests.test_doctest_packages tests.test_test_performance
 ```
 
 The workflow lint job validates GitHub Actions, checks the README release
-version, and runs Discord announcement and validation-helper tests [@ci]. The
-CI `fmt` and `self-check` jobs run rustfmt and
+version, validates the main-branch ruleset recipe that protects `main` with
+`CI Gate`, and runs release-campaign, Discord, social-release, and
+validation-helper tests [@ci] [@main-ruleset]. The CI `fmt` and `self-check`
+jobs run rustfmt and
 `cargo run --locked -- --self-check`; the separate path-filtered Performance
-workflow runs the release-mode Husk cursor benchmark with `--assert` [@performance]. The paid
-test job also validates the vendored Crossterm keyboard decoder and, on Unix
-runners, drives `red keys` through a PTY to cover legacy, Kitty CSI-u, xterm,
-fragmented, repeat, release, and automatic negotiation cases [@ci]
-[@keyboard-protocol]. For the details of the CI surface, see
-[CI And Validation](../../reference/validation/ci-and-validation); for benchmark
-thresholds and workstation baselines, see
+workflow runs the release-mode Husk cursor benchmark with `--assert`
+[@performance]. The docs job builds rustdoc with warnings denied, runs the
+doctest helper, and validates Markdown links [@ci]. The paid test job also
+validates the vendored Crossterm keyboard decoder and, on Unix runners, drives
+`red keys` through a PTY to cover legacy, Kitty CSI-u, xterm, fragmented,
+repeat, release, and automatic negotiation cases [@ci] [@keyboard-protocol].
+For the details of the CI surface, see
+[CI And Validation](../../reference/validation/ci-and-validation); for
+benchmark thresholds and workstation baselines, see
 [Performance Checks](../performance/performance-checks); for the runtime
 diagnostic itself, see [Self Check](../../reference/runtime/self-check).
 

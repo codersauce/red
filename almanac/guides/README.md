@@ -55,7 +55,7 @@ sources:
 
 # Guides
 
-Guide pages are the task-oriented shelf for Red maintainers. The topic graph keeps them under the `guides` root and connects individual guides to validation, plugins, LSP, sessions, release, installers, website, performance, agent, and operations topics [@topics]. Use this hub when you know the work you need to finish and want the procedure before reading subsystem architecture.
+Guide pages are the task-oriented shelf for Red maintainers. The topic graph keeps them under the `guides` root and connects individual guides to validation, plugins, LSP, sessions, release, installers, website, performance, agent, and AI-completion topics [@topics]. Use this hub when you know the work you need to finish and want the procedure before reading subsystem architecture.
 
 ## Everyday Development
 

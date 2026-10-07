@@ -1,7 +1,7 @@
 ---
 title: "Release Red"
 summary: "This guide describes the Red release flow from prepare-release workflow through reviewed campaign resolution, tag publishing, archive smoke tests, Homebrew update, installer and website verification, and announcement."
-topics: [guides, release, ci, installers]
+topics: [guides, release, ci, installers, website]
 sources:
   - id: releasing
     type: file

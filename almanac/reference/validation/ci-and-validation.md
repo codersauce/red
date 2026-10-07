@@ -6,6 +6,9 @@ sources:
   - id: ci
     type: file
     path: .github/workflows/ci.yml
+  - id: main-ruleset
+    type: file
+    path: .github/rulesets/main.json
   - id: ci-matrix
     type: file
     path: scripts/ci_matrix.py
@@ -36,6 +39,15 @@ sources:
   - id: release
     type: file
     path: .github/workflows/release.yml
+  - id: prepare-release
+    type: file
+    path: .github/workflows/prepare-release.yml
+  - id: announce-discord
+    type: file
+    path: .github/workflows/announce-discord.yml
+  - id: claude
+    type: file
+    path: .github/workflows/claude.yml
   - id: installers
     type: file
     path: .github/workflows/installers.yml
@@ -62,6 +74,15 @@ after a release is published [@plugin-check] [@performance] [@installers]
 the bundled self-check is also part of the
 [runtime assets](../../architecture/runtime/runtime-assets) area.
 
+Three current workflows are adjacent automation rather than ordinary validation
+gates. `Prepare Release` is a manual release-preparation workflow, `Announce
+Discord release` posts or previews release announcements after publication, and
+`Claude Code` runs only when GitHub issue or review text mentions `@claude`
+[@prepare-release] [@announce-discord] [@claude]. Use [Release Red](../../guides/releases/release-red)
+and [Release Campaign](../releases/release-campaign) for the release and
+announcement procedures instead of treating those workflows as local validation
+commands.
+
 ## Local Policy
 
 `AGENTS.md` requires `cargo clippy --all-targets --all-features -- -D warnings` before pushing Rust changes and requires every warning or error to be fixed [@agents]. It also says PR work must follow `.agents/skills/good-pr/SKILL.md`, including repository-specific PR publishing defaults [@agents].
@@ -86,7 +107,7 @@ operating system; release builds use separate target-specific caches [@ci].
 
 | Job | Main checks |
 | --- | --- |
-| `workflow-lint` | Validates GitHub Actions workflows, checks the README release version, validates the reviewed release campaign, and runs release-campaign, Discord announcement, social-release, and test-tooling unit tests [@ci]. |
+| `workflow-lint` | Validates GitHub Actions workflows, checks the README release version, validates the main-branch ruleset recipe that requires `CI Gate`, validates the reviewed release campaign, and runs release-campaign, Discord announcement, social-release, and test-tooling unit tests [@ci] [@main-ruleset]. |
 | `test` | Runs `cargo test --all-targets --all-features --verbose` with stable Rust and checksum-verified ripgrep on Ubuntu, macOS, and Windows; then runs the vendored Crossterm keyboard decoder tests and, outside Windows, builds `red` and exercises the terminal keyboard protocol in a Unix PTY [@ci] [@keyboard-protocol]. |
 | `clippy` | Denies every all-target, all-feature clippy warning on Ubuntu for code pull requests and manual runs; post-merge pushes and documentation-only pull requests skip it [@ci]. |
 | `fmt` | Runs `cargo fmt --all -- --check` [@ci]. |
@@ -112,8 +133,11 @@ without refreshing Linux package indexes. macOS reuses an existing ripgrep or
 installs it with Homebrew [@ci].
 
 The CI cost-control runbook treats `CI Gate` as the stable branch-protection
-check and says runner-size changes should be kept only when cost per successful
-run falls without reliability or memory regressions [@ci-cost-controls]. Its
+check, and the checked-in main-branch ruleset requires `CI Gate` as the only
+required status check while also requiring pull requests, strict branch updates,
+and blocking deletion or force pushes [@ci-cost-controls] [@main-ruleset]. It
+says runner-size changes should be kept only when cost per successful run falls
+without reliability or memory regressions [@ci-cost-controls]. Its
 August 2026 macOS benchmark kept three successful 6x replicas cheaper than
 three 12x replicas even with one slow cache-restore outlier, and it names
 four-minute rolling p90, platform-only failures, or worse cost per successful

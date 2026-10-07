@@ -45,6 +45,9 @@ sources:
   - id: arborium-evaluation
     type: conversation
     path: /Users/fcoury/.codex/sessions/2026/08/03/rollout-2026-08-03T22-35-21-019fca69-3a66-7590-b9c3-65e02dde412d.jsonl
+  - id: language-pack-release
+    type: file
+    path: almanac/guides/plugins/release-language-pack.md
 ---
 
 # Arborium Language Pack Source
@@ -73,4 +76,4 @@ The managed-tool catalog should be a separate project when Red is ready for it. 
 
 The practical rollout path is now metadata-first. Adding another high-quality Arborium language should require a reviewed Red metadata file plus catalog release work, because the source repository scaffolds the manifest, catalog metadata, provenance, example, query overlay, and documentation from that overlay without changing another pack [@packs-readme] [@packs-contributing]. Red-side changes are still needed when the editor's package schema, catalog validation, host API requirement, formatter contract, or highlighter behavior changes [@catalog-code] [@package-code] [@highlighter-code].
 
-Follow [Syntax Services](../../architecture/editor/syntax-services) for runtime highlighter effects, [Plugin Lifecycle And Reload](../../architecture/plugins/lifecycle-and-reload) for package activation and quarantine, and [Release Red](../../guides/releases/release-red) when catalog changes become release work.
+Follow [Syntax Services](../../architecture/editor/syntax-services) for runtime highlighter effects, [Plugin Lifecycle And Reload](../../architecture/plugins/lifecycle-and-reload) for package activation and quarantine, and [Release A Language Pack](../../guides/plugins/release-language-pack) when Arborium-derived pack changes need first-party pack publication and catalog verification [@language-pack-release]. Use [Release Red](../../guides/releases/release-red) when the Red-side package schema, runtime, installer, or editor release surface changes.

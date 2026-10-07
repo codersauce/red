@@ -1,7 +1,7 @@
 ---
 title: "Learning And Tutorial"
 summary: "Red keeps first-run teaching inside editor-owned, side-effect-free practice buffers, with Learn Red and tutorial commands sharing contextual routing but different progress stores."
-topics: [architecture, editor, onboarding]
+topics: [architecture, editor, onboarding, preferences]
 sources:
   - id: editor
     type: file

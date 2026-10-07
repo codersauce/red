@@ -1,7 +1,7 @@
 ---
 title: "Deploy Public Site"
 summary: "Use this guide when publishing getred.dev through OpenAI Sites, including the built-archive boundary, Codex connector calls, domain checks, and rollback path."
-topics: [guides, website, operations]
+topics: [guides, website]
 sources:
   - id: website-readme
     type: file

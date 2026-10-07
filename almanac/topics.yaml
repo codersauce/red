@@ -219,10 +219,6 @@ topics:
     title: IPC
     description: Versioned local protocol behavior for detachable sessions.
     parents: [detach]
-  - slug: operations
-    title: Operations
-    description: Task-oriented procedures for operating editor, agent, session, website, and release workflows.
-    parents: [guides]
   - slug: development
     title: Development
     description: Local maintainer development and validation workflow.
