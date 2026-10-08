@@ -51,9 +51,9 @@ sources:
   - id: whats-new
     type: file
     path: src/whats_new.rs
-  - id: v080-release-session
-    type: conversation
-    path: /Users/fcoury/.codex/sessions/2026/09/26/rollout-2026-09-26T18-58-30-01a0dfba-17a6-7ad2-9025-e1bf987aa2f2.jsonl
+  - id: website-deploy-guide
+    type: file
+    path: almanac/guides/website/deploy-public-site.md
 ---
 
 Use this guide to publish a Red release without mixing up release preparation, reviewed campaign resolution, the tag build, draft release review, Homebrew publication, installer smoke tests, and announcement. The release process is split on purpose: a prepare workflow opens a normal release PR, an annotated tag builds and smoke-tests archives into a draft GitHub release, publishing that release updates Homebrew, and a separate Discord workflow announces only published non-prerelease releases unless manually invoked [@prepare-release] [@release] [@announce-discord]. The reviewed campaign is the shared editorial source for GitHub release introductions, Discord and in-app highlights, and preview-only X and Bluesky copy [@campaign] [@release-campaign] [@social-release].
@@ -105,13 +105,13 @@ Before publishing, confirm the draft release contains all four archives, `SHA256
 
 Publishing the GitHub release triggers a second `Release` workflow run for the `release.published` event; its build, smoke, and draft-publish jobs are skipped, and only the `homebrew` job is eligible [@release]. That job requires `HOMEBREW_TAP_TOKEN`, downloads release tarballs and checksums, writes `Formula/red.rb` with OS-specific URLs and SHA-256 values, and pushes the formula update if it changed [@release]. Use `gh run list --event release` when checking publication automation, because the release-event `Release` run and the tag-push `Release` run have the same workflow name [@release].
 
-## Verify Installers And Announcement
+## Verify Installers, Website, And Announcement
 
 After publishing, verify Homebrew and the stable installers. The release docs require `brew update`, `brew install codersauce/tap/red`, `red --version`, and temporary-directory installer checks for Unix and Windows [@releasing]. Follow [Release Installers](../installers/release-installers) for installer-specific checks.
 
-Treat the public website as a separate release surface after the app release is public. The v0.8.0 release pass completed archive smoke tests, checksum checks, post-publication installer checks, Homebrew publication, and Discord announcement, then separately deployed the website release page and docs as OpenAI Sites version 23; all five public hosts served the new release page [@v080-release-session]. After each release, update the site to the exact published version, deploy it with [Deploy Public Site](../website/deploy-public-site), verify `/releases`, docs, installer files, and host coverage, and run the website production dependency audit before calling the website clean [@v080-release-session].
+Treat the public website as a separate release surface after the app release is public. The website can lag or drift even when the Red release itself is healthy, because it is maintained in the sibling `red-website` checkout and published through OpenAI Sites rather than the Red release workflow [@website-deploy-guide]. After each app release, update the site to the exact published version, deploy it with [Deploy Public Site](../website/deploy-public-site), verify `/releases`, docs, installer files, and host coverage, and run the website production dependency audit before calling the website portion complete [@website-deploy-guide].
 
-Do not hide unresolved website advisories inside an otherwise successful Red release. The same v0.8.0 pass found production dependency advisories in the unchanged website lockfile, including a direct critical Next.js advisory whose applicability to the vinext Worker was still unverified [@v080-release-session]. Rerun the website audit for the release being shipped, then close each advisory by upgrading or by recording the current applicability analysis before treating the public-site portion as complete.
+Do not hide unresolved website advisories inside an otherwise successful Red release. Rerun the website audit for the release being shipped, then close each advisory by upgrading or by recording the current applicability analysis before treating the public-site portion as complete. The website deploy guide keeps the historical deployment and advisory waypoints that explain why this check belongs in the release closeout [@website-deploy-guide].
 
 The Discord announcement workflow runs on published releases and manual dispatch, but it skips prereleases for automatic release events [@announce-discord]. It reads the published GitHub release, uses the matching release campaign when available, runs `scripts/discord_release.py` to build JSON and a Markdown summary, checks the webhook only when not in dry-run mode, and posts through `curl` with retry options [@announce-discord] [@discord-release]. The same workflow renders X and Bluesky campaign previews through `scripts/social_release.py` and writes them to the job summary without posting them [@announce-discord] [@social-release]. The helper selects announcement sections from the campaign or from "Features", "Performance", and "Bug Fixes", stops before installation boilerplate, builds a compact embed, chooses an image based on release scopes, and can include `@everyone` only when the workflow passes the flag [@discord-release].
 
