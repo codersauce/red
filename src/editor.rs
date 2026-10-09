@@ -27629,6 +27629,7 @@ impl Editor {
         match self.deferred_quit {
             DeferredQuit::Ready => {
                 self.deferred_quit = DeferredQuit::None;
+                // A buffer may have changed while the asynchronous save was pending.
                 self.modified_buffers().is_empty()
             }
             DeferredQuit::AfterSave(buffer_id) if !self.has_pending_format_save(buffer_id) => {
@@ -44997,7 +44998,9 @@ while True:
                         editor.test_execute_production_action(action).await.unwrap();
                     }
                 }
-                if std::fs::read_to_string(path).ok().as_deref() == Some(expected) {
+                if editor.pending_lsp_format_saves.is_empty()
+                    && std::fs::read_to_string(path).ok().as_deref() == Some(expected)
+                {
                     break;
                 }
                 tokio::time::sleep(Duration::from_millis(5)).await;
@@ -45102,6 +45105,43 @@ while True:
 
         assert!(!editor.take_deferred_quit());
         assert!(editor.buffer_manager[0].is_dirty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn wq_stays_open_when_buffer_changes_while_formatting_is_pending() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("changed-wq.rs");
+        std::fs::write(&path, "value   \n").unwrap();
+        let (mut editor, ready, release, _) = delayed_formatter_editor(
+            root.path(),
+            Buffer::new(
+                Some(path.to_string_lossy().into_owned()),
+                "value   \n".to_string(),
+            ),
+        );
+
+        editor
+            .test_execute_production_action(Action::Command("wq".to_string()))
+            .await
+            .unwrap();
+        wait_for_formatter_initialize(&ready).await;
+        editor
+            .test_execute_production_action(Action::InsertCharAtCursorPos('x'))
+            .await
+            .unwrap();
+        std::fs::write(&release, "release").unwrap();
+        complete_delayed_format_save(&mut editor, &path, "value   \n").await;
+
+        assert!(!editor.take_deferred_quit());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "value   \n");
+        assert!(editor.buffer_manager[0].contents().starts_with('x'));
+        assert!(editor.buffer_manager[0].is_dirty());
+        assert!(editor.pending_lsp_format_saves.is_empty());
+        assert!(editor
+            .last_error
+            .as_deref()
+            .is_some_and(|error| error.contains("stale")));
     }
 
     #[cfg(unix)]
