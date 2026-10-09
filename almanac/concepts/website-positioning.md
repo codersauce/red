@@ -36,17 +36,27 @@ AI-native work model and batteries-included runtime, but it must verify exact
 shipped shortcuts, command names, and feature names against repository docs
 before presenting them as current product behavior [@readme].
 
-The site may use "Pair Mode" and "Delegate Mode" as external product language,
-but those names must stay separate from shipped editor surfaces until the
-product adds matching commands or keys [@website-direction]. Current docs expose
-the interactive agent path as `Space A` or `:Agent` for the full Agent panel and
-`Space i` for bounded inline assist [@readme] [@getting-started]
+## Audience And Runtime Claims
+
+The site can explain Red as an AI-native editor for experienced developers, but
+runtime claims still come from the shipped editor and its docs. Current docs
+expose the interactive agent path as `Space A` or `:Agent` for the full Agent
+panel and `Space i` for bounded inline assist [@readme] [@getting-started]
 [@agent-workflow]. Background inline work is documented as hidden jobs that can
 finish without moving focus, notify the bottom line, reopen through `Space N` or
 `:InlineLast`, and remain inspectable in `Space H` / `:InlineHistory`
-[@agent-workflow]. A website section can explain that workflow as delegated
-work, but a dedicated `Space D` Delegate entry point is still a proposed site
-demo detail, not a current runtime shortcut [@website-direction] [@readme].
+[@agent-workflow].
+
+## Prototype Language
+
+The site may use "Pair Mode" and "Delegate Mode" as external product language,
+but those names must stay separate from shipped editor surfaces until the
+product adds matching commands or keys [@website-direction]. A website section
+can explain the current background inline workflow as delegated work, but a
+dedicated `Space D` Delegate entry point is still a proposed site demo detail,
+not a current runtime shortcut [@website-direction] [@readme].
+
+## Evidence-First Media
 
 Visual work for `getred.dev` is evidence-first. The selected direction calls for
 screenshots and videos of real Red project workflows rather than placeholder
@@ -58,6 +68,8 @@ picker, command discovery, Git workspace, theme browser, full Agent workflow,
 inline assist, InlineHistory receipts, language packs, plugins, and detachable
 sessions [@website-direction] [@readme] [@agent-workflow].
 
+## Visual Direction
+
 The design system should borrow from Red itself without turning design tokens
 into unsupported feature claims. The `red` theme defines the dark background
 `#101014`, foreground `#D8D8DE`, cursor/accent `#E5484D`, muted line numbers,
@@ -68,12 +80,16 @@ the shipped `Space t` theme browser rather than claiming an Ex `:theme` command
 unless that command is verified in current code [@getting-started]
 [@website-direction].
 
+## Prototype Artifacts
+
 Prototype artifacts from the design transcript are design direction, not
 production evidence. They can suggest Vim-style navigation, command-line
 interaction, live theme switching from bundled colors, and scripted Pair or
 Delegate demos, but every implementation pass must reopen the actual website
 repository and verify the current stack, install routes, browser behavior, and
 shipped Red shortcuts before publishing [@website-direction].
+
+## Installer URL Constraints
 
 Installer URLs are a site constraint, not just marketing copy. The README
 installation commands fetch `https://getred.dev/install.sh` and
@@ -83,6 +99,8 @@ with review [@readme]. This boundary keeps [Red Editor](red-editor) and
 [Agent-Attributed Edits](agent-attributed-edits) focused on current runtime
 facts while preserving the external-site audience, media plan, and prototype
 constraints for future website work.
+
+## Operating Guides
 
 Use [Refresh Public Site](../guides/website/refresh-public-site) for the
 operating procedure behind public docs, recording evidence, video packaging,

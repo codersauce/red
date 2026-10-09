@@ -156,19 +156,22 @@ useful only for timing drafts [@docs-foundation-session].
 ## Find The Production Assets
 
 The production Direction A homepage lives in the sibling `red-website`
-checkout, not in the exploratory `site/` prototype tree in this repository. The
-website README names `worker/design-a.html` as the standalone Direction A
-homepage and says the Worker serves that file at `/`, while `/docs`,
-documentation routes, and `/releases` come from the app router
-[@website-readme]. The page itself keeps the Docs and Releases links, points its
-social metadata at `https://getred.dev/og.png`, and references six `/media/*.mp4`
-clips with matching posters [@website-design-a].
+repository family, not in the exploratory `site/` prototype tree in this
+repository. Before editing production assets, follow
+[Deploy Public Site](deploy-public-site) to identify the current Sites source
+commit and use the matching local checkout or a fresh checkout of that source
+state [@deploy-public-site]. The website README names `worker/design-a.html` as
+the standalone Direction A homepage and says the Worker serves that file at
+`/`, while `/docs`, documentation routes, and `/releases` come from the app
+router [@website-readme]. The page itself keeps the Docs and Releases links,
+points its social metadata at `https://getred.dev/og.png`, and references six
+`/media/*.mp4` clips with matching posters [@website-design-a].
 
-Homepage recording sources are also in `red-website`. The capture README says
-the six silent MP4 loops and posters live in `public/media/`, while the editable
-VHS tapes, reset fixture, capture settings, postprocessor, and social-card
-source live under `captures/` [@website-captures]. Those files were copied from
-the Red repository's `site/captures/` prototype on 2026-09-26, and the exact
-Red binary commit used for the original recordings was not recorded
+Homepage recording sources are also in the website repository. The capture
+README says the six silent MP4 loops and posters live in `public/media/`, while
+the editable VHS tapes, reset fixture, capture settings, postprocessor, and
+social-card source live under `captures/` [@website-captures]. Those files were
+copied from the Red repository's `site/captures/` prototype on 2026-09-26, and
+the exact Red binary commit used for the original recordings was not recorded
 [@website-captures]. Re-recording therefore needs a current Red binary plus a
 fresh visual verification pass, not just a rebuild of the website.

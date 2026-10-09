@@ -30,69 +30,57 @@ sources:
 
 Use this guide when publishing the Red marketing site to `getred.dev` and its
 companion domains. The website is maintained in the sibling `red-website`
-checkout, not in this repository, and it builds a vinext app into a Cloudflare
-Worker rather than using a repo-owned Wrangler deployment flow [@website-readme].
-OpenAI Sites owns production deployment for that Worker, so the release boundary
-is a built `dist/` archive saved as a Sites version and then published with the
-Sites connector [@sites-session]. For content, media, and shortcut
-accuracy before publication, use [Refresh Public Site](refresh-public-site).
+repository family, not in this repository, and it builds a vinext app into a
+Cloudflare Worker rather than using a repo-owned Wrangler deployment flow
+[@website-readme]. OpenAI Sites owns production deployment for that Worker, so
+the release boundary is a built `dist/` archive saved as a Sites version and
+then published with the Sites connector [@sites-session]. For content, media,
+and shortcut accuracy before publication, use
+[Refresh Public Site](refresh-public-site).
 
 ## Reopen The Live State
 
 Do not infer production state from branch names, local worktrees, or an earlier
-deployment note. A read-only Sites audit on 2026-09-26 found project
-`appgprj_6a5d1afa50688191845035d9452f52b4`, active public URL
-`https://getred.dev`, no preview URL, and live version 19 at commit
-`97c8106ffc10d89e623c745e72003ebc283ee5fa` with deployment
-`appgdep_6aaef6e922ac8191bf111ea7693fc748` [@sites-session]. Treat those
-IDs as a rollback reference and historical snapshot, not as current truth.
-Before each deploy, call the Sites read methods again and record the current
-live version ID and deployment ID [@sites-session].
+deployment note. Before each deploy, call the Sites read methods again and
+record the current live version ID, deployment ID, source branch head, access
+mode, generated host, and custom-domain set [@sites-session]. Then choose or
+create the local `red-website` checkout that matches that source state before
+editing, building, or saving a Sites version [@sites-session]. A default sibling
+checkout may be behind the deployed source, and a release-specific worktree may
+be the better local authority for the commit being published [@sites-session].
 
-The same audit found four active custom domains: `getred.dev`,
-`getrededitor.com`, `rededitor.dev`, and `rededitor.app`; the generated
-`red-editor.fcoury.chatgpt.site` URL is not a custom-domain record
-[@sites-session]. The website code also treats those five hosts as public
-hosts for origin-aware install commands and metadata [@public-origin]. All five
-hosts returned `200` without redirects during the 2026-09-26 check, and the
-available Sites domain tools did not expose a redirect setting
-[@sites-session]. If canonical-host redirects are added, implement and test
-them in the Worker or another routing layer, then recheck installer behavior
-through each host.
+The website code treats `getred.dev`, `getrededitor.com`, `rededitor.dev`,
+`rededitor.app`, and the generated Sites host as public hosts for origin-aware
+install commands and metadata [@public-origin]. If canonical-host redirects are
+added, implement and test them in the Worker or another routing layer, then
+recheck installer behavior through each host.
 
-The September 2026 deployment audit found a real drift failure: the live site was
-serving the `codex/red-docs-foundation` branch content that showed Red `v0.2.4`,
-while the newer `origin/main` launch content showed Red `v0.7.0` and included
-`/releases` [@deployment-transcript]. A homepage redesign should preserve both
-the full docs branch content and the current release surface before deployment,
-or the site can regress by publishing one side of that split over the other
-[@deployment-transcript].
+Historical Sites waypoints explain why the live-state check is mandatory:
 
-The follow-up Direction A deployment fixed that split by merging the launch
-content and docs ancestry before saving a new Sites version [@sites-session].
-It published version 20 for the redesigned homepage, version 22 for the primary
-installer-command correction, and version 23 for the v0.8.0 release page and
-docs update across all five public hosts [@sites-session]. Those
-version numbers are historical waypoints only. They prove the Codex Sites
-connector can perform the save-then-deploy sequence in an authorized Codex
-session, but a later deploy still has to reopen the live version, deployment ID,
-source-branch head, and host checks before changing production.
+| Date | Waypoint | Durable lesson |
+| --- | --- | --- |
+| 2026-09-26 | A read-only Sites audit found project `appgprj_6a5d1afa50688191845035d9452f52b4`, active public URL `https://getred.dev`, no preview URL, live version 19 at commit `97c8106ffc10d89e623c745e72003ebc283ee5fa`, and deployment `appgdep_6aaef6e922ac8191bf111ea7693fc748` [@sites-session]. | Treat saved IDs as rollback references and historical snapshots, not current truth. |
+| 2026-09-26 | The same audit found four active custom domains plus the generated Sites host, and all five hosts returned `200` without redirects [@sites-session]. | Verify every host after deploys and after any routing change. |
+| September 2026 | The live site served `codex/red-docs-foundation` content that showed Red `v0.2.4`, while newer launch content showed Red `v0.7.0` and included `/releases` [@deployment-transcript]. | Preserve docs ancestry and the current release surface together. |
+| Follow-up Direction A deploy | Versions 20, 22, and 23 published the redesigned homepage, installer-command correction, and v0.8.0 release/docs update across all five public hosts [@sites-session]. | The Sites connector can perform the save-then-deploy sequence, but each future deploy still needs fresh source, version, deployment, and host evidence. |
 
 ## Build The Archive
 
-Deploy from an exact pushed commit in `red-website`. The Sites save operation
-expects `commit_sha` to be the full SHA at the head of the site's configured
-remote source branch, and the uploaded archive must be built from that same
-source state [@sites-session]. This is a stricter requirement
-than "the commit exists somewhere on GitHub": a save attempt can fail when the
-public branch has the desired commit but the Sites source branch still points at
-an older head [@sites-session]. The site requires Node
+Deploy from an exact pushed commit in the checkout that matches the current
+Sites source branch. The Sites save operation expects `commit_sha` to be the
+full SHA at the head of the site's configured remote source branch, and the
+uploaded archive must be built from that same source state [@sites-session].
+This is a stricter requirement than "the commit exists somewhere on GitHub": a
+save attempt can fail when the public branch has the desired commit but the
+Sites source branch still points at an older head [@sites-session]. The site
+requires Node
 `>=22.13.0`; `npm test` runs the installer drift check, `npm run build`, and
 rendered HTML assertions [@website-package]. Also run `npm audit --omit=dev`
 against the same export before saving a production version: the v0.8.0 website
-release found production dependency advisories in an otherwise unchanged
-lockfile after the release page and docs were already live, and that count is
-audit-time state rather than a durable release fact [@sites-session]. The README
+release found unresolved production dependency advisories in an otherwise
+unchanged lockfile after the release page and docs were already live, and the
+exact advisory count is audit-time state rather than a durable release fact
+[@sites-session]. The README
 requires installers to be synced only to an actually published Red release
 commit, because `public/installers.json` feeds the release version shown in the
 site [@website-readme].
@@ -110,7 +98,7 @@ Use an isolated export for the commit being deployed so dirty local state cannot
 enter the archive:
 
 ```shell
-repo="$HOME/code/red-website"
+repo="<path-to-matching-red-website-checkout>"
 sha="<full-sha>"
 release_dir="$(mktemp -d /tmp/red-site-release.XXXXXX)"
 git -C "$repo" archive --format=tar "$sha" | tar -xf - -C "$release_dir"

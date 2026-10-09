@@ -33,14 +33,16 @@ constraints separate from shipped editor runtime claims [@positioning].
 Use [Refresh public site](refresh-public-site) when changing website content,
 captures, walkthroughs, interactive homepage concepts, or production media. It
 is the guide for checking public claims against current Red docs and source,
-keeping prototype material out of runtime claims, finding the production
-`red-website` assets, and preparing replaceable media packages [@refresh].
+keeping prototype material out of runtime claims, finding production website
+assets, and preparing replaceable media packages [@refresh].
 
 Use [Deploy public site](deploy-public-site) only when refreshed content is
-ready to publish or roll back. It covers the sibling `red-website` checkout,
-the built `dist/` archive boundary, Sites connector calls, custom-domain
-checks, installer-route verification, and rollback to a saved Sites version
-[@deploy].
+ready to publish or roll back. It covers the sibling `red-website` repository
+family, the built `dist/` archive boundary, Sites connector calls,
+custom-domain checks, installer-route verification, and rollback to a saved
+Sites version [@deploy]. Website source and deployment evidence often live
+outside this repository, so reopen Sites state and match the deployed source
+commit before treating a local checkout as authoritative [@deploy].
 
 For editor release work that merely needs a reminder to coordinate the public
 site, stay with [Release Red](../releases/release-red). Move into this hub when

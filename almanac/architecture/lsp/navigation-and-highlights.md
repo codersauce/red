@@ -167,3 +167,15 @@ document-highlight configuration as shipped runtime behavior. Treat this page as
 the architecture map for the missing editor consumer paths, and treat current
 code as the source of truth for what users can invoke today [@editor]
 [@lsp-plan].
+
+## Related Pages
+
+Use [LSP Architecture](.) for the broader lifecycle and owner map, and
+[LSP Capabilities](../../concepts/lsp/capabilities) for the advertised server
+capability model. Use [Workspace Edits](workspace-edits) when location work
+starts sharing fail-closed edit preparation rules, and [Diagnostics UI](diagnostics-ui)
+for the existing editor-owned picker and visible LSP surface. Public key,
+command, and configuration changes should stay aligned with
+[Vim Compatibility](../../reference/vim/vim-compatibility),
+[Command Discovery](../commands/command-discovery), and
+[Default Config](../../reference/configuration/default-config).
