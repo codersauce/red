@@ -13811,6 +13811,7 @@ impl Editor {
         mappings
     }
 
+    #[allow(clippy::double_must_use)]
     #[async_recursion::async_recursion]
     async fn handle_key_action_inner(
         &mut self,
@@ -20283,6 +20284,7 @@ impl Editor {
             .await
     }
 
+    #[allow(clippy::double_must_use)]
     #[async_recursion::async_recursion]
     async fn execute_action_inner(
         &mut self,
