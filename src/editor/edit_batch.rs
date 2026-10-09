@@ -352,6 +352,7 @@ impl Editor {
         matches!(self.parse_substitute_command(command), Ok(Some(_)))
     }
 
+    #[allow(clippy::double_must_use)]
     #[async_recursion::async_recursion]
     pub(super) async fn execute_with_tracking(
         &mut self,
@@ -390,6 +391,7 @@ impl Editor {
         result
     }
 
+    #[allow(clippy::double_must_use)]
     #[async_recursion::async_recursion]
     pub(super) async fn handle_key_action(
         &mut self,

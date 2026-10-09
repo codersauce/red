@@ -3862,6 +3862,7 @@ pub struct Editor {
     /// LSP request currently owning the visible, cancellable code-action picker.
     pending_code_action_request: Option<i64>,
     pending_lsp_format_saves: HashMap<i64, PendingLspFormatSave>,
+    deferred_quit: DeferredQuit,
     pending_lsp_revision_snapshots: HashMap<i64, Vec<(String, u64)>>,
     pending_completions: HashMap<i64, PendingCompletion>,
     /// Definition requests whose eventual destination must precede queued CTRL-O/CTRL-I actions.
@@ -3950,6 +3951,14 @@ impl DetachedEditorCore {
         })
     }
 
+    async fn service_background(&mut self) -> anyhow::Result<()> {
+        self.editor
+            .service_background(&mut self.render_buffer, &mut self.runtime)
+            .await?;
+        self.stopped |= self.editor.take_deferred_quit();
+        Ok(())
+    }
+
     #[must_use]
     pub fn snapshot(&self, last_revision: Option<u64>) -> crate::headless::RenderDelta {
         crate::headless::RenderDelta {
@@ -4011,10 +4020,9 @@ impl DetachedEditorCore {
             self.editor
                 .finish_navigation_batch(&mut self.render_buffer, &mut self.runtime)
                 .await?;
+            self.stopped |= self.editor.take_deferred_quit();
         } else {
-            self.editor
-                .service_background(&mut self.render_buffer, &mut self.runtime)
-                .await?;
+            self.service_background().await?;
         }
         if self.editor.persist_session_snapshot(/*force*/ false) {
             self.editor.render(&mut self.render_buffer)?;
@@ -4035,9 +4043,7 @@ impl DetachedEditorCore {
                 EventRenderMode::Immediate,
             )
             .await?;
-        self.editor
-            .service_background(&mut self.render_buffer, &mut self.runtime)
-            .await?;
+        self.service_background().await?;
         self.finish_render()
     }
 
@@ -4055,9 +4061,7 @@ impl DetachedEditorCore {
                 EventRenderMode::Immediate,
             )
             .await?;
-        self.editor
-            .service_background(&mut self.render_buffer, &mut self.runtime)
-            .await?;
+        self.service_background().await?;
         self.finish_render()
     }
 
@@ -4067,9 +4071,7 @@ impl DetachedEditorCore {
     /// timers, directory watches, and agent events keep flowing in the core process.
     pub async fn tick(&mut self) -> anyhow::Result<Option<crate::headless::RenderDelta>> {
         let render_generation = self.editor.render_generation;
-        self.editor
-            .service_background(&mut self.render_buffer, &mut self.runtime)
-            .await?;
+        self.service_background().await?;
         if self.editor.persist_session_snapshot(/*force*/ false) {
             self.editor.render(&mut self.render_buffer)?;
         }
@@ -4558,6 +4560,13 @@ struct PendingLspFormatSave {
 struct ScratchBufferCommands {
     submit: Option<String>,
     cancel: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeferredQuit {
+    None,
+    AfterSave(BufferId),
+    Ready,
 }
 
 enum FormatOnSaveRequest {
@@ -5368,6 +5377,7 @@ impl Editor {
             pending_lsp_paste_formats: HashMap::new(),
             pending_code_action_request: None,
             pending_lsp_format_saves: HashMap::new(),
+            deferred_quit: DeferredQuit::None,
             pending_lsp_revision_snapshots: HashMap::new(),
             pending_completions: HashMap::new(),
             pending_definition_requests: HashSet::new(),
@@ -10325,6 +10335,9 @@ impl Editor {
             if !serviced_background {
                 self.service_background(&mut buffer, runtime).await?;
             }
+            if self.take_deferred_quit() {
+                break 'editor_loop;
+            }
             if self.persist_session_snapshot(/*force*/ false) {
                 self.render(&mut buffer)?;
             }
@@ -13798,6 +13811,7 @@ impl Editor {
         mappings
     }
 
+    #[allow(clippy::double_must_use)]
     #[async_recursion::async_recursion]
     async fn handle_key_action_inner(
         &mut self,
@@ -20270,6 +20284,7 @@ impl Editor {
             .await
     }
 
+    #[allow(clippy::double_must_use)]
     #[async_recursion::async_recursion]
     async fn execute_action_inner(
         &mut self,
@@ -20417,6 +20432,9 @@ impl Editor {
                 } else {
                     if *force {
                         return Ok(true);
+                    }
+                    if self.defer_quit_for_pending_save() {
+                        return Ok(false);
                     }
                     let modified_buffers = self.modified_buffers();
                     if modified_buffers.is_empty() {
@@ -27572,6 +27590,56 @@ impl Editor {
             .collect()
     }
 
+    fn has_pending_format_save(&self, buffer_id: BufferId) -> bool {
+        self.pending_lsp_format_saves.keys().any(|request_id| {
+            self.pending_lsp_edit_requests
+                .get(request_id)
+                .is_some_and(|pending| pending.buffer_id == buffer_id)
+        })
+    }
+
+    fn defer_quit_for_pending_save(&mut self) -> bool {
+        let buffer_id = self.current_buffer().id();
+        let should_defer = self.current_buffer().is_dirty()
+            && self
+                .buffer_manager
+                .iter()
+                .filter(|buffer| buffer.is_dirty())
+                .count()
+                == 1
+            && self.has_pending_format_save(buffer_id);
+        if should_defer {
+            self.deferred_quit = DeferredQuit::AfterSave(buffer_id);
+        }
+        should_defer
+    }
+
+    fn finish_deferred_quit(&mut self, buffer_id: BufferId, saved: bool) {
+        if self.deferred_quit != DeferredQuit::AfterSave(buffer_id) {
+            return;
+        }
+        self.deferred_quit = if saved {
+            DeferredQuit::Ready
+        } else {
+            DeferredQuit::None
+        };
+    }
+
+    fn take_deferred_quit(&mut self) -> bool {
+        match self.deferred_quit {
+            DeferredQuit::Ready => {
+                self.deferred_quit = DeferredQuit::None;
+                // A buffer may have changed while the asynchronous save was pending.
+                self.modified_buffers().is_empty()
+            }
+            DeferredQuit::AfterSave(buffer_id) if !self.has_pending_format_save(buffer_id) => {
+                self.deferred_quit = DeferredQuit::None;
+                false
+            }
+            DeferredQuit::None | DeferredQuit::AfterSave(_) => false,
+        }
+    }
+
     pub fn set_session_store(&mut self, store: SessionStore) {
         self.session_manager.set_store(store);
     }
@@ -29749,6 +29817,7 @@ impl Editor {
                     .as_deref()
                     .is_some_and(|candidate| candidate == uri)
         }) else {
+            self.finish_deferred_quit(buffer_id, /*saved*/ false);
             self.set_legacy_message(Some(
                 "formatted buffer is no longer open; save cancelled".to_string(),
             ));
@@ -29763,7 +29832,7 @@ impl Editor {
         } else {
             self.current_buffer_mut().save()
         };
-        match result {
+        let saved = match result {
             Ok(message) => {
                 self.set_notification_message(
                     if warning.is_some() {
@@ -29784,6 +29853,7 @@ impl Editor {
                         json!({ "file": file, "buffer_index": index, "document_id": self.current_buffer().id() }),
                     )
                     .await?;
+                true
             }
             Err(error) => {
                 if save_as.is_some() {
@@ -29791,12 +29861,14 @@ impl Editor {
                         .await;
                 }
                 self.set_legacy_message(Some(error.to_string()));
+                false
             }
-        }
+        };
         self.select_buffer_for_lsp_edit(original);
         (self.cx, self.cy, self.vtop, self.vleft, self.skipcol) = original_view;
         self.check_bounds();
         self.sync_inline_change_summaries();
+        self.finish_deferred_quit(buffer_id, saved);
         Ok(())
     }
 
@@ -30578,11 +30650,7 @@ impl Editor {
         save_as: Option<String>,
     ) -> anyhow::Result<FormatOnSaveRequest> {
         let buffer_id = self.current_buffer().id();
-        if self.pending_lsp_format_saves.keys().any(|request_id| {
-            self.pending_lsp_edit_requests
-                .get(request_id)
-                .is_some_and(|pending| pending.buffer_id == buffer_id)
-        }) {
+        if self.has_pending_format_save(buffer_id) {
             self.set_legacy_message(Some(
                 "format-on-save is already pending for this buffer".to_string(),
             ));
@@ -37826,6 +37894,18 @@ builtin = "rust"
     }
 
     #[test]
+    fn deferred_quit_is_cancelled_when_another_buffer_becomes_dirty() {
+        let mut editor = test_editor(80, 24);
+        let mut other = Buffer::new(None, String::new());
+        other.insert_str(0, 0, "changed");
+        editor.buffer_manager.push_buffer(other);
+        editor.deferred_quit = DeferredQuit::Ready;
+
+        assert!(!editor.take_deferred_quit());
+        assert_eq!(editor.deferred_quit, DeferredQuit::None);
+    }
+
+    #[test]
     #[should_panic(expected = "editor content mutations must occur inside an edit transaction")]
     fn recorded_edits_require_an_active_transaction() {
         let mut editor = test_editor(/*width*/ 80, /*height*/ 24);
@@ -44918,7 +44998,9 @@ while True:
                         editor.test_execute_production_action(action).await.unwrap();
                     }
                 }
-                if std::fs::read_to_string(path).ok().as_deref() == Some(expected) {
+                if editor.pending_lsp_format_saves.is_empty()
+                    && std::fs::read_to_string(path).ok().as_deref() == Some(expected)
+                {
                     break;
                 }
                 tokio::time::sleep(Duration::from_millis(5)).await;
@@ -44966,6 +45048,100 @@ while True:
         assert!(events.contains(&format!("textDocument/formatting {uri}")));
         assert_eq!(editor.buffer_manager[0].contents(), "value\n");
         assert!(!editor.buffer_manager[0].is_dirty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn wq_quits_after_delayed_format_save_completes() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("delayed-wq.rs");
+        std::fs::write(&path, "value   \n").unwrap();
+        let (mut editor, ready, release, _) = delayed_formatter_editor(
+            root.path(),
+            Buffer::new(
+                Some(path.to_string_lossy().into_owned()),
+                "value   \n".to_string(),
+            ),
+        );
+
+        editor
+            .test_execute_production_action(Action::Command("wq".to_string()))
+            .await
+            .unwrap();
+        wait_for_formatter_initialize(&ready).await;
+
+        assert!(!editor.take_deferred_quit());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "value   \n");
+
+        std::fs::write(&release, "release").unwrap();
+        complete_delayed_format_save(&mut editor, &path, "value\n").await;
+
+        assert!(editor.take_deferred_quit());
+        assert!(!editor.buffer_manager[0].is_dirty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn wq_stays_open_when_delayed_format_save_fails() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("failed-wq.rs");
+        std::fs::write(&path, "value   \n").unwrap();
+        let (mut editor, ready, release, _) = delayed_formatter_editor(
+            root.path(),
+            Buffer::new(
+                Some(path.to_string_lossy().into_owned()),
+                "value   \n".to_string(),
+            ),
+        );
+
+        editor
+            .test_execute_production_action(Action::Command("wq".to_string()))
+            .await
+            .unwrap();
+        wait_for_formatter_initialize(&ready).await;
+        std::fs::write(&path, "external\n").unwrap();
+        std::fs::write(&release, "release").unwrap();
+        complete_delayed_format_save(&mut editor, &path, "external\n").await;
+
+        assert!(!editor.take_deferred_quit());
+        assert!(editor.buffer_manager[0].is_dirty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn wq_stays_open_when_buffer_changes_while_formatting_is_pending() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("changed-wq.rs");
+        std::fs::write(&path, "value   \n").unwrap();
+        let (mut editor, ready, release, _) = delayed_formatter_editor(
+            root.path(),
+            Buffer::new(
+                Some(path.to_string_lossy().into_owned()),
+                "value   \n".to_string(),
+            ),
+        );
+
+        editor
+            .test_execute_production_action(Action::Command("wq".to_string()))
+            .await
+            .unwrap();
+        wait_for_formatter_initialize(&ready).await;
+        editor
+            .test_execute_production_action(Action::InsertCharAtCursorPos('x'))
+            .await
+            .unwrap();
+        std::fs::write(&release, "release").unwrap();
+        complete_delayed_format_save(&mut editor, &path, "value   \n").await;
+
+        assert!(!editor.take_deferred_quit());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "value   \n");
+        assert!(editor.buffer_manager[0].contents().starts_with('x'));
+        assert!(editor.buffer_manager[0].is_dirty());
+        assert!(editor.pending_lsp_format_saves.is_empty());
+        assert!(editor
+            .last_error
+            .as_deref()
+            .is_some_and(|error| error.contains("stale")));
     }
 
     #[cfg(unix)]
