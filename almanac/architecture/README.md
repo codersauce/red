@@ -27,6 +27,9 @@ sources:
   - id: config-fail-closed
     type: file
     path: almanac/decisions/configuration/fail-closed-recovery.md
+  - id: config-hub
+    type: file
+    path: almanac/architecture/configuration/README.md
   - id: followed-editing
     type: file
     path: almanac/architecture/agent/followed-editing.md
@@ -49,7 +52,7 @@ Architecture pages explain Red's runtime ownership, subsystem boundaries, and cr
 
 Start with [Red editor](../concepts/red-editor) for the product model, then read [Editor architecture](editor) when the change touches buffers, windows, input handling, rendering, plugin dispatch, LSP polling, recovery snapshots, or agent events [@editor-hub]. The editor subpages split that core into [Buffers and windows](editor/buffers-and-windows), [Rendering pipeline](editor/rendering-pipeline), [Text mutation boundary](editor/text-mutation-boundary), [LSP document sync](editor/lsp-document-sync), [Plugin host requests](editor/plugin-host-requests), [Syntax services](editor/syntax-services), and [Event loop](editor/event-loop).
 
-Use [Runtime lifecycle](startup/runtime-lifecycle) and [Red command](../reference/cli/red-command) for startup branches, utility modes, file opening, crash resume, and detach or attach decisions. Use [Layered config recovery](configuration/layered-config-recovery) and [Default config](../reference/configuration/default-config) when startup behavior is shaped by defaults, user TOML, recovery diagnostics, or strict command-line overrides.
+Use [Runtime lifecycle](startup/runtime-lifecycle) and [Red command](../reference/cli/red-command) for startup branches, utility modes, file opening, crash resume, and detach or attach decisions. Use [Configuration architecture](configuration) when startup behavior is shaped by defaults, user TOML, recovery diagnostics, strict command-line overrides, LSP defaults, theme loading, or Copilot completion settings [@config-hub].
 
 ## Integrations
 

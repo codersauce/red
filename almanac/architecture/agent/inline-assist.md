@@ -24,6 +24,9 @@ sources:
   - id: history
     type: file
     path: src/inline_history.rs
+  - id: copilot-guide
+    type: file
+    path: almanac/guides/agent/copilot-completion.md
 ---
 
 # Inline Assist
@@ -36,6 +39,9 @@ editor rather than letting Codex write files directly [@workflow] [@codex].
 Use this page when changing `Space i`, inline result validation, wider
 same-file proposals, retained inline history, or the handoff from an inline
 discussion into the full [Agent architecture](../agent) path.
+For inline ghost-text suggestions that run beside ordinary completion instead
+of through Codex turns, use [Copilot Inline Completion](../../guides/agent/copilot-completion)
+[@copilot-guide].
 
 ## Request Boundary
 

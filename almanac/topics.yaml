@@ -40,8 +40,8 @@ topics:
     description: Public command-line surfaces for Red and Husk.
     parents: [reference]
   - slug: commands
-    title: Commands
-    description: Editor commands, command palette discovery, and keymap-derived command lookup.
+    title: Editor Commands
+    description: Editor colon commands, command palette discovery, and keymap-derived command lookup, distinct from process CLI commands.
     parents: [editor, cli]
   - slug: configuration
     title: Configuration

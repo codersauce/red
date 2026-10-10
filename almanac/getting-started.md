@@ -24,6 +24,9 @@ sources:
   - id: release-guide
     type: file
     path: almanac/guides/releases/release-red.md
+  - id: release-hub
+    type: file
+    path: almanac/guides/releases/README.md
   - id: website-positioning
     type: file
     path: almanac/concepts/website-positioning.md
@@ -67,6 +70,6 @@ Then use [Sessions architecture](architecture/sessions) for the implementation s
 
 For local work, start with [Build, test, and validate](guides/development/build-test-and-validate). The README lists the expected development loop as `cargo build`, `cargo test --all-targets --all-features`, and `cargo clippy --all-targets --all-features -- -D warnings` after cloning the repository [@readme].
 
-For publication work, use [Release Red](guides/releases/release-red) instead of starting from the generic validation guide. The release guide keeps release preparation, reviewed campaign copy, tag publishing, archive smoke tests, Homebrew publication, installer checks, and announcement workflow in one reading path [@release-guide].
+For publication work, start with [Release Operations](guides/releases) instead of the generic validation guide. That hub routes editor releases, reviewed campaign copy, release workflow mechanics, installer smoke tests, public-site coordination, and language-pack publication before [Release Red](guides/releases/release-red) takes over the editor release runbook [@release-hub] [@release-guide].
 
 For external-site work, start with [Website positioning](concepts/website-positioning) to keep `getred.dev` audience, media, installer URL, and prototype-language constraints separate from shipped editor runtime claims [@website-positioning]. Then use [Website operations](guides/website) for the content refresh, media, deployment, domain, and rollback reading path [@website-operations].

@@ -33,6 +33,9 @@ sources:
   - id: release-guide
     type: file
     path: almanac/guides/releases/release-red.md
+  - id: release-hub
+    type: file
+    path: almanac/guides/releases/README.md
   - id: release-campaign
     type: file
     path: almanac/reference/releases/release-campaign.md
@@ -73,6 +76,18 @@ For live sessions, use [Detach And Reattach](sessions/detach-reattach) when the 
 
 Use [Performance Checks](performance/performance-checks) for deterministic CI performance gates and workstation benchmarks that catch editor, detach, interaction, and Git workspace regressions [@performance-guide].
 
-For publication work, [Release Red](releases/release-red) covers the editor release flow from prepare-release through tag publishing, archive smoke tests, Homebrew update, installer verification, and Discord announcement [@release-guide]. Use [Release Campaign](../reference/releases/release-campaign) when the work is the reviewed release-message manifest, exact version resolution, or the boundary between automated Discord posting and preview-only social copy [@release-campaign]. [Release A Language Pack](plugins/release-language-pack) covers the separate first-party language-pack tag, packaging, catalog update, and Red-side install verification path [@language-pack-release]. [Release Installers](installers/release-installers) narrows Red's Unix and Windows installer verification, checksum handling, self-check execution, fixture tests, and latest-release smoke tests [@installers-guide].
+For publication work, start with [Release Operations](releases), then move into
+[Release Red](releases/release-red) for the editor release flow from
+prepare-release through tag publishing, archive smoke tests, Homebrew update,
+installer verification, and Discord announcement [@release-hub]
+[@release-guide]. Use [Release Campaign](../reference/releases/release-campaign)
+when the work is the reviewed release-message manifest, exact version
+resolution, or the boundary between automated Discord posting and preview-only
+social copy [@release-campaign]. [Release A Language Pack](plugins/release-language-pack)
+covers the separate first-party language-pack tag, packaging, catalog update,
+and Red-side install verification path [@language-pack-release]. [Release Installers](installers/release-installers)
+narrows Red's Unix and Windows installer verification, checksum handling,
+self-check execution, fixture tests, and latest-release smoke tests
+[@installers-guide].
 
 Use [Website Operations](website) when publication work touches `getred.dev` docs, media, installer routes, OpenAI Sites, custom domains, or rollback [@website-hub]. Within that cluster, [Refresh Public Site](website/refresh-public-site) is the content and media procedure before publishing [@website-guide], and [Deploy Public Site](website/deploy-public-site) is the production Sites procedure [@deploy-public-site].

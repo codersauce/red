@@ -24,6 +24,9 @@ sources:
   - id: agent-check
     type: file
     path: almanac/reference/agent/agent-check.md
+  - id: inline-assist
+    type: file
+    path: almanac/architecture/agent/inline-assist.md
 ---
 
 # Copilot Inline Completion
@@ -37,6 +40,9 @@ with, read [LSP Completion](../../architecture/lsp/completion). For exact
 configuration defaults, use [Default Config](../../reference/configuration/default-config);
 for Codex agent readiness instead of Copilot completion, use
 [Agent Check](../../reference/agent/agent-check) [@config-reference] [@agent-check].
+For source-anchored Codex questions, annotations, replacements, and same-file
+proposals, use [Inline Assist](../../architecture/agent/inline-assist) instead
+[@inline-assist].
 
 ## Set Up
 
@@ -155,4 +161,7 @@ the `[copilot]`, `[completion]`, and `disable_ai` defaults. Use
 [LSP Completion](../../architecture/lsp/completion) when the issue is the
 ordinary popup request, filtering, or accepted-item mutation path. Use
 [Agent Check](../../reference/agent/agent-check) when the question is Codex
-app-server readiness rather than Copilot inline suggestions.
+app-server readiness rather than Copilot inline suggestions. Use
+[Inline Assist](../../architecture/agent/inline-assist) when the workflow is a
+bounded Codex turn over a selected source target rather than ghost-text
+completion [@inline-assist].
