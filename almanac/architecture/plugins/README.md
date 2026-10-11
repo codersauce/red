@@ -42,6 +42,9 @@ sources:
   - id: callback-dialogs
     type: file
     path: almanac/concepts/plugins/callback-scoped-dialogs.md
+  - id: git-workspace
+    type: file
+    path: almanac/architecture/plugins/git-workspace.md
 ---
 
 # Plugin Architecture
@@ -57,6 +60,12 @@ Use [Resource Ownership](resource-ownership) when plugin work touches panels, wo
 [Command Discovery And Dispatch](../commands/command-discovery) covers plugin command metadata, palette rows, colon command collisions, keymap shortcuts, command routing, and panel-global command scope.
 
 [Bundled Husk Plugins](../../concepts/plugins/bundled-husk-plugins) explains how shipped plugins relate to embedded runtime assets and pure Husk packages. [Callback-Scoped Dialogs](../../concepts/plugins/callback-scoped-dialogs) explains the handle-based picker and composer model used by plugin callbacks.
+
+Use [Git Workspace](git-workspace) when changing the bundled Git dashboard,
+status polling, structured diffs, gutter signs, hunk actions, commit buffers,
+push previews, or guarded Git operations. It is the architecture page for the
+large first-party plugin workflow that combines Husk state, internal Git core
+helpers, host-managed processes, and editor-owned workspace UI [@git-workspace].
 
 ## Host API Reading Map
 

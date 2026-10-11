@@ -30,6 +30,9 @@ sources:
   - id: tree-model
     type: file
     path: src/plugin/tree.rs
+  - id: git-workspace
+    type: file
+    path: almanac/architecture/plugins/git-workspace.md
 ---
 
 Bundled Husk plugins are the Husk feature layer that ships with Red itself. The repository embeds the `plugins/` tree into the binary as runtime assets, while `default_config.toml` selects the default configured plugin set by mapping plugin names to `.hk` files [@assets] [@default-config]. Most bundled behavior lives in single `.hk` compatibility shells, but Git and Neo-tree also call embedded pure Husk packages for typed parsing, path handling, row construction, and command argument construction [@git-plugin] [@neotree-plugin] [@git-core] [@neotree-core] [@runtime]. This distinction matters when changing plugin behavior: the shell owns editor events and host calls, while the core package owns deterministic logic that can be compiled and tested as Husk code.
@@ -48,7 +51,7 @@ Git and Neo-tree have an extra split. `plugins/git.hk` remains the editor-facing
 
 That split keeps public plugin compatibility small. A shell can continue to use Red events and UI calls, while pure package code can use typed data models without becoming a public host API. The user-facing host contract for plugin authors belongs in [Plugin host API](../../reference/plugins/host-api), not in the internal bridge operation names [@runtime].
 
-The Git shell owns the user-facing operation workflow around those pure helpers. User-triggered mutating operations such as commit, pull, merge, rebase, cherry-pick, revert, and safe-sync branches display transient progress through a plugin overlay, use host-managed busy animation, and then show bounded success or failure text [@git-plugin]. Background refresh and hunk application stay quiet, while the safe-sync ahead branch routes into the normal push menu instead of bypassing its existing confirmation and progress flow [@git-plugin].
+The Git shell owns the user-facing operation workflow around those pure helpers. User-triggered mutating operations such as commit, pull, merge, rebase, cherry-pick, revert, and safe-sync branches display transient progress through a plugin overlay, use host-managed busy animation, and then show bounded success or failure text [@git-plugin]. Background refresh and hunk application stay quiet, while the safe-sync ahead branch routes into the normal push menu instead of bypassing its existing confirmation and progress flow [@git-plugin]. Use [Git Workspace](../../architecture/plugins/git-workspace) for the dashboard, status polling, structured diff, hunk-action, commit-buffer, and guarded-operation architecture behind that shell [@git-workspace].
 
 The Git commit flow opens an editor-owned scratch buffer named `[Git Commit].gitcommit` with `GitSubmitMessage` as its submit command and `GitCancelMessage` as its cancel command [@git-plugin]. The scratch text contains a marker line, and only text above that marker becomes the commit message; the generated context below it is ignored before `git commit` receives stdin [@git-plugin]. The scratch buffer text tells users that `:w` or `:wq` submits and `:q` cancels, while the default Space command neighborhood also binds `Space c c` to `GitSubmitMessage` and `Space c q` to `GitCancelMessage` [@git-plugin] [@default-config].
 
