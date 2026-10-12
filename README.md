@@ -19,9 +19,9 @@ configuration; optional agent support requires an installed, authenticated Codex
 [Documentation](#documentation) ·
 [Community](https://discord.gg/5PWvAUNRHU)
 
-<!-- current-release: 0.8.0 -->
+<!-- current-release: 0.8.1 -->
 The current documented release is
-[v0.8.0](https://github.com/codersauce/red/releases/tag/v0.8.0).
+[v0.8.1](https://github.com/codersauce/red/releases/tag/v0.8.1).
 
 ![Red editing its Rust rendering pipeline with the project tree open](docs/images/editor-overview.jpg)
 
@@ -55,7 +55,7 @@ The PowerShell installer verifies the release checksum, installs to
 To pin a release or choose another directory:
 
 ```shell
-RED_VERSION=0.8.0 RED_INSTALL_DIR="$HOME/bin" \
+RED_VERSION=0.8.1 RED_INSTALL_DIR="$HOME/bin" \
   sh -c "$(curl --proto '=https' --tlsv1.2 -fsSL https://getred.dev/install.sh)"
 ```
 
@@ -82,23 +82,18 @@ completed `codex login`.
   sessions retain buffers, plugins, LSP state, and running agents across
   terminal or SSH disconnects.
 
-## New in v0.8.0
+## New in v0.8.1
 
-The v0.8.0 release adds:
+The v0.8.1 release adds:
 
-- **Directory browsing in editor windows.** Run `red .` or open a directory
-  with `:e`. Move through entries with normal editor keys, press Enter to open
-  one, or press `-` to go up. Directory buffers are read-only and revisitable.
-- **Mouse selection that stays in the editor.** Drag to make a Visual selection;
-  double-click selects a word, triple-click a line, and quadruple-click a
-  block. Continue with Vim motions and editing commands.
-- **Syntax detection for extensionless scripts.** Red reads a shebang when a
-  filename has no language match. Bundled interpreters cover common shells,
-  Node, Lua, PowerShell, and Husk; language packs can register more.
-- **Familiar picker keys.** Use `Ctrl-n` and `Ctrl-p` to move through results
-  without changing the search query.
-- **Optional Rust Glancer configuration.** Rust projects can opt into Glancer
-  with a documented server configuration; rust-analyzer remains the default.
+- **More room in pickers.** Press `Alt-p` or `F4` to hide or restore a preview
+  in the file, buffer, or project-search picker. Your query and selection stay
+  in place while longer paths become visible.
+- **Reliable save and quit with formatting.** When format-on-save is pending,
+  `:wq` waits for the save before exiting. If the save fails or the buffer
+  changes, Red stays open.
+
+This release also updates Wasmtime.
 
 ## First five minutes
 

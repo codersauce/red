@@ -128,14 +128,10 @@ def render_github(campaign: Mapping[str, Any]) -> str:
         else f"## Red: {campaign['headline']}"
     )
     stories = stories_for_channel(campaign, "github")
-    lines = [heading, "", campaign["summary"], "", "### Three things to try", ""]
-    for number, story in enumerate(stories[:3], start=1):
-        lines.append(f"{number}. **{story['title']}.** {story['summary']}")
-    lines.extend(("", "### More in this release", ""))
-    for story in stories[3:]:
-        label = "New" if story["status"] == "new" else "Improved"
+    lines = [heading, "", campaign["summary"], "", "### Highlights", ""]
+    for story in stories:
+        label = story["status"].title()
         lines.append(f"- **{label}: {story['title']}.** {story['summary']}")
-    lines.extend(("", "Agent support requires an installed Codex CLI and `codex login`."))
     return "\n".join(lines) + "\n"
 
 

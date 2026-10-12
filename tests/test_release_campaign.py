@@ -24,14 +24,13 @@ class ReleaseCampaignTest(unittest.TestCase):
         version = self.campaign["version"]
 
         self.assertTrue(version == "next" or SEMVER.fullmatch(version) is not None)
-        self.assertGreaterEqual(len(self.campaign["stories"]), 3)
+        self.assertGreaterEqual(len(self.campaign["stories"]), 1)
 
     def test_preserves_editorial_story_order(self) -> None:
         stories = stories_for_channel(self.campaign, "discord")
 
-        self.assertEqual(stories[0]["id"], "directory-buffers")
-        self.assertEqual(stories[1]["id"], "mouse-selection")
-        self.assertEqual(stories[2]["id"], "shebang-syntax")
+        self.assertEqual(stories[0]["id"], "picker-preview-toggle")
+        self.assertEqual(stories[1]["id"], "format-save-quit")
 
     def test_rejects_duplicate_story_ids(self) -> None:
         campaign = copy.deepcopy(self.campaign)
@@ -64,14 +63,14 @@ class ReleaseCampaignTest(unittest.TestCase):
             self.assertEqual(campaign["version"], "0.8.1")
             self.assertEqual(campaign["stories"], self.campaign["stories"])
 
-    def test_renders_github_intro_with_prerequisites_and_ordered_stories(self) -> None:
+    def test_renders_github_intro_with_ordered_stories(self) -> None:
         output = render(self.campaign, "github")
 
-        self.assertIn("### Three things to try", output)
-        self.assertIn("### More in this release", output)
-        self.assertIn("codex login", output)
-        self.assertIn("red .", output)
-        self.assertLess(output.index("Browse a directory"), output.index("Select with the mouse"))
+        self.assertIn("### Highlights", output)
+        self.assertIn("New: Make room for long paths", output)
+        self.assertIn("Improved: Save and quit", output)
+        self.assertNotIn("### More in this release", output)
+        self.assertLess(output.index("Make room for long paths"), output.index("Save and quit"))
 
     def test_social_previews_are_bounded_and_include_destination(self) -> None:
         for channel, limit in SOCIAL_LIMITS.items():
@@ -80,7 +79,7 @@ class ReleaseCampaignTest(unittest.TestCase):
 
                 self.assertLessEqual(len(output.rstrip("\n")), limit)
                 self.assertIn("https://github.com/codersauce/red/releases/latest", output)
-                self.assertIn("red .", output)
+                self.assertIn("Alt-p", output)
 
         resolved = copy.deepcopy(self.campaign)
         resolved["version"] = "0.8.1"
@@ -88,10 +87,10 @@ class ReleaseCampaignTest(unittest.TestCase):
             self.assertLessEqual(len(render(resolved, channel).rstrip("\n")), limit)
             self.assertIn("Red v0.8.1 is out", render(resolved, channel))
 
-    def test_channel_specific_stories_do_not_leak_into_x_preview(self) -> None:
-        output = render(self.campaign, "x")
+    def test_channel_specific_stories_do_not_leak_into_x_selection(self) -> None:
+        stories = stories_for_channel(self.campaign, "x")
 
-        self.assertNotIn("Glancer", output)
+        self.assertEqual([story["id"] for story in stories], ["picker-preview-toggle"])
 
     def test_rejects_boolean_pull_request_numbers(self) -> None:
         campaign = copy.deepcopy(self.campaign)
