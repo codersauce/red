@@ -29,8 +29,8 @@ class ReleaseCampaignTest(unittest.TestCase):
     def test_preserves_editorial_story_order(self) -> None:
         stories = stories_for_channel(self.campaign, "discord")
 
-        self.assertEqual(stories[0]["id"], "picker-preview-toggle")
-        self.assertEqual(stories[1]["id"], "format-save-quit")
+        self.assertEqual(stories[0]["id"], "standalone-updater")
+        self.assertEqual(stories[1]["id"], "daily-update-checks")
 
     def test_rejects_duplicate_story_ids(self) -> None:
         campaign = copy.deepcopy(self.campaign)
@@ -67,10 +67,10 @@ class ReleaseCampaignTest(unittest.TestCase):
         output = render(self.campaign, "github")
 
         self.assertIn("### Highlights", output)
-        self.assertIn("New: Make room for long paths", output)
-        self.assertIn("Improved: Save and quit", output)
+        self.assertIn("New: Update from the editor or terminal", output)
+        self.assertIn("New: Hear about new releases", output)
         self.assertNotIn("### More in this release", output)
-        self.assertLess(output.index("Make room for long paths"), output.index("Save and quit"))
+        self.assertLess(output.index("Update from the editor or terminal"), output.index("Hear about new releases"))
 
     def test_social_previews_are_bounded_and_include_destination(self) -> None:
         for channel, limit in SOCIAL_LIMITS.items():
@@ -79,7 +79,7 @@ class ReleaseCampaignTest(unittest.TestCase):
 
                 self.assertLessEqual(len(output.rstrip("\n")), limit)
                 self.assertIn("https://github.com/codersauce/red/releases/latest", output)
-                self.assertIn("Alt-p", output)
+                self.assertIn("red update", output)
 
         resolved = copy.deepcopy(self.campaign)
         resolved["version"] = "0.8.1"
@@ -90,7 +90,7 @@ class ReleaseCampaignTest(unittest.TestCase):
     def test_channel_specific_stories_do_not_leak_into_x_selection(self) -> None:
         stories = stories_for_channel(self.campaign, "x")
 
-        self.assertEqual([story["id"] for story in stories], ["picker-preview-toggle"])
+        self.assertEqual([story["id"] for story in stories], ["standalone-updater"])
 
     def test_rejects_boolean_pull_request_numbers(self) -> None:
         campaign = copy.deepcopy(self.campaign)

@@ -1,28 +1,28 @@
 schema_version = 1
 version = "0.8.2"
-headline = "More room in pickers, reliable save and quit"
-summary = "Red v0.8.1 lets you hide picker previews to see longer result paths. It also waits for an in-progress format-on-save before `:wq` exits, and updates Wasmtime."
+headline = "Update Red from your editor or terminal"
+summary = "Red v0.8.2 adds a managed updater for official standalone installations. Daily checks notify you about new stable releases; you choose when to install them."
 website = "https://github.com/codersauce/red/releases/latest"
 
-x_post = """{launch}. Hide picker previews with Alt-p or F4 to see longer paths. `:wq` now waits for format-on-save to finish before exiting.
+x_post = """{launch}. Official standalone installs can update with `red update` or `:update`. Daily checks notify you; installation waits for your command.
 
 {url}"""
-bluesky_post = """{launch}. Toggle picker previews with Alt-p or F4 to make room for long paths. `:wq` now waits for format-on-save to finish before exiting.
+bluesky_post = """{launch}. Update official standalone installs with `red update` or `:update`. Red checks daily and notifies you about new stable releases; you choose when to install.
 
 {url}"""
 
 [[stories]]
-id = "picker-preview-toggle"
-title = "Make room for long paths in pickers"
-summary = "Press Alt-p or F4 to hide or restore the preview in file, buffer, and project-search pickers. The query and selected result stay in place."
+id = "standalone-updater"
+title = "Update from the editor or terminal"
+summary = "Run `red update`, `:update`, or Update Red in the command palette for an official standalone installation. The updater verifies the release checksum and candidate binary before replacement. Restart your editing sessions to use the new version."
 status = "new"
-pull_requests = [375]
+pull_requests = [377]
 channels = ["github", "discord", "x", "bluesky", "in_app"]
 
 [[stories]]
-id = "format-save-quit"
-title = "Save and quit after formatting finishes"
-summary = "When format-on-save is pending, `:wq` waits for the save to finish before exiting. A failed save or a new edit keeps the editor open."
-status = "improved"
-pull_requests = [373]
+id = "daily-update-checks"
+title = "Hear about new releases without unattended installs"
+summary = "Red checks for a newer stable release once per day and notifies you. Set `[updates] mode = \"off\"` to disable automatic checks; manual updates remain available."
+status = "new"
+pull_requests = [377]
 channels = ["github", "discord", "in_app"]
