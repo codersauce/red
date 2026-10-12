@@ -1,5 +1,5 @@
 schema_version = 1
-version = "0.8.0"
+version = "0.8.1"
 headline = "Open a directory, stay in the editor"
 summary = "Red v0.8.0 turns directories into navigable, read-only editor buffers. Start with `red .`, move through entries with familiar keys, and open files in place. Mouse selection, shebang-based syntax detection, and picker navigation make the rest of the trip easier."
 website = "https://github.com/codersauce/red/releases/latest"

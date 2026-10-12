@@ -2,6 +2,39 @@
 
 All notable changes to Red are documented in this file.
 
+## [0.8.1](https://github.com/codersauce/red/compare/v0.8.0...v0.8.1)
+
+### Features
+
+- **picker:** Add preview toggle shortcuts ([fec58b2](https://github.com/codersauce/red/commit/fec58b2ca63cd80fd1c2f3b9ca188bf8852728f6))
+
+### Bug Fixes
+
+- **picker:** Keep preview action activatable from help ([1247ef9](https://github.com/codersauce/red/commit/1247ef9a7d580fcaf04b4edfacd6b02cacc75dfb))
+- **security:** Upgrade wasmtime ([22b909c](https://github.com/codersauce/red/commit/22b909c13d2b14e9cf93eafe95d0305373d1d4a9))
+- **ci:** Support clippy 1.99 ([40bc9fb](https://github.com/codersauce/red/commit/40bc9fb91c0720f6d36d5de0b3570f153648f145))
+- **editor:** Quit after pending format save ([cfe1fe5](https://github.com/codersauce/red/commit/cfe1fe57102920303160bd24cbe798cc114864e0))
+
+### Testing
+
+- **editor:** Cover edits during deferred quit ([bd74d6a](https://github.com/codersauce/red/commit/bd74d6a1c0d745eddb60f6bcf7c5089830cf43c5))
+
+### Other
+
+- Clarify release website closeout ([2c824c0](https://github.com/codersauce/red/commit/2c824c027d277abf4e59e59f537cd79d3826adbe))
+- Improve validation and decision routing ([9974376](https://github.com/codersauce/red/commit/9974376b488f6f7421b3fb7e1c091e4171425aa0))
+- Expand lsp capability gaps ([26b786e](https://github.com/codersauce/red/commit/26b786e8ee22f28a46b2407ee2ba237bf29c317d))
+- Improve language-pack and site guidance ([2d63515](https://github.com/codersauce/red/commit/2d63515be38c450fd3596aa9cd58860435edcd15))
+- Record v0.8.0 site waypoint ([a17c471](https://github.com/codersauce/red/commit/a17c4714cff5dcfb2698a293865d10b5ef36b93a))
+- Clarify lsp and command graph ([5b52f5e](https://github.com/codersauce/red/commit/5b52f5e253a1b2ce2d06066d6fd621097fddb36f))
+- Record LSP capability gaps ([670d377](https://github.com/codersauce/red/commit/670d3776f691d8e7ae730da06e6e981a227b8462))
+- Remove stale red version guidance ([1818b1a](https://github.com/codersauce/red/commit/1818b1a1aa858432a5b8445d1d62dbfca0dbbdec))
+- Clarify Sites source branch deployment ([062080e](https://github.com/codersauce/red/commit/062080e18989472ef37e1ea548846744a22832ab))
+- Add language pack topic ([ed89e23](https://github.com/codersauce/red/commit/ed89e23973e449356c5ad1ec73afa21634201256))
+- Add website release audit gate ([117f214](https://github.com/codersauce/red/commit/117f214cd11c11cdf4922ad99f1738cbc0b6d88d))
+- Improve architecture safety routing ([5c8a891](https://github.com/codersauce/red/commit/5c8a891db9e1b46dc0e3038c4bc39010c14a43ad))
+- Record directory buffer behavior ([d4a5d55](https://github.com/codersauce/red/commit/d4a5d55c5f63a40521f58e9f579de4df2531e5b5))
+
 ## [0.8.0](https://github.com/codersauce/red/compare/v0.7.0...v0.8.0)
 
 ### Features
