@@ -190,7 +190,7 @@ impl UiAction {
         let binding = if binding == "/" || binding.ends_with("+/") {
             binding
         } else {
-            binding.split('/').next()?
+            binding.split('/').next()?.trim()
         };
         let normalized = binding
             .replace("Ctrl-", "Ctrl+")
@@ -1031,6 +1031,13 @@ mod tests {
             Some(Event::Key(KeyEvent::new(
                 KeyCode::Char('j'),
                 KeyModifiers::CONTROL
+            )))
+        );
+        assert_eq!(
+            UiAction::new("toggle-preview", "Alt+p / F4", "toggle preview").event(),
+            Some(Event::Key(KeyEvent::new(
+                KeyCode::Char('p'),
+                KeyModifiers::ALT
             )))
         );
     }
