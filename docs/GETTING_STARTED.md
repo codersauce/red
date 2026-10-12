@@ -1,6 +1,6 @@
 # Getting started with Red
 
-This guide covers the day-to-day editor workflow in Red v0.8.1.
+This guide covers the day-to-day editor workflow in Red v0.8.2.
 For installation, see the [README](../README.md#install).
 
 ## First launch
@@ -40,6 +40,16 @@ Start or control it at any time:
 A starter configuration at `~/.config/red/config.toml` remains optional. Press
 `c` on the welcome screen to create one without overwriting existing settings.
 Embedded configuration, themes, and plugins work when the file is absent.
+
+## Updating Red
+
+Red checks for a newer stable release once per day and notifies you. To update an
+official standalone installation, run `:update` or choose **Update Red** in the
+command palette. Restart your editing sessions to use the new binary.
+
+Older standalone installations need a one-time installer migration. Homebrew
+and source builds use their existing update process. See [Updating Red](UPDATING.md)
+for commands and the setting that disables automatic checks.
 
 ## Editor model
 

@@ -19,9 +19,9 @@ configuration; optional agent support requires an installed, authenticated Codex
 [Documentation](#documentation) ·
 [Community](https://discord.gg/5PWvAUNRHU)
 
-<!-- current-release: 0.8.1 -->
+<!-- current-release: 0.8.2 -->
 The current documented release is
-[v0.8.1](https://github.com/codersauce/red/releases/tag/v0.8.1).
+[v0.8.2](https://github.com/codersauce/red/releases/tag/v0.8.2).
 
 ![Red editing its Rust rendering pipeline with the project tree open](docs/images/editor-overview.jpg)
 
@@ -55,7 +55,7 @@ The PowerShell installer verifies the release checksum, installs to
 To pin a release or choose another directory:
 
 ```shell
-RED_VERSION=0.8.1 RED_INSTALL_DIR="$HOME/bin" \
+RED_VERSION=0.8.2 RED_INSTALL_DIR="$HOME/bin" \
   sh -c "$(curl --proto '=https' --tlsv1.2 -fsSL https://getred.dev/install.sh)"
 ```
 
@@ -73,7 +73,11 @@ red update
 
 Inside the editor, use `:update` or **Update Red** in the command palette. Red checks
 once per day by default and only notifies; it never installs a release unattended.
-Homebrew and source installations continue to update through their package manager.
+Homebrew installations use `brew upgrade codersauce/tap/red`; source builds use
+your existing build process. If you installed Red before v0.8.2 or extracted an
+archive manually, rerun the official installer once into the same directory to
+enable managed updates. See [Updating Red](docs/UPDATING.md) for migration commands,
+restart behavior, and disabling automatic checks.
 
 Agent support is optional. It requires Codex CLI 0.144.1 or newer and a
 completed `codex login`.
@@ -93,18 +97,19 @@ completed `codex login`.
   sessions retain buffers, plugins, LSP state, and running agents across
   terminal or SSH disconnects.
 
-## New in v0.8.1
+## New in v0.8.2
 
-The v0.8.1 release adds:
+The v0.8.2 release adds a managed updater for official standalone installations:
 
-- **More room in pickers.** Press `Alt-p` or `F4` to hide or restore a preview
-  in the file, buffer, or project-search picker. Your query and selection stay
-  in place while longer paths become visible.
-- **Reliable save and quit with formatting.** When format-on-save is pending,
-  `:wq` waits for the save before exiting. If the save fails or the buffer
-  changes, Red stays open.
+- **Check automatically, install when you choose.** Red checks for a newer stable
+  release once per day and notifies you. Run `red update`, `:update`, or
+  **Update Red** in the command palette to install it.
+- **Verify before replacing.** The updater checks the archive's published SHA-256
+  checksum, candidate version, and bundled runtime before replacing the binary.
+  Existing editing sessions keep their current version until restarted.
 
-This release also updates Wasmtime.
+Use `[updates] mode = "off"` to disable automatic checks. Manual updates remain
+available. Homebrew and source builds keep their existing update process.
 
 ## First five minutes
 
