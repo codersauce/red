@@ -2,6 +2,24 @@
 
 All notable changes to Red are documented in this file.
 
+## [0.8.2](https://github.com/codersauce/red/compare/v0.8.1...v0.8.2)
+
+### Features
+
+- **update:** Add standalone updater ([f54a452](https://github.com/codersauce/red/commit/f54a4521ba5478e92f4176f67ac2326d88022f6c))
+
+### Testing
+
+- **installer:** Avoid parsing lock inode ([4af1613](https://github.com/codersauce/red/commit/4af1613ee54dfcdcf24fea8afd04caa4bdfc0c51))
+
+### Other
+
+- Tighten website release verification ([3dae522](https://github.com/codersauce/red/commit/3dae522b965e9ed95bf556d1657e5a296e6398e7))
+- Clarify website deploy access mode ([eb683b5](https://github.com/codersauce/red/commit/eb683b550a10116ecbe69a6bb405f2886ad7fc9e))
+- Document git workspace architecture ([d503788](https://github.com/codersauce/red/commit/d503788870b4b696bbd3cfb74c2d137bfd3e6bb7))
+- Add release and configuration hubs ([f51cc0b](https://github.com/codersauce/red/commit/f51cc0b5e0ea3cde64f2e1392c28523d58ecb6ef))
+- Clarify website deployment authority ([cfa8091](https://github.com/codersauce/red/commit/cfa80919fa27a045cc15ad84aa68b0fd15674323))
+
 ## [0.8.1](https://github.com/codersauce/red/compare/v0.8.0...v0.8.1)
 
 ### Features

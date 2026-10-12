@@ -1,5 +1,5 @@
 schema_version = 1
-version = "0.8.1"
+version = "0.8.2"
 headline = "More room in pickers, reliable save and quit"
 summary = "Red v0.8.1 lets you hide picker previews to see longer result paths. It also waits for an in-progress format-on-save before `:wq` exits, and updates Wasmtime."
 website = "https://github.com/codersauce/red/releases/latest"
