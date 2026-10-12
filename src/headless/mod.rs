@@ -606,6 +606,30 @@ pub fn session_is_active(directory: &Path, name: &str) -> anyhow::Result<bool> {
 }
 
 #[cfg(unix)]
+/// Checks whether the configured rendezvous directory contains any live owner.
+pub fn any_session_active(directory: &Path) -> anyhow::Result<bool> {
+    let entries = match std::fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.into()),
+    };
+    for entry in entries {
+        let entry = entry?;
+        let file_name = entry.file_name();
+        let Some(name) = file_name
+            .to_str()
+            .and_then(|name| name.strip_suffix(".pid"))
+        else {
+            continue;
+        };
+        if SessionPaths::new(directory, name).is_ok() && session_is_active(directory, name)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+#[cfg(unix)]
 fn write_private_file(path: &Path, contents: &[u8]) -> anyhow::Result<()> {
     use std::{io::Write as _, os::unix::fs::OpenOptionsExt as _};
 
