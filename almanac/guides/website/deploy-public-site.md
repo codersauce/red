@@ -136,13 +136,13 @@ fresh rollback IDs.
 
 After recording the current live version for rollback, verify that the configured
 Sites source branch points at the exact commit that produced the archive. Then
-ask Codex to call `sites.save_site_version` with the project ID, that full
-commit SHA, and the archive path for the built `dist/` tarball
-[@sites-session]. Record the returned
-version ID, version number, commit SHA, and archive metadata. Then ask Codex to
-publish that saved version with `sites.deploy_site_version`, because the site is
-currently public; use `deploy_private_site_version` only if a fresh Sites read
-shows the access mode has changed [@sites-session].
+ask Codex to call `sites.save_site_version` with the project ID from the fresh
+Sites read, that full commit SHA, and the archive path for the built `dist/`
+tarball [@sites-session]. Record the returned version ID, version number, commit
+SHA, and archive metadata. Publish the saved version with the operation that
+matches the freshly read access mode: use `sites.deploy_site_version` when the
+site is public, and use `deploy_private_site_version` only when the fresh Sites
+state says the site is private [@sites-session].
 
 Poll `sites.get_deployment_status` with the new deployment ID until it reaches a
 terminal status. A successful deploy is not complete until the generated Sites
