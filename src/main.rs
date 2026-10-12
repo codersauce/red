@@ -86,6 +86,15 @@ async fn run() -> anyhow::Result<()> {
     args.validate_utility_args()?;
 
     match &args.command {
+        Some(RootCommand::Update(update)) => {
+            let message = if update.check {
+                red::update::check().await?
+            } else {
+                red::update::install().await?
+            };
+            println!("{message}");
+            return Ok(());
+        }
         Some(RootCommand::Keys(keys)) => {
             return red::keyboard::inspect_keys(keys.protocol, keys.count);
         }
@@ -103,8 +112,10 @@ async fn run() -> anyhow::Result<()> {
         return stop_session(session).await;
     }
     if let Some(session) = &args.detach {
+        let session_guard = red::update::managed_session_guard().await?;
         let owner_pid = start_detached_owner(&args, session)?;
         wait_for_detached_owner(session, owner_pid).await?;
+        drop(session_guard);
         return attach_session(session).await;
     }
 
@@ -278,11 +289,13 @@ async fn run_editor_inner(args: Args) -> anyhow::Result<()> {
         }
     }
     editor.enable_diagnostic_cache(Config::path("cache/lsp-diagnostics"));
+    editor.enable_update_checks(Config::path("cache/updates"));
     editor.set_session_store(session_store);
 
     if let Some(session) = &args.core_session {
         #[cfg(unix)]
         {
+            let _session_guard = red::update::managed_session_guard().await?;
             let bound = red::headless::bind_session(&Config::path("run"), session)?;
             let core = red::editor::DetachedEditorCore::new(editor).await?;
             return red::headless::serve_editor_session(&bound, core).await;

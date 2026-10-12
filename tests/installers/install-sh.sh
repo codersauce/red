@@ -23,7 +23,7 @@ case "${1:-}" in
 esac
 EOF
 chmod +x "$payload_dir/red"
-tar -C "$payload_dir" -czf "$release_dir/red-x86_64-unknown-linux-gnu.tar.gz" red
+tar -C "$payload_dir" -czf "$release_dir/red-x86_64-unknown-linux-gnu.tar.gz" .
 
 if command -v sha256sum >/dev/null 2>&1; then
   checksum="$(sha256sum "$release_dir/red-x86_64-unknown-linux-gnu.tar.gz" | awk '{ print $1 }')"
@@ -41,6 +41,12 @@ RED_INSTALLER_ARCH=x86_64 \
 sh "$installer"
 
 "$install_dir/red" --self-check | grep -qx 'red self-check ok'
+grep -qx 'schema_version = 1' "$install_dir/.red-install.toml"
+grep -qx 'source = "standalone"' "$install_dir/.red-install.toml"
+grep -qx 'target = "x86_64-unknown-linux-gnu"' "$install_dir/.red-install.toml"
+test -f "$install_dir/.red-update.lock"
+lock_identity="$root/red-update-lock-identity"
+ln "$install_dir/.red-update.lock" "$lock_identity"
 
 # Reinstalling over an existing binary must remain safe.
 RED_VERSION=v9.9.9 \
@@ -49,6 +55,7 @@ RED_RELEASES_URL="file://$root/releases" \
 RED_INSTALLER_OS=Linux \
 RED_INSTALLER_ARCH=amd64 \
 sh "$installer"
+test "$install_dir/.red-update.lock" -ef "$lock_identity"
 
 printf '%064d  %s\n' 0 "red-x86_64-unknown-linux-gnu.tar.gz" > "$release_dir/SHA256SUMS.txt"
 if RED_VERSION=9.9.9 \

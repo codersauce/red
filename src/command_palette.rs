@@ -527,6 +527,15 @@ fn builtin_commands() -> Vec<BuiltinCommand> {
             Action::OpenWhatsNew,
         ),
         builtin(
+            "editor.update",
+            "Update Red",
+            "Editor",
+            "Install the latest stable standalone release",
+            Some(":update"),
+            &["upgrade", "new version", "release"],
+            Action::UpdateRed,
+        ),
+        builtin(
             "editor.learn",
             "Learn Red",
             "Editor",

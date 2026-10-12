@@ -64,6 +64,17 @@ You can also download a
 [build from source](#development). Red's editor, default configuration, themes,
 and plugins are bundled into the executable.
 
+Official standalone installations can check or install the latest stable release:
+
+```shell
+red update --check
+red update
+```
+
+Inside the editor, use `:update` or **Update Red** in the command palette. Red checks
+once per day by default and only notifies; it never installs a release unattended.
+Homebrew and source installations continue to update through their package manager.
+
 Agent support is optional. It requires Codex CLI 0.144.1 or newer and a
 completed `codex login`.
 
@@ -205,6 +216,10 @@ scrolloff = 8
 # Disable the automatic release panel or its optional GitHub refresh:
 # show_whats_new = false
 # fetch_release_notes = false
+
+[updates]
+# Set to "off" to disable the daily stable-release check.
+mode = "notify"
 
 [search]
 ignorecase = true

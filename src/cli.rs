@@ -95,12 +95,21 @@ pub struct Args {
 
 #[derive(Debug, Subcommand)]
 pub enum RootCommand {
+    /// Check for or install the latest stable Red release.
+    Update(UpdateArgs),
     /// Inspect how this terminal reports composer keyboard shortcuts.
     Keys(KeyboardArgs),
     /// Install and manage external plugin packages.
     Plugin(PluginArgs),
     /// Inspect and approve explicitly configured native language grammars.
     Language(LanguageArgs),
+}
+
+#[derive(Debug, ClapArgs)]
+pub struct UpdateArgs {
+    /// Report availability without downloading or installing the release.
+    #[arg(long)]
+    pub check: bool,
 }
 
 #[derive(Debug, ClapArgs)]
@@ -270,6 +279,15 @@ mod tests {
 
     #[test]
     fn parses_runtime_utility_flags() {
+        let update = Args::try_parse_from(["red", "update", "--check"]).unwrap();
+        assert!(matches!(
+            update.command,
+            Some(RootCommand::Update(UpdateArgs { check: true }))
+        ));
+        let update_file = Args::try_parse_from(["red", "--", "update"]).unwrap();
+        assert!(update_file.command.is_none());
+        assert_eq!(update_file.files, ["update"]);
+
         let keys =
             Args::try_parse_from(["red", "keys", "--protocol", "legacy", "--count", "1"]).unwrap();
         assert!(keys.utility_requested());

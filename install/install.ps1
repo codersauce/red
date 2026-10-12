@@ -69,12 +69,55 @@ try {
     $destination = Join-Path $InstallDir "red.exe"
     $stagedBinary = Join-Path $InstallDir (".red.install." + [guid]::NewGuid() + ".exe")
     Copy-Item -LiteralPath $sourceBinary -Destination $stagedBinary
+
+    & $stagedBinary --version | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        Remove-Item -LiteralPath $stagedBinary -Force -ErrorAction SilentlyContinue
+        throw "Downloaded red --version exited with code $LASTEXITCODE."
+    }
+    $hadNoColor = Test-Path Env:NO_COLOR
+    $previousNoColor = $env:NO_COLOR
+    try {
+        $env:NO_COLOR = "1"
+        $selfCheckOutput = @(& $stagedBinary --self-check)
+        if ($LASTEXITCODE -ne 0) {
+            throw "Downloaded red --self-check exited with code $LASTEXITCODE."
+        }
+        if ($selfCheckOutput.Count -eq 0 -or $selfCheckOutput[-1] -ne "red self-check ok") {
+            throw "Downloaded red returned unexpected self-check output."
+        }
+    } finally {
+        if ($hadNoColor) {
+            $env:NO_COLOR = $previousNoColor
+        } else {
+            Remove-Item Env:NO_COLOR -ErrorAction SilentlyContinue
+        }
+    }
     try {
         Move-Item -LiteralPath $stagedBinary -Destination $destination -Force
     } catch {
         Remove-Item -LiteralPath $stagedBinary -Force -ErrorAction SilentlyContinue
         throw "Could not replace $destination. Close any running Red process and try again."
     }
+
+    $lockFile = Join-Path $InstallDir ".red-update.lock"
+    if (-not (Test-Path -LiteralPath $lockFile)) {
+        New-Item -ItemType File -Path $lockFile | Out-Null
+    }
+    $lockItem = Get-Item -LiteralPath $lockFile
+    if (-not (Test-Path -LiteralPath $lockFile -PathType Leaf) -or
+        ($lockItem.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+        throw "$lockFile must be a regular file."
+    }
+
+    $receipt = Join-Path $InstallDir ".red-install.toml"
+    $receiptTemp = Join-Path $InstallDir (".red-install." + [guid]::NewGuid())
+    @(
+        "schema_version = 1"
+        'source = "standalone"'
+        'target = "x86_64-pc-windows-msvc"'
+    ) | Set-Content -LiteralPath $receiptTemp -Encoding ascii
+    Move-Item -LiteralPath $receiptTemp -Destination $receipt -Force
 
     if (-not $NoModifyPath) {
         $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
@@ -92,21 +135,7 @@ try {
     if ($LASTEXITCODE -ne 0) {
         throw "red --version exited with code $LASTEXITCODE."
     }
-    $hadNoColor = Test-Path Env:NO_COLOR
-    $previousNoColor = $env:NO_COLOR
-    try {
-        $env:NO_COLOR = "1"
-        & $destination --self-check
-        if ($LASTEXITCODE -ne 0) {
-            throw "red --self-check exited with code $LASTEXITCODE."
-        }
-    } finally {
-        if ($hadNoColor) {
-            $env:NO_COLOR = $previousNoColor
-        } else {
-            Remove-Item Env:NO_COLOR -ErrorAction SilentlyContinue
-        }
-    }
+    $selfCheckOutput | Write-Output
 
     Write-Output ""
     Write-Output "Red is installed at $destination."
@@ -117,5 +146,8 @@ try {
     }
     Write-Output "Agent support is optional: install Codex CLI, then run codex login."
 } finally {
+    if ($stagedBinary -and (Test-Path -LiteralPath $stagedBinary)) {
+        Remove-Item -LiteralPath $stagedBinary -Force -ErrorAction SilentlyContinue
+    }
     Remove-Item -LiteralPath $tempDir -Recurse -Force -ErrorAction SilentlyContinue
 }

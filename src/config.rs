@@ -191,6 +191,22 @@ impl LoadedConfig {
     }
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum UpdateMode {
+    /// Check once per day and notify when a stable release is available.
+    #[default]
+    Notify,
+    /// Disable automatic checks; explicit update commands remain available.
+    Off,
+}
+
+#[derive(Debug, Serialize, Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+pub struct UpdateConfig {
+    pub mode: UpdateMode,
+}
+
 #[derive(Debug, Serialize, Deserialize, Default)]
 /// Complete effective editor configuration.
 ///
@@ -248,6 +264,9 @@ pub struct Config {
     /// Defaults to on.
     #[serde(default)]
     pub fetch_release_notes: Option<bool>,
+    /// Stable-release update notification policy.
+    #[serde(default)]
+    pub updates: UpdateConfig,
     /// Retain inline conversations in local editor recovery snapshots. Defaults to on.
     #[serde(default)]
     pub persist_inline_history: Option<bool>,
@@ -2059,6 +2078,7 @@ fn known_top_level_field(field: &str) -> bool {
             | "splash"
             | "show_whats_new"
             | "fetch_release_notes"
+            | "updates"
             | "persist_inline_history"
             | "search"
             | "completion"
@@ -2212,6 +2232,7 @@ fn known_schema_path(path: &[String]) -> bool {
         ),
         ["agent", "env", _] => true,
         ["diagnostics", field] => matches!(*field, "gutter_signs" | "icon_style"),
+        ["updates", field] => *field == "mode",
         ["cursor", field] => matches!(
             *field,
             "normal"
@@ -4675,6 +4696,16 @@ groups = [["\\bif\\b", "\\belse\\b", "\\bendif\\b"]]
 
         assert!(!config.key_hints.enabled);
         assert_eq!(config.key_hints.delay_ms, 750);
+    }
+
+    #[test]
+    fn update_checks_can_be_disabled() {
+        let defaults = Config::from_user_toml_with_overrides("", &[]).unwrap();
+        assert_eq!(defaults.updates.mode, UpdateMode::Notify);
+
+        let config =
+            Config::from_user_toml_with_overrides("[updates]\nmode = \"off\"\n", &[]).unwrap();
+        assert_eq!(config.updates.mode, UpdateMode::Off);
     }
 
     #[test]

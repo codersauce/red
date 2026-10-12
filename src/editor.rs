@@ -59,6 +59,7 @@ mod session_manager;
 mod shell_command;
 mod signature_help;
 mod snippet;
+mod update;
 
 use std::{
     borrow::Cow,
@@ -2860,6 +2861,7 @@ pub enum Action {
     OpenSyntaxPicker,
     SetSyntax(String),
     OpenWhatsNew,
+    UpdateRed,
     OpenLearn,
     StartLearnLesson,
     ExitLearnLesson,
@@ -3783,6 +3785,7 @@ pub struct Editor {
     notifications: NotificationCenter,
     /// Explicit user-owned shell jobs and their bounded background output.
     shell_commands: shell_command::ShellCommandState,
+    update: update::UpdateState,
     message_browser: Option<notifications::MessageBrowser>,
     notification_presentation: notifications::NotificationPresentation,
     notification_frame_candidate: Option<notifications::NotificationExposureKey>,
@@ -5333,6 +5336,7 @@ impl Editor {
             search_highlights_suppressed: false,
             notifications: NotificationCenter::default(),
             shell_commands: shell_command::ShellCommandState::default(),
+            update: update::UpdateState::default(),
             message_browser: None,
             notification_presentation: notifications::NotificationPresentation::default(),
             notification_frame_candidate: None,
@@ -12898,6 +12902,7 @@ impl Editor {
             }
         }
         needs_render |= self.service_shell_commands(runtime).await;
+        needs_render |= self.service_red_update();
         self.sync_persistent_notifications();
         needs_render |= self.notification_presentation_changed();
         let background_render = if needs_render {
@@ -16889,6 +16894,9 @@ impl Editor {
         }
         if matches!(cmd, "whats-new" | "changelog") {
             return vec![Action::OpenWhatsNew];
+        }
+        if cmd == "update" {
+            return vec![Action::UpdateRed];
         }
         if cmd == "learn" {
             return vec![Action::OpenLearn];
@@ -23049,6 +23057,9 @@ impl Editor {
                     ));
                     self.render(buffer)?;
                 }
+            }
+            Action::UpdateRed => {
+                self.start_red_update();
             }
             Action::OpenLearn | Action::FinishLearnLesson => {
                 if self.tutorial_controller.is_some() {
@@ -34896,7 +34907,7 @@ builtin = "rust"
     }
 
     #[test]
-    fn release_note_colon_commands_open_the_same_branded_panel() {
+    fn release_and_update_colon_commands_map_to_branded_actions() {
         let mut editor = test_editor(80, 24);
         let runtime = Runtime::new();
 
@@ -34907,6 +34918,10 @@ builtin = "rust"
         assert_eq!(
             editor.handle_command("changelog", &runtime),
             vec![Action::OpenWhatsNew]
+        );
+        assert_eq!(
+            editor.handle_command("update", &runtime),
+            vec![Action::UpdateRed]
         );
     }
 

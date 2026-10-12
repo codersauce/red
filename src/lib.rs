@@ -62,6 +62,7 @@ pub mod tutorial;
 pub mod ui;
 pub mod undo;
 pub mod unicode_utils;
+pub mod update;
 pub mod utils;
 pub mod whats_new;
 pub mod window;
