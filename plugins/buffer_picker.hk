@@ -116,7 +116,7 @@ fn editor_info_loaded(info: EditorInfo) {
         actions: [
             PickerAction { action: "open_horizontal", key: "Ctrl-s", label: "Open horizontal split" },
             PickerAction { action: "open_vertical", key: "Ctrl-v", label: "Open vertical split" },
-            PickerAction { action: "toggle_preview", key: "Alt-p", label: "Toggle preview" },
+            PickerAction { action: "toggle_preview", key: "Alt-p / F4", label: "Toggle preview" },
         ],
     }, BufferPickerHandlers {
         selected: buffer_selected,

@@ -177,7 +177,7 @@ fn history_loaded(event: StoredValueEvent) {
             PickerAction { action: "toggle_ignored", key: "Alt-i", label: "Toggle ignored" },
             PickerAction { action: "toggle_follow", key: "Alt-f", label: "Toggle symlink following" },
             PickerAction { action: "toggle_all", key: "Ctrl-e", label: "Toggle hidden and ignored" },
-            PickerAction { action: "toggle_preview", key: "Alt-p", label: "Toggle preview" },
+            PickerAction { action: "toggle_preview", key: "Alt-p / F4", label: "Toggle preview" },
             PickerAction { action: "history_back", key: "Ctrl-h", label: "Previous search" },
             PickerAction { action: "history_forward", key: "Ctrl-l", label: "Next search" },
         ],
