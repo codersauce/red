@@ -24,6 +24,9 @@ sources:
   - id: sites-session
     type: conversation
     path: /Users/fcoury/.codex/sessions/2026/09/26/rollout-2026-09-26T18-58-30-01a0dfba-17a6-7ad2-9025-e1bf987aa2f2.jsonl
+  - id: v081-site-session
+    type: conversation
+    path: /Users/fcoury/.codex/sessions/2026/10/12/rollout-2026-10-12T15-34-37-01a13165-2e96-7002-8479-20c2189ae7fc.jsonl
 ---
 
 # Deploy Public Site
@@ -63,6 +66,7 @@ Historical Sites waypoints explain why the live-state check is mandatory:
 | 2026-09-26 | The same audit found four active custom domains plus the generated Sites host, and all five hosts returned `200` without redirects [@sites-session]. | Verify every host after deploys and after any routing change. |
 | September 2026 | The live site served `codex/red-docs-foundation` content that showed Red `v0.2.4`, while newer launch content showed Red `v0.7.0` and included `/releases` [@deployment-transcript]. | Preserve docs ancestry and the current release surface together. |
 | Follow-up Direction A deploy | Versions 20, 22, and 23 published the redesigned homepage, installer-command correction, and v0.8.0 release/docs update across all five public hosts [@sites-session]. | The Sites connector can perform the save-then-deploy sequence, but each future deploy still needs fresh source, version, deployment, and host evidence. |
+| 2026-10-12 | Version 24 published the v0.8.1 release-site update after PR 11 in `codersauce/red-website` merged, and the closeout verified release content, docs content, installer pins, and raw installer checksums across all five public hosts [@v081-site-session]. | The release-site check should validate host coverage, rendered release copy, docs routes affected by the release, `installers.json`, both raw installer files, and the pinned source commit together. |
 
 ## Build The Archive
 
@@ -159,6 +163,17 @@ assets [@sites-session] [@website-readme]. Compare installer checksums
 against the pinned `public/installers.json` values and confirm the page displays
 the intended published Red release, not a local `main` version
 [@website-readme].
+
+For release-site updates, make the host check executable enough to fail on
+partial deploys. The v0.8.1 closeout fetched `/releases`,
+`/docs/editor/navigation`, `/docs/languages`, `/installers.json`,
+`/install.sh`, and `/install.ps1` from every public host, required
+`installers.json.version` to match the release, required its `sourceCommit` to
+match the published Red release commit, hashed both raw installer files, and
+compared those hashes with the manifest entries before accepting the deploy
+[@v081-site-session]. Adapt the release-copy and docs assertions to the release
+being shipped; keep the manifest, installer-file, and host-coverage assertions
+for every release-site closeout.
 
 The homepage installer UI has a separate product contract from the raw installer
 files. The corrected live Direction A page uses `curl -fsS
