@@ -190,6 +190,7 @@ pub(crate) fn picker_reference_actions() -> Vec<UiAction> {
             "Ctrl+b / Ctrl+f",
             "Previous / next preview or result page",
         ),
+        ("Preview", "Alt+p / F4", "Toggle preview"),
         ("History", "Ctrl+h / Ctrl+l", "Previous / next picker query"),
         (
             "Search",

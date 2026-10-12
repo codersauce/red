@@ -429,6 +429,7 @@ pub struct Picker {
     busy_since: Option<Instant>,
     busy_frame: u64,
     key_actions: Vec<PickerKeyAction>,
+    show_preview: bool,
     preview: Option<PickerPreview>,
     item_preview_root: Option<PathBuf>,
     placeholder: Option<String>,
@@ -632,6 +633,7 @@ impl Picker {
             busy_since: None,
             busy_frame: 0,
             key_actions: Vec::new(),
+            show_preview: true,
             preview: None,
             item_preview_root: None,
             placeholder: None,
@@ -1340,10 +1342,12 @@ impl Picker {
     fn custom_action(&self, event: &event::KeyEvent) -> Option<KeyAction> {
         self.dynamic_items.as_ref()?;
         let key = normalized_key(event)?;
-        let action = self
-            .key_actions
-            .iter()
-            .find(|action| action.key.to_ascii_lowercase().replace("ctrl-", "c-") == key)?;
+        let action = self.key_actions.iter().find(|action| {
+            action
+                .key
+                .split(" / ")
+                .any(|binding| binding.trim().to_ascii_lowercase().replace("ctrl-", "c-") == key)
+        })?;
         if let Some(handle) = self.callback_handle {
             return Some(KeyAction::Single(Action::NotifyPicker(
                 handle,
@@ -3865,6 +3869,10 @@ impl Component for Picker {
                     return Some(action);
                 }
                 match event.code {
+                    KeyCode::Char('p') if event.modifiers == KeyModifiers::ALT => {
+                        Some(self.toggle_preview())
+                    }
+                    KeyCode::F(4) if event.modifiers.is_empty() => Some(self.toggle_preview()),
                     KeyCode::Char('j' | 'n') if event.modifiers.contains(KeyModifiers::CONTROL) => {
                         let previous = self.selected_item();
                         self.list.move_down();
@@ -4077,12 +4085,19 @@ fn display_width_tail(text: &str, max_width: usize) -> &str {
 }
 
 impl Picker {
+    fn toggle_preview(&mut self) -> KeyAction {
+        self.show_preview = !self.show_preview;
+        self.sync_list_bounds();
+        KeyAction::Single(Action::Refresh)
+    }
+
     fn has_preview(&self) -> bool {
-        self.preview.is_some()
-            || self
-                .selected_dynamic_item()
-                .is_some_and(|item| item.preview.is_some())
-            || (self.item_preview_root.is_some() && self.list.selected_index().is_some())
+        self.show_preview
+            && (self.preview.is_some()
+                || self
+                    .selected_dynamic_item()
+                    .is_some_and(|item| item.preview.is_some())
+                || (self.item_preview_root.is_some() && self.list.selected_index().is_some()))
     }
 
     fn current_preview(&self) -> Option<Cow<'_, PickerPreview>> {
@@ -4906,6 +4921,50 @@ mod tests {
         assert!(render_row(&buffer, layout.query_y).contains("needle"));
         assert!(render_row(&buffer, layout.results.y).contains("alpha"));
         assert_eq!(picker.cursor_position().unwrap().1, layout.query_y);
+    }
+
+    #[test]
+    fn preview_shortcuts_toggle_layout_without_losing_picker_state() {
+        let editor = test_editor_with_theme_and_size(Theme::default(), 120, 24);
+        let first = dynamic_item("one", "result-one.rs");
+        let mut second = dynamic_item("two", "result-two.rs");
+        second.preview = Some(PickerPreview::Text {
+            text: "preview text".to_string(),
+            language: None,
+        });
+        let mut picker = Picker::new_dynamic(
+            Some("Files".to_string()),
+            &editor,
+            vec![first, second],
+            15,
+            PickerOptions {
+                initial_query: "result".to_string(),
+                initial_selection: Some("two".to_string()),
+                ..PickerOptions::default()
+            },
+        );
+        let split_width = picker.layout().results.width;
+        let full_width = picker.width;
+
+        for (event, preview_visible, result_width) in [
+            (
+                key(KeyCode::Char('p'), KeyModifiers::ALT),
+                false,
+                full_width,
+            ),
+            (key(KeyCode::F(4), KeyModifiers::NONE), true, split_width),
+        ] {
+            assert_eq!(
+                picker.handle_event(&event),
+                Some(KeyAction::Single(Action::Refresh))
+            );
+            let layout = picker.layout();
+            assert_eq!(layout.preview.is_some(), preview_visible);
+            assert_eq!(layout.results.width, result_width);
+            assert_eq!(picker.list_bounds, Some(layout.results));
+            assert_eq!(picker.search, "result");
+            assert_eq!(picker.selected_dynamic_item().unwrap().id, "two");
+        }
     }
 
     #[test]
@@ -8267,7 +8326,7 @@ mod tests {
         let items = vec![dynamic_item("a", "alpha")];
         let options: PickerOptions = serde_json::from_value(json!({
             "actions": [
-                { "key": "c-o", "id": "openSplit" },
+                { "key": "Alt-p / F4", "id": "openSplit" },
                 { "key": "c-n", "id": "openSplit" },
                 { "key": "c-p", "id": "openSplit" }
             ]
@@ -8276,9 +8335,14 @@ mod tests {
         let mut picker =
             Picker::new_dynamic(/*title*/ None, &editor, items, /*id*/ 13, options);
 
-        for character in ['o', 'n', 'p'] {
+        for event in [
+            key(KeyCode::Char('p'), KeyModifiers::ALT),
+            key(KeyCode::F(4), KeyModifiers::NONE),
+            key(KeyCode::Char('n'), KeyModifiers::CONTROL),
+            key(KeyCode::Char('p'), KeyModifiers::CONTROL),
+        ] {
             assert_eq!(
-                picker.handle_event(&key(KeyCode::Char(character), KeyModifiers::CONTROL)),
+                picker.handle_event(&event),
                 Some(KeyAction::Single(Action::NotifyPlugins(
                     "picker:action:13".to_string(),
                     json!({
