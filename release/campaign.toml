@@ -1,52 +1,28 @@
 schema_version = 1
 version = "0.8.1"
-headline = "Open a directory, stay in the editor"
-summary = "Red v0.8.0 turns directories into navigable, read-only editor buffers. Start with `red .`, move through entries with familiar keys, and open files in place. Mouse selection, shebang-based syntax detection, and picker navigation make the rest of the trip easier."
+headline = "More room in pickers, reliable save and quit"
+summary = "Red v0.8.1 lets you hide picker previews to see longer result paths. It also waits for an in-progress format-on-save before `:wq` exits, and updates Wasmtime."
 website = "https://github.com/codersauce/red/releases/latest"
 
-x_post = """{launch}. Run `red .` to browse a directory in an editor window. Press Enter to open an entry or `-` to go up. Mouse selection and Ctrl-n/Ctrl-p picker navigation are here too.
+x_post = """{launch}. Hide picker previews with Alt-p or F4 to see longer paths. `:wq` now waits for format-on-save to finish before exiting.
 
 {url}"""
-bluesky_post = """{launch}. Directories are now read-only editor buffers: `red .` opens one, Enter opens an entry, and `-` goes up. You can also select text with the mouse and use shebangs to highlight extensionless scripts.
+bluesky_post = """{launch}. Toggle picker previews with Alt-p or F4 to make room for long paths. `:wq` now waits for format-on-save to finish before exiting.
 
 {url}"""
 
 [[stories]]
-id = "directory-buffers"
-title = "Browse a directory in an editor window"
-summary = "Run `red .` or `:e path/to/dir`, move with normal editor keys, press Enter to open an entry, and use `-` to go up. Directory buffers are read-only and can be revisited."
+id = "picker-preview-toggle"
+title = "Make room for long paths in pickers"
+summary = "Press Alt-p or F4 to hide or restore the preview in file, buffer, and project-search pickers. The query and selected result stay in place."
 status = "new"
-pull_requests = [370]
+pull_requests = [375]
 channels = ["github", "discord", "x", "bluesky", "in_app"]
 
 [[stories]]
-id = "mouse-selection"
-title = "Select with the mouse, keep editing with Vim keys"
-summary = "Drag to make a Visual selection, double-click for a word, triple-click for a line, or quadruple-click for a block. The selection remains available for motions and editing commands."
-status = "new"
-pull_requests = [363]
+id = "format-save-quit"
+title = "Save and quit after formatting finishes"
+summary = "When format-on-save is pending, `:wq` waits for the save to finish before exiting. A failed save or a new edit keeps the editor open."
+status = "improved"
+pull_requests = [373]
 channels = ["github", "discord", "in_app"]
-
-[[stories]]
-id = "shebang-syntax"
-title = "Highlight extensionless scripts from their shebang"
-summary = "When a filename has no language match, Red recognizes common shell, Node, Lua, PowerShell, and Husk interpreters from the first line. Language packs can register more."
-status = "new"
-pull_requests = [360]
-channels = ["github", "discord", "in_app"]
-
-[[stories]]
-id = "picker-control-navigation"
-title = "Move through picker results with Ctrl-n and Ctrl-p"
-summary = "Use Ctrl-n for the next result and Ctrl-p for the previous one without changing your search query."
-status = "new"
-pull_requests = [369]
-channels = ["github", "in_app"]
-
-[[stories]]
-id = "rust-glancer"
-title = "Try Rust Glancer as an optional language server"
-summary = "A documented configuration lets Rust projects use Glancer; rust-analyzer remains the default. Install Glancer separately before switching."
-status = "new"
-pull_requests = [364]
-channels = ["github", "in_app"]

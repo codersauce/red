@@ -1,6 +1,6 @@
 # Getting started with Red
 
-This guide covers the day-to-day editor workflow in Red v0.8.0.
+This guide covers the day-to-day editor workflow in Red v0.8.1.
 For installation, see the [README](../README.md#install).
 
 ## First launch
@@ -278,6 +278,10 @@ Use Neo-tree for file operations.
 | `Space g` | Project search using `rg` |
 | `Space t` | Theme browser |
 
+Press `Alt-p` or `F4` in the file, buffer, or project-search picker to hide or
+restore its preview. The query and selected result stay in place, and hiding
+the preview gives long result paths more room.
+
 In the file picker, append `:<line>` to a fuzzy filename query to open the
 selected file at that line. For example, `sona:123` opens `source_name.rs` at line 123.
 
@@ -357,6 +361,10 @@ search, as in Vim; it can be remapped explicitly in your configuration.
 | `:join [count]` / `:join! [count]` | Join with normalized or preserved spacing |
 | `:commands` | Open the command palette |
 | `:messages` | Browse active notifications and recent messages |
+
+When format-on-save is pending, `:wq` waits for the save to finish before
+exiting. If the save fails or the buffer changes during formatting, Red stays
+open so you can resolve it.
 
 Shell commands run asynchronously in Red's working directory using `$SHELL -c`
 on Unix or `COMSPEC /C` on Windows. Output streams into the Messages view while
