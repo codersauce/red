@@ -6,7 +6,7 @@ while IFS= read -r line; do
         *'"method":"initialize"'*)
             printf '{"jsonrpc":"2.0","id":%s,"result":{"commands":[{"name":"RpcHello","title":"Say hello via JSON-RPC","category":"Examples","arguments":true}],"events":["editor:ready"]}}\n' "$req_id"
             ;;
-        *'"method":"lifecycle/activate"'*|*'"method":"lifecycle/deactivate"'*|*'"method":"lifecycle/beforeExit"'*)
+        *'"method":"lifecycle/activate"'*|*'"method":"lifecycle/stateImport"'*|*'"method":"lifecycle/exportState"'*|*'"method":"lifecycle/deactivate"'*|*'"method":"lifecycle/beforeExit"'*)
             printf '{"jsonrpc":"2.0","id":%s,"result":null}\n' "$req_id"
             ;;
         *'"method":"command/execute"'*)
@@ -15,6 +15,11 @@ while IFS= read -r line; do
             ;;
         *'"method":"event/notify"'*)
             printf '{"jsonrpc":"2.0","id":%s,"result":null}\n' "$req_id"
+            ;;
+        *)
+            if [ -n "$req_id" ]; then
+                printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32601,"message":"Method not found"}}\n' "$req_id"
+            fi
             ;;
     esac
 done

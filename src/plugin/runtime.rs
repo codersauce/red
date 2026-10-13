@@ -4413,7 +4413,13 @@ impl Runtime {
             match existing.export_state(host) {
                 Ok(state) => state,
                 Err(error) => {
+                    let terminated = existing.is_terminated();
                     host.rollback_reload();
+                    if terminated {
+                        rpc_plugins.remove(name);
+                        host.remove_plugin(name);
+                        host.process_manager.shutdown_plugin(name);
+                    }
                     return Err(error);
                 }
             }
@@ -4434,7 +4440,13 @@ impl Runtime {
         if let Some(existing) = rpc_plugins.get_mut(name) {
             host.begin_reload_teardown(name);
             if let Err(error) = existing.deactivate(host) {
+                let terminated = existing.is_terminated();
                 host.rollback_reload();
+                if terminated {
+                    rpc_plugins.remove(name);
+                    host.remove_plugin(name);
+                    host.process_manager.shutdown_plugin(name);
+                }
                 return Err(error);
             }
         }
@@ -4462,6 +4474,18 @@ impl Runtime {
         host.remove_plugin(name);
         host.process_manager.shutdown_plugin(name);
         husk_result.and(rpc_result)
+    }
+
+    #[must_use]
+    pub(crate) fn is_plugin_alive(&self, name: &str) -> bool {
+        let mut inner = self.inner.lock().unwrap();
+        if inner.plugins.contains_key(name) {
+            return true;
+        }
+        inner
+            .rpc_plugins
+            .get_mut(name)
+            .is_some_and(|rpc| !rpc.is_terminated())
     }
 
     #[must_use]

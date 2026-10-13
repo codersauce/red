@@ -812,7 +812,7 @@ impl PluginRegistry {
             }
             Err(error) => {
                 crate::log!("Plugin `{name}` hot reload rejected: {error}");
-                if was_active {
+                if was_active && runtime.is_plugin_alive(name) {
                     if let Some(metadata) = previous_metadata {
                         self.metadata.insert(name.to_string(), metadata);
                     } else {
@@ -2610,5 +2610,128 @@ done
             Some(PluginStatus::Quarantined { stage, diagnostic, .. })
                 if stage == "dependency" && diagnostic.contains("a-rpc")
         ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn jsonrpc_plugin_terminated_during_export_state_is_quarantined_and_clears_commands() {
+        drain_requests();
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("examples/external-rpc-plugin/bin/rpc-hello");
+        let dir = tempfile_dir("rpc-export-terminated");
+        let dying_export = dir.join("dying_export.sh");
+        write_executable_script(
+            &dying_export,
+            r#"#!/bin/sh
+while IFS= read -r line; do
+    req_id=$(printf '%s' "$line" | sed -n 's/.*"jsonrpc":"2.0","id":\([0-9][0-9]*\).*/\1/p')
+    case "$line" in
+        *'"method":"initialize"'*)
+            printf '{"jsonrpc":"2.0","id":%s,"result":{"commands":[{"name":"DyingCmd"}]}}\n' "$req_id"
+            ;;
+        *'"method":"lifecycle/activate"'*)
+            printf '{"jsonrpc":"2.0","id":%s,"result":null}\n' "$req_id"
+            ;;
+        *'"method":"lifecycle/exportState"'*)
+            exit 1
+            ;;
+    esac
+done
+"#,
+        );
+
+        let mut registry = PluginRegistry::new();
+        registry.add("rpc-hello", fixture.to_str().unwrap());
+        registry.add("dying-export", dying_export.to_str().unwrap());
+        let mut runtime = Runtime::new();
+
+        registry.initialize(&mut runtime).await.unwrap();
+        registry.execute(&mut runtime, "RpcHello").await.unwrap();
+        let _ = ACTION_DISPATCHER.recv_request();
+        assert_eq!(
+            registry.statuses().get("rpc-hello"),
+            Some(&PluginStatus::Active)
+        );
+        assert_eq!(
+            registry.statuses().get("dying-export"),
+            Some(&PluginStatus::Active)
+        );
+        assert_eq!(
+            runtime.command_plugin("DyingCmd").as_deref(),
+            Some("dying-export")
+        );
+
+        registry.reload(&mut runtime).await.unwrap();
+        // `rpc-hello` answers `lifecycle/exportState` and reloads cleanly.
+        assert_eq!(
+            registry.statuses().get("rpc-hello"),
+            Some(&PluginStatus::Active)
+        );
+        // `dying-export` exited during `lifecycle/exportState`, so it is quarantined
+        // rather than left in `ActiveWithReloadError` with a dead process.
+        assert!(matches!(
+            registry.statuses().get("dying-export"),
+            Some(PluginStatus::Quarantined { stage, .. }) if stage == "activation"
+        ));
+        assert_eq!(runtime.command_plugin("DyingCmd"), None);
+
+        registry.deactivate_all(&mut runtime).await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn jsonrpc_plugin_background_polling_bounds_per_tick_drain() {
+        drain_requests();
+        let dir = tempfile_dir("rpc-bounded-poll");
+        let noisy_script = dir.join("noisy.sh");
+        write_executable_script(
+            &noisy_script,
+            r#"#!/bin/sh
+while IFS= read -r line; do
+    req_id=$(printf '%s' "$line" | sed -n 's/.*"jsonrpc":"2.0","id":\([0-9][0-9]*\).*/\1/p')
+    case "$line" in
+        *'"method":"initialize"'*)
+            printf '{"jsonrpc":"2.0","id":%s,"result":{"commands":[{"name":"StartFlood"}]}}\n' "$req_id"
+            ;;
+        *'"method":"lifecycle/activate"'*)
+            printf '{"jsonrpc":"2.0","id":%s,"result":null}\n' "$req_id"
+            ;;
+        *'"method":"command/execute"'*)
+            printf '{"jsonrpc":"2.0","id":%s,"result":null}\n' "$req_id"
+            i=0
+            while [ "$i" -lt 150 ]; do
+                printf '{"jsonrpc":"2.0","method":"red/execute","params":{"action":"Print","args":["flood"]}}\n'
+                i=$((i + 1))
+            done
+            ;;
+        *)
+            if [ -n "$req_id" ]; then
+                printf '{"jsonrpc":"2.0","id":%s,"result":null}\n' "$req_id"
+            fi
+            ;;
+    esac
+done
+"#,
+        );
+
+        let mut registry = PluginRegistry::new();
+        registry.add("noisy", noisy_script.to_str().unwrap());
+        let mut runtime = Runtime::new();
+        registry.initialize(&mut runtime).await.unwrap();
+        registry.execute(&mut runtime, "StartFlood").await.unwrap();
+
+        std::thread::sleep(Duration::from_millis(50));
+        registry.poll_rpc_events(&mut runtime);
+
+        let mut drained = 0usize;
+        while ACTION_DISPATCHER.try_recv_request().is_some() {
+            drained += 1;
+        }
+        assert!(
+            (1..=64).contains(&drained),
+            "expected per-tick drain between 1 and 64 frames, got {drained}"
+        );
+
+        registry.deactivate_all(&mut runtime).await.unwrap();
     }
 }

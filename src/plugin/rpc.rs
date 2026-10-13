@@ -12,7 +12,7 @@ use std::{
     path::{Path, PathBuf},
     process::{Child, ChildStdin, ChildStdout, Command, Stdio},
     sync::{
-        mpsc::{self, Receiver, RecvTimeoutError, TryRecvError},
+        mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TryRecvError},
         Arc, Mutex,
     },
     thread,
@@ -38,6 +38,10 @@ use super::{
 
 const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 const MAX_DIAGNOSTIC_BYTES: usize = 16 * 1024;
+const MAX_PENDING_RPC_FRAMES: usize = 256;
+const MAX_POLL_FRAMES_PER_TICK: usize = 64;
+const MAX_POLL_DURATION_PER_TICK: Duration = Duration::from_millis(5);
+const MAX_REENTRANT_CALLS_PER_REQUEST: usize = 1024;
 const DEFAULT_RPC_TIMEOUT: Duration = Duration::from_secs(5);
 const JSONRPC_VERSION: &str = "2.0";
 const JSONRPC_METHOD_NOT_FOUND: i64 = -32601;
@@ -320,6 +324,19 @@ impl RpcPlugin {
         Ok(())
     }
 
+    /// Returns whether the child process has exited or been terminated.
+    #[must_use]
+    pub(crate) fn is_terminated(&mut self) -> bool {
+        if self.terminated {
+            return true;
+        }
+        if let Ok(Some(_)) = self.child.try_wait() {
+            self.terminated = true;
+            return true;
+        }
+        false
+    }
+
     /// Exports state from the live process before a hot-reload swap.
     pub(crate) fn export_state(&mut self, host: &mut RedHost) -> Result<Option<Value>> {
         let result = self.call_plugin("lifecycle/exportState", json!({}), true, host)?;
@@ -511,20 +528,37 @@ impl RpcPlugin {
             .map(drop)
     }
 
-    /// Drains any unsolicited Plugin -> Host messages or process faults.
+    /// Drains any unsolicited Plugin -> Host messages or process faults within a per-tick budget.
     pub(crate) fn poll_events(&mut self, host: &mut RedHost) -> Result<()> {
         if self.terminated {
             anyhow::bail!("JSON-RPC plugin `{}` is not running", self.name);
         }
-        loop {
+        let started = Instant::now();
+        for _ in 0..MAX_POLL_FRAMES_PER_TICK {
+            if started.elapsed() >= MAX_POLL_DURATION_PER_TICK {
+                break;
+            }
             match self.stdout_rx.try_recv() {
                 Ok(StdoutEvent::Line(line)) => {
-                    let message: Value = serde_json::from_slice(&line).with_context(|| {
-                        format!("malformed JSON-RPC frame from plugin `{}`", self.name)
-                    })?;
-                    self.validate_jsonrpc_envelope(&message)?;
+                    let message: Value = match serde_json::from_slice(&line) {
+                        Ok(message) => message,
+                        Err(error) => {
+                            self.kill();
+                            anyhow::bail!(
+                                "malformed JSON-RPC frame from plugin `{}`: {error}",
+                                self.name
+                            );
+                        }
+                    };
+                    if let Err(error) = self.validate_jsonrpc_envelope(&message) {
+                        self.kill();
+                        return Err(error);
+                    }
                     if message.get("method").is_some() {
-                        self.handle_plugin_message(&message, host)?;
+                        if let Err(error) = self.handle_plugin_message(&message, host) {
+                            self.kill();
+                            return Err(error);
+                        }
                     }
                 }
                 Ok(StdoutEvent::Eof) => {
@@ -542,6 +576,7 @@ impl RpcPlugin {
                 }
             }
         }
+        Ok(())
     }
 
     fn call_plugin(
@@ -577,6 +612,7 @@ impl RpcPlugin {
         }
 
         let deadline = Instant::now() + self.timeout;
+        let mut reentrant_calls = 0usize;
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
@@ -604,6 +640,14 @@ impl RpcPlugin {
                         return Err(error);
                     }
                     if message.get("method").is_some() {
+                        reentrant_calls = reentrant_calls.saturating_add(1);
+                        if reentrant_calls > MAX_REENTRANT_CALLS_PER_REQUEST {
+                            self.kill();
+                            anyhow::bail!(
+                                "JSON-RPC plugin `{}` exceeded {MAX_REENTRANT_CALLS_PER_REQUEST} host calls during `{method}`",
+                                self.name
+                            );
+                        }
                         if let Err(error) = self.handle_plugin_message(&message, host) {
                             self.kill();
                             return Err(error);
@@ -1092,7 +1136,8 @@ fn response_matches_id(id: Option<&Value>, expected: u64) -> bool {
 }
 
 fn spawn_stdout_reader(stdout: ChildStdout) -> Receiver<StdoutEvent> {
-    let (tx, rx) = mpsc::channel();
+    let (tx, rx): (SyncSender<StdoutEvent>, Receiver<StdoutEvent>) =
+        mpsc::sync_channel(MAX_PENDING_RPC_FRAMES);
     thread::spawn(move || {
         let mut reader = BufReader::new(stdout);
         let mut line = Vec::new();
