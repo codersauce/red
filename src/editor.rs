@@ -26313,12 +26313,19 @@ impl Editor {
             .edits
             .into_iter()
             .map(|edit| {
-                let start = self.current_buffer().position_to_char_idx(edit.range.start);
-                let end = self.current_buffer().position_to_char_idx(edit.range.end);
+                let buffer = self.current_buffer();
+                let start = buffer.position_to_char_idx(edit.range.start);
+                let end = buffer.position_to_char_idx(edit.range.end);
+                // Position conversion clamps; edit endpoints must round-trip exactly.
+                anyhow::ensure!(
+                    buffer.char_idx_to_position(start) == edit.range.start
+                        && buffer.char_idx_to_position(end) == edit.range.end,
+                    "document edit range is out of bounds"
+                );
                 anyhow::ensure!(start <= end, "document edit range is reversed");
                 if let Some(expected_text) = &edit.expected_text {
                     anyhow::ensure!(
-                        self.current_buffer().text_in_range(edit.range) == *expected_text,
+                        buffer.text_in_range(edit.range) == *expected_text,
                         "document edit preimage no longer matches"
                     );
                 }
@@ -37523,6 +37530,12 @@ builtin = "rust"
             "text": "world",
             "expected_text": "different"
         });
+        let out_of_bounds_edit = |start: TextPosition, end: TextPosition| {
+            json!({
+                "expected_revision": revision.to_string(),
+                "edits": [{"range": {"start": start, "end": end}, "text": "!"}]
+            })
+        };
 
         for (params, expected_code) in [
             (
@@ -37540,6 +37553,14 @@ builtin = "rust"
             (
                 json!({"path": "/not/open/in/red", "expected_revision": "0", "edits": []}),
                 -32001,
+            ),
+            (
+                out_of_bounds_edit(TextPosition::new(1, 0), TextPosition::new(0, 5)),
+                -32003,
+            ),
+            (
+                out_of_bounds_edit(TextPosition::new(0, 0), TextPosition::new(0, 6)),
+                -32003,
             ),
         ] {
             let error = editor

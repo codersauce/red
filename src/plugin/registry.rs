@@ -861,8 +861,7 @@ impl PluginRegistry {
             .iter()
             .filter(|(plugin, path)| {
                 matches!(self.statuses.get(plugin), Some(PluginStatus::Pending))
-                    && Path::new(path).file_name().and_then(|name| name.to_str())
-                        == Some(PLUGIN_MANIFEST_FILE)
+                    && is_rpc_plugin_path(path)
             })
             .flat_map(|(plugin, _)| {
                 self.metadata
@@ -891,8 +890,7 @@ impl PluginRegistry {
     fn has_pending_rpc_plugin(&self) -> bool {
         self.plugins.iter().any(|(plugin, path)| {
             matches!(self.statuses.get(plugin), Some(PluginStatus::Pending))
-                && Path::new(path).file_name().and_then(|name| name.to_str())
-                    == Some(PLUGIN_MANIFEST_FILE)
+                && is_rpc_plugin_path(path)
         })
     }
 
@@ -932,7 +930,7 @@ impl PluginRegistry {
                             .any(|event| event.strip_prefix("onCommand:") == Some(command))
                     })
             })
-            .min_by(|left, right| left.0.cmp(&right.0))
+            .min_by_key(|(name, path)| (is_rpc_plugin_path(path), name))
             .cloned()
     }
 
@@ -1601,6 +1599,10 @@ fn plugin_metadata(name: &str, plugin: &str) -> anyhow::Result<PluginMetadata> {
     PluginMetadata::from_file(&path)
 }
 
+fn is_rpc_plugin_path(path: &str) -> bool {
+    Path::new(path).ends_with(PLUGIN_MANIFEST_FILE)
+}
+
 fn external_plugin_package(
     plugin: &str,
 ) -> anyhow::Result<Option<(std::path::PathBuf, PluginPackageManifest)>> {
@@ -1871,7 +1873,7 @@ mod tests {
     }
 
     #[test]
-    fn pending_rpc_discovery_matches_the_lazy_command_owner() {
+    fn pending_husk_command_takes_precedence_over_pending_rpc() {
         let root = tempfile_dir("pending-rpc-husk-collision");
         let manifest = root.join(PLUGIN_MANIFEST_FILE);
         fs::write(
@@ -1902,12 +1904,12 @@ mod tests {
         .unwrap();
         let mut registry = PluginRegistry::new();
         registry.add("pending-rpc", manifest.to_str().unwrap());
-        registry.add("a-lazy-husk", husk.to_str().unwrap());
+        registry.add("z-lazy-husk", husk.to_str().unwrap());
 
         assert!(registry.registered_commands(&Runtime::new()).is_empty());
         assert_eq!(
             registry.pending_command_plugin("RpcHello"),
-            Some(("a-lazy-husk".to_string(), husk.display().to_string()))
+            Some(("z-lazy-husk".to_string(), husk.display().to_string()))
         );
     }
 
