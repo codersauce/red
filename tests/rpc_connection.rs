@@ -267,7 +267,11 @@ fn run_registry_fixture() -> Result<()> {
     assert_eq!(initialize["params"]["plugin_id"], "rpc-test");
     assert_eq!(
         initialize["params"]["host_methods"],
-        json!(["red/DocumentSnapshot"])
+        json!([
+            "red/DocumentSnapshot",
+            "red/DocumentApply",
+            "red/DocumentUndo"
+        ])
     );
     write_message(
         &mut output,

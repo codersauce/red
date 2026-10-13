@@ -4559,6 +4559,67 @@ struct RpcDocumentSnapshotParams {
     path: Option<String>,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RpcDocumentApplyParams {
+    #[serde(default)]
+    path: Option<String>,
+    expected_revision: String,
+    #[serde(default = "default_plugin_edit_label")]
+    label: String,
+    edits: Vec<plugin::DocumentEdit>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RpcDocumentUndoParams {
+    #[serde(default)]
+    path: Option<String>,
+    transaction_id: String,
+}
+
+fn default_plugin_edit_label() -> String {
+    "plugin edit".to_string()
+}
+
+struct EditorRpcHost<'a> {
+    editor: &'a mut Editor,
+    render_buffer: &'a mut RenderBuffer,
+    runtime: &'a mut Runtime,
+}
+
+#[async_trait::async_trait]
+impl plugin::RpcHost for EditorRpcHost<'_> {
+    async fn respond(
+        &mut self,
+        owner: &str,
+        incoming: plugin::rpc::RpcIncoming,
+    ) -> anyhow::Result<()> {
+        match incoming {
+            plugin::rpc::RpcIncoming::Request(request) => {
+                let result = self
+                    .editor
+                    .rpc_host_request(
+                        self.render_buffer,
+                        self.runtime,
+                        owner,
+                        &request.method,
+                        &request.params,
+                    )
+                    .await;
+                request.respond(result).await
+            }
+            plugin::rpc::RpcIncoming::Notification(notification) => {
+                log!(
+                    "Ignoring unsupported RPC plugin notification `{}`",
+                    notification.method
+                );
+                Ok(())
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct PendingLspFormatSave {
     save_as: Option<String>,
@@ -10577,7 +10638,7 @@ impl Editor {
         buffer: &mut RenderBuffer,
         runtime: &mut Runtime,
     ) -> anyhow::Result<()> {
-        self.service_rpc_host_requests(runtime).await;
+        self.service_rpc_host_requests(buffer, runtime).await;
         self.service_mouse_selection(buffer, runtime).await?;
         self.service_open_file_changes(buffer, runtime).await?;
         if self.agent_lsp.has_work() {
@@ -20461,7 +20522,8 @@ impl Editor {
                     .and_then(|commands| commands.cancel.clone());
                 if let Some(command) = scratch_command {
                     add_to_history = false;
-                    self.execute_plugin_command(runtime, &command).await?;
+                    self.execute_plugin_command(buffer, runtime, &command)
+                        .await?;
                 } else {
                     if *force {
                         return Ok(true);
@@ -22028,7 +22090,7 @@ impl Editor {
                     self.current_dialog = Some(Box::new(TutorialDemoPanel::new(self, kind)));
                     self.render(buffer)?;
                 } else {
-                    self.execute_plugin_command(runtime, cmd).await?;
+                    self.execute_plugin_command(buffer, runtime, cmd).await?;
                 }
             }
             Action::GoToLine(line) => {
@@ -25799,28 +25861,33 @@ impl Editor {
         })
     }
 
-    fn rpc_host_request(
-        buffer_manager: &buffer_manager::BufferManager,
+    fn rpc_params<T: serde::de::DeserializeOwned>(
         method: &str,
         params: &Value,
-    ) -> std::result::Result<Value, plugin::rpc::RpcErrorObject> {
-        if method != plugin::rpc::DOCUMENT_SNAPSHOT_METHOD {
-            return Err(plugin::rpc::RpcErrorObject::method_not_found(method));
+    ) -> std::result::Result<T, plugin::rpc::RpcErrorObject> {
+        serde_json::from_value(params.clone()).map_err(|error| plugin::rpc::RpcErrorObject {
+            code: -32602,
+            message: format!("invalid {method} params: {error}"),
+            data: None,
+        })
+    }
+
+    fn rpc_document_error(code: i64, error: impl std::fmt::Display) -> plugin::rpc::RpcErrorObject {
+        plugin::rpc::RpcErrorObject {
+            code,
+            message: error.to_string(),
+            data: None,
         }
+    }
+
+    fn rpc_document_snapshot_request(
+        buffer_manager: &buffer_manager::BufferManager,
+        params: &Value,
+    ) -> std::result::Result<Value, plugin::rpc::RpcErrorObject> {
         let params: RpcDocumentSnapshotParams =
-            serde_json::from_value(params.clone()).map_err(|error| {
-                plugin::rpc::RpcErrorObject {
-                    code: -32602,
-                    message: format!("invalid red/DocumentSnapshot params: {error}"),
-                    data: None,
-                }
-            })?;
+            Self::rpc_params(plugin::rpc::DOCUMENT_SNAPSHOT_METHOD, params)?;
         let snapshot = Self::plugin_document_snapshot(buffer_manager, params.path.as_deref())
-            .map_err(|error| plugin::rpc::RpcErrorObject {
-                code: -32001,
-                message: error.to_string(),
-                data: None,
-            })?;
+            .map_err(|error| Self::rpc_document_error(-32001, error))?;
         Ok(json!({
             "path": snapshot.path,
             "revision": snapshot.revision.to_string(),
@@ -25828,30 +25895,148 @@ impl Editor {
         }))
     }
 
+    async fn rpc_document_apply_request(
+        &mut self,
+        render_buffer: &mut RenderBuffer,
+        runtime: &mut Runtime,
+        owner: &str,
+        params: &Value,
+    ) -> std::result::Result<Value, plugin::rpc::RpcErrorObject> {
+        let params: RpcDocumentApplyParams =
+            Self::rpc_params(plugin::rpc::DOCUMENT_APPLY_METHOD, params)?;
+        let expected_revision = params.expected_revision.parse::<u64>().map_err(|_| {
+            Self::rpc_document_error(
+                -32602,
+                "red/DocumentApply expected_revision must be a decimal u64 string",
+            )
+        })?;
+        let buffer_index =
+            Self::plugin_document_index(&self.buffer_manager, params.path.as_deref())
+                .map_err(|error| Self::rpc_document_error(-32001, error))?;
+        let revision = self.buffer_manager[buffer_index].revision();
+        if revision != expected_revision {
+            return Err(Self::rpc_document_error(
+                -32002,
+                format!(
+                    "document revision changed: expected {expected_revision}, found {revision}"
+                ),
+            ));
+        }
+        let transaction_id = self
+            .apply_plugin_document_transaction(
+                render_buffer,
+                runtime,
+                PluginDocumentTransaction {
+                    owner: owner.to_string(),
+                    path: params.path,
+                    expected_revision,
+                    label: params.label,
+                    edits: params.edits,
+                },
+            )
+            .await
+            .map_err(|error| Self::rpc_document_error(-32003, error))?;
+        Ok(json!({
+            "transaction_id": transaction_id,
+            "revision": self.buffer_manager[buffer_index].revision().to_string(),
+        }))
+    }
+
+    async fn rpc_document_undo_request(
+        &mut self,
+        render_buffer: &mut RenderBuffer,
+        runtime: &mut Runtime,
+        owner: &str,
+        params: &Value,
+    ) -> std::result::Result<Value, plugin::rpc::RpcErrorObject> {
+        let params: RpcDocumentUndoParams =
+            Self::rpc_params(plugin::rpc::DOCUMENT_UNDO_METHOD, params)?;
+        let buffer_index =
+            Self::plugin_document_index(&self.buffer_manager, params.path.as_deref())
+                .map_err(|error| Self::rpc_document_error(-32001, error))?;
+        self.undo_plugin_document_transaction(
+            render_buffer,
+            runtime,
+            owner,
+            params.path.as_deref(),
+            &params.transaction_id,
+        )
+        .await
+        .map_err(|error| Self::rpc_document_error(-32003, error))?;
+        Ok(json!({
+            "revision": self.buffer_manager[buffer_index].revision().to_string(),
+        }))
+    }
+
+    async fn rpc_host_request(
+        &mut self,
+        render_buffer: &mut RenderBuffer,
+        runtime: &mut Runtime,
+        owner: &str,
+        method: &str,
+        params: &Value,
+    ) -> std::result::Result<Value, plugin::rpc::RpcErrorObject> {
+        match method {
+            plugin::rpc::DOCUMENT_SNAPSHOT_METHOD => {
+                Self::rpc_document_snapshot_request(&self.buffer_manager, params)
+            }
+            plugin::rpc::DOCUMENT_APPLY_METHOD => {
+                self.rpc_document_apply_request(render_buffer, runtime, owner, params)
+                    .await
+            }
+            plugin::rpc::DOCUMENT_UNDO_METHOD => {
+                self.rpc_document_undo_request(render_buffer, runtime, owner, params)
+                    .await
+            }
+            _ => Err(plugin::rpc::RpcErrorObject::method_not_found(method)),
+        }
+    }
+
     async fn execute_plugin_command(
         &mut self,
+        render_buffer: &mut RenderBuffer,
         runtime: &mut Runtime,
         command: &str,
     ) -> anyhow::Result<()> {
-        let buffer_manager = &self.buffer_manager;
-        let mut host =
-            |method: &str, params: &Value| Self::rpc_host_request(buffer_manager, method, params);
-        self.plugin_registry
-            .execute_with_rpc_host(runtime, command, &mut host)
+        let Some(mut execution) = self
+            .plugin_registry
+            .prepare_rpc_command(runtime, command)
             .await
+        else {
+            return self.plugin_registry.execute(runtime, command).await;
+        };
+        let result = {
+            let mut host = EditorRpcHost {
+                editor: self,
+                render_buffer,
+                runtime,
+            };
+            execution.run(&mut host).await
+        };
+        self.plugin_registry
+            .finish_rpc_command(runtime, execution, result);
+        Ok(())
     }
 
-    async fn service_rpc_host_requests(&mut self, runtime: &mut Runtime) {
-        let buffer_manager = &self.buffer_manager;
-        let mut host =
-            |method: &str, params: &Value| Self::rpc_host_request(buffer_manager, method, params);
+    async fn service_rpc_host_requests(
+        &mut self,
+        render_buffer: &mut RenderBuffer,
+        runtime: &mut Runtime,
+    ) {
         for _ in 0..PLUGIN_REQUESTS_PER_TICK {
-            if !self
-                .plugin_registry
-                .service_rpc_host_request(runtime, &mut host)
-                .await
-            {
+            let Some((owner, incoming)) = self.plugin_registry.take_rpc_host_request() else {
                 break;
+            };
+            let result = {
+                let mut host = EditorRpcHost {
+                    editor: self,
+                    render_buffer,
+                    runtime,
+                };
+                plugin::RpcHost::respond(&mut host, &owner, incoming).await
+            };
+            if let Err(error) = result {
+                self.plugin_registry.quarantine_rpc(runtime, &owner, error);
             }
         }
     }
@@ -30141,7 +30326,8 @@ impl Editor {
             .get(&self.current_buffer().id())
             .and_then(|commands| commands.submit.clone());
         if let Some(command) = scratch_command {
-            self.execute_plugin_command(runtime, &command).await?;
+            self.execute_plugin_command(buffer, runtime, &command)
+                .await?;
             return Ok(false);
         }
         let resume_insert_transaction = self.commit_active_transaction_before_save();
@@ -36970,12 +37156,8 @@ builtin = "rust"
     #[test]
     fn rpc_document_snapshot_returns_unsaved_text_and_string_revision() {
         let editor = test_editor(/*width*/ 80, /*height*/ 24);
-        let response = Editor::rpc_host_request(
-            &editor.buffer_manager,
-            plugin::rpc::DOCUMENT_SNAPSHOT_METHOD,
-            &json!({}),
-        )
-        .unwrap();
+        let response =
+            Editor::rpc_document_snapshot_request(&editor.buffer_manager, &json!({})).unwrap();
 
         assert_eq!(response["path"], Value::Null);
         assert_eq!(
@@ -36989,21 +37171,145 @@ builtin = "rust"
     #[test]
     fn rpc_document_snapshot_rejects_invalid_and_unavailable_paths() {
         let editor = test_editor(/*width*/ 80, /*height*/ 24);
-        let invalid = Editor::rpc_host_request(
+        let invalid = Editor::rpc_document_snapshot_request(
             &editor.buffer_manager,
-            plugin::rpc::DOCUMENT_SNAPSHOT_METHOD,
             &json!({"unknown": true}),
         )
         .unwrap_err();
-        let unavailable = Editor::rpc_host_request(
+        let unavailable = Editor::rpc_document_snapshot_request(
             &editor.buffer_manager,
-            plugin::rpc::DOCUMENT_SNAPSHOT_METHOD,
             &json!({"path": "/not/open/in/red"}),
         )
         .unwrap_err();
 
         assert_eq!(invalid.code, -32602);
         assert_eq!(unavailable.code, -32001);
+    }
+
+    #[tokio::test]
+    async fn rpc_document_apply_and_undo_use_one_attributed_transaction() {
+        let mut editor = test_editor(/*width*/ 80, /*height*/ 24);
+        let revision = editor.current_buffer().revision().to_string();
+        let mut render_buffer = RenderBuffer::new(80, 24, &Style::default());
+        let mut runtime = Runtime::new();
+
+        let applied = editor
+            .rpc_host_request(
+                &mut render_buffer,
+                &mut runtime,
+                "rpc-test",
+                plugin::rpc::DOCUMENT_APPLY_METHOD,
+                &json!({
+                    "expected_revision": revision,
+                    "edits": [{
+                        "range": {
+                            "start": {"line": 0, "character": 0},
+                            "end": {"line": 0, "character": 5}
+                        },
+                        "text": "world",
+                        "expected_text": "hello"
+                    }]
+                }),
+            )
+            .await
+            .unwrap();
+        let transaction_id = applied["transaction_id"].as_str().unwrap();
+
+        assert_eq!(editor.current_buffer().contents(), "world");
+        assert!(editor.current_buffer().is_dirty());
+        assert_eq!(
+            applied["revision"],
+            editor.current_buffer().revision().to_string()
+        );
+        assert!(matches!(
+            &editor
+                .current_buffer()
+                .undo_history
+                .latest_transaction()
+                .unwrap()
+                .origin,
+            EditOrigin::Plugin { name } if name == "rpc-test"
+        ));
+
+        let forbidden = editor
+            .rpc_host_request(
+                &mut render_buffer,
+                &mut runtime,
+                "other-plugin",
+                plugin::rpc::DOCUMENT_UNDO_METHOD,
+                &json!({"transaction_id": transaction_id}),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(forbidden.code, -32003);
+        assert_eq!(editor.current_buffer().contents(), "world");
+
+        let undone = editor
+            .rpc_host_request(
+                &mut render_buffer,
+                &mut runtime,
+                "rpc-test",
+                plugin::rpc::DOCUMENT_UNDO_METHOD,
+                &json!({"transaction_id": transaction_id}),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(editor.current_buffer().contents(), "hello");
+        assert!(!editor.current_buffer().is_dirty());
+        assert_eq!(
+            undone["revision"],
+            editor.current_buffer().revision().to_string()
+        );
+    }
+
+    #[tokio::test]
+    async fn rpc_document_apply_rejects_invalid_stale_and_mismatched_edits() {
+        let mut editor = test_editor(/*width*/ 80, /*height*/ 24);
+        let revision = editor.current_buffer().revision();
+        let mut render_buffer = RenderBuffer::new(80, 24, &Style::default());
+        let mut runtime = Runtime::new();
+        let edit = json!({
+            "range": {
+                "start": {"line": 0, "character": 0},
+                "end": {"line": 0, "character": 5}
+            },
+            "text": "world",
+            "expected_text": "different"
+        });
+
+        for (params, expected_code) in [
+            (
+                json!({"expected_revision": revision, "edits": [edit.clone()]}),
+                -32602,
+            ),
+            (
+                json!({"expected_revision": (revision + 1).to_string(), "edits": [edit.clone()]}),
+                -32002,
+            ),
+            (
+                json!({"expected_revision": revision.to_string(), "edits": [edit]}),
+                -32003,
+            ),
+            (
+                json!({"path": "/not/open/in/red", "expected_revision": "0", "edits": []}),
+                -32001,
+            ),
+        ] {
+            let error = editor
+                .rpc_host_request(
+                    &mut render_buffer,
+                    &mut runtime,
+                    "rpc-test",
+                    plugin::rpc::DOCUMENT_APPLY_METHOD,
+                    &params,
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(error.code, expected_code, "{params}");
+        }
+        assert_eq!(editor.current_buffer().contents(), "hello");
+        assert!(!editor.current_buffer().is_dirty());
     }
 
     async fn install_event_recorder(editor: &mut Editor, runtime: &mut Runtime) {

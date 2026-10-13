@@ -18,6 +18,8 @@ def request_host(method, params):
     return response["result"]
 
 
+last_transaction_id = None
+
 for line in sys.stdin:
     message = json.loads(line)
     method = message.get("method")
@@ -40,13 +42,22 @@ for line in sys.stdin:
                             "name": "RpcDocument",
                             "metadata": {"title": "Show current RPC document"},
                         },
+                        {
+                            "name": "RpcApply",
+                            "metadata": {"title": "Apply an RPC document edit"},
+                        },
+                        {
+                            "name": "RpcUndo",
+                            "metadata": {"title": "Undo the last RPC edit"},
+                        },
                     ],
                 },
             }
         )
     elif method == "command/execute":
         try:
-            if message["params"]["name"] == "RpcDocument":
+            command = message["params"]["name"]
+            if command == "RpcDocument":
                 document = request_host("red/DocumentSnapshot", {})
                 path = document["path"] or "[scratch]"
                 result = {
@@ -55,6 +66,35 @@ for line in sys.stdin:
                         f"({len(document['text'])} chars)"
                     )
                 }
+            elif command == "RpcApply":
+                document = request_host("red/DocumentSnapshot", {})
+                applied = request_host(
+                    "red/DocumentApply",
+                    {
+                        "expected_revision": document["revision"],
+                        "label": "RPC example edit",
+                        "edits": [
+                            {
+                                "range": {
+                                    "start": {"line": 0, "character": 0},
+                                    "end": {"line": 0, "character": 0},
+                                },
+                                "text": "# Edited by Python RPC\n",
+                                "expected_text": "",
+                            }
+                        ],
+                    },
+                )
+                last_transaction_id = applied["transaction_id"]
+                result = {"message": f"RPC edit applied @ {applied['revision']}"}
+            elif command == "RpcUndo":
+                if last_transaction_id is None:
+                    raise RuntimeError("RpcApply has no transaction to undo")
+                undone = request_host(
+                    "red/DocumentUndo", {"transaction_id": last_transaction_id}
+                )
+                last_transaction_id = None
+                result = {"message": f"RPC edit undone @ {undone['revision']}"}
             else:
                 name = message["params"]["raw_args"] or "Red"
                 result = {"message": f"Hello, {name}, from Python RPC!"}

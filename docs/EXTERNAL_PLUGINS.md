@@ -131,9 +131,10 @@ See the [JSON-RPC plugin protocol](RPC_PLUGIN_PROTOCOL.md) for framing,
 lifecycle, capabilities, and the bounded version 1 surface. Declared commands
 appear in colon completion and the command palette before activation. Invoking
 one starts the process, validates its command metadata, and sends the typed
-`command/execute` request. Active plugins can call `red/DocumentSnapshot` to
-read the current unsaved text and revision of an open document. Event delivery
-and document mutation calls follow in later implementation steps.
+`command/execute` request. Active plugins can call `red/DocumentSnapshot`,
+`red/DocumentApply`, and `red/DocumentUndo` to read and transactionally edit
+open documents through Red's existing revision, dirty-state, undo, and LSP
+paths. Event delivery follows in a later implementation step.
 
 ## Lifecycle
 

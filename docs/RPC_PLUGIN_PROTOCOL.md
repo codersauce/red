@@ -69,7 +69,11 @@ The version 1 initialization parameters are:
   "protocol_versions": [1],
   "red_api_version": "0.19.0",
   "plugin_id": "document-tools",
-  "host_methods": ["red/DocumentSnapshot"]
+  "host_methods": [
+    "red/DocumentSnapshot",
+    "red/DocumentApply",
+    "red/DocumentUndo"
+  ]
 }
 ```
 
@@ -151,6 +155,55 @@ The optional `path` may be a string or `null`; additional fields are rejected
 with JSON-RPC error `-32602`. A document that is not open in Red returns
 application error `-32001`. These request errors leave the plugin active.
 
+## Document transactions
+
+`red/DocumentApply` applies one non-empty batch against an exact document
+revision. Red validates every range and optional preimage before applying any
+edit, then records the batch as one transaction attributed to the calling
+plugin:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": "plugin-2",
+  "method": "red/DocumentApply",
+  "params": {
+    "path": "src/main.rs",
+    "expected_revision": "42",
+    "label": "Rename greeting",
+    "edits": [{
+      "range": {
+        "start": {"line": 0, "character": 3},
+        "end": {"line": 0, "character": 7}
+      },
+      "text": "welcome",
+      "expected_text": "main"
+    }]
+  }
+}
+```
+
+`path` is optional and defaults to the current document. `label` is optional
+and defaults to `plugin edit`. The result contains the attributed transaction
+ID and resulting revision as decimal strings:
+
+```json
+{"jsonrpc":"2.0","id":"plugin-2","result":{"transaction_id":"...","revision":"43"}}
+```
+
+`red/DocumentUndo` reverts that transaction only while it remains the latest
+change and is owned by the calling plugin:
+
+```json
+{"jsonrpc":"2.0","id":"plugin-3","method":"red/DocumentUndo","params":{"path":"src/main.rs","transaction_id":"..."}}
+```
+
+Its result is `{"revision":"44"}`. Both calls preserve Red's ordinary dirty
+tracking, undo history, rendering, plugin notifications, and LSP updates.
+Invalid parameters return `-32602`, unavailable documents return `-32001`,
+stale revisions return `-32002`, and rejected transactions or undo requests
+return `-32003`. These application errors leave the plugin active.
+
 ## Version 1 surface
 
 Version 1 deliberately exposes a small set of typed operations:
@@ -179,10 +232,10 @@ will be pushed into a host-owned cache so rendering never waits for a plugin;
 disconnecting the plugin clears its contribution. Version 1 assigns no wire
 method or schema to that future surface.
 
-The current host integration activates and executes commands and serves
-`red/DocumentSnapshot`. Event delivery, document mutation calls, text panels,
-and statusline providers land as separate typed steps; declaring RPC activation
-events before event delivery is available fails activation with a diagnostic.
+The current host integration activates and executes commands and serves the
+three document methods above. Event delivery, text panels, and statusline
+providers land as separate typed steps; declaring RPC activation events before
+event delivery is available fails activation with a diagnostic.
 
 ## Errors and failure semantics
 

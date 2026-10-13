@@ -26,6 +26,8 @@ const MAX_DIAGNOSTIC_BYTES: usize = 16 * 1024;
 const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 const REAP_TIMEOUT: Duration = Duration::from_secs(2);
 pub(crate) const DOCUMENT_SNAPSHOT_METHOD: &str = "red/DocumentSnapshot";
+pub(crate) const DOCUMENT_APPLY_METHOD: &str = "red/DocumentApply";
+pub(crate) const DOCUMENT_UNDO_METHOD: &str = "red/DocumentUndo";
 
 /// Initialization parameters sent before an RPC plugin becomes active.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -347,6 +349,24 @@ pub struct RpcConnection {
     supervisor_task: Option<JoinHandle<()>>,
 }
 
+/// Cloneable request handle that keeps process ownership in [`RpcConnection`].
+#[derive(Clone)]
+pub(crate) struct RpcRequester {
+    writer: RpcWriter,
+    state: Arc<ConnectionState>,
+}
+
+impl RpcRequester {
+    pub(crate) async fn request(
+        &self,
+        method: &str,
+        params: Value,
+        deadline: Duration,
+    ) -> Result<Value> {
+        request(&self.writer, &self.state, method, params, deadline).await
+    }
+}
+
 impl RpcConnection {
     /// Spawns an already configured plugin command with piped standard streams.
     pub fn spawn(mut command: Command) -> Result<(Self, mpsc::Receiver<RpcIncoming>)> {
@@ -418,48 +438,13 @@ impl RpcConnection {
 
     /// Sends one request and correlates its response within the same deadline.
     pub async fn request(&self, method: &str, params: Value, deadline: Duration) -> Result<Value> {
-        anyhow::ensure!(!method.trim().is_empty(), "RPC method is empty");
-        ensure_named_params(&params)?;
-        let (response, receiver) = oneshot::channel();
-        let id = match self.state.reserve_request(method, response).await {
-            Ok(id) => id,
-            Err(error) => {
-                let report = self.state.fail(error.to_string()).await;
-                return Err(close_error(report));
-            }
-        };
-        let key = format!("s:{id}");
-        let frame = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
-        let operation = async {
-            self.writer.send(frame, deadline).await?;
-            receiver.await.context("RPC response channel closed")
-        };
-        match timeout(deadline, operation).await {
-            Ok(Ok(ResponseOutcome::Result(result))) => Ok(result),
-            Ok(Ok(ResponseOutcome::Error(error))) => Err(error.into()),
-            Ok(Ok(ResponseOutcome::Disconnected(reason))) => {
-                let report = self.state.wait_closed().await;
-                Err(anyhow::anyhow!(format_close_message(
-                    &reason,
-                    &report.diagnostics
-                )))
-            }
-            Ok(Err(error)) => {
-                self.state.remove_pending(&key).await;
-                let report = self.state.fail(error.to_string()).await;
-                Err(close_error(report))
-            }
-            Err(_) => {
-                self.state.remove_pending(&key).await;
-                let report = self
-                    .state
-                    .fail(format!(
-                        "RPC request `{method}` timed out after {} ms",
-                        deadline.as_millis()
-                    ))
-                    .await;
-                Err(close_error(report))
-            }
+        request(&self.writer, &self.state, method, params, deadline).await
+    }
+
+    pub(crate) fn requester(&self) -> RpcRequester {
+        RpcRequester {
+            writer: self.writer.clone(),
+            state: Arc::clone(&self.state),
         }
     }
 
@@ -545,6 +530,57 @@ impl RpcConnection {
             forced: report.forced,
             diagnostics: report.diagnostics,
         })
+    }
+}
+
+async fn request(
+    writer: &RpcWriter,
+    state: &Arc<ConnectionState>,
+    method: &str,
+    params: Value,
+    deadline: Duration,
+) -> Result<Value> {
+    anyhow::ensure!(!method.trim().is_empty(), "RPC method is empty");
+    ensure_named_params(&params)?;
+    let (response, receiver) = oneshot::channel();
+    let id = match state.reserve_request(method, response).await {
+        Ok(id) => id,
+        Err(error) => {
+            let report = state.fail(error.to_string()).await;
+            return Err(close_error(report));
+        }
+    };
+    let key = format!("s:{id}");
+    let frame = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
+    let operation = async {
+        writer.send(frame, deadline).await?;
+        receiver.await.context("RPC response channel closed")
+    };
+    match timeout(deadline, operation).await {
+        Ok(Ok(ResponseOutcome::Result(result))) => Ok(result),
+        Ok(Ok(ResponseOutcome::Error(error))) => Err(error.into()),
+        Ok(Ok(ResponseOutcome::Disconnected(reason))) => {
+            let report = state.wait_closed().await;
+            Err(anyhow::anyhow!(format_close_message(
+                &reason,
+                &report.diagnostics
+            )))
+        }
+        Ok(Err(error)) => {
+            state.remove_pending(&key).await;
+            let report = state.fail(error.to_string()).await;
+            Err(close_error(report))
+        }
+        Err(_) => {
+            state.remove_pending(&key).await;
+            let report = state
+                .fail(format!(
+                    "RPC request `{method}` timed out after {} ms",
+                    deadline.as_millis()
+                ))
+                .await;
+            Err(close_error(report))
+        }
     }
 }
 
