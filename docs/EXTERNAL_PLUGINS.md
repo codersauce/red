@@ -2,8 +2,9 @@
 
 Red loads external plugins from isolated package directories under
 `$XDG_CONFIG_HOME/red/plugins` (or the platform-equivalent Red configuration
-directory). A package contains a `red-plugin.toml` manifest and either a Husk
-entrypoint, a native companion, or both.
+directory). A package contains a `red-plugin.toml` manifest and a Husk
+entrypoint, a standalone JSON-RPC process, a native companion, language
+definitions, or one of the supported combinations.
 
 The editor remains the authority for buffers, undo history, UI focus, sessions,
 and user confirmations. Plugins request attributed operations through the
@@ -100,6 +101,36 @@ registration, and conventionally named lifecycle functions remain compatible.
 Prefer sparse `red::state_patch(PluginState { field: value })` updates over
 replacing the complete state record, especially when other fields contain
 larger result collections.
+
+## Standalone JSON-RPC process
+
+The optional `[rpc]` section declares a language-agnostic plugin process:
+
+```toml
+[plugin]
+id = "document-tools"
+name = "Document Tools"
+version = "0.1.0"
+red_api = "^0.19.0"
+
+[rpc]
+command = "python3"
+args = ["plugin.py"]
+```
+
+A bare command such as `python3` resolves through `PATH`. A command containing
+a path separator, such as `bin/document-tools`, must name an existing file
+inside the package. Red sets the process working directory to the package root
+and passes arguments directly without a shell.
+
+An RPC package cannot also declare a Husk entrypoint or `[companion]`.
+Language definitions may accompany any supported executable modality. Existing
+Husk, companion, and language-only manifests retain their current meaning.
+
+See the [JSON-RPC plugin protocol](RPC_PLUGIN_PROTOCOL.md) for framing,
+lifecycle, capabilities, and the bounded version 1 surface. Package validation
+and management classification are implemented first; process activation and
+editor integration follow in later implementation steps.
 
 ## Lifecycle
 

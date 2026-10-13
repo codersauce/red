@@ -1,6 +1,12 @@
 {
-  "api_version": "0.18.0",
+  "api_version": "0.19.0",
   "changes": [
+    {
+      "version": "0.19.0",
+      "kind": "introduced",
+      "symbols": ["red-plugin.toml [rpc]", "Red JSON-RPC protocol v1"],
+      "migration_note": "docs/RPC_PLUGIN_PROTOCOL.md"
+    },
     {
       "version": "0.18.0",
       "kind": "introduced",

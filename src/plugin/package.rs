@@ -45,6 +45,7 @@ const MAX_CATALOG_GRAMMAR_BYTES: u64 = 64 * 1024 * 1024;
 const COMMAND_SCOPE_API_VERSION: &str = "0.7.0";
 const COMMAND_ARGUMENTS_API_VERSION: &str = "0.11.0";
 const INDENTATION_API_VERSION: &str = "0.12.0";
+const RPC_PLUGIN_API_VERSION: &str = "0.19.0";
 
 /// A parsed and validated stable plugin identifier.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -91,6 +92,8 @@ pub struct PluginPackageManifest {
     #[serde(default)]
     pub keymaps: BTreeMap<String, BTreeMap<String, String>>,
     pub companion: Option<PluginCompanionManifest>,
+    /// Standalone JSON-RPC process declaration.
+    pub rpc: Option<PluginRpcManifest>,
     /// Reusable language definitions contributed without requiring a Husk entrypoint.
     #[serde(default)]
     pub languages: BTreeMap<String, LanguageConfig>,
@@ -154,6 +157,17 @@ pub struct PluginCompanionArtifact {
     pub sha256: String,
 }
 
+/// Standalone JSON-RPC process declaration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PluginRpcManifest {
+    /// Package-relative executable path or a bare command resolved through `PATH`.
+    pub command: String,
+    /// Arguments passed directly to the process without a shell.
+    #[serde(default)]
+    pub args: Vec<String>,
+}
+
 /// Origin retained so an installed package can be updated.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "kind")]
@@ -198,6 +212,7 @@ pub struct InstalledPlugin {
     pub compatible: bool,
     pub has_companion: bool,
     pub has_husk: bool,
+    pub has_rpc: bool,
     /// Whether the package contributes one or more language definitions.
     pub has_languages: bool,
     pub has_native_grammars: bool,
@@ -210,6 +225,27 @@ pub struct InstalledPlugin {
 #[derive(Debug, Clone)]
 pub struct PluginPackageManager {
     config_dir: PathBuf,
+}
+
+impl InstalledPlugin {
+    /// Human-readable package modalities for management surfaces.
+    #[must_use]
+    pub fn modality_label(&self) -> String {
+        let mut modalities = Vec::with_capacity(4);
+        if self.has_husk {
+            modalities.push("Husk");
+        }
+        if self.has_rpc {
+            modalities.push("JSON-RPC");
+        }
+        if self.has_companion {
+            modalities.push("Companion");
+        }
+        if self.has_languages {
+            modalities.push("Language");
+        }
+        modalities.join(" + ")
+    }
 }
 
 impl PluginPackageManifest {
@@ -236,8 +272,9 @@ impl PluginPackageManifest {
             self.plugin.husk_manifest.is_some()
                 || self.plugin.entry.is_some()
                 || self.companion.is_some()
+                || self.rpc.is_some()
                 || !self.languages.is_empty(),
-            "plugin package must declare a Husk entrypoint, native companion, or language"
+            "plugin package must declare a Husk entrypoint, JSON-RPC process, native companion, or language"
         );
         anyhow::ensure!(
             host_api_requirement_is_supported(&self.plugin.red_api)?,
@@ -245,6 +282,7 @@ impl PluginPackageManifest {
             self.plugin.red_api,
             SUPPORTED_HOST_API_VERSIONS.join(", ")
         );
+        self.validate_rpc(package_root)?;
 
         for relative in self
             .plugin
@@ -366,6 +404,29 @@ impl PluginPackageManifest {
             }
         }
         validate_keymaps(&self.keymaps)?;
+        Ok(())
+    }
+
+    fn validate_rpc(&self, package_root: &Path) -> Result<()> {
+        let Some(rpc) = &self.rpc else {
+            return Ok(());
+        };
+        anyhow::ensure!(
+            self.plugin.husk_manifest.is_none() && self.plugin.entry.is_none(),
+            "JSON-RPC plugins cannot also declare a Husk entrypoint"
+        );
+        anyhow::ensure!(
+            self.companion.is_none(),
+            "JSON-RPC plugins cannot also declare a native companion"
+        );
+        anyhow::ensure!(
+            host_api_requirement_requires_at_least(&self.plugin.red_api, RPC_PLUGIN_API_VERSION)?,
+            "JSON-RPC plugins require red_api = \"^{RPC_PLUGIN_API_VERSION}\" or later"
+        );
+        anyhow::ensure!(!rpc.command.trim().is_empty(), "RPC command is empty");
+        if !is_bare_command_name(&rpc.command) {
+            validate_package_file(package_root, Path::new(&rpc.command))?;
+        }
         Ok(())
     }
 
@@ -1139,6 +1200,14 @@ fn validate_relative_path(path: &Path) -> Result<()> {
     Ok(())
 }
 
+fn is_bare_command_name(command: &str) -> bool {
+    if command.contains('/') || command.contains('\\') {
+        return false;
+    }
+    let mut components = Path::new(command).components();
+    matches!(components.next(), Some(Component::Normal(_))) && components.next().is_none()
+}
+
 fn validate_package_file(package_root: &Path, relative: &Path) -> Result<()> {
     validate_relative_path(relative)?;
     let path = package_root.join(relative);
@@ -1274,6 +1343,7 @@ fn installed_from_record(record: PluginInstallRecord) -> Result<InstalledPlugin>
         compatible: host_api_requirement_is_supported(&manifest.plugin.red_api)?,
         has_companion: manifest.companion.is_some(),
         has_husk,
+        has_rpc: manifest.rpc.is_some(),
         has_languages: !manifest.languages.is_empty(),
         has_native_grammars,
         languages,
@@ -1448,10 +1518,11 @@ fn validate_catalog_manifest(
         manifest.plugin.husk_manifest.is_none()
             && manifest.plugin.entry.is_none()
             && manifest.companion.is_none()
+            && manifest.rpc.is_none()
             && manifest.activation.events.is_empty()
             && manifest.activation.commands.is_empty()
             && manifest.keymaps.is_empty(),
-        "catalog language packs cannot contain Husk code, native companions, activation events, or keymaps"
+        "catalog language packs cannot contain executable plugins, activation events, or keymaps"
     );
     let manifest_languages = manifest.languages.keys().cloned().collect::<BTreeSet<_>>();
     let catalog_languages = package.languages.iter().cloned().collect::<BTreeSet<_>>();
@@ -1771,6 +1842,31 @@ filenames = ["Buildfile"]
 
 [languages.buildspec.grammar]
 builtin = "rust"
+"#
+            ),
+        )
+        .unwrap();
+    }
+
+    fn write_rpc_package(root: &Path, red_api: &str, command: &str) {
+        fs::write(
+            root.join(PLUGIN_MANIFEST_FILE),
+            format!(
+                r#"
+schema_version = 1
+
+[plugin]
+id = "document-tools"
+name = "Document Tools"
+version = "1.0.0"
+red_api = "{red_api}"
+
+[rpc]
+command = "{command}"
+args = ["plugin.py"]
+
+[activation]
+commands = ["DocumentTools"]
 "#
             ),
         )
@@ -2177,6 +2273,106 @@ symbol = "tree_sitter_buildspec"
         assert!(error.to_string().contains("safety limit"));
         assert!(!destination.exists());
         assert!(manager.list().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn rpc_package_installs_and_validates_bare_and_relative_commands() {
+        let config = tempfile::tempdir().unwrap();
+        let package = tempfile::tempdir().unwrap();
+        write_rpc_package(package.path(), "^0.19.0", "python3");
+        let manager = PluginPackageManager::new(config.path());
+
+        let installed = manager.install_path(package.path()).await.unwrap();
+        let manifest = PluginPackageManifest::load(&installed.package_root).unwrap();
+
+        assert!(installed.has_rpc);
+        assert!(!installed.has_husk);
+        assert!(!installed.has_companion);
+        assert_eq!(installed.modality_label(), "JSON-RPC");
+        assert_eq!(manifest.rpc.as_ref().unwrap().command, "python3");
+        assert_eq!(manifest.rpc.as_ref().unwrap().args, ["plugin.py"]);
+
+        fs::create_dir(package.path().join("bin")).unwrap();
+        fs::write(package.path().join("bin/document-tools"), "executable").unwrap();
+        write_rpc_package(package.path(), "^0.19.0", "bin/document-tools");
+        let manifest = PluginPackageManifest::load(package.path()).unwrap();
+
+        assert_eq!(manifest.rpc.as_ref().unwrap().command, "bin/document-tools");
+    }
+
+    #[test]
+    fn rpc_package_rejects_ambiguous_modalities_and_old_host_api() {
+        let package = tempfile::tempdir().unwrap();
+        write_rpc_package(package.path(), "^0.19.0", "python3");
+        let manifest_path = package.path().join(PLUGIN_MANIFEST_FILE);
+        let source = fs::read_to_string(&manifest_path).unwrap();
+        let cases = [
+            (
+                source.replace(
+                    "red_api = \"^0.19.0\"",
+                    "red_api = \"^0.19.0\"\nentry = \"plugin.hk\"",
+                ),
+                "Husk entrypoint",
+            ),
+            (
+                format!("{source}\n[companion]\ncommand = \"bin/companion\"\n"),
+                "native companion",
+            ),
+            (
+                source.replace("red_api = \"^0.19.0\"", "red_api = \"^0.18.0\""),
+                "require red_api",
+            ),
+        ];
+
+        for (source, expected) in cases {
+            fs::write(&manifest_path, source).unwrap();
+            let error = PluginPackageManifest::load(package.path()).unwrap_err();
+            assert!(
+                error.to_string().contains(expected),
+                "expected `{expected}` in {error:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn rpc_command_paths_must_name_files_inside_the_package() {
+        let package = tempfile::tempdir().unwrap();
+
+        for (command, expected) in [
+            ("../document-tools", "unsafe component"),
+            ("/bin/document-tools", "package-relative"),
+            ("bin/missing", "does not exist"),
+        ] {
+            write_rpc_package(package.path(), "^0.19.0", command);
+            let error = PluginPackageManifest::load(package.path()).unwrap_err();
+            assert!(
+                error.to_string().contains(expected),
+                "expected `{expected}` in {error:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn catalog_language_manifest_rejects_rpc_content() {
+        let root = tempfile::tempdir().unwrap();
+        write_language_package(root.path(), "build-languages");
+        let manifest_path = root.path().join(PLUGIN_MANIFEST_FILE);
+        let mut source = fs::read_to_string(&manifest_path).unwrap();
+        source.push_str("\n[rpc]\ncommand = \"python3\"\n");
+        fs::write(&manifest_path, source).unwrap();
+        let manifest = PluginPackageManifest::load(root.path()).unwrap();
+        let artifact = CatalogArtifact {
+            url: "https://github.com/codersauce/red-language-packs/releases/download/test/test.tar.gz".to_string(),
+            sha256: "a".repeat(64),
+            size: 1,
+            grammars: BTreeMap::new(),
+        };
+        let package = catalog_package(artifact.clone());
+
+        let error =
+            validate_catalog_manifest(&package, &artifact, &manifest, root.path()).unwrap_err();
+
+        assert!(error.to_string().contains("executable plugins"));
     }
 
     #[tokio::test]

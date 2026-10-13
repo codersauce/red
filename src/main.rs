@@ -417,16 +417,13 @@ async fn run_plugin_command(command: &PluginCommand) -> anyhow::Result<()> {
                 } else {
                     "incompatible"
                 };
-                let companion = if plugin.has_companion {
-                    "companion"
-                } else if plugin.has_languages {
-                    "language"
-                } else {
-                    "husk"
-                };
                 println!(
                     "{}\t{}\t{}\t{}\t{}",
-                    plugin.id, plugin.version, state, compatibility, companion
+                    plugin.id,
+                    plugin.version,
+                    state,
+                    compatibility,
+                    plugin.modality_label()
                 );
             }
         }

@@ -523,7 +523,7 @@ fn plugin_manager_items(
             id: format!("installed:{}", package.id),
             icon: None,
             label: package.name.clone(),
-            kind: Some("Language".to_string()),
+            kind: Some(package.modality_label()),
             annotation: Some(format!(
                 "{} · v{} · {}",
                 if catalog_source {
@@ -33708,6 +33708,7 @@ mod test {
             compatible: true,
             has_companion: false,
             has_husk: false,
+            has_rpc: false,
             has_languages: true,
             has_native_grammars: true,
             languages: vec!["go".to_string()],
@@ -33743,6 +33744,7 @@ mod test {
             compatible: true,
             has_companion: false,
             has_husk: false,
+            has_rpc: false,
             has_languages: true,
             has_native_grammars: true,
             languages: vec!["go".to_string()],
@@ -33785,6 +33787,7 @@ mod test {
             compatible: true,
             has_companion: false,
             has_husk: false,
+            has_rpc: true,
             has_languages: true,
             has_native_grammars: true,
             languages: vec!["go".to_string()],
@@ -33803,6 +33806,7 @@ mod test {
 
         assert_eq!(items[0].id, "installed:go-language");
         assert_eq!(items[0].label, "Locally modified Go support");
+        assert_eq!(items[0].kind.as_deref(), Some("JSON-RPC + Language"));
         assert!(items[0].annotation.as_deref().unwrap().contains("Custom"));
         assert_eq!(items[1].id, "catalog:go-language");
         assert!(items[1]
