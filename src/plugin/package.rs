@@ -1866,12 +1866,13 @@ version = "1.0.0"
 red_api = "{red_api}"
 
 [rpc]
-command = "{command}"
+command = {command}
 args = ["plugin.py"]
 
 [activation]
 commands = ["DocumentTools"]
-"#
+"#,
+                command = toml::Value::String(command.into())
             ),
         )
         .unwrap();
@@ -2342,10 +2343,11 @@ symbol = "tree_sitter_buildspec"
     #[test]
     fn rpc_command_paths_must_name_files_inside_the_package() {
         let package = tempfile::tempdir().unwrap();
+        let absolute_command = package.path().join("document-tools");
 
         for (command, expected) in [
             ("../document-tools", "unsafe component"),
-            ("/bin/document-tools", "package-relative"),
+            (absolute_command.to_str().unwrap(), "package-relative"),
             ("bin/missing", "does not exist"),
         ] {
             write_rpc_package(package.path(), "^0.19.0", command);
