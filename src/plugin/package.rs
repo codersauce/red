@@ -228,6 +228,10 @@ pub struct PluginPackageManager {
 }
 
 impl InstalledPlugin {
+    pub(crate) fn restart_required(&self) -> bool {
+        self.has_husk || self.has_rpc || self.has_companion
+    }
+
     /// Human-readable package modalities for management surfaces.
     #[must_use]
     pub fn modality_label(&self) -> String {
@@ -2288,6 +2292,7 @@ symbol = "tree_sitter_buildspec"
         assert!(installed.has_rpc);
         assert!(!installed.has_husk);
         assert!(!installed.has_companion);
+        assert!(installed.restart_required());
         assert_eq!(installed.modality_label(), "JSON-RPC");
         assert_eq!(manifest.rpc.as_ref().unwrap().command, "python3");
         assert_eq!(manifest.rpc.as_ref().unwrap().args, ["plugin.py"]);

@@ -73,9 +73,33 @@ The version 1 initialization parameters are:
 }
 ```
 
-The response is an object containing `"protocol_version": 1`. The connection
-layer validates that selection and returns the remaining fields to activation,
-where command metadata and event subscriptions are validated before use.
+`plugin_id` is the stable ID from `[plugin].id`, independent of any local
+configuration alias used to register the package.
+
+The response declares the selected version and the plugin's command metadata:
+
+```json
+{
+  "protocol_version": 1,
+  "commands": [
+    {
+      "name": "DocumentTools",
+      "metadata": {
+        "title": "Document tools",
+        "arguments": true
+      }
+    }
+  ],
+  "events": []
+}
+```
+
+Every command declared under `[activation].commands` must appear exactly once,
+with no additional commands. Metadata uses Red's existing command fields:
+`title`, `category`, `description`, `aliases`, `visible`, `scope`, `arguments`,
+and `completions`. Omitted fields use the same defaults as Husk commands. If a
+Husk and RPC plugin expose the same command name, the Husk command keeps
+dispatch and discovery precedence.
 
 Red validates the full response before registering anything, then sends the
 `initialized` notification. Plugins must not call host methods before that
@@ -86,6 +110,25 @@ grace period.
 The plugin must keep reading responses while a command or event handler is
 running. A handler that waits for a host request while its message loop is
 blocked will deadlock itself.
+
+## Command execution
+
+Red lazily starts the plugin when a declared command is first invoked, then
+sends `command/execute`:
+
+```json
+{
+  "name": "DocumentTools",
+  "args": ["format", "selection"],
+  "raw_args": "format selection"
+}
+```
+
+Commands without `"arguments": true` receive empty `args` and `raw_args`.
+Successful commands return `null` or `{ "message": "Done" }`; Red displays a
+non-null message through its existing informational-message path. A JSON-RPC
+error is shown as a warning and leaves the connection active. A transport or
+result-schema failure quarantines the plugin.
 
 ## Version 1 surface
 
@@ -114,6 +157,11 @@ Statusline providers are planned as a later negotiated capability. Their data
 will be pushed into a host-owned cache so rendering never waits for a plugin;
 disconnecting the plugin clears its contribution. Version 1 assigns no wire
 method or schema to that future surface.
+
+The current host integration activates and executes commands. Event delivery,
+document host calls, text panels, and statusline providers land as separate
+typed steps; declaring RPC activation events before event delivery is available
+fails activation with a diagnostic.
 
 ## Errors and failure semantics
 

@@ -1,24 +1,29 @@
 use std::{
-    env,
+    env, fs,
     io::{BufRead, Write},
     time::Duration,
 };
 
 use anyhow::{Context as _, Result};
 use red::plugin::rpc::{RpcConnection, RpcIncoming, RpcInitializeParams};
+use red::plugin::{PluginRegistry, PluginStatus, Runtime};
 use serde_json::{json, Value};
 use tokio::process::Command;
 
 const FIXTURE_MODE: &str = "RED_RPC_FIXTURE_MODE";
 
 fn main() -> Result<()> {
+    if env::args().any(|argument| argument == "--registry-fixture") {
+        return run_registry_fixture();
+    }
     if let Ok(mode) = env::var(FIXTURE_MODE) {
         return run_fixture(&mode);
     }
 
     tokio::runtime::Runtime::new()?.block_on(async {
         exercises_bidirectional_requests_and_shutdown().await?;
-        deadline_failure_reaps_the_plugin_and_fails_its_peers().await
+        deadline_failure_reaps_the_plugin_and_fails_its_peers().await?;
+        registry_discovers_and_lazily_executes_an_rpc_command().await
     })
 }
 
@@ -74,6 +79,96 @@ async fn deadline_failure_reaps_the_plugin_and_fails_its_peers() -> Result<()> {
     assert!(peer.contains("timed out after 100 ms"));
     assert!(timed_out.contains("fixture stalled"));
     assert!(peer.contains("fixture stalled"));
+    Ok(())
+}
+
+async fn registry_discovers_and_lazily_executes_an_rpc_command() -> Result<()> {
+    let package = tempfile::tempdir()?;
+    let marker = package.path().join("executed.json");
+    let initialized_marker = package.path().join("initialized");
+    let executable = env::current_exe()?;
+    let executable_name = executable
+        .file_name()
+        .context("test executable has no file name")?
+        .to_string_lossy();
+    let executable_dir = executable
+        .parent()
+        .context("test executable has no parent")?;
+    let path = env::join_paths(
+        std::iter::once(executable_dir.to_path_buf())
+            .chain(env::split_paths(&env::var_os("PATH").unwrap_or_default())),
+    )?;
+    env::set_var("PATH", path);
+    env::set_var("RED_RPC_REGISTRY_MARKER", &marker);
+    fs::write(
+        package.path().join("red-plugin.toml"),
+        format!(
+            r#"schema_version = 1
+
+[plugin]
+id = "rpc-test"
+name = "RPC Test"
+version = "0.1.0"
+red_api = "^0.19.0"
+
+[rpc]
+command = "{executable_name}"
+args = ["--registry-fixture"]
+
+[activation]
+commands = ["RpcFail", "RpcHello"]
+"#
+        ),
+    )?;
+    let manifest = package.path().join("red-plugin.toml");
+    let mut registry = PluginRegistry::new();
+    registry.add(
+        "rpc-alias",
+        manifest.to_str().context("non-UTF-8 manifest path")?,
+    );
+    let mut runtime = Runtime::new();
+
+    registry.initialize(&mut runtime).await?;
+    registry.reload(&mut runtime).await?;
+    assert!(matches!(
+        registry.statuses().get("rpc-alias"),
+        Some(PluginStatus::Pending)
+    ));
+    registry.execute(&mut runtime, "RpcHello one two").await?;
+    assert!(matches!(
+        registry.statuses().get("rpc-alias"),
+        Some(PluginStatus::Active)
+    ));
+    let invocation: Value = serde_json::from_slice(&fs::read(&marker)?)?;
+    assert_eq!(invocation["name"], "RpcHello");
+    assert_eq!(invocation["args"], json!(["one", "two"]));
+    assert_eq!(invocation["raw_args"], "one two");
+    assert!(initialized_marker.is_file());
+    registry.execute(&mut runtime, "RpcFail").await?;
+    assert!(matches!(
+        registry.statuses().get("rpc-alias"),
+        Some(PluginStatus::Active)
+    ));
+    registry.deactivate_all(&mut runtime).await?;
+
+    fs::remove_file(&marker)?;
+    fs::remove_file(&initialized_marker)?;
+    let source = fs::read_to_string(&manifest)?;
+    fs::write(&manifest, source.replace("RpcHello", "RpcMismatch"))?;
+    let mut registry = PluginRegistry::new();
+    registry.add(
+        "rpc-alias",
+        manifest.to_str().context("non-UTF-8 manifest path")?,
+    );
+    registry.initialize(&mut runtime).await?;
+    registry.execute(&mut runtime, "RpcMismatch").await?;
+    assert!(matches!(
+        registry.statuses().get("rpc-alias"),
+        Some(PluginStatus::Quarantined { diagnostic, .. })
+            if diagnostic.contains("commands do not match")
+    ));
+    assert!(!marker.exists());
+    assert!(!initialized_marker.exists());
     Ok(())
 }
 
@@ -159,6 +254,67 @@ fn run_fixture(mode: &str) -> Result<()> {
     )?;
     assert_eq!(read_message(&mut input)?["method"], "exit");
     eprintln!("fixture exited");
+    Ok(())
+}
+
+fn run_registry_fixture() -> Result<()> {
+    let stdin = std::io::stdin();
+    let mut input = stdin.lock();
+    let stdout = std::io::stdout();
+    let mut output = stdout.lock();
+
+    let initialize = read_message(&mut input)?;
+    assert_eq!(initialize["params"]["plugin_id"], "rpc-test");
+    write_message(
+        &mut output,
+        json!({
+            "jsonrpc": "2.0",
+            "id": initialize["id"],
+            "result": {
+                "protocol_version": 1,
+                "commands": [
+                    {"name": "RpcFail"},
+                    {
+                        "name": "RpcHello",
+                        "metadata": {"title": "RPC hello", "arguments": true}
+                    }
+                ]
+            },
+        }),
+    )?;
+    assert_eq!(read_message(&mut input)?["method"], "initialized");
+    let marker = env::var_os("RED_RPC_REGISTRY_MARKER").context("missing marker path")?;
+    let marker = std::path::PathBuf::from(marker);
+    fs::write(marker.with_file_name("initialized"), [])?;
+    let execute = read_message(&mut input)?;
+    assert_eq!(execute["method"], "command/execute");
+    fs::write(marker, serde_json::to_vec(&execute["params"])?)?;
+    write_message(
+        &mut output,
+        json!({
+            "jsonrpc": "2.0",
+            "id": execute["id"],
+            "result": {"message": "hello from RPC"},
+        }),
+    )?;
+    let execute = read_message(&mut input)?;
+    assert_eq!(execute["method"], "command/execute");
+    assert_eq!(execute["params"]["name"], "RpcFail");
+    write_message(
+        &mut output,
+        json!({
+            "jsonrpc": "2.0",
+            "id": execute["id"],
+            "error": {"code": -32001, "message": "fixture failure"},
+        }),
+    )?;
+    let shutdown = read_message(&mut input)?;
+    assert_eq!(shutdown["method"], "shutdown");
+    write_message(
+        &mut output,
+        json!({"jsonrpc": "2.0", "id": shutdown["id"], "result": null}),
+    )?;
+    assert_eq!(read_message(&mut input)?["method"], "exit");
     Ok(())
 }
 

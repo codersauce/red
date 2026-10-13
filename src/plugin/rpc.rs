@@ -471,6 +471,16 @@ impl RpcConnection {
         params: RpcInitializeParams,
         deadline: Duration,
     ) -> Result<Value> {
+        let result = self.request_initialize(params, deadline).await?;
+        self.finish_initialize().await?;
+        Ok(result)
+    }
+
+    pub(crate) async fn request_initialize(
+        &self,
+        params: RpcInitializeParams,
+        deadline: Duration,
+    ) -> Result<Value> {
         let result = self
             .request("initialize", serde_json::to_value(params)?, deadline)
             .await?;
@@ -481,6 +491,10 @@ impl RpcConnection {
                 .await;
             return Err(close_error(report));
         }
+        Ok(result)
+    }
+
+    pub(crate) async fn finish_initialize(&self) -> Result<()> {
         self.state.mark_ready().await?;
         self.writer
             .send(
@@ -488,7 +502,7 @@ impl RpcConnection {
                 WRITE_TIMEOUT,
             )
             .await?;
-        Ok(result)
+        Ok(())
     }
 
     /// Requests graceful shutdown, then terminates and reaps after the grace period.

@@ -32,10 +32,11 @@ packages that declare those minors continue to load. New packages should target
 ## Standalone JSON-RPC packages
 
 Host API `0.19.0` introduces the package-level `[rpc]` contract for standalone
-plugins written in any language. Red validates and classifies these packages in
-this release; process activation and editor integration land in subsequent
-implementation steps. See the [JSON-RPC plugin protocol](RPC_PLUGIN_PROTOCOL.md)
-for the version 1 transport profile and supported surface.
+plugins written in any language. Red validates and classifies these packages,
+discovers their declared commands, starts the process on first invocation, and
+validates returned command metadata before dispatch. See the
+[JSON-RPC plugin protocol](RPC_PLUGIN_PROTOCOL.md) for the version 1 transport
+profile, command schema, and remaining typed surfaces.
 
 ## Native tree panels
 

@@ -128,9 +128,11 @@ Language definitions may accompany any supported executable modality. Existing
 Husk, companion, and language-only manifests retain their current meaning.
 
 See the [JSON-RPC plugin protocol](RPC_PLUGIN_PROTOCOL.md) for framing,
-lifecycle, capabilities, and the bounded version 1 surface. Package validation
-and management classification are implemented first; process activation and
-editor integration follow in later implementation steps.
+lifecycle, capabilities, and the bounded version 1 surface. Declared commands
+appear in colon completion and the command palette before activation. Invoking
+one starts the process, validates its command metadata, and sends the typed
+`command/execute` request. Event delivery and host document calls follow in
+later implementation steps.
 
 ## Lifecycle
 

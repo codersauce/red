@@ -16,15 +16,24 @@ use std::fs;
 use std::path::Path;
 use std::time::{Duration, Instant, SystemTime};
 
-use crate::editor::EditorStateSnapshot;
+use crate::editor::{Action, EditorStateSnapshot, PluginRequest};
+use anyhow::Context as _;
 use rayon::prelude::*;
 use semver::{Version, VersionReq};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+use tokio::process::Command;
 
 use super::package::{PluginPackageManifest, PLUGIN_MANIFEST_FILE};
-use super::{PluginMetadata, RequestId, Runtime};
+use super::rpc::{RpcConnection, RpcErrorObject, RpcInitializeParams};
+use super::{
+    CommandMetadata, CommandScope, PluginMetadata, RegisteredPluginCommand, RequestId, Runtime,
+};
 
 const PARALLEL_PLUGIN_STARTUP_MIN: usize = 4;
+const RPC_INITIALIZE_TIMEOUT: Duration = Duration::from_secs(5);
+const RPC_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
+const RPC_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Lifecycle authority for configured Husk plugins.
 pub struct PluginRegistry {
@@ -35,6 +44,36 @@ pub struct PluginRegistry {
     pending_plugins: usize,
     modified_at: HashMap<String, PluginModification>,
     last_hot_reload_poll: Instant,
+    rpc_plugins: HashMap<String, ActiveRpcPlugin>,
+}
+
+struct ActiveRpcPlugin {
+    connection: RpcConnection,
+    commands: HashMap<String, CommandMetadata>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RpcActivation {
+    protocol_version: u32,
+    #[serde(default)]
+    commands: Vec<RpcCommand>,
+    #[serde(default)]
+    events: Vec<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RpcCommand {
+    name: String,
+    #[serde(default)]
+    metadata: CommandMetadata,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RpcCommandResult {
+    message: Option<String>,
 }
 
 /// Host API version used for plugin compatibility checks.
@@ -106,6 +145,7 @@ impl PluginRegistry {
             pending_plugins: 0,
             modified_at: HashMap::new(),
             last_hot_reload_poll: Instant::now(),
+            rpc_plugins: HashMap::new(),
         }
     }
 
@@ -180,6 +220,7 @@ impl PluginRegistry {
                 .par_iter()
                 .filter(|(name, path)| {
                     !is_husk_package(path)
+                        && !is_rpc_package(path)
                         && matches!(self.statuses.get(name), Some(PluginStatus::Pending))
                         && self
                             .metadata
@@ -235,7 +276,7 @@ impl PluginRegistry {
                 let result = if let Some(program) = precompiled.remove(&name) {
                     program.and_then(|program| runtime.load_precompiled_plugin(&name, program))
                 } else {
-                    load_plugin(runtime, &name, &plugin).await
+                    Box::pin(self.load_plugin(runtime, &name, &plugin)).await
                 };
                 match result {
                     Ok(()) => {
@@ -341,6 +382,7 @@ impl PluginRegistry {
                 })
             );
         }
+        self.rpc_plugins.remove(name);
         crate::log!("Plugin `{name}` quarantined during {stage}: {diagnostic}");
         self.set_status(
             name.to_string(),
@@ -352,28 +394,318 @@ impl PluginRegistry {
         );
     }
 
+    async fn load_plugin(
+        &mut self,
+        runtime: &mut Runtime,
+        name: &str,
+        path: &str,
+    ) -> anyhow::Result<()> {
+        if let Some((root, manifest)) = external_rpc_package(path)? {
+            let plugin = self
+                .prepare_rpc_plugin(runtime, name, &root, &manifest)
+                .await?;
+            self.rpc_plugins.insert(name.to_string(), plugin);
+            return Ok(());
+        }
+        load_husk_plugin(runtime, name, path).await
+    }
+
+    async fn prepare_rpc_plugin(
+        &self,
+        runtime: &Runtime,
+        name: &str,
+        root: &Path,
+        manifest: &PluginPackageManifest,
+    ) -> anyhow::Result<ActiveRpcPlugin> {
+        anyhow::ensure!(
+            manifest.activation.events.is_empty(),
+            "RPC event activation is not implemented yet"
+        );
+        let rpc = manifest.rpc.as_ref().expect("RPC manifest checked above");
+        let executable = if rpc.command.bytes().any(|byte| matches!(byte, b'/' | b'\\')) {
+            root.join(&rpc.command)
+        } else {
+            Path::new(&rpc.command).to_path_buf()
+        };
+        let mut command = Command::new(executable);
+        command.args(&rpc.args).current_dir(root);
+        let (connection, incoming) = RpcConnection::spawn(command)?;
+        drop(incoming);
+        let result = connection
+            .request_initialize(
+                RpcInitializeParams {
+                    protocol_versions: vec![1],
+                    red_api_version: RED_HOST_API_VERSION.to_string(),
+                    plugin_id: manifest.plugin.id.to_string(),
+                    host_methods: Vec::new(),
+                },
+                RPC_INITIALIZE_TIMEOUT,
+            )
+            .await?;
+        let activation: RpcActivation = serde_json::from_value(result)
+            .context("RPC plugin returned invalid initialization metadata")?;
+        let commands = self.validate_rpc_activation(runtime, name, manifest, activation)?;
+        connection.finish_initialize().await?;
+        Ok(ActiveRpcPlugin {
+            connection,
+            commands,
+        })
+    }
+
+    async fn reload_rpc_plugin(
+        &mut self,
+        runtime: &mut Runtime,
+        name: &str,
+        path: &str,
+        root: &Path,
+        manifest: &PluginPackageManifest,
+        previous_metadata: Option<PluginMetadata>,
+    ) {
+        if !self.rpc_plugins.contains_key(name) {
+            self.set_status(name.to_string(), PluginStatus::Pending);
+            return;
+        }
+        match Box::pin(self.prepare_rpc_plugin(runtime, name, root, manifest)).await {
+            Ok(plugin) => {
+                let previous = self.rpc_plugins.insert(name.to_string(), plugin);
+                if let Some(previous) = previous {
+                    let shutdown = previous
+                        .connection
+                        .shutdown(RPC_SHUTDOWN_TIMEOUT, RPC_SHUTDOWN_TIMEOUT);
+                    let _ = Box::pin(shutdown).await;
+                }
+                self.set_status(name.to_string(), PluginStatus::Active);
+            }
+            Err(error) => {
+                if let Some(metadata) = previous_metadata {
+                    self.metadata.insert(name.to_string(), metadata);
+                }
+                self.set_status(
+                    name.to_string(),
+                    PluginStatus::ActiveWithReloadError {
+                        path: plugin_display_path(path),
+                        diagnostic: error.to_string(),
+                    },
+                );
+            }
+        }
+    }
+
+    fn validate_rpc_activation(
+        &self,
+        runtime: &Runtime,
+        plugin: &str,
+        manifest: &PluginPackageManifest,
+        activation: RpcActivation,
+    ) -> anyhow::Result<HashMap<String, CommandMetadata>> {
+        let commands = validate_rpc_commands(manifest, activation)?;
+        for command in commands.keys() {
+            if let Some(owner) = runtime.command_plugin(command) {
+                anyhow::bail!("command `{command}` is already registered by plugin `{owner}`");
+            }
+            if let Some((owner, _)) = self.rpc_plugins.iter().find(|(owner, active)| {
+                owner.as_str() != plugin && active.commands.contains_key(command)
+            }) {
+                anyhow::bail!("command `{command}` is already registered by plugin `{owner}`");
+            }
+        }
+        Ok(commands)
+    }
+
     /// Executes a plugin command and quarantines its owner on callback failure.
     pub async fn execute(&mut self, runtime: &mut Runtime, command: &str) -> anyhow::Result<()> {
-        self.ensure_command_registered(runtime, command).await;
+        Box::pin(self.execute_inner(runtime, command)).await
+    }
+
+    async fn execute_inner(&mut self, runtime: &mut Runtime, command: &str) -> anyhow::Result<()> {
+        let pending = self
+            .pending_command_plugin(command)
+            .or_else(|| self.pending_command_plugin(crate::command::split_invocation(command).0));
+        if self.command_plugin(runtime, command).is_none() {
+            self.ensure_command_registered(runtime, command).await;
+        }
+        if let Some((owner, name, raw_args)) = self.resolve_rpc_command(runtime, command) {
+            self.execute_rpc_command(runtime, owner, name, raw_args)
+                .await;
+            return Ok(());
+        }
         let owner = runtime.command_plugin(command);
+        let Some(owner) = owner else {
+            let warning = pending
+                .and_then(|(plugin, _)| self.statuses.get(&plugin))
+                .and_then(|status| match status {
+                    PluginStatus::Quarantined { diagnostic, .. } => Some(diagnostic.clone()),
+                    _ => None,
+                })
+                .unwrap_or_else(|| format!("unknown plugin command `{command}`"));
+            runtime.send_request(PluginRequest::Action(Action::PrintWarning(warning)));
+            return Ok(());
+        };
         if let Err(error) = runtime.execute_command(command).await {
             crate::log!("Plugin command `{command}` failed: {error:?}");
-            if let Some(owner) = owner {
-                let path = self
-                    .plugins
-                    .iter()
-                    .find(|(name, _)| name == &owner)
-                    .map(|(_, path)| path.clone())
-                    .unwrap_or_default();
-                self.quarantine(runtime, &owner, &path, "runtime", error.to_string());
-            }
+            let path = self.plugin_path(&owner);
+            self.quarantine(runtime, &owner, &path, "runtime", error.to_string());
         }
         Ok(())
     }
 
+    async fn execute_rpc_command(
+        &mut self,
+        runtime: &mut Runtime,
+        owner: String,
+        name: String,
+        raw_args: String,
+    ) {
+        let result = self.rpc_plugins[&owner]
+            .connection
+            .request(
+                "command/execute",
+                json!({
+                    "name": name,
+                    "args": raw_args.split_whitespace().collect::<Vec<_>>(),
+                    "raw_args": raw_args,
+                }),
+                RPC_COMMAND_TIMEOUT,
+            )
+            .await;
+        match result.and_then(decode_rpc_command_result) {
+            Ok(Some(action)) => runtime.send_request(PluginRequest::Action(action)),
+            Ok(None) => {}
+            Err(error) if error.downcast_ref::<RpcErrorObject>().is_some() => {
+                runtime.send_request(PluginRequest::Action(Action::PrintWarning(
+                    error.to_string(),
+                )));
+            }
+            Err(error) => {
+                let path = self.plugin_path(&owner);
+                self.quarantine(runtime, &owner, &path, "runtime", error.to_string());
+            }
+        }
+    }
+
+    fn resolve_rpc_command(
+        &self,
+        runtime: &Runtime,
+        input: &str,
+    ) -> Option<(String, String, String)> {
+        let (invoked_name, raw_args) = crate::command::split_invocation(input);
+        if runtime.command_plugin(invoked_name).is_some() {
+            return None;
+        }
+        if let Some((plugin, name)) = self.rpc_plugins.iter().find_map(|(plugin, active)| {
+            active
+                .commands
+                .get_key_value(input)
+                .map(|(name, _)| (plugin, name))
+        }) {
+            return Some((plugin.clone(), name.clone(), String::new()));
+        }
+        self.rpc_plugins.iter().find_map(|(plugin, active)| {
+            active
+                .commands
+                .get_key_value(invoked_name)
+                .filter(|(_, metadata)| metadata.arguments)
+                .map(|(name, _)| (plugin.clone(), name.clone(), raw_args.to_string()))
+        })
+    }
+
+    fn plugin_path(&self, plugin: &str) -> String {
+        self.plugins
+            .iter()
+            .find(|(name, _)| name == plugin)
+            .map(|(_, path)| path.clone())
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn command_plugin(&self, runtime: &Runtime, command: &str) -> Option<String> {
+        runtime.command_plugin(command).or_else(|| {
+            self.resolve_rpc_command(runtime, command)
+                .map(|(plugin, _, _)| plugin)
+        })
+    }
+
+    pub(crate) fn command_scope(&self, runtime: &Runtime, command: &str) -> Option<CommandScope> {
+        runtime.command_scope(command).or_else(|| {
+            let (plugin, name, _) = self.resolve_rpc_command(runtime, command)?;
+            self.rpc_plugins
+                .get(&plugin)?
+                .commands
+                .get(&name)
+                .map(|metadata| metadata.scope)
+        })
+    }
+
+    pub(crate) fn registered_commands(&self, runtime: &Runtime) -> Vec<RegisteredPluginCommand> {
+        if self.rpc_plugins.is_empty() && !self.has_pending_rpc_plugin() {
+            return runtime.registered_commands();
+        }
+        self.combined_registered_commands(runtime)
+    }
+
+    fn combined_registered_commands(&self, runtime: &Runtime) -> Vec<RegisteredPluginCommand> {
+        let mut commands = runtime
+            .registered_commands()
+            .into_iter()
+            .map(|command| (command.name.clone(), command))
+            .collect::<HashMap<_, _>>();
+        for (plugin, active) in &self.rpc_plugins {
+            for (name, metadata) in &active.commands {
+                commands
+                    .entry(name.clone())
+                    .or_insert_with(|| RegisteredPluginCommand {
+                        name: name.clone(),
+                        plugin: plugin.clone(),
+                        metadata: metadata.clone(),
+                    });
+            }
+        }
+        let pending = self
+            .plugins
+            .iter()
+            .filter(|(plugin, path)| {
+                matches!(self.statuses.get(plugin), Some(PluginStatus::Pending))
+                    && Path::new(path).file_name().and_then(|name| name.to_str())
+                        == Some(PLUGIN_MANIFEST_FILE)
+            })
+            .flat_map(|(plugin, _)| {
+                self.metadata
+                    .get(plugin)
+                    .into_iter()
+                    .flat_map(|metadata| &metadata.activation_events)
+                    .filter_map(|event| event.strip_prefix("onCommand:"))
+                    .filter(|name| {
+                        self.pending_command_plugin(name)
+                            .is_some_and(|(owner, _)| owner == *plugin)
+                    })
+                    .map(|name| RegisteredPluginCommand {
+                        name: name.to_string(),
+                        plugin: plugin.clone(),
+                        metadata: CommandMetadata::default(),
+                    })
+            });
+        for command in pending {
+            commands.entry(command.name.clone()).or_insert(command);
+        }
+        let mut commands = commands.into_values().collect::<Vec<_>>();
+        commands.sort_unstable_by(|left, right| left.name.cmp(&right.name));
+        commands
+    }
+
+    fn has_pending_rpc_plugin(&self) -> bool {
+        self.plugins.iter().any(|(plugin, path)| {
+            matches!(self.statuses.get(plugin), Some(PluginStatus::Pending))
+                && Path::new(path).file_name().and_then(|name| name.to_str())
+                    == Some(PLUGIN_MANIFEST_FILE)
+        })
+    }
+
+    pub(crate) fn has_command(&self, runtime: &Runtime, command: &str) -> bool {
+        self.command_plugin(runtime, command).is_some() || self.has_pending_command(command)
+    }
+
     /// Activates the pending plugin that declares `command`, if any.
     pub(crate) async fn ensure_command_registered(&mut self, runtime: &mut Runtime, command: &str) {
-        if runtime.command_plugin(command).is_some() {
+        if self.command_plugin(runtime, command).is_some() {
             return;
         }
         if let Some((name, path)) = self
@@ -394,15 +726,16 @@ impl PluginRegistry {
     fn pending_command_plugin(&self, command: &str) -> Option<(String, String)> {
         self.plugins
             .iter()
-            .find(|(name, _)| {
+            .filter(|(name, _)| {
                 matches!(self.statuses.get(name), Some(PluginStatus::Pending))
                     && self.metadata.get(name).is_some_and(|metadata| {
                         metadata
                             .activation_events
                             .iter()
-                            .any(|event| event == &format!("onCommand:{command}"))
+                            .any(|event| event.strip_prefix("onCommand:") == Some(command))
                     })
             })
+            .min_by(|left, right| left.0.cmp(&right.0))
             .cloned()
     }
 
@@ -485,7 +818,7 @@ impl PluginRegistry {
             self.quarantine(runtime, name, path, stage, diagnostic);
             return;
         }
-        match load_plugin(runtime, name, path).await {
+        match Box::pin(self.load_plugin(runtime, name, path)).await {
             Ok(()) => {
                 self.set_status(name.to_string(), PluginStatus::Active);
             }
@@ -628,6 +961,14 @@ impl PluginRegistry {
             return Ok(());
         }
 
+        for (_, plugin) in std::mem::take(&mut self.rpc_plugins) {
+            let shutdown = plugin
+                .connection
+                .shutdown(RPC_SHUTDOWN_TIMEOUT, RPC_SHUTDOWN_TIMEOUT);
+            if let Err(error) = Box::pin(shutdown).await {
+                crate::log!("RPC plugin shutdown failed: {error}");
+            }
+        }
         runtime.deactivate_all().await?;
         self.initialized = false;
         Ok(())
@@ -781,6 +1122,18 @@ impl PluginRegistry {
             self.quarantine(runtime, name, path, stage, diagnostic);
             return;
         }
+        if let Ok(Some((root, manifest))) = external_rpc_package(path) {
+            Box::pin(self.reload_rpc_plugin(
+                runtime,
+                name,
+                path,
+                &root,
+                &manifest,
+                previous_metadata.clone(),
+            ))
+            .await;
+            return;
+        }
         let source = plugin_source(path);
         let result = match source {
             Ok(source) => {
@@ -898,6 +1251,58 @@ impl PluginRegistry {
     }
 }
 
+fn validate_rpc_commands(
+    manifest: &PluginPackageManifest,
+    activation: RpcActivation,
+) -> anyhow::Result<HashMap<String, CommandMetadata>> {
+    anyhow::ensure!(
+        activation.protocol_version == 1,
+        "invalid RPC protocol version"
+    );
+    anyhow::ensure!(
+        activation.events.is_empty(),
+        "RPC events are not implemented yet"
+    );
+    let declared = manifest
+        .activation
+        .commands
+        .iter()
+        .cloned()
+        .collect::<HashSet<_>>();
+    anyhow::ensure!(
+        declared.len() == manifest.activation.commands.len(),
+        "RPC manifest declares duplicate commands"
+    );
+    let mut commands = HashMap::new();
+    for command in activation.commands {
+        super::runtime::validate_command_arguments(
+            command.metadata.arguments,
+            &command.metadata.completions,
+        )?;
+        anyhow::ensure!(
+            commands
+                .insert(command.name.clone(), command.metadata)
+                .is_none(),
+            "RPC plugin returned duplicate command `{}`",
+            command.name
+        );
+    }
+    anyhow::ensure!(
+        commands.keys().cloned().collect::<HashSet<_>>() == declared,
+        "RPC plugin commands do not match [activation].commands"
+    );
+    Ok(commands)
+}
+
+fn decode_rpc_command_result(value: Value) -> anyhow::Result<Option<Action>> {
+    if value.is_null() {
+        return Ok(None);
+    }
+    let result: RpcCommandResult =
+        serde_json::from_value(value).context("RPC command returned an invalid result")?;
+    Ok(result.message.map(Action::Print))
+}
+
 fn plugin_metadata_path(plugin: &str) -> Option<std::path::PathBuf> {
     (!crate::assets::is_bundled_plugin_specifier(plugin))
         .then(|| {
@@ -936,20 +1341,33 @@ fn external_plugin_package(
             continue;
         }
         let package = PluginPackageManifest::load(root)?;
+        let manifest_path = root.join(PLUGIN_MANIFEST_FILE);
+        let matches_rpc = package.rpc.is_some()
+            && plugin_paths_match(plugin_path, canonical_plugin.as_deref(), &manifest_path);
+        if matches_rpc {
+            return Ok(Some((root.to_path_buf(), package)));
+        }
         let Some(entry) = package.husk_entry(root) else {
             continue;
         };
-        let canonical_entry = entry.canonicalize().ok();
-        let matches = entry == plugin_path
-            || canonical_plugin
-                .as_ref()
-                .zip(canonical_entry.as_ref())
-                .is_some_and(|(plugin, entry)| plugin == entry);
-        if matches {
+        if plugin_paths_match(plugin_path, canonical_plugin.as_deref(), &entry) {
             return Ok(Some((root.to_path_buf(), package)));
         }
     }
     Ok(None)
+}
+
+fn plugin_paths_match(plugin: &Path, canonical_plugin: Option<&Path>, candidate: &Path) -> bool {
+    candidate == plugin
+        || canonical_plugin
+            .zip(candidate.canonicalize().ok().as_deref())
+            .is_some_and(|(plugin, candidate)| plugin == candidate)
+}
+
+fn external_rpc_package(
+    plugin: &str,
+) -> anyhow::Result<Option<(std::path::PathBuf, PluginPackageManifest)>> {
+    Ok(external_plugin_package(plugin)?.filter(|(_, manifest)| manifest.rpc.is_some()))
 }
 
 fn plugin_modification(plugin: &str) -> PluginModification {
@@ -1036,7 +1454,7 @@ fn plugin_source(plugin: &str) -> anyhow::Result<Cow<'static, str>> {
     Ok(Cow::Owned(fs::read_to_string(plugin)?))
 }
 
-async fn load_plugin(runtime: &mut Runtime, name: &str, plugin: &str) -> anyhow::Result<()> {
+async fn load_husk_plugin(runtime: &mut Runtime, name: &str, plugin: &str) -> anyhow::Result<()> {
     if is_husk_package(plugin) {
         return runtime.load_plugin_package(name, Path::new(plugin)).await;
     }
@@ -1044,6 +1462,10 @@ async fn load_plugin(runtime: &mut Runtime, name: &str, plugin: &str) -> anyhow:
     runtime
         .load_plugin_at(name, plugin_display_path(plugin), &source)
         .await
+}
+
+fn is_rpc_package(plugin: &str) -> bool {
+    external_rpc_package(plugin).ok().flatten().is_some()
 }
 
 fn is_husk_package(plugin: &str) -> bool {
@@ -1079,6 +1501,95 @@ mod tests {
 
         assert!(matches!(source, Cow::Borrowed(_)));
         assert!(!source.is_empty());
+    }
+
+    #[test]
+    fn rpc_command_messages_use_the_existing_print_action() {
+        let action = decode_rpc_command_result(serde_json::json!({"message": "hello"}))
+            .unwrap()
+            .unwrap();
+
+        assert!(matches!(action, Action::Print(message) if message == "hello"));
+    }
+
+    #[test]
+    fn pending_rpc_commands_are_discoverable_before_activation() {
+        let root = tempfile_dir("pending-rpc-command");
+        let manifest = root.join(PLUGIN_MANIFEST_FILE);
+        fs::write(
+            &manifest,
+            r#"
+                schema_version = 1
+
+                [plugin]
+                id = "pending-rpc"
+                name = "Pending RPC"
+                version = "0.1.0"
+                red_api = "^0.19.0"
+
+                [rpc]
+                command = "rpc-test"
+
+                [activation]
+                commands = ["RpcHello"]
+            "#,
+        )
+        .unwrap();
+        let mut registry = PluginRegistry::new();
+        registry.add("z-pending-rpc", manifest.to_str().unwrap());
+        registry.add("pending-rpc", manifest.to_str().unwrap());
+
+        let commands = registry.registered_commands(&Runtime::new());
+
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0].name, "RpcHello");
+        assert_eq!(commands[0].plugin, "pending-rpc");
+        assert_eq!(commands[0].metadata, CommandMetadata::default());
+        assert_eq!(
+            registry.pending_command_plugin("RpcHello"),
+            Some(("pending-rpc".to_string(), manifest.display().to_string()))
+        );
+    }
+
+    #[test]
+    fn pending_rpc_discovery_matches_the_lazy_command_owner() {
+        let root = tempfile_dir("pending-rpc-husk-collision");
+        let manifest = root.join(PLUGIN_MANIFEST_FILE);
+        fs::write(
+            &manifest,
+            r#"
+                schema_version = 1
+
+                [plugin]
+                id = "pending-rpc"
+                name = "Pending RPC"
+                version = "0.1.0"
+                red_api = "^0.19.0"
+
+                [rpc]
+                command = "rpc-test"
+
+                [activation]
+                commands = ["RpcHello"]
+            "#,
+        )
+        .unwrap();
+        let husk = root.join("lazy.hk");
+        fs::write(&husk, "pub fn activate() {}\n").unwrap();
+        fs::write(
+            root.join("package.json"),
+            r#"{"name":"lazy-husk","activation_events":["onCommand:RpcHello"]}"#,
+        )
+        .unwrap();
+        let mut registry = PluginRegistry::new();
+        registry.add("pending-rpc", manifest.to_str().unwrap());
+        registry.add("a-lazy-husk", husk.to_str().unwrap());
+
+        assert!(registry.registered_commands(&Runtime::new()).is_empty());
+        assert_eq!(
+            registry.pending_command_plugin("RpcHello"),
+            Some(("a-lazy-husk".to_string(), husk.display().to_string()))
+        );
     }
 
     #[tokio::test]
@@ -1146,6 +1657,26 @@ mod tests {
 
         let dir = tempfile_dir("husk-command");
         let plugin = dir.join("plugin.hk");
+        let manifest = dir.join(PLUGIN_MANIFEST_FILE);
+        fs::write(
+            &manifest,
+            r#"
+                schema_version = 1
+
+                [plugin]
+                id = "rpc-test"
+                name = "RPC Test"
+                version = "0.1.0"
+                red_api = "^0.19.0"
+
+                [rpc]
+                command = "missing-rpc-test"
+
+                [activation]
+                commands = ["Hello"]
+            "#,
+        )
+        .unwrap();
         fs::write(
             &plugin,
             r#"
@@ -1160,10 +1691,19 @@ mod tests {
         )
         .unwrap();
         let mut registry = PluginRegistry::new();
+        registry.add("rpc-test", manifest.to_str().unwrap());
         registry.add("test", plugin.to_str().unwrap());
         let mut runtime = Runtime::new();
 
         registry.initialize(&mut runtime).await.unwrap();
+        assert!(matches!(
+            registry.statuses().get("rpc-test"),
+            Some(PluginStatus::Pending)
+        ));
+        assert!(registry
+            .registered_commands(&runtime)
+            .iter()
+            .any(|command| command.name == "Hello" && command.plugin == "test"));
         registry.execute(&mut runtime, "Hello").await.unwrap();
 
         match ACTION_DISPATCHER.recv_request() {

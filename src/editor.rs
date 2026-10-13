@@ -349,7 +349,7 @@ async fn apply_plugin_manager_operation(
             Ok(PluginManagerOperationOutcome {
                 message: format!("Enabled plugin {id}."),
                 reload_languages: installed.has_languages,
-                restart_plugins: installed.has_husk || installed.has_companion,
+                restart_plugins: installed.restart_required(),
             })
         }
         "disable" => {
@@ -360,7 +360,7 @@ async fn apply_plugin_manager_operation(
             Ok(PluginManagerOperationOutcome {
                 message: format!("Disabled plugin {id}."),
                 reload_languages: installed.has_languages,
-                restart_plugins: installed.has_husk || installed.has_companion,
+                restart_plugins: installed.restart_required(),
             })
         }
         "update" => {
@@ -375,7 +375,7 @@ async fn apply_plugin_manager_operation(
                     format!("Updated {} to {}.", installed.name, installed.version)
                 },
                 reload_languages: installed.has_languages && !installed.has_native_grammars,
-                restart_plugins: installed.has_husk || installed.has_companion,
+                restart_plugins: installed.restart_required(),
             })
         }
         "remove" => {
@@ -386,7 +386,7 @@ async fn apply_plugin_manager_operation(
             Ok(PluginManagerOperationOutcome {
                 message: format!("Removed plugin {id}; its private data was preserved."),
                 reload_languages: installed.has_languages,
-                restart_plugins: installed.has_husk || installed.has_companion,
+                restart_plugins: installed.restart_required(),
             })
         }
         _ => anyhow::bail!("unknown plugin operation `{verb}`"),
@@ -13041,7 +13041,7 @@ impl Editor {
         let mut action = self.handle_event_with_runtime(&ev, Some(runtime))?;
         if started_with_panel_focus {
             let pending_commands = action.as_ref().map_or_else(Vec::new, |action| {
-                Self::pending_panel_plugin_commands(action, runtime)
+                self.pending_panel_plugin_commands(action, runtime)
             });
             if !pending_commands.is_empty() {
                 for command in pending_commands {
@@ -16383,41 +16383,54 @@ impl Editor {
         }
     }
 
-    fn pending_panel_plugin_commands(action: &KeyAction, runtime: &Runtime) -> Vec<String> {
+    fn pending_panel_plugin_commands(&self, action: &KeyAction, runtime: &Runtime) -> Vec<String> {
         let mut commands = Vec::new();
-        Self::collect_pending_panel_plugin_commands(action, runtime, &mut commands);
+        self.collect_pending_panel_plugin_commands(action, runtime, &mut commands);
         commands
     }
 
     fn collect_pending_panel_plugin_commands(
+        &self,
         action: &KeyAction,
         runtime: &Runtime,
         commands: &mut Vec<String>,
     ) {
         match action {
             KeyAction::Single(Action::PluginCommand(command)) => {
-                if runtime.command_scope(command).is_none() && !commands.contains(command) {
-                    commands.push(command.clone());
-                }
+                self.push_pending_panel_plugin_command(runtime, commands, command);
             }
             KeyAction::Multiple(actions) => {
                 for action in actions {
                     if let Action::PluginCommand(command) = action {
-                        if runtime.command_scope(command).is_none() && !commands.contains(command) {
-                            commands.push(command.clone());
-                        }
+                        self.push_pending_panel_plugin_command(runtime, commands, command);
                     }
                 }
             }
             KeyAction::Repeating(_, action) => {
-                Self::collect_pending_panel_plugin_commands(action, runtime, commands);
+                self.collect_pending_panel_plugin_commands(action, runtime, commands);
             }
             KeyAction::Nested(actions) => {
                 for action in actions.values() {
-                    Self::collect_pending_panel_plugin_commands(action, runtime, commands);
+                    self.collect_pending_panel_plugin_commands(action, runtime, commands);
                 }
             }
             KeyAction::None | KeyAction::Single(_) => {}
+        }
+    }
+
+    fn push_pending_panel_plugin_command(
+        &self,
+        runtime: &Runtime,
+        commands: &mut Vec<String>,
+        command: &str,
+    ) {
+        if self
+            .plugin_registry
+            .command_scope(runtime, command)
+            .is_none()
+            && !commands.iter().any(|pending| pending == command)
+        {
+            commands.push(command.to_string());
         }
     }
 
@@ -16465,10 +16478,12 @@ impl Editor {
             | Action::TogglePaneZoom
             | Action::OnlyWindow => true,
             Action::PluginCommand(command) => runtime.is_some_and(|runtime| {
-                runtime.command_scope(command).map_or_else(
-                    || self.plugin_registry.has_pending_command(command),
-                    |scope| scope == plugin::CommandScope::Global,
-                )
+                self.plugin_registry
+                    .command_scope(runtime, command)
+                    .map_or_else(
+                        || self.plugin_registry.has_pending_command(command),
+                        |scope| scope == plugin::CommandScope::Global,
+                    )
             }),
             _ => false,
         }
@@ -17074,7 +17089,7 @@ impl Editor {
         }
 
         let Some(parsed) = parsed else {
-            if runtime.command_plugin(cmd).is_some() {
+            if self.plugin_registry.has_command(runtime, cmd) {
                 return vec![Action::PluginCommand(cmd.to_string())];
             }
             self.set_routine_error(Some(format!("unknown command {cmd:?}")));
@@ -17937,14 +17952,14 @@ impl Editor {
                 KeyCode::Tab => {
                     self.reset_command_history_navigation();
                     let commands = runtime
-                        .map(Runtime::registered_commands)
+                        .map(|runtime| self.plugin_registry.registered_commands(runtime))
                         .unwrap_or_default();
                     self.complete_command_line(CompletionDirection::Next, &commands);
                 }
                 KeyCode::BackTab => {
                     self.reset_command_history_navigation();
                     let commands = runtime
-                        .map(Runtime::registered_commands)
+                        .map(|runtime| self.plugin_registry.registered_commands(runtime))
                         .unwrap_or_default();
                     self.complete_command_line(CompletionDirection::Previous, &commands);
                 }
@@ -22970,8 +22985,8 @@ impl Editor {
                 self.render(buffer)?;
             }
             Action::CommandPalette => {
-                let entries =
-                    command_palette::entries(&self.config.keys, &runtime.registered_commands());
+                let commands = self.plugin_registry.registered_commands(runtime);
+                let entries = command_palette::entries(&self.config.keys, &commands);
                 let actions = entries
                     .iter()
                     .map(|entry| (entry.id.clone(), entry.action.clone()))
