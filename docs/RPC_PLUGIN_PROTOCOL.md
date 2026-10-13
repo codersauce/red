@@ -105,6 +105,30 @@ and `completions`. Omitted fields use the same defaults as Husk commands. If a
 Husk and RPC plugin expose the same command name, the Husk command keeps
 dispatch and discovery precedence.
 
+The `events` array must likewise exactly match `[activation].events`. Protocol
+version 1 accepts three low-frequency global editor events:
+
+- `editor:ready` with an empty object payload;
+- `file:opened` with `file` and `buffer_index` fields; and
+- `file:saved` with `file`, `buffer_index`, and `document_id` fields.
+
+Red lazily starts a plugin when one of its declared events occurs and includes
+that triggering event. Each event is a one-way `event/notify` notification:
+
+```json
+{
+  "name": "file:saved",
+  "payload": {
+    "file": "src/main.rs",
+    "buffer_index": 0,
+    "document_id": 42
+  }
+}
+```
+
+Undeclared events are not sent. Event notifications have no response, and a
+write or transport failure quarantines only that plugin.
+
 Red validates the full response before registering anything, then sends the
 `initialized` notification. Plugins must not call host methods before that
 notification. During shutdown Red sends `shutdown`, waits for its response,
@@ -232,10 +256,9 @@ will be pushed into a host-owned cache so rendering never waits for a plugin;
 disconnecting the plugin clears its contribution. Version 1 assigns no wire
 method or schema to that future surface.
 
-The current host integration activates and executes commands and serves the
-three document methods above. Event delivery, text panels, and statusline
-providers land as separate typed steps; declaring RPC activation events before
-event delivery is available fails activation with a diagnostic.
+The current host integration activates and executes commands, delivers the
+three editor events above, and serves the three document methods. Text panels
+and statusline providers land as separate typed steps.
 
 ## Errors and failure semantics
 

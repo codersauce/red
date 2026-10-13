@@ -19,6 +19,7 @@ def request_host(method, params):
 
 
 last_transaction_id = None
+last_event = None
 
 for line in sys.stdin:
     message = json.loads(line)
@@ -47,13 +48,20 @@ for line in sys.stdin:
                             "metadata": {"title": "Apply an RPC document edit"},
                         },
                         {
+                            "name": "RpcLastEvent",
+                            "metadata": {"title": "Show the last RPC editor event"},
+                        },
+                        {
                             "name": "RpcUndo",
                             "metadata": {"title": "Undo the last RPC edit"},
                         },
                     ],
+                    "events": ["file:saved"],
                 },
             }
         )
+    elif method == "event/notify":
+        last_event = message["params"]
     elif method == "command/execute":
         try:
             command = message["params"]["name"]
@@ -95,6 +103,13 @@ for line in sys.stdin:
                 )
                 last_transaction_id = None
                 result = {"message": f"RPC edit undone @ {undone['revision']}"}
+            elif command == "RpcLastEvent":
+                if last_event is None:
+                    raise RuntimeError("no RPC editor event has been received")
+                event_file = last_event["payload"].get("file", "[scratch]")
+                result = {
+                    "message": f"Last RPC event: {last_event['name']} ({event_file})"
+                }
             else:
                 name = message["params"]["raw_args"] or "Red"
                 result = {"message": f"Hello, {name}, from Python RPC!"}

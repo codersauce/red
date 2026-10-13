@@ -134,7 +134,9 @@ one starts the process, validates its command metadata, and sends the typed
 `command/execute` request. Active plugins can call `red/DocumentSnapshot`,
 `red/DocumentApply`, and `red/DocumentUndo` to read and transactionally edit
 open documents through Red's existing revision, dirty-state, undo, and LSP
-paths. Event delivery follows in a later implementation step.
+paths. Declared `editor:ready`, `file:opened`, and `file:saved` events arrive as
+typed `event/notify` notifications; other editor and callback events remain
+outside protocol version 1.
 
 ## Lifecycle
 

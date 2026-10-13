@@ -85,6 +85,7 @@ async fn deadline_failure_reaps_the_plugin_and_fails_its_peers() -> Result<()> {
 async fn registry_discovers_and_lazily_executes_an_rpc_command() -> Result<()> {
     let package = tempfile::tempdir()?;
     let marker = package.path().join("executed.json");
+    let event_marker = package.path().join("event.json");
     let initialized_marker = package.path().join("initialized");
     let executable = env::current_exe()?;
     let executable_name = executable
@@ -117,6 +118,7 @@ args = ["--registry-fixture"]
 
 [activation]
 commands = ["RpcFail", "RpcHello"]
+events = ["file:saved"]
 "#
         ),
     )?;
@@ -134,6 +136,21 @@ commands = ["RpcFail", "RpcHello"]
         registry.statuses().get("rpc-alias"),
         Some(PluginStatus::Pending)
     ));
+    registry
+        .notify(&mut runtime, "editor:ready", json!({}))
+        .await?;
+    assert!(matches!(
+        registry.statuses().get("rpc-alias"),
+        Some(PluginStatus::Pending)
+    ));
+    let event_payload = json!({"file": "notes.txt", "buffer_index": 2, "document_id": 7});
+    registry
+        .notify(&mut runtime, "file:saved", event_payload.clone())
+        .await?;
+    assert!(matches!(
+        registry.statuses().get("rpc-alias"),
+        Some(PluginStatus::Active)
+    ));
     registry.execute(&mut runtime, "RpcHello one two").await?;
     assert!(matches!(
         registry.statuses().get("rpc-alias"),
@@ -143,6 +160,9 @@ commands = ["RpcFail", "RpcHello"]
     assert_eq!(invocation["name"], "RpcHello");
     assert_eq!(invocation["args"], json!(["one", "two"]));
     assert_eq!(invocation["raw_args"], "one two");
+    let event: Value = serde_json::from_slice(&fs::read(&event_marker)?)?;
+    assert_eq!(event["name"], "file:saved");
+    assert_eq!(event["payload"], event_payload);
     assert!(initialized_marker.is_file());
     registry.execute(&mut runtime, "RpcFail").await?;
     assert!(matches!(
@@ -169,6 +189,38 @@ commands = ["RpcFail", "RpcHello"]
     ));
     assert!(!marker.exists());
     assert!(!initialized_marker.exists());
+
+    fs::write(&manifest, source.replace("file:saved", "editor:ready"))?;
+    let mut registry = PluginRegistry::new();
+    registry.add(
+        "rpc-alias",
+        manifest.to_str().context("non-UTF-8 manifest path")?,
+    );
+    registry.initialize(&mut runtime).await?;
+    registry
+        .notify(&mut runtime, "editor:ready", json!({}))
+        .await?;
+    assert!(matches!(
+        registry.statuses().get("rpc-alias"),
+        Some(PluginStatus::Quarantined { diagnostic, .. })
+            if diagnostic.contains("events do not match")
+    ));
+
+    fs::write(&manifest, source.replace("file:saved", "cursor:moved"))?;
+    let mut registry = PluginRegistry::new();
+    registry.add(
+        "rpc-alias",
+        manifest.to_str().context("non-UTF-8 manifest path")?,
+    );
+    registry.initialize(&mut runtime).await?;
+    registry
+        .notify(&mut runtime, "cursor:moved", json!({}))
+        .await?;
+    assert!(matches!(
+        registry.statuses().get("rpc-alias"),
+        Some(PluginStatus::Quarantined { diagnostic, .. })
+            if diagnostic.contains("not supported by protocol version 1")
+    ));
     Ok(())
 }
 
@@ -280,6 +332,7 @@ fn run_registry_fixture() -> Result<()> {
             "id": initialize["id"],
             "result": {
                 "protocol_version": 1,
+                "events": ["file:saved"],
                 "commands": [
                     {"name": "RpcFail"},
                     {
@@ -294,6 +347,13 @@ fn run_registry_fixture() -> Result<()> {
     let marker = env::var_os("RED_RPC_REGISTRY_MARKER").context("missing marker path")?;
     let marker = std::path::PathBuf::from(marker);
     fs::write(marker.with_file_name("initialized"), [])?;
+    let event = read_message(&mut input)?;
+    assert_eq!(event["method"], "event/notify");
+    assert!(event.get("id").is_none());
+    fs::write(
+        marker.with_file_name("event.json"),
+        serde_json::to_vec(&event["params"])?,
+    )?;
     let execute = read_message(&mut input)?;
     assert_eq!(execute["method"], "command/execute");
     fs::write(marker, serde_json::to_vec(&execute["params"])?)?;

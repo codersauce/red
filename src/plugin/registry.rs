@@ -40,6 +40,8 @@ const PARALLEL_PLUGIN_STARTUP_MIN: usize = 4;
 const RPC_INITIALIZE_TIMEOUT: Duration = Duration::from_secs(5);
 const RPC_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 const RPC_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
+const RPC_EVENT_METHOD: &str = "event/notify";
+const RPC_EDITOR_EVENTS: &[&str] = &["editor:ready", "file:opened", "file:saved"];
 type RpcInbox = Arc<Mutex<mpsc::Receiver<RpcIncoming>>>;
 
 /// Lifecycle authority for configured Husk plugins.
@@ -58,6 +60,7 @@ struct ActiveRpcPlugin {
     connection: RpcConnection,
     incoming: RpcInbox,
     commands: HashMap<String, CommandMetadata>,
+    events: HashSet<String>,
 }
 
 #[async_trait]
@@ -456,10 +459,7 @@ impl PluginRegistry {
         root: &Path,
         manifest: &PluginPackageManifest,
     ) -> anyhow::Result<ActiveRpcPlugin> {
-        anyhow::ensure!(
-            manifest.activation.events.is_empty(),
-            "RPC event activation is not implemented yet"
-        );
+        let events = validate_rpc_manifest_events(manifest)?;
         let rpc = manifest.rpc.as_ref().expect("RPC manifest checked above");
         let executable = if rpc.command.bytes().any(|byte| matches!(byte, b'/' | b'\\')) {
             root.join(&rpc.command)
@@ -486,12 +486,14 @@ impl PluginRegistry {
             .await?;
         let activation: RpcActivation = serde_json::from_value(result)
             .context("RPC plugin returned invalid initialization metadata")?;
-        let commands = self.validate_rpc_activation(runtime, name, manifest, activation)?;
+        let commands =
+            self.validate_rpc_activation(runtime, name, manifest, &events, activation)?;
         connection.finish_initialize().await?;
         Ok(ActiveRpcPlugin {
             connection,
             incoming: Arc::new(Mutex::new(incoming)),
             commands,
+            events,
         })
     }
 
@@ -539,9 +541,10 @@ impl PluginRegistry {
         runtime: &Runtime,
         plugin: &str,
         manifest: &PluginPackageManifest,
+        events: &HashSet<String>,
         activation: RpcActivation,
     ) -> anyhow::Result<HashMap<String, CommandMetadata>> {
-        let commands = validate_rpc_commands(manifest, activation)?;
+        let commands = validate_rpc_declarations(manifest, events, activation)?;
         for command in commands.keys() {
             if let Some(owner) = runtime.command_plugin(command) {
                 anyhow::bail!("command `{command}` is already registered by plugin `{owner}`");
@@ -864,7 +867,7 @@ impl PluginRegistry {
                 self.activate_one(runtime, &name, &path).await;
             }
         }
-        for (plugin, error) in runtime.notify_isolated(event, args) {
+        for (plugin, error) in runtime.notify_isolated(event, args.clone()) {
             let path = self
                 .plugins
                 .iter()
@@ -873,7 +876,30 @@ impl PluginRegistry {
                 .unwrap_or_default();
             self.quarantine(runtime, &plugin, &path, "runtime", error.to_string());
         }
+        self.notify_rpc_plugins(runtime, event, &args).await;
         Ok(())
+    }
+
+    async fn notify_rpc_plugins(&mut self, runtime: &mut Runtime, event: &str, payload: &Value) {
+        let plugins = self
+            .rpc_plugins
+            .iter()
+            .filter(|(_, plugin)| plugin.events.contains(event))
+            .map(|(name, _)| name.clone())
+            .collect::<Vec<_>>();
+        for plugin in plugins {
+            let Some(active) = self.rpc_plugins.get(&plugin) else {
+                continue;
+            };
+            let result = active
+                .connection
+                .notify(RPC_EVENT_METHOD, json!({"name": event, "payload": payload}))
+                .await;
+            if let Err(error) = result {
+                let path = self.plugin_path(&plugin);
+                self.quarantine(runtime, &plugin, &path, "runtime", error.to_string());
+            }
+        }
     }
 
     /// Sends an event only to one plugin and quarantines it on failure.
@@ -1371,17 +1397,24 @@ impl RpcHost for UnavailableRpcHost {
     }
 }
 
-fn validate_rpc_commands(
+fn validate_rpc_declarations(
     manifest: &PluginPackageManifest,
+    events: &HashSet<String>,
     activation: RpcActivation,
 ) -> anyhow::Result<HashMap<String, CommandMetadata>> {
     anyhow::ensure!(
         activation.protocol_version == 1,
         "invalid RPC protocol version"
     );
+    let returned_event_count = activation.events.len();
+    let returned_events = activation.events.into_iter().collect::<HashSet<_>>();
     anyhow::ensure!(
-        activation.events.is_empty(),
-        "RPC events are not implemented yet"
+        returned_events.len() == returned_event_count,
+        "RPC plugin returned duplicate events"
+    );
+    anyhow::ensure!(
+        returned_events == *events,
+        "RPC plugin events do not match [activation].events"
     );
     let declared = manifest
         .activation
@@ -1412,6 +1445,28 @@ fn validate_rpc_commands(
         "RPC plugin commands do not match [activation].commands"
     );
     Ok(commands)
+}
+
+fn validate_rpc_manifest_events(
+    manifest: &PluginPackageManifest,
+) -> anyhow::Result<HashSet<String>> {
+    let events = manifest
+        .activation
+        .events
+        .iter()
+        .cloned()
+        .collect::<HashSet<_>>();
+    anyhow::ensure!(
+        events.len() == manifest.activation.events.len(),
+        "RPC manifest declares duplicate events"
+    );
+    for event in &events {
+        anyhow::ensure!(
+            RPC_EDITOR_EVENTS.contains(&event.as_str()),
+            "RPC event `{event}` is not supported by protocol version 1"
+        );
+    }
+    Ok(events)
 }
 
 fn decode_rpc_command_result(value: Value) -> anyhow::Result<Option<Action>> {
