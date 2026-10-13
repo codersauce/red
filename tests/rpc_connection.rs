@@ -265,6 +265,10 @@ fn run_registry_fixture() -> Result<()> {
 
     let initialize = read_message(&mut input)?;
     assert_eq!(initialize["params"]["plugin_id"], "rpc-test");
+    assert_eq!(
+        initialize["params"]["host_methods"],
+        json!(["red/DocumentSnapshot"])
+    );
     write_message(
         &mut output,
         json!({
@@ -289,6 +293,18 @@ fn run_registry_fixture() -> Result<()> {
     let execute = read_message(&mut input)?;
     assert_eq!(execute["method"], "command/execute");
     fs::write(marker, serde_json::to_vec(&execute["params"])?)?;
+    write_message(
+        &mut output,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "plugin-document",
+            "method": "red/DocumentSnapshot",
+            "params": {},
+        }),
+    )?;
+    let host_response = read_message(&mut input)?;
+    assert_eq!(host_response["id"], "plugin-document");
+    assert_eq!(host_response["error"]["code"], -32601);
     write_message(
         &mut output,
         json!({

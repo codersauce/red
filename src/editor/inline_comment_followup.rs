@@ -243,7 +243,7 @@ impl Editor {
             self.execute_with_tracking(&Action::EnterMode(Mode::Normal), frame, runtime, false)
                 .await?;
         }
-        self.plugin_registry.execute(runtime, "AgentOpen").await?;
+        self.execute_plugin_command(runtime, "AgentOpen").await?;
         runtime.send_request(PluginRequest::Action(Action::StageInlineAssistHandoff {
             request_id,
             comment_followup,

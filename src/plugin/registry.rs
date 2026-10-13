@@ -25,7 +25,9 @@ use serde_json::{json, Value};
 use tokio::process::Command;
 
 use super::package::{PluginPackageManifest, PLUGIN_MANIFEST_FILE};
-use super::rpc::{RpcConnection, RpcErrorObject, RpcInitializeParams};
+use super::rpc::{
+    RpcConnection, RpcErrorObject, RpcIncoming, RpcInitializeParams, DOCUMENT_SNAPSHOT_METHOD,
+};
 use super::{
     CommandMetadata, CommandScope, PluginMetadata, RegisteredPluginCommand, RequestId, Runtime,
 };
@@ -34,6 +36,9 @@ const PARALLEL_PLUGIN_STARTUP_MIN: usize = 4;
 const RPC_INITIALIZE_TIMEOUT: Duration = Duration::from_secs(5);
 const RPC_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 const RPC_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
+
+type RpcHostResult = std::result::Result<Value, RpcErrorObject>;
+type RpcHostHandler<'a> = dyn FnMut(&str, &Value) -> RpcHostResult + Send + 'a;
 
 /// Lifecycle authority for configured Husk plugins.
 pub struct PluginRegistry {
@@ -49,7 +54,30 @@ pub struct PluginRegistry {
 
 struct ActiveRpcPlugin {
     connection: RpcConnection,
+    incoming: tokio::sync::mpsc::Receiver<RpcIncoming>,
     commands: HashMap<String, CommandMetadata>,
+}
+
+impl ActiveRpcPlugin {
+    async fn request(
+        &mut self,
+        method: &str,
+        params: Value,
+        timeout: Duration,
+        host: &mut RpcHostHandler<'_>,
+    ) -> anyhow::Result<Value> {
+        let request = self.connection.request(method, params, timeout);
+        tokio::pin!(request);
+        loop {
+            tokio::select! {
+                result = &mut request => return result,
+                incoming = self.incoming.recv() => {
+                    let incoming = incoming.context("RPC incoming channel closed")?;
+                    respond_rpc_incoming(incoming, host).await?;
+                }
+            }
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -430,14 +458,13 @@ impl PluginRegistry {
         let mut command = Command::new(executable);
         command.args(&rpc.args).current_dir(root);
         let (connection, incoming) = RpcConnection::spawn(command)?;
-        drop(incoming);
         let result = connection
             .request_initialize(
                 RpcInitializeParams {
                     protocol_versions: vec![1],
                     red_api_version: RED_HOST_API_VERSION.to_string(),
                     plugin_id: manifest.plugin.id.to_string(),
-                    host_methods: Vec::new(),
+                    host_methods: vec![DOCUMENT_SNAPSHOT_METHOD.to_string()],
                 },
                 RPC_INITIALIZE_TIMEOUT,
             )
@@ -448,6 +475,7 @@ impl PluginRegistry {
         connection.finish_initialize().await?;
         Ok(ActiveRpcPlugin {
             connection,
+            incoming,
             commands,
         })
     }
@@ -514,10 +542,26 @@ impl PluginRegistry {
 
     /// Executes a plugin command and quarantines its owner on callback failure.
     pub async fn execute(&mut self, runtime: &mut Runtime, command: &str) -> anyhow::Result<()> {
-        Box::pin(self.execute_inner(runtime, command)).await
+        let mut unavailable =
+            |method: &str, _: &Value| Err(RpcErrorObject::method_not_found(method));
+        Box::pin(self.execute_inner(runtime, command, &mut unavailable)).await
     }
 
-    async fn execute_inner(&mut self, runtime: &mut Runtime, command: &str) -> anyhow::Result<()> {
+    pub(crate) async fn execute_with_rpc_host(
+        &mut self,
+        runtime: &mut Runtime,
+        command: &str,
+        host: &mut RpcHostHandler<'_>,
+    ) -> anyhow::Result<()> {
+        Box::pin(self.execute_inner(runtime, command, host)).await
+    }
+
+    async fn execute_inner(
+        &mut self,
+        runtime: &mut Runtime,
+        command: &str,
+        host: &mut RpcHostHandler<'_>,
+    ) -> anyhow::Result<()> {
         let pending = self
             .pending_command_plugin(command)
             .or_else(|| self.pending_command_plugin(crate::command::split_invocation(command).0));
@@ -525,7 +569,7 @@ impl PluginRegistry {
             self.ensure_command_registered(runtime, command).await;
         }
         if let Some((owner, name, raw_args)) = self.resolve_rpc_command(runtime, command) {
-            self.execute_rpc_command(runtime, owner, name, raw_args)
+            self.execute_rpc_command(runtime, owner, name, raw_args, host)
                 .await;
             return Ok(());
         }
@@ -555,9 +599,12 @@ impl PluginRegistry {
         owner: String,
         name: String,
         raw_args: String,
+        host: &mut RpcHostHandler<'_>,
     ) {
-        let result = self.rpc_plugins[&owner]
-            .connection
+        let result = self
+            .rpc_plugins
+            .get_mut(&owner)
+            .expect("resolved RPC command owner must be active")
             .request(
                 "command/execute",
                 json!({
@@ -566,6 +613,7 @@ impl PluginRegistry {
                     "raw_args": raw_args,
                 }),
                 RPC_COMMAND_TIMEOUT,
+                host,
             )
             .await;
         match result.and_then(decode_rpc_command_result) {
@@ -581,6 +629,27 @@ impl PluginRegistry {
                 self.quarantine(runtime, &owner, &path, "runtime", error.to_string());
             }
         }
+    }
+
+    pub(crate) async fn service_rpc_host_request(
+        &mut self,
+        runtime: &mut Runtime,
+        host: &mut RpcHostHandler<'_>,
+    ) -> bool {
+        let Some((owner, incoming)) = self.rpc_plugins.iter_mut().find_map(|(owner, plugin)| {
+            plugin
+                .incoming
+                .try_recv()
+                .ok()
+                .map(|incoming| (owner.clone(), incoming))
+        }) else {
+            return false;
+        };
+        if let Err(error) = respond_rpc_incoming(incoming, host).await {
+            let path = self.plugin_path(&owner);
+            self.quarantine(runtime, &owner, &path, "runtime", error.to_string());
+        }
+        true
     }
 
     fn resolve_rpc_command(
@@ -1248,6 +1317,25 @@ impl PluginRegistry {
         check_api_compatibility(metadata)
             .err()
             .map(|error| ("version", error.to_string()))
+    }
+}
+
+async fn respond_rpc_incoming(
+    incoming: RpcIncoming,
+    host: &mut RpcHostHandler<'_>,
+) -> anyhow::Result<()> {
+    match incoming {
+        RpcIncoming::Request(request) => {
+            let result = host(&request.method, &request.params);
+            request.respond(result).await
+        }
+        RpcIncoming::Notification(notification) => {
+            crate::log!(
+                "Ignoring unsupported RPC plugin notification `{}`",
+                notification.method
+            );
+            Ok(())
+        }
     }
 }
 

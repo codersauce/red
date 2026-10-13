@@ -130,6 +130,27 @@ non-null message through its existing informational-message path. A JSON-RPC
 error is shown as a warning and leaves the connection active. A transport or
 result-schema failure quarantines the plugin.
 
+## Document snapshots
+
+An active plugin can read the current unsaved contents of an open document with
+`red/DocumentSnapshot`. Pass an empty object to read the current document, or a
+path to select another open document:
+
+```json
+{"jsonrpc":"2.0","id":"plugin-1","method":"red/DocumentSnapshot","params":{"path":"src/main.rs"}}
+```
+
+The result contains the editor path, exact revision as a decimal string, and
+text:
+
+```json
+{"jsonrpc":"2.0","id":"plugin-1","result":{"path":"src/main.rs","revision":"42","text":"fn main() {}\n"}}
+```
+
+The optional `path` may be a string or `null`; additional fields are rejected
+with JSON-RPC error `-32602`. A document that is not open in Red returns
+application error `-32001`. These request errors leave the plugin active.
+
 ## Version 1 surface
 
 Version 1 deliberately exposes a small set of typed operations:
@@ -158,10 +179,10 @@ will be pushed into a host-owned cache so rendering never waits for a plugin;
 disconnecting the plugin clears its contribution. Version 1 assigns no wire
 method or schema to that future surface.
 
-The current host integration activates and executes commands. Event delivery,
-document host calls, text panels, and statusline providers land as separate
-typed steps; declaring RPC activation events before event delivery is available
-fails activation with a diagnostic.
+The current host integration activates and executes commands and serves
+`red/DocumentSnapshot`. Event delivery, document mutation calls, text panels,
+and statusline providers land as separate typed steps; declaring RPC activation
+events before event delivery is available fails activation with a diagnostic.
 
 ## Errors and failure semantics
 

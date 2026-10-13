@@ -25,6 +25,7 @@ const MAX_OUTSTANDING_REQUESTS: usize = 64;
 const MAX_DIAGNOSTIC_BYTES: usize = 16 * 1024;
 const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 const REAP_TIMEOUT: Duration = Duration::from_secs(2);
+pub(crate) const DOCUMENT_SNAPSHOT_METHOD: &str = "red/DocumentSnapshot";
 
 /// Initialization parameters sent before an RPC plugin becomes active.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -44,6 +45,16 @@ pub struct RpcErrorObject {
     pub message: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub data: Option<Value>,
+}
+
+impl RpcErrorObject {
+    pub(crate) fn method_not_found(method: &str) -> Self {
+        Self {
+            code: -32601,
+            message: format!("host method not found: {method}"),
+            data: None,
+        }
+    }
 }
 
 impl fmt::Display for RpcErrorObject {

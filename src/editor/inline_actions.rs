@@ -687,7 +687,7 @@ impl Editor {
                     )
                     .await?;
                 }
-                self.plugin_registry.execute(runtime, "AgentOpen").await?;
+                self.execute_plugin_command(runtime, "AgentOpen").await?;
                 // AgentOpen queues pane creation/restoration first. Stage the draft
                 // only after those requests have been processed.
                 runtime.send_request(PluginRequest::Action(Action::StageInlineAssistHandoff {

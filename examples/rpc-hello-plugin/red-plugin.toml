@@ -11,4 +11,4 @@ command = "python3"
 args = ["plugin.py"]
 
 [activation]
-commands = ["RpcHello"]
+commands = ["RpcDocument", "RpcHello"]

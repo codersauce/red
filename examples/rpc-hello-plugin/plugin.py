@@ -7,6 +7,17 @@ def send(message):
     print(json.dumps(message, separators=(",", ":")), flush=True)
 
 
+def request_host(method, params):
+    request_id = "plugin-1"
+    send({"jsonrpc": "2.0", "id": request_id, "method": method, "params": params})
+    response = json.loads(sys.stdin.readline())
+    if response.get("id") != request_id:
+        raise RuntimeError("unexpected host response")
+    if "error" in response:
+        raise RuntimeError(response["error"]["message"])
+    return response["result"]
+
+
 for line in sys.stdin:
     message = json.loads(line)
     method = message.get("method")
@@ -24,20 +35,38 @@ for line in sys.stdin:
                                 "title": "Hello from RPC",
                                 "arguments": True,
                             },
-                        }
+                        },
+                        {
+                            "name": "RpcDocument",
+                            "metadata": {"title": "Show current RPC document"},
+                        },
                     ],
                 },
             }
         )
     elif method == "command/execute":
-        name = message["params"]["raw_args"] or "Red"
-        send(
-            {
-                "jsonrpc": "2.0",
-                "id": message["id"],
-                "result": {"message": f"Hello, {name}, from Python RPC!"},
-            }
-        )
+        try:
+            if message["params"]["name"] == "RpcDocument":
+                document = request_host("red/DocumentSnapshot", {})
+                path = document["path"] or "[scratch]"
+                result = {
+                    "message": (
+                        f"Current document: {path} @ revision {document['revision']} "
+                        f"({len(document['text'])} chars)"
+                    )
+                }
+            else:
+                name = message["params"]["raw_args"] or "Red"
+                result = {"message": f"Hello, {name}, from Python RPC!"}
+            send({"jsonrpc": "2.0", "id": message["id"], "result": result})
+        except RuntimeError as error:
+            send(
+                {
+                    "jsonrpc": "2.0",
+                    "id": message["id"],
+                    "error": {"code": -32000, "message": str(error)},
+                }
+            )
     elif method == "shutdown":
         send({"jsonrpc": "2.0", "id": message["id"], "result": None})
     elif method == "exit":

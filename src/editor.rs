@@ -4552,6 +4552,13 @@ struct PluginDocumentTransaction {
     edits: Vec<plugin::DocumentEdit>,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RpcDocumentSnapshotParams {
+    #[serde(default)]
+    path: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 struct PendingLspFormatSave {
     save_as: Option<String>,
@@ -10570,6 +10577,7 @@ impl Editor {
         buffer: &mut RenderBuffer,
         runtime: &mut Runtime,
     ) -> anyhow::Result<()> {
+        self.service_rpc_host_requests(runtime).await;
         self.service_mouse_selection(buffer, runtime).await?;
         self.service_open_file_changes(buffer, runtime).await?;
         if self.agent_lsp.has_work() {
@@ -12810,10 +12818,12 @@ impl Editor {
                     });
                 }
                 PluginRequest::DocumentSnapshot { path, request_id } => {
-                    let payload = self.plugin_document_snapshot(path.as_deref()).map_or_else(
-                        |error| json!({ "ok": false, "error": error.to_string() }),
-                        |snapshot| json!({ "ok": true, "document": snapshot }),
-                    );
+                    let payload =
+                        Self::plugin_document_snapshot(&self.buffer_manager, path.as_deref())
+                            .map_or_else(
+                                |error| json!({ "ok": false, "error": error.to_string() }),
+                                |snapshot| json!({ "ok": true, "document": snapshot }),
+                            );
                     self.plugin_registry
                         .resolve_request(runtime, request_id, payload)
                         .await?;
@@ -20451,7 +20461,7 @@ impl Editor {
                     .and_then(|commands| commands.cancel.clone());
                 if let Some(command) = scratch_command {
                     add_to_history = false;
-                    self.plugin_registry.execute(runtime, &command).await?;
+                    self.execute_plugin_command(runtime, &command).await?;
                 } else {
                     if *force {
                         return Ok(true);
@@ -22018,7 +22028,7 @@ impl Editor {
                     self.current_dialog = Some(Box::new(TutorialDemoPanel::new(self, kind)));
                     self.render(buffer)?;
                 } else {
-                    self.plugin_registry.execute(runtime, cmd).await?;
+                    self.execute_plugin_command(runtime, cmd).await?;
                 }
             }
             Action::GoToLine(line) => {
@@ -25748,15 +25758,18 @@ impl Editor {
         self.ensure_buffer_lsp_opened(buffer_index).await
     }
 
-    fn plugin_document_index(&self, path: Option<&str>) -> anyhow::Result<usize> {
+    fn plugin_document_index(
+        buffer_manager: &buffer_manager::BufferManager,
+        path: Option<&str>,
+    ) -> anyhow::Result<usize> {
         let Some(path) = path else {
-            return Ok(self.buffer_manager.active_index());
+            return Ok(buffer_manager.active_index());
         };
         let requested = Path::new(path)
             .absolutize()
             .map(|path| path.into_owned())
             .unwrap_or_else(|_| PathBuf::from(path));
-        self.buffer_manager
+        buffer_manager
             .iter()
             .position(|buffer| {
                 buffer.file.as_deref().is_some_and(|candidate| {
@@ -25771,12 +25784,11 @@ impl Editor {
     }
 
     fn plugin_document_snapshot(
-        &self,
+        buffer_manager: &buffer_manager::BufferManager,
         path: Option<&str>,
     ) -> anyhow::Result<plugin::DocumentSnapshot> {
-        let buffer_index = self.plugin_document_index(path)?;
-        let buffer = self
-            .buffer_manager
+        let buffer_index = Self::plugin_document_index(buffer_manager, path)?;
+        let buffer = buffer_manager
             .get(buffer_index)
             .ok_or_else(|| anyhow::anyhow!("document buffer disappeared"))?;
         Ok(plugin::DocumentSnapshot {
@@ -25785,6 +25797,63 @@ impl Editor {
             revision: buffer.revision(),
             text: buffer.contents(),
         })
+    }
+
+    fn rpc_host_request(
+        buffer_manager: &buffer_manager::BufferManager,
+        method: &str,
+        params: &Value,
+    ) -> std::result::Result<Value, plugin::rpc::RpcErrorObject> {
+        if method != plugin::rpc::DOCUMENT_SNAPSHOT_METHOD {
+            return Err(plugin::rpc::RpcErrorObject::method_not_found(method));
+        }
+        let params: RpcDocumentSnapshotParams =
+            serde_json::from_value(params.clone()).map_err(|error| {
+                plugin::rpc::RpcErrorObject {
+                    code: -32602,
+                    message: format!("invalid red/DocumentSnapshot params: {error}"),
+                    data: None,
+                }
+            })?;
+        let snapshot = Self::plugin_document_snapshot(buffer_manager, params.path.as_deref())
+            .map_err(|error| plugin::rpc::RpcErrorObject {
+                code: -32001,
+                message: error.to_string(),
+                data: None,
+            })?;
+        Ok(json!({
+            "path": snapshot.path,
+            "revision": snapshot.revision.to_string(),
+            "text": snapshot.text,
+        }))
+    }
+
+    async fn execute_plugin_command(
+        &mut self,
+        runtime: &mut Runtime,
+        command: &str,
+    ) -> anyhow::Result<()> {
+        let buffer_manager = &self.buffer_manager;
+        let mut host =
+            |method: &str, params: &Value| Self::rpc_host_request(buffer_manager, method, params);
+        self.plugin_registry
+            .execute_with_rpc_host(runtime, command, &mut host)
+            .await
+    }
+
+    async fn service_rpc_host_requests(&mut self, runtime: &mut Runtime) {
+        let buffer_manager = &self.buffer_manager;
+        let mut host =
+            |method: &str, params: &Value| Self::rpc_host_request(buffer_manager, method, params);
+        for _ in 0..PLUGIN_REQUESTS_PER_TICK {
+            if !self
+                .plugin_registry
+                .service_rpc_host_request(runtime, &mut host)
+                .await
+            {
+                break;
+            }
+        }
     }
 
     async fn apply_plugin_document_transaction(
@@ -25797,7 +25866,8 @@ impl Editor {
             !transaction.edits.is_empty(),
             "document transaction contains no edits"
         );
-        let buffer_index = self.plugin_document_index(transaction.path.as_deref())?;
+        let buffer_index =
+            Self::plugin_document_index(&self.buffer_manager, transaction.path.as_deref())?;
         if buffer_index != self.buffer_manager.active_index() {
             self.set_current_buffer(render_buffer, buffer_index).await?;
         }
@@ -25861,7 +25931,7 @@ impl Editor {
         path: Option<&str>,
         transaction_id: &str,
     ) -> anyhow::Result<()> {
-        let buffer_index = self.plugin_document_index(path)?;
+        let buffer_index = Self::plugin_document_index(&self.buffer_manager, path)?;
         if buffer_index != self.buffer_manager.active_index() {
             self.set_current_buffer(render_buffer, buffer_index).await?;
         }
@@ -30071,7 +30141,7 @@ impl Editor {
             .get(&self.current_buffer().id())
             .and_then(|commands| commands.submit.clone());
         if let Some(command) = scratch_command {
-            self.plugin_registry.execute(runtime, &command).await?;
+            self.execute_plugin_command(runtime, &command).await?;
             return Ok(false);
         }
         let resume_insert_transaction = self.commit_active_transaction_before_save();
@@ -36895,6 +36965,45 @@ builtin = "rust"
         assert_eq!(payload["lsp_client"]["workspace_root"], "/repo");
         assert_eq!(payload["padding_left"], true);
         assert_eq!(payload["url_value"], 1);
+    }
+
+    #[test]
+    fn rpc_document_snapshot_returns_unsaved_text_and_string_revision() {
+        let editor = test_editor(/*width*/ 80, /*height*/ 24);
+        let response = Editor::rpc_host_request(
+            &editor.buffer_manager,
+            plugin::rpc::DOCUMENT_SNAPSHOT_METHOD,
+            &json!({}),
+        )
+        .unwrap();
+
+        assert_eq!(response["path"], Value::Null);
+        assert_eq!(
+            response["revision"],
+            editor.current_buffer().revision().to_string()
+        );
+        assert_eq!(response["text"], "hello");
+        assert!(response.get("buffer_index").is_none());
+    }
+
+    #[test]
+    fn rpc_document_snapshot_rejects_invalid_and_unavailable_paths() {
+        let editor = test_editor(/*width*/ 80, /*height*/ 24);
+        let invalid = Editor::rpc_host_request(
+            &editor.buffer_manager,
+            plugin::rpc::DOCUMENT_SNAPSHOT_METHOD,
+            &json!({"unknown": true}),
+        )
+        .unwrap_err();
+        let unavailable = Editor::rpc_host_request(
+            &editor.buffer_manager,
+            plugin::rpc::DOCUMENT_SNAPSHOT_METHOD,
+            &json!({"path": "/not/open/in/red"}),
+        )
+        .unwrap_err();
+
+        assert_eq!(invalid.code, -32602);
+        assert_eq!(unavailable.code, -32001);
     }
 
     async fn install_event_recorder(editor: &mut Editor, runtime: &mut Runtime) {
