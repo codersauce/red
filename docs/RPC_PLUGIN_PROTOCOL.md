@@ -48,10 +48,12 @@ messages; plugins write diagnostics to standard error. Batch arrays are not
 supported. Requests receive exactly one result or error response. Notifications
 receive no response.
 
-Version 1 limits each frame to 8 MiB, queued data to 16 MiB per connection, and
-outstanding requests to 64 in each direction. Red retains at most the last
-16 KiB of standard error when reporting a failure. Exceeding a transport limit,
-writing malformed framing, or closing the stream disconnects the plugin.
+Version 1 limits each frame to 8 MiB, queued data to 16 MiB in each direction
+per connection, and outstanding requests to 64 in each direction. Red retains
+at most the last 16 KiB of standard error when reporting a failure. Exceeding a
+transport limit, writing malformed framing, or closing the stream disconnects
+the plugin.
+Request deadlines cover queue admission, writing, and the response.
 
 ## Lifecycle and negotiation
 
@@ -59,6 +61,21 @@ Red starts an activated plugin once and sends `initialize` with the application
 protocol versions and supported host methods. The plugin selects protocol
 version `1` and returns its command metadata and event subscriptions. Its
 commands must exactly cover the commands declared by `[activation]`.
+
+The version 1 initialization parameters are:
+
+```json
+{
+  "protocol_versions": [1],
+  "red_api_version": "0.19.0",
+  "plugin_id": "document-tools",
+  "host_methods": ["red/DocumentSnapshot"]
+}
+```
+
+The response is an object containing `"protocol_version": 1`. The connection
+layer validates that selection and returns the remaining fields to activation,
+where command metadata and event subscriptions are validated before use.
 
 Red validates the full response before registering anything, then sends the
 `initialized` notification. Plugins must not call host methods before that
