@@ -1,8 +1,8 @@
 //! Supervised JSON-RPC 2.0 stdio plugins.
 //!
 //! JSON-RPC plugins run as child processes that exchange bounded, newline-delimited
-//! JSON-RPC 2.0 messages with Red over `stdin` and `stdout`. They share [`RedHost`] and
-//! [`RedPluginPolicy`] with Husk plugins so commands, event subscriptions, UI handles,
+//! JSON-RPC 2.0 messages with Red over `stdin` and `stdout`. They share `RedHost` and
+//! `RedPluginPolicy` with Husk plugins so commands, event subscriptions, UI handles,
 //! one-shot requests, and transactional reload staging obey the same safety and
 //! ownership invariants.
 
