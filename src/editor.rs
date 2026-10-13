@@ -4603,6 +4603,18 @@ struct RpcTextPanelParams {
     id: String,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RpcStatuslineSetParams {
+    text: String,
+    #[serde(default)]
+    side: plugin::rpc::RpcStatuslineSide,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RpcStatuslineClearParams {}
+
 fn default_rpc_text_panel_width() -> usize {
     30
 }
@@ -10767,6 +10779,7 @@ impl Editor {
                 .await?;
         }
         self.plugin_registry.poll_hot_reload(runtime).await;
+        self.render_dirty_rpc_statusline(buffer)?;
 
         for _ in 0..AGENT_EVENTS_PER_TICK {
             let Some(event) = self
@@ -26065,6 +26078,49 @@ impl Editor {
         }
     }
 
+    fn rpc_statusline_set_request(
+        &mut self,
+        owner: &str,
+        params: &Value,
+    ) -> std::result::Result<Value, plugin::rpc::RpcErrorObject> {
+        const MAX_TEXT_BYTES: usize = 128;
+
+        let params: RpcStatuslineSetParams =
+            Self::rpc_params(plugin::rpc::STATUSLINE_SET_METHOD, params)?;
+        if params.text.trim().is_empty() {
+            return Err(Self::rpc_error(
+                -32602,
+                "red/StatuslineSet text must contain a non-whitespace character",
+            ));
+        }
+        if params.text.len() > MAX_TEXT_BYTES {
+            return Err(Self::rpc_error(
+                -32602,
+                format!("red/StatuslineSet text may not exceed {MAX_TEXT_BYTES} UTF-8 bytes"),
+            ));
+        }
+        if params.text.chars().any(char::is_control) {
+            return Err(Self::rpc_error(
+                -32602,
+                "red/StatuslineSet text may not contain control characters",
+            ));
+        }
+        self.plugin_registry
+            .set_rpc_statusline(owner, params.side, params.text);
+        Ok(Value::Null)
+    }
+
+    fn rpc_statusline_clear_request(
+        &mut self,
+        owner: &str,
+        params: &Value,
+    ) -> std::result::Result<Value, plugin::rpc::RpcErrorObject> {
+        let _: RpcStatuslineClearParams =
+            Self::rpc_params(plugin::rpc::STATUSLINE_CLEAR_METHOD, params)?;
+        self.plugin_registry.clear_rpc_statusline(owner);
+        Ok(Value::Null)
+    }
+
     fn rpc_document_snapshot_request(
         buffer_manager: &buffer_manager::BufferManager,
         params: &Value,
@@ -26173,6 +26229,10 @@ impl Editor {
                 self.rpc_document_undo_request(render_buffer, runtime, owner, params)
                     .await
             }
+            plugin::rpc::STATUSLINE_SET_METHOD => self.rpc_statusline_set_request(owner, params),
+            plugin::rpc::STATUSLINE_CLEAR_METHOD => {
+                self.rpc_statusline_clear_request(owner, params)
+            }
             _ => self.rpc_text_panel_request(render_buffer, owner, method, params),
         }
     }
@@ -26209,7 +26269,8 @@ impl Editor {
         runtime: &mut Runtime,
     ) {
         for _ in 0..PLUGIN_REQUESTS_PER_TICK {
-            let Some((owner, incoming)) = self.plugin_registry.take_rpc_host_request() else {
+            let Some((owner, incoming)) = self.plugin_registry.take_rpc_host_request(runtime)
+            else {
                 break;
             };
             let result = {
@@ -37587,6 +37648,76 @@ builtin = "rust"
         .await
         .unwrap_err();
         assert_eq!(invalid.code, -32602);
+    }
+
+    #[tokio::test]
+    async fn rpc_statusline_contributions_are_cached_replaced_and_cleared() {
+        let mut editor = test_editor(/*width*/ 80, /*height*/ 24);
+        let mut render_buffer = RenderBuffer::new(80, 24, &Style::default());
+        let mut runtime = Runtime::new();
+        macro_rules! request {
+            ($owner:expr, $method:expr, $params:expr $(,)?) => {
+                editor.rpc_host_request(&mut render_buffer, &mut runtime, $owner, $method, &$params)
+            };
+        }
+
+        request!(
+            "right-plugin",
+            plugin::rpc::STATUSLINE_SET_METHOD,
+            json!({"text": "RPC right"}),
+        )
+        .await
+        .unwrap();
+        request!(
+            "left-plugin",
+            plugin::rpc::STATUSLINE_SET_METHOD,
+            json!({"text": "RPC left", "side": "left"}),
+        )
+        .await
+        .unwrap();
+
+        let generation = editor.render_generation;
+        editor
+            .service_background(&mut render_buffer, &mut runtime)
+            .await
+            .unwrap();
+        assert!(editor.render_generation > generation);
+        let row = editor.test_statusline_row();
+        let left = row.find("RPC left").unwrap();
+        let right = row.find("RPC right").unwrap();
+        let position = row.rfind("1:1").unwrap();
+        assert!(left < right && right < position, "{row:?}");
+
+        request!(
+            "right-plugin",
+            plugin::rpc::STATUSLINE_SET_METHOD,
+            json!({"text": "RPC moved", "side": "left"}),
+        )
+        .await
+        .unwrap();
+        let invalid = request!(
+            "right-plugin",
+            plugin::rpc::STATUSLINE_SET_METHOD,
+            json!({"text": "bad\nstatus"}),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(invalid.code, -32602);
+        assert!(editor.test_statusline_row().contains("RPC moved"));
+
+        for _ in 0..2 {
+            request!(
+                "right-plugin",
+                plugin::rpc::STATUSLINE_CLEAR_METHOD,
+                json!({}),
+            )
+            .await
+            .unwrap();
+        }
+        let row = editor.test_statusline_row();
+        assert!(row.contains("RPC left"));
+        assert!(!row.contains("RPC right"));
+        assert!(!row.contains("RPC moved"));
     }
 
     async fn install_event_recorder(editor: &mut Editor, runtime: &mut Runtime) {

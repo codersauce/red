@@ -326,7 +326,9 @@ fn run_registry_fixture() -> Result<()> {
             "red/TextPanelCreate",
             "red/TextPanelSetContent",
             "red/TextPanelFocus",
-            "red/TextPanelDispose"
+            "red/TextPanelDispose",
+            "red/StatuslineSet",
+            "red/StatuslineClear"
         ])
     );
     write_message(

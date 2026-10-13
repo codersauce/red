@@ -60,6 +60,14 @@ for line in sys.stdin:
                             "metadata": {"title": "Close the RPC text panel"},
                         },
                         {
+                            "name": "RpcStatusline",
+                            "metadata": {"title": "Set the RPC statusline"},
+                        },
+                        {
+                            "name": "RpcStatuslineClear",
+                            "metadata": {"title": "Clear the RPC statusline"},
+                        },
+                        {
                             "name": "RpcUndo",
                             "metadata": {"title": "Undo the last RPC edit"},
                         },
@@ -146,6 +154,15 @@ for line in sys.stdin:
                 result = None
             elif command == "RpcPanelClose":
                 request_host("red/TextPanelDispose", {"id": "python-preview"})
+                result = None
+            elif command == "RpcStatusline":
+                request_host(
+                    "red/StatuslineSet",
+                    {"text": "Python RPC ready", "side": "right"},
+                )
+                result = None
+            elif command == "RpcStatuslineClear":
+                request_host("red/StatuslineClear", {})
                 result = None
             else:
                 name = message["params"]["raw_args"] or "Red"

@@ -76,7 +76,9 @@ The version 1 initialization parameters are:
     "red/TextPanelCreate",
     "red/TextPanelSetContent",
     "red/TextPanelFocus",
-    "red/TextPanelDispose"
+    "red/TextPanelDispose",
+    "red/StatuslineSet",
+    "red/StatuslineClear"
   ]
 }
 ```
@@ -264,6 +266,30 @@ Unknown fields and invalid IDs or widths return `-32602`. A missing, disposed,
 not-owned, or over-limit panel returns `-32004`. These errors leave the plugin
 active.
 
+## Statusline contributions
+
+An active plugin can replace its single cached statusline contribution with
+`red/StatuslineSet`:
+
+```json
+{"jsonrpc":"2.0","id":"plugin-6","method":"red/StatuslineSet","params":{"text":"Build ready","side":"right"}}
+```
+
+`side` is optional, defaults to `right`, and also accepts `left`. `text` must
+contain a non-whitespace character, may not contain control characters, and is
+limited to 128 UTF-8 bytes. The method returns `null`; calling it again replaces
+the connection's previous text and side.
+
+`red/StatuslineClear` accepts an empty object and returns `null`, including when
+the connection has no contribution. Contributions render after configured
+sections on the left and before configured sections on the right, toward the
+center of the statusline. Red orders contributions by plugin name and drops or
+truncates them before edge sections when terminal width is constrained.
+
+Red renders only from its local cache. It never calls or waits for a plugin
+while drawing a frame. Disconnect, quarantine, successful hot reload, and
+editor deactivation clear the previous connection's contribution.
+
 ## Version 1 surface
 
 Version 1 deliberately exposes a small set of typed operations:
@@ -276,6 +302,7 @@ Version 1 deliberately exposes a small set of typed operations:
   revisions, attributed undo transactions, dirty tracking, and LSP updates.
 - Text-panel create, content replacement, focus, and disposal, with resources
   owned by the active plugin connection.
+- One cached plain-text statusline contribution per active plugin connection.
 
 Host calls use named parameters. Document revisions and request identifiers
 that may exceed JavaScript's exact integer range are decimal strings on the
@@ -287,14 +314,9 @@ There is no generic host-action escape hatch. Intercept or veto hooks,
 synchronous rendering callbacks, high-frequency cursor or viewport events, and
 transparent process restart are outside version 1.
 
-Statusline providers are planned as a later negotiated capability. Their data
-will be pushed into a host-owned cache so rendering never waits for a plugin;
-disconnecting the plugin clears its contribution. Version 1 assigns no wire
-method or schema to that future surface.
-
 The current host integration activates and executes commands, delivers the
 three editor events above, and serves the document and text-panel methods.
-Statusline providers land as a separate typed step.
+It also caches and renders one statusline contribution per active connection.
 
 ## Errors and failure semantics
 

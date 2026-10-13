@@ -11,7 +11,7 @@
 //! inspect status rather than assuming a changed source file became live.
 
 use std::borrow::Cow;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::Path;
 use std::sync::Arc;
@@ -30,9 +30,9 @@ use tokio::sync::{mpsc, Mutex};
 use super::package::{PluginPackageManifest, PLUGIN_MANIFEST_FILE};
 use super::rpc::{
     RpcConnection, RpcErrorObject, RpcIncoming, RpcInitializeParams, RpcRequester,
-    DOCUMENT_APPLY_METHOD, DOCUMENT_SNAPSHOT_METHOD, DOCUMENT_UNDO_METHOD,
-    TEXT_PANEL_CREATE_METHOD, TEXT_PANEL_DISPOSE_METHOD, TEXT_PANEL_FOCUS_METHOD,
-    TEXT_PANEL_SET_CONTENT_METHOD,
+    RpcStatuslineSide, DOCUMENT_APPLY_METHOD, DOCUMENT_SNAPSHOT_METHOD, DOCUMENT_UNDO_METHOD,
+    STATUSLINE_CLEAR_METHOD, STATUSLINE_SET_METHOD, TEXT_PANEL_CREATE_METHOD,
+    TEXT_PANEL_DISPOSE_METHOD, TEXT_PANEL_FOCUS_METHOD, TEXT_PANEL_SET_CONTENT_METHOD,
 };
 use super::{
     CommandMetadata, CommandScope, PluginMetadata, RegisteredPluginCommand, RequestId, Runtime,
@@ -58,6 +58,13 @@ pub struct PluginRegistry {
     last_hot_reload_poll: Instant,
     rpc_plugins: HashMap<String, ActiveRpcPlugin>,
     rpc_text_panels: HashMap<String, HashMap<String, String>>,
+    rpc_statuslines: BTreeMap<String, RpcStatuslineContribution>,
+    rpc_statusline_dirty: bool,
+}
+
+struct RpcStatuslineContribution {
+    side: RpcStatuslineSide,
+    text: String,
 }
 
 struct ActiveRpcPlugin {
@@ -193,7 +200,35 @@ impl PluginRegistry {
             last_hot_reload_poll: Instant::now(),
             rpc_plugins: HashMap::new(),
             rpc_text_panels: HashMap::new(),
+            rpc_statuslines: BTreeMap::new(),
+            rpc_statusline_dirty: false,
         }
+    }
+
+    pub(crate) fn set_rpc_statusline(
+        &mut self,
+        owner: &str,
+        side: RpcStatuslineSide,
+        text: String,
+    ) {
+        self.rpc_statuslines
+            .insert(owner.to_string(), RpcStatuslineContribution { side, text });
+        self.rpc_statusline_dirty = true;
+    }
+
+    pub(crate) fn clear_rpc_statusline(&mut self, owner: &str) {
+        self.rpc_statusline_dirty |= self.rpc_statuslines.remove(owner).is_some();
+    }
+
+    pub(crate) fn take_rpc_statusline_dirty(&mut self) -> bool {
+        std::mem::take(&mut self.rpc_statusline_dirty)
+    }
+
+    pub(crate) fn rpc_statuslines(&self, side: RpcStatuslineSide) -> impl Iterator<Item = &str> {
+        self.rpc_statuslines
+            .values()
+            .filter(move |contribution| contribution.side == side)
+            .map(|contribution| contribution.text.as_str())
     }
 
     pub(crate) fn register_rpc_text_panel(
@@ -465,6 +500,7 @@ impl PluginRegistry {
             );
         }
         self.close_rpc_text_panels(runtime, name);
+        self.clear_rpc_statusline(name);
         self.rpc_plugins.remove(name);
         crate::log!("Plugin `{name}` quarantined during {stage}: {diagnostic}");
         self.set_status(
@@ -524,6 +560,8 @@ impl PluginRegistry {
                         TEXT_PANEL_SET_CONTENT_METHOD.to_string(),
                         TEXT_PANEL_FOCUS_METHOD.to_string(),
                         TEXT_PANEL_DISPOSE_METHOD.to_string(),
+                        STATUSLINE_SET_METHOD.to_string(),
+                        STATUSLINE_CLEAR_METHOD.to_string(),
                     ],
                 },
                 RPC_INITIALIZE_TIMEOUT,
@@ -560,6 +598,7 @@ impl PluginRegistry {
                 let previous = self.rpc_plugins.insert(name.to_string(), plugin);
                 if let Some(previous) = previous {
                     self.close_rpc_text_panels(runtime, name);
+                    self.clear_rpc_statusline(name);
                     let shutdown = previous
                         .connection
                         .shutdown(RPC_SHUTDOWN_TIMEOUT, RPC_SHUTDOWN_TIMEOUT);
@@ -709,13 +748,23 @@ impl PluginRegistry {
         }
     }
 
-    pub(crate) fn take_rpc_host_request(&mut self) -> Option<(String, RpcIncoming)> {
+    pub(crate) fn take_rpc_host_request(
+        &mut self,
+        runtime: &mut Runtime,
+    ) -> Option<(String, RpcIncoming)> {
         for (owner, plugin) in &self.rpc_plugins {
             let Ok(mut incoming) = plugin.incoming.try_lock() else {
                 continue;
             };
-            if let Ok(request) = incoming.try_recv() {
-                return Some((owner.clone(), request));
+            match incoming.try_recv() {
+                Ok(request) => return Some((owner.clone(), request)),
+                Err(mpsc::error::TryRecvError::Empty) => {}
+                Err(mpsc::error::TryRecvError::Disconnected) => {
+                    let owner = owner.clone();
+                    drop(incoming);
+                    self.quarantine_rpc(runtime, &owner, anyhow::anyhow!("RPC connection closed"));
+                    return None;
+                }
             }
         }
         None
@@ -1141,6 +1190,8 @@ impl PluginRegistry {
             }
         }
         self.rpc_text_panels.clear();
+        self.rpc_statusline_dirty |= !self.rpc_statuslines.is_empty();
+        self.rpc_statuslines.clear();
         runtime.deactivate_all().await?;
         self.initialized = false;
         Ok(())
@@ -1735,7 +1786,7 @@ mod tests {
     }
 
     #[test]
-    fn rpc_quarantine_closes_only_the_owners_text_panels() {
+    fn rpc_quarantine_clears_only_the_owners_ui_resources() {
         drain_requests();
         let mut registry = PluginRegistry::new();
         let mut runtime = Runtime::new();
@@ -1745,6 +1796,16 @@ mod tests {
         let observer_id = registry
             .register_rpc_text_panel("observer", "preview")
             .unwrap();
+        registry.set_rpc_statusline(
+            "owner",
+            RpcStatuslineSide::Right,
+            "owner status".to_string(),
+        );
+        registry.set_rpc_statusline(
+            "observer",
+            RpcStatuslineSide::Right,
+            "observer status".to_string(),
+        );
 
         registry.quarantine_rpc(&mut runtime, "owner", anyhow::anyhow!("connection closed"));
 
@@ -1752,6 +1813,12 @@ mod tests {
         assert_eq!(
             registry.rpc_text_panel("observer", "preview"),
             Some(observer_id)
+        );
+        assert_eq!(
+            registry
+                .rpc_statuslines(RpcStatuslineSide::Right)
+                .collect::<Vec<_>>(),
+            vec!["observer status"]
         );
         assert!(matches!(
             runtime.try_recv_request(),

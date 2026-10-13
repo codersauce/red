@@ -32,6 +32,16 @@ pub(crate) const TEXT_PANEL_CREATE_METHOD: &str = "red/TextPanelCreate";
 pub(crate) const TEXT_PANEL_SET_CONTENT_METHOD: &str = "red/TextPanelSetContent";
 pub(crate) const TEXT_PANEL_FOCUS_METHOD: &str = "red/TextPanelFocus";
 pub(crate) const TEXT_PANEL_DISPOSE_METHOD: &str = "red/TextPanelDispose";
+pub(crate) const STATUSLINE_SET_METHOD: &str = "red/StatuslineSet";
+pub(crate) const STATUSLINE_CLEAR_METHOD: &str = "red/StatuslineClear";
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum RpcStatuslineSide {
+    Left,
+    #[default]
+    Right,
+}
 
 /// Initialization parameters sent before an RPC plugin becomes active.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]

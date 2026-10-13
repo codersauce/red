@@ -31,7 +31,7 @@ use crate::{
     editor::RenderCommand,
     lsp::{Diagnostic, DiagnosticSeverity},
     notification::{NotificationCounts, NotificationState, Severity},
-    plugin::DecorationAnchor,
+    plugin::{rpc::RpcStatuslineSide, DecorationAnchor},
     splash,
     theme::{SelectionForegroundPriority, Style, SurfacePalette, Theme},
     ui::IconCatalog,
@@ -174,6 +174,15 @@ struct StatuslineAccent {
     text: String,
     color: Color,
     minimum_contrast: Option<f32>,
+}
+
+fn rpc_statusline_segment(text: &str, style: &Style) -> StatuslineSegment {
+    StatuslineSegment {
+        text: statusline_icon_label("", text),
+        style: style.clone(),
+        accents: Vec::new(),
+        truncation_side: TruncationSide::Right,
+    }
 }
 
 struct StatuslineContext<'a> {
@@ -3907,12 +3916,17 @@ impl Editor {
 
         let base_style = self.theme.statusline_style.inner_style.clone();
         let icons = self.config.statusline.icons;
-        let left = statusline_segments(
+        let mut left = statusline_segments(
             left_sections,
             &context,
             &self.theme,
             icons.style,
             icons.color,
+        );
+        left.extend(
+            self.plugin_registry
+                .rpc_statuslines(RpcStatuslineSide::Left)
+                .map(|text| rpc_statusline_segment(text, &base_style)),
         );
         let mut right = statusline_segments(
             right_sections,
@@ -3922,6 +3936,12 @@ impl Editor {
             icons.color,
         );
         right.reverse();
+        right.splice(
+            ..0,
+            self.plugin_registry
+                .rpc_statuslines(RpcStatuslineSide::Right)
+                .map(|text| rpc_statusline_segment(text, &base_style)),
+        );
 
         let left_separator = self.theme.statusline_style.outer_chars[1];
         let right_separator = self.theme.statusline_style.outer_chars[2];
@@ -3937,6 +3957,16 @@ impl Editor {
                 &base_style,
             );
         }
+    }
+
+    pub(super) fn render_dirty_rpc_statusline(
+        &mut self,
+        buffer: &mut RenderBuffer,
+    ) -> anyhow::Result<()> {
+        if self.plugin_registry.take_rpc_statusline_dirty() {
+            self.render(buffer)?;
+        }
+        Ok(())
     }
 
     fn refresh_statusline_git(&mut self, file: Option<&str>, load_changes: bool) {
