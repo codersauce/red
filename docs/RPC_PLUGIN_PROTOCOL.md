@@ -55,6 +55,13 @@ transport limit, writing malformed framing, or closing the stream disconnects
 the plugin.
 Request deadlines cover queue admission, writing, and the response.
 
+The portable [envelope conformance fixture](../tests/fixtures/rpc_v1_envelopes.jsonl)
+contains one JSON object per line. Each `message` is a wire-envelope value;
+`expected` is `request`, `notification`, `response`, or `invalid`. Run
+`cargo test --lib protocol_v1_envelope_conformance` to check Red's parser, or
+feed the same cases into another implementation. The fixture checks envelope
+classification, not transport framing, lifecycle, or individual method schemas.
+
 ## Lifecycle and negotiation
 
 Red starts an activated plugin once and sends `initialize` with the application

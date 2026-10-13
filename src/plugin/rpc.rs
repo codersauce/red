@@ -984,20 +984,23 @@ mod tests {
     }
 
     #[test]
-    fn envelope_validation_rejects_batches_and_ambiguous_responses() {
-        assert!(classify_envelope(json!([])).is_err());
-        assert!(classify_envelope(json!({
-            "jsonrpc": "2.0",
-            "method": "red/Test",
-            "params": [],
-        }))
-        .is_err());
-        assert!(classify_envelope(json!({
-            "jsonrpc": "2.0",
-            "id": "1",
-            "result": null,
-            "error": {"code": -32000, "message": "both"},
-        }))
-        .is_err());
+    fn protocol_v1_envelope_conformance() {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Case {
+            expected: String,
+            message: Value,
+        }
+
+        for line in include_str!("../../tests/fixtures/rpc_v1_envelopes.jsonl").lines() {
+            let case: Case = serde_json::from_str(line).unwrap();
+            let actual = match classify_envelope(case.message) {
+                Ok(ParsedMessage::Request { .. }) => "request",
+                Ok(ParsedMessage::Notification { .. }) => "notification",
+                Ok(ParsedMessage::Response { .. }) => "response",
+                Err(_) => "invalid",
+            };
+            assert_eq!(actual, case.expected, "{line}");
+        }
     }
 }
