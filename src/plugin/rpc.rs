@@ -28,6 +28,10 @@ const REAP_TIMEOUT: Duration = Duration::from_secs(2);
 pub(crate) const DOCUMENT_SNAPSHOT_METHOD: &str = "red/DocumentSnapshot";
 pub(crate) const DOCUMENT_APPLY_METHOD: &str = "red/DocumentApply";
 pub(crate) const DOCUMENT_UNDO_METHOD: &str = "red/DocumentUndo";
+pub(crate) const TEXT_PANEL_CREATE_METHOD: &str = "red/TextPanelCreate";
+pub(crate) const TEXT_PANEL_SET_CONTENT_METHOD: &str = "red/TextPanelSetContent";
+pub(crate) const TEXT_PANEL_FOCUS_METHOD: &str = "red/TextPanelFocus";
+pub(crate) const TEXT_PANEL_DISPOSE_METHOD: &str = "red/TextPanelDispose";
 
 /// Initialization parameters sent before an RPC plugin becomes active.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]

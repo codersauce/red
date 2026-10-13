@@ -134,9 +134,11 @@ one starts the process, validates its command metadata, and sends the typed
 `command/execute` request. Active plugins can call `red/DocumentSnapshot`,
 `red/DocumentApply`, and `red/DocumentUndo` to read and transactionally edit
 open documents through Red's existing revision, dirty-state, undo, and LSP
-paths. Declared `editor:ready`, `file:opened`, and `file:saved` events arrive as
-typed `event/notify` notifications; other editor and callback events remain
-outside protocol version 1.
+paths. They can also create, replace the content of, focus, and dispose
+host-rendered text panels with connection-owned IDs. Declared `editor:ready`,
+`file:opened`, and `file:saved` events arrive as typed `event/notify`
+notifications; other editor and callback events remain outside protocol
+version 1.
 
 ## Lifecycle
 
@@ -199,6 +201,8 @@ package's private storage. The package owns validation and conversion.
 - `DocumentSnapshot`, `DocumentApply`, and `DocumentUndo` preserve editor
   revisions, preimages, attributed transactions, dirty tracking, and LSP
   notifications.
+- RPC text panels are capped per connection, use private host IDs, and are
+  disposed when their owner disconnects or reloads.
 - `CompanionCall` uses bounded JSON-lines frames, monotonic request IDs,
   timeouts, cancellation, lazy startup, and editor-shutdown supervision.
 - Plugin storage is namespaced and co-snapshotted without interpreting unknown

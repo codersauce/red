@@ -31,6 +31,8 @@ use super::package::{PluginPackageManifest, PLUGIN_MANIFEST_FILE};
 use super::rpc::{
     RpcConnection, RpcErrorObject, RpcIncoming, RpcInitializeParams, RpcRequester,
     DOCUMENT_APPLY_METHOD, DOCUMENT_SNAPSHOT_METHOD, DOCUMENT_UNDO_METHOD,
+    TEXT_PANEL_CREATE_METHOD, TEXT_PANEL_DISPOSE_METHOD, TEXT_PANEL_FOCUS_METHOD,
+    TEXT_PANEL_SET_CONTENT_METHOD,
 };
 use super::{
     CommandMetadata, CommandScope, PluginMetadata, RegisteredPluginCommand, RequestId, Runtime,
@@ -42,6 +44,7 @@ const RPC_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 const RPC_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 const RPC_EVENT_METHOD: &str = "event/notify";
 const RPC_EDITOR_EVENTS: &[&str] = &["editor:ready", "file:opened", "file:saved"];
+const MAX_RPC_TEXT_PANELS: usize = 16;
 type RpcInbox = Arc<Mutex<mpsc::Receiver<RpcIncoming>>>;
 
 /// Lifecycle authority for configured Husk plugins.
@@ -54,6 +57,7 @@ pub struct PluginRegistry {
     modified_at: HashMap<String, PluginModification>,
     last_hot_reload_poll: Instant,
     rpc_plugins: HashMap<String, ActiveRpcPlugin>,
+    rpc_text_panels: HashMap<String, HashMap<String, String>>,
 }
 
 struct ActiveRpcPlugin {
@@ -188,6 +192,42 @@ impl PluginRegistry {
             modified_at: HashMap::new(),
             last_hot_reload_poll: Instant::now(),
             rpc_plugins: HashMap::new(),
+            rpc_text_panels: HashMap::new(),
+        }
+    }
+
+    pub(crate) fn register_rpc_text_panel(
+        &mut self,
+        owner: &str,
+        id: &str,
+    ) -> anyhow::Result<String> {
+        let panels = self.rpc_text_panels.entry(owner.to_string()).or_default();
+        if let Some(host_id) = panels.get(id) {
+            return Ok(host_id.clone());
+        }
+        anyhow::ensure!(
+            panels.len() < MAX_RPC_TEXT_PANELS,
+            "plugin may own at most {MAX_RPC_TEXT_PANELS} text panels"
+        );
+        let host_id = format!("rpc-text-panel-{}", uuid::Uuid::new_v4());
+        panels.insert(id.to_string(), host_id.clone());
+        Ok(host_id)
+    }
+
+    pub(crate) fn rpc_text_panel(&self, owner: &str, id: &str) -> Option<String> {
+        self.rpc_text_panels.get(owner)?.get(id).cloned()
+    }
+
+    pub(crate) fn take_rpc_text_panel(&mut self, owner: &str, id: &str) -> Option<String> {
+        self.rpc_text_panels.get_mut(owner)?.remove(id)
+    }
+
+    fn close_rpc_text_panels(&mut self, runtime: &Runtime, owner: &str) {
+        let Some(panels) = self.rpc_text_panels.remove(owner) else {
+            return;
+        };
+        for id in panels.into_values() {
+            runtime.send_request(PluginRequest::ClosePanel { id });
         }
     }
 
@@ -424,6 +464,7 @@ impl PluginRegistry {
                 })
             );
         }
+        self.close_rpc_text_panels(runtime, name);
         self.rpc_plugins.remove(name);
         crate::log!("Plugin `{name}` quarantined during {stage}: {diagnostic}");
         self.set_status(
@@ -479,6 +520,10 @@ impl PluginRegistry {
                         DOCUMENT_SNAPSHOT_METHOD.to_string(),
                         DOCUMENT_APPLY_METHOD.to_string(),
                         DOCUMENT_UNDO_METHOD.to_string(),
+                        TEXT_PANEL_CREATE_METHOD.to_string(),
+                        TEXT_PANEL_SET_CONTENT_METHOD.to_string(),
+                        TEXT_PANEL_FOCUS_METHOD.to_string(),
+                        TEXT_PANEL_DISPOSE_METHOD.to_string(),
                     ],
                 },
                 RPC_INITIALIZE_TIMEOUT,
@@ -514,6 +559,7 @@ impl PluginRegistry {
             Ok(plugin) => {
                 let previous = self.rpc_plugins.insert(name.to_string(), plugin);
                 if let Some(previous) = previous {
+                    self.close_rpc_text_panels(runtime, name);
                     let shutdown = previous
                         .connection
                         .shutdown(RPC_SHUTDOWN_TIMEOUT, RPC_SHUTDOWN_TIMEOUT);
@@ -1094,6 +1140,7 @@ impl PluginRegistry {
                 crate::log!("RPC plugin shutdown failed: {error}");
             }
         }
+        self.rpc_text_panels.clear();
         runtime.deactivate_all().await?;
         self.initialized = false;
         Ok(())
@@ -1685,6 +1732,36 @@ mod tests {
             .unwrap();
 
         assert!(matches!(action, Action::Print(message) if message == "hello"));
+    }
+
+    #[test]
+    fn rpc_quarantine_closes_only_the_owners_text_panels() {
+        drain_requests();
+        let mut registry = PluginRegistry::new();
+        let mut runtime = Runtime::new();
+        let owner_id = registry
+            .register_rpc_text_panel("owner", "preview")
+            .unwrap();
+        let observer_id = registry
+            .register_rpc_text_panel("observer", "preview")
+            .unwrap();
+
+        registry.quarantine_rpc(&mut runtime, "owner", anyhow::anyhow!("connection closed"));
+
+        assert_eq!(registry.rpc_text_panel("owner", "preview"), None);
+        assert_eq!(
+            registry.rpc_text_panel("observer", "preview"),
+            Some(observer_id)
+        );
+        assert!(matches!(
+            runtime.try_recv_request(),
+            Some(PluginRequest::ClosePanel { id }) if id == owner_id
+        ));
+        assert!(runtime.try_recv_request().is_none());
+        assert!(matches!(
+            registry.statuses().get("owner"),
+            Some(PluginStatus::Quarantined { stage, .. }) if stage == "runtime"
+        ));
     }
 
     #[test]

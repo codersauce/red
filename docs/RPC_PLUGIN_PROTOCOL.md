@@ -2,8 +2,8 @@
 
 This document defines the transport profile and bounded initial surface for
 version 1 of Red's language-agnostic plugin protocol. Exact typed method schemas
-land with their implementations. Package validation and classification are
-implemented independently of process activation, which follows in later steps.
+land with their implementations. Package validation and classification remain
+independent of process activation.
 
 ## Package and process
 
@@ -72,7 +72,11 @@ The version 1 initialization parameters are:
   "host_methods": [
     "red/DocumentSnapshot",
     "red/DocumentApply",
-    "red/DocumentUndo"
+    "red/DocumentUndo",
+    "red/TextPanelCreate",
+    "red/TextPanelSetContent",
+    "red/TextPanelFocus",
+    "red/TextPanelDispose"
   ]
 }
 ```
@@ -228,6 +232,38 @@ Invalid parameters return `-32602`, unavailable documents return `-32001`,
 stale revisions return `-32002`, and rejected transactions or undo requests
 return `-32003`. These application errors leave the plugin active.
 
+## Text panels
+
+An active plugin can create a host-rendered text panel with a connection-local
+ID:
+
+```json
+{"jsonrpc":"2.0","id":"plugin-4","method":"red/TextPanelCreate","params":{"id":"preview","side":"right","width":36,"title":"Preview"}}
+```
+
+`side` is optional and accepts `left`, `right`, `top`, or `bottom`; `width`
+defaults to `30`, and `title` is optional. Calling create again with the same ID
+replaces that panel's configuration and content. A connection can own at most
+16 text panels, and each ID must contain 1 to 128 UTF-8 bytes.
+
+`red/TextPanelSetContent` replaces the panel's complete block list. Each block
+has an `id`, `text`, optional semantic `kind` (`user`, `agent`, `error`,
+`activity`, `action`, or `text`), and optional `format` (`plain` or `markdown`):
+
+```json
+{"jsonrpc":"2.0","id":"plugin-5","method":"red/TextPanelSetContent","params":{"id":"preview","blocks":[{"id":"result","format":"markdown","text":"# Result\nReady"}]}}
+```
+
+`red/TextPanelFocus` and `red/TextPanelDispose` each accept `{ "id": "preview"
+}`. All four methods return `null` on success. Panel IDs are private to the
+calling connection, so they cannot collide with Husk panels or panels owned by
+another RPC plugin. Disconnect, quarantine, and successful hot reload dispose
+all panels owned by the previous connection.
+
+Unknown fields and invalid IDs or widths return `-32602`. A missing, disposed,
+not-owned, or over-limit panel returns `-32004`. These errors leave the plugin
+active.
+
 ## Version 1 surface
 
 Version 1 deliberately exposes a small set of typed operations:
@@ -257,8 +293,8 @@ disconnecting the plugin clears its contribution. Version 1 assigns no wire
 method or schema to that future surface.
 
 The current host integration activates and executes commands, delivers the
-three editor events above, and serves the three document methods. Text panels
-and statusline providers land as separate typed steps.
+three editor events above, and serves the document and text-panel methods.
+Statusline providers land as a separate typed step.
 
 ## Errors and failure semantics
 

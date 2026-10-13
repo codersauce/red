@@ -4578,6 +4578,35 @@ struct RpcDocumentUndoParams {
     transaction_id: String,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RpcTextPanelCreateParams {
+    id: String,
+    #[serde(default)]
+    side: plugin::PanelSide,
+    #[serde(default = "default_rpc_text_panel_width")]
+    width: usize,
+    #[serde(default)]
+    title: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RpcTextPanelSetContentParams {
+    id: String,
+    blocks: Vec<plugin::TextPanelBlock>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RpcTextPanelParams {
+    id: String,
+}
+
+fn default_rpc_text_panel_width() -> usize {
+    30
+}
+
 fn default_plugin_edit_label() -> String {
     "plugin edit".to_string()
 }
@@ -25872,11 +25901,167 @@ impl Editor {
         })
     }
 
-    fn rpc_document_error(code: i64, error: impl std::fmt::Display) -> plugin::rpc::RpcErrorObject {
+    fn rpc_error(code: i64, error: impl std::fmt::Display) -> plugin::rpc::RpcErrorObject {
         plugin::rpc::RpcErrorObject {
             code,
             message: error.to_string(),
             data: None,
+        }
+    }
+
+    fn validate_rpc_text_panel_id(
+        method: &str,
+        id: &str,
+    ) -> std::result::Result<(), plugin::rpc::RpcErrorObject> {
+        if id.trim().is_empty() || id.len() > 128 {
+            return Err(Self::rpc_error(
+                -32602,
+                format!("{method} id must contain 1 to 128 UTF-8 bytes"),
+            ));
+        }
+        Ok(())
+    }
+
+    fn rpc_text_panel_host_id(
+        &self,
+        owner: &str,
+        method: &str,
+        id: &str,
+    ) -> std::result::Result<String, plugin::rpc::RpcErrorObject> {
+        Self::validate_rpc_text_panel_id(method, id)?;
+        self.plugin_registry
+            .rpc_text_panel(owner, id)
+            .ok_or_else(|| Self::rpc_text_panel_unavailable(id))
+    }
+
+    fn rpc_text_panel_unavailable(id: &str) -> plugin::rpc::RpcErrorObject {
+        Self::rpc_error(-32004, format!("text panel is unavailable: {id}"))
+    }
+
+    fn finish_rpc_text_panel_change(
+        &mut self,
+        render_buffer: &mut RenderBuffer,
+    ) -> std::result::Result<Value, plugin::rpc::RpcErrorObject> {
+        self.render(render_buffer).map_err(|error| {
+            Self::rpc_error(-32603, format!("failed to render text panel: {error}"))
+        })?;
+        Ok(Value::Null)
+    }
+
+    fn rpc_text_panel_create_request(
+        &mut self,
+        render_buffer: &mut RenderBuffer,
+        owner: &str,
+        params: RpcTextPanelCreateParams,
+    ) -> std::result::Result<Value, plugin::rpc::RpcErrorObject> {
+        Self::validate_rpc_text_panel_id(plugin::rpc::TEXT_PANEL_CREATE_METHOD, &params.id)?;
+        if params.width == 0 {
+            return Err(Self::rpc_error(
+                -32602,
+                "red/TextPanelCreate width must be greater than zero",
+            ));
+        }
+        let host_id = self
+            .plugin_registry
+            .register_rpc_text_panel(owner, &params.id)
+            .map_err(|error| Self::rpc_error(-32004, error))?;
+        self.clear_replaced_panel_zoom(&host_id);
+        self.panel_manager.create_text_panel(
+            host_id,
+            plugin::PanelConfig {
+                side: params.side,
+                width: params.width,
+                title: params.title,
+                ..plugin::PanelConfig::default()
+            },
+        );
+        self.apply_panel_layout();
+        self.finish_rpc_text_panel_change(render_buffer)
+    }
+
+    fn rpc_text_panel_set_content_request(
+        &mut self,
+        render_buffer: &mut RenderBuffer,
+        owner: &str,
+        params: RpcTextPanelSetContentParams,
+    ) -> std::result::Result<Value, plugin::rpc::RpcErrorObject> {
+        let host_id = self.rpc_text_panel_host_id(
+            owner,
+            plugin::rpc::TEXT_PANEL_SET_CONTENT_METHOD,
+            &params.id,
+        )?;
+        if self.panel_manager.panel_layout(&host_id).is_none() {
+            return Err(Self::rpc_text_panel_unavailable(&params.id));
+        }
+        self.panel_manager.update_text_panel(
+            &host_id,
+            params.blocks,
+            usize::from(self.size.1.saturating_sub(2)),
+            usize::from(self.size.0),
+        );
+        self.finish_rpc_text_panel_change(render_buffer)
+    }
+
+    fn rpc_text_panel_focus_request(
+        &mut self,
+        render_buffer: &mut RenderBuffer,
+        owner: &str,
+        params: RpcTextPanelParams,
+    ) -> std::result::Result<Value, plugin::rpc::RpcErrorObject> {
+        let host_id =
+            self.rpc_text_panel_host_id(owner, plugin::rpc::TEXT_PANEL_FOCUS_METHOD, &params.id)?;
+        if !self.panel_manager.focus_panel(&host_id) {
+            return Err(Self::rpc_text_panel_unavailable(&params.id));
+        }
+        self.finish_rpc_text_panel_change(render_buffer)
+    }
+
+    fn rpc_text_panel_dispose_request(
+        &mut self,
+        render_buffer: &mut RenderBuffer,
+        owner: &str,
+        params: RpcTextPanelParams,
+    ) -> std::result::Result<Value, plugin::rpc::RpcErrorObject> {
+        Self::validate_rpc_text_panel_id(plugin::rpc::TEXT_PANEL_DISPOSE_METHOD, &params.id)?;
+        let host_id = self
+            .plugin_registry
+            .take_rpc_text_panel(owner, &params.id)
+            .ok_or_else(|| Self::rpc_text_panel_unavailable(&params.id))?;
+        self.clear_replaced_panel_zoom(&host_id);
+        self.panel_manager.close_panel(&host_id);
+        self.apply_panel_layout();
+        self.finish_rpc_text_panel_change(render_buffer)
+    }
+
+    fn rpc_text_panel_request(
+        &mut self,
+        render_buffer: &mut RenderBuffer,
+        owner: &str,
+        method: &str,
+        params: &Value,
+    ) -> std::result::Result<Value, plugin::rpc::RpcErrorObject> {
+        match method {
+            plugin::rpc::TEXT_PANEL_CREATE_METHOD => self.rpc_text_panel_create_request(
+                render_buffer,
+                owner,
+                Self::rpc_params(method, params)?,
+            ),
+            plugin::rpc::TEXT_PANEL_SET_CONTENT_METHOD => self.rpc_text_panel_set_content_request(
+                render_buffer,
+                owner,
+                Self::rpc_params(method, params)?,
+            ),
+            plugin::rpc::TEXT_PANEL_FOCUS_METHOD => self.rpc_text_panel_focus_request(
+                render_buffer,
+                owner,
+                Self::rpc_params(method, params)?,
+            ),
+            plugin::rpc::TEXT_PANEL_DISPOSE_METHOD => self.rpc_text_panel_dispose_request(
+                render_buffer,
+                owner,
+                Self::rpc_params(method, params)?,
+            ),
+            _ => Err(plugin::rpc::RpcErrorObject::method_not_found(method)),
         }
     }
 
@@ -25887,7 +26072,7 @@ impl Editor {
         let params: RpcDocumentSnapshotParams =
             Self::rpc_params(plugin::rpc::DOCUMENT_SNAPSHOT_METHOD, params)?;
         let snapshot = Self::plugin_document_snapshot(buffer_manager, params.path.as_deref())
-            .map_err(|error| Self::rpc_document_error(-32001, error))?;
+            .map_err(|error| Self::rpc_error(-32001, error))?;
         Ok(json!({
             "path": snapshot.path,
             "revision": snapshot.revision.to_string(),
@@ -25905,17 +26090,17 @@ impl Editor {
         let params: RpcDocumentApplyParams =
             Self::rpc_params(plugin::rpc::DOCUMENT_APPLY_METHOD, params)?;
         let expected_revision = params.expected_revision.parse::<u64>().map_err(|_| {
-            Self::rpc_document_error(
+            Self::rpc_error(
                 -32602,
                 "red/DocumentApply expected_revision must be a decimal u64 string",
             )
         })?;
         let buffer_index =
             Self::plugin_document_index(&self.buffer_manager, params.path.as_deref())
-                .map_err(|error| Self::rpc_document_error(-32001, error))?;
+                .map_err(|error| Self::rpc_error(-32001, error))?;
         let revision = self.buffer_manager[buffer_index].revision();
         if revision != expected_revision {
-            return Err(Self::rpc_document_error(
+            return Err(Self::rpc_error(
                 -32002,
                 format!(
                     "document revision changed: expected {expected_revision}, found {revision}"
@@ -25935,7 +26120,7 @@ impl Editor {
                 },
             )
             .await
-            .map_err(|error| Self::rpc_document_error(-32003, error))?;
+            .map_err(|error| Self::rpc_error(-32003, error))?;
         Ok(json!({
             "transaction_id": transaction_id,
             "revision": self.buffer_manager[buffer_index].revision().to_string(),
@@ -25953,7 +26138,7 @@ impl Editor {
             Self::rpc_params(plugin::rpc::DOCUMENT_UNDO_METHOD, params)?;
         let buffer_index =
             Self::plugin_document_index(&self.buffer_manager, params.path.as_deref())
-                .map_err(|error| Self::rpc_document_error(-32001, error))?;
+                .map_err(|error| Self::rpc_error(-32001, error))?;
         self.undo_plugin_document_transaction(
             render_buffer,
             runtime,
@@ -25962,7 +26147,7 @@ impl Editor {
             &params.transaction_id,
         )
         .await
-        .map_err(|error| Self::rpc_document_error(-32003, error))?;
+        .map_err(|error| Self::rpc_error(-32003, error))?;
         Ok(json!({
             "revision": self.buffer_manager[buffer_index].revision().to_string(),
         }))
@@ -25988,7 +26173,7 @@ impl Editor {
                 self.rpc_document_undo_request(render_buffer, runtime, owner, params)
                     .await
             }
-            _ => Err(plugin::rpc::RpcErrorObject::method_not_found(method)),
+            _ => self.rpc_text_panel_request(render_buffer, owner, method, params),
         }
     }
 
@@ -37310,6 +37495,98 @@ builtin = "rust"
         }
         assert_eq!(editor.current_buffer().contents(), "hello");
         assert!(!editor.current_buffer().is_dirty());
+    }
+
+    #[tokio::test]
+    async fn rpc_text_panels_are_owned_and_disposed_by_connection() {
+        let mut editor = test_editor(/*width*/ 80, /*height*/ 24);
+        editor
+            .panel_manager
+            .create_text_panel("preview".to_string(), plugin::PanelConfig::default());
+        let mut render_buffer = RenderBuffer::new(80, 24, &Style::default());
+        let mut runtime = Runtime::new();
+        macro_rules! request {
+            ($owner:expr, $method:expr, $params:expr $(,)?) => {
+                editor.rpc_host_request(&mut render_buffer, &mut runtime, $owner, $method, &$params)
+            };
+        }
+
+        request!(
+            "rpc-test",
+            plugin::rpc::TEXT_PANEL_CREATE_METHOD,
+            json!({"id": "preview", "side": "right", "width": 32, "title": "RPC preview"}),
+        )
+        .await
+        .unwrap();
+        let host_id = editor
+            .plugin_registry
+            .rpc_text_panel("rpc-test", "preview")
+            .unwrap();
+
+        assert_ne!(host_id, "preview");
+        assert_eq!(
+            editor.panel_manager.panel_layout(&host_id),
+            Some((plugin::PanelSide::Right, 32))
+        );
+        request!(
+            "rpc-test",
+            plugin::rpc::TEXT_PANEL_SET_CONTENT_METHOD,
+            json!({
+                "id": "preview",
+                "blocks": [{"id": "result", "format": "markdown", "text": "# RPC panel\nRendered by Red"}]
+            }),
+        )
+            .await
+            .unwrap();
+
+        let forbidden = request!(
+            "other-plugin",
+            plugin::rpc::TEXT_PANEL_FOCUS_METHOD,
+            json!({"id": "preview"}),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(forbidden.code, -32004);
+
+        request!(
+            "rpc-test",
+            plugin::rpc::TEXT_PANEL_FOCUS_METHOD,
+            json!({"id": "preview"}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            editor.panel_manager.focused_panel_id(),
+            Some(host_id.as_str())
+        );
+
+        request!(
+            "rpc-test",
+            plugin::rpc::TEXT_PANEL_DISPOSE_METHOD,
+            json!({"id": "preview"}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(editor.panel_manager.panel_layout(&host_id), None);
+        assert!(editor.panel_manager.panel_layout("preview").is_some());
+
+        let disposed = request!(
+            "rpc-test",
+            plugin::rpc::TEXT_PANEL_SET_CONTENT_METHOD,
+            json!({"id": "preview", "blocks": []}),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(disposed.code, -32004);
+
+        let invalid = request!(
+            "rpc-test",
+            plugin::rpc::TEXT_PANEL_CREATE_METHOD,
+            json!({"id": " ", "width": 0}),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(invalid.code, -32602);
     }
 
     async fn install_event_recorder(editor: &mut Editor, runtime: &mut Runtime) {

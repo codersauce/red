@@ -52,6 +52,14 @@ for line in sys.stdin:
                             "metadata": {"title": "Show the last RPC editor event"},
                         },
                         {
+                            "name": "RpcPanel",
+                            "metadata": {"title": "Open an RPC text panel"},
+                        },
+                        {
+                            "name": "RpcPanelClose",
+                            "metadata": {"title": "Close the RPC text panel"},
+                        },
+                        {
                             "name": "RpcUndo",
                             "metadata": {"title": "Undo the last RPC edit"},
                         },
@@ -110,6 +118,35 @@ for line in sys.stdin:
                 result = {
                     "message": f"Last RPC event: {last_event['name']} ({event_file})"
                 }
+            elif command == "RpcPanel":
+                request_host(
+                    "red/TextPanelCreate",
+                    {
+                        "id": "python-preview",
+                        "side": "right",
+                        "width": 36,
+                        "title": "Python RPC",
+                    },
+                )
+                request_host(
+                    "red/TextPanelSetContent",
+                    {
+                        "id": "python-preview",
+                        "blocks": [
+                            {
+                                "id": "welcome",
+                                "kind": "agent",
+                                "format": "markdown",
+                                "text": "# Language-agnostic panel\n\nRendered by Red from a **Python** JSON-RPC plugin.",
+                            }
+                        ],
+                    },
+                )
+                request_host("red/TextPanelFocus", {"id": "python-preview"})
+                result = None
+            elif command == "RpcPanelClose":
+                request_host("red/TextPanelDispose", {"id": "python-preview"})
+                result = None
             else:
                 name = message["params"]["raw_args"] or "Red"
                 result = {"message": f"Hello, {name}, from Python RPC!"}

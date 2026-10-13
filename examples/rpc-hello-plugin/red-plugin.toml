@@ -11,5 +11,5 @@ command = "python3"
 args = ["plugin.py"]
 
 [activation]
-commands = ["RpcApply", "RpcDocument", "RpcHello", "RpcLastEvent", "RpcUndo"]
+commands = ["RpcApply", "RpcDocument", "RpcHello", "RpcLastEvent", "RpcPanel", "RpcPanelClose", "RpcUndo"]
 events = ["file:saved"]

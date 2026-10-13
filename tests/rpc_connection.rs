@@ -322,7 +322,11 @@ fn run_registry_fixture() -> Result<()> {
         json!([
             "red/DocumentSnapshot",
             "red/DocumentApply",
-            "red/DocumentUndo"
+            "red/DocumentUndo",
+            "red/TextPanelCreate",
+            "red/TextPanelSetContent",
+            "red/TextPanelFocus",
+            "red/TextPanelDispose"
         ])
     );
     write_message(
