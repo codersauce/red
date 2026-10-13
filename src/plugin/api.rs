@@ -981,6 +981,31 @@ pub(crate) fn validate_parsed_source(
     }
 }
 
+pub(crate) fn validate_dynamic_host_call(
+    kind: &str,
+    action: &str,
+    argument_count: usize,
+) -> anyhow::Result<()> {
+    let Some(definition) = HOST_CALLS.get(&(kind, action)) else {
+        anyhow::bail!("unknown Red host API {kind} call `{action}`");
+    };
+    let required = definition.required;
+    let total = definition.parameters.len();
+    if argument_count < required || argument_count > total {
+        anyhow::bail!(
+            "Red host API {kind} call `{action}` expects {}{} argument(s), got {}",
+            required,
+            if required == total {
+                String::new()
+            } else {
+                format!("..{total}")
+            },
+            argument_count
+        );
+    }
+    Ok(())
+}
+
 fn validate_red_attribute_sites(file: &File) -> Vec<RedAnnotationError> {
     let mut errors = Vec::new();
     let mut commands = HashSet::new();

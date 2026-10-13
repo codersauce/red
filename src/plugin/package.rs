@@ -90,6 +90,7 @@ pub struct PluginPackageManifest {
     pub activation: PluginActivation,
     #[serde(default)]
     pub keymaps: BTreeMap<String, BTreeMap<String, String>>,
+    pub rpc: Option<PluginRpcManifest>,
     pub companion: Option<PluginCompanionManifest>,
     /// Reusable language definitions contributed without requiring a Husk entrypoint.
     #[serde(default)]
@@ -117,6 +118,7 @@ pub struct PluginManifestSection {
     pub red_api: VersionReq,
     pub husk_manifest: Option<PathBuf>,
     pub entry: Option<PathBuf>,
+    pub rpc: Option<PluginRpcManifest>,
     pub description: Option<String>,
     pub repository: Option<String>,
     pub license: Option<String>,
@@ -130,6 +132,23 @@ pub struct PluginActivation {
     pub events: Vec<String>,
     #[serde(default)]
     pub commands: Vec<String>,
+}
+
+/// JSON-RPC stdio plugin declaration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PluginRpcManifest {
+    /// Package-relative development or bundled executable.
+    pub command: Option<PathBuf>,
+    /// Optional command-line arguments passed to the plugin executable.
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// Platform-specific development or bundled executable overrides.
+    #[serde(default)]
+    pub commands: BTreeMap<String, PathBuf>,
+    /// Release artifacts keyed by Rust target triple.
+    #[serde(default)]
+    pub artifacts: BTreeMap<String, PluginCompanionArtifact>,
 }
 
 /// Native companion declaration.
@@ -198,6 +217,8 @@ pub struct InstalledPlugin {
     pub compatible: bool,
     pub has_companion: bool,
     pub has_husk: bool,
+    #[serde(default)]
+    pub has_rpc: bool,
     /// Whether the package contributes one or more language definitions.
     pub has_languages: bool,
     pub has_native_grammars: bool,
@@ -213,6 +234,12 @@ pub struct PluginPackageManager {
 }
 
 impl PluginPackageManifest {
+    /// Returns the JSON-RPC declaration whether defined under `[rpc]` or `[plugin.rpc]`.
+    #[must_use]
+    pub fn rpc_manifest(&self) -> Option<&PluginRpcManifest> {
+        self.rpc.as_ref().or(self.plugin.rpc.as_ref())
+    }
+
     /// Loads, parses, and validates a package manifest.
     pub fn load(package_root: &Path) -> Result<Self> {
         let path = package_root.join(PLUGIN_MANIFEST_FILE);
@@ -233,12 +260,28 @@ impl PluginPackageManifest {
         );
         anyhow::ensure!(!self.plugin.name.trim().is_empty(), "plugin name is empty");
         anyhow::ensure!(
+            self.rpc.is_none() || self.plugin.rpc.is_none(),
+            "plugin package cannot declare both `[rpc]` and `[plugin.rpc]`"
+        );
+        anyhow::ensure!(
+            (self.plugin.husk_manifest.is_none() && self.plugin.entry.is_none())
+                || self.rpc_manifest().is_none(),
+            "plugin package cannot declare both a Husk entrypoint and a JSON-RPC entrypoint"
+        );
+        anyhow::ensure!(
             self.plugin.husk_manifest.is_some()
                 || self.plugin.entry.is_some()
+                || self.rpc_manifest().is_some()
                 || self.companion.is_some()
                 || !self.languages.is_empty(),
-            "plugin package must declare a Husk entrypoint, native companion, or language"
+            "plugin package must declare a Husk entrypoint, JSON-RPC entrypoint, native companion, or language"
         );
+        if let Some(rpc) = self.rpc_manifest() {
+            anyhow::ensure!(
+                rpc.command.is_some() || !rpc.commands.is_empty() || !rpc.artifacts.is_empty(),
+                "JSON-RPC plugin must declare a command, platform commands, or release artifacts"
+            );
+        }
         anyhow::ensure!(
             host_api_requirement_is_supported(&self.plugin.red_api)?,
             "plugin requires Red host API `{}`, but this release supports {}",
@@ -251,6 +294,16 @@ impl PluginPackageManifest {
             .husk_manifest
             .iter()
             .chain(self.plugin.entry.iter())
+            .chain(
+                self.rpc_manifest()
+                    .into_iter()
+                    .filter_map(|rpc| rpc.command.as_ref()),
+            )
+            .chain(
+                self.rpc_manifest()
+                    .into_iter()
+                    .flat_map(|rpc| rpc.commands.values()),
+            )
             .chain(
                 self.companion
                     .iter()
@@ -290,6 +343,11 @@ impl PluginPackageManifest {
             .companion
             .iter()
             .flat_map(|companion| &companion.artifacts)
+            .chain(
+                self.rpc_manifest()
+                    .into_iter()
+                    .flat_map(|rpc| &rpc.artifacts),
+            )
         {
             anyhow::ensure!(!target.trim().is_empty(), "companion target is empty");
             anyhow::ensure!(
@@ -413,6 +471,44 @@ impl PluginPackageManifest {
             .as_ref()
             .or(self.plugin.entry.as_ref())
             .map(|relative| package_root.join(relative))
+    }
+
+    /// Resolves the JSON-RPC plugin executable and arguments for the running host.
+    #[must_use]
+    pub fn rpc_command(&self, package_root: &Path) -> Option<(PathBuf, Vec<String>)> {
+        self.rpc_manifest().and_then(|rpc| {
+            let command = rpc
+                .commands
+                .get(host_target())
+                .or(rpc.command.as_ref())
+                .map(|relative| package_root.join(relative))
+                .or_else(|| {
+                    let downloaded = package_root
+                        .join(".red")
+                        .join("bin")
+                        .join(rpc_binary_name());
+                    downloaded.is_file().then_some(downloaded)
+                })?;
+            Some((command, rpc.args.clone()))
+        })
+    }
+
+    /// Returns the absolute JSON-RPC executable path used by the registry.
+    #[must_use]
+    pub fn rpc_entry(&self, package_root: &Path) -> Option<PathBuf> {
+        self.rpc_command(package_root)
+            .map(|(command, _)| command)
+            .or_else(|| {
+                self.rpc_manifest()
+                    .map(|_| package_root.join(PLUGIN_MANIFEST_FILE))
+            })
+    }
+
+    /// Returns the runtime plugin entrypoint (Husk or JSON-RPC) for the registry.
+    #[must_use]
+    pub fn plugin_entry(&self, package_root: &Path) -> Option<PathBuf> {
+        self.husk_entry(package_root)
+            .or_else(|| self.rpc_entry(package_root))
     }
 
     /// Resolves the native companion executable for the running host.
@@ -571,6 +667,7 @@ impl PluginPackageManager {
         };
         write_record(&staging, &record)?;
         self.install_companion_artifact(&manifest, &staging).await?;
+        self.install_rpc_artifact(&manifest, &staging).await?;
         self.install_language_artifacts(&manifest, &staging, false)
             .await?;
         self.activate_remote_package(&manifest, &staging, &destination, trust_native_grammars)?;
@@ -984,6 +1081,43 @@ impl PluginPackageManager {
         Ok(())
     }
 
+    async fn install_rpc_artifact(
+        &self,
+        manifest: &PluginPackageManifest,
+        package_root: &Path,
+    ) -> Result<()> {
+        let Some(rpc) = manifest.rpc_manifest() else {
+            return Ok(());
+        };
+        if rpc.command.is_some() || rpc.commands.contains_key(host_target()) {
+            return Ok(());
+        }
+        let target = host_target();
+        let Some(artifact) = rpc.artifacts.get(target) else {
+            anyhow::bail!("plugin has no JSON-RPC executable for `{target}`");
+        };
+        let response = reqwest::get(&artifact.url)
+            .await
+            .with_context(|| format!("failed to download JSON-RPC plugin from {}", artifact.url))?
+            .error_for_status()
+            .with_context(|| format!("JSON-RPC plugin download failed for {}", artifact.url))?;
+        let bytes = response.bytes().await?;
+        let actual = format!("{:x}", Sha256::digest(&bytes));
+        anyhow::ensure!(
+            actual.eq_ignore_ascii_case(&artifact.sha256),
+            "JSON-RPC plugin checksum mismatch: expected {}, got {actual}",
+            artifact.sha256
+        );
+        let bin_dir = package_root.join(".red").join("bin");
+        tokio::fs::create_dir_all(&bin_dir).await?;
+        let path = bin_dir.join(rpc_binary_name());
+        let mut file = tokio::fs::File::create(&path).await?;
+        file.write_all(&bytes).await?;
+        file.sync_all().await?;
+        set_executable(&path)?;
+        Ok(())
+    }
+
     async fn install_language_artifacts(
         &self,
         manifest: &PluginPackageManifest,
@@ -1256,6 +1390,7 @@ fn installed_from_record(record: PluginInstallRecord) -> Result<InstalledPlugin>
         "install record id does not match plugin manifest"
     );
     let has_husk = manifest.husk_entry(&record.package_root).is_some();
+    let has_rpc = manifest.rpc_manifest().is_some();
     let languages = manifest.languages.keys().cloned().collect::<Vec<_>>();
     let has_native_grammars = manifest.languages.iter().any(|(id, language)| {
         language
@@ -1274,6 +1409,7 @@ fn installed_from_record(record: PluginInstallRecord) -> Result<InstalledPlugin>
         compatible: host_api_requirement_is_supported(&manifest.plugin.red_api)?,
         has_companion: manifest.companion.is_some(),
         has_husk,
+        has_rpc,
         has_languages: !manifest.languages.is_empty(),
         has_native_grammars,
         languages,
@@ -1447,6 +1583,7 @@ fn validate_catalog_manifest(
     anyhow::ensure!(
         manifest.plugin.husk_manifest.is_none()
             && manifest.plugin.entry.is_none()
+            && manifest.rpc_manifest().is_none()
             && manifest.companion.is_none()
             && manifest.activation.events.is_empty()
             && manifest.activation.commands.is_empty()
@@ -1618,6 +1755,14 @@ fn companion_binary_name() -> &'static str {
         "companion.exe"
     } else {
         "companion"
+    }
+}
+
+fn rpc_binary_name() -> &'static str {
+    if cfg!(windows) {
+        "rpc-plugin.exe"
+    } else {
+        "rpc-plugin"
     }
 }
 
@@ -2492,5 +2637,39 @@ old_feature = "legacy_session"
             legacy.get("old_feature"),
             Some(&serde_json::json!({ "version": 1 }))
         );
+    }
+
+    #[tokio::test]
+    async fn installs_and_validates_external_jsonrpc_plugin_package() {
+        let config = tempfile::tempdir().unwrap();
+        let manager = PluginPackageManager::new(config.path());
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/external-rpc-plugin");
+
+        let installed = manager.install_path(&fixture).await.unwrap();
+        assert_eq!(installed.id.as_str(), "rpc-hello");
+        assert!(installed.has_rpc);
+        assert!(!installed.has_husk);
+        assert!(installed.compatible);
+
+        let manifest = PluginPackageManifest::load(&installed.package_root).unwrap();
+        assert!(manifest.plugin_entry(&installed.package_root).is_some());
+    }
+
+    #[test]
+    fn rejects_conflicting_husk_and_rpc_entrypoints_in_manifest() {
+        let package = tempfile::tempdir().unwrap();
+        write_package(package.path(), "conflict-plugin", "1.0.0");
+        let bin_dir = package.path().join("bin");
+        fs::create_dir_all(&bin_dir).unwrap();
+        fs::write(bin_dir.join("plugin"), "#!/bin/sh\n").unwrap();
+        let manifest_path = package.path().join(PLUGIN_MANIFEST_FILE);
+        let mut source = fs::read_to_string(&manifest_path).unwrap();
+        source.push_str("\n[rpc]\ncommand = \"bin/plugin\"\n");
+        fs::write(manifest_path, source).unwrap();
+
+        let error = PluginPackageManifest::load(package.path()).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("cannot declare both a Husk entrypoint and a JSON-RPC entrypoint"));
     }
 }

@@ -26,6 +26,7 @@ pub mod package;
 pub mod panel;
 pub mod process;
 mod registry;
+pub mod rpc;
 mod runtime;
 mod text_link;
 pub mod timer_stats;

@@ -34,6 +34,9 @@ pub struct PluginMetadata {
     #[serde(default = "default_main")]
     pub main: String,
 
+    /// Optional plugin runtime protocol (for example, `jsonrpc`).
+    pub protocol: Option<String>,
+
     /// Plugin homepage URL
     pub homepage: Option<String>,
 
@@ -131,7 +134,9 @@ impl PluginMetadata {
                 .entry
                 .as_ref()
                 .or(package.plugin.husk_manifest.as_ref())
+                .or_else(|| package.rpc_manifest().and_then(|rpc| rpc.command.as_ref()))
                 .map_or_else(default_main, |path| path.to_string_lossy().into_owned()),
+            protocol: package.rpc_manifest().map(|_| "jsonrpc".to_string()),
             homepage: None,
             repository: package.plugin.repository.as_ref().map(|url| Repository {
                 repo_type: "git".to_string(),
@@ -174,6 +179,7 @@ impl PluginMetadata {
             author: None,
             license: None,
             main: default_main(),
+            protocol: None,
             homepage: None,
             repository: None,
             keywords: vec![],

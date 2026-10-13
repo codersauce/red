@@ -145,6 +145,38 @@ replaced. Companions start lazily on the first `CompanionCall`; listing plugins
 and opening Red do not start them. Release packages may omit `command` and
 provide per-target `artifacts` with HTTPS GitHub URLs and SHA-256 digests.
 
+## JSON-RPC stdio plugins
+
+Packages written in other languages can omit `husk_manifest` / `entry` and
+declare a `[rpc]` executable speaking newline-delimited JSON-RPC 2.0 over
+`stdin` and `stdout`:
+
+```toml
+schema_version = 1
+
+[plugin]
+id = "my-rpc-plugin"
+name = "My RPC Plugin"
+version = "0.1.0"
+red_api = "^0.18.0"
+
+[rpc]
+command = "bin/my-plugin"
+args = ["--stdio"]
+
+[activation]
+commands = ["MyRpcPlugin"]
+```
+
+JSON-RPC plugins coexist with Husk plugins in the same registry, dependency
+graph, command palette, and hot-reload lifecycle. On activation, Red sends
+`initialize` and `lifecycle/activate` requests, and routes registered commands
+(`command/execute`), events (`event/notify`), picker/composer callbacks
+(`picker/event`, `composer/event`), and resolved requests (`request/resolve`)
+over JSON-RPC while servicing `red/execute`, `red/request`, `red/addCommand`,
+`red/on`, `red/config`, `red/snapshot`, `red/setTimeout`, `red/cancelTimeout`,
+and `red/log` calls from the plugin.
+
 Packages extracted from Red can declare migration without adding product
 knowledge to the host:
 

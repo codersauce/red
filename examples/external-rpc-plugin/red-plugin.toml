@@ -1,0 +1,18 @@
+schema_version = 1
+
+[plugin]
+id = "rpc-hello"
+name = "RPC Hello"
+version = "0.1.0"
+red_api = "^0.18.0"
+description = "Minimal external JSON-RPC 2.0 stdio plugin fixture"
+license = "MIT"
+
+[rpc]
+command = "bin/rpc-hello"
+
+[activation]
+commands = ["RpcHello"]
+
+[keymaps.normal]
+"Space J" = "RpcHello"

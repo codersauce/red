@@ -349,7 +349,7 @@ async fn apply_plugin_manager_operation(
             Ok(PluginManagerOperationOutcome {
                 message: format!("Enabled plugin {id}."),
                 reload_languages: installed.has_languages,
-                restart_plugins: installed.has_husk || installed.has_companion,
+                restart_plugins: installed.has_husk || installed.has_companion || installed.has_rpc,
             })
         }
         "disable" => {
@@ -360,7 +360,7 @@ async fn apply_plugin_manager_operation(
             Ok(PluginManagerOperationOutcome {
                 message: format!("Disabled plugin {id}."),
                 reload_languages: installed.has_languages,
-                restart_plugins: installed.has_husk || installed.has_companion,
+                restart_plugins: installed.has_husk || installed.has_companion || installed.has_rpc,
             })
         }
         "update" => {
@@ -375,7 +375,7 @@ async fn apply_plugin_manager_operation(
                     format!("Updated {} to {}.", installed.name, installed.version)
                 },
                 reload_languages: installed.has_languages && !installed.has_native_grammars,
-                restart_plugins: installed.has_husk || installed.has_companion,
+                restart_plugins: installed.has_husk || installed.has_companion || installed.has_rpc,
             })
         }
         "remove" => {
@@ -386,7 +386,7 @@ async fn apply_plugin_manager_operation(
             Ok(PluginManagerOperationOutcome {
                 message: format!("Removed plugin {id}; its private data was preserved."),
                 reload_languages: installed.has_languages,
-                restart_plugins: installed.has_husk || installed.has_companion,
+                restart_plugins: installed.has_husk || installed.has_companion || installed.has_rpc,
             })
         }
         _ => anyhow::bail!("unknown plugin operation `{verb}`"),
@@ -10668,6 +10668,7 @@ impl Editor {
                 .notify(runtime, &format!("filesystem:changed:{watch_id}"), payload)
                 .await?;
         }
+        self.plugin_registry.poll_rpc_events(runtime);
         self.plugin_registry.poll_hot_reload(runtime).await;
 
         for _ in 0..AGENT_EVENTS_PER_TICK {
@@ -33708,6 +33709,7 @@ mod test {
             compatible: true,
             has_companion: false,
             has_husk: false,
+            has_rpc: false,
             has_languages: true,
             has_native_grammars: true,
             languages: vec!["go".to_string()],
@@ -33743,6 +33745,7 @@ mod test {
             compatible: true,
             has_companion: false,
             has_husk: false,
+            has_rpc: false,
             has_languages: true,
             has_native_grammars: true,
             languages: vec!["go".to_string()],
@@ -33785,6 +33788,7 @@ mod test {
             compatible: true,
             has_companion: false,
             has_husk: false,
+            has_rpc: false,
             has_languages: true,
             has_native_grammars: true,
             languages: vec!["go".to_string()],

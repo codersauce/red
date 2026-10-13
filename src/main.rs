@@ -419,6 +419,8 @@ async fn run_plugin_command(command: &PluginCommand) -> anyhow::Result<()> {
                 };
                 let companion = if plugin.has_companion {
                     "companion"
+                } else if plugin.has_rpc {
+                    "rpc"
                 } else if plugin.has_languages {
                     "language"
                 } else {
@@ -1075,7 +1077,7 @@ fn finalize_runtime_config(
             &manifest,
             &installed.package_root,
         );
-        let Some(entrypoint) = manifest.husk_entry(&installed.package_root) else {
+        let Some(entrypoint) = manifest.plugin_entry(&installed.package_root) else {
             continue;
         };
         loaded

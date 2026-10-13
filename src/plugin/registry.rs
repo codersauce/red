@@ -179,6 +179,7 @@ impl PluginRegistry {
                 .par_iter()
                 .filter(|(name, path)| {
                     !is_husk_package(path)
+                        && !super::rpc::is_rpc_plugin(name, path)
                         && matches!(self.statuses.get(name), Some(PluginStatus::Pending))
                         && self
                             .metadata
@@ -753,6 +754,19 @@ impl PluginRegistry {
         }
     }
 
+    /// Drains unsolicited JSON-RPC plugin events and quarantines any faulted RPC plugin.
+    pub fn poll_rpc_events(&mut self, runtime: &mut Runtime) {
+        for (plugin, error) in runtime.poll_rpc_events() {
+            let path = self
+                .plugins
+                .iter()
+                .find(|(name, _)| name == &plugin)
+                .map(|(_, path)| path.clone())
+                .unwrap_or_default();
+            self.quarantine(runtime, &plugin, &path, "runtime", error.to_string());
+        }
+    }
+
     async fn reload_one_with_metadata(
         &mut self,
         runtime: &mut Runtime,
@@ -780,14 +794,17 @@ impl PluginRegistry {
             self.quarantine(runtime, name, path, stage, diagnostic);
             return;
         }
-        let source = plugin_source(path);
-        let result = match source {
-            Ok(source) => {
-                runtime
-                    .load_plugin_at(name, plugin_display_path(path), &source)
-                    .await
+        let result = if is_husk_package(path) || super::rpc::is_rpc_plugin(name, path) {
+            load_plugin(runtime, name, path).await
+        } else {
+            match plugin_source(path) {
+                Ok(source) => {
+                    runtime
+                        .load_plugin_at(name, plugin_display_path(path), &source)
+                        .await
+                }
+                Err(error) => Err(error),
             }
-            Err(error) => Err(error),
         };
         match result {
             Ok(()) => {
@@ -929,13 +946,21 @@ fn external_plugin_package(
         return Ok(None);
     }
     let plugin_path = Path::new(plugin);
+    if plugin_path.file_name().and_then(|name| name.to_str()) == Some(PLUGIN_MANIFEST_FILE)
+        && plugin_path.is_file()
+    {
+        if let Some(root) = plugin_path.parent() {
+            let package = PluginPackageManifest::load(root)?;
+            return Ok(Some((root.to_path_buf(), package)));
+        }
+    }
     let canonical_plugin = plugin_path.canonicalize().ok();
     for root in plugin_path.ancestors().skip(1) {
         if !root.join(PLUGIN_MANIFEST_FILE).is_file() {
             continue;
         }
         let package = PluginPackageManifest::load(root)?;
-        let Some(entry) = package.husk_entry(root) else {
+        let Some(entry) = package.plugin_entry(root) else {
             continue;
         };
         let canonical_entry = entry.canonicalize().ok();
@@ -1036,6 +1061,9 @@ fn plugin_source(plugin: &str) -> anyhow::Result<Cow<'static, str>> {
 }
 
 async fn load_plugin(runtime: &mut Runtime, name: &str, plugin: &str) -> anyhow::Result<()> {
+    if let Some(spec) = super::rpc::resolve_rpc_plugin_spec(name, plugin)? {
+        return runtime.load_rpc_plugin(name, spec).await;
+    }
     if is_husk_package(plugin) {
         return runtime.load_plugin_package(name, Path::new(plugin)).await;
     }
@@ -2139,5 +2167,448 @@ mod tests {
         ));
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[cfg(unix)]
+    fn write_executable_script(path: &Path, contents: &str) {
+        use std::os::unix::fs::PermissionsExt as _;
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        let _ = fs::remove_file(path);
+        fs::write(path, contents).unwrap();
+        let mut permissions = fs::metadata(path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(path, permissions).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn jsonrpc_plugin_coexists_with_husk_plugin_for_commands_events_and_requests() {
+        drain_requests();
+        let dir = tempfile_dir("rpc-coexistence");
+
+        let husk_plugin = dir.join("husk_plugin.hk");
+        fs::write(
+            &husk_plugin,
+            r#"
+                #[red::command(name = "HuskGreet", title = "Husk Greet")]
+                fn husk_greet() {
+                    red::execute("Print", "hello from husk");
+                }
+
+                #[red::on("editor:ready")]
+                fn on_ready(event: EmptyEvent) {
+                    red::execute("Print", "husk ready");
+                }
+            "#,
+        )
+        .unwrap();
+
+        let rpc_root = dir.join("rpc-pkg");
+        fs::create_dir_all(rpc_root.join("bin")).unwrap();
+        fs::write(
+            rpc_root.join(PLUGIN_MANIFEST_FILE),
+            format!(
+                r#"
+schema_version = 1
+
+[plugin]
+id = "rpc-coexist"
+name = "RPC Coexist"
+version = "0.1.0"
+red_api = "^{RED_HOST_API_VERSION}"
+
+[rpc]
+command = "bin/plugin.sh"
+"#
+            ),
+        )
+        .unwrap();
+        write_executable_script(
+            &rpc_root.join("bin/plugin.sh"),
+            r#"#!/bin/sh
+while IFS= read -r line; do
+    req_id=$(printf '%s' "$line" | sed -n 's/.*"jsonrpc":"2.0","id":\([0-9][0-9]*\).*/\1/p')
+    case "$line" in
+        *'"method":"initialize"'*)
+            printf '{"jsonrpc":"2.0","id":%s,"result":{"commands":[{"name":"RpcGreet","title":"RPC Greet","arguments":true}],"events":["editor:ready"]}}\n' "$req_id"
+            ;;
+        *'"method":"lifecycle/activate"'*)
+            printf '{"jsonrpc":"2.0","id":%s,"result":null}\n' "$req_id"
+            ;;
+        *'"method":"event/notify"'*)
+            printf '{"jsonrpc":"2.0","method":"red/execute","params":{"action":"Print","args":["rpc ready"]}}\n'
+            printf '{"jsonrpc":"2.0","id":%s,"result":null}\n' "$req_id"
+            ;;
+        *'"method":"command/execute"'*)
+            printf '{"jsonrpc":"2.0","id":900,"method":"red/request","params":{"action":"GetBufferText","args":[0,5],"handler":"on_text"}}\n'
+            read -r req_reply
+            printf '{"jsonrpc":"2.0","id":%s,"result":null}\n' "$req_id"
+            ;;
+        *'"method":"request/resolve"'*)
+            printf '{"jsonrpc":"2.0","method":"red/execute","params":{"action":"Print","args":["rpc got buffer text"]}}\n'
+            printf '{"jsonrpc":"2.0","id":%s,"result":null}\n' "$req_id"
+            ;;
+        *)
+            if [ -n "$req_id" ]; then
+                printf '{"jsonrpc":"2.0","id":%s,"result":null}\n' "$req_id"
+            fi
+            ;;
+    esac
+done
+"#,
+        );
+
+        let mut registry = PluginRegistry::new();
+        registry.add("husk-plugin", husk_plugin.to_str().unwrap());
+        registry.add(
+            "rpc-coexist",
+            rpc_root.join("bin/plugin.sh").to_str().unwrap(),
+        );
+        let mut runtime = Runtime::new();
+
+        registry.initialize(&mut runtime).await.unwrap();
+        assert_eq!(
+            registry.statuses().get("husk-plugin"),
+            Some(&PluginStatus::Active)
+        );
+        assert_eq!(
+            registry.statuses().get("rpc-coexist"),
+            Some(&PluginStatus::Active)
+        );
+
+        let registered = runtime
+            .registered_commands()
+            .into_iter()
+            .map(|cmd| (cmd.name, cmd.plugin))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            registered,
+            vec![
+                ("HuskGreet".to_string(), "husk-plugin".to_string()),
+                ("RpcGreet".to_string(), "rpc-coexist".to_string()),
+            ]
+        );
+
+        registry
+            .notify(&mut runtime, "editor:ready", serde_json::json!({}))
+            .await
+            .unwrap();
+        let mut ready_messages = vec![
+            ACTION_DISPATCHER.recv_request(),
+            ACTION_DISPATCHER.recv_request(),
+        ]
+        .into_iter()
+        .map(|req| match req {
+            PluginRequest::Action(Action::Print(msg)) => msg,
+            _ => panic!("unexpected plugin request"),
+        })
+        .collect::<Vec<_>>();
+        ready_messages.sort();
+        assert_eq!(ready_messages, vec!["husk ready", "rpc ready"]);
+
+        registry.execute(&mut runtime, "HuskGreet").await.unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::Action(Action::Print(msg)) if msg == "hello from husk"
+        ));
+
+        registry
+            .execute(&mut runtime, "RpcGreet world")
+            .await
+            .unwrap();
+        let request_id = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::GetBufferText {
+                request_id,
+                start_line: Some(0),
+                end_line: Some(5),
+            } => request_id,
+            _ => panic!("expected GetBufferText request"),
+        };
+        assert_eq!(
+            runtime.request_plugin(request_id).as_deref(),
+            Some("rpc-coexist")
+        );
+
+        assert!(registry
+            .resolve_request(
+                &mut runtime,
+                request_id,
+                serde_json::json!({ "text": "line 1\nline 2" })
+            )
+            .await
+            .unwrap());
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::Action(Action::Print(msg)) if msg == "rpc got buffer text"
+        ));
+
+        registry.deactivate_all(&mut runtime).await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn jsonrpc_plugin_supports_picker_callbacks_and_hot_reload_state_transfer() {
+        drain_requests();
+        let dir = tempfile_dir("rpc-picker-and-reload");
+        let script = dir.join("plugin.sh");
+        write_executable_script(
+            &script,
+            r#"#!/bin/sh
+STATE="initial"
+while IFS= read -r line; do
+    req_id=$(printf '%s' "$line" | sed -n 's/.*"jsonrpc":"2.0","id":\([0-9][0-9]*\).*/\1/p')
+    case "$line" in
+        *'"method":"initialize"'*)
+            printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$req_id"
+            ;;
+        *'"method":"lifecycle/stateImport"'*)
+            STATE="migrated"
+            printf '{"jsonrpc":"2.0","id":%s,"result":null}\n' "$req_id"
+            ;;
+        *'"method":"lifecycle/activate"'*)
+            printf '{"jsonrpc":"2.0","id":10,"method":"red/addCommand","params":{"name":"RpcPick"}}\n'
+            read -r _ack
+            printf '{"jsonrpc":"2.0","id":%s,"result":null}\n' "$req_id"
+            ;;
+        *'"method":"lifecycle/exportState"'*)
+            printf '{"jsonrpc":"2.0","id":%s,"result":{"state":{"version":1}}}\n' "$req_id"
+            ;;
+        *'"method":"command/execute"'*)
+            printf '{"jsonrpc":"2.0","id":11,"method":"red/execute","params":{"action":"OpenPicker","args":["Pick item",[{"id":"one","label":"One","data":null}],{} ]}}\n'
+            read -r _handle_reply
+            printf '{"jsonrpc":"2.0","id":%s,"result":null}\n' "$req_id"
+            ;;
+        *'"method":"picker/event"'*)
+            printf '{"jsonrpc":"2.0","method":"red/execute","params":{"action":"Print","args":["picked:%s"]}}\n' "$STATE"
+            printf '{"jsonrpc":"2.0","id":%s,"result":null}\n' "$req_id"
+            ;;
+        *)
+            if [ -n "$req_id" ]; then
+                printf '{"jsonrpc":"2.0","id":%s,"result":null}\n' "$req_id"
+            fi
+            ;;
+    esac
+done
+"#,
+        );
+
+        let mut registry = PluginRegistry::new();
+        registry.add("rpc-picker", script.to_str().unwrap());
+        let mut runtime = Runtime::new();
+        registry.initialize(&mut runtime).await.unwrap();
+
+        registry.reload(&mut runtime).await.unwrap();
+        assert_eq!(
+            registry.statuses().get("rpc-picker"),
+            Some(&PluginStatus::Active)
+        );
+
+        registry.execute(&mut runtime, "RpcPick").await.unwrap();
+        let handle = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::OpenCallbackPicker { owner, handle, .. } => {
+                assert_eq!(owner, "rpc-picker");
+                handle
+            }
+            _ => panic!("expected OpenCallbackPicker"),
+        };
+
+        assert!(registry
+            .notify_picker(
+                &mut runtime,
+                handle,
+                crate::editor::PickerCallback::Selected(crate::ui::PickerItem {
+                    id: "one".to_string(),
+                    icon: None,
+                    label: "One".to_string(),
+                    kind: None,
+                    annotation: None,
+                    detail: None,
+                    data: serde_json::Value::Null,
+                    matches: Vec::new(),
+                    detail_matches: Vec::new(),
+                    preview: None,
+                }),
+            )
+            .await
+            .unwrap());
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::Action(Action::Print(msg)) if msg == "picked:migrated"
+        ));
+
+        // Now write a broken replacement and verify transactional hot-reload rollback keeps the previous RPC process active!
+        write_executable_script(
+            &script,
+            r#"#!/bin/sh
+while IFS= read -r line; do
+    req_id=$(printf '%s' "$line" | sed -n 's/.*"jsonrpc":"2.0","id":\([0-9][0-9]*\).*/\1/p')
+    printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32000,"message":"broken reload"}}\n' "$req_id"
+done
+"#,
+        );
+        registry.reload(&mut runtime).await.unwrap();
+        assert!(matches!(
+            registry.statuses().get("rpc-picker"),
+            Some(PluginStatus::ActiveWithReloadError { diagnostic, .. })
+                if diagnostic.contains("broken reload")
+        ));
+        assert_eq!(
+            runtime.command_plugin("RpcPick").as_deref(),
+            Some("rpc-picker")
+        );
+
+        registry.deactivate_all(&mut runtime).await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn lazily_activates_external_rpc_example_package_and_cascades_quarantine_to_husk_dependent(
+    ) {
+        drain_requests();
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("examples/external-rpc-plugin/bin/rpc-hello");
+        let dir = tempfile_dir("rpc-husk-dependent");
+        let husk_dependent = dir.join("dependent.hk");
+        fs::write(
+            &husk_dependent,
+            r#"
+                #[red::command(name = "DependentCmd")]
+                fn dep_cmd() {
+                    red::execute("Print", "dependent ok");
+                }
+            "#,
+        )
+        .unwrap();
+        fs::write(
+            dir.join("package.json"),
+            r#"{"name":"husk-dep","dependencies":{"rpc-hello":"^0.1.0"}}"#,
+        )
+        .unwrap();
+
+        let mut registry = PluginRegistry::new();
+        registry.add("rpc-hello", fixture.to_str().unwrap());
+        registry.add("husk-dep", husk_dependent.to_str().unwrap());
+        let mut runtime = Runtime::new();
+
+        registry.initialize(&mut runtime).await.unwrap();
+        // `rpc-hello` is lazy (`commands = ["RpcHello"]`), so it remains Pending on initialize,
+        // and `husk-dep` is quarantined because its required dependency is not active yet.
+        assert_eq!(
+            registry.statuses().get("rpc-hello"),
+            Some(&PluginStatus::Pending)
+        );
+        assert!(matches!(
+            registry.statuses().get("husk-dep"),
+            Some(PluginStatus::Quarantined { stage, .. }) if stage == "dependency"
+        ));
+
+        // Invoking `RpcHello` lazily activates `rpc-hello` and runs the command.
+        registry.execute(&mut runtime, "RpcHello").await.unwrap();
+        assert_eq!(
+            registry.statuses().get("rpc-hello"),
+            Some(&PluginStatus::Active)
+        );
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::Action(Action::Print(msg)) if msg == "Hello from JSON-RPC plugin!"
+        ));
+
+        registry.deactivate_all(&mut runtime).await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn jsonrpc_plugin_command_collision_and_background_crash_quarantine_cascade() {
+        drain_requests();
+        let dir = tempfile_dir("rpc-crash-cascade");
+
+        let rpc_script = dir.join("rpc_base.sh");
+        write_executable_script(
+            &rpc_script,
+            r#"#!/bin/sh
+while IFS= read -r line; do
+    req_id=$(printf '%s' "$line" | sed -n 's/.*"jsonrpc":"2.0","id":\([0-9][0-9]*\).*/\1/p')
+    case "$line" in
+        *'"method":"initialize"'*)
+            printf '{"jsonrpc":"2.0","id":%s,"result":{"commands":[{"name":"SharedCmd"}]}}\n' "$req_id"
+            ;;
+        *'"method":"lifecycle/activate"'*)
+            printf '{"jsonrpc":"2.0","id":%s,"result":null}\n' "$req_id"
+            ;;
+        *'"method":"command/execute"'*)
+            # Unsolicited print then exit abruptly after responding
+            printf '{"jsonrpc":"2.0","id":%s,"result":null}\n' "$req_id"
+            exit 1
+            ;;
+    esac
+done
+"#,
+        );
+
+        let colliding_husk = dir.join("colliding.hk");
+        fs::write(
+            &colliding_husk,
+            r#"
+                #[red::command(name = "SharedCmd")]
+                fn shared() {}
+            "#,
+        )
+        .unwrap();
+
+        let dependent_dir = dir.join("dependent");
+        fs::create_dir_all(&dependent_dir).unwrap();
+        let dependent_husk = dependent_dir.join("plugin.hk");
+        fs::write(
+            &dependent_husk,
+            r#"
+                #[red::command(name = "DepCmd")]
+                fn dep() {}
+            "#,
+        )
+        .unwrap();
+        fs::write(
+            dependent_dir.join("package.json"),
+            r#"{"name":"z-dependent","dependencies":{"a-rpc":"^0.1.0"}}"#,
+        )
+        .unwrap();
+
+        let mut registry = PluginRegistry::new();
+        registry.add("a-rpc", rpc_script.to_str().unwrap());
+        registry.add("b-colliding", colliding_husk.to_str().unwrap());
+        registry.add("z-dependent", dependent_husk.to_str().unwrap());
+        let mut runtime = Runtime::new();
+
+        registry.initialize(&mut runtime).await.unwrap();
+        assert_eq!(
+            registry.statuses().get("a-rpc"),
+            Some(&PluginStatus::Active)
+        );
+        assert!(matches!(
+            registry.statuses().get("b-colliding"),
+            Some(PluginStatus::Quarantined { diagnostic, .. })
+                if diagnostic.contains("already registered by plugin `a-rpc`")
+        ));
+        assert_eq!(
+            registry.statuses().get("z-dependent"),
+            Some(&PluginStatus::Active)
+        );
+
+        // Execute `SharedCmd`, causing `a-rpc` to exit right after replying.
+        registry.execute(&mut runtime, "SharedCmd").await.unwrap();
+        // Wait briefly for child process EOF to be observed by stdout reader thread.
+        std::thread::sleep(Duration::from_millis(50));
+        registry.poll_rpc_events(&mut runtime);
+
+        assert!(matches!(
+            registry.statuses().get("a-rpc"),
+            Some(PluginStatus::Quarantined { stage, .. }) if stage == "runtime"
+        ));
+        assert!(matches!(
+            registry.statuses().get("z-dependent"),
+            Some(PluginStatus::Quarantined { stage, diagnostic, .. })
+                if stage == "dependency" && diagnostic.contains("a-rpc")
+        ));
     }
 }

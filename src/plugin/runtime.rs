@@ -302,7 +302,7 @@ extern "red" {
 static RED_HOST_AST: OnceLock<husk_ast::File> = OnceLock::new();
 static RED_HOST_PAYLOAD_SCHEMA: OnceLock<PluginPayloadSchema> = OnceLock::new();
 
-struct RedHost {
+pub(crate) struct RedHost {
     dispatcher: Arc<Dispatcher<PluginRequest, PluginResponse>>,
     process_manager: ProcessManager,
     pending_timeouts: Vec<PendingTimeout>,
@@ -319,9 +319,47 @@ struct RedHost {
     neotree_core: Option<husk_runtime::Vm>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PluginCallbackTarget {
+    Husk(Callback),
+    Rpc {
+        plugin: String,
+        handler: Option<String>,
+    },
+}
+
+impl PluginCallbackTarget {
+    pub(crate) fn plugin(&self) -> &str {
+        match self {
+            Self::Husk(callback) => callback.plugin(),
+            Self::Rpc { plugin, .. } => plugin,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum PendingRequestCallback {
+    Husk(Callback),
+    Rpc {
+        plugin: String,
+        action: String,
+        handler: Option<String>,
+        rpc_id: Option<serde_json::Value>,
+    },
+}
+
+impl PendingRequestCallback {
+    pub(crate) fn plugin(&self) -> &str {
+        match self {
+            Self::Husk(callback) => callback.plugin(),
+            Self::Rpc { plugin, .. } => plugin,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct RedCommand {
-    callback: Callback,
+    callback: PluginCallbackTarget,
     metadata: CommandMetadata,
 }
 
@@ -703,8 +741,8 @@ fn payload_variant_name(name: &str) -> String {
 #[derive(Debug, Clone)]
 struct RedPluginPolicy {
     commands: HashMap<String, RedCommand>,
-    event_listeners: HashMap<String, Arc<Vec<Callback>>>,
-    pending_requests: HashMap<RequestId, Callback>,
+    event_listeners: HashMap<String, Arc<Vec<PluginCallbackTarget>>>,
+    pending_requests: HashMap<RequestId, PendingRequestCallback>,
     picker_handlers: HashMap<PickerHandle, PickerRegistration>,
     composer_handlers: HashMap<ComposerHandle, ComposerRegistration>,
     plugin_states: HashMap<String, HashMap<String, Value>>,
@@ -743,15 +781,15 @@ impl Default for RedPluginPolicy {
 
 #[derive(Debug, Clone, Default)]
 struct PickerHandlers {
-    selected: Option<Callback>,
-    cancelled: Option<Callback>,
-    changed: Option<Callback>,
-    query: Option<Callback>,
-    action: Option<Callback>,
+    selected: Option<PluginCallbackTarget>,
+    cancelled: Option<PluginCallbackTarget>,
+    changed: Option<PluginCallbackTarget>,
+    query: Option<PluginCallbackTarget>,
+    action: Option<PluginCallbackTarget>,
 }
 
 impl PickerHandlers {
-    fn callback(&self, kind: PickerCallbackKind) -> Option<&Callback> {
+    fn callback(&self, kind: PickerCallbackKind) -> Option<&PluginCallbackTarget> {
         match kind {
             PickerCallbackKind::Selected => self.selected.as_ref(),
             PickerCallbackKind::Cancelled => self.cancelled.as_ref(),
@@ -778,12 +816,12 @@ struct PickerRegistration {
 
 #[derive(Debug, Clone, Default)]
 struct ComposerHandlers {
-    submitted: Option<Callback>,
-    cancelled: Option<Callback>,
+    submitted: Option<PluginCallbackTarget>,
+    cancelled: Option<PluginCallbackTarget>,
 }
 
 impl ComposerHandlers {
-    fn callback(&self, kind: ComposerCallbackKind) -> Option<&Callback> {
+    fn callback(&self, kind: ComposerCallbackKind) -> Option<&PluginCallbackTarget> {
         match kind {
             ComposerCallbackKind::Submitted => self.submitted.as_ref(),
             ComposerCallbackKind::Cancelled => self.cancelled.as_ref(),
@@ -1107,6 +1145,264 @@ impl RedHost {
         } else {
             log!("[PLUGIN:HUSK] {}", message);
         }
+    }
+
+    pub(crate) fn log_rpc(&mut self, plugin: &str, message: &str) {
+        let formatted = format!("[{plugin}] {message}");
+        if let Some(effects) = &mut self.staged_effects {
+            effects.push(StagedHostEffect::Log(formatted));
+        } else {
+            log!("[PLUGIN:RPC] {}", formatted);
+        }
+    }
+
+    pub(crate) fn snapshots_json(&self) -> serde_json::Value {
+        let mut map = serde_json::Map::new();
+        for (name, value) in &self.snapshots {
+            map.insert(name.clone(), value_to_json(value));
+        }
+        serde_json::Value::Object(map)
+    }
+
+    pub(crate) fn query_rpc(
+        &mut self,
+        plugin: &str,
+        query: &str,
+    ) -> anyhow::Result<serde_json::Value> {
+        self.query(plugin, query).map(|value| value_to_json(&value))
+    }
+
+    pub(crate) fn schedule_timeout_rpc(&mut self, delay_ms: u64) -> String {
+        self.schedule_timeout(delay_ms)
+    }
+
+    pub(crate) fn cancel_timeout_rpc(&mut self, timer_id: &str) {
+        self.cancel_timeout(timer_id);
+    }
+
+    pub(crate) fn add_rpc_command(
+        &mut self,
+        plugin: &str,
+        command: &str,
+        handler: Option<String>,
+        metadata: CommandMetadata,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(!command.trim().is_empty(), "command name cannot be empty");
+        validate_command_arguments(metadata.arguments, &metadata.completions)?;
+        if let Some(existing) = self.policy().commands.get(command) {
+            if existing.callback.plugin() != plugin {
+                anyhow::bail!(
+                    "command `{command}` is already registered by plugin `{}`",
+                    existing.callback.plugin()
+                );
+            }
+        }
+        self.policy_mut().commands.insert(
+            command.to_string(),
+            RedCommand {
+                callback: PluginCallbackTarget::Rpc {
+                    plugin: plugin.to_string(),
+                    handler,
+                },
+                metadata,
+            },
+        );
+        Ok(())
+    }
+
+    pub(crate) fn add_rpc_event_listener(
+        &mut self,
+        plugin: &str,
+        event: &str,
+        handler: Option<String>,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(!event.trim().is_empty(), "event name cannot be empty");
+        let listeners = self
+            .policy_mut()
+            .event_listeners
+            .entry(event.to_string())
+            .or_default();
+        Arc::make_mut(listeners).push(PluginCallbackTarget::Rpc {
+            plugin: plugin.to_string(),
+            handler,
+        });
+        Ok(())
+    }
+
+    pub(crate) fn add_rpc_config_binding(
+        &mut self,
+        plugin: &str,
+        key: Option<String>,
+        handler: Option<String>,
+    ) -> anyhow::Result<RequestId> {
+        if !self
+            .policy_mut()
+            .config_bindings
+            .entry(plugin.to_string())
+            .or_default()
+            .insert(key.clone())
+        {
+            anyhow::bail!("duplicate `#[red::config]` binding for `{plugin}`");
+        }
+        let args = key
+            .into_iter()
+            .map(serde_json::Value::String)
+            .collect::<Vec<_>>();
+        self.request_rpc(plugin, "GetConfig", &args, handler, None)
+    }
+
+    pub(crate) fn execute_rpc(
+        &mut self,
+        plugin: &str,
+        action: &str,
+        args: &[serde_json::Value],
+    ) -> anyhow::Result<serde_json::Value> {
+        let mut value_args = args
+            .iter()
+            .cloned()
+            .map(Value::from_json)
+            .collect::<Vec<_>>();
+
+        match action {
+            "OpenPicker" => {
+                while value_args.len() < 4 {
+                    if value_args.len() == 2 {
+                        value_args.push(Value::from_json(serde_json::json!({})));
+                    } else if value_args.len() == 3 {
+                        value_args.push(rpc_default_picker_handlers());
+                    } else {
+                        break;
+                    }
+                }
+                if let Some(slot) = value_args.get_mut(3) {
+                    *slot = wrap_rpc_picker_handlers(slot);
+                }
+            }
+            "OpenConfirm" => {
+                if value_args.len() == 2 {
+                    value_args.push(rpc_default_picker_handlers());
+                } else if let Some(slot) = value_args.get_mut(2) {
+                    *slot = wrap_rpc_picker_handlers(slot);
+                }
+            }
+            "OpenComposer" => {
+                while value_args.len() < 4 {
+                    if value_args.len() == 2 {
+                        value_args.push(Value::from_json(serde_json::json!([])));
+                    } else if value_args.len() == 3 {
+                        value_args.push(rpc_default_composer_handlers());
+                    } else {
+                        break;
+                    }
+                }
+                if let Some(slot) = value_args.get_mut(3) {
+                    *slot = wrap_rpc_composer_handlers(slot);
+                }
+            }
+            "OpenInput" => {
+                if value_args.len() == 2 {
+                    value_args.push(rpc_default_composer_handlers());
+                } else if let Some(slot) = value_args.get_mut(2) {
+                    *slot = wrap_rpc_composer_handlers(slot);
+                }
+            }
+            _ => {}
+        }
+
+        super::api::validate_dynamic_host_call("execute", action, value_args.len())?;
+        let result = self.execute(plugin, action, &value_args)?;
+        Ok(value_to_json(&result))
+    }
+
+    pub(crate) fn request_rpc(
+        &mut self,
+        plugin: &str,
+        action: &str,
+        args: &[serde_json::Value],
+        handler: Option<String>,
+        deferred_rpc_id: Option<serde_json::Value>,
+    ) -> anyhow::Result<RequestId> {
+        let value_args = args
+            .iter()
+            .cloned()
+            .map(Value::from_json)
+            .collect::<Vec<_>>();
+        super::api::validate_dynamic_host_call("request", action, 1 + value_args.len())?;
+        let request_id = self.policy_mut().allocate_request_id();
+        self.policy_mut().pending_requests.insert(
+            request_id,
+            PendingRequestCallback::Rpc {
+                plugin: plugin.to_string(),
+                action: action.to_string(),
+                handler,
+                rpc_id: deferred_rpc_id,
+            },
+        );
+        if let Err(error) = self.request(plugin, request_id, action, &value_args) {
+            self.policy_mut().pending_requests.remove(&request_id);
+            return Err(error);
+        }
+        Ok(request_id)
+    }
+
+    pub(crate) fn state_get_rpc(&self, plugin: &str, key: Option<&str>) -> serde_json::Value {
+        if let Some(key) = key {
+            self.policy()
+                .plugin_states
+                .get(plugin)
+                .and_then(|state| state.get(key))
+                .map_or(serde_json::Value::Null, value_to_json)
+        } else {
+            self.policy()
+                .typed_states
+                .get(plugin)
+                .map_or(serde_json::Value::Null, value_to_json)
+        }
+    }
+
+    pub(crate) fn state_set_rpc(
+        &mut self,
+        plugin: &str,
+        key: Option<String>,
+        value: serde_json::Value,
+    ) {
+        if let Some(key) = key {
+            self.policy_mut()
+                .plugin_states
+                .entry(plugin.to_string())
+                .or_default()
+                .insert(key, Value::from_json(value));
+        } else {
+            self.policy_mut()
+                .typed_states
+                .insert(plugin.to_string(), Value::from_json(value));
+        }
+    }
+
+    pub(crate) fn state_patch_rpc(
+        &mut self,
+        plugin: &str,
+        patch: serde_json::Value,
+    ) -> anyhow::Result<()> {
+        let Some(patch_obj) = patch.as_object() else {
+            anyhow::bail!("`red/statePatch` requires an object");
+        };
+        let mut current = self
+            .policy()
+            .typed_states
+            .get(plugin)
+            .map(value_to_json)
+            .unwrap_or_else(|| serde_json::json!({}));
+        let Some(current_obj) = current.as_object_mut() else {
+            anyhow::bail!("plugin state for `{plugin}` is not an object");
+        };
+        for (k, v) in patch_obj {
+            current_obj.insert(k.clone(), v.clone());
+        }
+        self.policy_mut()
+            .typed_states
+            .insert(plugin.to_string(), Value::from_json(current));
+        Ok(())
     }
 
     fn begin_reload_replacement(&mut self, plugin: &str) {
@@ -2430,9 +2726,13 @@ impl RedHost {
                         );
                     }
                 }
-                self.policy_mut()
-                    .commands
-                    .insert(command.to_string(), RedCommand { callback, metadata });
+                self.policy_mut().commands.insert(
+                    command.to_string(),
+                    RedCommand {
+                        callback: PluginCallbackTarget::Husk(callback),
+                        metadata,
+                    },
+                );
                 Ok(Value::Unit)
             }
             "red::on" => {
@@ -2443,7 +2743,7 @@ impl RedHost {
                     .event_listeners
                     .entry(event.to_string())
                     .or_default();
-                Arc::make_mut(listeners).push(callback);
+                Arc::make_mut(listeners).push(PluginCallbackTarget::Husk(callback));
                 Ok(Value::Unit)
             }
             "red::execute" => {
@@ -2456,7 +2756,7 @@ impl RedHost {
                 let request_id = self.policy_mut().allocate_request_id();
                 self.policy_mut()
                     .pending_requests
-                    .insert(request_id, callback);
+                    .insert(request_id, PendingRequestCallback::Husk(callback));
                 if let Err(error) = self.request(plugin, request_id, action, &args[2..]) {
                     self.policy_mut().pending_requests.remove(&request_id);
                     return Err(error);
@@ -3215,14 +3515,15 @@ impl Host for RedHost {
                     self.policy_mut().commands.insert(
                         name,
                         RedCommand {
-                            callback: function.callback().clone(),
+                            callback: PluginCallbackTarget::Husk(function.callback().clone()),
                             metadata,
                         },
                     );
                 }
                 super::api::RedFunctionAnnotation::Event { name } => {
                     let listeners = self.policy_mut().event_listeners.entry(name).or_default();
-                    Arc::make_mut(listeners).push(function.callback().clone());
+                    Arc::make_mut(listeners)
+                        .push(PluginCallbackTarget::Husk(function.callback().clone()));
                 }
                 super::api::RedFunctionAnnotation::StateInitializer => {
                     let Some(husk_ast::TypeExpr {
@@ -3255,9 +3556,10 @@ impl Host for RedHost {
                         anyhow::bail!("duplicate `#[red::config]` binding for `{plugin}`");
                     }
                     let request_id = self.policy_mut().allocate_request_id();
-                    self.policy_mut()
-                        .pending_requests
-                        .insert(request_id, function.callback().clone());
+                    self.policy_mut().pending_requests.insert(
+                        request_id,
+                        PendingRequestCallback::Husk(function.callback().clone()),
+                    );
                     let arguments = key.into_iter().map(Value::String).collect::<Vec<_>>();
                     if let Err(error) = self.request(plugin, request_id, "GetConfig", &arguments) {
                         self.policy_mut().pending_requests.remove(&request_id);
@@ -3369,22 +3671,23 @@ fn red_picker_handlers(
     value: &Value,
     function: &str,
 ) -> anyhow::Result<PickerHandlers> {
-    let fields = match value {
+    let (fields, rpc_mode) = match value {
+        Value::Struct { type_name, fields } if type_name == "RpcPickerHandlers" => (fields, true),
         Value::Struct { type_name, fields } => {
             anyhow::ensure!(
                 type_name == "PickerHandlers",
                 "`{function}` handlers must be PickerHandlers, found {type_name}"
             );
-            fields
+            (fields, false)
         }
         // Red still compiles plugins under the legacy semantic profile, which erases
         // nominal struct identity at runtime. Static checking has already established
         // the PickerHandlers type before this adapter receives the native object.
-        Value::Object(fields) => fields,
+        Value::Object(fields) => (fields, false),
         _ => anyhow::bail!("`{function}` handlers must be a PickerHandlers value"),
     };
 
-    let callback = |name: &str| -> anyhow::Result<Option<Callback>> {
+    let callback = |name: &str| -> anyhow::Result<Option<PluginCallbackTarget>> {
         match fields.get(name) {
             None | Some(Value::Unit | Value::Null | Value::Missing(_)) => Ok(None),
             Some(Value::Callback(callback)) => {
@@ -3393,7 +3696,29 @@ fn red_picker_handlers(
                     "`{function}` handler `{name}` belongs to plugin `{}`, not `{plugin}`",
                     callback.plugin()
                 );
-                Ok(Some(callback.clone()))
+                Ok(Some(PluginCallbackTarget::Husk(callback.clone())))
+            }
+            Some(Value::Bool(true)) | Some(Value::Json(serde_json::Value::Bool(true)))
+                if rpc_mode =>
+            {
+                Ok(Some(PluginCallbackTarget::Rpc {
+                    plugin: plugin.to_string(),
+                    handler: None,
+                }))
+            }
+            Some(Value::Bool(false)) | Some(Value::Json(serde_json::Value::Bool(false)))
+                if rpc_mode =>
+            {
+                Ok(None)
+            }
+            Some(Value::String(handler))
+            | Some(Value::Json(serde_json::Value::String(handler)))
+                if rpc_mode =>
+            {
+                Ok(Some(PluginCallbackTarget::Rpc {
+                    plugin: plugin.to_string(),
+                    handler: Some(handler.clone()),
+                }))
             }
             Some(_) => anyhow::bail!("`{function}` handler `{name}` must be a function callback"),
         }
@@ -3418,19 +3743,20 @@ fn red_composer_handlers(
     value: &Value,
     function: &str,
 ) -> anyhow::Result<ComposerHandlers> {
-    let fields = match value {
+    let (fields, rpc_mode) = match value {
+        Value::Struct { type_name, fields } if type_name == "RpcComposerHandlers" => (fields, true),
         Value::Struct { type_name, fields } => {
             anyhow::ensure!(
                 type_name == "ComposerHandlers",
                 "`{function}` handlers must be ComposerHandlers, found {type_name}"
             );
-            fields
+            (fields, false)
         }
-        Value::Object(fields) => fields,
+        Value::Object(fields) => (fields, false),
         _ => anyhow::bail!("`{function}` handlers must be a ComposerHandlers value"),
     };
 
-    let callback = |name: &str| -> anyhow::Result<Option<Callback>> {
+    let callback = |name: &str| -> anyhow::Result<Option<PluginCallbackTarget>> {
         match fields.get(name) {
             None | Some(Value::Unit | Value::Null | Value::Missing(_)) => Ok(None),
             Some(Value::Callback(callback)) => {
@@ -3439,7 +3765,29 @@ fn red_composer_handlers(
                     "`{function}` handler `{name}` belongs to plugin `{}`, not `{plugin}`",
                     callback.plugin()
                 );
-                Ok(Some(callback.clone()))
+                Ok(Some(PluginCallbackTarget::Husk(callback.clone())))
+            }
+            Some(Value::Bool(true)) | Some(Value::Json(serde_json::Value::Bool(true)))
+                if rpc_mode =>
+            {
+                Ok(Some(PluginCallbackTarget::Rpc {
+                    plugin: plugin.to_string(),
+                    handler: None,
+                }))
+            }
+            Some(Value::Bool(false)) | Some(Value::Json(serde_json::Value::Bool(false)))
+                if rpc_mode =>
+            {
+                Ok(None)
+            }
+            Some(Value::String(handler))
+            | Some(Value::Json(serde_json::Value::String(handler)))
+                if rpc_mode =>
+            {
+                Ok(Some(PluginCallbackTarget::Rpc {
+                    plugin: plugin.to_string(),
+                    handler: Some(handler.clone()),
+                }))
             }
             Some(_) => anyhow::bail!("`{function}` handler `{name}` must be a function callback"),
         }
@@ -3771,6 +4119,81 @@ fn value_to_i32(value: &Value) -> Option<i32> {
     }
 }
 
+fn rpc_default_picker_handlers() -> Value {
+    Value::Struct {
+        type_name: "RpcPickerHandlers".to_string(),
+        fields: Arc::new(BTreeMap::from([
+            ("selected".to_string(), Value::Bool(true)),
+            ("cancelled".to_string(), Value::Bool(true)),
+            ("changed".to_string(), Value::Bool(true)),
+            ("query".to_string(), Value::Bool(true)),
+            ("action".to_string(), Value::Bool(true)),
+        ])),
+    }
+}
+
+fn wrap_rpc_picker_handlers(value: &Value) -> Value {
+    match value {
+        Value::Unit | Value::Null | Value::Missing(_) => rpc_default_picker_handlers(),
+        Value::Object(fields) | Value::Struct { fields, .. } if fields.is_empty() => {
+            rpc_default_picker_handlers()
+        }
+        Value::Object(fields) | Value::Struct { fields, .. } => Value::Struct {
+            type_name: "RpcPickerHandlers".to_string(),
+            fields: Arc::clone(fields),
+        },
+        Value::Json(serde_json::Value::Null) => rpc_default_picker_handlers(),
+        Value::Json(serde_json::Value::Object(map)) if map.is_empty() => {
+            rpc_default_picker_handlers()
+        }
+        Value::Json(serde_json::Value::Object(map)) => Value::Struct {
+            type_name: "RpcPickerHandlers".to_string(),
+            fields: Arc::new(
+                map.iter()
+                    .map(|(k, v)| (k.clone(), Value::from_json(v.clone())))
+                    .collect(),
+            ),
+        },
+        other => other.clone(),
+    }
+}
+
+fn rpc_default_composer_handlers() -> Value {
+    Value::Struct {
+        type_name: "RpcComposerHandlers".to_string(),
+        fields: Arc::new(BTreeMap::from([
+            ("submitted".to_string(), Value::Bool(true)),
+            ("cancelled".to_string(), Value::Bool(true)),
+        ])),
+    }
+}
+
+fn wrap_rpc_composer_handlers(value: &Value) -> Value {
+    match value {
+        Value::Unit | Value::Null | Value::Missing(_) => rpc_default_composer_handlers(),
+        Value::Object(fields) | Value::Struct { fields, .. } if fields.is_empty() => {
+            rpc_default_composer_handlers()
+        }
+        Value::Object(fields) | Value::Struct { fields, .. } => Value::Struct {
+            type_name: "RpcComposerHandlers".to_string(),
+            fields: Arc::clone(fields),
+        },
+        Value::Json(serde_json::Value::Null) => rpc_default_composer_handlers(),
+        Value::Json(serde_json::Value::Object(map)) if map.is_empty() => {
+            rpc_default_composer_handlers()
+        }
+        Value::Json(serde_json::Value::Object(map)) => Value::Struct {
+            type_name: "RpcComposerHandlers".to_string(),
+            fields: Arc::new(
+                map.iter()
+                    .map(|(k, v)| (k.clone(), Value::from_json(v.clone())))
+                    .collect(),
+            ),
+        },
+        other => other.clone(),
+    }
+}
+
 #[derive(Clone)]
 pub struct Runtime {
     inner: Arc<Mutex<RuntimeInner>>,
@@ -3790,6 +4213,7 @@ pub struct RegisteredPluginCommand {
 
 struct RuntimeInner {
     plugins: HashMap<String, husk_runtime::Vm>,
+    rpc_plugins: HashMap<String, super::rpc::RpcPlugin>,
     host: RedHost,
     anonymous_module_count: usize,
     typecheck_enabled: bool,
@@ -3823,6 +4247,7 @@ impl Runtime {
         Ok(Self {
             inner: Arc::new(Mutex::new(RuntimeInner {
                 plugins: HashMap::new(),
+                rpc_plugins: HashMap::new(),
                 host: RedHost::with_dispatcher(process_permissions, dispatcher.clone()),
                 anonymous_module_count: 0,
                 typecheck_enabled: true,
@@ -3963,15 +4388,80 @@ impl Runtime {
         result
     }
 
+    /// Spawns, initializes, and transactionally activates a JSON-RPC stdio plugin.
+    pub async fn load_rpc_plugin(
+        &mut self,
+        name: &str,
+        spec: super::rpc::RpcPluginSpec,
+    ) -> anyhow::Result<()> {
+        let _span = crate::editor::perf::PerfSpan::with_detail("rpc:load", name);
+        let mut inner = self.inner.lock().unwrap();
+        let RuntimeInner {
+            plugins,
+            rpc_plugins,
+            host,
+            ..
+        } = &mut *inner;
+        let was_loaded = rpc_plugins.contains_key(name) || plugins.contains_key(name);
+        if was_loaded {
+            host.begin_reload();
+        } else {
+            host.begin_initial_activation();
+        }
+
+        let exported_state = if let Some(existing) = rpc_plugins.get_mut(name) {
+            match existing.export_state(host) {
+                Ok(state) => state,
+                Err(error) => {
+                    host.rollback_reload();
+                    return Err(error);
+                }
+            }
+        } else {
+            None
+        };
+
+        host.begin_reload_replacement(name);
+        let candidate =
+            match super::rpc::RpcPlugin::spawn_and_activate(name, spec, exported_state, host) {
+                Ok(candidate) => candidate,
+                Err(error) => {
+                    host.rollback_reload();
+                    return Err(error);
+                }
+            };
+
+        if let Some(existing) = rpc_plugins.get_mut(name) {
+            host.begin_reload_teardown(name);
+            if let Err(error) = existing.deactivate(host) {
+                host.rollback_reload();
+                return Err(error);
+            }
+        }
+
+        host.commit_reload();
+        plugins.remove(name);
+        rpc_plugins.insert(name.to_string(), candidate);
+        Ok(())
+    }
+
     pub fn unload_plugin(&mut self, name: &str) -> anyhow::Result<()> {
         let mut inner = self.inner.lock().unwrap();
-        let RuntimeInner { plugins, host, .. } = &mut *inner;
-        let result = plugins
+        let RuntimeInner {
+            plugins,
+            rpc_plugins,
+            host,
+            ..
+        } = &mut *inner;
+        let husk_result = plugins
             .remove(name)
             .map_or(Ok(()), |mut vm| vm.deactivate_plugin(name, host));
+        let rpc_result = rpc_plugins
+            .remove(name)
+            .map_or(Ok(()), |mut rpc| rpc.deactivate_and_shutdown(host));
         host.remove_plugin(name);
         host.process_manager.shutdown_plugin(name);
-        result
+        husk_result.and(rpc_result)
     }
 
     #[must_use]
@@ -4024,29 +4514,52 @@ impl Runtime {
     pub async fn execute_command(&mut self, command: &str) -> anyhow::Result<()> {
         let _span = crate::editor::perf::PerfSpan::with_detail("husk:command", command);
         let mut inner = self.inner.lock().unwrap();
-        let RuntimeInner { plugins, host, .. } = &mut *inner;
+        let RuntimeInner {
+            plugins,
+            rpc_plugins,
+            host,
+            ..
+        } = &mut *inner;
         let (name, registered, raw_args) = resolve_command(&host.policy().commands, command)
             .ok_or_else(|| anyhow::anyhow!("unknown Husk plugin command `{command}`"))?;
+        let name = name.to_string();
+        let raw_args = raw_args.to_string();
+        let accepts_arguments = registered.metadata.arguments;
         let callback = registered.callback.clone();
-        let args = if registered.metadata.arguments {
-            let payload = command_invocation_payload(name, raw_args);
-            vec![decoded_callback_payload(host, &callback, 0, &payload)?]
-        } else {
-            Vec::new()
-        };
-        call_plugin_callback(plugins, host, &callback, args).map(drop)
+        match callback {
+            PluginCallbackTarget::Husk(callback) => {
+                let args = if accepts_arguments {
+                    let payload = command_invocation_payload(&name, &raw_args);
+                    vec![decoded_callback_payload(host, &callback, 0, &payload)?]
+                } else {
+                    Vec::new()
+                };
+                call_plugin_callback(plugins, host, &callback, args).map(drop)
+            }
+            PluginCallbackTarget::Rpc { plugin, handler } => {
+                let payload = command_invocation_payload(&name, &raw_args);
+                let rpc = rpc_plugins.get_mut(&plugin).ok_or_else(|| {
+                    anyhow::anyhow!("JSON-RPC command references unloaded plugin `{plugin}`")
+                })?;
+                rpc.execute_command(&name, handler.as_deref(), payload, host)
+            }
+        }
     }
 
     pub async fn notify(&mut self, event: &str, args: serde_json::Value) -> anyhow::Result<()> {
         let _span = crate::editor::perf::PerfSpan::with_detail("husk:notify", event);
         let mut inner = self.inner.lock().unwrap();
-        let RuntimeInner { plugins, host, .. } = &mut *inner;
+        let RuntimeInner {
+            plugins,
+            rpc_plugins,
+            host,
+            ..
+        } = &mut *inner;
         let Some(callbacks) = host.policy().event_listeners.get(event).cloned() else {
             return Ok(());
         };
         for callback in callbacks.iter() {
-            let argument = decoded_callback_payload(host, callback, 0, &args)?;
-            call_plugin_callback(plugins, host, callback, vec![argument])?;
+            call_event_listener(plugins, rpc_plugins, host, callback, event, &args)?;
         }
         Ok(())
     }
@@ -4057,17 +4570,19 @@ impl Runtime {
         args: serde_json::Value,
     ) -> Vec<(String, anyhow::Error)> {
         let mut inner = self.inner.lock().unwrap();
-        let RuntimeInner { plugins, host, .. } = &mut *inner;
+        let RuntimeInner {
+            plugins,
+            rpc_plugins,
+            host,
+            ..
+        } = &mut *inner;
         let Some(callbacks) = host.policy().event_listeners.get(event).cloned() else {
             return Vec::new();
         };
         callbacks
             .iter()
             .filter_map(|callback| {
-                decoded_callback_payload(host, callback, 0, &args)
-                    .and_then(|argument| {
-                        call_plugin_callback(plugins, host, callback, vec![argument])
-                    })
+                call_event_listener(plugins, rpc_plugins, host, callback, event, &args)
                     .err()
                     .map(|error| (callback.plugin().to_string(), error))
             })
@@ -4081,7 +4596,12 @@ impl Runtime {
         args: serde_json::Value,
     ) -> Vec<(String, anyhow::Error)> {
         let mut inner = self.inner.lock().unwrap();
-        let RuntimeInner { plugins, host, .. } = &mut *inner;
+        let RuntimeInner {
+            plugins,
+            rpc_plugins,
+            host,
+            ..
+        } = &mut *inner;
         let Some(callbacks) = host.policy().event_listeners.get(event).cloned() else {
             return Vec::new();
         };
@@ -4089,10 +4609,7 @@ impl Runtime {
             .iter()
             .filter(|callback| callback.plugin() == plugin)
             .filter_map(|callback| {
-                decoded_callback_payload(host, callback, 0, &args)
-                    .and_then(|argument| {
-                        call_plugin_callback(plugins, host, callback, vec![argument])
-                    })
+                call_event_listener(plugins, rpc_plugins, host, callback, event, &args)
                     .err()
                     .map(|error| (plugin.to_string(), error))
             })
@@ -4117,7 +4634,12 @@ impl Runtime {
         event: PickerCallback,
     ) -> anyhow::Result<bool> {
         let mut inner = self.inner.lock().unwrap();
-        let RuntimeInner { plugins, host, .. } = &mut *inner;
+        let RuntimeInner {
+            plugins,
+            rpc_plugins,
+            host,
+            ..
+        } = &mut *inner;
         let kind = event.kind();
         let registration = if kind.is_terminal() {
             host.policy_mut().picker_handlers.remove(&handle)
@@ -4130,7 +4652,19 @@ impl Runtime {
         let Some(callback) = registration.handlers.callback(kind).cloned() else {
             return Ok(true);
         };
-        call_plugin_callback(plugins, host, &callback, vec![picker_callback_value(event)])?;
+        match callback {
+            PluginCallbackTarget::Husk(callback) => {
+                call_plugin_callback(plugins, host, &callback, vec![picker_callback_value(event)])?;
+            }
+            PluginCallbackTarget::Rpc { plugin, handler } => {
+                let rpc = rpc_plugins.get_mut(&plugin).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "JSON-RPC picker callback references unloaded plugin `{plugin}`"
+                    )
+                })?;
+                rpc.notify_picker(handle, kind, handler.as_deref(), event, host)?;
+            }
+        }
         Ok(true)
     }
 
@@ -4163,20 +4697,38 @@ impl Runtime {
         event: ComposerCallback,
     ) -> anyhow::Result<bool> {
         let mut inner = self.inner.lock().unwrap();
-        let RuntimeInner { plugins, host, .. } = &mut *inner;
+        let RuntimeInner {
+            plugins,
+            rpc_plugins,
+            host,
+            ..
+        } = &mut *inner;
+        let kind = event.kind();
         let registration = host.policy_mut().composer_handlers.remove(&handle);
         let Some(registration) = registration else {
             return Ok(false);
         };
-        let Some(callback) = registration.handlers.callback(event.kind()).cloned() else {
+        let Some(callback) = registration.handlers.callback(kind).cloned() else {
             return Ok(true);
         };
-        call_plugin_callback(
-            plugins,
-            host,
-            &callback,
-            vec![composer_callback_value(event)],
-        )?;
+        match callback {
+            PluginCallbackTarget::Husk(callback) => {
+                call_plugin_callback(
+                    plugins,
+                    host,
+                    &callback,
+                    vec![composer_callback_value(event)],
+                )?;
+            }
+            PluginCallbackTarget::Rpc { plugin, handler } => {
+                let rpc = rpc_plugins.get_mut(&plugin).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "JSON-RPC composer callback references unloaded plugin `{plugin}`"
+                    )
+                })?;
+                rpc.notify_composer(handle, kind, handler.as_deref(), event, host)?;
+            }
+        }
         Ok(true)
     }
 
@@ -4197,18 +4749,66 @@ impl Runtime {
         payload: serde_json::Value,
     ) -> anyhow::Result<bool> {
         let mut inner = self.inner.lock().unwrap();
-        let RuntimeInner { plugins, host, .. } = &mut *inner;
+        let RuntimeInner {
+            plugins,
+            rpc_plugins,
+            host,
+            ..
+        } = &mut *inner;
         let Some(callback) = host.policy_mut().pending_requests.remove(&request_id) else {
             return Ok(false);
         };
-        let payload = decoded_callback_payload(host, &callback, 0, &payload)?;
-        call_plugin_callback(
-            plugins,
-            host,
-            &callback,
-            vec![payload, Value::Int(request_id.get())],
-        )?;
+        match callback {
+            PendingRequestCallback::Husk(callback) => {
+                let payload = decoded_callback_payload(host, &callback, 0, &payload)?;
+                call_plugin_callback(
+                    plugins,
+                    host,
+                    &callback,
+                    vec![payload, Value::Int(request_id.get())],
+                )?;
+            }
+            PendingRequestCallback::Rpc {
+                plugin,
+                action,
+                handler,
+                rpc_id,
+            } => {
+                let rpc = rpc_plugins.get_mut(&plugin).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "JSON-RPC request callback references unloaded plugin `{plugin}`"
+                    )
+                })?;
+                rpc.resolve_request(
+                    request_id,
+                    &action,
+                    handler.as_deref(),
+                    rpc_id,
+                    &payload,
+                    host,
+                )?;
+            }
+        }
         Ok(true)
+    }
+
+    /// Drains unsolicited JSON-RPC messages and reports any crashed RPC plugin processes.
+    pub fn poll_rpc_events(&mut self) -> Vec<(String, anyhow::Error)> {
+        let mut inner = self.inner.lock().unwrap();
+        let RuntimeInner {
+            rpc_plugins, host, ..
+        } = &mut *inner;
+        let mut names = rpc_plugins.keys().cloned().collect::<Vec<_>>();
+        names.sort_unstable();
+        let mut failures = Vec::new();
+        for name in names {
+            if let Some(rpc) = rpc_plugins.get_mut(&name) {
+                if let Err(error) = rpc.poll_events(host) {
+                    failures.push((name, error));
+                }
+            }
+        }
+        failures
     }
 
     #[must_use]
@@ -4267,7 +4867,12 @@ impl Runtime {
 
     pub async fn before_exit(&mut self, snapshot: serde_json::Value) -> anyhow::Result<()> {
         let mut inner = self.inner.lock().unwrap();
-        let RuntimeInner { plugins, host, .. } = &mut *inner;
+        let RuntimeInner {
+            plugins,
+            rpc_plugins,
+            host,
+            ..
+        } = &mut *inner;
         let mut names = plugins.keys().cloned().collect::<Vec<_>>();
         names.sort_unstable();
         for name in names {
@@ -4275,12 +4880,24 @@ impl Runtime {
                 vm.before_exit(snapshot.clone(), host)?;
             }
         }
+        let mut rpc_names = rpc_plugins.keys().cloned().collect::<Vec<_>>();
+        rpc_names.sort_unstable();
+        for name in rpc_names {
+            if let Some(rpc) = rpc_plugins.get_mut(&name) {
+                rpc.before_exit(&snapshot, host)?;
+            }
+        }
         Ok(())
     }
 
     pub async fn deactivate_all(&mut self) -> anyhow::Result<()> {
         let mut inner = self.inner.lock().unwrap();
-        let RuntimeInner { plugins, host, .. } = &mut *inner;
+        let RuntimeInner {
+            plugins,
+            rpc_plugins,
+            host,
+            ..
+        } = &mut *inner;
         let mut names = plugins.keys().cloned().collect::<Vec<_>>();
         names.sort_unstable();
         let mut first_error = None;
@@ -4294,8 +4911,42 @@ impl Runtime {
                 }
             }
         }
+        let mut rpc_names = rpc_plugins.keys().cloned().collect::<Vec<_>>();
+        rpc_names.sort_unstable();
+        for name in rpc_names {
+            let Some(mut rpc) = rpc_plugins.remove(&name) else {
+                continue;
+            };
+            if let Err(error) = rpc.deactivate_and_shutdown(host) {
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
+            }
+        }
         host.clear_policy();
         first_error.map_or(Ok(()), Err)
+    }
+}
+
+fn call_event_listener(
+    plugins: &mut HashMap<String, husk_runtime::Vm>,
+    rpc_plugins: &mut HashMap<String, super::rpc::RpcPlugin>,
+    host: &mut RedHost,
+    callback: &PluginCallbackTarget,
+    event: &str,
+    args: &serde_json::Value,
+) -> anyhow::Result<()> {
+    match callback {
+        PluginCallbackTarget::Husk(callback) => {
+            let argument = decoded_callback_payload(host, callback, 0, args)?;
+            call_plugin_callback(plugins, host, callback, vec![argument]).map(drop)
+        }
+        PluginCallbackTarget::Rpc { plugin, handler } => {
+            let rpc = rpc_plugins.get_mut(plugin).ok_or_else(|| {
+                anyhow::anyhow!("JSON-RPC event listener references unloaded plugin `{plugin}`")
+            })?;
+            rpc.notify_event(event, handler.as_deref(), args, host)
+        }
     }
 }
 
