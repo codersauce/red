@@ -29,6 +29,7 @@ use tokio::sync::{mpsc, Mutex};
 use tokio::task::JoinHandle;
 
 use super::package::{PluginPackageManifest, PLUGIN_MANIFEST_FILE};
+use super::process::inherited_environment;
 use super::rpc::{
     RpcConnection, RpcErrorObject, RpcIncoming, RpcInitializeParams, RpcRequester,
     RpcStatuslineSide, DOCUMENT_APPLY_METHOD, DOCUMENT_SNAPSHOT_METHOD, DOCUMENT_UNDO_METHOD,
@@ -614,6 +615,8 @@ impl PluginRegistry {
 
     fn prepare_rpc_plugin(
         &self,
+        runtime: &Runtime,
+        name: &str,
         root: &Path,
         manifest: &PluginPackageManifest,
         path: String,
@@ -627,7 +630,10 @@ impl PluginRegistry {
             Path::new(&rpc.command).to_path_buf()
         };
         let mut command = Command::new(executable);
-        command.args(&rpc.args).current_dir(root);
+        command.env_clear().args(&rpc.args).current_dir(root);
+        for (key, value) in inherited_environment(&runtime.inherited_environment_keys(name))? {
+            command.env(key, value);
+        }
         let (connection, incoming) = RpcConnection::spawn(command)?;
         let request = connection.requester();
         let params = RpcInitializeParams {
@@ -671,6 +677,7 @@ impl PluginRegistry {
 
     fn start_rpc_plugin(
         &mut self,
+        runtime: &Runtime,
         name: &str,
         root: &Path,
         manifest: &PluginPackageManifest,
@@ -681,13 +688,15 @@ impl PluginRegistry {
             !self.rpc_activations.contains_key(name),
             "RPC plugin `{name}` is already starting"
         );
-        let pending = self.prepare_rpc_plugin(root, manifest, path, previous_metadata)?;
+        let pending =
+            self.prepare_rpc_plugin(runtime, name, root, manifest, path, previous_metadata)?;
         self.rpc_activations.insert(name.to_string(), pending);
         Ok(())
     }
 
     fn start_rpc_path(
         &mut self,
+        runtime: &Runtime,
         name: &str,
         path: &str,
         previous_metadata: Option<PluginMetadata>,
@@ -695,7 +704,14 @@ impl PluginRegistry {
         let Some((root, manifest)) = external_rpc_package(path)? else {
             return Ok(false);
         };
-        self.start_rpc_plugin(name, &root, &manifest, path.to_string(), previous_metadata)?;
+        self.start_rpc_plugin(
+            runtime,
+            name,
+            &root,
+            &manifest,
+            path.to_string(),
+            previous_metadata,
+        )?;
         Ok(true)
     }
 
@@ -735,7 +751,7 @@ impl PluginRegistry {
         name: &str,
         path: &str,
     ) -> bool {
-        match self.start_rpc_path(name, path, None) {
+        match self.start_rpc_path(runtime, name, path, None) {
             Ok(true) => self.await_rpc_activation(runtime, name).await,
             Ok(false) => return false,
             Err(error) => self.quarantine(
@@ -751,6 +767,7 @@ impl PluginRegistry {
 
     fn reload_rpc_plugin(
         &mut self,
+        runtime: &Runtime,
         name: &str,
         path: &str,
         root: &Path,
@@ -763,6 +780,7 @@ impl PluginRegistry {
             return;
         }
         if let Err(error) = self.start_rpc_plugin(
+            runtime,
             name,
             root,
             manifest,
@@ -1571,7 +1589,7 @@ impl PluginRegistry {
             self.quarantine(runtime, name, path, stage, diagnostic);
             return;
         }
-        match self.start_rpc_path(name, path, None) {
+        match self.start_rpc_path(runtime, name, path, None) {
             Ok(true) => return,
             Ok(false) => {}
             Err(error) => {
@@ -1915,7 +1933,14 @@ impl PluginRegistry {
         }
         match external_rpc_package(path) {
             Ok(Some((root, manifest))) => {
-                self.reload_rpc_plugin(name, path, &root, &manifest, previous_metadata.clone());
+                self.reload_rpc_plugin(
+                    runtime,
+                    name,
+                    path,
+                    &root,
+                    &manifest,
+                    previous_metadata.clone(),
+                );
                 return;
             }
             Err(error)

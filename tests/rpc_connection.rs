@@ -1,10 +1,12 @@
 use std::{
+    collections::HashMap,
     env, fs,
     io::{BufRead, Write},
     time::Duration,
 };
 
 use anyhow::{Context as _, Result};
+use red::config::PluginPermissions;
 use red::plugin::rpc::{RpcConnection, RpcIncoming, RpcInitializeParams};
 use red::plugin::{PluginRegistry, PluginStatus, Runtime};
 use serde_json::{json, Value};
@@ -15,6 +17,8 @@ mod common;
 mod editor;
 
 const FIXTURE_MODE: &str = "RED_RPC_FIXTURE_MODE";
+const ALLOWED_ENVIRONMENT: &str = "RED_RPC_TEST_ALLOWED";
+const DENIED_ENVIRONMENT: &str = "RED_RPC_TEST_DENIED";
 
 fn main() -> Result<()> {
     if env::args().any(|argument| argument == "--editor-fixture") {
@@ -145,7 +149,9 @@ async fn registry_discovers_and_lazily_executes_an_rpc_command() -> Result<()> {
             .chain(env::split_paths(&env::var_os("PATH").unwrap_or_default())),
     )?;
     env::set_var("PATH", path);
-    env::set_var("RED_RPC_REGISTRY_MARKER", &marker);
+    env::set_var(ALLOWED_ENVIRONMENT, "allowed");
+    env::set_var(DENIED_ENVIRONMENT, "denied");
+    let marker_argument = serde_json::to_string(marker.to_str().context("non-UTF-8 marker")?)?;
     fs::write(
         package.path().join("red-plugin.toml"),
         format!(
@@ -159,7 +165,7 @@ red_api = "^0.19.0"
 
 [rpc]
 command = "{executable_name}"
-args = ["--registry-fixture"]
+args = ["--registry-fixture", {marker_argument}]
 
 [activation]
 commands = ["RpcFail", "RpcHello"]
@@ -173,7 +179,13 @@ events = ["file:saved"]
         "rpc-alias",
         manifest.to_str().context("non-UTF-8 manifest path")?,
     );
-    let mut runtime = Runtime::new();
+    let mut runtime = Runtime::new_with_permissions(HashMap::from([(
+        "rpc-alias".to_string(),
+        PluginPermissions {
+            inherit_env: vec![ALLOWED_ENVIRONMENT.to_string()],
+            ..PluginPermissions::default()
+        },
+    )]));
 
     registry.initialize(&mut runtime).await?;
     registry.reload(&mut runtime).await?;
@@ -205,6 +217,11 @@ events = ["file:saved"]
     assert_eq!(invocation["name"], "RpcHello");
     assert_eq!(invocation["args"], json!(["one", "two"]));
     assert_eq!(invocation["raw_args"], "one two");
+    let environment: Value =
+        serde_json::from_slice(&fs::read(marker.with_file_name("environment.json"))?)?;
+    assert_eq!(environment["allowed"], "allowed");
+    assert_eq!(environment["denied"], Value::Null);
+    assert_eq!(environment["path"], true);
     let event: Value = serde_json::from_slice(&fs::read(&event_marker)?)?;
     assert_eq!(event["name"], "file:saved");
     assert_eq!(event["payload"], event_payload);
@@ -403,8 +420,19 @@ fn run_registry_fixture() -> Result<()> {
         }),
     )?;
     assert_eq!(read_message(&mut input)?["method"], "initialized");
-    let marker = env::var_os("RED_RPC_REGISTRY_MARKER").context("missing marker path")?;
-    let marker = std::path::PathBuf::from(marker);
+    let marker = env::args()
+        .skip_while(|argument| argument != "--registry-fixture")
+        .nth(1)
+        .map(std::path::PathBuf::from)
+        .context("missing marker path")?;
+    fs::write(
+        marker.with_file_name("environment.json"),
+        serde_json::to_vec(&json!({
+            "allowed": env::var(ALLOWED_ENVIRONMENT).ok(),
+            "denied": env::var(DENIED_ENVIRONMENT).ok(),
+            "path": env::var_os("PATH").is_some(),
+        }))?,
+    )?;
     fs::write(marker.with_file_name("initialized"), [])?;
     let event = read_message(&mut input)?;
     assert_eq!(event["method"], "event/notify");

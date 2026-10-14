@@ -40,6 +40,19 @@ existing file that cannot escape through traversal or symbolic links. Red
 launches it with the package root as its working directory and passes `args`
 directly without a shell.
 
+RPC processes start with a cleared environment. Red then inherits its baseline
+home, `PATH`, user, shell, locale, terminal, temporary-directory, XDG,
+`SSH_AUTH_SOCK`, and Windows process variables. Grant other variables by the
+plugin's configured owner name; package manifests cannot request them:
+
+```toml
+[plugin_permissions.document_tools]
+inherit_env = ["DOCUMENT_TOOLS_TOKEN"]
+```
+
+Values are never written to the log. This filtering limits accidental ambient
+environment exposure; it does not sandbox the native plugin process.
+
 ## Transport profile
 
 The transport is JSON-RPC 2.0 over UTF-8 standard input and output. Each compact

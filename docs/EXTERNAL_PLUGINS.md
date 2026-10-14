@@ -123,6 +123,19 @@ a path separator, such as `bin/document-tools`, must name an existing file
 inside the package. Red sets the process working directory to the package root
 and passes arguments directly without a shell.
 
+RPC processes inherit only Red's baseline home, path, locale, terminal,
+temporary-directory, XDG, SSH-agent, and Windows variables. A user can grant
+additional variables under the configured plugin owner; the package cannot
+grant itself access:
+
+```toml
+[plugin_permissions.document_tools]
+inherit_env = ["DOCUMENT_TOOLS_TOKEN"]
+```
+
+This environment filtering reduces accidental exposure and is not a native
+process sandbox.
+
 An RPC package cannot also declare a Husk entrypoint or `[companion]`.
 Language definitions may accompany any supported executable modality. Existing
 Husk, companion, and language-only manifests retain their current meaning.
