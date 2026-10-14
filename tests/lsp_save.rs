@@ -116,6 +116,7 @@ async fn did_save_contains_the_final_formatted_text() {
             save_after_uri: Some(uri),
             save_as: None,
             save_previous_file: None,
+            source: None,
         })
         .await
         .unwrap();

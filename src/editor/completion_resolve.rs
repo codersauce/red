@@ -65,9 +65,18 @@ impl Editor {
         let Some(file) = self.current_buffer().file.clone() else {
             return Ok(false);
         };
-        let resolves_completion = self
-            .lsp
-            .server_capabilities_for_file(&file)
+        if item
+            .source
+            .as_ref()
+            .is_some_and(|source| !self.lsp.request_source_is_current(source))
+        {
+            return Ok(false);
+        }
+        let capabilities = item.source.as_ref().map_or_else(
+            || self.lsp.server_capabilities_for_file(&file),
+            |source| self.lsp.server_capabilities_for_source(source),
+        );
+        let resolves_completion = capabilities
             .and_then(|capabilities| capabilities.completion_provider.as_ref())
             .and_then(|completion| completion.resolve_provider)
             .unwrap_or(false);
@@ -94,11 +103,26 @@ impl Editor {
         if snapshot.initial_revision != snapshot.revision {
             let position = self.cursor_lsp_position();
             if let Some(uri) = snapshot.uri.as_deref() {
-                match self
-                    .lsp
-                    .request_completion(uri, position.line, position.character, None)
-                    .await
-                {
+                let params = serde_json::json!({
+                    "textDocument": { "uri": uri },
+                    "position": { "line": position.line, "character": position.character },
+                    "context": { "triggerKind": 1 },
+                });
+                let refresh = if let Some(source) = &item.source {
+                    self.lsp
+                        .send_request_for_source(
+                            &source.key,
+                            "textDocument/completion",
+                            params,
+                            false,
+                        )
+                        .await
+                } else {
+                    self.lsp
+                        .request_completion(uri, position.line, position.character, None)
+                        .await
+                };
+                match refresh {
                     Ok(request_id) if request_id > 0 => {
                         self.pending_completion_refreshes.insert(
                             request_id,
@@ -120,16 +144,26 @@ impl Editor {
             }
         }
 
-        let request_id = match self
-            .lsp
-            .send_request_for_file(
-                &file,
-                "completionItem/resolve",
-                serde_json::to_value(item)?,
-                false,
-            )
-            .await
-        {
+        let request = if let Some(source) = &item.source {
+            self.lsp
+                .send_request_for_source(
+                    &source.key,
+                    "completionItem/resolve",
+                    serde_json::to_value(item)?,
+                    false,
+                )
+                .await
+        } else {
+            self.lsp
+                .send_request_for_file(
+                    &file,
+                    "completionItem/resolve",
+                    serde_json::to_value(item)?,
+                    false,
+                )
+                .await
+        };
+        let request_id = match request {
             Ok(request_id) if request_id > 0 => request_id,
             Ok(_) => return Ok(false),
             Err(error) => {
@@ -156,15 +190,17 @@ impl Editor {
         response: &ResponseMessage,
     ) -> Option<Action> {
         let pending = self.pending_completion_resolutions.remove(&response.id)?;
-        let item = match serde_json::from_value::<CompletionResponseItem>(response.result.clone()) {
-            Ok(item) => item,
-            Err(error) => {
-                self.set_legacy_message(Some(format!(
+        let mut item =
+            match serde_json::from_value::<CompletionResponseItem>(response.result.clone()) {
+                Ok(item) => item,
+                Err(error) => {
+                    self.set_legacy_message(Some(format!(
                     "invalid completion resolve response; inserting without deferred edits: {error}"
                 )));
-                pending.item.clone()
-            }
-        };
+                    pending.item.clone()
+                }
+            };
+        item.source.clone_from(&pending.item.source);
         self.apply_resolved_completion_action(pending, item)
     }
 
@@ -212,9 +248,12 @@ impl Editor {
             return None;
         }
 
-        let refreshed = serde_json::from_value::<CompletionResponse>(response.result.clone())
+        let mut refreshed = serde_json::from_value::<CompletionResponse>(response.result.clone())
             .ok()
             .and_then(|response| refreshed_completion_item(&pending.item, response));
+        if let Some(refreshed) = &mut refreshed {
+            refreshed.source.clone_from(&pending.item.source);
+        }
         self.finish_completion_refresh(pending, refreshed)
     }
 
@@ -265,8 +304,8 @@ mod tests {
         config::Config,
         editor::Mode,
         lsp::{
-            CompletionResponse, InboundMessage, LspError, LspManager, Position, Range,
-            ResponseError, TextEdit,
+            CompletionResponse, InboundMessage, LspError, LspManager, LspRequestSource, Position,
+            Range, ResponseError, TextEdit,
         },
         theme::Theme,
     };
@@ -346,6 +385,62 @@ mod tests {
         );
         // Selecting a completion closes its popup before the resolve response arrives.
         editor.completion_snapshot = None;
+    }
+
+    #[test]
+    fn completion_follow_ups_preserve_the_originating_server() {
+        let source = LspRequestSource {
+            key: "typescript:/workspace".to_string(),
+            instance: 7,
+        };
+
+        let mut resolve_editor = editor("mod symbols;\nGal\n");
+        let snapshot =
+            resolve_editor.activate_completion_snapshot(resolve_editor.completion_snapshot());
+        let mut selected = completion();
+        selected.source = Some(source.clone());
+        resolve_editor.pending_completion_resolutions.insert(
+            17,
+            PendingCompletionResolution {
+                item: selected.clone(),
+                commit_character: None,
+                snapshot,
+            },
+        );
+        let resolved = resolve_editor
+            .resolved_completion_action(&ResponseMessage {
+                id: 17,
+                result: serde_json::to_value(&selected).unwrap(),
+                request: None,
+            })
+            .unwrap();
+        assert!(matches!(
+            resolved,
+            Action::ApplyResolvedCompletion { item, .. } if item.source == Some(source.clone())
+        ));
+
+        let mut refresh_editor = editor("mod symbols;\nGal\n");
+        let snapshot =
+            refresh_editor.activate_completion_snapshot(refresh_editor.completion_snapshot());
+        refresh_editor.pending_completion_refreshes.insert(
+            18,
+            PendingCompletionRefresh {
+                item: selected,
+                commit_character: None,
+                snapshot,
+            },
+        );
+        let refreshed = refresh_editor
+            .refreshed_completion_action(&ResponseMessage {
+                id: 18,
+                result: json!([{ "label": "GalacticWidget", "data": { "resolve": "galactic-widget" } }]),
+                request: None,
+            })
+            .unwrap();
+        assert!(matches!(
+            refreshed,
+            Action::ApplyCompletion { item, .. } if item.source == Some(source)
+        ));
     }
 
     #[tokio::test]

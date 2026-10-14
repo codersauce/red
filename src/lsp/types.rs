@@ -19,11 +19,16 @@ use serde_json::Value;
 
 use crate::log;
 
+use super::LspRequestSource;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TextDocumentPublishDiagnostics {
     pub uri: Option<String>,
     pub diagnostics: Vec<Diagnostic>,
+    /// Managed producer identity; never serialized onto the LSP wire.
+    #[serde(skip)]
+    pub source: Option<LspRequestSource>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1754,6 +1759,8 @@ pub struct InlayHintLabelPart {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CompletionResponseItem {
+    #[serde(skip)]
+    pub source: Option<super::LspRequestSource>,
     pub label: String,
     pub label_details: Option<CompletionItemLabelDetails>,
     pub kind: Option<CompletionItemKind>,

@@ -10,10 +10,17 @@ use red::{
     buffer::Buffer,
     config::Config,
     editor::{Action, Editor},
-    lsp::LspClient,
+    lsp::{LspClient, LspRequestSource},
     test_utils::EditorTestExt,
     theme::Theme,
 };
+
+fn request_source(key: &str) -> LspRequestSource {
+    LspRequestSource {
+        key: key.to_string(),
+        instance: 0,
+    }
+}
 
 fn recording_editor(buffers: Vec<Buffer>) -> (Editor, Arc<Mutex<Vec<LspEvent>>>) {
     let lsp = RecordingLsp::default();
@@ -556,11 +563,12 @@ async fn workspace_edit_uri_with_parent_alias_updates_the_existing_dirty_buffer(
                 id: serde_json::json!(7),
                 method: "workspace/applyEdit".to_string(),
                 params: serde_json::json!({}),
-                source: Some("mock".to_string()),
+                source: Some(request_source("mock")),
             })),
             save_after_uri: None,
             save_as: None,
             save_previous_file: None,
+            source: None,
         })
         .await
         .unwrap();
@@ -603,11 +611,12 @@ async fn server_workspace_edit_without_an_originating_root_fails_closed_for_an_o
                 id: serde_json::json!(8),
                 method: "workspace/applyEdit".to_string(),
                 params: serde_json::json!({}),
-                source: Some("missing".to_string()),
+                source: Some(request_source("missing")),
             })),
             save_after_uri: None,
             save_as: None,
             save_previous_file: None,
+            source: None,
         })
         .await
         .unwrap();
@@ -649,7 +658,7 @@ async fn server_workspace_edit_opens_and_syncs_an_unopened_dirty_buffer_before_s
         id: serde_json::json!("edit-1"),
         method: "workspace/applyEdit".to_string(),
         params: serde_json::json!({}),
-        source: Some("mock".to_string()),
+        source: Some(request_source("mock")),
     };
 
     editor
@@ -662,6 +671,7 @@ async fn server_workspace_edit_opens_and_syncs_an_unopened_dirty_buffer_before_s
             save_after_uri: None,
             save_as: None,
             save_previous_file: None,
+            source: None,
         })
         .await
         .unwrap();
@@ -718,11 +728,12 @@ async fn invalid_server_workspace_edit_reports_failure_without_opening_or_mutati
                 id: serde_json::json!(2),
                 method: "workspace/applyEdit".to_string(),
                 params: serde_json::json!({}),
-                source: Some("mock".to_string()),
+                source: Some(request_source("mock")),
             })),
             save_after_uri: None,
             save_as: None,
             save_previous_file: None,
+            source: None,
         })
         .await
         .unwrap();
@@ -775,11 +786,12 @@ async fn resource_only_rename_closes_old_lsp_uri_and_opens_new_uri_without_losin
                 id: serde_json::json!(3),
                 method: "workspace/applyEdit".to_string(),
                 params: serde_json::json!({}),
-                source: Some("mock".to_string()),
+                source: Some(request_source("mock")),
             })),
             save_after_uri: None,
             save_as: None,
             save_previous_file: None,
+            source: None,
         })
         .await
         .unwrap();
@@ -836,11 +848,12 @@ async fn server_workspace_unopened_and_resource_edits_fail_closed_without_mutati
                 id: serde_json::json!(4),
                 method: "workspace/applyEdit".to_string(),
                 params: serde_json::json!({}),
-                source: Some("mock".to_string()),
+                source: Some(request_source("mock")),
             })),
             save_after_uri: None,
             save_as: None,
             save_previous_file: None,
+            source: None,
         })
         .await
         .unwrap();
@@ -877,11 +890,12 @@ async fn server_workspace_unopened_and_resource_edits_fail_closed_without_mutati
                 id: serde_json::json!(5),
                 method: "workspace/applyEdit".to_string(),
                 params: serde_json::json!({}),
-                source: Some("mock".to_string()),
+                source: Some(request_source("mock")),
             })),
             save_after_uri: None,
             save_as: None,
             save_previous_file: None,
+            source: None,
         })
         .await
         .unwrap();

@@ -109,7 +109,10 @@ impl Editor {
             .current_buffer()
             .file
             .as_deref()
-            .and_then(|file| self.lsp.server_capabilities_for_file(file))
+            .and_then(|file| {
+                self.lsp
+                    .server_capabilities_for_method(file, "textDocument/signatureHelp")
+            })
             .and_then(|capabilities| capabilities.signature_help_provider.as_ref())
         else {
             return self.signature_help.clear();
@@ -203,10 +206,11 @@ impl Editor {
             return Ok(false);
         };
         self.ensure_current_buffer_lsp_opened().await?;
-        if self
-            .lsp
-            .server_capabilities_for_file(&file)
-            .is_some_and(|cap| cap.signature_help_provider.is_none())
+        if self.lsp.server_capabilities_for_file(&file).is_some()
+            && self
+                .lsp
+                .server_capabilities_for_method(&file, "textDocument/signatureHelp")
+                .is_none()
         {
             return Ok(self.signature_help.clear());
         }

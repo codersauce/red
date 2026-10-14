@@ -851,6 +851,7 @@ mod tests {
 
     fn item(label: &str, kind: Option<CompletionItemKind>) -> CompletionResponseItem {
         CompletionResponseItem {
+            source: None,
             label: label.to_string(),
             label_details: None,
             kind,

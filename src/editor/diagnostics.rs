@@ -3,9 +3,11 @@
 //! A server can publish compiler diagnostics and return its own native diagnostics
 //! from a pull request. An empty report clears only the channel that produced it.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use crate::lsp::{Diagnostic, Position, Range};
+
+pub(super) const DEFAULT_PRODUCER: &str = "";
 
 #[derive(Clone, Copy)]
 pub(super) enum DiagnosticReportKind {
@@ -22,7 +24,7 @@ struct DocumentReports {
 
 #[derive(Default)]
 pub(super) struct DiagnosticReports {
-    documents: HashMap<String, DocumentReports>,
+    documents: HashMap<String, BTreeMap<String, DocumentReports>>,
     generation: u64,
 }
 
@@ -30,11 +32,25 @@ impl DiagnosticReports {
     pub(super) fn update(
         &mut self,
         uri: &str,
+        producer: &str,
         kind: DiagnosticReportKind,
         diagnostics: &[Diagnostic],
     ) -> Vec<Diagnostic> {
         self.generation = self.generation.wrapping_add(1);
-        let reports = self.documents.entry(uri.to_string()).or_default();
+        let producers = self.documents.entry(uri.to_string()).or_default();
+        // Test clients and legacy single-client implementations do not attach
+        // provenance. Reuse one unambiguous owner without allowing an untagged
+        // report to clear or overwrite any of multiple attached servers.
+        let producer = if producer.is_empty() {
+            let mut existing = producers.keys();
+            match (existing.next(), existing.next()) {
+                (Some(producer), None) => producer.clone(),
+                _ => producer.to_string(),
+            }
+        } else {
+            producer.to_string()
+        };
+        let reports = producers.entry(producer).or_default();
         if reports.provisional {
             reports.push.clear();
             reports.pull.clear();
@@ -44,13 +60,14 @@ impl DiagnosticReports {
             DiagnosticReportKind::Push => reports.push = diagnostics.to_vec(),
             DiagnosticReportKind::Pull => reports.pull = diagnostics.to_vec(),
         }
-        merged_reports(reports)
+        merged_document_reports(producers)
     }
 
     /// Restores both channels optimistically until the restarted server responds.
     pub(super) fn restore(
         &mut self,
         uri: String,
+        producer: String,
         push: Vec<Diagnostic>,
         pull: Vec<Diagnostic>,
     ) -> Vec<Diagnostic> {
@@ -60,31 +77,36 @@ impl DiagnosticReports {
             pull,
             provisional: true,
         };
-        let merged = merged_reports(&reports);
-        self.documents.insert(uri, reports);
-        merged
+        let producers = self.documents.entry(uri).or_default();
+        producers.insert(producer, reports);
+        merged_document_reports(producers)
     }
 
     pub(super) fn entries(
         &self,
-    ) -> impl Iterator<Item = (&str, &[Diagnostic], &[Diagnostic])> + '_ {
-        self.documents.iter().map(|(uri, reports)| {
-            (
-                uri.as_str(),
-                reports.push.as_slice(),
-                reports.pull.as_slice(),
-            )
+    ) -> impl Iterator<Item = (&str, &str, &[Diagnostic], &[Diagnostic])> + '_ {
+        self.documents.iter().flat_map(|(uri, producers)| {
+            producers.iter().map(|(producer, reports)| {
+                (
+                    uri.as_str(),
+                    producer.as_str(),
+                    reports.push.as_slice(),
+                    reports.pull.as_slice(),
+                )
+            })
         })
     }
 
     pub(super) fn has_provisional(&self) -> bool {
-        self.documents.values().any(|reports| reports.provisional)
+        self.documents
+            .values()
+            .any(|producers| producers.values().any(|reports| reports.provisional))
     }
 
     pub(super) fn is_provisional(&self, uri: &str) -> bool {
         self.documents
             .get(uri)
-            .is_some_and(|reports| reports.provisional)
+            .is_some_and(|producers| producers.values().any(|reports| reports.provisional))
     }
 
     pub(super) fn generation(&self) -> u64 {
@@ -101,18 +123,83 @@ impl DiagnosticReports {
         edit: &Range,
         replacement: &str,
     ) -> Option<Vec<Diagnostic>> {
-        let reports = self.documents.get_mut(uri)?;
+        let producers = self.documents.get_mut(uri)?;
         self.generation = self.generation.wrapping_add(1);
-        for diagnostics in [&mut reports.push, &mut reports.pull] {
-            diagnostics.retain_mut(|diagnostic| {
-                let Some(range) = rebase_range(&diagnostic.range, edit, replacement) else {
-                    return false;
-                };
-                diagnostic.range = range;
-                true
-            });
+        for reports in producers.values_mut() {
+            for diagnostics in [&mut reports.push, &mut reports.pull] {
+                diagnostics.retain_mut(|diagnostic| {
+                    let Some(range) = rebase_range(&diagnostic.range, edit, replacement) else {
+                        return false;
+                    };
+                    diagnostic.range = range;
+                    true
+                });
+            }
         }
-        Some(merged_reports(reports))
+        Some(merged_document_reports(producers))
+    }
+
+    pub(super) fn for_producer(&self, uri: &str, producer: &str) -> Vec<Diagnostic> {
+        self.documents
+            .get(uri)
+            .and_then(|producers| producers.get(producer))
+            .map(merged_reports)
+            .unwrap_or_default()
+    }
+
+    pub(super) fn producers(&self, uri: &str) -> Vec<&str> {
+        self.documents
+            .get(uri)
+            .map(|producers| producers.keys().map(String::as_str).collect())
+            .unwrap_or_default()
+    }
+
+    pub(super) fn remove_producer(&mut self, uri: &str, producer: &str) -> Vec<Diagnostic> {
+        self.generation = self.generation.wrapping_add(1);
+        let Some(producers) = self.documents.get_mut(uri) else {
+            return Vec::new();
+        };
+        producers.remove(producer);
+        let merged = merged_document_reports(producers);
+        if producers.is_empty() {
+            self.documents.remove(uri);
+        }
+        merged
+    }
+
+    pub(super) fn remove_producer_everywhere(
+        &mut self,
+        producer: &str,
+    ) -> Vec<(String, Vec<Diagnostic>)> {
+        let uris = self
+            .documents
+            .iter()
+            .filter(|(_, producers)| producers.contains_key(producer))
+            .map(|(uri, _)| uri.clone())
+            .collect::<Vec<_>>();
+        uris.into_iter()
+            .map(|uri| {
+                let merged = self.remove_producer(&uri, producer);
+                (uri, merged)
+            })
+            .collect()
+    }
+
+    pub(super) fn retain_producers(
+        &mut self,
+        uri: &str,
+        producers: &std::collections::HashSet<String>,
+    ) -> Vec<Diagnostic> {
+        self.generation = self.generation.wrapping_add(1);
+        let Some(reports) = self.documents.get_mut(uri) else {
+            return Vec::new();
+        };
+        reports.retain(|producer, _| producer == DEFAULT_PRODUCER || producers.contains(producer));
+        let merged = merged_document_reports(reports);
+        if reports.is_empty() {
+            self.documents.remove(uri);
+        }
+        merged
     }
 
     pub(super) fn remove(&mut self, uri: &str) {
@@ -135,6 +222,16 @@ fn merged_reports(reports: &DocumentReports) -> Vec<Diagnostic> {
     for diagnostic in &reports.pull {
         if !merged.contains(diagnostic) {
             merged.push(diagnostic.clone());
+        }
+    }
+    merged
+}
+
+fn merged_document_reports(producers: &BTreeMap<String, DocumentReports>) -> Vec<Diagnostic> {
+    let mut merged = Vec::new();
+    for diagnostic in producers.values().flat_map(merged_reports) {
+        if !merged.contains(&diagnostic) {
+            merged.push(diagnostic);
         }
     }
     merged
@@ -267,6 +364,7 @@ mod tests {
                 TextDocumentPublishDiagnostics {
                     uri: Some(uri.to_string()),
                     diagnostics: items,
+                    source: None,
                 },
             )),
             None,
@@ -336,6 +434,75 @@ mod tests {
         assert_eq!(editor.diagnostics[&uri], vec![compiler, native]);
         pull(&mut editor, &uri, json!({ "kind": "full", "items": [] }));
         assert!(editor.diagnostics[&uri].is_empty());
+    }
+
+    #[test]
+    fn producers_replace_and_clear_only_their_own_diagnostics() {
+        let uri = "file:///workspace/index.ts";
+        let typescript = diagnostic("declared but never read");
+        let eslint = diagnostic("assigned a value but never used");
+        let mut reports = DiagnosticReports::default();
+
+        reports.update(
+            uri,
+            "typescript:/workspace",
+            DiagnosticReportKind::Push,
+            std::slice::from_ref(&typescript),
+        );
+        let merged = reports.update(
+            uri,
+            "eslint:/workspace",
+            DiagnosticReportKind::Push,
+            std::slice::from_ref(&eslint),
+        );
+        assert_eq!(merged, vec![eslint.clone(), typescript.clone()]);
+        assert_eq!(reports.for_producer(uri, "eslint:/workspace"), vec![eslint]);
+
+        let merged = reports.update(uri, "eslint:/workspace", DiagnosticReportKind::Push, &[]);
+        assert_eq!(merged, vec![typescript.clone()]);
+        assert_eq!(
+            reports.remove_producer(uri, "typescript:/workspace"),
+            Vec::<Diagnostic>::new()
+        );
+    }
+
+    #[test]
+    fn failed_producer_is_removed_from_every_document_without_clearing_peers() {
+        let mut reports = DiagnosticReports::default();
+        let first = "file:///workspace/first.ts";
+        let second = "file:///workspace/second.ts";
+        let eslint = diagnostic("eslint");
+        let typescript = diagnostic("typescript");
+        for uri in [first, second] {
+            reports.update(
+                uri,
+                "eslint:/workspace",
+                DiagnosticReportKind::Push,
+                std::slice::from_ref(&eslint),
+            );
+            reports.update(
+                uri,
+                "typescript:/workspace",
+                DiagnosticReportKind::Push,
+                std::slice::from_ref(&typescript),
+            );
+        }
+
+        let removed = reports.remove_producer_everywhere("eslint:/workspace");
+
+        assert_eq!(removed.len(), 2);
+        assert_eq!(
+            reports.for_producer(first, "eslint:/workspace"),
+            Vec::<Diagnostic>::new()
+        );
+        assert_eq!(
+            reports.for_producer(first, "typescript:/workspace"),
+            vec![typescript.clone()]
+        );
+        assert_eq!(
+            reports.for_producer(second, "typescript:/workspace"),
+            vec![typescript]
+        );
     }
 
     #[test]
@@ -614,20 +781,21 @@ mod tests {
         let compiler = diagnostic("compiler");
         reports.update(
             "old",
+            DEFAULT_PRODUCER,
             DiagnosticReportKind::Push,
             std::slice::from_ref(&compiler),
         );
         reports.rename("old", Some("new"));
         assert!(reports
-            .update("old", DiagnosticReportKind::Pull, &[])
+            .update("old", DEFAULT_PRODUCER, DiagnosticReportKind::Pull, &[])
             .is_empty());
         assert_eq!(
-            reports.update("new", DiagnosticReportKind::Pull, &[]),
+            reports.update("new", DEFAULT_PRODUCER, DiagnosticReportKind::Pull, &[]),
             vec![compiler]
         );
         reports.remove("new");
         assert!(reports
-            .update("new", DiagnosticReportKind::Pull, &[])
+            .update("new", DEFAULT_PRODUCER, DiagnosticReportKind::Pull, &[])
             .is_empty());
     }
 
@@ -637,8 +805,8 @@ mod tests {
         let uri = "file:///workspace/main.rs";
         let pushed = diagnostic_on_line("compiler", 1, 2, 5);
         let pulled = diagnostic_on_line("native", 2, 1, 4);
-        reports.update(uri, DiagnosticReportKind::Push, &[pushed]);
-        reports.update(uri, DiagnosticReportKind::Pull, &[pulled]);
+        reports.update(uri, DEFAULT_PRODUCER, DiagnosticReportKind::Push, &[pushed]);
+        reports.update(uri, DEFAULT_PRODUCER, DiagnosticReportKind::Pull, &[pulled]);
 
         let moved = reports
             .rebase(
@@ -679,7 +847,7 @@ mod tests {
         assert_eq!(moved[0].range.end.character, 7);
         assert_eq!(moved[1].range.start.line, 3);
 
-        let retained = reports.update(uri, DiagnosticReportKind::Pull, &[]);
+        let retained = reports.update(uri, DEFAULT_PRODUCER, DiagnosticReportKind::Pull, &[]);
         assert_eq!(retained.len(), 1);
         assert_eq!(retained[0].range.start.line, 2);
         assert_eq!(retained[0].range.start.character, 4);
@@ -710,11 +878,13 @@ mod tests {
         let uri = "file:///workspace/main.rs";
         reports.update(
             uri,
+            DEFAULT_PRODUCER,
             DiagnosticReportKind::Push,
             &[diagnostic_on_line("edited", 0, 2, 6)],
         );
         reports.update(
             uri,
+            DEFAULT_PRODUCER,
             DiagnosticReportKind::Pull,
             &[diagnostic_on_line("untouched", 1, 0, 3)],
         );
@@ -740,7 +910,7 @@ mod tests {
         assert_eq!(remaining[0].message, "untouched");
         assert_eq!(remaining[0].range.start.line, 2);
         assert!(reports
-            .update(uri, DiagnosticReportKind::Pull, &[])
+            .update(uri, DEFAULT_PRODUCER, DiagnosticReportKind::Pull, &[])
             .is_empty());
     }
 

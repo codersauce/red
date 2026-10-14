@@ -396,7 +396,12 @@ async fn lazy_initialization_keeps_input_responsive() -> Result<()> {
     h.command("RpcWait").await?;
     h.until(|h| h.marker("started", 1).exists()).await?;
     h.release(1)?;
-    h.until(|h| h.screen().contains("RpcWait done")).await?;
+    h.until(|h| !h.core.test_rpc_command_pending("slow"))
+        .await?;
+    // The earlier warning can mask success until both transient notices expire.
+    // Check retained feedback after settlement instead of transient priority.
+    h.command("messages").await?;
+    assert!(h.screen().contains("RpcWait done"), "{}", h.screen());
     Ok(())
 }
 

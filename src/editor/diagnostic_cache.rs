@@ -21,7 +21,7 @@ use sha2::{Digest as _, Sha256};
 use crate::{
     buffer::Buffer,
     config::{LanguageServerConfig, LspConfig},
-    lsp::{file_path, Diagnostic, LspManager},
+    lsp::{file_path, manager::client_key, Diagnostic, LspManager},
 };
 
 use super::diagnostics::DiagnosticReports;
@@ -82,12 +82,14 @@ struct OpenDocument {
 #[derive(Clone)]
 struct ReportSnapshot {
     uri: String,
+    producer: String,
     push: Vec<Diagnostic>,
     pull: Vec<Diagnostic>,
 }
 
 pub(super) struct RestoredDiagnosticReports {
     pub(super) uri: String,
+    pub(super) producer: String,
     pub(super) push: Vec<Diagnostic>,
     pub(super) pull: Vec<Diagnostic>,
 }
@@ -133,73 +135,71 @@ impl DiagnosticCache {
         let mut restored = Vec::new();
 
         for document in &open_documents {
-            let Some(route) = routing.resolve_document(&document.file) else {
-                continue;
-            };
-            let workspace_root = canonical_workspace_root(&route.workspace_root);
-            if !self.loaded_workspaces.insert(workspace_root.clone()) {
-                continue;
-            }
-
-            let cache_path = workspace_cache_path(&self.directory, &workspace_root);
-            let workspace = match read_workspace(&cache_path) {
-                Ok(Some(workspace)) => workspace,
-                Ok(None) => continue,
-                Err(error) => {
-                    crate::log!(
-                        "ignoring unreadable diagnostic cache {}: {error}",
-                        cache_path.display()
-                    );
+            for route in routing.resolve_documents(&document.file) {
+                let workspace_root = canonical_workspace_root(&route.workspace_root);
+                if !self.loaded_workspaces.insert(workspace_root.clone()) {
                     continue;
                 }
-            };
-            if workspace.version != CACHE_SCHEMA_VERSION
-                || workspace.workspace_root != workspace_root
-                || cache_expired(workspace.captured_at_ms)
-            {
-                continue;
-            }
-            let Ok(fingerprint) = workspace_fingerprint(&workspace_root, config) else {
-                continue;
-            };
-            if workspace.workspace_sha256 != fingerprint {
-                continue;
-            }
 
-            for cached in workspace.documents {
-                if cached.push.is_empty() && cached.pull.is_empty() {
-                    continue;
-                }
-                let Ok(path) = file_path(&cached.uri) else {
-                    continue;
+                let cache_path = workspace_cache_path(&self.directory, &workspace_root);
+                let workspace = match read_workspace(&cache_path) {
+                    Ok(Some(workspace)) => workspace,
+                    Ok(None) => continue,
+                    Err(error) => {
+                        crate::log!(
+                            "ignoring unreadable diagnostic cache {}: {error}",
+                            cache_path.display()
+                        );
+                        continue;
+                    }
                 };
-                let Some(route) = routing.resolve_document(&path) else {
-                    continue;
-                };
-                if route.uri != cached.uri
-                    || route.server_name != cached.server_name
-                    || canonical_workspace_root(&route.workspace_root) != workspace_root
+                if workspace.version != CACHE_SCHEMA_VERSION
+                    || workspace.workspace_root != workspace_root
+                    || cache_expired(workspace.captured_at_ms)
                 {
                     continue;
                 }
-                let Some(server) = config.servers.get(&route.server_name) else {
+                let Ok(fingerprint) = workspace_fingerprint(&workspace_root, config) else {
                     continue;
                 };
-                if server_fingerprint(server).ok() != Some(cached.server_config_sha256) {
+                if workspace.workspace_sha256 != fingerprint {
                     continue;
                 }
-                let current_hash = open_by_uri
-                    .get(cached.uri.as_str())
-                    .map(|contents| hash_rope(contents))
-                    .or_else(|| hash_file(Path::new(&path)).ok());
-                if current_hash != Some(cached.content_sha256) {
-                    continue;
+
+                for cached in workspace.documents {
+                    if cached.push.is_empty() && cached.pull.is_empty() {
+                        continue;
+                    }
+                    let Ok(path) = file_path(&cached.uri) else {
+                        continue;
+                    };
+                    let Some(route) = routing.resolve_documents(&path).into_iter().find(|route| {
+                        route.uri == cached.uri
+                            && route.server_name == cached.server_name
+                            && canonical_workspace_root(&route.workspace_root) == workspace_root
+                    }) else {
+                        continue;
+                    };
+                    let Some(server) = config.servers.get(&route.server_name) else {
+                        continue;
+                    };
+                    if server_fingerprint(server).ok() != Some(cached.server_config_sha256) {
+                        continue;
+                    }
+                    let current_hash = open_by_uri
+                        .get(cached.uri.as_str())
+                        .map(|contents| hash_rope(contents))
+                        .or_else(|| hash_file(Path::new(&path)).ok());
+                    if current_hash != Some(cached.content_sha256) {
+                        continue;
+                    }
+                    restored.push(RestoredDiagnosticReports {
+                        uri: cached.uri,
+                        producer: client_key(&route),
+                        push: cached.push,
+                        pull: cached.pull,
+                    });
                 }
-                restored.push(RestoredDiagnosticReports {
-                    uri: cached.uri,
-                    push: cached.push,
-                    pull: cached.pull,
-                });
             }
         }
 
@@ -230,8 +230,9 @@ impl DiagnosticCache {
         let documents = open_documents(buffers);
         let reports = reports
             .entries()
-            .map(|(uri, push, pull)| ReportSnapshot {
+            .map(|(uri, producer, push, pull)| ReportSnapshot {
                 uri: uri.to_string(),
+                producer: producer.to_string(),
                 push: push.to_vec(),
                 pull: pull.to_vec(),
             })
@@ -307,24 +308,23 @@ fn persist_workspaces(
     let mut workspaces = HashMap::<PathBuf, CachedWorkspace>::new();
 
     for document in open_documents {
-        let Some(route) = routing.resolve_document(&document.file) else {
-            continue;
-        };
-        let workspace_root = canonical_workspace_root(&route.workspace_root);
-        if workspaces.contains_key(&workspace_root) {
-            continue;
+        for route in routing.resolve_documents(&document.file) {
+            let workspace_root = canonical_workspace_root(&route.workspace_root);
+            if workspaces.contains_key(&workspace_root) {
+                continue;
+            }
+            let workspace_sha256 = workspace_fingerprint(&workspace_root, config)?;
+            workspaces.insert(
+                workspace_root.clone(),
+                CachedWorkspace {
+                    version: CACHE_SCHEMA_VERSION,
+                    workspace_root,
+                    workspace_sha256,
+                    captured_at_ms: current_time_ms(),
+                    documents: Vec::new(),
+                },
+            );
         }
-        let workspace_sha256 = workspace_fingerprint(&workspace_root, config)?;
-        workspaces.insert(
-            workspace_root.clone(),
-            CachedWorkspace {
-                version: CACHE_SCHEMA_VERSION,
-                workspace_root,
-                workspace_sha256,
-                captured_at_ms: current_time_ms(),
-                documents: Vec::new(),
-            },
-        );
     }
 
     for report in reports {
@@ -334,7 +334,11 @@ fn persist_workspaces(
         let Ok(path) = file_path(&report.uri) else {
             continue;
         };
-        let Some(route) = routing.resolve_document(&path) else {
+        let routes = routing.resolve_documents(&path);
+        let Some(route) = routes
+            .into_iter()
+            .find(|route| report.producer.is_empty() || client_key(route) == report.producer)
+        else {
             continue;
         };
         if route.uri != report.uri {
@@ -365,9 +369,9 @@ fn persist_workspaces(
     }
 
     for workspace in workspaces.values_mut() {
-        workspace
-            .documents
-            .sort_unstable_by(|left, right| left.uri.cmp(&right.uri));
+        workspace.documents.sort_unstable_by(|left, right| {
+            (&left.uri, &left.server_name).cmp(&(&right.uri, &right.server_name))
+        });
         write_workspace(directory, workspace)?;
     }
     Ok(())
