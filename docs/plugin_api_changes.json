@@ -4,7 +4,7 @@
     {
       "version": "0.19.0",
       "kind": "introduced",
-      "symbols": ["red-plugin.toml [rpc]", "Red JSON-RPC protocol v1", "RPC release artifacts", "red/DocumentSnapshot.include_document_id", "RPC document_id selectors", "red/PickerOpen", "picker/event", "red/DocumentCreate", "red/DocumentShow", "red/DocumentWatch", "red/DocumentUnwatch", "document/event", "red/DocumentSnapshot.include_selection", "RPC selection context", "red/DocumentApply.allow_inactive", "red/DocumentUndo.allow_inactive", "red/TextPanelCreate.actions", "TextPanelBlock.format=code", "TextPanelHeaderAction.key", "SetTextPanelActions", "red/TextPanelSetActions", "panel/event", "red/ClipboardWrite"],
+      "symbols": ["red-plugin.toml [rpc]", "Red JSON-RPC protocol v1", "RPC release artifacts", "red/DocumentSnapshot.include_document_id", "RPC document_id selectors", "red/PickerOpen", "picker/event", "red/DocumentCreate", "red/DocumentShow", "red/DocumentWatch", "red/DocumentUnwatch", "document/event", "red/DocumentSnapshot.include_selection", "RPC selection context", "red/DocumentApply.allow_inactive", "red/DocumentUndo.allow_inactive", "red/TextPanelCreate.actions", "TextPanelBlock.format=code", "TextPanelHeaderAction.key", "SetTextPanelActions", "red/TextPanelSetActions", "panel/event", "red/ClipboardWrite", "red/MessageShow"],
       "migration_note": "docs/RPC_PLUGIN_PROTOCOL.md"
     },
     {

@@ -97,7 +97,8 @@ these panel actions.
 Panel and live-preview runs use background work so Cancel and Close remain
 responsive. `JsonRun` and `JsonQuery` keep their synchronous command responses;
 use `JsonCancel` to interrupt a command-triggered query. Copy writes the complete
-result to the system clipboard without giving the plugin read access.
+result to the system clipboard without giving the plugin read access, then shows
+a transient success message while leaving the durable ready status intact.
 `JsonCopy` provides the same explicit copy operation from the command line.
 
 `JsonExplore` and the Explore header action open a native picker over the

@@ -134,6 +134,7 @@ The version 1 initialization parameters are:
     "red/TextPanelFocus",
     "red/TextPanelDispose",
     "red/ClipboardWrite",
+    "red/MessageShow",
     "red/StatuslineSet",
     "red/StatuslineClear",
     "red/PickerOpen"
@@ -570,13 +571,30 @@ parameters return `-32602`; a disabled or unavailable system clipboard returns
 `-32004`; and an operating-system write failure returns `-32003`. These errors
 leave the plugin active.
 
+## Messages
+
+Use `red/MessageShow` for brief feedback from an explicit user action, such as
+confirming that a result was copied:
+
+```json
+{"jsonrpc":"2.0","id":"plugin-7","method":"red/MessageShow","params":{"message":"JSON result copied","severity":"success"}}
+```
+
+`message` must contain a non-whitespace character, may not contain control
+characters, and is limited to 1024 UTF-8 bytes. `severity` is optional, defaults
+to `info`, and also accepts `success`, `warning`, or `error`. The method returns
+`null` after publishing through Red's existing foreground notification path.
+Presentation duration and acknowledgment follow Red's severity policy, and the
+message remains available in notification history after its transient display
+expires. Use statusline contributions for durable state instead.
+
 ## Statusline contributions
 
 An active plugin can replace its single cached statusline contribution with
 `red/StatuslineSet`:
 
 ```json
-{"jsonrpc":"2.0","id":"plugin-7","method":"red/StatuslineSet","params":{"text":"Build ready","side":"right"}}
+{"jsonrpc":"2.0","id":"plugin-8","method":"red/StatuslineSet","params":{"text":"Build ready","side":"right"}}
 ```
 
 `side` is optional, defaults to `right`, and also accepts `left`. `text` must
@@ -600,7 +618,7 @@ Host API `0.19.0` adds a host-rendered, locally filtered picker. Opening it is a
 bounded host request; `command/execute` does not wait for user selection:
 
 ```json
-{"jsonrpc":"2.0","id":"plugin-8","method":"red/PickerOpen","params":{"id":"targets","title":"Choose a target","items":[{"id":"debug","label":"Debug"},{"id":"release","label":"Release","detail":"optimized","data":{"profile":"release"}}]}}
+{"jsonrpc":"2.0","id":"plugin-9","method":"red/PickerOpen","params":{"id":"targets","title":"Choose a target","items":[{"id":"debug","label":"Debug"},{"id":"release","label":"Release","detail":"optimized","data":{"profile":"release"}}]}}
 ```
 
 `id` identifies the picker within the calling connection and must contain 1 to

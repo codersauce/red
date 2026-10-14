@@ -189,6 +189,12 @@ class PluginProcess:
             raise AssertionError(request)
         self.reply(request)
 
+    def expect_message(self, message, severity="info"):
+        request = self.expect_host_request("red/MessageShow")
+        if request["params"] != {"message": message, "severity": severity}:
+            raise AssertionError(request)
+        self.reply(request)
+
     def load_runtime(self, config=None, preferences=None, history=None):
         request = self.expect_host_request("red/ConfigGet")
         self.reply(request, config)
@@ -440,7 +446,7 @@ class JsonWorkbenchTest(unittest.TestCase):
             copied = plugin.expect_host_request("red/ClipboardWrite")
             self.assertEqual(copied["params"], {"text": "1\n2\n"})
             plugin.reply(copied)
-            plugin.expect_status("JSON: copied")
+            plugin.expect_message("JSON result copied", "success")
             self.assertEqual(
                 plugin.receive()["result"], {"message": "JSON result copied"}
             )
@@ -505,7 +511,7 @@ class JsonWorkbenchTest(unittest.TestCase):
             copied = plugin.expect_host_request("red/ClipboardWrite")
             self.assertEqual(copied["params"], {"text": "1\n2\n"})
             plugin.reply(copied)
-            plugin.expect_status("JSON: copied")
+            plugin.expect_message("JSON result copied", "success")
 
             plugin.send_notification(
                 "panel/event", {"id": "json-workbench", "action": "close"}
@@ -629,7 +635,7 @@ class JsonWorkbenchTest(unittest.TestCase):
             copied = plugin.expect_host_request("red/ClipboardWrite")
             self.assertEqual(copied["params"], {"text": '{"ok":true}\n'})
             plugin.reply(copied)
-            plugin.expect_status("JSON: copied")
+            plugin.expect_message("JSON result copied", "success")
             self.assertEqual(
                 plugin.receive()["result"], {"message": "JSON result copied"}
             )

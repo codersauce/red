@@ -4696,6 +4696,35 @@ struct RpcClipboardWriteParams {
     text: String,
 }
 
+#[derive(Clone, Copy, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum RpcMessageSeverity {
+    #[default]
+    Info,
+    Success,
+    Warning,
+    Error,
+}
+
+impl From<RpcMessageSeverity> for Severity {
+    fn from(severity: RpcMessageSeverity) -> Self {
+        match severity {
+            RpcMessageSeverity::Info => Self::Info,
+            RpcMessageSeverity::Success => Self::Success,
+            RpcMessageSeverity::Warning => Self::Warning,
+            RpcMessageSeverity::Error => Self::Error,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RpcMessageShowParams {
+    message: String,
+    #[serde(default)]
+    severity: RpcMessageSeverity,
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RpcStatuslineSetParams {
@@ -26437,26 +26466,61 @@ impl Editor {
 
         let params: RpcStatuslineSetParams =
             Self::rpc_params(plugin::rpc::STATUSLINE_SET_METHOD, params)?;
-        if params.text.trim().is_empty() {
-            return Err(Self::rpc_error(
-                -32602,
-                "red/StatuslineSet text must contain a non-whitespace character",
-            ));
-        }
-        if params.text.len() > MAX_TEXT_BYTES {
-            return Err(Self::rpc_error(
-                -32602,
-                format!("red/StatuslineSet text may not exceed {MAX_TEXT_BYTES} UTF-8 bytes"),
-            ));
-        }
-        if params.text.chars().any(char::is_control) {
-            return Err(Self::rpc_error(
-                -32602,
-                "red/StatuslineSet text may not contain control characters",
-            ));
-        }
+        Self::validate_rpc_single_line_text(
+            plugin::rpc::STATUSLINE_SET_METHOD,
+            "text",
+            &params.text,
+            MAX_TEXT_BYTES,
+        )?;
         self.plugin_registry
             .set_rpc_statusline(owner, params.side, params.text);
+        Ok(Value::Null)
+    }
+
+    fn validate_rpc_single_line_text(
+        method: &str,
+        field: &str,
+        value: &str,
+        max_bytes: usize,
+    ) -> std::result::Result<(), plugin::rpc::RpcErrorObject> {
+        if value.trim().is_empty() {
+            return Err(Self::rpc_error(
+                -32602,
+                format!("{method} {field} must contain a non-whitespace character"),
+            ));
+        }
+        if value.len() > max_bytes {
+            return Err(Self::rpc_error(
+                -32602,
+                format!("{method} {field} may not exceed {max_bytes} UTF-8 bytes"),
+            ));
+        }
+        if value.chars().any(char::is_control) {
+            return Err(Self::rpc_error(
+                -32602,
+                format!("{method} {field} may not contain control characters"),
+            ));
+        }
+        Ok(())
+    }
+
+    fn rpc_message_show_request(
+        &mut self,
+        render_buffer: &mut RenderBuffer,
+        params: &Value,
+    ) -> std::result::Result<Value, plugin::rpc::RpcErrorObject> {
+        const MAX_MESSAGE_BYTES: usize = 1024;
+
+        let params: RpcMessageShowParams =
+            Self::rpc_params(plugin::rpc::MESSAGE_SHOW_METHOD, params)?;
+        Self::validate_rpc_single_line_text(
+            plugin::rpc::MESSAGE_SHOW_METHOD,
+            "message",
+            &params.message,
+            MAX_MESSAGE_BYTES,
+        )?;
+        self.set_foreground_message(params.severity.into(), Some(params.message));
+        self.draw_commandline(render_buffer);
         Ok(Value::Null)
     }
 
@@ -27037,6 +27101,9 @@ impl Editor {
             plugin::rpc::STATUSLINE_SET_METHOD => self.rpc_statusline_set_request(owner, params),
             plugin::rpc::STATUSLINE_CLEAR_METHOD => {
                 self.rpc_statusline_clear_request(owner, params)
+            }
+            plugin::rpc::MESSAGE_SHOW_METHOD => {
+                self.rpc_message_show_request(render_buffer, params)
             }
             plugin::rpc::CLIPBOARD_WRITE_METHOD => self.rpc_clipboard_write_request(params),
             _ => self.rpc_presentation_request(render_buffer, runtime, owner, method, params),
@@ -39225,6 +39292,52 @@ builtin = "rust"
             .unwrap_err();
         assert_eq!(oversized.code, -32602);
         assert_eq!(copied.lock().unwrap().as_deref(), Some(text));
+    }
+
+    #[tokio::test]
+    async fn rpc_message_show_is_visible_bounded_and_severity_typed() {
+        let mut editor = test_editor(/*width*/ 80, /*height*/ 24);
+        let mut render_buffer = RenderBuffer::new(80, 24, &Style::default());
+        let mut runtime = Runtime::new();
+        macro_rules! request {
+            ($params:expr $(,)?) => {
+                editor.rpc_host_request(
+                    &mut render_buffer,
+                    &mut runtime,
+                    "rpc-test",
+                    plugin::rpc::MESSAGE_SHOW_METHOD,
+                    &$params,
+                )
+            };
+        }
+
+        assert_eq!(
+            request!(json!({
+                "message": "JSON result copied",
+                "severity": "success"
+            }))
+            .await
+            .unwrap(),
+            Value::Null
+        );
+        assert!(render_text_rows(&render_buffer)
+            .last()
+            .unwrap()
+            .contains("JSON result copied"));
+        let message = editor.notifications().records().next_back().unwrap();
+        assert_eq!(message.content.summary, "JSON result copied");
+        assert_eq!(message.severity, Severity::Success);
+
+        for params in [
+            json!({"message": " "}),
+            json!({"message": "bad\nmessage"}),
+            json!({"message": "x".repeat(1025)}),
+            json!({"message": "value", "severity": "fatal"}),
+            json!({"message": "value", "unknown": true}),
+        ] {
+            assert_eq!(request!(params).await.unwrap_err().code, -32602);
+        }
+        assert_eq!(editor.notifications().records().count(), 1);
     }
 
     #[tokio::test]

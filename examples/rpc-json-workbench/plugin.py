@@ -1191,7 +1191,10 @@ class JsonWorkbench:
         if self.result is None:
             raise OperationError("JsonRun has no result to copy")
         self.request_host("red/ClipboardWrite", {"text": self.result})
-        self.best_effort_status("JSON: copied")
+        self.request_host(
+            "red/MessageShow",
+            {"message": "JSON result copied", "severity": "success"},
+        )
         return {"message": "JSON result copied"}
 
     def clear_explorer(self):

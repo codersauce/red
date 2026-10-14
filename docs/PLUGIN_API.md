@@ -36,7 +36,7 @@ Host API `0.19.0` introduces the complete version 1 `[rpc]` contract for
 standalone plugins written in any language. Its bounded, owner-scoped surfaces
 cover commands, snapshots and transactions, editable documents, watches,
 pickers, configuration, storage, statusline contributions, clipboard writes,
-and text panels. Text panels support code highlighting, keyboard and F1 action
+foreground messages, and text panels. Text panels support code highlighting, keyboard and F1 action
 discovery, and action updates that preserve panel content and UI state. Red
 validates package metadata and initialization before dispatch, starts a process
 on first invocation, and cleans up connection-owned resources on exit. See the
