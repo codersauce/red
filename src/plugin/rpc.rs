@@ -77,6 +77,16 @@ impl RpcErrorObject {
             data: None,
         }
     }
+
+    pub(crate) fn response_too_large(method: &str) -> Self {
+        Self {
+            code: -32006,
+            message: format!(
+                "{method} response exceeds the {MAX_FRAME_BYTES}-byte RPC frame limit"
+            ),
+            data: None,
+        }
+    }
 }
 
 impl fmt::Display for RpcErrorObject {
@@ -100,11 +110,24 @@ pub struct RpcHostRequest {
 impl RpcHostRequest {
     /// Sends exactly one result or error for this request.
     pub async fn respond(self, result: std::result::Result<Value, RpcErrorObject>) -> Result<()> {
-        let response = match result {
-            Ok(result) => json!({"jsonrpc": "2.0", "id": self.id, "result": result}),
-            Err(error) => json!({"jsonrpc": "2.0", "id": self.id, "error": error}),
-        };
-        self.writer.enqueue(response)
+        match result {
+            Ok(result) => {
+                let id = self.id;
+                let response = RpcWriter::serialize(
+                    json!({"jsonrpc": "2.0", "id": id.clone(), "result": result}),
+                )?;
+                if response.len() > MAX_FRAME_BYTES {
+                    let error = RpcErrorObject::response_too_large(&self.method);
+                    self.writer
+                        .enqueue(json!({"jsonrpc": "2.0", "id": id, "error": error}))
+                } else {
+                    self.writer.enqueue_bytes(response)
+                }
+            }
+            Err(error) => self
+                .writer
+                .enqueue(json!({"jsonrpc": "2.0", "id": self.id, "error": error})),
+        }
     }
 }
 
@@ -320,9 +343,14 @@ struct RpcWriter {
 }
 
 impl RpcWriter {
-    fn encode(value: Value) -> Result<Vec<u8>> {
+    fn serialize(value: Value) -> Result<Vec<u8>> {
         let mut bytes = serde_json::to_vec(&value)?;
         bytes.push(b'\n');
+        Ok(bytes)
+    }
+
+    fn encode(value: Value) -> Result<Vec<u8>> {
+        let bytes = Self::serialize(value)?;
         anyhow::ensure!(
             bytes.len() <= MAX_FRAME_BYTES,
             "RPC frame exceeds {MAX_FRAME_BYTES} bytes"
@@ -331,8 +359,14 @@ impl RpcWriter {
     }
 
     fn enqueue(&self, value: Value) -> Result<()> {
+        let bytes = Self::encode(value).inspect_err(|error| {
+            self.state.signal_failure(error.to_string());
+        })?;
+        self.enqueue_bytes(bytes)
+    }
+
+    fn enqueue_bytes(&self, bytes: Vec<u8>) -> Result<()> {
         let result = (|| {
-            let bytes = Self::encode(value)?;
             let permits = u32::try_from(bytes.len()).expect("frame limit fits in u32");
             let byte_budget = self
                 .byte_budget

@@ -26418,6 +26418,11 @@ impl Editor {
             params.document_id.as_deref(),
         )?;
         let buffer = &buffer_manager[index];
+        if buffer.byte_len() >= plugin::rpc::MAX_FRAME_BYTES {
+            return Err(plugin::rpc::RpcErrorObject::response_too_large(
+                plugin::rpc::DOCUMENT_SNAPSHOT_METHOD,
+            ));
+        }
         let mut snapshot = json!({
             "path": buffer.file,
             "revision": buffer.revision().to_string(),
@@ -37749,6 +37754,21 @@ builtin = "rust"
 
         assert_eq!(invalid.code, -32602);
         assert_eq!(unavailable.code, -32001);
+    }
+
+    #[test]
+    fn rpc_document_snapshot_rejects_text_that_cannot_fit_in_a_frame() {
+        let mut editor = test_editor(/*width*/ 80, /*height*/ 24);
+        editor.buffer_manager.replace_buffers(vec![Buffer::new(
+            None,
+            "x".repeat(plugin::rpc::MAX_FRAME_BYTES),
+        )]);
+
+        let error =
+            Editor::rpc_document_snapshot_request(&editor.buffer_manager, &json!({})).unwrap_err();
+
+        assert_eq!(error.code, -32006);
+        assert!(error.message.contains("RPC frame limit"));
     }
 
     #[test]

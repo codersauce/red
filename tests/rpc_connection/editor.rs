@@ -15,14 +15,22 @@ struct Harness {
 
 impl Harness {
     async fn new(mapping: KeyAction) -> Result<Self> {
-        Self::build(mapping, false).await
+        Self::build(mapping, false, default_buffers()).await
     }
 
     async fn with_delayed_initialization(mapping: KeyAction) -> Result<Self> {
-        Self::build(mapping, true).await
+        Self::build(mapping, true, default_buffers()).await
     }
 
-    async fn build(mapping: KeyAction, delay_initialization: bool) -> Result<Self> {
+    async fn with_buffers(mapping: KeyAction, buffers: Vec<Buffer>) -> Result<Self> {
+        Self::build(mapping, false, buffers).await
+    }
+
+    async fn build(
+        mapping: KeyAction,
+        delay_initialization: bool,
+        buffers: Vec<Buffer>,
+    ) -> Result<Self> {
         let package = tempfile::tempdir()?;
         let slow = package.path().join("slow");
         let fast = package.path().join("fast");
@@ -35,6 +43,7 @@ impl Harness {
                 "RpcLegacy",
                 "RpcPath",
                 "RpcPicker",
+                "RpcOversized",
             ],
         )?;
         write_package(&fast, &["RpcRead"])?;
@@ -64,10 +73,7 @@ impl Harness {
             24,
             config,
             Theme::default(),
-            vec![
-                Buffer::new(None, "hello".into()),
-                Buffer::new(None, "other".into()),
-            ],
+            buffers,
         )?;
         Ok(Self {
             core: DetachedEditorCore::new(editor).await?,
@@ -139,6 +145,13 @@ impl Harness {
     }
 }
 
+fn default_buffers() -> Vec<Buffer> {
+    vec![
+        Buffer::new(None, "hello".into()),
+        Buffer::new(None, "other".into()),
+    ]
+}
+
 fn write_package(root: &Path, commands: &[&str]) -> Result<()> {
     fs::create_dir_all(root)?;
     let executable = env::current_exe()?;
@@ -163,6 +176,9 @@ pub(super) async fn run() -> Result<()> {
     responsive_commands_and_undo()
         .await
         .context("responsive commands and undo")?;
+    oversized_snapshot_keeps_the_connection_active()
+        .await
+        .context("oversized document snapshot")?;
     legacy_mutation_rejects_changed_document()
         .await
         .context("legacy target guard")?;
@@ -193,6 +209,23 @@ pub(super) async fn run() -> Result<()> {
     explicit_path_edit_preserves_the_active_view_and_insert()
         .await
         .context("off-screen document edit")?;
+    Ok(())
+}
+
+async fn oversized_snapshot_keeps_the_connection_active() -> Result<()> {
+    const RPC_FRAME_BYTES: usize = 8 * 1024 * 1024;
+    let mut h = Harness::with_buffers(
+        KeyAction::Single(Action::PluginCommand("RpcOversized".into())),
+        vec![
+            Buffer::new(None, "\\".repeat(RPC_FRAME_BYTES / 2)),
+            Buffer::new(Some("small.txt".into()), "other".into()),
+        ],
+    )
+    .await?;
+
+    h.command("RpcOversized").await?;
+    h.until(|h| h.screen().contains("RpcOversized done"))
+        .await?;
     Ok(())
 }
 
@@ -629,6 +662,23 @@ fn fixture_command(
     input: &mut impl BufRead,
     output: &mut impl Write,
 ) -> Result<()> {
+    if name == "RpcOversized" {
+        write_message(
+            output,
+            json!({"jsonrpc":"2.0","id":"host","method":"red/DocumentSnapshot","params":{}}),
+        )?;
+        let response = read_message(input)?;
+        anyhow::ensure!(response["id"] == "host", "unexpected message: {response}");
+        anyhow::ensure!(response["error"]["code"] == -32006, "{response}");
+        let document = host_request(
+            input,
+            output,
+            "red/DocumentSnapshot",
+            json!({"path":"small.txt"}),
+        )?;
+        anyhow::ensure!(document["text"] == "other", "{document}");
+        return Ok(());
+    }
     if name == "RpcPicker" {
         host_request(
             input,

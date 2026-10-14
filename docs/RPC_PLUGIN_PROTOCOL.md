@@ -89,7 +89,8 @@ Version 1 limits each frame to 8 MiB, queued data to 16 MiB in each direction
 per connection, and outstanding requests to 64 in each direction. Red retains
 at most the last 16 KiB of standard error when reporting a failure. Exceeding a
 transport limit, writing malformed framing, or closing the stream disconnects
-the plugin.
+the plugin. When a successful host response would exceed the frame limit, Red
+returns application error `-32006` instead and keeps the connection active.
 Request deadlines begin after bounded queue admission and cover the response.
 A stalled writer therefore fails through the write watchdog, its request
 deadline, or the shared outbound byte limit, whichever is reached first.
@@ -294,7 +295,8 @@ text:
 
 The optional `path` may be a string or `null`; unknown fields are rejected
 with JSON-RPC error `-32602`. A document that is not open in Red returns
-application error `-32001`. These request errors leave the plugin active.
+application error `-32001`. A snapshot that cannot fit in one frame returns
+`-32006`. These request errors leave the plugin active.
 
 Host API `0.20.0` adds `include_document_id: true` to request a `document_id`
 field in the snapshot result. It is a decimal string that identifies the open
