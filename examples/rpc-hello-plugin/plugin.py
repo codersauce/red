@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import itertools
 import json
 import sys
 
@@ -7,22 +8,48 @@ def send(message):
     print(json.dumps(message, separators=(",", ":")), flush=True)
 
 
+def send_error(message, detail):
+    if "id" in message:
+        send({"jsonrpc": "2.0", "id": message["id"], "error": {"code": -32000, "message": detail}})
+
+
+def read_messages():
+    """Service notifications and lifecycle messages during every receive loop."""
+    global last_event
+    for line in sys.stdin:
+        message = json.loads(line)
+        method = message.get("method")
+        if method == "event/notify":
+            last_event = message["params"]
+        elif method == "shutdown":
+            send({"jsonrpc": "2.0", "id": message["id"], "result": None})
+        elif method == "exit":
+            sys.exit(0)
+        else:
+            yield message
+
+
 def request_host(method, params):
-    request_id = "plugin-1"
+    request_id = f"plugin-{next(request_ids)}"
     send({"jsonrpc": "2.0", "id": request_id, "method": method, "params": params})
-    response = json.loads(sys.stdin.readline())
-    if response.get("id") != request_id:
-        raise RuntimeError("unexpected host response")
-    if "error" in response:
-        raise RuntimeError(response["error"]["message"])
-    return response["result"]
+    for response in incoming:
+        if "method" in response:
+            send_error(response, "plugin is busy waiting for a host response")
+            continue
+        if response.get("id") != request_id:
+            raise RuntimeError("unexpected host response")
+        if "error" in response:
+            raise RuntimeError(response["error"]["message"])
+        return response["result"]
+    raise RuntimeError("host closed stdin while awaiting response")
 
 
 last_transaction_id = None
 last_event = None
+request_ids = itertools.count(1)
+incoming = read_messages()
 
-for line in sys.stdin:
-    message = json.loads(line)
+for message in incoming:
     method = message.get("method")
     if method == "initialize":
         send(
@@ -76,8 +103,6 @@ for line in sys.stdin:
                 },
             }
         )
-    elif method == "event/notify":
-        last_event = message["params"]
     elif method == "command/execute":
         try:
             command = message["params"]["name"]
@@ -169,14 +194,4 @@ for line in sys.stdin:
                 result = {"message": f"Hello, {name}, from Python RPC!"}
             send({"jsonrpc": "2.0", "id": message["id"], "result": result})
         except RuntimeError as error:
-            send(
-                {
-                    "jsonrpc": "2.0",
-                    "id": message["id"],
-                    "error": {"code": -32000, "message": str(error)},
-                }
-            )
-    elif method == "shutdown":
-        send({"jsonrpc": "2.0", "id": message["id"], "result": None})
-    elif method == "exit":
-        break
+            send_error(message, str(error))
