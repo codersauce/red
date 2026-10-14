@@ -156,6 +156,10 @@ fn default_buffers() -> Vec<Buffer> {
     ]
 }
 
+fn json_file_is_ready(path: &Path) -> bool {
+    fs::read(path).is_ok_and(|bytes| serde_json::from_slice::<Value>(&bytes).is_ok())
+}
+
 fn write_package(root: &Path, commands: &[&str]) -> Result<()> {
     fs::create_dir_all(root)?;
     let executable = env::current_exe()?;
@@ -252,12 +256,14 @@ async fn rpc_panel_actions_are_owner_routed() -> Result<()> {
             },
         })
         .await?;
-    h.until(|_| slow.join("panel-run.json").exists()).await?;
+    h.until(|_| json_file_is_ready(&slow.join("panel-run.json")))
+        .await?;
     let event: Value = serde_json::from_slice(&fs::read(slow.join("panel-run.json"))?)?;
     assert_eq!(event, json!({"id": "preview", "action": "run"}));
 
     h.key(KeyCode::Character('q')).await?;
-    h.until(|_| slow.join("panel-close.json").exists()).await?;
+    h.until(|_| json_file_is_ready(&slow.join("panel-close.json")))
+        .await?;
     let event: Value = serde_json::from_slice(&fs::read(slow.join("panel-close.json"))?)?;
     assert_eq!(event, json!({"id": "preview", "action": "close"}));
 
