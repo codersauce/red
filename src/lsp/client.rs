@@ -658,6 +658,10 @@ pub struct RealLspClient {
 }
 
 impl RealLspClient {
+    pub(crate) fn instance_id(&self) -> u64 {
+        self.instance_id
+    }
+
     fn fail_server(&mut self, reason: impl Into<String>) {
         self.initialize_failed = true;
         self.initialized = false;

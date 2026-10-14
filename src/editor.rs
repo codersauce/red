@@ -14638,7 +14638,14 @@ impl Editor {
             .unwrap_or_else(|| uri.to_string());
         if source.is_some_and(|source| {
             lsp_file_path(&uri)
-                .map(|file| !self.lsp.request_source_owns_file(source, &file))
+                .map(|file| match kind {
+                    diagnostics::DiagnosticReportKind::Push => {
+                        !self.lsp.request_source_owns_workspace_file(source, &file)
+                    }
+                    diagnostics::DiagnosticReportKind::Pull => {
+                        !self.lsp.request_source_owns_file(source, &file)
+                    }
+                })
                 .unwrap_or(true)
         }) {
             return None;

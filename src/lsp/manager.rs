@@ -140,9 +140,14 @@ fn supports_method(capabilities: &ServerCapabilities, method: &str) -> bool {
             capabilities.document_range_formatting_provider.as_ref(),
             DocumentRangeFormattingProviderCapability
         ),
-        "textDocument/rename" | "textDocument/prepareRename" => provider_enabled!(
+        "textDocument/rename" => provider_enabled!(
             capabilities.rename_provider.as_ref(),
             RenameProviderCapability
+        ),
+        "textDocument/prepareRename" => matches!(
+            capabilities.rename_provider.as_ref(),
+            Some(RenameProviderCapability::Options(options))
+                if options.prepare_provider == Some(true)
         ),
         "textDocument/foldingRange" => provider_enabled!(
             capabilities.folding_range_provider.as_ref(),
@@ -1384,7 +1389,7 @@ impl LspClient for LspManager {
                         let source = self
                             .clients
                             .get(&client_key)
-                            .and_then(|client| client.server_instance_for_file(""))
+                            .map(|client| client.instance_id())
                             .map(|instance| LspRequestSource {
                                 key: client_key.clone(),
                                 instance,
@@ -1407,7 +1412,7 @@ impl LspClient for LspManager {
                 let source = self
                     .clients
                     .get(&client_key)
-                    .and_then(|client| client.server_instance_for_file(""))
+                    .map(|client| client.instance_id())
                     .map(|instance| LspRequestSource {
                         key: client_key.clone(),
                         instance,
@@ -2354,7 +2359,11 @@ mod tests {
         let mut eslint_client =
             RealLspClient::with_test_channels(eslint_tx, eslint_response_rx, eslint, root.clone());
         eslint_client.set_test_capabilities(
-            serde_json::from_value(serde_json::json!({ "codeActionProvider": true })).unwrap(),
+            serde_json::from_value(serde_json::json!({
+                "codeActionProvider": true,
+                "renameProvider": true
+            }))
+            .unwrap(),
         );
         manager
             .clients
@@ -2372,7 +2381,12 @@ mod tests {
             serde_json::from_value(serde_json::json!({
                 "documentSymbolProvider": true,
                 "completionProvider": { "triggerCharacters": ["."] },
-                "signatureHelpProvider": { "triggerCharacters": ["("] }
+                "signatureHelpProvider": { "triggerCharacters": ["("] },
+                "renameProvider": { "prepareProvider": true },
+                "diagnosticProvider": {
+                    "interFileDependencies": true,
+                    "workspaceDiagnostics": false
+                }
             }))
             .unwrap(),
         );
@@ -2407,6 +2421,91 @@ mod tests {
                 .and_then(|provider| provider.trigger_characters.as_ref()),
             Some(&vec!["(".to_string()])
         );
+        assert_eq!(
+            manager
+                .request_source_for_file(&file, "textDocument/prepareRename")
+                .unwrap()
+                .key,
+            client_key(&documents[1])
+        );
+        assert_eq!(
+            manager
+                .request_source_for_file(&file, "textDocument/publishDiagnostics")
+                .unwrap()
+                .key,
+            client_key(&documents[0])
+        );
+        assert_eq!(
+            manager
+                .request_source_for_file(&file, "textDocument/diagnostic")
+                .unwrap()
+                .key,
+            client_key(&documents[1])
+        );
+    }
+
+    #[tokio::test]
+    async fn diagnostic_source_covers_unopened_workspace_files_and_survives_failure() {
+        let root = std::env::current_dir().unwrap();
+        let config = server("typescript", &["ts"]);
+        let mut manager = LspManager::new(LspConfig {
+            enabled: true,
+            format_on_save: false,
+            servers: HashMap::from([("typescript".to_string(), config.clone())]),
+        });
+        let file = root.join("manager-open.ts").to_string_lossy().into_owned();
+        let unopened = root
+            .join("manager-unopened.ts")
+            .to_string_lossy()
+            .into_owned();
+        let document = manager.resolve_document(&file).unwrap();
+        let key = client_key(&document);
+        let (request_tx, _request_rx) = tokio::sync::mpsc::channel(1);
+        let (response_tx, response_rx) = tokio::sync::mpsc::channel(2);
+        manager.clients.insert(
+            key.clone(),
+            RealLspClient::with_test_channels(request_tx, response_rx, config, root),
+        );
+        let source = manager.request_source(&key, &file).unwrap();
+        let instance = source.instance;
+
+        assert!(!manager.request_source_owns_file(&source, &unopened));
+        assert!(manager.request_source_owns_workspace_file(&source, &unopened));
+
+        response_tx
+            .send(InboundMessage::ProcessingError(LspError::ProtocolError(
+                "expected failure".to_string(),
+            )))
+            .await
+            .unwrap();
+        response_tx
+            .send(InboundMessage::Notification(
+                ParsedNotification::PublishDiagnostics(
+                    serde_json::from_value(serde_json::json!({
+                        "uri": file_uri(&unopened).unwrap(),
+                        "diagnostics": []
+                    }))
+                    .unwrap(),
+                ),
+            ))
+            .await
+            .unwrap();
+
+        let InboundMessage::ClientFailure { source, .. } =
+            manager.recv_response().await.unwrap().unwrap().0
+        else {
+            panic!("expected managed client failure");
+        };
+        assert_eq!(source.key, key);
+        assert_eq!(source.instance, instance);
+
+        let InboundMessage::Notification(ParsedNotification::PublishDiagnostics(report)) =
+            manager.recv_response().await.unwrap().unwrap().0
+        else {
+            panic!("expected buffered diagnostics");
+        };
+        assert_eq!(report.source.as_ref().unwrap().instance, instance);
+        assert!(!manager.request_source_is_current(report.source.as_ref().unwrap()));
     }
 
     #[tokio::test]

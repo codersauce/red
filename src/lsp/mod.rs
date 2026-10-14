@@ -13,7 +13,7 @@
 
 use std::{
     fmt::{self, Display, Formatter},
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::atomic::AtomicUsize,
     time::{Duration, Instant},
 };
@@ -785,6 +785,14 @@ pub trait LspClient: std::any::Any + Send {
     /// Reports whether a current managed server still owns the open document.
     fn request_source_owns_file(&self, source: &LspRequestSource, _file: &str) -> bool {
         self.request_source_is_current(source)
+    }
+
+    /// Reports whether a current managed server owns the workspace containing `file`.
+    fn request_source_owns_workspace_file(&self, source: &LspRequestSource, file: &str) -> bool {
+        self.request_source_is_current(source)
+            && self
+                .workspace_root_for_source(source)
+                .is_some_and(|root| Path::new(file).starts_with(root))
     }
 
     /// Returns the document version owned by a specific managed server.

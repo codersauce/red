@@ -369,7 +369,12 @@ impl Editor {
         } else {
             method
         };
-        let Some(lsp_source) = self.lsp.request_source_for_file(&file, route_method) else {
+        let lsp_source = self.lsp.request_source_for_file(&file, method).or_else(|| {
+            (route_method != method)
+                .then(|| self.lsp.request_source_for_file(&file, route_method))
+                .flatten()
+        });
+        let Some(lsp_source) = lsp_source else {
             return Ok(StartQuery::Immediate(result_status(
                 self.lsp.server_status_for_file(&file),
                 "no ready language server supports this operation; inspect lsp_status and retry",
