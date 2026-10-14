@@ -42,11 +42,11 @@ directly without a shell.
 
 Release packages may omit `command` and provide a native executable for each
 supported Rust target triple. Target-specific local commands and release
-artifacts require `red_api = "^0.20.0"` or later:
+artifacts require `red_api = "^0.19.0"` or later:
 
 ```toml
 [plugin]
-red_api = "^0.20.0"
+red_api = "^0.19.0"
 
 [rpc]
 args = []
@@ -89,7 +89,8 @@ Version 1 limits each frame to 8 MiB, queued data to 16 MiB in each direction
 per connection, and outstanding requests to 64 in each direction. Red retains
 at most the last 16 KiB of standard error when reporting a failure. Exceeding a
 transport limit, writing malformed framing, or closing the stream disconnects
-the plugin.
+the plugin. When a successful host response would exceed the frame limit, Red
+returns application error `-32006` instead and keeps the connection active.
 Request deadlines begin after bounded queue admission and cover the response.
 A stalled writer therefore fails through the write watchdog, its request
 deadline, or the shared outbound byte limit, whichever is reached first.
@@ -113,9 +114,13 @@ The version 1 initialization parameters are:
 ```json
 {
   "protocol_versions": [1],
-  "red_api_version": "0.21.0",
+  "red_api_version": "0.19.0",
   "plugin_id": "document-tools",
   "host_methods": [
+    "red/DocumentCreate",
+    "red/DocumentShow",
+    "red/DocumentWatch",
+    "red/DocumentUnwatch",
     "red/DocumentSnapshot",
     "red/DocumentApply",
     "red/DocumentUndo",
@@ -124,9 +129,12 @@ The version 1 initialization parameters are:
     "red/StorageSet",
     "red/StorageDelete",
     "red/TextPanelCreate",
+    "red/TextPanelSetActions",
     "red/TextPanelSetContent",
     "red/TextPanelFocus",
     "red/TextPanelDispose",
+    "red/ClipboardWrite",
+    "red/MessageShow",
     "red/StatuslineSet",
     "red/StatuslineClear",
     "red/PickerOpen"
@@ -275,6 +283,45 @@ fields, invalid keys, and oversized writes return `-32602`; an unavailable
 owner or oversized read returns `-32005`, and a persistence failure returns
 `-32603`. These request errors leave the connection active.
 
+## Editable documents
+
+Host API `0.19.0` adds ordinary editable documents for explicit user workflows.
+`red/DocumentCreate` accepts initial text of at most 1 MiB and an optional
+supported syntax name:
+
+```json
+{"jsonrpc":"2.0","id":"plugin-create","method":"red/DocumentCreate","params":{"text":"{\"ok\":true}\n","syntax":"json"}}
+```
+
+The result contains a stable decimal-string document ID:
+
+```json
+{"jsonrpc":"2.0","id":"plugin-create","result":{"document_id":"42"}}
+```
+
+The document is an ordinary unnamed buffer, outside connection-owned cleanup.
+Initial text that differs from Red's normal blank-buffer baseline is one
+attributed undo transaction, so generated content is dirty, prompts before
+discard, can be undone independently, participates in crash recovery, and can
+be saved with the usual Save As flow. Closing, disabling, quarantining, or
+reloading the plugin leaves the document open. `syntax` must contain 1 to 128
+UTF-8 bytes and resolve to an installed syntax; invalid or unknown values
+return `-32602`.
+
+`red/DocumentShow` reveals a live document by ID. The optional `target` is
+`current` by default and also accepts `horizontal` or `vertical` to use Red's
+native split routing:
+
+```json
+{"jsonrpc":"2.0","id":"plugin-show","method":"red/DocumentShow","params":{"document_id":"42","target":"current"}}
+```
+
+The result is `null`. A closed ID returns `-32001`; malformed IDs or targets
+return `-32602`; a split or render failure returns `-32003`. Only this explicit
+call changes focus, so background computation cannot reveal a document by
+creating it. Plugins using either method must require `red_api = "^0.19.0"` or
+later.
+
 ## Document snapshots
 
 An active plugin can read the current unsaved contents of an open document with
@@ -294,9 +341,10 @@ text:
 
 The optional `path` may be a string or `null`; unknown fields are rejected
 with JSON-RPC error `-32602`. A document that is not open in Red returns
-application error `-32001`. These request errors leave the plugin active.
+application error `-32001`. A snapshot that cannot fit in one frame returns
+`-32006`. These request errors leave the plugin active.
 
-Host API `0.20.0` adds `include_document_id: true` to request a `document_id`
+Host API `0.19.0` adds `include_document_id: true` to request a `document_id`
 field in the snapshot result. It is a decimal string that identifies the open
 buffer, including an unnamed buffer, independently of its position in the
 buffer list. It remains stable until that buffer closes and must not be saved
@@ -305,7 +353,74 @@ across editor restarts. Omitting the option preserves the original result shape.
 Snapshot, apply, and undo requests accept this ID as an optional `document_id`
 selector. A closed ID returns `-32001`; malformed IDs or conflicting `path` and
 ID selectors return `-32602`. Plugins using these fields must require
-`red_api = "^0.20.0"` or later. Older RPC and Husk packages continue to load.
+`red_api = "^0.19.0"` or later. Older Husk packages continue to load.
+
+Host API `0.19.0` adds opt-in contiguous selection context. Set
+`include_selection: true` to return the selected preimage and its normalized
+half-open range atomically with the document ID, revision, and complete text:
+
+```json
+{"jsonrpc":"2.0","id":"plugin-selection","method":"red/DocumentSnapshot","params":{"include_selection":true}}
+{"jsonrpc":"2.0","id":"plugin-selection","result":{"document_id":"42","path":"data.json","revision":"7","text":"{\"value\":42}\n","selection":{"range":{"start":{"line":0,"character":9},"end":{"line":0,"character":11}},"text":"42"}}}
+```
+
+The option implies `include_document_id`. For the active document, Red resolves
+the current contiguous character or line selection, falling back to its native
+last-visual-selection marks after Visual mode exits. A document without such a
+selection, including an inactive target, returns `selection: null`. Block and
+multiple selections return `-32003` without disconnecting the plugin. Positions
+use the same zero-based Unicode-scalar coordinates as document edits; line
+selections include their exact line ending, including CRLF. A plugin must apply
+against the returned whole-document revision and selected `text` preimage.
+Omitting the option preserves every earlier response shape. Plugins using it
+must require `red_api = "^0.19.0"` or later.
+
+## Document watches
+
+Host API `0.19.0` adds owner-local invalidation notifications for live document
+workflows. Establish a watch by stable document ID before taking the first
+snapshot:
+
+```json
+{"jsonrpc":"2.0","id":"plugin-watch","method":"red/DocumentWatch","params":{"document_id":"42"}}
+{"jsonrpc":"2.0","id":"plugin-watch","result":{"revision":"7"}}
+```
+
+The result is the document revision observed when the watch was installed. A
+plugin should then snapshot the document and treat any notification received
+during setup as a request to read the latest state again. This ordering ensures
+that changes during setup are either present in the snapshot or reported as an
+invalidation.
+
+Each connection may watch at most two documents. Repeating a watch is
+idempotent and does not consume another slot. Red coalesces changes for 50 ms
+before enqueueing one owner-local `document/event` notification containing the
+latest revision:
+
+```json
+{"jsonrpc":"2.0","method":"document/event","params":{"document_id":"42","event":"changed","revision":"9"}}
+```
+
+The event is an invalidation, not an edit log or document snapshot. Plugins
+must read the current document when they need its text. A close removes the
+watch, drops any pending change, and sends one terminal event without a
+revision:
+
+```json
+{"jsonrpc":"2.0","method":"document/event","params":{"document_id":"42","event":"closed"}}
+```
+
+Stop watching with `red/DocumentUnwatch`; it returns `null` and is idempotent,
+including after the document closes. Disconnect, quarantine, successful reload,
+and editor deactivation release every remaining watch. Malformed or closed IDs
+return `-32602` or `-32001` when installing a watch; exceeding the cap returns
+`-32004`. These application errors leave the connection active.
+
+Notifications are coalesced before they enter the existing 16 MiB outbound
+queue and remain subject to the 8 MiB frame and transport watchdog limits.
+Transport failure or queue overflow quarantines a slow connection. Plugins
+using watches must require
+`red_api = "^0.19.0"` or later.
 
 ## Document transactions
 
@@ -343,15 +458,20 @@ ID and resulting revision as decimal strings:
 {"jsonrpc":"2.0","id":"plugin-2","result":{"transaction_id":"...","revision":"43"}}
 ```
 
-For deferred work, request a snapshot with `include_document_id: true` and
-pass its `document_id` with the revision to apply, then with the transaction ID
-to undo. ID-selected mutations currently require that document to be active;
+For deferred work, request a snapshot with `include_document_id: true` and pass
+its `document_id` with the revision to apply, then with the transaction ID to
+undo. By default, ID-selected mutations require that document to be active;
 otherwise they return `-32003` without switching focus or changing contents.
-Select the document again before retrying, and refresh its snapshot if its
-revision has changed. An ID never silently falls back to another open buffer.
-Explicit path mutations preserve the active buffer, view, and user insertion
-transaction when editing another open document. Plugin edits and user edits
-remain separate undo transactions; undo checks include uncommitted user edits.
+An ID never silently falls back to another open buffer.
+
+Host API `0.19.0` lets an ID-selected mutation set `allow_inactive: true`. Red
+then applies or undoes against that open document while preserving the active
+buffer, window focus and view, and user insertion transaction. The option
+only changes stable-ID selection; omitting it preserves the earlier restriction.
+Explicit path mutations retain their existing background behavior. Plugin edits
+and user edits remain separate undo transactions; undo checks include
+uncommitted user edits. Plugins using the option must require
+`red_api = "^0.19.0"` or later.
 During a command, a legacy mutation with neither path nor ID is rejected if
 the current document differs from the one at invocation. The host never
 silently redirects such a request to that earlier document. Outside a pending
@@ -378,24 +498,56 @@ An active plugin can create a host-rendered text panel with a connection-local
 ID:
 
 ```json
-{"jsonrpc":"2.0","id":"plugin-4","method":"red/TextPanelCreate","params":{"id":"preview","side":"right","width":36,"title":"Preview"}}
+{"jsonrpc":"2.0","id":"plugin-4","method":"red/TextPanelCreate","params":{"id":"preview","side":"right","width":36,"title":"Preview","actions":[{"id":"run","label":"Run"},{"id":"close","label":"Close","compact_label":"x"}]}}
 ```
 
 `side` is optional and accepts `left`, `right`, `top`, or `bottom`; `width`
 defaults to `30`, and `title` is optional. Calling create again with the same ID
-replaces that panel's configuration and content. A connection can own at most
-16 text panels, and each ID must contain 1 to 128 UTF-8 bytes.
+replaces that panel's configuration and content with a fresh backing resource.
+A connection can own at most 16 text panels, and each ID must contain 1 to 128
+UTF-8 bytes.
+
+Host API `0.19.0` adds an optional `actions` array bounded to 16 controls, plus
+panel-local shortcuts and dynamic updates. Action IDs are
+unique within the panel and contain 1 to 64 UTF-8
+bytes; `label` contains 1 to 128 bytes and optional `compact_label` contains 1
+to 64. Optional `key`, `group`, and `description` fields contain at most 64,
+128, and 512 bytes. These fields plus `priority`, `enabled`, and
+`show_in_header` drive the focused shortcut, F1 entry, responsive
+priority, availability, and button visibility from one declaration. Shortcuts
+must be unique among enabled actions. Red chooses compact labels when needed
+and sends the owning connection a notification when the user activates a
+declared action:
+
+```json
+{"jsonrpc":"2.0","method":"panel/event","params":{"id":"preview","action":"run"}}
+```
+
+The `id` remains the connection-local ID supplied by the plugin; private host
+IDs are never exposed. Red also sends `action: "close"` for its native panel
+close gesture, whether or not that action appears in the header. Navigation
+and selection events remain local to the renderer. Events queued for a panel
+that was disposed or replaced are discarded and cannot reach its successor or
+a Husk plugin.
+
+`red/TextPanelSetActions` accepts the panel `id` and a complete `actions` array.
+It updates shortcuts, F1 entries, and header controls without replacing panel
+content, focus, selection, or scroll state. The same bounds, validation, and
+connection ownership as create apply.
 
 `red/TextPanelSetContent` replaces the panel's complete block list. Each block
 has an `id`, `text`, optional semantic `kind` (`user`, `agent`, `error`,
-`activity`, `action`, or `text`), and optional `format` (`plain` or `markdown`):
+`activity`, `action`, or `text`), and optional `format` (`plain`, `markdown`,
+or `code`). Code blocks may include `language`; Red renders them verbatim with
+the active theme's syntax colors and falls back to unhighlighted preformatted
+text for omitted or unsupported languages:
 
 ```json
-{"jsonrpc":"2.0","id":"plugin-5","method":"red/TextPanelSetContent","params":{"id":"preview","blocks":[{"id":"result","format":"markdown","text":"# Result\nReady"}]}}
+{"jsonrpc":"2.0","id":"plugin-5","method":"red/TextPanelSetContent","params":{"id":"preview","blocks":[{"id":"result","format":"code","language":"json","text":"{\n  \"ready\": true\n}"}]}}
 ```
 
 `red/TextPanelFocus` and `red/TextPanelDispose` each accept `{ "id": "preview"
-}`. All four methods return `null` on success. Panel IDs are private to the
+}`. All five methods return `null` on success. Panel IDs are private to the
 calling connection, so they cannot collide with Husk panels or panels owned by
 another RPC plugin. Disconnect, quarantine, and successful hot reload dispose
 all panels owned by the previous connection.
@@ -404,13 +556,45 @@ Unknown fields and invalid IDs or widths return `-32602`. A missing, disposed,
 not-owned, or over-limit panel returns `-32004`. These errors leave the plugin
 active.
 
+## Clipboard writes
+
+Host API `0.19.0` adds a bounded, write-only clipboard method for an explicit
+user action such as a panel Copy button:
+
+```json
+{"jsonrpc":"2.0","id":"plugin-6","method":"red/ClipboardWrite","params":{"text":"complete result\n"}}
+```
+
+The method preserves the exact UTF-8 text, accepts at most 1 MiB, and returns
+`null`. Red does not expose clipboard reads to plugins. Oversized or unknown
+parameters return `-32602`; a disabled or unavailable system clipboard returns
+`-32004`; and an operating-system write failure returns `-32003`. These errors
+leave the plugin active.
+
+## Messages
+
+Use `red/MessageShow` for brief feedback from an explicit user action, such as
+confirming that a result was copied:
+
+```json
+{"jsonrpc":"2.0","id":"plugin-7","method":"red/MessageShow","params":{"message":"JSON result copied","severity":"success"}}
+```
+
+`message` must contain a non-whitespace character, may not contain control
+characters, and is limited to 1024 UTF-8 bytes. `severity` is optional, defaults
+to `info`, and also accepts `success`, `warning`, or `error`. The method returns
+`null` after publishing through Red's existing foreground notification path.
+Presentation duration and acknowledgment follow Red's severity policy, and the
+message remains available in notification history after its transient display
+expires. Use statusline contributions for durable state instead.
+
 ## Statusline contributions
 
 An active plugin can replace its single cached statusline contribution with
 `red/StatuslineSet`:
 
 ```json
-{"jsonrpc":"2.0","id":"plugin-6","method":"red/StatuslineSet","params":{"text":"Build ready","side":"right"}}
+{"jsonrpc":"2.0","id":"plugin-8","method":"red/StatuslineSet","params":{"text":"Build ready","side":"right"}}
 ```
 
 `side` is optional, defaults to `right`, and also accepts `left`. `text` must
@@ -430,11 +614,11 @@ editor deactivation clear the previous connection's contribution.
 
 ## Pickers
 
-Host API `0.21.0` adds a host-rendered, locally filtered picker. Opening it is a
+Host API `0.19.0` adds a host-rendered, locally filtered picker. Opening it is a
 bounded host request; `command/execute` does not wait for user selection:
 
 ```json
-{"jsonrpc":"2.0","id":"plugin-7","method":"red/PickerOpen","params":{"id":"targets","title":"Choose a target","items":[{"id":"debug","label":"Debug"},{"id":"release","label":"Release","detail":"optimized","data":{"profile":"release"}}]}}
+{"jsonrpc":"2.0","id":"plugin-9","method":"red/PickerOpen","params":{"id":"targets","title":"Choose a target","items":[{"id":"debug","label":"Debug"},{"id":"release","label":"Release","detail":"optimized","data":{"profile":"release"}}]}}
 ```
 
 `id` identifies the picker within the calling connection and must contain 1 to
@@ -472,8 +656,16 @@ Version 1 deliberately exposes a small set of typed operations:
 - Declared editor events with documented JSON payloads. Process-local callback
   events and raw keyboard input are excluded.
 - Owner-scoped configuration and bounded persistent JSON storage.
-- `red/DocumentSnapshot`, `red/DocumentApply`, and `red/DocumentUndo`, preserving
-  revisions, attributed undo transactions, dirty tracking, and LSP updates.
+- Ordinary editable document creation and explicit ID-based reveal through
+  `red/DocumentCreate` and `red/DocumentShow`.
+- `red/DocumentSnapshot`, `red/DocumentApply`, and `red/DocumentUndo`,
+  preserving revisions, attributed undo transactions, dirty tracking, and LSP
+  updates.
+- Opt-in, revision-bound contiguous selection text and normalized ranges on
+  document snapshots.
+- Opt-in stable-ID document mutation that preserves the active editor view.
+- Owner-local, coalesced document invalidations through `red/DocumentWatch`,
+  `red/DocumentUnwatch`, and `document/event`.
 - Text-panel create, content replacement, focus, and disposal, with resources
   owned by the active plugin connection.
 - One cached plain-text statusline contribution per active plugin connection.

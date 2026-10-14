@@ -25,6 +25,11 @@ pub(crate) const MAX_OUTSTANDING_REQUESTS: usize = 64;
 const MAX_DIAGNOSTIC_BYTES: usize = 16 * 1024;
 const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 const REAP_TIMEOUT: Duration = Duration::from_secs(2);
+pub(crate) const DOCUMENT_CREATE_METHOD: &str = "red/DocumentCreate";
+pub(crate) const DOCUMENT_SHOW_METHOD: &str = "red/DocumentShow";
+pub(crate) const DOCUMENT_WATCH_METHOD: &str = "red/DocumentWatch";
+pub(crate) const DOCUMENT_UNWATCH_METHOD: &str = "red/DocumentUnwatch";
+pub(crate) const DOCUMENT_EVENT_METHOD: &str = "document/event";
 pub(crate) const DOCUMENT_SNAPSHOT_METHOD: &str = "red/DocumentSnapshot";
 pub(crate) const DOCUMENT_APPLY_METHOD: &str = "red/DocumentApply";
 pub(crate) const DOCUMENT_UNDO_METHOD: &str = "red/DocumentUndo";
@@ -33,9 +38,13 @@ pub(crate) const STORAGE_GET_METHOD: &str = "red/StorageGet";
 pub(crate) const STORAGE_SET_METHOD: &str = "red/StorageSet";
 pub(crate) const STORAGE_DELETE_METHOD: &str = "red/StorageDelete";
 pub(crate) const TEXT_PANEL_CREATE_METHOD: &str = "red/TextPanelCreate";
+pub(crate) const TEXT_PANEL_SET_ACTIONS_METHOD: &str = "red/TextPanelSetActions";
 pub(crate) const TEXT_PANEL_SET_CONTENT_METHOD: &str = "red/TextPanelSetContent";
 pub(crate) const TEXT_PANEL_FOCUS_METHOD: &str = "red/TextPanelFocus";
 pub(crate) const TEXT_PANEL_DISPOSE_METHOD: &str = "red/TextPanelDispose";
+pub(crate) const PANEL_EVENT_METHOD: &str = "panel/event";
+pub(crate) const CLIPBOARD_WRITE_METHOD: &str = "red/ClipboardWrite";
+pub(crate) const MESSAGE_SHOW_METHOD: &str = "red/MessageShow";
 pub(crate) const STATUSLINE_SET_METHOD: &str = "red/StatuslineSet";
 pub(crate) const STATUSLINE_CLEAR_METHOD: &str = "red/StatuslineClear";
 pub(crate) const PICKER_OPEN_METHOD: &str = "red/PickerOpen";
@@ -77,6 +86,16 @@ impl RpcErrorObject {
             data: None,
         }
     }
+
+    pub(crate) fn response_too_large(method: &str) -> Self {
+        Self {
+            code: -32006,
+            message: format!(
+                "{method} response exceeds the {MAX_FRAME_BYTES}-byte RPC frame limit"
+            ),
+            data: None,
+        }
+    }
 }
 
 impl fmt::Display for RpcErrorObject {
@@ -100,11 +119,24 @@ pub struct RpcHostRequest {
 impl RpcHostRequest {
     /// Sends exactly one result or error for this request.
     pub async fn respond(self, result: std::result::Result<Value, RpcErrorObject>) -> Result<()> {
-        let response = match result {
-            Ok(result) => json!({"jsonrpc": "2.0", "id": self.id, "result": result}),
-            Err(error) => json!({"jsonrpc": "2.0", "id": self.id, "error": error}),
-        };
-        self.writer.enqueue(response)
+        match result {
+            Ok(result) => {
+                let id = self.id;
+                let response = RpcWriter::serialize(
+                    json!({"jsonrpc": "2.0", "id": id.clone(), "result": result}),
+                )?;
+                if response.len() > MAX_FRAME_BYTES {
+                    let error = RpcErrorObject::response_too_large(&self.method);
+                    self.writer
+                        .enqueue(json!({"jsonrpc": "2.0", "id": id, "error": error}))
+                } else {
+                    self.writer.enqueue_bytes(response)
+                }
+            }
+            Err(error) => self
+                .writer
+                .enqueue(json!({"jsonrpc": "2.0", "id": self.id, "error": error})),
+        }
     }
 }
 
@@ -320,9 +352,14 @@ struct RpcWriter {
 }
 
 impl RpcWriter {
-    fn encode(value: Value) -> Result<Vec<u8>> {
+    fn serialize(value: Value) -> Result<Vec<u8>> {
         let mut bytes = serde_json::to_vec(&value)?;
         bytes.push(b'\n');
+        Ok(bytes)
+    }
+
+    fn encode(value: Value) -> Result<Vec<u8>> {
+        let bytes = Self::serialize(value)?;
         anyhow::ensure!(
             bytes.len() <= MAX_FRAME_BYTES,
             "RPC frame exceeds {MAX_FRAME_BYTES} bytes"
@@ -331,8 +368,14 @@ impl RpcWriter {
     }
 
     fn enqueue(&self, value: Value) -> Result<()> {
+        let bytes = Self::encode(value).inspect_err(|error| {
+            self.state.signal_failure(error.to_string());
+        })?;
+        self.enqueue_bytes(bytes)
+    }
+
+    fn enqueue_bytes(&self, bytes: Vec<u8>) -> Result<()> {
         let result = (|| {
-            let bytes = Self::encode(value)?;
             let permits = u32::try_from(bytes.len()).expect("frame limit fits in u32");
             let byte_budget = self
                 .byte_budget

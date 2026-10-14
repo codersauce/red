@@ -2100,6 +2100,10 @@ pub enum PluginRequest {
         id: String,
         blocks: Vec<plugin::TextPanelBlock>,
     },
+    SetTextPanelActions {
+        id: String,
+        actions: Vec<plugin::TextPanelHeaderAction>,
+    },
     AppendTextPanel {
         id: String,
         block_id: String,
@@ -2326,6 +2330,7 @@ impl PluginRequest {
             Self::InvalidateWorkspacePaths { .. } => "InvalidateWorkspacePaths",
             Self::CreateTextPanel { .. } => "CreateTextPanel",
             Self::UpdateTextPanel { .. } => "UpdateTextPanel",
+            Self::SetTextPanelActions { .. } => "SetTextPanelActions",
             Self::AppendTextPanel { .. } => "AppendTextPanel",
             Self::FocusTextPanelComposer { .. } => "FocusTextPanelComposer",
             Self::SetTextPanelComposerState { .. } => "SetTextPanelComposerState",
@@ -4584,6 +4589,28 @@ struct PluginDocumentTransaction {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct RpcDocumentCreateParams {
+    text: String,
+    #[serde(default)]
+    syntax: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RpcDocumentShowParams {
+    document_id: String,
+    #[serde(default)]
+    target: plugin::OpenLocationTarget,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RpcDocumentWatchParams {
+    document_id: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RpcDocumentSnapshotParams {
     #[serde(default)]
     path: Option<String>,
@@ -4591,6 +4618,8 @@ struct RpcDocumentSnapshotParams {
     document_id: Option<String>,
     #[serde(default)]
     include_document_id: bool,
+    #[serde(default)]
+    include_selection: bool,
 }
 
 #[derive(Deserialize)]
@@ -4600,6 +4629,8 @@ struct RpcDocumentApplyParams {
     path: Option<String>,
     #[serde(default)]
     document_id: Option<String>,
+    #[serde(default)]
+    allow_inactive: bool,
     expected_revision: String,
     #[serde(default = "default_plugin_edit_label")]
     label: String,
@@ -4613,6 +4644,8 @@ struct RpcDocumentUndoParams {
     path: Option<String>,
     #[serde(default)]
     document_id: Option<String>,
+    #[serde(default)]
+    allow_inactive: bool,
     transaction_id: String,
 }
 
@@ -4633,6 +4666,8 @@ struct RpcTextPanelCreateParams {
     width: usize,
     #[serde(default)]
     title: Option<String>,
+    #[serde(default)]
+    actions: Vec<plugin::TextPanelHeaderAction>,
 }
 
 #[derive(Deserialize)]
@@ -4644,8 +4679,50 @@ struct RpcTextPanelSetContentParams {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct RpcTextPanelSetActionsParams {
+    id: String,
+    actions: Vec<plugin::TextPanelHeaderAction>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RpcTextPanelParams {
     id: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RpcClipboardWriteParams {
+    text: String,
+}
+
+#[derive(Clone, Copy, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum RpcMessageSeverity {
+    #[default]
+    Info,
+    Success,
+    Warning,
+    Error,
+}
+
+impl From<RpcMessageSeverity> for Severity {
+    fn from(severity: RpcMessageSeverity) -> Self {
+        match severity {
+            RpcMessageSeverity::Info => Self::Info,
+            RpcMessageSeverity::Success => Self::Success,
+            RpcMessageSeverity::Warning => Self::Warning,
+            RpcMessageSeverity::Error => Self::Error,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RpcMessageShowParams {
+    message: String,
+    #[serde(default)]
+    severity: RpcMessageSeverity,
 }
 
 #[derive(Deserialize)]
@@ -4712,6 +4789,16 @@ struct RpcStorageSetParams {
 
 const RPC_STORAGE_MAX_KEY_BYTES: usize = 128;
 const RPC_PLUGIN_VALUE_MAX_BYTES: usize = 1024 * 1024;
+const RPC_DOCUMENT_CREATE_MAX_BYTES: usize = 1024 * 1024;
+const RPC_DOCUMENT_SYNTAX_MAX_BYTES: usize = 128;
+const MAX_RPC_TEXT_PANEL_ACTIONS: usize = 16;
+const RPC_TEXT_PANEL_ACTION_ID_MAX_BYTES: usize = 64;
+const RPC_TEXT_PANEL_ACTION_KEY_MAX_BYTES: usize = 64;
+const RPC_TEXT_PANEL_ACTION_LABEL_MAX_BYTES: usize = 128;
+const RPC_TEXT_PANEL_ACTION_GROUP_MAX_BYTES: usize = 128;
+const RPC_TEXT_PANEL_ACTION_DESCRIPTION_MAX_BYTES: usize = 512;
+const RPC_TEXT_PANEL_ACTION_COMPACT_LABEL_MAX_BYTES: usize = 64;
+const RPC_CLIPBOARD_MAX_BYTES: usize = 1024 * 1024;
 const MAX_RPC_PICKER_ITEMS: usize = 4_096;
 
 fn default_rpc_text_panel_width() -> usize {
@@ -10782,6 +10869,9 @@ impl Editor {
         self.plugin_registry.poll_rpc_lifecycle(runtime).await;
         self.plugin_registry.poll_rpc_commands(runtime).await;
         self.service_rpc_host_requests(buffer, runtime).await;
+        self.plugin_registry
+            .flush_rpc_document_events(runtime)
+            .await;
         self.service_mouse_selection(buffer, runtime).await?;
         self.service_open_file_changes(buffer, runtime).await?;
         if self.agent_lsp.has_work() {
@@ -12733,9 +12823,10 @@ impl Editor {
                     needs_render = true;
                 }
                 PluginRequest::UpdateTextPanel { id, blocks } => {
-                    self.panel_manager.update_text_panel(
+                    self.panel_manager.update_text_panel_with_highlighter(
                         &id,
                         blocks,
+                        &mut self.highlighter,
                         usize::from(self.size.1.saturating_sub(2)),
                         usize::from(self.size.0),
                     );
@@ -12746,15 +12837,19 @@ impl Editor {
                     );
                     needs_render = true;
                 }
+                PluginRequest::SetTextPanelActions { id, actions } => {
+                    needs_render |= self.panel_manager.set_text_panel_actions(&id, actions);
+                }
                 PluginRequest::AppendTextPanel {
                     id,
                     block_id,
                     delta,
                 } => {
-                    self.panel_manager.append_text_panel(
+                    self.panel_manager.append_text_panel_with_highlighter(
                         &id,
                         &block_id,
                         &delta,
+                        &mut self.highlighter,
                         usize::from(self.size.1.saturating_sub(2)),
                         usize::from(self.size.0),
                     );
@@ -16215,6 +16310,9 @@ impl Editor {
                     {
                         return Some(self.follow_text_panel_link(target));
                     }
+                }
+                if let Some(event) = self.panel_manager.action_shortcut_event(ev) {
+                    return Self::panel_event_key_action(event);
                 }
                 let control = event.modifiers.contains(KeyModifiers::CONTROL);
                 let text_panel = !self.panel_manager.focused_row_panel();
@@ -25694,6 +25792,8 @@ impl Editor {
             "cursor": { "line": line, "column": column }
         });
         self.plugin_registry
+            .queue_rpc_document_changed(id.as_u64(), revision);
+        self.plugin_registry
             .notify(runtime, "buffer:changed", buffer_info)
             .await?;
         self.lsp_coordinator.record_notified_revision(id, revision);
@@ -25790,6 +25890,8 @@ impl Editor {
             }
         }
         self.lsp_coordinator.forget_buffer(removed_id);
+        self.plugin_registry
+            .queue_rpc_document_closed(removed_id.as_u64());
 
         if self.buffer_manager.len() == 1 {
             self.buffer_manager
@@ -26025,6 +26127,124 @@ impl Editor {
         Ok(())
     }
 
+    fn validate_rpc_text_panel_action_field(
+        method: &str,
+        field: &str,
+        value: &str,
+        max_bytes: usize,
+    ) -> std::result::Result<(), plugin::rpc::RpcErrorObject> {
+        if value.trim().is_empty() || value.len() > max_bytes {
+            return Err(Self::rpc_error(
+                -32602,
+                format!("{method} action {field} must contain 1 to {max_bytes} UTF-8 bytes"),
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_optional_rpc_text_panel_action_field(
+        method: &str,
+        field: &str,
+        value: &str,
+        max_bytes: usize,
+    ) -> std::result::Result<(), plugin::rpc::RpcErrorObject> {
+        if value.is_empty() {
+            return Ok(());
+        }
+        Self::validate_rpc_text_panel_action_field(method, field, value, max_bytes)
+    }
+
+    fn validate_rpc_text_panel_action_shortcut(
+        method: &str,
+        action: &plugin::TextPanelHeaderAction,
+    ) -> std::result::Result<(), plugin::rpc::RpcErrorObject> {
+        Self::validate_optional_rpc_text_panel_action_field(
+            method,
+            "key",
+            &action.key,
+            RPC_TEXT_PANEL_ACTION_KEY_MAX_BYTES,
+        )?;
+        if !action.key.is_empty() && action.event().is_none() {
+            return Err(Self::rpc_error(
+                -32602,
+                format!(
+                    "{method} action key is not a supported shortcut: {}",
+                    action.key
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_rpc_text_panel_actions(
+        method: &str,
+        actions: &[plugin::TextPanelHeaderAction],
+    ) -> std::result::Result<HashSet<String>, plugin::rpc::RpcErrorObject> {
+        if actions.len() > MAX_RPC_TEXT_PANEL_ACTIONS {
+            return Err(Self::rpc_error(
+                -32602,
+                format!("{method} may contain at most {MAX_RPC_TEXT_PANEL_ACTIONS} actions"),
+            ));
+        }
+        let mut ids = HashSet::with_capacity(actions.len());
+        for action in actions {
+            Self::validate_rpc_text_panel_action_field(
+                method,
+                "id",
+                &action.id,
+                RPC_TEXT_PANEL_ACTION_ID_MAX_BYTES,
+            )?;
+            Self::validate_rpc_text_panel_action_field(
+                method,
+                "label",
+                &action.label,
+                RPC_TEXT_PANEL_ACTION_LABEL_MAX_BYTES,
+            )?;
+            Self::validate_rpc_text_panel_action_shortcut(method, action)?;
+            Self::validate_optional_rpc_text_panel_action_field(
+                method,
+                "group",
+                &action.group,
+                RPC_TEXT_PANEL_ACTION_GROUP_MAX_BYTES,
+            )?;
+            Self::validate_optional_rpc_text_panel_action_field(
+                method,
+                "description",
+                &action.description,
+                RPC_TEXT_PANEL_ACTION_DESCRIPTION_MAX_BYTES,
+            )?;
+            if let Some(label) = &action.compact_label {
+                Self::validate_rpc_text_panel_action_field(
+                    method,
+                    "compact_label",
+                    label,
+                    RPC_TEXT_PANEL_ACTION_COMPACT_LABEL_MAX_BYTES,
+                )?;
+            }
+            if !ids.insert(action.id.clone()) {
+                return Err(Self::rpc_error(
+                    -32602,
+                    format!("{method} action id is duplicated: {}", action.id),
+                ));
+            }
+        }
+        for (index, action) in actions.iter().enumerate() {
+            let Some(event) = action.enabled.then(|| action.event()).flatten() else {
+                continue;
+            };
+            if actions[..index]
+                .iter()
+                .any(|previous| previous.enabled && previous.event().as_ref() == Some(&event))
+            {
+                return Err(Self::rpc_error(
+                    -32602,
+                    format!("{method} action shortcut is duplicated: {}", action.key),
+                ));
+            }
+        }
+        Ok(ids)
+    }
+
     fn rpc_text_panel_host_id(
         &self,
         owner: &str,
@@ -26064,10 +26284,18 @@ impl Editor {
                 "red/TextPanelCreate width must be greater than zero",
             ));
         }
-        let host_id = self
+        let action_ids = Self::validate_rpc_text_panel_actions(
+            plugin::rpc::TEXT_PANEL_CREATE_METHOD,
+            &params.actions,
+        )?;
+        let (host_id, replaced) = self
             .plugin_registry
-            .register_rpc_text_panel(owner, &params.id)
+            .register_rpc_text_panel(owner, &params.id, action_ids)
             .map_err(|error| Self::rpc_error(-32004, error))?;
+        if let Some(replaced) = replaced {
+            self.clear_replaced_panel_zoom(&replaced);
+            self.panel_manager.close_panel(&replaced);
+        }
         self.clear_replaced_panel_zoom(&host_id);
         self.panel_manager.create_text_panel(
             host_id,
@@ -26075,11 +26303,35 @@ impl Editor {
                 side: params.side,
                 width: params.width,
                 title: params.title,
+                header_actions: params.actions,
                 ..plugin::PanelConfig::default()
             },
         );
         self.apply_panel_layout();
         self.finish_rpc_text_panel_change(render_buffer)
+    }
+
+    fn rpc_clipboard_write_request(
+        &mut self,
+        params: &Value,
+    ) -> std::result::Result<Value, plugin::rpc::RpcErrorObject> {
+        let params: RpcClipboardWriteParams =
+            Self::rpc_params(plugin::rpc::CLIPBOARD_WRITE_METHOD, params)?;
+        if params.text.len() > RPC_CLIPBOARD_MAX_BYTES {
+            return Err(Self::rpc_error(
+                -32602,
+                format!(
+                    "red/ClipboardWrite text may not exceed {RPC_CLIPBOARD_MAX_BYTES} UTF-8 bytes"
+                ),
+            ));
+        }
+        if !self.config.clipboard.enabled || !self.clipboard.is_available() {
+            return Err(Self::rpc_error(-32004, "system clipboard is unavailable"));
+        }
+        self.clipboard
+            .set_text(&params.text)
+            .map_err(|error| Self::rpc_error(-32003, error))?;
+        Ok(Value::Null)
     }
 
     fn rpc_text_panel_set_content_request(
@@ -26096,12 +26348,40 @@ impl Editor {
         if self.panel_manager.panel_layout(&host_id).is_none() {
             return Err(Self::rpc_text_panel_unavailable(&params.id));
         }
-        self.panel_manager.update_text_panel(
+        self.panel_manager.update_text_panel_with_highlighter(
             &host_id,
             params.blocks,
+            &mut self.highlighter,
             usize::from(self.size.1.saturating_sub(2)),
             usize::from(self.size.0),
         );
+        self.finish_rpc_text_panel_change(render_buffer)
+    }
+
+    fn rpc_text_panel_set_actions_request(
+        &mut self,
+        render_buffer: &mut RenderBuffer,
+        owner: &str,
+        params: RpcTextPanelSetActionsParams,
+    ) -> std::result::Result<Value, plugin::rpc::RpcErrorObject> {
+        Self::validate_rpc_resource_id(plugin::rpc::TEXT_PANEL_SET_ACTIONS_METHOD, &params.id)?;
+        let action_ids = Self::validate_rpc_text_panel_actions(
+            plugin::rpc::TEXT_PANEL_SET_ACTIONS_METHOD,
+            &params.actions,
+        )?;
+        let host_id = self.rpc_text_panel_host_id(
+            owner,
+            plugin::rpc::TEXT_PANEL_SET_ACTIONS_METHOD,
+            &params.id,
+        )?;
+        if self.panel_manager.panel_layout(&host_id).is_none() {
+            return Err(Self::rpc_text_panel_unavailable(&params.id));
+        }
+        self.panel_manager
+            .set_text_panel_actions(&host_id, params.actions);
+        self.plugin_registry
+            .update_rpc_text_panel_actions(owner, &params.id, action_ids)
+            .ok_or_else(|| Self::rpc_text_panel_unavailable(&params.id))?;
         self.finish_rpc_text_panel_change(render_buffer)
     }
 
@@ -26158,6 +26438,11 @@ impl Editor {
                 owner,
                 Self::rpc_params(method, params)?,
             ),
+            plugin::rpc::TEXT_PANEL_SET_ACTIONS_METHOD => self.rpc_text_panel_set_actions_request(
+                render_buffer,
+                owner,
+                Self::rpc_params(method, params)?,
+            ),
             plugin::rpc::TEXT_PANEL_FOCUS_METHOD => self.rpc_text_panel_focus_request(
                 render_buffer,
                 owner,
@@ -26181,26 +26466,61 @@ impl Editor {
 
         let params: RpcStatuslineSetParams =
             Self::rpc_params(plugin::rpc::STATUSLINE_SET_METHOD, params)?;
-        if params.text.trim().is_empty() {
-            return Err(Self::rpc_error(
-                -32602,
-                "red/StatuslineSet text must contain a non-whitespace character",
-            ));
-        }
-        if params.text.len() > MAX_TEXT_BYTES {
-            return Err(Self::rpc_error(
-                -32602,
-                format!("red/StatuslineSet text may not exceed {MAX_TEXT_BYTES} UTF-8 bytes"),
-            ));
-        }
-        if params.text.chars().any(char::is_control) {
-            return Err(Self::rpc_error(
-                -32602,
-                "red/StatuslineSet text may not contain control characters",
-            ));
-        }
+        Self::validate_rpc_single_line_text(
+            plugin::rpc::STATUSLINE_SET_METHOD,
+            "text",
+            &params.text,
+            MAX_TEXT_BYTES,
+        )?;
         self.plugin_registry
             .set_rpc_statusline(owner, params.side, params.text);
+        Ok(Value::Null)
+    }
+
+    fn validate_rpc_single_line_text(
+        method: &str,
+        field: &str,
+        value: &str,
+        max_bytes: usize,
+    ) -> std::result::Result<(), plugin::rpc::RpcErrorObject> {
+        if value.trim().is_empty() {
+            return Err(Self::rpc_error(
+                -32602,
+                format!("{method} {field} must contain a non-whitespace character"),
+            ));
+        }
+        if value.len() > max_bytes {
+            return Err(Self::rpc_error(
+                -32602,
+                format!("{method} {field} may not exceed {max_bytes} UTF-8 bytes"),
+            ));
+        }
+        if value.chars().any(char::is_control) {
+            return Err(Self::rpc_error(
+                -32602,
+                format!("{method} {field} may not contain control characters"),
+            ));
+        }
+        Ok(())
+    }
+
+    fn rpc_message_show_request(
+        &mut self,
+        render_buffer: &mut RenderBuffer,
+        params: &Value,
+    ) -> std::result::Result<Value, plugin::rpc::RpcErrorObject> {
+        const MAX_MESSAGE_BYTES: usize = 1024;
+
+        let params: RpcMessageShowParams =
+            Self::rpc_params(plugin::rpc::MESSAGE_SHOW_METHOD, params)?;
+        Self::validate_rpc_single_line_text(
+            plugin::rpc::MESSAGE_SHOW_METHOD,
+            "message",
+            &params.message,
+            MAX_MESSAGE_BYTES,
+        )?;
+        self.set_foreground_message(params.severity.into(), Some(params.message));
+        self.draw_commandline(render_buffer);
         Ok(Value::Null)
     }
 
@@ -26371,9 +26691,7 @@ impl Editor {
             return Self::plugin_document_index(buffer_manager, path)
                 .map_err(|error| Self::rpc_error(-32001, error));
         };
-        let id = document_id
-            .parse::<u64>()
-            .map_err(|_| Self::rpc_error(-32602, "document_id must be a decimal u64 string"))?;
+        let id = Self::rpc_document_id(document_id)?;
         let index = buffer_manager
             .iter()
             .position(|buffer| buffer.id().as_u64() == id)
@@ -26391,13 +26709,154 @@ impl Editor {
         Ok(index)
     }
 
+    fn rpc_document_id(document_id: &str) -> std::result::Result<u64, plugin::rpc::RpcErrorObject> {
+        document_id
+            .parse::<u64>()
+            .map_err(|_| Self::rpc_error(-32602, "document_id must be a decimal u64 string"))
+    }
+
+    fn rpc_document_create_request(
+        &mut self,
+        owner: &str,
+        params: &Value,
+    ) -> std::result::Result<Value, plugin::rpc::RpcErrorObject> {
+        let params: RpcDocumentCreateParams =
+            Self::rpc_params(plugin::rpc::DOCUMENT_CREATE_METHOD, params)?;
+        if params.text.len() > RPC_DOCUMENT_CREATE_MAX_BYTES {
+            return Err(Self::rpc_error(
+                -32602,
+                format!(
+                    "red/DocumentCreate text may not exceed {RPC_DOCUMENT_CREATE_MAX_BYTES} UTF-8 bytes"
+                ),
+            ));
+        }
+        let syntax = params
+            .syntax
+            .map(|syntax| {
+                if syntax.is_empty() || syntax.len() > RPC_DOCUMENT_SYNTAX_MAX_BYTES {
+                    return Err(Self::rpc_error(
+                        -32602,
+                        format!(
+                            "red/DocumentCreate syntax must contain 1 to {RPC_DOCUMENT_SYNTAX_MAX_BYTES} UTF-8 bytes"
+                        ),
+                    ));
+                }
+                self.highlighter
+                    .language_id_for_name(&syntax)
+                    .map(str::to_string)
+                    .ok_or_else(|| {
+                        Self::rpc_error(
+                            -32602,
+                            format!("red/DocumentCreate unknown syntax {syntax:?}"),
+                        )
+                    })
+            })
+            .transpose()?;
+
+        let mut document = Buffer::new(/*file*/ None, String::new());
+        if let Some(syntax) = syntax {
+            document.set_syntax_selection(SyntaxSelection::Language(syntax));
+        }
+        let cursor = CursorSnapshot::default();
+        document.undo_history.begin_transaction_with_origin(
+            "create plugin document",
+            cursor,
+            EditOrigin::Plugin {
+                name: owner.to_string(),
+            },
+        );
+        let end = document.char_idx_to_position(document.char_len());
+        apply_transactional_replacement(
+            &mut document,
+            TextRange::new(TextPosition::new(0, 0), end),
+            &params.text,
+        );
+        document.undo_history.commit_transaction(cursor);
+        document.refresh_dirty();
+        let document_id = document.id().as_u64().to_string();
+        self.buffer_manager.push_buffer(document);
+        Ok(json!({ "document_id": document_id }))
+    }
+
+    async fn rpc_document_show_request(
+        &mut self,
+        render_buffer: &mut RenderBuffer,
+        params: &Value,
+    ) -> std::result::Result<Value, plugin::rpc::RpcErrorObject> {
+        let params: RpcDocumentShowParams =
+            Self::rpc_params(plugin::rpc::DOCUMENT_SHOW_METHOD, params)?;
+        let index = Self::rpc_document_index(
+            &self.buffer_manager,
+            /*path*/ None,
+            Some(&params.document_id),
+        )?;
+        match params.target {
+            plugin::OpenLocationTarget::Current => self
+                .set_current_buffer(render_buffer, index)
+                .await
+                .map_err(|error| Self::rpc_error(-32003, error))?,
+            plugin::OpenLocationTarget::Horizontal | plugin::OpenLocationTarget::Vertical => {
+                let shown = self.update_window_layout(|windows| match params.target {
+                    plugin::OpenLocationTarget::Horizontal => windows.split_horizontal(index),
+                    plugin::OpenLocationTarget::Vertical => windows.split_vertical(index),
+                    plugin::OpenLocationTarget::Current => unreachable!(),
+                });
+                if !shown {
+                    return Err(Self::rpc_error(
+                        -32003,
+                        "unable to show document in requested target",
+                    ));
+                }
+                self.request_diagnostics()
+                    .await
+                    .and_then(|()| self.render(render_buffer))
+                    .map_err(|error| Self::rpc_error(-32003, error))?;
+            }
+        }
+        Ok(Value::Null)
+    }
+
+    fn rpc_document_watch_request(
+        &mut self,
+        owner: &str,
+        params: &Value,
+    ) -> std::result::Result<Value, plugin::rpc::RpcErrorObject> {
+        let params: RpcDocumentWatchParams =
+            Self::rpc_params(plugin::rpc::DOCUMENT_WATCH_METHOD, params)?;
+        let index = Self::rpc_document_index(
+            &self.buffer_manager,
+            /*path*/ None,
+            Some(&params.document_id),
+        )?;
+        let document = &self.buffer_manager[index];
+        let document_id = document.id().as_u64();
+        let revision = document.revision();
+        self.plugin_registry
+            .watch_rpc_document(owner, document_id)?;
+        Ok(json!({ "revision": revision.to_string() }))
+    }
+
+    fn rpc_document_unwatch_request(
+        &mut self,
+        owner: &str,
+        params: &Value,
+    ) -> std::result::Result<Value, plugin::rpc::RpcErrorObject> {
+        let params: RpcDocumentWatchParams =
+            Self::rpc_params(plugin::rpc::DOCUMENT_UNWATCH_METHOD, params)?;
+        let document_id = Self::rpc_document_id(&params.document_id)?;
+        self.plugin_registry
+            .unwatch_rpc_document(owner, document_id)?;
+        Ok(Value::Null)
+    }
+
     fn rpc_document_mutation_index(
         buffer_manager: &buffer_manager::BufferManager,
         path: Option<&str>,
         document_id: Option<&str>,
+        allow_inactive: bool,
     ) -> std::result::Result<usize, plugin::rpc::RpcErrorObject> {
         let index = Self::rpc_document_index(buffer_manager, path, document_id)?;
-        if document_id.is_some() && index != buffer_manager.active_index() {
+        if document_id.is_some() && !allow_inactive && index != buffer_manager.active_index() {
             return Err(Self::rpc_error(
                 -32003,
                 "document_id is not the current document",
@@ -26406,25 +26865,111 @@ impl Editor {
         Ok(index)
     }
 
+    fn rpc_visual_selection_range(
+        &self,
+        mode: Mode,
+        selection: Rect,
+    ) -> std::result::Result<TextRange, plugin::rpc::RpcErrorObject> {
+        let (x0, y0, x1, y1): (usize, usize, usize, usize) = selection.into();
+        match mode {
+            Mode::Visual => Ok(TextRange::new(
+                TextPosition::new(y0, self.grapheme_to_char_on_line(x0, y0)),
+                self.visual_selection_end_position(x1, y1),
+            )),
+            Mode::VisualLine => {
+                let end = if y1 < self.current_buffer().len() {
+                    TextPosition::new(y1 + 1, 0)
+                } else {
+                    TextPosition::new(y1, self.line_character_len(y1))
+                };
+                Ok(TextRange::new(TextPosition::new(y0, 0), end))
+            }
+            Mode::VisualBlock => Err(Self::rpc_error(
+                -32003,
+                "red/DocumentSnapshot does not support block selections",
+            )),
+            Mode::Normal | Mode::Insert | Mode::Command | Mode::Search => {
+                unreachable!("stored visual selections retain a visual mode")
+            }
+        }
+    }
+
+    fn rpc_document_selection(
+        &self,
+        index: usize,
+    ) -> std::result::Result<Option<Value>, plugin::rpc::RpcErrorObject> {
+        if index != self.buffer_manager.active_index() {
+            return Ok(None);
+        }
+        if self.has_multi_cursor_selections() {
+            return Err(Self::rpc_error(
+                -32003,
+                "red/DocumentSnapshot does not support multiple selections",
+            ));
+        }
+        let current = if matches!(
+            self.mode,
+            Mode::Visual | Mode::VisualLine | Mode::VisualBlock
+        ) {
+            self.selection.map(|selection| (self.mode, selection))
+        } else {
+            None
+        };
+        let selection = current.or_else(|| {
+            let buffer_id = self.current_buffer().id();
+            let saved = self.last_visual_selections.get(&buffer_id).copied()?;
+            let start = self.special_marks.get(&(buffer_id, '<'))?;
+            let end = self.special_marks.get(&(buffer_id, '>'))?;
+            let start = self.point_for_text_position(
+                self.current_buffer().char_idx_to_position(start.char_index),
+            );
+            let end = self.point_for_text_position(
+                self.current_buffer().char_idx_to_position(end.char_index),
+            );
+            Some((saved.mode, Rect::new(start.x, start.y, end.x, end.y)))
+        });
+        let Some((mode, selection)) = selection else {
+            return Ok(None);
+        };
+        let range = self.rpc_visual_selection_range(mode, selection)?;
+        Ok(Some(json!({
+            "range": range,
+            "text": self.current_buffer().text_in_range(range),
+        })))
+    }
+
     fn rpc_document_snapshot_request(
-        buffer_manager: &buffer_manager::BufferManager,
+        &self,
         params: &Value,
     ) -> std::result::Result<Value, plugin::rpc::RpcErrorObject> {
         let params: RpcDocumentSnapshotParams =
             Self::rpc_params(plugin::rpc::DOCUMENT_SNAPSHOT_METHOD, params)?;
         let index = Self::rpc_document_index(
-            buffer_manager,
+            &self.buffer_manager,
             params.path.as_deref(),
             params.document_id.as_deref(),
         )?;
-        let buffer = &buffer_manager[index];
+        let selection = if params.include_selection {
+            self.rpc_document_selection(index)?
+        } else {
+            None
+        };
+        let buffer = &self.buffer_manager[index];
+        if buffer.byte_len() >= plugin::rpc::MAX_FRAME_BYTES {
+            return Err(plugin::rpc::RpcErrorObject::response_too_large(
+                plugin::rpc::DOCUMENT_SNAPSHOT_METHOD,
+            ));
+        }
         let mut snapshot = json!({
             "path": buffer.file,
             "revision": buffer.revision().to_string(),
             "text": buffer.contents(),
         });
-        if params.include_document_id {
+        if params.include_document_id || params.include_selection {
             snapshot["document_id"] = json!(buffer.id().as_u64().to_string());
+        }
+        if params.include_selection {
+            snapshot["selection"] = selection.unwrap_or(Value::Null);
         }
         Ok(snapshot)
     }
@@ -26453,6 +26998,7 @@ impl Editor {
             &self.buffer_manager,
             params.path.as_deref(),
             params.document_id.as_deref(),
+            params.allow_inactive,
         )?;
         let revision = self.buffer_manager[buffer_index].revision();
         if revision != expected_revision {
@@ -26503,6 +27049,7 @@ impl Editor {
             &self.buffer_manager,
             params.path.as_deref(),
             params.document_id.as_deref(),
+            params.allow_inactive,
         )?;
         let state = self.begin_rpc_document_mutation(buffer_index);
         let result = self
@@ -26530,9 +27077,15 @@ impl Editor {
         params: &Value,
     ) -> std::result::Result<Value, plugin::rpc::RpcErrorObject> {
         match method {
-            plugin::rpc::DOCUMENT_SNAPSHOT_METHOD => {
-                Self::rpc_document_snapshot_request(&self.buffer_manager, params)
+            plugin::rpc::DOCUMENT_CREATE_METHOD => self.rpc_document_create_request(owner, params),
+            plugin::rpc::DOCUMENT_SHOW_METHOD => {
+                self.rpc_document_show_request(render_buffer, params).await
             }
+            plugin::rpc::DOCUMENT_WATCH_METHOD => self.rpc_document_watch_request(owner, params),
+            plugin::rpc::DOCUMENT_UNWATCH_METHOD => {
+                self.rpc_document_unwatch_request(owner, params)
+            }
+            plugin::rpc::DOCUMENT_SNAPSHOT_METHOD => self.rpc_document_snapshot_request(params),
             plugin::rpc::DOCUMENT_APPLY_METHOD => {
                 self.rpc_document_apply_request(render_buffer, runtime, owner, params)
                     .await
@@ -26549,6 +27102,10 @@ impl Editor {
             plugin::rpc::STATUSLINE_CLEAR_METHOD => {
                 self.rpc_statusline_clear_request(owner, params)
             }
+            plugin::rpc::MESSAGE_SHOW_METHOD => {
+                self.rpc_message_show_request(render_buffer, params)
+            }
+            plugin::rpc::CLIPBOARD_WRITE_METHOD => self.rpc_clipboard_write_request(params),
             _ => self.rpc_presentation_request(render_buffer, runtime, owner, method, params),
         }
     }
@@ -26765,6 +27322,8 @@ impl Editor {
         let highlighter = Highlighter::with_registry(&theme, self.highlighter.registry())?;
         self.theme = theme;
         self.highlighter = highlighter;
+        self.panel_manager
+            .rehighlight_text_panels(&mut self.highlighter);
         self.highlight_cache.clear();
         self.sync_diagnostic_gutter_signs();
         self.workspace_manager
@@ -37720,8 +38279,7 @@ builtin = "rust"
     #[test]
     fn rpc_document_snapshot_returns_unsaved_text_and_string_revision() {
         let editor = test_editor(/*width*/ 80, /*height*/ 24);
-        let response =
-            Editor::rpc_document_snapshot_request(&editor.buffer_manager, &json!({})).unwrap();
+        let response = editor.rpc_document_snapshot_request(&json!({})).unwrap();
 
         assert_eq!(response["path"], Value::Null);
         assert_eq!(
@@ -37736,19 +38294,31 @@ builtin = "rust"
     #[test]
     fn rpc_document_snapshot_rejects_invalid_and_unavailable_paths() {
         let editor = test_editor(/*width*/ 80, /*height*/ 24);
-        let invalid = Editor::rpc_document_snapshot_request(
-            &editor.buffer_manager,
-            &json!({"unknown": true}),
-        )
-        .unwrap_err();
-        let unavailable = Editor::rpc_document_snapshot_request(
-            &editor.buffer_manager,
-            &json!({"path": "/not/open/in/red"}),
-        )
-        .unwrap_err();
+        let invalid = editor
+            .rpc_document_snapshot_request(&json!({"unknown": true}))
+            .unwrap_err();
+        let unavailable = editor
+            .rpc_document_snapshot_request(&json!({"path": "/not/open/in/red"}))
+            .unwrap_err();
 
         assert_eq!(invalid.code, -32602);
         assert_eq!(unavailable.code, -32001);
+    }
+
+    #[test]
+    fn rpc_document_snapshot_rejects_text_that_cannot_fit_in_a_frame() {
+        let mut editor = test_editor(/*width*/ 80, /*height*/ 24);
+        editor.buffer_manager.replace_buffers(vec![Buffer::new(
+            None,
+            "x".repeat(plugin::rpc::MAX_FRAME_BYTES),
+        )]);
+
+        let error = editor
+            .rpc_document_snapshot_request(&json!({}))
+            .unwrap_err();
+
+        assert_eq!(error.code, -32006);
+        assert!(error.message.contains("RPC frame limit"));
     }
 
     #[test]
@@ -37759,11 +38329,9 @@ builtin = "rust"
             Some("second.txt".to_string()),
             "second".to_string(),
         ));
-        let second = Editor::rpc_document_snapshot_request(
-            &editor.buffer_manager,
-            &json!({"include_document_id": true}),
-        )
-        .unwrap();
+        let second = editor
+            .rpc_document_snapshot_request(&json!({"include_document_id": true}))
+            .unwrap();
         let second_id = &second["document_id"];
         assert_ne!(second_id, &json!(first_id));
 
@@ -37772,28 +38340,288 @@ builtin = "rust"
             json!({"document_id": 1}),
             json!({"document_id": first_id, "path": "second.txt"}),
         ] {
-            let error =
-                Editor::rpc_document_snapshot_request(&editor.buffer_manager, &params).unwrap_err();
+            let error = editor.rpc_document_snapshot_request(&params).unwrap_err();
             assert_eq!(error.code, -32602, "{params}");
         }
 
         editor.buffer_manager.remove_buffer(0);
-        let reindexed = Editor::rpc_document_snapshot_request(
-            &editor.buffer_manager,
-            &json!({"document_id": second_id, "include_document_id": true}),
-        )
-        .unwrap();
+        let reindexed = editor
+            .rpc_document_snapshot_request(
+                &json!({"document_id": second_id, "include_document_id": true}),
+            )
+            .unwrap();
         assert_eq!(reindexed, second);
-        let closed = Editor::rpc_document_snapshot_request(
-            &editor.buffer_manager,
-            &json!({"document_id": first_id}),
-        )
-        .unwrap_err();
+        let closed = editor
+            .rpc_document_snapshot_request(&json!({"document_id": first_id}))
+            .unwrap_err();
+        assert_eq!(closed.code, -32001);
+    }
+
+    #[test]
+    fn rpc_document_snapshot_normalizes_contiguous_selection_context() {
+        let mut editor = test_editor(/*width*/ 80, /*height*/ 24);
+        let text = "x😀e\u{301}\r\nlast\n";
+        editor
+            .buffer_manager
+            .replace_buffers(vec![Buffer::new(None, text.to_string())]);
+        let document_id = editor.current_buffer().id().as_u64().to_string();
+        let none = editor
+            .rpc_document_snapshot_request(&json!({"include_selection": true}))
+            .unwrap();
+        assert_eq!(none["selection"], Value::Null);
+
+        editor.mode = Mode::Visual;
+        editor.selection = Some(Rect::new(
+            /*x0*/ 1, /*y0*/ 0, /*x1*/ 2, /*y1*/ 0,
+        ));
+        let character = editor
+            .rpc_document_snapshot_request(&json!({"include_selection": true}))
+            .unwrap();
+        assert_eq!(character["document_id"], document_id);
+        assert_eq!(character["text"], text);
+        assert_eq!(
+            character["selection"],
+            json!({
+                "range": {
+                    "start": {"line": 0, "character": 1},
+                    "end": {"line": 0, "character": 4},
+                },
+                "text": "😀e\u{301}",
+            })
+        );
+
+        editor
+            .buffer_manager
+            .add_buffer(Buffer::new(None, "other\n".to_string()));
+        let inactive = editor
+            .rpc_document_snapshot_request(
+                &json!({"document_id": document_id, "include_selection": true}),
+            )
+            .unwrap();
+        assert_eq!(inactive["selection"], Value::Null);
+        editor.buffer_manager.set_active_index(0);
+
+        editor.capture_last_visual_selection();
+        editor.mode = Mode::Normal;
+        editor.selection = None;
+        let saved = editor
+            .rpc_document_snapshot_request(&json!({"include_selection": true}))
+            .unwrap();
+        assert_eq!(saved["selection"], character["selection"]);
+
+        editor.mode = Mode::VisualLine;
+        editor.selection = Some(Rect::new(
+            /*x0*/ 0, /*y0*/ 0, /*x1*/ 0, /*y1*/ 0,
+        ));
+        let line = editor
+            .rpc_document_snapshot_request(&json!({"include_selection": true}))
+            .unwrap();
+        assert_eq!(
+            line["selection"],
+            json!({
+                "range": {
+                    "start": {"line": 0, "character": 0},
+                    "end": {"line": 1, "character": 0},
+                },
+                "text": "x😀e\u{301}\r\n",
+            })
+        );
+
+        editor.mode = Mode::VisualBlock;
+        let block = editor
+            .rpc_document_snapshot_request(&json!({"include_selection": true}))
+            .unwrap_err();
+        assert_eq!(block.code, -32003);
+        assert!(block.message.contains("block selections"));
+
+        editor.mode = Mode::Normal;
+        editor.selection = None;
+        editor
+            .buffer_manager
+            .replace_buffers(vec![Buffer::new(None, "same same\n".to_string())]);
+        editor.select_next_occurrence();
+        let multiple = editor
+            .rpc_document_snapshot_request(&json!({"include_selection": true}))
+            .unwrap_err();
+        assert_eq!(multiple.code, -32003);
+        assert!(multiple.message.contains("multiple selections"));
+    }
+
+    #[tokio::test]
+    async fn rpc_created_documents_use_normal_undo_discard_and_save_as() {
+        let directory = tempfile::tempdir().unwrap();
+        let saved = directory.path().join("result.json");
+        let mut editor = test_editor(/*width*/ 80, /*height*/ 24);
+        let source_id = editor.current_buffer().id();
+        let mut render_buffer = RenderBuffer::new(80, 24, &Style::default());
+        let mut runtime = Runtime::new();
+        let created = editor
+            .rpc_host_request(
+                &mut render_buffer,
+                &mut runtime,
+                "rpc-test",
+                plugin::rpc::DOCUMENT_CREATE_METHOD,
+                &json!({"text": "{\"value\":1}\n", "syntax": "json"}),
+            )
+            .await
+            .unwrap();
+        let document_id = created["document_id"].as_str().unwrap();
+        let created_id = document_id.parse::<u64>().unwrap();
+        let created_index = editor
+            .buffer_manager
+            .iter()
+            .position(|buffer| buffer.id().as_u64() == created_id)
+            .unwrap();
+        let document = &editor.buffer_manager[created_index];
+
+        assert_eq!(editor.current_buffer().id(), source_id);
+        assert_eq!(document.file, None);
+        assert_eq!(document.contents(), "{\"value\":1}\n");
+        assert!(document.is_dirty());
+        assert_eq!(document.undo_history.node_count(), 1);
+        assert!(matches!(
+            document.syntax_selection(),
+            SyntaxSelection::Language(language) if language == "json"
+        ));
+        assert!(matches!(
+            &document.undo_history.latest_transaction().unwrap().origin,
+            EditOrigin::Plugin { name } if name == "rpc-test"
+        ));
+        assert!(!editor.current_buffer().is_dirty());
+        assert_eq!(editor.current_buffer().undo_history.node_count(), 0);
+
+        editor
+            .rpc_host_request(
+                &mut render_buffer,
+                &mut runtime,
+                "rpc-test",
+                plugin::rpc::DOCUMENT_SHOW_METHOD,
+                &json!({"document_id": document_id}),
+            )
+            .await
+            .unwrap();
+        editor
+            .delete_current_buffer(&mut render_buffer, /*force*/ false)
+            .await
+            .unwrap();
+        assert_eq!(editor.buffer_manager.len(), 2);
+        assert_eq!(editor.current_buffer().file, None);
+        assert!(editor.current_buffer().is_dirty());
+        assert!(editor
+            .save_as_action(saved.to_str().unwrap(), &mut render_buffer, &mut runtime)
+            .await
+            .unwrap());
+        assert_eq!(std::fs::read_to_string(&saved).unwrap(), "{\"value\":1}\n");
+        assert!(!editor.current_buffer().is_dirty());
+
+        let buffer = editor.current_buffer_mut();
+        let mut history = std::mem::take(&mut buffer.undo_history);
+        history.undo(buffer).unwrap();
+        buffer.undo_history = history;
+        buffer.refresh_dirty();
+
+        assert_eq!(editor.current_buffer().contents(), "\n");
+        assert!(editor.current_buffer().is_dirty());
+        assert_eq!(editor.buffer_manager[0].id(), source_id);
+        assert_eq!(editor.buffer_manager[0].contents(), "hello");
+        editor
+            .delete_current_buffer(&mut render_buffer, /*force*/ true)
+            .await
+            .unwrap();
+        assert_eq!(editor.buffer_manager.len(), 1);
+        assert_eq!(editor.current_buffer().contents(), "hello");
+    }
+
+    #[tokio::test]
+    async fn rpc_document_show_uses_stable_ids_and_native_split_targets() {
+        let mut editor = test_editor(/*width*/ 80, /*height*/ 24);
+        let mut render_buffer = RenderBuffer::new(80, 24, &Style::default());
+        let mut runtime = Runtime::new();
+        let first = editor
+            .rpc_host_request(
+                &mut render_buffer,
+                &mut runtime,
+                "rpc-test",
+                plugin::rpc::DOCUMENT_CREATE_METHOD,
+                &json!({"text": ".first"}),
+            )
+            .await
+            .unwrap();
+        let second = editor
+            .rpc_host_request(
+                &mut render_buffer,
+                &mut runtime,
+                "rpc-test",
+                plugin::rpc::DOCUMENT_CREATE_METHOD,
+                &json!({"text": ".second"}),
+            )
+            .await
+            .unwrap();
+        editor.buffer_manager.remove_buffer(0);
+
+        editor
+            .rpc_host_request(
+                &mut render_buffer,
+                &mut runtime,
+                "rpc-test",
+                plugin::rpc::DOCUMENT_SHOW_METHOD,
+                &json!({"document_id": second["document_id"], "target": "vertical"}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(editor.current_buffer().contents(), ".second");
+        assert_eq!(editor.window_manager.windows().len(), 2);
+
+        let first_id: u64 = first["document_id"].as_str().unwrap().parse().unwrap();
+        let first_index = editor
+            .buffer_manager
+            .iter()
+            .position(|buffer| buffer.id().as_u64() == first_id)
+            .unwrap();
+        editor.buffer_manager.remove_buffer(first_index);
+        let closed = editor
+            .rpc_host_request(
+                &mut render_buffer,
+                &mut runtime,
+                "rpc-test",
+                plugin::rpc::DOCUMENT_SHOW_METHOD,
+                &json!({"document_id": first["document_id"]}),
+            )
+            .await
+            .unwrap_err();
         assert_eq!(closed.code, -32001);
     }
 
     #[tokio::test]
-    async fn rpc_document_identity_prevents_edits_and_undo_after_switching_buffers() {
+    async fn rpc_document_create_rejects_invalid_or_oversized_inputs() {
+        let mut editor = test_editor(/*width*/ 80, /*height*/ 24);
+        let mut render_buffer = RenderBuffer::new(80, 24, &Style::default());
+        let mut runtime = Runtime::new();
+        let original_buffers = editor.buffer_manager.len();
+
+        for params in [
+            json!({}),
+            json!({"text": "value", "unknown": true}),
+            json!({"text": "value", "syntax": "not-a-red-syntax"}),
+            json!({"text": "x".repeat(RPC_DOCUMENT_CREATE_MAX_BYTES + 1)}),
+        ] {
+            let error = editor
+                .rpc_host_request(
+                    &mut render_buffer,
+                    &mut runtime,
+                    "rpc-test",
+                    plugin::rpc::DOCUMENT_CREATE_METHOD,
+                    &params,
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(error.code, -32602, "{params}");
+        }
+        assert_eq!(editor.buffer_manager.len(), original_buffers);
+    }
+
+    #[tokio::test]
+    async fn rpc_document_identity_requires_explicit_inactive_mutation_opt_in() {
         let mut editor = test_editor(/*width*/ 80, /*height*/ 24);
         let document_id = editor.current_buffer().id().as_u64().to_string();
         let revision = editor.current_buffer().revision();
@@ -37820,35 +38648,66 @@ builtin = "rust"
         });
         editor
             .buffer_manager
-            .add_buffer(Buffer::new(None, "hello".to_string()));
+            .add_buffer(Buffer::new(None, "query\n".repeat(30)));
+        editor
+            .window_manager
+            .active_window_mut()
+            .unwrap()
+            .buffer_index = 1;
+        editor.mode = Mode::Insert;
+        editor.cx = 1;
+        editor.cy = 1;
+        editor.vtop = 5;
+        editor.sync_to_window();
+        editor.begin_transaction("insert");
+        let active_id = editor.current_buffer().id();
+        let active_view = (editor.cx, editor.cy, editor.vtop);
         assert_eq!(editor.current_buffer().revision(), revision);
-        let rejected = request!(plugin::rpc::DOCUMENT_APPLY_METHOD, apply)
+        let rejected = request!(plugin::rpc::DOCUMENT_APPLY_METHOD, apply.clone())
             .await
             .unwrap_err();
         assert_eq!(rejected.code, -32003);
         assert_eq!(editor.buffer_manager.active_index(), 1);
         assert_eq!(editor.buffer_manager[0].contents(), "hello");
-        assert_eq!(editor.buffer_manager[1].contents(), "hello");
+        assert_eq!(editor.current_buffer().id(), active_id);
         assert!(!editor.current_buffer().is_dirty());
 
-        editor.buffer_manager.set_active_index(0);
-        let applied = request!(plugin::rpc::DOCUMENT_APPLY_METHOD, apply)
+        let mut inactive_apply = apply;
+        inactive_apply["allow_inactive"] = json!(true);
+        let applied = request!(plugin::rpc::DOCUMENT_APPLY_METHOD, inactive_apply)
             .await
             .unwrap();
         let undo = json!({"document_id": document_id, "transaction_id": applied["transaction_id"]});
-        editor.buffer_manager.set_active_index(1);
-        let rejected = request!(plugin::rpc::DOCUMENT_UNDO_METHOD, undo)
+        assert_eq!(editor.buffer_manager.active_index(), 1);
+        assert_eq!(
+            editor.window_manager.active_window().unwrap().buffer_index,
+            1
+        );
+        assert_eq!(editor.current_buffer().id(), active_id);
+        assert_eq!((editor.cx, editor.cy, editor.vtop), active_view);
+        assert!(editor.transaction_active());
+        assert_eq!(editor.buffer_manager[0].contents(), "world");
+
+        let rejected = request!(plugin::rpc::DOCUMENT_UNDO_METHOD, undo.clone())
             .await
             .unwrap_err();
         assert_eq!(rejected.code, -32003);
         assert_eq!(editor.buffer_manager.active_index(), 1);
         assert_eq!(editor.buffer_manager[0].contents(), "world");
-        assert_eq!(editor.current_buffer().contents(), "hello");
-        editor.buffer_manager.set_active_index(0);
-        request!(plugin::rpc::DOCUMENT_UNDO_METHOD, undo)
+        let mut inactive_undo = undo;
+        inactive_undo["allow_inactive"] = json!(true);
+        request!(plugin::rpc::DOCUMENT_UNDO_METHOD, inactive_undo)
             .await
             .unwrap();
-        assert_eq!(editor.current_buffer().contents(), "hello");
+        assert_eq!(editor.buffer_manager.active_index(), 1);
+        assert_eq!(
+            editor.window_manager.active_window().unwrap().buffer_index,
+            1
+        );
+        assert_eq!(editor.current_buffer().id(), active_id);
+        assert_eq!((editor.cx, editor.cy, editor.vtop), active_view);
+        assert!(editor.transaction_active());
+        assert_eq!(editor.buffer_manager[0].contents(), "hello");
     }
 
     #[tokio::test]
@@ -38228,6 +39087,27 @@ builtin = "rust"
         request!(
             "rpc-test",
             plugin::rpc::TEXT_PANEL_CREATE_METHOD,
+            json!({
+                "id": "preview",
+                "side": "right",
+                "width": 32,
+                "title": "RPC preview",
+                "actions": [
+                    {"id": "run", "label": "Run"},
+                    {"id": "close", "label": "Close", "compact_label": "x"}
+                ]
+            }),
+        )
+        .await
+        .unwrap();
+        let replaced_id = editor
+            .plugin_registry
+            .rpc_text_panel("rpc-test", "preview")
+            .unwrap();
+
+        request!(
+            "rpc-test",
+            plugin::rpc::TEXT_PANEL_CREATE_METHOD,
             json!({"id": "preview", "side": "right", "width": 32, "title": "RPC preview"}),
         )
         .await
@@ -38238,25 +39118,56 @@ builtin = "rust"
             .unwrap();
 
         assert_ne!(host_id, "preview");
+        assert_ne!(host_id, replaced_id);
+        assert_eq!(editor.panel_manager.panel_layout(&replaced_id), None);
         assert_eq!(
             editor.panel_manager.panel_layout(&host_id),
             Some((plugin::PanelSide::Right, 32))
         );
         request!(
             "rpc-test",
+            plugin::rpc::TEXT_PANEL_SET_ACTIONS_METHOD,
+            json!({
+                "id": "preview",
+                "actions": [
+                    {
+                        "id": "run",
+                        "key": "r",
+                        "label": "Run",
+                        "description": "Run the preview",
+                        "priority": "essential"
+                    },
+                    {
+                        "id": "live",
+                        "key": "",
+                        "label": "Live preview",
+                        "show_in_header": false
+                    }
+                ]
+            }),
+        )
+        .await
+        .unwrap();
+        request!(
+            "rpc-test",
             plugin::rpc::TEXT_PANEL_SET_CONTENT_METHOD,
             json!({
                 "id": "preview",
-                "blocks": [{"id": "result", "format": "markdown", "text": "# RPC panel\nRendered by Red"}]
+                "blocks": [{
+                    "id": "result",
+                    "format": "code",
+                    "language": "json",
+                    "text": "{\n  \"ready\": true\n}"
+                }]
             }),
         )
-            .await
-            .unwrap();
+        .await
+        .unwrap();
 
         let forbidden = request!(
             "other-plugin",
-            plugin::rpc::TEXT_PANEL_FOCUS_METHOD,
-            json!({"id": "preview"}),
+            plugin::rpc::TEXT_PANEL_SET_ACTIONS_METHOD,
+            json!({"id": "preview", "actions": []}),
         )
         .await
         .unwrap_err();
@@ -38301,6 +39212,132 @@ builtin = "rust"
         .await
         .unwrap_err();
         assert_eq!(invalid.code, -32602);
+
+        for actions in [
+            json!([{"id": "run", "label": " "}]),
+            json!([
+                {"id": "run", "key": "r", "label": "Run"},
+                {"id": "repeat", "key": "r", "label": "Repeat"}
+            ]),
+            json!([{"id": "run", "key": "not-a-key", "label": "Run"}]),
+            json!([{"id": "run", "label": "Run", "description": "x".repeat(RPC_TEXT_PANEL_ACTION_DESCRIPTION_MAX_BYTES + 1)}]),
+            json!([{"id": "run", "label": "Run", "unknown": true}]),
+            json!([
+                {"id": "same", "label": "One"},
+                {"id": "same", "label": "Two"}
+            ]),
+            Value::Array(
+                (0..=MAX_RPC_TEXT_PANEL_ACTIONS)
+                    .map(|index| json!({"id": index.to_string(), "label": "Action"}))
+                    .collect(),
+            ),
+        ] {
+            let invalid = request!(
+                "rpc-test",
+                plugin::rpc::TEXT_PANEL_CREATE_METHOD,
+                json!({"id": "invalid-actions", "actions": actions}),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(invalid.code, -32602);
+        }
+    }
+
+    #[tokio::test]
+    async fn rpc_clipboard_write_is_exact_bounded_and_reports_unavailable() {
+        let mut editor = test_editor(/*width*/ 80, /*height*/ 24);
+        let mut render_buffer = RenderBuffer::new(80, 24, &Style::default());
+        let mut runtime = Runtime::new();
+
+        let unavailable = editor
+            .rpc_host_request(
+                &mut render_buffer,
+                &mut runtime,
+                "rpc-test",
+                plugin::rpc::CLIPBOARD_WRITE_METHOD,
+                &json!({"text": "value"}),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(unavailable.code, -32004);
+
+        let clipboard = crate::clipboard::MemoryClipboardProvider::default();
+        let copied = clipboard.shared_text();
+        editor.test_set_clipboard(Box::new(clipboard));
+        let text = "😀e\u{301}\r\nexact";
+        assert_eq!(
+            editor
+                .rpc_host_request(
+                    &mut render_buffer,
+                    &mut runtime,
+                    "rpc-test",
+                    plugin::rpc::CLIPBOARD_WRITE_METHOD,
+                    &json!({"text": text}),
+                )
+                .await
+                .unwrap(),
+            Value::Null
+        );
+        assert_eq!(copied.lock().unwrap().as_deref(), Some(text));
+
+        let oversized = editor
+            .rpc_host_request(
+                &mut render_buffer,
+                &mut runtime,
+                "rpc-test",
+                plugin::rpc::CLIPBOARD_WRITE_METHOD,
+                &json!({"text": "x".repeat(RPC_CLIPBOARD_MAX_BYTES + 1)}),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(oversized.code, -32602);
+        assert_eq!(copied.lock().unwrap().as_deref(), Some(text));
+    }
+
+    #[tokio::test]
+    async fn rpc_message_show_is_visible_bounded_and_severity_typed() {
+        let mut editor = test_editor(/*width*/ 80, /*height*/ 24);
+        let mut render_buffer = RenderBuffer::new(80, 24, &Style::default());
+        let mut runtime = Runtime::new();
+        macro_rules! request {
+            ($params:expr $(,)?) => {
+                editor.rpc_host_request(
+                    &mut render_buffer,
+                    &mut runtime,
+                    "rpc-test",
+                    plugin::rpc::MESSAGE_SHOW_METHOD,
+                    &$params,
+                )
+            };
+        }
+
+        assert_eq!(
+            request!(json!({
+                "message": "JSON result copied",
+                "severity": "success"
+            }))
+            .await
+            .unwrap(),
+            Value::Null
+        );
+        assert!(render_text_rows(&render_buffer)
+            .last()
+            .unwrap()
+            .contains("JSON result copied"));
+        let message = editor.notifications().records().next_back().unwrap();
+        assert_eq!(message.content.summary, "JSON result copied");
+        assert_eq!(message.severity, Severity::Success);
+
+        for params in [
+            json!({"message": " "}),
+            json!({"message": "bad\nmessage"}),
+            json!({"message": "x".repeat(1025)}),
+            json!({"message": "value", "severity": "fatal"}),
+            json!({"message": "value", "unknown": true}),
+        ] {
+            assert_eq!(request!(params).await.unwrap_err().code, -32602);
+        }
+        assert_eq!(editor.notifications().records().count(), 1);
     }
 
     #[tokio::test]

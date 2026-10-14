@@ -1,0 +1,20 @@
+schema_version = 1
+
+[plugin]
+id = "json-workbench"
+name = "JSON Workbench"
+version = "0.9.0"
+red_api = "^0.19.0"
+description = "Preview, explore, apply, copy, and undo jq transformations"
+license = "MIT"
+
+[rpc]
+command = "python3"
+args = ["plugin.py"]
+
+[rpc.commands]
+aarch64-pc-windows-msvc = "python"
+x86_64-pc-windows-msvc = "python"
+
+[activation]
+commands = ["JsonApply", "JsonCancel", "JsonClose", "JsonCopy", "JsonExplore", "JsonLive", "JsonOpenResult", "JsonQueries", "JsonQuery", "JsonRun", "JsonSelection", "JsonSource", "JsonUndo", "JsonWorkbench"]

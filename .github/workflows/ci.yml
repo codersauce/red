@@ -84,7 +84,7 @@ jobs:
         run: python3 -m unittest tests.test_release_campaign tests.test_discord_release tests.test_social_release
 
       - name: Test validation helpers and RPC example
-        run: python3 -m unittest tests.test_ci_policy tests.test_doctest_packages tests.test_test_performance tests.test_rpc_example
+        run: python3 -m unittest tests.test_ci_policy tests.test_doctest_packages tests.test_test_performance tests.test_rpc_example tests.test_json_workbench
 
   test:
     name: Test Suite (${{ matrix.name }}, stable)

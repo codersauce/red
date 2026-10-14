@@ -144,7 +144,7 @@ configuration and plugin-owned payloads remain intentionally dynamic.
 
 ### Text panels
 
-Text panels keep conversation content as source-backed blocks instead of flattening it into selectable rows. A block has a stable `id`, a `user`, `agent`, `error`, or `text` kind, a `plain` or `markdown` format, and its original `text`:
+Text panels keep conversation content as source-backed blocks instead of flattening it into selectable rows. A block has a stable `id`, a `user`, `agent`, `error`, or `text` kind, a `plain`, `markdown`, or verbatim `code` format, an optional code `language`, and its original `text`:
 
 ```husk
 red::execute("CreateTextPanel", "assistant", PanelConfig {

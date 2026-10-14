@@ -722,6 +722,21 @@ pub(crate) fn render_code_lines_with_highlighter(
         .collect()
 }
 
+/// Render pre-highlighted source verbatim for a cached text-panel layout.
+pub(crate) fn render_code_lines(
+    source: &str,
+    width: usize,
+    styles: &[StyleInfo],
+) -> Vec<RenderedTextLine> {
+    if width == 0 {
+        return Vec::new();
+    }
+    project_highlighted_lines(source, styles, None)
+        .into_iter()
+        .flat_map(|spans| wrap_verbatim(&spans, width, &[], &[]))
+        .collect()
+}
+
 /// Render an exact two-sided edit using the same syntax spans and verbatim
 /// wrapping as Markdown code blocks, with the Git workspace's diff palette.
 pub(crate) fn render_diff_lines_with_highlighter(

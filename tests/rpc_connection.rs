@@ -400,6 +400,10 @@ fn run_registry_fixture() -> Result<()> {
     assert_eq!(
         initialize["params"]["host_methods"],
         json!([
+            "red/DocumentCreate",
+            "red/DocumentShow",
+            "red/DocumentWatch",
+            "red/DocumentUnwatch",
             "red/DocumentSnapshot",
             "red/DocumentApply",
             "red/DocumentUndo",
@@ -408,9 +412,12 @@ fn run_registry_fixture() -> Result<()> {
             "red/StorageSet",
             "red/StorageDelete",
             "red/TextPanelCreate",
+            "red/TextPanelSetActions",
             "red/TextPanelSetContent",
             "red/TextPanelFocus",
             "red/TextPanelDispose",
+            "red/ClipboardWrite",
+            "red/MessageShow",
             "red/StatuslineSet",
             "red/StatuslineClear",
             "red/PickerOpen"

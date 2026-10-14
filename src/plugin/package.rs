@@ -47,7 +47,7 @@ const COMMAND_SCOPE_API_VERSION: &str = "0.7.0";
 const COMMAND_ARGUMENTS_API_VERSION: &str = "0.11.0";
 const INDENTATION_API_VERSION: &str = "0.12.0";
 const RPC_PLUGIN_API_VERSION: &str = "0.19.0";
-const RPC_ARTIFACT_API_VERSION: &str = "0.20.0";
+const RPC_ARTIFACT_API_VERSION: &str = RPC_PLUGIN_API_VERSION;
 
 /// A parsed and validated stable plugin identifier.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -562,6 +562,17 @@ impl PluginPackageManager {
         self.config_dir.join("plugin-data").join(id.as_str())
     }
 
+    fn enabled_for_install(&self, id: &PluginId) -> Result<bool> {
+        let path = self
+            .packages_dir()
+            .join(id.as_str())
+            .join(INSTALL_RECORD_FILE);
+        if !path.is_file() {
+            return Ok(true);
+        }
+        Ok(read_record(&path)?.enabled)
+    }
+
     /// Installs a local development checkout without copying its source.
     pub async fn install_path(&self, source: &Path) -> Result<InstalledPlugin> {
         self.install_path_with_trust(source, false).await
@@ -639,7 +650,7 @@ impl PluginPackageManager {
             schema_version: 1,
             id: id.clone(),
             version: manifest.plugin.version.clone(),
-            enabled: true,
+            enabled: self.enabled_for_install(&id)?,
             source: PluginInstallSource::GitHub {
                 repository: repository.to_string(),
                 requested_version: requested_version.map(str::to_string),
@@ -734,7 +745,7 @@ impl PluginPackageManager {
                 schema_version: 1,
                 id: id.clone(),
                 version: manifest.plugin.version.clone(),
-                enabled: true,
+                enabled: self.enabled_for_install(&id)?,
                 source: PluginInstallSource::Catalog {
                     catalog_url: catalog_url.to_string(),
                     package: package.id.clone(),
@@ -1015,7 +1026,7 @@ impl PluginPackageManager {
             schema_version: 1,
             id: id.clone(),
             version: manifest.plugin.version.clone(),
-            enabled: true,
+            enabled: self.enabled_for_install(&id)?,
             source,
             package_root,
             installed_at_ms: now_ms(),
@@ -2507,7 +2518,7 @@ symbol = "tree_sitter_buildspec"
     #[test]
     fn rpc_executables_resolve_target_command_then_generic_then_artifact() {
         let package = tempfile::tempdir().unwrap();
-        write_rpc_artifact_package(package.path(), "1.0.0", "^0.20.0");
+        write_rpc_artifact_package(package.path(), "1.0.0", "^0.19.0");
         let mut manifest = PluginPackageManifest::load(package.path()).unwrap();
 
         assert!(manifest.rpc_command(package.path()).is_none());
@@ -2538,9 +2549,9 @@ symbol = "tree_sitter_buildspec"
             .insert(host_target().to_string(), "bin/document-tools".to_string());
         assert_eq!(manifest.rpc_command(package.path()), Some(target_command));
 
-        write_rpc_artifact_package(package.path(), "1.0.0", "^0.19.0");
+        write_rpc_artifact_package(package.path(), "1.0.0", "^0.18.0");
         let error = PluginPackageManifest::load(package.path()).unwrap_err();
-        assert!(error.to_string().contains("require red_api = \"^0.20.0\""));
+        assert!(error.to_string().contains("require red_api = \"^0.19.0\""));
     }
 
     #[tokio::test]
@@ -2551,7 +2562,7 @@ symbol = "tree_sitter_buildspec"
         let manager = PluginPackageManager::new(config.path());
         let installed = manager.install_path(previous.path()).await.unwrap();
         let staging = tempfile::tempdir().unwrap();
-        write_rpc_artifact_package(staging.path(), "2.0.0", "^0.20.0");
+        write_rpc_artifact_package(staging.path(), "2.0.0", "^0.19.0");
         let mut manifest = PluginPackageManifest::load(staging.path()).unwrap();
 
         let bytes = b"native RPC executable".to_vec();
@@ -2974,6 +2985,11 @@ root_markers = ["Acmefile", ".git"]
         write_package(package.path(), "test", "1.1.0");
         let updated = manager.update(&plugin.id).await.unwrap();
         assert_eq!(updated.version, Version::parse("1.1.0").unwrap());
+        assert!(!updated.enabled);
+
+        manager.set_enabled(&plugin.id, true).unwrap();
+        let updated = manager.update(&plugin.id).await.unwrap();
+        assert!(updated.enabled);
     }
 
     #[tokio::test]

@@ -1,4 +1,5 @@
 use super::*;
+use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use red::{
     buffer::Buffer,
     config::{Config, KeyAction},
@@ -15,14 +16,22 @@ struct Harness {
 
 impl Harness {
     async fn new(mapping: KeyAction) -> Result<Self> {
-        Self::build(mapping, false).await
+        Self::build(mapping, false, default_buffers()).await
     }
 
     async fn with_delayed_initialization(mapping: KeyAction) -> Result<Self> {
-        Self::build(mapping, true).await
+        Self::build(mapping, true, default_buffers()).await
     }
 
-    async fn build(mapping: KeyAction, delay_initialization: bool) -> Result<Self> {
+    async fn with_buffers(mapping: KeyAction, buffers: Vec<Buffer>) -> Result<Self> {
+        Self::build(mapping, false, buffers).await
+    }
+
+    async fn build(
+        mapping: KeyAction,
+        delay_initialization: bool,
+        buffers: Vec<Buffer>,
+    ) -> Result<Self> {
         let package = tempfile::tempdir()?;
         let slow = package.path().join("slow");
         let fast = package.path().join("fast");
@@ -34,7 +43,11 @@ impl Harness {
                 "RpcUndo",
                 "RpcLegacy",
                 "RpcPath",
+                "RpcPanel",
                 "RpcPicker",
+                "RpcOversized",
+                "RpcWatch",
+                "RpcUnwatch",
             ],
         )?;
         write_package(&fast, &["RpcRead"])?;
@@ -64,10 +77,7 @@ impl Harness {
             24,
             config,
             Theme::default(),
-            vec![
-                Buffer::new(None, "hello".into()),
-                Buffer::new(None, "other".into()),
-            ],
+            buffers,
         )?;
         Ok(Self {
             core: DetachedEditorCore::new(editor).await?,
@@ -139,6 +149,17 @@ impl Harness {
     }
 }
 
+fn default_buffers() -> Vec<Buffer> {
+    vec![
+        Buffer::new(None, "hello".into()),
+        Buffer::new(None, "other".into()),
+    ]
+}
+
+fn json_file_is_ready(path: &Path) -> bool {
+    fs::read(path).is_ok_and(|bytes| serde_json::from_slice::<Value>(&bytes).is_ok())
+}
+
 fn write_package(root: &Path, commands: &[&str]) -> Result<()> {
     fs::create_dir_all(root)?;
     let executable = env::current_exe()?;
@@ -150,7 +171,7 @@ fn write_package(root: &Path, commands: &[&str]) -> Result<()> {
         .chain(commands.iter().copied())
         .collect::<Vec<_>>();
     fs::write(root.join("red-plugin.toml"), format!(
-        "schema_version = 1\n[plugin]\nid = \"editor-fixture\"\nname = \"Editor Fixture\"\nversion = \"0.1.0\"\nred_api = \"^0.20.0\"\n[rpc]\ncommand = {executable:?}\nargs = {}\n[activation]\ncommands = {}\n",
+        "schema_version = 1\n[plugin]\nid = \"editor-fixture\"\nname = \"Editor Fixture\"\nversion = \"0.1.0\"\nred_api = \"^0.19.0\"\n[rpc]\ncommand = {executable:?}\nargs = {}\n[activation]\ncommands = {}\n",
         serde_json::to_string(&args)?, serde_json::to_string(commands)?,
     ))?;
     Ok(())
@@ -163,6 +184,9 @@ pub(super) async fn run() -> Result<()> {
     responsive_commands_and_undo()
         .await
         .context("responsive commands and undo")?;
+    oversized_snapshot_keeps_the_connection_active()
+        .await
+        .context("oversized document snapshot")?;
     legacy_mutation_rejects_changed_document()
         .await
         .context("legacy target guard")?;
@@ -190,9 +214,163 @@ pub(super) async fn run() -> Result<()> {
     host_native_pickers_select_cancel_and_reload_cleanly()
         .await
         .context("host-native RPC pickers")?;
+    rpc_panel_actions_are_owner_routed()
+        .await
+        .context("RPC panel actions")?;
     explicit_path_edit_preserves_the_active_view_and_insert()
         .await
         .context("off-screen document edit")?;
+    document_watches_coalesce_close_unwatch_and_reload()
+        .await
+        .context("RPC document watches")?;
+    document_watch_cap_leaves_the_connection_active()
+        .await
+        .context("RPC document watch cap")?;
+    Ok(())
+}
+
+async fn rpc_panel_actions_are_owner_routed() -> Result<()> {
+    let mut h = Harness::new(KeyAction::Single(Action::PluginCommand("RpcPanel".into()))).await?;
+    let slow = h.package.path().join("slow");
+
+    h.command("RpcPanel").await?;
+    h.until(|h| {
+        h.screen().contains("RPC panel content") && !h.core.test_rpc_command_pending("slow")
+    })
+    .await?;
+    assert!(h.screen().contains("Run"), "{}", h.screen());
+    let run_column = h
+        .screen()
+        .lines()
+        .next()
+        .and_then(|line| line.find("[Run]"))
+        .context("rendered Run action")?
+        + 1;
+    h.core
+        .input(InputEvent::Mouse {
+            event: MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: u16::try_from(run_column)?,
+                row: 0,
+                modifiers: KeyModifiers::NONE,
+            },
+        })
+        .await?;
+    h.until(|_| json_file_is_ready(&slow.join("panel-run.json")))
+        .await?;
+    let event: Value = serde_json::from_slice(&fs::read(slow.join("panel-run.json"))?)?;
+    assert_eq!(event, json!({"id": "preview", "action": "run"}));
+
+    h.key(KeyCode::Character('q')).await?;
+    h.until(|_| json_file_is_ready(&slow.join("panel-close.json")))
+        .await?;
+    let event: Value = serde_json::from_slice(&fs::read(slow.join("panel-close.json"))?)?;
+    assert_eq!(event, json!({"id": "preview", "action": "close"}));
+
+    h.command("RpcRead").await?;
+    h.until(|h| h.screen().contains("RpcRead done")).await?;
+    Ok(())
+}
+
+async fn document_watches_coalesce_close_unwatch_and_reload() -> Result<()> {
+    let mut h = Harness::new(KeyAction::Single(Action::PluginCommand("RpcWatch".into()))).await?;
+    let slow = h.package.path().join("slow");
+
+    h.command("RpcWatch").await?;
+    h.until(|h| h.marker("done", 1).exists()).await?;
+    let watched: Value = serde_json::from_slice(&fs::read(slow.join("watched.json"))?)?;
+    h.text("iabc").await?;
+    h.until(|_| slow.join("document-event-1.json").exists())
+        .await?;
+    let changed: Value = serde_json::from_slice(&fs::read(slow.join("document-event-1.json"))?)?;
+    assert_eq!(changed["event"], "changed");
+    assert_eq!(changed["document_id"], watched["document_id"]);
+    assert!(changed["revision"]
+        .as_str()
+        .is_some_and(|revision| revision.parse::<u64>().is_ok()));
+    tokio::time::sleep(Duration::from_millis(75)).await;
+    h.core.tick().await?;
+    assert!(!slow.join("document-event-2.json").exists());
+
+    h.command("bd!").await?;
+    h.until(|_| slow.join("document-event-2.json").exists())
+        .await?;
+    let closed: Value = serde_json::from_slice(&fs::read(slow.join("document-event-2.json"))?)?;
+    assert_eq!(
+        closed,
+        json!({
+            "document_id": watched["document_id"],
+            "event": "closed",
+        })
+    );
+
+    h.command("RpcWatch").await?;
+    h.until(|h| h.marker("done", 2).exists()).await?;
+    h.command("RpcUnwatch").await?;
+    h.until(|h| h.marker("done", 3).exists()).await?;
+    for index in 1..=2 {
+        fs::remove_file(slow.join(format!("document-event-{index}.json")))?;
+    }
+    h.text("iX").await?;
+    tokio::time::sleep(Duration::from_millis(75)).await;
+    h.core.tick().await?;
+    assert!(!slow.join("document-event-1.json").exists());
+
+    h.command("RpcWatch").await?;
+    h.until(|h| h.marker("done", 4).exists()).await?;
+    let process_path = slow.join("process-id");
+    let previous = fs::read_to_string(&process_path)?;
+    let manifest = slow.join("red-plugin.toml");
+    let source = fs::read_to_string(&manifest)?;
+    fs::write(&manifest, format!("{source}\n# Reload watched plugin.\n"))?;
+    h.until(|_| fs::read_to_string(&process_path).is_ok_and(|pid| pid != previous))
+        .await?;
+    h.text("iY").await?;
+    tokio::time::sleep(Duration::from_millis(75)).await;
+    h.core.tick().await?;
+    assert!(!slow.join("document-event-1.json").exists());
+    Ok(())
+}
+
+async fn document_watch_cap_leaves_the_connection_active() -> Result<()> {
+    let mut h = Harness::new(KeyAction::Single(Action::PluginCommand("RpcWatch".into()))).await?;
+
+    h.command("RpcWatch").await?;
+    h.until(|h| h.marker("done", 1).exists()).await?;
+    h.command("bnext").await?;
+    h.command("RpcWatch").await?;
+    h.until(|h| h.marker("done", 2).exists()).await?;
+    h.command("enew").await?;
+    h.command("RpcWatch").await?;
+    h.until(|h| h.marker("done", 3).exists()).await?;
+    let rejected: Value = serde_json::from_slice(&fs::read(h.marker("done", 3))?)?;
+    assert!(rejected["error"]["message"]
+        .as_str()
+        .is_some_and(|message| message.contains("at most 2 documents")));
+
+    h.command("RpcUnwatch").await?;
+    h.until(|h| h.marker("done", 4).exists()).await?;
+    h.command("RpcWatch").await?;
+    h.until(|h| h.marker("done", 5).exists()).await?;
+    let recovered: Value = serde_json::from_slice(&fs::read(h.marker("done", 5))?)?;
+    assert!(recovered.get("error").is_none(), "{recovered}");
+    Ok(())
+}
+
+async fn oversized_snapshot_keeps_the_connection_active() -> Result<()> {
+    const RPC_FRAME_BYTES: usize = 8 * 1024 * 1024;
+    let mut h = Harness::with_buffers(
+        KeyAction::Single(Action::PluginCommand("RpcOversized".into())),
+        vec![
+            Buffer::new(None, "\\".repeat(RPC_FRAME_BYTES / 2)),
+            Buffer::new(Some("small.txt".into()), "other".into()),
+        ],
+    )
+    .await?;
+
+    h.command("RpcOversized").await?;
+    h.until(|h| h.screen().contains("RpcOversized done"))
+        .await?;
     Ok(())
 }
 
@@ -571,6 +749,7 @@ pub(super) fn fixture() -> Result<()> {
     let process_id = std::process::id().to_string();
     fs::write("process-id", &process_id)?;
     let mut count = 0;
+    let mut document_event_count = 0;
     loop {
         let request = read_message(&mut input)?;
         match request["method"].as_str() {
@@ -602,6 +781,22 @@ pub(super) fn fixture() -> Result<()> {
                     serde_json::to_vec(&request["params"])?,
                 )?;
             }
+            Some("document/event") => {
+                document_event_count += 1;
+                fs::write(
+                    format!("document-event-{document_event_count}.json"),
+                    serde_json::to_vec(&request["params"])?,
+                )?;
+            }
+            Some("panel/event") => {
+                let action = request["params"]["action"]
+                    .as_str()
+                    .context("panel action")?;
+                fs::write(
+                    format!("panel-{action}.json"),
+                    serde_json::to_vec(&request["params"])?,
+                )?;
+            }
             Some("shutdown") => {
                 if Path::new("delay-shutdown").exists() {
                     fs::write(format!("shutdown-started-{process_id}"), [])?;
@@ -629,6 +824,55 @@ fn fixture_command(
     input: &mut impl BufRead,
     output: &mut impl Write,
 ) -> Result<()> {
+    if name == "RpcWatch" {
+        let document = host_request(
+            input,
+            output,
+            "red/DocumentSnapshot",
+            json!({"include_document_id":true}),
+        )?;
+        let watched = host_request(
+            input,
+            output,
+            "red/DocumentWatch",
+            json!({"document_id":document["document_id"]}),
+        )?;
+        fs::write(
+            "watched.json",
+            serde_json::to_vec(&json!({
+                "document_id": document["document_id"],
+                "revision": watched["revision"],
+            }))?,
+        )?;
+        return Ok(());
+    }
+    if name == "RpcUnwatch" {
+        let watched: Value = serde_json::from_slice(&fs::read("watched.json")?)?;
+        host_request(
+            input,
+            output,
+            "red/DocumentUnwatch",
+            json!({"document_id":watched["document_id"]}),
+        )?;
+        return Ok(());
+    }
+    if name == "RpcOversized" {
+        write_message(
+            output,
+            json!({"jsonrpc":"2.0","id":"host","method":"red/DocumentSnapshot","params":{}}),
+        )?;
+        let response = read_message(input)?;
+        anyhow::ensure!(response["id"] == "host", "unexpected message: {response}");
+        anyhow::ensure!(response["error"]["code"] == -32006, "{response}");
+        let document = host_request(
+            input,
+            output,
+            "red/DocumentSnapshot",
+            json!({"path":"small.txt"}),
+        )?;
+        anyhow::ensure!(document["text"] == "other", "{document}");
+        return Ok(());
+    }
     if name == "RpcPicker" {
         host_request(
             input,
@@ -642,6 +886,39 @@ fn fixture_command(
                     {"id": "beta", "label": "Beta", "detail": "second", "data": {"rank": 2}}
                 ]
             }),
+        )?;
+        return Ok(());
+    }
+    if name == "RpcPanel" {
+        host_request(
+            input,
+            output,
+            "red/TextPanelCreate",
+            json!({
+                "id": "preview",
+                "side": "right",
+                "width": 32,
+                "title": "RPC panel",
+                "actions": [
+                    {"id": "run", "label": "Run"},
+                    {"id": "close", "label": "Close", "compact_label": "x"}
+                ]
+            }),
+        )?;
+        host_request(
+            input,
+            output,
+            "red/TextPanelSetContent",
+            json!({
+                "id": "preview",
+                "blocks": [{"id": "content", "text": "RPC panel content"}]
+            }),
+        )?;
+        host_request(
+            input,
+            output,
+            "red/TextPanelFocus",
+            json!({"id": "preview"}),
         )?;
         return Ok(());
     }

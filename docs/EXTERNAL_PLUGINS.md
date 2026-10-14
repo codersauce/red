@@ -128,7 +128,7 @@ an installed language runtime:
 
 ```toml
 [plugin]
-red_api = "^0.20.0"
+red_api = "^0.19.0"
 
 [rpc]
 
@@ -143,7 +143,7 @@ to 128 MiB, verify SHA-256 before writing, set executable permissions, and
 prepare the executable before replacing the installed package. Local path
 installs keep using bundled or development commands and do not download
 release artifacts. Target-specific commands and artifacts require
-`red_api = "^0.20.0"` or later.
+`red_api = "^0.19.0"` or later.
 
 RPC processes inherit only Red's baseline home, path, locale, terminal,
 temporary-directory, XDG, SSH-agent, and Windows variables. A user can grant
@@ -166,14 +166,19 @@ See the [JSON-RPC plugin protocol](RPC_PLUGIN_PROTOCOL.md) for framing,
 lifecycle, capabilities, and the bounded version 1 surface. Declared commands
 appear in colon completion and the command palette before activation. Invoking
 one starts the process, validates its command metadata, and sends the typed
-`command/execute` request. Active plugins can call `red/DocumentSnapshot`,
-`red/DocumentApply`, and `red/DocumentUndo` to read and transactionally edit
-open documents through Red's existing revision, dirty-state, undo, and LSP
-paths. They can also create, replace the content of, focus, and dispose
-host-rendered text panels with connection-owned IDs, and set or clear one
-cached statusline contribution. Declared `editor:ready`, `file:opened`, and
-`file:saved` events arrive as typed `event/notify` notifications; other editor
-and callback events remain outside protocol version 1.
+`command/execute` request. Active plugins can create and explicitly reveal
+ordinary editable documents with `red/DocumentCreate` and `red/DocumentShow`.
+They can call `red/DocumentSnapshot`, `red/DocumentApply`, and
+`red/DocumentUndo` to read and transactionally edit open documents through
+Red's existing revision, dirty-state, undo, and LSP paths. RPC plugins may also
+request exact contiguous selection context with normalized Unicode-scalar
+ranges, or watch two stable document IDs for coalesced owner-local
+`document/event` invalidations and terminal close notifications. They can
+create, replace the content of, focus, and dispose host-rendered text panels
+with connection-owned IDs, and set or clear one cached statusline
+contribution. Declared `editor:ready`, `file:opened`, and `file:saved` events
+arrive as typed `event/notify` notifications; other editor and callback events
+remain outside protocol version 1.
 
 ## Lifecycle
 
@@ -190,7 +195,8 @@ red plugin remove replay --purge
 Ordinary removal preserves namespaced plugin data for later reinstall. `--purge`
 also removes that data. Install and update stage a complete package, validate
 compatibility and checksums, and atomically replace the active package. Failed
-updates leave the previous installation intact.
+updates leave the previous installation intact, and successful updates preserve
+the package's enabled or disabled state.
 
 ## Manifest
 
@@ -233,11 +239,22 @@ package's private storage. The package owns validation and conversion.
 
 ## Host-owned safety boundaries
 
+- `DocumentCreate` produces ordinary unnamed buffers with bounded initial text,
+  independent undo and dirty tracking, and no connection-owned cleanup;
+  `DocumentShow` requires an explicit stable document ID and user action.
 - `DocumentSnapshot`, `DocumentApply`, and `DocumentUndo` preserve editor
   revisions, preimages, attributed transactions, dirty tracking, and LSP
   notifications.
-- RPC text panels are capped per connection, use private host IDs, and are
-  disposed when their owner disconnects or reloads.
+- Opt-in RPC selection snapshots bind the exact selected text and normalized
+  range to the same stable document ID and revision as the complete text.
+- Opt-in stable-ID RPC mutations reuse the background transaction path while
+  preserving the active editor view and insert transaction.
+- RPC document watches are capped at two per connection, carry only stable IDs
+  and revisions, coalesce rapid changes, and are released on disconnect or
+  reload.
+- RPC text panels are capped per connection, use private host IDs, route only
+  declared actions and close to their owner, and are disposed when their owner
+  disconnects or reloads. Clipboard access is bounded and write-only.
 - RPC statusline contributions are cached by the host and cleared when their
   owner disconnects or reloads; rendering never waits for plugin IPC.
 - `CompanionCall` uses bounded JSON-lines frames, monotonic request IDs,
