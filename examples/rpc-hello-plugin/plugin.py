@@ -15,11 +15,13 @@ def send_error(message, detail):
 
 def read_messages():
     """Service notifications and lifecycle messages during every receive loop."""
-    global last_event
+    global initialized, last_event
     for line in sys.stdin:
         message = json.loads(line)
         method = message.get("method")
-        if method == "event/notify":
+        if method == "initialized":
+            initialized = True
+        elif method == "event/notify":
             last_event = message["params"]
         elif method == "picker/event":
             picker = message["params"]
@@ -36,6 +38,8 @@ def read_messages():
 
 
 def request_host(method, params):
+    if not initialized:
+        raise RuntimeError("cannot call host methods before initialized")
     request_id = f"plugin-{next(request_ids)}"
     send({"jsonrpc": "2.0", "id": request_id, "method": method, "params": params})
     for response in incoming:
@@ -50,6 +54,7 @@ def request_host(method, params):
     raise RuntimeError("host closed stdin while awaiting response")
 
 
+initialized = False
 last_transaction_id = None
 last_document_id = None
 last_event = None
@@ -83,7 +88,10 @@ for message in incoming:
                         },
                         {
                             "name": "RpcApply",
-                            "metadata": {"title": "Apply an RPC document edit"},
+                            "metadata": {
+                                "title": "Apply an RPC document edit",
+                                "arguments": True,
+                            },
                         },
                         {
                             "name": "RpcLastEvent",
@@ -143,22 +151,33 @@ for message in incoming:
                 }
             elif command == "RpcApply":
                 document = request_host("red/DocumentSnapshot", {"include_document_id": True})
+                suffix = message["params"].get("raw_args") or ""
+                if suffix:
+                    first_line = document.get("text", "").split("\n", 1)[0].rstrip("\r")
+                    edit = {
+                        "range": {
+                            "start": {"line": 0, "character": 0},
+                            "end": {"line": 0, "character": len(first_line)},
+                        },
+                        "text": f"{first_line} {suffix}",
+                        "expected_text": first_line,
+                    }
+                else:
+                    edit = {
+                        "range": {
+                            "start": {"line": 0, "character": 0},
+                            "end": {"line": 0, "character": 0},
+                        },
+                        "text": "# Edited by Python RPC\n",
+                        "expected_text": "",
+                    }
                 applied = request_host(
                     "red/DocumentApply",
                     {
                         "document_id": document["document_id"],
                         "expected_revision": document["revision"],
                         "label": "RPC example edit",
-                        "edits": [
-                            {
-                                "range": {
-                                    "start": {"line": 0, "character": 0},
-                                    "end": {"line": 0, "character": 0},
-                                },
-                                "text": "# Edited by Python RPC\n",
-                                "expected_text": "",
-                            }
-                        ],
+                        "edits": [edit],
                     },
                 )
                 last_transaction_id = applied["transaction_id"]
