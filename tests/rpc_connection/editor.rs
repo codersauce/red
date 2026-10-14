@@ -1,4 +1,5 @@
 use super::*;
+use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use red::{
     buffer::Buffer,
     config::{Config, KeyAction},
@@ -42,6 +43,7 @@ impl Harness {
                 "RpcUndo",
                 "RpcLegacy",
                 "RpcPath",
+                "RpcPanel",
                 "RpcPicker",
                 "RpcOversized",
                 "RpcWatch",
@@ -165,7 +167,7 @@ fn write_package(root: &Path, commands: &[&str]) -> Result<()> {
         .chain(commands.iter().copied())
         .collect::<Vec<_>>();
     fs::write(root.join("red-plugin.toml"), format!(
-        "schema_version = 1\n[plugin]\nid = \"editor-fixture\"\nname = \"Editor Fixture\"\nversion = \"0.1.0\"\nred_api = \"^0.23.0\"\n[rpc]\ncommand = {executable:?}\nargs = {}\n[activation]\ncommands = {}\n",
+        "schema_version = 1\n[plugin]\nid = \"editor-fixture\"\nname = \"Editor Fixture\"\nversion = \"0.1.0\"\nred_api = \"^0.26.0\"\n[rpc]\ncommand = {executable:?}\nargs = {}\n[activation]\ncommands = {}\n",
         serde_json::to_string(&args)?, serde_json::to_string(commands)?,
     ))?;
     Ok(())
@@ -208,6 +210,9 @@ pub(super) async fn run() -> Result<()> {
     host_native_pickers_select_cancel_and_reload_cleanly()
         .await
         .context("host-native RPC pickers")?;
+    rpc_panel_actions_are_owner_routed()
+        .await
+        .context("RPC panel actions")?;
     explicit_path_edit_preserves_the_active_view_and_insert()
         .await
         .context("off-screen document edit")?;
@@ -217,6 +222,47 @@ pub(super) async fn run() -> Result<()> {
     document_watch_cap_leaves_the_connection_active()
         .await
         .context("RPC document watch cap")?;
+    Ok(())
+}
+
+async fn rpc_panel_actions_are_owner_routed() -> Result<()> {
+    let mut h = Harness::new(KeyAction::Single(Action::PluginCommand("RpcPanel".into()))).await?;
+    let slow = h.package.path().join("slow");
+
+    h.command("RpcPanel").await?;
+    h.until(|h| {
+        h.screen().contains("RPC panel content") && !h.core.test_rpc_command_pending("slow")
+    })
+    .await?;
+    assert!(h.screen().contains("Run"), "{}", h.screen());
+    let run_column = h
+        .screen()
+        .lines()
+        .next()
+        .and_then(|line| line.find("[Run]"))
+        .context("rendered Run action")?
+        + 1;
+    h.core
+        .input(InputEvent::Mouse {
+            event: MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: u16::try_from(run_column)?,
+                row: 0,
+                modifiers: KeyModifiers::NONE,
+            },
+        })
+        .await?;
+    h.until(|_| slow.join("panel-run.json").exists()).await?;
+    let event: Value = serde_json::from_slice(&fs::read(slow.join("panel-run.json"))?)?;
+    assert_eq!(event, json!({"id": "preview", "action": "run"}));
+
+    h.key(KeyCode::Character('q')).await?;
+    h.until(|_| slow.join("panel-close.json").exists()).await?;
+    let event: Value = serde_json::from_slice(&fs::read(slow.join("panel-close.json"))?)?;
+    assert_eq!(event, json!({"id": "preview", "action": "close"}));
+
+    h.command("RpcRead").await?;
+    h.until(|h| h.screen().contains("RpcRead done")).await?;
     Ok(())
 }
 
@@ -736,6 +782,15 @@ pub(super) fn fixture() -> Result<()> {
                     serde_json::to_vec(&request["params"])?,
                 )?;
             }
+            Some("panel/event") => {
+                let action = request["params"]["action"]
+                    .as_str()
+                    .context("panel action")?;
+                fs::write(
+                    format!("panel-{action}.json"),
+                    serde_json::to_vec(&request["params"])?,
+                )?;
+            }
             Some("shutdown") => {
                 if Path::new("delay-shutdown").exists() {
                     fs::write(format!("shutdown-started-{process_id}"), [])?;
@@ -825,6 +880,39 @@ fn fixture_command(
                     {"id": "beta", "label": "Beta", "detail": "second", "data": {"rank": 2}}
                 ]
             }),
+        )?;
+        return Ok(());
+    }
+    if name == "RpcPanel" {
+        host_request(
+            input,
+            output,
+            "red/TextPanelCreate",
+            json!({
+                "id": "preview",
+                "side": "right",
+                "width": 32,
+                "title": "RPC panel",
+                "actions": [
+                    {"id": "run", "label": "Run"},
+                    {"id": "close", "label": "Close", "compact_label": "x"}
+                ]
+            }),
+        )?;
+        host_request(
+            input,
+            output,
+            "red/TextPanelSetContent",
+            json!({
+                "id": "preview",
+                "blocks": [{"id": "content", "text": "RPC panel content"}]
+            }),
+        )?;
+        host_request(
+            input,
+            output,
+            "red/TextPanelFocus",
+            json!({"id": "preview"}),
         )?;
         return Ok(());
     }

@@ -213,6 +213,7 @@ class JsonWorkbenchTest(unittest.TestCase):
         if create_panel:
             create = plugin.expect_host_request("red/TextPanelCreate")
             self.assertEqual(create["params"]["id"], "json-workbench")
+            self.assertEqual(create["params"]["actions"], WORKBENCH.PANEL_ACTIONS)
             plugin.reply(create)
         content = plugin.expect_host_request("red/TextPanelSetContent")
         self.assertEqual(content["params"]["blocks"][1]["text"], output)
@@ -311,6 +312,15 @@ class JsonWorkbenchTest(unittest.TestCase):
             plugin.expect_status("JSON: ready (4 B)")
             self.assertEqual(plugin.receive()["id"], "query")
 
+            plugin.command("copy", "JsonCopy")
+            copied = plugin.expect_host_request("red/ClipboardWrite")
+            self.assertEqual(copied["params"], {"text": "1\n2\n"})
+            plugin.reply(copied)
+            plugin.expect_status("JSON: copied")
+            self.assertEqual(
+                plugin.receive()["result"], {"message": "JSON result copied"}
+            )
+
             plugin.command("apply", "JsonApply")
             apply = plugin.expect_host_request("red/DocumentApply")
             edit = apply["params"]["edits"][0]
@@ -348,6 +358,35 @@ class JsonWorkbenchTest(unittest.TestCase):
             clear = plugin.expect_host_request("red/StatuslineClear")
             plugin.reply(clear)
             self.assertIsNone(plugin.receive()["result"])
+
+    def test_panel_copy_and_close_actions_are_notifications(self):
+        document = {
+            "path": "data.json",
+            "document_id": "7",
+            "revision": "1",
+            "text": "{}",
+        }
+        with PluginProcess(self.fake_jq) as plugin:
+            plugin.command("query", "JsonQuery", "stream")
+            plugin.load_runtime()
+            self.complete_query(plugin, "query", document, "1\n2\n", True)
+
+            plugin.send_notification(
+                "panel/event", {"id": "json-workbench", "action": "copy"}
+            )
+            copied = plugin.expect_host_request("red/ClipboardWrite")
+            self.assertEqual(copied["params"], {"text": "1\n2\n"})
+            plugin.reply(copied)
+            plugin.expect_status("JSON: copied")
+
+            plugin.send_notification(
+                "panel/event", {"id": "json-workbench", "action": "close"}
+            )
+            dispose = plugin.expect_host_request("red/TextPanelDispose")
+            self.assertEqual(dispose["params"], {"id": "json-workbench"})
+            plugin.reply(dispose)
+            clear = plugin.expect_host_request("red/StatuslineClear")
+            plugin.reply(clear)
 
     def test_selected_source_uses_captured_range_and_revision(self):
         text = "before\r\n😀e\u0301\r\nafter"

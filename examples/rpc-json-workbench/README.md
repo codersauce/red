@@ -23,6 +23,7 @@ Open a JSON document and run:
 :JsonQuery .users | map(select(.active))
 :JsonQueries
 :JsonOpenResult
+:JsonCopy
 :JsonSource
 :JsonApply
 :JsonUndo
@@ -61,6 +62,12 @@ closed like any other buffer. Query and result documents remain open if the
 plugin exits or reloads, while the preview panel remains connection-owned.
 `JsonSource` explicitly returns to the pinned source when you want to inspect
 it directly.
+
+The preview header exposes Run, Cancel, Apply, Open, Copy, and Close actions.
+Run schedules work in the background so Cancel and Close remain responsive;
+Copy writes the complete result to the system clipboard without giving the
+plugin read access. `JsonCopy` provides the same explicit copy operation from
+the command line.
 
 `JsonQueries` opens a native picker containing configured presets and up to 20
 recent successful queries. Choosing one runs it against the pinned source after

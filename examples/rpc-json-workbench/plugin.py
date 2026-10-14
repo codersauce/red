@@ -21,6 +21,14 @@ HISTORY_LIMIT = 20
 PRESET_LIMIT = 128
 PICKER_LABEL_LIMIT = 256
 PANEL_ID = "json-workbench"
+PANEL_ACTIONS = [
+    {"id": "run", "label": "Run", "compact_label": "R"},
+    {"id": "cancel", "label": "Cancel", "compact_label": "X"},
+    {"id": "apply", "label": "Apply", "compact_label": "A"},
+    {"id": "open", "label": "Open", "compact_label": "O"},
+    {"id": "copy", "label": "Copy", "compact_label": "C"},
+    {"id": "close", "label": "Close", "compact_label": "×"},
+]
 PICKER_ID = "json-queries"
 HISTORY_KEY = "query-history"
 PREFERENCES_KEY = "query-preferences"
@@ -88,6 +96,13 @@ COMMANDS = [
         "name": "JsonOpenResult",
         "metadata": {
             "title": "Open the JSON result in a document",
+            "category": "JSON Workbench",
+        },
+    },
+    {
+        "name": "JsonCopy",
+        "metadata": {
+            "title": "Copy the JSON result",
             "category": "JSON Workbench",
         },
     },
@@ -401,9 +416,7 @@ class JsonWorkbench:
         elif method == "exit":
             self.close_protocol(CommandCancelled())
             return False
-        elif method == "picker/event":
-            self.incoming.put(message)
-        elif method == "document/event":
+        elif method in ("picker/event", "document/event", "panel/event"):
             self.incoming.put(message)
         elif method == "command/execute" and self.command_active.is_set():
             self.send_error(message, "JSON Workbench is busy")
@@ -465,6 +478,7 @@ class JsonWorkbench:
                 "side": "right",
                 "width": 48,
                 "title": "JSON Workbench",
+                "actions": PANEL_ACTIONS,
             },
         )
         self.panel_open = True
@@ -895,6 +909,13 @@ class JsonWorkbench:
         self.best_effort_status("JSON: result")
         return {"message": "JSON result document ready"}
 
+    def copy_result(self, _params):
+        if self.result is None:
+            raise OperationError("JsonRun has no result to copy")
+        self.request_host("red/ClipboardWrite", {"text": self.result})
+        self.best_effort_status("JSON: copied")
+        return {"message": "JSON result copied"}
+
     def source(self, _params):
         if self.source_id is None:
             raise OperationError("JSON Workbench has no source document")
@@ -1069,6 +1090,35 @@ class JsonWorkbench:
         else:
             self.toggle_history()
 
+    def handle_panel_event(self, message):
+        params = message.get("params", {})
+        if params.get("id") != PANEL_ID:
+            return
+        action = params.get("action")
+        handlers = {
+            "cancel": self.cancel,
+            "apply": self.apply,
+            "open": self.open_result,
+            "copy": self.copy_result,
+            "close": self.close,
+        }
+        if action == "run":
+            self.start_background_query(None)
+            return
+        handler = handlers.get(action)
+        if handler is None:
+            return
+        if self.background_busy() and action not in ("cancel", "close"):
+            self.best_effort_status("JSON: busy")
+            return
+        try:
+            handler({})
+        except CommandCancelled:
+            pass
+        except OperationError as error:
+            self.retire_preview(error)
+            self.best_effort_status("JSON: error")
+
     def handle_document_event(self, message):
         params = message.get("params", {})
         document_id = params.get("document_id")
@@ -1189,6 +1239,7 @@ class JsonWorkbench:
             "JsonQuery": self.query,
             "JsonQueries": self.queries,
             "JsonOpenResult": self.open_result,
+            "JsonCopy": self.copy_result,
             "JsonSource": self.source,
             "JsonApply": self.apply,
             "JsonUndo": self.undo,
@@ -1213,6 +1264,11 @@ class JsonWorkbench:
 
     def serve(self):
         threading.Thread(target=self.read_messages, daemon=True).start()
+        notification_handlers = {
+            "picker/event": self.handle_picker_event,
+            "document/event": self.handle_document_event,
+            "panel/event": self.handle_panel_event,
+        }
         try:
             while not self.closed.is_set():
                 message = self.incoming.get()
@@ -1233,10 +1289,8 @@ class JsonWorkbench:
                     )
                 elif method == "command/execute":
                     self.execute(message)
-                elif method == "picker/event":
-                    self.handle_picker_event(message)
-                elif method == "document/event":
-                    self.handle_document_event(message)
+                elif method in notification_handlers:
+                    notification_handlers[method](message)
                 else:
                     self.send_error(message, "method not found")
         finally:

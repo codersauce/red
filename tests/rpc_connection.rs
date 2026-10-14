@@ -405,6 +405,7 @@ fn run_registry_fixture() -> Result<()> {
             "red/TextPanelSetContent",
             "red/TextPanelFocus",
             "red/TextPanelDispose",
+            "red/ClipboardWrite",
             "red/StatuslineSet",
             "red/StatuslineClear",
             "red/PickerOpen"

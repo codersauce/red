@@ -251,8 +251,9 @@ package's private storage. The package owns validation and conversion.
 - RPC document watches are capped at two per connection, carry only stable IDs
   and revisions, coalesce rapid changes, and are released on disconnect or
   reload.
-- RPC text panels are capped per connection, use private host IDs, and are
-  disposed when their owner disconnects or reloads.
+- RPC text panels are capped per connection, use private host IDs, route only
+  declared actions and close to their owner, and are disposed when their owner
+  disconnects or reloads. Clipboard access is bounded and write-only.
 - RPC statusline contributions are cached by the host and cleared when their
   owner disconnects or reloads; rendering never waits for plugin IPC.
 - `CompanionCall` uses bounded JSON-lines frames, monotonic request IDs,

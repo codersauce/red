@@ -32,12 +32,13 @@ use super::package::{PluginPackageManifest, PLUGIN_MANIFEST_FILE};
 use super::process::inherited_environment;
 use super::rpc::{
     RpcConnection, RpcErrorObject, RpcIncoming, RpcInitializeParams, RpcRequester,
-    RpcStatuslineSide, CONFIG_GET_METHOD, DOCUMENT_APPLY_METHOD, DOCUMENT_CREATE_METHOD,
-    DOCUMENT_EVENT_METHOD, DOCUMENT_SHOW_METHOD, DOCUMENT_SNAPSHOT_METHOD, DOCUMENT_UNDO_METHOD,
-    DOCUMENT_UNWATCH_METHOD, DOCUMENT_WATCH_METHOD, MAX_OUTSTANDING_REQUESTS, MAX_QUEUED_BYTES,
-    PICKER_EVENT_METHOD, PICKER_OPEN_METHOD, STATUSLINE_CLEAR_METHOD, STATUSLINE_SET_METHOD,
-    STORAGE_DELETE_METHOD, STORAGE_GET_METHOD, STORAGE_SET_METHOD, TEXT_PANEL_CREATE_METHOD,
-    TEXT_PANEL_DISPOSE_METHOD, TEXT_PANEL_FOCUS_METHOD, TEXT_PANEL_SET_CONTENT_METHOD,
+    RpcStatuslineSide, CLIPBOARD_WRITE_METHOD, CONFIG_GET_METHOD, DOCUMENT_APPLY_METHOD,
+    DOCUMENT_CREATE_METHOD, DOCUMENT_EVENT_METHOD, DOCUMENT_SHOW_METHOD, DOCUMENT_SNAPSHOT_METHOD,
+    DOCUMENT_UNDO_METHOD, DOCUMENT_UNWATCH_METHOD, DOCUMENT_WATCH_METHOD, MAX_OUTSTANDING_REQUESTS,
+    MAX_QUEUED_BYTES, PANEL_EVENT_METHOD, PICKER_EVENT_METHOD, PICKER_OPEN_METHOD,
+    STATUSLINE_CLEAR_METHOD, STATUSLINE_SET_METHOD, STORAGE_DELETE_METHOD, STORAGE_GET_METHOD,
+    STORAGE_SET_METHOD, TEXT_PANEL_CREATE_METHOD, TEXT_PANEL_DISPOSE_METHOD,
+    TEXT_PANEL_FOCUS_METHOD, TEXT_PANEL_SET_CONTENT_METHOD,
 };
 use super::{
     CommandMetadata, CommandScope, PluginMetadata, RegisteredPluginCommand, RequestId, Runtime,
@@ -66,7 +67,7 @@ pub struct PluginRegistry {
     rpc_plugins: HashMap<String, ActiveRpcPlugin>,
     rpc_activations: HashMap<String, PendingRpcPlugin>,
     rpc_retirements: HashMap<String, JoinHandle<()>>,
-    rpc_text_panels: HashMap<String, HashMap<String, String>>,
+    rpc_text_panels: HashMap<String, HashMap<String, RpcTextPanel>>,
     rpc_pickers: HashMap<super::PickerHandle, RpcPicker>,
     next_rpc_picker_handle: i32,
     rpc_statuslines: BTreeMap<String, RpcStatuslineContribution>,
@@ -81,6 +82,16 @@ struct RpcStatuslineContribution {
 struct RpcPicker {
     owner: String,
     id: String,
+}
+
+struct RpcTextPanel {
+    host_id: String,
+    actions: HashSet<String>,
+}
+
+fn is_rpc_text_panel_host_id(id: &str) -> bool {
+    id.strip_prefix("rpc-text-panel-")
+        .is_some_and(|id| uuid::Uuid::parse_str(id).is_ok())
 }
 
 struct ActiveRpcPlugin {
@@ -230,7 +241,7 @@ struct RpcCommandResult {
 }
 
 /// Host API version used for plugin compatibility checks.
-pub const RED_HOST_API_VERSION: &str = "0.25.0";
+pub const RED_HOST_API_VERSION: &str = "0.26.0";
 pub(crate) const SUPPORTED_HOST_API_VERSIONS: &[&str] = &[
     "0.4.0",
     "0.6.0",
@@ -250,6 +261,7 @@ pub(crate) const SUPPORTED_HOST_API_VERSIONS: &[&str] = &[
     "0.22.0",
     "0.23.0",
     "0.24.0",
+    "0.25.0",
     RED_HOST_API_VERSION,
 ];
 
@@ -459,34 +471,48 @@ impl PluginRegistry {
         &mut self,
         owner: &str,
         id: &str,
-    ) -> anyhow::Result<String> {
+        actions: HashSet<String>,
+    ) -> anyhow::Result<(String, Option<String>)> {
         let panels = self.rpc_text_panels.entry(owner.to_string()).or_default();
-        if let Some(host_id) = panels.get(id) {
-            return Ok(host_id.clone());
+        if !panels.contains_key(id) {
+            anyhow::ensure!(
+                panels.len() < MAX_RPC_TEXT_PANELS,
+                "plugin may own at most {MAX_RPC_TEXT_PANELS} text panels"
+            );
         }
-        anyhow::ensure!(
-            panels.len() < MAX_RPC_TEXT_PANELS,
-            "plugin may own at most {MAX_RPC_TEXT_PANELS} text panels"
-        );
         let host_id = format!("rpc-text-panel-{}", uuid::Uuid::new_v4());
-        panels.insert(id.to_string(), host_id.clone());
-        Ok(host_id)
+        let replaced = panels
+            .insert(
+                id.to_string(),
+                RpcTextPanel {
+                    host_id: host_id.clone(),
+                    actions,
+                },
+            )
+            .map(|panel| panel.host_id);
+        Ok((host_id, replaced))
     }
 
     pub(crate) fn rpc_text_panel(&self, owner: &str, id: &str) -> Option<String> {
-        self.rpc_text_panels.get(owner)?.get(id).cloned()
+        self.rpc_text_panels
+            .get(owner)?
+            .get(id)
+            .map(|panel| panel.host_id.clone())
     }
 
     pub(crate) fn take_rpc_text_panel(&mut self, owner: &str, id: &str) -> Option<String> {
-        self.rpc_text_panels.get_mut(owner)?.remove(id)
+        self.rpc_text_panels
+            .get_mut(owner)?
+            .remove(id)
+            .map(|panel| panel.host_id)
     }
 
     fn close_rpc_text_panels(&mut self, runtime: &Runtime, owner: &str) {
         let Some(panels) = self.rpc_text_panels.remove(owner) else {
             return;
         };
-        for id in panels.into_values() {
-            runtime.send_request(PluginRequest::ClosePanel { id });
+        for panel in panels.into_values() {
+            runtime.send_request(PluginRequest::ClosePanel { id: panel.host_id });
         }
     }
 
@@ -834,6 +860,7 @@ impl PluginRegistry {
                 TEXT_PANEL_SET_CONTENT_METHOD.to_string(),
                 TEXT_PANEL_FOCUS_METHOD.to_string(),
                 TEXT_PANEL_DISPOSE_METHOD.to_string(),
+                CLIPBOARD_WRITE_METHOD.to_string(),
                 STATUSLINE_SET_METHOD.to_string(),
                 STATUSLINE_CLEAR_METHOD.to_string(),
                 PICKER_OPEN_METHOD.to_string(),
@@ -1664,6 +1691,13 @@ impl PluginRegistry {
         args: serde_json::Value,
     ) -> anyhow::Result<()> {
         let _span = crate::editor::perf::PerfSpan::with_detail("notify", event);
+        if let Some(panel_id) = event.strip_prefix("panel:event:") {
+            if self.notify_rpc_text_panel(runtime, panel_id, &args).await
+                || is_rpc_text_panel_host_id(panel_id)
+            {
+                return Ok(());
+            }
+        }
         if self.pending_plugins != 0 {
             let pending = self
                 .plugins
@@ -1694,6 +1728,46 @@ impl PluginRegistry {
         }
         self.notify_rpc_plugins(runtime, event, &args).await;
         Ok(())
+    }
+
+    async fn notify_rpc_text_panel(
+        &mut self,
+        runtime: &mut Runtime,
+        host_id: &str,
+        payload: &Value,
+    ) -> bool {
+        let action = payload
+            .get("action")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let Some((owner, id, deliver)) = self.rpc_text_panels.iter().find_map(|(owner, panels)| {
+            panels.iter().find_map(|(id, panel)| {
+                (panel.host_id == host_id).then(|| {
+                    (
+                        owner.clone(),
+                        id.clone(),
+                        action == "close" || panel.actions.contains(action),
+                    )
+                })
+            })
+        }) else {
+            return false;
+        };
+        if !deliver {
+            return true;
+        }
+        let Some(plugin) = self.rpc_plugins.get(&owner) else {
+            return true;
+        };
+        if let Err(error) = plugin
+            .connection
+            .notify(PANEL_EVENT_METHOD, json!({"id": id, "action": action}))
+            .await
+        {
+            let path = self.plugin_path(&owner);
+            self.quarantine(runtime, &owner, &path, "runtime", error.to_string());
+        }
+        true
     }
 
     async fn activate_for_event(
@@ -2617,11 +2691,13 @@ mod tests {
         let mut registry = PluginRegistry::new();
         let mut runtime = Runtime::new();
         let owner_id = registry
-            .register_rpc_text_panel("owner", "preview")
-            .unwrap();
+            .register_rpc_text_panel("owner", "preview", HashSet::new())
+            .unwrap()
+            .0;
         let observer_id = registry
-            .register_rpc_text_panel("observer", "preview")
-            .unwrap();
+            .register_rpc_text_panel("observer", "preview", HashSet::new())
+            .unwrap()
+            .0;
         let owner_picker = registry.register_rpc_picker("owner", "choices".to_string());
         let observer_picker = registry.register_rpc_picker("observer", "choices".to_string());
         assert!(owner_picker.get() < 0 && observer_picker.get() < 0);
@@ -3316,6 +3392,9 @@ mod tests {
         check_api_compatibility(&metadata).unwrap();
 
         metadata.red_api_version = Some("^0.24.0".to_string());
+        check_api_compatibility(&metadata).unwrap();
+
+        metadata.red_api_version = Some("^0.25.0".to_string());
         check_api_compatibility(&metadata).unwrap();
 
         metadata.red_api_version = Some("^0.5.0".to_string());

@@ -4661,6 +4661,8 @@ struct RpcTextPanelCreateParams {
     width: usize,
     #[serde(default)]
     title: Option<String>,
+    #[serde(default)]
+    actions: Vec<plugin::TextPanelHeaderAction>,
 }
 
 #[derive(Deserialize)]
@@ -4674,6 +4676,12 @@ struct RpcTextPanelSetContentParams {
 #[serde(deny_unknown_fields)]
 struct RpcTextPanelParams {
     id: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RpcClipboardWriteParams {
+    text: String,
 }
 
 #[derive(Deserialize)]
@@ -4742,6 +4750,11 @@ const RPC_STORAGE_MAX_KEY_BYTES: usize = 128;
 const RPC_PLUGIN_VALUE_MAX_BYTES: usize = 1024 * 1024;
 const RPC_DOCUMENT_CREATE_MAX_BYTES: usize = 1024 * 1024;
 const RPC_DOCUMENT_SYNTAX_MAX_BYTES: usize = 128;
+const MAX_RPC_TEXT_PANEL_ACTIONS: usize = 8;
+const RPC_TEXT_PANEL_ACTION_ID_MAX_BYTES: usize = 64;
+const RPC_TEXT_PANEL_ACTION_LABEL_MAX_BYTES: usize = 128;
+const RPC_TEXT_PANEL_ACTION_COMPACT_LABEL_MAX_BYTES: usize = 64;
+const RPC_CLIPBOARD_MAX_BYTES: usize = 1024 * 1024;
 const MAX_RPC_PICKER_ITEMS: usize = 4_096;
 
 fn default_rpc_text_panel_width() -> usize {
@@ -26062,6 +26075,62 @@ impl Editor {
         Ok(())
     }
 
+    fn validate_rpc_text_panel_action_field(
+        field: &str,
+        value: &str,
+        max_bytes: usize,
+    ) -> std::result::Result<(), plugin::rpc::RpcErrorObject> {
+        if value.trim().is_empty() || value.len() > max_bytes {
+            return Err(Self::rpc_error(
+                -32602,
+                format!(
+                    "red/TextPanelCreate action {field} must contain 1 to {max_bytes} UTF-8 bytes"
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_rpc_text_panel_actions(
+        actions: &[plugin::TextPanelHeaderAction],
+    ) -> std::result::Result<HashSet<String>, plugin::rpc::RpcErrorObject> {
+        if actions.len() > MAX_RPC_TEXT_PANEL_ACTIONS {
+            return Err(Self::rpc_error(
+                -32602,
+                format!(
+                    "red/TextPanelCreate may contain at most {MAX_RPC_TEXT_PANEL_ACTIONS} actions"
+                ),
+            ));
+        }
+        let mut ids = HashSet::with_capacity(actions.len());
+        for action in actions {
+            Self::validate_rpc_text_panel_action_field(
+                "id",
+                &action.id,
+                RPC_TEXT_PANEL_ACTION_ID_MAX_BYTES,
+            )?;
+            Self::validate_rpc_text_panel_action_field(
+                "label",
+                &action.label,
+                RPC_TEXT_PANEL_ACTION_LABEL_MAX_BYTES,
+            )?;
+            if let Some(label) = &action.compact_label {
+                Self::validate_rpc_text_panel_action_field(
+                    "compact_label",
+                    label,
+                    RPC_TEXT_PANEL_ACTION_COMPACT_LABEL_MAX_BYTES,
+                )?;
+            }
+            if !ids.insert(action.id.clone()) {
+                return Err(Self::rpc_error(
+                    -32602,
+                    format!("red/TextPanelCreate action id is duplicated: {}", action.id),
+                ));
+            }
+        }
+        Ok(ids)
+    }
+
     fn rpc_text_panel_host_id(
         &self,
         owner: &str,
@@ -26101,10 +26170,15 @@ impl Editor {
                 "red/TextPanelCreate width must be greater than zero",
             ));
         }
-        let host_id = self
+        let action_ids = Self::validate_rpc_text_panel_actions(&params.actions)?;
+        let (host_id, replaced) = self
             .plugin_registry
-            .register_rpc_text_panel(owner, &params.id)
+            .register_rpc_text_panel(owner, &params.id, action_ids)
             .map_err(|error| Self::rpc_error(-32004, error))?;
+        if let Some(replaced) = replaced {
+            self.clear_replaced_panel_zoom(&replaced);
+            self.panel_manager.close_panel(&replaced);
+        }
         self.clear_replaced_panel_zoom(&host_id);
         self.panel_manager.create_text_panel(
             host_id,
@@ -26112,11 +26186,35 @@ impl Editor {
                 side: params.side,
                 width: params.width,
                 title: params.title,
+                header_actions: params.actions,
                 ..plugin::PanelConfig::default()
             },
         );
         self.apply_panel_layout();
         self.finish_rpc_text_panel_change(render_buffer)
+    }
+
+    fn rpc_clipboard_write_request(
+        &mut self,
+        params: &Value,
+    ) -> std::result::Result<Value, plugin::rpc::RpcErrorObject> {
+        let params: RpcClipboardWriteParams =
+            Self::rpc_params(plugin::rpc::CLIPBOARD_WRITE_METHOD, params)?;
+        if params.text.len() > RPC_CLIPBOARD_MAX_BYTES {
+            return Err(Self::rpc_error(
+                -32602,
+                format!(
+                    "red/ClipboardWrite text may not exceed {RPC_CLIPBOARD_MAX_BYTES} UTF-8 bytes"
+                ),
+            ));
+        }
+        if !self.config.clipboard.enabled || !self.clipboard.is_available() {
+            return Err(Self::rpc_error(-32004, "system clipboard is unavailable"));
+        }
+        self.clipboard
+            .set_text(&params.text)
+            .map_err(|error| Self::rpc_error(-32003, error))?;
+        Ok(Value::Null)
     }
 
     fn rpc_text_panel_set_content_request(
@@ -26819,6 +26917,7 @@ impl Editor {
             plugin::rpc::STATUSLINE_CLEAR_METHOD => {
                 self.rpc_statusline_clear_request(owner, params)
             }
+            plugin::rpc::CLIPBOARD_WRITE_METHOD => self.rpc_clipboard_write_request(params),
             _ => self.rpc_presentation_request(render_buffer, runtime, owner, method, params),
         }
     }
@@ -38798,6 +38897,27 @@ builtin = "rust"
         request!(
             "rpc-test",
             plugin::rpc::TEXT_PANEL_CREATE_METHOD,
+            json!({
+                "id": "preview",
+                "side": "right",
+                "width": 32,
+                "title": "RPC preview",
+                "actions": [
+                    {"id": "run", "label": "Run"},
+                    {"id": "close", "label": "Close", "compact_label": "x"}
+                ]
+            }),
+        )
+        .await
+        .unwrap();
+        let replaced_id = editor
+            .plugin_registry
+            .rpc_text_panel("rpc-test", "preview")
+            .unwrap();
+
+        request!(
+            "rpc-test",
+            plugin::rpc::TEXT_PANEL_CREATE_METHOD,
             json!({"id": "preview", "side": "right", "width": 32, "title": "RPC preview"}),
         )
         .await
@@ -38808,6 +38928,8 @@ builtin = "rust"
             .unwrap();
 
         assert_ne!(host_id, "preview");
+        assert_ne!(host_id, replaced_id);
+        assert_eq!(editor.panel_manager.panel_layout(&replaced_id), None);
         assert_eq!(
             editor.panel_manager.panel_layout(&host_id),
             Some((plugin::PanelSide::Right, 32))
@@ -38871,6 +38993,79 @@ builtin = "rust"
         .await
         .unwrap_err();
         assert_eq!(invalid.code, -32602);
+
+        for actions in [
+            json!([{"id": "run", "label": " "}]),
+            json!([
+                {"id": "same", "label": "One"},
+                {"id": "same", "label": "Two"}
+            ]),
+            Value::Array(
+                (0..=MAX_RPC_TEXT_PANEL_ACTIONS)
+                    .map(|index| json!({"id": index.to_string(), "label": "Action"}))
+                    .collect(),
+            ),
+        ] {
+            let invalid = request!(
+                "rpc-test",
+                plugin::rpc::TEXT_PANEL_CREATE_METHOD,
+                json!({"id": "invalid-actions", "actions": actions}),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(invalid.code, -32602);
+        }
+    }
+
+    #[tokio::test]
+    async fn rpc_clipboard_write_is_exact_bounded_and_reports_unavailable() {
+        let mut editor = test_editor(/*width*/ 80, /*height*/ 24);
+        let mut render_buffer = RenderBuffer::new(80, 24, &Style::default());
+        let mut runtime = Runtime::new();
+
+        let unavailable = editor
+            .rpc_host_request(
+                &mut render_buffer,
+                &mut runtime,
+                "rpc-test",
+                plugin::rpc::CLIPBOARD_WRITE_METHOD,
+                &json!({"text": "value"}),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(unavailable.code, -32004);
+
+        let clipboard = crate::clipboard::MemoryClipboardProvider::default();
+        let copied = clipboard.shared_text();
+        editor.test_set_clipboard(Box::new(clipboard));
+        let text = "😀e\u{301}\r\nexact";
+        assert_eq!(
+            editor
+                .rpc_host_request(
+                    &mut render_buffer,
+                    &mut runtime,
+                    "rpc-test",
+                    plugin::rpc::CLIPBOARD_WRITE_METHOD,
+                    &json!({"text": text}),
+                )
+                .await
+                .unwrap(),
+            Value::Null
+        );
+        assert_eq!(copied.lock().unwrap().as_deref(), Some(text));
+
+        let oversized = editor
+            .rpc_host_request(
+                &mut render_buffer,
+                &mut runtime,
+                "rpc-test",
+                plugin::rpc::CLIPBOARD_WRITE_METHOD,
+                &json!({"text": "x".repeat(RPC_CLIPBOARD_MAX_BYTES + 1)}),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(oversized.code, -32602);
+        assert_eq!(copied.lock().unwrap().as_deref(), Some(text));
     }
 
     #[tokio::test]

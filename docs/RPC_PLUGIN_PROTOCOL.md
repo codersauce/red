@@ -114,7 +114,7 @@ The version 1 initialization parameters are:
 ```json
 {
   "protocol_versions": [1],
-  "red_api_version": "0.25.0",
+  "red_api_version": "0.26.0",
   "plugin_id": "document-tools",
   "host_methods": [
     "red/DocumentCreate",
@@ -132,6 +132,7 @@ The version 1 initialization parameters are:
     "red/TextPanelSetContent",
     "red/TextPanelFocus",
     "red/TextPanelDispose",
+    "red/ClipboardWrite",
     "red/StatuslineSet",
     "red/StatuslineClear",
     "red/PickerOpen"
@@ -495,13 +496,31 @@ An active plugin can create a host-rendered text panel with a connection-local
 ID:
 
 ```json
-{"jsonrpc":"2.0","id":"plugin-4","method":"red/TextPanelCreate","params":{"id":"preview","side":"right","width":36,"title":"Preview"}}
+{"jsonrpc":"2.0","id":"plugin-4","method":"red/TextPanelCreate","params":{"id":"preview","side":"right","width":36,"title":"Preview","actions":[{"id":"run","label":"Run"},{"id":"close","label":"Close","compact_label":"x"}]}}
 ```
 
 `side` is optional and accepts `left`, `right`, `top`, or `bottom`; `width`
 defaults to `30`, and `title` is optional. Calling create again with the same ID
-replaces that panel's configuration and content. A connection can own at most
-16 text panels, and each ID must contain 1 to 128 UTF-8 bytes.
+replaces that panel's configuration and content with a fresh backing resource.
+A connection can own at most 16 text panels, and each ID must contain 1 to 128
+UTF-8 bytes.
+
+Host API `0.26.0` adds an optional `actions` array with at most eight header
+controls. Action IDs are unique within the panel and contain 1 to 64 UTF-8
+bytes; `label` contains 1 to 128 bytes and optional `compact_label` contains 1
+to 64. Red chooses the compact labels when the panel is narrow and sends the
+owning connection a notification when the user activates a declared action:
+
+```json
+{"jsonrpc":"2.0","method":"panel/event","params":{"id":"preview","action":"run"}}
+```
+
+The `id` remains the connection-local ID supplied by the plugin; private host
+IDs are never exposed. Red also sends `action: "close"` for its native panel
+close gesture, whether or not that action appears in the header. Navigation
+and selection events remain local to the renderer. Events queued for a panel
+that was disposed or replaced are discarded and cannot reach its successor or
+a Husk plugin.
 
 `red/TextPanelSetContent` replaces the panel's complete block list. Each block
 has an `id`, `text`, optional semantic `kind` (`user`, `agent`, `error`,
@@ -521,13 +540,28 @@ Unknown fields and invalid IDs or widths return `-32602`. A missing, disposed,
 not-owned, or over-limit panel returns `-32004`. These errors leave the plugin
 active.
 
+## Clipboard writes
+
+Host API `0.26.0` adds a bounded, write-only clipboard method for an explicit
+user action such as a panel Copy button:
+
+```json
+{"jsonrpc":"2.0","id":"plugin-6","method":"red/ClipboardWrite","params":{"text":"complete result\n"}}
+```
+
+The method preserves the exact UTF-8 text, accepts at most 1 MiB, and returns
+`null`. Red does not expose clipboard reads to plugins. Oversized or unknown
+parameters return `-32602`; a disabled or unavailable system clipboard returns
+`-32004`; and an operating-system write failure returns `-32003`. These errors
+leave the plugin active.
+
 ## Statusline contributions
 
 An active plugin can replace its single cached statusline contribution with
 `red/StatuslineSet`:
 
 ```json
-{"jsonrpc":"2.0","id":"plugin-6","method":"red/StatuslineSet","params":{"text":"Build ready","side":"right"}}
+{"jsonrpc":"2.0","id":"plugin-7","method":"red/StatuslineSet","params":{"text":"Build ready","side":"right"}}
 ```
 
 `side` is optional, defaults to `right`, and also accepts `left`. `text` must
@@ -551,7 +585,7 @@ Host API `0.21.0` adds a host-rendered, locally filtered picker. Opening it is a
 bounded host request; `command/execute` does not wait for user selection:
 
 ```json
-{"jsonrpc":"2.0","id":"plugin-7","method":"red/PickerOpen","params":{"id":"targets","title":"Choose a target","items":[{"id":"debug","label":"Debug"},{"id":"release","label":"Release","detail":"optimized","data":{"profile":"release"}}]}}
+{"jsonrpc":"2.0","id":"plugin-8","method":"red/PickerOpen","params":{"id":"targets","title":"Choose a target","items":[{"id":"debug","label":"Debug"},{"id":"release","label":"Release","detail":"optimized","data":{"profile":"release"}}]}}
 ```
 
 `id` identifies the picker within the calling connection and must contain 1 to
