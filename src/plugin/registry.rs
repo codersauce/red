@@ -625,11 +625,13 @@ impl PluginRegistry {
     ) -> anyhow::Result<PendingRpcPlugin> {
         let events = validate_rpc_manifest_events(manifest)?;
         let rpc = manifest.rpc.as_ref().expect("RPC manifest checked above");
-        let executable = if rpc.command.bytes().any(|byte| matches!(byte, b'/' | b'\\')) {
-            root.join(&rpc.command)
-        } else {
-            Path::new(&rpc.command).to_path_buf()
-        };
+        let executable = manifest.rpc_command(root).ok_or_else(|| {
+            anyhow::anyhow!(
+                "JSON-RPC plugin `{}` has no executable for `{}`",
+                manifest.plugin.id,
+                crate::language::host_target()
+            )
+        })?;
         let mut command = Command::new(executable);
         command.env_clear().args(&rpc.args).current_dir(root);
         for (key, value) in inherited_environment(&runtime.inherited_environment_keys(name))? {

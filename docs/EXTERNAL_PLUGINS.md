@@ -123,6 +123,28 @@ a path separator, such as `bin/document-tools`, must name an existing file
 inside the package. Red sets the process working directory to the package root
 and passes arguments directly without a shell.
 
+Release packages can declare target-specific executables instead of requiring
+an installed language runtime:
+
+```toml
+[plugin]
+red_api = "^0.20.0"
+
+[rpc]
+
+[rpc.artifacts.aarch64-apple-darwin]
+url = "https://github.com/example/document-tools/releases/download/v0.1.0/document-tools-aarch64-apple-darwin"
+sha256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+```
+
+Red prefers a matching entry in `[rpc.commands]`, then `rpc.command`, then a
+matching `[rpc.artifacts]` entry. GitHub installs and updates bound artifacts
+to 128 MiB, verify SHA-256 before writing, set executable permissions, and
+prepare the executable before replacing the installed package. Local path
+installs keep using bundled or development commands and do not download
+release artifacts. Target-specific commands and artifacts require
+`red_api = "^0.20.0"` or later.
+
 RPC processes inherit only Red's baseline home, path, locale, terminal,
 temporary-directory, XDG, SSH-agent, and Windows variables. A user can grant
 additional variables under the configured plugin owner; the package cannot

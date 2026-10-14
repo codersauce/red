@@ -42,10 +42,12 @@ const MAX_PACKAGE_ARCHIVE_BYTES: usize = 128 * 1024 * 1024;
 const MAX_PACKAGE_UNPACKED_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_PACKAGE_ARCHIVE_FILES: usize = 1024;
 const MAX_CATALOG_GRAMMAR_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_EXECUTABLE_ARTIFACT_BYTES: usize = 128 * 1024 * 1024;
 const COMMAND_SCOPE_API_VERSION: &str = "0.7.0";
 const COMMAND_ARGUMENTS_API_VERSION: &str = "0.11.0";
 const INDENTATION_API_VERSION: &str = "0.12.0";
 const RPC_PLUGIN_API_VERSION: &str = "0.19.0";
+const RPC_ARTIFACT_API_VERSION: &str = "0.20.0";
 
 /// A parsed and validated stable plugin identifier.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -146,23 +148,32 @@ pub struct PluginCompanionManifest {
     pub commands: BTreeMap<String, PathBuf>,
     /// Release artifacts keyed by Rust target triple.
     #[serde(default)]
-    pub artifacts: BTreeMap<String, PluginCompanionArtifact>,
+    pub artifacts: BTreeMap<String, PluginExecutableArtifact>,
 }
 
-/// One downloadable native companion executable.
+/// One downloadable native plugin executable.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct PluginCompanionArtifact {
+pub struct PluginExecutableArtifact {
     pub url: String,
     pub sha256: String,
 }
+
+/// Backward-compatible name for companion artifact declarations.
+pub type PluginCompanionArtifact = PluginExecutableArtifact;
 
 /// Standalone JSON-RPC process declaration.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PluginRpcManifest {
     /// Package-relative executable path or a bare command resolved through `PATH`.
-    pub command: String,
+    pub command: Option<String>,
+    /// Platform-specific development or bundled executable overrides.
+    #[serde(default)]
+    pub commands: BTreeMap<String, String>,
+    /// Release artifacts keyed by Rust target triple.
+    #[serde(default)]
+    pub artifacts: BTreeMap<String, PluginExecutableArtifact>,
     /// Arguments passed directly to the process without a shell.
     #[serde(default)]
     pub args: Vec<String>,
@@ -333,17 +344,7 @@ impl PluginPackageManifest {
             .iter()
             .flat_map(|companion| &companion.artifacts)
         {
-            anyhow::ensure!(!target.trim().is_empty(), "companion target is empty");
-            anyhow::ensure!(
-                artifact.url.starts_with("https://github.com/")
-                    || artifact.url.starts_with("https://api.github.com/"),
-                "companion artifacts must use a GitHub HTTPS URL"
-            );
-            anyhow::ensure!(
-                artifact.sha256.len() == 64
-                    && artifact.sha256.bytes().all(|byte| byte.is_ascii_hexdigit()),
-                "companion artifact for `{target}` has an invalid SHA-256 digest"
-            );
+            validate_executable_artifact("companion", target, artifact)?;
         }
         for (field, storage_key) in &self.migration.legacy_session_fields {
             anyhow::ensure!(
@@ -427,11 +428,7 @@ impl PluginPackageManifest {
             host_api_requirement_requires_at_least(&self.plugin.red_api, RPC_PLUGIN_API_VERSION)?,
             "JSON-RPC plugins require red_api = \"^{RPC_PLUGIN_API_VERSION}\" or later"
         );
-        anyhow::ensure!(!rpc.command.trim().is_empty(), "RPC command is empty");
-        if !is_bare_command_name(&rpc.command) {
-            validate_package_file(package_root, Path::new(&rpc.command))?;
-        }
-        Ok(())
+        validate_rpc_executables(&self.plugin.red_api, package_root, rpc)
     }
 
     fn uses_command_arguments(&self, package_root: &Path) -> bool {
@@ -496,6 +493,22 @@ impl PluginPackageManifest {
                         .join(companion_binary_name());
                     downloaded.is_file().then_some(downloaded)
                 })
+        })
+    }
+
+    /// Resolves the standalone RPC executable for the running host.
+    #[must_use]
+    pub fn rpc_command(&self, package_root: &Path) -> Option<PathBuf> {
+        let rpc = self.rpc.as_ref()?;
+        if let Some(command) = rpc.commands.get(host_target()).or(rpc.command.as_ref()) {
+            return Some(resolve_rpc_command(package_root, command));
+        }
+        rpc.artifacts.get(host_target()).and_then(|_| {
+            let downloaded = package_root
+                .join(".red")
+                .join("bin")
+                .join(rpc_binary_name());
+            downloaded.is_file().then_some(downloaded)
         })
     }
 
@@ -636,6 +649,7 @@ impl PluginPackageManager {
         };
         write_record(&staging, &record)?;
         self.install_companion_artifact(&manifest, &staging).await?;
+        self.install_rpc_artifact(&manifest, &staging).await?;
         self.install_language_artifacts(&manifest, &staging, false)
             .await?;
         self.activate_remote_package(&manifest, &staging, &destination, trust_native_grammars)?;
@@ -1027,26 +1041,26 @@ impl PluginPackageManager {
         let Some(artifact) = companion.artifacts.get(target) else {
             anyhow::bail!("plugin has no native companion for `{target}`");
         };
-        let response = reqwest::get(&artifact.url)
+        install_executable_artifact(artifact, package_root, companion_binary_name(), "companion")
             .await
-            .with_context(|| format!("failed to download companion from {}", artifact.url))?
-            .error_for_status()
-            .with_context(|| format!("companion download failed for {}", artifact.url))?;
-        let bytes = response.bytes().await?;
-        let actual = format!("{:x}", Sha256::digest(&bytes));
-        anyhow::ensure!(
-            actual.eq_ignore_ascii_case(&artifact.sha256),
-            "companion checksum mismatch: expected {}, got {actual}",
-            artifact.sha256
-        );
-        let bin_dir = package_root.join(".red").join("bin");
-        tokio::fs::create_dir_all(&bin_dir).await?;
-        let path = bin_dir.join(companion_binary_name());
-        let mut file = tokio::fs::File::create(&path).await?;
-        file.write_all(&bytes).await?;
-        file.sync_all().await?;
-        set_executable(&path)?;
-        Ok(())
+    }
+
+    async fn install_rpc_artifact(
+        &self,
+        manifest: &PluginPackageManifest,
+        package_root: &Path,
+    ) -> Result<()> {
+        let Some(rpc) = &manifest.rpc else {
+            return Ok(());
+        };
+        if rpc.command.is_some() || rpc.commands.contains_key(host_target()) {
+            return Ok(());
+        }
+        let target = host_target();
+        let Some(artifact) = rpc.artifacts.get(target) else {
+            anyhow::bail!("plugin has no JSON-RPC executable for `{target}`");
+        };
+        install_executable_artifact(artifact, package_root, rpc_binary_name(), "RPC").await
     }
 
     async fn install_language_artifacts(
@@ -1212,6 +1226,68 @@ fn is_bare_command_name(command: &str) -> bool {
     matches!(components.next(), Some(Component::Normal(_))) && components.next().is_none()
 }
 
+fn validate_rpc_command(package_root: &Path, command: &str) -> Result<()> {
+    anyhow::ensure!(!command.trim().is_empty(), "RPC command is empty");
+    if !is_bare_command_name(command) {
+        validate_package_file(package_root, Path::new(command))?;
+    }
+    Ok(())
+}
+
+fn validate_rpc_executables(
+    red_api: &VersionReq,
+    package_root: &Path,
+    rpc: &PluginRpcManifest,
+) -> Result<()> {
+    anyhow::ensure!(
+        rpc.command.is_some() || !rpc.commands.is_empty() || !rpc.artifacts.is_empty(),
+        "RPC process must declare a command or release artifact"
+    );
+    if !rpc.commands.is_empty() || !rpc.artifacts.is_empty() {
+        anyhow::ensure!(
+            host_api_requirement_requires_at_least(red_api, RPC_ARTIFACT_API_VERSION)?,
+            "target-specific RPC executables require red_api = \"^{RPC_ARTIFACT_API_VERSION}\" or later"
+        );
+    }
+    if let Some(command) = &rpc.command {
+        validate_rpc_command(package_root, command)?;
+    }
+    for (target, command) in &rpc.commands {
+        anyhow::ensure!(!target.trim().is_empty(), "RPC command target is empty");
+        validate_rpc_command(package_root, command)?;
+    }
+    for (target, artifact) in &rpc.artifacts {
+        validate_executable_artifact("RPC", target, artifact)?;
+    }
+    Ok(())
+}
+
+fn resolve_rpc_command(package_root: &Path, command: &str) -> PathBuf {
+    if is_bare_command_name(command) {
+        PathBuf::from(command)
+    } else {
+        package_root.join(command)
+    }
+}
+
+fn validate_executable_artifact(
+    kind: &str,
+    target: &str,
+    artifact: &PluginExecutableArtifact,
+) -> Result<()> {
+    anyhow::ensure!(!target.trim().is_empty(), "{kind} target is empty");
+    anyhow::ensure!(
+        artifact.url.starts_with("https://github.com/")
+            || artifact.url.starts_with("https://api.github.com/"),
+        "{kind} artifacts must use a GitHub HTTPS URL"
+    );
+    anyhow::ensure!(
+        artifact.sha256.len() == 64 && artifact.sha256.bytes().all(|byte| byte.is_ascii_hexdigit()),
+        "{kind} artifact for `{target}` has an invalid SHA-256 digest"
+    );
+    Ok(())
+}
+
 fn validate_package_file(package_root: &Path, relative: &Path) -> Result<()> {
     validate_relative_path(relative)?;
     let path = package_root.join(relative);
@@ -1354,6 +1430,67 @@ fn installed_from_record(record: PluginInstallRecord) -> Result<InstalledPlugin>
         source: record.source,
         package_root: record.package_root,
     })
+}
+
+async fn install_executable_artifact(
+    artifact: &PluginExecutableArtifact,
+    package_root: &Path,
+    filename: &str,
+    kind: &str,
+) -> Result<()> {
+    let bytes = download_executable_artifact(artifact, kind).await?;
+    let bin_dir = package_root.join(".red").join("bin");
+    tokio::fs::create_dir_all(&bin_dir).await?;
+    let path = bin_dir.join(filename);
+    let mut file = tokio::fs::File::create(&path).await?;
+    file.write_all(&bytes).await?;
+    file.sync_all().await?;
+    set_executable(&path)?;
+    Ok(())
+}
+
+async fn download_executable_artifact(
+    artifact: &PluginExecutableArtifact,
+    kind: &str,
+) -> Result<Vec<u8>> {
+    let mut response = reqwest::get(&artifact.url)
+        .await
+        .with_context(|| format!("failed to download {kind} from {}", artifact.url))?
+        .error_for_status()
+        .with_context(|| format!("{kind} download failed for {}", artifact.url))?;
+    if let Some(length) = response.content_length() {
+        validate_executable_artifact_size(length)?;
+    }
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response.chunk().await? {
+        validate_executable_artifact_size(bytes.len().saturating_add(chunk.len()) as u64)?;
+        bytes.extend_from_slice(&chunk);
+    }
+    verify_executable_artifact_bytes(artifact, &bytes, kind)?;
+    Ok(bytes)
+}
+
+fn validate_executable_artifact_size(size: u64) -> Result<()> {
+    anyhow::ensure!(
+        size <= MAX_EXECUTABLE_ARTIFACT_BYTES as u64,
+        "plugin executable exceeds the {MAX_EXECUTABLE_ARTIFACT_BYTES} byte safety limit"
+    );
+    Ok(())
+}
+
+fn verify_executable_artifact_bytes(
+    artifact: &PluginExecutableArtifact,
+    bytes: &[u8],
+    kind: &str,
+) -> Result<()> {
+    validate_executable_artifact_size(bytes.len() as u64)?;
+    let actual = format!("{:x}", Sha256::digest(bytes));
+    anyhow::ensure!(
+        actual.eq_ignore_ascii_case(&artifact.sha256),
+        "{kind} checksum mismatch: expected {}, got {actual}",
+        artifact.sha256
+    );
+    Ok(())
 }
 
 async fn download_catalog_artifact(artifact: &CatalogArtifact) -> Result<Vec<u8>> {
@@ -1696,6 +1833,14 @@ fn companion_binary_name() -> &'static str {
     }
 }
 
+fn rpc_binary_name() -> &'static str {
+    if cfg!(windows) {
+        "rpc.exe"
+    } else {
+        "rpc"
+    }
+}
+
 #[cfg(unix)]
 fn set_executable(path: &Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt as _;
@@ -1876,6 +2021,53 @@ commands = ["DocumentTools"]
             ),
         )
         .unwrap();
+    }
+
+    fn write_rpc_artifact_package(root: &Path, version: &str, red_api: &str) {
+        fs::write(
+            root.join(PLUGIN_MANIFEST_FILE),
+            format!(
+                r#"
+schema_version = 1
+
+[plugin]
+id = "document-tools"
+name = "Document Tools"
+version = "{version}"
+red_api = "{red_api}"
+
+[rpc]
+
+[rpc.artifacts."{target}"]
+url = "https://github.com/example/document-tools/releases/download/v{version}/document-tools"
+sha256 = "{sha256}"
+
+[activation]
+commands = ["DocumentTools"]
+"#,
+                target = host_target(),
+                sha256 = "0".repeat(64),
+            ),
+        )
+        .unwrap();
+    }
+
+    async fn serve_http_once(body: Vec<u8>, content_length: u64) -> String {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 1024];
+            let _ = stream.read(&mut request).await;
+            let headers = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {content_length}\r\nConnection: close\r\n\r\n"
+            );
+            let _ = stream.write_all(headers.as_bytes()).await;
+            let _ = stream.write_all(&body).await;
+        });
+        format!("http://{address}/artifact")
     }
 
     fn write_native_language_package(root: &Path, id: &str, grammar: &[u8]) {
@@ -2295,7 +2487,10 @@ symbol = "tree_sitter_buildspec"
         assert!(!installed.has_companion);
         assert!(installed.restart_required());
         assert_eq!(installed.modality_label(), "JSON-RPC");
-        assert_eq!(manifest.rpc.as_ref().unwrap().command, "python3");
+        assert_eq!(
+            manifest.rpc.as_ref().unwrap().command.as_deref(),
+            Some("python3")
+        );
         assert_eq!(manifest.rpc.as_ref().unwrap().args, ["plugin.py"]);
 
         fs::create_dir(package.path().join("bin")).unwrap();
@@ -2303,7 +2498,125 @@ symbol = "tree_sitter_buildspec"
         write_rpc_package(package.path(), "^0.19.0", "bin/document-tools");
         let manifest = PluginPackageManifest::load(package.path()).unwrap();
 
-        assert_eq!(manifest.rpc.as_ref().unwrap().command, "bin/document-tools");
+        assert_eq!(
+            manifest.rpc.as_ref().unwrap().command.as_deref(),
+            Some("bin/document-tools")
+        );
+    }
+
+    #[test]
+    fn rpc_executables_resolve_target_command_then_generic_then_artifact() {
+        let package = tempfile::tempdir().unwrap();
+        write_rpc_artifact_package(package.path(), "1.0.0", "^0.20.0");
+        let mut manifest = PluginPackageManifest::load(package.path()).unwrap();
+
+        assert!(manifest.rpc_command(package.path()).is_none());
+
+        let downloaded = package
+            .path()
+            .join(".red")
+            .join("bin")
+            .join(rpc_binary_name());
+        fs::create_dir_all(downloaded.parent().unwrap()).unwrap();
+        fs::write(&downloaded, "artifact").unwrap();
+        assert_eq!(manifest.rpc_command(package.path()), Some(downloaded));
+
+        manifest.rpc.as_mut().unwrap().command = Some("python3".to_string());
+        assert_eq!(
+            manifest.rpc_command(package.path()),
+            Some(PathBuf::from("python3"))
+        );
+
+        let target_command = package.path().join("bin/document-tools");
+        fs::create_dir_all(target_command.parent().unwrap()).unwrap();
+        fs::write(&target_command, "target command").unwrap();
+        manifest
+            .rpc
+            .as_mut()
+            .unwrap()
+            .commands
+            .insert(host_target().to_string(), "bin/document-tools".to_string());
+        assert_eq!(manifest.rpc_command(package.path()), Some(target_command));
+
+        write_rpc_artifact_package(package.path(), "1.0.0", "^0.19.0");
+        let error = PluginPackageManifest::load(package.path()).unwrap_err();
+        assert!(error.to_string().contains("require red_api = \"^0.20.0\""));
+    }
+
+    #[tokio::test]
+    async fn rpc_artifact_rejections_preserve_the_installed_version() {
+        let config = tempfile::tempdir().unwrap();
+        let previous = tempfile::tempdir().unwrap();
+        write_rpc_package(previous.path(), "^0.19.0", "python3");
+        let manager = PluginPackageManager::new(config.path());
+        let installed = manager.install_path(previous.path()).await.unwrap();
+        let staging = tempfile::tempdir().unwrap();
+        write_rpc_artifact_package(staging.path(), "2.0.0", "^0.20.0");
+        let mut manifest = PluginPackageManifest::load(staging.path()).unwrap();
+
+        let bytes = b"native RPC executable".to_vec();
+        let url = serve_http_once(bytes.clone(), bytes.len() as u64).await;
+        manifest
+            .rpc
+            .as_mut()
+            .unwrap()
+            .artifacts
+            .get_mut(host_target())
+            .unwrap()
+            .url = url;
+        let error = manager
+            .install_rpc_artifact(&manifest, staging.path())
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("checksum mismatch"));
+
+        let url = serve_http_once(Vec::new(), MAX_EXECUTABLE_ARTIFACT_BYTES as u64 + 1).await;
+        manifest
+            .rpc
+            .as_mut()
+            .unwrap()
+            .artifacts
+            .get_mut(host_target())
+            .unwrap()
+            .url = url;
+        let error = manager
+            .install_rpc_artifact(&manifest, staging.path())
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("safety limit"));
+        assert_eq!(
+            manager.installed(&installed.id).unwrap().unwrap().version,
+            Version::parse("1.0.0").unwrap()
+        );
+
+        let url = serve_http_once(bytes.clone(), bytes.len() as u64).await;
+        let artifact = manifest
+            .rpc
+            .as_mut()
+            .unwrap()
+            .artifacts
+            .get_mut(host_target())
+            .unwrap();
+        artifact.url = url;
+        artifact.sha256 = format!("{:x}", Sha256::digest(&bytes));
+        manager
+            .install_rpc_artifact(&manifest, staging.path())
+            .await
+            .unwrap();
+        let executable = staging
+            .path()
+            .join(".red")
+            .join("bin")
+            .join(rpc_binary_name());
+        assert_eq!(fs::read(&executable).unwrap(), bytes);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            assert_ne!(
+                fs::metadata(executable).unwrap().permissions().mode() & 0o111,
+                0
+            );
+        }
     }
 
     #[test]

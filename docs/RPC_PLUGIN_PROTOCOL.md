@@ -40,6 +40,30 @@ existing file that cannot escape through traversal or symbolic links. Red
 launches it with the package root as its working directory and passes `args`
 directly without a shell.
 
+Release packages may omit `command` and provide a native executable for each
+supported Rust target triple. Target-specific local commands and release
+artifacts require `red_api = "^0.20.0"` or later:
+
+```toml
+[plugin]
+red_api = "^0.20.0"
+
+[rpc]
+args = []
+
+[rpc.artifacts.aarch64-apple-darwin]
+url = "https://github.com/example/document-tools/releases/download/v0.1.0/document-tools-aarch64-apple-darwin"
+sha256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+```
+
+For the running target, Red selects `[rpc.commands]`, then `rpc.command`, then
+`[rpc.artifacts]`. GitHub installs and updates download a selected artifact
+into the staged package, reject executables larger than 128 MiB, verify the
+declared SHA-256 digest, and set executable permissions before atomically
+replacing the installed package. A failed download or verification leaves the
+previous installation active. Local path installs do not download release
+artifacts.
+
 RPC processes start with a cleared environment. Red then inherits its baseline
 home, `PATH`, user, shell, locale, terminal, temporary-directory, XDG,
 `SSH_AUTH_SOCK`, and Windows process variables. Grant other variables by the
