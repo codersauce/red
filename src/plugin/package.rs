@@ -562,6 +562,17 @@ impl PluginPackageManager {
         self.config_dir.join("plugin-data").join(id.as_str())
     }
 
+    fn enabled_for_install(&self, id: &PluginId) -> Result<bool> {
+        let path = self
+            .packages_dir()
+            .join(id.as_str())
+            .join(INSTALL_RECORD_FILE);
+        if !path.is_file() {
+            return Ok(true);
+        }
+        Ok(read_record(&path)?.enabled)
+    }
+
     /// Installs a local development checkout without copying its source.
     pub async fn install_path(&self, source: &Path) -> Result<InstalledPlugin> {
         self.install_path_with_trust(source, false).await
@@ -639,7 +650,7 @@ impl PluginPackageManager {
             schema_version: 1,
             id: id.clone(),
             version: manifest.plugin.version.clone(),
-            enabled: true,
+            enabled: self.enabled_for_install(&id)?,
             source: PluginInstallSource::GitHub {
                 repository: repository.to_string(),
                 requested_version: requested_version.map(str::to_string),
@@ -734,7 +745,7 @@ impl PluginPackageManager {
                 schema_version: 1,
                 id: id.clone(),
                 version: manifest.plugin.version.clone(),
-                enabled: true,
+                enabled: self.enabled_for_install(&id)?,
                 source: PluginInstallSource::Catalog {
                     catalog_url: catalog_url.to_string(),
                     package: package.id.clone(),
@@ -1015,7 +1026,7 @@ impl PluginPackageManager {
             schema_version: 1,
             id: id.clone(),
             version: manifest.plugin.version.clone(),
-            enabled: true,
+            enabled: self.enabled_for_install(&id)?,
             source,
             package_root,
             installed_at_ms: now_ms(),
@@ -2974,6 +2985,11 @@ root_markers = ["Acmefile", ".git"]
         write_package(package.path(), "test", "1.1.0");
         let updated = manager.update(&plugin.id).await.unwrap();
         assert_eq!(updated.version, Version::parse("1.1.0").unwrap());
+        assert!(!updated.enabled);
+
+        manager.set_enabled(&plugin.id, true).unwrap();
+        let updated = manager.update(&plugin.id).await.unwrap();
+        assert!(updated.enabled);
     }
 
     #[tokio::test]

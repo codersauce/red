@@ -57,10 +57,34 @@ else:
 '''
 
 
+def process_is_running(pid):
+    if os.name == "nt":
+        result = subprocess.run(
+            ["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        return f'"{pid}"' in result.stdout
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    return True
+
+
 class PluginProcess:
+    plugin_path = PLUGIN
+
     def __init__(self, fake_jq):
         self.process = subprocess.Popen(
-            [sys.executable, str(PLUGIN), sys.executable, str(fake_jq)],
+            [
+                sys.executable,
+                self.plugin_path.name,
+                sys.executable,
+                str(fake_jq),
+            ],
+            cwd=self.plugin_path.parent,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -201,12 +225,26 @@ class JsonWorkbenchTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.tempdir = tempfile.TemporaryDirectory()
-        cls.fake_jq = Path(cls.tempdir.name) / "fake_jq.py"
+        root = Path(cls.tempdir.name)
+        package = root / "JSON Workbench package"
+        package.mkdir()
+        PluginProcess.plugin_path = package / "plugin.py"
+        shutil.copy2(PLUGIN, PluginProcess.plugin_path)
+        tools = root / "tools with spaces"
+        tools.mkdir()
+        cls.fake_jq = tools / "fake jq.py"
         cls.fake_jq.write_text(FAKE_JQ, encoding="utf-8")
 
     @classmethod
     def tearDownClass(cls):
+        PluginProcess.plugin_path = PLUGIN
         cls.tempdir.cleanup()
+
+    def assert_process_reaped(self, pid):
+        deadline = time.monotonic() + 2
+        while process_is_running(pid) and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertFalse(process_is_running(pid), f"process {pid} is still running")
 
     def complete_query(self, plugin, command_id, document, output, create_panel):
         snapshot = plugin.expect_host_request("red/DocumentSnapshot")
@@ -973,9 +1011,7 @@ class JsonWorkbenchTest(unittest.TestCase):
             self.assertEqual(
                 plugin.receive()["result"], {"message": "JSON preview cancelled"}
             )
-            if os.name == "posix":
-                with self.assertRaises(ProcessLookupError):
-                    os.kill(child_pid, 0)
+            self.assert_process_reaped(child_pid)
 
             plugin.send_notification(
                 "document/event", {"document_id": "7", "event": "closed"}
@@ -1235,9 +1271,7 @@ class JsonWorkbenchTest(unittest.TestCase):
             clear = plugin.expect_host_request("red/StatuslineClear")
             plugin.reply(clear)
             self.assertIsNone(plugin.receive()["result"])
-            if os.name == "posix":
-                with self.assertRaises(ProcessLookupError):
-                    os.kill(child_pid, 0)
+            self.assert_process_reaped(child_pid)
 
             plugin.send_picker_event(picker, "preset-0")
             plugin.command("after-close", "JsonApply")
@@ -1247,6 +1281,13 @@ class JsonWorkbenchTest(unittest.TestCase):
             )
 
     def test_jq_failures_are_bounded_and_reaped(self):
+        runner = WORKBENCH.JsonWorkbench(["red-json-workbench-missing-jq"])
+        with self.assertRaisesRegex(
+            WORKBENCH.OperationError,
+            "install jq or set plugin_config.json-workbench.jq_path",
+        ):
+            runner.run_jq(".", b"{}")
+
         command = [sys.executable, str(self.fake_jq)]
         for query_text, expected in [
             ("invalid", "jq: compile error"),
@@ -1296,9 +1337,7 @@ class JsonWorkbenchTest(unittest.TestCase):
         plugin.reader.join(timeout=1)
         self.assertEqual(plugin.process.stderr.read(), "")
         plugin.close_pipes()
-        if os.name == "posix":
-            with self.assertRaises(ProcessLookupError):
-                os.kill(child_pid, 0)
+        self.assert_process_reaped(child_pid)
 
     @unittest.skipUnless(shutil.which("jq"), "jq is not installed")
     def test_real_jq_smoke(self):

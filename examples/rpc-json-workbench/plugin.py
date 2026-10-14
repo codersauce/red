@@ -692,8 +692,14 @@ class JsonWorkbench:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
             )
+        except FileNotFoundError as error:
+            executable = self.jq_command[0]
+            raise OperationError(
+                f"jq executable `{executable}` was not found; "
+                "install jq or set plugin_config.json-workbench.jq_path"
+            ) from error
         except OSError as error:
-            raise OperationError(f"jq is unavailable: {error}") from error
+            raise OperationError(f"jq could not start: {error}") from error
 
         collected = {}
         overflow = queue.Queue()

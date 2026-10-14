@@ -1,9 +1,9 @@
 # JSON Workbench
 
-JSON Workbench is a standalone Python JSON-RPC plugin that previews and applies
-[`jq`](https://jqlang.org/) filters to an open Red document. It keeps the source
-document pinned until `JsonClose`, shows complete output in a host-rendered
-panel, and uses Red's revision-checked transaction and undo APIs.
+JSON Workbench is a standalone Python JSON-RPC plugin that previews, explores,
+and applies [`jq`](https://jqlang.org/) filters to an open Red document. It keeps
+the source document pinned until `JsonClose`, shows complete output in a
+host-rendered panel, and uses Red's revision-checked transaction and undo APIs.
 
 Requirements: Python 3.9 or later and `jq` on `PATH`. Install the development
 package with:
@@ -11,6 +11,27 @@ package with:
 ```console
 red plugin install --path ./examples/rpc-json-workbench
 ```
+
+The package selects `python3` on macOS and Linux and `python` on Windows. Red
+passes the package path and jq filter directly without a shell, so spaces in
+either path are supported. If jq is elsewhere, set `jq_path` as shown below.
+A missing executable reports how to install or configure it without disabling
+the plugin.
+
+The same package manager handles JSON-RPC and Husk plugins:
+
+```console
+red plugin list
+red plugin disable json-workbench
+red plugin update json-workbench
+red plugin enable json-workbench
+```
+
+Restart Red after changing an installed plugin's enabled state from the CLI.
+Local package manifests are watched while Red is running. After editing
+`plugin.py`, save or touch `red-plugin.toml` to trigger reload; a valid reload
+replaces the process, while a failed reload leaves the previous process active.
+Updates preserve the package's enabled state.
 
 Open a JSON document and run:
 
@@ -108,6 +129,46 @@ query text to 16 KiB, and each jq run to five seconds. Empty output and JSON
 streams are preserved exactly. Failed, timed-out, or oversized runs cannot be
 applied. Picker-driven failures appear in the result panel because they do not
 have a waiting command response.
+
+## Reload and coexistence
+
+The `Json*` command prefix keeps this example separate from typical Husk
+commands. JSON-RPC and Husk packages can run at the same time, and their
+pickers, panels, status, storage, and watches remain owner-scoped. If two
+plugins still declare the same command, the Husk command keeps dispatch and
+discovery precedence.
+
+Reload does not transfer a live workbench session. Query and result documents
+are ordinary user-owned buffers and remain open, while the old preview panel,
+status contribution, picker, watches, subprocess, pending requests, source ID,
+and undo transaction are retired with the connection. Run `JsonWorkbench`
+again from the intended source. Saved query history and the history preference
+are the only plugin state restored from owner-scoped storage.
+
+## Acceptance walkthrough
+
+1. Install the package from a quoted path containing a space, then confirm
+   `red plugin list` reports `enabled`, `compatible`, and `JSON-RPC`.
+2. Open unsaved JSON, run `JsonWorkbench`, enter a multiline filter in the new
+   query buffer, and run `JsonRun`.
+3. Configure a preset, choose it with `JsonQueries`, save the query normally,
+   and enable `JsonLive`.
+4. Start an expensive filter from the panel and cancel it; editing and Husk UI
+   should remain responsive.
+5. Use `JsonExplore` on nested arrays, escaped keys, and a JSON stream. Copy the
+   exact raw result, open a frozen result document, and confirm exploration did
+   not rewrite either one.
+6. Apply to a document and to a contiguous visual selection, undo each change,
+   then edit the source after previewing and confirm stale Apply is rejected.
+7. Save or touch the local manifest while its panel and a Husk picker or panel
+   are open. The plugin-owned UI should retire, the ordinary query/result
+   documents should remain, and both modalities should still work after
+   reopening.
+8. Temporarily set `jq_path` to a nonexistent executable, restart Red, and
+   confirm the error suggests installing jq or correcting that setting. Restore
+   the path before continuing.
+9. Exercise `disable`, `update`, and `enable`; a disabled update must remain
+   disabled until the explicit enable command.
 
 For a package-local development override, an explicit jq executable may also be
 appended to `[rpc].args`, after `plugin.py`:

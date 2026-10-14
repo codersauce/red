@@ -195,7 +195,8 @@ red plugin remove replay --purge
 Ordinary removal preserves namespaced plugin data for later reinstall. `--purge`
 also removes that data. Install and update stage a complete package, validate
 compatibility and checksums, and atomically replace the active package. Failed
-updates leave the previous installation intact.
+updates leave the previous installation intact, and successful updates preserve
+the package's enabled or disabled state.
 
 ## Manifest
 
