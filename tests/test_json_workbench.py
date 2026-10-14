@@ -50,6 +50,8 @@ elif query == "echo":
     sys.stdout.buffer.write(source)
 elif query == "wrap":
     sys.stdout.buffer.write(b"<" + source + b">")
+elif query == "nested":
+    sys.stdout.buffer.write(b'{"a.b":{"quote\\"key":[1,2]},"dup":1,"dup":2,"big":9007199254740993}\n{"second":[]}\n')
 else:
     sys.stdout.buffer.write(b'{"ok":true}\n')
 '''
@@ -286,6 +288,56 @@ class JsonWorkbenchTest(unittest.TestCase):
             with self.subTest(text=text):
                 self.assertEqual(WORKBENCH.end_position(text), expected)
 
+    def test_json_explorer_preserves_stream_structure_and_bounds_children(self):
+        roots = WORKBENCH.parse_json_stream(
+            '{"dup":1,"dup":2,"big":9007199254740993}\n[true]\n'
+        )
+        self.assertEqual(len(roots), 2)
+        self.assertIsInstance(roots[0], WORKBENCH.JsonObject)
+        self.assertEqual(
+            roots[0].pairs,
+            [("dup", 1), ("dup", 2), ("big", 9007199254740993)],
+        )
+        self.assertEqual(WORKBENCH.parse_json_stream(" \r\n\t"), [])
+        with self.assertRaisesRegex(WORKBENCH.OperationError, "64 levels"):
+            WORKBENCH.parse_json_stream("[" * 65 + "0" + "]" * 65)
+
+        runner = WORKBENCH.JsonWorkbench(["jq"])
+        runner.result_context = {"query": ".", "path": None, "revision": "1"}
+        runner.result_generation = 3
+        runner.explore_roots = roots
+        items, actions = runner.explorer_items(3, (("root", 0),))
+        duplicates = [item for item in items if item["label"] == '"dup"']
+        self.assertEqual(len(duplicates), 2)
+        self.assertTrue(
+            all("not addressable" in item["detail"] for item in duplicates)
+        )
+        self.assertTrue(all(item["id"] not in actions for item in duplicates))
+
+        runner.explore_roots = [
+            list(range(WORKBENCH.EXPLORE_CHILD_LIMIT + 2))
+        ]
+        items, actions = runner.explorer_items(3, (("root", 0),))
+        self.assertEqual(len(items), WORKBENCH.EXPLORE_CHILD_LIMIT + 3)
+        self.assertEqual(items[-1]["label"], "… 2 more values")
+        self.assertNotIn("index-1000", actions)
+
+        runner.explore_roots = []
+        self.assertEqual(
+            runner.explorer_items(3, ()),
+            ([{"id": "empty", "label": "No JSON roots"}], {}),
+        )
+
+    def test_json_explorer_builds_escaped_stream_paths(self):
+        path = (("root", 1), ("key", 'a"bé\n'), ("index", 3))
+        self.assertEqual(
+            WORKBENCH.json_breadcrumb(2, path), '$<2>["a\\"bé\\n"][3]'
+        )
+        self.assertEqual(
+            WORKBENCH.json_path_query(".items | map(.)", 2, path),
+            '(([(.items | map(.))][1]) | .["a\\"b\\u00e9\\n"]) | .[3]',
+        )
+
     def test_query_apply_undo_and_close_preserve_exact_text(self):
         source = "😀e\u0301\r\nlast"
         document = {
@@ -387,6 +439,124 @@ class JsonWorkbenchTest(unittest.TestCase):
             plugin.reply(dispose)
             clear = plugin.expect_host_request("red/StatuslineClear")
             plugin.reply(clear)
+
+    def test_explorer_navigates_nested_streams_and_rejects_stale_actions(self):
+        output = (
+            '{"a.b":{"quote\\"key":[1,2]},"dup":1,"dup":2,'
+            '"big":9007199254740993}\n{"second":[]}\n'
+        )
+        document = {
+            "path": "data.json",
+            "document_id": "7",
+            "revision": "1",
+            "text": "{}",
+        }
+        with PluginProcess(self.fake_jq) as plugin:
+            plugin.command("query", "JsonQuery", "nested")
+            plugin.load_runtime()
+            self.complete_query(plugin, "query", document, output, True)
+
+            plugin.command("explore", "JsonExplore")
+            panel = plugin.expect_host_request("red/TextPanelSetContent")
+            self.assertIn(
+                "Inspect: stream · 2 roots", panel["params"]["blocks"][0]["text"]
+            )
+            self.assertEqual(panel["params"]["blocks"][1]["text"], output)
+            plugin.reply(panel)
+            roots = plugin.expect_host_request("red/PickerOpen")
+            self.assertEqual(
+                [item["label"] for item in roots["params"]["items"]],
+                ["Root 1", "Root 2"],
+            )
+            plugin.reply(roots)
+            self.assertIsNone(plugin.receive()["result"])
+
+            plugin.send_picker_event(roots, "root-0")
+            panel = plugin.expect_host_request("red/TextPanelSetContent")
+            self.assertIn("Inspect: $<1>", panel["params"]["blocks"][0]["text"])
+            plugin.reply(panel)
+            root = plugin.expect_host_request("red/PickerOpen")
+            duplicates = [
+                item for item in root["params"]["items"] if item["label"] == '"dup"'
+            ]
+            self.assertEqual(len(duplicates), 2)
+            self.assertTrue(
+                all("not addressable" in item["detail"] for item in duplicates)
+            )
+            plugin.reply(root)
+
+            plugin.send_picker_event(root, "key-0")
+            panel = plugin.expect_host_request("red/TextPanelSetContent")
+            self.assertIn(
+                'Inspect: $<1>["a.b"]', panel["params"]["blocks"][0]["text"]
+            )
+            plugin.reply(panel)
+            nested = plugin.expect_host_request("red/PickerOpen")
+            key = next(
+                item for item in nested["params"]["items"] if item["id"] == "key-0"
+            )
+            self.assertEqual(key["label"], '"quote\\"key"')
+            plugin.reply(nested)
+
+            plugin.send_picker_event(nested, "key-0")
+            panel = plugin.expect_host_request("red/TextPanelSetContent")
+            self.assertIn(
+                'Inspect: $<1>["a.b"]["quote\\"key"]',
+                panel["params"]["blocks"][0]["text"],
+            )
+            plugin.reply(panel)
+            array = plugin.expect_host_request("red/PickerOpen")
+            self.assertEqual(
+                [item["label"] for item in array["params"]["items"][-2:]],
+                ["[0]", "[1]"],
+            )
+            run = next(
+                item for item in array["params"]["items"] if item["id"] == "run-path"
+            )
+            self.assertEqual(
+                run["detail"],
+                '(([(nested)][0]) | .["a.b"]) | .["quote\\"key"]',
+            )
+            plugin.reply(array)
+
+            plugin.send_picker_event(array)
+            plugin.command("reopen-explorer", "JsonExplore")
+            panel = plugin.expect_host_request("red/TextPanelSetContent")
+            self.assertIn(
+                'Inspect: $<1>["a.b"]["quote\\"key"]',
+                panel["params"]["blocks"][0]["text"],
+            )
+            plugin.reply(panel)
+            reopened = plugin.expect_host_request("red/PickerOpen")
+            self.assertEqual(
+                [item["label"] for item in reopened["params"]["items"][-2:]],
+                ["[0]", "[1]"],
+            )
+            plugin.reply(reopened)
+            self.assertIsNone(plugin.receive()["result"])
+
+            plugin.send_picker_event(reopened, "run-path")
+            selected = plugin.expect_host_request("red/DocumentSnapshot")
+            self.assertEqual(selected["params"], {"document_id": "7"})
+            plugin.reply(selected, document)
+            plugin.expect_status("JSON: running")
+            content = plugin.expect_host_request("red/TextPanelSetContent")
+            self.assertEqual(
+                content["params"]["blocks"][1]["text"], '{"ok":true}\n'
+            )
+            plugin.reply(content)
+            plugin.expect_status("JSON: ready (12 B)")
+            time.sleep(0.01)
+
+            plugin.send_picker_event(reopened, "run-path")
+            plugin.command("copy", "JsonCopy")
+            copied = plugin.expect_host_request("red/ClipboardWrite")
+            self.assertEqual(copied["params"], {"text": '{"ok":true}\n'})
+            plugin.reply(copied)
+            plugin.expect_status("JSON: copied")
+            self.assertEqual(
+                plugin.receive()["result"], {"message": "JSON result copied"}
+            )
 
     def test_selected_source_uses_captured_range_and_revision(self):
         text = "before\r\n😀e\u0301\r\nafter"

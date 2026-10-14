@@ -24,6 +24,7 @@ Open a JSON document and run:
 :JsonQueries
 :JsonOpenResult
 :JsonCopy
+:JsonExplore
 :JsonSource
 :JsonApply
 :JsonUndo
@@ -63,11 +64,20 @@ plugin exits or reloads, while the preview panel remains connection-owned.
 `JsonSource` explicitly returns to the pinned source when you want to inspect
 it directly.
 
-The preview header exposes Run, Cancel, Apply, Open, Copy, and Close actions.
+The preview header exposes Run, Cancel, Apply, Explore, Open, Copy, and Close actions.
 Run schedules work in the background so Cancel and Close remain responsive;
 Copy writes the complete result to the system clipboard without giving the
 plugin read access. `JsonCopy` provides the same explicit copy operation from
 the command line.
+
+`JsonExplore` and the Explore header action open a native picker over the
+latest result. Object keys and array indexes form a breadcrumb in the panel;
+Run this path builds a correctly escaped jq filter and previews that subtree as
+the next result. JSON streams appear as separate roots, while empty output is
+shown explicitly. Duplicate object keys remain visible but cannot become a jq
+path because their lookup is ambiguous. Exploration never rewrites the exact
+raw output used by Copy, Open, or Apply. Cancelling and reopening the explorer
+returns to the same node until a new result arrives.
 
 `JsonQueries` opens a native picker containing configured presets and up to 20
 recent successful queries. Choosing one runs it against the pinned source after

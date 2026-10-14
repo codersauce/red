@@ -20,11 +20,16 @@ LIVE_DEBOUNCE_SECONDS = 0.12
 HISTORY_LIMIT = 20
 PRESET_LIMIT = 128
 PICKER_LABEL_LIMIT = 256
+EXPLORE_ROOT_LIMIT = 1024
+EXPLORE_CHILD_LIMIT = 1000
+EXPLORE_NODE_LIMIT = 10000
+EXPLORE_DEPTH_LIMIT = 64
 PANEL_ID = "json-workbench"
 PANEL_ACTIONS = [
     {"id": "run", "label": "Run", "compact_label": "R"},
     {"id": "cancel", "label": "Cancel", "compact_label": "X"},
     {"id": "apply", "label": "Apply", "compact_label": "A"},
+    {"id": "explore", "label": "Explore", "compact_label": "E"},
     {"id": "open", "label": "Open", "compact_label": "O"},
     {"id": "copy", "label": "Copy", "compact_label": "C"},
     {"id": "close", "label": "Close", "compact_label": "×"},
@@ -100,6 +105,13 @@ COMMANDS = [
         },
     },
     {
+        "name": "JsonExplore",
+        "metadata": {
+            "title": "Explore the JSON result",
+            "category": "JSON Workbench",
+        },
+    },
+    {
         "name": "JsonCopy",
         "metadata": {
             "title": "Copy the JSON result",
@@ -142,6 +154,11 @@ class HostError(OperationError):
 
 class CommandCancelled(Exception):
     pass
+
+
+class JsonObject:
+    def __init__(self, pairs):
+        self.pairs = pairs
 
 
 def end_position(text):
@@ -207,6 +224,99 @@ def query_label(query_text):
         query_text.replace("\r\n", " ").replace("\r", " ").replace("\n", " ")
     ).strip()
     return bounded_text(label, PICKER_LABEL_LIMIT) or "[empty query]"
+
+
+def parse_json_stream(text):
+    def reject_constant(value):
+        raise ValueError(f"non-standard JSON value: {value}")
+
+    decoder = json.JSONDecoder(
+        object_pairs_hook=JsonObject,
+        parse_constant=reject_constant,
+    )
+    roots = []
+    offset = 0
+    while True:
+        while offset < len(text) and text[offset].isspace():
+            offset += 1
+        if offset == len(text):
+            break
+        if len(roots) >= EXPLORE_ROOT_LIMIT:
+            raise OperationError(
+                f"JSON result contains more than {EXPLORE_ROOT_LIMIT} roots"
+            )
+        try:
+            value, offset = decoder.raw_decode(text, offset)
+        except (json.JSONDecodeError, RecursionError, ValueError) as error:
+            raise OperationError(f"result is not valid bounded JSON: {error}") from error
+        roots.append(value)
+    validate_json_tree(roots)
+    return roots
+
+
+def validate_json_tree(roots):
+    pending = [(root, 1) for root in roots]
+    nodes = 0
+    while pending:
+        node, depth = pending.pop()
+        nodes += 1
+        if nodes > EXPLORE_NODE_LIMIT:
+            raise OperationError(
+                f"JSON result contains more than {EXPLORE_NODE_LIMIT} values"
+            )
+        if depth > EXPLORE_DEPTH_LIMIT:
+            raise OperationError(
+                f"JSON result exceeds {EXPLORE_DEPTH_LIMIT} levels"
+            )
+        if isinstance(node, JsonObject):
+            pending.extend((value, depth + 1) for _key, value in node.pairs)
+        elif isinstance(node, list):
+            pending.extend((value, depth + 1) for value in node)
+
+
+def json_value_detail(value):
+    if isinstance(value, JsonObject):
+        return f"object · {len(value.pairs)} keys"
+    if isinstance(value, list):
+        return f"array · {len(value)} items"
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "boolean"
+    if isinstance(value, str):
+        return f"string · {len(value)} characters"
+    return "number"
+
+
+def json_node(roots, path):
+    node = roots[path[0][1]]
+    for kind, value in path[1:]:
+        if kind == "index":
+            node = node[value]
+        else:
+            node = next(child for key, child in node.pairs if key == value)
+    return node
+
+
+def json_breadcrumb(root_count, path):
+    if not path:
+        return f"stream · {root_count} roots"
+    root = path[0][1]
+    breadcrumb = "$" if root_count == 1 else f"$<{root + 1}>"
+    for kind, value in path[1:]:
+        token = value if kind == "index" else json.dumps(value, ensure_ascii=False)
+        breadcrumb += f"[{token}]"
+    return breadcrumb
+
+
+def json_path_query(base_query, root_count, path):
+    root = path[0][1]
+    query = base_query if root_count == 1 else f"[({base_query})][{root}]"
+    for kind, value in path[1:]:
+        token = str(value) if kind == "index" else json.dumps(value)
+        query = f"({query}) | .[{token}]"
+    validate_query(query)
+    return query
 
 
 def normalize_history(value):
@@ -342,16 +452,22 @@ class JsonWorkbench:
         self.cancelling = threading.Event()
         self.closed = threading.Event()
         self.request_ids = itertools.count(1)
+        self.explore_picker_ids = itertools.count(1)
         self.source_id = None
         self.source_selection = None
         self.query_document_id = None
         self.last_query = None
         self.result = None
+        self.result_context = None
+        self.result_generation = 0
         self.candidate = None
         self.transaction = None
         self.panel_open = False
         self.active_picker_id = None
         self.picker_actions = {}
+        self.explore_roots = None
+        self.explore_path = None
+        self.inspect_path = None
         self.active_run = None
         self.run_generation = 0
         self.live_enabled = False
@@ -625,9 +741,10 @@ class JsonWorkbench:
 
         return decode_result(process, collected)
 
-    def show_result(self, document, query_text, output):
+    def show_result(self, document, query_text, output, inspect_path=None):
         self.ensure_panel()
         path = document["path"] or "[scratch]"
+        inspection = "" if inspect_path is None else f"\nInspect: {inspect_path}"
         self.request_host(
             "red/TextPanelSetContent",
             {
@@ -639,7 +756,7 @@ class JsonWorkbench:
                         "format": "plain",
                         "text": (
                             f"Source: {path} @ {document['revision']}\n"
-                            f"Filter: {query_text}"
+                            f"Filter: {query_text}{inspection}"
                         ),
                     },
                     {
@@ -759,7 +876,10 @@ class JsonWorkbench:
     ):
         validate_query(query_text)
         self.last_query = query_text
+        self.result_generation += 1
+        self.clear_explorer()
         self.result = None
+        self.result_context = None
         self.candidate = None
         try:
             self.ensure_run_active(cancel, generation)
@@ -775,6 +895,11 @@ class JsonWorkbench:
             self.show_result(document, query_text, output)
             self.ensure_run_active(cancel, generation)
             self.result = output
+            self.result_context = {
+                "path": document["path"],
+                "revision": document["revision"],
+                "query": query_text,
+            }
             self.candidate = {
                 "document_id": self.source_id,
                 "revision": document["revision"],
@@ -895,8 +1020,10 @@ class JsonWorkbench:
 
     def cancel(self, _params):
         self.stop_background_query()
+        self.clear_explorer()
         self.candidate = None
         self.result = None
+        self.result_context = None
         self.best_effort_status("JSON: cancelled")
         return {"message": "JSON preview cancelled"}
 
@@ -916,6 +1043,171 @@ class JsonWorkbench:
         self.best_effort_status("JSON: copied")
         return {"message": "JSON result copied"}
 
+    def clear_explorer(self):
+        if self.active_picker_id is not None and self.active_picker_id.startswith(
+            "json-explore-"
+        ):
+            self.clear_picker()
+        self.explore_roots = None
+        self.explore_path = None
+        self.inspect_path = None
+
+    def refresh_result_panel(self):
+        context = self.result_context
+        if context is None or self.result is None:
+            raise OperationError("JsonRun has no result to explore")
+        self.show_result(
+            context,
+            context["query"],
+            self.result,
+            inspect_path=self.inspect_path,
+        )
+
+    def explorer_root_items(self, generation, roots):
+        if not roots:
+            return [{"id": "empty", "label": "No JSON roots"}], {}
+        items = []
+        actions = {}
+        for index, value in enumerate(roots):
+            item_id = f"root-{index}"
+            items.append(
+                {
+                    "id": item_id,
+                    "label": f"Root {index + 1}",
+                    "detail": json_value_detail(value),
+                }
+            )
+            actions[item_id] = ("explore", (generation, (("root", index),)))
+        return items, actions
+
+    def explorer_object_children(self, generation, path, node):
+        counts = {}
+        for key, _value in node.pairs:
+            counts[key] = counts.get(key, 0) + 1
+        items = []
+        actions = {}
+        for index, (key, value) in enumerate(node.pairs[:EXPLORE_CHILD_LIMIT]):
+            item_id = f"key-{index}"
+            detail = json_value_detail(value)
+            duplicate = counts[key] > 1
+            if duplicate:
+                detail += " · duplicate key is not addressable"
+            items.append(
+                {
+                    "id": item_id,
+                    "label": bounded_text(
+                        json.dumps(key, ensure_ascii=False), PICKER_LABEL_LIMIT
+                    ),
+                    "detail": detail,
+                }
+            )
+            if not duplicate:
+                actions[item_id] = (
+                    "explore",
+                    (generation, (*path, ("key", key))),
+                )
+        return items, actions, len(node.pairs)
+
+    def explorer_array_children(self, generation, path, node):
+        items = []
+        actions = {}
+        for index, value in enumerate(node[:EXPLORE_CHILD_LIMIT]):
+            item_id = f"index-{index}"
+            items.append(
+                {
+                    "id": item_id,
+                    "label": f"[{index}]",
+                    "detail": json_value_detail(value),
+                }
+            )
+            actions[item_id] = (
+                "explore",
+                (generation, (*path, ("index", index))),
+            )
+        return items, actions, len(node)
+
+    def explorer_children(self, generation, path, node):
+        if isinstance(node, JsonObject):
+            return self.explorer_object_children(generation, path, node)
+        if isinstance(node, list):
+            return self.explorer_array_children(generation, path, node)
+        return [], {}, 0
+
+    def explorer_items(self, generation, path):
+        roots = self.explore_roots
+        if roots is None:
+            return [], {}
+        if not path:
+            return self.explorer_root_items(generation, roots)
+
+        context = self.result_context
+        node = json_node(roots, path)
+        query = json_path_query(context["query"], len(roots), path)
+        items = [
+            {
+                "id": "run-path",
+                "label": "Run this path",
+                "detail": query_label(query),
+            },
+            {"id": "back", "label": "Back"},
+        ]
+        actions = {
+            "run-path": ("explore-query", (generation, query)),
+            "back": ("explore", (generation, path[:-1])),
+        }
+        children, child_actions, child_count = self.explorer_children(
+            generation, path, node
+        )
+        items.extend(children)
+        actions.update(child_actions)
+        if child_count > EXPLORE_CHILD_LIMIT:
+            items.append(
+                {
+                    "id": "truncated",
+                    "label": f"… {child_count - EXPLORE_CHILD_LIMIT} more values",
+                }
+            )
+        return items, actions
+
+    def open_explorer(self, generation, path):
+        if generation != self.result_generation or self.explore_roots is None:
+            return
+        breadcrumb = json_breadcrumb(len(self.explore_roots), path)
+        self.explore_path = path
+        self.inspect_path = breadcrumb
+        self.refresh_result_panel()
+        items, actions = self.explorer_items(generation, path)
+        self.clear_picker()
+        self.active_picker_id = (
+            f"json-explore-{generation}-{next(self.explore_picker_ids)}"
+        )
+        self.picker_actions = actions
+        try:
+            self.request_host(
+                "red/PickerOpen",
+                {
+                    "id": self.active_picker_id,
+                    "title": bounded_text(f"JSON {breadcrumb}", PICKER_LABEL_LIMIT),
+                    "items": items,
+                },
+            )
+        except OperationError:
+            self.clear_picker()
+            raise
+
+    def explore(self, _params):
+        if self.result is None or self.result_context is None:
+            raise OperationError("JsonRun has no result to explore")
+        generation = self.result_generation
+        if self.explore_roots is None:
+            self.explore_roots = parse_json_stream(self.result)
+            self.explore_path = (
+                (("root", 0),) if len(self.explore_roots) == 1 else ()
+            )
+        path = self.explore_path
+        self.open_explorer(generation, path)
+        return None
+
     def source(self, _params):
         if self.source_id is None:
             raise OperationError("JSON Workbench has no source document")
@@ -929,6 +1221,8 @@ class JsonWorkbench:
                 self.candidate = None
                 self.transaction = None
                 self.result = None
+                self.result_context = None
+                self.clear_explorer()
             raise
         self.best_effort_status("JSON: source")
         return {"message": "JSON source document ready"}
@@ -945,6 +1239,21 @@ class JsonWorkbench:
     def clear_picker(self):
         self.active_picker_id = None
         self.picker_actions = {}
+
+    def handle_picker_action(self, kind, value):
+        if kind == "query":
+            self.start_background_query(value)
+        elif kind == "explore":
+            generation, path = value
+            self.open_explorer(generation, path)
+        elif kind == "explore-query":
+            generation, query_text = value
+            if generation == self.result_generation:
+                self.start_background_query(query_text)
+        elif kind == "clear":
+            self.clear_history()
+        elif kind == "toggle":
+            self.toggle_history()
 
     def query_picker_items(self):
         items = []
@@ -1046,8 +1355,10 @@ class JsonWorkbench:
             self.stop_background_query()
         self.run_generation += 1
         generation = self.run_generation
+        self.clear_explorer()
         self.candidate = None
         self.result = None
+        self.result_context = None
         cancel = threading.Event()
         thread = threading.Thread(
             target=self.background_query,
@@ -1082,13 +1393,13 @@ class JsonWorkbench:
         action = actions.get(item.get("id"))
         if action is None:
             return
-        kind, query_text = action
-        if kind == "query":
-            self.start_background_query(query_text)
-        elif kind == "clear":
-            self.clear_history()
-        else:
-            self.toggle_history()
+        try:
+            self.handle_picker_action(*action)
+        except CommandCancelled:
+            pass
+        except OperationError as error:
+            self.retire_preview(error)
+            self.best_effort_status("JSON: error")
 
     def handle_panel_event(self, message):
         params = message.get("params", {})
@@ -1098,6 +1409,7 @@ class JsonWorkbench:
         handlers = {
             "cancel": self.cancel,
             "apply": self.apply,
+            "explore": self.explore,
             "open": self.open_result,
             "copy": self.copy_result,
             "close": self.close,
@@ -1140,8 +1452,10 @@ class JsonWorkbench:
         if document_id == self.query_document_id:
             self.query_document_id = None
         self.disable_live()
+        self.clear_explorer()
         self.candidate = None
         self.result = None
+        self.result_context = None
         error = OperationError("JSON Workbench document was closed")
         self.retire_preview(error, create=True)
         self.best_effort_status("JSON: closed")
@@ -1212,6 +1526,10 @@ class JsonWorkbench:
         self.source_selection = None
         self.query_document_id = None
         self.result = None
+        self.result_context = None
+        self.explore_roots = None
+        self.explore_path = None
+        self.inspect_path = None
         self.candidate = None
         self.transaction = None
         self.panel_open = False
@@ -1239,6 +1557,7 @@ class JsonWorkbench:
             "JsonQuery": self.query,
             "JsonQueries": self.queries,
             "JsonOpenResult": self.open_result,
+            "JsonExplore": self.explore,
             "JsonCopy": self.copy_result,
             "JsonSource": self.source,
             "JsonApply": self.apply,

@@ -25,7 +25,7 @@ methods while remaining compatible with host API `0.21`.
 [`rpc-json-workbench`](rpc-json-workbench/) is a useful Python and `jq` plugin
 that exercises the `0.26` editable-document, live-watch, selection-context,
 background-mutation, panel-action, and clipboard surfaces while previewing,
-applying, copying, and undoing transformations.
+exploring, applying, copying, and undoing transformations.
 
 The `.js`, `.ts`, and JavaScript test files in this directory are historical examples
 for the removed Deno plugin runtime. They are retained for migration reference, are
