@@ -1,28 +1,44 @@
 schema_version = 1
-version = "0.8.2"
-headline = "Update Red from your editor or terminal"
-summary = "Red v0.8.2 adds a managed updater for official standalone installations. Daily checks notify you about new stable releases; you choose when to install them."
+version = "0.9.0"
+headline = "TypeScript and ESLint together, plugins in your language"
+summary = "Red v0.9.0 lets multiple language servers work on the same file and adds a JSON-RPC plugin interface for external programs. JSON Workbench demonstrates the new interface with live jq queries and reviewable document transformations."
 website = "https://github.com/codersauce/red/releases/latest"
 
-x_post = """{launch}. Official standalone installs can update with `red update` or `:update`. Daily checks notify you; installation waits for your command.
+x_post = """{launch}. Run TypeScript and ESLint together, write plugins in your language over JSON-RPC, and explore JSON with the installable jq-powered JSON Workbench.
 
 {url}"""
-bluesky_post = """{launch}. Update official standalone installs with `red update` or `:update`. Red checks daily and notifies you about new stable releases; you choose when to install.
+bluesky_post = """{launch}. TypeScript and ESLint can share a buffer. Build plugins in your language over JSON-RPC, or try the installable JSON Workbench for live jq previews and undoable transformations.
 
 {url}"""
 
 [[stories]]
-id = "standalone-updater"
-title = "Update from the editor or terminal"
-summary = "Run `red update`, `:update`, or Update Red in the command palette for an official standalone installation. The updater verifies the release checksum and candidate binary before replacement. Restart your editing sessions to use the new version."
+id = "multiple-language-servers"
+title = "Use TypeScript and ESLint together"
+summary = "Attach multiple configured language servers to the same document. Diagnostics and code actions are combined, while completion, hover, and navigation use a capable server. Install the server executables and configure ESLint in Red's user config; attachment is automatic afterward. External Prettier formatting keeps its precedence."
 status = "new"
-pull_requests = [377]
+pull_requests = [383]
 channels = ["github", "discord", "x", "bluesky", "in_app"]
 
 [[stories]]
-id = "daily-update-checks"
-title = "Hear about new releases without unattended installs"
-summary = "Red checks for a newer stable release once per day and notifies you. Set `[updates] mode = \"off\"` to disable automatic checks; manual updates remain available."
+id = "json-rpc-plugins"
+title = "Write plugins in your language"
+summary = "Run external plugins as supervised JSON-RPC processes over stdio. Plugins can contribute commands, panels, pickers, statusline content, and revision-checked document edits, with owner-scoped configuration and storage. Existing Husk plugins remain supported."
 status = "new"
-pull_requests = [377]
+pull_requests = [380]
+channels = ["github", "discord", "x", "bluesky", "in_app"]
+
+[[stories]]
+id = "json-workbench"
+title = "Query and transform JSON with JSON Workbench"
+summary = "Install the example plugin to run jq filters against a pinned document or selection, edit queries with live previews, explore results, and apply or undo checked transformations. Saved query history, result documents, and copying are included. Requires Python 3.9 or newer and jq on PATH; the plugin is installed separately."
+status = "new"
+pull_requests = [381]
+channels = ["github", "discord", "x", "bluesky", "in_app"]
+
+[[stories]]
+id = "wasmtime-security-update"
+title = "Update the WebAssembly runtime"
+summary = "Wasmtime is updated to 48.0.6, addressing the security advisories reported against the previously pinned 48.0.5 release."
+status = "improved"
+pull_requests = [384]
 channels = ["github", "discord", "in_app"]

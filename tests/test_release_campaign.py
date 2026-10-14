@@ -16,15 +16,19 @@ from scripts.release_campaign import (
 )
 
 
+CAMPAIGN_FIXTURE = Path(__file__).parent / "fixtures" / "release_campaign_updater.toml"
+
+
 class ReleaseCampaignTest(unittest.TestCase):
     def setUp(self) -> None:
-        self.campaign = load_campaign(DEFAULT_CAMPAIGN)
+        self.campaign = load_campaign(CAMPAIGN_FIXTURE)
 
     def test_checked_in_campaign_accepts_next_or_a_resolved_release_version(self) -> None:
-        version = self.campaign["version"]
+        campaign = load_campaign(DEFAULT_CAMPAIGN)
+        version = campaign["version"]
 
         self.assertTrue(version == "next" or SEMVER.fullmatch(version) is not None)
-        self.assertGreaterEqual(len(self.campaign["stories"]), 1)
+        self.assertGreaterEqual(len(campaign["stories"]), 1)
 
     def test_preserves_editorial_story_order(self) -> None:
         stories = stories_for_channel(self.campaign, "discord")
@@ -55,7 +59,7 @@ class ReleaseCampaignTest(unittest.TestCase):
     def test_updates_only_the_resolved_campaign_version(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "campaign.toml"
-            path.write_text(DEFAULT_CAMPAIGN.read_text(encoding="utf-8"), encoding="utf-8")
+            path.write_text(CAMPAIGN_FIXTURE.read_text(encoding="utf-8"), encoding="utf-8")
 
             set_version(path, "0.8.1")
             campaign = load_campaign(path)

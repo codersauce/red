@@ -2,6 +2,63 @@
 
 All notable changes to Red are documented in this file.
 
+## [0.9.0](https://github.com/codersauce/red/compare/v0.8.2...v0.9.0)
+
+### Features
+
+- **lsp:** Support multiple servers per document ([#383](https://github.com/codersauce/red/issues/383)) ([bf2c203](https://github.com/codersauce/red/commit/bf2c2039db6fb36b8a011cd72546d321ac28a6c9))
+- **plugins:** Add rpc message feedback ([4e49009](https://github.com/codersauce/red/commit/4e49009485894b2f1e5036852523ca4a15bf1d2d))
+- **plugins:** Refine json workbench panels ([c9bde98](https://github.com/codersauce/red/commit/c9bde98f9ee56c3fdd7bc42a28865b47270d4b3d))
+- **plugins:** Validate json workbench distribution ([8cb693d](https://github.com/codersauce/red/commit/8cb693ddefd9ee79a0970327d4e0faa65bba4165))
+- **plugins:** Explore rpc json results ([d1f0246](https://github.com/codersauce/red/commit/d1f02464ecca8dbc1824f259c3640b1329b1d3d2))
+- **plugins:** Add rpc panel actions ([811fdbf](https://github.com/codersauce/red/commit/811fdbfcc90bd8cac53c1c003cb0e6222177c19d))
+- **plugins:** Support inactive rpc document edits ([6393fbb](https://github.com/codersauce/red/commit/6393fbbb7494acbea822250dd84dbf46aff19054))
+- **plugins:** Add rpc selection context ([720dfb0](https://github.com/codersauce/red/commit/720dfb00148995eec79158c64fe279ce1ecb1ee7))
+- **plugins:** Add live rpc document previews ([cadd845](https://github.com/codersauce/red/commit/cadd84565b7fbecf30e43c09078dcbbdc6153483))
+- **plugins:** Add editable RPC documents ([dd227a2](https://github.com/codersauce/red/commit/dd227a2eab9e265bfe9760b217032b9b532b7e34))
+- **plugins:** Add reusable JSON queries ([e530906](https://github.com/codersauce/red/commit/e530906ede9038570615a85861149622271b601e))
+- **plugins:** Add JSON workbench example ([8243d16](https://github.com/codersauce/red/commit/8243d1642a49d2cc4534bb72abf7b5001ed22949))
+- **plugins:** Add rpc pickers ([c5976c1](https://github.com/codersauce/red/commit/c5976c11c17ba72677f31858d74a623745749f39))
+- **plugins:** Install rpc release artifacts ([0930c35](https://github.com/codersauce/red/commit/0930c35cf1a590eb1f0b2d2b5a00bd6030b2a327))
+- **plugins:** Add rpc config and storage ([efb3ec2](https://github.com/codersauce/red/commit/efb3ec2f75c7fa07db4937e99baed61ab8df3eca))
+- **plugins:** Restrict rpc child environments ([ab2f2c3](https://github.com/codersauce/red/commit/ab2f2c32a244bda6dec3974b6ffbb07290773482))
+- **plugins:** Keep rpc lifecycle work responsive ([6a45053](https://github.com/codersauce/red/commit/6a4505393bd0df3c609d8482125e1eb04a4c2d59))
+- **plugins:** Keep input responsive during rpc commands ([4b14665](https://github.com/codersauce/red/commit/4b14665b53e78020fb861499cc088e123bc47cc6))
+- **plugins:** Add stable rpc document targeting ([cfad830](https://github.com/codersauce/red/commit/cfad83019962c13d92a3eef00bee744ef92b63a6))
+- **plugins:** Add RPC statusline contributions ([a806156](https://github.com/codersauce/red/commit/a80615699ab5fa908f95f7c0f4eb8321d5af047f))
+- **plugins:** Add RPC text panels ([32d4e10](https://github.com/codersauce/red/commit/32d4e106034ec47ac381db5d8972d786894c35ef))
+- **plugins:** Deliver RPC editor events ([cbaeca2](https://github.com/codersauce/red/commit/cbaeca2e6787485adbbeda8190fb486c61deae1a))
+- **plugins:** Add RPC document transactions ([ff464a5](https://github.com/codersauce/red/commit/ff464a5d0b403dae9078575d9c287f6679895b28))
+- **plugins:** Add RPC document snapshots ([873705f](https://github.com/codersauce/red/commit/873705febd989b94d4070bcc587f81980abbbe86))
+- **plugins:** Activate JSON-RPC commands ([4dffa35](https://github.com/codersauce/red/commit/4dffa35dd58014c55daad30280c10962e5eb47af))
+- **plugins:** Add JSON-RPC process transport ([4d8114b](https://github.com/codersauce/red/commit/4d8114bb01fe1a3f97b3df191f3c7e71c76aae9d))
+- **plugins:** Define JSON-RPC package contract ([f377d57](https://github.com/codersauce/red/commit/f377d57a457a128797f232c00826fe7b2233332a))
+
+### Bug Fixes
+
+- **plugins:** Keep oversized rpc responses recoverable ([3a79a94](https://github.com/codersauce/red/commit/3a79a947a5e266d0f5587b56ea8a7cdc1ad6e40c))
+- **plugins:** Handle interleaved messages in rpc example ([32a6f41](https://github.com/codersauce/red/commit/32a6f410e5ae2035bf4a4db57119b3d57cb1c3e0))
+- **plugins:** Enforce edit bounds and Husk command precedence ([bb87e7f](https://github.com/codersauce/red/commit/bb87e7f4f82c7ec5a99c205a64135e25b31a0117))
+
+### Documentation
+
+- **plugins:** Plan json workbench ux ([ae8a4d4](https://github.com/codersauce/red/commit/ae8a4d4926e865f4b93b049003df11054fface14))
+
+### Testing
+
+- **plugins:** Await complete panel events ([5d56a5b](https://github.com/codersauce/red/commit/5d56a5b4c0a63265ee13b06fa049a222b631d205))
+- **plugins:** Accept native jq newlines ([17472d4](https://github.com/codersauce/red/commit/17472d4779ad3ee236de0158b005692eade043d2))
+- **plugins:** Stabilize json workbench explorer ([ccbc487](https://github.com/codersauce/red/commit/ccbc48762b2b57d48a18fd678e43d95760b9d8fc))
+- **plugins:** Stabilize rpc ci ([0eaf788](https://github.com/codersauce/red/commit/0eaf78892b93f43e111c54f1055f407ca34998e5))
+- **plugins:** Stabilize rpc ci ([bf26279](https://github.com/codersauce/red/commit/bf2627991fcbf025e966c046f0606ba9e1fca036))
+- **plugins:** Use a native absolute path in RPC package test ([f6a9754](https://github.com/codersauce/red/commit/f6a9754861cbcd4dd6f27277eca5c8e9d8968616))
+- **plugins:** Add protocol v1 envelope conformance fixture ([28f2306](https://github.com/codersauce/red/commit/28f2306e2967cfe9d3f53b886dcceb156cfcc976))
+
+### Other
+
+- Record json-rpc plugin boundary ([b71445a](https://github.com/codersauce/red/commit/b71445a8b813a0710c66822e9aa61e4f6f0ba7cc))
+- Record v0.8.2 website closeout ([26a6d98](https://github.com/codersauce/red/commit/26a6d98b11dd26f041916477ab1a049d457324c0))
+
 ## [0.8.2](https://github.com/codersauce/red/compare/v0.8.1...v0.8.2)
 
 ### Features

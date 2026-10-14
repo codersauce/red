@@ -1,0 +1,28 @@
+schema_version = 1
+version = "0.8.2"
+headline = "Update Red from your editor or terminal"
+summary = "Red v0.8.2 adds a managed updater for official standalone installations. Daily checks notify you about new stable releases; you choose when to install them."
+website = "https://github.com/codersauce/red/releases/latest"
+
+x_post = """{launch}. Official standalone installs can update with `red update` or `:update`. Daily checks notify you; installation waits for your command.
+
+{url}"""
+bluesky_post = """{launch}. Update official standalone installs with `red update` or `:update`. Red checks daily and notifies you about new stable releases; you choose when to install.
+
+{url}"""
+
+[[stories]]
+id = "standalone-updater"
+title = "Update from the editor or terminal"
+summary = "Run `red update`, `:update`, or Update Red in the command palette for an official standalone installation. The updater verifies the release checksum and candidate binary before replacement. Restart your editing sessions to use the new version."
+status = "new"
+pull_requests = [377]
+channels = ["github", "discord", "x", "bluesky", "in_app"]
+
+[[stories]]
+id = "daily-update-checks"
+title = "Hear about new releases without unattended installs"
+summary = "Red checks for a newer stable release once per day and notifies you. Set `[updates] mode = \"off\"` to disable automatic checks; manual updates remain available."
+status = "new"
+pull_requests = [377]
+channels = ["github", "discord", "in_app"]
