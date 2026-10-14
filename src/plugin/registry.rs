@@ -14,7 +14,7 @@ use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant, SystemTime};
 
 use crate::editor::{Action, EditorStateSnapshot, PluginRequest};
@@ -26,6 +26,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::process::Command;
 use tokio::sync::{mpsc, Mutex};
+use tokio::task::JoinHandle;
 
 use super::package::{PluginPackageManifest, PLUGIN_MANIFEST_FILE};
 use super::rpc::{
@@ -72,6 +73,48 @@ struct ActiveRpcPlugin {
     incoming: RpcInbox,
     commands: HashMap<String, CommandMetadata>,
     events: HashSet<String>,
+    command: Option<PendingRpcCommand>,
+}
+
+struct PendingRpcCommand {
+    execution: RpcCommandExecution,
+    task: JoinHandle<anyhow::Result<Value>>,
+    document: crate::buffer::BufferId,
+}
+
+impl Drop for PendingRpcCommand {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+/// Identifies one command wait without keeping a retired connection alive.
+#[derive(Clone)]
+pub(crate) struct RpcCommandToken {
+    id: tokio::task::Id,
+    owner: String,
+    incoming: Weak<Mutex<mpsc::Receiver<RpcIncoming>>>,
+}
+
+impl RpcCommandToken {
+    pub(crate) fn id(&self) -> tokio::task::Id {
+        self.id
+    }
+
+    pub(crate) fn is_pending(&self, registry: &PluginRegistry) -> bool {
+        registry
+            .rpc_plugins
+            .get(&self.owner)
+            .and_then(|plugin| plugin.command.as_ref())
+            .is_some_and(|command| command.task.id() == self.id)
+    }
+
+    pub(crate) fn is_current(&self, registry: &PluginRegistry) -> bool {
+        registry
+            .rpc_plugins
+            .get(&self.owner)
+            .is_some_and(|plugin| Weak::ptr_eq(&self.incoming, &Arc::downgrade(&plugin.incoming)))
+    }
 }
 
 #[async_trait]
@@ -578,6 +621,7 @@ impl PluginRegistry {
             incoming: Arc::new(Mutex::new(incoming)),
             commands,
             events,
+            command: None,
         })
     }
 
@@ -690,7 +734,74 @@ impl PluginRegistry {
     ) {
         let mut execution = self.rpc_command_execution(owner, name, raw_args);
         let result = execution.run(&mut UnavailableRpcHost).await;
-        self.finish_rpc_command(runtime, execution, result);
+        self.finish_rpc_command(runtime, &execution, result);
+    }
+
+    pub(crate) async fn start_rpc_command(
+        &mut self,
+        runtime: &mut Runtime,
+        command: &str,
+        document: crate::buffer::BufferId,
+    ) -> anyhow::Result<Option<RpcCommandToken>> {
+        let Some(execution) = self.prepare_rpc_command(runtime, command).await else {
+            return Ok(None);
+        };
+        let plugin = self
+            .rpc_plugins
+            .get_mut(&execution.owner)
+            .expect("active RPC owner");
+        anyhow::ensure!(
+            plugin.command.is_none(),
+            "RPC plugin `{}` is busy",
+            execution.owner
+        );
+        let request = execution.request.clone();
+        let params = execution.params.clone();
+        let task = tokio::spawn(async move {
+            request
+                .request("command/execute", params, RPC_COMMAND_TIMEOUT)
+                .await
+        });
+        let token = RpcCommandToken {
+            id: task.id(),
+            owner: execution.owner.clone(),
+            incoming: Arc::downgrade(&execution.incoming),
+        };
+        plugin.command = Some(PendingRpcCommand {
+            execution,
+            task,
+            document,
+        });
+        Ok(Some(token))
+    }
+
+    pub(crate) async fn poll_rpc_commands(&mut self, runtime: &mut Runtime) {
+        let completed = self
+            .rpc_plugins
+            .values_mut()
+            .filter_map(|plugin| {
+                plugin
+                    .command
+                    .as_ref()
+                    .filter(|command| command.task.is_finished())?;
+                plugin.command.take()
+            })
+            .collect::<Vec<_>>();
+        for mut command in completed {
+            let result = (&mut command.task)
+                .await
+                .map_err(anyhow::Error::from)
+                .and_then(std::convert::identity);
+            self.finish_rpc_command(runtime, &command.execution, result);
+        }
+    }
+
+    pub(crate) fn rpc_command_document(&self, owner: &str) -> Option<crate::buffer::BufferId> {
+        self.rpc_plugins
+            .get(owner)?
+            .command
+            .as_ref()
+            .map(|command| command.document)
     }
 
     pub(crate) async fn prepare_rpc_command(
@@ -730,7 +841,7 @@ impl PluginRegistry {
     pub(crate) fn finish_rpc_command(
         &mut self,
         runtime: &mut Runtime,
-        execution: RpcCommandExecution,
+        execution: &RpcCommandExecution,
         result: anyhow::Result<Value>,
     ) {
         // A retired connection cannot publish into its replacement.
@@ -741,7 +852,7 @@ impl PluginRegistry {
         {
             return;
         }
-        let owner = execution.owner;
+        let owner = &execution.owner;
         match result.and_then(decode_rpc_command_result) {
             Ok(Some(action)) => runtime.send_request(PluginRequest::Action(action)),
             Ok(None) => {}
@@ -751,8 +862,8 @@ impl PluginRegistry {
                 )));
             }
             Err(error) => {
-                let path = self.plugin_path(&owner);
-                self.quarantine(runtime, &owner, &path, "runtime", error.to_string());
+                let path = self.plugin_path(owner);
+                self.quarantine(runtime, owner, &path, "runtime", error.to_string());
             }
         }
     }

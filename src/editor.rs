@@ -55,6 +55,7 @@ pub mod render_buffer;
 pub mod rendering;
 #[cfg(test)]
 mod resize_tests;
+mod rpc_commands;
 mod session_manager;
 mod shell_command;
 mod signature_help;
@@ -3565,6 +3566,9 @@ pub struct Editor {
     /// Picker callbacks may enqueue navigation that must commit before the next input event.
     service_background_before_next_input: bool,
 
+    /// Paused action tails belonging to asynchronous RPC commands.
+    rpc_commands: rpc_commands::RpcCommands,
+
     /// Rows changed by the most recent detached frame, reused for protocol deltas.
     last_detached_changed_rows: Vec<usize>,
 
@@ -4091,6 +4095,15 @@ impl DetachedEditorCore {
         self.stopped
     }
 
+    /// Observes command settlement without timing assumptions in subprocess tests.
+    #[doc(hidden)]
+    pub fn test_rpc_command_pending(&self, owner: &str) -> bool {
+        self.editor
+            .plugin_registry
+            .rpc_command_document(owner)
+            .is_some()
+    }
+
     pub fn persist(&mut self) {
         self.editor.persist_session_snapshot(/*force*/ true);
     }
@@ -4584,6 +4597,13 @@ struct RpcDocumentUndoParams {
     #[serde(default)]
     document_id: Option<String>,
     transaction_id: String,
+}
+
+struct RpcDocumentMutationState {
+    index: usize,
+    view: (usize, usize, usize, usize, usize),
+    resume_insert: bool,
+    terminal_output: bool,
 }
 
 #[derive(Deserialize)]
@@ -5376,6 +5396,7 @@ impl Editor {
             suppress_reactivation_click: false,
             render_generation: 0,
             service_background_before_next_input: false,
+            rpc_commands: rpc_commands::RpcCommands::default(),
             last_detached_changed_rows: Vec::new(),
             last_rendered_window: None,
             last_rendered_viewport: None,
@@ -10687,6 +10708,7 @@ impl Editor {
         buffer: &mut RenderBuffer,
         runtime: &mut Runtime,
     ) -> anyhow::Result<()> {
+        self.plugin_registry.poll_rpc_commands(runtime).await;
         self.service_rpc_host_requests(buffer, runtime).await;
         self.service_mouse_selection(buffer, runtime).await?;
         self.service_open_file_changes(buffer, runtime).await?;
@@ -13024,6 +13046,7 @@ impl Editor {
         }
         needs_render |= self.service_shell_commands(runtime).await;
         needs_render |= self.service_red_update();
+        self.resume_rpc_actions(buffer, runtime).await?;
         self.sync_persistent_notifications();
         needs_render |= self.notification_presentation_changed();
         let background_render = if needs_render {
@@ -13070,6 +13093,7 @@ impl Editor {
         runtime: &mut Runtime,
         render_mode: EventRenderMode,
     ) -> anyhow::Result<ProcessedEvent> {
+        self.rpc_commands.interrupt(&ev);
         if matches!(
             ev,
             Event::Key(KeyEvent {
@@ -13955,20 +13979,8 @@ impl Editor {
                 quit
             }
             KeyAction::Multiple(actions) => {
-                let mut quit = false;
-                for action in actions {
-                    let recipe_token = self.pending_semantic_recipe_token();
-                    let action_quit = self.execute(action, buffer, runtime).await?;
-                    self.append_pending_semantic_action(recipe_token, action);
-                    if action_quit {
-                        quit = true;
-                        break;
-                    }
-                    if self.replay_is_cancelled() {
-                        break;
-                    }
-                }
-                quit
+                self.execute_key_actions(ev, actions, buffer, runtime)
+                    .await?
             }
             KeyAction::Nested(actions) => {
                 log!(
@@ -13987,18 +13999,8 @@ impl Editor {
                 false
             }
             KeyAction::Repeating(times, action) => {
-                self.repeater = None;
-                let mut quit = false;
-                for _ in 0..*times as usize {
-                    if self.handle_key_action(ev, action, buffer, runtime).await? {
-                        quit = true;
-                        break;
-                    }
-                    if self.replay_checkpoint(buffer, runtime).await? {
-                        break;
-                    }
-                }
-                quit
+                self.repeat_key_action(ev, *times, action, buffer, runtime)
+                    .await?
             }
         };
 
@@ -14017,80 +14019,84 @@ impl Editor {
                 return Ok(());
             };
 
+            self.replay_semantic_change(change, buffer, runtime).await
+        })
+    }
+
+    fn replay_semantic_change<'a>(
+        &'a mut self,
+        change: SemanticChange,
+        buffer: &'a mut RenderBuffer,
+        runtime: &'a mut Runtime,
+    ) -> BoxFuture<'a, anyhow::Result<()>> {
+        Box::pin(async move {
+            let steps = match change {
+                SemanticChange::Input(events) => {
+                    events.into_iter().map(SemanticChangeStep::Input).collect()
+                }
+                SemanticChange::Recipe(steps) => steps,
+            };
             self.pending_semantic_change = None;
             self.replaying_semantic_change = true;
-            let result = async {
-                match change {
-                    SemanticChange::Input(events) => {
-                        for event in &events {
-                            if let Some(action) =
-                                self.handle_event_with_runtime(event, Some(runtime))?
-                            {
-                                if self
-                                    .handle_resolved_key_action(event, &action, buffer, runtime)
-                                    .await?
-                                {
-                                    anyhow::bail!("repeated change attempted to quit the editor");
-                                }
-                            }
-                            if self.replay_checkpoint(buffer, runtime).await? {
-                                break;
-                            }
-                        }
-                    }
-                    SemanticChange::Recipe(steps) => {
-                        for step in &steps {
-                            match step {
-                                SemanticChangeStep::Input(event) => {
-                                    if let Some(action) =
-                                        self.handle_event_with_runtime(event, Some(runtime))?
-                                    {
-                                        if self
-                                            .handle_resolved_key_action(
-                                                event, &action, buffer, runtime,
-                                            )
-                                            .await?
-                                        {
-                                            anyhow::bail!(
-                                                "repeated change attempted to quit the editor"
-                                            );
-                                        }
-                                    }
-                                }
-                                SemanticChangeStep::Action(action) => {
-                                    if self.execute(action, buffer, runtime).await? {
-                                        anyhow::bail!(
-                                            "repeated change attempted to quit the editor"
-                                        );
-                                    }
-                                }
-                                SemanticChangeStep::VisualLineShift {
-                                    direction,
-                                    line_count,
-                                    count,
-                                } => {
-                                    self.replay_visual_line_shift(
-                                        *direction,
-                                        *line_count,
-                                        *count,
-                                        buffer,
-                                        runtime,
-                                    )
-                                    .await?;
-                                }
-                            }
-                            if self.replay_checkpoint(buffer, runtime).await? {
-                                break;
-                            }
-                        }
-                    }
-                }
-                Ok(())
-            }
-            .await;
+            let result = self.replay_semantic_steps(&steps, buffer, runtime).await;
             self.replaying_semantic_change = false;
             result
         })
+    }
+
+    async fn replay_semantic_steps(
+        &mut self,
+        steps: &[SemanticChangeStep],
+        buffer: &mut RenderBuffer,
+        runtime: &mut Runtime,
+    ) -> anyhow::Result<()> {
+        for (index, step) in steps.iter().enumerate() {
+            let checkpoint = self.rpc_command_checkpoint();
+            anyhow::ensure!(
+                !self.execute_semantic_step(step, buffer, runtime).await?,
+                "repeated change attempted to quit the editor"
+            );
+            if let Some(command) = self.rpc_command_started_since(checkpoint) {
+                self.defer_rpc_action(
+                    command,
+                    rpc_commands::RpcContinuation::Semantic(SemanticChange::Recipe(
+                        steps[index + 1..].to_vec(),
+                    )),
+                );
+                break;
+            }
+            if self.replay_checkpoint(buffer, runtime).await? {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    async fn execute_semantic_step(
+        &mut self,
+        step: &SemanticChangeStep,
+        buffer: &mut RenderBuffer,
+        runtime: &mut Runtime,
+    ) -> anyhow::Result<bool> {
+        match step {
+            SemanticChangeStep::Input(event) => {
+                let Some(action) = self.handle_event_with_runtime(event, Some(runtime))? else {
+                    return Ok(false);
+                };
+                self.handle_resolved_key_action(event, &action, buffer, runtime)
+                    .await
+            }
+            SemanticChangeStep::Action(action) => self.execute(action, buffer, runtime).await,
+            SemanticChangeStep::VisualLineShift {
+                direction,
+                line_count,
+                count,
+            } => {
+                self.replay_visual_line_shift(*direction, *line_count, *count, buffer, runtime)
+                    .await?;
+                Ok(false)
+            }
+        }
     }
 
     #[inline(never)]
@@ -14166,8 +14172,17 @@ impl Editor {
         }
 
         self.macro_instructions_remaining = MACRO_MAX_REPLAY_EVENTS;
+        self.drain_macro_replay(buffer, runtime).await
+    }
+
+    async fn drain_macro_replay(
+        &mut self,
+        buffer: &mut RenderBuffer,
+        runtime: &mut Runtime,
+    ) -> anyhow::Result<()> {
         let result = async {
             while let Some(replay) = self.macro_replay_queue.pop_front() {
+                let checkpoint = self.rpc_command_checkpoint();
                 if self.macro_instructions_remaining == 0 {
                     self.set_legacy_message(Some(format!(
                         "macro instruction limit ({MACRO_MAX_REPLAY_EVENTS}) reached"
@@ -14186,6 +14201,10 @@ impl Editor {
                     {
                         anyhow::bail!("macro attempted to quit the editor");
                     }
+                }
+                if let Some(command) = self.rpc_command_started_since(checkpoint) {
+                    self.defer_rpc_action(command, rpc_commands::RpcContinuation::Macro);
+                    break;
                 }
                 if self.replay_checkpoint(buffer, runtime).await? {
                     break;
@@ -22096,16 +22115,7 @@ impl Editor {
                     self.record_command_history(cmd);
                     false
                 };
-                let result: anyhow::Result<bool> = async {
-                    for action in actions {
-                        self.set_legacy_message(None);
-                        if self.execute(&action, buffer, runtime).await? {
-                            return Ok(true);
-                        }
-                    }
-                    Ok(false)
-                }
-                .await;
+                let result = self.execute_command_actions(actions, buffer, runtime).await;
                 if deferred_history && !matches!(result, Ok(true)) {
                     self.flush_command_history();
                 }
@@ -26205,6 +26215,11 @@ impl Editor {
     ) -> std::result::Result<Value, plugin::rpc::RpcErrorObject> {
         let params: RpcDocumentApplyParams =
             Self::rpc_params(plugin::rpc::DOCUMENT_APPLY_METHOD, params)?;
+        self.validate_rpc_document_context(
+            owner,
+            params.path.as_deref(),
+            params.document_id.as_deref(),
+        )?;
         let expected_revision = params.expected_revision.parse::<u64>().map_err(|_| {
             Self::rpc_error(
                 -32602,
@@ -26225,7 +26240,8 @@ impl Editor {
                 ),
             ));
         }
-        let transaction_id = self
+        let state = self.begin_rpc_document_mutation(buffer_index);
+        let result = self
             .apply_plugin_document_transaction(
                 render_buffer,
                 runtime,
@@ -26237,8 +26253,9 @@ impl Editor {
                     edits: params.edits,
                 },
             )
-            .await
-            .map_err(|error| Self::rpc_error(-32003, error))?;
+            .await;
+        self.finish_rpc_document_mutation(state, render_buffer)?;
+        let transaction_id = result.map_err(|error| Self::rpc_error(-32003, error))?;
         Ok(json!({
             "transaction_id": transaction_id,
             "revision": self.buffer_manager[buffer_index].revision().to_string(),
@@ -26254,20 +26271,28 @@ impl Editor {
     ) -> std::result::Result<Value, plugin::rpc::RpcErrorObject> {
         let params: RpcDocumentUndoParams =
             Self::rpc_params(plugin::rpc::DOCUMENT_UNDO_METHOD, params)?;
+        self.validate_rpc_document_context(
+            owner,
+            params.path.as_deref(),
+            params.document_id.as_deref(),
+        )?;
         let buffer_index = Self::rpc_document_mutation_index(
             &self.buffer_manager,
             params.path.as_deref(),
             params.document_id.as_deref(),
         )?;
-        self.undo_plugin_document_transaction(
-            render_buffer,
-            runtime,
-            owner,
-            params.path.as_deref(),
-            &params.transaction_id,
-        )
-        .await
-        .map_err(|error| Self::rpc_error(-32003, error))?;
+        let state = self.begin_rpc_document_mutation(buffer_index);
+        let result = self
+            .undo_plugin_document_transaction(
+                render_buffer,
+                runtime,
+                owner,
+                params.path.as_deref(),
+                &params.transaction_id,
+            )
+            .await;
+        self.finish_rpc_document_mutation(state, render_buffer)?;
+        result.map_err(|error| Self::rpc_error(-32003, error))?;
         Ok(json!({
             "revision": self.buffer_manager[buffer_index].revision().to_string(),
         }))
@@ -26303,27 +26328,22 @@ impl Editor {
 
     async fn execute_plugin_command(
         &mut self,
-        render_buffer: &mut RenderBuffer,
+        _render_buffer: &mut RenderBuffer,
         runtime: &mut Runtime,
         command: &str,
     ) -> anyhow::Result<()> {
-        let Some(mut execution) = self
+        let document = self.current_buffer().id();
+        match self
             .plugin_registry
-            .prepare_rpc_command(runtime, command)
+            .start_rpc_command(runtime, command, document)
             .await
-        else {
-            return self.plugin_registry.execute(runtime, command).await;
-        };
-        let result = {
-            let mut host = EditorRpcHost {
-                editor: self,
-                render_buffer,
-                runtime,
-            };
-            execution.run(&mut host).await
-        };
-        self.plugin_registry
-            .finish_rpc_command(runtime, execution, result);
+        {
+            Ok(Some(token)) => self.rpc_commands.started(token),
+            Ok(None) => return self.plugin_registry.execute(runtime, command).await,
+            Err(error) => runtime.send_request(PluginRequest::Action(Action::PrintWarning(
+                error.to_string(),
+            ))),
+        }
         Ok(())
     }
 

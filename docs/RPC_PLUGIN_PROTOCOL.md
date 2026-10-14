@@ -171,6 +171,23 @@ non-null message through its existing informational-message path. A JSON-RPC
 error is shown as a warning and leaves the connection active. A transport or
 result-schema failure quarantines the plugin.
 
+After activation, the editor waits for command responses in the background,
+so input, resizing, other plugins, and incoming host calls continue. Each
+connection runs at most one command at a time; another invocation reports
+that the plugin is busy without disconnecting it. The 30-second command
+deadline still applies. Closing or replacing a connection retires its pending
+command; late completion cannot affect the replacement.
+
+Dependent actions in a key binding, repeated command, macro, or dot replay
+pause until that command settles. Macro depth and instruction limits carry
+across the wait. New user key, paste, or mouse-action input cancels the paused
+actions, while the plugin command itself continues. Resize, focus, mouse
+movement, and key-release events do not cancel them. Retiring the connection
+also discards its paused actions.
+
+This command scheduling does not yet make initialization, hot reload,
+shutdown, or pipe-write acknowledgements nonblocking.
+
 ## Document snapshots
 
 An active plugin can read the current unsaved contents of an open document with
@@ -245,8 +262,15 @@ to undo. ID-selected mutations currently require that document to be active;
 otherwise they return `-32003` without switching focus or changing contents.
 Select the document again before retrying, and refresh its snapshot if its
 revision has changed. An ID never silently falls back to another open buffer.
-Legacy requests without an ID retain their existing path/current-document
-behavior; a revision alone does not identify a document.
+Explicit path mutations preserve the active buffer, view, and user insertion
+transaction when editing another open document. Plugin edits and user edits
+remain separate undo transactions; undo checks include uncommitted user edits.
+During a command, a legacy mutation with neither path nor ID is rejected if
+the current document differs from the one at invocation. The host never
+silently redirects such a request to that earlier document. Outside a pending
+command, omitted selectors still mean the current document; use an explicit
+selector for work that can outlive a buffer switch, since a revision alone
+does not identify a document.
 
 `red/DocumentUndo` reverts that transaction only while it remains the latest
 change and is owned by the calling plugin:

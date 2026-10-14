@@ -10,9 +10,16 @@ use red::plugin::{PluginRegistry, PluginStatus, Runtime};
 use serde_json::{json, Value};
 use tokio::process::Command;
 
+mod common;
+#[path = "rpc_connection/editor.rs"]
+mod editor;
+
 const FIXTURE_MODE: &str = "RED_RPC_FIXTURE_MODE";
 
 fn main() -> Result<()> {
+    if env::args().any(|argument| argument == "--editor-fixture") {
+        return editor::fixture();
+    }
     if env::args().any(|argument| argument == "--registry-fixture") {
         return run_registry_fixture();
     }
@@ -23,7 +30,8 @@ fn main() -> Result<()> {
     tokio::runtime::Runtime::new()?.block_on(async {
         exercises_bidirectional_requests_and_shutdown().await?;
         deadline_failure_reaps_the_plugin_and_fails_its_peers().await?;
-        registry_discovers_and_lazily_executes_an_rpc_command().await
+        registry_discovers_and_lazily_executes_an_rpc_command().await?;
+        editor::run().await
     })
 }
 
