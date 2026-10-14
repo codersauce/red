@@ -30,6 +30,7 @@ fn main() -> Result<()> {
     tokio::runtime::Runtime::new()?.block_on(async {
         exercises_bidirectional_requests_and_shutdown().await?;
         deadline_failure_reaps_the_plugin_and_fails_its_peers().await?;
+        stalled_reader_rejects_bounded_writes_without_blocking().await?;
         registry_discovers_and_lazily_executes_an_rpc_command().await?;
         editor::run().await
     })
@@ -87,6 +88,42 @@ async fn deadline_failure_reaps_the_plugin_and_fails_its_peers() -> Result<()> {
     assert!(peer.contains("timed out after 100 ms"));
     assert!(timed_out.contains("fixture stalled"));
     assert!(peer.contains("fixture stalled"));
+    Ok(())
+}
+
+async fn stalled_reader_rejects_bounded_writes_without_blocking() -> Result<()> {
+    let (connection, _incoming) = spawn_fixture("stall-reader")?;
+    connection
+        .initialize(initialize_params(), Duration::from_secs(2))
+        .await?;
+    let payload = json!({"bytes": "x".repeat(7 * 1024 * 1024)});
+    let mut rejected = None;
+    for _ in 0..8 {
+        let result = tokio::time::timeout(
+            Duration::from_millis(100),
+            connection.notify("test/event", payload.clone()),
+        )
+        .await
+        .context("RPC notification waited on a stalled reader")?;
+        if let Err(error) = result {
+            rejected = Some(error.to_string());
+            break;
+        }
+    }
+    let rejected = rejected.context("RPC outbound limits accepted an unbounded backlog")?;
+    assert!(
+        rejected.contains("budget") || rejected.contains("queue"),
+        "{rejected}"
+    );
+    let peer = tokio::time::timeout(
+        Duration::from_secs(2),
+        connection.request("test/peer", Value::Null, Duration::from_secs(10)),
+    )
+    .await
+    .context("bounded write rejection did not close the connection")?
+    .unwrap_err()
+    .to_string();
+    assert!(!peer.is_empty());
     Ok(())
 }
 
@@ -157,7 +194,7 @@ events = ["file:saved"]
         .await?;
     assert!(matches!(
         registry.statuses().get("rpc-alias"),
-        Some(PluginStatus::Active)
+        Some(PluginStatus::Pending)
     ));
     registry.execute(&mut runtime, "RpcHello one two").await?;
     assert!(matches!(
@@ -177,11 +214,18 @@ events = ["file:saved"]
         registry.statuses().get("rpc-alias"),
         Some(PluginStatus::Active)
     ));
+    let source = fs::read_to_string(&manifest)?;
+    fs::write(&manifest, "not valid toml = [")?;
+    registry.reload(&mut runtime).await?;
+    assert!(matches!(
+        registry.statuses().get("rpc-alias"),
+        Some(PluginStatus::ActiveWithReloadError { .. })
+    ));
+    fs::write(&manifest, &source)?;
     registry.deactivate_all(&mut runtime).await?;
 
     fs::remove_file(&marker)?;
     fs::remove_file(&initialized_marker)?;
-    let source = fs::read_to_string(&manifest)?;
     fs::write(&manifest, source.replace("RpcHello", "RpcMismatch"))?;
     let mut registry = PluginRegistry::new();
     registry.add(
@@ -208,6 +252,7 @@ events = ["file:saved"]
     registry
         .notify(&mut runtime, "editor:ready", json!({}))
         .await?;
+    registry.execute(&mut runtime, "RpcHello").await?;
     assert!(matches!(
         registry.statuses().get("rpc-alias"),
         Some(PluginStatus::Quarantined { diagnostic, .. })
@@ -265,7 +310,7 @@ fn run_fixture(mode: &str) -> Result<()> {
     )?;
     assert_eq!(read_message(&mut input)?["method"], "initialized");
 
-    if mode == "hang" {
+    if matches!(mode, "hang" | "stall-reader") {
         eprintln!("fixture stalled");
         std::thread::sleep(Duration::from_secs(60));
         return Ok(());

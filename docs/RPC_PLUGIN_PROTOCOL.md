@@ -53,7 +53,9 @@ per connection, and outstanding requests to 64 in each direction. Red retains
 at most the last 16 KiB of standard error when reporting a failure. Exceeding a
 transport limit, writing malformed framing, or closing the stream disconnects
 the plugin.
-Request deadlines cover queue admission, writing, and the response.
+Request deadlines begin after bounded queue admission and cover the response.
+A stalled writer therefore fails through the write watchdog, its request
+deadline, or the shared outbound byte limit, whichever is reached first.
 
 The portable [envelope conformance fixture](../tests/fixtures/rpc_v1_envelopes.jsonl)
 contains one JSON object per line. Each `message` is a wire-envelope value;
@@ -178,6 +180,11 @@ that the plugin is busy without disconnecting it. The 30-second command
 deadline still applies. Closing or replacing a connection retires its pending
 command; late completion cannot affect the replacement.
 
+An event-triggered activation queues its triggering events in arrival order.
+Commands report busy until that activation finishes. When a command triggers
+activation first, declared events that arrive during initialization are queued
+behind the command.
+
 Dependent actions in a key binding, repeated command, macro, or dot replay
 pause until that command settles. Macro depth and instruction limits carry
 across the wait. New user key, paste, or mouse-action input cancels the paused
@@ -185,8 +192,12 @@ actions, while the plugin command itself continues. Resize, focus, mouse
 movement, and key-release events do not cancel them. Retiring the connection
 also discards its paused actions.
 
-This command scheduling does not yet make initialization, hot reload,
-shutdown, or pipe-write acknowledgements nonblocking.
+Lazy and event-triggered initialization, replacement validation, and retired
+process shutdown run in the background. The previous connection remains active
+until its replacement validates, then its resources are cleared during the
+swap. Notifications and host responses enter the bounded writer queue without
+waiting for a child pipe acknowledgement. Eager plugins still initialize before
+the editor first opens.
 
 ## Document snapshots
 

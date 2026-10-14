@@ -10708,6 +10708,7 @@ impl Editor {
         buffer: &mut RenderBuffer,
         runtime: &mut Runtime,
     ) -> anyhow::Result<()> {
+        self.plugin_registry.poll_rpc_lifecycle(runtime).await;
         self.plugin_registry.poll_rpc_commands(runtime).await;
         self.service_rpc_host_requests(buffer, runtime).await;
         self.service_mouse_selection(buffer, runtime).await?;

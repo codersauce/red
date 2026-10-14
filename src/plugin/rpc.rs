@@ -19,9 +19,9 @@ use tokio::{
     time::timeout,
 };
 
-const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
-const MAX_QUEUED_BYTES: usize = 16 * 1024 * 1024;
-const MAX_OUTSTANDING_REQUESTS: usize = 64;
+pub(crate) const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
+pub(crate) const MAX_QUEUED_BYTES: usize = 16 * 1024 * 1024;
+pub(crate) const MAX_OUTSTANDING_REQUESTS: usize = 64;
 const MAX_DIAGNOSTIC_BYTES: usize = 16 * 1024;
 const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 const REAP_TIMEOUT: Duration = Duration::from_secs(2);
@@ -98,7 +98,7 @@ impl RpcHostRequest {
             Ok(result) => json!({"jsonrpc": "2.0", "id": self.id, "result": result}),
             Err(error) => json!({"jsonrpc": "2.0", "id": self.id, "error": error}),
         };
-        self.writer.send(response, WRITE_TIMEOUT).await
+        self.writer.enqueue(response)
     }
 }
 
@@ -167,6 +167,10 @@ struct ConnectionState {
 }
 
 impl ConnectionState {
+    fn signal_failure(&self, reason: impl Into<String>) {
+        let _ = self.stop.send(Stop::Failure(reason.into()));
+    }
+
     async fn reserve_request(
         &self,
         method: &str,
@@ -298,7 +302,7 @@ impl ConnectionState {
 
 struct OutboundFrame {
     bytes: Vec<u8>,
-    written: oneshot::Sender<std::result::Result<(), String>>,
+    written: Option<oneshot::Sender<std::result::Result<(), String>>>,
     _byte_budget: OwnedSemaphorePermit,
 }
 
@@ -310,21 +314,49 @@ struct RpcWriter {
 }
 
 impl RpcWriter {
+    fn encode(value: Value) -> Result<Vec<u8>> {
+        let mut bytes = serde_json::to_vec(&value)?;
+        bytes.push(b'\n');
+        anyhow::ensure!(
+            bytes.len() <= MAX_FRAME_BYTES,
+            "RPC frame exceeds {MAX_FRAME_BYTES} bytes"
+        );
+        Ok(bytes)
+    }
+
+    fn enqueue(&self, value: Value) -> Result<()> {
+        let result = (|| {
+            let bytes = Self::encode(value)?;
+            let permits = u32::try_from(bytes.len()).expect("frame limit fits in u32");
+            let byte_budget = self
+                .byte_budget
+                .clone()
+                .try_acquire_many_owned(permits)
+                .map_err(|_| anyhow::anyhow!("RPC outbound byte budget is exhausted"))?;
+            self.frames
+                .try_send(OutboundFrame {
+                    bytes,
+                    written: None,
+                    _byte_budget: byte_budget,
+                })
+                .map_err(|error| anyhow::anyhow!("RPC writer queue rejected a frame: {error}"))
+        })();
+        if let Err(error) = &result {
+            self.state.signal_failure(error.to_string());
+        }
+        result
+    }
+
     async fn send(&self, value: Value, deadline: Duration) -> Result<()> {
         let operation = async {
-            let mut bytes = serde_json::to_vec(&value)?;
-            bytes.push(b'\n');
-            anyhow::ensure!(
-                bytes.len() <= MAX_FRAME_BYTES,
-                "RPC frame exceeds {MAX_FRAME_BYTES} bytes"
-            );
+            let bytes = Self::encode(value)?;
             let permits = u32::try_from(bytes.len()).expect("frame limit fits in u32");
             let byte_budget = self.byte_budget.clone().acquire_many_owned(permits).await?;
             let (written, acknowledgement) = oneshot::channel();
             self.frames
                 .send(OutboundFrame {
                     bytes,
-                    written,
+                    written: Some(written),
                     _byte_budget: byte_budget,
                 })
                 .await
@@ -370,6 +402,27 @@ pub(crate) struct RpcRequester {
     state: Arc<ConnectionState>,
 }
 
+pub(crate) struct RpcPendingResponse {
+    receiver: oneshot::Receiver<ResponseOutcome>,
+    state: Arc<ConnectionState>,
+    key: String,
+    method: String,
+    deadline: Duration,
+}
+
+impl RpcPendingResponse {
+    pub(crate) async fn wait(self) -> Result<Value> {
+        receive_response(
+            &self.state,
+            &self.key,
+            &self.method,
+            self.receiver,
+            self.deadline,
+        )
+        .await
+    }
+}
+
 impl RpcRequester {
     pub(crate) async fn request(
         &self,
@@ -378,6 +431,37 @@ impl RpcRequester {
         deadline: Duration,
     ) -> Result<Value> {
         request(&self.writer, &self.state, method, params, deadline).await
+    }
+
+    pub(crate) async fn begin_request(
+        &self,
+        method: &str,
+        params: Value,
+        deadline: Duration,
+    ) -> Result<RpcPendingResponse> {
+        anyhow::ensure!(!method.trim().is_empty(), "RPC method is empty");
+        ensure_named_params(&params)?;
+        let (response, receiver) = oneshot::channel();
+        let id = match self.state.reserve_request(method, response).await {
+            Ok(id) => id,
+            Err(error) => {
+                self.state.signal_failure(error.to_string());
+                return Err(error);
+            }
+        };
+        let key = format!("s:{id}");
+        let frame = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
+        if let Err(error) = self.writer.enqueue(frame) {
+            self.state.remove_pending(&key).await;
+            return Err(error);
+        }
+        Ok(RpcPendingResponse {
+            receiver,
+            state: Arc::clone(&self.state),
+            key,
+            method: method.to_string(),
+            deadline,
+        })
     }
 }
 
@@ -462,17 +546,19 @@ impl RpcConnection {
         }
     }
 
+    pub(crate) fn notification_size(method: &str, params: &Value) -> Result<usize> {
+        anyhow::ensure!(!method.trim().is_empty(), "RPC method is empty");
+        ensure_named_params(params)?;
+        Ok(RpcWriter::encode(json!({"jsonrpc": "2.0", "method": method, "params": params}))?.len())
+    }
+
     /// Sends one notification without creating a pending response.
     pub async fn notify(&self, method: &str, params: Value) -> Result<()> {
         anyhow::ensure!(!method.trim().is_empty(), "RPC method is empty");
         ensure_named_params(&params)?;
         self.state.ensure_ready().await?;
         self.writer
-            .send(
-                json!({"jsonrpc": "2.0", "method": method, "params": params}),
-                WRITE_TIMEOUT,
-            )
-            .await
+            .enqueue(json!({"jsonrpc": "2.0", "method": method, "params": params}))
     }
 
     /// Negotiates protocol version 1 and emits `initialized` after validation.
@@ -507,11 +593,7 @@ impl RpcConnection {
     pub(crate) async fn finish_initialize(&self) -> Result<()> {
         self.state.mark_ready().await?;
         self.writer
-            .send(
-                json!({"jsonrpc": "2.0", "method": "initialized", "params": {}}),
-                WRITE_TIMEOUT,
-            )
-            .await?;
+            .enqueue(json!({"jsonrpc": "2.0", "method": "initialized", "params": {}}))?;
         Ok(())
     }
 
@@ -554,23 +636,24 @@ async fn request(
     params: Value,
     deadline: Duration,
 ) -> Result<Value> {
-    anyhow::ensure!(!method.trim().is_empty(), "RPC method is empty");
-    ensure_named_params(&params)?;
-    let (response, receiver) = oneshot::channel();
-    let id = match state.reserve_request(method, response).await {
-        Ok(id) => id,
-        Err(error) => {
-            let report = state.fail(error.to_string()).await;
-            return Err(close_error(report));
-        }
-    };
-    let key = format!("s:{id}");
-    let frame = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
-    let operation = async {
-        writer.send(frame, deadline).await?;
-        receiver.await.context("RPC response channel closed")
-    };
-    match timeout(deadline, operation).await {
+    RpcRequester {
+        writer: writer.clone(),
+        state: Arc::clone(state),
+    }
+    .begin_request(method, params, deadline)
+    .await?
+    .wait()
+    .await
+}
+
+async fn receive_response(
+    state: &Arc<ConnectionState>,
+    key: &str,
+    method: &str,
+    receiver: oneshot::Receiver<ResponseOutcome>,
+    deadline: Duration,
+) -> Result<Value> {
+    match timeout(deadline, receiver).await {
         Ok(Ok(ResponseOutcome::Result(result))) => Ok(result),
         Ok(Ok(ResponseOutcome::Error(error))) => Err(error.into()),
         Ok(Ok(ResponseOutcome::Disconnected(reason))) => {
@@ -581,12 +664,12 @@ async fn request(
             )))
         }
         Ok(Err(error)) => {
-            state.remove_pending(&key).await;
+            state.remove_pending(key).await;
             let report = state.fail(error.to_string()).await;
             Err(close_error(report))
         }
         Err(_) => {
-            state.remove_pending(&key).await;
+            state.remove_pending(key).await;
             let report = state
                 .fail(format!(
                     "RPC request `{method}` timed out after {} ms",
@@ -628,7 +711,9 @@ async fn write_messages(
             )),
         };
         let failed = result.as_ref().err().cloned();
-        let _ = frame.written.send(result);
+        if let Some(written) = frame.written {
+            let _ = written.send(result);
+        }
         if let Some(reason) = failed {
             state.fail(reason).await;
             return;

@@ -15,6 +15,14 @@ struct Harness {
 
 impl Harness {
     async fn new(mapping: KeyAction) -> Result<Self> {
+        Self::build(mapping, false).await
+    }
+
+    async fn with_delayed_initialization(mapping: KeyAction) -> Result<Self> {
+        Self::build(mapping, true).await
+    }
+
+    async fn build(mapping: KeyAction, delay_initialization: bool) -> Result<Self> {
         let package = tempfile::tempdir()?;
         let slow = package.path().join("slow");
         let fast = package.path().join("fast");
@@ -23,6 +31,9 @@ impl Harness {
             &["RpcWait", "RpcEdit", "RpcUndo", "RpcLegacy", "RpcPath"],
         )?;
         write_package(&fast, &["RpcRead"])?;
+        if delay_initialization {
+            fs::write(slow.join("delay-initialize"), [])?;
+        }
         let mut config = Config::from_user_toml_with_overrides("disable_ai = true", &[])?;
         config.plugins.clear();
         config.lsp.enabled = false;
@@ -139,6 +150,9 @@ fn write_package(root: &Path, commands: &[&str]) -> Result<()> {
 }
 
 pub(super) async fn run() -> Result<()> {
+    lazy_initialization_keeps_input_responsive()
+        .await
+        .context("responsive lazy initialization")?;
     responsive_commands_and_undo()
         .await
         .context("responsive commands and undo")?;
@@ -163,9 +177,38 @@ pub(super) async fn run() -> Result<()> {
     replacement_discards_the_retired_command_tail()
         .await
         .context("retired command completion")?;
+    reload_initialization_and_retirement_keep_input_responsive()
+        .await
+        .context("responsive RPC reload lifecycle")?;
     explicit_path_edit_preserves_the_active_view_and_insert()
         .await
         .context("off-screen document edit")?;
+    Ok(())
+}
+
+async fn lazy_initialization_keeps_input_responsive() -> Result<()> {
+    let mut h = Harness::with_delayed_initialization(KeyAction::Single(Action::PluginCommand(
+        "RpcWait extra".into(),
+    )))
+    .await?;
+    h.key(KeyCode::Function(2)).await?;
+    let slow = h.package.path().join("slow");
+    h.until(|_| slow.join("initialize-started").exists())
+        .await?;
+    h.text("iuser").await?;
+    h.core.resize(90, 30).await?;
+    assert!(h.screen().contains("userhello"));
+    fs::write(slow.join("initialize-release"), [])?;
+    h.until(|h| {
+        h.screen()
+            .contains("unknown plugin command `RpcWait extra`")
+    })
+    .await?;
+    assert!(!h.marker("started", 1).exists());
+    h.command("RpcWait").await?;
+    h.until(|h| h.marker("started", 1).exists()).await?;
+    h.release(1)?;
+    h.until(|h| h.screen().contains("RpcWait done")).await?;
     Ok(())
 }
 
@@ -321,6 +364,68 @@ async fn replacement_discards_the_retired_command_tail() -> Result<()> {
     Ok(())
 }
 
+async fn reload_initialization_and_retirement_keep_input_responsive() -> Result<()> {
+    let mut h = Harness::new(KeyAction::Single(Action::PluginCommand("RpcWait".into()))).await?;
+    h.key(KeyCode::Function(2)).await?;
+    h.until(|h| h.marker("started", 1).exists()).await?;
+    h.release(1)?;
+    h.until(|h| !h.core.test_rpc_command_pending("slow"))
+        .await?;
+
+    let slow = h.package.path().join("slow");
+    let process_path = slow.join("process-id");
+    let previous = fs::read_to_string(&process_path)?;
+    fs::write(slow.join("delay-initialize"), [])?;
+    fs::write(slow.join("delay-shutdown"), [])?;
+    let manifest = slow.join("red-plugin.toml");
+    let source = fs::read_to_string(&manifest)?;
+    let generation_b = source.replacen(
+        "\"--editor-fixture\"",
+        "\"--editor-fixture\", \"--generation=B\"",
+        1,
+    );
+    fs::write(
+        &manifest,
+        format!("{generation_b}\n# Delayed lifecycle reload.\n"),
+    )?;
+    h.until(|_| slow.join("generation-started-B").exists())
+        .await?;
+
+    h.text("iX").await?;
+    h.command("RpcWait").await?;
+    h.until(|h| h.marker("started", 2).exists()).await?;
+    h.release(2)?;
+    h.until(|h| !h.core.test_rpc_command_pending("slow"))
+        .await?;
+    fs::write(
+        &manifest,
+        generation_b.replace("--generation=B", "--generation=C"),
+    )?;
+    h.until(|_| slow.join("generation-started-C").exists())
+        .await?;
+    fs::write(slow.join("initialize-release"), [])?;
+    h.until(|_| fs::read_to_string(&process_path).is_ok_and(|pid| pid != previous))
+        .await?;
+    assert!(slow.join("generation-active-C").exists());
+    let shutdown_started = slow.join(format!("shutdown-started-{previous}"));
+    h.until(|_| shutdown_started.exists()).await?;
+
+    for name in ["started-1", "release-1", "done-1"] {
+        let _ = fs::remove_file(slow.join(name));
+    }
+    h.command("RpcWait").await?;
+    h.until(|h| h.marker("started", 1).exists()).await?;
+    h.text("iY").await?;
+    assert!(h.screen().contains("Y"));
+    h.release(1)?;
+    h.until(|h| !h.core.test_rpc_command_pending("slow"))
+        .await?;
+    fs::write(slow.join(format!("shutdown-release-{previous}")), [])?;
+    h.until(|_| slow.join(format!("shutdown-done-{previous}")).exists())
+        .await?;
+    Ok(())
+}
+
 async fn nested_macro_events_survive_a_second_wait() -> Result<()> {
     let mut h = Harness::new(KeyAction::Multiple(vec![
         Action::PluginCommand("RpcWait".into()),
@@ -389,8 +494,22 @@ pub(super) fn fixture() -> Result<()> {
     let mut input = std::io::stdin().lock();
     let mut output = std::io::stdout().lock();
     let initialize = read_message(&mut input)?;
-    let commands = env::args()
-        .skip(2)
+    let arguments = env::args().skip(2).collect::<Vec<_>>();
+    let generation = arguments
+        .iter()
+        .find_map(|argument| argument.strip_prefix("--generation=").map(str::to_string));
+    if let Some(generation) = &generation {
+        fs::write(format!("generation-started-{generation}"), [])?;
+    }
+    if Path::new("delay-initialize").exists() {
+        fs::write("initialize-started", [])?;
+        while !Path::new("initialize-release").exists() {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+    let commands = arguments
+        .into_iter()
+        .filter(|argument| !argument.starts_with("--generation="))
         .map(|name| json!({"name": name}))
         .collect::<Vec<_>>();
     write_message(
@@ -398,7 +517,11 @@ pub(super) fn fixture() -> Result<()> {
         json!({"jsonrpc":"2.0", "id":initialize["id"], "result":{"protocol_version":1,"commands":commands}}),
     )?;
     let _initialized = read_message(&mut input)?;
-    fs::write("process-id", std::process::id().to_string())?;
+    if let Some(generation) = &generation {
+        fs::write(format!("generation-active-{generation}"), [])?;
+    }
+    let process_id = std::process::id().to_string();
+    fs::write("process-id", &process_id)?;
     let mut count = 0;
     loop {
         let request = read_message(&mut input)?;
@@ -422,11 +545,22 @@ pub(super) fn fixture() -> Result<()> {
                 write_message(&mut output, response.clone())?;
                 fs::write(format!("done-{count}"), serde_json::to_vec(&response)?)?;
             }
-            Some("shutdown") => write_message(
-                &mut output,
-                json!({"jsonrpc":"2.0", "id":request["id"], "result":null}),
-            )?,
-            Some("exit") => return Ok(()),
+            Some("shutdown") => {
+                if Path::new("delay-shutdown").exists() {
+                    fs::write(format!("shutdown-started-{process_id}"), [])?;
+                    while !Path::new(&format!("shutdown-release-{process_id}")).exists() {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                }
+                write_message(
+                    &mut output,
+                    json!({"jsonrpc":"2.0", "id":request["id"], "result":null}),
+                )?;
+            }
+            Some("exit") => {
+                fs::write(format!("shutdown-done-{process_id}"), [])?;
+                return Ok(());
+            }
             _ => {}
         }
     }
