@@ -38,6 +38,7 @@ pub(crate) const STORAGE_GET_METHOD: &str = "red/StorageGet";
 pub(crate) const STORAGE_SET_METHOD: &str = "red/StorageSet";
 pub(crate) const STORAGE_DELETE_METHOD: &str = "red/StorageDelete";
 pub(crate) const TEXT_PANEL_CREATE_METHOD: &str = "red/TextPanelCreate";
+pub(crate) const TEXT_PANEL_SET_ACTIONS_METHOD: &str = "red/TextPanelSetActions";
 pub(crate) const TEXT_PANEL_SET_CONTENT_METHOD: &str = "red/TextPanelSetContent";
 pub(crate) const TEXT_PANEL_FOCUS_METHOD: &str = "red/TextPanelFocus";
 pub(crate) const TEXT_PANEL_DISPOSE_METHOD: &str = "red/TextPanelDispose";

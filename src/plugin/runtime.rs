@@ -1869,6 +1869,16 @@ impl RedHost {
                     .unwrap_or_default();
                 self.send_request(PluginRequest::UpdateTextPanel { id, blocks });
             }
+            "SetTextPanelActions" => {
+                let id = red_required_string(args, 0, "SetTextPanelActions")?.to_string();
+                let actions = args
+                    .get(1)
+                    .map(value_to_json)
+                    .map(serde_json::from_value::<Vec<super::TextPanelHeaderAction>>)
+                    .transpose()?
+                    .unwrap_or_default();
+                self.send_request(PluginRequest::SetTextPanelActions { id, actions });
+            }
             "AppendTextPanel" => {
                 let id = args
                     .first()

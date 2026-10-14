@@ -4,7 +4,7 @@ schema_version = 1
 id = "rpc-hello"
 name = "RPC Hello"
 version = "0.1.0"
-red_api = "^0.21.0"
+red_api = "^0.19.0"
 
 [rpc]
 command = "python3"

@@ -38,7 +38,7 @@ use super::rpc::{
     MAX_QUEUED_BYTES, PANEL_EVENT_METHOD, PICKER_EVENT_METHOD, PICKER_OPEN_METHOD,
     STATUSLINE_CLEAR_METHOD, STATUSLINE_SET_METHOD, STORAGE_DELETE_METHOD, STORAGE_GET_METHOD,
     STORAGE_SET_METHOD, TEXT_PANEL_CREATE_METHOD, TEXT_PANEL_DISPOSE_METHOD,
-    TEXT_PANEL_FOCUS_METHOD, TEXT_PANEL_SET_CONTENT_METHOD,
+    TEXT_PANEL_FOCUS_METHOD, TEXT_PANEL_SET_ACTIONS_METHOD, TEXT_PANEL_SET_CONTENT_METHOD,
 };
 use super::{
     CommandMetadata, CommandScope, PluginMetadata, RegisteredPluginCommand, RequestId, Runtime,
@@ -241,7 +241,7 @@ struct RpcCommandResult {
 }
 
 /// Host API version used for plugin compatibility checks.
-pub const RED_HOST_API_VERSION: &str = "0.26.0";
+pub const RED_HOST_API_VERSION: &str = "0.19.0";
 pub(crate) const SUPPORTED_HOST_API_VERSIONS: &[&str] = &[
     "0.4.0",
     "0.6.0",
@@ -255,13 +255,6 @@ pub(crate) const SUPPORTED_HOST_API_VERSIONS: &[&str] = &[
     "0.16.0",
     "0.17.0",
     "0.18.0",
-    "0.19.0",
-    "0.20.0",
-    "0.21.0",
-    "0.22.0",
-    "0.23.0",
-    "0.24.0",
-    "0.25.0",
     RED_HOST_API_VERSION,
 ];
 
@@ -498,6 +491,17 @@ impl PluginRegistry {
             .get(owner)?
             .get(id)
             .map(|panel| panel.host_id.clone())
+    }
+
+    pub(crate) fn update_rpc_text_panel_actions(
+        &mut self,
+        owner: &str,
+        id: &str,
+        actions: HashSet<String>,
+    ) -> Option<String> {
+        let panel = self.rpc_text_panels.get_mut(owner)?.get_mut(id)?;
+        panel.actions = actions;
+        Some(panel.host_id.clone())
     }
 
     pub(crate) fn take_rpc_text_panel(&mut self, owner: &str, id: &str) -> Option<String> {
@@ -857,6 +861,7 @@ impl PluginRegistry {
                 STORAGE_SET_METHOD.to_string(),
                 STORAGE_DELETE_METHOD.to_string(),
                 TEXT_PANEL_CREATE_METHOD.to_string(),
+                TEXT_PANEL_SET_ACTIONS_METHOD.to_string(),
                 TEXT_PANEL_SET_CONTENT_METHOD.to_string(),
                 TEXT_PANEL_FOCUS_METHOD.to_string(),
                 TEXT_PANEL_DISPOSE_METHOD.to_string(),
@@ -3382,19 +3387,7 @@ mod tests {
         metadata.red_api_version = Some("^0.18.0".to_string());
         check_api_compatibility(&metadata).unwrap();
 
-        metadata.red_api_version = Some("^0.21.0".to_string());
-        check_api_compatibility(&metadata).unwrap();
-
-        metadata.red_api_version = Some("^0.22.0".to_string());
-        check_api_compatibility(&metadata).unwrap();
-
-        metadata.red_api_version = Some("^0.23.0".to_string());
-        check_api_compatibility(&metadata).unwrap();
-
-        metadata.red_api_version = Some("^0.24.0".to_string());
-        check_api_compatibility(&metadata).unwrap();
-
-        metadata.red_api_version = Some("^0.25.0".to_string());
+        metadata.red_api_version = Some("^0.19.0".to_string());
         check_api_compatibility(&metadata).unwrap();
 
         metadata.red_api_version = Some("^0.5.0".to_string());

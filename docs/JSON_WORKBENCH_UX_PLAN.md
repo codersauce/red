@@ -6,15 +6,15 @@ Make JSON Workbench preserve and highlight its JSON preview, provide keyboard ac
 
 - Preserve indentation and spacing in the preview and use the active theme's syntax colors.
 - Make workbench actions accessible from the keyboard while the panel is focused.
-- Show Run, Apply, and Close; show Cancel in place of Run while work is running.
+- Show Run, Apply, and Close; show Cancel in place of Run while panel or live-preview work is running.
 - Preserve navigation, search, selection, window controls, and existing plugin compatibility.
 - Keep implementation churn and branching low; verify each step and provide manual test instructions.
 
-**Current implementation**
+**Baseline addressed by this plan**
 
 At commit `8cb693dd`, JSON Workbench sends the original jq output as a `plain` text-panel block. Plain-text wrapping collapses whitespace. Copy, Open result, and Apply use the original output independently of the display.
 
-The panel already supports navigation, search, selection, command entry, and `q` to close. Its compact header labels are clickable abbreviations, not shortcuts. RPC header actions have no shortcut declaration. The implementation work described below has not started.
+The panel already supports navigation, search, selection, command entry, and `q` to close. Its compact header labels are clickable abbreviations, not shortcuts. RPC header actions have no shortcut declaration. The implementation below replaces this baseline.
 
 Sources: [workbench plugin](../examples/rpc-json-workbench/plugin.py), [panel renderer](../src/plugin/panel.rs), [rendering primitives](../src/plugin/markdown.rs), and [RPC protocol](RPC_PLUGIN_PROTOCOL.md#text-panels).
 
@@ -55,17 +55,17 @@ Keep `e` for word-end movement, `l` for moving right, and `y` for yanking a sele
 
 Use `r` for Run, `a` for Apply, and `Ctrl-c` for Cancel in this panel. These complete the keyboard-first workflow; they are recommended defaults rather than keys explicitly selected in the preceding discussion. All existing `:Json...` commands remain usable.
 
-Use F1 to expose the panel's actual action bindings and execute its actions through Red's native searchable shortcut surface, including Live mode and saved queries. Do not add a parallel JSON-specific action picker or command.
+Use F1 to expose and execute the panel's currently available action bindings through Red's native searchable shortcut surface, including Live mode and saved queries when their prerequisites are met. Actions appear as state changes make them relevant; disabled primary actions remain visible in the header. Do not add a parallel JSON-specific action picker or command.
 
 **Visible controls and state**
 
-The header shows the title followed by Run, Apply, and the conventional close control. While a query is active, Cancel occupies Run's place. Apply is enabled only when there is a valid, current result; the existing revision and transaction checks remain authoritative if state changes before dispatch.
+The header shows the title followed by Run, Apply, and the conventional close control. While a panel or live-preview query is active, Cancel occupies Run's place. Existing `:JsonRun` and `:JsonQuery` commands retain their synchronous command response and do not promise an interactive Cancel state. Apply is enabled only when there is a valid, current result; the existing revision and transaction checks remain authoritative if state changes before dispatch.
 
 Explore, Open result, Copy, Source, Live mode, saved queries, and Undo do not receive header buttons. At narrow widths, omit lower-priority buttons as whole controls and keep keyboard/action-picker access; do not reduce labels to initials. Preserve a usable title and close affordance where space permits.
 
 **Action discovery**
 
-Use Red's existing `F1` shortcut surface as both the complete contextual reference and the searchable, executable action picker. Panel actions must appear there with their current label, shortcut, availability, and description; choosing an entry invokes the same action ID as its key or button. Actions without a direct shortcut, including Live mode and saved queries initially, remain executable from this picker.
+Use Red's existing `F1` shortcut surface as the contextual reference and searchable action picker for actions that can run now. Enabled panel actions appear there with their current label, shortcut, and description; choosing an entry invokes the same action ID as its key or button. Actions without a direct shortcut, including Live mode and saved queries when available, remain executable from this picker.
 
 Render a one-row contextual action hint at the bottom of a focused action panel. For JSON Workbench it prioritizes `Enter Explore`, `o Open`, and `c Copy`, followed by Red's existing responsive `F1` overflow marker. Search and Visual modes replace or suppress this hint with their own mode help, and narrow panes drop complete low-priority actions rather than clipping labels or keys.
 
@@ -75,7 +75,7 @@ Header buttons retain readable labels. F1 and the contextual hint disclose short
 
 Expose these capabilities through the shared panel implementation so Husk and JSON-RPC plugins can use them. Keep `plain` and `markdown` behavior and existing action declarations compatible. New action metadata uses defaults that preserve existing clickable headers. The new panel shortcuts do not become global editor bindings.
 
-Version the additive contract starting at host API `0.27.0`, update the canonical API metadata and protocol documentation, retain support for previous API contracts, and update JSON Workbench's requirement to the earliest contract it actually needs. If the steps ship independently, follow the repository's versioning policy for each shipped addition instead of modifying a released contract in place.
+Keep this additive contract in the pending host API `0.19.0`, update the canonical API metadata and protocol documentation, and preserve support through the last released `0.18.0` contract. The complete JSON-RPC surface is one unreleased release train, so its intermediate development versions do not become permanent compatibility milestones. After `0.19.0` ships, open one pending API version for the next release train and do not modify a released contract in place.
 
 **Implementation order and acceptance**
 

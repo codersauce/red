@@ -42,11 +42,11 @@ directly without a shell.
 
 Release packages may omit `command` and provide a native executable for each
 supported Rust target triple. Target-specific local commands and release
-artifacts require `red_api = "^0.20.0"` or later:
+artifacts require `red_api = "^0.19.0"` or later:
 
 ```toml
 [plugin]
-red_api = "^0.20.0"
+red_api = "^0.19.0"
 
 [rpc]
 args = []
@@ -114,7 +114,7 @@ The version 1 initialization parameters are:
 ```json
 {
   "protocol_versions": [1],
-  "red_api_version": "0.26.0",
+  "red_api_version": "0.19.0",
   "plugin_id": "document-tools",
   "host_methods": [
     "red/DocumentCreate",
@@ -129,6 +129,7 @@ The version 1 initialization parameters are:
     "red/StorageSet",
     "red/StorageDelete",
     "red/TextPanelCreate",
+    "red/TextPanelSetActions",
     "red/TextPanelSetContent",
     "red/TextPanelFocus",
     "red/TextPanelDispose",
@@ -283,7 +284,7 @@ owner or oversized read returns `-32005`, and a persistence failure returns
 
 ## Editable documents
 
-Host API `0.22.0` adds ordinary editable documents for explicit user workflows.
+Host API `0.19.0` adds ordinary editable documents for explicit user workflows.
 `red/DocumentCreate` accepts initial text of at most 1 MiB and an optional
 supported syntax name:
 
@@ -317,7 +318,7 @@ native split routing:
 The result is `null`. A closed ID returns `-32001`; malformed IDs or targets
 return `-32602`; a split or render failure returns `-32003`. Only this explicit
 call changes focus, so background computation cannot reveal a document by
-creating it. Plugins using either method must require `red_api = "^0.22.0"` or
+creating it. Plugins using either method must require `red_api = "^0.19.0"` or
 later.
 
 ## Document snapshots
@@ -342,7 +343,7 @@ with JSON-RPC error `-32602`. A document that is not open in Red returns
 application error `-32001`. A snapshot that cannot fit in one frame returns
 `-32006`. These request errors leave the plugin active.
 
-Host API `0.20.0` adds `include_document_id: true` to request a `document_id`
+Host API `0.19.0` adds `include_document_id: true` to request a `document_id`
 field in the snapshot result. It is a decimal string that identifies the open
 buffer, including an unnamed buffer, independently of its position in the
 buffer list. It remains stable until that buffer closes and must not be saved
@@ -351,9 +352,9 @@ across editor restarts. Omitting the option preserves the original result shape.
 Snapshot, apply, and undo requests accept this ID as an optional `document_id`
 selector. A closed ID returns `-32001`; malformed IDs or conflicting `path` and
 ID selectors return `-32602`. Plugins using these fields must require
-`red_api = "^0.20.0"` or later. Older RPC and Husk packages continue to load.
+`red_api = "^0.19.0"` or later. Older Husk packages continue to load.
 
-Host API `0.24.0` adds opt-in contiguous selection context. Set
+Host API `0.19.0` adds opt-in contiguous selection context. Set
 `include_selection: true` to return the selected preimage and its normalized
 half-open range atomically with the document ID, revision, and complete text:
 
@@ -371,11 +372,11 @@ use the same zero-based Unicode-scalar coordinates as document edits; line
 selections include their exact line ending, including CRLF. A plugin must apply
 against the returned whole-document revision and selected `text` preimage.
 Omitting the option preserves every earlier response shape. Plugins using it
-must require `red_api = "^0.24.0"` or later.
+must require `red_api = "^0.19.0"` or later.
 
 ## Document watches
 
-Host API `0.23.0` adds owner-local invalidation notifications for live document
+Host API `0.19.0` adds owner-local invalidation notifications for live document
 workflows. Establish a watch by stable document ID before taking the first
 snapshot:
 
@@ -418,7 +419,7 @@ Notifications are coalesced before they enter the existing 16 MiB outbound
 queue and remain subject to the 8 MiB frame and transport watchdog limits.
 Transport failure or queue overflow quarantines a slow connection. Plugins
 using watches must require
-`red_api = "^0.23.0"` or later.
+`red_api = "^0.19.0"` or later.
 
 ## Document transactions
 
@@ -462,14 +463,14 @@ undo. By default, ID-selected mutations require that document to be active;
 otherwise they return `-32003` without switching focus or changing contents.
 An ID never silently falls back to another open buffer.
 
-Host API `0.25.0` lets an ID-selected mutation set `allow_inactive: true`. Red
+Host API `0.19.0` lets an ID-selected mutation set `allow_inactive: true`. Red
 then applies or undoes against that open document while preserving the active
 buffer, window focus and view, and user insertion transaction. The option
 only changes stable-ID selection; omitting it preserves the earlier restriction.
 Explicit path mutations retain their existing background behavior. Plugin edits
 and user edits remain separate undo transactions; undo checks include
 uncommitted user edits. Plugins using the option must require
-`red_api = "^0.25.0"` or later.
+`red_api = "^0.19.0"` or later.
 During a command, a legacy mutation with neither path nor ID is rejected if
 the current document differs from the one at invocation. The host never
 silently redirects such a request to that earlier document. Outside a pending
@@ -505,11 +506,17 @@ replaces that panel's configuration and content with a fresh backing resource.
 A connection can own at most 16 text panels, and each ID must contain 1 to 128
 UTF-8 bytes.
 
-Host API `0.26.0` adds an optional `actions` array with at most eight header
-controls. Action IDs are unique within the panel and contain 1 to 64 UTF-8
+Host API `0.19.0` adds an optional `actions` array bounded to 16 controls, plus
+panel-local shortcuts and dynamic updates. Action IDs are
+unique within the panel and contain 1 to 64 UTF-8
 bytes; `label` contains 1 to 128 bytes and optional `compact_label` contains 1
-to 64. Red chooses the compact labels when the panel is narrow and sends the
-owning connection a notification when the user activates a declared action:
+to 64. Optional `key`, `group`, and `description` fields contain at most 64,
+128, and 512 bytes. These fields plus `priority`, `enabled`, and
+`show_in_header` drive the focused shortcut, F1 entry, responsive
+priority, availability, and button visibility from one declaration. Shortcuts
+must be unique among enabled actions. Red chooses compact labels when needed
+and sends the owning connection a notification when the user activates a
+declared action:
 
 ```json
 {"jsonrpc":"2.0","method":"panel/event","params":{"id":"preview","action":"run"}}
@@ -522,16 +529,24 @@ and selection events remain local to the renderer. Events queued for a panel
 that was disposed or replaced are discarded and cannot reach its successor or
 a Husk plugin.
 
+`red/TextPanelSetActions` accepts the panel `id` and a complete `actions` array.
+It updates shortcuts, F1 entries, and header controls without replacing panel
+content, focus, selection, or scroll state. The same bounds, validation, and
+connection ownership as create apply.
+
 `red/TextPanelSetContent` replaces the panel's complete block list. Each block
 has an `id`, `text`, optional semantic `kind` (`user`, `agent`, `error`,
-`activity`, `action`, or `text`), and optional `format` (`plain` or `markdown`):
+`activity`, `action`, or `text`), and optional `format` (`plain`, `markdown`,
+or `code`). Code blocks may include `language`; Red renders them verbatim with
+the active theme's syntax colors and falls back to unhighlighted preformatted
+text for omitted or unsupported languages:
 
 ```json
-{"jsonrpc":"2.0","id":"plugin-5","method":"red/TextPanelSetContent","params":{"id":"preview","blocks":[{"id":"result","format":"markdown","text":"# Result\nReady"}]}}
+{"jsonrpc":"2.0","id":"plugin-5","method":"red/TextPanelSetContent","params":{"id":"preview","blocks":[{"id":"result","format":"code","language":"json","text":"{\n  \"ready\": true\n}"}]}}
 ```
 
 `red/TextPanelFocus` and `red/TextPanelDispose` each accept `{ "id": "preview"
-}`. All four methods return `null` on success. Panel IDs are private to the
+}`. All five methods return `null` on success. Panel IDs are private to the
 calling connection, so they cannot collide with Husk panels or panels owned by
 another RPC plugin. Disconnect, quarantine, and successful hot reload dispose
 all panels owned by the previous connection.
@@ -542,7 +557,7 @@ active.
 
 ## Clipboard writes
 
-Host API `0.26.0` adds a bounded, write-only clipboard method for an explicit
+Host API `0.19.0` adds a bounded, write-only clipboard method for an explicit
 user action such as a panel Copy button:
 
 ```json
@@ -581,7 +596,7 @@ editor deactivation clear the previous connection's contribution.
 
 ## Pickers
 
-Host API `0.21.0` adds a host-rendered, locally filtered picker. Opening it is a
+Host API `0.19.0` adds a host-rendered, locally filtered picker. Opening it is a
 bounded host request; `command/execute` does not wait for user selection:
 
 ```json

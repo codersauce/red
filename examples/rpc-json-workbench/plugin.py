@@ -25,19 +25,32 @@ EXPLORE_CHILD_LIMIT = 1000
 EXPLORE_NODE_LIMIT = 10000
 EXPLORE_DEPTH_LIMIT = 64
 PANEL_ID = "json-workbench"
-PANEL_ACTIONS = [
-    {"id": "run", "label": "Run", "compact_label": "R"},
-    {"id": "cancel", "label": "Cancel", "compact_label": "X"},
-    {"id": "apply", "label": "Apply", "compact_label": "A"},
-    {"id": "explore", "label": "Explore", "compact_label": "E"},
-    {"id": "open", "label": "Open", "compact_label": "O"},
-    {"id": "copy", "label": "Copy", "compact_label": "C"},
-    {"id": "close", "label": "Close", "compact_label": "×"},
-]
 PICKER_ID = "json-queries"
 HISTORY_KEY = "query-history"
 PREFERENCES_KEY = "query-preferences"
 EOF = object()
+
+
+def panel_action(
+    action_id,
+    key,
+    label,
+    description,
+    priority="primary",
+    enabled=True,
+    show_in_header=True,
+):
+    return {
+        "id": action_id,
+        "key": key,
+        "label": label,
+        "group": "JSON Workbench",
+        "description": description,
+        "priority": priority,
+        "enabled": enabled,
+        "show_in_header": show_in_header,
+    }
+
 
 COMMANDS = [
     {
@@ -463,6 +476,7 @@ class JsonWorkbench:
         self.candidate = None
         self.transaction = None
         self.panel_open = False
+        self.sent_panel_actions = None
         self.active_picker_id = None
         self.picker_actions = {}
         self.explore_roots = None
@@ -587,6 +601,7 @@ class JsonWorkbench:
     def ensure_panel(self):
         if self.panel_open:
             return
+        actions = self.panel_actions()
         self.request_host(
             "red/TextPanelCreate",
             {
@@ -594,10 +609,133 @@ class JsonWorkbench:
                 "side": "right",
                 "width": 48,
                 "title": "JSON Workbench",
-                "actions": PANEL_ACTIONS,
+                "actions": actions,
             },
         )
         self.panel_open = True
+        self.sent_panel_actions = actions
+
+    @staticmethod
+    def run_panel_action(busy):
+        if busy:
+            return panel_action(
+                "cancel",
+                "Ctrl-c",
+                "Cancel",
+                "Cancel the running query",
+                priority="essential",
+            )
+        return panel_action(
+            "run",
+            "r",
+            "Run",
+            "Run the current jq query",
+            priority="essential",
+        )
+
+    def panel_actions(self, busy=None):
+        if busy is None:
+            busy = self.background_busy()
+        has_result = self.result is not None and not busy
+        has_source = self.source_id is not None and not busy
+        return [
+            self.run_panel_action(busy),
+            panel_action(
+                "apply",
+                "a",
+                "Apply",
+                "Replace the source with the current result",
+                enabled=self.candidate is not None and not busy,
+            ),
+            panel_action(
+                "close",
+                "q",
+                "×",
+                "Close the JSON Workbench",
+                priority="essential",
+            ),
+            panel_action(
+                "explore",
+                "Enter",
+                "Explore",
+                "Explore the result as a JSON tree",
+                priority="essential",
+                enabled=has_result,
+                show_in_header=False,
+            ),
+            panel_action(
+                "open",
+                "o",
+                "Open",
+                "Open the result in an editor buffer",
+                enabled=has_result,
+                show_in_header=False,
+            ),
+            panel_action(
+                "copy",
+                "c",
+                "Copy",
+                "Copy the complete result",
+                enabled=has_result,
+                show_in_header=False,
+            ),
+            panel_action(
+                "source",
+                "s",
+                "Source",
+                "Return to the source document",
+                priority="secondary",
+                enabled=has_source,
+                show_in_header=False,
+            ),
+            panel_action(
+                "undo",
+                "u",
+                "Undo",
+                "Undo the last workbench Apply",
+                priority="secondary",
+                enabled=self.transaction is not None and not busy,
+                show_in_header=False,
+            ),
+            panel_action(
+                "live",
+                "",
+                "Pause live preview"
+                if self.live_enabled
+                else "Start live preview",
+                "Toggle automatic previews when query or source changes",
+                priority="reference",
+                enabled=self.source_id is not None
+                and self.query_document_id is not None,
+                show_in_header=False,
+            ),
+            panel_action(
+                "queries",
+                "",
+                "Saved queries",
+                "Choose a preset or recent jq query",
+                priority="reference",
+                enabled=not busy,
+                show_in_header=False,
+            ),
+        ]
+
+    def update_panel_actions(self, busy=None):
+        if not self.panel_open:
+            return
+        actions = self.panel_actions(busy)
+        if actions == self.sent_panel_actions:
+            return
+        self.request_host(
+            "red/TextPanelSetActions", {"id": PANEL_ID, "actions": actions}
+        )
+        self.sent_panel_actions = actions
+
+    def best_effort_panel_actions(self, busy=None):
+        try:
+            self.update_panel_actions(busy)
+        except (OperationError, CommandCancelled):
+            pass
 
     def retire_preview(self, error, create=False):
         try:
@@ -623,6 +761,7 @@ class JsonWorkbench:
             )
         except (OperationError, CommandCancelled):
             pass
+        self.best_effort_panel_actions()
 
     def snapshot_source(self, include_selection=False):
         if self.source_id is None:
@@ -768,7 +907,8 @@ class JsonWorkbench:
                     {
                         "id": "result",
                         "kind": "text",
-                        "format": "plain",
+                        "format": "code",
+                        "language": "json",
                         "text": output,
                     },
                 ],
@@ -919,6 +1059,7 @@ class JsonWorkbench:
             self.set_status(
                 f"JSON: ready ({len(output.encode('utf-8'))} B{note})"
             )
+            self.update_panel_actions(busy=False)
         except OperationError as error:
             self.retire_preview(error, create=background)
             raise
@@ -939,6 +1080,7 @@ class JsonWorkbench:
             self.query_document_id = self.create_document(self.initial_query())
             self.show_document(self.query_document_id)
         self.best_effort_status("JSON: query")
+        self.update_panel_actions()
         return {"message": "JSON query document ready"}
 
     def workbench(self, _params):
@@ -1014,6 +1156,7 @@ class JsonWorkbench:
         if self.live_enabled:
             self.disable_live()
             self.best_effort_status("JSON: live paused")
+            self.update_panel_actions()
             return {"message": "JSON live preview paused"}
         self.stop_background_query()
         if self.source_id is None or self.query_document_id is None:
@@ -1022,6 +1165,7 @@ class JsonWorkbench:
         self.live_enabled = True
         self.start_background_query(None, replace=True, debounce=True)
         self.best_effort_status("JSON: live")
+        self.update_panel_actions()
         return {"message": "JSON live preview scheduled"}
 
     def cancel(self, _params):
@@ -1031,6 +1175,7 @@ class JsonWorkbench:
         self.result = None
         self.result_context = None
         self.best_effort_status("JSON: cancelled")
+        self.update_panel_actions()
         return {"message": "JSON preview cancelled"}
 
     def open_result(self, _params):
@@ -1229,6 +1374,7 @@ class JsonWorkbench:
                 self.result = None
                 self.result_context = None
                 self.clear_explorer()
+                self.best_effort_panel_actions()
             raise
         self.best_effort_status("JSON: source")
         return {"message": "JSON source document ready"}
@@ -1352,6 +1498,8 @@ class JsonWorkbench:
             pass
         except OperationError:
             self.best_effort_status("JSON: error")
+        finally:
+            self.best_effort_panel_actions(busy=False)
 
     def start_background_query(self, query_text, replace=False, debounce=False):
         if self.background_busy():
@@ -1372,6 +1520,7 @@ class JsonWorkbench:
             name="json-workbench-query",
         )
         self.active_run = (thread, cancel, generation)
+        self.update_panel_actions()
         thread.start()
         return True
 
@@ -1418,6 +1567,10 @@ class JsonWorkbench:
             "explore": self.explore,
             "open": self.open_result,
             "copy": self.copy_result,
+            "source": self.source,
+            "undo": self.undo,
+            "live": self.live,
+            "queries": self.queries,
             "close": self.close,
         }
         if action == "run":
@@ -1426,7 +1579,7 @@ class JsonWorkbench:
         handler = handlers.get(action)
         if handler is None:
             return
-        if self.background_busy() and action not in ("cancel", "close"):
+        if self.background_busy() and action not in ("cancel", "close", "live"):
             self.best_effort_status("JSON: busy")
             return
         try:
@@ -1473,6 +1626,7 @@ class JsonWorkbench:
         if candidate["output"] == candidate["source"]:
             self.candidate = None
             self.best_effort_status("JSON: unchanged")
+            self.update_panel_actions()
             return {"message": "JSON preview already matches the source"}
         try:
             applied = self.request_host(
@@ -1503,6 +1657,7 @@ class JsonWorkbench:
         }
         self.candidate = None
         self.best_effort_status("JSON: applied")
+        self.update_panel_actions()
         return {"message": f"JSON result applied @ {applied['revision']}"}
 
     def undo(self, _params):
@@ -1513,10 +1668,12 @@ class JsonWorkbench:
         except HostError as error:
             if error.code == -32001:
                 self.transaction = None
+                self.best_effort_panel_actions()
             raise
         self.transaction = None
         self.candidate = None
         self.best_effort_status("JSON: undone")
+        self.update_panel_actions()
         return {"message": f"JSON result undone @ {undone['revision']}"}
 
     def close(self, _params):
@@ -1539,6 +1696,7 @@ class JsonWorkbench:
         self.candidate = None
         self.transaction = None
         self.panel_open = False
+        self.sent_panel_actions = None
         return None
 
     def execute(self, message):
@@ -1581,8 +1739,10 @@ class JsonWorkbench:
             return
         except OperationError as error:
             self.best_effort_status("JSON: error")
+            self.command_active.clear()
             self.send_error(message, error)
         else:
+            self.command_active.clear()
             self.send({"jsonrpc": "2.0", "id": message["id"], "result": result})
         finally:
             self.command_active.clear()

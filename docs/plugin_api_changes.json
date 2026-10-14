@@ -1,52 +1,10 @@
 {
-  "api_version": "0.26.0",
+  "api_version": "0.19.0",
   "changes": [
-    {
-      "version": "0.26.0",
-      "kind": "introduced",
-      "symbols": ["red/TextPanelCreate.actions", "panel/event", "red/ClipboardWrite"],
-      "migration_note": "docs/RPC_PLUGIN_PROTOCOL.md#text-panels"
-    },
-    {
-      "version": "0.25.0",
-      "kind": "introduced",
-      "symbols": ["red/DocumentApply.allow_inactive", "red/DocumentUndo.allow_inactive"],
-      "migration_note": "docs/RPC_PLUGIN_PROTOCOL.md#document-transactions"
-    },
-    {
-      "version": "0.24.0",
-      "kind": "introduced",
-      "symbols": ["red/DocumentSnapshot.include_selection", "RPC selection context"],
-      "migration_note": "docs/RPC_PLUGIN_PROTOCOL.md#document-snapshots"
-    },
-    {
-      "version": "0.23.0",
-      "kind": "introduced",
-      "symbols": ["red/DocumentWatch", "red/DocumentUnwatch", "document/event"],
-      "migration_note": "docs/RPC_PLUGIN_PROTOCOL.md#document-watches"
-    },
-    {
-      "version": "0.22.0",
-      "kind": "introduced",
-      "symbols": ["red/DocumentCreate", "red/DocumentShow"],
-      "migration_note": "docs/RPC_PLUGIN_PROTOCOL.md#editable-documents"
-    },
-    {
-      "version": "0.21.0",
-      "kind": "introduced",
-      "symbols": ["red/PickerOpen", "picker/event"],
-      "migration_note": "docs/RPC_PLUGIN_PROTOCOL.md#pickers"
-    },
-    {
-      "version": "0.20.0",
-      "kind": "introduced",
-      "symbols": ["red/DocumentSnapshot.include_document_id", "RPC document_id selectors"],
-      "migration_note": "docs/RPC_PLUGIN_PROTOCOL.md#document-snapshots"
-    },
     {
       "version": "0.19.0",
       "kind": "introduced",
-      "symbols": ["red-plugin.toml [rpc]", "Red JSON-RPC protocol v1"],
+      "symbols": ["red-plugin.toml [rpc]", "Red JSON-RPC protocol v1", "RPC release artifacts", "red/DocumentSnapshot.include_document_id", "RPC document_id selectors", "red/PickerOpen", "picker/event", "red/DocumentCreate", "red/DocumentShow", "red/DocumentWatch", "red/DocumentUnwatch", "document/event", "red/DocumentSnapshot.include_selection", "RPC selection context", "red/DocumentApply.allow_inactive", "red/DocumentUndo.allow_inactive", "red/TextPanelCreate.actions", "TextPanelBlock.format=code", "TextPanelHeaderAction.key", "SetTextPanelActions", "red/TextPanelSetActions", "panel/event", "red/ClipboardWrite"],
       "migration_note": "docs/RPC_PLUGIN_PROTOCOL.md"
     },
     {

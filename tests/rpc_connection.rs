@@ -402,6 +402,7 @@ fn run_registry_fixture() -> Result<()> {
             "red/StorageSet",
             "red/StorageDelete",
             "red/TextPanelCreate",
+            "red/TextPanelSetActions",
             "red/TextPanelSetContent",
             "red/TextPanelFocus",
             "red/TextPanelDispose",

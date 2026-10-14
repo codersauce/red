@@ -128,7 +128,7 @@ an installed language runtime:
 
 ```toml
 [plugin]
-red_api = "^0.20.0"
+red_api = "^0.19.0"
 
 [rpc]
 
@@ -143,7 +143,7 @@ to 128 MiB, verify SHA-256 before writing, set executable permissions, and
 prepare the executable before replacing the installed package. Local path
 installs keep using bundled or development commands and do not download
 release artifacts. Target-specific commands and artifacts require
-`red_api = "^0.20.0"` or later.
+`red_api = "^0.19.0"` or later.
 
 RPC processes inherit only Red's baseline home, path, locale, terminal,
 temporary-directory, XDG, SSH-agent, and Windows variables. A user can grant

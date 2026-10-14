@@ -167,7 +167,7 @@ fn write_package(root: &Path, commands: &[&str]) -> Result<()> {
         .chain(commands.iter().copied())
         .collect::<Vec<_>>();
     fs::write(root.join("red-plugin.toml"), format!(
-        "schema_version = 1\n[plugin]\nid = \"editor-fixture\"\nname = \"Editor Fixture\"\nversion = \"0.1.0\"\nred_api = \"^0.26.0\"\n[rpc]\ncommand = {executable:?}\nargs = {}\n[activation]\ncommands = {}\n",
+        "schema_version = 1\n[plugin]\nid = \"editor-fixture\"\nname = \"Editor Fixture\"\nversion = \"0.1.0\"\nred_api = \"^0.19.0\"\n[rpc]\ncommand = {executable:?}\nargs = {}\n[activation]\ncommands = {}\n",
         serde_json::to_string(&args)?, serde_json::to_string(commands)?,
     ))?;
     Ok(())

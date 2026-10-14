@@ -93,6 +93,7 @@ class PluginProcess:
             bufsize=1,
         )
         self.output = queue.Queue()
+        self.action_updates = []
         self.reader = threading.Thread(target=self._read_output, daemon=True)
         self.reader.start()
         self.send("initialize", "initialize", {})
@@ -123,18 +124,32 @@ class PluginProcess:
         self.process.stdin.flush()
 
     def receive(self, timeout=2):
-        message = self.output.get(timeout=timeout)
-        if message is EOF:
-            raise AssertionError(f"plugin exited early: {self.process.stderr.read()}")
-        if isinstance(message, Exception):
-            raise message
-        return message
+        while True:
+            message = self.output.get(timeout=timeout)
+            if message is EOF:
+                raise AssertionError(
+                    f"plugin exited early: {self.process.stderr.read()}"
+                )
+            if isinstance(message, Exception):
+                raise message
+            if message.get("method") == "red/TextPanelSetActions":
+                self.action_updates.append(message["params"]["actions"])
+                self.reply(message)
+                continue
+            return message
 
     def command(self, request_id, name, raw_args=""):
         self.send(
             request_id,
             "command/execute",
             {"name": name, "args": [], "raw_args": raw_args},
+        )
+
+    def latest_action(self, action_id):
+        return next(
+            action
+            for action in self.action_updates[-1]
+            if action["id"] == action_id
         )
 
     def expect_host_request(self, method):
@@ -253,10 +268,27 @@ class JsonWorkbenchTest(unittest.TestCase):
         if create_panel:
             create = plugin.expect_host_request("red/TextPanelCreate")
             self.assertEqual(create["params"]["id"], "json-workbench")
-            self.assertEqual(create["params"]["actions"], WORKBENCH.PANEL_ACTIONS)
+            self.assertEqual(
+                [action["id"] for action in create["params"]["actions"]],
+                [
+                    "run",
+                    "apply",
+                    "close",
+                    "explore",
+                    "open",
+                    "copy",
+                    "source",
+                    "undo",
+                    "live",
+                    "queries",
+                ],
+            )
             plugin.reply(create)
         content = plugin.expect_host_request("red/TextPanelSetContent")
-        self.assertEqual(content["params"]["blocks"][1]["text"], output)
+        result = content["params"]["blocks"][1]
+        self.assertEqual(result["text"], output)
+        self.assertEqual(result["format"], "code")
+        self.assertEqual(result["language"], "json")
         plugin.reply(content)
         plugin.expect_status(f"JSON: ready ({len(output.encode('utf-8'))} B)")
         response = plugin.receive()
@@ -401,6 +433,8 @@ class JsonWorkbenchTest(unittest.TestCase):
             plugin.reply(content)
             plugin.expect_status("JSON: ready (4 B)")
             self.assertEqual(plugin.receive()["id"], "query")
+            self.assertTrue(plugin.latest_action("apply")["enabled"])
+            self.assertFalse(plugin.latest_action("undo")["enabled"])
 
             plugin.command("copy", "JsonCopy")
             copied = plugin.expect_host_request("red/ClipboardWrite")
@@ -425,6 +459,8 @@ class JsonWorkbenchTest(unittest.TestCase):
             self.assertEqual(
                 plugin.receive()["result"], {"message": "JSON result applied @ 12"}
             )
+            self.assertFalse(plugin.latest_action("apply")["enabled"])
+            self.assertTrue(plugin.latest_action("undo")["enabled"])
 
             plugin.command("undo", "JsonUndo")
             undo = plugin.expect_host_request("red/DocumentUndo")
@@ -441,6 +477,8 @@ class JsonWorkbenchTest(unittest.TestCase):
             self.assertEqual(
                 plugin.receive()["result"], {"message": "JSON result undone @ 13"}
             )
+            self.assertFalse(plugin.latest_action("apply")["enabled"])
+            self.assertFalse(plugin.latest_action("undo")["enabled"])
 
             plugin.command("close", "JsonClose")
             dispose = plugin.expect_host_request("red/TextPanelDispose")
@@ -660,6 +698,7 @@ class JsonWorkbenchTest(unittest.TestCase):
             plugin.reply(retired)
             plugin.expect_status("JSON: error")
             self.assertIn("revision changed", plugin.receive()["error"]["message"])
+            self.assertFalse(plugin.latest_action("apply")["enabled"])
 
             plugin.command("changed", "JsonQuery", "wrap")
             changed = plugin.expect_host_request("red/DocumentSnapshot")
@@ -737,6 +776,7 @@ class JsonWorkbenchTest(unittest.TestCase):
             plugin.reply(retired)
             plugin.expect_status("JSON: error")
             self.assertIn("revision changed", plugin.receive()["error"]["message"])
+            self.assertFalse(plugin.latest_action("apply")["enabled"])
 
             plugin.command("invalidated", "JsonApply")
             plugin.expect_status("JSON: error")
@@ -754,6 +794,7 @@ class JsonWorkbenchTest(unittest.TestCase):
             plugin.reply(retired)
             plugin.expect_status("JSON: error")
             self.assertIn("no longer open", plugin.receive()["error"]["message"])
+            self.assertFalse(plugin.latest_action("apply")["enabled"])
 
             plugin.command("closed-query", "JsonQuery", "stream")
             closed = plugin.expect_host_request("red/DocumentSnapshot")
@@ -795,6 +836,7 @@ class JsonWorkbenchTest(unittest.TestCase):
             self.complete_failed_query(plugin, document, "jq: compile error")
             plugin.expect_status("JSON: error")
             self.assertIn("compile error", plugin.receive()["error"]["message"])
+            self.assertFalse(plugin.latest_action("apply")["enabled"])
 
             plugin.command("not-applicable", "JsonApply")
             plugin.expect_status("JSON: error")
@@ -808,6 +850,7 @@ class JsonWorkbenchTest(unittest.TestCase):
                 plugin.receive()["result"],
                 {"message": "JSON preview already matches the source"},
             )
+            self.assertFalse(plugin.latest_action("apply")["enabled"])
 
     def complete_failed_query(self, plugin, document, error):
         snapshot = plugin.expect_host_request("red/DocumentSnapshot")
@@ -917,6 +960,14 @@ class JsonWorkbenchTest(unittest.TestCase):
             plugin.expect_status("JSON: applied")
             self.assertEqual(plugin.receive()["id"], "apply")
 
+            plugin.command("closed-source", "JsonSource")
+            shown = plugin.expect_host_request("red/DocumentShow")
+            plugin.reply(shown, error=(-32001, "document is no longer open"))
+            plugin.expect_status("JSON: error")
+            self.assertIn("no longer open", plugin.receive()["error"]["message"])
+            for action_id in ("source", "apply", "undo"):
+                self.assertFalse(plugin.latest_action(action_id)["enabled"])
+
     def test_live_preview_reconciles_setup_and_coalesces_latest_changes(self):
         source = {
             "path": "data.json",
@@ -995,6 +1046,7 @@ class JsonWorkbenchTest(unittest.TestCase):
         with PluginProcess(self.fake_jq) as plugin:
             self.open_workbench(plugin, source)
             self.enable_live(plugin)
+            self.assertTrue(plugin.latest_action("cancel")["enabled"])
             query = plugin.expect_host_request("red/DocumentSnapshot")
             plugin.reply(query, slow_query)
             snapshot = plugin.expect_host_request("red/DocumentSnapshot")
@@ -1011,6 +1063,7 @@ class JsonWorkbenchTest(unittest.TestCase):
             self.assertEqual(
                 plugin.receive()["result"], {"message": "JSON preview cancelled"}
             )
+            self.assertTrue(plugin.latest_action("run")["enabled"])
             self.assert_process_reaped(child_pid)
 
             plugin.send_notification(
@@ -1199,6 +1252,13 @@ class JsonWorkbenchTest(unittest.TestCase):
             plugin.reply(apply, {"transaction_id": "tx-1", "revision": "2"})
             plugin.expect_status("JSON: applied")
             self.assertEqual(plugin.receive()["id"], "apply")
+
+            plugin.command("closed-undo", "JsonUndo")
+            undo = plugin.expect_host_request("red/DocumentUndo")
+            plugin.reply(undo, error=(-32001, "document is no longer open"))
+            plugin.expect_status("JSON: error")
+            self.assertIn("no longer open", plugin.receive()["error"]["message"])
+            self.assertFalse(plugin.latest_action("undo")["enabled"])
 
     def test_history_opt_out_survives_partial_storage_failure(self):
         document = {

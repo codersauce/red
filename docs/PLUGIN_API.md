@@ -1,6 +1,6 @@
 # Plugin compatibility
 
-Red host API version `0.26.0` is defined by
+Red host API version `0.19.0` is defined by
 [`src/plugin/host_api.json`](../src/plugin/host_api.json). That file is the canonical,
 machine-readable list of execute actions, request actions, signatures, and introduction
 versions. Runtime dispatch and the bundled-plugin corpus are checked against it in tests.
@@ -24,57 +24,24 @@ required/optional arity (`HUSK-A0002`) and obvious literal argument types
 annotations use `HUSK-A0004`. `--no-typecheck` is an unsupported development
 escape hatch; compatibility guarantees do not apply while it is enabled.
 
-Host API `0.26.0` retains the complete `0.4.0`, `0.6.0`, `0.7.0`,
+Host API `0.19.0` retains the complete `0.4.0`, `0.6.0`, `0.7.0`,
 `0.8.0`, `0.9.0`,
-`0.10.0`, `0.11.0`, `0.12.0`, `0.14.0`, `0.16.0`, `0.17.0`, `0.18.0`,
-`0.19.0`, `0.20.0`, `0.21.0`, `0.22.0`, `0.23.0`, `0.24.0`, and `0.25.0`
+`0.10.0`, `0.11.0`, `0.12.0`, `0.14.0`, `0.16.0`, `0.17.0`, and `0.18.0`
 contracts, so existing packages that declare those minors continue to load. New
-packages should target `"red_api_version": "^0.26.0"`.
+packages should target `"red_api_version": "^0.19.0"`.
 
 ## Standalone JSON-RPC packages
 
-Host API `0.19.0` introduces the package-level `[rpc]` contract for standalone
-plugins written in any language. Red validates and classifies these packages,
-discovers their declared commands, starts the process on first invocation, and
-validates returned command metadata before dispatch. See the
-[JSON-RPC plugin protocol](RPC_PLUGIN_PROTOCOL.md) for the version 1 transport
-profile, command schema, and remaining typed surfaces.
-
-Host API `0.20.0` adds opt-in stable document identities to RPC snapshots and
-document selectors. See [document snapshots](RPC_PLUGIN_PROTOCOL.md#document-snapshots)
-for targeting unnamed buffers and rejecting edits after a buffer switch.
-
-Host API `0.21.0` adds host-rendered RPC pickers with owner-local selection and
-cancellation notifications. See [pickers](RPC_PLUGIN_PROTOCOL.md#pickers) for
-the bounded item schema and cleanup semantics.
-
-Host API `0.22.0` adds `red/DocumentCreate` and `red/DocumentShow` for ordinary
-editable documents with independent undo, dirty tracking, Save As, recovery,
-and explicit stable-ID navigation. See
-[editable documents](RPC_PLUGIN_PROTOCOL.md#editable-documents) for the bounded
-request schemas and lifetime rules.
-
-Host API `0.23.0` adds two owner-scoped document watches per RPC connection.
-`red/DocumentWatch` and `red/DocumentUnwatch` provide coalesced
-`document/event` invalidations without exposing raw edits. See
-[document watches](RPC_PLUGIN_PROTOCOL.md#document-watches) for setup ordering,
-closure, bounds, and cleanup semantics.
-
-Host API `0.24.0` adds opt-in contiguous selection context to RPC document
-snapshots. The result carries exact selected text and a normalized
-Unicode-scalar range under the same document revision as the complete snapshot.
-See [document snapshots](RPC_PLUGIN_PROTOCOL.md#document-snapshots) for active,
-last-visual, block, and multiple-selection behavior.
-
-Host API `0.25.0` adds opt-in stable-ID Apply and Undo against an inactive RPC
-document. The mutation reuses Red's existing background transaction path and
-preserves the active buffer, view, and insert transaction. See
-[document transactions](RPC_PLUGIN_PROTOCOL.md#document-transactions).
-
-Host API `0.26.0` adds bounded actions to RPC text-panel headers, owner-routed
-`panel/event` notifications, and a write-only 1 MiB `red/ClipboardWrite`
-method. See [text panels](RPC_PLUGIN_PROTOCOL.md#text-panels) and
-[clipboard writes](RPC_PLUGIN_PROTOCOL.md#clipboard-writes).
+Host API `0.19.0` introduces the complete version 1 `[rpc]` contract for
+standalone plugins written in any language. Its bounded, owner-scoped surfaces
+cover commands, snapshots and transactions, editable documents, watches,
+pickers, configuration, storage, statusline contributions, clipboard writes,
+and text panels. Text panels support code highlighting, keyboard and F1 action
+discovery, and action updates that preserve panel content and UI state. Red
+validates package metadata and initialization before dispatch, starts a process
+on first invocation, and cleans up connection-owned resources on exit. See the
+[JSON-RPC plugin protocol](RPC_PLUGIN_PROTOCOL.md) for transport and method
+contracts.
 
 ## Native tree panels
 
@@ -508,7 +475,7 @@ archived context.
 
 ## Text panels
 
-`CreateTextPanel`, `UpdateTextPanel`, and `AppendTextPanel` provide a source-backed conversation surface. `TextPanelBlock` accepts an `id`, `kind` (`user`, `agent`, `error`, or `text`), `format` (`plain` or `markdown`), and `text`; the host preserves the source while wrapping and rendering it for the current panel width. These calls were introduced in host API `0.2.0`.
+`CreateTextPanel`, `UpdateTextPanel`, and `AppendTextPanel` provide a source-backed conversation surface. `TextPanelBlock` accepts an `id`, `kind` (`user`, `agent`, `error`, or `text`), `format` (`plain`, `markdown`, or `code`), and `text`; `code` blocks may include a `language` name for syntax highlighting. Code rendering preserves indentation, repeated spaces, and logical blank lines while wrapping to the panel width. An omitted or unsupported language remains readable verbatim. The host preserves the source independently from its rendered layout. These calls were introduced in host API `0.2.0`; `code` and `language` require `0.19.0`.
 
 Both row and text panels accept `side: "left"`, `"right"`, `"top"`, or
 `"bottom"` in `PanelConfig`. `width` is measured in columns for left/right panes
@@ -521,7 +488,7 @@ theme's `sash.hoverBorder`, `panelTitle.activeBorder`, or `focusBorder`, then
 derives a readable accent when those colors are absent or insufficiently
 contrasted. Plugins do not need to configure a border to make resizing visible.
 
-`PanelConfig` may include `composer: Json { placeholder: String, rows: i32 }` for a persistent footer composer and `header_actions: [Json { id: String, label: String, compact_label?: String }]` for clickable, right-aligned header controls. Row panels can also set `surface: ThemeStyleSpec` and `border: ThemeStyleSpec` to resolve theme-aware panel foreground, background, and separator colors without affecting other panels. Header actions emit `panel:event:<id>` using their configured `id`; compact labels are selected automatically on narrow panels, with the rightmost actions retained when space is especially limited. Focus the footer with `FocusTextPanelComposer(id)`, update its enabled/status state with `SetTextPanelComposerState(id, enabled, status?)`, replace its bounded prompt history with `SetTextPanelComposerHistory(id, history)`, and clear its draft with `ClearTextPanelComposer(id)`. `SetTextPanelComposerHistory` was introduced in host API `0.15.0`; it normalizes, deduplicates, and limits supplied entries without changing the current draft.
+`PanelConfig` may include `composer: Json { placeholder: String, rows: i32 }` for a persistent footer composer and `header_actions` for panel-owned actions. Existing `{ id, label, compact_label? }` declarations remain clickable header controls. Host API `0.19.0` also accepts `key`, `group`, `description`, `priority`, `enabled`, and `show_in_header`. A focused panel dispatches enabled shortcuts only from idle Normal mode; search, Visual selection, incomplete motions, composer input, and links under Enter keep precedence. Enabled hidden actions remain searchable and executable through F1; disabled actions appear after an update makes them available. `SetTextPanelActions(id, actions)` replaces the action list without recreating the panel. Row panels can also set `surface: ThemeStyleSpec` and `border: ThemeStyleSpec` to resolve theme-aware panel foreground, background, and separator colors without affecting other panels. Actions emit `panel:event:<id>` using their configured `id`; compact labels are selected automatically on narrow panels, while priority keeps essential actions visible where possible. Focus the footer with `FocusTextPanelComposer(id)`, update its enabled/status state with `SetTextPanelComposerState(id, enabled, status?)`, replace its bounded prompt history with `SetTextPanelComposerHistory(id, history)`, and clear its draft with `ClearTextPanelComposer(id)`. `SetTextPanelComposerHistory` was introduced in host API `0.15.0`; it normalizes, deduplicates, and limits supplied entries without changing the current draft.
 
 A focused footer is a host-owned modal text area, not an editor file buffer. It supports Unicode-safe editing, wrapping, click-to-position cursor movement, counts, Vim word and character motions, `d`/`c`/`y` operators, inner/around text objects, Visual/Visual-line/Visual-block selections, transactional undo/redo, local yank/paste registers, dot-repeat, local macro recording, and prompt-local `/` or `?` searches. Its mode, pending operator, selection, undo tree, register, and search never alter the main editor. File writes, Ex commands, window operations, LSP requests, and plugin callbacks cannot be invoked through textarea keys.
 

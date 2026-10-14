@@ -2100,6 +2100,10 @@ pub enum PluginRequest {
         id: String,
         blocks: Vec<plugin::TextPanelBlock>,
     },
+    SetTextPanelActions {
+        id: String,
+        actions: Vec<plugin::TextPanelHeaderAction>,
+    },
     AppendTextPanel {
         id: String,
         block_id: String,
@@ -2326,6 +2330,7 @@ impl PluginRequest {
             Self::InvalidateWorkspacePaths { .. } => "InvalidateWorkspacePaths",
             Self::CreateTextPanel { .. } => "CreateTextPanel",
             Self::UpdateTextPanel { .. } => "UpdateTextPanel",
+            Self::SetTextPanelActions { .. } => "SetTextPanelActions",
             Self::AppendTextPanel { .. } => "AppendTextPanel",
             Self::FocusTextPanelComposer { .. } => "FocusTextPanelComposer",
             Self::SetTextPanelComposerState { .. } => "SetTextPanelComposerState",
@@ -4674,6 +4679,13 @@ struct RpcTextPanelSetContentParams {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct RpcTextPanelSetActionsParams {
+    id: String,
+    actions: Vec<plugin::TextPanelHeaderAction>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RpcTextPanelParams {
     id: String,
 }
@@ -4750,9 +4762,12 @@ const RPC_STORAGE_MAX_KEY_BYTES: usize = 128;
 const RPC_PLUGIN_VALUE_MAX_BYTES: usize = 1024 * 1024;
 const RPC_DOCUMENT_CREATE_MAX_BYTES: usize = 1024 * 1024;
 const RPC_DOCUMENT_SYNTAX_MAX_BYTES: usize = 128;
-const MAX_RPC_TEXT_PANEL_ACTIONS: usize = 8;
+const MAX_RPC_TEXT_PANEL_ACTIONS: usize = 16;
 const RPC_TEXT_PANEL_ACTION_ID_MAX_BYTES: usize = 64;
+const RPC_TEXT_PANEL_ACTION_KEY_MAX_BYTES: usize = 64;
 const RPC_TEXT_PANEL_ACTION_LABEL_MAX_BYTES: usize = 128;
+const RPC_TEXT_PANEL_ACTION_GROUP_MAX_BYTES: usize = 128;
+const RPC_TEXT_PANEL_ACTION_DESCRIPTION_MAX_BYTES: usize = 512;
 const RPC_TEXT_PANEL_ACTION_COMPACT_LABEL_MAX_BYTES: usize = 64;
 const RPC_CLIPBOARD_MAX_BYTES: usize = 1024 * 1024;
 const MAX_RPC_PICKER_ITEMS: usize = 4_096;
@@ -12779,9 +12794,10 @@ impl Editor {
                     needs_render = true;
                 }
                 PluginRequest::UpdateTextPanel { id, blocks } => {
-                    self.panel_manager.update_text_panel(
+                    self.panel_manager.update_text_panel_with_highlighter(
                         &id,
                         blocks,
+                        &mut self.highlighter,
                         usize::from(self.size.1.saturating_sub(2)),
                         usize::from(self.size.0),
                     );
@@ -12792,15 +12808,19 @@ impl Editor {
                     );
                     needs_render = true;
                 }
+                PluginRequest::SetTextPanelActions { id, actions } => {
+                    needs_render |= self.panel_manager.set_text_panel_actions(&id, actions);
+                }
                 PluginRequest::AppendTextPanel {
                     id,
                     block_id,
                     delta,
                 } => {
-                    self.panel_manager.append_text_panel(
+                    self.panel_manager.append_text_panel_with_highlighter(
                         &id,
                         &block_id,
                         &delta,
+                        &mut self.highlighter,
                         usize::from(self.size.1.saturating_sub(2)),
                         usize::from(self.size.0),
                     );
@@ -16261,6 +16281,9 @@ impl Editor {
                     {
                         return Some(self.follow_text_panel_link(target));
                     }
+                }
+                if let Some(event) = self.panel_manager.action_shortcut_event(ev) {
+                    return Self::panel_event_key_action(event);
                 }
                 let control = event.modifiers.contains(KeyModifiers::CONTROL);
                 let text_panel = !self.panel_manager.focused_row_panel();
@@ -26076,6 +26099,7 @@ impl Editor {
     }
 
     fn validate_rpc_text_panel_action_field(
+        method: &str,
         field: &str,
         value: &str,
         max_bytes: usize,
@@ -26083,8 +26107,40 @@ impl Editor {
         if value.trim().is_empty() || value.len() > max_bytes {
             return Err(Self::rpc_error(
                 -32602,
+                format!("{method} action {field} must contain 1 to {max_bytes} UTF-8 bytes"),
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_optional_rpc_text_panel_action_field(
+        method: &str,
+        field: &str,
+        value: &str,
+        max_bytes: usize,
+    ) -> std::result::Result<(), plugin::rpc::RpcErrorObject> {
+        if value.is_empty() {
+            return Ok(());
+        }
+        Self::validate_rpc_text_panel_action_field(method, field, value, max_bytes)
+    }
+
+    fn validate_rpc_text_panel_action_shortcut(
+        method: &str,
+        action: &plugin::TextPanelHeaderAction,
+    ) -> std::result::Result<(), plugin::rpc::RpcErrorObject> {
+        Self::validate_optional_rpc_text_panel_action_field(
+            method,
+            "key",
+            &action.key,
+            RPC_TEXT_PANEL_ACTION_KEY_MAX_BYTES,
+        )?;
+        if !action.key.is_empty() && action.event().is_none() {
+            return Err(Self::rpc_error(
+                -32602,
                 format!(
-                    "red/TextPanelCreate action {field} must contain 1 to {max_bytes} UTF-8 bytes"
+                    "{method} action key is not a supported shortcut: {}",
+                    action.key
                 ),
             ));
         }
@@ -26092,30 +26148,45 @@ impl Editor {
     }
 
     fn validate_rpc_text_panel_actions(
+        method: &str,
         actions: &[plugin::TextPanelHeaderAction],
     ) -> std::result::Result<HashSet<String>, plugin::rpc::RpcErrorObject> {
         if actions.len() > MAX_RPC_TEXT_PANEL_ACTIONS {
             return Err(Self::rpc_error(
                 -32602,
-                format!(
-                    "red/TextPanelCreate may contain at most {MAX_RPC_TEXT_PANEL_ACTIONS} actions"
-                ),
+                format!("{method} may contain at most {MAX_RPC_TEXT_PANEL_ACTIONS} actions"),
             ));
         }
         let mut ids = HashSet::with_capacity(actions.len());
         for action in actions {
             Self::validate_rpc_text_panel_action_field(
+                method,
                 "id",
                 &action.id,
                 RPC_TEXT_PANEL_ACTION_ID_MAX_BYTES,
             )?;
             Self::validate_rpc_text_panel_action_field(
+                method,
                 "label",
                 &action.label,
                 RPC_TEXT_PANEL_ACTION_LABEL_MAX_BYTES,
             )?;
+            Self::validate_rpc_text_panel_action_shortcut(method, action)?;
+            Self::validate_optional_rpc_text_panel_action_field(
+                method,
+                "group",
+                &action.group,
+                RPC_TEXT_PANEL_ACTION_GROUP_MAX_BYTES,
+            )?;
+            Self::validate_optional_rpc_text_panel_action_field(
+                method,
+                "description",
+                &action.description,
+                RPC_TEXT_PANEL_ACTION_DESCRIPTION_MAX_BYTES,
+            )?;
             if let Some(label) = &action.compact_label {
                 Self::validate_rpc_text_panel_action_field(
+                    method,
                     "compact_label",
                     label,
                     RPC_TEXT_PANEL_ACTION_COMPACT_LABEL_MAX_BYTES,
@@ -26124,7 +26195,21 @@ impl Editor {
             if !ids.insert(action.id.clone()) {
                 return Err(Self::rpc_error(
                     -32602,
-                    format!("red/TextPanelCreate action id is duplicated: {}", action.id),
+                    format!("{method} action id is duplicated: {}", action.id),
+                ));
+            }
+        }
+        for (index, action) in actions.iter().enumerate() {
+            let Some(event) = action.enabled.then(|| action.event()).flatten() else {
+                continue;
+            };
+            if actions[..index]
+                .iter()
+                .any(|previous| previous.enabled && previous.event().as_ref() == Some(&event))
+            {
+                return Err(Self::rpc_error(
+                    -32602,
+                    format!("{method} action shortcut is duplicated: {}", action.key),
                 ));
             }
         }
@@ -26170,7 +26255,10 @@ impl Editor {
                 "red/TextPanelCreate width must be greater than zero",
             ));
         }
-        let action_ids = Self::validate_rpc_text_panel_actions(&params.actions)?;
+        let action_ids = Self::validate_rpc_text_panel_actions(
+            plugin::rpc::TEXT_PANEL_CREATE_METHOD,
+            &params.actions,
+        )?;
         let (host_id, replaced) = self
             .plugin_registry
             .register_rpc_text_panel(owner, &params.id, action_ids)
@@ -26231,12 +26319,40 @@ impl Editor {
         if self.panel_manager.panel_layout(&host_id).is_none() {
             return Err(Self::rpc_text_panel_unavailable(&params.id));
         }
-        self.panel_manager.update_text_panel(
+        self.panel_manager.update_text_panel_with_highlighter(
             &host_id,
             params.blocks,
+            &mut self.highlighter,
             usize::from(self.size.1.saturating_sub(2)),
             usize::from(self.size.0),
         );
+        self.finish_rpc_text_panel_change(render_buffer)
+    }
+
+    fn rpc_text_panel_set_actions_request(
+        &mut self,
+        render_buffer: &mut RenderBuffer,
+        owner: &str,
+        params: RpcTextPanelSetActionsParams,
+    ) -> std::result::Result<Value, plugin::rpc::RpcErrorObject> {
+        Self::validate_rpc_resource_id(plugin::rpc::TEXT_PANEL_SET_ACTIONS_METHOD, &params.id)?;
+        let action_ids = Self::validate_rpc_text_panel_actions(
+            plugin::rpc::TEXT_PANEL_SET_ACTIONS_METHOD,
+            &params.actions,
+        )?;
+        let host_id = self.rpc_text_panel_host_id(
+            owner,
+            plugin::rpc::TEXT_PANEL_SET_ACTIONS_METHOD,
+            &params.id,
+        )?;
+        if self.panel_manager.panel_layout(&host_id).is_none() {
+            return Err(Self::rpc_text_panel_unavailable(&params.id));
+        }
+        self.panel_manager
+            .set_text_panel_actions(&host_id, params.actions);
+        self.plugin_registry
+            .update_rpc_text_panel_actions(owner, &params.id, action_ids)
+            .ok_or_else(|| Self::rpc_text_panel_unavailable(&params.id))?;
         self.finish_rpc_text_panel_change(render_buffer)
     }
 
@@ -26289,6 +26405,11 @@ impl Editor {
                 Self::rpc_params(method, params)?,
             ),
             plugin::rpc::TEXT_PANEL_SET_CONTENT_METHOD => self.rpc_text_panel_set_content_request(
+                render_buffer,
+                owner,
+                Self::rpc_params(method, params)?,
+            ),
+            plugin::rpc::TEXT_PANEL_SET_ACTIONS_METHOD => self.rpc_text_panel_set_actions_request(
                 render_buffer,
                 owner,
                 Self::rpc_params(method, params)?,
@@ -27134,6 +27255,8 @@ impl Editor {
         let highlighter = Highlighter::with_registry(&theme, self.highlighter.registry())?;
         self.theme = theme;
         self.highlighter = highlighter;
+        self.panel_manager
+            .rehighlight_text_panels(&mut self.highlighter);
         self.highlight_cache.clear();
         self.sync_diagnostic_gutter_signs();
         self.workspace_manager
@@ -38936,19 +39059,48 @@ builtin = "rust"
         );
         request!(
             "rpc-test",
+            plugin::rpc::TEXT_PANEL_SET_ACTIONS_METHOD,
+            json!({
+                "id": "preview",
+                "actions": [
+                    {
+                        "id": "run",
+                        "key": "r",
+                        "label": "Run",
+                        "description": "Run the preview",
+                        "priority": "essential"
+                    },
+                    {
+                        "id": "live",
+                        "key": "",
+                        "label": "Live preview",
+                        "show_in_header": false
+                    }
+                ]
+            }),
+        )
+        .await
+        .unwrap();
+        request!(
+            "rpc-test",
             plugin::rpc::TEXT_PANEL_SET_CONTENT_METHOD,
             json!({
                 "id": "preview",
-                "blocks": [{"id": "result", "format": "markdown", "text": "# RPC panel\nRendered by Red"}]
+                "blocks": [{
+                    "id": "result",
+                    "format": "code",
+                    "language": "json",
+                    "text": "{\n  \"ready\": true\n}"
+                }]
             }),
         )
-            .await
-            .unwrap();
+        .await
+        .unwrap();
 
         let forbidden = request!(
             "other-plugin",
-            plugin::rpc::TEXT_PANEL_FOCUS_METHOD,
-            json!({"id": "preview"}),
+            plugin::rpc::TEXT_PANEL_SET_ACTIONS_METHOD,
+            json!({"id": "preview", "actions": []}),
         )
         .await
         .unwrap_err();
@@ -38996,6 +39148,13 @@ builtin = "rust"
 
         for actions in [
             json!([{"id": "run", "label": " "}]),
+            json!([
+                {"id": "run", "key": "r", "label": "Run"},
+                {"id": "repeat", "key": "r", "label": "Repeat"}
+            ]),
+            json!([{"id": "run", "key": "not-a-key", "label": "Run"}]),
+            json!([{"id": "run", "label": "Run", "description": "x".repeat(RPC_TEXT_PANEL_ACTION_DESCRIPTION_MAX_BYTES + 1)}]),
+            json!([{"id": "run", "label": "Run", "unknown": true}]),
             json!([
                 {"id": "same", "label": "One"},
                 {"id": "same", "label": "Two"}

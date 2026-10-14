@@ -69,8 +69,9 @@ impl Editor {
                 .iter_mut()
                 .zip(actions.iter().filter(|action| action.enabled))
             {
-                if action.priority != crate::ui::ActionPriority::Reference
-                    && action.event().is_some()
+                if self.panel_manager.owns_surface_action(&action.id)
+                    || (action.priority != crate::ui::ActionPriority::Reference
+                        && action.event().is_some())
                 {
                     entry.target = Some(ShortcutTarget::Surface(action.id.clone()));
                 }
@@ -109,11 +110,16 @@ impl Editor {
                             dialog.activate_surface_action(&id)
                         } else {
                             self.panel_manager
-                                .surface_actions()
-                                .iter()
-                                .find(|action| action.id == id && action.enabled)
-                                .and_then(crate::ui::UiAction::event)
-                                .and_then(|event| self.handle_panel_event(&event, runtime))
+                                .activate_surface_action(&id)
+                                .and_then(Self::panel_event_key_action)
+                                .or_else(|| {
+                                    self.panel_manager
+                                        .surface_actions()
+                                        .iter()
+                                        .find(|action| action.id == id && action.enabled)
+                                        .and_then(crate::ui::UiAction::event)
+                                        .and_then(|event| self.handle_panel_event(&event, runtime))
+                                })
                         }
                         .unwrap_or(KeyAction::Single(Action::Refresh)),
                         ShortcutTarget::Workspace(id) => self

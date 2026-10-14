@@ -85,11 +85,20 @@ plugin exits or reloads, while the preview panel remains connection-owned.
 `JsonSource` explicitly returns to the pinned source when you want to inspect
 it directly.
 
-The preview header exposes Run, Cancel, Apply, Explore, Open, Copy, and Close actions.
-Run schedules work in the background so Cancel and Close remain responsive;
-Copy writes the complete result to the system clipboard without giving the
-plugin read access. `JsonCopy` provides the same explicit copy operation from
-the command line.
+The preview header keeps Run, Apply, and Close visible, replacing Run with
+Cancel during panel-initiated or live-preview work. Focus the panel to use `r`
+for Run, `Ctrl-c` for Cancel, `a` for Apply, `Enter` for Explore, `o` for Open,
+`c` for Copy, `s` for Source, `u` for Undo, and `q` for Close. F1 opens Red's
+searchable list of currently available actions, including Live preview and
+Saved queries when their prerequisites are met. Search,
+Visual selection, pending motions, and links under Enter keep precedence over
+these panel actions.
+
+Panel and live-preview runs use background work so Cancel and Close remain
+responsive. `JsonRun` and `JsonQuery` keep their synchronous command responses;
+use `JsonCancel` to interrupt a command-triggered query. Copy writes the complete
+result to the system clipboard without giving the plugin read access.
+`JsonCopy` provides the same explicit copy operation from the command line.
 
 `JsonExplore` and the Explore header action open a native picker over the
 latest result. Object keys and array indexes form a breadcrumb in the panel;

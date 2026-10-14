@@ -4,7 +4,7 @@ schema_version = 1
 id = "json-workbench"
 name = "JSON Workbench"
 version = "0.9.0"
-red_api = "^0.26.0"
+red_api = "^0.19.0"
 description = "Preview, explore, apply, copy, and undo jq transformations"
 license = "MIT"
 

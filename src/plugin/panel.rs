@@ -19,19 +19,23 @@ use std::{
 };
 
 use crossterm::event::{Event, KeyCode, KeyModifiers};
-use serde::{Deserialize, Serialize};
+use serde::{
+    de::Error as _, ser::SerializeStruct, Deserialize, Deserializer, Serialize, Serializer,
+};
 use unicode_segmentation::UnicodeSegmentation;
 
 use super::markdown::{
-    render_markdown_lines, wrap_plain_text, RenderedTextLine, RenderedTextLineBreak,
-    RenderedTextSpan, TextPanelLineSelection, TextPanelSpanSelection, TextPanelSpanStyle,
+    render_code_lines, render_markdown_lines, wrap_plain_text, RenderedTextLine,
+    RenderedTextLineBreak, RenderedTextSpan, TextPanelLineSelection, TextPanelSpanSelection,
+    TextPanelSpanStyle,
 };
 use super::text_link::{TextPanelLink, TextPanelLinkTarget};
 use super::TreePanelModel;
 use crate::{
     buffer::BufferId,
     color::{blend_color, Color},
-    editor::{render_buffer::RenderBuffer, Point},
+    editor::{render_buffer::RenderBuffer, Point, StyleInfo},
+    highlighter::Highlighter,
     text_layout::{LayoutOptions, TextLayout},
     theme::{
         SelectionForegroundPriority, Style, SurfaceCardColors, SurfaceCardPalette, SurfacePalette,
@@ -217,14 +221,68 @@ pub struct TextPanelHeaderDetail {
     pub shortcut: Option<String>,
 }
 
-/// One clickable action rendered in a text-panel header.
+fn text_panel_action_visible_by_default() -> bool {
+    true
+}
+
+/// One panel-owned action, optionally rendered as a header button.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TextPanelHeaderAction {
     pub id: String,
-    pub label: String,
     #[serde(default)]
+    pub key: String,
+    pub label: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub group: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub description: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compact_label: Option<String>,
+    #[serde(default)]
+    pub priority: ActionPriority,
+    #[serde(default = "text_panel_action_visible_by_default")]
+    pub enabled: bool,
+    #[serde(default = "text_panel_action_visible_by_default")]
+    pub show_in_header: bool,
+}
+
+impl TextPanelHeaderAction {
+    fn ui_action(&self) -> UiAction {
+        UiAction {
+            id: self.id.clone(),
+            key: self.key.clone(),
+            label: self.label.clone(),
+            group: self.group.clone(),
+            description: self.description.clone(),
+            compact_label: self.compact_label.clone(),
+            compact_key: None,
+            trigger: None,
+            priority: self.priority,
+            modes: Vec::new(),
+            enabled: self.enabled,
+        }
+    }
+
+    pub(crate) fn event(&self) -> Option<Event> {
+        self.ui_action().event()
+    }
+}
+
+impl Default for TextPanelHeaderAction {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            key: String::new(),
+            label: String::new(),
+            group: String::new(),
+            description: String::new(),
+            compact_label: None,
+            priority: ActionPriority::default(),
+            enabled: true,
+            show_in_header: true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -283,24 +341,98 @@ pub enum TextPanelBlockKind {
 }
 
 /// Presentation format for a source-backed text-panel block.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum TextPanelBlockFormat {
     #[default]
     Plain,
     Markdown,
+    Code(Option<String>),
 }
 
 /// One logical block in a text panel.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TextPanelBlock {
     pub id: String,
-    #[serde(default)]
     pub kind: TextPanelBlockKind,
-    #[serde(default)]
     pub format: TextPanelBlockFormat,
     pub text: String,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum TextPanelBlockWireFormat {
+    #[default]
+    Plain,
+    Markdown,
+    Code,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TextPanelBlockWire {
+    id: String,
+    #[serde(default)]
+    kind: TextPanelBlockKind,
+    #[serde(default)]
+    format: TextPanelBlockWireFormat,
+    #[serde(default)]
+    language: Option<String>,
+    text: String,
+}
+
+impl<'de> Deserialize<'de> for TextPanelBlock {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = TextPanelBlockWire::deserialize(deserializer)?;
+        let format = match wire.format {
+            TextPanelBlockWireFormat::Plain if wire.language.is_some() => {
+                return Err(D::Error::custom("language requires format code"));
+            }
+            TextPanelBlockWireFormat::Markdown if wire.language.is_some() => {
+                return Err(D::Error::custom("language requires format code"));
+            }
+            TextPanelBlockWireFormat::Plain => TextPanelBlockFormat::Plain,
+            TextPanelBlockWireFormat::Markdown => TextPanelBlockFormat::Markdown,
+            TextPanelBlockWireFormat::Code => TextPanelBlockFormat::Code(wire.language),
+        };
+        Ok(Self {
+            id: wire.id,
+            kind: wire.kind,
+            format,
+            text: wire.text,
+        })
+    }
+}
+
+impl Serialize for TextPanelBlock {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let language = match &self.format {
+            TextPanelBlockFormat::Code(language) => language.as_deref(),
+            _ => None,
+        };
+        let mut block = serializer
+            .serialize_struct("TextPanelBlock", if language.is_some() { 5 } else { 4 })?;
+        block.serialize_field("id", &self.id)?;
+        block.serialize_field("kind", &self.kind)?;
+        block.serialize_field(
+            "format",
+            match &self.format {
+                TextPanelBlockFormat::Plain => "plain",
+                TextPanelBlockFormat::Markdown => "markdown",
+                TextPanelBlockFormat::Code(_) => "code",
+            },
+        )?;
+        if let Some(language) = language {
+            block.serialize_field("language", language)?;
+        }
+        block.serialize_field("text", &self.text)?;
+        block.end()
+    }
 }
 
 /// Turn-scoped progress state rendered in a dedicated panel status row.
@@ -385,7 +517,12 @@ impl TextPanelContentMetrics {
 }
 
 fn text_panel_header_rows(config: &PanelConfig) -> usize {
-    if config.title.is_some() || !config.header_actions.is_empty() {
+    if config.title.is_some()
+        || config
+            .header_actions
+            .iter()
+            .any(|action| action.show_in_header)
+    {
         2
     } else {
         0
@@ -396,6 +533,7 @@ pub struct TextPanel {
     pub id: String,
     pub config: PanelConfig,
     pub blocks: Vec<TextPanelBlock>,
+    block_styles: Vec<Vec<StyleInfo>>,
     pub scroll: usize,
     pub follow_tail: bool,
     viewport: FollowTailViewport,
@@ -893,6 +1031,7 @@ impl TextPanel {
             id,
             config,
             blocks: Vec::new(),
+            block_styles: Vec::new(),
             scroll: 0,
             follow_tail: true,
             viewport: FollowTailViewport::default(),
@@ -943,12 +1082,23 @@ impl TextPanel {
         panel_height: usize,
         panel_width: usize,
     ) {
+        self.update_blocks_with_highlighter(blocks, None, panel_height, panel_width);
+    }
+
+    fn update_blocks_with_highlighter(
+        &mut self,
+        blocks: Vec<TextPanelBlock>,
+        highlighter: Option<&mut Highlighter>,
+        panel_height: usize,
+        panel_width: usize,
+    ) {
         if blocks.is_empty() {
             self.viewport.reset();
             self.scroll = self.viewport.offset();
             self.follow_tail = self.viewport.is_following();
         }
         self.blocks = blocks;
+        self.refresh_block_styles(highlighter);
         self.invalidate_layout();
         if self.follow_tail {
             self.scroll_to_bottom(panel_height, panel_width);
@@ -969,6 +1119,17 @@ impl TextPanel {
         panel_height: usize,
         panel_width: usize,
     ) {
+        self.append_delta_with_highlighter(block_id, delta, None, panel_height, panel_width);
+    }
+
+    fn append_delta_with_highlighter(
+        &mut self,
+        block_id: &str,
+        delta: &str,
+        highlighter: Option<&mut Highlighter>,
+        panel_height: usize,
+        panel_width: usize,
+    ) {
         if let Some(block) = self.blocks.iter_mut().find(|block| block.id == block_id) {
             block.text.push_str(delta);
         } else {
@@ -979,6 +1140,7 @@ impl TextPanel {
                 text: delta.to_string(),
             });
         }
+        self.refresh_block_styles(highlighter);
         self.invalidate_layout();
 
         if self.follow_tail {
@@ -1041,7 +1203,28 @@ impl TextPanel {
             .saturating_sub(text_panel_header_rows(&self.config))
             .saturating_sub(self.composer_height(panel_height, panel_width))
             .saturating_sub(self.status_height())
+            .saturating_sub(self.action_footer_height())
             .max(1)
+    }
+
+    fn action_footer_height(&self) -> usize {
+        usize::from(
+            self.action_shortcuts_active()
+                && self.composer.is_none()
+                && self
+                    .config
+                    .header_actions
+                    .iter()
+                    .any(|action| !action.show_in_header && action.enabled),
+        )
+    }
+
+    fn action_shortcuts_active(&self) -> bool {
+        self.scrollback.focused
+            && self.scrollback.mode == TextPanelScrollbackMode::Normal
+            && self.search.active.is_none()
+            && self.scrollback.pending_find.is_none()
+            && self.scrollback.pending_jump.is_none()
     }
 
     fn composer_height(&self, panel_height: usize, panel_width: usize) -> usize {
@@ -1190,13 +1373,20 @@ impl TextPanel {
                     TextPanelSpanStyle::User,
                 ));
                 let content_width = width.saturating_sub(if framed { 4 } else { 0 }).max(1);
-                let mut block_lines = match block.format {
+                let mut block_lines = match &block.format {
                     TextPanelBlockFormat::Plain => {
                         wrap_plain_text(&block.text, content_width, TextPanelSpanStyle::Text)
                     }
                     TextPanelBlockFormat::Markdown => {
                         render_markdown_lines(&block.text, content_width)
                     }
+                    TextPanelBlockFormat::Code(_) => render_code_lines(
+                        &block.text,
+                        content_width,
+                        self.block_styles
+                            .get(block_index)
+                            .map_or(&[], Vec::as_slice),
+                    ),
                 };
                 if block_lines.is_empty() {
                     block_lines.push(RenderedTextLine::plain(
@@ -1243,9 +1433,16 @@ impl TextPanel {
                         })
                         .collect()
                 } else {
-                    match block.format {
+                    match &block.format {
                         TextPanelBlockFormat::Plain => wrap_plain_text(&block.text, width, style),
                         TextPanelBlockFormat::Markdown => render_markdown_lines(&block.text, width),
+                        TextPanelBlockFormat::Code(_) => render_code_lines(
+                            &block.text,
+                            width,
+                            self.block_styles
+                                .get(block_index)
+                                .map_or(&[], Vec::as_slice),
+                        ),
                     }
                 };
                 if block_lines.is_empty() {
@@ -1584,6 +1781,32 @@ impl TextPanelLayout {
 }
 
 impl TextPanel {
+    fn refresh_block_styles(&mut self, mut highlighter: Option<&mut Highlighter>) {
+        self.block_styles = self
+            .blocks
+            .iter()
+            .map(|block| {
+                let TextPanelBlockFormat::Code(language) = &block.format else {
+                    return Vec::new();
+                };
+                let Some(highlighter) = highlighter.as_deref_mut() else {
+                    return Vec::new();
+                };
+                let Some(language) = language
+                    .as_deref()
+                    .and_then(|language| highlighter.language_id_for_name(language))
+                    .map(str::to_owned)
+                else {
+                    return Vec::new();
+                };
+                highlighter
+                    .highlight(&language, &block.text)
+                    .unwrap_or_default()
+            })
+            .collect();
+        self.invalidate_layout();
+    }
+
     fn invalidate_layout(&self) {
         self.layout_cache.borrow_mut().take();
         self.search_cache.borrow_mut().take();
@@ -2929,6 +3152,21 @@ impl PanelManager {
         true
     }
 
+    pub fn set_text_panel_actions(
+        &mut self,
+        id: &str,
+        actions: Vec<TextPanelHeaderAction>,
+    ) -> bool {
+        let Some(panel) = self.text_panels.get_mut(id) else {
+            return false;
+        };
+        if panel.config.header_actions == actions {
+            return false;
+        }
+        panel.config.header_actions = actions;
+        true
+    }
+
     pub fn update_text_panel(
         &mut self,
         id: &str,
@@ -2944,6 +3182,31 @@ impl PanelManager {
                 .presentation
                 .height(&panel.id, &panel.config, panel_height);
             panel.update_blocks(blocks, panel_height, width);
+        }
+    }
+
+    pub fn update_text_panel_with_highlighter(
+        &mut self,
+        id: &str,
+        blocks: Vec<TextPanelBlock>,
+        highlighter: &mut Highlighter,
+        panel_height: usize,
+        terminal_width: usize,
+    ) {
+        if let Some(panel) = self.text_panels.get_mut(id) {
+            let width = self
+                .presentation
+                .width(&panel.id, &panel.config, terminal_width);
+            let panel_height = self
+                .presentation
+                .height(&panel.id, &panel.config, panel_height);
+            panel.update_blocks_with_highlighter(blocks, Some(highlighter), panel_height, width);
+        }
+    }
+
+    pub fn rehighlight_text_panels(&mut self, highlighter: &mut Highlighter) {
+        for panel in self.text_panels.values_mut() {
+            panel.refresh_block_styles(Some(highlighter));
         }
     }
 
@@ -2963,6 +3226,32 @@ impl PanelManager {
                 .presentation
                 .height(&panel.id, &panel.config, panel_height);
             panel.append_delta(block_id, delta, panel_height, width);
+        }
+    }
+
+    pub fn append_text_panel_with_highlighter(
+        &mut self,
+        id: &str,
+        block_id: &str,
+        delta: &str,
+        highlighter: &mut Highlighter,
+        panel_height: usize,
+        terminal_width: usize,
+    ) {
+        if let Some(panel) = self.text_panels.get_mut(id) {
+            let width = self
+                .presentation
+                .width(&panel.id, &panel.config, terminal_width);
+            let panel_height = self
+                .presentation
+                .height(&panel.id, &panel.config, panel_height);
+            panel.append_delta_with_highlighter(
+                block_id,
+                delta,
+                Some(highlighter),
+                panel_height,
+                width,
+            );
         }
     }
 
@@ -3390,13 +3679,25 @@ impl PanelManager {
         else {
             return Vec::new();
         };
-        let mut actions = panel
-            .composer
-            .as_ref()
-            .map(|composer| {
-                text_panel_actions(composer, &panel.scrollback, TextPanelOverflow::None).1
-            })
-            .unwrap_or_else(|| crate::ui::surface_reference_actions("SCROLLBACK NORMAL"));
+        let mut actions = if panel.action_shortcuts_active() {
+            panel
+                .config
+                .header_actions
+                .iter()
+                .map(TextPanelHeaderAction::ui_action)
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        actions.extend(
+            panel
+                .composer
+                .as_ref()
+                .map(|composer| {
+                    text_panel_actions(composer, &panel.scrollback, TextPanelOverflow::None).1
+                })
+                .unwrap_or_else(|| crate::ui::surface_reference_actions("SCROLLBACK NORMAL")),
+        );
         if let Some(detail) = &panel.header_detail {
             if let (Some(action), Some(shortcut)) = (&detail.action, &detail.shortcut) {
                 actions.push(
@@ -3407,6 +3708,54 @@ impl PanelManager {
             }
         }
         actions
+    }
+
+    pub(crate) fn activate_surface_action(&self, id: &str) -> Option<PanelEvent> {
+        let panel = self.text_panels.get(self.focused.as_deref()?)?;
+        let action = panel
+            .config
+            .header_actions
+            .iter()
+            .find(|action| action.id == id && action.enabled)?;
+        Some(PanelEvent {
+            panel_id: panel.id.clone(),
+            action: action.id.clone(),
+            selected_index: panel.scroll,
+            row: None,
+            text: None,
+        })
+    }
+
+    pub(crate) fn owns_surface_action(&self, id: &str) -> bool {
+        self.focused
+            .as_deref()
+            .and_then(|panel_id| self.text_panels.get(panel_id))
+            .is_some_and(|panel| {
+                panel
+                    .config
+                    .header_actions
+                    .iter()
+                    .any(|action| action.id == id)
+            })
+    }
+
+    pub(crate) fn action_shortcut_event(&self, event: &Event) -> Option<PanelEvent> {
+        let panel = self.text_panels.get(self.focused.as_deref()?)?;
+        if !panel.action_shortcuts_active() {
+            return None;
+        }
+        let action = panel
+            .config
+            .header_actions
+            .iter()
+            .find(|action| action.enabled && action.event().as_ref() == Some(event))?;
+        Some(PanelEvent {
+            panel_id: panel.id.clone(),
+            action: action.id.clone(),
+            selected_index: panel.scroll,
+            row: None,
+            text: None,
+        })
     }
 
     pub fn focused_row_panel(&self) -> bool {
@@ -5135,12 +5484,21 @@ fn render_text_panel(
             &palette.secondary,
         );
     }
-    for (start, _, label) in header_actions {
+    for (start, action, label) in header_actions {
         let x = content_position.x + start;
         buffer.set_text(x, position.y, "[", &palette.divider);
-        buffer.set_text(x + 1, position.y, label, &palette.accent);
         buffer.set_text(
-            x + 1 + display_width(label),
+            x + 1,
+            position.y,
+            &label,
+            if action.enabled {
+                &palette.accent
+            } else {
+                &palette.muted
+            },
+        );
+        buffer.set_text(
+            x + 1 + display_width(&label),
             position.y,
             "]",
             &palette.divider,
@@ -5158,9 +5516,11 @@ fn render_text_panel(
 
     let composer_height = panel.composer_height(height, width);
     let status_height = panel.status_height();
+    let action_footer_height = panel.action_footer_height();
     let content_height = height
         .saturating_sub(composer_height)
-        .saturating_sub(status_height);
+        .saturating_sub(status_height)
+        .saturating_sub(action_footer_height);
     let visible_rows = content_height.saturating_sub(title_rows);
     let layout = panel.layout(width);
     let max_scroll = layout.lines.len().saturating_sub(visible_rows);
@@ -5281,6 +5641,31 @@ fn render_text_panel(
         );
     }
 
+    if action_footer_height > 0 && panel.scrollback.focused {
+        let actions = panel
+            .config
+            .header_actions
+            .iter()
+            .map(|action| {
+                let mut hint = action.ui_action();
+                if action.show_in_header {
+                    hint.priority = ActionPriority::Reference;
+                }
+                hint
+            })
+            .collect::<Vec<_>>();
+        ActionBar::new(&actions)
+            .with_context(panel.config.title.as_deref().unwrap_or("Text panel"))
+            .render(
+                buffer,
+                content_position.x,
+                position.y + content_height + status_height,
+                metrics.width,
+                theme,
+                &palette.surface,
+            );
+    }
+
     if let Some(composer) = panel.composer.as_ref().filter(|_| composer_height > 0) {
         let overflow = match (scroll > 0, scroll < max_scroll) {
             (true, true) => TextPanelOverflow::Both,
@@ -5291,7 +5676,8 @@ fn render_text_panel(
         let composer_top = position
             .y
             .saturating_add(content_height)
-            .saturating_add(status_height);
+            .saturating_add(status_height)
+            .saturating_add(action_footer_height);
         buffer.set_text(
             position.x,
             composer_top,
@@ -5886,7 +6272,10 @@ fn render_text_panel_status(
     }
 }
 
-fn text_panel_header_actions(config: &PanelConfig, width: usize) -> Vec<(usize, &str, &str)> {
+fn text_panel_header_actions(
+    config: &PanelConfig,
+    width: usize,
+) -> Vec<(usize, &TextPanelHeaderAction, String)> {
     text_panel_header_actions_with_title_width(
         config,
         width,
@@ -5897,7 +6286,7 @@ fn text_panel_header_actions(config: &PanelConfig, width: usize) -> Vec<(usize, 
 fn text_panel_header_actions_for_panel(
     panel: &TextPanel,
     width: usize,
-) -> Vec<(usize, &str, &str)> {
+) -> Vec<(usize, &TextPanelHeaderAction, String)> {
     let Some(detail) = &panel.header_detail else {
         return text_panel_header_actions(&panel.config, width);
     };
@@ -5916,24 +6305,31 @@ fn text_panel_header_actions_with_title_width(
     config: &PanelConfig,
     width: usize,
     title_width: usize,
-) -> Vec<(usize, &str, &str)> {
-    let full_width = config
+) -> Vec<(usize, &TextPanelHeaderAction, String)> {
+    let visible = config
         .header_actions
         .iter()
-        .map(|action| display_width(&action.label).saturating_add(2))
+        .filter(|action| action.show_in_header)
+        .collect::<Vec<_>>();
+    let full_width = visible
+        .iter()
+        .map(|action| display_width(&text_panel_header_action_label(action)).saturating_add(2))
         .sum::<usize>()
-        .saturating_add(config.header_actions.len().saturating_sub(1));
+        .saturating_add(visible.len().saturating_sub(1));
     let compact = full_width.saturating_add(title_width).saturating_add(1) > width;
-    let mut labels = config
-        .header_actions
-        .iter()
+    let mut labels = visible
+        .into_iter()
         .map(|action| {
             let label = if compact {
-                action.compact_label.as_deref().unwrap_or(&action.label)
+                action
+                    .compact_label
+                    .as_deref()
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| text_panel_header_action_label(action))
             } else {
-                &action.label
+                text_panel_header_action_label(action)
             };
-            (action.id.as_str(), label)
+            (action, label)
         })
         .collect::<Vec<_>>();
     let mut used = labels
@@ -5942,8 +6338,13 @@ fn text_panel_header_actions_with_title_width(
         .sum::<usize>()
         .saturating_add(labels.len().saturating_sub(1));
     while used > width && !labels.is_empty() {
-        let (_, label) = labels.remove(0);
-        used = used.saturating_sub(display_width(label).saturating_add(2));
+        let remove = labels
+            .iter()
+            .enumerate()
+            .max_by_key(|(index, (action, _))| (action.priority, std::cmp::Reverse(*index)))
+            .map_or(0, |(index, _)| index);
+        let (_, label) = labels.remove(remove);
+        used = used.saturating_sub(display_width(&label).saturating_add(2));
         if !labels.is_empty() {
             used = used.saturating_sub(1);
         }
@@ -5953,7 +6354,7 @@ fn text_panel_header_actions_with_title_width(
         .into_iter()
         .map(|(action, label)| {
             let current = start;
-            start = start.saturating_add(display_width(label).saturating_add(3));
+            start = start.saturating_add(display_width(&label).saturating_add(3));
             (current, action, label)
         })
         .collect()
@@ -6000,7 +6401,16 @@ fn text_panel_header_action_at(panel: &TextPanel, width: usize, x: usize) -> Opt
         .find(|(start, _, label)| {
             x >= *start && x < start.saturating_add(display_width(label).saturating_add(2))
         })
-        .map(|(_, action, _)| action)
+        .filter(|(_, action, _)| action.enabled)
+        .map(|(_, action, _)| action.id.as_str())
+}
+
+fn text_panel_header_action_label(action: &TextPanelHeaderAction) -> String {
+    if action.key.chars().count() == 1 && display_width(&action.label) > 1 {
+        format!("{} {}", action.key, action.label)
+    } else {
+        action.label.clone()
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -8147,6 +8557,7 @@ mod tests {
                     id: "close".into(),
                     label: "×".into(),
                     compact_label: None,
+                    ..TextPanelHeaderAction::default()
                 }],
                 ..PanelConfig::default()
             },
@@ -8222,6 +8633,7 @@ mod tests {
                     id: id.into(),
                     label: label.into(),
                     compact_label: Some(compact.into()),
+                    ..TextPanelHeaderAction::default()
                 })
                 .collect(),
                 ..Default::default()
@@ -8241,7 +8653,7 @@ mod tests {
         assert_eq!(
             text_panel_header_actions_for_panel(&panel, 60)
                 .iter()
-                .map(|(_, _, label)| *label)
+                .map(|(_, _, label)| label.as_str())
                 .collect::<Vec<_>>(),
             ["C", "N", "×"]
         );
@@ -8250,7 +8662,10 @@ mod tests {
             .1
             .contains('→'));
         for (start, action, _) in text_panel_header_actions_for_panel(&panel, 60) {
-            assert_eq!(text_panel_header_action_at(&panel, 60, start), Some(action));
+            assert_eq!(
+                text_panel_header_action_at(&panel, 60, start),
+                Some(action.id.as_str())
+            );
         }
     }
 
@@ -8274,16 +8689,19 @@ mod tests {
                         id: "clear".to_string(),
                         label: "Clear".to_string(),
                         compact_label: Some("C".to_string()),
+                        ..TextPanelHeaderAction::default()
                     },
                     TextPanelHeaderAction {
                         id: "new".to_string(),
                         label: "New".to_string(),
                         compact_label: Some("N".to_string()),
+                        ..TextPanelHeaderAction::default()
                     },
                     TextPanelHeaderAction {
                         id: "close".to_string(),
                         label: "×".to_string(),
                         compact_label: Some("×".to_string()),
+                        ..TextPanelHeaderAction::default()
                     },
                 ],
             },
@@ -8308,7 +8726,183 @@ mod tests {
 
         let actions = text_panel_header_actions(&manager.text_panels["agent"].config, 4);
         assert_eq!(actions.len(), 1);
-        assert_eq!(actions[0].1, "close");
+        assert_eq!(actions[0].1.id, "close");
+    }
+
+    #[test]
+    fn text_panel_code_blocks_preserve_source_and_refresh_highlights() {
+        let source = "{\n  \"users\": [\n\n    true\n  ]\n}";
+        let block: TextPanelBlock = serde_json::from_value(serde_json::json!({
+            "id": "result",
+            "format": "code",
+            "language": "json",
+            "text": source,
+        }))
+        .unwrap();
+        assert_eq!(
+            block.format,
+            TextPanelBlockFormat::Code(Some("json".to_string()))
+        );
+        let serialized = serde_json::to_value(&block).unwrap();
+        assert_eq!(serialized["format"], "code");
+        assert_eq!(serialized["language"], "json");
+
+        let theme = parse_vscode_theme("themes/red.json").unwrap();
+        let mut highlighter = Highlighter::new(&theme).unwrap();
+        let mut manager = PanelManager::default();
+        manager.create_text_panel("preview".into(), PanelConfig::default());
+        manager.update_text_panel_with_highlighter(
+            "preview",
+            vec![block],
+            &mut highlighter,
+            /*panel_height*/ 20,
+            /*terminal_width*/ 40,
+        );
+        let panel = &manager.text_panels["preview"];
+        let layout = panel.layout(40);
+        let rendered = layout
+            .rendered
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.text.as_str())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>();
+        assert!(rendered.iter().any(|line| line == "  \"users\": ["));
+        assert!(rendered.iter().any(String::is_empty));
+        assert!(layout
+            .rendered
+            .iter()
+            .flat_map(|line| &line.spans)
+            .any(|span| span.syntax_style.is_some()));
+        assert_eq!(panel.copy_all(), source);
+
+        let old_layout = Arc::clone(&layout);
+        let mut replacement = Highlighter::new(&theme).unwrap();
+        manager.rehighlight_text_panels(&mut replacement);
+        assert!(!Arc::ptr_eq(
+            &old_layout,
+            &manager.text_panels["preview"].layout(40)
+        ));
+    }
+
+    #[test]
+    fn text_panel_code_blocks_fall_back_and_reject_invalid_metadata() {
+        for language in [None, Some("unsupported")]
+            .into_iter()
+            .map(|language| language.map(str::to_string))
+        {
+            let mut panel = TextPanel::new("preview".into(), PanelConfig::default());
+            panel.update_blocks(
+                vec![TextPanelBlock {
+                    id: "result".into(),
+                    kind: TextPanelBlockKind::Text,
+                    format: TextPanelBlockFormat::Code(language),
+                    text: "  one\n\n    two".into(),
+                }],
+                /*panel_height*/ 20,
+                /*panel_width*/ 40,
+            );
+            let layout = panel.layout(40);
+            assert!(layout
+                .rendered
+                .iter()
+                .flat_map(|line| &line.spans)
+                .all(|span| span.syntax_style.is_none()));
+            assert_eq!(panel.copy_all(), "  one\n\n    two");
+        }
+        assert!(serde_json::from_value::<TextPanelBlock>(serde_json::json!({
+            "id": "result",
+            "format": "plain",
+            "language": "json",
+            "text": "{}",
+        }))
+        .is_err());
+        assert!(serde_json::from_value::<TextPanelBlock>(serde_json::json!({
+            "id": "result",
+            "format": "code",
+            "text": "{}",
+            "unknown": true,
+        }))
+        .is_err());
+    }
+
+    #[test]
+    fn text_panel_actions_share_shortcuts_footer_and_discovery() {
+        let action = |id: &str, key: &str, enabled: bool| TextPanelHeaderAction {
+            id: id.into(),
+            key: key.into(),
+            label: id.into(),
+            enabled,
+            show_in_header: false,
+            ..TextPanelHeaderAction::default()
+        };
+        let mut manager = PanelManager::default();
+        manager.create_text_panel(
+            "preview".into(),
+            PanelConfig {
+                title: Some("Preview".into()),
+                header_actions: vec![
+                    action("run", "r", true),
+                    action("apply", "a", false),
+                    action("live", "", true),
+                ],
+                ..PanelConfig::default()
+            },
+        );
+        assert_eq!(manager.text_panels["preview"].action_footer_height(), 0);
+        assert!(manager.focus_panel("preview"));
+        let panel = &manager.text_panels["preview"];
+        assert_eq!(panel.action_footer_height(), 1);
+        assert_eq!(
+            manager
+                .action_shortcut_event(&UiAction::new("", "r", "").event().unwrap())
+                .unwrap()
+                .action,
+            "run"
+        );
+        assert!(manager.activate_surface_action("apply").is_none());
+        assert_eq!(
+            manager.activate_surface_action("live").unwrap().action,
+            "live"
+        );
+        assert!(manager
+            .surface_actions()
+            .iter()
+            .any(|action| { action.id == "live" && action.key.is_empty() && action.enabled }));
+
+        manager
+            .text_panels
+            .get_mut("preview")
+            .unwrap()
+            .scrollback
+            .mode = TextPanelScrollbackMode::Visual;
+        assert!(manager
+            .action_shortcut_event(&UiAction::new("", "r", "").event().unwrap())
+            .is_none());
+    }
+
+    #[test]
+    fn legacy_text_panel_actions_keep_clickable_defaults() {
+        let action: TextPanelHeaderAction = serde_json::from_value(serde_json::json!({
+            "id": "close",
+            "label": "Close",
+            "compact_label": "x",
+        }))
+        .unwrap();
+        assert!(action.enabled);
+        assert!(action.show_in_header);
+        assert!(action.key.is_empty());
+        assert!(
+            serde_json::from_value::<TextPanelHeaderAction>(serde_json::json!({
+                "id": "close",
+                "label": "Close",
+                "unknown": true,
+            }))
+            .is_err()
+        );
     }
 
     #[test]
@@ -9218,6 +9812,7 @@ mod tests {
                 id: "close".to_string(),
                 label: "×".to_string(),
                 compact_label: Some("×".to_string()),
+                ..TextPanelHeaderAction::default()
             }],
             ..PanelConfig::default()
         };
