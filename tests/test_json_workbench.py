@@ -315,6 +315,7 @@ class JsonWorkbenchTest(unittest.TestCase):
             apply = plugin.expect_host_request("red/DocumentApply")
             edit = apply["params"]["edits"][0]
             self.assertEqual(apply["params"]["document_id"], "7")
+            self.assertIs(apply["params"]["allow_inactive"], True)
             self.assertEqual(apply["params"]["expected_revision"], "11")
             self.assertEqual(edit["range"]["end"], {"line": 1, "character": 4})
             self.assertEqual(edit["expected_text"], source)
@@ -328,7 +329,12 @@ class JsonWorkbenchTest(unittest.TestCase):
             plugin.command("undo", "JsonUndo")
             undo = plugin.expect_host_request("red/DocumentUndo")
             self.assertEqual(
-                undo["params"], {"document_id": "7", "transaction_id": "tx-1"}
+                undo["params"],
+                {
+                    "document_id": "7",
+                    "allow_inactive": True,
+                    "transaction_id": "tx-1",
+                },
             )
             plugin.reply(undo, {"revision": "13"})
             plugin.expect_status("JSON: undone")

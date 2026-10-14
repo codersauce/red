@@ -246,6 +246,8 @@ package's private storage. The package owns validation and conversion.
   notifications.
 - Opt-in RPC selection snapshots bind the exact selected text and normalized
   range to the same stable document ID and revision as the complete text.
+- Opt-in stable-ID RPC mutations reuse the background transaction path while
+  preserving the active editor view and insert transaction.
 - RPC document watches are capped at two per connection, carry only stable IDs
   and revisions, coalesce rapid changes, and are released on disconnect or
   reload.

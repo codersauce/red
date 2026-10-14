@@ -4624,6 +4624,8 @@ struct RpcDocumentApplyParams {
     path: Option<String>,
     #[serde(default)]
     document_id: Option<String>,
+    #[serde(default)]
+    allow_inactive: bool,
     expected_revision: String,
     #[serde(default = "default_plugin_edit_label")]
     label: String,
@@ -4637,6 +4639,8 @@ struct RpcDocumentUndoParams {
     path: Option<String>,
     #[serde(default)]
     document_id: Option<String>,
+    #[serde(default)]
+    allow_inactive: bool,
     transaction_id: String,
 }
 
@@ -26566,9 +26570,10 @@ impl Editor {
         buffer_manager: &buffer_manager::BufferManager,
         path: Option<&str>,
         document_id: Option<&str>,
+        allow_inactive: bool,
     ) -> std::result::Result<usize, plugin::rpc::RpcErrorObject> {
         let index = Self::rpc_document_index(buffer_manager, path, document_id)?;
-        if document_id.is_some() && index != buffer_manager.active_index() {
+        if document_id.is_some() && !allow_inactive && index != buffer_manager.active_index() {
             return Err(Self::rpc_error(
                 -32003,
                 "document_id is not the current document",
@@ -26710,6 +26715,7 @@ impl Editor {
             &self.buffer_manager,
             params.path.as_deref(),
             params.document_id.as_deref(),
+            params.allow_inactive,
         )?;
         let revision = self.buffer_manager[buffer_index].revision();
         if revision != expected_revision {
@@ -26760,6 +26766,7 @@ impl Editor {
             &self.buffer_manager,
             params.path.as_deref(),
             params.document_id.as_deref(),
+            params.allow_inactive,
         )?;
         let state = self.begin_rpc_document_mutation(buffer_index);
         let result = self
@@ -38325,7 +38332,7 @@ builtin = "rust"
     }
 
     #[tokio::test]
-    async fn rpc_document_identity_prevents_edits_and_undo_after_switching_buffers() {
+    async fn rpc_document_identity_requires_explicit_inactive_mutation_opt_in() {
         let mut editor = test_editor(/*width*/ 80, /*height*/ 24);
         let document_id = editor.current_buffer().id().as_u64().to_string();
         let revision = editor.current_buffer().revision();
@@ -38352,35 +38359,66 @@ builtin = "rust"
         });
         editor
             .buffer_manager
-            .add_buffer(Buffer::new(None, "hello".to_string()));
+            .add_buffer(Buffer::new(None, "query\n".repeat(30)));
+        editor
+            .window_manager
+            .active_window_mut()
+            .unwrap()
+            .buffer_index = 1;
+        editor.mode = Mode::Insert;
+        editor.cx = 1;
+        editor.cy = 1;
+        editor.vtop = 5;
+        editor.sync_to_window();
+        editor.begin_transaction("insert");
+        let active_id = editor.current_buffer().id();
+        let active_view = (editor.cx, editor.cy, editor.vtop);
         assert_eq!(editor.current_buffer().revision(), revision);
-        let rejected = request!(plugin::rpc::DOCUMENT_APPLY_METHOD, apply)
+        let rejected = request!(plugin::rpc::DOCUMENT_APPLY_METHOD, apply.clone())
             .await
             .unwrap_err();
         assert_eq!(rejected.code, -32003);
         assert_eq!(editor.buffer_manager.active_index(), 1);
         assert_eq!(editor.buffer_manager[0].contents(), "hello");
-        assert_eq!(editor.buffer_manager[1].contents(), "hello");
+        assert_eq!(editor.current_buffer().id(), active_id);
         assert!(!editor.current_buffer().is_dirty());
 
-        editor.buffer_manager.set_active_index(0);
-        let applied = request!(plugin::rpc::DOCUMENT_APPLY_METHOD, apply)
+        let mut inactive_apply = apply;
+        inactive_apply["allow_inactive"] = json!(true);
+        let applied = request!(plugin::rpc::DOCUMENT_APPLY_METHOD, inactive_apply)
             .await
             .unwrap();
         let undo = json!({"document_id": document_id, "transaction_id": applied["transaction_id"]});
-        editor.buffer_manager.set_active_index(1);
-        let rejected = request!(plugin::rpc::DOCUMENT_UNDO_METHOD, undo)
+        assert_eq!(editor.buffer_manager.active_index(), 1);
+        assert_eq!(
+            editor.window_manager.active_window().unwrap().buffer_index,
+            1
+        );
+        assert_eq!(editor.current_buffer().id(), active_id);
+        assert_eq!((editor.cx, editor.cy, editor.vtop), active_view);
+        assert!(editor.transaction_active());
+        assert_eq!(editor.buffer_manager[0].contents(), "world");
+
+        let rejected = request!(plugin::rpc::DOCUMENT_UNDO_METHOD, undo.clone())
             .await
             .unwrap_err();
         assert_eq!(rejected.code, -32003);
         assert_eq!(editor.buffer_manager.active_index(), 1);
         assert_eq!(editor.buffer_manager[0].contents(), "world");
-        assert_eq!(editor.current_buffer().contents(), "hello");
-        editor.buffer_manager.set_active_index(0);
-        request!(plugin::rpc::DOCUMENT_UNDO_METHOD, undo)
+        let mut inactive_undo = undo;
+        inactive_undo["allow_inactive"] = json!(true);
+        request!(plugin::rpc::DOCUMENT_UNDO_METHOD, inactive_undo)
             .await
             .unwrap();
-        assert_eq!(editor.current_buffer().contents(), "hello");
+        assert_eq!(editor.buffer_manager.active_index(), 1);
+        assert_eq!(
+            editor.window_manager.active_window().unwrap().buffer_index,
+            1
+        );
+        assert_eq!(editor.current_buffer().id(), active_id);
+        assert_eq!((editor.cx, editor.cy, editor.vtop), active_view);
+        assert!(editor.transaction_active());
+        assert_eq!(editor.buffer_manager[0].contents(), "hello");
     }
 
     #[tokio::test]

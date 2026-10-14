@@ -31,8 +31,8 @@ Open a JSON document and run:
 
 `JsonQuery` pins the current document on its first successful snapshot. Later
 queries keep using that document even after switching buffers. `JsonApply` and
-`JsonUndo` require the pinned source to be active; use `JsonSource` before
-applying or undoing. Close the workbench before starting on another source.
+`JsonUndo` update the pinned source without leaving the query or result
+document. Close the workbench before starting on another source.
 
 `JsonWorkbench` pins the source, opens the preview panel, and creates one
 ordinary unnamed query document. Edit that document with normal Red commands
@@ -59,8 +59,8 @@ stops work and removes both watches before disposing the panel.
 unnamed document with JSON syntax. Each copy is frozen and can be saved or
 closed like any other buffer. Query and result documents remain open if the
 plugin exits or reloads, while the preview panel remains connection-owned.
-`JsonSource` explicitly returns to the pinned source before `JsonApply` or
-`JsonUndo`.
+`JsonSource` explicitly returns to the pinned source when you want to inspect
+it directly.
 
 `JsonQueries` opens a native picker containing configured presets and up to 20
 recent successful queries. Choosing one runs it against the pinned source after

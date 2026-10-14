@@ -1109,6 +1109,7 @@ class JsonWorkbench:
                 "red/DocumentApply",
                 {
                     "document_id": candidate["document_id"],
+                    "allow_inactive": True,
                     "expected_revision": candidate["revision"],
                     "label": "JSON Workbench apply",
                     "edits": [
@@ -1127,6 +1128,7 @@ class JsonWorkbench:
             raise
         self.transaction = {
             "document_id": candidate["document_id"],
+            "allow_inactive": True,
             "transaction_id": applied["transaction_id"],
         }
         self.candidate = None

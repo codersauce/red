@@ -114,7 +114,7 @@ The version 1 initialization parameters are:
 ```json
 {
   "protocol_versions": [1],
-  "red_api_version": "0.24.0",
+  "red_api_version": "0.25.0",
   "plugin_id": "document-tools",
   "host_methods": [
     "red/DocumentCreate",
@@ -455,15 +455,20 @@ ID and resulting revision as decimal strings:
 {"jsonrpc":"2.0","id":"plugin-2","result":{"transaction_id":"...","revision":"43"}}
 ```
 
-For deferred work, request a snapshot with `include_document_id: true` and
-pass its `document_id` with the revision to apply, then with the transaction ID
-to undo. ID-selected mutations currently require that document to be active;
+For deferred work, request a snapshot with `include_document_id: true` and pass
+its `document_id` with the revision to apply, then with the transaction ID to
+undo. By default, ID-selected mutations require that document to be active;
 otherwise they return `-32003` without switching focus or changing contents.
-Select the document again before retrying, and refresh its snapshot if its
-revision has changed. An ID never silently falls back to another open buffer.
-Explicit path mutations preserve the active buffer, view, and user insertion
-transaction when editing another open document. Plugin edits and user edits
-remain separate undo transactions; undo checks include uncommitted user edits.
+An ID never silently falls back to another open buffer.
+
+Host API `0.25.0` lets an ID-selected mutation set `allow_inactive: true`. Red
+then applies or undoes against that open document while preserving the active
+buffer, window focus and view, and user insertion transaction. The option
+only changes stable-ID selection; omitting it preserves the earlier restriction.
+Explicit path mutations retain their existing background behavior. Plugin edits
+and user edits remain separate undo transactions; undo checks include
+uncommitted user edits. Plugins using the option must require
+`red_api = "^0.25.0"` or later.
 During a command, a legacy mutation with neither path nor ID is rejected if
 the current document differs from the one at invocation. The host never
 silently redirects such a request to that earlier document. Outside a pending
@@ -591,6 +596,7 @@ Version 1 deliberately exposes a small set of typed operations:
   updates.
 - Opt-in, revision-bound contiguous selection text and normalized ranges on
   document snapshots.
+- Opt-in stable-ID document mutation that preserves the active editor view.
 - Owner-local, coalesced document invalidations through `red/DocumentWatch`,
   `red/DocumentUnwatch`, and `document/event`.
 - Text-panel create, content replacement, focus, and disposal, with resources

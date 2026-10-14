@@ -1,6 +1,12 @@
 {
-  "api_version": "0.24.0",
+  "api_version": "0.25.0",
   "changes": [
+    {
+      "version": "0.25.0",
+      "kind": "introduced",
+      "symbols": ["red/DocumentApply.allow_inactive", "red/DocumentUndo.allow_inactive"],
+      "migration_note": "docs/RPC_PLUGIN_PROTOCOL.md#document-transactions"
+    },
     {
       "version": "0.24.0",
       "kind": "introduced",

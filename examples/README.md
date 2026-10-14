@@ -23,8 +23,9 @@ declarative command in a standalone, installable package.
 [`rpc-hello-plugin`](rpc-hello-plugin/) demonstrates the baseline JSON-RPC host
 methods while remaining compatible with host API `0.21`.
 [`rpc-json-workbench`](rpc-json-workbench/) is a useful Python and `jq` plugin
-that exercises the `0.24` editable-document, live-watch, and selection-context
-surfaces while previewing, applying, and undoing transformations.
+that exercises the `0.25` editable-document, live-watch, selection-context, and
+background-mutation surfaces while previewing, applying, and undoing
+transformations.
 
 The `.js`, `.ts`, and JavaScript test files in this directory are historical examples
 for the removed Deno plugin runtime. They are retained for migration reference, are
