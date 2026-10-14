@@ -778,6 +778,9 @@ pub struct PluginPermissions {
     /// not invoke a shell when launching plugin processes.
     #[serde(default)]
     pub process: Vec<String>,
+    /// Additional host environment variables inherited by this plugin's RPC process.
+    #[serde(default)]
+    pub inherit_env: Vec<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
@@ -2217,7 +2220,7 @@ fn known_schema_path(path: &[String]) -> bool {
         [field] => known_top_level_field(field),
         ["keys", ..] | ["plugin_config", ..] => true,
         ["plugins", _] => true,
-        ["plugin_permissions", _] | ["plugin_permissions", _, "process"] => true,
+        ["plugin_permissions", _] | ["plugin_permissions", _, "process" | "inherit_env"] => true,
         ["agent", field] => matches!(
             *field,
             "adapter"
@@ -4962,7 +4965,7 @@ theme = "theme/nightfox.json"
     }
 
     #[test]
-    fn plugin_process_permissions_accept_executable_allowlists() {
+    fn plugin_permissions_accept_process_and_environment_allowlists() {
         let config: Config = toml::from_str(
             r#"
 theme = "theme/nightfox.json"
@@ -4971,6 +4974,7 @@ theme = "theme/nightfox.json"
 
 [plugin_permissions.project_search]
 process = ["rg", "/usr/bin/git"]
+inherit_env = ["PROJECT_SEARCH_TOKEN"]
 "#,
         )
         .unwrap();
@@ -4979,6 +4983,7 @@ process = ["rg", "/usr/bin/git"]
             config.plugin_permissions.get("project_search"),
             Some(&PluginPermissions {
                 process: vec!["rg".to_string(), "/usr/bin/git".to_string()],
+                inherit_env: vec!["PROJECT_SEARCH_TOKEN".to_string()],
             })
         );
     }

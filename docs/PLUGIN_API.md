@@ -1,6 +1,6 @@
-# Husk plugin compatibility
+# Plugin compatibility
 
-Red host API version `0.18.0` is defined by
+Red host API version `0.21.0` is defined by
 [`src/plugin/host_api.json`](../src/plugin/host_api.json). That file is the canonical,
 machine-readable list of execute actions, request actions, signatures, and introduction
 versions. Runtime dispatch and the bundled-plugin corpus are checked against it in tests.
@@ -24,10 +24,27 @@ required/optional arity (`HUSK-A0002`) and obvious literal argument types
 annotations use `HUSK-A0004`. `--no-typecheck` is an unsupported development
 escape hatch; compatibility guarantees do not apply while it is enabled.
 
-Host API `0.18.0` retains the complete `0.4.0`, `0.6.0`, `0.7.0`, `0.8.0`, `0.9.0`,
-`0.10.0`, `0.11.0`, `0.12.0`, `0.14.0`, `0.16.0`, and `0.17.0` contracts, so existing
+Host API `0.21.0` retains the complete `0.4.0`, `0.6.0`, `0.7.0`, `0.8.0`, `0.9.0`,
+`0.10.0`, `0.11.0`, `0.12.0`, `0.14.0`, `0.16.0`, `0.17.0`, `0.18.0`, `0.19.0`, and `0.20.0` contracts, so existing
 packages that declare those minors continue to load. New packages should target
-`"red_api_version": "^0.18.0"`.
+`"red_api_version": "^0.21.0"`.
+
+## Standalone JSON-RPC packages
+
+Host API `0.19.0` introduces the package-level `[rpc]` contract for standalone
+plugins written in any language. Red validates and classifies these packages,
+discovers their declared commands, starts the process on first invocation, and
+validates returned command metadata before dispatch. See the
+[JSON-RPC plugin protocol](RPC_PLUGIN_PROTOCOL.md) for the version 1 transport
+profile, command schema, and remaining typed surfaces.
+
+Host API `0.20.0` adds opt-in stable document identities to RPC snapshots and
+document selectors. See [document snapshots](RPC_PLUGIN_PROTOCOL.md#document-snapshots)
+for targeting unnamed buffers and rejecting edits after a buffer switch.
+
+Host API `0.21.0` adds host-rendered RPC pickers with owner-local selection and
+cancellation notifications. See [pickers](RPC_PLUGIN_PROTOCOL.md#pickers) for
+the bounded item schema and cleanup semantics.
 
 ## Native tree panels
 

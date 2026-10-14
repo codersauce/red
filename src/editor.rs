@@ -55,6 +55,7 @@ pub mod render_buffer;
 pub mod rendering;
 #[cfg(test)]
 mod resize_tests;
+mod rpc_commands;
 mod session_manager;
 mod shell_command;
 mod signature_help;
@@ -349,7 +350,7 @@ async fn apply_plugin_manager_operation(
             Ok(PluginManagerOperationOutcome {
                 message: format!("Enabled plugin {id}."),
                 reload_languages: installed.has_languages,
-                restart_plugins: installed.has_husk || installed.has_companion,
+                restart_plugins: installed.restart_required(),
             })
         }
         "disable" => {
@@ -360,7 +361,7 @@ async fn apply_plugin_manager_operation(
             Ok(PluginManagerOperationOutcome {
                 message: format!("Disabled plugin {id}."),
                 reload_languages: installed.has_languages,
-                restart_plugins: installed.has_husk || installed.has_companion,
+                restart_plugins: installed.restart_required(),
             })
         }
         "update" => {
@@ -375,7 +376,7 @@ async fn apply_plugin_manager_operation(
                     format!("Updated {} to {}.", installed.name, installed.version)
                 },
                 reload_languages: installed.has_languages && !installed.has_native_grammars,
-                restart_plugins: installed.has_husk || installed.has_companion,
+                restart_plugins: installed.restart_required(),
             })
         }
         "remove" => {
@@ -386,7 +387,7 @@ async fn apply_plugin_manager_operation(
             Ok(PluginManagerOperationOutcome {
                 message: format!("Removed plugin {id}; its private data was preserved."),
                 reload_languages: installed.has_languages,
-                restart_plugins: installed.has_husk || installed.has_companion,
+                restart_plugins: installed.restart_required(),
             })
         }
         _ => anyhow::bail!("unknown plugin operation `{verb}`"),
@@ -523,7 +524,7 @@ fn plugin_manager_items(
             id: format!("installed:{}", package.id),
             icon: None,
             label: package.name.clone(),
-            kind: Some("Language".to_string()),
+            kind: Some(package.modality_label()),
             annotation: Some(format!(
                 "{} · v{} · {}",
                 if catalog_source {
@@ -1737,6 +1738,23 @@ fn plugin_storage_value<'a>(
     key: &str,
 ) -> Option<&'a serde_json::Value> {
     plugin_storage_value_for_workspace(preferences, plugin, key, &get_workspace_path())
+}
+
+fn delete_plugin_storage_value(
+    preferences: &mut PreferencesStore,
+    plugin: &str,
+    key: &str,
+) -> anyhow::Result<()> {
+    let scoped_key = scoped_plugin_storage_key(plugin, key);
+    if plugin == "session_restore"
+        && key == "latest"
+        && preferences.plugin_storage(plugin, key).is_some()
+    {
+        preferences.set_plugin_storage(plugin, &scoped_key, Value::Null)
+    } else {
+        preferences.remove_plugin_storage(plugin, &scoped_key)?;
+        Ok(())
+    }
 }
 
 fn snake_case_key(key: &str) -> String {
@@ -3565,6 +3583,9 @@ pub struct Editor {
     /// Picker callbacks may enqueue navigation that must commit before the next input event.
     service_background_before_next_input: bool,
 
+    /// Paused action tails belonging to asynchronous RPC commands.
+    rpc_commands: rpc_commands::RpcCommands,
+
     /// Rows changed by the most recent detached frame, reused for protocol deltas.
     last_detached_changed_rows: Vec<usize>,
 
@@ -4091,6 +4112,15 @@ impl DetachedEditorCore {
         self.stopped
     }
 
+    /// Observes command settlement without timing assumptions in subprocess tests.
+    #[doc(hidden)]
+    pub fn test_rpc_command_pending(&self, owner: &str) -> bool {
+        self.editor
+            .plugin_registry
+            .rpc_command_document(owner)
+            .is_some()
+    }
+
     pub fn persist(&mut self) {
         self.editor.persist_session_snapshot(/*force*/ true);
     }
@@ -4550,6 +4580,184 @@ struct PluginDocumentTransaction {
     expected_revision: u64,
     label: String,
     edits: Vec<plugin::DocumentEdit>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RpcDocumentSnapshotParams {
+    #[serde(default)]
+    path: Option<String>,
+    #[serde(default)]
+    document_id: Option<String>,
+    #[serde(default)]
+    include_document_id: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RpcDocumentApplyParams {
+    #[serde(default)]
+    path: Option<String>,
+    #[serde(default)]
+    document_id: Option<String>,
+    expected_revision: String,
+    #[serde(default = "default_plugin_edit_label")]
+    label: String,
+    edits: Vec<plugin::DocumentEdit>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RpcDocumentUndoParams {
+    #[serde(default)]
+    path: Option<String>,
+    #[serde(default)]
+    document_id: Option<String>,
+    transaction_id: String,
+}
+
+struct RpcDocumentMutationState {
+    index: usize,
+    view: (usize, usize, usize, usize, usize),
+    resume_insert: bool,
+    terminal_output: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RpcTextPanelCreateParams {
+    id: String,
+    #[serde(default)]
+    side: plugin::PanelSide,
+    #[serde(default = "default_rpc_text_panel_width")]
+    width: usize,
+    #[serde(default)]
+    title: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RpcTextPanelSetContentParams {
+    id: String,
+    blocks: Vec<plugin::TextPanelBlock>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RpcTextPanelParams {
+    id: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RpcStatuslineSetParams {
+    text: String,
+    #[serde(default)]
+    side: plugin::rpc::RpcStatuslineSide,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RpcPickerOpenParams {
+    id: String,
+    #[serde(default)]
+    title: Option<String>,
+    items: Vec<RpcPickerItem>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RpcPickerItem {
+    id: String,
+    label: String,
+    #[serde(default)]
+    detail: Option<String>,
+    #[serde(default)]
+    data: Value,
+}
+
+impl From<RpcPickerItem> for PickerItem {
+    fn from(item: RpcPickerItem) -> Self {
+        Self {
+            id: item.id,
+            icon: None,
+            label: item.label,
+            kind: None,
+            annotation: None,
+            detail: item.detail,
+            data: item.data,
+            matches: Vec::new(),
+            detail_matches: Vec::new(),
+            preview: None,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RpcEmptyParams {}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RpcStorageKeyParams {
+    key: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RpcStorageSetParams {
+    key: String,
+    value: Value,
+}
+
+const RPC_STORAGE_MAX_KEY_BYTES: usize = 128;
+const RPC_PLUGIN_VALUE_MAX_BYTES: usize = 1024 * 1024;
+const MAX_RPC_PICKER_ITEMS: usize = 4_096;
+
+fn default_rpc_text_panel_width() -> usize {
+    30
+}
+
+fn default_plugin_edit_label() -> String {
+    "plugin edit".to_string()
+}
+
+struct EditorRpcHost<'a> {
+    editor: &'a mut Editor,
+    render_buffer: &'a mut RenderBuffer,
+    runtime: &'a mut Runtime,
+}
+
+#[async_trait::async_trait]
+impl plugin::RpcHost for EditorRpcHost<'_> {
+    async fn respond(
+        &mut self,
+        owner: &str,
+        incoming: plugin::rpc::RpcIncoming,
+    ) -> anyhow::Result<()> {
+        match incoming {
+            plugin::rpc::RpcIncoming::Request(request) => {
+                let result = self
+                    .editor
+                    .rpc_host_request(
+                        self.render_buffer,
+                        self.runtime,
+                        owner,
+                        &request.method,
+                        &request.params,
+                    )
+                    .await;
+                request.respond(result).await
+            }
+            plugin::rpc::RpcIncoming::Notification(notification) => {
+                log!(
+                    "Ignoring unsupported RPC plugin notification `{}`",
+                    notification.method
+                );
+                Ok(())
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -5259,6 +5467,7 @@ impl Editor {
             suppress_reactivation_click: false,
             render_generation: 0,
             service_background_before_next_input: false,
+            rpc_commands: rpc_commands::RpcCommands::default(),
             last_detached_changed_rows: Vec::new(),
             last_rendered_window: None,
             last_rendered_viewport: None,
@@ -10570,6 +10779,9 @@ impl Editor {
         buffer: &mut RenderBuffer,
         runtime: &mut Runtime,
     ) -> anyhow::Result<()> {
+        self.plugin_registry.poll_rpc_lifecycle(runtime).await;
+        self.plugin_registry.poll_rpc_commands(runtime).await;
+        self.service_rpc_host_requests(buffer, runtime).await;
         self.service_mouse_selection(buffer, runtime).await?;
         self.service_open_file_changes(buffer, runtime).await?;
         if self.agent_lsp.has_work() {
@@ -10669,6 +10881,7 @@ impl Editor {
                 .await?;
         }
         self.plugin_registry.poll_hot_reload(runtime).await;
+        self.render_dirty_rpc_statusline(buffer)?;
 
         for _ in 0..AGENT_EVENTS_PER_TICK {
             let Some(event) = self
@@ -12810,10 +13023,12 @@ impl Editor {
                     });
                 }
                 PluginRequest::DocumentSnapshot { path, request_id } => {
-                    let payload = self.plugin_document_snapshot(path.as_deref()).map_or_else(
-                        |error| json!({ "ok": false, "error": error.to_string() }),
-                        |snapshot| json!({ "ok": true, "document": snapshot }),
-                    );
+                    let payload =
+                        Self::plugin_document_snapshot(&self.buffer_manager, path.as_deref())
+                            .map_or_else(
+                                |error| json!({ "ok": false, "error": error.to_string() }),
+                                |snapshot| json!({ "ok": true, "document": snapshot }),
+                            );
                     self.plugin_registry
                         .resolve_request(runtime, request_id, payload)
                         .await?;
@@ -12903,6 +13118,7 @@ impl Editor {
         }
         needs_render |= self.service_shell_commands(runtime).await;
         needs_render |= self.service_red_update();
+        self.resume_rpc_actions(buffer, runtime).await?;
         self.sync_persistent_notifications();
         needs_render |= self.notification_presentation_changed();
         let background_render = if needs_render {
@@ -12949,6 +13165,7 @@ impl Editor {
         runtime: &mut Runtime,
         render_mode: EventRenderMode,
     ) -> anyhow::Result<ProcessedEvent> {
+        self.rpc_commands.interrupt(&ev);
         if matches!(
             ev,
             Event::Key(KeyEvent {
@@ -13041,7 +13258,7 @@ impl Editor {
         let mut action = self.handle_event_with_runtime(&ev, Some(runtime))?;
         if started_with_panel_focus {
             let pending_commands = action.as_ref().map_or_else(Vec::new, |action| {
-                Self::pending_panel_plugin_commands(action, runtime)
+                self.pending_panel_plugin_commands(action, runtime)
             });
             if !pending_commands.is_empty() {
                 for command in pending_commands {
@@ -13834,20 +14051,8 @@ impl Editor {
                 quit
             }
             KeyAction::Multiple(actions) => {
-                let mut quit = false;
-                for action in actions {
-                    let recipe_token = self.pending_semantic_recipe_token();
-                    let action_quit = self.execute(action, buffer, runtime).await?;
-                    self.append_pending_semantic_action(recipe_token, action);
-                    if action_quit {
-                        quit = true;
-                        break;
-                    }
-                    if self.replay_is_cancelled() {
-                        break;
-                    }
-                }
-                quit
+                self.execute_key_actions(ev, actions, buffer, runtime)
+                    .await?
             }
             KeyAction::Nested(actions) => {
                 log!(
@@ -13866,18 +14071,8 @@ impl Editor {
                 false
             }
             KeyAction::Repeating(times, action) => {
-                self.repeater = None;
-                let mut quit = false;
-                for _ in 0..*times as usize {
-                    if self.handle_key_action(ev, action, buffer, runtime).await? {
-                        quit = true;
-                        break;
-                    }
-                    if self.replay_checkpoint(buffer, runtime).await? {
-                        break;
-                    }
-                }
-                quit
+                self.repeat_key_action(ev, *times, action, buffer, runtime)
+                    .await?
             }
         };
 
@@ -13896,80 +14091,84 @@ impl Editor {
                 return Ok(());
             };
 
+            self.replay_semantic_change(change, buffer, runtime).await
+        })
+    }
+
+    fn replay_semantic_change<'a>(
+        &'a mut self,
+        change: SemanticChange,
+        buffer: &'a mut RenderBuffer,
+        runtime: &'a mut Runtime,
+    ) -> BoxFuture<'a, anyhow::Result<()>> {
+        Box::pin(async move {
+            let steps = match change {
+                SemanticChange::Input(events) => {
+                    events.into_iter().map(SemanticChangeStep::Input).collect()
+                }
+                SemanticChange::Recipe(steps) => steps,
+            };
             self.pending_semantic_change = None;
             self.replaying_semantic_change = true;
-            let result = async {
-                match change {
-                    SemanticChange::Input(events) => {
-                        for event in &events {
-                            if let Some(action) =
-                                self.handle_event_with_runtime(event, Some(runtime))?
-                            {
-                                if self
-                                    .handle_resolved_key_action(event, &action, buffer, runtime)
-                                    .await?
-                                {
-                                    anyhow::bail!("repeated change attempted to quit the editor");
-                                }
-                            }
-                            if self.replay_checkpoint(buffer, runtime).await? {
-                                break;
-                            }
-                        }
-                    }
-                    SemanticChange::Recipe(steps) => {
-                        for step in &steps {
-                            match step {
-                                SemanticChangeStep::Input(event) => {
-                                    if let Some(action) =
-                                        self.handle_event_with_runtime(event, Some(runtime))?
-                                    {
-                                        if self
-                                            .handle_resolved_key_action(
-                                                event, &action, buffer, runtime,
-                                            )
-                                            .await?
-                                        {
-                                            anyhow::bail!(
-                                                "repeated change attempted to quit the editor"
-                                            );
-                                        }
-                                    }
-                                }
-                                SemanticChangeStep::Action(action) => {
-                                    if self.execute(action, buffer, runtime).await? {
-                                        anyhow::bail!(
-                                            "repeated change attempted to quit the editor"
-                                        );
-                                    }
-                                }
-                                SemanticChangeStep::VisualLineShift {
-                                    direction,
-                                    line_count,
-                                    count,
-                                } => {
-                                    self.replay_visual_line_shift(
-                                        *direction,
-                                        *line_count,
-                                        *count,
-                                        buffer,
-                                        runtime,
-                                    )
-                                    .await?;
-                                }
-                            }
-                            if self.replay_checkpoint(buffer, runtime).await? {
-                                break;
-                            }
-                        }
-                    }
-                }
-                Ok(())
-            }
-            .await;
+            let result = self.replay_semantic_steps(&steps, buffer, runtime).await;
             self.replaying_semantic_change = false;
             result
         })
+    }
+
+    async fn replay_semantic_steps(
+        &mut self,
+        steps: &[SemanticChangeStep],
+        buffer: &mut RenderBuffer,
+        runtime: &mut Runtime,
+    ) -> anyhow::Result<()> {
+        for (index, step) in steps.iter().enumerate() {
+            let checkpoint = self.rpc_command_checkpoint();
+            anyhow::ensure!(
+                !self.execute_semantic_step(step, buffer, runtime).await?,
+                "repeated change attempted to quit the editor"
+            );
+            if let Some(command) = self.rpc_command_started_since(checkpoint) {
+                self.defer_rpc_action(
+                    command,
+                    rpc_commands::RpcContinuation::Semantic(SemanticChange::Recipe(
+                        steps[index + 1..].to_vec(),
+                    )),
+                );
+                break;
+            }
+            if self.replay_checkpoint(buffer, runtime).await? {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    async fn execute_semantic_step(
+        &mut self,
+        step: &SemanticChangeStep,
+        buffer: &mut RenderBuffer,
+        runtime: &mut Runtime,
+    ) -> anyhow::Result<bool> {
+        match step {
+            SemanticChangeStep::Input(event) => {
+                let Some(action) = self.handle_event_with_runtime(event, Some(runtime))? else {
+                    return Ok(false);
+                };
+                self.handle_resolved_key_action(event, &action, buffer, runtime)
+                    .await
+            }
+            SemanticChangeStep::Action(action) => self.execute(action, buffer, runtime).await,
+            SemanticChangeStep::VisualLineShift {
+                direction,
+                line_count,
+                count,
+            } => {
+                self.replay_visual_line_shift(*direction, *line_count, *count, buffer, runtime)
+                    .await?;
+                Ok(false)
+            }
+        }
     }
 
     #[inline(never)]
@@ -14045,8 +14244,17 @@ impl Editor {
         }
 
         self.macro_instructions_remaining = MACRO_MAX_REPLAY_EVENTS;
+        self.drain_macro_replay(buffer, runtime).await
+    }
+
+    async fn drain_macro_replay(
+        &mut self,
+        buffer: &mut RenderBuffer,
+        runtime: &mut Runtime,
+    ) -> anyhow::Result<()> {
         let result = async {
             while let Some(replay) = self.macro_replay_queue.pop_front() {
+                let checkpoint = self.rpc_command_checkpoint();
                 if self.macro_instructions_remaining == 0 {
                     self.set_legacy_message(Some(format!(
                         "macro instruction limit ({MACRO_MAX_REPLAY_EVENTS}) reached"
@@ -14065,6 +14273,10 @@ impl Editor {
                     {
                         anyhow::bail!("macro attempted to quit the editor");
                     }
+                }
+                if let Some(command) = self.rpc_command_started_since(checkpoint) {
+                    self.defer_rpc_action(command, rpc_commands::RpcContinuation::Macro);
+                    break;
                 }
                 if self.replay_checkpoint(buffer, runtime).await? {
                     break;
@@ -16383,41 +16595,54 @@ impl Editor {
         }
     }
 
-    fn pending_panel_plugin_commands(action: &KeyAction, runtime: &Runtime) -> Vec<String> {
+    fn pending_panel_plugin_commands(&self, action: &KeyAction, runtime: &Runtime) -> Vec<String> {
         let mut commands = Vec::new();
-        Self::collect_pending_panel_plugin_commands(action, runtime, &mut commands);
+        self.collect_pending_panel_plugin_commands(action, runtime, &mut commands);
         commands
     }
 
     fn collect_pending_panel_plugin_commands(
+        &self,
         action: &KeyAction,
         runtime: &Runtime,
         commands: &mut Vec<String>,
     ) {
         match action {
             KeyAction::Single(Action::PluginCommand(command)) => {
-                if runtime.command_scope(command).is_none() && !commands.contains(command) {
-                    commands.push(command.clone());
-                }
+                self.push_pending_panel_plugin_command(runtime, commands, command);
             }
             KeyAction::Multiple(actions) => {
                 for action in actions {
                     if let Action::PluginCommand(command) = action {
-                        if runtime.command_scope(command).is_none() && !commands.contains(command) {
-                            commands.push(command.clone());
-                        }
+                        self.push_pending_panel_plugin_command(runtime, commands, command);
                     }
                 }
             }
             KeyAction::Repeating(_, action) => {
-                Self::collect_pending_panel_plugin_commands(action, runtime, commands);
+                self.collect_pending_panel_plugin_commands(action, runtime, commands);
             }
             KeyAction::Nested(actions) => {
                 for action in actions.values() {
-                    Self::collect_pending_panel_plugin_commands(action, runtime, commands);
+                    self.collect_pending_panel_plugin_commands(action, runtime, commands);
                 }
             }
             KeyAction::None | KeyAction::Single(_) => {}
+        }
+    }
+
+    fn push_pending_panel_plugin_command(
+        &self,
+        runtime: &Runtime,
+        commands: &mut Vec<String>,
+        command: &str,
+    ) {
+        if self
+            .plugin_registry
+            .command_scope(runtime, command)
+            .is_none()
+            && !commands.iter().any(|pending| pending == command)
+        {
+            commands.push(command.to_string());
         }
     }
 
@@ -16465,10 +16690,12 @@ impl Editor {
             | Action::TogglePaneZoom
             | Action::OnlyWindow => true,
             Action::PluginCommand(command) => runtime.is_some_and(|runtime| {
-                runtime.command_scope(command).map_or_else(
-                    || self.plugin_registry.has_pending_command(command),
-                    |scope| scope == plugin::CommandScope::Global,
-                )
+                self.plugin_registry
+                    .command_scope(runtime, command)
+                    .map_or_else(
+                        || self.plugin_registry.has_pending_command(command),
+                        |scope| scope == plugin::CommandScope::Global,
+                    )
             }),
             _ => false,
         }
@@ -17074,7 +17301,7 @@ impl Editor {
         }
 
         let Some(parsed) = parsed else {
-            if runtime.command_plugin(cmd).is_some() {
+            if self.plugin_registry.has_command(runtime, cmd) {
                 return vec![Action::PluginCommand(cmd.to_string())];
             }
             self.set_routine_error(Some(format!("unknown command {cmd:?}")));
@@ -17873,7 +18100,7 @@ impl Editor {
             .as_ref()
             .and_then(|dialog| dialog.picker_handle())
         {
-            runtime.release_picker(handle);
+            self.plugin_registry.release_picker(runtime, handle);
         }
         if let Some(handle) = self
             .current_dialog
@@ -17937,14 +18164,14 @@ impl Editor {
                 KeyCode::Tab => {
                     self.reset_command_history_navigation();
                     let commands = runtime
-                        .map(Runtime::registered_commands)
+                        .map(|runtime| self.plugin_registry.registered_commands(runtime))
                         .unwrap_or_default();
                     self.complete_command_line(CompletionDirection::Next, &commands);
                 }
                 KeyCode::BackTab => {
                     self.reset_command_history_navigation();
                     let commands = runtime
-                        .map(Runtime::registered_commands)
+                        .map(|runtime| self.plugin_registry.registered_commands(runtime))
                         .unwrap_or_default();
                     self.complete_command_line(CompletionDirection::Previous, &commands);
                 }
@@ -20436,7 +20663,8 @@ impl Editor {
                     .and_then(|commands| commands.cancel.clone());
                 if let Some(command) = scratch_command {
                     add_to_history = false;
-                    self.plugin_registry.execute(runtime, &command).await?;
+                    self.execute_plugin_command(buffer, runtime, &command)
+                        .await?;
                 } else {
                     if *force {
                         return Ok(true);
@@ -21959,16 +22187,7 @@ impl Editor {
                     self.record_command_history(cmd);
                     false
                 };
-                let result: anyhow::Result<bool> = async {
-                    for action in actions {
-                        self.set_legacy_message(None);
-                        if self.execute(&action, buffer, runtime).await? {
-                            return Ok(true);
-                        }
-                    }
-                    Ok(false)
-                }
-                .await;
+                let result = self.execute_command_actions(actions, buffer, runtime).await;
                 if deferred_history && !matches!(result, Ok(true)) {
                     self.flush_command_history();
                 }
@@ -22003,7 +22222,7 @@ impl Editor {
                     self.current_dialog = Some(Box::new(TutorialDemoPanel::new(self, kind)));
                     self.render(buffer)?;
                 } else {
-                    self.plugin_registry.execute(runtime, cmd).await?;
+                    self.execute_plugin_command(buffer, runtime, cmd).await?;
                 }
             }
             Action::GoToLine(line) => {
@@ -22970,8 +23189,8 @@ impl Editor {
                 self.render(buffer)?;
             }
             Action::CommandPalette => {
-                let entries =
-                    command_palette::entries(&self.config.keys, &runtime.registered_commands());
+                let commands = self.plugin_registry.registered_commands(runtime);
+                let entries = command_palette::entries(&self.config.keys, &commands);
                 let actions = entries
                     .iter()
                     .map(|entry| (entry.id.clone(), entry.action.clone()))
@@ -24160,7 +24379,7 @@ impl Editor {
             .and_then(|dialog| dialog.picker_handle());
         if picker_handle_before_action != picker_handle_after_action {
             if let Some(handle) = picker_handle_before_action {
-                runtime.release_picker(handle);
+                self.plugin_registry.release_picker(runtime, handle);
             }
         }
         let composer_handle_after_action = self
@@ -25733,15 +25952,18 @@ impl Editor {
         self.ensure_buffer_lsp_opened(buffer_index).await
     }
 
-    fn plugin_document_index(&self, path: Option<&str>) -> anyhow::Result<usize> {
+    fn plugin_document_index(
+        buffer_manager: &buffer_manager::BufferManager,
+        path: Option<&str>,
+    ) -> anyhow::Result<usize> {
         let Some(path) = path else {
-            return Ok(self.buffer_manager.active_index());
+            return Ok(buffer_manager.active_index());
         };
         let requested = Path::new(path)
             .absolutize()
             .map(|path| path.into_owned())
             .unwrap_or_else(|_| PathBuf::from(path));
-        self.buffer_manager
+        buffer_manager
             .iter()
             .position(|buffer| {
                 buffer.file.as_deref().is_some_and(|candidate| {
@@ -25756,12 +25978,11 @@ impl Editor {
     }
 
     fn plugin_document_snapshot(
-        &self,
+        buffer_manager: &buffer_manager::BufferManager,
         path: Option<&str>,
     ) -> anyhow::Result<plugin::DocumentSnapshot> {
-        let buffer_index = self.plugin_document_index(path)?;
-        let buffer = self
-            .buffer_manager
+        let buffer_index = Self::plugin_document_index(buffer_manager, path)?;
+        let buffer = buffer_manager
             .get(buffer_index)
             .ok_or_else(|| anyhow::anyhow!("document buffer disappeared"))?;
         Ok(plugin::DocumentSnapshot {
@@ -25770,6 +25991,611 @@ impl Editor {
             revision: buffer.revision(),
             text: buffer.contents(),
         })
+    }
+
+    fn rpc_params<T: serde::de::DeserializeOwned>(
+        method: &str,
+        params: &Value,
+    ) -> std::result::Result<T, plugin::rpc::RpcErrorObject> {
+        serde_json::from_value(params.clone()).map_err(|error| plugin::rpc::RpcErrorObject {
+            code: -32602,
+            message: format!("invalid {method} params: {error}"),
+            data: None,
+        })
+    }
+
+    fn rpc_error(code: i64, error: impl std::fmt::Display) -> plugin::rpc::RpcErrorObject {
+        plugin::rpc::RpcErrorObject {
+            code,
+            message: error.to_string(),
+            data: None,
+        }
+    }
+
+    fn validate_rpc_resource_id(
+        method: &str,
+        id: &str,
+    ) -> std::result::Result<(), plugin::rpc::RpcErrorObject> {
+        if id.trim().is_empty() || id.len() > 128 {
+            return Err(Self::rpc_error(
+                -32602,
+                format!("{method} id must contain 1 to 128 UTF-8 bytes"),
+            ));
+        }
+        Ok(())
+    }
+
+    fn rpc_text_panel_host_id(
+        &self,
+        owner: &str,
+        method: &str,
+        id: &str,
+    ) -> std::result::Result<String, plugin::rpc::RpcErrorObject> {
+        Self::validate_rpc_resource_id(method, id)?;
+        self.plugin_registry
+            .rpc_text_panel(owner, id)
+            .ok_or_else(|| Self::rpc_text_panel_unavailable(id))
+    }
+
+    fn rpc_text_panel_unavailable(id: &str) -> plugin::rpc::RpcErrorObject {
+        Self::rpc_error(-32004, format!("text panel is unavailable: {id}"))
+    }
+
+    fn finish_rpc_text_panel_change(
+        &mut self,
+        render_buffer: &mut RenderBuffer,
+    ) -> std::result::Result<Value, plugin::rpc::RpcErrorObject> {
+        self.render(render_buffer).map_err(|error| {
+            Self::rpc_error(-32603, format!("failed to render text panel: {error}"))
+        })?;
+        Ok(Value::Null)
+    }
+
+    fn rpc_text_panel_create_request(
+        &mut self,
+        render_buffer: &mut RenderBuffer,
+        owner: &str,
+        params: RpcTextPanelCreateParams,
+    ) -> std::result::Result<Value, plugin::rpc::RpcErrorObject> {
+        Self::validate_rpc_resource_id(plugin::rpc::TEXT_PANEL_CREATE_METHOD, &params.id)?;
+        if params.width == 0 {
+            return Err(Self::rpc_error(
+                -32602,
+                "red/TextPanelCreate width must be greater than zero",
+            ));
+        }
+        let host_id = self
+            .plugin_registry
+            .register_rpc_text_panel(owner, &params.id)
+            .map_err(|error| Self::rpc_error(-32004, error))?;
+        self.clear_replaced_panel_zoom(&host_id);
+        self.panel_manager.create_text_panel(
+            host_id,
+            plugin::PanelConfig {
+                side: params.side,
+                width: params.width,
+                title: params.title,
+                ..plugin::PanelConfig::default()
+            },
+        );
+        self.apply_panel_layout();
+        self.finish_rpc_text_panel_change(render_buffer)
+    }
+
+    fn rpc_text_panel_set_content_request(
+        &mut self,
+        render_buffer: &mut RenderBuffer,
+        owner: &str,
+        params: RpcTextPanelSetContentParams,
+    ) -> std::result::Result<Value, plugin::rpc::RpcErrorObject> {
+        let host_id = self.rpc_text_panel_host_id(
+            owner,
+            plugin::rpc::TEXT_PANEL_SET_CONTENT_METHOD,
+            &params.id,
+        )?;
+        if self.panel_manager.panel_layout(&host_id).is_none() {
+            return Err(Self::rpc_text_panel_unavailable(&params.id));
+        }
+        self.panel_manager.update_text_panel(
+            &host_id,
+            params.blocks,
+            usize::from(self.size.1.saturating_sub(2)),
+            usize::from(self.size.0),
+        );
+        self.finish_rpc_text_panel_change(render_buffer)
+    }
+
+    fn rpc_text_panel_focus_request(
+        &mut self,
+        render_buffer: &mut RenderBuffer,
+        owner: &str,
+        params: RpcTextPanelParams,
+    ) -> std::result::Result<Value, plugin::rpc::RpcErrorObject> {
+        let host_id =
+            self.rpc_text_panel_host_id(owner, plugin::rpc::TEXT_PANEL_FOCUS_METHOD, &params.id)?;
+        if !self.panel_manager.focus_panel(&host_id) {
+            return Err(Self::rpc_text_panel_unavailable(&params.id));
+        }
+        self.finish_rpc_text_panel_change(render_buffer)
+    }
+
+    fn rpc_text_panel_dispose_request(
+        &mut self,
+        render_buffer: &mut RenderBuffer,
+        owner: &str,
+        params: RpcTextPanelParams,
+    ) -> std::result::Result<Value, plugin::rpc::RpcErrorObject> {
+        Self::validate_rpc_resource_id(plugin::rpc::TEXT_PANEL_DISPOSE_METHOD, &params.id)?;
+        let host_id = self
+            .plugin_registry
+            .take_rpc_text_panel(owner, &params.id)
+            .ok_or_else(|| Self::rpc_text_panel_unavailable(&params.id))?;
+        self.clear_replaced_panel_zoom(&host_id);
+        self.panel_manager.close_panel(&host_id);
+        self.apply_panel_layout();
+        self.finish_rpc_text_panel_change(render_buffer)
+    }
+
+    fn rpc_presentation_request(
+        &mut self,
+        render_buffer: &mut RenderBuffer,
+        runtime: &mut Runtime,
+        owner: &str,
+        method: &str,
+        params: &Value,
+    ) -> std::result::Result<Value, plugin::rpc::RpcErrorObject> {
+        match method {
+            plugin::rpc::PICKER_OPEN_METHOD => {
+                self.rpc_picker_open_request(render_buffer, runtime, owner, params)
+            }
+            plugin::rpc::TEXT_PANEL_CREATE_METHOD => self.rpc_text_panel_create_request(
+                render_buffer,
+                owner,
+                Self::rpc_params(method, params)?,
+            ),
+            plugin::rpc::TEXT_PANEL_SET_CONTENT_METHOD => self.rpc_text_panel_set_content_request(
+                render_buffer,
+                owner,
+                Self::rpc_params(method, params)?,
+            ),
+            plugin::rpc::TEXT_PANEL_FOCUS_METHOD => self.rpc_text_panel_focus_request(
+                render_buffer,
+                owner,
+                Self::rpc_params(method, params)?,
+            ),
+            plugin::rpc::TEXT_PANEL_DISPOSE_METHOD => self.rpc_text_panel_dispose_request(
+                render_buffer,
+                owner,
+                Self::rpc_params(method, params)?,
+            ),
+            _ => Err(plugin::rpc::RpcErrorObject::method_not_found(method)),
+        }
+    }
+
+    fn rpc_statusline_set_request(
+        &mut self,
+        owner: &str,
+        params: &Value,
+    ) -> std::result::Result<Value, plugin::rpc::RpcErrorObject> {
+        const MAX_TEXT_BYTES: usize = 128;
+
+        let params: RpcStatuslineSetParams =
+            Self::rpc_params(plugin::rpc::STATUSLINE_SET_METHOD, params)?;
+        if params.text.trim().is_empty() {
+            return Err(Self::rpc_error(
+                -32602,
+                "red/StatuslineSet text must contain a non-whitespace character",
+            ));
+        }
+        if params.text.len() > MAX_TEXT_BYTES {
+            return Err(Self::rpc_error(
+                -32602,
+                format!("red/StatuslineSet text may not exceed {MAX_TEXT_BYTES} UTF-8 bytes"),
+            ));
+        }
+        if params.text.chars().any(char::is_control) {
+            return Err(Self::rpc_error(
+                -32602,
+                "red/StatuslineSet text may not contain control characters",
+            ));
+        }
+        self.plugin_registry
+            .set_rpc_statusline(owner, params.side, params.text);
+        Ok(Value::Null)
+    }
+
+    fn rpc_statusline_clear_request(
+        &mut self,
+        owner: &str,
+        params: &Value,
+    ) -> std::result::Result<Value, plugin::rpc::RpcErrorObject> {
+        let _: RpcEmptyParams = Self::rpc_params(plugin::rpc::STATUSLINE_CLEAR_METHOD, params)?;
+        self.plugin_registry.clear_rpc_statusline(owner);
+        Ok(Value::Null)
+    }
+
+    fn rpc_picker_open_request(
+        &mut self,
+        render_buffer: &mut RenderBuffer,
+        runtime: &mut Runtime,
+        owner: &str,
+        params: &Value,
+    ) -> std::result::Result<Value, plugin::rpc::RpcErrorObject> {
+        let params: RpcPickerOpenParams =
+            Self::rpc_params(plugin::rpc::PICKER_OPEN_METHOD, params)?;
+        Self::validate_rpc_resource_id(plugin::rpc::PICKER_OPEN_METHOD, &params.id)?;
+        if params.items.len() > MAX_RPC_PICKER_ITEMS {
+            return Err(Self::rpc_error(
+                -32602,
+                format!("red/PickerOpen may contain at most {MAX_RPC_PICKER_ITEMS} items"),
+            ));
+        }
+
+        self.release_current_dialog_callbacks(runtime);
+        let handle = self.plugin_registry.register_rpc_picker(owner, params.id);
+        self.current_dialog = Some(Box::new(Picker::new_callback(
+            params.title,
+            self,
+            params.items.into_iter().map(Into::into).collect(),
+            handle,
+            PickerOptions::default(),
+        )));
+        self.render(render_buffer).map_err(|error| {
+            Self::rpc_error(-32603, format!("failed to render picker: {error}"))
+        })?;
+        Ok(Value::Null)
+    }
+
+    fn validate_rpc_storage_key(
+        method: &str,
+        key: &str,
+    ) -> std::result::Result<(), plugin::rpc::RpcErrorObject> {
+        if key.is_empty()
+            || key.len() > RPC_STORAGE_MAX_KEY_BYTES
+            || key.contains(':')
+            || key.chars().any(char::is_control)
+        {
+            return Err(Self::rpc_error(
+                -32602,
+                format!(
+                    "{method} key must contain 1 to {RPC_STORAGE_MAX_KEY_BYTES} UTF-8 bytes without `:` or control characters"
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_rpc_storage_owner(
+        method: &str,
+        owner: &str,
+    ) -> std::result::Result<(), plugin::rpc::RpcErrorObject> {
+        if owner.contains(':') {
+            return Err(Self::rpc_error(
+                -32005,
+                format!("{method} is unavailable for a plugin owner containing `:`"),
+            ));
+        }
+        Ok(())
+    }
+
+    fn rpc_config_get_request(
+        &self,
+        owner: &str,
+        params: &Value,
+    ) -> std::result::Result<Value, plugin::rpc::RpcErrorObject> {
+        let _: RpcEmptyParams = Self::rpc_params(plugin::rpc::CONFIG_GET_METHOD, params)?;
+        let value = self
+            .config
+            .plugin_config
+            .get(owner)
+            .cloned()
+            .unwrap_or(Value::Null);
+        let value_bytes = serde_json::to_vec(&value)
+            .map_err(|error| Self::rpc_error(-32603, error))?
+            .len();
+        if value_bytes > RPC_PLUGIN_VALUE_MAX_BYTES {
+            return Err(Self::rpc_error(
+                -32005,
+                format!(
+                    "plugin configuration exceeds {RPC_PLUGIN_VALUE_MAX_BYTES} serialized bytes"
+                ),
+            ));
+        }
+        Ok(value)
+    }
+
+    fn rpc_storage_request(
+        &mut self,
+        owner: &str,
+        method: &str,
+        params: &Value,
+    ) -> std::result::Result<Value, plugin::rpc::RpcErrorObject> {
+        Self::validate_rpc_storage_owner(method, owner)?;
+        match method {
+            plugin::rpc::STORAGE_GET_METHOD => {
+                let params: RpcStorageKeyParams = Self::rpc_params(method, params)?;
+                Self::validate_rpc_storage_key(method, &params.key)?;
+                let value = plugin_storage_value(&self.preferences, owner, &params.key)
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                let value_bytes = serde_json::to_vec(&value)
+                    .map_err(|error| Self::rpc_error(-32603, error))?
+                    .len();
+                if value_bytes > RPC_PLUGIN_VALUE_MAX_BYTES {
+                    return Err(Self::rpc_error(
+                        -32005,
+                        format!(
+                            "stored value exceeds {RPC_PLUGIN_VALUE_MAX_BYTES} serialized bytes"
+                        ),
+                    ));
+                }
+                Ok(value)
+            }
+            plugin::rpc::STORAGE_SET_METHOD => {
+                let params: RpcStorageSetParams = Self::rpc_params(method, params)?;
+                Self::validate_rpc_storage_key(method, &params.key)?;
+                let value_bytes = serde_json::to_vec(&params.value)
+                    .map_err(|error| Self::rpc_error(-32603, error))?
+                    .len();
+                if value_bytes > RPC_PLUGIN_VALUE_MAX_BYTES {
+                    return Err(Self::rpc_error(
+                        -32602,
+                        format!(
+                            "{method} value may not exceed {RPC_PLUGIN_VALUE_MAX_BYTES} serialized bytes"
+                        ),
+                    ));
+                }
+                let key = scoped_plugin_storage_key(owner, &params.key);
+                self.preferences
+                    .set_plugin_storage(owner, &key, params.value)
+                    .map_err(|error| Self::rpc_error(-32603, error))?;
+                Ok(Value::Null)
+            }
+            plugin::rpc::STORAGE_DELETE_METHOD => {
+                let params: RpcStorageKeyParams = Self::rpc_params(method, params)?;
+                Self::validate_rpc_storage_key(method, &params.key)?;
+                delete_plugin_storage_value(&mut self.preferences, owner, &params.key)
+                    .map_err(|error| Self::rpc_error(-32603, error))?;
+                Ok(Value::Null)
+            }
+            _ => Err(plugin::rpc::RpcErrorObject::method_not_found(method)),
+        }
+    }
+
+    fn rpc_document_index(
+        buffer_manager: &buffer_manager::BufferManager,
+        path: Option<&str>,
+        document_id: Option<&str>,
+    ) -> std::result::Result<usize, plugin::rpc::RpcErrorObject> {
+        let Some(document_id) = document_id else {
+            return Self::plugin_document_index(buffer_manager, path)
+                .map_err(|error| Self::rpc_error(-32001, error));
+        };
+        let id = document_id
+            .parse::<u64>()
+            .map_err(|_| Self::rpc_error(-32602, "document_id must be a decimal u64 string"))?;
+        let index = buffer_manager
+            .iter()
+            .position(|buffer| buffer.id().as_u64() == id)
+            .ok_or_else(|| Self::rpc_error(-32001, "document_id is no longer open"))?;
+        if let Some(path) = path {
+            let path_index = Self::plugin_document_index(buffer_manager, Some(path))
+                .map_err(|error| Self::rpc_error(-32001, error))?;
+            if path_index != index {
+                return Err(Self::rpc_error(
+                    -32602,
+                    "path and document_id refer to different documents",
+                ));
+            }
+        }
+        Ok(index)
+    }
+
+    fn rpc_document_mutation_index(
+        buffer_manager: &buffer_manager::BufferManager,
+        path: Option<&str>,
+        document_id: Option<&str>,
+    ) -> std::result::Result<usize, plugin::rpc::RpcErrorObject> {
+        let index = Self::rpc_document_index(buffer_manager, path, document_id)?;
+        if document_id.is_some() && index != buffer_manager.active_index() {
+            return Err(Self::rpc_error(
+                -32003,
+                "document_id is not the current document",
+            ));
+        }
+        Ok(index)
+    }
+
+    fn rpc_document_snapshot_request(
+        buffer_manager: &buffer_manager::BufferManager,
+        params: &Value,
+    ) -> std::result::Result<Value, plugin::rpc::RpcErrorObject> {
+        let params: RpcDocumentSnapshotParams =
+            Self::rpc_params(plugin::rpc::DOCUMENT_SNAPSHOT_METHOD, params)?;
+        let index = Self::rpc_document_index(
+            buffer_manager,
+            params.path.as_deref(),
+            params.document_id.as_deref(),
+        )?;
+        let buffer = &buffer_manager[index];
+        let mut snapshot = json!({
+            "path": buffer.file,
+            "revision": buffer.revision().to_string(),
+            "text": buffer.contents(),
+        });
+        if params.include_document_id {
+            snapshot["document_id"] = json!(buffer.id().as_u64().to_string());
+        }
+        Ok(snapshot)
+    }
+
+    async fn rpc_document_apply_request(
+        &mut self,
+        render_buffer: &mut RenderBuffer,
+        runtime: &mut Runtime,
+        owner: &str,
+        params: &Value,
+    ) -> std::result::Result<Value, plugin::rpc::RpcErrorObject> {
+        let params: RpcDocumentApplyParams =
+            Self::rpc_params(plugin::rpc::DOCUMENT_APPLY_METHOD, params)?;
+        self.validate_rpc_document_context(
+            owner,
+            params.path.as_deref(),
+            params.document_id.as_deref(),
+        )?;
+        let expected_revision = params.expected_revision.parse::<u64>().map_err(|_| {
+            Self::rpc_error(
+                -32602,
+                "red/DocumentApply expected_revision must be a decimal u64 string",
+            )
+        })?;
+        let buffer_index = Self::rpc_document_mutation_index(
+            &self.buffer_manager,
+            params.path.as_deref(),
+            params.document_id.as_deref(),
+        )?;
+        let revision = self.buffer_manager[buffer_index].revision();
+        if revision != expected_revision {
+            return Err(Self::rpc_error(
+                -32002,
+                format!(
+                    "document revision changed: expected {expected_revision}, found {revision}"
+                ),
+            ));
+        }
+        let state = self.begin_rpc_document_mutation(buffer_index);
+        let result = self
+            .apply_plugin_document_transaction(
+                render_buffer,
+                runtime,
+                PluginDocumentTransaction {
+                    owner: owner.to_string(),
+                    path: params.path,
+                    expected_revision,
+                    label: params.label,
+                    edits: params.edits,
+                },
+            )
+            .await;
+        self.finish_rpc_document_mutation(state, render_buffer)?;
+        let transaction_id = result.map_err(|error| Self::rpc_error(-32003, error))?;
+        Ok(json!({
+            "transaction_id": transaction_id,
+            "revision": self.buffer_manager[buffer_index].revision().to_string(),
+        }))
+    }
+
+    async fn rpc_document_undo_request(
+        &mut self,
+        render_buffer: &mut RenderBuffer,
+        runtime: &mut Runtime,
+        owner: &str,
+        params: &Value,
+    ) -> std::result::Result<Value, plugin::rpc::RpcErrorObject> {
+        let params: RpcDocumentUndoParams =
+            Self::rpc_params(plugin::rpc::DOCUMENT_UNDO_METHOD, params)?;
+        self.validate_rpc_document_context(
+            owner,
+            params.path.as_deref(),
+            params.document_id.as_deref(),
+        )?;
+        let buffer_index = Self::rpc_document_mutation_index(
+            &self.buffer_manager,
+            params.path.as_deref(),
+            params.document_id.as_deref(),
+        )?;
+        let state = self.begin_rpc_document_mutation(buffer_index);
+        let result = self
+            .undo_plugin_document_transaction(
+                render_buffer,
+                runtime,
+                owner,
+                params.path.as_deref(),
+                &params.transaction_id,
+            )
+            .await;
+        self.finish_rpc_document_mutation(state, render_buffer)?;
+        result.map_err(|error| Self::rpc_error(-32003, error))?;
+        Ok(json!({
+            "revision": self.buffer_manager[buffer_index].revision().to_string(),
+        }))
+    }
+
+    async fn rpc_host_request(
+        &mut self,
+        render_buffer: &mut RenderBuffer,
+        runtime: &mut Runtime,
+        owner: &str,
+        method: &str,
+        params: &Value,
+    ) -> std::result::Result<Value, plugin::rpc::RpcErrorObject> {
+        match method {
+            plugin::rpc::DOCUMENT_SNAPSHOT_METHOD => {
+                Self::rpc_document_snapshot_request(&self.buffer_manager, params)
+            }
+            plugin::rpc::DOCUMENT_APPLY_METHOD => {
+                self.rpc_document_apply_request(render_buffer, runtime, owner, params)
+                    .await
+            }
+            plugin::rpc::DOCUMENT_UNDO_METHOD => {
+                self.rpc_document_undo_request(render_buffer, runtime, owner, params)
+                    .await
+            }
+            plugin::rpc::CONFIG_GET_METHOD => self.rpc_config_get_request(owner, params),
+            plugin::rpc::STORAGE_GET_METHOD
+            | plugin::rpc::STORAGE_SET_METHOD
+            | plugin::rpc::STORAGE_DELETE_METHOD => self.rpc_storage_request(owner, method, params),
+            plugin::rpc::STATUSLINE_SET_METHOD => self.rpc_statusline_set_request(owner, params),
+            plugin::rpc::STATUSLINE_CLEAR_METHOD => {
+                self.rpc_statusline_clear_request(owner, params)
+            }
+            _ => self.rpc_presentation_request(render_buffer, runtime, owner, method, params),
+        }
+    }
+
+    async fn execute_plugin_command(
+        &mut self,
+        _render_buffer: &mut RenderBuffer,
+        runtime: &mut Runtime,
+        command: &str,
+    ) -> anyhow::Result<()> {
+        let document = self.current_buffer().id();
+        match self
+            .plugin_registry
+            .start_rpc_command(runtime, command, document)
+            .await
+        {
+            Ok(Some(token)) => self.rpc_commands.started(token),
+            Ok(None) => return self.plugin_registry.execute(runtime, command).await,
+            Err(error) => runtime.send_request(PluginRequest::Action(Action::PrintWarning(
+                error.to_string(),
+            ))),
+        }
+        Ok(())
+    }
+
+    async fn service_rpc_host_requests(
+        &mut self,
+        render_buffer: &mut RenderBuffer,
+        runtime: &mut Runtime,
+    ) {
+        for _ in 0..PLUGIN_REQUESTS_PER_TICK {
+            let Some((owner, incoming)) = self.plugin_registry.take_rpc_host_request(runtime)
+            else {
+                break;
+            };
+            let result = {
+                let mut host = EditorRpcHost {
+                    editor: self,
+                    render_buffer,
+                    runtime,
+                };
+                plugin::RpcHost::respond(&mut host, &owner, incoming).await
+            };
+            if let Err(error) = result {
+                self.plugin_registry.quarantine_rpc(runtime, &owner, error);
+            }
+        }
     }
 
     async fn apply_plugin_document_transaction(
@@ -25782,7 +26608,8 @@ impl Editor {
             !transaction.edits.is_empty(),
             "document transaction contains no edits"
         );
-        let buffer_index = self.plugin_document_index(transaction.path.as_deref())?;
+        let buffer_index =
+            Self::plugin_document_index(&self.buffer_manager, transaction.path.as_deref())?;
         if buffer_index != self.buffer_manager.active_index() {
             self.set_current_buffer(render_buffer, buffer_index).await?;
         }
@@ -25797,12 +26624,19 @@ impl Editor {
             .edits
             .into_iter()
             .map(|edit| {
-                let start = self.current_buffer().position_to_char_idx(edit.range.start);
-                let end = self.current_buffer().position_to_char_idx(edit.range.end);
+                let buffer = self.current_buffer();
+                let start = buffer.position_to_char_idx(edit.range.start);
+                let end = buffer.position_to_char_idx(edit.range.end);
+                // Position conversion clamps; edit endpoints must round-trip exactly.
+                anyhow::ensure!(
+                    buffer.char_idx_to_position(start) == edit.range.start
+                        && buffer.char_idx_to_position(end) == edit.range.end,
+                    "document edit range is out of bounds"
+                );
                 anyhow::ensure!(start <= end, "document edit range is reversed");
                 if let Some(expected_text) = &edit.expected_text {
                     anyhow::ensure!(
-                        self.current_buffer().text_in_range(edit.range) == *expected_text,
+                        buffer.text_in_range(edit.range) == *expected_text,
                         "document edit preimage no longer matches"
                     );
                 }
@@ -25846,7 +26680,7 @@ impl Editor {
         path: Option<&str>,
         transaction_id: &str,
     ) -> anyhow::Result<()> {
-        let buffer_index = self.plugin_document_index(path)?;
+        let buffer_index = Self::plugin_document_index(&self.buffer_manager, path)?;
         if buffer_index != self.buffer_manager.active_index() {
             self.set_current_buffer(render_buffer, buffer_index).await?;
         }
@@ -30056,7 +30890,8 @@ impl Editor {
             .get(&self.current_buffer().id())
             .and_then(|commands| commands.submit.clone());
         if let Some(command) = scratch_command {
-            self.plugin_registry.execute(runtime, &command).await?;
+            self.execute_plugin_command(buffer, runtime, &command)
+                .await?;
             return Ok(false);
         }
         let resume_insert_transaction = self.commit_active_transaction_before_save();
@@ -33708,6 +34543,7 @@ mod test {
             compatible: true,
             has_companion: false,
             has_husk: false,
+            has_rpc: false,
             has_languages: true,
             has_native_grammars: true,
             languages: vec!["go".to_string()],
@@ -33743,6 +34579,7 @@ mod test {
             compatible: true,
             has_companion: false,
             has_husk: false,
+            has_rpc: false,
             has_languages: true,
             has_native_grammars: true,
             languages: vec!["go".to_string()],
@@ -33785,6 +34622,7 @@ mod test {
             compatible: true,
             has_companion: false,
             has_husk: false,
+            has_rpc: true,
             has_languages: true,
             has_native_grammars: true,
             languages: vec!["go".to_string()],
@@ -33803,6 +34641,7 @@ mod test {
 
         assert_eq!(items[0].id, "installed:go-language");
         assert_eq!(items[0].label, "Locally modified Go support");
+        assert_eq!(items[0].kind.as_deref(), Some("JSON-RPC + Language"));
         assert!(items[0].annotation.as_deref().unwrap().contains("Custom"));
         assert_eq!(items[1].id, "catalog:go-language");
         assert!(items[1]
@@ -36876,6 +37715,662 @@ builtin = "rust"
         assert_eq!(payload["lsp_client"]["workspace_root"], "/repo");
         assert_eq!(payload["padding_left"], true);
         assert_eq!(payload["url_value"], 1);
+    }
+
+    #[test]
+    fn rpc_document_snapshot_returns_unsaved_text_and_string_revision() {
+        let editor = test_editor(/*width*/ 80, /*height*/ 24);
+        let response =
+            Editor::rpc_document_snapshot_request(&editor.buffer_manager, &json!({})).unwrap();
+
+        assert_eq!(response["path"], Value::Null);
+        assert_eq!(
+            response["revision"],
+            editor.current_buffer().revision().to_string()
+        );
+        assert_eq!(response["text"], "hello");
+        assert!(response.get("buffer_index").is_none());
+        assert!(response.get("document_id").is_none());
+    }
+
+    #[test]
+    fn rpc_document_snapshot_rejects_invalid_and_unavailable_paths() {
+        let editor = test_editor(/*width*/ 80, /*height*/ 24);
+        let invalid = Editor::rpc_document_snapshot_request(
+            &editor.buffer_manager,
+            &json!({"unknown": true}),
+        )
+        .unwrap_err();
+        let unavailable = Editor::rpc_document_snapshot_request(
+            &editor.buffer_manager,
+            &json!({"path": "/not/open/in/red"}),
+        )
+        .unwrap_err();
+
+        assert_eq!(invalid.code, -32602);
+        assert_eq!(unavailable.code, -32001);
+    }
+
+    #[test]
+    fn rpc_document_identity_survives_reindexing_and_rejects_conflicts() {
+        let mut editor = test_editor(/*width*/ 80, /*height*/ 24);
+        let first_id = editor.current_buffer().id().as_u64().to_string();
+        editor.buffer_manager.add_buffer(Buffer::new(
+            Some("second.txt".to_string()),
+            "second".to_string(),
+        ));
+        let second = Editor::rpc_document_snapshot_request(
+            &editor.buffer_manager,
+            &json!({"include_document_id": true}),
+        )
+        .unwrap();
+        let second_id = &second["document_id"];
+        assert_ne!(second_id, &json!(first_id));
+
+        for params in [
+            json!({"document_id": "invalid"}),
+            json!({"document_id": 1}),
+            json!({"document_id": first_id, "path": "second.txt"}),
+        ] {
+            let error =
+                Editor::rpc_document_snapshot_request(&editor.buffer_manager, &params).unwrap_err();
+            assert_eq!(error.code, -32602, "{params}");
+        }
+
+        editor.buffer_manager.remove_buffer(0);
+        let reindexed = Editor::rpc_document_snapshot_request(
+            &editor.buffer_manager,
+            &json!({"document_id": second_id, "include_document_id": true}),
+        )
+        .unwrap();
+        assert_eq!(reindexed, second);
+        let closed = Editor::rpc_document_snapshot_request(
+            &editor.buffer_manager,
+            &json!({"document_id": first_id}),
+        )
+        .unwrap_err();
+        assert_eq!(closed.code, -32001);
+    }
+
+    #[tokio::test]
+    async fn rpc_document_identity_prevents_edits_and_undo_after_switching_buffers() {
+        let mut editor = test_editor(/*width*/ 80, /*height*/ 24);
+        let document_id = editor.current_buffer().id().as_u64().to_string();
+        let revision = editor.current_buffer().revision();
+        let mut render_buffer = RenderBuffer::new(80, 24, &Style::default());
+        let mut runtime = Runtime::new();
+        macro_rules! request {
+            ($method:expr, $params:expr) => {
+                editor.rpc_host_request(
+                    &mut render_buffer,
+                    &mut runtime,
+                    "rpc-test",
+                    $method,
+                    &$params,
+                )
+            };
+        }
+        let apply = json!({
+            "document_id": document_id,
+            "expected_revision": revision.to_string(),
+            "edits": [{
+                "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 5}},
+                "text": "world"
+            }]
+        });
+        editor
+            .buffer_manager
+            .add_buffer(Buffer::new(None, "hello".to_string()));
+        assert_eq!(editor.current_buffer().revision(), revision);
+        let rejected = request!(plugin::rpc::DOCUMENT_APPLY_METHOD, apply)
+            .await
+            .unwrap_err();
+        assert_eq!(rejected.code, -32003);
+        assert_eq!(editor.buffer_manager.active_index(), 1);
+        assert_eq!(editor.buffer_manager[0].contents(), "hello");
+        assert_eq!(editor.buffer_manager[1].contents(), "hello");
+        assert!(!editor.current_buffer().is_dirty());
+
+        editor.buffer_manager.set_active_index(0);
+        let applied = request!(plugin::rpc::DOCUMENT_APPLY_METHOD, apply)
+            .await
+            .unwrap();
+        let undo = json!({"document_id": document_id, "transaction_id": applied["transaction_id"]});
+        editor.buffer_manager.set_active_index(1);
+        let rejected = request!(plugin::rpc::DOCUMENT_UNDO_METHOD, undo)
+            .await
+            .unwrap_err();
+        assert_eq!(rejected.code, -32003);
+        assert_eq!(editor.buffer_manager.active_index(), 1);
+        assert_eq!(editor.buffer_manager[0].contents(), "world");
+        assert_eq!(editor.current_buffer().contents(), "hello");
+        editor.buffer_manager.set_active_index(0);
+        request!(plugin::rpc::DOCUMENT_UNDO_METHOD, undo)
+            .await
+            .unwrap();
+        assert_eq!(editor.current_buffer().contents(), "hello");
+    }
+
+    #[tokio::test]
+    async fn rpc_document_apply_and_undo_use_one_attributed_transaction() {
+        let mut editor = test_editor(/*width*/ 80, /*height*/ 24);
+        let revision = editor.current_buffer().revision().to_string();
+        let mut render_buffer = RenderBuffer::new(80, 24, &Style::default());
+        let mut runtime = Runtime::new();
+
+        let applied = editor
+            .rpc_host_request(
+                &mut render_buffer,
+                &mut runtime,
+                "rpc-test",
+                plugin::rpc::DOCUMENT_APPLY_METHOD,
+                &json!({
+                    "expected_revision": revision,
+                    "edits": [{
+                        "range": {
+                            "start": {"line": 0, "character": 0},
+                            "end": {"line": 0, "character": 5}
+                        },
+                        "text": "world",
+                        "expected_text": "hello"
+                    }]
+                }),
+            )
+            .await
+            .unwrap();
+        let transaction_id = applied["transaction_id"].as_str().unwrap();
+
+        assert_eq!(editor.current_buffer().contents(), "world");
+        assert!(editor.current_buffer().is_dirty());
+        assert_eq!(
+            applied["revision"],
+            editor.current_buffer().revision().to_string()
+        );
+        assert!(matches!(
+            &editor
+                .current_buffer()
+                .undo_history
+                .latest_transaction()
+                .unwrap()
+                .origin,
+            EditOrigin::Plugin { name } if name == "rpc-test"
+        ));
+
+        let forbidden = editor
+            .rpc_host_request(
+                &mut render_buffer,
+                &mut runtime,
+                "other-plugin",
+                plugin::rpc::DOCUMENT_UNDO_METHOD,
+                &json!({"transaction_id": transaction_id}),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(forbidden.code, -32003);
+        assert_eq!(editor.current_buffer().contents(), "world");
+
+        let undone = editor
+            .rpc_host_request(
+                &mut render_buffer,
+                &mut runtime,
+                "rpc-test",
+                plugin::rpc::DOCUMENT_UNDO_METHOD,
+                &json!({"transaction_id": transaction_id}),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(editor.current_buffer().contents(), "hello");
+        assert!(!editor.current_buffer().is_dirty());
+        assert_eq!(
+            undone["revision"],
+            editor.current_buffer().revision().to_string()
+        );
+    }
+
+    #[tokio::test]
+    async fn rpc_document_apply_rejects_invalid_stale_and_mismatched_edits() {
+        let mut editor = test_editor(/*width*/ 80, /*height*/ 24);
+        let revision = editor.current_buffer().revision();
+        let mut render_buffer = RenderBuffer::new(80, 24, &Style::default());
+        let mut runtime = Runtime::new();
+        let edit = json!({
+            "range": {
+                "start": {"line": 0, "character": 0},
+                "end": {"line": 0, "character": 5}
+            },
+            "text": "world",
+            "expected_text": "different"
+        });
+        let out_of_bounds_edit = |start: TextPosition, end: TextPosition| {
+            json!({
+                "expected_revision": revision.to_string(),
+                "edits": [{"range": {"start": start, "end": end}, "text": "!"}]
+            })
+        };
+
+        for (params, expected_code) in [
+            (
+                json!({"expected_revision": revision, "edits": [edit.clone()]}),
+                -32602,
+            ),
+            (
+                json!({"expected_revision": (revision + 1).to_string(), "edits": [edit.clone()]}),
+                -32002,
+            ),
+            (
+                json!({"expected_revision": revision.to_string(), "edits": [edit]}),
+                -32003,
+            ),
+            (
+                json!({"path": "/not/open/in/red", "expected_revision": "0", "edits": []}),
+                -32001,
+            ),
+            (
+                out_of_bounds_edit(TextPosition::new(1, 0), TextPosition::new(0, 5)),
+                -32003,
+            ),
+            (
+                out_of_bounds_edit(TextPosition::new(0, 0), TextPosition::new(0, 6)),
+                -32003,
+            ),
+        ] {
+            let error = editor
+                .rpc_host_request(
+                    &mut render_buffer,
+                    &mut runtime,
+                    "rpc-test",
+                    plugin::rpc::DOCUMENT_APPLY_METHOD,
+                    &params,
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(error.code, expected_code, "{params}");
+        }
+        assert_eq!(editor.current_buffer().contents(), "hello");
+        assert!(!editor.current_buffer().is_dirty());
+    }
+
+    #[tokio::test]
+    async fn rpc_config_and_storage_are_owner_scoped_bounded_and_persistent() {
+        let directory = tempfile::tempdir().unwrap();
+        let preferences_path = directory.path().join("preferences.json");
+        let mut editor = test_editor(/*width*/ 80, /*height*/ 24);
+        editor.preferences = PreferencesStore::load(&preferences_path);
+        let owners = [("rpc-one", json!({"label": "one"})), ("rpc-two", json!(2))];
+        for (owner, value) in &owners {
+            editor
+                .config
+                .plugin_config
+                .insert((*owner).to_string(), value.clone());
+        }
+        let mut render_buffer = RenderBuffer::new(80, 24, &Style::default());
+        let mut runtime = Runtime::new();
+        macro_rules! request {
+            ($owner:expr, $method:expr, $params:expr $(,)?) => {
+                editor.rpc_host_request(&mut render_buffer, &mut runtime, $owner, $method, &$params)
+            };
+        }
+
+        for (owner, value) in &owners {
+            assert_eq!(
+                request!(owner, plugin::rpc::CONFIG_GET_METHOD, json!({}))
+                    .await
+                    .unwrap(),
+                *value
+            );
+            request!(
+                owner,
+                plugin::rpc::STORAGE_SET_METHOD,
+                json!({"key": "shared", "value": value}),
+            )
+            .await
+            .unwrap();
+        }
+        editor
+            .preferences
+            .set_plugin_storage("rpc-one", "foreign:shared", json!("private"))
+            .unwrap();
+        let collision = request!(
+            "rpc-one:foreign",
+            plugin::rpc::STORAGE_GET_METHOD,
+            json!({"key": "shared"}),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(collision.code, -32005);
+
+        for key in [
+            "".to_string(),
+            "foreign:key".to_string(),
+            "x".repeat(RPC_STORAGE_MAX_KEY_BYTES + 1),
+        ] {
+            let invalid = request!(
+                "rpc-one",
+                plugin::rpc::STORAGE_GET_METHOD,
+                json!({"key": key}),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(invalid.code, -32602);
+        }
+        request!(
+            "rpc-one",
+            plugin::rpc::STORAGE_SET_METHOD,
+            json!({"key": " ", "value": true}),
+        )
+        .await
+        .unwrap();
+        let oversized_value = json!("x".repeat(RPC_PLUGIN_VALUE_MAX_BYTES));
+        editor
+            .config
+            .plugin_config
+            .insert("rpc-large".to_string(), oversized_value.clone());
+        let oversized_config = request!("rpc-large", plugin::rpc::CONFIG_GET_METHOD, json!({}))
+            .await
+            .unwrap_err();
+        let oversized_storage = request!(
+            "rpc-one",
+            plugin::rpc::STORAGE_SET_METHOD,
+            json!({"key": "oversized", "value": oversized_value}),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            (oversized_config.code, oversized_storage.code),
+            (-32005, -32602)
+        );
+
+        editor
+            .preferences
+            .set_plugin_storage("session_restore", "latest", json!("legacy"))
+            .unwrap();
+        request!(
+            "session_restore",
+            plugin::rpc::STORAGE_DELETE_METHOD,
+            json!({"key": "latest"}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            request!(
+                "session_restore",
+                plugin::rpc::STORAGE_GET_METHOD,
+                json!({"key": "latest"})
+            )
+            .await
+            .unwrap(),
+            Value::Null
+        );
+
+        editor.preferences = PreferencesStore::load(&preferences_path);
+        for (owner, value) in &owners {
+            assert_eq!(
+                request!(
+                    owner,
+                    plugin::rpc::STORAGE_GET_METHOD,
+                    json!({"key": "shared"})
+                )
+                .await
+                .unwrap(),
+                *value
+            );
+        }
+        for _ in 0..2 {
+            request!(
+                "rpc-one",
+                plugin::rpc::STORAGE_DELETE_METHOD,
+                json!({"key": "shared"}),
+            )
+            .await
+            .unwrap();
+        }
+        assert_eq!(
+            request!(
+                "rpc-one",
+                plugin::rpc::STORAGE_GET_METHOD,
+                json!({"key": "shared"})
+            )
+            .await
+            .unwrap(),
+            Value::Null
+        );
+        let reloaded = PreferencesStore::load(&preferences_path);
+        assert_eq!(reloaded.plugin_storage("rpc-one", "shared"), None);
+        assert_eq!(
+            reloaded.plugin_storage("rpc-one", "foreign:shared"),
+            Some(&json!("private"))
+        );
+        assert_eq!(
+            reloaded.plugin_storage("rpc-two", "shared"),
+            Some(&json!(2))
+        );
+    }
+
+    #[tokio::test]
+    async fn rpc_picker_open_uses_the_host_renderer_and_replaces_callbacks() {
+        let mut editor = test_editor(/*width*/ 80, /*height*/ 24);
+        let mut render_buffer = RenderBuffer::new(80, 24, &Style::default());
+        let mut runtime = Runtime::new();
+        macro_rules! request {
+            ($params:expr) => {
+                editor.rpc_host_request(
+                    &mut render_buffer,
+                    &mut runtime,
+                    "rpc-test",
+                    plugin::rpc::PICKER_OPEN_METHOD,
+                    &$params,
+                )
+            };
+        }
+
+        request!(json!({
+            "id": "choices",
+            "title": "RPC choices",
+            "items": [
+                {"id": "alpha", "label": "Alpha"},
+                {"id": "beta", "label": "Beta", "detail": "second", "data": {"rank": 2}}
+            ]
+        }))
+        .await
+        .unwrap();
+
+        let first = editor
+            .current_dialog
+            .as_ref()
+            .and_then(|dialog| dialog.picker_handle())
+            .unwrap();
+        let rendered = render_text_rows(&render_buffer).join("\n");
+        assert!(first.get() < 0);
+        assert!(rendered.contains("RPC choices"), "{rendered}");
+        assert!(rendered.contains("Beta"), "{rendered}");
+
+        request!(json!({"id": "replacement", "items": []}))
+            .await
+            .unwrap();
+        let second = editor
+            .current_dialog
+            .as_ref()
+            .and_then(|dialog| dialog.picker_handle())
+            .unwrap();
+        assert_ne!(first, second);
+        assert!(!editor.plugin_registry.release_picker(&mut runtime, first));
+        assert!(editor.plugin_registry.release_picker(&mut runtime, second));
+
+        let invalid = request!(json!({"id": "choices", "items": [], "unknown": true}))
+            .await
+            .unwrap_err();
+        assert_eq!(invalid.code, -32602);
+
+        let oversized = (0..=MAX_RPC_PICKER_ITEMS)
+            .map(|index| json!({"id": index.to_string(), "label": "item"}))
+            .collect::<Vec<_>>();
+        let invalid = request!(json!({"id": "choices", "items": oversized}))
+            .await
+            .unwrap_err();
+        assert_eq!(invalid.code, -32602);
+    }
+
+    #[tokio::test]
+    async fn rpc_text_panels_are_owned_and_disposed_by_connection() {
+        let mut editor = test_editor(/*width*/ 80, /*height*/ 24);
+        editor
+            .panel_manager
+            .create_text_panel("preview".to_string(), plugin::PanelConfig::default());
+        let mut render_buffer = RenderBuffer::new(80, 24, &Style::default());
+        let mut runtime = Runtime::new();
+        macro_rules! request {
+            ($owner:expr, $method:expr, $params:expr $(,)?) => {
+                editor.rpc_host_request(&mut render_buffer, &mut runtime, $owner, $method, &$params)
+            };
+        }
+
+        request!(
+            "rpc-test",
+            plugin::rpc::TEXT_PANEL_CREATE_METHOD,
+            json!({"id": "preview", "side": "right", "width": 32, "title": "RPC preview"}),
+        )
+        .await
+        .unwrap();
+        let host_id = editor
+            .plugin_registry
+            .rpc_text_panel("rpc-test", "preview")
+            .unwrap();
+
+        assert_ne!(host_id, "preview");
+        assert_eq!(
+            editor.panel_manager.panel_layout(&host_id),
+            Some((plugin::PanelSide::Right, 32))
+        );
+        request!(
+            "rpc-test",
+            plugin::rpc::TEXT_PANEL_SET_CONTENT_METHOD,
+            json!({
+                "id": "preview",
+                "blocks": [{"id": "result", "format": "markdown", "text": "# RPC panel\nRendered by Red"}]
+            }),
+        )
+            .await
+            .unwrap();
+
+        let forbidden = request!(
+            "other-plugin",
+            plugin::rpc::TEXT_PANEL_FOCUS_METHOD,
+            json!({"id": "preview"}),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(forbidden.code, -32004);
+
+        request!(
+            "rpc-test",
+            plugin::rpc::TEXT_PANEL_FOCUS_METHOD,
+            json!({"id": "preview"}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            editor.panel_manager.focused_panel_id(),
+            Some(host_id.as_str())
+        );
+
+        request!(
+            "rpc-test",
+            plugin::rpc::TEXT_PANEL_DISPOSE_METHOD,
+            json!({"id": "preview"}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(editor.panel_manager.panel_layout(&host_id), None);
+        assert!(editor.panel_manager.panel_layout("preview").is_some());
+
+        let disposed = request!(
+            "rpc-test",
+            plugin::rpc::TEXT_PANEL_SET_CONTENT_METHOD,
+            json!({"id": "preview", "blocks": []}),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(disposed.code, -32004);
+
+        let invalid = request!(
+            "rpc-test",
+            plugin::rpc::TEXT_PANEL_CREATE_METHOD,
+            json!({"id": " ", "width": 0}),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(invalid.code, -32602);
+    }
+
+    #[tokio::test]
+    async fn rpc_statusline_contributions_are_cached_replaced_and_cleared() {
+        let mut editor = test_editor(/*width*/ 80, /*height*/ 24);
+        let mut render_buffer = RenderBuffer::new(80, 24, &Style::default());
+        let mut runtime = Runtime::new();
+        macro_rules! request {
+            ($owner:expr, $method:expr, $params:expr $(,)?) => {
+                editor.rpc_host_request(&mut render_buffer, &mut runtime, $owner, $method, &$params)
+            };
+        }
+
+        request!(
+            "right-plugin",
+            plugin::rpc::STATUSLINE_SET_METHOD,
+            json!({"text": "RPC right"}),
+        )
+        .await
+        .unwrap();
+        request!(
+            "left-plugin",
+            plugin::rpc::STATUSLINE_SET_METHOD,
+            json!({"text": "RPC left", "side": "left"}),
+        )
+        .await
+        .unwrap();
+
+        let generation = editor.render_generation;
+        editor
+            .service_background(&mut render_buffer, &mut runtime)
+            .await
+            .unwrap();
+        assert!(editor.render_generation > generation);
+        let row = editor.test_statusline_row();
+        let left = row.find("RPC left").unwrap();
+        let right = row.find("RPC right").unwrap();
+        let position = row.rfind("1:1").unwrap();
+        assert!(left < right && right < position, "{row:?}");
+
+        request!(
+            "right-plugin",
+            plugin::rpc::STATUSLINE_SET_METHOD,
+            json!({"text": "RPC moved", "side": "left"}),
+        )
+        .await
+        .unwrap();
+        let invalid = request!(
+            "right-plugin",
+            plugin::rpc::STATUSLINE_SET_METHOD,
+            json!({"text": "bad\nstatus"}),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(invalid.code, -32602);
+        assert!(editor.test_statusline_row().contains("RPC moved"));
+
+        for _ in 0..2 {
+            request!(
+                "right-plugin",
+                plugin::rpc::STATUSLINE_CLEAR_METHOD,
+                json!({}),
+            )
+            .await
+            .unwrap();
+        }
+        let row = editor.test_statusline_row();
+        assert!(row.contains("RPC left"));
+        assert!(!row.contains("RPC right"));
+        assert!(!row.contains("RPC moved"));
     }
 
     async fn install_event_recorder(editor: &mut Editor, runtime: &mut Runtime) {

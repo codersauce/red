@@ -276,8 +276,8 @@ async fn shell_filter_applies_to_its_buffer_after_client_disconnects() {
     let core = DetachedEditorCore::new(editor).await.unwrap();
     let session = bind_session(directory.path(), "filter-work").unwrap();
 
-    let server = serve_editor_session(&session, core);
-    let client = async {
+    let server = Box::pin(serve_editor_session(&session, core));
+    let client = Box::pin(async {
         let mut first = connect_session(directory.path(), "filter-work", None, (100, 24))
             .await
             .unwrap();
@@ -380,7 +380,7 @@ async fn shell_filter_applies_to_its_buffer_after_client_disconnects() {
 
         stop_session(directory.path(), "filter-work").await.unwrap();
         drop(second);
-    };
+    });
 
     let (server_result, ()) = tokio::join!(server, client);
     server_result.unwrap();

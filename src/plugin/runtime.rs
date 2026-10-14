@@ -3839,6 +3839,15 @@ impl Runtime {
         self.dispatcher.try_recv_request()
     }
 
+    pub(crate) fn inherited_environment_keys(&self, plugin_name: &str) -> Vec<String> {
+        self.inner
+            .lock()
+            .unwrap()
+            .host
+            .process_manager
+            .inherited_environment_keys(plugin_name)
+    }
+
     pub fn set_typecheck_enabled(&mut self, enabled: bool) {
         self.inner.lock().unwrap().typecheck_enabled = enabled;
     }
@@ -5181,6 +5190,7 @@ mod tests {
             "git".to_string(),
             PluginPermissions {
                 process: vec![command.to_string()],
+                ..PluginPermissions::default()
             },
         )]));
         runtime.load_plugin("git", source).await.unwrap();
@@ -11601,6 +11611,7 @@ mod tests {
             "transactional-process".to_string(),
             PluginPermissions {
                 process: vec!["/bin/sleep".to_string()],
+                ..PluginPermissions::default()
             },
         )]));
         runtime
@@ -11661,6 +11672,7 @@ mod tests {
             "quarantined-process".to_string(),
             PluginPermissions {
                 process: vec!["/bin/sleep".to_string()],
+                ..PluginPermissions::default()
             },
         )]));
         runtime
@@ -13682,6 +13694,7 @@ mod tests {
             "git".to_string(),
             PluginPermissions {
                 process: vec!["git".to_string()],
+                ..PluginPermissions::default()
             },
         )]));
         runtime
@@ -16105,6 +16118,7 @@ mod tests {
             "git".to_string(),
             PluginPermissions {
                 process: vec!["git".to_string()],
+                ..PluginPermissions::default()
             },
         )]));
         runtime
@@ -16284,6 +16298,7 @@ mod tests {
             "git".to_string(),
             PluginPermissions {
                 process: vec!["git".to_string()],
+                ..PluginPermissions::default()
             },
         )]));
         runtime
@@ -16453,6 +16468,7 @@ mod tests {
             "project_search".to_string(),
             PluginPermissions {
                 process: vec!["rg".to_string()],
+                ..PluginPermissions::default()
             },
         )]));
         runtime

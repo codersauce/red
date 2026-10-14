@@ -26,6 +26,7 @@ pub mod package;
 pub mod panel;
 pub mod process;
 mod registry;
+pub mod rpc;
 mod runtime;
 mod text_link;
 pub mod timer_stats;
@@ -46,6 +47,7 @@ pub use panel::{
     TextPanelHeaderDetail, TextPanelSessionSnapshot, TextPanelSnapshotFocus, TextPanelStatus,
 };
 pub use registry::{PluginRegistry, PluginStatus, RED_HOST_API_VERSION};
+pub(crate) use registry::{RpcCommandToken, RpcHost};
 pub use runtime::{
     CommandMetadata, CommandScope, ComposerHandle, PickerHandle, RegisteredPluginCommand,
     RequestId, Runtime,

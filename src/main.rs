@@ -417,16 +417,13 @@ async fn run_plugin_command(command: &PluginCommand) -> anyhow::Result<()> {
                 } else {
                     "incompatible"
                 };
-                let companion = if plugin.has_companion {
-                    "companion"
-                } else if plugin.has_languages {
-                    "language"
-                } else {
-                    "husk"
-                };
                 println!(
                     "{}\t{}\t{}\t{}\t{}",
-                    plugin.id, plugin.version, state, compatibility, companion
+                    plugin.id,
+                    plugin.version,
+                    state,
+                    compatibility,
+                    plugin.modality_label()
                 );
             }
         }
@@ -1075,7 +1072,14 @@ fn finalize_runtime_config(
             &manifest,
             &installed.package_root,
         );
-        let Some(entrypoint) = manifest.husk_entry(&installed.package_root) else {
+        let entrypoint = manifest.husk_entry(&installed.package_root).or_else(|| {
+            manifest.rpc.is_some().then(|| {
+                installed
+                    .package_root
+                    .join(red::plugin::package::PLUGIN_MANIFEST_FILE)
+            })
+        });
+        let Some(entrypoint) = entrypoint else {
             continue;
         };
         loaded
