@@ -1414,7 +1414,9 @@ class JsonWorkbenchTest(unittest.TestCase):
     @unittest.skipUnless(shutil.which("jq"), "jq is not installed")
     def test_real_jq_smoke(self):
         runner = WORKBENCH.JsonWorkbench([shutil.which("jq")], jq_timeout=2)
-        self.assertEqual(runner.run_jq(".answer", b'{"answer":42}'), "42\n")
+        self.assertEqual(
+            runner.run_jq(".answer", b'{"answer":42}'), f"42{os.linesep}"
+        )
 
 
 if __name__ == "__main__":
