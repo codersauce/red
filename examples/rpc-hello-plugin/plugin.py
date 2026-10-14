@@ -72,6 +72,10 @@ for message in incoming:
                             "metadata": {"title": "Show current RPC document"},
                         },
                         {
+                            "name": "RpcConfig",
+                            "metadata": {"title": "Show this RPC plugin's configuration"},
+                        },
+                        {
                             "name": "RpcApply",
                             "metadata": {"title": "Apply an RPC document edit"},
                         },
@@ -96,6 +100,14 @@ for message in incoming:
                             "metadata": {"title": "Clear the RPC statusline"},
                         },
                         {
+                            "name": "RpcStorage",
+                            "metadata": {"title": "Increment persistent RPC storage"},
+                        },
+                        {
+                            "name": "RpcStorageClear",
+                            "metadata": {"title": "Clear persistent RPC storage"},
+                        },
+                        {
                             "name": "RpcUndo",
                             "metadata": {"title": "Undo the last RPC edit"},
                         },
@@ -107,7 +119,10 @@ for message in incoming:
     elif method == "command/execute":
         try:
             command = message["params"]["name"]
-            if command == "RpcDocument":
+            if command == "RpcConfig":
+                config = request_host("red/ConfigGet", {})
+                result = {"message": f"RPC config: {json.dumps(config, separators=(',', ':'))}"}
+            elif command == "RpcDocument":
                 document = request_host("red/DocumentSnapshot", {})
                 path = document["path"] or "[scratch]"
                 result = {
@@ -193,6 +208,14 @@ for message in incoming:
             elif command == "RpcStatuslineClear":
                 request_host("red/StatuslineClear", {})
                 result = None
+            elif command == "RpcStorage":
+                count = request_host("red/StorageGet", {"key": "count"})
+                count = count + 1 if isinstance(count, int) else 1
+                request_host("red/StorageSet", {"key": "count", "value": count})
+                result = {"message": f"Persistent RPC count: {count}"}
+            elif command == "RpcStorageClear":
+                request_host("red/StorageDelete", {"key": "count"})
+                result = {"message": "Persistent RPC count cleared"}
             else:
                 name = message["params"]["raw_args"] or "Red"
                 result = {"message": f"Hello, {name}, from Python RPC!"}

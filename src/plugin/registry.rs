@@ -32,8 +32,9 @@ use super::package::{PluginPackageManifest, PLUGIN_MANIFEST_FILE};
 use super::process::inherited_environment;
 use super::rpc::{
     RpcConnection, RpcErrorObject, RpcIncoming, RpcInitializeParams, RpcRequester,
-    RpcStatuslineSide, DOCUMENT_APPLY_METHOD, DOCUMENT_SNAPSHOT_METHOD, DOCUMENT_UNDO_METHOD,
-    MAX_OUTSTANDING_REQUESTS, MAX_QUEUED_BYTES, STATUSLINE_CLEAR_METHOD, STATUSLINE_SET_METHOD,
+    RpcStatuslineSide, CONFIG_GET_METHOD, DOCUMENT_APPLY_METHOD, DOCUMENT_SNAPSHOT_METHOD,
+    DOCUMENT_UNDO_METHOD, MAX_OUTSTANDING_REQUESTS, MAX_QUEUED_BYTES, STATUSLINE_CLEAR_METHOD,
+    STATUSLINE_SET_METHOD, STORAGE_DELETE_METHOD, STORAGE_GET_METHOD, STORAGE_SET_METHOD,
     TEXT_PANEL_CREATE_METHOD, TEXT_PANEL_DISPOSE_METHOD, TEXT_PANEL_FOCUS_METHOD,
     TEXT_PANEL_SET_CONTENT_METHOD,
 };
@@ -644,6 +645,10 @@ impl PluginRegistry {
                 DOCUMENT_SNAPSHOT_METHOD.to_string(),
                 DOCUMENT_APPLY_METHOD.to_string(),
                 DOCUMENT_UNDO_METHOD.to_string(),
+                CONFIG_GET_METHOD.to_string(),
+                STORAGE_GET_METHOD.to_string(),
+                STORAGE_SET_METHOD.to_string(),
+                STORAGE_DELETE_METHOD.to_string(),
                 TEXT_PANEL_CREATE_METHOD.to_string(),
                 TEXT_PANEL_SET_CONTENT_METHOD.to_string(),
                 TEXT_PANEL_FOCUS_METHOD.to_string(),

@@ -1740,6 +1740,23 @@ fn plugin_storage_value<'a>(
     plugin_storage_value_for_workspace(preferences, plugin, key, &get_workspace_path())
 }
 
+fn delete_plugin_storage_value(
+    preferences: &mut PreferencesStore,
+    plugin: &str,
+    key: &str,
+) -> anyhow::Result<()> {
+    let scoped_key = scoped_plugin_storage_key(plugin, key);
+    if plugin == "session_restore"
+        && key == "latest"
+        && preferences.plugin_storage(plugin, key).is_some()
+    {
+        preferences.set_plugin_storage(plugin, &scoped_key, Value::Null)
+    } else {
+        preferences.remove_plugin_storage(plugin, &scoped_key)?;
+        Ok(())
+    }
+}
+
 fn snake_case_key(key: &str) -> String {
     let chars = key.chars().collect::<Vec<_>>();
     let mut result = String::with_capacity(key.len());
@@ -4641,7 +4658,23 @@ struct RpcStatuslineSetParams {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RpcStatuslineClearParams {}
+struct RpcEmptyParams {}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RpcStorageKeyParams {
+    key: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RpcStorageSetParams {
+    key: String,
+    value: Value,
+}
+
+const RPC_STORAGE_MAX_KEY_BYTES: usize = 128;
+const RPC_PLUGIN_VALUE_MAX_BYTES: usize = 1024 * 1024;
 
 fn default_rpc_text_panel_width() -> usize {
     30
@@ -26134,10 +26167,125 @@ impl Editor {
         owner: &str,
         params: &Value,
     ) -> std::result::Result<Value, plugin::rpc::RpcErrorObject> {
-        let _: RpcStatuslineClearParams =
-            Self::rpc_params(plugin::rpc::STATUSLINE_CLEAR_METHOD, params)?;
+        let _: RpcEmptyParams = Self::rpc_params(plugin::rpc::STATUSLINE_CLEAR_METHOD, params)?;
         self.plugin_registry.clear_rpc_statusline(owner);
         Ok(Value::Null)
+    }
+
+    fn validate_rpc_storage_key(
+        method: &str,
+        key: &str,
+    ) -> std::result::Result<(), plugin::rpc::RpcErrorObject> {
+        if key.is_empty()
+            || key.len() > RPC_STORAGE_MAX_KEY_BYTES
+            || key.contains(':')
+            || key.chars().any(char::is_control)
+        {
+            return Err(Self::rpc_error(
+                -32602,
+                format!(
+                    "{method} key must contain 1 to {RPC_STORAGE_MAX_KEY_BYTES} UTF-8 bytes without `:` or control characters"
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_rpc_storage_owner(
+        method: &str,
+        owner: &str,
+    ) -> std::result::Result<(), plugin::rpc::RpcErrorObject> {
+        if owner.contains(':') {
+            return Err(Self::rpc_error(
+                -32005,
+                format!("{method} is unavailable for a plugin owner containing `:`"),
+            ));
+        }
+        Ok(())
+    }
+
+    fn rpc_config_get_request(
+        &self,
+        owner: &str,
+        params: &Value,
+    ) -> std::result::Result<Value, plugin::rpc::RpcErrorObject> {
+        let _: RpcEmptyParams = Self::rpc_params(plugin::rpc::CONFIG_GET_METHOD, params)?;
+        let value = self
+            .config
+            .plugin_config
+            .get(owner)
+            .cloned()
+            .unwrap_or(Value::Null);
+        let value_bytes = serde_json::to_vec(&value)
+            .map_err(|error| Self::rpc_error(-32603, error))?
+            .len();
+        if value_bytes > RPC_PLUGIN_VALUE_MAX_BYTES {
+            return Err(Self::rpc_error(
+                -32005,
+                format!(
+                    "plugin configuration exceeds {RPC_PLUGIN_VALUE_MAX_BYTES} serialized bytes"
+                ),
+            ));
+        }
+        Ok(value)
+    }
+
+    fn rpc_storage_request(
+        &mut self,
+        owner: &str,
+        method: &str,
+        params: &Value,
+    ) -> std::result::Result<Value, plugin::rpc::RpcErrorObject> {
+        Self::validate_rpc_storage_owner(method, owner)?;
+        match method {
+            plugin::rpc::STORAGE_GET_METHOD => {
+                let params: RpcStorageKeyParams = Self::rpc_params(method, params)?;
+                Self::validate_rpc_storage_key(method, &params.key)?;
+                let value = plugin_storage_value(&self.preferences, owner, &params.key)
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                let value_bytes = serde_json::to_vec(&value)
+                    .map_err(|error| Self::rpc_error(-32603, error))?
+                    .len();
+                if value_bytes > RPC_PLUGIN_VALUE_MAX_BYTES {
+                    return Err(Self::rpc_error(
+                        -32005,
+                        format!(
+                            "stored value exceeds {RPC_PLUGIN_VALUE_MAX_BYTES} serialized bytes"
+                        ),
+                    ));
+                }
+                Ok(value)
+            }
+            plugin::rpc::STORAGE_SET_METHOD => {
+                let params: RpcStorageSetParams = Self::rpc_params(method, params)?;
+                Self::validate_rpc_storage_key(method, &params.key)?;
+                let value_bytes = serde_json::to_vec(&params.value)
+                    .map_err(|error| Self::rpc_error(-32603, error))?
+                    .len();
+                if value_bytes > RPC_PLUGIN_VALUE_MAX_BYTES {
+                    return Err(Self::rpc_error(
+                        -32602,
+                        format!(
+                            "{method} value may not exceed {RPC_PLUGIN_VALUE_MAX_BYTES} serialized bytes"
+                        ),
+                    ));
+                }
+                let key = scoped_plugin_storage_key(owner, &params.key);
+                self.preferences
+                    .set_plugin_storage(owner, &key, params.value)
+                    .map_err(|error| Self::rpc_error(-32603, error))?;
+                Ok(Value::Null)
+            }
+            plugin::rpc::STORAGE_DELETE_METHOD => {
+                let params: RpcStorageKeyParams = Self::rpc_params(method, params)?;
+                Self::validate_rpc_storage_key(method, &params.key)?;
+                delete_plugin_storage_value(&mut self.preferences, owner, &params.key)
+                    .map_err(|error| Self::rpc_error(-32603, error))?;
+                Ok(Value::Null)
+            }
+            _ => Err(plugin::rpc::RpcErrorObject::method_not_found(method)),
+        }
     }
 
     fn rpc_document_index(
@@ -26319,6 +26467,10 @@ impl Editor {
                 self.rpc_document_undo_request(render_buffer, runtime, owner, params)
                     .await
             }
+            plugin::rpc::CONFIG_GET_METHOD => self.rpc_config_get_request(owner, params),
+            plugin::rpc::STORAGE_GET_METHOD
+            | plugin::rpc::STORAGE_SET_METHOD
+            | plugin::rpc::STORAGE_DELETE_METHOD => self.rpc_storage_request(owner, method, params),
             plugin::rpc::STATUSLINE_SET_METHOD => self.rpc_statusline_set_request(owner, params),
             plugin::rpc::STATUSLINE_CLEAR_METHOD => {
                 self.rpc_statusline_clear_request(owner, params)
@@ -37763,6 +37915,162 @@ builtin = "rust"
         }
         assert_eq!(editor.current_buffer().contents(), "hello");
         assert!(!editor.current_buffer().is_dirty());
+    }
+
+    #[tokio::test]
+    async fn rpc_config_and_storage_are_owner_scoped_bounded_and_persistent() {
+        let directory = tempfile::tempdir().unwrap();
+        let preferences_path = directory.path().join("preferences.json");
+        let mut editor = test_editor(/*width*/ 80, /*height*/ 24);
+        editor.preferences = PreferencesStore::load(&preferences_path);
+        let owners = [("rpc-one", json!({"label": "one"})), ("rpc-two", json!(2))];
+        for (owner, value) in &owners {
+            editor
+                .config
+                .plugin_config
+                .insert((*owner).to_string(), value.clone());
+        }
+        let mut render_buffer = RenderBuffer::new(80, 24, &Style::default());
+        let mut runtime = Runtime::new();
+        macro_rules! request {
+            ($owner:expr, $method:expr, $params:expr $(,)?) => {
+                editor.rpc_host_request(&mut render_buffer, &mut runtime, $owner, $method, &$params)
+            };
+        }
+
+        for (owner, value) in &owners {
+            assert_eq!(
+                request!(owner, plugin::rpc::CONFIG_GET_METHOD, json!({}))
+                    .await
+                    .unwrap(),
+                *value
+            );
+            request!(
+                owner,
+                plugin::rpc::STORAGE_SET_METHOD,
+                json!({"key": "shared", "value": value}),
+            )
+            .await
+            .unwrap();
+        }
+        editor
+            .preferences
+            .set_plugin_storage("rpc-one", "foreign:shared", json!("private"))
+            .unwrap();
+        let collision = request!(
+            "rpc-one:foreign",
+            plugin::rpc::STORAGE_GET_METHOD,
+            json!({"key": "shared"}),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(collision.code, -32005);
+
+        for key in [
+            "".to_string(),
+            "foreign:key".to_string(),
+            "x".repeat(RPC_STORAGE_MAX_KEY_BYTES + 1),
+        ] {
+            let invalid = request!(
+                "rpc-one",
+                plugin::rpc::STORAGE_GET_METHOD,
+                json!({"key": key}),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(invalid.code, -32602);
+        }
+        request!(
+            "rpc-one",
+            plugin::rpc::STORAGE_SET_METHOD,
+            json!({"key": " ", "value": true}),
+        )
+        .await
+        .unwrap();
+        let oversized_value = json!("x".repeat(RPC_PLUGIN_VALUE_MAX_BYTES));
+        editor
+            .config
+            .plugin_config
+            .insert("rpc-large".to_string(), oversized_value.clone());
+        let oversized_config = request!("rpc-large", plugin::rpc::CONFIG_GET_METHOD, json!({}))
+            .await
+            .unwrap_err();
+        let oversized_storage = request!(
+            "rpc-one",
+            plugin::rpc::STORAGE_SET_METHOD,
+            json!({"key": "oversized", "value": oversized_value}),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            (oversized_config.code, oversized_storage.code),
+            (-32005, -32602)
+        );
+
+        editor
+            .preferences
+            .set_plugin_storage("session_restore", "latest", json!("legacy"))
+            .unwrap();
+        request!(
+            "session_restore",
+            plugin::rpc::STORAGE_DELETE_METHOD,
+            json!({"key": "latest"}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            request!(
+                "session_restore",
+                plugin::rpc::STORAGE_GET_METHOD,
+                json!({"key": "latest"})
+            )
+            .await
+            .unwrap(),
+            Value::Null
+        );
+
+        editor.preferences = PreferencesStore::load(&preferences_path);
+        for (owner, value) in &owners {
+            assert_eq!(
+                request!(
+                    owner,
+                    plugin::rpc::STORAGE_GET_METHOD,
+                    json!({"key": "shared"})
+                )
+                .await
+                .unwrap(),
+                *value
+            );
+        }
+        for _ in 0..2 {
+            request!(
+                "rpc-one",
+                plugin::rpc::STORAGE_DELETE_METHOD,
+                json!({"key": "shared"}),
+            )
+            .await
+            .unwrap();
+        }
+        assert_eq!(
+            request!(
+                "rpc-one",
+                plugin::rpc::STORAGE_GET_METHOD,
+                json!({"key": "shared"})
+            )
+            .await
+            .unwrap(),
+            Value::Null
+        );
+        let reloaded = PreferencesStore::load(&preferences_path);
+        assert_eq!(reloaded.plugin_storage("rpc-one", "shared"), None);
+        assert_eq!(
+            reloaded.plugin_storage("rpc-one", "foreign:shared"),
+            Some(&json!("private"))
+        );
+        assert_eq!(
+            reloaded.plugin_storage("rpc-two", "shared"),
+            Some(&json!(2))
+        );
     }
 
     #[tokio::test]

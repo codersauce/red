@@ -95,6 +95,10 @@ The version 1 initialization parameters are:
     "red/DocumentSnapshot",
     "red/DocumentApply",
     "red/DocumentUndo",
+    "red/ConfigGet",
+    "red/StorageGet",
+    "red/StorageSet",
+    "red/StorageDelete",
     "red/TextPanelCreate",
     "red/TextPanelSetContent",
     "red/TextPanelFocus",
@@ -211,6 +215,40 @@ until its replacement validates, then its resources are cleared during the
 swap. Notifications and host responses enter the bounded writer queue without
 waiting for a child pipe acknowledgement. Eager plugins still initialize before
 the editor first opens.
+
+## Configuration and storage
+
+`red/ConfigGet` accepts an empty object and returns the calling plugin's value
+from `[plugin_config.<owner>]`, or `null` when it has no configuration. The
+owner is the local name Red used to register the plugin; the process cannot
+read another plugin's configuration by supplying an ID:
+
+```json
+{"jsonrpc":"2.0","id":"plugin-config","method":"red/ConfigGet","params":{}}
+```
+
+Plugins can persist JSON under that same owner with `red/StorageGet`,
+`red/StorageSet`, and `red/StorageDelete`:
+
+```json
+{"jsonrpc":"2.0","id":"plugin-get","method":"red/StorageGet","params":{"key":"settings"}}
+{"jsonrpc":"2.0","id":"plugin-set","method":"red/StorageSet","params":{"key":"settings","value":{"enabled":true}}}
+{"jsonrpc":"2.0","id":"plugin-delete","method":"red/StorageDelete","params":{"key":"settings"}}
+```
+
+Get returns the stored value or `null` when the key is missing. Set and delete
+return `null`; deleting a missing key succeeds. Values survive editor restarts
+through Red's existing preferences store. Husk and RPC plugins use the same
+owner-scoped store and lookup rules, so changing a plugin's local registration
+name selects a different configuration and storage namespace.
+
+Keys must contain 1 to 128 UTF-8 bytes and may not contain `:` or control
+characters. Storage is unavailable when the configured owner name contains
+`:` because existing preference keys use that delimiter. A configuration or
+stored value may use at most 1 MiB after compact JSON serialization. Unknown
+fields, invalid keys, and oversized writes return `-32602`; an unavailable
+owner or oversized read returns `-32005`, and a persistence failure returns
+`-32603`. These request errors leave the connection active.
 
 ## Document snapshots
 
@@ -373,6 +411,7 @@ Version 1 deliberately exposes a small set of typed operations:
   and scope rules.
 - Declared editor events with documented JSON payloads. Process-local callback
   events and raw keyboard input are excluded.
+- Owner-scoped configuration and bounded persistent JSON storage.
 - `red/DocumentSnapshot`, `red/DocumentApply`, and `red/DocumentUndo`, preserving
   revisions, attributed undo transactions, dirty tracking, and LSP updates.
 - Text-panel create, content replacement, focus, and disposal, with resources
@@ -390,8 +429,9 @@ synchronous rendering callbacks, high-frequency cursor or viewport events, and
 transparent process restart are outside version 1.
 
 The current host integration activates and executes commands, delivers the
-three editor events above, and serves the document and text-panel methods.
-It also caches and renders one statusline contribution per active connection.
+three editor events above, serves configuration, storage, document, and
+text-panel methods, and caches one statusline contribution per active
+connection.
 
 ## Errors and failure semantics
 

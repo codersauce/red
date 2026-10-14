@@ -385,6 +385,25 @@ impl PreferencesStore {
         self.save_plugin_storage()
     }
 
+    /// Deletes and immediately persists a plugin-owned preference value.
+    pub(crate) fn remove_plugin_storage(
+        &mut self,
+        plugin: &str,
+        key: &str,
+    ) -> anyhow::Result<bool> {
+        let removed = self
+            .preferences
+            .plugin_storage
+            .remove(&plugin_storage_key(plugin, key))
+            .is_some();
+        if !removed && !self.plugin_storage_dirty {
+            return Ok(false);
+        }
+        self.plugin_storage_dirty = true;
+        self.save_plugin_storage()?;
+        Ok(removed)
+    }
+
     /// Flushes deferred preferences and ordered exit-hook values in one write.
     pub(crate) fn flush_plugin_storage(
         &mut self,

@@ -68,6 +68,23 @@ class RpcExampleTest(unittest.TestCase):
                 self.assertEqual(output[-1]["id"], "document")
                 self.assertEqual(output[-1]["error"], {"code": -32000, "message": expected})
 
+    def test_config_and_storage_methods_are_exercised(self):
+        output = self.run_plugin(
+            {"id": "config", "method": "command/execute", "params": {"name": "RpcConfig"}},
+            {"id": "plugin-1", "result": {"greeting": "hello"}},
+            {"id": "storage", "method": "command/execute", "params": {"name": "RpcStorage"}},
+            {"id": "plugin-2", "result": 2},
+            {"id": "plugin-3", "result": None},
+            {"id": "clear", "method": "command/execute", "params": {"name": "RpcStorageClear"}},
+            {"id": "plugin-4", "result": None},
+        )
+        replies = {message["id"]: message for message in output}
+        self.assertEqual(replies["plugin-1"]["method"], "red/ConfigGet")
+        self.assertEqual(replies["plugin-2"]["method"], "red/StorageGet")
+        self.assertEqual(replies["plugin-3"]["params"], {"key": "count", "value": 3})
+        self.assertEqual(replies["plugin-4"]["method"], "red/StorageDelete")
+        self.assertEqual(replies["storage"]["result"]["message"], "Persistent RPC count: 3")
+
     def test_shutdown_and_exit_interrupt_a_host_response_wait(self):
         output = self.run_plugin(
             {"id": "document", "method": "command/execute", "params": {"name": "RpcDocument"}},
