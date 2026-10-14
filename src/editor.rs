@@ -4600,6 +4600,12 @@ struct RpcDocumentShowParams {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct RpcDocumentWatchParams {
+    document_id: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RpcDocumentSnapshotParams {
     #[serde(default)]
     path: Option<String>,
@@ -10800,6 +10806,9 @@ impl Editor {
         self.plugin_registry.poll_rpc_lifecycle(runtime).await;
         self.plugin_registry.poll_rpc_commands(runtime).await;
         self.service_rpc_host_requests(buffer, runtime).await;
+        self.plugin_registry
+            .flush_rpc_document_events(runtime)
+            .await;
         self.service_mouse_selection(buffer, runtime).await?;
         self.service_open_file_changes(buffer, runtime).await?;
         if self.agent_lsp.has_work() {
@@ -25712,6 +25721,8 @@ impl Editor {
             "cursor": { "line": line, "column": column }
         });
         self.plugin_registry
+            .queue_rpc_document_changed(id.as_u64(), revision);
+        self.plugin_registry
             .notify(runtime, "buffer:changed", buffer_info)
             .await?;
         self.lsp_coordinator.record_notified_revision(id, revision);
@@ -25808,6 +25819,8 @@ impl Editor {
             }
         }
         self.lsp_coordinator.forget_buffer(removed_id);
+        self.plugin_registry
+            .queue_rpc_document_closed(removed_id.as_u64());
 
         if self.buffer_manager.len() == 1 {
             self.buffer_manager
@@ -26389,9 +26402,7 @@ impl Editor {
             return Self::plugin_document_index(buffer_manager, path)
                 .map_err(|error| Self::rpc_error(-32001, error));
         };
-        let id = document_id
-            .parse::<u64>()
-            .map_err(|_| Self::rpc_error(-32602, "document_id must be a decimal u64 string"))?;
+        let id = Self::rpc_document_id(document_id)?;
         let index = buffer_manager
             .iter()
             .position(|buffer| buffer.id().as_u64() == id)
@@ -26407,6 +26418,12 @@ impl Editor {
             }
         }
         Ok(index)
+    }
+
+    fn rpc_document_id(document_id: &str) -> std::result::Result<u64, plugin::rpc::RpcErrorObject> {
+        document_id
+            .parse::<u64>()
+            .map_err(|_| Self::rpc_error(-32602, "document_id must be a decimal u64 string"))
     }
 
     fn rpc_document_create_request(
@@ -26507,6 +26524,39 @@ impl Editor {
                     .map_err(|error| Self::rpc_error(-32003, error))?;
             }
         }
+        Ok(Value::Null)
+    }
+
+    fn rpc_document_watch_request(
+        &mut self,
+        owner: &str,
+        params: &Value,
+    ) -> std::result::Result<Value, plugin::rpc::RpcErrorObject> {
+        let params: RpcDocumentWatchParams =
+            Self::rpc_params(plugin::rpc::DOCUMENT_WATCH_METHOD, params)?;
+        let index = Self::rpc_document_index(
+            &self.buffer_manager,
+            /*path*/ None,
+            Some(&params.document_id),
+        )?;
+        let document = &self.buffer_manager[index];
+        let document_id = document.id().as_u64();
+        let revision = document.revision();
+        self.plugin_registry
+            .watch_rpc_document(owner, document_id)?;
+        Ok(json!({ "revision": revision.to_string() }))
+    }
+
+    fn rpc_document_unwatch_request(
+        &mut self,
+        owner: &str,
+        params: &Value,
+    ) -> std::result::Result<Value, plugin::rpc::RpcErrorObject> {
+        let params: RpcDocumentWatchParams =
+            Self::rpc_params(plugin::rpc::DOCUMENT_UNWATCH_METHOD, params)?;
+        let document_id = Self::rpc_document_id(&params.document_id)?;
+        self.plugin_registry
+            .unwatch_rpc_document(owner, document_id)?;
         Ok(Value::Null)
     }
 
@@ -26657,6 +26707,10 @@ impl Editor {
             plugin::rpc::DOCUMENT_CREATE_METHOD => self.rpc_document_create_request(owner, params),
             plugin::rpc::DOCUMENT_SHOW_METHOD => {
                 self.rpc_document_show_request(render_buffer, params).await
+            }
+            plugin::rpc::DOCUMENT_WATCH_METHOD => self.rpc_document_watch_request(owner, params),
+            plugin::rpc::DOCUMENT_UNWATCH_METHOD => {
+                self.rpc_document_unwatch_request(owner, params)
             }
             plugin::rpc::DOCUMENT_SNAPSHOT_METHOD => {
                 Self::rpc_document_snapshot_request(&self.buffer_manager, params)

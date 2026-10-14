@@ -1,6 +1,12 @@
 {
-  "api_version": "0.22.0",
+  "api_version": "0.23.0",
   "changes": [
+    {
+      "version": "0.23.0",
+      "kind": "introduced",
+      "symbols": ["red/DocumentWatch", "red/DocumentUnwatch", "document/event"],
+      "migration_note": "docs/RPC_PLUGIN_PROTOCOL.md#document-watches"
+    },
     {
       "version": "0.22.0",
       "kind": "introduced",

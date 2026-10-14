@@ -16,6 +16,7 @@ RESULT_LIMIT = 1024 * 1024
 DIAGNOSTIC_LIMIT = 64 * 1024
 QUERY_LIMIT = 16 * 1024
 JQ_TIMEOUT_SECONDS = 5
+LIVE_DEBOUNCE_SECONDS = 0.12
 HISTORY_LIMIT = 20
 PRESET_LIMIT = 128
 PICKER_LABEL_LIMIT = 256
@@ -37,6 +38,20 @@ COMMANDS = [
         "name": "JsonRun",
         "metadata": {
             "title": "Run the editable JSON query",
+            "category": "JSON Workbench",
+        },
+    },
+    {
+        "name": "JsonLive",
+        "metadata": {
+            "title": "Toggle live JSON previews",
+            "category": "JSON Workbench",
+        },
+    },
+    {
+        "name": "JsonCancel",
+        "metadata": {
+            "title": "Cancel the current JSON preview",
             "category": "JSON Workbench",
         },
     },
@@ -315,6 +330,9 @@ class JsonWorkbench:
         self.active_picker_id = None
         self.picker_actions = {}
         self.active_run = None
+        self.run_generation = 0
+        self.live_enabled = False
+        self.watched_ids = set()
 
     def send(self, message):
         frame = json.dumps(
@@ -376,6 +394,8 @@ class JsonWorkbench:
             self.close_protocol(CommandCancelled())
             return False
         elif method == "picker/event":
+            self.incoming.put(message)
+        elif method == "document/event":
             self.incoming.put(message)
         elif method == "command/execute" and self.command_active.is_set():
             self.send_error(message, "JSON Workbench is busy")
@@ -477,17 +497,18 @@ class JsonWorkbench:
             "red/DocumentSnapshot", {"document_id": self.source_id}
         )
 
-    def run_cancelled(self, cancel):
+    def run_cancelled(self, cancel, generation=None):
         return (
             self.cancelling.is_set()
             or self.closed.is_set()
             or (cancel is not None and cancel.is_set())
+            or (generation is not None and generation != self.run_generation)
         )
 
-    def wait_for_jq(self, process, overflow, cancel=None):
+    def wait_for_jq(self, process, overflow, cancel=None, generation=None):
         deadline = time.monotonic() + self.jq_timeout
         while process.poll() is None:
-            if self.run_cancelled(cancel):
+            if self.run_cancelled(cancel, generation):
                 return CommandCancelled()
             failure = overflow_failure(overflow)
             if failure is not None:
@@ -503,7 +524,7 @@ class JsonWorkbench:
                 pass
         return None
 
-    def run_jq(self, query_text, source, cancel=None):
+    def run_jq(self, query_text, source, cancel=None, generation=None):
         try:
             process = subprocess.Popen(
                 [*self.jq_command, "--", query_text],
@@ -546,7 +567,7 @@ class JsonWorkbench:
         for worker in workers:
             worker.start()
 
-        failure = self.wait_for_jq(process, overflow, cancel)
+        failure = self.wait_for_jq(process, overflow, cancel, generation)
         if failure is not None:
             stop_process(process)
         else:
@@ -670,8 +691,8 @@ class JsonWorkbench:
         self.storage_available = True
         return True
 
-    def ensure_run_active(self, cancel):
-        if self.run_cancelled(cancel):
+    def ensure_run_active(self, cancel, generation=None):
+        if self.run_cancelled(cancel, generation):
             raise CommandCancelled()
 
     def remember_query(self, query_text):
@@ -689,24 +710,26 @@ class JsonWorkbench:
             return False
         return True
 
-    def run_query(self, query_text, cancel=None, background=False):
+    def run_query(
+        self, query_text, cancel=None, background=False, generation=None
+    ):
         validate_query(query_text)
         self.last_query = query_text
         self.result = None
         self.candidate = None
         try:
-            self.ensure_run_active(cancel)
+            self.ensure_run_active(cancel, generation)
             document = self.snapshot_source()
-            self.ensure_run_active(cancel)
+            self.ensure_run_active(cancel, generation)
             source = document["text"]
             source_bytes = source.encode("utf-8")
             if len(source_bytes) > SOURCE_LIMIT:
                 raise OperationError(f"JSON source exceeds {SOURCE_LIMIT} bytes")
             self.set_status("JSON: running")
-            output = self.run_jq(query_text, source_bytes, cancel)
-            self.ensure_run_active(cancel)
+            output = self.run_jq(query_text, source_bytes, cancel, generation)
+            self.ensure_run_active(cancel, generation)
             self.show_result(document, query_text, output)
-            self.ensure_run_active(cancel)
+            self.ensure_run_active(cancel, generation)
             self.result = output
             self.candidate = {
                 "document_id": self.source_id,
@@ -715,7 +738,7 @@ class JsonWorkbench:
                 "output": output,
             }
             saved = self.remember_query(query_text)
-            self.ensure_run_active(cancel)
+            self.ensure_run_active(cancel, generation)
             note = "" if saved else "; history not saved"
             self.set_status(
                 f"JSON: ready ({len(output.encode('utf-8'))} B{note})"
@@ -744,20 +767,81 @@ class JsonWorkbench:
         self.best_effort_status("JSON: query")
         return {"message": "JSON query document ready"}
 
-    def run(self, _params):
+    def snapshot_query(self):
         if self.query_document_id is None:
             raise OperationError("JsonWorkbench has no query document")
         try:
-            query = self.request_host(
+            return self.request_host(
                 "red/DocumentSnapshot", {"document_id": self.query_document_id}
             )
         except HostError as error:
             if error.code == -32001:
                 self.query_document_id = None
             raise
+
+    def run(self, _params):
+        self.stop_background_query()
+        query = self.snapshot_query()
         self.load_settings()
         self.load_storage()
         return self.run_query(query["text"])
+
+    def watch_document(self, document_id):
+        watched = self.request_host(
+            "red/DocumentWatch", {"document_id": document_id}
+        )
+        if not isinstance(watched, dict) or not isinstance(
+            watched.get("revision"), str
+        ) or not watched["revision"].isdigit():
+            raise OperationError("red/DocumentWatch returned an invalid revision")
+
+    def disable_live(self):
+        self.live_enabled = False
+        self.stop_background_query()
+        watched_ids = tuple(sorted(self.watched_ids))
+        self.watched_ids.clear()
+        for document_id in watched_ids:
+            self.request_host(
+                "red/DocumentUnwatch", {"document_id": document_id}
+            )
+
+    def watch_workbench_documents(self):
+        watched = []
+        try:
+            for document_id in (self.source_id, self.query_document_id):
+                self.watch_document(document_id)
+                watched.append(document_id)
+        except OperationError:
+            for document_id in watched:
+                try:
+                    self.request_host(
+                        "red/DocumentUnwatch", {"document_id": document_id}
+                    )
+                except OperationError:
+                    pass
+            raise
+        return set(watched)
+
+    def live(self, _params):
+        if self.live_enabled:
+            self.disable_live()
+            self.best_effort_status("JSON: live paused")
+            return {"message": "JSON live preview paused"}
+        self.stop_background_query()
+        if self.source_id is None or self.query_document_id is None:
+            raise OperationError("JsonWorkbench must be open before live preview")
+        self.watched_ids = self.watch_workbench_documents()
+        self.live_enabled = True
+        self.start_background_query(None, replace=True, debounce=True)
+        self.best_effort_status("JSON: live")
+        return {"message": "JSON live preview scheduled"}
+
+    def cancel(self, _params):
+        self.stop_background_query()
+        self.candidate = None
+        self.result = None
+        self.best_effort_status("JSON: cancelled")
+        return {"message": "JSON preview cancelled"}
 
     def open_result(self, _params):
         if self.result is None:
@@ -787,6 +871,7 @@ class JsonWorkbench:
     def query(self, params):
         query_text = params.get("raw_args", "")
         validate_query(query_text)
+        self.stop_background_query()
         self.clear_picker()
         self.load_settings()
         self.load_storage()
@@ -871,32 +956,48 @@ class JsonWorkbench:
         state = "resumed" if self.history_enabled else "paused"
         self.best_effort_status(f"JSON: history {state}{note}")
 
-    def background_query(self, query_text, cancel):
+    def background_query(self, query_text, cancel, generation, debounce):
         try:
-            self.run_query(query_text, cancel=cancel, background=True)
+            if debounce and cancel.wait(LIVE_DEBOUNCE_SECONDS):
+                raise CommandCancelled()
+            if query_text is None:
+                query_text = self.snapshot_query()["text"]
+            self.run_query(
+                query_text,
+                cancel=cancel,
+                background=True,
+                generation=generation,
+            )
         except CommandCancelled:
             pass
         except OperationError:
             self.best_effort_status("JSON: error")
 
-    def start_background_query(self, query_text):
+    def start_background_query(self, query_text, replace=False, debounce=False):
         if self.background_busy():
-            self.best_effort_status("JSON: busy")
-            return
+            if not replace:
+                self.best_effort_status("JSON: busy")
+                return False
+            self.stop_background_query()
+        self.run_generation += 1
+        generation = self.run_generation
         self.candidate = None
+        self.result = None
         cancel = threading.Event()
         thread = threading.Thread(
             target=self.background_query,
-            args=(query_text, cancel),
+            args=(query_text, cancel, generation, debounce),
             name="json-workbench-query",
         )
-        self.active_run = (thread, cancel)
+        self.active_run = (thread, cancel, generation)
         thread.start()
+        return True
 
     def stop_background_query(self):
         if self.active_run is None:
             return
-        thread, cancel = self.active_run
+        thread, cancel, _generation = self.active_run
+        self.run_generation += 1
         cancel.set()
         if thread.ident is not None:
             thread.join()
@@ -923,6 +1024,32 @@ class JsonWorkbench:
             self.clear_history()
         else:
             self.toggle_history()
+
+    def handle_document_event(self, message):
+        params = message.get("params", {})
+        document_id = params.get("document_id")
+        if document_id not in self.watched_ids:
+            return
+        event = params.get("event")
+        if event == "changed":
+            revision = params.get("revision")
+            if self.live_enabled and isinstance(revision, str) and revision.isdigit():
+                self.start_background_query(None, replace=True, debounce=True)
+            return
+        if event == "closed":
+            self.retire_closed_document(document_id)
+
+    def retire_closed_document(self, document_id):
+        if document_id == self.source_id:
+            self.source_id = None
+        if document_id == self.query_document_id:
+            self.query_document_id = None
+        self.disable_live()
+        self.candidate = None
+        self.result = None
+        error = OperationError("JSON Workbench document was closed")
+        self.retire_preview(error, create=True)
+        self.best_effort_status("JSON: closed")
 
     def apply(self, _params):
         candidate = self.candidate
@@ -980,7 +1107,10 @@ class JsonWorkbench:
 
     def close(self, _params):
         self.clear_picker()
-        self.stop_background_query()
+        if self.live_enabled or self.watched_ids:
+            self.disable_live()
+        else:
+            self.stop_background_query()
         if self.panel_open:
             self.request_host("red/TextPanelDispose", {"id": PANEL_ID})
         self.request_host("red/StatuslineClear", {})
@@ -995,12 +1125,21 @@ class JsonWorkbench:
     def execute(self, message):
         params = message.get("params", {})
         name = params.get("name")
-        if self.background_busy() and name != "JsonClose":
+        background_commands = {
+            "JsonCancel",
+            "JsonClose",
+            "JsonLive",
+            "JsonQuery",
+            "JsonRun",
+        }
+        if self.background_busy() and name not in background_commands:
             self.send_error(message, "JSON Workbench is busy")
             return
         handlers = {
             "JsonWorkbench": self.workbench,
             "JsonRun": self.run,
+            "JsonLive": self.live,
+            "JsonCancel": self.cancel,
             "JsonQuery": self.query,
             "JsonQueries": self.queries,
             "JsonOpenResult": self.open_result,
@@ -1050,6 +1189,8 @@ class JsonWorkbench:
                     self.execute(message)
                 elif method == "picker/event":
                     self.handle_picker_event(message)
+                elif method == "document/event":
+                    self.handle_document_event(message)
                 else:
                     self.send_error(message, "method not found")
         finally:

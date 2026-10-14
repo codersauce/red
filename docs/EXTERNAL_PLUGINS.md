@@ -170,10 +170,12 @@ one starts the process, validates its command metadata, and sends the typed
 ordinary editable documents with `red/DocumentCreate` and `red/DocumentShow`.
 They can call `red/DocumentSnapshot`, `red/DocumentApply`, and
 `red/DocumentUndo` to read and transactionally edit open documents through
-Red's existing revision, dirty-state, undo, and LSP paths. They can also
-create, replace the content of, focus, and dispose
-host-rendered text panels with connection-owned IDs, and set or clear one
-cached statusline contribution. Declared `editor:ready`, `file:opened`, and
+Red's existing revision, dirty-state, undo, and LSP paths. RPC plugins may also
+watch two stable document IDs for coalesced owner-local `document/event`
+invalidations and terminal close notifications. They can create, replace the
+content of, focus, and dispose host-rendered text panels with connection-owned
+IDs, and set or clear one cached statusline contribution. Declared
+`editor:ready`, `file:opened`, and
 `file:saved` events arrive as typed `event/notify` notifications; other editor
 and callback events remain outside protocol version 1.
 
@@ -241,6 +243,9 @@ package's private storage. The package owns validation and conversion.
 - `DocumentSnapshot`, `DocumentApply`, and `DocumentUndo` preserve editor
   revisions, preimages, attributed transactions, dirty tracking, and LSP
   notifications.
+- RPC document watches are capped at two per connection, carry only stable IDs
+  and revisions, coalesce rapid changes, and are released on disconnect or
+  reload.
 - RPC text panels are capped per connection, use private host IDs, and are
   disposed when their owner disconnects or reloads.
 - RPC statusline contributions are cached by the host and cleared when their

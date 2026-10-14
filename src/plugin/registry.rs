@@ -33,11 +33,11 @@ use super::process::inherited_environment;
 use super::rpc::{
     RpcConnection, RpcErrorObject, RpcIncoming, RpcInitializeParams, RpcRequester,
     RpcStatuslineSide, CONFIG_GET_METHOD, DOCUMENT_APPLY_METHOD, DOCUMENT_CREATE_METHOD,
-    DOCUMENT_SHOW_METHOD, DOCUMENT_SNAPSHOT_METHOD, DOCUMENT_UNDO_METHOD, MAX_OUTSTANDING_REQUESTS,
-    MAX_QUEUED_BYTES, PICKER_EVENT_METHOD, PICKER_OPEN_METHOD, STATUSLINE_CLEAR_METHOD,
-    STATUSLINE_SET_METHOD, STORAGE_DELETE_METHOD, STORAGE_GET_METHOD, STORAGE_SET_METHOD,
-    TEXT_PANEL_CREATE_METHOD, TEXT_PANEL_DISPOSE_METHOD, TEXT_PANEL_FOCUS_METHOD,
-    TEXT_PANEL_SET_CONTENT_METHOD,
+    DOCUMENT_EVENT_METHOD, DOCUMENT_SHOW_METHOD, DOCUMENT_SNAPSHOT_METHOD, DOCUMENT_UNDO_METHOD,
+    DOCUMENT_UNWATCH_METHOD, DOCUMENT_WATCH_METHOD, MAX_OUTSTANDING_REQUESTS, MAX_QUEUED_BYTES,
+    PICKER_EVENT_METHOD, PICKER_OPEN_METHOD, STATUSLINE_CLEAR_METHOD, STATUSLINE_SET_METHOD,
+    STORAGE_DELETE_METHOD, STORAGE_GET_METHOD, STORAGE_SET_METHOD, TEXT_PANEL_CREATE_METHOD,
+    TEXT_PANEL_DISPOSE_METHOD, TEXT_PANEL_FOCUS_METHOD, TEXT_PANEL_SET_CONTENT_METHOD,
 };
 use super::{
     CommandMetadata, CommandScope, PluginMetadata, RegisteredPluginCommand, RequestId, Runtime,
@@ -50,6 +50,8 @@ const RPC_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 const RPC_EVENT_METHOD: &str = "event/notify";
 const RPC_EDITOR_EVENTS: &[&str] = &["editor:ready", "file:opened", "file:saved"];
 const MAX_RPC_TEXT_PANELS: usize = 16;
+const MAX_RPC_DOCUMENT_WATCHES: usize = 2;
+const RPC_DOCUMENT_EVENT_INTERVAL: Duration = Duration::from_millis(50);
 type RpcInbox = Arc<Mutex<mpsc::Receiver<RpcIncoming>>>;
 
 /// Lifecycle authority for configured Husk plugins.
@@ -86,7 +88,15 @@ struct ActiveRpcPlugin {
     incoming: RpcInbox,
     commands: HashMap<String, CommandMetadata>,
     events: HashSet<String>,
+    document_watches: HashMap<u64, RpcDocumentWatch>,
+    closed_documents: Vec<u64>,
     command: Option<PendingRpcCommand>,
+}
+
+#[derive(Default)]
+struct RpcDocumentWatch {
+    pending_revision: Option<u64>,
+    ready_at: Option<Instant>,
 }
 
 struct PendingRpcCommand {
@@ -220,7 +230,7 @@ struct RpcCommandResult {
 }
 
 /// Host API version used for plugin compatibility checks.
-pub const RED_HOST_API_VERSION: &str = "0.22.0";
+pub const RED_HOST_API_VERSION: &str = "0.23.0";
 pub(crate) const SUPPORTED_HOST_API_VERSIONS: &[&str] = &[
     "0.4.0",
     "0.6.0",
@@ -237,6 +247,7 @@ pub(crate) const SUPPORTED_HOST_API_VERSIONS: &[&str] = &[
     "0.19.0",
     "0.20.0",
     "0.21.0",
+    "0.22.0",
     RED_HOST_API_VERSION,
 ];
 
@@ -326,6 +337,120 @@ impl PluginRegistry {
             .values()
             .filter(move |contribution| contribution.side == side)
             .map(|contribution| contribution.text.as_str())
+    }
+
+    pub(crate) fn watch_rpc_document(
+        &mut self,
+        owner: &str,
+        document_id: u64,
+    ) -> std::result::Result<(), RpcErrorObject> {
+        let plugin = self
+            .rpc_plugins
+            .get_mut(owner)
+            .ok_or_else(|| RpcErrorObject {
+                code: -32005,
+                message: "RPC plugin connection is not active".to_string(),
+                data: None,
+            })?;
+        if plugin.document_watches.contains_key(&document_id) {
+            return Ok(());
+        }
+        if plugin.document_watches.len() >= MAX_RPC_DOCUMENT_WATCHES {
+            return Err(RpcErrorObject {
+                code: -32004,
+                message: format!(
+                    "RPC plugin may watch at most {MAX_RPC_DOCUMENT_WATCHES} documents"
+                ),
+                data: None,
+            });
+        }
+        plugin
+            .document_watches
+            .insert(document_id, RpcDocumentWatch::default());
+        Ok(())
+    }
+
+    pub(crate) fn unwatch_rpc_document(
+        &mut self,
+        owner: &str,
+        document_id: u64,
+    ) -> std::result::Result<(), RpcErrorObject> {
+        let plugin = self
+            .rpc_plugins
+            .get_mut(owner)
+            .ok_or_else(|| RpcErrorObject {
+                code: -32005,
+                message: "RPC plugin connection is not active".to_string(),
+                data: None,
+            })?;
+        plugin.document_watches.remove(&document_id);
+        Ok(())
+    }
+
+    pub(crate) fn queue_rpc_document_changed(&mut self, document_id: u64, revision: u64) {
+        let ready_at = Instant::now() + RPC_DOCUMENT_EVENT_INTERVAL;
+        for plugin in self.rpc_plugins.values_mut() {
+            let Some(watch) = plugin.document_watches.get_mut(&document_id) else {
+                continue;
+            };
+            watch.pending_revision = Some(revision);
+            watch.ready_at.get_or_insert(ready_at);
+        }
+    }
+
+    async fn send_rpc_document_event(&mut self, runtime: &mut Runtime, owner: &str, params: Value) {
+        let Some(plugin) = self.rpc_plugins.get(owner) else {
+            return;
+        };
+        if let Err(error) = plugin
+            .connection
+            .notify(DOCUMENT_EVENT_METHOD, params)
+            .await
+        {
+            let path = self.plugin_path(owner);
+            self.quarantine(runtime, owner, &path, "runtime", error.to_string());
+        }
+    }
+
+    pub(crate) async fn flush_rpc_document_events(&mut self, runtime: &mut Runtime) {
+        let now = Instant::now();
+        let mut events = Vec::new();
+        for (owner, plugin) in &mut self.rpc_plugins {
+            for document_id in plugin.closed_documents.drain(..) {
+                events.push((owner.clone(), document_id, None));
+            }
+            for (&document_id, watch) in &mut plugin.document_watches {
+                if !watch.ready_at.is_some_and(|ready_at| ready_at <= now) {
+                    continue;
+                }
+                watch.ready_at = None;
+                if let Some(revision) = watch.pending_revision.take() {
+                    events.push((owner.clone(), document_id, Some(revision)));
+                }
+            }
+        }
+        for (owner, document_id, revision) in events {
+            let params = match revision {
+                Some(revision) => json!({
+                    "document_id": document_id.to_string(),
+                    "event": "changed",
+                    "revision": revision.to_string(),
+                }),
+                None => json!({
+                    "document_id": document_id.to_string(),
+                    "event": "closed",
+                }),
+            };
+            self.send_rpc_document_event(runtime, &owner, params).await;
+        }
+    }
+
+    pub(crate) fn queue_rpc_document_closed(&mut self, document_id: u64) {
+        for plugin in self.rpc_plugins.values_mut() {
+            if plugin.document_watches.remove(&document_id).is_some() {
+                plugin.closed_documents.push(document_id);
+            }
+        }
     }
 
     pub(crate) fn register_rpc_text_panel(
@@ -694,6 +819,8 @@ impl PluginRegistry {
             host_methods: vec![
                 DOCUMENT_CREATE_METHOD.to_string(),
                 DOCUMENT_SHOW_METHOD.to_string(),
+                DOCUMENT_WATCH_METHOD.to_string(),
+                DOCUMENT_UNWATCH_METHOD.to_string(),
                 DOCUMENT_SNAPSHOT_METHOD.to_string(),
                 DOCUMENT_APPLY_METHOD.to_string(),
                 DOCUMENT_UNDO_METHOD.to_string(),
@@ -897,6 +1024,8 @@ impl PluginRegistry {
             incoming,
             commands,
             events,
+            document_watches: HashMap::new(),
+            closed_documents: Vec::new(),
             command: None,
         };
         if let Err(error) =
@@ -955,6 +1084,8 @@ impl PluginRegistry {
             incoming,
             commands: _,
             events: _,
+            document_watches: _,
+            closed_documents: _,
             command: _,
         } = plugin;
         let task = tokio::spawn(async move {
@@ -3174,6 +3305,9 @@ mod tests {
         check_api_compatibility(&metadata).unwrap();
 
         metadata.red_api_version = Some("^0.21.0".to_string());
+        check_api_compatibility(&metadata).unwrap();
+
+        metadata.red_api_version = Some("^0.22.0".to_string());
         check_api_compatibility(&metadata).unwrap();
 
         metadata.red_api_version = Some("^0.5.0".to_string());

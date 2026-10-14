@@ -392,6 +392,8 @@ fn run_registry_fixture() -> Result<()> {
         json!([
             "red/DocumentCreate",
             "red/DocumentShow",
+            "red/DocumentWatch",
+            "red/DocumentUnwatch",
             "red/DocumentSnapshot",
             "red/DocumentApply",
             "red/DocumentUndo",

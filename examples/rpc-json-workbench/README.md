@@ -17,6 +17,8 @@ Open a JSON document and run:
 ```text
 :JsonWorkbench
 :JsonRun
+:JsonLive
+:JsonCancel
 :JsonQuery .users | map(select(.active))
 :JsonQueries
 :JsonOpenResult
@@ -36,6 +38,13 @@ ordinary unnamed query document. Edit that document with normal Red commands
 and run it with `JsonRun`; its undo history and dirty state are independent of
 the source. The query can be saved normally as a `.jq` file. If the query
 document is closed, the next `JsonWorkbench` invocation creates a replacement.
+
+`JsonLive` watches the pinned source and query documents, then refreshes the
+preview after 120 ms of quiet. Rapid edits retain one latest desired run and
+replace any active `jq` child. Run `JsonLive` again to pause or `JsonCancel` to
+stop current work while keeping live mode available for the next edit. Closing
+either watched document pauses live mode and retires the preview; `JsonClose`
+stops work and removes both watches before disposing the panel.
 
 `JsonOpenResult` copies the latest successful output into a new editable,
 unnamed document with JSON syntax. Each copy is frozen and can be saved or

@@ -114,11 +114,13 @@ The version 1 initialization parameters are:
 ```json
 {
   "protocol_versions": [1],
-  "red_api_version": "0.22.0",
+  "red_api_version": "0.23.0",
   "plugin_id": "document-tools",
   "host_methods": [
     "red/DocumentCreate",
     "red/DocumentShow",
+    "red/DocumentWatch",
+    "red/DocumentUnwatch",
     "red/DocumentSnapshot",
     "red/DocumentApply",
     "red/DocumentUndo",
@@ -350,6 +352,53 @@ selector. A closed ID returns `-32001`; malformed IDs or conflicting `path` and
 ID selectors return `-32602`. Plugins using these fields must require
 `red_api = "^0.20.0"` or later. Older RPC and Husk packages continue to load.
 
+## Document watches
+
+Host API `0.23.0` adds owner-local invalidation notifications for live document
+workflows. Establish a watch by stable document ID before taking the first
+snapshot:
+
+```json
+{"jsonrpc":"2.0","id":"plugin-watch","method":"red/DocumentWatch","params":{"document_id":"42"}}
+{"jsonrpc":"2.0","id":"plugin-watch","result":{"revision":"7"}}
+```
+
+The result is the document revision observed when the watch was installed. A
+plugin should then snapshot the document and treat any notification received
+during setup as a request to read the latest state again. This ordering ensures
+that changes during setup are either present in the snapshot or reported as an
+invalidation.
+
+Each connection may watch at most two documents. Repeating a watch is
+idempotent and does not consume another slot. Red coalesces changes for 50 ms
+before enqueueing one owner-local `document/event` notification containing the
+latest revision:
+
+```json
+{"jsonrpc":"2.0","method":"document/event","params":{"document_id":"42","event":"changed","revision":"9"}}
+```
+
+The event is an invalidation, not an edit log or document snapshot. Plugins
+must read the current document when they need its text. A close removes the
+watch, drops any pending change, and sends one terminal event without a
+revision:
+
+```json
+{"jsonrpc":"2.0","method":"document/event","params":{"document_id":"42","event":"closed"}}
+```
+
+Stop watching with `red/DocumentUnwatch`; it returns `null` and is idempotent,
+including after the document closes. Disconnect, quarantine, successful reload,
+and editor deactivation release every remaining watch. Malformed or closed IDs
+return `-32602` or `-32001` when installing a watch; exceeding the cap returns
+`-32004`. These application errors leave the connection active.
+
+Notifications are coalesced before they enter the existing 16 MiB outbound
+queue and remain subject to the 8 MiB frame and transport watchdog limits.
+Transport failure or queue overflow quarantines a slow connection. Plugins
+using watches must require
+`red_api = "^0.23.0"` or later.
+
 ## Document transactions
 
 `red/DocumentApply` applies one non-empty batch against an exact document
@@ -520,6 +569,8 @@ Version 1 deliberately exposes a small set of typed operations:
 - `red/DocumentSnapshot`, `red/DocumentApply`, and `red/DocumentUndo`,
   preserving revisions, attributed undo transactions, dirty tracking, and LSP
   updates.
+- Owner-local, coalesced document invalidations through `red/DocumentWatch`,
+  `red/DocumentUnwatch`, and `document/event`.
 - Text-panel create, content replacement, focus, and disposal, with resources
   owned by the active plugin connection.
 - One cached plain-text statusline contribution per active plugin connection.

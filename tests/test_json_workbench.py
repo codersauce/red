@@ -221,6 +221,57 @@ class JsonWorkbenchTest(unittest.TestCase):
         self.assertEqual(response["result"], {"message": "JSON preview ready"})
         return snapshot
 
+    def open_workbench(self, plugin, source, query_id="9"):
+        plugin.command("workbench", "JsonWorkbench")
+        snapshot = plugin.expect_host_request("red/DocumentSnapshot")
+        self.assertEqual(snapshot["params"], {"include_document_id": True})
+        plugin.reply(snapshot, source)
+        plugin.load_runtime()
+        panel = plugin.expect_host_request("red/TextPanelCreate")
+        plugin.reply(panel)
+        help_content = plugin.expect_host_request("red/TextPanelSetContent")
+        self.assertIn(":JsonRun", help_content["params"]["blocks"][1]["text"])
+        plugin.reply(help_content)
+        created = plugin.expect_host_request("red/DocumentCreate")
+        self.assertEqual(created["params"], {"text": "."})
+        plugin.reply(created, {"document_id": query_id})
+        shown = plugin.expect_host_request("red/DocumentShow")
+        self.assertEqual(shown["params"], {"document_id": query_id})
+        plugin.reply(shown)
+        plugin.expect_status("JSON: query")
+        self.assertEqual(
+            plugin.receive()["result"],
+            {"message": "JSON query document ready"},
+        )
+
+    def enable_live(self, plugin, source_id="7", query_id="9"):
+        plugin.command("live", "JsonLive")
+        for document_id in (source_id, query_id):
+            watch = plugin.expect_host_request("red/DocumentWatch")
+            self.assertEqual(watch["params"], {"document_id": document_id})
+            plugin.reply(watch, {"revision": "1"})
+        plugin.expect_status("JSON: live")
+        self.assertEqual(
+            plugin.receive()["result"],
+            {"message": "JSON live preview scheduled"},
+        )
+
+    def complete_background_query(
+        self, plugin, query, source, output, query_snapshot=None
+    ):
+        if query_snapshot is None:
+            query_snapshot = plugin.expect_host_request("red/DocumentSnapshot")
+        self.assertEqual(query_snapshot["params"], {"document_id": "9"})
+        plugin.reply(query_snapshot, query)
+        source_snapshot = plugin.expect_host_request("red/DocumentSnapshot")
+        self.assertEqual(source_snapshot["params"], {"document_id": "7"})
+        plugin.reply(source_snapshot, source)
+        plugin.expect_status("JSON: running")
+        content = plugin.expect_host_request("red/TextPanelSetContent")
+        self.assertEqual(content["params"]["blocks"][1]["text"], output)
+        plugin.reply(content)
+        plugin.expect_status(f"JSON: ready ({len(output.encode('utf-8'))} B)")
+
     def test_end_position_uses_red_unicode_scalar_coordinates(self):
         for text, expected in [
             ("", {"line": 0, "character": 0}),
@@ -440,29 +491,7 @@ class JsonWorkbenchTest(unittest.TestCase):
         }
         output = '{"ok":true}\n'
         with PluginProcess(self.fake_jq) as plugin:
-            plugin.command("workbench", "JsonWorkbench")
-            snapshot = plugin.expect_host_request("red/DocumentSnapshot")
-            self.assertEqual(snapshot["params"], {"include_document_id": True})
-            plugin.reply(snapshot, source)
-            plugin.load_runtime()
-            panel = plugin.expect_host_request("red/TextPanelCreate")
-            plugin.reply(panel)
-            help_content = plugin.expect_host_request("red/TextPanelSetContent")
-            self.assertIn(
-                ":JsonRun", help_content["params"]["blocks"][1]["text"]
-            )
-            plugin.reply(help_content)
-            created = plugin.expect_host_request("red/DocumentCreate")
-            self.assertEqual(created["params"], {"text": "."})
-            plugin.reply(created, {"document_id": "9"})
-            shown = plugin.expect_host_request("red/DocumentShow")
-            self.assertEqual(shown["params"], {"document_id": "9"})
-            plugin.reply(shown)
-            plugin.expect_status("JSON: query")
-            self.assertEqual(
-                plugin.receive()["result"],
-                {"message": "JSON query document ready"},
-            )
+            self.open_workbench(plugin, source)
 
             plugin.command("workbench-again", "JsonWorkbench")
             snapshot = plugin.expect_host_request("red/DocumentSnapshot")
@@ -523,6 +552,125 @@ class JsonWorkbenchTest(unittest.TestCase):
             plugin.reply(apply, {"transaction_id": "tx-1", "revision": "2"})
             plugin.expect_status("JSON: applied")
             self.assertEqual(plugin.receive()["id"], "apply")
+
+    def test_live_preview_reconciles_setup_and_coalesces_latest_changes(self):
+        source = {
+            "path": "data.json",
+            "document_id": "7",
+            "revision": "1",
+            "text": "{}",
+        }
+        query = {"path": None, "revision": "2", "text": "stream"}
+        with PluginProcess(self.fake_jq) as plugin:
+            self.open_workbench(plugin, source)
+            self.enable_live(plugin)
+
+            stale = plugin.expect_host_request("red/DocumentSnapshot")
+            self.assertEqual(stale["params"], {"document_id": "9"})
+            plugin.send_notification(
+                "document/event",
+                {"document_id": "9", "event": "changed", "revision": "2"},
+            )
+            plugin.reply(stale, {"path": None, "revision": "1", "text": "."})
+            next_snapshot = plugin.expect_host_request("red/DocumentSnapshot")
+            if next_snapshot["params"] == {"document_id": "7"}:
+                plugin.reply(next_snapshot, source)
+                next_snapshot = plugin.expect_host_request("red/DocumentSnapshot")
+            self.complete_background_query(
+                plugin, query, source, "1\n2\n", query_snapshot=next_snapshot
+            )
+
+            plugin.send_notification(
+                "document/event",
+                {"document_id": "9", "event": "changed", "revision": "3"},
+            )
+            invalid = plugin.expect_host_request("red/DocumentSnapshot")
+            plugin.reply(
+                invalid, {"path": None, "revision": "3", "text": "invalid"}
+            )
+            self.complete_failed_query(plugin, source, "jq: compile error")
+            plugin.expect_status("JSON: error")
+
+            plugin.send_notification(
+                "document/event",
+                {"document_id": "7", "event": "changed", "revision": "4"},
+            )
+            plugin.send_notification(
+                "document/event",
+                {"document_id": "9", "event": "changed", "revision": "5"},
+            )
+            plugin.send_notification(
+                "document/event",
+                {"document_id": "7", "event": "changed", "revision": "6"},
+            )
+            latest_query = {"path": None, "revision": "5", "text": "echo"}
+            latest_source = {
+                **source,
+                "revision": "6",
+                "text": '{"n":6}',
+            }
+            self.complete_background_query(
+                plugin, latest_query, latest_source, latest_source["text"]
+            )
+            with self.assertRaises(queue.Empty):
+                plugin.receive(timeout=0.25)
+
+    def test_live_cancel_and_document_close_reap_work(self):
+        pid_file = Path(self.tempdir.name) / "live-slow.pid"
+        source = {
+            "path": "data.json",
+            "document_id": "7",
+            "revision": "1",
+            "text": "{}",
+        }
+        slow_query = {
+            "path": None,
+            "revision": "1",
+            "text": f"slow:{pid_file}",
+        }
+        with PluginProcess(self.fake_jq) as plugin:
+            self.open_workbench(plugin, source)
+            self.enable_live(plugin)
+            query = plugin.expect_host_request("red/DocumentSnapshot")
+            plugin.reply(query, slow_query)
+            snapshot = plugin.expect_host_request("red/DocumentSnapshot")
+            plugin.reply(snapshot, source)
+            plugin.expect_status("JSON: running")
+            deadline = time.monotonic() + 2
+            while not pid_file.exists() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertTrue(pid_file.exists(), "controlled jq child did not start")
+            child_pid = int(pid_file.read_text(encoding="utf-8"))
+
+            plugin.command("cancel", "JsonCancel")
+            plugin.expect_status("JSON: cancelled")
+            self.assertEqual(
+                plugin.receive()["result"], {"message": "JSON preview cancelled"}
+            )
+            if os.name == "posix":
+                with self.assertRaises(ProcessLookupError):
+                    os.kill(child_pid, 0)
+
+            plugin.send_notification(
+                "document/event", {"document_id": "7", "event": "closed"}
+            )
+            unwatched = set()
+            for _ in range(2):
+                unwatch = plugin.expect_host_request("red/DocumentUnwatch")
+                unwatched.add(unwatch["params"]["document_id"])
+                plugin.reply(unwatch)
+            self.assertEqual(unwatched, {"7", "9"})
+            retired = plugin.expect_host_request("red/TextPanelSetContent")
+            self.assertIn("was closed", retired["params"]["blocks"][0]["text"])
+            plugin.reply(retired)
+            plugin.expect_status("JSON: closed")
+
+            plugin.command("close", "JsonClose")
+            dispose = plugin.expect_host_request("red/TextPanelDispose")
+            plugin.reply(dispose)
+            clear = plugin.expect_host_request("red/StatuslineClear")
+            plugin.reply(clear)
+            self.assertIsNone(plugin.receive()["result"])
 
     def test_query_picker_selects_a_preset_and_records_history(self):
         document = {

@@ -44,6 +44,8 @@ impl Harness {
                 "RpcPath",
                 "RpcPicker",
                 "RpcOversized",
+                "RpcWatch",
+                "RpcUnwatch",
             ],
         )?;
         write_package(&fast, &["RpcRead"])?;
@@ -163,7 +165,7 @@ fn write_package(root: &Path, commands: &[&str]) -> Result<()> {
         .chain(commands.iter().copied())
         .collect::<Vec<_>>();
     fs::write(root.join("red-plugin.toml"), format!(
-        "schema_version = 1\n[plugin]\nid = \"editor-fixture\"\nname = \"Editor Fixture\"\nversion = \"0.1.0\"\nred_api = \"^0.20.0\"\n[rpc]\ncommand = {executable:?}\nargs = {}\n[activation]\ncommands = {}\n",
+        "schema_version = 1\n[plugin]\nid = \"editor-fixture\"\nname = \"Editor Fixture\"\nversion = \"0.1.0\"\nred_api = \"^0.23.0\"\n[rpc]\ncommand = {executable:?}\nargs = {}\n[activation]\ncommands = {}\n",
         serde_json::to_string(&args)?, serde_json::to_string(commands)?,
     ))?;
     Ok(())
@@ -209,6 +211,97 @@ pub(super) async fn run() -> Result<()> {
     explicit_path_edit_preserves_the_active_view_and_insert()
         .await
         .context("off-screen document edit")?;
+    document_watches_coalesce_close_unwatch_and_reload()
+        .await
+        .context("RPC document watches")?;
+    document_watch_cap_leaves_the_connection_active()
+        .await
+        .context("RPC document watch cap")?;
+    Ok(())
+}
+
+async fn document_watches_coalesce_close_unwatch_and_reload() -> Result<()> {
+    let mut h = Harness::new(KeyAction::Single(Action::PluginCommand("RpcWatch".into()))).await?;
+    let slow = h.package.path().join("slow");
+
+    h.command("RpcWatch").await?;
+    h.until(|h| h.marker("done", 1).exists()).await?;
+    let watched: Value = serde_json::from_slice(&fs::read(slow.join("watched.json"))?)?;
+    h.text("iabc").await?;
+    h.until(|_| slow.join("document-event-1.json").exists())
+        .await?;
+    let changed: Value = serde_json::from_slice(&fs::read(slow.join("document-event-1.json"))?)?;
+    assert_eq!(changed["event"], "changed");
+    assert_eq!(changed["document_id"], watched["document_id"]);
+    assert!(changed["revision"]
+        .as_str()
+        .is_some_and(|revision| revision.parse::<u64>().is_ok()));
+    tokio::time::sleep(Duration::from_millis(75)).await;
+    h.core.tick().await?;
+    assert!(!slow.join("document-event-2.json").exists());
+
+    h.command("bd!").await?;
+    h.until(|_| slow.join("document-event-2.json").exists())
+        .await?;
+    let closed: Value = serde_json::from_slice(&fs::read(slow.join("document-event-2.json"))?)?;
+    assert_eq!(
+        closed,
+        json!({
+            "document_id": watched["document_id"],
+            "event": "closed",
+        })
+    );
+
+    h.command("RpcWatch").await?;
+    h.until(|h| h.marker("done", 2).exists()).await?;
+    h.command("RpcUnwatch").await?;
+    h.until(|h| h.marker("done", 3).exists()).await?;
+    for index in 1..=2 {
+        fs::remove_file(slow.join(format!("document-event-{index}.json")))?;
+    }
+    h.text("iX").await?;
+    tokio::time::sleep(Duration::from_millis(75)).await;
+    h.core.tick().await?;
+    assert!(!slow.join("document-event-1.json").exists());
+
+    h.command("RpcWatch").await?;
+    h.until(|h| h.marker("done", 4).exists()).await?;
+    let process_path = slow.join("process-id");
+    let previous = fs::read_to_string(&process_path)?;
+    let manifest = slow.join("red-plugin.toml");
+    let source = fs::read_to_string(&manifest)?;
+    fs::write(&manifest, format!("{source}\n# Reload watched plugin.\n"))?;
+    h.until(|_| fs::read_to_string(&process_path).is_ok_and(|pid| pid != previous))
+        .await?;
+    h.text("iY").await?;
+    tokio::time::sleep(Duration::from_millis(75)).await;
+    h.core.tick().await?;
+    assert!(!slow.join("document-event-1.json").exists());
+    Ok(())
+}
+
+async fn document_watch_cap_leaves_the_connection_active() -> Result<()> {
+    let mut h = Harness::new(KeyAction::Single(Action::PluginCommand("RpcWatch".into()))).await?;
+
+    h.command("RpcWatch").await?;
+    h.until(|h| h.marker("done", 1).exists()).await?;
+    h.command("bnext").await?;
+    h.command("RpcWatch").await?;
+    h.until(|h| h.marker("done", 2).exists()).await?;
+    h.command("enew").await?;
+    h.command("RpcWatch").await?;
+    h.until(|h| h.marker("done", 3).exists()).await?;
+    let rejected: Value = serde_json::from_slice(&fs::read(h.marker("done", 3))?)?;
+    assert!(rejected["error"]["message"]
+        .as_str()
+        .is_some_and(|message| message.contains("at most 2 documents")));
+
+    h.command("RpcUnwatch").await?;
+    h.until(|h| h.marker("done", 4).exists()).await?;
+    h.command("RpcWatch").await?;
+    h.until(|h| h.marker("done", 5).exists()).await?;
+    let recovered: Value = serde_json::from_slice(&fs::read(h.marker("done", 5))?)?;
+    assert!(recovered.get("error").is_none(), "{recovered}");
     Ok(())
 }
 
@@ -604,6 +697,7 @@ pub(super) fn fixture() -> Result<()> {
     let process_id = std::process::id().to_string();
     fs::write("process-id", &process_id)?;
     let mut count = 0;
+    let mut document_event_count = 0;
     loop {
         let request = read_message(&mut input)?;
         match request["method"].as_str() {
@@ -635,6 +729,13 @@ pub(super) fn fixture() -> Result<()> {
                     serde_json::to_vec(&request["params"])?,
                 )?;
             }
+            Some("document/event") => {
+                document_event_count += 1;
+                fs::write(
+                    format!("document-event-{document_event_count}.json"),
+                    serde_json::to_vec(&request["params"])?,
+                )?;
+            }
             Some("shutdown") => {
                 if Path::new("delay-shutdown").exists() {
                     fs::write(format!("shutdown-started-{process_id}"), [])?;
@@ -662,6 +763,38 @@ fn fixture_command(
     input: &mut impl BufRead,
     output: &mut impl Write,
 ) -> Result<()> {
+    if name == "RpcWatch" {
+        let document = host_request(
+            input,
+            output,
+            "red/DocumentSnapshot",
+            json!({"include_document_id":true}),
+        )?;
+        let watched = host_request(
+            input,
+            output,
+            "red/DocumentWatch",
+            json!({"document_id":document["document_id"]}),
+        )?;
+        fs::write(
+            "watched.json",
+            serde_json::to_vec(&json!({
+                "document_id": document["document_id"],
+                "revision": watched["revision"],
+            }))?,
+        )?;
+        return Ok(());
+    }
+    if name == "RpcUnwatch" {
+        let watched: Value = serde_json::from_slice(&fs::read("watched.json")?)?;
+        host_request(
+            input,
+            output,
+            "red/DocumentUnwatch",
+            json!({"document_id":watched["document_id"]}),
+        )?;
+        return Ok(());
+    }
     if name == "RpcOversized" {
         write_message(
             output,
