@@ -40,13 +40,13 @@ use crate::lsp::{
 };
 use crate::{log, lsp::LspError};
 
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+pub(crate) const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_LSP_FRAME_BYTES: usize = 16 * 1024 * 1024;
 const MAX_LSP_HEADER_BYTES: usize = 16 * 1024;
 const MAX_LSP_STDERR_LINE_BYTES: usize = 64 * 1024;
 const MAX_LSP_STDERR_TAIL_LINES: usize = 8;
-const MAX_PENDING_LSP_MESSAGES: usize = 512;
-const MAX_PENDING_LSP_BYTES: usize = 16 * 1024 * 1024;
+pub(crate) const MAX_PENDING_LSP_MESSAGES: usize = 512;
+pub(crate) const MAX_PENDING_LSP_BYTES: usize = 16 * 1024 * 1024;
 const DOCUMENT_DIFF_BLOCK_BYTES: usize = 32;
 const SHUTDOWN_RESPONSE_TIMEOUT: Duration = Duration::from_secs(1);
 #[cfg(windows)]
@@ -104,7 +104,7 @@ fn json_value_size(value: &Value) -> usize {
     }
 }
 
-fn outbound_message_size(message: &OutboundMessage) -> usize {
+pub(crate) fn outbound_message_size(message: &OutboundMessage) -> usize {
     match message {
         OutboundMessage::Request(request) => request
             .method
@@ -260,6 +260,11 @@ impl RealLspClient {
             config,
             workspace_root,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_test_capabilities(&mut self, capabilities: ServerCapabilities) {
+        self.server_capabilities = Some(capabilities);
     }
 
     pub async fn start(
@@ -970,6 +975,38 @@ impl RealLspClient {
 
         Ok(())
     }
+
+    pub(crate) async fn send_prepared_request(
+        &mut self,
+        mut request: Request,
+        force: bool,
+    ) -> Result<i64, LspError> {
+        let id = request.id;
+        let method = request.method.clone();
+        request.timestamp = Instant::now();
+        let message = OutboundMessage::Request(request.clone());
+
+        if !self.initialized && !force {
+            log!(
+                "[lsp] client not initialized yet, adding request to pending: {}",
+                id
+            );
+            self.queue_pending(message)?;
+            return Ok(id);
+        }
+
+        self.pending_responses.insert(id, request);
+        self.request_tx.send(message).await?;
+        log!("[lsp] sent prepared request: id={id} method={method}");
+        Ok(id)
+    }
+
+    pub(crate) fn owns_request(&self, id: i64) -> bool {
+        self.pending_responses.contains_key(&id)
+            || self.pending_messages.iter().any(
+                |message| matches!(message, OutboundMessage::Request(request) if request.id == id),
+            )
+    }
 }
 
 #[async_trait::async_trait]
@@ -981,24 +1018,8 @@ impl LspClient for RealLspClient {
         force: bool,
     ) -> Result<i64, LspError> {
         log!("[lsp] send_request: method={} force={force}", method);
-
-        let req = Request::new(method, params);
-        let id = req.id;
-        let msg = OutboundMessage::Request(req.clone());
-
-        if !self.initialized && !force {
-            log!(
-                "[lsp] client not initialized yet, adding request to pending: {}",
-                id
-            );
-            self.queue_pending(msg)?;
-            return Ok(id);
-        }
-
-        self.pending_responses.insert(id, req);
-        self.request_tx.send(msg).await?;
-
-        Ok(id)
+        self.send_prepared_request(Request::new(method, params), force)
+            .await
     }
 
     async fn send_notification(
@@ -1605,325 +1626,6 @@ impl LspClient for RealLspClient {
     //     Ok(())
     // }
 
-    async fn will_save(&mut self, file: &str) -> Result<(), LspError> {
-        log!("will_save file: {}", file);
-
-        let params = json!({
-            "textDocument": {
-                "uri": file_uri(file)?,
-            },
-            "reason": 1,
-        });
-
-        self.send_notification("textDocument/willSave", params, false)
-            .await?;
-
-        Ok(())
-    }
-
-    async fn hover(&mut self, file: &str, x: usize, y: usize) -> Result<i64, LspError> {
-        let params = json!({
-            "textDocument": {
-                "uri": file_uri(file)?,
-            },
-            "position": {
-                "line": y,
-                "character": x,
-            }
-        });
-
-        self.send_request("textDocument/hover", params, false).await
-    }
-
-    async fn goto_definition(&mut self, file: &str, x: usize, y: usize) -> Result<i64, LspError> {
-        let params = json!({
-            "textDocument": {
-                "uri": file_uri(file)?,
-            },
-            "position": {
-                "line": y,
-                "character": x,
-            }
-        });
-
-        self.send_request("textDocument/definition", params, false)
-            .await
-    }
-
-    async fn completion(&mut self, file: &str, x: usize, y: usize) -> Result<i64, LspError> {
-        let params = json!({
-            "textDocument": {
-                "uri": file_uri(file)?,
-            },
-            "position": {
-                "line": y,
-                "character": x,
-            },
-            "context": {
-                "triggerKind": 1
-            }
-        });
-
-        self.send_request("textDocument/completion", params, false)
-            .await
-    }
-
-    async fn format_document(&mut self, file: &str) -> Result<i64, LspError> {
-        self.format_document_with_options(file, 4, true).await
-    }
-
-    async fn format_document_with_options(
-        &mut self,
-        file: &str,
-        tab_size: usize,
-        insert_spaces: bool,
-    ) -> Result<i64, LspError> {
-        let params = json!({
-            "textDocument": {
-                "uri": file_uri(file)?,
-            },
-            "options": {
-                "tabSize": tab_size,
-                "insertSpaces": insert_spaces,
-                "trimTrailingWhitespace": true,
-                "insertFinalNewline": true,
-                "trimFinalNewlines": true
-            }
-        });
-
-        self.send_request("textDocument/formatting", params, false)
-            .await
-    }
-
-    async fn format_range_with_options(
-        &mut self,
-        file: &str,
-        range: Range,
-        tab_size: usize,
-        insert_spaces: bool,
-    ) -> Result<i64, LspError> {
-        let params = json!({
-            "textDocument": {
-                "uri": file_uri(file)?,
-            },
-            "range": range,
-            "options": {
-                "tabSize": tab_size,
-                "insertSpaces": insert_spaces,
-                "trimTrailingWhitespace": true,
-                "insertFinalNewline": false,
-                "trimFinalNewlines": false
-            }
-        });
-
-        self.send_request("textDocument/rangeFormatting", params, false)
-            .await
-    }
-
-    async fn document_symbols(&mut self, file: &str) -> Result<i64, LspError> {
-        let params = json!({
-            "textDocument": {
-                "uri": file_uri(file)?,
-            }
-        });
-
-        self.send_request("textDocument/documentSymbol", params, false)
-            .await
-    }
-
-    async fn code_action(
-        &mut self,
-        file: &str,
-        range: Range,
-        diagnostics: Vec<Diagnostic>,
-    ) -> Result<i64, LspError> {
-        let params = json!({
-            "textDocument": {
-                "uri": file_uri(file)?,
-            },
-            "range": range,
-            "context": {
-                "diagnostics": diagnostics
-            }
-        });
-
-        self.send_request("textDocument/codeAction", params, false)
-            .await
-    }
-
-    async fn document_highlight(
-        &mut self,
-        file: &str,
-        x: usize,
-        y: usize,
-    ) -> Result<i64, LspError> {
-        let params = json!({
-            "textDocument": {
-                "uri": file_uri(file)?,
-            },
-            "position": {
-                "line": y,
-                "character": x,
-            }
-        });
-
-        self.send_request("textDocument/documentHighlight", params, false)
-            .await
-    }
-
-    async fn document_link(&mut self, file: &str) -> Result<i64, LspError> {
-        let params = json!({
-            "textDocument": {
-                "uri": file_uri(file)?,
-            }
-        });
-
-        self.send_request("textDocument/documentLink", params, false)
-            .await
-    }
-
-    async fn document_color(&mut self, file: &str) -> Result<i64, LspError> {
-        let params = json!({
-            "textDocument": {
-                "uri": file_uri(file)?,
-            }
-        });
-
-        self.send_request("textDocument/documentColor", params, false)
-            .await
-    }
-
-    async fn folding_range(&mut self, file: &str) -> Result<i64, LspError> {
-        let params = json!({
-            "textDocument": {
-                "uri": file_uri(file)?,
-            }
-        });
-
-        self.send_request("textDocument/foldingRange", params, false)
-            .await
-    }
-
-    async fn workspace_symbol(&mut self, query: &str) -> Result<i64, LspError> {
-        let params = json!({
-            "query": query
-        });
-
-        self.send_request("workspace/symbol", params, false).await
-    }
-
-    async fn references(
-        &mut self,
-        file: &str,
-        x: usize,
-        y: usize,
-        include_declaration: bool,
-    ) -> Result<i64, LspError> {
-        let params = json!({
-            "textDocument": {
-                "uri": file_uri(file)?,
-            },
-            "position": {
-                "line": y,
-                "character": x,
-            },
-            "context": {
-                "includeDeclaration": include_declaration,
-            },
-        });
-
-        self.send_request("textDocument/references", params, false)
-            .await
-    }
-
-    async fn call_hierarchy_prepare(
-        &mut self,
-        file: &str,
-        x: usize,
-        y: usize,
-    ) -> Result<i64, LspError> {
-        let params = json!({
-            "textDocument": {
-                "uri": file_uri(file)?,
-            },
-            "position": {
-                "line": y,
-                "character": x,
-            }
-        });
-
-        self.send_request("textDocument/prepareCallHierarchy", params, false)
-            .await
-    }
-
-    async fn semantic_tokens_full(&mut self, file: &str) -> Result<i64, LspError> {
-        let params = json!({
-            "textDocument": {
-                "uri": file_uri(file)?,
-            }
-        });
-
-        self.send_request("textDocument/semanticTokens/full", params, false)
-            .await
-    }
-
-    async fn inlay_hint(&mut self, file: &str, range: Range) -> Result<i64, LspError> {
-        let params = json!({
-            "textDocument": {
-                "uri": file_uri(file)?,
-            },
-            "range": range
-        });
-
-        self.send_request("textDocument/inlayHint", params, false)
-            .await
-    }
-
-    async fn signature_help(&mut self, file: &str, x: usize, y: usize) -> Result<i64, LspError> {
-        self.signature_help_with_context(file, x, y, None).await
-    }
-
-    async fn signature_help_with_context(
-        &mut self,
-        file: &str,
-        x: usize,
-        y: usize,
-        context: Option<super::SignatureHelpContext>,
-    ) -> Result<i64, LspError> {
-        let mut params = json!({
-            "textDocument": {
-                "uri": file_uri(file)?,
-            },
-            "position": {
-                "line": y,
-                "character": x,
-            }
-        });
-
-        if let Some(context) = context {
-            params["context"] = serde_json::to_value(context)?;
-        }
-        self.send_request("textDocument/signatureHelp", params, false)
-            .await
-    }
-
-    async fn rename(
-        &mut self,
-        file: &str,
-        x: usize,
-        y: usize,
-        new_name: &str,
-    ) -> Result<i64, LspError> {
-        let params = json!({
-            "textDocument": { "uri": file_uri(file)? },
-            "position": { "line": y, "character": x },
-            "newName": new_name,
-        });
-
-        self.send_request("textDocument/rename", params, false)
-            .await
-    }
-
     fn server_status_for_file(&self, _file: &str) -> &'static str {
         if self.initialize_failed {
             "failed"
@@ -2370,6 +2072,7 @@ mod test {
             method: "textDocument/completion".to_string(),
             params: json!({}),
             timestamp: Instant::now(),
+            source: None,
         };
         let mut client = RealLspClient {
             instance_id: crate::lsp::next_id() as u64,
@@ -2637,6 +2340,7 @@ mod test {
             method: "textDocument/completion".to_string(),
             params: json!({}),
             timestamp: Instant::now(),
+            source: None,
         };
         let mut config = default_language_servers()
             .remove("rust")
@@ -2973,6 +2677,7 @@ mod test {
             method: "initialize".to_string(),
             params: json!({}),
             timestamp: Instant::now(),
+            source: None,
         };
         let mut client = RealLspClient {
             instance_id: crate::lsp::next_id() as u64,
@@ -3036,6 +2741,7 @@ mod test {
             method: "initialize".to_string(),
             params: json!({}),
             timestamp: Instant::now(),
+            source: None,
         };
         let mut client = RealLspClient {
             instance_id: crate::lsp::next_id() as u64,
@@ -3161,6 +2867,7 @@ mod test {
             method: "textDocument/formatting".to_string(),
             params: json!({}),
             timestamp: Instant::now(),
+            source: None,
         };
         let mut client = RealLspClient {
             instance_id: crate::lsp::next_id() as u64,

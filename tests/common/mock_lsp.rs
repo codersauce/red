@@ -206,6 +206,15 @@ impl LspClient for MockLsp {
         Ok(0)
     }
 
+    async fn format_document_with_options(
+        &mut self,
+        file: &str,
+        _tab_size: usize,
+        _insert_spaces: bool,
+    ) -> Result<i64, LspError> {
+        self.format_document(file).await
+    }
+
     async fn document_symbols(&mut self, _file: &str) -> Result<i64, LspError> {
         Ok(0)
     }
@@ -400,6 +409,15 @@ impl LspClient for RecordingLsp {
     async fn format_document(&mut self, file: &str) -> Result<i64, LspError> {
         self.record(LspEvent::FormatDocument(file.to_string()));
         Ok(45)
+    }
+
+    async fn format_document_with_options(
+        &mut self,
+        file: &str,
+        _tab_size: usize,
+        _insert_spaces: bool,
+    ) -> Result<i64, LspError> {
+        self.format_document(file).await
     }
 
     async fn document_symbols(&mut self, file: &str) -> Result<i64, LspError> {

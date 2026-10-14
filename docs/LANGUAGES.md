@@ -70,6 +70,49 @@ separate process. Explicit `[lsp.servers.<name>]` definitions and explicit
 `settings` values are returned to `workspace/configuration` requests; dotted
 sections select nested objects and unknown sections resolve to JSON `null`.
 
+## Attach multiple language servers to one document
+
+Named servers with overlapping filename or extension selectors all attach to
+the document. Each receives open, change, save, and close notifications with
+its configured language ID. Diagnostics are merged for display, while an empty
+report clears only the server that published it. Code actions are collected
+from every attached server and commands are sent back to their origin.
+
+Red sends ordinary single-result requests, such as completion, hover,
+navigation, symbols, and inlay hints, to the first ready attached server that
+advertises the capability. Server configuration names provide the stable
+alphabetical tie-breaker when more than one server supports the same request.
+Unsupported requests are not sent to an earlier server simply because its name
+sorts first.
+
+For example, TypeScript and ESLint can share `.ts` and `.tsx` selectors:
+
+```toml
+[lsp.servers.eslint]
+command = "vscode-eslint-language-server"
+args = ["--stdio"]
+documents = [
+  { language_id = "typescript", file_extensions = ["ts"] },
+  { language_id = "typescriptreact", file_extensions = ["tsx"] },
+]
+root_markers = ["eslint.config.js", "package.json", ".git"]
+
+[lsp.servers.typescript]
+command = "typescript-language-server"
+args = ["--stdio"]
+documents = [
+  { language_id = "typescript", file_extensions = ["ts"] },
+  { language_id = "typescriptreact", file_extensions = ["tsx"] },
+]
+root_markers = ["tsconfig.json", "package.json", ".git"]
+```
+
+An external formatter remains independent of these attachments. A configured
+Prettier formatter continues to win under `formatting.provider = "auto"`; when
+formatting falls back to LSP, Red uses the same capable-server selection rule.
+The complete regression configuration is in
+[`tests/fixtures/multi_server_lsp/config.toml`](../tests/fixtures/multi_server_lsp/config.toml).
+
 For rust-analyzer launches, Red also reads `rust-analyzer.rustfmt.extraArgs` from
 the nearest project-local `.vscode/settings.json`. Settings files may contain comments and
 trailing commas. Red searches upward from the Cargo workspace but never beyond

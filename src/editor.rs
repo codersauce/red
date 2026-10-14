@@ -141,10 +141,10 @@ use crate::{
         text_edit_char_range, workspace_edit_operations, Command as LspCommand, CompletionItemKind,
         CompletionItemLabelDetails, CompletionResponse, CompletionResponseItem, Diagnostic,
         DiagnosticSeverity, DocumentEdit as LspDocumentEdit, Hover as LspHover, HoverContents,
-        InboundMessage, InlayHint, InsertTextFormat, Location, LspClient, MarkedString, MarkupKind,
-        OpenWorkspaceDocument, ParsedNotification, Position as LspPosition, ProgressParams,
-        ProgressToken, Range, ResponseMessage, ServerCapabilities,
-        ServerRequest as LspServerRequest, TextEdit as LspTextEdit,
+        InboundMessage, InlayHint, InsertTextFormat, Location, LspClient, LspRequestSource,
+        MarkedString, MarkupKind, OpenWorkspaceDocument, ParsedNotification,
+        Position as LspPosition, ProgressParams, ProgressToken, Range, ResponseMessage,
+        ServerCapabilities, ServerRequest as LspServerRequest, TextEdit as LspTextEdit,
         WorkspaceEditOperation as LspWorkspaceEditOperation, MAX_WORKSPACE_EDIT_TOTAL_BYTES,
     },
     matchit::{self, MatchDirection, MatchMotion},
@@ -2930,6 +2930,7 @@ pub enum Action {
         expected_revisions: Vec<(String, u64)>,
         command: Option<Box<LspCommand>>,
         label: String,
+        source: Option<LspRequestSource>,
     },
     ApplyLspWorkspaceEditOperations {
         operations: Vec<LspWorkspaceEditOperation>,
@@ -2940,6 +2941,7 @@ pub enum Action {
         save_after_uri: Option<String>,
         save_as: Option<String>,
         save_previous_file: Option<String>,
+        source: Option<LspRequestSource>,
     },
     CompleteLspFormatSave {
         buffer_id: BufferId,
@@ -3890,6 +3892,8 @@ pub struct Editor {
     pending_lsp_paste_formats: HashMap<i64, PendingLspEdit>,
     /// LSP request currently owning the visible, cancellable code-action picker.
     pending_code_action_request: Option<i64>,
+    pending_code_action_requests: HashSet<i64>,
+    pending_code_action_responses: Vec<ResponseMessage>,
     pending_lsp_format_saves: HashMap<i64, PendingLspFormatSave>,
     deferred_quit: DeferredQuit,
     pending_lsp_revision_snapshots: HashMap<i64, Vec<(String, u64)>>,
@@ -5161,6 +5165,17 @@ impl Editor {
         let indentation = Self::configured_indentation(&loaded.config);
         let previous_routing = crate::lsp::LspManager::new(self.config.lsp.clone());
         let updated_routing = crate::lsp::LspManager::new(loaded.config.lsp.clone());
+        let changed_servers = self
+            .config
+            .lsp
+            .servers
+            .keys()
+            .chain(loaded.config.lsp.servers.keys())
+            .filter(|name| {
+                self.config.lsp.servers.get(*name) != loaded.config.lsp.servers.get(*name)
+            })
+            .cloned()
+            .collect::<HashSet<_>>();
         let affected = self.lsp.reconfigure(loaded.config.lsp.clone()).await?;
         let affected = affected.into_iter().collect::<HashSet<_>>();
 
@@ -5205,14 +5220,41 @@ impl Editor {
                     }
                     return Err(error.into());
                 }
-                reopened.push((uri.clone(), route_changed));
+                let current_sources = updated_routing
+                    .resolve_documents(file)
+                    .into_iter()
+                    .map(|document| crate::lsp::manager::client_key(&document))
+                    .collect::<HashSet<_>>();
+                let removed_sources = previous_routing
+                    .resolve_documents(file)
+                    .into_iter()
+                    .map(|document| crate::lsp::manager::client_key(&document))
+                    .filter(|source| {
+                        !current_sources.contains(source)
+                            || changed_servers.iter().any(|server| {
+                                source
+                                    .strip_prefix(server.as_str())
+                                    .is_some_and(|root| root.starts_with(':'))
+                            })
+                    })
+                    .collect::<Vec<_>>();
+                reopened.push((uri.clone(), route_changed, removed_sources));
             }
         }
-        for (uri, route_changed) in reopened {
+        for (uri, route_changed, removed_sources) in reopened {
             if route_changed {
                 self.lsp_coordinator.mark_document_closed(&uri);
-                self.diagnostics.remove(&uri);
-                self.diagnostic_reports.remove(&uri);
+                let mut merged = None;
+                for source in removed_sources {
+                    merged = Some(self.diagnostic_reports.remove_producer(&uri, &source));
+                }
+                if let Some(merged) = merged {
+                    if merged.is_empty() {
+                        self.diagnostics.remove(&uri);
+                    } else {
+                        self.diagnostics.insert(uri.clone(), merged);
+                    }
+                }
             }
             self.lsp_coordinator.mark_document_opened(uri);
         }
@@ -5676,6 +5718,8 @@ impl Editor {
             pending_lsp_edit_requests: HashMap::new(),
             pending_lsp_paste_formats: HashMap::new(),
             pending_code_action_request: None,
+            pending_code_action_requests: HashSet::new(),
+            pending_code_action_responses: Vec::new(),
             pending_lsp_format_saves: HashMap::new(),
             deferred_quit: DeferredQuit::None,
             pending_lsp_revision_snapshots: HashMap::new(),
@@ -14532,8 +14576,23 @@ impl Editor {
             .set(DIAGNOSTIC_GUTTER_NAMESPACE.to_string(), signs)
     }
 
+    #[cfg(test)]
     fn add_diagnostics(&mut self, uri: Option<&str>, diagnostics: &[Diagnostic]) -> Option<Action> {
-        self.update_diagnostics(uri, diagnostics, diagnostics::DiagnosticReportKind::Push)
+        self.add_diagnostics_from(uri, None, diagnostics)
+    }
+
+    fn add_diagnostics_from(
+        &mut self,
+        uri: Option<&str>,
+        source: Option<&LspRequestSource>,
+        diagnostics: &[Diagnostic],
+    ) -> Option<Action> {
+        self.update_diagnostics_from(
+            uri,
+            source,
+            diagnostics,
+            diagnostics::DiagnosticReportKind::Push,
+        )
     }
 
     fn clear_current_buffer_diagnostics(&mut self) {
@@ -14551,9 +14610,20 @@ impl Editor {
         self.sync_diagnostic_gutter_signs();
     }
 
+    #[cfg(test)]
     fn update_diagnostics(
         &mut self,
         uri: Option<&str>,
+        diagnostics: &[Diagnostic],
+        kind: diagnostics::DiagnosticReportKind,
+    ) -> Option<Action> {
+        self.update_diagnostics_from(uri, None, diagnostics, kind)
+    }
+
+    fn update_diagnostics_from(
+        &mut self,
+        uri: Option<&str>,
+        source: Option<&LspRequestSource>,
         diagnostics: &[Diagnostic],
         kind: diagnostics::DiagnosticReportKind,
     ) -> Option<Action> {
@@ -14566,9 +14636,21 @@ impl Editor {
             .ok()
             .and_then(|path| crate::lsp::file_uri(path).ok())
             .unwrap_or_else(|| uri.to_string());
+        if source.is_some_and(|source| {
+            lsp_file_path(&uri)
+                .map(|file| !self.lsp.request_source_owns_file(source, &file))
+                .unwrap_or(true)
+        }) {
+            return None;
+        }
+        let producer = source
+            .map(|source| source.key.as_str())
+            .unwrap_or(diagnostics::DEFAULT_PRODUCER);
         log!("Adding diagnostics for {uri}: {diagnostics:#?}");
-        self.record_agent_diagnostic_report(&uri);
-        let merged = self.diagnostic_reports.update(&uri, kind, diagnostics);
+        self.record_agent_diagnostic_report(&uri, producer);
+        let merged = self
+            .diagnostic_reports
+            .update(&uri, producer, kind, diagnostics);
         self.diagnostics.insert(uri, merged);
         self.mark_diagnostic_cache_dirty();
         self.sync_diagnostic_gutter_signs();
@@ -14851,22 +14933,28 @@ impl Editor {
         }
         let uri = pending.uri.clone();
         let previous_file = save.as_ref().and_then(|save| save.previous_file.clone());
-        Some(self.workspace_edit_action(
-            vec![LspWorkspaceEditOperation::Document {
-                edit: LspDocumentEdit {
-                    uri: uri.clone(),
-                    version: None,
-                    edits,
-                },
-            }],
-            vec![(uri.clone(), pending.revision)],
-            None,
-            "format document".to_string(),
-            None,
-            save.as_ref().map(|_| uri),
-            save.and_then(|save| save.save_as),
-            previous_file,
-        ))
+        Some(
+            self.workspace_edit_action(
+                vec![LspWorkspaceEditOperation::Document {
+                    edit: LspDocumentEdit {
+                        uri: uri.clone(),
+                        version: None,
+                        edits,
+                    },
+                }],
+                vec![(uri.clone(), pending.revision)],
+                None,
+                "format document".to_string(),
+                None,
+                save.as_ref().map(|_| uri),
+                save.and_then(|save| save.save_as),
+                previous_file,
+                response
+                    .request
+                    .as_ref()
+                    .and_then(|request| request.source.clone()),
+            ),
+        )
     }
 
     fn paste_formatting_action(&mut self, response: &ResponseMessage) -> Option<Action> {
@@ -14883,22 +14971,28 @@ impl Editor {
             }
         };
         let uri = pending.uri;
-        Some(self.workspace_edit_action(
-            vec![LspWorkspaceEditOperation::Document {
-                edit: LspDocumentEdit {
-                    uri: uri.clone(),
-                    version: None,
-                    edits,
-                },
-            }],
-            vec![(uri, pending.revision)],
-            None,
-            "format pasted text".to_string(),
-            None,
-            None,
-            None,
-            None,
-        ))
+        Some(
+            self.workspace_edit_action(
+                vec![LspWorkspaceEditOperation::Document {
+                    edit: LspDocumentEdit {
+                        uri: uri.clone(),
+                        version: None,
+                        edits,
+                    },
+                }],
+                vec![(uri, pending.revision)],
+                None,
+                "format pasted text".to_string(),
+                None,
+                None,
+                None,
+                None,
+                response
+                    .request
+                    .as_ref()
+                    .and_then(|request| request.source.clone()),
+            ),
+        )
     }
 
     fn code_action_loading_picker(&self) -> Picker {
@@ -14913,42 +15007,79 @@ impl Editor {
     }
 
     fn finish_code_action_request(&mut self, request_id: i64) -> bool {
-        if self.pending_code_action_request != Some(request_id) {
+        let primary = self.pending_code_action_request == Some(request_id);
+        let batched = self.pending_code_action_requests.remove(&request_id);
+        if !primary && !batched {
             return false;
         }
-        self.pending_code_action_request = None;
+        if primary {
+            self.pending_code_action_request = None;
+        }
+        if !self.pending_code_action_requests.is_empty() {
+            return false;
+        }
         self.current_dialog
             .as_ref()
             .is_some_and(|dialog| dialog.picker_id() == Some(CODE_ACTION_PICKER_ID))
     }
 
+    fn clear_pending_code_action_requests(&mut self) {
+        let mut request_ids = std::mem::take(&mut self.pending_code_action_requests);
+        if let Some(request_id) = self.pending_code_action_request.take() {
+            request_ids.insert(request_id);
+        }
+        for request_id in request_ids {
+            self.pending_lsp_edit_requests.remove(&request_id);
+            self.pending_lsp_revision_snapshots.remove(&request_id);
+        }
+        self.pending_code_action_responses.clear();
+    }
+
     fn code_action_picker(&mut self, response: &ResponseMessage) -> Option<Action> {
+        if self.pending_code_action_request != Some(response.id)
+            && !self.pending_code_action_requests.contains(&response.id)
+        {
+            return None;
+        }
         let pending = self.pending_lsp_edit_requests.remove(&response.id)?;
         let revision_snapshot = self.pending_lsp_revision_snapshots.remove(&response.id);
+        self.pending_code_action_responses.push(response.clone());
         if !self.finish_code_action_request(response.id) {
             return None;
         }
+        self.finish_code_action_picker(pending, revision_snapshot)
+    }
+
+    fn finish_code_action_picker(
+        &mut self,
+        pending: PendingLspEdit,
+        revision_snapshot: Option<Vec<(String, u64)>>,
+    ) -> Option<Action> {
         if !self.pending_lsp_edit_is_current(&pending) {
             self.set_legacy_message(Some(
                 "code-action response is stale; buffer changed".to_string(),
             ));
             return Some(Action::CloseDialog);
         }
-        let values = match &response.result {
-            Value::Null => {
-                self.set_legacy_message(Some("no applicable LSP code actions".to_string()));
-                return Some(Action::CloseDialog);
+        let mut values = Vec::new();
+        for response in std::mem::take(&mut self.pending_code_action_responses) {
+            let source = response.request.and_then(|request| request.source);
+            match response.result {
+                Value::Null => {}
+                Value::Array(actions) => {
+                    for action in actions {
+                        values.push((source.clone(), action));
+                    }
+                }
+                _ => {
+                    self.set_legacy_message(Some("invalid LSP code-action response".to_string()));
+                }
             }
-            Value::Array(values) => values,
-            _ => {
-                self.set_legacy_message(Some("invalid LSP code-action response".to_string()));
-                return Some(Action::CloseDialog);
-            }
-        };
+        }
 
         let mut items = Vec::new();
         let mut actions = HashMap::new();
-        for (index, value) in values.iter().enumerate() {
+        for (index, (source, value)) in values.iter().enumerate() {
             if value.get("disabled").is_some() {
                 continue;
             }
@@ -15004,10 +15135,20 @@ impl Editor {
                 continue;
             }
 
-            let annotation = value
+            let mut annotation = value
                 .get("kind")
                 .and_then(Value::as_str)
                 .map(ToString::to_string);
+            if let Some(source) = &source {
+                let server = source
+                    .key
+                    .split_once(':')
+                    .map_or(source.key.as_str(), |v| v.0);
+                annotation = Some(match annotation {
+                    Some(kind) => format!("{server} · {kind}"),
+                    None => server.to_string(),
+                });
+            }
             let preferred = value.get("isPreferred").and_then(Value::as_bool) == Some(true);
             let item_id = index.to_string();
             items.push(PickerItem {
@@ -15022,9 +15163,19 @@ impl Editor {
                 detail_matches: Vec::new(),
                 preview: None,
             });
-            actions.insert(
-                item_id,
-                self.workspace_edit_action(
+            let action = match source.clone() {
+                None => self.workspace_edit_action(
+                    operations.clone(),
+                    expected_revisions.clone(),
+                    command.clone(),
+                    title.to_string(),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                ),
+                Some(source) => self.workspace_edit_action(
                     operations,
                     expected_revisions,
                     command,
@@ -15033,8 +15184,10 @@ impl Editor {
                     None,
                     None,
                     None,
+                    Some(source),
                 ),
-            );
+            };
+            actions.insert(item_id, action);
         }
 
         if items.is_empty() {
@@ -15086,6 +15239,7 @@ impl Editor {
         save_after_uri: Option<String>,
         save_as: Option<String>,
         save_previous_file: Option<String>,
+        source: Option<LspRequestSource>,
     ) -> Action {
         if response.is_none()
             && save_after_uri.is_none()
@@ -15104,6 +15258,7 @@ impl Editor {
                 expected_revisions,
                 command: command.map(Box::new),
                 label,
+                source,
             };
         }
         Action::ApplyLspWorkspaceEditOperations {
@@ -15115,6 +15270,7 @@ impl Editor {
             save_after_uri,
             save_as,
             save_previous_file,
+            source,
         }
     }
 
@@ -15271,16 +15427,22 @@ impl Editor {
             self.set_legacy_message(Some(error));
             return None;
         }
-        Some(self.workspace_edit_action(
-            operations,
-            expected_revisions,
-            None,
-            "rename symbol".to_string(),
-            None,
-            None,
-            None,
-            None,
-        ))
+        Some(
+            self.workspace_edit_action(
+                operations,
+                expected_revisions,
+                None,
+                "rename symbol".to_string(),
+                None,
+                None,
+                None,
+                None,
+                response
+                    .request
+                    .as_ref()
+                    .and_then(|request| request.source.clone()),
+            ),
+        )
     }
 
     fn server_workspace_edit_action(&mut self, request: &LspServerRequest) -> Action {
@@ -15314,6 +15476,7 @@ impl Editor {
             None,
             label,
             Some(request.clone()),
+            None,
             None,
             None,
             None,
@@ -15390,6 +15553,21 @@ impl Editor {
         true
     }
 
+    fn remove_lsp_diagnostics_for_source(&mut self, source: &LspRequestSource) {
+        for (uri, merged) in self
+            .diagnostic_reports
+            .remove_producer_everywhere(&source.key)
+        {
+            if merged.is_empty() {
+                self.diagnostics.remove(&uri);
+            } else {
+                self.diagnostics.insert(uri, merged);
+            }
+        }
+        self.mark_diagnostic_cache_dirty();
+        self.sync_diagnostic_gutter_signs();
+    }
+
     fn handle_lsp_message(
         &mut self,
         msg: &InboundMessage,
@@ -15398,7 +15576,9 @@ impl Editor {
         if self.handle_agent_lsp_message(msg) {
             return None;
         }
-        fn parse_diagnostics(msg: &ResponseMessage) -> Option<(String, Vec<Diagnostic>)> {
+        fn parse_diagnostics(
+            msg: &ResponseMessage,
+        ) -> Option<(String, Option<LspRequestSource>, Vec<Diagnostic>)> {
             let req = msg.request.as_ref()?;
             let params = req.params.as_object()?;
             let text_document = params.get("textDocument")?.as_object()?;
@@ -15407,6 +15587,7 @@ impl Editor {
 
             Some((
                 uri.to_string(),
+                req.source.clone(),
                 diagnostics
                     .iter()
                     .filter_map(|d| serde_json::from_value::<Diagnostic>(d.clone()).ok())
@@ -15422,9 +15603,10 @@ impl Editor {
                     }
 
                     if method == "textDocument/diagnostic" {
-                        if let Some((uri, diagnostics)) = parse_diagnostics(msg) {
-                            return self.update_diagnostics(
+                        if let Some((uri, source, diagnostics)) = parse_diagnostics(msg) {
+                            return self.update_diagnostics_from(
                                 Some(&uri),
+                                source.as_ref(),
                                 &diagnostics,
                                 diagnostics::DiagnosticReportKind::Pull,
                             );
@@ -15554,10 +15736,16 @@ impl Editor {
 
                         match CompletionResponse::deserialize(&msg.result) {
                             Ok(completion_response) => {
-                                let items = Self::merge_completion_items(
-                                    completion_response.items(),
-                                    pending.buffer_items,
-                                );
+                                let source = msg
+                                    .request
+                                    .as_ref()
+                                    .and_then(|request| request.source.clone());
+                                let mut lsp_items = completion_response.items();
+                                for item in &mut lsp_items {
+                                    item.source = source.clone();
+                                }
+                                let items =
+                                    Self::merge_completion_items(lsp_items, pending.buffer_items);
                                 return self
                                     .show_completion_items(items, snapshot)
                                     .then_some(Action::ShowDialog);
@@ -15594,9 +15782,11 @@ impl Editor {
                 None
             }
             InboundMessage::Notification(msg) => match msg {
-                ParsedNotification::PublishDiagnostics(msg) => {
-                    self.add_diagnostics(msg.uri.as_deref(), &msg.diagnostics)
-                }
+                ParsedNotification::PublishDiagnostics(msg) => self.add_diagnostics_from(
+                    msg.uri.as_deref(),
+                    msg.source.as_ref(),
+                    &msg.diagnostics,
+                ),
                 ParsedNotification::Progress(progress_params) => {
                     // self.plugin_registry
                     //     .notify(
@@ -15657,7 +15847,7 @@ impl Editor {
                 let pending = self.pending_lsp_edit_requests.remove(&id);
                 let pending_completion = self.pending_completions.remove(&id);
                 let save = self.pending_lsp_format_saves.remove(&id);
-                self.pending_lsp_revision_snapshots.remove(&id);
+                let revision_snapshot = self.pending_lsp_revision_snapshots.remove(&id);
                 if pending_completion
                     .as_ref()
                     .is_some_and(|pending| pending.superseded)
@@ -15676,7 +15866,11 @@ impl Editor {
                 if method.as_deref() == Some("textDocument/codeAction")
                     && self.finish_code_action_request(id)
                 {
-                    return Some(Action::CloseDialog);
+                    return pending
+                        .and_then(|pending| {
+                            self.finish_code_action_picker(pending, revision_snapshot)
+                        })
+                        .or(Some(Action::CloseDialog));
                 }
                 let save_as = save.as_ref().is_some_and(|save| save.save_as.is_some());
                 if (error_msg.code == -32601 || save_as)
@@ -15761,7 +15955,7 @@ impl Editor {
                     let pending = self.pending_lsp_edit_requests.remove(id);
                     let pending_completion = self.pending_completions.remove(id);
                     let save = self.pending_lsp_format_saves.remove(id);
-                    self.pending_lsp_revision_snapshots.remove(id);
+                    let revision_snapshot = self.pending_lsp_revision_snapshots.remove(id);
                     if pending_completion
                         .as_ref()
                         .is_some_and(|pending| pending.superseded)
@@ -15778,7 +15972,11 @@ impl Editor {
                     if method.as_deref() == Some("textDocument/codeAction")
                         && self.finish_code_action_request(*id)
                     {
-                        return Some(Action::CloseDialog);
+                        return pending
+                            .and_then(|pending| {
+                                self.finish_code_action_picker(pending, revision_snapshot)
+                            })
+                            .or(Some(Action::CloseDialog));
                     }
                     let save_as = save.as_ref().is_some_and(|save| save.save_as.is_some());
                     if (matches!(
@@ -15829,6 +16027,10 @@ impl Editor {
             }
             InboundMessage::ProcessingError(error_msg) => {
                 Some(Action::Print(error_msg.to_string()))
+            }
+            InboundMessage::ClientFailure { source, error } => {
+                self.remove_lsp_diagnostics_for_source(source);
+                Some(Action::Print(error.to_string()))
             }
             InboundMessage::ServerStderr(message) => {
                 Some(Action::Print(format!("LSP server error: {message}")))
@@ -22393,51 +22595,64 @@ impl Editor {
                         start: position,
                         end: position,
                     };
-                    let diagnostics = self
-                        .diagnostics
-                        .get(&uri)
-                        .into_iter()
-                        .flatten()
-                        .filter(|diagnostic| {
-                            let start = (
-                                diagnostic.range.start.line,
-                                diagnostic.range.start.character,
-                            );
-                            let end = (diagnostic.range.end.line, diagnostic.range.end.character);
-                            let cursor = (position.line, position.character);
-                            start <= cursor && cursor <= end
-                        })
-                        .cloned()
-                        .collect();
                     let pending = PendingLspEdit {
                         buffer_id: self.current_buffer().id(),
                         revision: self.current_buffer().revision(),
-                        uri,
+                        uri: uri.clone(),
                     };
                     let revisions = self.open_buffer_revision_snapshot();
                     self.release_current_dialog_callbacks(runtime);
-                    self.pending_code_action_request = None;
+                    self.clear_pending_code_action_requests();
                     self.current_dialog = Some(Box::new(self.code_action_loading_picker()));
                     self.render(buffer)?;
 
-                    let request: anyhow::Result<i64> = async {
+                    let request: anyhow::Result<Vec<i64>> = async {
                         self.ensure_current_buffer_lsp_opened().await?;
-                        Ok(self.lsp.code_action(&file, range, diagnostics).await?)
+                        let diagnostics = self
+                            .lsp
+                            .request_sources_for_file(&file, "textDocument/codeAction")
+                            .into_iter()
+                            .map(|source| {
+                                let diagnostics = self
+                                    .diagnostic_reports
+                                    .for_producer(&uri, &source)
+                                    .into_iter()
+                                    .filter(|diagnostic| {
+                                        let start = (
+                                            diagnostic.range.start.line,
+                                            diagnostic.range.start.character,
+                                        );
+                                        let end = (
+                                            diagnostic.range.end.line,
+                                            diagnostic.range.end.character,
+                                        );
+                                        let cursor = (position.line, position.character);
+                                        start <= cursor && cursor <= end
+                                    })
+                                    .collect();
+                                (source, diagnostics)
+                            })
+                            .collect();
+                        Ok(self.lsp.code_actions(&file, range, diagnostics).await?)
                     }
                     .await;
-                    let request_id = match request {
-                        Ok(request_id) => request_id,
+                    let request_ids = match request {
+                        Ok(request_ids) => request_ids,
                         Err(error) => {
                             self.current_dialog = None;
                             self.render(buffer)?;
                             return Err(error);
                         }
                     };
-                    if request_id > 0 {
+                    if let Some(&request_id) = request_ids.first() {
                         self.pending_code_action_request = Some(request_id);
-                        self.pending_lsp_edit_requests.insert(request_id, pending);
-                        self.pending_lsp_revision_snapshots
-                            .insert(request_id, revisions);
+                        self.pending_code_action_requests = request_ids.iter().copied().collect();
+                        for request_id in request_ids {
+                            self.pending_lsp_edit_requests
+                                .insert(request_id, pending.clone());
+                            self.pending_lsp_revision_snapshots
+                                .insert(request_id, revisions.clone());
+                        }
                     } else {
                         self.current_dialog = None;
                         self.set_legacy_message(Some(
@@ -22497,6 +22712,7 @@ impl Editor {
                 expected_revisions,
                 command,
                 label,
+                source,
             } => {
                 let operations = documents
                     .iter()
@@ -22512,6 +22728,7 @@ impl Editor {
                     None,
                     None,
                     None,
+                    source.as_ref(),
                     buffer,
                     runtime,
                 )
@@ -22526,6 +22743,7 @@ impl Editor {
                 save_after_uri,
                 save_as,
                 save_previous_file,
+                source,
             } => {
                 self.apply_lsp_workspace_edit(
                     operations,
@@ -22536,6 +22754,7 @@ impl Editor {
                     save_after_uri.as_deref(),
                     save_as.as_deref(),
                     save_previous_file.clone(),
+                    source.as_ref(),
                     buffer,
                     runtime,
                 )
@@ -23560,7 +23779,7 @@ impl Editor {
                     .as_ref()
                     .is_some_and(|dialog| dialog.picker_id() == Some(CODE_ACTION_PICKER_ID))
                 {
-                    self.pending_code_action_request = None;
+                    self.clear_pending_code_action_requests();
                 }
                 self.release_current_dialog_callbacks(runtime);
                 self.current_dialog = None;
@@ -25088,7 +25307,10 @@ impl Editor {
                 .current_buffer()
                 .file
                 .as_deref()
-                .and_then(|file| self.lsp.server_capabilities_for_file(file))
+                .and_then(|file| {
+                    self.lsp
+                        .server_capabilities_for_method(file, "textDocument/signatureHelp")
+                })
                 .and_then(|capabilities| capabilities.signature_help_provider.as_ref())
                 .is_some()
         {
@@ -26043,8 +26265,23 @@ impl Editor {
             }
             self.diagnostic_reports
                 .rename(previous_uri, current_uri.as_deref());
-            if let Some(diagnostics) = self.diagnostics.remove(previous_uri) {
-                if let Some(current_uri) = current_uri.as_ref() {
+            self.diagnostics.remove(previous_uri);
+            if let Some(current_uri) = current_uri.as_ref() {
+                let sources = self
+                    .buffer_manager
+                    .get(buffer_index)
+                    .and_then(|buffer| buffer.file.as_deref())
+                    .map(|file| {
+                        self.lsp
+                            .attachment_sources_for_file(file)
+                            .into_iter()
+                            .collect::<HashSet<_>>()
+                    })
+                    .unwrap_or_default();
+                let diagnostics = self
+                    .diagnostic_reports
+                    .retain_producers(current_uri, &sources);
+                if !diagnostics.is_empty() {
                     self.diagnostics.insert(current_uri.clone(), diagnostics);
                 }
             }
@@ -28197,19 +28434,7 @@ impl Editor {
                 let requires_snapshot = self
                     .lsp_coordinator
                     .requires_before_snapshot(source.id(), source.revision());
-                let full_sync = requires_snapshot
-                    && self
-                        .lsp
-                        .server_capabilities_for_file(file)
-                        .is_some_and(|capabilities| {
-                            !matches!(
-                                capabilities
-                                    .text_document_sync
-                                    .as_ref()
-                                    .and_then(|sync| sync.change_kind()),
-                                Some(crate::lsp::TextDocumentSyncKind::Incremental)
-                            )
-                        });
+                let full_sync = requires_snapshot && !self.lsp.requires_incremental_change(file);
                 (!full_sync).then(|| {
                     (
                         source.id(),
@@ -29065,12 +29290,12 @@ impl Editor {
         let restored = cache.load(&self.config.lsp, &self.buffer_manager);
         let mut changed = false;
         for reports in restored {
-            if self.diagnostics.contains_key(&reports.uri) {
-                continue;
-            }
-            let diagnostics =
-                self.diagnostic_reports
-                    .restore(reports.uri.clone(), reports.push, reports.pull);
+            let diagnostics = self.diagnostic_reports.restore(
+                reports.uri.clone(),
+                reports.producer,
+                reports.push,
+                reports.pull,
+            );
             self.diagnostics.insert(reports.uri, diagnostics);
             changed = true;
         }
@@ -30319,7 +30544,10 @@ impl Editor {
         let Some(file) = self.current_buffer().file.as_deref() else {
             return false;
         };
-        let Some(capabilities) = self.lsp.server_capabilities_for_file(file) else {
+        let Some(capabilities) = self
+            .lsp
+            .server_capabilities_for_method(file, "textDocument/completion")
+        else {
             return false;
         };
 
@@ -30448,6 +30676,7 @@ impl Editor {
                     let normalized = word.to_lowercase();
                     if seen.insert(normalized) {
                         items.push(CompletionResponseItem {
+                            source: None,
                             label: word.clone(),
                             label_details: Some(CompletionItemLabelDetails {
                                 detail: None,
@@ -30736,6 +30965,16 @@ impl Editor {
         if !self.config.completion.enabled {
             return Ok(());
         }
+        if item
+            .source
+            .as_ref()
+            .is_some_and(|source| !self.lsp.request_source_is_current(source))
+        {
+            self.set_legacy_message(Some(
+                "completion is stale because its language server restarted".to_string(),
+            ));
+            return Ok(());
+        }
         let continuation = self.coordinated_completion_continuation(item, commit_character);
         let snapshot = self.completion_snapshot.take();
         if snapshot
@@ -30845,7 +31084,11 @@ impl Editor {
         }
 
         if let Some(command) = &item.command {
-            self.execute_lsp_command(command, None).await?;
+            self.execute_lsp_command(
+                command,
+                item.source.as_ref().map(|source| source.key.as_str()),
+            )
+            .await?;
         }
 
         if let Some(continuation) = continuation {
@@ -30882,6 +31125,37 @@ impl Editor {
         Ok(())
     }
 
+    fn lsp_workspace_root_for_edit(
+        &self,
+        operations: &[LspWorkspaceEditOperation],
+        response: Option<&LspServerRequest>,
+        source: Option<&LspRequestSource>,
+    ) -> Option<PathBuf> {
+        if let Some(source) = source {
+            self.lsp.workspace_root_for_source(source)
+        } else if let Some(request) = response {
+            self.lsp.workspace_root_for_request(request)
+        } else {
+            operations
+                .iter()
+                .map(|operation| match operation {
+                    LspWorkspaceEditOperation::Document { edit } => &edit.uri,
+                    LspWorkspaceEditOperation::Create { uri, .. }
+                    | LspWorkspaceEditOperation::Delete { uri, .. } => uri,
+                    LspWorkspaceEditOperation::Rename { old_uri, .. } => old_uri,
+                })
+                .next()
+                .and_then(|uri| lsp_file_path(uri).ok())
+                .and_then(|file| self.lsp.workspace_root_for_file(&file))
+                .or_else(|| {
+                    self.current_buffer()
+                        .file
+                        .as_deref()
+                        .and_then(|file| self.lsp.workspace_root_for_file(file))
+                })
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn apply_lsp_workspace_edit(
         &mut self,
@@ -30893,9 +31167,17 @@ impl Editor {
         save_after_uri: Option<&str>,
         save_as: Option<&str>,
         save_previous_file: Option<String>,
+        source: Option<&LspRequestSource>,
         render_buffer: &mut RenderBuffer,
         runtime: &mut Runtime,
     ) -> anyhow::Result<()> {
+        let source = source.or_else(|| response.and_then(|request| request.source.as_ref()));
+        if source.is_some_and(|source| !self.lsp.request_source_is_current(source)) {
+            self.set_legacy_message(Some(
+                "workspace edit is stale because its language server restarted".to_string(),
+            ));
+            return Ok(());
+        }
         let touched_paths = operations
             .iter()
             .flat_map(|operation| match operation {
@@ -30953,10 +31235,12 @@ impl Editor {
                 if !touched_paths.contains(&path) {
                     return None;
                 }
-                let version = buffer
-                    .file
-                    .as_deref()
-                    .and_then(|file| self.lsp.document_version(file));
+                let version = buffer.file.as_deref().and_then(|file| {
+                    source.map_or_else(
+                        || self.lsp.document_version(file),
+                        |source| self.lsp.document_version_for_source(file, source),
+                    )
+                });
                 Some(OpenWorkspaceDocument {
                     index,
                     uri,
@@ -30967,27 +31251,7 @@ impl Editor {
                 })
             })
             .collect();
-        let workspace_root = if let Some(request) = response {
-            self.lsp.workspace_root_for_request(request)
-        } else {
-            operations
-                .iter()
-                .map(|operation| match operation {
-                    LspWorkspaceEditOperation::Document { edit } => &edit.uri,
-                    LspWorkspaceEditOperation::Create { uri, .. }
-                    | LspWorkspaceEditOperation::Delete { uri, .. } => uri,
-                    LspWorkspaceEditOperation::Rename { old_uri, .. } => old_uri,
-                })
-                .next()
-                .and_then(|uri| lsp_file_path(uri).ok())
-                .and_then(|file| self.lsp.workspace_root_for_file(&file))
-                .or_else(|| {
-                    self.current_buffer()
-                        .file
-                        .as_deref()
-                        .and_then(|file| self.lsp.workspace_root_for_file(file))
-                })
-        };
+        let workspace_root = self.lsp_workspace_root_for_edit(operations, response, source);
         if response.is_some() && workspace_root.is_none() {
             let reason =
                 "LSP workspace edit cannot be applied because its originating server is unavailable"
@@ -31117,7 +31381,14 @@ impl Editor {
             let new_uri = crate::lsp::file_uri(file).ok();
             if let Some(new_uri) = &new_uri {
                 self.diagnostic_reports.rename(uri, Some(new_uri));
-                if let Some(diagnostics) = self.diagnostics.remove(uri) {
+                let sources = self
+                    .lsp
+                    .attachment_sources_for_file(file)
+                    .into_iter()
+                    .collect::<HashSet<_>>();
+                self.diagnostics.remove(uri);
+                let diagnostics = self.diagnostic_reports.retain_producers(new_uri, &sources);
+                if !diagnostics.is_empty() {
                     self.diagnostics.insert(new_uri.clone(), diagnostics);
                 }
                 self.mark_diagnostic_cache_dirty();
@@ -31150,7 +31421,11 @@ impl Editor {
             if let Err(error) = self
                 .execute_lsp_command(
                     command,
-                    response.and_then(|request| request.source.as_deref()),
+                    source.map(|source| source.key.as_str()).or_else(|| {
+                        response
+                            .and_then(|request| request.source.as_ref())
+                            .map(|source| source.key.as_str())
+                    }),
                 )
                 .await
             {
@@ -42989,6 +43264,7 @@ builtin = "rust"
 
     fn completion_item(label: &str) -> CompletionResponseItem {
         CompletionResponseItem {
+            source: None,
             label: label.to_string(),
             label_details: None,
             kind: None,
@@ -44073,6 +44349,7 @@ builtin = "rust"
                 }
             }),
             timestamp: std::time::Instant::now(),
+            source: None,
         };
         let response = ResponseMessage {
             id: 1,
@@ -45868,6 +46145,7 @@ builtin = "rust"
                 expected_revisions,
                 command: None,
                 label,
+                ..
             }) if documents.len() == 1
                 && documents[0].uri.contains("caf%C3%A9%20%231.rs")
                 && expected_revisions == vec![(documents[0].uri.clone(), revision)]
@@ -45951,6 +46229,7 @@ builtin = "rust"
                 expected_revisions,
                 command: None,
                 label,
+                ..
             }) if documents.len() == 1
                 && expected_revisions == vec![(documents[0].uri.clone(), revision)]
                 && label == "format pasted text"
@@ -46193,6 +46472,7 @@ while True:
                 expected_revisions,
                 command: None,
                 label,
+                ..
             }) if documents.len() == 1
                 && expected_revisions == &vec![(documents[0].uri.clone(), revision)]
                 && label == "Remove unused binding from request handler"
@@ -46238,6 +46518,193 @@ while True:
         );
     }
 
+    #[test]
+    fn code_action_picker_combines_servers_and_keeps_action_origin() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("index.rs");
+        let mut editor = workspace_lsp_test_editor(root.path(), &path, "const unused = 1;");
+        let uri = editor.buffer_manager[0].uri().unwrap().unwrap();
+        let pending = PendingLspEdit {
+            buffer_id: editor.buffer_manager[0].id(),
+            revision: editor.buffer_manager[0].revision(),
+            uri: uri.clone(),
+        };
+        for id in [43, 44] {
+            editor.pending_lsp_edit_requests.insert(id, pending.clone());
+        }
+        editor.pending_code_action_request = Some(43);
+        editor.pending_code_action_requests = HashSet::from([43, 44]);
+        editor.current_dialog = Some(Box::new(editor.code_action_loading_picker()));
+
+        let response = |id, server: &str, title: &str| {
+            let mut request = crate::lsp::Request::new(
+                "textDocument/codeAction",
+                serde_json::json!({ "textDocument": { "uri": uri } }),
+            );
+            request.source = Some(LspRequestSource {
+                key: format!("{server}:{}", root.path().display()),
+                instance: 7,
+            });
+            InboundMessage::Message(ResponseMessage {
+                id,
+                result: serde_json::json!([{
+                    "title": title,
+                    "command": { "title": title, "command": format!("{server}.fix") }
+                }]),
+                request: Some(request),
+            })
+        };
+
+        assert!(editor
+            .handle_lsp_message(
+                &response(43, "typescript", "TypeScript fix"),
+                Some("textDocument/codeAction".to_string()),
+            )
+            .is_none());
+        let action = editor.handle_lsp_message(
+            &response(44, "eslint", "ESLint fix"),
+            Some("textDocument/codeAction".to_string()),
+        );
+        assert!(matches!(action, Some(Action::ShowDialog)), "{action:?}");
+
+        let mut rendered = RenderBuffer::new(60, 12, &Style::default());
+        editor
+            .current_dialog
+            .as_ref()
+            .unwrap()
+            .draw(&mut rendered)
+            .unwrap();
+        let frame = render_text_rows(&rendered).join("\n");
+        assert!(frame.contains("TypeScript fix"), "{frame}");
+        assert!(frame.contains("ESLint fix"), "{frame}");
+
+        let selected = editor
+            .current_dialog
+            .as_mut()
+            .unwrap()
+            .handle_event(&Event::Key(KeyEvent::new(
+                KeyCode::Enter,
+                KeyModifiers::NONE,
+            )));
+        let Some(KeyAction::Multiple(actions)) = selected else {
+            panic!("expected code-action picker selection");
+        };
+        assert!(matches!(
+            actions.last(),
+            Some(Action::ApplyLspWorkspaceEdit { source: Some(source), .. })
+                if source.key.starts_with("typescript:")
+        ));
+    }
+
+    #[test]
+    fn code_action_picker_keeps_peer_results_when_the_last_server_fails() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("red-partial-code-action.rs");
+        let mut editor = workspace_lsp_test_editor(root.path(), &path, "const unused = 1;");
+        let uri = editor.buffer_manager[0].uri().unwrap().unwrap();
+        let pending = PendingLspEdit {
+            buffer_id: editor.buffer_manager[0].id(),
+            revision: editor.buffer_manager[0].revision(),
+            uri: uri.clone(),
+        };
+        for id in [43, 44] {
+            editor.pending_lsp_edit_requests.insert(id, pending.clone());
+        }
+        editor.pending_code_action_request = Some(43);
+        editor.pending_code_action_requests = HashSet::from([43, 44]);
+        editor.current_dialog = Some(Box::new(editor.code_action_loading_picker()));
+        let response = InboundMessage::Message(ResponseMessage {
+            id: 43,
+            result: serde_json::json!([{
+                "title": "TypeScript fix",
+                "command": { "title": "TypeScript fix", "command": "typescript.fix" }
+            }]),
+            request: Some(crate::lsp::Request::new(
+                "textDocument/codeAction",
+                serde_json::json!({ "textDocument": { "uri": uri } }),
+            )),
+        });
+
+        assert!(editor
+            .handle_lsp_message(&response, Some("textDocument/codeAction".to_string()))
+            .is_none());
+        let action = editor.handle_lsp_message(
+            &InboundMessage::RequestError {
+                id: 44,
+                error: crate::lsp::LspError::RequestTimeout(Duration::from_secs(30)),
+            },
+            Some("textDocument/codeAction".to_string()),
+        );
+
+        assert!(matches!(action, Some(Action::ShowDialog)), "{action:?}");
+        let mut rendered = RenderBuffer::new(60, 12, &Style::default());
+        editor
+            .current_dialog
+            .as_ref()
+            .unwrap()
+            .draw(&mut rendered)
+            .unwrap();
+        assert!(render_text_rows(&rendered)
+            .join("\n")
+            .contains("TypeScript fix"));
+        assert!(editor.pending_lsp_edit_requests.is_empty());
+    }
+
+    #[test]
+    fn code_action_picker_keeps_a_late_success_after_a_peer_fails() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("red-late-code-action.rs");
+        let mut editor = workspace_lsp_test_editor(root.path(), &path, "const unused = 1;");
+        let uri = editor.buffer_manager[0].uri().unwrap().unwrap();
+        let pending = PendingLspEdit {
+            buffer_id: editor.buffer_manager[0].id(),
+            revision: editor.buffer_manager[0].revision(),
+            uri: uri.clone(),
+        };
+        for id in [43, 44] {
+            editor.pending_lsp_edit_requests.insert(id, pending.clone());
+        }
+        editor.pending_code_action_request = Some(43);
+        editor.pending_code_action_requests = HashSet::from([43, 44]);
+        editor.current_dialog = Some(Box::new(editor.code_action_loading_picker()));
+
+        assert!(editor
+            .handle_lsp_message(
+                &InboundMessage::RequestError {
+                    id: 43,
+                    error: crate::lsp::LspError::RequestTimeout(Duration::from_secs(30)),
+                },
+                Some("textDocument/codeAction".to_string()),
+            )
+            .is_none());
+        let action = editor.handle_lsp_message(
+            &InboundMessage::Message(ResponseMessage {
+                id: 44,
+                result: serde_json::json!([{
+                    "title": "ESLint fix",
+                    "command": { "title": "ESLint fix", "command": "eslint.fix" }
+                }]),
+                request: Some(crate::lsp::Request::new(
+                    "textDocument/codeAction",
+                    serde_json::json!({ "textDocument": { "uri": uri } }),
+                )),
+            }),
+            Some("textDocument/codeAction".to_string()),
+        );
+
+        assert!(matches!(action, Some(Action::ShowDialog)), "{action:?}");
+        let mut rendered = RenderBuffer::new(60, 12, &Style::default());
+        editor
+            .current_dialog
+            .as_ref()
+            .unwrap()
+            .draw(&mut rendered)
+            .unwrap();
+        assert!(render_text_rows(&rendered)
+            .join("\n")
+            .contains("ESLint fix"));
+    }
+
     #[tokio::test]
     async fn closing_a_loading_code_action_picker_ignores_its_late_response() {
         let path = std::env::temp_dir().join("red-cancelled-code-action.rs");
@@ -46255,6 +46722,17 @@ while True:
             },
         );
         editor.pending_code_action_request = Some(43);
+        editor.pending_code_action_requests = HashSet::from([43, 44]);
+        editor.pending_lsp_edit_requests.insert(
+            44,
+            PendingLspEdit {
+                buffer_id: editor.buffer_manager[0].id(),
+                revision: editor.buffer_manager[0].revision(),
+                uri: uri.clone(),
+            },
+        );
+        editor.pending_lsp_revision_snapshots.insert(43, Vec::new());
+        editor.pending_lsp_revision_snapshots.insert(44, Vec::new());
         editor.current_dialog = Some(Box::new(editor.code_action_loading_picker()));
 
         editor
@@ -46263,6 +46741,8 @@ while True:
             .unwrap();
         assert_eq!(editor.pending_code_action_request, None);
         assert!(editor.current_dialog.is_none());
+        assert!(editor.pending_lsp_edit_requests.is_empty());
+        assert!(editor.pending_lsp_revision_snapshots.is_empty());
 
         let message = InboundMessage::Message(ResponseMessage {
             id: 43,
@@ -46391,6 +46871,7 @@ while True:
                 expected_revisions: revisions,
                 command: None,
                 label: "apply quick fix".to_string(),
+                source: None,
             })
             .await
             .unwrap();
@@ -46458,6 +46939,7 @@ while True:
                 expected_revisions: vec![(uri.clone(), revision)],
                 command: None,
                 label: "import missing item".to_string(),
+                source: None,
             })
             .await
             .unwrap();
@@ -46541,6 +47023,7 @@ while True:
                 expected_revisions: revisions.clone(),
                 command: None,
                 label: "invalid edit".to_string(),
+                source: None,
             })
             .await
             .unwrap();
@@ -46573,6 +47056,7 @@ while True:
                 expected_revisions: revisions.clone(),
                 command: None,
                 label: "overlapping edit".to_string(),
+                source: None,
             })
             .await
             .unwrap();
@@ -46604,6 +47088,7 @@ while True:
                 expected_revisions: revisions,
                 command: None,
                 label: "stale edit".to_string(),
+                source: None,
             })
             .await
             .unwrap();
@@ -46636,6 +47121,7 @@ while True:
                 expected_revisions: vec![(uri, revision)],
                 command: None,
                 label: "versioned edit".to_string(),
+                source: None,
             })
             .await
             .unwrap();
@@ -46931,7 +47417,10 @@ while True:
                     "newText": "updated"
                 }] } }
             }),
-            source: Some("rust:/tmp/project".to_string()),
+            source: Some(LspRequestSource {
+                key: "rust:/tmp/project".to_string(),
+                instance: 0,
+            }),
         });
 
         let action = editor.handle_lsp_message(&message, None);
@@ -46948,7 +47437,10 @@ while True:
             id: serde_json::json!(2),
             method: "workspace/applyEdit".to_string(),
             params: serde_json::json!({ "label": "Broken" }),
-            source: Some("rust:/tmp/project".to_string()),
+            source: Some(LspRequestSource {
+                key: "rust:/tmp/project".to_string(),
+                instance: 0,
+            }),
         });
         assert!(matches!(
             editor.handle_lsp_message(&invalid, None),
@@ -46986,6 +47478,7 @@ while True:
                 save_after_uri: None,
                 save_as: None,
                 save_previous_file: None,
+                source: None,
             })
             .await
             .unwrap();
@@ -47032,6 +47525,7 @@ while True:
                 save_after_uri: None,
                 save_as: None,
                 save_previous_file: None,
+                source: None,
             })
             .await
             .unwrap();
@@ -47085,6 +47579,7 @@ while True:
                 save_after_uri: None,
                 save_as: None,
                 save_previous_file: None,
+                source: None,
             })
             .await
             .unwrap();
@@ -47117,6 +47612,7 @@ while True:
                 save_after_uri: None,
                 save_as: None,
                 save_previous_file: None,
+                source: None,
             })
             .await
             .unwrap();
@@ -48217,6 +48713,7 @@ while True:
                 save_after_uri: Some(target_uri),
                 save_as: Some(target_file),
                 save_previous_file: Some(root.path().join("source.rs").to_string_lossy().into()),
+                source: None,
             })
             .await
             .unwrap();
@@ -48275,6 +48772,7 @@ while True:
                 save_after_uri: Some(target_uri),
                 save_as: Some(target_file),
                 save_previous_file: Some(source_file.clone()),
+                source: None,
             })
             .await
             .unwrap();
@@ -48779,6 +49277,7 @@ while True:
                 save_after_uri: None,
                 save_as: None,
                 save_previous_file: None,
+                source: None,
             })
             .await
             .unwrap();

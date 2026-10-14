@@ -25,7 +25,7 @@ pub(super) struct AgentLsp {
     workers: Vec<EditWorker>,
     plans: HashMap<String, EditPlan>,
     retired: BTreeSet<i64>,
-    reports: HashMap<String, ReportStamp>,
+    reports: HashMap<(String, String), ReportStamp>,
     report_sequence: u64,
 }
 
@@ -52,7 +52,7 @@ struct QueryContext {
     root: PathBuf,
     server_root: PathBuf,
     file: String,
-    instance: u64,
+    lsp_source: crate::lsp::LspRequestSource,
     source: BufferId,
     snapshots: Vec<BufferSnapshot>,
     allow_sensitive_paths: bool,
@@ -358,22 +358,32 @@ impl Editor {
             utf16_byte_offset(&self.buffer_manager[index].contents(), *position)?;
         }
         self.ensure_buffer_lsp_opened(index).await?;
-        if self.lsp.server_status_for_file(&file) != "ready" {
+        let method = match request.call {
+            EditorToolCall::LspPrepareRename { .. } => "textDocument/prepareRename",
+            EditorToolCall::LspPreviewRename { .. } => "textDocument/rename",
+            EditorToolCall::LspDiagnostics { .. } => "textDocument/diagnostic",
+            _ => unreachable!("validated query"),
+        };
+        let route_method = if matches!(request.call, EditorToolCall::LspDiagnostics { .. }) {
+            "textDocument/publishDiagnostics"
+        } else {
+            method
+        };
+        let Some(lsp_source) = self.lsp.request_source_for_file(&file, route_method) else {
             return Ok(StartQuery::Immediate(result_status(
                 self.lsp.server_status_for_file(&file),
-                "language server is not ready; inspect lsp_status and retry",
+                "no ready language server supports this operation; inspect lsp_status and retry",
             )));
-        }
-        let caps = serde_json::to_value(self.lsp.server_capabilities_for_file(&file))?;
+        };
+        let caps = serde_json::to_value(self.lsp.server_capabilities_for_source(&lsp_source))?;
         anyhow::ensure!(
             caps["positionEncoding"].is_null() || caps["positionEncoding"] == "utf-16",
             "language server did not negotiate UTF-16 positions"
         );
         let server_root = self
             .lsp
-            .workspace_root_for_file(&file)
+            .workspace_root_for_source(&lsp_source)
             .ok_or_else(|| anyhow::anyhow!("language server has no workspace root"))?;
-        let server = self.lsp.server_name_for_file(&file);
         // Flush all visible documents owned by this server before asking it to rename.
         let indices = self
             .buffer_manager
@@ -387,8 +397,9 @@ impl Editor {
                     self.config.agent.allow_sensitive_paths,
                 )
                 .ok()?;
-                (self.lsp.workspace_root_for_file(file).as_ref() == Some(&server_root)
-                    && self.lsp.server_name_for_file(file) == server)
+                self.lsp
+                    .request_sources_for_file(file, route_method)
+                    .contains(&lsp_source.key)
                     .then_some(i)
             })
             .collect::<Vec<_>>();
@@ -433,7 +444,7 @@ impl Editor {
                 uri: crate::lsp::file_uri(&path)?,
                 path,
                 revision: buffer.revision(),
-                version: self.lsp.document_version(file),
+                version: self.lsp.document_version_for_source(file, &lsp_source),
                 contents: buffer.contents_snapshot(),
                 dirty: buffer.is_dirty(),
             });
@@ -447,10 +458,7 @@ impl Editor {
             root,
             server_root,
             file: file.clone(),
-            instance: self
-                .lsp
-                .server_instance_for_file(&file)
-                .ok_or_else(|| anyhow::anyhow!("language server became unavailable"))?,
+            lsp_source,
             source: self.buffer_manager[index].id(),
             snapshots,
             allow_sensitive_paths: self.config.agent.allow_sensitive_paths,
@@ -501,7 +509,13 @@ impl Editor {
                     let sequence = self
                         .agent_lsp
                         .reports
-                        .get(&uri)
+                        .get(&(uri.clone(), context.lsp_source.key.clone()))
+                        .or_else(|| {
+                            self.agent_lsp.reports.get(&(
+                                uri.clone(),
+                                super::diagnostics::DEFAULT_PRODUCER.to_string(),
+                            ))
+                        })
                         .map_or(0, |stamp| stamp.sequence);
                     return Ok(StartQuery::Pending {
                         id: -(crate::lsp::next_id() as i64),
@@ -520,7 +534,7 @@ impl Editor {
         };
         let id = self
             .lsp
-            .send_request_for_file(&file, method, params, false)
+            .send_request_for_source(&context.lsp_source.key, method, params, false)
             .await?;
         anyhow::ensure!(id > 0, "language server is unavailable");
         Ok(StartQuery::Pending {
@@ -553,7 +567,7 @@ impl Editor {
             "agent access policy changed"
         );
         anyhow::ensure!(
-            self.lsp.server_instance_for_file(&context.file) == Some(context.instance),
+            self.lsp.request_source_is_current(&context.lsp_source),
             "language server changed or stopped; request a new preview"
         );
         for snapshot in &context.snapshots {
@@ -670,8 +684,9 @@ impl Editor {
                 );
                 let diagnostics: Vec<Diagnostic> = serde_json::from_value(result["items"].clone())?;
                 let uri = crate::lsp::file_uri(&pending.context.file)?;
-                self.update_diagnostics(
+                self.update_diagnostics_from(
                     Some(&uri),
+                    Some(&pending.context.lsp_source),
                     &diagnostics,
                     diagnostics::DiagnosticReportKind::Pull,
                 );
@@ -714,7 +729,16 @@ impl Editor {
             let received = pending.push_sequence.is_some_and(|sequence| {
                 crate::lsp::file_uri(&pending.context.file)
                     .ok()
-                    .and_then(|uri| self.agent_lsp.reports.get(&uri))
+                    .and_then(|uri| {
+                        self.agent_lsp
+                            .reports
+                            .get(&(uri.clone(), pending.context.lsp_source.key.clone()))
+                            .or_else(|| {
+                                self.agent_lsp
+                                    .reports
+                                    .get(&(uri, super::diagnostics::DEFAULT_PRODUCER.to_string()))
+                            })
+                    })
                     .is_some_and(|stamp| stamp.sequence > sequence)
             });
             if !pending.tool.response.is_closed()
@@ -907,7 +931,7 @@ impl Editor {
         )
     }
 
-    pub(super) fn record_agent_diagnostic_report(&mut self, uri: &str) {
+    pub(super) fn record_agent_diagnostic_report(&mut self, uri: &str, producer: &str) {
         self.agent_lsp.report_sequence = self.agent_lsp.report_sequence.wrapping_add(1);
         let revision = self
             .buffer_manager
@@ -915,7 +939,7 @@ impl Editor {
             .find(|buffer| buffer.uri().ok().flatten().as_deref() == Some(uri))
             .map(Buffer::revision);
         self.agent_lsp.reports.insert(
-            uri.to_string(),
+            (uri.to_string(), producer.to_string()),
             ReportStamp {
                 sequence: self.agent_lsp.report_sequence,
                 revision,
@@ -987,24 +1011,37 @@ impl Editor {
                 continue;
             }
             let relative = path.strip_prefix(root).unwrap_or(&path);
-            let stamp = self.agent_lsp.reports.get(&uri);
             let revision = index.map(|i| self.buffer_manager[i].revision());
+            let producers = self.diagnostic_reports.producers(&uri);
+            let stamps = producers
+                .iter()
+                .filter_map(|producer| {
+                    self.agent_lsp
+                        .reports
+                        .get(&(uri.clone(), (*producer).to_string()))
+                })
+                .collect::<Vec<_>>();
             let freshness = if !self.diagnostics.contains_key(&uri) {
                 "not_received"
             } else if self.diagnostic_reports.is_provisional(&uri) {
                 "provisional"
-            } else if let Some(stamp) = stamp {
-                if stamp.revision != revision {
-                    "stale"
-                } else {
-                    "unversioned"
-                }
-            } else {
+            } else if stamps.len() != producers.len() {
                 "not_received"
+            } else if stamps.iter().any(|stamp| stamp.revision != revision) {
+                "stale"
+            } else {
+                "unversioned"
             };
+            let received_at_ms = stamps.iter().map(|stamp| stamp.received_at_ms).min();
+            let observed_revision = (!stamps.is_empty()
+                && stamps.iter().all(|stamp| stamp.revision == revision))
+            .then_some(revision)
+            .flatten();
             if documents.len() < 100 {
-                documents.push(json!({"path": relative, "revision": revision, "freshness": freshness,
-                    "received_at_ms": stamp.map(|stamp| stamp.received_at_ms), "observed_revision": stamp.and_then(|stamp| stamp.revision)}));
+                documents.push(
+                    json!({"path": relative, "revision": revision, "freshness": freshness,
+                    "received_at_ms": received_at_ms, "observed_revision": observed_revision}),
+                );
             }
             for diagnostic in self.diagnostics.get(&uri).into_iter().flatten() {
                 if let Some(range) = range {
