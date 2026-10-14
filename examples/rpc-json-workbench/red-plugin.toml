@@ -1,0 +1,16 @@
+schema_version = 1
+
+[plugin]
+id = "json-workbench"
+name = "JSON Workbench"
+version = "0.1.0"
+red_api = "^0.21.0"
+description = "Preview, apply, and undo jq transformations"
+license = "MIT"
+
+[rpc]
+command = "python3"
+args = ["plugin.py"]
+
+[activation]
+commands = ["JsonApply", "JsonClose", "JsonQuery", "JsonUndo"]
