@@ -35,6 +35,13 @@ COMMANDS = [
         },
     },
     {
+        "name": "JsonSelection",
+        "metadata": {
+            "title": "Open a JSON workbench for the last selection",
+            "category": "JSON Workbench",
+        },
+    },
+    {
         "name": "JsonRun",
         "metadata": {
             "title": "Run the editable JSON query",
@@ -321,6 +328,7 @@ class JsonWorkbench:
         self.closed = threading.Event()
         self.request_ids = itertools.count(1)
         self.source_id = None
+        self.source_selection = None
         self.query_document_id = None
         self.last_query = None
         self.result = None
@@ -486,16 +494,38 @@ class JsonWorkbench:
         except (OperationError, CommandCancelled):
             pass
 
-    def snapshot_source(self):
+    def snapshot_source(self, include_selection=False):
         if self.source_id is None:
-            document = self.request_host(
-                "red/DocumentSnapshot", {"include_document_id": True}
-            )
+            params = {"include_document_id": True}
+            if include_selection:
+                params["include_selection"] = True
+            document = self.request_host("red/DocumentSnapshot", params)
             self.source_id = document["document_id"]
+            selection = document.get("selection")
+            if selection is not None:
+                self.source_selection = {
+                    "range": selection["range"],
+                    "text": selection["text"],
+                    "revision": document["revision"],
+                }
             return document
         return self.request_host(
             "red/DocumentSnapshot", {"document_id": self.source_id}
         )
+
+    def query_source(self, document):
+        selection = self.source_selection
+        if selection is None:
+            source = document["text"]
+            return source, {
+                "start": {"line": 0, "character": 0},
+                "end": end_position(source),
+            }
+        if document["revision"] != selection["revision"]:
+            raise OperationError(
+                "selected JSON source changed; close and reopen the workbench"
+            )
+        return selection["text"], selection["range"]
 
     def run_cancelled(self, cancel, generation=None):
         return (
@@ -721,7 +751,7 @@ class JsonWorkbench:
             self.ensure_run_active(cancel, generation)
             document = self.snapshot_source()
             self.ensure_run_active(cancel, generation)
-            source = document["text"]
+            source, source_range = self.query_source(document)
             source_bytes = source.encode("utf-8")
             if len(source_bytes) > SOURCE_LIMIT:
                 raise OperationError(f"JSON source exceeds {SOURCE_LIMIT} bytes")
@@ -734,6 +764,7 @@ class JsonWorkbench:
             self.candidate = {
                 "document_id": self.source_id,
                 "revision": document["revision"],
+                "range": source_range,
                 "source": source,
                 "output": output,
             }
@@ -748,9 +779,7 @@ class JsonWorkbench:
             raise
         return {"message": "JSON preview ready"}
 
-    def workbench(self, _params):
-        self.clear_picker()
-        document = self.snapshot_source()
+    def show_workbench(self, document):
         self.load_settings()
         self.load_storage()
         self.show_workbench_help(document)
@@ -766,6 +795,20 @@ class JsonWorkbench:
             self.show_document(self.query_document_id)
         self.best_effort_status("JSON: query")
         return {"message": "JSON query document ready"}
+
+    def workbench(self, _params):
+        self.clear_picker()
+        return self.show_workbench(self.snapshot_source())
+
+    def selection(self, _params):
+        if self.source_id is not None:
+            raise OperationError("close the current JSON Workbench first")
+        self.clear_picker()
+        document = self.snapshot_source(include_selection=True)
+        if self.source_selection is None:
+            self.source_id = None
+            raise OperationError("JsonSelection has no contiguous visual selection")
+        return self.show_workbench(document)
 
     def snapshot_query(self):
         if self.query_document_id is None:
@@ -861,6 +904,7 @@ class JsonWorkbench:
         except HostError as error:
             if error.code == -32001:
                 self.source_id = None
+                self.source_selection = None
                 self.candidate = None
                 self.transaction = None
                 self.result = None
@@ -1042,6 +1086,7 @@ class JsonWorkbench:
     def retire_closed_document(self, document_id):
         if document_id == self.source_id:
             self.source_id = None
+            self.source_selection = None
         if document_id == self.query_document_id:
             self.query_document_id = None
         self.disable_live()
@@ -1068,10 +1113,7 @@ class JsonWorkbench:
                     "label": "JSON Workbench apply",
                     "edits": [
                         {
-                            "range": {
-                                "start": {"line": 0, "character": 0},
-                                "end": end_position(candidate["source"]),
-                            },
+                            "range": candidate["range"],
                             "text": candidate["output"],
                             "expected_text": candidate["source"],
                         }
@@ -1115,6 +1157,7 @@ class JsonWorkbench:
             self.request_host("red/TextPanelDispose", {"id": PANEL_ID})
         self.request_host("red/StatuslineClear", {})
         self.source_id = None
+        self.source_selection = None
         self.query_document_id = None
         self.result = None
         self.candidate = None
@@ -1137,6 +1180,7 @@ class JsonWorkbench:
             return
         handlers = {
             "JsonWorkbench": self.workbench,
+            "JsonSelection": self.selection,
             "JsonRun": self.run,
             "JsonLive": self.live,
             "JsonCancel": self.cancel,

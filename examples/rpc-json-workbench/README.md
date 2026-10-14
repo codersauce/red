@@ -16,6 +16,7 @@ Open a JSON document and run:
 
 ```text
 :JsonWorkbench
+:JsonSelection
 :JsonRun
 :JsonLive
 :JsonCancel
@@ -38,6 +39,14 @@ ordinary unnamed query document. Edit that document with normal Red commands
 and run it with `JsonRun`; its undo history and dirty state are independent of
 the source. The query can be saved normally as a `.jq` file. If the query
 document is closed, the next `JsonWorkbench` invocation creates a replacement.
+
+`JsonSelection` opens the same workbench against Red's most recent contiguous
+character or line selection. Leave Visual mode with `Esc`, then run the command;
+block and multiple selections are rejected. Filters receive only the exact
+selected text, and `JsonApply` replaces only its normalized range with an exact
+preimage check against the captured whole-document revision. Any source change,
+including one outside the range, requires closing and reopening the workbench
+before another selected run can become applicable.
 
 `JsonLive` watches the pinned source and query documents, then refreshes the
 preview after 120 ms of quiet. Rapid edits retain one latest desired run and

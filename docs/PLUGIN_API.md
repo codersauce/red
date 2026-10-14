@@ -1,6 +1,6 @@
 # Plugin compatibility
 
-Red host API version `0.23.0` is defined by
+Red host API version `0.24.0` is defined by
 [`src/plugin/host_api.json`](../src/plugin/host_api.json). That file is the canonical,
 machine-readable list of execute actions, request actions, signatures, and introduction
 versions. Runtime dispatch and the bundled-plugin corpus are checked against it in tests.
@@ -24,11 +24,11 @@ required/optional arity (`HUSK-A0002`) and obvious literal argument types
 annotations use `HUSK-A0004`. `--no-typecheck` is an unsupported development
 escape hatch; compatibility guarantees do not apply while it is enabled.
 
-Host API `0.23.0` retains the complete `0.4.0`, `0.6.0`, `0.7.0`, `0.8.0`, `0.9.0`,
+Host API `0.24.0` retains the complete `0.4.0`, `0.6.0`, `0.7.0`, `0.8.0`, `0.9.0`,
 `0.10.0`, `0.11.0`, `0.12.0`, `0.14.0`, `0.16.0`, `0.17.0`, `0.18.0`,
-`0.19.0`, `0.20.0`, `0.21.0`, and `0.22.0` contracts, so existing packages
+`0.19.0`, `0.20.0`, `0.21.0`, `0.22.0`, and `0.23.0` contracts, so existing packages
 that declare those minors continue to load. New packages should target
-`"red_api_version": "^0.23.0"`.
+`"red_api_version": "^0.24.0"`.
 
 ## Standalone JSON-RPC packages
 
@@ -58,6 +58,12 @@ Host API `0.23.0` adds two owner-scoped document watches per RPC connection.
 `document/event` invalidations without exposing raw edits. See
 [document watches](RPC_PLUGIN_PROTOCOL.md#document-watches) for setup ordering,
 closure, bounds, and cleanup semantics.
+
+Host API `0.24.0` adds opt-in contiguous selection context to RPC document
+snapshots. The result carries exact selected text and a normalized
+Unicode-scalar range under the same document revision as the complete snapshot.
+See [document snapshots](RPC_PLUGIN_PROTOCOL.md#document-snapshots) for active,
+last-visual, block, and multiple-selection behavior.
 
 ## Native tree panels
 

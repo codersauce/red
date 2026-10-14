@@ -114,7 +114,7 @@ The version 1 initialization parameters are:
 ```json
 {
   "protocol_versions": [1],
-  "red_api_version": "0.23.0",
+  "red_api_version": "0.24.0",
   "plugin_id": "document-tools",
   "host_methods": [
     "red/DocumentCreate",
@@ -352,6 +352,26 @@ selector. A closed ID returns `-32001`; malformed IDs or conflicting `path` and
 ID selectors return `-32602`. Plugins using these fields must require
 `red_api = "^0.20.0"` or later. Older RPC and Husk packages continue to load.
 
+Host API `0.24.0` adds opt-in contiguous selection context. Set
+`include_selection: true` to return the selected preimage and its normalized
+half-open range atomically with the document ID, revision, and complete text:
+
+```json
+{"jsonrpc":"2.0","id":"plugin-selection","method":"red/DocumentSnapshot","params":{"include_selection":true}}
+{"jsonrpc":"2.0","id":"plugin-selection","result":{"document_id":"42","path":"data.json","revision":"7","text":"{\"value\":42}\n","selection":{"range":{"start":{"line":0,"character":9},"end":{"line":0,"character":11}},"text":"42"}}}
+```
+
+The option implies `include_document_id`. For the active document, Red resolves
+the current contiguous character or line selection, falling back to its native
+last-visual-selection marks after Visual mode exits. A document without such a
+selection, including an inactive target, returns `selection: null`. Block and
+multiple selections return `-32003` without disconnecting the plugin. Positions
+use the same zero-based Unicode-scalar coordinates as document edits; line
+selections include their exact line ending, including CRLF. A plugin must apply
+against the returned whole-document revision and selected `text` preimage.
+Omitting the option preserves every earlier response shape. Plugins using it
+must require `red_api = "^0.24.0"` or later.
+
 ## Document watches
 
 Host API `0.23.0` adds owner-local invalidation notifications for live document
@@ -569,6 +589,8 @@ Version 1 deliberately exposes a small set of typed operations:
 - `red/DocumentSnapshot`, `red/DocumentApply`, and `red/DocumentUndo`,
   preserving revisions, attributed undo transactions, dirty tracking, and LSP
   updates.
+- Opt-in, revision-bound contiguous selection text and normalized ranges on
+  document snapshots.
 - Owner-local, coalesced document invalidations through `red/DocumentWatch`,
   `red/DocumentUnwatch`, and `document/event`.
 - Text-panel create, content replacement, focus, and disposal, with resources

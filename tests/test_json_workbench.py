@@ -48,6 +48,8 @@ elif query.startswith("slow:"):
     time.sleep(10)
 elif query == "echo":
     sys.stdout.buffer.write(source)
+elif query == "wrap":
+    sys.stdout.buffer.write(b"<" + source + b">")
 else:
     sys.stdout.buffer.write(b'{"ok":true}\n')
 '''
@@ -340,6 +342,115 @@ class JsonWorkbenchTest(unittest.TestCase):
             clear = plugin.expect_host_request("red/StatuslineClear")
             plugin.reply(clear)
             self.assertIsNone(plugin.receive()["result"])
+
+    def test_selected_source_uses_captured_range_and_revision(self):
+        text = "before\r\n😀e\u0301\r\nafter"
+        selected = "😀e\u0301\r\n"
+        selection_range = {
+            "start": {"line": 1, "character": 0},
+            "end": {"line": 2, "character": 0},
+        }
+        document = {
+            "path": "data.json",
+            "document_id": "7",
+            "revision": "11",
+            "text": text,
+            "selection": {"range": selection_range, "text": selected},
+        }
+        output = f"<{selected}>"
+        with PluginProcess(self.fake_jq) as plugin:
+            plugin.command("selection", "JsonSelection")
+            snapshot = plugin.expect_host_request("red/DocumentSnapshot")
+            self.assertEqual(
+                snapshot["params"],
+                {"include_document_id": True, "include_selection": True},
+            )
+            plugin.reply(snapshot, document)
+            plugin.load_runtime()
+            create = plugin.expect_host_request("red/TextPanelCreate")
+            plugin.reply(create)
+            help_content = plugin.expect_host_request("red/TextPanelSetContent")
+            plugin.reply(help_content)
+            created = plugin.expect_host_request("red/DocumentCreate")
+            plugin.reply(created, {"document_id": "9"})
+            shown = plugin.expect_host_request("red/DocumentShow")
+            plugin.reply(shown)
+            plugin.expect_status("JSON: query")
+            self.assertEqual(plugin.receive()["id"], "selection")
+
+            plugin.command("query", "JsonQuery", "wrap")
+            source = plugin.expect_host_request("red/DocumentSnapshot")
+            self.assertEqual(source["params"], {"document_id": "7"})
+            plugin.reply(source, document)
+            plugin.expect_status("JSON: running")
+            content = plugin.expect_host_request("red/TextPanelSetContent")
+            self.assertEqual(content["params"]["blocks"][1]["text"], output)
+            plugin.reply(content)
+            plugin.expect_status(f"JSON: ready ({len(output.encode('utf-8'))} B)")
+            self.assertEqual(plugin.receive()["id"], "query")
+
+            plugin.command("stale", "JsonApply")
+            apply = plugin.expect_host_request("red/DocumentApply")
+            self.assertEqual(apply["params"]["expected_revision"], "11")
+            self.assertEqual(
+                apply["params"]["edits"],
+                [
+                    {
+                        "range": selection_range,
+                        "text": output,
+                        "expected_text": selected,
+                    }
+                ],
+            )
+            plugin.reply(apply, error=(-32002, "document revision changed"))
+            retired = plugin.expect_host_request("red/TextPanelSetContent")
+            plugin.reply(retired)
+            plugin.expect_status("JSON: error")
+            self.assertIn("revision changed", plugin.receive()["error"]["message"])
+
+            plugin.command("changed", "JsonQuery", "wrap")
+            changed = plugin.expect_host_request("red/DocumentSnapshot")
+            self.assertEqual(changed["params"], {"document_id": "7"})
+            plugin.reply(
+                changed,
+                {
+                    **document,
+                    "revision": "12",
+                    "text": f"changed\r\n{selected}after",
+                },
+            )
+            retired = plugin.expect_host_request("red/TextPanelSetContent")
+            self.assertIn(
+                "close and reopen", retired["params"]["blocks"][0]["text"]
+            )
+            plugin.reply(retired)
+            plugin.expect_status("JSON: error")
+            self.assertIn("close and reopen", plugin.receive()["error"]["message"])
+
+    def test_json_selection_requires_context_without_pinning_source(self):
+        document = {
+            "path": "data.json",
+            "document_id": "7",
+            "revision": "1",
+            "text": "{}",
+            "selection": None,
+        }
+        with PluginProcess(self.fake_jq) as plugin:
+            plugin.command("selection", "JsonSelection")
+            snapshot = plugin.expect_host_request("red/DocumentSnapshot")
+            plugin.reply(snapshot, document)
+            plugin.expect_status("JSON: error")
+            self.assertIn(
+                "no contiguous visual selection",
+                plugin.receive()["error"]["message"],
+            )
+
+            plugin.command("query", "JsonQuery", "stream")
+            plugin.load_runtime()
+            source = self.complete_query(
+                plugin, "query", document, "1\n2\n", create_panel=True
+            )
+            self.assertEqual(source["params"], {"include_document_id": True})
 
     def test_pinned_source_retry_and_invalidation_rules(self):
         first = {"path": "a.json", "document_id": "7", "revision": "1", "text": "{}"}

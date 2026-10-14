@@ -4613,6 +4613,8 @@ struct RpcDocumentSnapshotParams {
     document_id: Option<String>,
     #[serde(default)]
     include_document_id: bool,
+    #[serde(default)]
+    include_selection: bool,
 }
 
 #[derive(Deserialize)]
@@ -26575,18 +26577,96 @@ impl Editor {
         Ok(index)
     }
 
+    fn rpc_visual_selection_range(
+        &self,
+        mode: Mode,
+        selection: Rect,
+    ) -> std::result::Result<TextRange, plugin::rpc::RpcErrorObject> {
+        let (x0, y0, x1, y1): (usize, usize, usize, usize) = selection.into();
+        match mode {
+            Mode::Visual => Ok(TextRange::new(
+                TextPosition::new(y0, self.grapheme_to_char_on_line(x0, y0)),
+                self.visual_selection_end_position(x1, y1),
+            )),
+            Mode::VisualLine => {
+                let end = if y1 < self.current_buffer().len() {
+                    TextPosition::new(y1 + 1, 0)
+                } else {
+                    TextPosition::new(y1, self.line_character_len(y1))
+                };
+                Ok(TextRange::new(TextPosition::new(y0, 0), end))
+            }
+            Mode::VisualBlock => Err(Self::rpc_error(
+                -32003,
+                "red/DocumentSnapshot does not support block selections",
+            )),
+            Mode::Normal | Mode::Insert | Mode::Command | Mode::Search => {
+                unreachable!("stored visual selections retain a visual mode")
+            }
+        }
+    }
+
+    fn rpc_document_selection(
+        &self,
+        index: usize,
+    ) -> std::result::Result<Option<Value>, plugin::rpc::RpcErrorObject> {
+        if index != self.buffer_manager.active_index() {
+            return Ok(None);
+        }
+        if self.has_multi_cursor_selections() {
+            return Err(Self::rpc_error(
+                -32003,
+                "red/DocumentSnapshot does not support multiple selections",
+            ));
+        }
+        let current = if matches!(
+            self.mode,
+            Mode::Visual | Mode::VisualLine | Mode::VisualBlock
+        ) {
+            self.selection.map(|selection| (self.mode, selection))
+        } else {
+            None
+        };
+        let selection = current.or_else(|| {
+            let buffer_id = self.current_buffer().id();
+            let saved = self.last_visual_selections.get(&buffer_id).copied()?;
+            let start = self.special_marks.get(&(buffer_id, '<'))?;
+            let end = self.special_marks.get(&(buffer_id, '>'))?;
+            let start = self.point_for_text_position(
+                self.current_buffer().char_idx_to_position(start.char_index),
+            );
+            let end = self.point_for_text_position(
+                self.current_buffer().char_idx_to_position(end.char_index),
+            );
+            Some((saved.mode, Rect::new(start.x, start.y, end.x, end.y)))
+        });
+        let Some((mode, selection)) = selection else {
+            return Ok(None);
+        };
+        let range = self.rpc_visual_selection_range(mode, selection)?;
+        Ok(Some(json!({
+            "range": range,
+            "text": self.current_buffer().text_in_range(range),
+        })))
+    }
+
     fn rpc_document_snapshot_request(
-        buffer_manager: &buffer_manager::BufferManager,
+        &self,
         params: &Value,
     ) -> std::result::Result<Value, plugin::rpc::RpcErrorObject> {
         let params: RpcDocumentSnapshotParams =
             Self::rpc_params(plugin::rpc::DOCUMENT_SNAPSHOT_METHOD, params)?;
         let index = Self::rpc_document_index(
-            buffer_manager,
+            &self.buffer_manager,
             params.path.as_deref(),
             params.document_id.as_deref(),
         )?;
-        let buffer = &buffer_manager[index];
+        let selection = if params.include_selection {
+            self.rpc_document_selection(index)?
+        } else {
+            None
+        };
+        let buffer = &self.buffer_manager[index];
         if buffer.byte_len() >= plugin::rpc::MAX_FRAME_BYTES {
             return Err(plugin::rpc::RpcErrorObject::response_too_large(
                 plugin::rpc::DOCUMENT_SNAPSHOT_METHOD,
@@ -26597,8 +26677,11 @@ impl Editor {
             "revision": buffer.revision().to_string(),
             "text": buffer.contents(),
         });
-        if params.include_document_id {
+        if params.include_document_id || params.include_selection {
             snapshot["document_id"] = json!(buffer.id().as_u64().to_string());
+        }
+        if params.include_selection {
+            snapshot["selection"] = selection.unwrap_or(Value::Null);
         }
         Ok(snapshot)
     }
@@ -26712,9 +26795,7 @@ impl Editor {
             plugin::rpc::DOCUMENT_UNWATCH_METHOD => {
                 self.rpc_document_unwatch_request(owner, params)
             }
-            plugin::rpc::DOCUMENT_SNAPSHOT_METHOD => {
-                Self::rpc_document_snapshot_request(&self.buffer_manager, params)
-            }
+            plugin::rpc::DOCUMENT_SNAPSHOT_METHOD => self.rpc_document_snapshot_request(params),
             plugin::rpc::DOCUMENT_APPLY_METHOD => {
                 self.rpc_document_apply_request(render_buffer, runtime, owner, params)
                     .await
@@ -37902,8 +37983,7 @@ builtin = "rust"
     #[test]
     fn rpc_document_snapshot_returns_unsaved_text_and_string_revision() {
         let editor = test_editor(/*width*/ 80, /*height*/ 24);
-        let response =
-            Editor::rpc_document_snapshot_request(&editor.buffer_manager, &json!({})).unwrap();
+        let response = editor.rpc_document_snapshot_request(&json!({})).unwrap();
 
         assert_eq!(response["path"], Value::Null);
         assert_eq!(
@@ -37918,16 +37998,12 @@ builtin = "rust"
     #[test]
     fn rpc_document_snapshot_rejects_invalid_and_unavailable_paths() {
         let editor = test_editor(/*width*/ 80, /*height*/ 24);
-        let invalid = Editor::rpc_document_snapshot_request(
-            &editor.buffer_manager,
-            &json!({"unknown": true}),
-        )
-        .unwrap_err();
-        let unavailable = Editor::rpc_document_snapshot_request(
-            &editor.buffer_manager,
-            &json!({"path": "/not/open/in/red"}),
-        )
-        .unwrap_err();
+        let invalid = editor
+            .rpc_document_snapshot_request(&json!({"unknown": true}))
+            .unwrap_err();
+        let unavailable = editor
+            .rpc_document_snapshot_request(&json!({"path": "/not/open/in/red"}))
+            .unwrap_err();
 
         assert_eq!(invalid.code, -32602);
         assert_eq!(unavailable.code, -32001);
@@ -37941,8 +38017,9 @@ builtin = "rust"
             "x".repeat(plugin::rpc::MAX_FRAME_BYTES),
         )]);
 
-        let error =
-            Editor::rpc_document_snapshot_request(&editor.buffer_manager, &json!({})).unwrap_err();
+        let error = editor
+            .rpc_document_snapshot_request(&json!({}))
+            .unwrap_err();
 
         assert_eq!(error.code, -32006);
         assert!(error.message.contains("RPC frame limit"));
@@ -37956,11 +38033,9 @@ builtin = "rust"
             Some("second.txt".to_string()),
             "second".to_string(),
         ));
-        let second = Editor::rpc_document_snapshot_request(
-            &editor.buffer_manager,
-            &json!({"include_document_id": true}),
-        )
-        .unwrap();
+        let second = editor
+            .rpc_document_snapshot_request(&json!({"include_document_id": true}))
+            .unwrap();
         let second_id = &second["document_id"];
         assert_ne!(second_id, &json!(first_id));
 
@@ -37969,24 +38044,111 @@ builtin = "rust"
             json!({"document_id": 1}),
             json!({"document_id": first_id, "path": "second.txt"}),
         ] {
-            let error =
-                Editor::rpc_document_snapshot_request(&editor.buffer_manager, &params).unwrap_err();
+            let error = editor.rpc_document_snapshot_request(&params).unwrap_err();
             assert_eq!(error.code, -32602, "{params}");
         }
 
         editor.buffer_manager.remove_buffer(0);
-        let reindexed = Editor::rpc_document_snapshot_request(
-            &editor.buffer_manager,
-            &json!({"document_id": second_id, "include_document_id": true}),
-        )
-        .unwrap();
+        let reindexed = editor
+            .rpc_document_snapshot_request(
+                &json!({"document_id": second_id, "include_document_id": true}),
+            )
+            .unwrap();
         assert_eq!(reindexed, second);
-        let closed = Editor::rpc_document_snapshot_request(
-            &editor.buffer_manager,
-            &json!({"document_id": first_id}),
-        )
-        .unwrap_err();
+        let closed = editor
+            .rpc_document_snapshot_request(&json!({"document_id": first_id}))
+            .unwrap_err();
         assert_eq!(closed.code, -32001);
+    }
+
+    #[test]
+    fn rpc_document_snapshot_normalizes_contiguous_selection_context() {
+        let mut editor = test_editor(/*width*/ 80, /*height*/ 24);
+        let text = "x😀e\u{301}\r\nlast\n";
+        editor
+            .buffer_manager
+            .replace_buffers(vec![Buffer::new(None, text.to_string())]);
+        let document_id = editor.current_buffer().id().as_u64().to_string();
+        let none = editor
+            .rpc_document_snapshot_request(&json!({"include_selection": true}))
+            .unwrap();
+        assert_eq!(none["selection"], Value::Null);
+
+        editor.mode = Mode::Visual;
+        editor.selection = Some(Rect::new(
+            /*x0*/ 1, /*y0*/ 0, /*x1*/ 2, /*y1*/ 0,
+        ));
+        let character = editor
+            .rpc_document_snapshot_request(&json!({"include_selection": true}))
+            .unwrap();
+        assert_eq!(character["document_id"], document_id);
+        assert_eq!(character["text"], text);
+        assert_eq!(
+            character["selection"],
+            json!({
+                "range": {
+                    "start": {"line": 0, "character": 1},
+                    "end": {"line": 0, "character": 4},
+                },
+                "text": "😀e\u{301}",
+            })
+        );
+
+        editor
+            .buffer_manager
+            .add_buffer(Buffer::new(None, "other\n".to_string()));
+        let inactive = editor
+            .rpc_document_snapshot_request(
+                &json!({"document_id": document_id, "include_selection": true}),
+            )
+            .unwrap();
+        assert_eq!(inactive["selection"], Value::Null);
+        editor.buffer_manager.set_active_index(0);
+
+        editor.capture_last_visual_selection();
+        editor.mode = Mode::Normal;
+        editor.selection = None;
+        let saved = editor
+            .rpc_document_snapshot_request(&json!({"include_selection": true}))
+            .unwrap();
+        assert_eq!(saved["selection"], character["selection"]);
+
+        editor.mode = Mode::VisualLine;
+        editor.selection = Some(Rect::new(
+            /*x0*/ 0, /*y0*/ 0, /*x1*/ 0, /*y1*/ 0,
+        ));
+        let line = editor
+            .rpc_document_snapshot_request(&json!({"include_selection": true}))
+            .unwrap();
+        assert_eq!(
+            line["selection"],
+            json!({
+                "range": {
+                    "start": {"line": 0, "character": 0},
+                    "end": {"line": 1, "character": 0},
+                },
+                "text": "x😀e\u{301}\r\n",
+            })
+        );
+
+        editor.mode = Mode::VisualBlock;
+        let block = editor
+            .rpc_document_snapshot_request(&json!({"include_selection": true}))
+            .unwrap_err();
+        assert_eq!(block.code, -32003);
+        assert!(block.message.contains("block selections"));
+
+        editor.mode = Mode::Normal;
+        editor.selection = None;
+        editor
+            .buffer_manager
+            .replace_buffers(vec![Buffer::new(None, "same same\n".to_string())]);
+        editor.select_next_occurrence();
+        let multiple = editor
+            .rpc_document_snapshot_request(&json!({"include_selection": true}))
+            .unwrap_err();
+        assert_eq!(multiple.code, -32003);
+        assert!(multiple.message.contains("multiple selections"));
     }
 
     #[tokio::test]
