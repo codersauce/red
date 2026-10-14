@@ -16,6 +16,7 @@ Open a JSON document and run:
 
 ```text
 :JsonQuery .users | map(select(.active))
+:JsonQueries
 :JsonApply
 :JsonUndo
 :JsonClose
@@ -27,11 +28,38 @@ queries keep using that document even after switching buffers. `JsonApply` and
 retrying if Red reports that it is not current. Close the workbench before
 starting on another source.
 
-The plugin bounds source and complete output to 1 MiB, jq diagnostics to 64 KiB,
-query text to 16 KiB, and each jq run to five seconds. Empty output and JSON streams
-are preserved exactly. Failed, timed-out, or oversized runs cannot be applied.
+`JsonQueries` opens a native picker containing configured presets and up to 20
+recent successful queries. Choosing one runs it against the pinned source after
+the command finishes, so `JsonClose` remains available to cancel slow work.
+The picker also provides explicit actions to clear, pause, or resume history.
+Pause keeps existing entries until they are cleared. Query history is stored in
+the plugin's owner-scoped Red storage; source and result text are never stored.
 
-To use an explicit jq executable, append it to `[rpc].args`, after `plugin.py`:
+Optional configuration lives under the plugin's local registration name:
+
+```toml
+[plugin_config.json-workbench]
+jq_path = "/opt/homebrew/bin/jq"
+timeout_seconds = 3
+result_limit_bytes = 262144
+
+[[plugin_config.json-workbench.presets]]
+label = "Active users"
+query = ".users | map(select(.active))"
+```
+
+Recognized configuration values are validated when the workbench first runs.
+Timeout and result limits may lower the built-in ceilings of five seconds and
+1 MiB. Preset labels use at most 256 UTF-8 bytes and filters use at most 16 KiB.
+
+The plugin bounds source and complete output to 1 MiB, jq diagnostics to 64 KiB,
+query text to 16 KiB, and each jq run to five seconds. Empty output and JSON
+streams are preserved exactly. Failed, timed-out, or oversized runs cannot be
+applied. Picker-driven failures appear in the result panel because they do not
+have a waiting command response.
+
+For a package-local development override, an explicit jq executable may also be
+appended to `[rpc].args`, after `plugin.py`:
 
 ```toml
 args = ["plugin.py", "/opt/homebrew/bin/jq"]

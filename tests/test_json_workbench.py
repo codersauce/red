@@ -123,11 +123,43 @@ class PluginProcess:
             response["error"] = {"code": error[0], "message": error[1]}
         self._write(response)
 
+    def send_picker_event(self, picker, item_id=None):
+        params = {"id": picker["params"]["id"]}
+        if item_id is None:
+            params["event"] = "cancelled"
+        else:
+            params["event"] = "selected"
+            params["item"] = next(
+                item for item in picker["params"]["items"] if item["id"] == item_id
+            )
+        self.send_notification("picker/event", params)
+
+    def expect_storage(self, method, key):
+        request = self.expect_host_request(method)
+        if request["params"]["key"] != key:
+            raise AssertionError(request)
+        return request
+
     def expect_status(self, text=None):
         request = self.expect_host_request("red/StatuslineSet")
         if text is not None and request["params"]["text"] != text:
             raise AssertionError(request)
         self.reply(request)
+
+    def load_runtime(self, config=None, preferences=None, history=None):
+        request = self.expect_host_request("red/ConfigGet")
+        self.reply(request, config)
+        request = self.expect_host_request("red/StorageGet")
+        if request["params"] != {"key": "query-preferences"}:
+            raise AssertionError(request)
+        self.reply(
+            request,
+            {"history_enabled": False} if preferences is None else preferences,
+        )
+        request = self.expect_host_request("red/StorageGet")
+        if request["params"] != {"key": "query-history"}:
+            raise AssertionError(request)
+        self.reply(request, history)
 
     def stop(self):
         if self.process.poll() is None:
@@ -210,6 +242,7 @@ class JsonWorkbenchTest(unittest.TestCase):
         }
         with PluginProcess(self.fake_jq) as plugin:
             plugin.command("query", "JsonQuery", "stream")
+            plugin.load_runtime()
             snapshot = plugin.expect_host_request("red/DocumentSnapshot")
             self.assertEqual(snapshot["params"], {"include_document_id": True})
             plugin.send_notification(
@@ -262,6 +295,7 @@ class JsonWorkbenchTest(unittest.TestCase):
         second = {"path": "a.json", "revision": "2", "text": "{\"a\":1}"}
         with PluginProcess(self.fake_jq) as plugin:
             plugin.command("first", "JsonQuery", "stream")
+            plugin.load_runtime()
             self.complete_query(plugin, "first", first, "1\n2\n", True)
 
             plugin.command("switched", "JsonApply")
@@ -339,6 +373,7 @@ class JsonWorkbenchTest(unittest.TestCase):
         }
         with PluginProcess(self.fake_jq) as plugin:
             plugin.command("valid", "JsonQuery", "stream")
+            plugin.load_runtime()
             self.complete_query(plugin, "valid", document, "1\n2\n", True)
 
             plugin.command("invalid", "JsonQuery", "invalid")
@@ -368,6 +403,282 @@ class JsonWorkbenchTest(unittest.TestCase):
         self.assertIn(error, retired["params"]["blocks"][0]["text"])
         plugin.reply(retired)
 
+    def test_phase_two_settings_and_history_normalization(self):
+        command, timeout, result_limit, presets = WORKBENCH.parse_settings(
+            {
+                "jq_path": "/opt/bin/jq",
+                "timeout_seconds": 2.5,
+                "result_limit_bytes": 4096,
+                "presets": [{"label": "Active users", "query": ".active"}],
+            },
+            ["jq"],
+            5,
+        )
+        self.assertEqual(command, ["/opt/bin/jq"])
+        self.assertEqual(timeout, 2.5)
+        self.assertEqual(result_limit, 4096)
+        self.assertEqual(presets, [("Active users", ".active")])
+        with self.assertRaisesRegex(WORKBENCH.OperationError, "timeout_seconds"):
+            WORKBENCH.parse_settings({"timeout_seconds": 6}, ["jq"], 5)
+
+        history = [".a", "", 7, ".a", ".b", *(f".{i}" for i in range(30))]
+        normalized = WORKBENCH.normalize_history(history)
+        self.assertEqual(normalized[:2], [".a", ".b"])
+        self.assertEqual(len(normalized), WORKBENCH.HISTORY_LIMIT)
+        self.assertEqual(WORKBENCH.normalize_history({"query": ".a"}), [])
+        self.assertEqual(
+            WORKBENCH.query_label('.message == "two  spaces"\n| .value'),
+            '.message == "two  spaces" | .value',
+        )
+
+    def test_query_picker_selects_a_preset_and_records_history(self):
+        document = {
+            "path": "data.json",
+            "document_id": "7",
+            "revision": "1",
+            "text": "{}",
+        }
+        config = {"presets": [{"label": "Stream", "query": "stream"}]}
+        with PluginProcess(self.fake_jq) as plugin:
+            plugin.command("queries", "JsonQueries")
+            snapshot = plugin.expect_host_request("red/DocumentSnapshot")
+            self.assertEqual(snapshot["params"], {"include_document_id": True})
+            plugin.reply(snapshot, document)
+            plugin.load_runtime(
+                config=config,
+                preferences={"history_enabled": True},
+                history=[],
+            )
+            picker = plugin.expect_host_request("red/PickerOpen")
+            plugin.reply(picker)
+            self.assertIsNone(plugin.receive()["result"])
+
+            plugin.send_notification(
+                "event/notify", {"name": "file:saved", "payload": {}}
+            )
+            plugin.send_picker_event(picker, "preset-0")
+            selected = plugin.expect_host_request("red/DocumentSnapshot")
+            self.assertEqual(selected["params"], {"document_id": "7"})
+            plugin.reply(selected, document)
+            plugin.expect_status("JSON: running")
+            create = plugin.expect_host_request("red/TextPanelCreate")
+            plugin.reply(create)
+            content = plugin.expect_host_request("red/TextPanelSetContent")
+            self.assertEqual(content["params"]["blocks"][1]["text"], "1\n2\n")
+            plugin.reply(content)
+            saved = plugin.expect_storage("red/StorageSet", "query-history")
+            self.assertEqual(saved["params"]["value"], ["stream"])
+            plugin.reply(saved)
+            plugin.expect_status("JSON: ready (4 B)")
+
+    def test_query_history_survives_restart_and_picker_actions(self):
+        document = {
+            "path": "data.json",
+            "document_id": "7",
+            "revision": "1",
+            "text": "{}",
+        }
+        persisted = ["stream", ".old"]
+        config = {"presets": [{"label": "Active", "query": ".active"}]}
+        with PluginProcess(self.fake_jq) as plugin:
+            plugin.command("queries", "JsonQueries")
+            snapshot = plugin.expect_host_request("red/DocumentSnapshot")
+            plugin.reply(snapshot, document)
+            plugin.load_runtime(
+                config=config,
+                preferences={"history_enabled": True},
+                history=persisted,
+            )
+            picker = plugin.expect_host_request("red/PickerOpen")
+            ids = [item["id"] for item in picker["params"]["items"]]
+            self.assertEqual(
+                ids,
+                [
+                    "preset-0",
+                    "history-0",
+                    "history-1",
+                    "history-clear",
+                    "history-toggle",
+                ],
+            )
+            plugin.reply(picker)
+            self.assertIsNone(plugin.receive()["result"])
+            plugin.send_picker_event(picker)
+
+            plugin.command("clear-picker", "JsonQueries")
+            picker = plugin.expect_host_request("red/PickerOpen")
+            plugin.reply(picker)
+            self.assertIsNone(plugin.receive()["result"])
+            plugin.send_picker_event(picker, "history-clear")
+            deleted = plugin.expect_storage("red/StorageDelete", "query-history")
+            plugin.reply(deleted)
+            plugin.expect_status("JSON: history cleared")
+
+            plugin.command("toggle-picker", "JsonQueries")
+            picker = plugin.expect_host_request("red/PickerOpen")
+            ids = [item["id"] for item in picker["params"]["items"]]
+            self.assertNotIn("history-0", ids)
+            self.assertNotIn("history-clear", ids)
+            plugin.reply(picker)
+            self.assertIsNone(plugin.receive()["result"])
+            plugin.send_picker_event(picker, "history-toggle")
+            preference = plugin.expect_storage(
+                "red/StorageSet", "query-preferences"
+            )
+            self.assertEqual(
+                preference["params"]["value"], {"history_enabled": False}
+            )
+            plugin.reply(preference)
+            plugin.expect_status("JSON: history paused")
+
+            plugin.command("paused-picker", "JsonQueries")
+            paused = plugin.expect_host_request("red/PickerOpen")
+            toggle = next(
+                item for item in paused["params"]["items"]
+                if item["id"] == "history-toggle"
+            )
+            self.assertEqual(toggle["label"], "Resume query history")
+            plugin.reply(paused)
+            self.assertIsNone(plugin.receive()["result"])
+            plugin.send_picker_event(paused)
+
+    def test_picker_failure_is_visible_without_a_command_response(self):
+        document = {
+            "path": "data.json",
+            "document_id": "7",
+            "revision": "1",
+            "text": "{}",
+        }
+        config = {"presets": [{"label": "Invalid", "query": "invalid"}]}
+        with PluginProcess(self.fake_jq) as plugin:
+            plugin.command("queries", "JsonQueries")
+            snapshot = plugin.expect_host_request("red/DocumentSnapshot")
+            plugin.reply(snapshot, document)
+            plugin.load_runtime(config=config)
+            picker = plugin.expect_host_request("red/PickerOpen")
+            plugin.reply(picker)
+            self.assertIsNone(plugin.receive()["result"])
+            plugin.send_picker_event(picker, "preset-0")
+            selected = plugin.expect_host_request("red/DocumentSnapshot")
+            plugin.reply(selected, document)
+            plugin.expect_status("JSON: running")
+            create = plugin.expect_host_request("red/TextPanelCreate")
+            plugin.reply(create)
+            error = plugin.expect_host_request("red/TextPanelSetContent")
+            self.assertIn("compile error", error["params"]["blocks"][0]["text"])
+            plugin.reply(error)
+            plugin.expect_status("JSON: error")
+
+    def test_storage_failure_leaves_query_applicable(self):
+        document = {
+            "path": "data.json",
+            "document_id": "7",
+            "revision": "1",
+            "text": "{}",
+        }
+        with PluginProcess(self.fake_jq) as plugin:
+            plugin.command("query", "JsonQuery", "stream")
+            plugin.load_runtime(preferences={"history_enabled": True}, history=[])
+            snapshot = plugin.expect_host_request("red/DocumentSnapshot")
+            plugin.reply(snapshot, document)
+            plugin.expect_status("JSON: running")
+            create = plugin.expect_host_request("red/TextPanelCreate")
+            plugin.reply(create)
+            content = plugin.expect_host_request("red/TextPanelSetContent")
+            plugin.reply(content)
+            saved = plugin.expect_storage("red/StorageSet", "query-history")
+            plugin.reply(saved, error=(-32603, "preferences unavailable"))
+            plugin.expect_status("JSON: ready (4 B; history not saved)")
+            self.assertEqual(plugin.receive()["id"], "query")
+
+            plugin.command("apply", "JsonApply")
+            apply = plugin.expect_host_request("red/DocumentApply")
+            plugin.reply(apply, {"transaction_id": "tx-1", "revision": "2"})
+            plugin.expect_status("JSON: applied")
+            self.assertEqual(plugin.receive()["id"], "apply")
+
+    def test_history_opt_out_survives_partial_storage_failure(self):
+        document = {
+            "path": "data.json",
+            "document_id": "7",
+            "revision": "1",
+            "text": "{}",
+        }
+        output = '{"ok":true}\n'
+        with PluginProcess(self.fake_jq) as plugin:
+            plugin.command("query", "JsonQuery", ".private")
+            config = plugin.expect_host_request("red/ConfigGet")
+            plugin.reply(config)
+            preferences = plugin.expect_storage(
+                "red/StorageGet", "query-preferences"
+            )
+            plugin.reply(preferences, {"history_enabled": False})
+            history = plugin.expect_storage("red/StorageGet", "query-history")
+            plugin.reply(history, error=(-32603, "history unavailable"))
+            self.complete_query(plugin, "query", document, output, create_panel=True)
+
+            plugin.command("queries", "JsonQueries")
+            picker = plugin.expect_host_request("red/PickerOpen")
+            self.assertEqual(
+                picker["params"]["items"],
+                [{"id": "history-toggle", "label": "Resume query history"}],
+            )
+            plugin.reply(picker)
+            self.assertIsNone(plugin.receive()["result"])
+            plugin.send_picker_event(picker)
+
+    def test_close_cancels_picker_work_and_ignores_stale_selection(self):
+        pid_file = Path(self.tempdir.name) / "picker-slow.pid"
+        document = {
+            "path": "data.json",
+            "document_id": "7",
+            "revision": "1",
+            "text": "{}",
+        }
+        config = {
+            "presets": [{"label": "Slow", "query": f"slow:{pid_file}"}]
+        }
+        with PluginProcess(self.fake_jq) as plugin:
+            plugin.command("queries", "JsonQueries")
+            snapshot = plugin.expect_host_request("red/DocumentSnapshot")
+            plugin.reply(snapshot, document)
+            plugin.load_runtime(config=config)
+            picker = plugin.expect_host_request("red/PickerOpen")
+            plugin.reply(picker)
+            self.assertIsNone(plugin.receive()["result"])
+            plugin.send_picker_event(picker, "preset-0")
+            plugin.command("busy", "JsonApply")
+            messages = [plugin.receive(), plugin.receive()]
+            selected = next(
+                message
+                for message in messages
+                if message.get("method") == "red/DocumentSnapshot"
+            )
+            busy = next(message for message in messages if message.get("id") == "busy")
+            self.assertIn("busy", busy["error"]["message"])
+            plugin.reply(selected, document)
+            plugin.expect_status("JSON: running")
+            deadline = time.monotonic() + 2
+            while not pid_file.exists() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertTrue(pid_file.exists(), "controlled jq child did not start")
+            child_pid = int(pid_file.read_text(encoding="utf-8"))
+
+            plugin.command("close", "JsonClose")
+            clear = plugin.expect_host_request("red/StatuslineClear")
+            plugin.reply(clear)
+            self.assertIsNone(plugin.receive()["result"])
+            if os.name == "posix":
+                with self.assertRaises(ProcessLookupError):
+                    os.kill(child_pid, 0)
+
+            plugin.send_picker_event(picker, "preset-0")
+            plugin.command("after-close", "JsonApply")
+            plugin.expect_status("JSON: error")
+            self.assertIn(
+                "no applicable preview", plugin.receive()["error"]["message"]
+            )
+
     def test_jq_failures_are_bounded_and_reaped(self):
         command = [sys.executable, str(self.fake_jq)]
         for query_text, expected in [
@@ -389,10 +700,15 @@ class JsonWorkbenchTest(unittest.TestCase):
         runner = WORKBENCH.JsonWorkbench(command, jq_timeout=1)
         self.assertEqual(runner.run_jq("empty", b"{}"), "")
 
+        runner.result_limit = 3
+        with self.assertRaisesRegex(WORKBENCH.OperationError, "exceeds 3 bytes"):
+            runner.run_jq("default", b"{}")
+
     def test_shutdown_interrupts_a_running_query(self):
         plugin = PluginProcess(self.fake_jq)
         pid_file = Path(self.tempdir.name) / "slow.pid"
         plugin.command("query", "JsonQuery", f"slow:{pid_file}")
+        plugin.load_runtime()
         snapshot = plugin.expect_host_request("red/DocumentSnapshot")
         plugin.reply(
             snapshot,
