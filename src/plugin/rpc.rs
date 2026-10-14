@@ -38,6 +38,8 @@ pub(crate) const TEXT_PANEL_FOCUS_METHOD: &str = "red/TextPanelFocus";
 pub(crate) const TEXT_PANEL_DISPOSE_METHOD: &str = "red/TextPanelDispose";
 pub(crate) const STATUSLINE_SET_METHOD: &str = "red/StatuslineSet";
 pub(crate) const STATUSLINE_CLEAR_METHOD: &str = "red/StatuslineClear";
+pub(crate) const PICKER_OPEN_METHOD: &str = "red/PickerOpen";
+pub(crate) const PICKER_EVENT_METHOD: &str = "picker/event";
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]

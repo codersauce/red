@@ -4658,6 +4658,43 @@ struct RpcStatuslineSetParams {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct RpcPickerOpenParams {
+    id: String,
+    #[serde(default)]
+    title: Option<String>,
+    items: Vec<RpcPickerItem>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RpcPickerItem {
+    id: String,
+    label: String,
+    #[serde(default)]
+    detail: Option<String>,
+    #[serde(default)]
+    data: Value,
+}
+
+impl From<RpcPickerItem> for PickerItem {
+    fn from(item: RpcPickerItem) -> Self {
+        Self {
+            id: item.id,
+            icon: None,
+            label: item.label,
+            kind: None,
+            annotation: None,
+            detail: item.detail,
+            data: item.data,
+            matches: Vec::new(),
+            detail_matches: Vec::new(),
+            preview: None,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RpcEmptyParams {}
 
 #[derive(Deserialize)]
@@ -4675,6 +4712,7 @@ struct RpcStorageSetParams {
 
 const RPC_STORAGE_MAX_KEY_BYTES: usize = 128;
 const RPC_PLUGIN_VALUE_MAX_BYTES: usize = 1024 * 1024;
+const MAX_RPC_PICKER_ITEMS: usize = 4_096;
 
 fn default_rpc_text_panel_width() -> usize {
     30
@@ -18062,7 +18100,7 @@ impl Editor {
             .as_ref()
             .and_then(|dialog| dialog.picker_handle())
         {
-            runtime.release_picker(handle);
+            self.plugin_registry.release_picker(runtime, handle);
         }
         if let Some(handle) = self
             .current_dialog
@@ -24341,7 +24379,7 @@ impl Editor {
             .and_then(|dialog| dialog.picker_handle());
         if picker_handle_before_action != picker_handle_after_action {
             if let Some(handle) = picker_handle_before_action {
-                runtime.release_picker(handle);
+                self.plugin_registry.release_picker(runtime, handle);
             }
         }
         let composer_handle_after_action = self
@@ -25974,7 +26012,7 @@ impl Editor {
         }
     }
 
-    fn validate_rpc_text_panel_id(
+    fn validate_rpc_resource_id(
         method: &str,
         id: &str,
     ) -> std::result::Result<(), plugin::rpc::RpcErrorObject> {
@@ -25993,7 +26031,7 @@ impl Editor {
         method: &str,
         id: &str,
     ) -> std::result::Result<String, plugin::rpc::RpcErrorObject> {
-        Self::validate_rpc_text_panel_id(method, id)?;
+        Self::validate_rpc_resource_id(method, id)?;
         self.plugin_registry
             .rpc_text_panel(owner, id)
             .ok_or_else(|| Self::rpc_text_panel_unavailable(id))
@@ -26019,7 +26057,7 @@ impl Editor {
         owner: &str,
         params: RpcTextPanelCreateParams,
     ) -> std::result::Result<Value, plugin::rpc::RpcErrorObject> {
-        Self::validate_rpc_text_panel_id(plugin::rpc::TEXT_PANEL_CREATE_METHOD, &params.id)?;
+        Self::validate_rpc_resource_id(plugin::rpc::TEXT_PANEL_CREATE_METHOD, &params.id)?;
         if params.width == 0 {
             return Err(Self::rpc_error(
                 -32602,
@@ -26087,7 +26125,7 @@ impl Editor {
         owner: &str,
         params: RpcTextPanelParams,
     ) -> std::result::Result<Value, plugin::rpc::RpcErrorObject> {
-        Self::validate_rpc_text_panel_id(plugin::rpc::TEXT_PANEL_DISPOSE_METHOD, &params.id)?;
+        Self::validate_rpc_resource_id(plugin::rpc::TEXT_PANEL_DISPOSE_METHOD, &params.id)?;
         let host_id = self
             .plugin_registry
             .take_rpc_text_panel(owner, &params.id)
@@ -26098,14 +26136,18 @@ impl Editor {
         self.finish_rpc_text_panel_change(render_buffer)
     }
 
-    fn rpc_text_panel_request(
+    fn rpc_presentation_request(
         &mut self,
         render_buffer: &mut RenderBuffer,
+        runtime: &mut Runtime,
         owner: &str,
         method: &str,
         params: &Value,
     ) -> std::result::Result<Value, plugin::rpc::RpcErrorObject> {
         match method {
+            plugin::rpc::PICKER_OPEN_METHOD => {
+                self.rpc_picker_open_request(render_buffer, runtime, owner, params)
+            }
             plugin::rpc::TEXT_PANEL_CREATE_METHOD => self.rpc_text_panel_create_request(
                 render_buffer,
                 owner,
@@ -26169,6 +26211,38 @@ impl Editor {
     ) -> std::result::Result<Value, plugin::rpc::RpcErrorObject> {
         let _: RpcEmptyParams = Self::rpc_params(plugin::rpc::STATUSLINE_CLEAR_METHOD, params)?;
         self.plugin_registry.clear_rpc_statusline(owner);
+        Ok(Value::Null)
+    }
+
+    fn rpc_picker_open_request(
+        &mut self,
+        render_buffer: &mut RenderBuffer,
+        runtime: &mut Runtime,
+        owner: &str,
+        params: &Value,
+    ) -> std::result::Result<Value, plugin::rpc::RpcErrorObject> {
+        let params: RpcPickerOpenParams =
+            Self::rpc_params(plugin::rpc::PICKER_OPEN_METHOD, params)?;
+        Self::validate_rpc_resource_id(plugin::rpc::PICKER_OPEN_METHOD, &params.id)?;
+        if params.items.len() > MAX_RPC_PICKER_ITEMS {
+            return Err(Self::rpc_error(
+                -32602,
+                format!("red/PickerOpen may contain at most {MAX_RPC_PICKER_ITEMS} items"),
+            ));
+        }
+
+        self.release_current_dialog_callbacks(runtime);
+        let handle = self.plugin_registry.register_rpc_picker(owner, params.id);
+        self.current_dialog = Some(Box::new(Picker::new_callback(
+            params.title,
+            self,
+            params.items.into_iter().map(Into::into).collect(),
+            handle,
+            PickerOptions::default(),
+        )));
+        self.render(render_buffer).map_err(|error| {
+            Self::rpc_error(-32603, format!("failed to render picker: {error}"))
+        })?;
         Ok(Value::Null)
     }
 
@@ -26475,7 +26549,7 @@ impl Editor {
             plugin::rpc::STATUSLINE_CLEAR_METHOD => {
                 self.rpc_statusline_clear_request(owner, params)
             }
-            _ => self.rpc_text_panel_request(render_buffer, owner, method, params),
+            _ => self.rpc_presentation_request(render_buffer, runtime, owner, method, params),
         }
     }
 
@@ -38071,6 +38145,70 @@ builtin = "rust"
             reloaded.plugin_storage("rpc-two", "shared"),
             Some(&json!(2))
         );
+    }
+
+    #[tokio::test]
+    async fn rpc_picker_open_uses_the_host_renderer_and_replaces_callbacks() {
+        let mut editor = test_editor(/*width*/ 80, /*height*/ 24);
+        let mut render_buffer = RenderBuffer::new(80, 24, &Style::default());
+        let mut runtime = Runtime::new();
+        macro_rules! request {
+            ($params:expr) => {
+                editor.rpc_host_request(
+                    &mut render_buffer,
+                    &mut runtime,
+                    "rpc-test",
+                    plugin::rpc::PICKER_OPEN_METHOD,
+                    &$params,
+                )
+            };
+        }
+
+        request!(json!({
+            "id": "choices",
+            "title": "RPC choices",
+            "items": [
+                {"id": "alpha", "label": "Alpha"},
+                {"id": "beta", "label": "Beta", "detail": "second", "data": {"rank": 2}}
+            ]
+        }))
+        .await
+        .unwrap();
+
+        let first = editor
+            .current_dialog
+            .as_ref()
+            .and_then(|dialog| dialog.picker_handle())
+            .unwrap();
+        let rendered = render_text_rows(&render_buffer).join("\n");
+        assert!(first.get() < 0);
+        assert!(rendered.contains("RPC choices"), "{rendered}");
+        assert!(rendered.contains("Beta"), "{rendered}");
+
+        request!(json!({"id": "replacement", "items": []}))
+            .await
+            .unwrap();
+        let second = editor
+            .current_dialog
+            .as_ref()
+            .and_then(|dialog| dialog.picker_handle())
+            .unwrap();
+        assert_ne!(first, second);
+        assert!(!editor.plugin_registry.release_picker(&mut runtime, first));
+        assert!(editor.plugin_registry.release_picker(&mut runtime, second));
+
+        let invalid = request!(json!({"id": "choices", "items": [], "unknown": true}))
+            .await
+            .unwrap_err();
+        assert_eq!(invalid.code, -32602);
+
+        let oversized = (0..=MAX_RPC_PICKER_ITEMS)
+            .map(|index| json!({"id": index.to_string(), "label": "item"}))
+            .collect::<Vec<_>>();
+        let invalid = request!(json!({"id": "choices", "items": oversized}))
+            .await
+            .unwrap_err();
+        assert_eq!(invalid.code, -32602);
     }
 
     #[tokio::test]

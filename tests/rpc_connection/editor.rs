@@ -28,7 +28,14 @@ impl Harness {
         let fast = package.path().join("fast");
         write_package(
             &slow,
-            &["RpcWait", "RpcEdit", "RpcUndo", "RpcLegacy", "RpcPath"],
+            &[
+                "RpcWait",
+                "RpcEdit",
+                "RpcUndo",
+                "RpcLegacy",
+                "RpcPath",
+                "RpcPicker",
+            ],
         )?;
         write_package(&fast, &["RpcRead"])?;
         if delay_initialization {
@@ -180,6 +187,9 @@ pub(super) async fn run() -> Result<()> {
     reload_initialization_and_retirement_keep_input_responsive()
         .await
         .context("responsive RPC reload lifecycle")?;
+    host_native_pickers_select_cancel_and_reload_cleanly()
+        .await
+        .context("host-native RPC pickers")?;
     explicit_path_edit_preserves_the_active_view_and_insert()
         .await
         .context("off-screen document edit")?;
@@ -426,6 +436,44 @@ async fn reload_initialization_and_retirement_keep_input_responsive() -> Result<
     Ok(())
 }
 
+async fn host_native_pickers_select_cancel_and_reload_cleanly() -> Result<()> {
+    let mut h = Harness::new(KeyAction::Single(Action::PluginCommand("RpcWait".into()))).await?;
+    let slow = h.package.path().join("slow");
+
+    h.command("RpcPicker").await?;
+    h.until(|h| h.screen().contains("RPC choices") && h.screen().contains("Beta"))
+        .await?;
+    h.text("bet").await?;
+    assert!(!h.screen().contains("Alpha"), "{}", h.screen());
+    h.key(KeyCode::Enter).await?;
+    let selected = slow.join("picker-selected");
+    h.until(|_| selected.exists()).await?;
+    let selected: Value = serde_json::from_slice(&fs::read(selected)?)?;
+    assert_eq!(selected["item"]["id"], "beta");
+
+    h.command("RpcPicker").await?;
+    h.until(|h| h.screen().contains("RPC choices")).await?;
+    h.key(KeyCode::Escape).await?;
+    h.until(|_| slow.join("picker-cancelled").exists()).await?;
+
+    h.command("RpcPicker").await?;
+    h.until(|h| h.screen().contains("RPC choices")).await?;
+    let process_path = slow.join("process-id");
+    let previous = fs::read_to_string(&process_path)?;
+    let manifest = slow.join("red-plugin.toml");
+    let source = fs::read_to_string(&manifest)?;
+    fs::write(
+        &manifest,
+        format!("{source}\n# Reload with an open picker.\n"),
+    )?;
+    h.until(|h| {
+        fs::read_to_string(&process_path).is_ok_and(|pid| pid != previous)
+            && !h.screen().contains("RPC choices")
+    })
+    .await?;
+    Ok(())
+}
+
 async fn nested_macro_events_survive_a_second_wait() -> Result<()> {
     let mut h = Harness::new(KeyAction::Multiple(vec![
         Action::PluginCommand("RpcWait".into()),
@@ -545,6 +593,15 @@ pub(super) fn fixture() -> Result<()> {
                 write_message(&mut output, response.clone())?;
                 fs::write(format!("done-{count}"), serde_json::to_vec(&response)?)?;
             }
+            Some("picker/event") => {
+                let event = request["params"]["event"]
+                    .as_str()
+                    .context("picker event")?;
+                fs::write(
+                    format!("picker-{event}"),
+                    serde_json::to_vec(&request["params"])?,
+                )?;
+            }
             Some("shutdown") => {
                 if Path::new("delay-shutdown").exists() {
                     fs::write(format!("shutdown-started-{process_id}"), [])?;
@@ -572,6 +629,22 @@ fn fixture_command(
     input: &mut impl BufRead,
     output: &mut impl Write,
 ) -> Result<()> {
+    if name == "RpcPicker" {
+        host_request(
+            input,
+            output,
+            "red/PickerOpen",
+            json!({
+                "id": "choices",
+                "title": "RPC choices",
+                "items": [
+                    {"id": "alpha", "label": "Alpha"},
+                    {"id": "beta", "label": "Beta", "detail": "second", "data": {"rank": 2}}
+                ]
+            }),
+        )?;
+        return Ok(());
+    }
     if name == "RpcUndo" {
         let params = serde_json::from_slice(&fs::read("last-edit")?)?;
         host_request(input, output, "red/DocumentUndo", params)?;

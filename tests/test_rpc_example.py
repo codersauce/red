@@ -85,6 +85,29 @@ class RpcExampleTest(unittest.TestCase):
         self.assertEqual(replies["plugin-4"]["method"], "red/StorageDelete")
         self.assertEqual(replies["storage"]["result"]["message"], "Persistent RPC count: 3")
 
+    def test_picker_events_are_serviced_while_opening_the_host_picker(self):
+        output = self.run_plugin(
+            {"id": "picker", "method": "command/execute", "params": {"name": "RpcPicker"}},
+            {
+                "method": "picker/event",
+                "params": {
+                    "id": "python-choice",
+                    "event": "selected",
+                    "item": {"id": "beta", "label": "Beta", "detail": "second choice", "data": None},
+                },
+            },
+            {"id": "plugin-1", "result": None},
+            {"id": "last", "method": "command/execute", "params": {"name": "RpcLastEvent"}},
+        )
+        replies = {message["id"]: message for message in output}
+        self.assertEqual(replies["plugin-1"]["method"], "red/PickerOpen")
+        self.assertEqual(replies["plugin-1"]["params"]["items"][1]["id"], "beta")
+        self.assertIsNone(replies["picker"]["result"])
+        self.assertEqual(
+            replies["last"]["result"]["message"],
+            "Last RPC event: picker:selected (python-choice)",
+        )
+
     def test_shutdown_and_exit_interrupt_a_host_response_wait(self):
         output = self.run_plugin(
             {"id": "document", "method": "command/execute", "params": {"name": "RpcDocument"}},

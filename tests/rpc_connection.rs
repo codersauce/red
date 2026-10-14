@@ -402,7 +402,8 @@ fn run_registry_fixture() -> Result<()> {
             "red/TextPanelFocus",
             "red/TextPanelDispose",
             "red/StatuslineSet",
-            "red/StatuslineClear"
+            "red/StatuslineClear",
+            "red/PickerOpen"
         ])
     );
     write_message(

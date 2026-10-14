@@ -21,6 +21,12 @@ def read_messages():
         method = message.get("method")
         if method == "event/notify":
             last_event = message["params"]
+        elif method == "picker/event":
+            picker = message["params"]
+            last_event = {
+                "name": f"picker:{picker['event']}",
+                "payload": {"file": picker["id"]},
+            }
         elif method == "shutdown":
             send({"jsonrpc": "2.0", "id": message["id"], "result": None})
         elif method == "exit":
@@ -82,6 +88,10 @@ for message in incoming:
                         {
                             "name": "RpcLastEvent",
                             "metadata": {"title": "Show the last RPC editor event"},
+                        },
+                        {
+                            "name": "RpcPicker",
+                            "metadata": {"title": "Open an RPC picker"},
                         },
                         {
                             "name": "RpcPanel",
@@ -170,6 +180,20 @@ for message in incoming:
                 result = {
                     "message": f"Last RPC event: {last_event['name']} ({event_file})"
                 }
+            elif command == "RpcPicker":
+                request_host(
+                    "red/PickerOpen",
+                    {
+                        "id": "python-choice",
+                        "title": "Python RPC picker",
+                        "items": [
+                            {"id": "alpha", "label": "Alpha"},
+                            {"id": "beta", "label": "Beta", "detail": "second choice"},
+                            {"id": "gamma", "label": "Gamma", "data": {"rank": 3}},
+                        ],
+                    },
+                )
+                result = None
             elif command == "RpcPanel":
                 request_host(
                     "red/TextPanelCreate",

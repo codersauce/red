@@ -113,7 +113,7 @@ The version 1 initialization parameters are:
 ```json
 {
   "protocol_versions": [1],
-  "red_api_version": "0.19.0",
+  "red_api_version": "0.21.0",
   "plugin_id": "document-tools",
   "host_methods": [
     "red/DocumentSnapshot",
@@ -128,7 +128,8 @@ The version 1 initialization parameters are:
     "red/TextPanelFocus",
     "red/TextPanelDispose",
     "red/StatuslineSet",
-    "red/StatuslineClear"
+    "red/StatuslineClear",
+    "red/PickerOpen"
   ]
 }
 ```
@@ -427,6 +428,41 @@ Red renders only from its local cache. It never calls or waits for a plugin
 while drawing a frame. Disconnect, quarantine, successful hot reload, and
 editor deactivation clear the previous connection's contribution.
 
+## Pickers
+
+Host API `0.21.0` adds a host-rendered, locally filtered picker. Opening it is a
+bounded host request; `command/execute` does not wait for user selection:
+
+```json
+{"jsonrpc":"2.0","id":"plugin-7","method":"red/PickerOpen","params":{"id":"targets","title":"Choose a target","items":[{"id":"debug","label":"Debug"},{"id":"release","label":"Release","detail":"optimized","data":{"profile":"release"}}]}}
+```
+
+`id` identifies the picker within the calling connection and must contain 1 to
+128 UTF-8 bytes. `title` is optional. `items` may contain at most 4096 entries;
+each entry requires string `id` and `label` fields and may include string
+`detail` and arbitrary JSON `data`. Unknown fields are rejected. The method
+returns `null` after Red installs and renders the picker. Red owns filtering,
+selection, keyboard handling, and drawing, so rendering never waits on the
+plugin.
+
+Selection closes the picker and sends only its owner a `picker/event`
+notification containing the connection-local ID and selected item:
+
+```json
+{"jsonrpc":"2.0","method":"picker/event","params":{"id":"targets","event":"selected","item":{"id":"release","label":"Release","detail":"optimized","data":{"profile":"release"}}}}
+```
+
+Escape or Ctrl-C sends `{"id":"targets","event":"cancelled"}` through the
+same notification method. Local query and highlight changes are not sent to
+the plugin. Replacing the dialog, disconnecting, quarantine, successful hot
+reload, and editor deactivation release the picker without waiting on the
+process. Picker IDs are private to the connection, and RPC handles occupy a
+separate range from Husk callback handles, so both plugin modalities continue
+to use the same native picker UI without sharing callback ownership.
+
+Invalid parameters return `-32602` and leave the plugin active. Transport
+failure while sending a terminal notification quarantines the owning plugin.
+
 ## Version 1 surface
 
 Version 1 deliberately exposes a small set of typed operations:
@@ -441,6 +477,7 @@ Version 1 deliberately exposes a small set of typed operations:
 - Text-panel create, content replacement, focus, and disposal, with resources
   owned by the active plugin connection.
 - One cached plain-text statusline contribution per active plugin connection.
+- Host-rendered, locally filtered pickers with owner-local terminal events.
 
 Host calls use named parameters. Document revisions and request identifiers
 that may exceed JavaScript's exact integer range are decimal strings on the
@@ -453,9 +490,9 @@ synchronous rendering callbacks, high-frequency cursor or viewport events, and
 transparent process restart are outside version 1.
 
 The current host integration activates and executes commands, delivers the
-three editor events above, serves configuration, storage, document, and
-text-panel methods, and caches one statusline contribution per active
-connection.
+three editor events above, serves configuration, storage, document,
+text-panel, statusline, and picker methods, and keeps UI resources owned by the
+active connection.
 
 ## Errors and failure semantics
 

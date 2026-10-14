@@ -33,10 +33,10 @@ use super::process::inherited_environment;
 use super::rpc::{
     RpcConnection, RpcErrorObject, RpcIncoming, RpcInitializeParams, RpcRequester,
     RpcStatuslineSide, CONFIG_GET_METHOD, DOCUMENT_APPLY_METHOD, DOCUMENT_SNAPSHOT_METHOD,
-    DOCUMENT_UNDO_METHOD, MAX_OUTSTANDING_REQUESTS, MAX_QUEUED_BYTES, STATUSLINE_CLEAR_METHOD,
-    STATUSLINE_SET_METHOD, STORAGE_DELETE_METHOD, STORAGE_GET_METHOD, STORAGE_SET_METHOD,
-    TEXT_PANEL_CREATE_METHOD, TEXT_PANEL_DISPOSE_METHOD, TEXT_PANEL_FOCUS_METHOD,
-    TEXT_PANEL_SET_CONTENT_METHOD,
+    DOCUMENT_UNDO_METHOD, MAX_OUTSTANDING_REQUESTS, MAX_QUEUED_BYTES, PICKER_EVENT_METHOD,
+    PICKER_OPEN_METHOD, STATUSLINE_CLEAR_METHOD, STATUSLINE_SET_METHOD, STORAGE_DELETE_METHOD,
+    STORAGE_GET_METHOD, STORAGE_SET_METHOD, TEXT_PANEL_CREATE_METHOD, TEXT_PANEL_DISPOSE_METHOD,
+    TEXT_PANEL_FOCUS_METHOD, TEXT_PANEL_SET_CONTENT_METHOD,
 };
 use super::{
     CommandMetadata, CommandScope, PluginMetadata, RegisteredPluginCommand, RequestId, Runtime,
@@ -64,6 +64,8 @@ pub struct PluginRegistry {
     rpc_activations: HashMap<String, PendingRpcPlugin>,
     rpc_retirements: HashMap<String, JoinHandle<()>>,
     rpc_text_panels: HashMap<String, HashMap<String, String>>,
+    rpc_pickers: HashMap<super::PickerHandle, RpcPicker>,
+    next_rpc_picker_handle: i32,
     rpc_statuslines: BTreeMap<String, RpcStatuslineContribution>,
     rpc_statusline_dirty: bool,
 }
@@ -71,6 +73,11 @@ pub struct PluginRegistry {
 struct RpcStatuslineContribution {
     side: RpcStatuslineSide,
     text: String,
+}
+
+struct RpcPicker {
+    owner: String,
+    id: String,
 }
 
 struct ActiveRpcPlugin {
@@ -212,7 +219,7 @@ struct RpcCommandResult {
 }
 
 /// Host API version used for plugin compatibility checks.
-pub const RED_HOST_API_VERSION: &str = "0.20.0";
+pub const RED_HOST_API_VERSION: &str = "0.21.0";
 pub(crate) const SUPPORTED_HOST_API_VERSIONS: &[&str] = &[
     "0.4.0",
     "0.6.0",
@@ -227,6 +234,7 @@ pub(crate) const SUPPORTED_HOST_API_VERSIONS: &[&str] = &[
     "0.17.0",
     "0.18.0",
     "0.19.0",
+    "0.20.0",
     RED_HOST_API_VERSION,
 ];
 
@@ -285,6 +293,8 @@ impl PluginRegistry {
             rpc_activations: HashMap::new(),
             rpc_retirements: HashMap::new(),
             rpc_text_panels: HashMap::new(),
+            rpc_pickers: HashMap::new(),
+            next_rpc_picker_handle: -1,
             rpc_statuslines: BTreeMap::new(),
             rpc_statusline_dirty: false,
         }
@@ -348,6 +358,41 @@ impl PluginRegistry {
         };
         for id in panels.into_values() {
             runtime.send_request(PluginRequest::ClosePanel { id });
+        }
+    }
+
+    pub(crate) fn register_rpc_picker(&mut self, owner: &str, id: String) -> super::PickerHandle {
+        let handle = super::PickerHandle::from_raw(self.next_rpc_picker_handle);
+        self.next_rpc_picker_handle = self.next_rpc_picker_handle.checked_sub(1).unwrap_or(-1);
+        self.rpc_pickers.insert(
+            handle,
+            RpcPicker {
+                owner: owner.to_string(),
+                id,
+            },
+        );
+        handle
+    }
+
+    pub(crate) fn release_picker(
+        &mut self,
+        runtime: &mut Runtime,
+        handle: super::PickerHandle,
+    ) -> bool {
+        let rpc = self.rpc_pickers.remove(&handle).is_some();
+        runtime.release_picker(handle) || rpc
+    }
+
+    fn close_rpc_pickers(&mut self, runtime: &Runtime, owner: &str) {
+        let handles = self
+            .rpc_pickers
+            .iter()
+            .filter(|(_, picker)| picker.owner == owner)
+            .map(|(handle, _)| *handle)
+            .collect::<Vec<_>>();
+        for handle in handles {
+            self.rpc_pickers.remove(&handle);
+            runtime.send_request(PluginRequest::ClosePicker { id: handle.get() });
         }
     }
 
@@ -589,6 +634,7 @@ impl PluginRegistry {
             );
         }
         self.close_rpc_text_panels(runtime, name);
+        self.close_rpc_pickers(runtime, name);
         self.clear_rpc_statusline(name);
         self.rpc_plugins.remove(name);
         if let Some(pending) = self.rpc_activations.remove(name) {
@@ -657,6 +703,7 @@ impl PluginRegistry {
                 TEXT_PANEL_DISPOSE_METHOD.to_string(),
                 STATUSLINE_SET_METHOD.to_string(),
                 STATUSLINE_CLEAR_METHOD.to_string(),
+                PICKER_OPEN_METHOD.to_string(),
             ],
         };
         let task = tokio::spawn(async move {
@@ -866,6 +913,7 @@ impl PluginRegistry {
         }
         if let Some(previous) = self.rpc_plugins.insert(name.clone(), plugin) {
             self.close_rpc_text_panels(runtime, &name);
+            self.close_rpc_pickers(runtime, &name);
             self.clear_rpc_statusline(&name);
             self.retire_rpc_plugin(&name, previous);
         }
@@ -1624,6 +1672,34 @@ impl PluginRegistry {
         }
     }
 
+    async fn notify_rpc_picker(
+        &mut self,
+        runtime: &mut Runtime,
+        handle: super::PickerHandle,
+        event: crate::editor::PickerCallback,
+    ) -> anyhow::Result<bool> {
+        let picker = self.rpc_pickers.get(&handle).expect("RPC picker exists");
+        let params = match &event {
+            crate::editor::PickerCallback::Selected(item) => {
+                json!({"id": picker.id, "event": "selected", "item": item})
+            }
+            crate::editor::PickerCallback::Cancelled => {
+                json!({"id": picker.id, "event": "cancelled"})
+            }
+            _ => return Ok(true),
+        };
+        let owner = picker.owner.clone();
+        self.rpc_pickers.remove(&handle);
+        let Some(plugin) = self.rpc_plugins.get(&owner) else {
+            return Ok(true);
+        };
+        if let Err(error) = plugin.connection.notify(PICKER_EVENT_METHOD, params).await {
+            let path = self.plugin_path(&owner);
+            self.quarantine(runtime, &owner, &path, "runtime", error.to_string());
+        }
+        Ok(true)
+    }
+
     /// Delivers a callback-scoped picker event only to the plugin that opened it.
     ///
     /// Terminal callbacks are consumed even when the callback fails.
@@ -1633,6 +1709,9 @@ impl PluginRegistry {
         handle: super::PickerHandle,
         event: crate::editor::PickerCallback,
     ) -> anyhow::Result<bool> {
+        if self.rpc_pickers.contains_key(&handle) {
+            return self.notify_rpc_picker(runtime, handle, event).await;
+        }
         let owner = runtime.picker_plugin(handle);
         match runtime.notify_picker(handle, event) {
             Ok(resolved) => Ok(resolved),
@@ -1763,6 +1842,7 @@ impl PluginRegistry {
             let _ = task.await;
         }
         self.rpc_text_panels.clear();
+        self.rpc_pickers.clear();
         self.rpc_statusline_dirty |= !self.rpc_statuslines.is_empty();
         self.rpc_statuslines.clear();
         runtime.deactivate_all().await?;
@@ -2405,6 +2485,10 @@ mod tests {
         let observer_id = registry
             .register_rpc_text_panel("observer", "preview")
             .unwrap();
+        let owner_picker = registry.register_rpc_picker("owner", "choices".to_string());
+        let observer_picker = registry.register_rpc_picker("observer", "choices".to_string());
+        assert!(owner_picker.get() < 0 && observer_picker.get() < 0);
+        assert!(!runtime.release_picker(owner_picker));
         registry.set_rpc_statusline(
             "owner",
             RpcStatuslineSide::Right,
@@ -2429,9 +2513,15 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["observer status"]
         );
+        assert!(!registry.rpc_pickers.contains_key(&owner_picker));
+        assert!(registry.rpc_pickers.contains_key(&observer_picker));
         assert!(matches!(
             runtime.try_recv_request(),
             Some(PluginRequest::ClosePanel { id }) if id == owner_id
+        ));
+        assert!(matches!(
+            runtime.try_recv_request(),
+            Some(PluginRequest::ClosePicker { id }) if id == owner_picker.get()
         ));
         assert!(runtime.try_recv_request().is_none());
         assert!(matches!(
