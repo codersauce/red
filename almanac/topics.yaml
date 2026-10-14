@@ -131,6 +131,10 @@ topics:
     title: Host API
     description: Versioned Red host API calls and plugin-to-editor request contracts.
     parents: [plugins]
+  - slug: json-rpc-plugins
+    title: JSON-RPC Plugins
+    description: Language-agnostic external plugin process protocol, transport limits, and host-boundary decisions.
+    parents: [plugins, host-api, safety]
   - slug: filesystem
     title: Filesystem
     description: Workspace-confined file access and fail-closed path handling.

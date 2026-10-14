@@ -67,6 +67,11 @@ push previews, or guarded Git operations. It is the architecture page for the
 large first-party plugin workflow that combines Husk state, internal Git core
 helpers, host-managed processes, and editor-owned workspace UI [@git-workspace].
 
+Use [JSON-RPC Plugin Boundary](../../decisions/plugins/json-rpc-plugin-boundary)
+when evaluating language-agnostic external plugin work. It records the decision
+to prefer a bounded async JSON-RPC process boundary over a blocking generic
+bridge to the full Husk host API.
+
 ## Host API Reading Map
 
 Use [Red Host API](red-host-api) for the architecture of `red::execute` and `red::request`: schema validation, runtime dispatch, compatibility checks, and why plugin effects return to editor-owned requests [@host-api] [@runtime]. Use [Plugin Host API](../../reference/plugins/host-api) when you need exact host API versions, call names, signatures, introduction versions, and accepted compatibility targets [@host-api-reference].
