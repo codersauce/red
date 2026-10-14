@@ -1,6 +1,12 @@
 {
-  "api_version": "0.21.0",
+  "api_version": "0.22.0",
   "changes": [
+    {
+      "version": "0.22.0",
+      "kind": "introduced",
+      "symbols": ["red/DocumentCreate", "red/DocumentShow"],
+      "migration_note": "docs/RPC_PLUGIN_PROTOCOL.md#editable-documents"
+    },
     {
       "version": "0.21.0",
       "kind": "introduced",

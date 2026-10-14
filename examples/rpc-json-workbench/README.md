@@ -15,8 +15,12 @@ red plugin install --path ./examples/rpc-json-workbench
 Open a JSON document and run:
 
 ```text
+:JsonWorkbench
+:JsonRun
 :JsonQuery .users | map(select(.active))
 :JsonQueries
+:JsonOpenResult
+:JsonSource
 :JsonApply
 :JsonUndo
 :JsonClose
@@ -24,9 +28,21 @@ Open a JSON document and run:
 
 `JsonQuery` pins the current document on its first successful snapshot. Later
 queries keep using that document even after switching buffers. `JsonApply` and
-`JsonUndo` currently require the pinned source to be active; select it before
-retrying if Red reports that it is not current. Close the workbench before
-starting on another source.
+`JsonUndo` require the pinned source to be active; use `JsonSource` before
+applying or undoing. Close the workbench before starting on another source.
+
+`JsonWorkbench` pins the source, opens the preview panel, and creates one
+ordinary unnamed query document. Edit that document with normal Red commands
+and run it with `JsonRun`; its undo history and dirty state are independent of
+the source. The query can be saved normally as a `.jq` file. If the query
+document is closed, the next `JsonWorkbench` invocation creates a replacement.
+
+`JsonOpenResult` copies the latest successful output into a new editable,
+unnamed document with JSON syntax. Each copy is frozen and can be saved or
+closed like any other buffer. Query and result documents remain open if the
+plugin exits or reloads, while the preview panel remains connection-owned.
+`JsonSource` explicitly returns to the pinned source before `JsonApply` or
+`JsonUndo`.
 
 `JsonQueries` opens a native picker containing configured presets and up to 20
 recent successful queries. Choosing one runs it against the pinned source after

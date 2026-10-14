@@ -114,9 +114,11 @@ The version 1 initialization parameters are:
 ```json
 {
   "protocol_versions": [1],
-  "red_api_version": "0.21.0",
+  "red_api_version": "0.22.0",
   "plugin_id": "document-tools",
   "host_methods": [
+    "red/DocumentCreate",
+    "red/DocumentShow",
     "red/DocumentSnapshot",
     "red/DocumentApply",
     "red/DocumentUndo",
@@ -275,6 +277,45 @@ stored value may use at most 1 MiB after compact JSON serialization. Unknown
 fields, invalid keys, and oversized writes return `-32602`; an unavailable
 owner or oversized read returns `-32005`, and a persistence failure returns
 `-32603`. These request errors leave the connection active.
+
+## Editable documents
+
+Host API `0.22.0` adds ordinary editable documents for explicit user workflows.
+`red/DocumentCreate` accepts initial text of at most 1 MiB and an optional
+supported syntax name:
+
+```json
+{"jsonrpc":"2.0","id":"plugin-create","method":"red/DocumentCreate","params":{"text":"{\"ok\":true}\n","syntax":"json"}}
+```
+
+The result contains a stable decimal-string document ID:
+
+```json
+{"jsonrpc":"2.0","id":"plugin-create","result":{"document_id":"42"}}
+```
+
+The document is an ordinary unnamed buffer, outside connection-owned cleanup.
+Initial text that differs from Red's normal blank-buffer baseline is one
+attributed undo transaction, so generated content is dirty, prompts before
+discard, can be undone independently, participates in crash recovery, and can
+be saved with the usual Save As flow. Closing, disabling, quarantining, or
+reloading the plugin leaves the document open. `syntax` must contain 1 to 128
+UTF-8 bytes and resolve to an installed syntax; invalid or unknown values
+return `-32602`.
+
+`red/DocumentShow` reveals a live document by ID. The optional `target` is
+`current` by default and also accepts `horizontal` or `vertical` to use Red's
+native split routing:
+
+```json
+{"jsonrpc":"2.0","id":"plugin-show","method":"red/DocumentShow","params":{"document_id":"42","target":"current"}}
+```
+
+The result is `null`. A closed ID returns `-32001`; malformed IDs or targets
+return `-32602`; a split or render failure returns `-32003`. Only this explicit
+call changes focus, so background computation cannot reveal a document by
+creating it. Plugins using either method must require `red_api = "^0.22.0"` or
+later.
 
 ## Document snapshots
 
@@ -474,8 +515,11 @@ Version 1 deliberately exposes a small set of typed operations:
 - Declared editor events with documented JSON payloads. Process-local callback
   events and raw keyboard input are excluded.
 - Owner-scoped configuration and bounded persistent JSON storage.
-- `red/DocumentSnapshot`, `red/DocumentApply`, and `red/DocumentUndo`, preserving
-  revisions, attributed undo transactions, dirty tracking, and LSP updates.
+- Ordinary editable document creation and explicit ID-based reveal through
+  `red/DocumentCreate` and `red/DocumentShow`.
+- `red/DocumentSnapshot`, `red/DocumentApply`, and `red/DocumentUndo`,
+  preserving revisions, attributed undo transactions, dirty tracking, and LSP
+  updates.
 - Text-panel create, content replacement, focus, and disposal, with resources
   owned by the active plugin connection.
 - One cached plain-text statusline contribution per active plugin connection.

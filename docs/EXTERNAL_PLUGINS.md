@@ -166,10 +166,12 @@ See the [JSON-RPC plugin protocol](RPC_PLUGIN_PROTOCOL.md) for framing,
 lifecycle, capabilities, and the bounded version 1 surface. Declared commands
 appear in colon completion and the command palette before activation. Invoking
 one starts the process, validates its command metadata, and sends the typed
-`command/execute` request. Active plugins can call `red/DocumentSnapshot`,
-`red/DocumentApply`, and `red/DocumentUndo` to read and transactionally edit
-open documents through Red's existing revision, dirty-state, undo, and LSP
-paths. They can also create, replace the content of, focus, and dispose
+`command/execute` request. Active plugins can create and explicitly reveal
+ordinary editable documents with `red/DocumentCreate` and `red/DocumentShow`.
+They can call `red/DocumentSnapshot`, `red/DocumentApply`, and
+`red/DocumentUndo` to read and transactionally edit open documents through
+Red's existing revision, dirty-state, undo, and LSP paths. They can also
+create, replace the content of, focus, and dispose
 host-rendered text panels with connection-owned IDs, and set or clear one
 cached statusline contribution. Declared `editor:ready`, `file:opened`, and
 `file:saved` events arrive as typed `event/notify` notifications; other editor
@@ -233,6 +235,9 @@ package's private storage. The package owns validation and conversion.
 
 ## Host-owned safety boundaries
 
+- `DocumentCreate` produces ordinary unnamed buffers with bounded initial text,
+  independent undo and dirty tracking, and no connection-owned cleanup;
+  `DocumentShow` requires an explicit stable document ID and user action.
 - `DocumentSnapshot`, `DocumentApply`, and `DocumentUndo` preserve editor
   revisions, preimages, attributed transactions, dirty tracking, and LSP
   notifications.

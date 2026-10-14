@@ -32,11 +32,12 @@ use super::package::{PluginPackageManifest, PLUGIN_MANIFEST_FILE};
 use super::process::inherited_environment;
 use super::rpc::{
     RpcConnection, RpcErrorObject, RpcIncoming, RpcInitializeParams, RpcRequester,
-    RpcStatuslineSide, CONFIG_GET_METHOD, DOCUMENT_APPLY_METHOD, DOCUMENT_SNAPSHOT_METHOD,
-    DOCUMENT_UNDO_METHOD, MAX_OUTSTANDING_REQUESTS, MAX_QUEUED_BYTES, PICKER_EVENT_METHOD,
-    PICKER_OPEN_METHOD, STATUSLINE_CLEAR_METHOD, STATUSLINE_SET_METHOD, STORAGE_DELETE_METHOD,
-    STORAGE_GET_METHOD, STORAGE_SET_METHOD, TEXT_PANEL_CREATE_METHOD, TEXT_PANEL_DISPOSE_METHOD,
-    TEXT_PANEL_FOCUS_METHOD, TEXT_PANEL_SET_CONTENT_METHOD,
+    RpcStatuslineSide, CONFIG_GET_METHOD, DOCUMENT_APPLY_METHOD, DOCUMENT_CREATE_METHOD,
+    DOCUMENT_SHOW_METHOD, DOCUMENT_SNAPSHOT_METHOD, DOCUMENT_UNDO_METHOD, MAX_OUTSTANDING_REQUESTS,
+    MAX_QUEUED_BYTES, PICKER_EVENT_METHOD, PICKER_OPEN_METHOD, STATUSLINE_CLEAR_METHOD,
+    STATUSLINE_SET_METHOD, STORAGE_DELETE_METHOD, STORAGE_GET_METHOD, STORAGE_SET_METHOD,
+    TEXT_PANEL_CREATE_METHOD, TEXT_PANEL_DISPOSE_METHOD, TEXT_PANEL_FOCUS_METHOD,
+    TEXT_PANEL_SET_CONTENT_METHOD,
 };
 use super::{
     CommandMetadata, CommandScope, PluginMetadata, RegisteredPluginCommand, RequestId, Runtime,
@@ -219,7 +220,7 @@ struct RpcCommandResult {
 }
 
 /// Host API version used for plugin compatibility checks.
-pub const RED_HOST_API_VERSION: &str = "0.21.0";
+pub const RED_HOST_API_VERSION: &str = "0.22.0";
 pub(crate) const SUPPORTED_HOST_API_VERSIONS: &[&str] = &[
     "0.4.0",
     "0.6.0",
@@ -235,6 +236,7 @@ pub(crate) const SUPPORTED_HOST_API_VERSIONS: &[&str] = &[
     "0.18.0",
     "0.19.0",
     "0.20.0",
+    "0.21.0",
     RED_HOST_API_VERSION,
 ];
 
@@ -690,6 +692,8 @@ impl PluginRegistry {
             red_api_version: RED_HOST_API_VERSION.to_string(),
             plugin_id: manifest.plugin.id.to_string(),
             host_methods: vec![
+                DOCUMENT_CREATE_METHOD.to_string(),
+                DOCUMENT_SHOW_METHOD.to_string(),
                 DOCUMENT_SNAPSHOT_METHOD.to_string(),
                 DOCUMENT_APPLY_METHOD.to_string(),
                 DOCUMENT_UNDO_METHOD.to_string(),
@@ -3167,6 +3171,9 @@ mod tests {
         check_api_compatibility(&metadata).unwrap();
 
         metadata.red_api_version = Some("^0.18.0".to_string());
+        check_api_compatibility(&metadata).unwrap();
+
+        metadata.red_api_version = Some("^0.21.0".to_string());
         check_api_compatibility(&metadata).unwrap();
 
         metadata.red_api_version = Some("^0.5.0".to_string());

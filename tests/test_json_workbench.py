@@ -431,6 +431,99 @@ class JsonWorkbenchTest(unittest.TestCase):
             '.message == "two  spaces" | .value',
         )
 
+    def test_editable_query_result_and_source_workflow(self):
+        source = {
+            "path": "data.json",
+            "document_id": "7",
+            "revision": "1",
+            "text": "{}",
+        }
+        output = '{"ok":true}\n'
+        with PluginProcess(self.fake_jq) as plugin:
+            plugin.command("workbench", "JsonWorkbench")
+            snapshot = plugin.expect_host_request("red/DocumentSnapshot")
+            self.assertEqual(snapshot["params"], {"include_document_id": True})
+            plugin.reply(snapshot, source)
+            plugin.load_runtime()
+            panel = plugin.expect_host_request("red/TextPanelCreate")
+            plugin.reply(panel)
+            help_content = plugin.expect_host_request("red/TextPanelSetContent")
+            self.assertIn(
+                ":JsonRun", help_content["params"]["blocks"][1]["text"]
+            )
+            plugin.reply(help_content)
+            created = plugin.expect_host_request("red/DocumentCreate")
+            self.assertEqual(created["params"], {"text": "."})
+            plugin.reply(created, {"document_id": "9"})
+            shown = plugin.expect_host_request("red/DocumentShow")
+            self.assertEqual(shown["params"], {"document_id": "9"})
+            plugin.reply(shown)
+            plugin.expect_status("JSON: query")
+            self.assertEqual(
+                plugin.receive()["result"],
+                {"message": "JSON query document ready"},
+            )
+
+            plugin.command("workbench-again", "JsonWorkbench")
+            snapshot = plugin.expect_host_request("red/DocumentSnapshot")
+            self.assertEqual(snapshot["params"], {"document_id": "7"})
+            plugin.reply(snapshot, source)
+            help_content = plugin.expect_host_request("red/TextPanelSetContent")
+            plugin.reply(help_content)
+            shown = plugin.expect_host_request("red/DocumentShow")
+            self.assertEqual(shown["params"], {"document_id": "9"})
+            plugin.reply(shown)
+            plugin.expect_status("JSON: query")
+            self.assertEqual(
+                plugin.receive()["result"],
+                {"message": "JSON query document ready"},
+            )
+
+            plugin.command("run", "JsonRun")
+            query = plugin.expect_host_request("red/DocumentSnapshot")
+            self.assertEqual(query["params"], {"document_id": "9"})
+            plugin.reply(
+                query,
+                {
+                    "path": None,
+                    "revision": "3",
+                    "text": ".users | map(select(.active))",
+                },
+            )
+            self.complete_query(plugin, "run", source, output, create_panel=False)
+
+            plugin.command("result", "JsonOpenResult")
+            result = plugin.expect_host_request("red/DocumentCreate")
+            self.assertEqual(
+                result["params"], {"text": output, "syntax": "json"}
+            )
+            plugin.reply(result, {"document_id": "10"})
+            shown = plugin.expect_host_request("red/DocumentShow")
+            self.assertEqual(shown["params"], {"document_id": "10"})
+            plugin.reply(shown)
+            plugin.expect_status("JSON: result")
+            self.assertEqual(
+                plugin.receive()["result"],
+                {"message": "JSON result document ready"},
+            )
+
+            plugin.command("source", "JsonSource")
+            shown = plugin.expect_host_request("red/DocumentShow")
+            self.assertEqual(shown["params"], {"document_id": "7"})
+            plugin.reply(shown)
+            plugin.expect_status("JSON: source")
+            self.assertEqual(
+                plugin.receive()["result"],
+                {"message": "JSON source document ready"},
+            )
+
+            plugin.command("apply", "JsonApply")
+            apply = plugin.expect_host_request("red/DocumentApply")
+            self.assertEqual(apply["params"]["document_id"], "7")
+            plugin.reply(apply, {"transaction_id": "tx-1", "revision": "2"})
+            plugin.expect_status("JSON: applied")
+            self.assertEqual(plugin.receive()["id"], "apply")
+
     def test_query_picker_selects_a_preset_and_records_history(self):
         document = {
             "path": "data.json",

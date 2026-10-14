@@ -27,6 +27,20 @@ EOF = object()
 
 COMMANDS = [
     {
+        "name": "JsonWorkbench",
+        "metadata": {
+            "title": "Open an editable JSON query",
+            "category": "JSON Workbench",
+        },
+    },
+    {
+        "name": "JsonRun",
+        "metadata": {
+            "title": "Run the editable JSON query",
+            "category": "JSON Workbench",
+        },
+    },
+    {
         "name": "JsonQuery",
         "metadata": {
             "title": "Preview a jq query",
@@ -45,6 +59,20 @@ COMMANDS = [
         "name": "JsonQueries",
         "metadata": {
             "title": "Choose a saved JSON query",
+            "category": "JSON Workbench",
+        },
+    },
+    {
+        "name": "JsonOpenResult",
+        "metadata": {
+            "title": "Open the JSON result in a document",
+            "category": "JSON Workbench",
+        },
+    },
+    {
+        "name": "JsonSource",
+        "metadata": {
+            "title": "Show the JSON source document",
             "category": "JSON Workbench",
         },
     },
@@ -278,6 +306,9 @@ class JsonWorkbench:
         self.closed = threading.Event()
         self.request_ids = itertools.count(1)
         self.source_id = None
+        self.query_document_id = None
+        self.last_query = None
+        self.result = None
         self.candidate = None
         self.transaction = None
         self.panel_open = False
@@ -556,6 +587,55 @@ class JsonWorkbench:
             },
         )
 
+    def create_document(self, text, syntax=None):
+        params = {"text": text}
+        if syntax is not None:
+            params["syntax"] = syntax
+        created = self.request_host("red/DocumentCreate", params)
+        if not isinstance(created, dict) or not isinstance(
+            created.get("document_id"), str
+        ):
+            raise OperationError("red/DocumentCreate returned an invalid document ID")
+        return created["document_id"]
+
+    def show_document(self, document_id):
+        self.request_host("red/DocumentShow", {"document_id": document_id})
+
+    def initial_query(self):
+        if self.last_query is not None:
+            return self.last_query
+        if self.history:
+            return self.history[0]
+        if self.presets:
+            return self.presets[0][1]
+        return "."
+
+    def show_workbench_help(self, document):
+        if self.result is not None:
+            return
+        self.ensure_panel()
+        path = document["path"] or "[scratch]"
+        self.request_host(
+            "red/TextPanelSetContent",
+            {
+                "id": PANEL_ID,
+                "blocks": [
+                    {
+                        "id": "source",
+                        "kind": "activity",
+                        "format": "plain",
+                        "text": f"Source: {path} @ {document['revision']}",
+                    },
+                    {
+                        "id": "instructions",
+                        "kind": "text",
+                        "format": "plain",
+                        "text": "Edit the query document, then run :JsonRun.",
+                    },
+                ],
+            },
+        )
+
     def load_settings(self):
         if self.settings_loaded:
             return
@@ -611,6 +691,8 @@ class JsonWorkbench:
 
     def run_query(self, query_text, cancel=None, background=False):
         validate_query(query_text)
+        self.last_query = query_text
+        self.result = None
         self.candidate = None
         try:
             self.ensure_run_active(cancel)
@@ -625,6 +707,7 @@ class JsonWorkbench:
             self.ensure_run_active(cancel)
             self.show_result(document, query_text, output)
             self.ensure_run_active(cancel)
+            self.result = output
             self.candidate = {
                 "document_id": self.source_id,
                 "revision": document["revision"],
@@ -641,6 +724,65 @@ class JsonWorkbench:
             self.retire_preview(error, create=background)
             raise
         return {"message": "JSON preview ready"}
+
+    def workbench(self, _params):
+        self.clear_picker()
+        document = self.snapshot_source()
+        self.load_settings()
+        self.load_storage()
+        self.show_workbench_help(document)
+        if self.query_document_id is not None:
+            try:
+                self.show_document(self.query_document_id)
+            except HostError as error:
+                if error.code != -32001:
+                    raise
+                self.query_document_id = None
+        if self.query_document_id is None:
+            self.query_document_id = self.create_document(self.initial_query())
+            self.show_document(self.query_document_id)
+        self.best_effort_status("JSON: query")
+        return {"message": "JSON query document ready"}
+
+    def run(self, _params):
+        if self.query_document_id is None:
+            raise OperationError("JsonWorkbench has no query document")
+        try:
+            query = self.request_host(
+                "red/DocumentSnapshot", {"document_id": self.query_document_id}
+            )
+        except HostError as error:
+            if error.code == -32001:
+                self.query_document_id = None
+            raise
+        self.load_settings()
+        self.load_storage()
+        return self.run_query(query["text"])
+
+    def open_result(self, _params):
+        if self.result is None:
+            raise OperationError("JsonRun has no result to open")
+        self.clear_picker()
+        document_id = self.create_document(self.result, syntax="json")
+        self.show_document(document_id)
+        self.best_effort_status("JSON: result")
+        return {"message": "JSON result document ready"}
+
+    def source(self, _params):
+        if self.source_id is None:
+            raise OperationError("JSON Workbench has no source document")
+        self.clear_picker()
+        try:
+            self.show_document(self.source_id)
+        except HostError as error:
+            if error.code == -32001:
+                self.source_id = None
+                self.candidate = None
+                self.transaction = None
+                self.result = None
+            raise
+        self.best_effort_status("JSON: source")
+        return {"message": "JSON source document ready"}
 
     def query(self, params):
         query_text = params.get("raw_args", "")
@@ -843,6 +985,8 @@ class JsonWorkbench:
             self.request_host("red/TextPanelDispose", {"id": PANEL_ID})
         self.request_host("red/StatuslineClear", {})
         self.source_id = None
+        self.query_document_id = None
+        self.result = None
         self.candidate = None
         self.transaction = None
         self.panel_open = False
@@ -855,8 +999,12 @@ class JsonWorkbench:
             self.send_error(message, "JSON Workbench is busy")
             return
         handlers = {
+            "JsonWorkbench": self.workbench,
+            "JsonRun": self.run,
             "JsonQuery": self.query,
             "JsonQueries": self.queries,
+            "JsonOpenResult": self.open_result,
+            "JsonSource": self.source,
             "JsonApply": self.apply,
             "JsonUndo": self.undo,
             "JsonClose": self.close,

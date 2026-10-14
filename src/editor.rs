@@ -4584,6 +4584,22 @@ struct PluginDocumentTransaction {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct RpcDocumentCreateParams {
+    text: String,
+    #[serde(default)]
+    syntax: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RpcDocumentShowParams {
+    document_id: String,
+    #[serde(default)]
+    target: plugin::OpenLocationTarget,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RpcDocumentSnapshotParams {
     #[serde(default)]
     path: Option<String>,
@@ -4712,6 +4728,8 @@ struct RpcStorageSetParams {
 
 const RPC_STORAGE_MAX_KEY_BYTES: usize = 128;
 const RPC_PLUGIN_VALUE_MAX_BYTES: usize = 1024 * 1024;
+const RPC_DOCUMENT_CREATE_MAX_BYTES: usize = 1024 * 1024;
+const RPC_DOCUMENT_SYNTAX_MAX_BYTES: usize = 128;
 const MAX_RPC_PICKER_ITEMS: usize = 4_096;
 
 fn default_rpc_text_panel_width() -> usize {
@@ -26391,6 +26409,107 @@ impl Editor {
         Ok(index)
     }
 
+    fn rpc_document_create_request(
+        &mut self,
+        owner: &str,
+        params: &Value,
+    ) -> std::result::Result<Value, plugin::rpc::RpcErrorObject> {
+        let params: RpcDocumentCreateParams =
+            Self::rpc_params(plugin::rpc::DOCUMENT_CREATE_METHOD, params)?;
+        if params.text.len() > RPC_DOCUMENT_CREATE_MAX_BYTES {
+            return Err(Self::rpc_error(
+                -32602,
+                format!(
+                    "red/DocumentCreate text may not exceed {RPC_DOCUMENT_CREATE_MAX_BYTES} UTF-8 bytes"
+                ),
+            ));
+        }
+        let syntax = params
+            .syntax
+            .map(|syntax| {
+                if syntax.is_empty() || syntax.len() > RPC_DOCUMENT_SYNTAX_MAX_BYTES {
+                    return Err(Self::rpc_error(
+                        -32602,
+                        format!(
+                            "red/DocumentCreate syntax must contain 1 to {RPC_DOCUMENT_SYNTAX_MAX_BYTES} UTF-8 bytes"
+                        ),
+                    ));
+                }
+                self.highlighter
+                    .language_id_for_name(&syntax)
+                    .map(str::to_string)
+                    .ok_or_else(|| {
+                        Self::rpc_error(
+                            -32602,
+                            format!("red/DocumentCreate unknown syntax {syntax:?}"),
+                        )
+                    })
+            })
+            .transpose()?;
+
+        let mut document = Buffer::new(/*file*/ None, String::new());
+        if let Some(syntax) = syntax {
+            document.set_syntax_selection(SyntaxSelection::Language(syntax));
+        }
+        let cursor = CursorSnapshot::default();
+        document.undo_history.begin_transaction_with_origin(
+            "create plugin document",
+            cursor,
+            EditOrigin::Plugin {
+                name: owner.to_string(),
+            },
+        );
+        let end = document.char_idx_to_position(document.char_len());
+        apply_transactional_replacement(
+            &mut document,
+            TextRange::new(TextPosition::new(0, 0), end),
+            &params.text,
+        );
+        document.undo_history.commit_transaction(cursor);
+        document.refresh_dirty();
+        let document_id = document.id().as_u64().to_string();
+        self.buffer_manager.push_buffer(document);
+        Ok(json!({ "document_id": document_id }))
+    }
+
+    async fn rpc_document_show_request(
+        &mut self,
+        render_buffer: &mut RenderBuffer,
+        params: &Value,
+    ) -> std::result::Result<Value, plugin::rpc::RpcErrorObject> {
+        let params: RpcDocumentShowParams =
+            Self::rpc_params(plugin::rpc::DOCUMENT_SHOW_METHOD, params)?;
+        let index = Self::rpc_document_index(
+            &self.buffer_manager,
+            /*path*/ None,
+            Some(&params.document_id),
+        )?;
+        match params.target {
+            plugin::OpenLocationTarget::Current => self
+                .set_current_buffer(render_buffer, index)
+                .await
+                .map_err(|error| Self::rpc_error(-32003, error))?,
+            plugin::OpenLocationTarget::Horizontal | plugin::OpenLocationTarget::Vertical => {
+                let shown = self.update_window_layout(|windows| match params.target {
+                    plugin::OpenLocationTarget::Horizontal => windows.split_horizontal(index),
+                    plugin::OpenLocationTarget::Vertical => windows.split_vertical(index),
+                    plugin::OpenLocationTarget::Current => unreachable!(),
+                });
+                if !shown {
+                    return Err(Self::rpc_error(
+                        -32003,
+                        "unable to show document in requested target",
+                    ));
+                }
+                self.request_diagnostics()
+                    .await
+                    .and_then(|()| self.render(render_buffer))
+                    .map_err(|error| Self::rpc_error(-32003, error))?;
+            }
+        }
+        Ok(Value::Null)
+    }
+
     fn rpc_document_mutation_index(
         buffer_manager: &buffer_manager::BufferManager,
         path: Option<&str>,
@@ -26535,6 +26654,10 @@ impl Editor {
         params: &Value,
     ) -> std::result::Result<Value, plugin::rpc::RpcErrorObject> {
         match method {
+            plugin::rpc::DOCUMENT_CREATE_METHOD => self.rpc_document_create_request(owner, params),
+            plugin::rpc::DOCUMENT_SHOW_METHOD => {
+                self.rpc_document_show_request(render_buffer, params).await
+            }
             plugin::rpc::DOCUMENT_SNAPSHOT_METHOD => {
                 Self::rpc_document_snapshot_request(&self.buffer_manager, params)
             }
@@ -37810,6 +37933,179 @@ builtin = "rust"
         )
         .unwrap_err();
         assert_eq!(closed.code, -32001);
+    }
+
+    #[tokio::test]
+    async fn rpc_created_documents_use_normal_undo_discard_and_save_as() {
+        let directory = tempfile::tempdir().unwrap();
+        let saved = directory.path().join("result.json");
+        let mut editor = test_editor(/*width*/ 80, /*height*/ 24);
+        let source_id = editor.current_buffer().id();
+        let mut render_buffer = RenderBuffer::new(80, 24, &Style::default());
+        let mut runtime = Runtime::new();
+        let created = editor
+            .rpc_host_request(
+                &mut render_buffer,
+                &mut runtime,
+                "rpc-test",
+                plugin::rpc::DOCUMENT_CREATE_METHOD,
+                &json!({"text": "{\"value\":1}\n", "syntax": "json"}),
+            )
+            .await
+            .unwrap();
+        let document_id = created["document_id"].as_str().unwrap();
+        let created_id = document_id.parse::<u64>().unwrap();
+        let created_index = editor
+            .buffer_manager
+            .iter()
+            .position(|buffer| buffer.id().as_u64() == created_id)
+            .unwrap();
+        let document = &editor.buffer_manager[created_index];
+
+        assert_eq!(editor.current_buffer().id(), source_id);
+        assert_eq!(document.file, None);
+        assert_eq!(document.contents(), "{\"value\":1}\n");
+        assert!(document.is_dirty());
+        assert_eq!(document.undo_history.node_count(), 1);
+        assert!(matches!(
+            document.syntax_selection(),
+            SyntaxSelection::Language(language) if language == "json"
+        ));
+        assert!(matches!(
+            &document.undo_history.latest_transaction().unwrap().origin,
+            EditOrigin::Plugin { name } if name == "rpc-test"
+        ));
+        assert!(!editor.current_buffer().is_dirty());
+        assert_eq!(editor.current_buffer().undo_history.node_count(), 0);
+
+        editor
+            .rpc_host_request(
+                &mut render_buffer,
+                &mut runtime,
+                "rpc-test",
+                plugin::rpc::DOCUMENT_SHOW_METHOD,
+                &json!({"document_id": document_id}),
+            )
+            .await
+            .unwrap();
+        editor
+            .delete_current_buffer(&mut render_buffer, /*force*/ false)
+            .await
+            .unwrap();
+        assert_eq!(editor.buffer_manager.len(), 2);
+        assert_eq!(editor.current_buffer().file, None);
+        assert!(editor.current_buffer().is_dirty());
+        assert!(editor
+            .save_as_action(saved.to_str().unwrap(), &mut render_buffer, &mut runtime)
+            .await
+            .unwrap());
+        assert_eq!(std::fs::read_to_string(&saved).unwrap(), "{\"value\":1}\n");
+        assert!(!editor.current_buffer().is_dirty());
+
+        let buffer = editor.current_buffer_mut();
+        let mut history = std::mem::take(&mut buffer.undo_history);
+        history.undo(buffer).unwrap();
+        buffer.undo_history = history;
+        buffer.refresh_dirty();
+
+        assert_eq!(editor.current_buffer().contents(), "\n");
+        assert!(editor.current_buffer().is_dirty());
+        assert_eq!(editor.buffer_manager[0].id(), source_id);
+        assert_eq!(editor.buffer_manager[0].contents(), "hello");
+        editor
+            .delete_current_buffer(&mut render_buffer, /*force*/ true)
+            .await
+            .unwrap();
+        assert_eq!(editor.buffer_manager.len(), 1);
+        assert_eq!(editor.current_buffer().contents(), "hello");
+    }
+
+    #[tokio::test]
+    async fn rpc_document_show_uses_stable_ids_and_native_split_targets() {
+        let mut editor = test_editor(/*width*/ 80, /*height*/ 24);
+        let mut render_buffer = RenderBuffer::new(80, 24, &Style::default());
+        let mut runtime = Runtime::new();
+        let first = editor
+            .rpc_host_request(
+                &mut render_buffer,
+                &mut runtime,
+                "rpc-test",
+                plugin::rpc::DOCUMENT_CREATE_METHOD,
+                &json!({"text": ".first"}),
+            )
+            .await
+            .unwrap();
+        let second = editor
+            .rpc_host_request(
+                &mut render_buffer,
+                &mut runtime,
+                "rpc-test",
+                plugin::rpc::DOCUMENT_CREATE_METHOD,
+                &json!({"text": ".second"}),
+            )
+            .await
+            .unwrap();
+        editor.buffer_manager.remove_buffer(0);
+
+        editor
+            .rpc_host_request(
+                &mut render_buffer,
+                &mut runtime,
+                "rpc-test",
+                plugin::rpc::DOCUMENT_SHOW_METHOD,
+                &json!({"document_id": second["document_id"], "target": "vertical"}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(editor.current_buffer().contents(), ".second");
+        assert_eq!(editor.window_manager.windows().len(), 2);
+
+        let first_id: u64 = first["document_id"].as_str().unwrap().parse().unwrap();
+        let first_index = editor
+            .buffer_manager
+            .iter()
+            .position(|buffer| buffer.id().as_u64() == first_id)
+            .unwrap();
+        editor.buffer_manager.remove_buffer(first_index);
+        let closed = editor
+            .rpc_host_request(
+                &mut render_buffer,
+                &mut runtime,
+                "rpc-test",
+                plugin::rpc::DOCUMENT_SHOW_METHOD,
+                &json!({"document_id": first["document_id"]}),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(closed.code, -32001);
+    }
+
+    #[tokio::test]
+    async fn rpc_document_create_rejects_invalid_or_oversized_inputs() {
+        let mut editor = test_editor(/*width*/ 80, /*height*/ 24);
+        let mut render_buffer = RenderBuffer::new(80, 24, &Style::default());
+        let mut runtime = Runtime::new();
+        let original_buffers = editor.buffer_manager.len();
+
+        for params in [
+            json!({}),
+            json!({"text": "value", "unknown": true}),
+            json!({"text": "value", "syntax": "not-a-red-syntax"}),
+            json!({"text": "x".repeat(RPC_DOCUMENT_CREATE_MAX_BYTES + 1)}),
+        ] {
+            let error = editor
+                .rpc_host_request(
+                    &mut render_buffer,
+                    &mut runtime,
+                    "rpc-test",
+                    plugin::rpc::DOCUMENT_CREATE_METHOD,
+                    &params,
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(error.code, -32602, "{params}");
+        }
+        assert_eq!(editor.buffer_manager.len(), original_buffers);
     }
 
     #[tokio::test]

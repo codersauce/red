@@ -1,6 +1,6 @@
 # Plugin compatibility
 
-Red host API version `0.21.0` is defined by
+Red host API version `0.22.0` is defined by
 [`src/plugin/host_api.json`](../src/plugin/host_api.json). That file is the canonical,
 machine-readable list of execute actions, request actions, signatures, and introduction
 versions. Runtime dispatch and the bundled-plugin corpus are checked against it in tests.
@@ -24,10 +24,10 @@ required/optional arity (`HUSK-A0002`) and obvious literal argument types
 annotations use `HUSK-A0004`. `--no-typecheck` is an unsupported development
 escape hatch; compatibility guarantees do not apply while it is enabled.
 
-Host API `0.21.0` retains the complete `0.4.0`, `0.6.0`, `0.7.0`, `0.8.0`, `0.9.0`,
-`0.10.0`, `0.11.0`, `0.12.0`, `0.14.0`, `0.16.0`, `0.17.0`, `0.18.0`, `0.19.0`, and `0.20.0` contracts, so existing
+Host API `0.22.0` retains the complete `0.4.0`, `0.6.0`, `0.7.0`, `0.8.0`, `0.9.0`,
+`0.10.0`, `0.11.0`, `0.12.0`, `0.14.0`, `0.16.0`, `0.17.0`, `0.18.0`, `0.19.0`, `0.20.0`, and `0.21.0` contracts, so existing
 packages that declare those minors continue to load. New packages should target
-`"red_api_version": "^0.21.0"`.
+`"red_api_version": "^0.22.0"`.
 
 ## Standalone JSON-RPC packages
 
@@ -45,6 +45,12 @@ for targeting unnamed buffers and rejecting edits after a buffer switch.
 Host API `0.21.0` adds host-rendered RPC pickers with owner-local selection and
 cancellation notifications. See [pickers](RPC_PLUGIN_PROTOCOL.md#pickers) for
 the bounded item schema and cleanup semantics.
+
+Host API `0.22.0` adds `red/DocumentCreate` and `red/DocumentShow` for ordinary
+editable documents with independent undo, dirty tracking, Save As, recovery,
+and explicit stable-ID navigation. See
+[editable documents](RPC_PLUGIN_PROTOCOL.md#editable-documents) for the bounded
+request schemas and lifetime rules.
 
 ## Native tree panels
 

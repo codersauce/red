@@ -20,9 +20,11 @@ the [plugin API](../docs/PLUGIN_API.md#declarative-plugin-authoring).
 [`external-hello-plugin`](external-hello-plugin/) demonstrates the same
 declarative command in a standalone, installable package.
 
-[`rpc-hello-plugin`](rpc-hello-plugin/) demonstrates every JSON-RPC host method.
+[`rpc-hello-plugin`](rpc-hello-plugin/) demonstrates the baseline JSON-RPC host
+methods while remaining compatible with host API `0.21`.
 [`rpc-json-workbench`](rpc-json-workbench/) is a useful Python and `jq` plugin
-that previews, applies, and undoes transformations through those typed methods.
+that also exercises the `0.22` editable-document surface while previewing,
+applying, and undoing transformations.
 
 The `.js`, `.ts`, and JavaScript test files in this directory are historical examples
 for the removed Deno plugin runtime. They are retained for migration reference, are
