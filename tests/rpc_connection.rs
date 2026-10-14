@@ -19,6 +19,7 @@ mod editor;
 const FIXTURE_MODE: &str = "RED_RPC_FIXTURE_MODE";
 const ALLOWED_ENVIRONMENT: &str = "RED_RPC_TEST_ALLOWED";
 const DENIED_ENVIRONMENT: &str = "RED_RPC_TEST_DENIED";
+const TEST_STACK_BYTES: usize = 8 * 1024 * 1024;
 
 fn main() -> Result<()> {
     if env::args().any(|argument| argument == "--editor-fixture") {
@@ -31,6 +32,15 @@ fn main() -> Result<()> {
         return run_fixture(&mode);
     }
 
+    std::thread::Builder::new()
+        .name("rpc-connection-tests".into())
+        .stack_size(TEST_STACK_BYTES)
+        .spawn(run_tests)?
+        .join()
+        .map_err(|_| anyhow::anyhow!("RPC connection test thread panicked"))?
+}
+
+fn run_tests() -> Result<()> {
     tokio::runtime::Runtime::new()?.block_on(async {
         exercises_bidirectional_requests_and_shutdown().await?;
         deadline_failure_reaps_the_plugin_and_fails_its_peers().await?;
