@@ -32,8 +32,10 @@ class RpcExampleTest(unittest.TestCase):
             {"method": "event/notify", "params": {"name": "file:saved", "payload": {"file": "notes.txt"}}},
             {"method": "unknown/notification"},
             {"id": "nested", "method": "command/execute", "params": {"name": "RpcHello", "raw_args": "nested"}},
-            {"id": "plugin-1", "result": {"revision": "0"}},
+            {"id": "plugin-1", "result": {"revision": "0", "document_id": "7"}},
             {"id": "plugin-2", "result": {"transaction_id": "edit-1", "revision": "1"}},
+            {"id": "undo", "method": "command/execute", "params": {"name": "RpcUndo"}},
+            {"id": "plugin-3", "result": {"revision": "2"}},
             {"id": "event", "method": "command/execute", "params": {"name": "RpcLastEvent"}},
             {"id": "shutdown", "method": "shutdown"},
             {"method": "exit"},
@@ -41,9 +43,13 @@ class RpcExampleTest(unittest.TestCase):
         replies = {message["id"]: message for message in output}
         self.assertEqual(
             [message["id"] for message in output],
-            ["initialize", "plugin-1", "nested", "plugin-2", "apply", "event", "shutdown"],
+            ["initialize", "plugin-1", "nested", "plugin-2", "apply", "plugin-3", "undo", "event", "shutdown"],
         )
+        self.assertEqual(replies["plugin-1"]["params"], {"include_document_id": True})
+        self.assertEqual(replies["plugin-2"]["params"]["document_id"], "7")
+        self.assertEqual(replies["plugin-3"]["params"], {"document_id": "7", "transaction_id": "edit-1"})
         self.assertEqual(replies["apply"]["result"]["message"], "RPC edit applied @ 1")
+        self.assertEqual(replies["undo"]["result"]["message"], "RPC edit undone @ 2")
         self.assertEqual(replies["event"]["result"]["message"], "Last RPC event: file:saved (notes.txt)")
         self.assertEqual(replies["nested"]["error"]["code"], -32000)
         self.assertIsNone(replies["shutdown"]["result"])

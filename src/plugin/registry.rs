@@ -130,7 +130,7 @@ struct RpcCommandResult {
 }
 
 /// Host API version used for plugin compatibility checks.
-pub const RED_HOST_API_VERSION: &str = "0.19.0";
+pub const RED_HOST_API_VERSION: &str = "0.20.0";
 pub(crate) const SUPPORTED_HOST_API_VERSIONS: &[&str] = &[
     "0.4.0",
     "0.6.0",
@@ -144,6 +144,7 @@ pub(crate) const SUPPORTED_HOST_API_VERSIONS: &[&str] = &[
     "0.16.0",
     "0.17.0",
     "0.18.0",
+    "0.19.0",
     RED_HOST_API_VERSION,
 ];
 
@@ -732,6 +733,14 @@ impl PluginRegistry {
         execution: RpcCommandExecution,
         result: anyhow::Result<Value>,
     ) {
+        // A retired connection cannot publish into its replacement.
+        if !self
+            .rpc_plugins
+            .get(&execution.owner)
+            .is_some_and(|plugin| Arc::ptr_eq(&plugin.incoming, &execution.incoming))
+        {
+            return;
+        }
         let owner = execution.owner;
         match result.and_then(decode_rpc_command_result) {
             Ok(Some(action)) => runtime.send_request(PluginRequest::Action(action)),

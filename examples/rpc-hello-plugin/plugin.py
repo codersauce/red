@@ -45,6 +45,7 @@ def request_host(method, params):
 
 
 last_transaction_id = None
+last_document_id = None
 last_event = None
 request_ids = itertools.count(1)
 incoming = read_messages()
@@ -116,10 +117,11 @@ for message in incoming:
                     )
                 }
             elif command == "RpcApply":
-                document = request_host("red/DocumentSnapshot", {})
+                document = request_host("red/DocumentSnapshot", {"include_document_id": True})
                 applied = request_host(
                     "red/DocumentApply",
                     {
+                        "document_id": document["document_id"],
                         "expected_revision": document["revision"],
                         "label": "RPC example edit",
                         "edits": [
@@ -135,12 +137,14 @@ for message in incoming:
                     },
                 )
                 last_transaction_id = applied["transaction_id"]
+                last_document_id = document["document_id"]
                 result = {"message": f"RPC edit applied @ {applied['revision']}"}
             elif command == "RpcUndo":
                 if last_transaction_id is None:
                     raise RuntimeError("RpcApply has no transaction to undo")
                 undone = request_host(
-                    "red/DocumentUndo", {"transaction_id": last_transaction_id}
+                    "red/DocumentUndo",
+                    {"document_id": last_document_id, "transaction_id": last_transaction_id},
                 )
                 last_transaction_id = None
                 result = {"message": f"RPC edit undone @ {undone['revision']}"}

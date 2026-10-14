@@ -1,6 +1,12 @@
 {
-  "api_version": "0.19.0",
+  "api_version": "0.20.0",
   "changes": [
+    {
+      "version": "0.20.0",
+      "kind": "introduced",
+      "symbols": ["red/DocumentSnapshot.include_document_id", "RPC document_id selectors"],
+      "migration_note": "docs/RPC_PLUGIN_PROTOCOL.md#document-snapshots"
+    },
     {
       "version": "0.19.0",
       "kind": "introduced",

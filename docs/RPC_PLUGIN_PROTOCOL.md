@@ -188,9 +188,20 @@ text:
 {"jsonrpc":"2.0","id":"plugin-1","result":{"path":"src/main.rs","revision":"42","text":"fn main() {}\n"}}
 ```
 
-The optional `path` may be a string or `null`; additional fields are rejected
+The optional `path` may be a string or `null`; unknown fields are rejected
 with JSON-RPC error `-32602`. A document that is not open in Red returns
 application error `-32001`. These request errors leave the plugin active.
+
+Host API `0.20.0` adds `include_document_id: true` to request a `document_id`
+field in the snapshot result. It is a decimal string that identifies the open
+buffer, including an unnamed buffer, independently of its position in the
+buffer list. It remains stable until that buffer closes and must not be saved
+across editor restarts. Omitting the option preserves the original result shape.
+
+Snapshot, apply, and undo requests accept this ID as an optional `document_id`
+selector. A closed ID returns `-32001`; malformed IDs or conflicting `path` and
+ID selectors return `-32602`. Plugins using these fields must require
+`red_api = "^0.20.0"` or later. Older RPC and Husk packages continue to load.
 
 ## Document transactions
 
@@ -227,6 +238,15 @@ ID and resulting revision as decimal strings:
 ```json
 {"jsonrpc":"2.0","id":"plugin-2","result":{"transaction_id":"...","revision":"43"}}
 ```
+
+For deferred work, request a snapshot with `include_document_id: true` and
+pass its `document_id` with the revision to apply, then with the transaction ID
+to undo. ID-selected mutations currently require that document to be active;
+otherwise they return `-32003` without switching focus or changing contents.
+Select the document again before retrying, and refresh its snapshot if its
+revision has changed. An ID never silently falls back to another open buffer.
+Legacy requests without an ID retain their existing path/current-document
+behavior; a revision alone does not identify a document.
 
 `red/DocumentUndo` reverts that transaction only while it remains the latest
 change and is owned by the calling plugin:

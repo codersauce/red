@@ -4557,6 +4557,10 @@ struct PluginDocumentTransaction {
 struct RpcDocumentSnapshotParams {
     #[serde(default)]
     path: Option<String>,
+    #[serde(default)]
+    document_id: Option<String>,
+    #[serde(default)]
+    include_document_id: bool,
 }
 
 #[derive(Deserialize)]
@@ -4564,6 +4568,8 @@ struct RpcDocumentSnapshotParams {
 struct RpcDocumentApplyParams {
     #[serde(default)]
     path: Option<String>,
+    #[serde(default)]
+    document_id: Option<String>,
     expected_revision: String,
     #[serde(default = "default_plugin_edit_label")]
     label: String,
@@ -4575,6 +4581,8 @@ struct RpcDocumentApplyParams {
 struct RpcDocumentUndoParams {
     #[serde(default)]
     path: Option<String>,
+    #[serde(default)]
+    document_id: Option<String>,
     transaction_id: String,
 }
 
@@ -26121,19 +26129,71 @@ impl Editor {
         Ok(Value::Null)
     }
 
+    fn rpc_document_index(
+        buffer_manager: &buffer_manager::BufferManager,
+        path: Option<&str>,
+        document_id: Option<&str>,
+    ) -> std::result::Result<usize, plugin::rpc::RpcErrorObject> {
+        let Some(document_id) = document_id else {
+            return Self::plugin_document_index(buffer_manager, path)
+                .map_err(|error| Self::rpc_error(-32001, error));
+        };
+        let id = document_id
+            .parse::<u64>()
+            .map_err(|_| Self::rpc_error(-32602, "document_id must be a decimal u64 string"))?;
+        let index = buffer_manager
+            .iter()
+            .position(|buffer| buffer.id().as_u64() == id)
+            .ok_or_else(|| Self::rpc_error(-32001, "document_id is no longer open"))?;
+        if let Some(path) = path {
+            let path_index = Self::plugin_document_index(buffer_manager, Some(path))
+                .map_err(|error| Self::rpc_error(-32001, error))?;
+            if path_index != index {
+                return Err(Self::rpc_error(
+                    -32602,
+                    "path and document_id refer to different documents",
+                ));
+            }
+        }
+        Ok(index)
+    }
+
+    fn rpc_document_mutation_index(
+        buffer_manager: &buffer_manager::BufferManager,
+        path: Option<&str>,
+        document_id: Option<&str>,
+    ) -> std::result::Result<usize, plugin::rpc::RpcErrorObject> {
+        let index = Self::rpc_document_index(buffer_manager, path, document_id)?;
+        if document_id.is_some() && index != buffer_manager.active_index() {
+            return Err(Self::rpc_error(
+                -32003,
+                "document_id is not the current document",
+            ));
+        }
+        Ok(index)
+    }
+
     fn rpc_document_snapshot_request(
         buffer_manager: &buffer_manager::BufferManager,
         params: &Value,
     ) -> std::result::Result<Value, plugin::rpc::RpcErrorObject> {
         let params: RpcDocumentSnapshotParams =
             Self::rpc_params(plugin::rpc::DOCUMENT_SNAPSHOT_METHOD, params)?;
-        let snapshot = Self::plugin_document_snapshot(buffer_manager, params.path.as_deref())
-            .map_err(|error| Self::rpc_error(-32001, error))?;
-        Ok(json!({
-            "path": snapshot.path,
-            "revision": snapshot.revision.to_string(),
-            "text": snapshot.text,
-        }))
+        let index = Self::rpc_document_index(
+            buffer_manager,
+            params.path.as_deref(),
+            params.document_id.as_deref(),
+        )?;
+        let buffer = &buffer_manager[index];
+        let mut snapshot = json!({
+            "path": buffer.file,
+            "revision": buffer.revision().to_string(),
+            "text": buffer.contents(),
+        });
+        if params.include_document_id {
+            snapshot["document_id"] = json!(buffer.id().as_u64().to_string());
+        }
+        Ok(snapshot)
     }
 
     async fn rpc_document_apply_request(
@@ -26151,9 +26211,11 @@ impl Editor {
                 "red/DocumentApply expected_revision must be a decimal u64 string",
             )
         })?;
-        let buffer_index =
-            Self::plugin_document_index(&self.buffer_manager, params.path.as_deref())
-                .map_err(|error| Self::rpc_error(-32001, error))?;
+        let buffer_index = Self::rpc_document_mutation_index(
+            &self.buffer_manager,
+            params.path.as_deref(),
+            params.document_id.as_deref(),
+        )?;
         let revision = self.buffer_manager[buffer_index].revision();
         if revision != expected_revision {
             return Err(Self::rpc_error(
@@ -26192,9 +26254,11 @@ impl Editor {
     ) -> std::result::Result<Value, plugin::rpc::RpcErrorObject> {
         let params: RpcDocumentUndoParams =
             Self::rpc_params(plugin::rpc::DOCUMENT_UNDO_METHOD, params)?;
-        let buffer_index =
-            Self::plugin_document_index(&self.buffer_manager, params.path.as_deref())
-                .map_err(|error| Self::rpc_error(-32001, error))?;
+        let buffer_index = Self::rpc_document_mutation_index(
+            &self.buffer_manager,
+            params.path.as_deref(),
+            params.document_id.as_deref(),
+        )?;
         self.undo_plugin_document_transaction(
             render_buffer,
             runtime,
@@ -37419,6 +37483,7 @@ builtin = "rust"
         );
         assert_eq!(response["text"], "hello");
         assert!(response.get("buffer_index").is_none());
+        assert!(response.get("document_id").is_none());
     }
 
     #[test]
@@ -37437,6 +37502,106 @@ builtin = "rust"
 
         assert_eq!(invalid.code, -32602);
         assert_eq!(unavailable.code, -32001);
+    }
+
+    #[test]
+    fn rpc_document_identity_survives_reindexing_and_rejects_conflicts() {
+        let mut editor = test_editor(/*width*/ 80, /*height*/ 24);
+        let first_id = editor.current_buffer().id().as_u64().to_string();
+        editor.buffer_manager.add_buffer(Buffer::new(
+            Some("second.txt".to_string()),
+            "second".to_string(),
+        ));
+        let second = Editor::rpc_document_snapshot_request(
+            &editor.buffer_manager,
+            &json!({"include_document_id": true}),
+        )
+        .unwrap();
+        let second_id = &second["document_id"];
+        assert_ne!(second_id, &json!(first_id));
+
+        for params in [
+            json!({"document_id": "invalid"}),
+            json!({"document_id": 1}),
+            json!({"document_id": first_id, "path": "second.txt"}),
+        ] {
+            let error =
+                Editor::rpc_document_snapshot_request(&editor.buffer_manager, &params).unwrap_err();
+            assert_eq!(error.code, -32602, "{params}");
+        }
+
+        editor.buffer_manager.remove_buffer(0);
+        let reindexed = Editor::rpc_document_snapshot_request(
+            &editor.buffer_manager,
+            &json!({"document_id": second_id, "include_document_id": true}),
+        )
+        .unwrap();
+        assert_eq!(reindexed, second);
+        let closed = Editor::rpc_document_snapshot_request(
+            &editor.buffer_manager,
+            &json!({"document_id": first_id}),
+        )
+        .unwrap_err();
+        assert_eq!(closed.code, -32001);
+    }
+
+    #[tokio::test]
+    async fn rpc_document_identity_prevents_edits_and_undo_after_switching_buffers() {
+        let mut editor = test_editor(/*width*/ 80, /*height*/ 24);
+        let document_id = editor.current_buffer().id().as_u64().to_string();
+        let revision = editor.current_buffer().revision();
+        let mut render_buffer = RenderBuffer::new(80, 24, &Style::default());
+        let mut runtime = Runtime::new();
+        macro_rules! request {
+            ($method:expr, $params:expr) => {
+                editor.rpc_host_request(
+                    &mut render_buffer,
+                    &mut runtime,
+                    "rpc-test",
+                    $method,
+                    &$params,
+                )
+            };
+        }
+        let apply = json!({
+            "document_id": document_id,
+            "expected_revision": revision.to_string(),
+            "edits": [{
+                "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 5}},
+                "text": "world"
+            }]
+        });
+        editor
+            .buffer_manager
+            .add_buffer(Buffer::new(None, "hello".to_string()));
+        assert_eq!(editor.current_buffer().revision(), revision);
+        let rejected = request!(plugin::rpc::DOCUMENT_APPLY_METHOD, apply)
+            .await
+            .unwrap_err();
+        assert_eq!(rejected.code, -32003);
+        assert_eq!(editor.buffer_manager.active_index(), 1);
+        assert_eq!(editor.buffer_manager[0].contents(), "hello");
+        assert_eq!(editor.buffer_manager[1].contents(), "hello");
+        assert!(!editor.current_buffer().is_dirty());
+
+        editor.buffer_manager.set_active_index(0);
+        let applied = request!(plugin::rpc::DOCUMENT_APPLY_METHOD, apply)
+            .await
+            .unwrap();
+        let undo = json!({"document_id": document_id, "transaction_id": applied["transaction_id"]});
+        editor.buffer_manager.set_active_index(1);
+        let rejected = request!(plugin::rpc::DOCUMENT_UNDO_METHOD, undo)
+            .await
+            .unwrap_err();
+        assert_eq!(rejected.code, -32003);
+        assert_eq!(editor.buffer_manager.active_index(), 1);
+        assert_eq!(editor.buffer_manager[0].contents(), "world");
+        assert_eq!(editor.current_buffer().contents(), "hello");
+        editor.buffer_manager.set_active_index(0);
+        request!(plugin::rpc::DOCUMENT_UNDO_METHOD, undo)
+            .await
+            .unwrap();
+        assert_eq!(editor.current_buffer().contents(), "hello");
     }
 
     #[tokio::test]
