@@ -628,11 +628,17 @@ class JsonWorkbenchTest(unittest.TestCase):
             )
             plugin.reply(content)
             plugin.expect_status("JSON: ready (12 B)")
-            time.sleep(0.01)
 
             plugin.send_picker_event(reopened, "run-path")
-            plugin.command("copy", "JsonCopy")
-            copied = plugin.expect_host_request("red/ClipboardWrite")
+            for attempt in range(20):
+                plugin.command(f"copy-{attempt}", "JsonCopy")
+                copied = plugin.receive()
+                if copied.get("error", {}).get("message") != "JSON Workbench is busy":
+                    break
+                time.sleep(0.01)
+            else:
+                self.fail("JSON Workbench remained busy after its result was ready")
+            self.assertEqual(copied["method"], "red/ClipboardWrite")
             self.assertEqual(copied["params"], {"text": '{"ok":true}\n'})
             plugin.reply(copied)
             plugin.expect_message("JSON result copied", "success")
