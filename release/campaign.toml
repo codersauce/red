@@ -1,44 +1,44 @@
 schema_version = 1
-version = "0.9.0"
-headline = "TypeScript and ESLint together, plugins in your language"
-summary = "Red v0.9.0 lets multiple language servers work on the same file and adds a JSON-RPC plugin interface for external programs. JSON Workbench demonstrates the new interface with live jq queries and reviewable document transformations."
+version = "0.9.1"
+headline = "More reliable completion, symbol search, and plugins"
+summary = "Red v0.9.1 fixes completion after punctuation and keeps large language-server results from stopping plugins. It also makes plugin failures easier to diagnose and improves terminal command output."
 website = "https://github.com/codersauce/red/releases/latest"
 
-x_post = """{launch}. Run TypeScript and ESLint together, write plugins in your language over JSON-RPC, and explore JSON with the installable jq-powered JSON Workbench.
+x_post = """{launch}. Fixes for completion after punctuation and large symbol searches, clearer plugin startup and failure messages, and an in-editor plugin status view.
 
 {url}"""
-bluesky_post = """{launch}. TypeScript and ESLint can share a buffer. Build plugins in your language over JSON-RPC, or try the installable JSON Workbench for live jq previews and undoable transformations.
+bluesky_post = """{launch}. A maintenance release for completion, large symbol searches, and plugin memory handling. Inspect current-session plugin state with :plugin-status, and get clearer startup and failure messages.
 
 {url}"""
 
 [[stories]]
-id = "multiple-language-servers"
-title = "Use TypeScript and ESLint together"
-summary = "Attach multiple configured language servers to the same document. Diagnostics and code actions are combined, while completion, hover, and navigation use a capable server. Install the server executables and configure ESLint in Red's user config; attachment is automatic afterward. External Prettier formatting keeps its precedence."
-status = "new"
-pull_requests = [383]
-channels = ["github", "discord", "x", "bluesky", "in_app"]
-
-[[stories]]
-id = "json-rpc-plugins"
-title = "Write plugins in your language"
-summary = "Run external plugins as supervised JSON-RPC processes over stdio. Plugins can contribute commands, panels, pickers, statusline content, and revision-checked document edits, with owner-scoped configuration and storage. Existing Husk plugins remain supported."
-status = "new"
-pull_requests = [380]
-channels = ["github", "discord", "x", "bluesky", "in_app"]
-
-[[stories]]
-id = "json-workbench"
-title = "Query and transform JSON with JSON Workbench"
-summary = "Install the example plugin to run jq filters against a pinned document or selection, edit queries with live previews, explore results, and apply or undo checked transformations. Saved query history, result documents, and copying are included. Requires Python 3.9 or newer and jq on PATH; the plugin is installed separately."
-status = "new"
-pull_requests = [381]
-channels = ["github", "discord", "x", "bluesky", "in_app"]
-
-[[stories]]
-id = "wasmtime-security-update"
-title = "Update the WebAssembly runtime"
-summary = "Wasmtime is updated to 48.0.6, addressing the security advisories reported against the previously pinned 48.0.5 release."
+id = "punctuation-completion"
+title = "Keep member completion working as you type"
+summary = "Typing through a completion and continuing with punctuation preserves the period and requests members after the updated text reaches the language server. Late completion responses no longer discard punctuation or dismiss the new member menu."
 status = "improved"
-pull_requests = [384]
+pull_requests = [390]
+channels = ["github", "discord", "x", "bluesky", "in_app"]
+
+[[stories]]
+id = "large-symbol-results"
+title = "Search large symbol lists without stopping the plugin"
+summary = "Large symbol and reference results are trimmed to fit the receiving plugin's memory budget, with the original count retained for truncated-result messages. Other oversized request results produce a warning rather than stopping the plugin. Shared arrays and maps are counted once against the Husk heap while new copies still respect the limit."
+status = "improved"
+pull_requests = [393, 398, 399]
+channels = ["github", "discord", "in_app"]
+
+[[stories]]
+id = "plugin-diagnostics"
+title = "Inspect plugin state and understand startup failures"
+summary = "Run :plugin-status to inspect plugins in the current editor session, including starting, active, disabled, and quarantined states. Startup notices explain pending commands, executable failures retain their cause, and commands from stopped plugins explain why they are unavailable."
+status = "new"
+pull_requests = [396, 400]
+channels = ["github", "discord", "in_app"]
+
+[[stories]]
+id = "terminal-output"
+title = "Read terminal command output more easily"
+summary = "Plugin lists and catalog results use aligned columns measured in terminal display width, including Unicode text. Utility commands share consistent styling, and closed output pipes exit quietly."
+status = "improved"
+pull_requests = [391]
 channels = ["github", "discord", "in_app"]
