@@ -2110,10 +2110,11 @@ impl RuntimeHeap {
     }
 
     fn set_cell(&mut self, handle: CellHandle, value: Value) -> anyhow::Result<()> {
-        let HeapObject::Cell(current) = self.object(handle)? else {
+        let HeapObject::Cell(cell) = self.object_mut(handle)? else {
             anyhow::bail!("Husk heap handle does not refer to a cell");
         };
-        let current = current.clone();
+        // Take the old value out instead of cloning it: strings and JSON clone deeply.
+        let current = std::mem::replace(cell, Value::Unit);
         // Charge the new value before releasing the old one, so storage they
         // share stays counted instead of being released and charged again.
         let new_bytes = self.shared.acquire(&value);
@@ -2125,16 +2126,20 @@ impl RuntimeHeap {
         if next_bytes > self.max_bytes {
             self.shared.acquire(&current);
             self.shared.release(&value);
+            let live_without_old = self.live_bytes.saturating_sub(old_bytes);
+            let HeapObject::Cell(cell) = self.object_mut(handle)? else {
+                unreachable!("cell kind was checked above");
+            };
+            *cell = current;
             anyhow::bail!(
-                "Husk heap byte limit exceeded (value needs {new_bytes} bytes with {} of {} bytes live)",
-                self.live_bytes.saturating_sub(old_bytes),
+                "Husk heap byte limit exceeded (value needs {new_bytes} bytes with {live_without_old} of {} bytes live)",
                 self.max_bytes
             );
         }
-        let HeapObject::Cell(current) = self.object_mut(handle)? else {
-            unreachable!("cell kind was checked before taking a mutable borrow");
+        let HeapObject::Cell(cell) = self.object_mut(handle)? else {
+            unreachable!("cell kind was checked above");
         };
-        *current = value;
+        *cell = value;
         self.live_bytes = next_bytes;
         Ok(())
     }
@@ -2352,10 +2357,10 @@ pub fn heap_value_size(value: &Value) -> usize {
             .iter()
             .map(heap_value_size)
             .fold(0, usize::saturating_add),
-        Value::Object(values) | Value::Struct { fields: values, .. } => values
-            .iter()
-            .map(|(name, value)| name.len().saturating_add(heap_value_size(value)))
-            .fold(0, usize::saturating_add),
+        Value::Object(values) => heap_fields_size(values),
+        Value::Struct { type_name, fields } => {
+            type_name.len().saturating_add(heap_fields_size(fields))
+        }
         Value::Variant {
             type_name,
             case,
@@ -2387,6 +2392,13 @@ pub fn heap_value_size(value: &Value) -> usize {
         | Value::Range { .. }
         | Value::Closure(_) => 0,
     })
+}
+
+fn heap_fields_size(fields: &BTreeMap<String, Value>) -> usize {
+    fields
+        .iter()
+        .map(|(name, value)| name.len().saturating_add(heap_value_size(value)))
+        .fold(0, usize::saturating_add)
 }
 
 fn heap_json_size(value: &serde_json::Value) -> usize {
@@ -7205,6 +7217,34 @@ mod tests {
                 .map(|index| Value::String(format!("value-{index:06}")))
                 .collect(),
         ))
+    }
+
+    #[test]
+    fn unshared_value_is_charged_exactly_its_heap_value_size() {
+        let value = Value::Struct {
+            type_name: "SymbolsResult".to_string(),
+            fields: Arc::new(BTreeMap::from([
+                ("ok".to_string(), Value::Bool(true)),
+                ("symbols".to_string(), shared_values(3)),
+                (
+                    "kind".to_string(),
+                    Value::Variant {
+                        type_name: "Kind".to_string(),
+                        case: "Function".to_string(),
+                        fields: Arc::new(vec![Value::Tuple(Arc::new(vec![Value::Int(1)]))]),
+                    },
+                ),
+                (
+                    "raw".to_string(),
+                    Value::Json(serde_json::json!({ "a": [1, "b"] })),
+                ),
+            ])),
+        };
+        let mut shared = SharedStorage::default();
+
+        assert_eq!(shared.acquire(&value), heap_value_size(&value));
+        assert_eq!(shared.release(&value), heap_value_size(&value));
+        assert!(shared.entries.is_empty());
     }
 
     #[test]
