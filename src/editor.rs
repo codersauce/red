@@ -30947,6 +30947,9 @@ impl Editor {
     ) -> anyhow::Result<()> {
         let continuation = self.coordinated_completion_continuation(item, commit_character);
         self.close_completion_popup();
+        // Taken before the rejections below: a lingering snapshot would let a
+        // delayed response past the dismissal guard and reopen the popup.
+        let snapshot = self.completion_snapshot.take();
         if !self.config.completion.enabled {
             return Ok(());
         }
@@ -30960,7 +30963,6 @@ impl Editor {
             ));
             return Ok(());
         }
-        let snapshot = self.completion_snapshot.take();
         if snapshot
             .as_ref()
             .is_some_and(|snapshot| !self.completion_snapshot_is_current(snapshot))
@@ -43768,6 +43770,153 @@ builtin = "rust"
             .unwrap();
 
         assert_eq!(editor.current_buffer().contents(), "torch.many");
+        assert!(editor.current_dialog.is_none());
+    }
+
+    /// Minimal client whose managed-server identity can change mid-test.
+    struct RestartableLsp {
+        instance: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    }
+
+    #[async_trait::async_trait]
+    impl LspClient for RestartableLsp {
+        async fn initialize(&mut self) -> Result<(), crate::lsp::LspError> {
+            Ok(())
+        }
+
+        async fn did_open(
+            &mut self,
+            _file: &str,
+            _contents: &str,
+        ) -> Result<(), crate::lsp::LspError> {
+            Ok(())
+        }
+
+        async fn did_change(
+            &mut self,
+            _file: &str,
+            _contents: String,
+        ) -> Result<(), crate::lsp::LspError> {
+            Ok(())
+        }
+
+        async fn request_diagnostics(
+            &mut self,
+            _file_uri: &str,
+        ) -> Result<Option<i64>, crate::lsp::LspError> {
+            Ok(None)
+        }
+
+        async fn send_request(
+            &mut self,
+            _method: &str,
+            _params: serde_json::Value,
+            _force: bool,
+        ) -> Result<i64, crate::lsp::LspError> {
+            Ok(0)
+        }
+
+        async fn send_notification(
+            &mut self,
+            _method: &str,
+            _params: serde_json::Value,
+            _force: bool,
+        ) -> Result<(), crate::lsp::LspError> {
+            Ok(())
+        }
+
+        async fn request_completion(
+            &mut self,
+            _file_uri: &str,
+            _line: usize,
+            _character: usize,
+            _trigger_character: Option<char>,
+        ) -> Result<i64, crate::lsp::LspError> {
+            Ok(0)
+        }
+
+        async fn recv_response(
+            &mut self,
+        ) -> Result<Option<(InboundMessage, Option<String>)>, crate::lsp::LspError> {
+            Ok(None)
+        }
+
+        fn get_server_capabilities(&self) -> Option<&ServerCapabilities> {
+            None
+        }
+
+        async fn shutdown(&mut self) -> Result<(), crate::lsp::LspError> {
+            Ok(())
+        }
+
+        fn server_instance_for_file(&self, _file: &str) -> Option<u64> {
+            Some(self.instance.load(std::sync::atomic::Ordering::SeqCst))
+        }
+    }
+
+    #[tokio::test]
+    async fn rejected_stale_completion_dismisses_the_session_for_late_responses() {
+        let instance = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1));
+        let config: Config = toml::from_str(include_str!("../default_config.toml")).unwrap();
+        let lsp = Box::new(RestartableLsp {
+            instance: std::sync::Arc::clone(&instance),
+        });
+        let buffer = Buffer::new(None, "torch.man".to_string());
+        let mut editor =
+            Editor::with_size(lsp, 80, 24, config, Theme::default(), vec![buffer]).unwrap();
+        editor.test_disable_terminal_output();
+        editor.mode = Mode::Insert;
+        editor.cx = "torch.man".chars().count();
+        editor.refresh_cursor_goal();
+        editor.sync_to_window();
+
+        let mut stale_item = completion_item("manual_seed");
+        stale_item.source = Some(LspRequestSource {
+            key: "torch.py".to_string(),
+            instance: 1,
+        });
+        let request_snapshot = editor.completion_snapshot();
+        assert!(editor.show_completion_items(vec![stale_item], request_snapshot));
+        let pending_snapshot = editor.completion_snapshot.clone().unwrap();
+        editor.pending_completions.insert(
+            42,
+            PendingCompletion {
+                buffer_items: Vec::new(),
+                snapshot: pending_snapshot,
+                displayed_immediately: true,
+                superseded: false,
+            },
+        );
+
+        // The server restarts between displaying the menu and accepting the item.
+        instance.store(2, std::sync::atomic::Ordering::SeqCst);
+        let mut render_buffer = RenderBuffer::new(80, 24, &Style::default());
+        let mut runtime = Runtime::new();
+        editor
+            .process_editor_event(
+                Event::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)),
+                &mut render_buffer,
+                &mut runtime,
+                EventRenderMode::Immediate,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(editor.current_buffer().contents(), "torch.man");
+        assert!(editor.current_dialog.is_none());
+        assert!(editor.completion_snapshot.is_none());
+
+        let late_response = InboundMessage::Message(ResponseMessage {
+            id: 42,
+            result: serde_json::json!([{ "label": "manual" }]),
+            request: Some(crate::lsp::Request::new(
+                "textDocument/completion",
+                serde_json::json!({ "position": { "line": 0, "character": 9 } }),
+            )),
+        });
+        assert!(editor
+            .handle_lsp_message(&late_response, Some("textDocument/completion".to_string()))
+            .is_none());
         assert!(editor.current_dialog.is_none());
     }
 
