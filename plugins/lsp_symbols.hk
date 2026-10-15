@@ -130,8 +130,6 @@ fn state() -> LspSymbolsState {
 }
 
 // Pickers show at most this many rows, so batches never retain more records.
-// Slice results before passing them to a helper: every binding of an array is
-// charged its full size against the plugin heap, even though the data is shared.
 fn max_batch_records() -> i32 {
     return 4096;
 }
@@ -527,7 +525,7 @@ fn symbol_batch_timeout(event: TimerEvent) {
         processed = processed + 1;
     }
 
-    // Keep the growing result out of helper-call frames and extend it once per batch.
+    // Extend the stored items once per batch, not once per record.
     let current = state();
     let items: [PickerItem] = red::extend(red::state("lsp_symbol_batch_items"), batch);
     red::state_set("lsp_symbol_batch_items", items);
