@@ -66,10 +66,12 @@ disable_ai = false
 # Master switch for language-server diagnostics in the editor UI.
 show_diagnostics = true
 
-# Check once per day and notify when a stable Red release is available.
-# Set mode to "off" to disable automatic checks; :update remains available.
+# Check once per day and install a newer stable Red release in the background.
+# Running sessions keep their version until restarted. Set mode to "notify" to
+# only announce new releases, or "off" to disable automatic checks; :update
+# remains available.
 [updates]
-mode = "notify"
+mode = "auto"
 
 [diagnostics]
 # Show one severity-aware sign beside the line number. Supported icon styles

@@ -71,13 +71,14 @@ red update --check
 red update
 ```
 
-Inside the editor, use `:update` or **Update Red** in the command palette. Red checks
-once per day by default and only notifies; it never installs a release unattended.
+Inside the editor, use `:update` or **Update Red** in the command palette. By default
+Red checks once per day and installs a newer stable release in the background after
+verifying its signed checksums; running sessions keep their version until restarted.
 Homebrew installations use `brew upgrade codersauce/tap/red`; source builds use
 your existing build process. If you installed Red before v0.8.2 or extracted an
 archive manually, rerun the official installer once into the same directory to
 enable managed updates. See [Updating Red](docs/UPDATING.md) for migration commands,
-restart behavior, and disabling automatic checks.
+restart behavior, and switching to notify-only or disabling automatic checks.
 
 Agent support is optional. It requires Codex CLI 0.144.1 or newer and a
 completed `codex login`.
@@ -223,8 +224,9 @@ scrolloff = 8
 # fetch_release_notes = false
 
 [updates]
-# Set to "off" to disable the daily stable-release check.
-mode = "notify"
+# "auto" installs new stable releases in the background, "notify" only announces
+# them, and "off" disables the daily check.
+mode = "auto"
 
 [search]
 ignorecase = true

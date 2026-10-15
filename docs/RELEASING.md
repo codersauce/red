@@ -108,7 +108,7 @@ automatically posted announcement.
    section that identifies first-time contributors.
 7. Review the draft GitHub release and confirm:
    - all four archives are attached
-   - `SHA256SUMS.txt` is attached
+   - `SHA256SUMS.txt` and `SHA256SUMS.txt.minisig` are attached
    - `install.sh` and `install.ps1` are attached
    - install instructions match the release tag
    - the curated flagship stories lead the complete changelog
@@ -188,5 +188,10 @@ git push origin v0.2.0-rc1
   published. Draft releases intentionally do not update the tap.
 - If `brew install` fails checksum validation, compare the formula values with
   the release `SHA256SUMS.txt`.
+- If the **Sign checksums** step fails, confirm the `RED_MINISIGN_SECRET_KEY`
+  repository secret holds the unencrypted minisign secret key whose public half is
+  `install/release-signing.pub`. To rotate the key, add the new public key to
+  `RELEASE_PUBLIC_KEYS` in `src/update.rs` and ship that release signed with the old
+  key before switching the secret, so existing installations trust the new key.
 - If a tag was pushed with the wrong version, delete the draft release and tag,
   fix the version, and push a new tag before publishing anything.

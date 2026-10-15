@@ -284,6 +284,26 @@ jobs:
           cd dist
           sha256sum red-* > SHA256SUMS.txt
 
+      # Red's updater installs unattended only when a release key signed SHA256SUMS.txt for
+      # this exact tag. The public half lives in install/release-signing.pub and src/update.rs.
+      - name: Sign checksums
+        env:
+          RED_MINISIGN_SECRET_KEY: ${{ secrets.RED_MINISIGN_SECRET_KEY }}
+          TAG_NAME: ${{ github.event_name == 'workflow_dispatch' && inputs.tag_name || github.ref_name }}
+        run: |
+          set -euo pipefail
+          if [ -z "$RED_MINISIGN_SECRET_KEY" ]; then
+            echo "RED_MINISIGN_SECRET_KEY is required to sign release checksums." >&2
+            exit 1
+          fi
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq minisign
+          key="$RUNNER_TEMP/minisign.key"
+          trap 'rm -f "$key"' EXIT
+          (umask 077 && printf '%s\n' "$RED_MINISIGN_SECRET_KEY" > "$key")
+          minisign -S -s "$key" -m dist/SHA256SUMS.txt -t "red ${TAG_NAME} SHA256SUMS.txt"
+          minisign -V -p install/release-signing.pub -m dist/SHA256SUMS.txt
+
       - name: Prepare release metadata
         id: release
         run: |
@@ -295,6 +315,7 @@ jobs:
             prerelease_flag="--prerelease"
           fi
 
+          signing_key="$(tail -n 1 install/release-signing.pub)"
           previous_tag="$(git tag --sort=-version:refname | grep -v "^${tag}$" | head -n 1 || true)"
           changelog_url="https://github.com/${{ github.repository }}/commits/${tag}"
           if [[ -n "$previous_tag" ]]; then
@@ -333,7 +354,12 @@ jobs:
 
           ## Checksums
 
-          Download \`SHA256SUMS.txt\` from this release to verify archives.
+          Download \`SHA256SUMS.txt\` from this release to verify archives. Its signature,
+          \`SHA256SUMS.txt.minisig\`, verifies with [minisign](https://jedisct1.github.io/minisign/):
+
+          \`\`\`bash
+          minisign -Vm SHA256SUMS.txt -P ${signing_key}
+          \`\`\`
 
           ## Full Changelog
 

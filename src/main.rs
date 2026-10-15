@@ -90,6 +90,8 @@ async fn run() -> anyhow::Result<()> {
         Some(RootCommand::Update(update)) => {
             let message = if update.check {
                 red::update::check().await?
+            } else if update.auto {
+                red::update::automatic().await?
             } else {
                 red::update::install().await?
             };

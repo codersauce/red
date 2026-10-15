@@ -18,10 +18,17 @@ red update
 ```
 
 Inside the editor, run `:update` or choose **Update Red** in the command palette.
-You can continue editing while the update worker runs. The updater verifies the
-archive's published SHA-256 checksum, candidate version, and bundled runtime
-self-check before replacing the executable. It uses an exclusive installation
-lock to prevent concurrent updates.
+You can continue editing while the update worker runs. Before replacing the
+executable, the updater checks that:
+
+- `SHA256SUMS.txt` carries a minisign signature from Red's release key, issued
+  for that exact release tag
+- the downloaded archive matches its SHA-256 checksum
+- the new binary reports the expected version and passes its bundled runtime
+  self-check
+
+If any check fails, the installed executable stays unchanged. An exclusive
+installation lock prevents concurrent updates.
 
 Restart your editing sessions after a successful update. Running sessions keep
 their current version. If a detached session is active, save and stop it before
@@ -68,18 +75,40 @@ brew upgrade codersauce/tap/red
 For a source build, rebuild and reinstall using your existing build process.
 The standalone updater refuses to replace executables it doesn't own.
 
-## Disable automatic checks
+## Automatic updates
 
-Red checks at most once per day by default and only notifies you; it never
-installs a release unattended. Add this to `~/.config/red/config.toml` and restart
-Red to disable those checks:
+Red checks for a newer stable release at most once per day. By default it
+installs that release in the background, with the same verification as
+`red update`, and then tells you to restart. Sessions that are already running
+keep their version until you restart them.
+
+Red postpones the installation to the next day's check while another update or a
+detached session holds the installation. If an automatic installation fails, Red
+shows a warning, keeps the current version, and tries again the next day. Homebrew
+and source builds aren't replaced; Red only tells you when a release is available.
+
+To choose when updates are installed, set `mode` in `~/.config/red/config.toml`
+and restart Red:
 
 ```toml
 [updates]
-mode = "off"
+# "auto" (default) installs in the background, "notify" only announces new
+# releases, and "off" disables the daily check.
+mode = "notify"
 ```
 
-`red update --check`, `red update`, and `:update` remain available.
+`red update --check`, `red update`, and `:update` remain available in every mode.
+
+## Verify a release manually
+
+Each release publishes `SHA256SUMS.txt` and its minisign signature,
+`SHA256SUMS.txt.minisig`. Red's release public key is in
+[`install/release-signing.pub`](../install/release-signing.pub):
+
+```shell
+minisign -Vm SHA256SUMS.txt -p install/release-signing.pub
+shasum -a 256 -c SHA256SUMS.txt --ignore-missing
+```
 
 ## Next steps
 
