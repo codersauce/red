@@ -18773,7 +18773,7 @@ mod tests {
         assert_eq!(final_items[4_095].detail.as_deref(), Some("4096:4"));
         assert_eq!(
             final_status.as_deref(),
-            Some("4096 symbols (results truncated)")
+            Some("4096 symbols (results truncated: first 4096 of 4097)")
         );
 
         let timeout_count = runtime.pending_timeout_count();
@@ -19069,7 +19069,7 @@ mod tests {
         );
         assert_eq!(
             final_status.as_deref(),
-            Some("4096 references (results truncated)")
+            Some("4096 references (results truncated: first 4096 of 4097)")
         );
         assert!(!busy);
         assert!(runtime.poll_timer_callbacks().is_empty());
@@ -19229,6 +19229,87 @@ mod tests {
             .unwrap();
         assert!(runtime.picker_plugin(handle).is_none());
         assert!(ACTION_DISPATCHER.try_recv_request().is_none());
+    }
+
+    #[tokio::test]
+    async fn lsp_symbols_workspace_symbols_survive_results_larger_than_the_picker() {
+        drain_requests();
+
+        let mut runtime = Runtime::new();
+        load_lsp_symbols(&mut runtime).await;
+        runtime
+            .execute_command("LspWorkspaceSymbols")
+            .await
+            .unwrap();
+        let handle = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::OpenCallbackPicker { handle, .. } => handle,
+            _ => panic!("expected workspace-symbol picker"),
+        };
+        let request_id = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::WorkspaceSymbols { request_id, query } => {
+                assert_eq!(query, "");
+                request_id
+            }
+            _ => panic!("expected initial workspace-symbol request"),
+        };
+
+        // An uncapped empty-query response, as typescript-language-server sends for a
+        // large project. Retaining all of it once more exhausted the plugin heap.
+        runtime
+            .resolve_request(request_id, sample_symbol_payload_with_count(20_000))
+            .await
+            .unwrap();
+
+        let mut final_items = Vec::new();
+        let mut final_status = None;
+        let mut busy = true;
+        for _ in 0..80 {
+            while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
+                match request {
+                    PluginRequest::UpdatePickerItems { id, items } => {
+                        assert_eq!(id, handle.get());
+                        final_items = items;
+                    }
+                    PluginRequest::UpdatePickerStatus { id, status } => {
+                        assert_eq!(id, handle.get());
+                        final_status = status;
+                    }
+                    PluginRequest::UpdatePickerBusy {
+                        id,
+                        busy: next_busy,
+                    } => {
+                        assert_eq!(id, handle.get());
+                        busy = next_busy;
+                    }
+                    _ => panic!("unexpected request while batching workspace symbols"),
+                }
+            }
+            if !busy {
+                break;
+            }
+            for callback in runtime.poll_timer_callbacks() {
+                if let PluginRequest::TimeoutCallback { timer_id } = callback {
+                    runtime
+                        .notify(
+                            "timeout:callback",
+                            serde_json::json!({ "timer_id": timer_id }),
+                        )
+                        .await
+                        .unwrap();
+                }
+            }
+        }
+
+        assert!(!busy);
+        assert_eq!(final_items.len(), 4_096);
+        assert_eq!(final_items[4_095].label, "symbol_4095");
+        assert_eq!(
+            final_status.as_deref(),
+            Some("4096 symbols (results truncated: first 4096 of 20000; type to narrow)")
+        );
+        assert!(runtime
+            .notify_picker(handle, PickerCallback::Cancelled)
+            .unwrap());
     }
 
     #[tokio::test]
