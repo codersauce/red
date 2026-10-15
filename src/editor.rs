@@ -27384,10 +27384,18 @@ impl Editor {
 
     async fn execute_plugin_command(
         &mut self,
-        _render_buffer: &mut RenderBuffer,
+        render_buffer: &mut RenderBuffer,
         runtime: &mut Runtime,
         command: &str,
     ) -> anyhow::Result<()> {
+        if let Some(warning) = self
+            .plugin_registry
+            .quarantined_command_warning(runtime, command)
+        {
+            self.set_routine_foreground_message(Severity::Warning, warning);
+            self.draw_commandline(render_buffer);
+            return Ok(());
+        }
         let document = self.current_buffer().id();
         match self
             .plugin_registry

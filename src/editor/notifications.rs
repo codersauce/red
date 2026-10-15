@@ -156,13 +156,31 @@ impl Editor {
     }
 
     pub(super) fn set_foreground_message(&mut self, severity: Severity, message: Option<String>) {
+        self.publish_foreground_message(severity, None, message);
+    }
+
+    /// Leads the bottom line with the result of a command the user just ran,
+    /// without adding to the messages that need attention.
+    pub(super) fn set_routine_foreground_message(&mut self, severity: Severity, message: String) {
+        self.publish_foreground_message(severity, Some(AttentionPolicy::Quiet), Some(message));
+    }
+
+    fn publish_foreground_message(
+        &mut self,
+        severity: Severity,
+        attention: Option<AttentionPolicy>,
+        message: Option<String>,
+    ) {
         let Some(message) = message else {
             self.last_error = None;
             return;
         };
-        let notice = Notice::new(NotificationSource::Editor, severity, &message)
+        let mut notice = Notice::new(NotificationSource::Editor, severity, &message)
             .with_display_priority(DisplayPriority::Foreground)
             .with_details(&message);
+        if let Some(attention) = attention {
+            notice = notice.with_attention(attention);
+        }
         if let Err(error) = self.publish_notification(notice) {
             self.notification_fallback = Some(crate::notification::single_line(truncate_chars(
                 &message, 4_096,
@@ -924,6 +942,30 @@ mod tests {
         assert!(row.contains(":wa — no modified buffers"), "{row}");
         assert!(row.contains("1 needs attention"), "{row}");
         assert!(!row.contains("old diagnostics failure"), "{row}");
+    }
+
+    #[test]
+    fn routine_foreground_warning_leads_without_needing_attention() {
+        let mut editor = editor(120, 24);
+        editor
+            .publish_notification(Notice::new(
+                NotificationSource::Editor,
+                Severity::Error,
+                "plugin stopped",
+            ))
+            .unwrap();
+        editor.set_routine_foreground_message(
+            Severity::Warning,
+            "`Crash` is unavailable because plugin `crashy` was stopped".into(),
+        );
+
+        let mut buffer = RenderBuffer::new(120, 24, &Style::default());
+        editor.draw_commandline(&mut buffer);
+        let row = render_text_rows(&buffer).pop().unwrap();
+
+        assert!(row.contains("`Crash` is unavailable"), "{row}");
+        assert!(row.contains("1 needs attention"), "{row}");
+        assert!(!row.contains("plugin stopped"), "{row}");
     }
 
     #[test]

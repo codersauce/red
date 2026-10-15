@@ -74,7 +74,13 @@ pub struct PluginRegistry {
     rpc_statusline_dirty: bool,
     /// Commands of plugins at the time they were quarantined, keyed by command name,
     /// so invoking one explains why it is unavailable instead of calling it unknown.
-    quarantined_commands: HashMap<String, String>,
+    quarantined_commands: HashMap<String, QuarantinedCommand>,
+}
+
+struct QuarantinedCommand {
+    plugin: String,
+    /// Keeps panel key bindings able to reach the explanation for global commands.
+    scope: CommandScope,
 }
 
 struct RpcStatuslineContribution {
@@ -867,38 +873,82 @@ impl PluginRegistry {
             .registered_commands()
             .into_iter()
             .filter(|command| command.plugin == name)
-            .map(|command| command.name)
-            .collect::<Vec<_>>();
+            .map(|command| (command.name, command.metadata.scope))
+            .collect::<HashMap<_, _>>();
         if let Some(active) = self.rpc_plugins.get(name) {
-            commands.extend(active.commands.keys().cloned());
-        }
-        if let Some(metadata) = self.metadata.get(name) {
             commands.extend(
-                metadata
-                    .activation_events
+                active
+                    .commands
                     .iter()
-                    .filter_map(|event| event.strip_prefix("onCommand:"))
-                    .map(str::to_string),
+                    .map(|(command, metadata)| (command.clone(), metadata.scope)),
             );
         }
-        self.quarantined_commands.retain(|_, owner| owner != name);
-        for command in commands {
-            self.quarantined_commands.insert(command, name.to_string());
+        if let Some(metadata) = self.metadata.get(name) {
+            // Declared activation commands run from panels while pending
+            // (`has_pending_command`), so they keep that reach unless the plugin
+            // registered a narrower scope before it was quarantined.
+            for command in metadata
+                .activation_events
+                .iter()
+                .filter_map(|event| event.strip_prefix("onCommand:"))
+            {
+                commands
+                    .entry(command.to_string())
+                    .or_insert(CommandScope::Global);
+            }
+        }
+        self.quarantined_commands
+            .retain(|_, command| command.plugin != name);
+        for (command, scope) in commands {
+            self.quarantined_commands.insert(
+                command,
+                QuarantinedCommand {
+                    plugin: name.to_string(),
+                    scope,
+                },
+            );
         }
     }
 
-    /// Returns the quarantined plugin that owned `command`, if it is still quarantined.
-    fn quarantined_command_plugin(&self, command: &str) -> Option<&str> {
+    /// Returns the record for `command` if the plugin that owned it is still quarantined.
+    fn quarantined_command(&self, command: &str) -> Option<&QuarantinedCommand> {
         [command, crate::command::split_invocation(command).0]
             .into_iter()
             .find_map(|name| self.quarantined_commands.get(name))
-            .map(String::as_str)
-            .filter(|plugin| {
+            .filter(|quarantined| {
                 matches!(
-                    self.statuses.get(*plugin),
+                    self.statuses.get(&quarantined.plugin),
                     Some(PluginStatus::Quarantined { .. })
                 )
             })
+    }
+
+    /// Explains why `command` is unavailable when no active plugin provides it
+    /// and the plugin that did is quarantined.
+    pub(crate) fn quarantined_command_warning(
+        &self,
+        runtime: &Runtime,
+        command: &str,
+    ) -> Option<String> {
+        if self.command_plugin(runtime, command).is_some() {
+            return None;
+        }
+        let quarantined = self.quarantined_command(command)?;
+        self.quarantine_explanation(command, &quarantined.plugin)
+    }
+
+    fn quarantine_explanation(&self, command: &str, plugin: &str) -> Option<String> {
+        let name = if self.quarantined_commands.contains_key(command) {
+            command
+        } else {
+            crate::command::split_invocation(command).0
+        };
+        match self.statuses.get(plugin) {
+            Some(PluginStatus::Quarantined { diagnostic, .. }) => {
+                Some(quarantined_command_message(name, plugin, diagnostic))
+            }
+            _ => None,
+        }
     }
 
     async fn load_plugin(
@@ -1341,16 +1391,12 @@ impl PluginRegistry {
         }
         let owner = runtime.command_plugin(command);
         let Some(owner) = owner else {
-            let quarantined = pending
-                .map(|(plugin, _)| plugin)
-                .or_else(|| self.quarantined_command_plugin(command).map(str::to_string));
+            let quarantined = pending.map(|(plugin, _)| plugin).or_else(|| {
+                self.quarantined_command(command)
+                    .map(|quarantined| quarantined.plugin.clone())
+            });
             let warning = quarantined
-                .and_then(|plugin| match self.statuses.get(&plugin) {
-                    Some(PluginStatus::Quarantined { diagnostic, .. }) => {
-                        Some(quarantined_command_message(command, &plugin, diagnostic))
-                    }
-                    _ => None,
-                })
+                .and_then(|plugin| self.quarantine_explanation(command, &plugin))
                 .unwrap_or_else(|| format!("unknown plugin command `{command}`"));
             runtime.send_request(PluginRequest::Action(Action::PrintWarning(warning)));
             return Ok(());
@@ -1670,14 +1716,20 @@ impl PluginRegistry {
     }
 
     pub(crate) fn command_scope(&self, runtime: &Runtime, command: &str) -> Option<CommandScope> {
-        runtime.command_scope(command).or_else(|| {
-            let (plugin, name, _) = self.resolve_rpc_command(runtime, command)?;
-            self.rpc_plugins
-                .get(&plugin)?
-                .commands
-                .get(&name)
-                .map(|metadata| metadata.scope)
-        })
+        runtime
+            .command_scope(command)
+            .or_else(|| {
+                let (plugin, name, _) = self.resolve_rpc_command(runtime, command)?;
+                self.rpc_plugins
+                    .get(&plugin)?
+                    .commands
+                    .get(&name)
+                    .map(|metadata| metadata.scope)
+            })
+            .or_else(|| {
+                self.quarantined_command(command)
+                    .map(|quarantined| quarantined.scope)
+            })
     }
 
     pub(crate) fn registered_commands(&self, runtime: &Runtime) -> Vec<RegisteredPluginCommand> {
@@ -1745,7 +1797,7 @@ impl PluginRegistry {
     pub(crate) fn has_command(&self, runtime: &Runtime, command: &str) -> bool {
         self.command_plugin(runtime, command).is_some()
             || self.has_pending_command(command)
-            || self.quarantined_command_plugin(command).is_some()
+            || self.quarantined_command(command).is_some()
     }
 
     /// Activates the pending plugin that declares `command`, if any.
@@ -3487,6 +3539,15 @@ mod tests {
             assert!(registry.has_command(&runtime, command));
         }
         assert!(!registry.has_command(&runtime, "NeverRegistered"));
+        assert!(registry
+            .quarantined_command_warning(&runtime, "OpenPrompt extra args")
+            .is_some_and(|warning| warning.starts_with(
+                "`OpenPrompt` is unavailable because plugin `dialogs` was stopped: "
+            )));
+        assert_eq!(
+            registry.quarantined_command_warning(&runtime, "NeverRegistered"),
+            None
+        );
         registry.execute(&mut runtime, "OpenChoices").await.unwrap();
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
@@ -3540,6 +3601,10 @@ mod tests {
         expect_quarantine_notice("lazy");
         for _ in 0..2 {
             assert!(registry.has_command(&runtime, "LazyHello"));
+            assert_eq!(
+                registry.command_scope(&runtime, "LazyHello"),
+                Some(CommandScope::Global)
+            );
             assert!(matches!(
                 ACTION_DISPATCHER.recv_request(),
                 PluginRequest::Action(Action::PrintWarning(message))
@@ -3547,6 +3612,46 @@ mod tests {
             ));
             registry.execute(&mut runtime, "LazyHello").await.unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn quarantined_commands_keep_their_registered_scope() {
+        drain_requests();
+        let dir = tempfile_dir("quarantine-scope");
+        let plugin = dir.join("plugin.hk");
+        fs::write(
+            &plugin,
+            r#"
+                #[red::command(name = "GlobalCrash", scope = "global")]
+                fn global_crash() { red::execute("Print", 1 / 0); }
+
+                #[red::command(name = "EditorOnly")]
+                fn editor_only() {}
+            "#,
+        )
+        .unwrap();
+        let mut registry = PluginRegistry::new();
+        registry.add("scoped", plugin.to_str().unwrap());
+        let mut runtime = Runtime::new();
+        registry.initialize(&mut runtime).await.unwrap();
+        assert_eq!(
+            registry.command_scope(&runtime, "GlobalCrash"),
+            Some(CommandScope::Global)
+        );
+
+        registry.execute(&mut runtime, "GlobalCrash").await.unwrap();
+        expect_quarantine_notice("scoped");
+
+        assert_eq!(runtime.command_plugin("GlobalCrash"), None);
+        assert_eq!(
+            registry.command_scope(&runtime, "GlobalCrash"),
+            Some(CommandScope::Global)
+        );
+        assert_eq!(
+            registry.command_scope(&runtime, "EditorOnly"),
+            Some(CommandScope::Editor)
+        );
+        assert_eq!(registry.command_scope(&runtime, "NeverRegistered"), None);
     }
 
     #[tokio::test]
