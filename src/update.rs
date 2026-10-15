@@ -902,6 +902,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum Fault {
         None,
@@ -1162,6 +1163,7 @@ mod tests {
         assert!(verify_checksums(checksums, &signature, "v1.0.0", &keys[..1]).is_err());
     }
 
+    #[cfg(unix)]
     #[test]
     fn transient_lock_conflicts_are_deferred() {
         let directory = tempfile::TempDir::new().unwrap();
