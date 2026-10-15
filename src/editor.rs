@@ -51,6 +51,7 @@ mod navigation_perf_tests;
 mod notifications;
 mod package_actions;
 pub(crate) mod perf;
+mod plugin_status;
 pub mod render_buffer;
 pub mod rendering;
 #[cfg(test)]
@@ -2927,6 +2928,7 @@ pub enum Action {
     SaveStatuslineLayout(StatuslineConfig),
     CancelStatuslineLayout(StatuslineConfig),
     ConfigDiagnostics,
+    PluginStatus,
     ReloadLanguages,
     ShowDialog,
     CloseDialog,
@@ -17007,6 +17009,7 @@ impl Editor {
             | Action::OpenDiagnosticsPicker
             | Action::OpenErrorDiagnosticsPicker
             | Action::ConfigDiagnostics
+            | Action::PluginStatus
             | Action::Suspend
             | Action::ViewLogs
             | Action::OpenMessages
@@ -17506,6 +17509,9 @@ impl Editor {
         }
         if cmd == "config-diagnostics" {
             return vec![Action::ConfigDiagnostics];
+        }
+        if cmd == "plugin-status" {
+            return vec![Action::PluginStatus];
         }
         if matches!(
             cmd,
@@ -23783,6 +23789,11 @@ impl Editor {
                 self.open_config_diagnostics();
                 self.render(buffer)?;
             }
+            Action::PluginStatus => {
+                self.release_current_dialog_callbacks(runtime);
+                self.open_plugin_status();
+                self.render(buffer)?;
+            }
             Action::ReloadLanguages => {
                 match self.reload_languages().await {
                     Ok(count) => {
@@ -27420,7 +27431,20 @@ impl Editor {
             .start_rpc_command(runtime, command, document)
             .await
         {
-            Ok(Some(token)) => self.rpc_commands.started(token),
+            Ok(Some(token)) => {
+                if token.awaits_activation(&self.plugin_registry) {
+                    let name = crate::command::split_invocation(command).0;
+                    self.set_routine_foreground_message(
+                        Severity::Info,
+                        format!(
+                            "plugin `{}` is starting; `{name}` runs once it is ready",
+                            token.owner()
+                        ),
+                    );
+                    self.draw_commandline(render_buffer);
+                }
+                self.rpc_commands.started(token);
+            }
             Ok(None) => return self.plugin_registry.execute(runtime, command).await,
             Err(error) => runtime.send_request(PluginRequest::Action(Action::PrintWarning(
                 error.to_string(),

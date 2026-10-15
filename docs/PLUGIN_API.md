@@ -499,8 +499,10 @@ Codex app-server updates other than assistant text chunks are forwarded to plugi
 ## Quarantine and self-check
 
 Plugins load independently. Source, version, dependency, compile, activation, and runtime
-failures quarantine only their owner. `red --self-check` prints every bundled plugin's
-status. Required plugin dependencies must be active or the dependent plugin is
+failures quarantine only their owner. In the editor, `:plugin-status` lists every
+configured plugin's state for the session (active, starting, loads on first use,
+disabled, or quarantined), with the stage and full reason for each quarantine.
+`red --self-check` prints every bundled plugin's status. Required plugin dependencies must be active or the dependent plugin is
 quarantined with the dependency chain. A request result too large for a plugin's memory
 does not quarantine it; see [Oversized request results](#oversized-request-results).
 

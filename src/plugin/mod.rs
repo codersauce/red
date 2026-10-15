@@ -46,7 +46,9 @@ pub use panel::{
     TextPanelBlockKind, TextPanelComposerConfig, TextPanelComposerSnapshot, TextPanelHeaderAction,
     TextPanelHeaderDetail, TextPanelSessionSnapshot, TextPanelSnapshotFocus, TextPanelStatus,
 };
-pub(crate) use registry::{quarantine_reason, RpcCommandToken, RpcHost};
+pub(crate) use registry::{
+    quarantine_reason, PluginSessionState, PluginStatusRow, RpcCommandToken, RpcHost,
+};
 pub use registry::{PluginRegistry, PluginStatus, RED_HOST_API_VERSION};
 pub use runtime::{
     CommandMetadata, CommandScope, ComposerHandle, PickerHandle, RegisteredPluginCommand,

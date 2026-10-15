@@ -165,6 +165,19 @@ impl RpcCommandToken {
         self.id
     }
 
+    pub(crate) fn owner(&self) -> &str {
+        &self.owner
+    }
+
+    /// Whether this command is queued behind its plugin's startup handshake.
+    pub(crate) fn awaits_activation(&self, registry: &PluginRegistry) -> bool {
+        registry
+            .rpc_activations
+            .get(&self.owner)
+            .and_then(|plugin| plugin.command.as_ref())
+            .is_some_and(|command| command.id == self.id)
+    }
+
     pub(crate) fn is_pending(&self, registry: &PluginRegistry) -> bool {
         let active = registry
             .rpc_plugins
@@ -272,6 +285,41 @@ pub(crate) const SUPPORTED_HOST_API_VERSIONS: &[&str] = &[
 struct PluginModification {
     source: Option<SystemTime>,
     metadata: Option<SystemTime>,
+}
+
+/// One configured plugin's state, as the `:plugin-status` view shows it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PluginStatusRow {
+    pub(crate) name: String,
+    pub(crate) path: String,
+    pub(crate) state: PluginSessionState,
+    pub(crate) status: PluginStatus,
+}
+
+/// [`PluginStatus`] refined with whether a pending plugin is starting or lazy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum PluginSessionState {
+    Quarantined,
+    ReloadRejected,
+    Starting,
+    Pending,
+    Active,
+    LoadsOnFirstUse,
+    Disabled,
+}
+
+impl PluginSessionState {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Quarantined => "quarantined",
+            Self::ReloadRejected => "active, reload rejected",
+            Self::Starting => "starting",
+            Self::Pending => "pending",
+            Self::Active => "active",
+            Self::LoadsOnFirstUse => "loads on first use",
+            Self::Disabled => "disabled",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -612,6 +660,41 @@ impl PluginRegistry {
     /// Returns current lifecycle status keyed by plugin name.
     pub fn statuses(&self) -> &HashMap<String, PluginStatus> {
         &self.statuses
+    }
+
+    /// Describes each configured plugin's session state, in configuration order.
+    pub(crate) fn status_rows(&self) -> Vec<PluginStatusRow> {
+        self.plugins
+            .iter()
+            .map(|(name, path)| {
+                let status = self
+                    .statuses
+                    .get(name)
+                    .cloned()
+                    .unwrap_or(PluginStatus::Pending);
+                let state = match &status {
+                    PluginStatus::Pending if self.rpc_activations.contains_key(name) => {
+                        PluginSessionState::Starting
+                    }
+                    PluginStatus::Pending if self.metadata.get(name).is_some_and(is_lazy) => {
+                        PluginSessionState::LoadsOnFirstUse
+                    }
+                    PluginStatus::Pending => PluginSessionState::Pending,
+                    PluginStatus::Active => PluginSessionState::Active,
+                    PluginStatus::ActiveWithReloadError { .. } => {
+                        PluginSessionState::ReloadRejected
+                    }
+                    PluginStatus::Disabled => PluginSessionState::Disabled,
+                    PluginStatus::Quarantined { .. } => PluginSessionState::Quarantined,
+                };
+                PluginStatusRow {
+                    name: name.clone(),
+                    path: plugin_display_path(path),
+                    state,
+                    status,
+                }
+            })
+            .collect()
     }
 
     fn set_status(&mut self, name: String, status: PluginStatus) {
@@ -1479,11 +1562,11 @@ impl PluginRegistry {
             .rpc_activations
             .get_mut(owner)
             .expect("pending RPC plugin activation");
+        let (name, raw_args) = crate::command::split_invocation(command);
         anyhow::ensure!(
             pending.command.is_none() && pending.notifications.is_empty(),
-            "RPC plugin `{owner}` is busy"
+            "plugin `{owner}` is still starting and already has a command waiting; run `{name}` again once it is ready"
         );
-        let (name, raw_args) = crate::command::split_invocation(command);
         let id = pending.task.id();
         pending.command = Some(PendingRpcInvocation {
             id,
@@ -3069,6 +3152,63 @@ mod tests {
             Some(PluginStatus::Quarantined { stage, diagnostic, .. })
                 if stage == "source" && diagnostic.contains(&expected_error)
         ));
+    }
+
+    #[tokio::test]
+    async fn status_rows_describe_each_plugin_in_configuration_order() {
+        drain_requests();
+
+        let dir = tempfile_dir("status-rows");
+        let lazy = dir.join("lazy");
+        fs::create_dir_all(&lazy).unwrap();
+        let manifest = lazy.join(PLUGIN_MANIFEST_FILE);
+        fs::write(
+            &manifest,
+            r#"
+                schema_version = 1
+
+                [plugin]
+                id = "lazy"
+                name = "Lazy"
+                version = "0.1.0"
+                red_api = "^0.19.0"
+
+                [rpc]
+                command = "missing-status-rows-plugin"
+
+                [activation]
+                commands = ["Lazy"]
+            "#,
+        )
+        .unwrap();
+        let working = dir.join("working.hk");
+        fs::write(&working, "pub fn activate() {}").unwrap();
+        let broken = dir.join("broken.hk");
+        fs::write(&broken, "pub fn activate( {").unwrap();
+        let mut registry = PluginRegistry::new();
+        registry.add("working", working.to_str().unwrap());
+        registry.add("lazy", manifest.to_str().unwrap());
+        registry.add("broken", broken.to_str().unwrap());
+        let mut runtime = Runtime::new();
+
+        registry.initialize(&mut runtime).await.unwrap();
+        let rows = registry.status_rows();
+
+        assert_eq!(
+            rows.iter()
+                .map(|row| (row.name.as_str(), row.state))
+                .collect::<Vec<_>>(),
+            vec![
+                ("working", PluginSessionState::Active),
+                ("lazy", PluginSessionState::LoadsOnFirstUse),
+                ("broken", PluginSessionState::Quarantined),
+            ]
+        );
+        assert!(matches!(
+            &rows[2].status,
+            PluginStatus::Quarantined { diagnostic, .. } if diagnostic.contains("HUSK-P0001")
+        ));
+        assert_eq!(rows[0].path, plugin_display_path(working.to_str().unwrap()));
     }
 
     #[tokio::test]

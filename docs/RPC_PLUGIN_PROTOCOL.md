@@ -249,6 +249,11 @@ swap. Notifications and host responses enter the bounded writer queue without
 waiting for a child pipe acknowledgement. Eager plugins still initialize before
 the editor first opens.
 
+A plugin must answer `initialize` within 5 seconds, or Red quarantines it. The
+command that starts a lazy plugin waits for that answer, and Red shows that the
+plugin is starting. Another command for the same plugin is rejected with a
+"still starting" warning until the first one runs.
+
 ## Configuration and storage
 
 `red/ConfigGet` accepts an empty object and returns the calling plugin's value

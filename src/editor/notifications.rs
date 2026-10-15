@@ -224,7 +224,7 @@ impl Editor {
             "Plugin: {plugin}\nStage: {stage}\nSource: {path}\n\n{diagnostic}\n\n\
              Red stopped this plugin for the rest of the session, so its commands and dialogs \
              are unavailable. Restart Red to load it again. If you are developing this \
-             plugin, saving a fix reloads it."
+             plugin, saving a fix reloads it. Run :plugin-status to see every plugin's state."
         );
         self.publish_plugin_notice(plugin, Severity::Error, "quarantine", summary, details);
     }
