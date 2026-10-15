@@ -19,6 +19,7 @@ pub mod agent_tools;
 pub mod assets;
 pub mod buffer;
 pub mod cli;
+pub mod cli_style;
 pub mod clipboard;
 pub mod codex;
 pub mod color;

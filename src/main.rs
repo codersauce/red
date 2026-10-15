@@ -29,6 +29,7 @@ use crossterm::{style, QueueableCommand};
 use red::assets;
 use red::buffer::Buffer;
 use red::cli::{Args, LanguageCommand, PluginCommand, RootCommand};
+use red::cli_style;
 use red::config::{
     Config, ConfigDiagnosticSeverity, ConfigRecovery, KeyAction, Keys, LoadedConfig,
 };
@@ -400,7 +401,17 @@ async fn run_plugin_command(command: &PluginCommand) -> anyhow::Result<()> {
                     target.to_string(),
                 ]);
             }
-            print_plugin_table(["NAME", "VERSION", "TIER", "STATUS", "TARGET"], &rows);
+            print_plugin_table(
+                ["NAME", "VERSION", "TIER", "STATUS", "TARGET"],
+                &rows,
+                [
+                    style_bold,
+                    style_plain,
+                    style_tier,
+                    style_status,
+                    style_target,
+                ],
+            );
         }
         PluginCommand::List => {
             let plugins = manager.list()?;
@@ -430,7 +441,17 @@ async fn run_plugin_command(command: &PluginCommand) -> anyhow::Result<()> {
                 })
                 .collect();
             if !rows.is_empty() {
-                print_plugin_table(["NAME", "VERSION", "STATE", "STATUS", "MODALITY"], &rows);
+                print_plugin_table(
+                    ["NAME", "VERSION", "STATE", "STATUS", "MODALITY"],
+                    &rows,
+                    [
+                        style_bold,
+                        style_plain,
+                        style_status,
+                        style_status,
+                        style_dim,
+                    ],
+                );
             }
         }
         PluginCommand::Update(arguments) if arguments.all => {
@@ -487,31 +508,87 @@ async fn run_plugin_command(command: &PluginCommand) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Maps a cell's text to the ANSI code it should be painted with, if any.
+type CellStyle = fn(&str) -> Option<&'static str>;
+
+fn style_plain(_cell: &str) -> Option<&'static str> {
+    None
+}
+
+fn style_bold(_cell: &str) -> Option<&'static str> {
+    Some(cli_style::BOLD)
+}
+
+fn style_dim(_cell: &str) -> Option<&'static str> {
+    Some(cli_style::DIM)
+}
+
+/// Accent trusted official packages; fade the rest.
+fn style_tier(cell: &str) -> Option<&'static str> {
+    if cell == "Official" {
+        Some(cli_style::CYAN)
+    } else {
+        Some(cli_style::DIM)
+    }
+}
+
+fn style_status(cell: &str) -> Option<&'static str> {
+    match cell {
+        "compatible" | "enabled" => Some(cli_style::GREEN),
+        "incompatible" => Some(cli_style::RED),
+        "disabled" => Some(cli_style::DIM),
+        _ => None,
+    }
+}
+
+/// Fade the host triple, which repeats on every row, so a missing artifact
+/// stands out.
+fn style_target(cell: &str) -> Option<&'static str> {
+    if cell == "unavailable" {
+        Some(cli_style::YELLOW)
+    } else {
+        Some(cli_style::DIM)
+    }
+}
+
 /// Prints rows as space-aligned columns under an uppercase header, sizing each
 /// column to its widest cell so long plugin ids do not break the alignment.
-fn print_plugin_table<const N: usize>(header: [&str; N], rows: &[[String; N]]) {
+/// Widths are measured on the plain text and ANSI codes are applied afterward
+/// (and only on a TTY without `NO_COLOR`), so styling never skews the columns.
+fn print_plugin_table<const N: usize>(
+    header: [&str; N],
+    rows: &[[String; N]],
+    styles: [CellStyle; N],
+) {
+    let use_color = cli_style::stdout_color_enabled();
     let mut widths: [usize; N] = header.map(str::len);
     for row in rows {
         for (width, cell) in widths.iter_mut().zip(row) {
             *width = (*width).max(cell.len());
         }
     }
-    let print_row = |cells: [&str; N]| {
+    let print_row = |cells: [&str; N], codes: [Option<&'static str>; N]| {
         let mut line = String::new();
-        for (index, (cell, width)) in cells.iter().zip(widths).enumerate() {
+        for (index, ((cell, width), code)) in cells.iter().zip(widths).zip(codes).enumerate() {
             if index > 0 {
                 line.push_str("  ");
             }
-            line.push_str(cell);
+            match code {
+                Some(code) => line.push_str(&cli_style::paint(code, cell, use_color)),
+                None => line.push_str(cell),
+            }
             if index + 1 < N {
                 line.extend(std::iter::repeat_n(' ', width - cell.len()));
             }
         }
         println!("{line}");
     };
-    print_row(header);
+    print_row(header, [Some(cli_style::DIM); N]);
     for row in rows {
-        print_row(std::array::from_fn(|index| row[index].as_str()));
+        print_row(
+            std::array::from_fn(|index| row[index].as_str()),
+            std::array::from_fn(|index| styles[index](&row[index])),
+        );
     }
 }
 

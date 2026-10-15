@@ -10,6 +10,7 @@ use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 
 use crate::assets;
+use crate::cli_style::{color_enabled, paint, BOLD, CYAN, DIM, GREEN};
 
 /// Result of the onboarding flow.
 pub enum Outcome {
@@ -126,27 +127,6 @@ fn render_welcome(config_dir: &Path, use_color: bool) -> String {
         paint(BOLD, "[Y/n]", use_color)
     ));
     out
-}
-
-/// Decide whether to emit ANSI color: only on a TTY and only when the
-/// `NO_COLOR` convention is not set.
-fn color_enabled(no_color_set: bool, is_tty: bool) -> bool {
-    is_tty && !no_color_set
-}
-
-const BOLD: &str = "\x1b[1m";
-const DIM: &str = "\x1b[2m";
-const CYAN: &str = "\x1b[36m";
-const GREEN: &str = "\x1b[32m";
-const RESET: &str = "\x1b[0m";
-
-/// Wrap `text` in an ANSI `code` when `use_color`, otherwise return it plain.
-fn paint(code: &str, text: &str, use_color: bool) -> String {
-    if use_color {
-        format!("{code}{text}{RESET}")
-    } else {
-        text.to_string()
-    }
 }
 
 #[cfg(test)]
@@ -274,11 +254,4 @@ mod tests {
         );
     }
 
-    #[test]
-    fn color_enabled_only_on_tty_without_no_color() {
-        assert!(color_enabled(false, true));
-        assert!(!color_enabled(true, true)); // NO_COLOR set disables color
-        assert!(!color_enabled(false, false)); // not a tty disables color
-        assert!(!color_enabled(true, false));
-    }
 }
