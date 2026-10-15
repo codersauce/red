@@ -2225,8 +2225,10 @@ mod tests {
 
         let tab = Event::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
         let action = editor.handle_event(&tab).unwrap().unwrap();
-        assert!(matches!(action, KeyAction::Multiple(ref actions)
-            if matches!(actions.first(), Some(Action::ApplyCompletion { item, .. }) if item.label == "foobar")));
+        assert!(
+            matches!(action, KeyAction::Single(Action::ApplyCompletion { item, .. })
+            if item.label == "foobar")
+        );
         editor
             .test_execute_action(Action::AcceptInlineCompletion)
             .await

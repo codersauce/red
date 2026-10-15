@@ -9,7 +9,8 @@ use red::{
     config::{Config, KeyAction},
     editor::{Action, Editor, Mode},
     lsp::{
-        Command, CompletionResponseItem, InsertTextFormat, LspClient, Position, Range, TextEdit,
+        Command, CompletionResponseItem, InboundMessage, InsertTextFormat, LspClient,
+        LspRequestSource, Position, Range, Request, ResponseMessage, TextEdit,
     },
     test_utils::EditorTestExt,
     theme::Theme,
@@ -145,6 +146,162 @@ async fn request_completion_sends_trigger_character_context() {
         "expected trigger completion request, got {:?}",
         recorded(&events)
     );
+}
+
+async fn type_completion_keys(editor: &mut Editor, text: &str) {
+    for character in text.chars() {
+        editor
+            .test_execute_event(Event::Key(KeyEvent::new(
+                KeyCode::Char(character),
+                KeyModifiers::NONE,
+            )))
+            .await
+            .unwrap();
+    }
+}
+
+async fn deferred_commit_editor() -> (Editor, RecordingLsp, serde_json::Value) {
+    let lsp = RecordingLsp::default().with_capabilities(json!({
+        "completionProvider": { "resolveProvider": true, "triggerCharacters": ["."] }
+    }));
+    let mut config = Config {
+        disable_ai: true,
+        ..Config::default()
+    };
+    config.completion.auto_trigger = false;
+    let file = "/tmp/red-completion-commit.ts";
+    let buffer = Buffer::new(Some(file.to_string()), "cons".to_string());
+    let mut editor = Editor::test_with_size(
+        Box::new(lsp.clone()),
+        80,
+        24,
+        config,
+        Theme::default(),
+        vec![buffer],
+    )
+    .unwrap();
+    editor.test_disable_terminal_output();
+    editor
+        .test_execute_action(Action::EnterMode(Mode::Insert))
+        .await
+        .unwrap();
+    editor
+        .test_execute_action(Action::SetCursor(4, 0))
+        .await
+        .unwrap();
+    editor
+        .test_ensure_current_buffer_lsp_opened()
+        .await
+        .unwrap();
+    let mut selected = json!({
+        "label": "console",
+        "textEdit": { "range": range(0, 0, 0, 4), "newText": "console" },
+        "commitCharacters": ["."],
+        "data": { "resolve": "console" }
+    });
+    let mut request = Request::new(
+        "textDocument/completion",
+        json!({
+            "textDocument": { "uri": editor.test_current_buffer().uri().unwrap() },
+            "position": { "line": 0, "character": 4 }
+        }),
+    );
+    request.source = Some(LspRequestSource {
+        key: file.to_string(),
+        instance: 1,
+    });
+    lsp.queue_message(InboundMessage::Message(ResponseMessage {
+        id: request.id,
+        result: json!([selected]),
+        request: Some(request),
+    }));
+    editor.test_service_background().await.unwrap();
+    type_completion_keys(&mut editor, "ole.").await;
+    assert_eq!(editor.test_buffer_contents(), "console");
+    assert!(!recorded(&lsp.events()).iter().any(|event| matches!(
+        event,
+        LspEvent::RequestCompletion {
+            trigger_character: Some('.'),
+            ..
+        }
+    )));
+    selected["textEdit"]["range"] = json!(range(0, 0, 0, 7));
+    (editor, lsp, selected)
+}
+
+fn assert_member_request_follows_change(lsp: &RecordingLsp, line: usize) {
+    let events = recorded(&lsp.events());
+    let index = events
+        .iter()
+        .position(|event| {
+            matches!(
+                event,
+                LspEvent::RequestCompletion {
+                    trigger_character: Some('.'),
+                    ..
+                }
+            )
+        })
+        .expect("committing a period must request member completion");
+    assert!(matches!(events[index], LspEvent::RequestCompletion {
+        line: actual_line, character: 8, ..
+    } if actual_line == line));
+    assert!(events[..index]
+        .iter()
+        .any(|event| matches!(event, LspEvent::DidChange(_))));
+}
+
+#[tokio::test]
+async fn deferred_commit_resolves_imports_before_requesting_members() {
+    let (mut editor, lsp, mut selected) = deferred_commit_editor().await;
+    lsp.reply_to_last(json!([selected]));
+    editor.test_service_background().await.unwrap();
+    assert_eq!(editor.test_buffer_contents(), "console");
+    selected["additionalTextEdits"] = json!([text_edit(
+        range(0, 0, 0, 0),
+        "import { console } from './console';\n"
+    )]);
+    lsp.events().lock().unwrap().clear();
+    lsp.reply_to_last(selected);
+    editor.test_service_background().await.unwrap();
+
+    assert_eq!(
+        editor.test_buffer_contents(),
+        "import { console } from './console';\nconsole."
+    );
+    assert_member_request_follows_change(&lsp, 1);
+}
+
+#[tokio::test]
+async fn typing_ahead_preserves_commit_and_ignores_late_completion_work() {
+    for pending_resolve in [false, true] {
+        let (mut editor, lsp, selected) = deferred_commit_editor().await;
+        if pending_resolve {
+            lsp.reply_to_last(json!([selected]));
+            editor.test_service_background().await.unwrap();
+        }
+        // Capture this pending request's reply, but deliver it only after typing ahead.
+        // Include a matching member to expose an incorrectly reopened refresh popup.
+        lsp.reply_to_last(if pending_resolve {
+            selected
+        } else {
+            json!([selected, { "label": "log" }])
+        });
+        lsp.events().lock().unwrap().clear();
+        type_completion_keys(&mut editor, "lo").await;
+        assert_eq!(editor.test_buffer_contents(), "console.lo");
+        assert_member_request_follows_change(&lsp, 0);
+
+        editor.test_service_background().await.unwrap();
+        assert_eq!(editor.test_buffer_contents(), "console.lo");
+        // This minimal config leaves Tab unbound unless a completion popup captures it.
+        assert_eq!(
+            editor
+                .test_handle_event(Event::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)))
+                .unwrap(),
+            None
+        );
+    }
 }
 
 #[tokio::test]

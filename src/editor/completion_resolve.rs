@@ -1,7 +1,8 @@
 //! Deferred completion details, including import edits computed only after selection.
 
 use super::{
-    Action, CompletionResponse, CompletionResponseItem, CompletionSnapshot, Editor, ResponseMessage,
+    Action, CompletionResponse, CompletionResponseItem, CompletionSnapshot, Editor,
+    PendingCompletion, ResponseMessage,
 };
 
 #[derive(Debug, Clone)]
@@ -11,12 +12,7 @@ pub(super) struct PendingCompletionResolution {
     snapshot: CompletionSnapshot,
 }
 
-#[derive(Debug, Clone)]
-pub(super) struct PendingCompletionRefresh {
-    item: CompletionResponseItem,
-    commit_character: Option<char>,
-    snapshot: CompletionSnapshot,
-}
+pub(super) type PendingCompletionRefresh = PendingCompletionResolution;
 
 fn completion_candidate_matches(
     selected: &CompletionResponseItem,
@@ -47,6 +43,47 @@ fn refreshed_completion_item(
 }
 
 impl Editor {
+    /// Finish typed punctuation before another input can invalidate its pending edit.
+    /// Deferred details remain optional when the user continues typing.
+    pub(super) fn pending_completion_commit(&mut self) -> Option<Action> {
+        let refresh_id = self
+            .pending_completion_refreshes
+            .iter()
+            .find_map(|(id, pending)| pending.commit_character.map(|_| *id));
+        let pending = if let Some(id) = refresh_id {
+            let pending = self.pending_completion_refreshes.remove(&id)?;
+            // A late refresh must not become a new popup for the current buffer.
+            self.pending_completions.insert(
+                id,
+                PendingCompletion {
+                    buffer_items: Vec::new(),
+                    snapshot: pending.snapshot.clone(),
+                    displayed_immediately: false,
+                    superseded: true,
+                },
+            );
+            pending
+        } else {
+            let id = self
+                .pending_completion_resolutions
+                .iter()
+                .find_map(|(id, pending)| pending.commit_character.map(|_| *id))?;
+            self.pending_completion_resolutions.remove(&id)?
+        };
+        let item = pending.item.clone();
+        self.apply_resolved_completion_action(pending, item)
+    }
+
+    pub(super) fn close_completion_popup(&mut self) {
+        if self
+            .current_dialog
+            .as_ref()
+            .is_some_and(|dialog| dialog.accepts_completion_updates())
+        {
+            self.current_dialog = None;
+        }
+    }
+
     /// Ask the originating server for edits it intentionally omitted from its list.
     pub(super) async fn resolve_completion_item(
         &mut self,

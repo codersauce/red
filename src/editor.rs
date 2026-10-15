@@ -13381,6 +13381,10 @@ impl Editor {
             });
         }
 
+        if let Some(action) = self.pending_completion_commit() {
+            self.execute(&action, buffer, runtime).await?;
+        }
+
         let render_generation = self.render_generation;
         let window_before = self.window_manager.active_stable_window_id();
         let repeat_signature = Self::key_signature(&ev);
@@ -16168,18 +16172,6 @@ impl Editor {
             let action = current_dialog.handle_event(ev);
             let allows_passthrough = current_dialog.allows_event_passthrough();
             if action.is_some() || !allows_passthrough {
-                let action = match (action, ev) {
-                    (
-                        Some(action),
-                        Event::Key(KeyEvent {
-                            code: KeyCode::Char(c),
-                            ..
-                        }),
-                    ) if allows_passthrough && self.is_completion_trigger_char(*c) => {
-                        Some(Self::retrigger_after_completion_commit(action, *c))
-                    }
-                    (action, _) => action,
-                };
                 return Ok(action);
             }
         }
@@ -24323,6 +24315,9 @@ impl Editor {
                 {
                     self.apply_completion(item, *commit_character, runtime)
                         .await?;
+                } else {
+                    self.close_completion_popup();
+                    self.completion_snapshot = None;
                 }
                 self.render(buffer)?;
             }
@@ -30575,25 +30570,6 @@ impl Editor {
         KeyAction::Multiple(actions)
     }
 
-    fn retrigger_after_completion_commit(action: KeyAction, c: char) -> KeyAction {
-        let KeyAction::Multiple(mut actions) = action else {
-            return action;
-        };
-        let committed = actions.iter().any(|action| {
-            matches!(
-                action,
-                Action::ApplyCompletion {
-                    commit_character: Some(character),
-                    ..
-                } if *character == c
-            )
-        });
-        if committed {
-            actions.push(Action::RequestCompletionWithTrigger(c));
-        }
-        KeyAction::Multiple(actions)
-    }
-
     fn handle_trigger_char(&mut self, c: char) -> anyhow::Result<Option<KeyAction>> {
         if !self.is_completion_trigger_char(c) {
             return Ok(None);
@@ -30969,6 +30945,8 @@ impl Editor {
         commit_character: Option<char>,
         runtime: &mut Runtime,
     ) -> anyhow::Result<()> {
+        let continuation = self.coordinated_completion_continuation(item, commit_character);
+        self.close_completion_popup();
         if !self.config.completion.enabled {
             return Ok(());
         }
@@ -30982,7 +30960,6 @@ impl Editor {
             ));
             return Ok(());
         }
-        let continuation = self.coordinated_completion_continuation(item, commit_character);
         let snapshot = self.completion_snapshot.take();
         if snapshot
             .as_ref()
@@ -31100,6 +31077,10 @@ impl Editor {
 
         if let Some(continuation) = continuation {
             self.restore_coordinated_completion(continuation);
+        }
+
+        if let Some(character) = commit_character.filter(|c| self.is_completion_trigger_char(*c)) {
+            self.request_completion(Some(character)).await?;
         }
 
         Ok(())
@@ -43724,26 +43705,6 @@ builtin = "rust"
         ));
     }
 
-    #[test]
-    fn committed_trigger_character_requests_member_completion() {
-        let action = KeyAction::Multiple(vec![
-            Action::ApplyCompletion {
-                item: Box::new(completion_item("torch")),
-                commit_character: Some('.'),
-            },
-            Action::CloseDialog,
-        ]);
-
-        let KeyAction::Multiple(actions) = Editor::retrigger_after_completion_commit(action, '.')
-        else {
-            panic!("expected ordered completion actions");
-        };
-        assert!(matches!(
-            actions.last(),
-            Some(Action::RequestCompletionWithTrigger('.'))
-        ));
-    }
-
     #[tokio::test]
     async fn delayed_lsp_completion_selects_its_best_match_over_buffer_words() {
         let mut editor = completion_typing_editor();
@@ -44158,11 +44119,11 @@ builtin = "rust"
             .unwrap();
 
         let tab = Event::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
-        let KeyAction::Multiple(actions) = editor.handle_event(&tab).unwrap().unwrap() else {
-            panic!("expected completion application and close actions");
+        let KeyAction::Single(action) = editor.handle_event(&tab).unwrap().unwrap() else {
+            panic!("expected completion application action");
         };
         editor
-            .execute(&actions[0], &mut render_buffer, &mut runtime)
+            .execute(&action, &mut render_buffer, &mut runtime)
             .await
             .unwrap();
 
@@ -44171,10 +44132,6 @@ builtin = "rust"
             .last_error
             .as_deref()
             .is_some_and(|error| error.contains("stale")));
-        editor
-            .execute(&actions[1], &mut render_buffer, &mut runtime)
-            .await
-            .unwrap();
         assert!(editor.current_dialog.is_none());
     }
 
@@ -44426,12 +44383,9 @@ builtin = "rust"
         ));
         let tab = Event::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
         let action = editor.handle_event(&tab).unwrap().unwrap();
-        let KeyAction::Multiple(actions) = action else {
-            panic!("expected completion application action");
-        };
         assert!(matches!(
-            actions.first(),
-            Some(Action::ApplyCompletion { item, .. }) if item.label == "xb"
+            action,
+            KeyAction::Single(Action::ApplyCompletion { item, .. }) if item.label == "xb"
         ));
     }
 

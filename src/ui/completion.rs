@@ -769,13 +769,10 @@ impl Component for CompletionUI {
                 modifiers: KeyModifiers::NONE,
                 ..
             }) if self.selected_item().is_some() => self.selected_item().map(|item| {
-                KeyAction::Multiple(vec![
-                    Action::ApplyCompletion {
-                        item: Box::new(item.clone()),
-                        commit_character: None,
-                    },
-                    Action::CloseDialog,
-                ])
+                KeyAction::Single(Action::ApplyCompletion {
+                    item: Box::new(item.clone()),
+                    commit_character: None,
+                })
             }),
             Event::Key(KeyEvent {
                 code: KeyCode::Enter,
@@ -800,13 +797,10 @@ impl Component for CompletionUI {
                 ..
             }) if self.commit_chars.contains(c) => {
                 if let Some(item) = self.selected_item() {
-                    Some(KeyAction::Multiple(vec![
-                        Action::ApplyCompletion {
-                            item: Box::new(item.clone()),
-                            commit_character: Some(*c),
-                        },
-                        Action::CloseDialog,
-                    ]))
+                    Some(KeyAction::Single(Action::ApplyCompletion {
+                        item: Box::new(item.clone()),
+                        commit_character: Some(*c),
+                    }))
                 } else {
                     Some(KeyAction::Single(Action::CloseDialog))
                 }
@@ -1346,13 +1340,10 @@ mod tests {
         for code in [KeyCode::Tab, KeyCode::Enter] {
             assert_eq!(
                 ui.handle_event(&key(code, KeyModifiers::NONE)),
-                Some(KeyAction::Multiple(vec![
-                    Action::ApplyCompletion {
-                        item: Box::new(selected.clone()),
-                        commit_character: None,
-                    },
-                    Action::CloseDialog,
-                ]))
+                Some(KeyAction::Single(Action::ApplyCompletion {
+                    item: Box::new(selected.clone()),
+                    commit_character: None,
+                }))
             );
         }
     }
