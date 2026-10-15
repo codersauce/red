@@ -227,6 +227,10 @@ pub struct Config {
     /// Plugin names excluded from discovery or activation.
     #[serde(default)]
     pub disabled_plugins: Vec<String>,
+    /// Name-to-path entries that `disabled_plugins` or `disable_ai` removed from
+    /// `plugins`, kept so status views can still list them.
+    #[serde(skip)]
+    pub disabled_plugin_paths: HashMap<String, String>,
     /// Capabilities granted to individual plugins.
     #[serde(default)]
     pub plugin_permissions: HashMap<String, PluginPermissions>,
@@ -1969,11 +1973,18 @@ impl Config {
     }
 
     fn apply_disabled_plugins(&mut self) {
+        let mut disabled = self
+            .disabled_plugins
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
         if self.disable_ai {
-            self.plugins.remove("agent");
+            disabled.push("agent");
         }
-        for plugin in &self.disabled_plugins {
-            self.plugins.remove(plugin);
+        for plugin in disabled {
+            if let Some(path) = self.plugins.remove(plugin) {
+                self.disabled_plugin_paths.insert(plugin.to_string(), path);
+            }
         }
     }
 }
@@ -3860,6 +3871,7 @@ disabled_plugins = ["fidget"]
             Some(&KeyAction::Single(Action::FilePicker))
         );
         assert!(!config.plugins.contains_key("fidget"));
+        assert!(config.disabled_plugin_paths.contains_key("fidget"));
         assert!(config.plugins.contains_key("theme_browser"));
     }
 

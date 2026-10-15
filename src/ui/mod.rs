@@ -72,11 +72,11 @@ pub(crate) use keymap_hints::draw_keymap_hints;
 pub(crate) use learn::{draw_learn_coach, CoachLayout, LearnHub};
 use list::List;
 pub(crate) use messages::{MessageRow, MessagesPanel, MessagesView};
-pub(crate) use picker::MAX_UNFOCUSED_PREVIEW_BYTES;
 pub use picker::{
     LegacyPickerOptions, Picker, PickerIcon, PickerItem, PickerItemLayout, PickerOptions,
     PickerPresentation, PickerPreview, PickerUpdate,
 };
+pub(crate) use picker::{MAX_UNFOCUSED_PREVIEW_BYTES, MIN_HORIZONTAL_PREVIEW_PANE_WIDTH};
 pub(crate) use prompt_buffer::{
     first_prompt_line, normalize_prompt_newlines, PromptBuffer, PromptInput, PromptKeyPolicy,
     PROMPT_MAX_BYTES,

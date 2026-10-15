@@ -517,13 +517,19 @@ impl RpcRequester {
 impl RpcConnection {
     /// Spawns an already configured plugin command with piped standard streams.
     pub fn spawn(mut command: Command) -> Result<(Self, mpsc::Receiver<RpcIncoming>)> {
+        let program = command
+            .as_std()
+            .get_program()
+            .to_string_lossy()
+            .into_owned();
         let mut child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true)
             .spawn()
-            .context("failed to start RPC plugin")?;
+            // Quarantine reasons show only the outermost message, so keep the OS error in it.
+            .map_err(|error| anyhow::anyhow!("failed to start RPC plugin `{program}`: {error}"))?;
         let stdin = child
             .stdin
             .take()
