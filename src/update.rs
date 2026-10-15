@@ -960,7 +960,20 @@ mod tests {
         owner.try_lock_shared().unwrap();
         assert!(ManagedInstall::acquire(executable.clone()).is_err());
         drop(owner);
-        ManagedInstall::acquire(executable).unwrap();
+        // flock belongs to the open file description, which a child forked by a
+        // concurrently running test inherits until it execs. The released lock
+        // can therefore stay held for a moment, so retry instead of expecting
+        // the very next attempt to succeed.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            match ManagedInstall::acquire(executable.clone()) {
+                Ok(_) => break,
+                Err(_) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(error) => panic!("lock was not released: {error:#}"),
+            }
+        }
     }
 
     #[cfg(unix)]

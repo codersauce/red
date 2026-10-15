@@ -876,6 +876,7 @@ impl PluginPackageManager {
     pub fn set_enabled(&self, id: &PluginId, enabled: bool) -> Result<()> {
         let install_dir = self.packages_dir().join(id.as_str());
         let path = install_dir.join(INSTALL_RECORD_FILE);
+        anyhow::ensure!(path.is_file(), "plugin `{id}` is not installed");
         let mut record = read_record(&path)?;
         record.enabled = enabled;
         write_record_atomic(&install_dir, &record)
