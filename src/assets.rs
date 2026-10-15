@@ -16,6 +16,8 @@ use std::{
 
 use include_dir::{include_dir, Dir};
 
+use crate::cli_style;
+
 /// Complete configuration defaults embedded in the Red binary.
 pub const DEFAULT_CONFIG: &str = include_str!("../default_config.toml");
 
@@ -331,47 +333,83 @@ pub fn list_runtime_assets(
 
 /// Formats the runtime asset inventory used by `red --runtime-files`.
 pub fn format_runtime_files(config_dir: &Path) -> anyhow::Result<String> {
+    render_runtime_files(config_dir, false)
+}
+
+/// Lists runtime assets in aligned columns. With `use_color`, assets that come
+/// from the user config or `$RED_RUNTIME` are highlighted and the embedded
+/// majority is dimmed, so overrides stand out.
+pub fn render_runtime_files(config_dir: &Path, use_color: bool) -> anyhow::Result<String> {
     let mut out = String::new();
 
     for (heading, kind) in [
         ("Runtime plugins", RuntimeAssetKind::Plugin),
         ("Runtime themes", RuntimeAssetKind::Theme),
     ] {
-        out.push_str(heading);
-        out.push_str(":\n");
+        out.push_str(&cli_style::paint(
+            cli_style::BOLD,
+            &format!("{heading}:"),
+            use_color,
+        ));
+        out.push('\n');
 
         let entries = list_runtime_assets(kind, config_dir)?;
         if entries.is_empty() {
             out.push_str("  (none)\n");
         }
 
-        for entry in entries {
-            out.push_str("  ");
-            out.push_str(&entry.file);
-            out.push_str("  ");
-            out.push_str(&entry.source.to_string());
-            if !entry.shadows.is_empty() {
-                out.push_str(" (shadows ");
-                out.push_str(
-                    &entry
-                        .shadows
-                        .iter()
-                        .map(ToString::to_string)
-                        .collect::<Vec<_>>()
-                        .join(", "),
-                );
-                out.push(')');
-            }
+        let rows = entries
+            .iter()
+            .map(|entry| {
+                let shadows = if entry.shadows.is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        "(shadows {})",
+                        entry
+                            .shadows
+                            .iter()
+                            .map(ToString::to_string)
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )
+                };
+                [entry.file.clone(), entry.source.to_string(), shadows]
+            })
+            .collect::<Vec<_>>();
+        for line in cli_style::render_table(
+            "  ",
+            None,
+            &rows,
+            [
+                cli_style::style_plain,
+                style_runtime_source,
+                cli_style::style_dim,
+            ],
+            use_color,
+        ) {
+            out.push_str(&line);
             out.push('\n');
         }
         out.push('\n');
     }
 
-    out.push_str("Resolution order: user config, $RED_RUNTIME, embedded.\n");
-    out.push_str(
-        "Use `red --eject plugins/<file>` or `red --eject themes/<file>` to copy an asset into your config directory.\n",
-    );
+    for footer in [
+        "Resolution order: user config, $RED_RUNTIME, embedded.",
+        "Use `red --eject plugins/<file>` or `red --eject themes/<file>` to copy an asset into your config directory.",
+    ] {
+        out.push_str(&cli_style::paint(cli_style::DIM, footer, use_color));
+        out.push('\n');
+    }
     Ok(out)
+}
+
+fn style_runtime_source(cell: &str) -> Option<&'static str> {
+    match cell {
+        "user" => Some(cli_style::BOLD_CYAN),
+        "runtime" => Some(cli_style::BOLD_YELLOW),
+        _ => Some(cli_style::DIM),
+    }
 }
 
 /// Copies a development or embedded asset into the user configuration layer.

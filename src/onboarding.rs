@@ -253,5 +253,4 @@ mod tests {
             "expected ANSI escapes when colored"
         );
     }
-
 }
