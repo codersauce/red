@@ -66,6 +66,8 @@ pub struct PluginRegistry {
     last_hot_reload_poll: Instant,
     rpc_plugins: HashMap<String, ActiveRpcPlugin>,
     rpc_activations: HashMap<String, PendingRpcPlugin>,
+    /// Plugins the configuration disabled, listed only for status views.
+    disabled: Vec<(String, String)>,
     rpc_retirements: HashMap<String, JoinHandle<()>>,
     rpc_text_panels: HashMap<String, HashMap<String, RpcTextPanel>>,
     rpc_pickers: HashMap<super::PickerHandle, RpcPicker>,
@@ -369,6 +371,7 @@ impl PluginRegistry {
             last_hot_reload_poll: Instant::now(),
             rpc_plugins: HashMap::new(),
             rpc_activations: HashMap::new(),
+            disabled: Vec::new(),
             rpc_retirements: HashMap::new(),
             rpc_text_panels: HashMap::new(),
             rpc_pickers: HashMap::new(),
@@ -662,8 +665,26 @@ impl PluginRegistry {
         &self.statuses
     }
 
-    /// Describes each configured plugin's session state, in configuration order.
+    /// Records a plugin the configuration disabled, so status views can list it.
+    ///
+    /// It is not registered for activation and has no lifecycle status.
+    pub fn add_disabled(&mut self, name: &str, path: &str) {
+        self.disabled.push((name.to_string(), path.to_string()));
+    }
+
+    /// Describes each configured plugin's session state, in configuration order,
+    /// followed by the disabled plugins.
     pub(crate) fn status_rows(&self) -> Vec<PluginStatusRow> {
+        let disabled = self
+            .disabled
+            .iter()
+            .filter(|(name, _)| !self.statuses.contains_key(name))
+            .map(|(name, path)| PluginStatusRow {
+                name: name.clone(),
+                path: plugin_display_path(path),
+                state: PluginSessionState::Disabled,
+                status: PluginStatus::Disabled,
+            });
         self.plugins
             .iter()
             .map(|(name, path)| {
@@ -694,6 +715,7 @@ impl PluginRegistry {
                     status,
                 }
             })
+            .chain(disabled)
             .collect()
     }
 
@@ -1563,10 +1585,14 @@ impl PluginRegistry {
             .get_mut(owner)
             .expect("pending RPC plugin activation");
         let (name, raw_args) = crate::command::split_invocation(command);
-        anyhow::ensure!(
-            pending.command.is_none() && pending.notifications.is_empty(),
-            "plugin `{owner}` is still starting and already has a command waiting; run `{name}` again once it is ready"
-        );
+        if let Some(conflict) = starting_rpc_conflict(
+            owner,
+            name,
+            pending.command.is_some(),
+            !pending.notifications.is_empty(),
+        ) {
+            anyhow::bail!(conflict);
+        }
         let id = pending.task.id();
         pending.command = Some(PendingRpcInvocation {
             id,
@@ -2897,6 +2923,26 @@ fn plugin_display_path(plugin: &str) -> String {
 }
 
 /// One-line reason from a possibly multi-line quarantine diagnostic.
+/// Explains why `command` cannot queue behind a starting RPC plugin, which runs
+/// at most one queued command, and none when an event started it.
+fn starting_rpc_conflict(
+    owner: &str,
+    command: &str,
+    command_waiting: bool,
+    events_waiting: bool,
+) -> Option<String> {
+    let reason = if command_waiting {
+        "already has a command waiting"
+    } else if events_waiting {
+        "is handling the event that started it"
+    } else {
+        return None;
+    };
+    Some(format!(
+        "plugin `{owner}` is still starting and {reason}; run `{command}` again once it is ready"
+    ))
+}
+
 pub(crate) fn quarantine_reason(diagnostic: &str) -> &str {
     diagnostic
         .lines()
@@ -3209,6 +3255,32 @@ mod tests {
             PluginStatus::Quarantined { diagnostic, .. } if diagnostic.contains("HUSK-P0001")
         ));
         assert_eq!(rows[0].path, plugin_display_path(working.to_str().unwrap()));
+
+        registry.add_disabled("off", "/plugins/off.hk");
+        let rows = registry.status_rows();
+        assert_eq!(
+            rows.last().map(|row| (row.name.as_str(), row.state)),
+            Some(("off", PluginSessionState::Disabled))
+        );
+    }
+
+    #[test]
+    fn starting_rpc_conflict_names_what_the_plugin_is_waiting_on() {
+        assert_eq!(starting_rpc_conflict("slow", "Run", false, false), None);
+        assert_eq!(
+            starting_rpc_conflict("slow", "Run", true, true).as_deref(),
+            Some(
+                "plugin `slow` is still starting and already has a command waiting; \
+                 run `Run` again once it is ready"
+            )
+        );
+        assert_eq!(
+            starting_rpc_conflict("slow", "Run", false, true).as_deref(),
+            Some(
+                "plugin `slow` is still starting and is handling the event that started it; \
+                 run `Run` again once it is ready"
+            )
+        );
     }
 
     #[tokio::test]

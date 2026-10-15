@@ -3968,6 +3968,10 @@ impl DetachedEditorCore {
             let path = Config::resolve_plugin_path(path);
             editor.plugin_registry.add(name, path.as_str());
         }
+        for (name, path) in &editor.config.disabled_plugin_paths {
+            let path = Config::resolve_plugin_path(path);
+            editor.plugin_registry.add_disabled(name, path.as_str());
+        }
         editor.plugin_registry.initialize(&mut runtime).await?;
         editor
             .plugin_registry
@@ -10586,6 +10590,10 @@ impl Editor {
             for (name, path) in &self.config.plugins {
                 let path = Config::resolve_plugin_path(path);
                 self.plugin_registry.add(name, path.as_str());
+            }
+            for (name, path) in &self.config.disabled_plugin_paths {
+                let path = Config::resolve_plugin_path(path);
+                self.plugin_registry.add_disabled(name, path.as_str());
             }
             self.plugin_registry.initialize(runtime).await?;
             self.plugin_registry
