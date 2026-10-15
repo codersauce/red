@@ -11,6 +11,8 @@
 
 use std::io::{self, IsTerminal, Write};
 
+use crate::unicode_utils::display_width;
+
 pub const BOLD: &str = "\x1b[1m";
 pub const DIM: &str = "\x1b[2m";
 pub const RED: &str = "\x1b[31m";
@@ -167,10 +169,6 @@ pub fn print_table<const N: usize>(
     }
 }
 
-fn display_width(text: &str) -> usize {
-    text.chars().count()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -225,6 +223,17 @@ mod tests {
         };
         assert_eq!(plain, colored.iter().map(strip).collect::<Vec<_>>());
         assert!(colored[0].contains(BOLD));
+    }
+
+    #[test]
+    fn render_table_measures_cells_in_display_columns() {
+        let rows = vec![
+            ["日本語.hk".to_string(), "x".to_string()],
+            ["ascii.hk".to_string(), "y".to_string()],
+        ];
+        let lines = render_table("", None, &rows, [style_plain, style_plain], false);
+        // "日本語" occupies six terminal columns, not three characters.
+        assert_eq!(lines, ["日本語.hk  x", "ascii.hk   y"]);
     }
 
     #[test]
