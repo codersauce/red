@@ -26,8 +26,8 @@ use husk_ast::{
     EnumVariantFields, File as HuskFile, ItemKind, StructField, TypeExpr, TypeExprKind,
 };
 use husk_runtime::{
-    AnnotatedFunction, Callback, CompileOptions, CompiledProgram, Host, PackageLimits,
-    ResolvedPackage, SemanticProfile, Value,
+    heap_cell_size, heap_value_size, AnnotatedFunction, Callback, CompileOptions, CompiledProgram,
+    Host, PackageLimits, ResolvedPackage, SemanticProfile, Value,
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -704,7 +704,7 @@ fn payload_variant_name(name: &str) -> String {
 struct RedPluginPolicy {
     commands: HashMap<String, RedCommand>,
     event_listeners: HashMap<String, Arc<Vec<Callback>>>,
-    pending_requests: HashMap<RequestId, Callback>,
+    pending_requests: HashMap<RequestId, PendingRequest>,
     picker_handlers: HashMap<PickerHandle, PickerRegistration>,
     composer_handlers: HashMap<ComposerHandle, ComposerRegistration>,
     plugin_states: HashMap<String, HashMap<String, Value>>,
@@ -770,6 +770,13 @@ impl PickerHandlers {
     }
 }
 
+/// A plugin request awaiting its result, and the host request that produced it.
+#[derive(Debug, Clone)]
+struct PendingRequest {
+    callback: Callback,
+    request: String,
+}
+
 #[derive(Debug, Clone)]
 struct PickerRegistration {
     plugin: String,
@@ -810,7 +817,7 @@ impl RedPluginPolicy {
             !callbacks.is_empty()
         });
         self.pending_requests
-            .retain(|_, callback| callback.plugin() != plugin);
+            .retain(|_, pending| pending.callback.plugin() != plugin);
         self.picker_handlers
             .retain(|_, registration| registration.plugin != plugin);
         self.composer_handlers
@@ -1820,9 +1827,9 @@ impl RedHost {
                         .and_then(|value| i64::try_from(value).ok())
                         .ok_or_else(|| anyhow::anyhow!("CancelGitStatus requires a request id"))?,
                 );
-                if let Some(callback) = self.policy().pending_requests.get(&request_id) {
+                if let Some(pending) = self.policy().pending_requests.get(&request_id) {
                     anyhow::ensure!(
-                        callback.plugin() == plugin,
+                        pending.callback.plugin() == plugin,
                         "cannot cancel another plugin's request"
                     );
                     self.policy_mut().pending_requests.remove(&request_id);
@@ -2464,9 +2471,13 @@ impl RedHost {
                 let action = red_required_string(args, 0, path)?;
                 let callback = red_required_callback(args, 1, path)?.clone();
                 let request_id = self.policy_mut().allocate_request_id();
-                self.policy_mut()
-                    .pending_requests
-                    .insert(request_id, callback);
+                self.policy_mut().pending_requests.insert(
+                    request_id,
+                    PendingRequest {
+                        callback,
+                        request: action.to_string(),
+                    },
+                );
                 if let Err(error) = self.request(plugin, request_id, action, &args[2..]) {
                     self.policy_mut().pending_requests.remove(&request_id);
                     return Err(error);
@@ -3265,9 +3276,13 @@ impl Host for RedHost {
                         anyhow::bail!("duplicate `#[red::config]` binding for `{plugin}`");
                     }
                     let request_id = self.policy_mut().allocate_request_id();
-                    self.policy_mut()
-                        .pending_requests
-                        .insert(request_id, function.callback().clone());
+                    self.policy_mut().pending_requests.insert(
+                        request_id,
+                        PendingRequest {
+                            callback: function.callback().clone(),
+                            request: "GetConfig".to_string(),
+                        },
+                    );
                     let arguments = key.into_iter().map(Value::String).collect::<Vec<_>>();
                     if let Err(error) = self.request(plugin, request_id, "GetConfig", &arguments) {
                         self.policy_mut().pending_requests.remove(&request_id);
@@ -4237,16 +4252,55 @@ impl Runtime {
     ) -> anyhow::Result<bool> {
         let mut inner = self.inner.lock().unwrap();
         let RuntimeInner { plugins, host, .. } = &mut *inner;
-        let Some(callback) = host.policy_mut().pending_requests.remove(&request_id) else {
+        let Some(PendingRequest { callback, request }) =
+            host.policy_mut().pending_requests.remove(&request_id)
+        else {
             return Ok(false);
         };
-        let payload = decoded_callback_payload(host, &callback, 0, &payload)?;
-        call_plugin_callback(
-            plugins,
-            host,
-            &callback,
-            vec![payload, Value::Int(request_id.get())],
-        )?;
+        let mut payload = decoded_callback_payload(host, &callback, 0, &payload)?;
+        let request_id = Value::Int(request_id.get());
+        if let Some(vm) = plugins.get_mut(callback.plugin()) {
+            let available = vm.available_heap_bytes();
+            let needed = heap_cell_size(&payload).saturating_add(heap_cell_size(&request_id));
+            // A plugin needs heap to work through a list after it arrives, so a
+            // list that only just fits still fails the callback. Trim lists past
+            // half the free heap; other results can only be delivered or dropped.
+            let list_field = trimmable_result_list(&request);
+            let limit = if list_field.is_some() {
+                available / 2
+            } else {
+                available
+            };
+            if needed > limit {
+                let budget = (available / 2).saturating_sub(heap_cell_size(&request_id));
+                match list_field.and_then(|field| trimmed_result(&payload, field, budget)) {
+                    None if needed <= available => {}
+                    Some((trimmed, kept)) => {
+                        crate::log_warn!(
+                            "Trimmed `{request}` result for plugin `{}` to {kept} entries: \
+                             {needed} bytes exceeded its {available} free heap bytes",
+                            callback.plugin()
+                        );
+                        payload = trimmed;
+                    }
+                    None => {
+                        crate::log_warn!(
+                            "Dropped `{request}` result for plugin `{}`: {needed} bytes \
+                             exceeded its {available} free heap bytes",
+                            callback.plugin()
+                        );
+                        host.send_request(PluginRequest::PluginResultDropped {
+                            plugin: callback.plugin().to_string(),
+                            request,
+                            needed,
+                            available,
+                        });
+                        return Ok(true);
+                    }
+                }
+            }
+        }
+        call_plugin_callback(plugins, host, &callback, vec![payload, request_id])?;
         Ok(true)
     }
 
@@ -4259,7 +4313,7 @@ impl Runtime {
             .policy()
             .pending_requests
             .get(&request_id)
-            .map(|callback| callback.plugin().to_string())
+            .map(|pending| pending.callback.plugin().to_string())
     }
 
     pub fn set_snapshot(&mut self, name: impl Into<String>, value: serde_json::Value) {
@@ -4406,6 +4460,53 @@ fn validate_command_registration(
         decoded_callback_payload(host, callback, 0, &command_invocation_payload("", ""))?;
     }
     Ok(())
+}
+
+/// The list field a plugin can still use in part when the whole result is too large.
+fn trimmable_result_list(request: &str) -> Option<&'static str> {
+    match request {
+        "DocumentSymbols" | "WorkspaceSymbols" => Some("symbols"),
+        "References" => Some("references"),
+        _ => None,
+    }
+}
+
+/// Keeps the longest prefix of `payload.field` whose result fits in `budget` heap
+/// bytes, returning the trimmed result and how many entries it kept.
+fn trimmed_result(payload: &Value, field: &str, budget: usize) -> Option<(Value, usize)> {
+    let fields = match payload {
+        Value::Struct { fields, .. } | Value::Object(fields) => fields,
+        _ => return None,
+    };
+    let Value::Array(items) = fields.get(field)? else {
+        return None;
+    };
+    let item_sizes = items.iter().map(heap_value_size).collect::<Vec<_>>();
+    let envelope = heap_cell_size(payload).saturating_sub(item_sizes.iter().sum());
+    let mut used = envelope;
+    let kept = item_sizes
+        .iter()
+        .take_while(|size| {
+            used = used.saturating_add(**size);
+            used <= budget
+        })
+        .count();
+    if envelope > budget {
+        return None;
+    }
+    let mut trimmed_fields = (**fields).clone();
+    trimmed_fields.insert(
+        field.to_string(),
+        Value::Array(Arc::new(items[..kept].to_vec())),
+    );
+    let trimmed = match payload {
+        Value::Struct { type_name, .. } => Value::Struct {
+            type_name: type_name.clone(),
+            fields: Arc::new(trimmed_fields),
+        },
+        _ => Value::Object(Arc::new(trimmed_fields)),
+    };
+    Some((trimmed, kept))
 }
 
 fn decoded_callback_payload(
@@ -5022,6 +5123,7 @@ mod tests {
     fn sample_symbol_payload() -> serde_json::Value {
         serde_json::json!({
             "ok": true,
+            "total": 1,
             "symbols": [{
                 "id": "root:0:main",
                 "parent_id": null,
@@ -5068,6 +5170,7 @@ mod tests {
             .collect::<Vec<_>>();
         serde_json::json!({
             "ok": true,
+            "total": count,
             "symbols": symbols,
         })
     }
@@ -5088,6 +5191,7 @@ mod tests {
             "ok": true,
             "file": "src/main.rs",
             "position": { "line": 0, "character": 0 },
+            "total": count,
             "references": references,
         })
     }
@@ -19251,10 +19355,12 @@ mod tests {
         assert!(ACTION_DISPATCHER.try_recv_request().is_none());
     }
 
-    #[tokio::test]
-    async fn lsp_symbols_workspace_symbols_survive_results_larger_than_the_picker() {
+    /// Opens the workspace-symbol picker, answers its empty query with `payload`,
+    /// and runs the batches until the picker settles.
+    async fn settle_workspace_symbols(
+        payload: serde_json::Value,
+    ) -> (Vec<crate::ui::PickerItem>, Option<String>) {
         drain_requests();
-
         let mut runtime = Runtime::new();
         load_lsp_symbols(&mut runtime).await;
         runtime
@@ -19273,12 +19379,7 @@ mod tests {
             _ => panic!("expected initial workspace-symbol request"),
         };
 
-        // An uncapped empty-query response, as typescript-language-server sends for a
-        // large project. Retaining all of it once more exhausted the plugin heap.
-        runtime
-            .resolve_request(request_id, sample_symbol_payload_with_count(20_000))
-            .await
-            .unwrap();
+        assert!(runtime.resolve_request(request_id, payload).await.unwrap());
 
         let mut final_items = Vec::new();
         let mut final_status = None;
@@ -19319,17 +19420,140 @@ mod tests {
                 }
             }
         }
-
         assert!(!busy);
-        assert_eq!(final_items.len(), 4_096);
-        assert_eq!(final_items[4_095].label, "symbol_4095");
-        assert_eq!(
-            final_status.as_deref(),
-            Some("4096 symbols (results truncated: first 4096 of 20000; type to narrow)")
-        );
         assert!(runtime
             .notify_picker(handle, PickerCallback::Cancelled)
             .unwrap());
+        (final_items, final_status)
+    }
+
+    #[tokio::test]
+    async fn lsp_symbols_workspace_symbols_survive_results_larger_than_the_picker() {
+        // An uncapped empty-query response, as typescript-language-server sends for a
+        // large project. Retaining all of it once more exhausted the plugin heap.
+        let (items, status) =
+            settle_workspace_symbols(sample_symbol_payload_with_count(20_000)).await;
+
+        assert_eq!(items.len(), 4_096);
+        assert_eq!(items[4_095].label, "symbol_4095");
+        assert_eq!(
+            status.as_deref(),
+            Some("4096 symbols (results truncated: first 4096 of 20000; type to narrow)")
+        );
+    }
+
+    #[tokio::test]
+    async fn result_larger_than_the_plugin_heap_is_dropped_without_failing_the_plugin() {
+        drain_requests();
+        let mut runtime = Runtime::new();
+        runtime
+            .load_plugin(
+                "reader",
+                r#"
+                    pub fn activate() {
+                        red::add_command("ReadAll", read_all);
+                        red::add_command("Ping", ping);
+                    }
+                    fn read_all() { red::request("GetBufferText", loaded); }
+                    fn loaded(payload: Json) { red::execute("Print", "loaded"); }
+                    fn ping() { red::execute("Print", "pong"); }
+                "#,
+            )
+            .await
+            .unwrap();
+        runtime.execute_command("ReadAll").await.unwrap();
+        let request_id = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::GetBufferText { request_id, .. } => request_id,
+            _ => panic!("expected buffer text request"),
+        };
+
+        let text = "x".repeat(70 * 1024 * 1024);
+        assert!(runtime
+            .resolve_request(request_id, serde_json::json!({ "text": text }))
+            .await
+            .unwrap());
+
+        match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::PluginResultDropped {
+                plugin,
+                request,
+                needed,
+                available,
+            } => {
+                assert_eq!(plugin, "reader");
+                assert_eq!(request, "GetBufferText");
+                assert!(needed > 70 * 1024 * 1024, "{needed}");
+                assert!(available < needed, "{available} < {needed}");
+            }
+            _ => panic!("expected the dropped result to be reported"),
+        }
+        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
+        assert_eq!(runtime.request_plugin(request_id), None);
+
+        runtime.execute_command("Ping").await.unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::Action(Action::Print(message)) if message == "pong"
+        ));
+    }
+
+    #[test]
+    fn trimmed_result_keeps_the_longest_prefix_that_fits() {
+        let result = |count: usize| Value::Struct {
+            type_name: "SymbolsResult".to_string(),
+            fields: Arc::new(BTreeMap::from([
+                ("ok".to_string(), Value::Bool(true)),
+                (
+                    "symbols".to_string(),
+                    Value::Array(Arc::new(
+                        (0..count)
+                            .map(|index| Value::String(format!("symbol_{index:04}")))
+                            .collect(),
+                    )),
+                ),
+            ])),
+        };
+        let budget = heap_cell_size(&result(100));
+
+        let (trimmed, kept) = trimmed_result(&result(1_000), "symbols", budget).unwrap();
+        assert_eq!(kept, 100);
+        assert_eq!(heap_cell_size(&trimmed), budget);
+        let (_, kept) = trimmed_result(&result(1_000), "symbols", budget - 1).unwrap();
+        assert_eq!(kept, 99);
+
+        let empty = heap_cell_size(&result(0));
+        assert!(trimmed_result(&result(1_000), "symbols", empty - 1).is_none());
+        assert!(trimmed_result(&result(10), "references", budget).is_none());
+        assert!(trimmed_result(&Value::String("text".into()), "symbols", budget).is_none());
+    }
+
+    #[tokio::test]
+    async fn workspace_symbols_that_barely_fit_the_plugin_heap_are_trimmed_before_delivery() {
+        // About 62 MB once decoded: it fits the 64 MiB heap, but the plugin then
+        // has no room left to build picker items from it.
+        let (items, status) =
+            settle_workspace_symbols(sample_symbol_payload_with_count(28_000)).await;
+
+        assert_eq!(items.len(), 4_096);
+        assert_eq!(
+            status.as_deref(),
+            Some("4096 symbols (results truncated: first 4096 of 28000; type to narrow)")
+        );
+    }
+
+    #[tokio::test]
+    async fn workspace_symbols_larger_than_the_plugin_heap_are_trimmed_before_delivery() {
+        // About 130 MB once decoded, twice the plugin heap, so delivering it whole
+        // failed before any plugin code could trim it.
+        let (items, status) =
+            settle_workspace_symbols(sample_symbol_payload_with_count(60_000)).await;
+
+        assert_eq!(items.len(), 4_096);
+        assert_eq!(items[4_095].label, "symbol_4095");
+        assert_eq!(
+            status.as_deref(),
+            Some("4096 symbols (results truncated: first 4096 of 60000; type to narrow)")
+        );
     }
 
     #[tokio::test]
@@ -19522,6 +19746,7 @@ mod tests {
             "ok": true,
             "file": "src/main.rs",
             "position": { "line": 4, "character": 3 },
+            "total": 3,
             "references": [
                 {
                     "file": "src/main.rs",

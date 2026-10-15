@@ -1,6 +1,12 @@
 {
-  "api_version": "0.19.0",
+  "api_version": "0.20.0",
   "changes": [
+    {
+      "version": "0.20.0",
+      "kind": "introduced",
+      "symbols": ["DocumentSymbols.total", "WorkspaceSymbols.total", "References.total", "oversized request results"],
+      "migration_note": "docs/PLUGIN_API.md#oversized-request-results"
+    },
     {
       "version": "0.19.0",
       "kind": "introduced",

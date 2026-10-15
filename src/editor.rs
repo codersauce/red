@@ -1919,6 +1919,14 @@ pub enum PluginRequest {
         pickers: Vec<PickerHandle>,
         composers: Vec<ComposerHandle>,
     },
+    /// A `request` result did not fit in `plugin`'s free heap, so its callback
+    /// was skipped instead of failing inside the plugin.
+    PluginResultDropped {
+        plugin: String,
+        request: String,
+        needed: usize,
+        available: usize,
+    },
     BufferInsert {
         x: usize,
         y: usize,
@@ -2289,6 +2297,7 @@ impl PluginRequest {
             Self::UpdatePickerPreview { .. } => "UpdatePickerPreview",
             Self::ClosePicker { .. } => "ClosePicker",
             Self::PluginQuarantined { .. } => "PluginQuarantined",
+            Self::PluginResultDropped { .. } => "PluginResultDropped",
             Self::BufferInsert { .. } => "BufferInsert",
             Self::BufferDelete { .. } => "BufferDelete",
             Self::BufferReplace { .. } => "BufferReplace",
@@ -12152,6 +12161,15 @@ impl Editor {
                         self.current_dialog = None;
                     }
                     self.publish_plugin_quarantine(&plugin, &stage, &path, &diagnostic);
+                    needs_render = true;
+                }
+                PluginRequest::PluginResultDropped {
+                    plugin,
+                    request,
+                    needed,
+                    available,
+                } => {
+                    self.publish_plugin_result_dropped(&plugin, &request, needed, available);
                     needs_render = true;
                 }
                 PluginRequest::BufferInsert { x, y, text } => {
@@ -27692,6 +27710,7 @@ impl Editor {
             "buffer_index": buffer_index,
             "document_id": pending.buffer_id,
             "revision": pending.revision,
+            "total": symbols.len(),
             "symbols": symbols,
         }))
     }
@@ -27704,6 +27723,7 @@ impl Editor {
 
         Ok(json!({
             "ok": true,
+            "total": symbols.len(),
             "symbols": symbols,
         }))
     }
@@ -27732,6 +27752,7 @@ impl Editor {
             "ok": true,
             "file": file,
             "position": position,
+            "total": references.len(),
             "references": references,
         }))
     }
@@ -35519,6 +35540,34 @@ mod test {
 
     fn drain_plugin_requests() {
         while ACTION_DISPATCHER.try_recv_request().is_some() {}
+    }
+
+    #[tokio::test]
+    async fn dropped_plugin_result_is_reported_as_a_plugin_warning() {
+        drain_plugin_requests();
+        let mut core = DetachedEditorCore::new(test_editor(100, 12)).await.unwrap();
+
+        ACTION_DISPATCHER.send_request(PluginRequest::PluginResultDropped {
+            plugin: "reader".to_string(),
+            request: "GetBufferText".to_string(),
+            needed: 70 * 1024 * 1024,
+            available: 60 * 1024 * 1024,
+        });
+        core.tick().await.unwrap();
+
+        let notice = core.editor.notifications.records().next_back().unwrap();
+        assert_eq!(notice.severity, Severity::Warning);
+        assert_eq!(notice.source.label(), "reader");
+        assert_eq!(
+            notice.content.summary,
+            "dropped a GetBufferText result too large for its memory (70.0 MiB needed, 60.0 MiB free)"
+        );
+        let details = notice.content.details.as_deref().unwrap();
+        assert!(details.contains("Request: GetBufferText"), "{details}");
+        assert!(
+            details.contains("instead of stopping the plugin"),
+            "{details}"
+        );
     }
 
     #[tokio::test]
@@ -44733,6 +44782,7 @@ builtin = "rust"
             .plugin_document_symbols_payload(&response, &pending)
             .unwrap();
         assert_eq!(payload["buffer_index"], 0);
+        assert_eq!(payload["total"], 0);
         assert_eq!(payload["document_id"], json!(pending.buffer_id));
         assert_eq!(
             editor.plugin_windows_payload()["windows"][0]["document_id"],
@@ -45028,6 +45078,7 @@ builtin = "rust"
         let symbols = payload["symbols"].as_array().unwrap();
 
         assert_eq!(payload["ok"], true);
+        assert_eq!(payload["total"], 1);
         assert_eq!(symbols.len(), 1);
         assert_eq!(symbols[0]["name"], "build");
         assert_eq!(symbols[0]["detail"], "tools");
@@ -45074,6 +45125,7 @@ builtin = "rust"
         assert_eq!(payload["file"], "/tmp/project/src/main.rs");
         assert_eq!(payload["position"]["line"], 3);
         assert_eq!(payload["position"]["character"], 5);
+        assert_eq!(payload["total"], 2);
         assert_eq!(references.len(), 2);
         assert_eq!(references[0]["file"], "/tmp/project/src/main.rs");
         assert_eq!(references[1]["file"], "/tmp/project/src/lib.rs");
@@ -45104,18 +45156,16 @@ builtin = "rust"
             )),
         };
 
-        assert_eq!(
-            editor
-                .plugin_workspace_symbols_payload(&workspace_response)
-                .unwrap()["symbols"],
-            serde_json::json!([])
-        );
-        assert_eq!(
-            editor
-                .plugin_references_payload(&references_response)
-                .unwrap()["references"],
-            serde_json::json!([])
-        );
+        let workspace = editor
+            .plugin_workspace_symbols_payload(&workspace_response)
+            .unwrap();
+        assert_eq!(workspace["symbols"], serde_json::json!([]));
+        assert_eq!(workspace["total"], 0);
+        let references = editor
+            .plugin_references_payload(&references_response)
+            .unwrap();
+        assert_eq!(references["references"], serde_json::json!([]));
+        assert_eq!(references["total"], 0);
     }
 
     #[test]

@@ -2147,6 +2147,15 @@ impl RuntimeHeap {
     }
 }
 
+/// Heap bytes charged for storing `value` in one variable or parameter cell.
+///
+/// Every cell is charged the value's full size, including arrays it shares with
+/// other cells.
+#[must_use]
+pub fn heap_cell_size(value: &Value) -> usize {
+    std::mem::size_of::<HeapObject>().saturating_add(heap_value_size(value))
+}
+
 fn heap_object_size(object: &HeapObject) -> usize {
     std::mem::size_of::<HeapObject>().saturating_add(match object {
         HeapObject::Cell(value) => heap_value_size(value),
@@ -2182,7 +2191,9 @@ fn heap_object_size(object: &HeapObject) -> usize {
     })
 }
 
-fn heap_value_size(value: &Value) -> usize {
+/// Heap bytes `value` accounts for inside a cell, including shared contents.
+#[must_use]
+pub fn heap_value_size(value: &Value) -> usize {
     std::mem::size_of::<Value>().saturating_add(match value {
         Value::String(value) => value.len(),
         Value::Array(values) | Value::Tuple(values) => values
@@ -3151,6 +3162,13 @@ impl Vm {
     /// Set live heap object and approximate byte limits for this instance.
     pub fn set_heap_limits(&mut self, max_objects: usize, max_bytes: usize) {
         self.heap.set_limits(max_objects, max_bytes);
+    }
+
+    /// Heap bytes the next call can still allocate, after collecting the
+    /// unreachable objects that the call itself would collect first.
+    pub fn available_heap_bytes(&mut self) -> usize {
+        self.collect_heap_before_call(&[]);
+        self.heap.max_bytes.saturating_sub(self.heap.live_bytes)
     }
 
     /// Set the maximum number of explicitly retained closure handles.
@@ -6997,6 +7015,36 @@ mod tests {
         assert!(rendered.contains("help: a similarly named field exists: `ui_style`"));
         assert!(rendered.contains("while calling `header_style` in plugin `fidget`"));
         assert!(rendered.contains("while calling `inspect` in plugin `fidget`"));
+    }
+
+    #[test]
+    fn available_heap_bytes_predicts_whether_an_argument_fits() {
+        let mut host = TestHost;
+        let mut vm = Vm::new();
+        vm.load_plugin("sink", "pub fn take(values: [String]) {}", &mut host)
+            .unwrap();
+        let values = Value::Array(Arc::new(
+            (0..1_000)
+                .map(|index| Value::String(format!("value-{index}")))
+                .collect(),
+        ));
+        let needed = heap_cell_size(&values);
+        let live = vm.heap.live_bytes;
+
+        vm.set_heap_limits(1_000_000, live + needed - 1);
+        assert_eq!(vm.available_heap_bytes(), needed - 1);
+        let error = vm
+            .call_export("sink", "take", vec![values.clone()], &mut host)
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("heap byte limit exceeded"),
+            "{error}"
+        );
+
+        vm.set_heap_limits(1_000_000, live + needed);
+        assert_eq!(vm.available_heap_bytes(), needed);
+        vm.call_export("sink", "take", vec![values], &mut host)
+            .unwrap();
     }
 
     #[test]
