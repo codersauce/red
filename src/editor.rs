@@ -1909,6 +1909,16 @@ pub enum PluginRequest {
     ClosePicker {
         id: i32,
     },
+    /// The registry stopped `plugin` for the session; tell the user and close
+    /// the dialogs whose callbacks it can no longer answer.
+    PluginQuarantined {
+        plugin: String,
+        stage: String,
+        path: String,
+        diagnostic: String,
+        pickers: Vec<PickerHandle>,
+        composers: Vec<ComposerHandle>,
+    },
     BufferInsert {
         x: usize,
         y: usize,
@@ -2278,6 +2288,7 @@ impl PluginRequest {
             Self::UpdatePickerBusy { .. } => "UpdatePickerBusy",
             Self::UpdatePickerPreview { .. } => "UpdatePickerPreview",
             Self::ClosePicker { .. } => "ClosePicker",
+            Self::PluginQuarantined { .. } => "PluginQuarantined",
             Self::BufferInsert { .. } => "BufferInsert",
             Self::BufferDelete { .. } => "BufferDelete",
             Self::BufferReplace { .. } => "BufferReplace",
@@ -12120,6 +12131,28 @@ impl Editor {
                         self.current_dialog = None;
                         needs_render = true;
                     }
+                }
+                PluginRequest::PluginQuarantined {
+                    plugin,
+                    stage,
+                    path,
+                    diagnostic,
+                    pickers,
+                    composers,
+                } => {
+                    if self.current_dialog.as_ref().is_some_and(|dialog| {
+                        dialog
+                            .picker_id()
+                            .is_some_and(|id| pickers.iter().any(|handle| handle.get() == id))
+                            || dialog
+                                .composer_handle()
+                                .is_some_and(|handle| composers.contains(&handle))
+                    }) {
+                        self.release_current_dialog_callbacks(runtime);
+                        self.current_dialog = None;
+                    }
+                    self.publish_plugin_quarantine(&plugin, &stage, &path, &diagnostic);
+                    needs_render = true;
                 }
                 PluginRequest::BufferInsert { x, y, text } => {
                     self.begin_transaction("plugin insert");
@@ -35478,6 +35511,69 @@ mod test {
 
     fn drain_plugin_requests() {
         while ACTION_DISPATCHER.try_recv_request().is_some() {}
+    }
+
+    #[tokio::test]
+    async fn plugin_quarantine_closes_only_its_dialog_and_reports_the_plugin() {
+        drain_plugin_requests();
+        let mut core = DetachedEditorCore::new(test_editor(80, 12)).await.unwrap();
+        let owned = PickerHandle::from_raw(7);
+        let picker = Picker::new_callback(
+            Some("Workspace Symbols".to_string()),
+            &core.editor,
+            Vec::new(),
+            owned,
+            PickerOptions::default(),
+        );
+        core.editor.current_dialog = Some(Box::new(picker));
+        let quarantined = |pickers: Vec<PickerHandle>| {
+            PluginRequest::PluginQuarantined {
+            plugin: "lsp_symbols".to_string(),
+            stage: "runtime".to_string(),
+            path: "plugins/lsp_symbols.hk".to_string(),
+            diagnostic: "error[HUSK-R0001]: Husk heap byte limit exceeded\n  --> plugins/lsp_symbols.hk:413:9"
+                .to_string(),
+            pickers,
+            composers: Vec::new(),
+        }
+        };
+
+        ACTION_DISPATCHER.send_request(quarantined(vec![PickerHandle::from_raw(8)]));
+        core.tick().await.unwrap();
+        assert_eq!(
+            core.editor
+                .current_dialog
+                .as_ref()
+                .and_then(|dialog| dialog.picker_id()),
+            Some(owned.get())
+        );
+
+        ACTION_DISPATCHER.send_request(quarantined(vec![owned]));
+        core.tick().await.unwrap();
+        assert!(core.editor.current_dialog.is_none());
+
+        let editor = &core.editor;
+        assert_eq!(editor.notifications.records().len(), 1);
+        let notice = editor.notifications.records().next_back().unwrap();
+        assert_eq!(notice.severity, Severity::Error);
+        assert_eq!(notice.source.label(), "lsp_symbols");
+        assert_eq!(notice.occurrences, 2);
+        assert_eq!(
+            notice.content.summary,
+            "stopped for this session: error[HUSK-R0001]: Husk heap byte limit exceeded"
+        );
+        let details = notice.content.details.as_deref().unwrap();
+        assert!(details.contains("Stage: runtime"), "{details}");
+        assert!(
+            details.contains("Source: plugins/lsp_symbols.hk"),
+            "{details}"
+        );
+        assert!(
+            details.contains("--> plugins/lsp_symbols.hk:413:9"),
+            "{details}"
+        );
+        assert!(details.contains("Restart Red"), "{details}");
+        assert!(notice.needs_attention(Instant::now()));
     }
 
     fn collect_print_requests() -> Vec<String> {

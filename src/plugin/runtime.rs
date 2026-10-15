@@ -3993,6 +3993,26 @@ impl Runtime {
         result
     }
 
+    /// Returns the callback pickers and composers `plugin` opened that are still registered.
+    #[must_use]
+    pub fn plugin_dialogs(&self, plugin: &str) -> (Vec<PickerHandle>, Vec<ComposerHandle>) {
+        let inner = self.inner.lock().unwrap();
+        let policy = inner.host.policy();
+        let pickers = policy
+            .picker_handlers
+            .iter()
+            .filter(|(_, registration)| registration.plugin == plugin)
+            .map(|(handle, _)| *handle)
+            .collect();
+        let composers = policy
+            .composer_handlers
+            .iter()
+            .filter(|(_, registration)| registration.plugin == plugin)
+            .map(|(handle, _)| *handle)
+            .collect();
+        (pickers, composers)
+    }
+
     #[must_use]
     pub fn command_plugin(&self, command: &str) -> Option<String> {
         let inner = self.inner.lock().unwrap();

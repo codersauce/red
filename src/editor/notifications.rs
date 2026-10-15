@@ -186,6 +186,43 @@ impl Editor {
         self.set_routine_warning(Some(format!("No more {target} to move to")));
     }
 
+    /// Reports that the plugin registry stopped `plugin` for the rest of the session.
+    pub(super) fn publish_plugin_quarantine(
+        &mut self,
+        plugin: &str,
+        stage: &str,
+        path: &str,
+        diagnostic: &str,
+    ) {
+        let summary = format!(
+            "stopped for this session: {}",
+            crate::plugin::quarantine_reason(diagnostic)
+        );
+        let details = format!(
+            "Plugin: {plugin}\nStage: {stage}\nSource: {path}\n\n{diagnostic}\n\n\
+             Red stopped this plugin for the rest of the session, so its commands and dialogs \
+             are unavailable. Restart Red to load it again. If you are developing this \
+             plugin, saving a fix reloads it."
+        );
+        let notice = Notice::new(
+            NotificationSource::Plugin {
+                name: plugin.to_string(),
+                generation: 0,
+            },
+            Severity::Error,
+            &summary,
+        )
+        .with_key("quarantine")
+        .with_details(details);
+        let labeled = format!("{plugin}: {summary}");
+        if let Err(error) = self.publish_notification(notice) {
+            log!("could not retain plugin quarantine notice: {error}");
+            self.set_notification_message(Severity::Error, Some(labeled));
+        } else {
+            self.last_error = Some(labeled);
+        }
+    }
+
     fn set_message_with_attention(
         &mut self,
         severity: Severity,
