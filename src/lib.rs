@@ -97,3 +97,18 @@ macro_rules! log {
         }
     };
 }
+
+#[macro_export]
+macro_rules! log_warn {
+    ($($arg:tt)*) => {
+        {
+            if let Some(logger) = $crate::LOGGER
+                .get_or_init(|| $crate::Logger::try_new("red.log").ok())
+                .as_ref()
+            {
+                let log_message = format!($($arg)*);
+                logger.log_with_level($crate::logger::LogLevel::Warn, &log_message);
+            }
+        }
+    };
+}

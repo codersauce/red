@@ -156,13 +156,31 @@ impl Editor {
     }
 
     pub(super) fn set_foreground_message(&mut self, severity: Severity, message: Option<String>) {
+        self.publish_foreground_message(severity, None, message);
+    }
+
+    /// Leads the bottom line with the result of a command the user just ran,
+    /// without adding to the messages that need attention.
+    pub(super) fn set_routine_foreground_message(&mut self, severity: Severity, message: String) {
+        self.publish_foreground_message(severity, Some(AttentionPolicy::Quiet), Some(message));
+    }
+
+    fn publish_foreground_message(
+        &mut self,
+        severity: Severity,
+        attention: Option<AttentionPolicy>,
+        message: Option<String>,
+    ) {
         let Some(message) = message else {
             self.last_error = None;
             return;
         };
-        let notice = Notice::new(NotificationSource::Editor, severity, &message)
+        let mut notice = Notice::new(NotificationSource::Editor, severity, &message)
             .with_display_priority(DisplayPriority::Foreground)
             .with_details(&message);
+        if let Some(attention) = attention {
+            notice = notice.with_attention(attention);
+        }
         if let Err(error) = self.publish_notification(notice) {
             self.notification_fallback = Some(crate::notification::single_line(truncate_chars(
                 &message, 4_096,
@@ -184,6 +202,43 @@ impl Editor {
 
     pub(super) fn set_navigation_boundary_warning(&mut self, target: &str) {
         self.set_routine_warning(Some(format!("No more {target} to move to")));
+    }
+
+    /// Reports that the plugin registry stopped `plugin` for the rest of the session.
+    pub(super) fn publish_plugin_quarantine(
+        &mut self,
+        plugin: &str,
+        stage: &str,
+        path: &str,
+        diagnostic: &str,
+    ) {
+        let summary = format!(
+            "stopped for this session: {}",
+            crate::plugin::quarantine_reason(diagnostic)
+        );
+        let details = format!(
+            "Plugin: {plugin}\nStage: {stage}\nSource: {path}\n\n{diagnostic}\n\n\
+             Red stopped this plugin for the rest of the session, so its commands and dialogs \
+             are unavailable. Restart Red to load it again. If you are developing this \
+             plugin, saving a fix reloads it."
+        );
+        let notice = Notice::new(
+            NotificationSource::Plugin {
+                name: plugin.to_string(),
+                generation: 0,
+            },
+            Severity::Error,
+            &summary,
+        )
+        .with_key("quarantine")
+        .with_details(details);
+        let labeled = format!("{plugin}: {summary}");
+        if let Err(error) = self.publish_notification(notice) {
+            log!("could not retain plugin quarantine notice: {error}");
+            self.set_notification_message(Severity::Error, Some(labeled));
+        } else {
+            self.last_error = Some(labeled);
+        }
     }
 
     fn set_message_with_attention(
@@ -887,6 +942,30 @@ mod tests {
         assert!(row.contains(":wa — no modified buffers"), "{row}");
         assert!(row.contains("1 needs attention"), "{row}");
         assert!(!row.contains("old diagnostics failure"), "{row}");
+    }
+
+    #[test]
+    fn routine_foreground_warning_leads_without_needing_attention() {
+        let mut editor = editor(120, 24);
+        editor
+            .publish_notification(Notice::new(
+                NotificationSource::Editor,
+                Severity::Error,
+                "plugin stopped",
+            ))
+            .unwrap();
+        editor.set_routine_foreground_message(
+            Severity::Warning,
+            "`Crash` is unavailable because plugin `crashy` was stopped".into(),
+        );
+
+        let mut buffer = RenderBuffer::new(120, 24, &Style::default());
+        editor.draw_commandline(&mut buffer);
+        let row = render_text_rows(&buffer).pop().unwrap();
+
+        assert!(row.contains("`Crash` is unavailable"), "{row}");
+        assert!(row.contains("1 needs attention"), "{row}");
+        assert!(!row.contains("plugin stopped"), "{row}");
     }
 
     #[test]
