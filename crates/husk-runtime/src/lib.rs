@@ -1877,10 +1877,133 @@ struct HeapSlot {
     object: Option<HeapObject>,
 }
 
+/// Shared array and map storage held by heap cells, charged once however many
+/// cells hold it.
+///
+/// Each entry counts the cells and accounted parent storage that refer to it,
+/// and keeps the storage alive so its address cannot be reused while counted.
+/// Counted storage never changes: every runtime write goes through
+/// `Arc::make_mut` on a clone of a cell's value, which copies storage this
+/// table also holds.
+#[derive(Debug, Clone, Default)]
+struct SharedStorage {
+    entries: HashMap<usize, (SharedRef, usize)>,
+}
+
+#[derive(Debug, Clone)]
+enum SharedRef {
+    List(Arc<Vec<Value>>),
+    Map(Arc<BTreeMap<String, Value>>),
+}
+
+impl SharedStorage {
+    /// Records one more holder of `value` and returns the bytes that are newly
+    /// charged: the value itself, plus the contents of storage nothing else holds.
+    fn acquire(&mut self, value: &Value) -> usize {
+        std::mem::size_of::<Value>().saturating_add(match value {
+            Value::Array(values) | Value::Tuple(values) => self.acquire_list(values),
+            Value::Object(fields) => self.acquire_map(fields),
+            Value::Struct { type_name, fields } => {
+                type_name.len().saturating_add(self.acquire_map(fields))
+            }
+            Value::Variant {
+                type_name,
+                case,
+                fields,
+            } => type_name
+                .len()
+                .saturating_add(case.len())
+                .saturating_add(self.acquire_list(fields)),
+            value => heap_value_size(value).saturating_sub(std::mem::size_of::<Value>()),
+        })
+    }
+
+    /// Drops one holder of `value` and returns the bytes no longer charged.
+    /// Mirrors [`SharedStorage::acquire`] for the same value.
+    fn release(&mut self, value: &Value) -> usize {
+        std::mem::size_of::<Value>().saturating_add(match value {
+            Value::Array(values) | Value::Tuple(values) => self.release_storage(shared_key(values)),
+            Value::Object(fields) => self.release_storage(shared_key(fields)),
+            Value::Struct { type_name, fields } => type_name
+                .len()
+                .saturating_add(self.release_storage(shared_key(fields))),
+            Value::Variant {
+                type_name,
+                case,
+                fields,
+            } => type_name
+                .len()
+                .saturating_add(case.len())
+                .saturating_add(self.release_storage(shared_key(fields))),
+            value => heap_value_size(value).saturating_sub(std::mem::size_of::<Value>()),
+        })
+    }
+
+    fn acquire_list(&mut self, values: &Arc<Vec<Value>>) -> usize {
+        if self.hold(shared_key(values)) {
+            return 0;
+        }
+        self.entries
+            .insert(shared_key(values), (SharedRef::List(Arc::clone(values)), 1));
+        values
+            .iter()
+            .map(|value| self.acquire(value))
+            .fold(0, usize::saturating_add)
+    }
+
+    fn acquire_map(&mut self, fields: &Arc<BTreeMap<String, Value>>) -> usize {
+        if self.hold(shared_key(fields)) {
+            return 0;
+        }
+        self.entries
+            .insert(shared_key(fields), (SharedRef::Map(Arc::clone(fields)), 1));
+        fields
+            .iter()
+            .map(|(name, value)| name.len().saturating_add(self.acquire(value)))
+            .fold(0, usize::saturating_add)
+    }
+
+    fn hold(&mut self, key: usize) -> bool {
+        match self.entries.get_mut(&key) {
+            Some((_, holders)) => {
+                *holders += 1;
+                true
+            }
+            None => false,
+        }
+    }
+
+    fn release_storage(&mut self, key: usize) -> usize {
+        let Some((_, holders)) = self.entries.get_mut(&key) else {
+            return 0;
+        };
+        *holders -= 1;
+        if *holders > 0 {
+            return 0;
+        }
+        let (storage, _) = self.entries.remove(&key).expect("entry was just found");
+        match storage {
+            SharedRef::List(values) => values
+                .iter()
+                .map(|value| self.release(value))
+                .fold(0, usize::saturating_add),
+            SharedRef::Map(fields) => fields
+                .iter()
+                .map(|(name, value)| name.len().saturating_add(self.release(value)))
+                .fold(0, usize::saturating_add),
+        }
+    }
+}
+
+fn shared_key<T>(storage: &Arc<T>) -> usize {
+    Arc::as_ptr(storage) as usize
+}
+
 #[derive(Debug, Clone)]
 struct RuntimeHeap {
     slots: Vec<HeapSlot>,
     free: Vec<u32>,
+    shared: SharedStorage,
     live_objects: usize,
     live_closures: usize,
     live_bytes: usize,
@@ -1893,6 +2016,7 @@ impl Default for RuntimeHeap {
         Self {
             slots: Vec::new(),
             free: Vec::new(),
+            shared: SharedStorage::default(),
             live_objects: 0,
             live_closures: 0,
             live_bytes: 0,
@@ -1915,9 +2039,17 @@ impl RuntimeHeap {
                 self.max_objects
             );
         }
-        let object_bytes = heap_object_size(&object);
+        let object_bytes = match &object {
+            HeapObject::Cell(value) => {
+                std::mem::size_of::<HeapObject>().saturating_add(self.shared.acquire(value))
+            }
+            HeapObject::Closure(_) => heap_object_size(&object),
+        };
         let next_bytes = self.live_bytes.saturating_add(object_bytes);
         if next_bytes > self.max_bytes {
+            if let HeapObject::Cell(value) = &object {
+                self.shared.release(value);
+            }
             anyhow::bail!(
                 "Husk heap byte limit exceeded (requested {object_bytes} bytes with {} of {} bytes live)",
                 self.live_bytes,
@@ -1978,18 +2110,21 @@ impl RuntimeHeap {
     }
 
     fn set_cell(&mut self, handle: CellHandle, value: Value) -> anyhow::Result<()> {
-        let old_bytes = match self.object(handle)? {
-            HeapObject::Cell(current) => heap_value_size(current),
-            HeapObject::Closure(_) => {
-                anyhow::bail!("Husk heap handle does not refer to a cell");
-            }
+        let HeapObject::Cell(current) = self.object(handle)? else {
+            anyhow::bail!("Husk heap handle does not refer to a cell");
         };
-        let new_bytes = heap_value_size(&value);
+        let current = current.clone();
+        // Charge the new value before releasing the old one, so storage they
+        // share stays counted instead of being released and charged again.
+        let new_bytes = self.shared.acquire(&value);
+        let old_bytes = self.shared.release(&current);
         let next_bytes = self
             .live_bytes
             .saturating_sub(old_bytes)
             .saturating_add(new_bytes);
         if next_bytes > self.max_bytes {
+            self.shared.acquire(&current);
+            self.shared.release(&value);
             anyhow::bail!(
                 "Husk heap byte limit exceeded (value needs {new_bytes} bytes with {} of {} bytes live)",
                 self.live_bytes.saturating_sub(old_bytes),
@@ -2056,12 +2191,21 @@ impl RuntimeHeap {
         {
             return;
         }
-        let object_bytes = slot.object.as_ref().map_or(0, heap_object_size);
-        slot.object = None;
+        let object = slot.object.take().expect("cell kind was checked above");
         slot.generation = slot.generation.wrapping_add(1).max(1);
+        let object_bytes = self.object_bytes_released(&object);
         self.free.push(handle.slot);
         self.live_objects = self.live_objects.saturating_sub(1);
         self.live_bytes = self.live_bytes.saturating_sub(object_bytes);
+    }
+
+    fn object_bytes_released(&mut self, object: &HeapObject) -> usize {
+        match object {
+            HeapObject::Cell(value) => {
+                std::mem::size_of::<HeapObject>().saturating_add(self.shared.release(value))
+            }
+            HeapObject::Closure(_) => heap_object_size(object),
+        }
     }
 
     fn reachable_handles(
@@ -2134,9 +2278,14 @@ impl RuntimeHeap {
                 slot.marked = false;
                 continue;
             }
-            let is_closure = matches!(slot.object, Some(HeapObject::Closure(_)));
-            let object_bytes = slot.object.as_ref().map_or(0, heap_object_size);
-            slot.object = None;
+            let object = slot.object.take().expect("checked above");
+            let is_closure = matches!(object, HeapObject::Closure(_));
+            let object_bytes = match &object {
+                HeapObject::Cell(value) => {
+                    std::mem::size_of::<HeapObject>().saturating_add(self.shared.release(value))
+                }
+                HeapObject::Closure(_) => heap_object_size(&object),
+            };
             slot.generation = slot.generation.wrapping_add(1).max(1);
             self.free
                 .push(u32::try_from(index).expect("allocated heap indices fit in u32"));
@@ -2147,10 +2296,12 @@ impl RuntimeHeap {
     }
 }
 
-/// Heap bytes charged for storing `value` in one variable or parameter cell.
+/// Heap bytes charged for storing `value` in one variable or parameter cell
+/// when no other cell holds any of its arrays or maps.
 ///
-/// Every cell is charged the value's full size, including arrays it shares with
-/// other cells.
+/// Arrays and maps that cells share are charged once, so a value whose storage
+/// is already held is charged less. For a value built outside the runtime,
+/// such as a host result, this is the exact charge.
 #[must_use]
 pub fn heap_cell_size(value: &Value) -> usize {
     std::mem::size_of::<HeapObject>().saturating_add(heap_value_size(value))
@@ -2191,7 +2342,8 @@ fn heap_object_size(object: &HeapObject) -> usize {
     })
 }
 
-/// Heap bytes `value` accounts for inside a cell, including shared contents.
+/// Heap bytes `value` accounts for inside a cell, including the contents of its
+/// arrays and maps.
 #[must_use]
 pub fn heap_value_size(value: &Value) -> usize {
     std::mem::size_of::<Value>().saturating_add(match value {
@@ -7045,6 +7197,119 @@ mod tests {
         assert_eq!(vm.available_heap_bytes(), needed);
         vm.call_export("sink", "take", vec![values], &mut host)
             .unwrap();
+    }
+
+    fn shared_values(count: usize) -> Value {
+        Value::Array(Arc::new(
+            (0..count)
+                .map(|index| Value::String(format!("value-{index:06}")))
+                .collect(),
+        ))
+    }
+
+    #[test]
+    fn shared_array_is_charged_once_however_many_cells_hold_it() {
+        let mut host = TestHost;
+        let mut vm = Vm::new();
+        vm.load_plugin(
+            "sharing",
+            r#"
+                pub fn take(values: [String]) {
+                    let kept = values;
+                    let again = kept;
+                    forward(again, kept);
+                }
+                fn forward(first: [String], second: [String]) {
+                    let last = first;
+                }
+                pub fn noop() {}
+            "#,
+            &mut host,
+        )
+        .unwrap();
+        let values = shared_values(10_000);
+        let needed = heap_cell_size(&values);
+        let live = vm.heap.live_bytes;
+        // Room for the array once, not for the six cells that hold it.
+        vm.set_heap_limits(1_000_000, live + needed + 4 * 1024);
+
+        vm.call_export("sharing", "take", vec![values], &mut host)
+            .unwrap();
+        vm.call_export("sharing", "noop", Vec::new(), &mut host)
+            .unwrap();
+        assert_eq!(vm.heap.live_bytes, live);
+        assert!(vm.heap.shared.entries.is_empty());
+    }
+
+    #[test]
+    fn copying_a_shared_array_to_change_it_is_charged() {
+        let mut host = TestHost;
+        let mut vm = Vm::new();
+        vm.load_plugin(
+            "copies",
+            r#"
+                pub fn grow(values: [String]) {
+                    let mut copy = values;
+                    copy.push("extra");
+                }
+                pub fn take(values: [String]) {
+                    let kept = values;
+                }
+            "#,
+            &mut host,
+        )
+        .unwrap();
+        let values = shared_values(10_000);
+        let needed = heap_cell_size(&values);
+        let live = vm.heap.live_bytes;
+        vm.set_heap_limits(1_000_000, live + needed + 4 * 1024);
+
+        let error = vm
+            .call_export("copies", "grow", vec![values.clone()], &mut host)
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("heap byte limit exceeded"),
+            "{error}"
+        );
+
+        // The failed write left the original array counted once, not leaked.
+        vm.call_export("copies", "take", vec![values], &mut host)
+            .unwrap();
+        assert_eq!(vm.heap.live_bytes, live);
+        assert!(vm.heap.shared.entries.is_empty());
+    }
+
+    #[test]
+    fn growing_an_array_past_the_heap_limit_still_fails() {
+        let mut host = TestHost;
+        let mut vm = Vm::new();
+        vm.load_plugin(
+            "runaway",
+            r#"
+                pub fn grow(chunk: String) {
+                    let mut items = [];
+                    for index in 0..1000 {
+                        items.push(chunk);
+                    }
+                }
+            "#,
+            &mut host,
+        )
+        .unwrap();
+        vm.set_heap_limits(1_000_000, vm.heap.live_bytes + 256 * 1024);
+
+        let error = vm
+            .call_export(
+                "runaway",
+                "grow",
+                vec![Value::String("x".repeat(1024))],
+                &mut host,
+            )
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("heap byte limit exceeded"),
+            "{error}"
+        );
     }
 
     #[test]
