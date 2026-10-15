@@ -513,24 +513,23 @@ reported without letting an untrusted process grow editor memory indefinitely.
 
 ## Oversized request results
 
-Each Husk plugin runs with a 64 MiB heap. Red delivers a request result unchanged
-whenever it fits in the plugin's free heap. When it does not, host API `0.20.0` handles
-it before any plugin code runs, instead of letting the callback fail and quarantine the
-plugin:
+Each Husk plugin runs with a 64 MiB heap. Host API `0.20.0` checks each request result
+against the plugin's free heap before any plugin code runs, instead of letting the
+callback fail and quarantine the plugin:
 
-- `DocumentSymbols`, `WorkspaceSymbols`, and `References` results keep the leading
-  entries of `symbols` or `references` that fit in half of the free heap. The other half
-  leaves room for the plugin to bind the list to one more variable, since every variable
-  holding a list is charged its full size.
+- `DocumentSymbols`, `WorkspaceSymbols`, and `References` results are delivered unchanged
+  when they fit in half of the free heap. Larger ones keep the leading entries of
+  `symbols` or `references` that fit in that half. The other half is the plugin's room to
+  work with the list, for example to build picker items from it.
 - Every successful result of those three requests includes `total`, the number of
   entries before any trimming. A list shorter than `total` was trimmed. Failed results
   (`ok: false`) do not include `total`, so read it only after checking `ok`.
-- Any other result is dropped. Its callback is not called, the plugin stays active, and
-  Red shows a warning attributed to the plugin with the size it needed and the space it
-  had.
+- Any other result is delivered unchanged when it fits in the free heap, and dropped
+  when it does not. A dropped result's callback is not called, the plugin stays active,
+  and Red shows a warning attributed to the plugin with the size it needed and the
+  space it had.
 
-Before `0.20.0`, these results quarantined the plugin. To stay within the heap, slice
-large lists before passing them to helper functions; each binding is charged again.
+Before `0.20.0`, these results quarantined the plugin.
 
 ## Edit notification boundaries
 

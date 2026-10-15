@@ -4262,13 +4262,19 @@ impl Runtime {
         if let Some(vm) = plugins.get_mut(callback.plugin()) {
             let available = vm.available_heap_bytes();
             let needed = heap_cell_size(&payload).saturating_add(heap_cell_size(&request_id));
-            if needed > available {
-                // Binding the trimmed list to one more variable charges it again
-                // (#395), so leave the plugin room for that copy.
+            // A plugin needs heap to work through a list after it arrives, so a
+            // list that only just fits still fails the callback. Trim lists past
+            // half the free heap; other results can only be delivered or dropped.
+            let list_field = trimmable_result_list(&request);
+            let limit = if list_field.is_some() {
+                available / 2
+            } else {
+                available
+            };
+            if needed > limit {
                 let budget = (available / 2).saturating_sub(heap_cell_size(&request_id));
-                match trimmable_result_list(&request)
-                    .and_then(|field| trimmed_result(&payload, field, budget))
-                {
+                match list_field.and_then(|field| trimmed_result(&payload, field, budget)) {
+                    None if needed <= available => {}
                     Some((trimmed, kept)) => {
                         crate::log_warn!(
                             "Trimmed `{request}` result for plugin `{}` to {kept} entries: \
@@ -19519,6 +19525,20 @@ mod tests {
         assert!(trimmed_result(&result(1_000), "symbols", empty - 1).is_none());
         assert!(trimmed_result(&result(10), "references", budget).is_none());
         assert!(trimmed_result(&Value::String("text".into()), "symbols", budget).is_none());
+    }
+
+    #[tokio::test]
+    async fn workspace_symbols_that_barely_fit_the_plugin_heap_are_trimmed_before_delivery() {
+        // About 62 MB once decoded: it fits the 64 MiB heap, but the plugin then
+        // has no room left to build picker items from it.
+        let (items, status) =
+            settle_workspace_symbols(sample_symbol_payload_with_count(28_000)).await;
+
+        assert_eq!(items.len(), 4_096);
+        assert_eq!(
+            status.as_deref(),
+            Some("4096 symbols (results truncated: first 4096 of 28000; type to narrow)")
+        );
     }
 
     #[tokio::test]
