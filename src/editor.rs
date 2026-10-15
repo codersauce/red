@@ -13381,6 +13381,10 @@ impl Editor {
             });
         }
 
+        if let Some(action) = self.pending_completion_commit() {
+            self.execute(&action, buffer, runtime).await?;
+        }
+
         let render_generation = self.render_generation;
         let window_before = self.window_manager.active_stable_window_id();
         let repeat_signature = Self::key_signature(&ev);
@@ -16168,18 +16172,6 @@ impl Editor {
             let action = current_dialog.handle_event(ev);
             let allows_passthrough = current_dialog.allows_event_passthrough();
             if action.is_some() || !allows_passthrough {
-                let action = match (action, ev) {
-                    (
-                        Some(action),
-                        Event::Key(KeyEvent {
-                            code: KeyCode::Char(c),
-                            ..
-                        }),
-                    ) if allows_passthrough && self.is_completion_trigger_char(*c) => {
-                        Some(Self::retrigger_after_completion_commit(action, *c))
-                    }
-                    (action, _) => action,
-                };
                 return Ok(action);
             }
         }
@@ -24323,6 +24315,9 @@ impl Editor {
                 {
                     self.apply_completion(item, *commit_character, runtime)
                         .await?;
+                } else {
+                    self.close_completion_popup();
+                    self.completion_snapshot = None;
                 }
                 self.render(buffer)?;
             }
@@ -30575,25 +30570,6 @@ impl Editor {
         KeyAction::Multiple(actions)
     }
 
-    fn retrigger_after_completion_commit(action: KeyAction, c: char) -> KeyAction {
-        let KeyAction::Multiple(mut actions) = action else {
-            return action;
-        };
-        let committed = actions.iter().any(|action| {
-            matches!(
-                action,
-                Action::ApplyCompletion {
-                    commit_character: Some(character),
-                    ..
-                } if *character == c
-            )
-        });
-        if committed {
-            actions.push(Action::RequestCompletionWithTrigger(c));
-        }
-        KeyAction::Multiple(actions)
-    }
-
     fn handle_trigger_char(&mut self, c: char) -> anyhow::Result<Option<KeyAction>> {
         if !self.is_completion_trigger_char(c) {
             return Ok(None);
@@ -30969,6 +30945,11 @@ impl Editor {
         commit_character: Option<char>,
         runtime: &mut Runtime,
     ) -> anyhow::Result<()> {
+        let continuation = self.coordinated_completion_continuation(item, commit_character);
+        self.close_completion_popup();
+        // Taken before the rejections below: a lingering snapshot would let a
+        // delayed response past the dismissal guard and reopen the popup.
+        let snapshot = self.completion_snapshot.take();
         if !self.config.completion.enabled {
             return Ok(());
         }
@@ -30982,8 +30963,6 @@ impl Editor {
             ));
             return Ok(());
         }
-        let continuation = self.coordinated_completion_continuation(item, commit_character);
-        let snapshot = self.completion_snapshot.take();
         if snapshot
             .as_ref()
             .is_some_and(|snapshot| !self.completion_snapshot_is_current(snapshot))
@@ -31100,6 +31079,10 @@ impl Editor {
 
         if let Some(continuation) = continuation {
             self.restore_coordinated_completion(continuation);
+        }
+
+        if let Some(character) = commit_character.filter(|c| self.is_completion_trigger_char(*c)) {
+            self.request_completion(Some(character)).await?;
         }
 
         Ok(())
@@ -43724,26 +43707,6 @@ builtin = "rust"
         ));
     }
 
-    #[test]
-    fn committed_trigger_character_requests_member_completion() {
-        let action = KeyAction::Multiple(vec![
-            Action::ApplyCompletion {
-                item: Box::new(completion_item("torch")),
-                commit_character: Some('.'),
-            },
-            Action::CloseDialog,
-        ]);
-
-        let KeyAction::Multiple(actions) = Editor::retrigger_after_completion_commit(action, '.')
-        else {
-            panic!("expected ordered completion actions");
-        };
-        assert!(matches!(
-            actions.last(),
-            Some(Action::RequestCompletionWithTrigger('.'))
-        ));
-    }
-
     #[tokio::test]
     async fn delayed_lsp_completion_selects_its_best_match_over_buffer_words() {
         let mut editor = completion_typing_editor();
@@ -43807,6 +43770,153 @@ builtin = "rust"
             .unwrap();
 
         assert_eq!(editor.current_buffer().contents(), "torch.many");
+        assert!(editor.current_dialog.is_none());
+    }
+
+    /// Minimal client whose managed-server identity can change mid-test.
+    struct RestartableLsp {
+        instance: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    }
+
+    #[async_trait::async_trait]
+    impl LspClient for RestartableLsp {
+        async fn initialize(&mut self) -> Result<(), crate::lsp::LspError> {
+            Ok(())
+        }
+
+        async fn did_open(
+            &mut self,
+            _file: &str,
+            _contents: &str,
+        ) -> Result<(), crate::lsp::LspError> {
+            Ok(())
+        }
+
+        async fn did_change(
+            &mut self,
+            _file: &str,
+            _contents: String,
+        ) -> Result<(), crate::lsp::LspError> {
+            Ok(())
+        }
+
+        async fn request_diagnostics(
+            &mut self,
+            _file_uri: &str,
+        ) -> Result<Option<i64>, crate::lsp::LspError> {
+            Ok(None)
+        }
+
+        async fn send_request(
+            &mut self,
+            _method: &str,
+            _params: serde_json::Value,
+            _force: bool,
+        ) -> Result<i64, crate::lsp::LspError> {
+            Ok(0)
+        }
+
+        async fn send_notification(
+            &mut self,
+            _method: &str,
+            _params: serde_json::Value,
+            _force: bool,
+        ) -> Result<(), crate::lsp::LspError> {
+            Ok(())
+        }
+
+        async fn request_completion(
+            &mut self,
+            _file_uri: &str,
+            _line: usize,
+            _character: usize,
+            _trigger_character: Option<char>,
+        ) -> Result<i64, crate::lsp::LspError> {
+            Ok(0)
+        }
+
+        async fn recv_response(
+            &mut self,
+        ) -> Result<Option<(InboundMessage, Option<String>)>, crate::lsp::LspError> {
+            Ok(None)
+        }
+
+        fn get_server_capabilities(&self) -> Option<&ServerCapabilities> {
+            None
+        }
+
+        async fn shutdown(&mut self) -> Result<(), crate::lsp::LspError> {
+            Ok(())
+        }
+
+        fn server_instance_for_file(&self, _file: &str) -> Option<u64> {
+            Some(self.instance.load(std::sync::atomic::Ordering::SeqCst))
+        }
+    }
+
+    #[tokio::test]
+    async fn rejected_stale_completion_dismisses_the_session_for_late_responses() {
+        let instance = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1));
+        let config: Config = toml::from_str(include_str!("../default_config.toml")).unwrap();
+        let lsp = Box::new(RestartableLsp {
+            instance: std::sync::Arc::clone(&instance),
+        });
+        let buffer = Buffer::new(None, "torch.man".to_string());
+        let mut editor =
+            Editor::with_size(lsp, 80, 24, config, Theme::default(), vec![buffer]).unwrap();
+        editor.test_disable_terminal_output();
+        editor.mode = Mode::Insert;
+        editor.cx = "torch.man".chars().count();
+        editor.refresh_cursor_goal();
+        editor.sync_to_window();
+
+        let mut stale_item = completion_item("manual_seed");
+        stale_item.source = Some(LspRequestSource {
+            key: "torch.py".to_string(),
+            instance: 1,
+        });
+        let request_snapshot = editor.completion_snapshot();
+        assert!(editor.show_completion_items(vec![stale_item], request_snapshot));
+        let pending_snapshot = editor.completion_snapshot.clone().unwrap();
+        editor.pending_completions.insert(
+            42,
+            PendingCompletion {
+                buffer_items: Vec::new(),
+                snapshot: pending_snapshot,
+                displayed_immediately: true,
+                superseded: false,
+            },
+        );
+
+        // The server restarts between displaying the menu and accepting the item.
+        instance.store(2, std::sync::atomic::Ordering::SeqCst);
+        let mut render_buffer = RenderBuffer::new(80, 24, &Style::default());
+        let mut runtime = Runtime::new();
+        editor
+            .process_editor_event(
+                Event::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)),
+                &mut render_buffer,
+                &mut runtime,
+                EventRenderMode::Immediate,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(editor.current_buffer().contents(), "torch.man");
+        assert!(editor.current_dialog.is_none());
+        assert!(editor.completion_snapshot.is_none());
+
+        let late_response = InboundMessage::Message(ResponseMessage {
+            id: 42,
+            result: serde_json::json!([{ "label": "manual" }]),
+            request: Some(crate::lsp::Request::new(
+                "textDocument/completion",
+                serde_json::json!({ "position": { "line": 0, "character": 9 } }),
+            )),
+        });
+        assert!(editor
+            .handle_lsp_message(&late_response, Some("textDocument/completion".to_string()))
+            .is_none());
         assert!(editor.current_dialog.is_none());
     }
 
@@ -44158,11 +44268,11 @@ builtin = "rust"
             .unwrap();
 
         let tab = Event::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
-        let KeyAction::Multiple(actions) = editor.handle_event(&tab).unwrap().unwrap() else {
-            panic!("expected completion application and close actions");
+        let KeyAction::Single(action) = editor.handle_event(&tab).unwrap().unwrap() else {
+            panic!("expected completion application action");
         };
         editor
-            .execute(&actions[0], &mut render_buffer, &mut runtime)
+            .execute(&action, &mut render_buffer, &mut runtime)
             .await
             .unwrap();
 
@@ -44171,10 +44281,6 @@ builtin = "rust"
             .last_error
             .as_deref()
             .is_some_and(|error| error.contains("stale")));
-        editor
-            .execute(&actions[1], &mut render_buffer, &mut runtime)
-            .await
-            .unwrap();
         assert!(editor.current_dialog.is_none());
     }
 
@@ -44426,12 +44532,9 @@ builtin = "rust"
         ));
         let tab = Event::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
         let action = editor.handle_event(&tab).unwrap().unwrap();
-        let KeyAction::Multiple(actions) = action else {
-            panic!("expected completion application action");
-        };
         assert!(matches!(
-            actions.first(),
-            Some(Action::ApplyCompletion { item, .. }) if item.label == "xb"
+            action,
+            KeyAction::Single(Action::ApplyCompletion { item, .. }) if item.label == "xb"
         ));
     }
 
