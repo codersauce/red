@@ -140,6 +140,10 @@ pub(super) fn relative_notice_age(updated_at: SystemTime, now: SystemTime) -> Op
     Some(format!("{value}{unit} ago"))
 }
 
+fn mebibytes(bytes: usize) -> String {
+    format!("{:.1} MiB", bytes as f64 / (1024.0 * 1024.0))
+}
+
 impl Editor {
     /// Transitional operation-local result plus durable notification publication.
     /// Clearing the old slot never clears notification history or active work.
@@ -222,20 +226,59 @@ impl Editor {
              are unavailable. Restart Red to load it again. If you are developing this \
              plugin, saving a fix reloads it."
         );
+        self.publish_plugin_notice(plugin, Severity::Error, "quarantine", summary, details);
+    }
+
+    /// Reports a request result the host skipped because it did not fit in the
+    /// plugin's free heap.
+    pub(super) fn publish_plugin_result_dropped(
+        &mut self,
+        plugin: &str,
+        request: &str,
+        needed: usize,
+        available: usize,
+    ) {
+        let summary = format!(
+            "dropped a {request} result too large for its memory ({} needed, {} free)",
+            mebibytes(needed),
+            mebibytes(available)
+        );
+        let details = format!(
+            "Plugin: {plugin}\nRequest: {request}\nNeeded: {needed} bytes\nFree: {available} \
+             bytes\n\nRed skipped this result instead of stopping the plugin. The plugin keeps \
+             running, but whatever was waiting for this result will not receive it."
+        );
+        self.publish_plugin_notice(
+            plugin,
+            Severity::Warning,
+            &format!("dropped-result:{request}"),
+            summary,
+            details,
+        );
+    }
+
+    fn publish_plugin_notice(
+        &mut self,
+        plugin: &str,
+        severity: Severity,
+        key: &str,
+        summary: String,
+        details: String,
+    ) {
         let notice = Notice::new(
             NotificationSource::Plugin {
                 name: plugin.to_string(),
                 generation: 0,
             },
-            Severity::Error,
+            severity,
             &summary,
         )
-        .with_key("quarantine")
+        .with_key(key)
         .with_details(details);
         let labeled = format!("{plugin}: {summary}");
         if let Err(error) = self.publish_notification(notice) {
-            log!("could not retain plugin quarantine notice: {error}");
-            self.set_notification_message(Severity::Error, Some(labeled));
+            log!("could not retain plugin notice: {error}");
+            self.set_notification_message(severity, Some(labeled));
         } else {
             self.last_error = Some(labeled);
         }

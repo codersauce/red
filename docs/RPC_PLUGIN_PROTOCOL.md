@@ -114,7 +114,7 @@ The version 1 initialization parameters are:
 ```json
 {
   "protocol_versions": [1],
-  "red_api_version": "0.19.0",
+  "red_api_version": "0.20.0",
   "plugin_id": "document-tools",
   "host_methods": [
     "red/DocumentCreate",

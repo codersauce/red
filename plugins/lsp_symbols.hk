@@ -43,10 +43,14 @@ struct LspLocation {
     range: LspTextRange,
 }
 
+// `total` counts the server's results before Red trimmed a list too large for
+// this plugin's memory. Successful results always carry it; failures do not, so
+// read it only after checking `ok`.
 struct SymbolsResult {
     ok: bool,
     error: String,
     symbols: [LspSymbol],
+    total: i32,
 }
 
 struct ReferencesResult {
@@ -55,6 +59,7 @@ struct ReferencesResult {
     file: String,
     position: Position,
     references: [LspLocation],
+    total: i32,
 }
 
 struct LspSymbolsProgressClient {
@@ -368,7 +373,7 @@ fn show_document_symbols(result: SymbolsResult, request_id: i32) {
         return;
     }
 
-    if count <= 64 {
+    if count <= 64 && result.total <= count {
         let items = symbol_items(result.symbols, false);
         let handle = red::execute("OpenPicker", "Document Symbols", items, PickerOptions {
             placeholder: "Filter document symbols",
@@ -395,7 +400,7 @@ fn show_document_symbols(result: SymbolsResult, request_id: i32) {
     let current = state();
     current.picker = Some(handle);
     save_state(current);
-    start_symbol_batch(result.symbols.slice(0, max_batch_records()), false, handle, count);
+    start_symbol_batch(result.symbols.slice(0, max_batch_records()), false, handle, result.total);
 }
 
 fn update_workspace_symbols(result: SymbolsResult, request_id: i32) {
@@ -418,8 +423,8 @@ fn update_workspace_symbols(result: SymbolsResult, request_id: i32) {
     }
 
     let received = red::len(result.symbols);
-    if received > 64 {
-        start_symbol_batch(result.symbols.slice(0, max_batch_records()), true, handle, received);
+    if received > 64 || result.total > received {
+        start_symbol_batch(result.symbols.slice(0, max_batch_records()), true, handle, result.total);
         red::execute("UpdatePickerStatus", handle, "Loading 0/" + received + " symbols");
         return;
     }
@@ -605,10 +610,10 @@ fn show_references(result: ReferencesResult, request_id: i32) {
     }
 
     let received = red::len(result.references);
-    if received > 64 {
+    if received > 64 || result.total > received {
         red::execute("UpdatePickerStatus", handle, "Loading 0/" + received + " references");
         let references = result.references.slice(0, max_batch_records());
-        start_reference_batch(references, received, result.file, result.position, handle);
+        start_reference_batch(references, result.total, result.file, result.position, handle);
         return;
     }
 
