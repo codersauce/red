@@ -567,7 +567,7 @@ fn print_plugin_table<const N: usize>(
             *width = (*width).max(cell.len());
         }
     }
-    let print_row = |cells: [&str; N], codes: [Option<&'static str>; N]| {
+    let render_row = |cells: [&str; N], codes: [Option<&'static str>; N]| {
         let mut line = String::new();
         for (index, ((cell, width), code)) in cells.iter().zip(widths).zip(codes).enumerate() {
             if index > 0 {
@@ -581,14 +581,32 @@ fn print_plugin_table<const N: usize>(
                 line.extend(std::iter::repeat_n(' ', width - cell.len()));
             }
         }
-        println!("{line}");
+        line
     };
-    print_row(header, [Some(cli_style::DIM); N]);
+    let mut out = stdout().lock();
+    write_cli_line(&mut out, &render_row(header, [Some(cli_style::DIM); N]));
     for row in rows {
-        print_row(
-            std::array::from_fn(|index| row[index].as_str()),
-            std::array::from_fn(|index| styles[index](&row[index])),
+        write_cli_line(
+            &mut out,
+            &render_row(
+                std::array::from_fn(|index| row[index].as_str()),
+                std::array::from_fn(|index| styles[index](&row[index])),
+            ),
         );
+    }
+}
+
+/// Write one line of CLI output without panicking when the reader has gone
+/// away (e.g. `red plugin catalog | head`). A closed pipe exits with 141, the
+/// status a process killed by SIGPIPE reports, so pipelines behave as they
+/// would with any other Unix tool; other write failures exit with an error.
+fn write_cli_line(out: &mut impl std::io::Write, line: &str) {
+    if let Err(error) = writeln!(out, "{line}") {
+        if error.kind() == std::io::ErrorKind::BrokenPipe {
+            std::process::exit(141);
+        }
+        eprintln!("red: failed to write to stdout: {error}");
+        std::process::exit(1);
     }
 }
 

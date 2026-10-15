@@ -5,6 +5,12 @@ edition = "2021"
 default-run = "red"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
+[lints.rust]
+# Apple's ld notes that the debug binary's __eh_frame outgrows the 16MB compact
+# unwind limit; that only slows panic unwinding and cannot be avoided at this
+# binary size, so don't surface the linker message on every build.
+linker_messages = "allow"
+
 [[test]]
 name = "rpc_connection"
 path = "tests/rpc_connection.rs"
