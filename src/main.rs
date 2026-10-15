@@ -380,6 +380,7 @@ async fn run_plugin_command(command: &PluginCommand) -> anyhow::Result<()> {
         PluginCommand::Catalog(arguments) => {
             let url = arguments.catalog_url.clone().unwrap_or_else(catalog_url);
             let catalog = PluginCatalog::fetch(&url).await?;
+            let mut rows = Vec::new();
             for package in catalog.packages {
                 let compatibility = if package.supports_current_red_release()? {
                     "compatible"
@@ -391,40 +392,45 @@ async fn run_plugin_command(command: &PluginCommand) -> anyhow::Result<()> {
                 } else {
                     "unavailable"
                 };
-                println!(
-                    "{}\t{}\t{}\t{}\t{}",
-                    package.id,
-                    package.version,
-                    package.tier.label(),
-                    compatibility,
-                    target
-                );
+                rows.push([
+                    package.id.to_string(),
+                    package.version.to_string(),
+                    package.tier.label().to_string(),
+                    compatibility.to_string(),
+                    target.to_string(),
+                ]);
             }
+            print_plugin_table(["NAME", "VERSION", "TIER", "STATUS", "TARGET"], &rows);
         }
         PluginCommand::List => {
             let plugins = manager.list()?;
             if plugins.is_empty() {
                 println!("No external plugins installed.");
             }
-            for plugin in plugins {
-                let state = if plugin.enabled {
-                    "enabled"
-                } else {
-                    "disabled"
-                };
-                let compatibility = if plugin.compatible {
-                    "compatible"
-                } else {
-                    "incompatible"
-                };
-                println!(
-                    "{}\t{}\t{}\t{}\t{}",
-                    plugin.id,
-                    plugin.version,
-                    state,
-                    compatibility,
-                    plugin.modality_label()
-                );
+            let rows: Vec<[String; 5]> = plugins
+                .into_iter()
+                .map(|plugin| {
+                    let state = if plugin.enabled {
+                        "enabled"
+                    } else {
+                        "disabled"
+                    };
+                    let compatibility = if plugin.compatible {
+                        "compatible"
+                    } else {
+                        "incompatible"
+                    };
+                    [
+                        plugin.id.to_string(),
+                        plugin.version.to_string(),
+                        state.to_string(),
+                        compatibility.to_string(),
+                        plugin.modality_label(),
+                    ]
+                })
+                .collect();
+            if !rows.is_empty() {
+                print_plugin_table(["NAME", "VERSION", "STATE", "STATUS", "MODALITY"], &rows);
             }
         }
         PluginCommand::Update(arguments) if arguments.all => {
@@ -479,6 +485,34 @@ async fn run_plugin_command(command: &PluginCommand) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+/// Prints rows as space-aligned columns under an uppercase header, sizing each
+/// column to its widest cell so long plugin ids do not break the alignment.
+fn print_plugin_table<const N: usize>(header: [&str; N], rows: &[[String; N]]) {
+    let mut widths: [usize; N] = header.map(str::len);
+    for row in rows {
+        for (width, cell) in widths.iter_mut().zip(row) {
+            *width = (*width).max(cell.len());
+        }
+    }
+    let print_row = |cells: [&str; N]| {
+        let mut line = String::new();
+        for (index, (cell, width)) in cells.iter().zip(widths).enumerate() {
+            if index > 0 {
+                line.push_str("  ");
+            }
+            line.push_str(cell);
+            if index + 1 < N {
+                line.extend(std::iter::repeat_n(' ', width - cell.len()));
+            }
+        }
+        println!("{line}");
+    };
+    print_row(header);
+    for row in rows {
+        print_row(std::array::from_fn(|index| row[index].as_str()));
+    }
 }
 
 fn run_language_command(command: &LanguageCommand, overrides: &[String]) -> anyhow::Result<()> {
