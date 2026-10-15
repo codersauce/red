@@ -1,5 +1,5 @@
 schema_version = 1
-version = "0.9.0"
+version = "0.9.1"
 headline = "TypeScript and ESLint together, plugins in your language"
 summary = "Red v0.9.0 lets multiple language servers work on the same file and adds a JSON-RPC plugin interface for external programs. JSON Workbench demonstrates the new interface with live jq queries and reviewable document transformations."
 website = "https://github.com/codersauce/red/releases/latest"

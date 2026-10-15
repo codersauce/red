@@ -2,6 +2,35 @@
 
 All notable changes to Red are documented in this file.
 
+## [0.9.1](https://github.com/codersauce/red/compare/v0.9.0...v0.9.1)
+
+### Features
+
+- **plugins:** Show each plugin's session state and report RPC startup ([#400](https://github.com/codersauce/red/issues/400)) ([e342145](https://github.com/codersauce/red/commit/e3421450450d59d192720f0cbd84bc6706665cf7))
+- **cli:** Style utility command output with shared CLI helpers ([ff24a5e](https://github.com/codersauce/red/commit/ff24a5ee3118397df445d650d44a4a435e2866bf))
+- **cli:** Style plugin tables with shared ANSI helpers ([ea8eda9](https://github.com/codersauce/red/commit/ea8eda91e136ea1109a13436025ecf2adea0f2eb))
+
+### Bug Fixes
+
+- **husk:** Charge shared arrays and maps once against the plugin heap ([#399](https://github.com/codersauce/red/issues/399)) ([ce2ef65](https://github.com/codersauce/red/commit/ce2ef65c91b8e5f11dc73997b537a731c25c71d3))
+- **plugins:** Trim or drop request results too large for a plugin's heap ([#398](https://github.com/codersauce/red/issues/398)) ([b08fdb6](https://github.com/codersauce/red/commit/b08fdb66b5c58ef34a8ee3f339232145f4bd991c))
+- **plugins:** Surface quarantined-command explanations from any focus ([8fdd49a](https://github.com/codersauce/red/commit/8fdd49a67d516c986989c06dd3f32ab23f7db9c5))
+- **plugins:** Tell the user when a plugin is quarantined ([0991362](https://github.com/codersauce/red/commit/099136257fd0d7cd186cebab5b1bdd0f7150656c))
+- **lsp:** Keep large symbol results from exhausting the lsp_symbols heap ([0d5039b](https://github.com/codersauce/red/commit/0d5039bb700abd95be08f936a056add1498fe344))
+- **cli:** Measure table cells in terminal display columns ([6d618e6](https://github.com/codersauce/red/commit/6d618e6a27b503744ac24ab1ec9bd9b6c2ca0c9b))
+- **cli:** Exit quietly on closed stdout and silence eh_frame linker note ([62248de](https://github.com/codersauce/red/commit/62248deb284aea7880ead0500eb1d2f7bfda0867))
+- **cli:** Align plugin catalog and list output into padded columns ([945b0f6](https://github.com/codersauce/red/commit/945b0f63f6ef47e6f24bd7cc2660053d408b4547))
+- **completion:** Clear the snapshot when rejecting a stale accept ([795c589](https://github.com/codersauce/red/commit/795c58966cd0c13cb483c608b90d3a0fd93b0998))
+- **completion:** Preserve punctuation during deferred resolution ([c0b4bfb](https://github.com/codersauce/red/commit/c0b4bfb03afbbee2d5f1a755e4567fe2f7198916))
+
+### Documentation
+
+- **plugins:** Add Node.js JSON-RPC example and align host API 0.19.0 ([ef37e0e](https://github.com/codersauce/red/commit/ef37e0e5a4828c357d58a06368318e97a0d13a90))
+
+### Testing
+
+- **update:** Retry lock reacquisition after releasing the session lock ([43a98f8](https://github.com/codersauce/red/commit/43a98f818360bc4183f584bedf420b11505d04a7))
+
 ## [0.9.0](https://github.com/codersauce/red/compare/v0.8.2...v0.9.0)
 
 ### Features
