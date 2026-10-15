@@ -439,6 +439,7 @@ impl Editor {
             .map(|record| {
                 let timestamp: chrono::DateTime<chrono::Local> = record.updated_at.into();
                 MessageRow {
+                    id: record.id,
                     summary: format!("{} {}", record.severity.marker(), record.content.summary),
                     metadata: format!(
                         "{} · {} · {}{}",
@@ -508,6 +509,11 @@ impl Editor {
             .and_then(|id| ids.iter().position(|candidate| *candidate == id))
             .unwrap_or(0);
         match action {
+            MessageAction::Select(id) if ids.contains(id) => {
+                browser.selected = Some(*id);
+                browser.scroll = 0;
+            }
+            MessageAction::Select(_) => {}
             MessageAction::Next | MessageAction::Previous => {
                 let next = if matches!(action, MessageAction::Next) {
                     selected.saturating_add(1).min(ids.len().saturating_sub(1))
@@ -585,6 +591,7 @@ impl Editor {
             }
             MessageAction::ScrollDown => browser.scroll = browser.scroll.saturating_add(5),
             MessageAction::ScrollUp => browser.scroll = browser.scroll.saturating_sub(5),
+            MessageAction::ScrollTo(scroll) => browser.scroll = *scroll,
             MessageAction::Close => unreachable!(),
         }
         self.refresh_message_browser();
@@ -1131,6 +1138,75 @@ mod tests {
             .is_active(Instant::now()));
         editor.handle_message_action(&MessageAction::ClearInactive);
         assert!(editor.notifications.get(first).is_none());
+    }
+
+    #[test]
+    fn mouse_selects_message_details_without_acknowledging_or_editing() {
+        for width in [100, 64] {
+            let mut editor = editor(width, 24);
+            let first = editor
+                .publish_notification(
+                    Notice::new(NotificationSource::Editor, Severity::Error, "first")
+                        .with_details("selected message details"),
+                )
+                .unwrap();
+            let newer = editor
+                .publish_notification(Notice::new(
+                    NotificationSource::Editor,
+                    Severity::Warning,
+                    "newer",
+                ))
+                .unwrap();
+            editor.open_messages();
+            editor.handle_message_action(&MessageAction::ScrollTo(5));
+
+            // Click the second message's metadata line through the editor's modal route.
+            let event = Event::Mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 2,
+                row: 4,
+                modifiers: KeyModifiers::NONE,
+            });
+            let Some(KeyAction::Single(Action::MessageHistory(action))) =
+                editor.handle_event(&event).unwrap()
+            else {
+                panic!("message click did not reach the dialog");
+            };
+            editor.handle_message_action(&action);
+            let browser = editor.message_browser.as_ref().unwrap();
+            assert_eq!(browser.selected, Some(first));
+            assert_eq!(browser.scroll, 0);
+            assert!(editor
+                .notifications
+                .get(first)
+                .unwrap()
+                .is_active(Instant::now()));
+            let rendered = (0..24)
+                .map(|row| editor.test_render_row(row).unwrap())
+                .collect::<String>();
+            assert!(rendered.contains("selected message details"));
+            assert_eq!(editor.current_buffer().contents(), "hello");
+
+            // A notice may leave the active group after the click was rendered.
+            let event = Event::Mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 2,
+                row: 1,
+                modifiers: KeyModifiers::NONE,
+            });
+            let Some(KeyAction::Single(Action::MessageHistory(action))) =
+                editor.handle_event(&event).unwrap()
+            else {
+                panic!("message click did not reach the dialog");
+            };
+            editor.notifications.resolve(newer).unwrap();
+            assert_eq!(editor.message_ids(Instant::now()), vec![first, newer]);
+            editor.handle_message_action(&action);
+            assert_eq!(
+                editor.message_browser.as_ref().unwrap().selected,
+                Some(newer)
+            );
+        }
     }
 
     struct RetainedDraft;
