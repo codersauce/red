@@ -401,8 +401,13 @@ async fn lazy_initialization_keeps_input_responsive() -> Result<()> {
     })
     .await?;
     h.key(KeyCode::Function(2)).await?;
-    h.until(|h| h.screen().contains("plugin `slow` is still starting"))
-        .await?;
+    // The refusal answers this keypress, so it must replace the "is starting"
+    // notice right away rather than wait for that notice to expire.
+    assert!(
+        h.screen().contains("plugin `slow` is still starting"),
+        "{}",
+        h.screen()
+    );
     h.command("plugin-status").await?;
     h.until(|h| h.screen().contains("Plugin status")).await?;
     assert!(h.screen().contains("starting"), "{}", h.screen());
