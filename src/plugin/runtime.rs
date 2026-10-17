@@ -10067,9 +10067,14 @@ mod tests {
         assert!(printed_messages(&requests)
             .iter()
             .any(|message| message.contains("prompt is preserved")));
-        assert!(last_panel_blocks(&requests)
-            .iter()
-            .any(|block| block.text == "retry this exact prompt"));
+        assert_eq!(
+            last_panel_blocks(&requests)
+                .iter()
+                .filter(|block| block.text == "retry this exact prompt")
+                .count(),
+            1,
+            "the returned prompt is shown once, not again as queued"
+        );
 
         let retry = items
             .iter()

@@ -118,6 +118,11 @@ pub struct AgentPaneLifecycle {
     in_flight_tail: String,
     /// Recap for a retried prompt, taken from `in_flight_tail`.
     retry_tail: Option<String>,
+    /// Whether `transcript_tail` already holds the running turn's reply header.
+    reply_open: bool,
+    /// Thread forgotten by a reset while it was still being resumed; a late
+    /// restore of it must not be adopted.
+    forgotten_session: Option<String>,
     next_prompt: u64,
 }
 
@@ -199,16 +204,25 @@ impl AgentPaneLifecycle {
     }
 
     /// Starts over: the current thread is forgotten and nothing stays queued.
+    /// A thread that is still being created becomes the fresh conversation's
+    /// thread, so a reset never starts a second one alongside it.
     pub fn reset(&mut self) -> Vec<AgentPaneEffect> {
-        let effects = self
-            .session_id
-            .take()
+        let starting = self.phase() == AgentPanePhase::Starting;
+        let restoring = self.phase() == AgentPanePhase::Restoring;
+        let forgotten = self.session_id.take();
+        let effects = forgotten
+            .clone()
             .map(|session_id| AgentPaneEffect::ForgetSession { session_id })
             .into_iter()
             .collect();
-        let next_prompt = self.next_prompt;
         *self = Self {
-            next_prompt,
+            phase: starting.then_some(AgentPanePhase::Starting),
+            forgotten_session: if restoring {
+                forgotten
+            } else {
+                self.forgotten_session.take()
+            },
+            next_prompt: self.next_prompt,
             ..Self::default()
         };
         effects
@@ -225,6 +239,7 @@ impl AgentPaneLifecycle {
 
     /// A Codex thread exists. A different previous thread is closed.
     pub fn session_created(&mut self, session_id: &str) -> Vec<AgentPaneEffect> {
+        self.forgotten_session = None;
         let mut effects = Vec::new();
         if let Some(previous) = self.session_id.replace(session_id.to_string()) {
             if previous != session_id {
@@ -247,6 +262,25 @@ impl AgentPaneLifecycle {
         }
         self.phase = Some(AgentPanePhase::Idle);
         self.paused = !self.queue.is_empty();
+    }
+
+    /// Streamed reply text for the running turn. The tail mirrors the pane's
+    /// transcript, so a follow-up sent automatically after this turn recaps the
+    /// finished answer instead of the transcript from when it was queued.
+    pub fn reply_delta(&mut self, session_id: &str, text: &str) {
+        let running = matches!(
+            self.phase(),
+            AgentPanePhase::Working | AgentPanePhase::Stopping
+        );
+        if !running || text.is_empty() || self.session_id.as_deref() != Some(session_id) {
+            return;
+        }
+        if !self.reply_open {
+            self.reply_open = true;
+            self.end_transcript_line();
+            self.transcript_tail.push_str("Agent: ");
+        }
+        self.push_transcript(text);
     }
 
     /// The editor confirmed the turn the pane just dispatched.
@@ -280,6 +314,7 @@ impl AgentPaneLifecycle {
         }
         // A stop that lost the race to completion still means "stop here".
         let hold = self.stop_requested || outcome == AgentTurnOutcome::Stopped;
+        self.close_reply();
         self.phase = Some(AgentPanePhase::Idle);
         self.turn_id = None;
         self.in_flight = None;
@@ -319,6 +354,7 @@ impl AgentPaneLifecycle {
     pub fn session_lost(&mut self, unsent: bool) -> Vec<AgentPaneEffect> {
         let retry = self.in_flight.take().filter(|_| unsent);
         let had_session = self.session_id.take().is_some();
+        self.close_reply();
         self.recap_pending |= had_session || retry.is_some();
         self.phase = Some(AgentPanePhase::Idle);
         self.turn_id = None;
@@ -363,6 +399,9 @@ impl AgentPaneLifecycle {
 
     /// The persisted thread is live again.
     pub fn restored(&mut self, session_id: &str) -> Vec<AgentPaneEffect> {
+        if self.forgotten_session.as_deref() == Some(session_id) {
+            return Vec::new();
+        }
         // Adopt a live thread the editor restored without a pane request, such as
         // after the plugin reloads, but never replace a different thread.
         match self.session_id.as_deref() {
@@ -417,6 +456,10 @@ impl AgentPaneLifecycle {
                     || (self.phase() == AgentPanePhase::Idle && self.session_id.is_none()) =>
             {
                 self.session_created(&session_id)
+            }
+            "agent:update" => {
+                self.reply_delta(&session_id, &text("text"));
+                Vec::new()
             }
             "agent:turn_started" => {
                 if let Some(turn_id) = turn_id {
@@ -478,6 +521,9 @@ impl AgentPaneLifecycle {
                 };
                 let wire_text = self.wire_text(&prompt.text);
                 self.in_flight_tail = self.transcript_tail.clone();
+                // Mirror the pane committing the message to its transcript.
+                self.end_transcript_line();
+                self.push_transcript(&format!("You: {}\n", prompt.text));
                 self.phase = Some(AgentPanePhase::Working);
                 self.turn_id = None;
                 self.in_flight = Some(prompt.clone());
@@ -492,13 +538,33 @@ impl AgentPaneLifecycle {
     }
 
     fn set_transcript(&mut self, transcript: &str) {
-        let skip = transcript.chars().count().saturating_sub(MAX_RECAP_CHARS);
-        self.transcript_tail = transcript.chars().skip(skip).collect();
+        // The pane's transcript is authoritative; streamed deltas extend it.
+        self.transcript_tail = recap_tail(transcript);
+    }
+
+    fn push_transcript(&mut self, text: &str) {
+        self.transcript_tail.push_str(text);
+        // Trim in batches so streaming deltas do not recount the tail every time.
+        if self.transcript_tail.len() > MAX_RECAP_CHARS * 8 {
+            self.transcript_tail = recap_tail(&self.transcript_tail);
+        }
+    }
+
+    fn end_transcript_line(&mut self) {
+        if !self.transcript_tail.is_empty() && !self.transcript_tail.ends_with('\n') {
+            self.transcript_tail.push('\n');
+        }
+    }
+
+    fn close_reply(&mut self) {
+        if std::mem::take(&mut self.reply_open) {
+            self.end_transcript_line();
+        }
     }
 
     fn wire_text(&mut self, text: &str) -> String {
         let retry_tail = self.retry_tail.take();
-        let recap = retry_tail.as_ref().unwrap_or(&self.transcript_tail);
+        let recap = recap_tail(retry_tail.as_ref().unwrap_or(&self.transcript_tail));
         if !std::mem::take(&mut self.recap_pending) || recap.trim().is_empty() {
             return text.to_string();
         }
@@ -514,6 +580,12 @@ impl AgentPaneLifecycle {
             text,
         }
     }
+}
+
+/// The last [`MAX_RECAP_CHARS`] characters of a transcript.
+fn recap_tail(transcript: &str) -> String {
+    let skip = transcript.chars().count().saturating_sub(MAX_RECAP_CHARS);
+    transcript.chars().skip(skip).collect()
 }
 
 #[cfg(test)]
@@ -683,6 +755,57 @@ mod tests {
         assert!(!wire[0].contains("Error: lost"));
         assert!(wire[0].ends_with("Follow-up:\nretry me"));
         assert_eq!(wire[0].matches("retry me").count(), 1);
+    }
+
+    #[test]
+    fn an_auto_sent_follow_up_recaps_the_answer_that_finished_before_it() {
+        let mut pane = live("s1");
+        pane.submit("first".into(), "");
+        pane.turn_started("s1", "t1");
+        pane.observe(
+            "agent:update",
+            &serde_json::json!({ "session_id": "s1", "text": "partial " }),
+        );
+        // Queued mid-stream: the pane's transcript has only part of the answer.
+        pane.submit("second".into(), "You: first\nAgent: partial ");
+        pane.observe(
+            "agent:update",
+            &serde_json::json!({ "session_id": "s1", "text": "and the rest" }),
+        );
+        pane.turn_ended("s1", Some("t1"), AgentTurnOutcome::Completed);
+        pane.session_lost(/*unsent*/ true);
+        let wire = dispatched(&pane.session_created("s2"));
+        assert!(wire[0].contains("You: first\nAgent: partial and the rest\n"));
+        assert!(wire[0].ends_with("Follow-up:\nsecond"));
+        assert_eq!(wire[0].matches("second").count(), 1);
+    }
+
+    #[test]
+    fn reset_while_a_thread_is_starting_adopts_it_instead_of_starting_another() {
+        let mut pane = AgentPaneLifecycle::default();
+        assert_eq!(pane.start(), [AgentPaneEffect::StartSession]);
+        let mut effects = pane.reset();
+        effects.extend(pane.start());
+        assert!(effects.is_empty(), "no second thread: {effects:?}");
+        assert_eq!(pane.phase(), AgentPanePhase::Starting);
+        pane.session_created("s1");
+        assert_eq!(pane.snapshot().session_id.as_deref(), Some("s1"));
+    }
+
+    #[test]
+    fn a_thread_forgotten_while_restoring_is_not_adopted_when_it_comes_back() {
+        let mut pane = AgentPaneLifecycle::default();
+        pane.restore_pending("old", "/tmp");
+        let effects = pane.reset();
+        assert_eq!(
+            effects,
+            [AgentPaneEffect::ForgetSession {
+                session_id: "old".into()
+            }]
+        );
+        assert!(pane.restored("old").is_empty());
+        assert_eq!(pane.snapshot().session_id, None);
+        assert_eq!(pane.start(), [AgentPaneEffect::StartSession]);
     }
 
     #[test]

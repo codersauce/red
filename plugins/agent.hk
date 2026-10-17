@@ -2080,11 +2080,18 @@ fn render_conversation() {
         }
     }
     blocks = presented;
-    // Messages the core has not sent yet render below the conversation.
+    // Messages the core has not sent yet render below the conversation. A prompt
+    // returned for retry after a lost session is already in the transcript.
     for prompt in state().pane.queued {
-        blocks = red::push(blocks, AgentTextBlock {
-            id: prompt.id, kind: "user", format: "plain", text: prompt.text,
-        });
+        let shown = false;
+        for block in blocks {
+            if block.id == prompt.id { shown = true; }
+        }
+        if !shown {
+            blocks = red::push(blocks, AgentTextBlock {
+                id: prompt.id, kind: "user", format: "plain", text: prompt.text,
+            });
+        }
     }
     if red::len(blocks) == 0 {
         blocks = [AgentTextBlock {
