@@ -1695,6 +1695,10 @@ fn resolve_agent_tool_path_kind(
         }
     }
     anyhow::ensure!(
+        !crate::lsp::workspace_edit::is_vcs_metadata_path(normalized.strip_prefix(root)?),
+        "editor tool path is inside version-control metadata"
+    );
+    anyhow::ensure!(
         allow_sensitive_paths || !agent_context_path_is_sensitive(&normalized),
         "editor tool path is a sensitive file; set [agent] allow_sensitive_paths = true to opt in"
     );
@@ -1703,6 +1707,18 @@ fn resolve_agent_tool_path_kind(
         "editor tool path is ignored by the workspace"
     );
     Ok(normalized)
+}
+
+/// Rejects agent writes to control or secret paths before any buffer changes, so
+/// a refused write never leaves a dirty buffer that a later user save could persist.
+fn ensure_agent_writable_path(root: &Path, path: &Path) -> anyhow::Result<()> {
+    let relative = path.strip_prefix(root)?;
+    anyhow::ensure!(
+        !crate::lsp::workspace_edit::is_protected_workspace_path(relative),
+        "editor tool cannot write protected control or secret path {}",
+        relative.display()
+    );
+    Ok(())
 }
 
 fn scoped_plugin_storage_key_for_workspace(plugin: &str, key: &str, workspace: &Path) -> String {
@@ -9888,9 +9904,10 @@ impl Editor {
         };
         #[cfg(not(unix))]
         let result = {
-            let parent = path
-                .parent()
-                .ok_or_else(|| anyhow::anyhow!("workspace file has no parent"));
+            let parent = ensure_agent_writable_path(root, path).and_then(|()| {
+                path.parent()
+                    .ok_or_else(|| anyhow::anyhow!("workspace file has no parent"))
+            });
             parent.and_then(|parent| {
                 if !parent.is_dir() {
                     crate::lsp::workspace_edit::secure_create_workspace_directory(root, parent)?;
@@ -10111,6 +10128,7 @@ impl Editor {
                 content,
             } => {
                 let path = resolve_path(&path)?;
+                ensure_agent_writable_path(&root, &path)?;
                 self.apply_agent_contents(
                     &request.session_id,
                     &path,
@@ -10128,6 +10146,7 @@ impl Editor {
                     /*is_dir*/ true,
                     allow_sensitive_paths,
                 )?;
+                ensure_agent_writable_path(&root, &path)?;
                 let created =
                     crate::lsp::workspace_edit::secure_create_workspace_directory(&root, &path)?;
                 Ok(json!({
@@ -10285,6 +10304,7 @@ impl Editor {
                 edits,
             } => {
                 let path = resolve_path(&path)?;
+                ensure_agent_writable_path(&root, &path)?;
                 self.open_agent_buffer(&path, /*create*/ true, render_buffer)
                     .await?;
                 let current_revision = self.current_buffer().revision();
@@ -35843,6 +35863,55 @@ mod test {
         assert_eq!(result["already_exists"], true);
         assert_eq!(editor.current_buffer().id(), buffer_id);
         assert_eq!(editor.current_buffer().contents(), before);
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn agent_writes_to_protected_paths_fail_before_touching_a_buffer() {
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir_all(root.path().join(".git/hooks")).unwrap();
+        fs::write(root.path().join(".git/config"), "[remote]\n").unwrap();
+        let mut editor = test_editor(/*width*/ 80, /*height*/ 24);
+        editor.test_set_agent_root(root.path());
+        let buffers = editor.buffer_manager.len();
+        let request = |call| EditorToolRequest {
+            session_id: "protected".to_string(),
+            call,
+        };
+        for path in [
+            ".git/hooks/pre-commit",
+            ".red/init.hk",
+            "red.toml",
+            ".vscode/tasks.json",
+        ] {
+            let write = editor
+                .test_run_agent_editor_tool(request(EditorToolCall::WriteFile {
+                    path: path.to_string(),
+                    expected_revision: 0,
+                    content: "echo pwned\n".to_string(),
+                }))
+                .await;
+            assert!(write.is_err(), "write_file {path}");
+            let edit = editor
+                .test_run_agent_editor_tool(request(EditorToolCall::ApplyEdits {
+                    path: path.to_string(),
+                    expected_revision: 0,
+                    edits: Vec::new(),
+                }))
+                .await;
+            assert!(edit.is_err(), "apply_edits {path}");
+        }
+        let read = editor
+            .test_run_agent_editor_tool(request(EditorToolCall::ReadFile {
+                path: ".git/config".to_string(),
+                start_line: 1,
+                line_count: 10,
+            }))
+            .await
+            .unwrap_err();
+        assert!(read.to_string().contains("version-control metadata"));
+        assert_eq!(editor.buffer_manager.len(), buffers);
+        assert!(!root.path().join(".git/hooks/pre-commit").exists());
     }
 
     #[tokio::test]

@@ -2173,6 +2173,9 @@ fn list_file_paths(
     for entry in WalkBuilder::new(root)
         .follow_links(false)
         .hidden(false)
+        .filter_entry(|entry| {
+            !crate::lsp::workspace_edit::is_vcs_metadata_path(Path::new(entry.file_name()))
+        })
         .build()
     {
         if cancelled.load(Ordering::Relaxed) {
@@ -3438,6 +3441,23 @@ mod tests {
             consented["files"],
             json!([".env", "alpha.txt", "beta.txt", "gamma.txt"])
         );
+    }
+
+    #[test]
+    fn file_listing_skips_version_control_metadata() {
+        let root = tempfile::tempdir().unwrap();
+        for directory in [".git/objects/ab", ".jj/repo", "src"] {
+            std::fs::create_dir_all(root.path().join(directory)).unwrap();
+        }
+        std::fs::write(root.path().join(".git/config"), "[remote]").unwrap();
+        std::fs::write(root.path().join(".git/objects/ab/cdef"), "blob").unwrap();
+        std::fs::write(root.path().join(".jj/repo/store"), "store").unwrap();
+        std::fs::write(root.path().join("src/main.rs"), "fn main() {}").unwrap();
+        let cancelled = AtomicBool::new(false);
+
+        let listed = list_files(root.path(), 0, MAX_FILES, &cancelled, true).unwrap();
+
+        assert_eq!(listed["files"], json!(["src/main.rs"]));
     }
 
     #[test]
