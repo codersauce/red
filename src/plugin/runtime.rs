@@ -1254,6 +1254,21 @@ impl RedHost {
                     context,
                 });
             }
+            "AgentSubmit" => {
+                let text = args.first().map(value_to_string).unwrap_or_default();
+                let transcript = args.get(1).map(value_to_string).unwrap_or_default();
+                self.send_request(PluginRequest::AgentSubmit { text, transcript });
+            }
+            "AgentStop" => self.send_request(PluginRequest::AgentStop),
+            "AgentSendQueued" => {
+                let transcript = args.first().map(value_to_string).unwrap_or_default();
+                self.send_request(PluginRequest::AgentSendQueued { transcript });
+            }
+            "AgentDiscardQueued" => self.send_request(PluginRequest::AgentDiscardQueued),
+            "AgentReset" => {
+                let start = args.first().and_then(Value::as_bool).unwrap_or(false);
+                self.send_request(PluginRequest::AgentReset { start });
+            }
             "AgentCancel" => {
                 let session_id = args
                     .first()
@@ -4684,6 +4699,239 @@ mod tests {
         while ACTION_DISPATCHER.try_recv_request().is_some() {}
     }
 
+    /// Plays the editor core for bundled Agent pane tests. Pane intents and agent
+    /// events go through the real [`AgentPaneLifecycle`], and its effects come
+    /// back as the requests and notifications the editor would produce.
+    #[derive(Default)]
+    struct AgentCore {
+        lifecycle: crate::editor::agent_pane::AgentPaneLifecycle,
+        published: Option<crate::editor::agent_pane::AgentPaneSnapshot>,
+        turns: u32,
+        /// Runtime the state belongs to; a test with a new runtime starts fresh.
+        runtime: Option<std::sync::Weak<Mutex<RuntimeInner>>>,
+    }
+
+    fn agent_core_for(runtime: &Runtime) {
+        // A weak handle survives moves but never matches a dropped runtime whose
+        // memory a later test happens to reuse.
+        AGENT_CORE.with(|core| {
+            let same = core
+                .borrow()
+                .runtime
+                .as_ref()
+                .and_then(std::sync::Weak::upgrade)
+                .is_some_and(|inner| Arc::ptr_eq(&inner, &runtime.inner));
+            if !same {
+                // The editor publishes the idle snapshot at startup; only changes follow.
+                let lifecycle = crate::editor::agent_pane::AgentPaneLifecycle::default();
+                *core.borrow_mut() = AgentCore {
+                    published: Some(lifecycle.snapshot()),
+                    lifecycle,
+                    runtime: Some(Arc::downgrade(&runtime.inner)),
+                    ..AgentCore::default()
+                };
+            }
+        });
+    }
+
+    thread_local! {
+        static AGENT_CORE: std::cell::RefCell<AgentCore> = std::cell::RefCell::new(AgentCore::default());
+    }
+
+    /// Takes every queued plugin request.
+    fn drain_collect() -> Vec<PluginRequest> {
+        std::iter::from_fn(|| ACTION_DISPATCHER.try_recv_request()).collect()
+    }
+
+    fn sent_agent_prompts(requests: &[PluginRequest]) -> Vec<(String, String)> {
+        requests
+            .iter()
+            .filter_map(|request| match request {
+                PluginRequest::AgentPrompt { session_id, text } => {
+                    Some((session_id.clone(), text.clone()))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn printed_messages(requests: &[PluginRequest]) -> Vec<String> {
+        requests
+            .iter()
+            .filter_map(|request| match request {
+                PluginRequest::Action(Action::Print(message)) => Some(message.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn panel_statuses(requests: &[PluginRequest]) -> Vec<Option<(String, bool)>> {
+        requests
+            .iter()
+            .filter_map(|request| match request {
+                PluginRequest::SetTextPanelStatus { id, status } if id == "agent-conversation" => {
+                    Some(
+                        status
+                            .as_ref()
+                            .map(|status| (status.label.clone(), status.busy)),
+                    )
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Blocks of the last full Agent panel render.
+    fn last_panel_blocks(requests: &[PluginRequest]) -> Vec<crate::plugin::TextPanelBlock> {
+        requests
+            .iter()
+            .rev()
+            .find_map(|request| match request {
+                PluginRequest::UpdateTextPanel { id, blocks } if id == "agent-conversation" => {
+                    Some(blocks.clone())
+                }
+                _ => None,
+            })
+            .unwrap_or_default()
+    }
+
+    /// Lets the core observe an agent event, notifies the plugin, then settles.
+    async fn core_notify(runtime: &mut Runtime, event: &str, payload: serde_json::Value) {
+        agent_core_for(runtime);
+        let effects = AGENT_CORE.with(|core| core.borrow_mut().lifecycle.observe(event, &payload));
+        runtime.notify(event, payload).await.unwrap();
+        settle_agent_core(runtime, effects).await;
+    }
+
+    /// Applies pending pane intents and runs the resulting effects.
+    async fn core_settle(runtime: &mut Runtime) {
+        settle_agent_core(runtime, Vec::new()).await;
+    }
+
+    /// Moves queued plugin requests out of the dispatcher, applying pane intents
+    /// to the core and keeping every other request in order.
+    fn absorb_plugin_requests(
+        passed: &mut Vec<PluginRequest>,
+        effects: &mut Vec<crate::editor::agent_pane::AgentPaneEffect>,
+    ) {
+        while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
+            let applied = AGENT_CORE.with(|core| {
+                let lifecycle = &mut core.borrow_mut().lifecycle;
+                match request {
+                    PluginRequest::AgentSubmit { text, transcript } => {
+                        Ok(lifecycle.submit(text, &transcript).1)
+                    }
+                    PluginRequest::AgentStop => Ok(lifecycle.stop()),
+                    PluginRequest::AgentSendQueued { transcript } => {
+                        Ok(lifecycle.send_queued(&transcript))
+                    }
+                    PluginRequest::AgentDiscardQueued => {
+                        lifecycle.discard_queued();
+                        Ok(Vec::new())
+                    }
+                    PluginRequest::AgentReset { start } => {
+                        let mut effects = lifecycle.reset();
+                        if start {
+                            effects.extend(lifecycle.start());
+                        }
+                        Ok(effects)
+                    }
+                    other => Err(Box::new(other)),
+                }
+            });
+            match applied {
+                Ok(more) => effects.extend(more),
+                Err(other) => passed.push(*other),
+            }
+        }
+    }
+
+    async fn settle_agent_core(
+        runtime: &mut Runtime,
+        mut effects: Vec<crate::editor::agent_pane::AgentPaneEffect>,
+    ) {
+        use crate::editor::agent_pane::AgentPaneEffect;
+        agent_core_for(runtime);
+        let mut passed = Vec::new();
+        for _ in 0..64 {
+            absorb_plugin_requests(&mut passed, &mut effects);
+            {
+                let snapshot = AGENT_CORE.with(|core| {
+                    let mut core = core.borrow_mut();
+                    let snapshot = core.lifecycle.snapshot();
+                    (core.published.as_ref() != Some(&snapshot)).then(|| {
+                        core.published = Some(snapshot.clone());
+                        snapshot
+                    })
+                });
+                if let Some(snapshot) = snapshot {
+                    // Like the editor, publish before running effects.
+                    runtime
+                        .notify("agent:pane_state", serde_json::to_value(snapshot).unwrap())
+                        .await
+                        .unwrap();
+                    absorb_plugin_requests(&mut passed, &mut effects);
+                } else if effects.is_empty() {
+                    break;
+                }
+            }
+            for effect in std::mem::take(&mut effects) {
+                match effect {
+                    AgentPaneEffect::StartSession => passed.push(PluginRequest::AgentNewSession {
+                        cwd: PathBuf::from("/workspace"),
+                    }),
+                    AgentPaneEffect::ResumeSession { session_id, cwd } => {
+                        passed.push(PluginRequest::AgentResumeSession {
+                            cwd: PathBuf::from(cwd),
+                            session_id,
+                        })
+                    }
+                    AgentPaneEffect::Dispatch {
+                        session_id,
+                        wire_text,
+                        ..
+                    } => {
+                        passed.push(PluginRequest::AgentPrompt {
+                            session_id: session_id.clone(),
+                            text: wire_text,
+                        });
+                        // The editor confirms each dispatched turn with a turn id.
+                        let turn_id = AGENT_CORE.with(|core| {
+                            let mut core = core.borrow_mut();
+                            core.turns += 1;
+                            format!("turn-{}", core.turns)
+                        });
+                        let payload =
+                            serde_json::json!({ "session_id": session_id, "turn_id": turn_id });
+                        effects.extend(AGENT_CORE.with(|core| {
+                            core.borrow_mut()
+                                .lifecycle
+                                .observe("agent:turn_started", &payload)
+                        }));
+                        runtime.notify("agent:turn_started", payload).await.unwrap();
+                        absorb_plugin_requests(&mut passed, &mut effects);
+                    }
+                    AgentPaneEffect::Interrupt { session_id } => {
+                        passed.push(PluginRequest::AgentCancel { session_id })
+                    }
+                    AgentPaneEffect::CloseSession { session_id } => {
+                        passed.push(PluginRequest::AgentCloseSession { session_id })
+                    }
+                    AgentPaneEffect::ForgetSession { session_id } => {
+                        passed.push(PluginRequest::AgentCloseSession {
+                            session_id: session_id.clone(),
+                        });
+                        passed.push(PluginRequest::AgentForgetSession { session_id });
+                    }
+                }
+            }
+        }
+        // Hand everything else back so tests assert on it as before.
+        for request in passed {
+            ACTION_DISPATCHER.send_request(request);
+        }
+    }
+
     #[test]
     fn monotonic_time_uses_a_shared_millisecond_clock() {
         let mut first_host = RedHost::new(HashMap::new());
@@ -4847,6 +5095,28 @@ mod tests {
         }
     }
 
+    /// Finds the agent picker with `expected_title` among collected requests.
+    fn find_agent_picker(
+        requests: &[PluginRequest],
+        expected_title: &str,
+    ) -> (PickerHandle, Vec<PickerItem>) {
+        requests
+            .iter()
+            .find_map(|request| match request {
+                PluginRequest::OpenCallbackPicker {
+                    owner,
+                    handle,
+                    title,
+                    items,
+                    ..
+                } if owner == "agent" && title.as_deref() == Some(expected_title) => {
+                    Some((*handle, items.clone()))
+                }
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("expected the {expected_title:?} agent picker"))
+    }
+
     fn recv_agent_picker(expected_title: &str) -> (PickerHandle, Vec<PickerItem>) {
         match ACTION_DISPATCHER.recv_request() {
             PluginRequest::OpenCallbackPicker {
@@ -4905,20 +5175,23 @@ mod tests {
             .unwrap();
     }
 
-    fn recv_optimistic_agent_start(
+    /// Settles a first prompt through the core and checks what the pane shows
+    /// while Codex starts: the message once, a busy "Starting agent…" status,
+    /// saved history, and exactly one new-session request.
+    async fn recv_optimistic_agent_start(
+        runtime: &mut Runtime,
         prompt: &str,
         expected_history: serde_json::Value,
         expect_panel_creation: bool,
-    ) -> RequestId {
+    ) {
+        core_settle(runtime).await;
         let mut created = false;
-        let mut focused = false;
         let mut rendered = false;
         let mut busy = false;
-        let mut refreshed = false;
         let mut history_saved = false;
-
-        loop {
-            match ACTION_DISPATCHER.recv_request() {
+        let mut started = false;
+        while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
+            match request {
                 PluginRequest::CreateTextPanel { id, .. } => {
                     assert_eq!(id, "agent-conversation");
                     created = true;
@@ -4928,10 +5201,9 @@ mod tests {
                     assert_eq!(serde_json::json!(history), expected_history);
                 }
                 PluginRequest::SetTextPanelHeaderDetail {
-                    id,
                     detail: Some(detail),
+                    ..
                 } => {
-                    assert_eq!(id, "agent-conversation");
                     assert_eq!(detail.text, "Codex");
                 }
                 PluginRequest::AgentModelRequest {
@@ -4942,55 +5214,49 @@ mod tests {
                 } => {}
                 PluginRequest::UpdateTextPanel { id, blocks } => {
                     assert_eq!(id, "agent-conversation");
-                    assert_eq!(
-                        blocks
-                            .iter()
-                            .filter(|block| {
-                                block.kind == crate::plugin::TextPanelBlockKind::User
-                                    && block.text == prompt
-                            })
-                            .count(),
-                        1,
-                        "an optimistic prompt must appear exactly once"
-                    );
-                    rendered = true;
-                }
-                PluginRequest::FocusTextPanelComposer { id } => {
-                    assert_eq!(id, "agent-conversation");
-                    focused = true;
+                    let shown = blocks
+                        .iter()
+                        .filter(|block| {
+                            block.kind == crate::plugin::TextPanelBlockKind::User
+                                && block.text == prompt
+                        })
+                        .count();
+                    assert!(shown <= 1, "an optimistic prompt must appear at most once");
+                    rendered |= shown == 1;
                 }
                 PluginRequest::SetTextPanelStatus {
                     id,
                     status: Some(status),
                 } => {
                     assert_eq!(id, "agent-conversation");
-                    assert!(status.busy);
-                    assert_eq!(status.label, "Starting agent…");
-                    busy = true;
-                }
-                PluginRequest::Action(Action::Refresh) => {
-                    assert!(rendered, "the prompt must render before refresh");
-                    assert!(busy, "the startup status must render before refresh");
-                    refreshed = true;
+                    busy |= status.busy && status.label == "Starting agent…";
                 }
                 PluginRequest::SetPluginStorage { plugin, key, value } => {
                     assert_eq!(plugin, "agent");
                     assert_eq!(key, "prompt_history");
                     assert_eq!(value, expected_history);
-                    assert!(refreshed, "paint the prompt before persisting history");
                     history_saved = true;
                 }
-                PluginRequest::GetConfig { request_id, key } => {
-                    assert_eq!(key.as_deref(), Some("cwd"));
-                    assert!(refreshed, "paint the prompt before starting Codex");
-                    assert!(history_saved, "save prompt history before requesting Codex");
-                    assert_eq!(created, expect_panel_creation);
-                    assert_eq!(focused, expect_panel_creation);
-                    return request_id;
+                PluginRequest::AgentNewSession { cwd } => {
+                    assert_eq!(cwd, Path::new("/workspace"));
+                    assert!(!started, "one prompt must start one session");
+                    started = true;
                 }
-                _ => panic!("unexpected request before optimistic agent startup"),
+                PluginRequest::SetTextPanelStatus { status: None, .. }
+                | PluginRequest::FocusTextPanelComposer { .. }
+                | PluginRequest::SetPanelVisible { .. }
+                | PluginRequest::Action(Action::Refresh) => {}
+                other => panic!(
+                    "unexpected request during optimistic agent startup: {}",
+                    other.label()
+                ),
             }
         }
+        assert!(rendered, "the prompt must be visible while Codex starts");
+        assert!(busy, "the pane must show that Codex is starting");
+        assert!(history_saved, "prompt history must be saved");
+        assert!(started, "the core must request a session");
+        assert_eq!(created, expect_panel_creation);
     }
 
     async fn submit_agent_prompt(runtime: &mut Runtime, prompt: &str) {
@@ -5017,6 +5283,7 @@ mod tests {
                         )
                         .await
                         .unwrap();
+                    core_settle(runtime).await;
                     break;
                 }
                 PluginRequest::GetPluginStorage {
@@ -5039,16 +5306,16 @@ mod tests {
                 _ => panic!("expected docked or floating agent composer"),
             }
         }
+        core_settle(runtime).await;
     }
 
     async fn open_agent_setup_picker(runtime: &mut Runtime) -> (PickerHandle, Vec<PickerItem>) {
-        runtime
-            .notify(
-                "agent:error",
-                serde_json::json!({ "message": "Codex login required" }),
-            )
-            .await
-            .unwrap();
+        core_notify(
+            runtime,
+            "agent:error",
+            serde_json::json!({ "message": "Codex login required" }),
+        )
+        .await;
         loop {
             if let PluginRequest::OpenCallbackPicker {
                 owner,
@@ -7280,6 +7547,7 @@ mod tests {
         runtime.load_plugin("test", source).await.unwrap();
 
         runtime.execute_command("AgentStart").await.unwrap();
+        core_settle(&mut runtime).await;
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
             PluginRequest::AgentNewSession { cwd } if cwd == Path::new("/workspace")
@@ -7338,64 +7606,44 @@ mod tests {
                 ComposerCallback::Submitted("explain the workspace".to_string()),
             )
             .unwrap();
-        let request_id = recv_optimistic_agent_start(
+        recv_optimistic_agent_start(
+            &mut runtime,
             "explain the workspace",
             serde_json::json!(["explain the workspace"]),
             true,
-        );
-        runtime
-            .resolve_request(request_id, serde_json::json!({ "value": "/workspace" }))
-            .await
-            .unwrap();
-        assert!(matches!(
-            ACTION_DISPATCHER.recv_request(),
-            PluginRequest::AgentNewSession { cwd }
-                if cwd.as_path() == std::path::Path::new("/workspace")
-        ));
+        )
+        .await;
 
-        runtime
-            .notify(
-                "agent:session_created",
-                serde_json::json!({ "session_id": "session-lazy" }),
-            )
-            .await
-            .unwrap();
-        assert!(matches!(
-            ACTION_DISPATCHER.recv_request(),
-            PluginRequest::UpdateTextPanel { id, .. } if id == "agent-conversation"
-        ));
-        assert!(matches!(
-            ACTION_DISPATCHER.recv_request(),
-            PluginRequest::Action(Action::Print(message)) if message == "Agent session started"
-        ));
-        assert!(matches!(
-            ACTION_DISPATCHER.recv_request(),
-            PluginRequest::UpdateTextPanel { id, blocks }
-                if id == "agent-conversation"
-                    && blocks.len() == 1
-                    && blocks[0].text == "explain the workspace"
-        ));
-        assert!(matches!(
-            ACTION_DISPATCHER.recv_request(),
-            PluginRequest::SetTextPanelStatus { id, status: Some(status) }
-                if id == "agent-conversation"
-                    && status.busy
-                    && status.label == "Waiting for agent…"
-        ));
-        assert!(matches!(
-            ACTION_DISPATCHER.recv_request(),
-            PluginRequest::Action(Action::Refresh)
-        ));
-        assert!(matches!(
-            ACTION_DISPATCHER.recv_request(),
+        core_notify(
+            &mut runtime,
+            "agent:session_created",
+            serde_json::json!({ "session_id": "session-lazy" }),
+        )
+        .await;
+        let requests = drain_collect();
+        assert!(printed_messages(&requests).contains(&"Agent session started".to_string()));
+        assert_eq!(
+            sent_agent_prompts(&requests),
+            [(
+                "session-lazy".to_string(),
+                "explain the workspace".to_string()
+            )]
+        );
+        let blocks = last_panel_blocks(&requests);
+        assert_eq!(
+            blocks
+                .iter()
+                .filter(|block| block.text == "explain the workspace")
+                .count(),
+            1,
+            "the sent message replaces its queued copy"
+        );
+        assert!(panel_statuses(&requests).contains(&Some(("Waiting for agent…".to_string(), true))));
+        assert!(requests.iter().any(|request| matches!(
+            request,
             PluginRequest::SetPluginStorage { plugin, key, .. }
                 if plugin == "agent" && key == "transcript"
-        ));
-        assert!(matches!(
-            ACTION_DISPATCHER.recv_request(),
-            PluginRequest::AgentPrompt { session_id, text }
-                if session_id == "session-lazy" && text == "explain the workspace"
-        ));
+        )));
     }
 
     #[tokio::test]
@@ -7406,36 +7654,33 @@ mod tests {
             .load_plugin("agent", include_str!("../../plugins/agent.hk"))
             .await
             .unwrap();
-        runtime
-            .notify(
-                "agent:session_created",
-                serde_json::json!({"session_id":"progress"}),
-            )
-            .await
-            .unwrap();
+        core_notify(
+            &mut runtime,
+            "agent:session_created",
+            serde_json::json!({"session_id":"progress"}),
+        )
+        .await;
         drain_requests();
         let state = |runtime: &Runtime| {
             let inner = runtime.inner.lock().unwrap();
             value_to_json(inner.host.policy().typed_states.get("agent").unwrap())
         };
-        runtime
-            .notify(
-                "agent:update",
-                serde_json::json!({"session_id":"progress","text":"first"}),
-            )
-            .await
-            .unwrap();
+        core_notify(
+            &mut runtime,
+            "agent:update",
+            serde_json::json!({"session_id":"progress","text":"first"}),
+        )
+        .await;
         let timer = state(&runtime)["stream_timer"].clone();
         assert_ne!(timer, "");
         drain_requests();
         for text in [" second", " third"] {
-            runtime
-                .notify(
-                    "agent:update",
-                    serde_json::json!({"session_id":"progress","text":text}),
-                )
-                .await
-                .unwrap();
+            core_notify(
+                &mut runtime,
+                "agent:update",
+                serde_json::json!({"session_id":"progress","text":text}),
+            )
+            .await;
             assert_eq!(
                 state(&runtime)["stream_timer"],
                 timer,
@@ -7454,13 +7699,12 @@ mod tests {
         }
         assert_eq!(appended, "first second third");
 
-        runtime
-            .notify(
-                "agent:update",
-                serde_json::json!({"session_id":"progress","text":" fourth"}),
-            )
-            .await
-            .unwrap();
+        core_notify(
+            &mut runtime,
+            "agent:update",
+            serde_json::json!({"session_id":"progress","text":" fourth"}),
+        )
+        .await;
         let timer = state(&runtime)["stream_timer"].clone();
         runtime
             .notify(
@@ -7469,6 +7713,7 @@ mod tests {
             )
             .await
             .unwrap();
+        core_settle(&mut runtime).await;
         assert_eq!(state(&runtime)["stream_delta"], "");
         drain_requests();
         runtime
@@ -7481,27 +7726,24 @@ mod tests {
                 "full render already contains pending text"
             );
         }
-        runtime
-            .notify(
-                "agent:message_completed",
-                serde_json::json!({"session_id":"progress","text":"First message."}),
-            )
-            .await
-            .unwrap();
-        runtime
-            .notify(
-                "agent:update",
-                serde_json::json!({"session_id":"progress","text":"Final"}),
-            )
-            .await
-            .unwrap();
-        runtime
-            .notify(
-                "agent:message_completed",
-                serde_json::json!({"session_id":"progress","text":"Final answer."}),
-            )
-            .await
-            .unwrap();
+        core_notify(
+            &mut runtime,
+            "agent:message_completed",
+            serde_json::json!({"session_id":"progress","text":"First message."}),
+        )
+        .await;
+        core_notify(
+            &mut runtime,
+            "agent:update",
+            serde_json::json!({"session_id":"progress","text":"Final"}),
+        )
+        .await;
+        core_notify(
+            &mut runtime,
+            "agent:message_completed",
+            serde_json::json!({"session_id":"progress","text":"Final answer."}),
+        )
+        .await;
         let current = state(&runtime);
         let messages: Vec<_> = current["transcript_blocks"]
             .as_array()
@@ -7523,13 +7765,12 @@ mod tests {
             .load_plugin("agent", include_str!("../../plugins/agent.hk"))
             .await
             .unwrap();
-        runtime
-            .notify(
-                "agent:session_created",
-                serde_json::json!({"session_id":"progress"}),
-            )
-            .await
-            .unwrap();
+        core_notify(
+            &mut runtime,
+            "agent:session_created",
+            serde_json::json!({"session_id":"progress"}),
+        )
+        .await;
         drain_requests();
         let state = |runtime: &Runtime| {
             let inner = runtime.inner.lock().unwrap();
@@ -7541,16 +7782,15 @@ mod tests {
             ("c", "Reading missing.rs", "failed", "File not found"),
         ] {
             // Exercise completion without start as well as bounded output details.
-            runtime
-                .notify(
-                    "agent:activity",
-                    serde_json::json!({"session_id":"progress","update":{
-                        "session_update":"tool_call_update","tool_call_id":id,"title":title,
-                        "kind":"read","status":status,"detail":detail
-                    }}),
-                )
-                .await
-                .unwrap();
+            core_notify(
+                &mut runtime,
+                "agent:activity",
+                serde_json::json!({"session_id":"progress","update":{
+                    "session_update":"tool_call_update","tool_call_id":id,"title":title,
+                    "kind":"read","status":status,"detail":detail
+                }}),
+            )
+            .await;
         }
         let current = state(&runtime);
         let compact = current["transcript_blocks"][0]["text"].as_str().unwrap();
@@ -7566,6 +7806,7 @@ mod tests {
             )
             .await
             .unwrap();
+        core_settle(&mut runtime).await;
         let mut expanded = false;
         while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
             if let PluginRequest::UpdateTextPanel { blocks, .. } = request {
@@ -7577,14 +7818,13 @@ mod tests {
         }
         assert!(expanded);
         runtime.execute_command("AgentActivity").await.unwrap();
-        runtime
-            .notify(
-                "agent:message_completed",
-                serde_json::json!({"session_id":"progress","text":"Done."}),
-            )
-            .await
-            .unwrap();
-        runtime.notify("agent:completed", serde_json::json!({"session_id":"progress","stop_reason":"completed","elapsed_ms":1200})).await.unwrap();
+        core_notify(
+            &mut runtime,
+            "agent:message_completed",
+            serde_json::json!({"session_id":"progress","text":"Done."}),
+        )
+        .await;
+        core_notify(&mut runtime, "agent:completed", serde_json::json!({"session_id":"progress","stop_reason":"completed","elapsed_ms":1200})).await;
         let current = state(&runtime);
         assert_eq!(current["activity_rows"], serde_json::json!([]));
         assert_eq!(current["activity_history"].as_array().unwrap().len(), 1);
@@ -7645,13 +7885,12 @@ mod tests {
             .load_plugin("agent", include_str!("../../plugins/agent.hk"))
             .await
             .unwrap();
-        runtime
-            .notify(
-                "agent:session_created",
-                serde_json::json!({"session_id":"activity"}),
-            )
-            .await
-            .unwrap();
+        core_notify(
+            &mut runtime,
+            "agent:session_created",
+            serde_json::json!({"session_id":"activity"}),
+        )
+        .await;
         let state = |runtime: &Runtime| {
             let inner = runtime.inner.lock().unwrap();
             value_to_json(inner.host.policy().typed_states.get("agent").unwrap())
@@ -7660,20 +7899,19 @@ mod tests {
             drain_requests();
             submit_agent_prompt(&mut runtime, &format!("turn {turn}")).await;
             for index in 0..8 {
-                runtime.notify("agent:activity", serde_json::json!({"session_id":"activity","update":{
+                core_notify(&mut runtime, "agent:activity", serde_json::json!({"session_id":"activity","update":{
                     "session_update":"tool_call_update","tool_call_id":format!("{turn}:{index}"),
                     "title":format!("Reading file{index}.rs"),"full_title":format!("Reading /workspace/src/file{index}.rs"),
                     "kind":"read","status":"failed","detail":"full diagnostic outside workspace"
-                }})).await.unwrap();
+                }})).await;
             }
-            runtime
-                .notify(
-                    "agent:message_completed",
-                    serde_json::json!({"session_id":"activity","text":"Answer"}),
-                )
-                .await
-                .unwrap();
-            runtime.notify("agent:completed", serde_json::json!({"session_id":"activity","stop_reason":"completed","elapsed_ms":2000})).await.unwrap();
+            core_notify(
+                &mut runtime,
+                "agent:message_completed",
+                serde_json::json!({"session_id":"activity","text":"Answer"}),
+            )
+            .await;
+            core_notify(&mut runtime, "agent:completed", serde_json::json!({"session_id":"activity","stop_reason":"completed","elapsed_ms":2000})).await;
         }
         let current = state(&runtime);
         let first_id = current["activity_history"][0]["id"]
@@ -7692,6 +7930,7 @@ mod tests {
             )
             .await
             .unwrap();
+        core_settle(&mut runtime).await;
         let mut found_preview = false;
         while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
             if let PluginRequest::UpdateTextPanel { blocks, .. } = request {
@@ -7710,6 +7949,7 @@ mod tests {
         }
         assert!(found_preview);
         runtime.notify("panel:event:agent-conversation", serde_json::json!({"action":"activate_block","text":format!("activity-details:{first_id}")})).await.unwrap();
+        core_settle(&mut runtime).await;
         let mut opened = false;
         let mut inspected = false;
         while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
@@ -7747,37 +7987,39 @@ mod tests {
             .load_plugin("agent", include_str!("../../plugins/agent.hk"))
             .await
             .unwrap();
-        runtime
-            .notify(
-                "agent:session_created",
-                serde_json::json!({"session_id":"late"}),
-            )
-            .await
-            .unwrap();
+        core_notify(
+            &mut runtime,
+            "agent:session_created",
+            serde_json::json!({"session_id":"late"}),
+        )
+        .await;
         let state = |runtime: &Runtime| {
             let inner = runtime.inner.lock().unwrap();
             value_to_json(inner.host.policy().typed_states.get("agent").unwrap())
         };
         drain_requests();
         submit_agent_prompt(&mut runtime, "explain it").await;
-        runtime
-            .notify(
-                "agent:message_completed",
-                serde_json::json!({"session_id":"late","text":"The useful answer."}),
-            )
-            .await
-            .unwrap();
-        runtime
-            .notify(
-                "agent:activity",
-                serde_json::json!({"session_id":"late","update":{
-                    "session_update":"tool_call_update","tool_call_id":"late-read","kind":"read",
-                    "title":"Reading optional file","status":"failed","detail":"outside workspace"
-                }}),
-            )
-            .await
-            .unwrap();
-        runtime.notify("agent:completed", serde_json::json!({"session_id":"late","stop_reason":"completed","elapsed_ms":19000})).await.unwrap();
+        core_notify(
+            &mut runtime,
+            "agent:message_completed",
+            serde_json::json!({"session_id":"late","text":"The useful answer."}),
+        )
+        .await;
+        core_notify(
+            &mut runtime,
+            "agent:activity",
+            serde_json::json!({"session_id":"late","update":{
+                "session_update":"tool_call_update","tool_call_id":"late-read","kind":"read",
+                "title":"Reading optional file","status":"failed","detail":"outside workspace"
+            }}),
+        )
+        .await;
+        core_notify(
+            &mut runtime,
+            "agent:completed",
+            serde_json::json!({"session_id":"late","stop_reason":"completed","elapsed_ms":19000}),
+        )
+        .await;
         let current = state(&runtime);
         assert_eq!(
             current["transcript_blocks"][1]["text"],
@@ -7795,23 +8037,21 @@ mod tests {
 
         drain_requests();
         submit_agent_prompt(&mut runtime, "try another request").await;
-        runtime
-            .notify(
-                "agent:activity",
-                serde_json::json!({"session_id":"late","update":{
-                    "session_update":"tool_call","tool_call_id":"pending-read","kind":"read",
-                    "title":"Reading source","status":"in_progress"
-                }}),
-            )
-            .await
-            .unwrap();
-        runtime
-            .notify(
-                "agent:error",
-                serde_json::json!({"session_id":"late","message":"Connection lost"}),
-            )
-            .await
-            .unwrap();
+        core_notify(
+            &mut runtime,
+            "agent:activity",
+            serde_json::json!({"session_id":"late","update":{
+                "session_update":"tool_call","tool_call_id":"pending-read","kind":"read",
+                "title":"Reading source","status":"in_progress"
+            }}),
+        )
+        .await;
+        core_notify(
+            &mut runtime,
+            "agent:error",
+            serde_json::json!({"session_id":"late","message":"Connection lost"}),
+        )
+        .await;
         let current = state(&runtime);
         let last = current["transcript_blocks"]
             .as_array()
@@ -7835,40 +8075,36 @@ mod tests {
             .load_plugin("agent", include_str!("../../plugins/agent.hk"))
             .await
             .unwrap();
-        runtime
-            .notify(
-                "agent:session_created",
-                serde_json::json!({"session_id":"clear-progress"}),
-            )
-            .await
-            .unwrap();
+        core_notify(
+            &mut runtime,
+            "agent:session_created",
+            serde_json::json!({"session_id":"clear-progress"}),
+        )
+        .await;
         drain_requests();
         submit_agent_prompt(&mut runtime, "earlier question").await;
-        runtime
-            .notify(
-                "agent:message_completed",
-                serde_json::json!({"session_id":"clear-progress","text":"Earlier answer."}),
-            )
-            .await
-            .unwrap();
-        runtime
-            .notify(
-                "agent:completed",
-                serde_json::json!({"session_id":"clear-progress","stop_reason":"completed"}),
-            )
-            .await
-            .unwrap();
+        core_notify(
+            &mut runtime,
+            "agent:message_completed",
+            serde_json::json!({"session_id":"clear-progress","text":"Earlier answer."}),
+        )
+        .await;
+        core_notify(
+            &mut runtime,
+            "agent:completed",
+            serde_json::json!({"session_id":"clear-progress","stop_reason":"completed"}),
+        )
+        .await;
         runtime.execute_command("AgentClear").await.unwrap();
         drain_requests();
         submit_agent_prompt(&mut runtime, "new question").await;
-        runtime
-            .notify(
-                "agent:message_completed",
-                serde_json::json!({"session_id":"clear-progress","text":"New answer."}),
-            )
-            .await
-            .unwrap();
-        runtime.notify("agent:completed", serde_json::json!({"session_id":"clear-progress","stop_reason":"completed","elapsed_ms":2000})).await.unwrap();
+        core_notify(
+            &mut runtime,
+            "agent:message_completed",
+            serde_json::json!({"session_id":"clear-progress","text":"New answer."}),
+        )
+        .await;
+        core_notify(&mut runtime, "agent:completed", serde_json::json!({"session_id":"clear-progress","stop_reason":"completed","elapsed_ms":2000})).await;
         let current = {
             let inner = runtime.inner.lock().unwrap();
             value_to_json(inner.host.policy().typed_states.get("agent").unwrap())
@@ -7886,13 +8122,12 @@ mod tests {
             .load_plugin("agent", include_str!("../../plugins/agent.hk"))
             .await
             .unwrap();
-        runtime
-            .notify(
-                "agent:session_created",
-                serde_json::json!({ "session_id": "session-typed" }),
-            )
-            .await
-            .unwrap();
+        core_notify(
+            &mut runtime,
+            "agent:session_created",
+            serde_json::json!({ "session_id": "session-typed" }),
+        )
+        .await;
         drain_requests();
 
         let state = |runtime: &Runtime| {
@@ -7900,70 +8135,66 @@ mod tests {
             value_to_json(inner.host.policy().typed_states.get("agent").unwrap())
         };
 
-        runtime
-            .notify(
-                "agent:activity",
-                serde_json::json!({
-                    "session_id": "session-typed",
-                    "update": {
-                        "session_update": "agent_thought_chunk",
-                        "content": { "text": "inspect imports" },
-                    },
-                }),
-            )
-            .await
-            .unwrap();
+        core_notify(
+            &mut runtime,
+            "agent:activity",
+            serde_json::json!({
+                "session_id": "session-typed",
+                "update": {
+                    "session_update": "agent_thought_chunk",
+                    "content": { "text": "inspect imports" },
+                },
+            }),
+        )
+        .await;
         assert_eq!(state(&runtime)["thought"], "inspect imports");
         assert_eq!(state(&runtime)["ui_phase"], "thinking");
         drain_requests();
 
-        runtime
-            .notify(
-                "agent:activity",
-                serde_json::json!({
-                    "session_id": "session-typed",
-                    "update": { "session_update": "agent_thought_chunk" },
-                }),
-            )
-            .await
-            .unwrap();
+        core_notify(
+            &mut runtime,
+            "agent:activity",
+            serde_json::json!({
+                "session_id": "session-typed",
+                "update": { "session_update": "agent_thought_chunk" },
+            }),
+        )
+        .await;
         assert_eq!(state(&runtime)["thought"], "inspect imports");
         drain_requests();
 
-        runtime
-            .notify(
-                "agent:activity",
-                serde_json::json!({
-                    "session_id": "session-typed",
-                    "update": {
-                        "session_update": "tool_call",
-                        "tool_call_id": "tool-1",
-                        "kind": "Read file",
-                    },
-                }),
-            )
-            .await
-            .unwrap();
+        core_notify(
+            &mut runtime,
+            "agent:activity",
+            serde_json::json!({
+                "session_id": "session-typed",
+                "update": {
+                    "session_update": "tool_call",
+                    "tool_call_id": "tool-1",
+                    "kind": "Read file",
+                },
+            }),
+        )
+        .await;
         let current = state(&runtime);
         assert_eq!(current["activity_rows"][0]["title"], "Read file");
         assert_eq!(current["activity_rows"][0]["status"], "in_progress");
         assert_eq!(current["ui_phase"], "tool");
         drain_requests();
 
-        runtime
-            .notify(
-                "agent:activity",
-                serde_json::json!({
-                    "session_id": "session-typed",
-                    "update": {
-                        "session_update": "tool_call_update",
-                        "tool_call_id": "tool-1",
-                        "status": "completed",
-                    },
-                }),
-            )
-            .await
-            .unwrap();
+        core_notify(
+            &mut runtime,
+            "agent:activity",
+            serde_json::json!({
+                "session_id": "session-typed",
+                "update": {
+                    "session_update": "tool_call_update",
+                    "tool_call_id": "tool-1",
+                    "status": "completed",
+                },
+            }),
+        )
+        .await;
         let current = state(&runtime);
         assert_eq!(current["activity_rows"][0]["title"], "Read file");
         assert_eq!(current["activity_rows"][0]["status"], "completed");
@@ -7971,29 +8202,27 @@ mod tests {
         drain_requests();
 
         let previous = state(&runtime);
-        runtime
-            .notify(
-                "agent:activity",
-                serde_json::json!({
-                    "session_id": "session-typed",
-                    "update": { "session_update": "future_host_event", "new_field": 7 },
-                }),
-            )
-            .await
-            .unwrap();
+        core_notify(
+            &mut runtime,
+            "agent:activity",
+            serde_json::json!({
+                "session_id": "session-typed",
+                "update": { "session_update": "future_host_event", "new_field": 7 },
+            }),
+        )
+        .await;
         assert_eq!(state(&runtime), previous);
         assert!(ACTION_DISPATCHER.try_recv_request().is_none());
 
-        runtime
-            .notify(
-                "agent:activity",
-                serde_json::json!({
-                    "session_id": "different-session",
-                    "update": { "session_update": "plan" },
-                }),
-            )
-            .await
-            .unwrap();
+        core_notify(
+            &mut runtime,
+            "agent:activity",
+            serde_json::json!({
+                "session_id": "different-session",
+                "update": { "session_update": "plan" },
+            }),
+        )
+        .await;
         assert_eq!(state(&runtime), previous);
         assert!(ACTION_DISPATCHER.try_recv_request().is_none());
     }
@@ -8006,54 +8235,50 @@ mod tests {
             .load_plugin("agent", include_str!("../../plugins/agent.hk"))
             .await
             .unwrap();
-        runtime
-            .notify(
-                "agent:session_created",
-                serde_json::json!({ "session_id": "session-summary" }),
-            )
-            .await
-            .unwrap();
+        core_notify(
+            &mut runtime,
+            "agent:session_created",
+            serde_json::json!({ "session_id": "session-summary" }),
+        )
+        .await;
         drain_requests();
         submit_agent_prompt(&mut runtime, "explain it").await;
         drain_requests();
-        runtime
-            .notify(
-                "agent:activity",
-                serde_json::json!({
-                    "session_id": "session-summary",
-                    "update": {
-                        "session_update": "tool_call",
-                        "tool_call_id": "tool-1",
-                        "title": "Read source",
-                        "status": "completed",
-                    },
-                }),
-            )
-            .await
-            .unwrap();
+        core_notify(
+            &mut runtime,
+            "agent:activity",
+            serde_json::json!({
+                "session_id": "session-summary",
+                "update": {
+                    "session_update": "tool_call",
+                    "tool_call_id": "tool-1",
+                    "title": "Read source",
+                    "status": "completed",
+                },
+            }),
+        )
+        .await;
         drain_requests();
-        runtime
-            .notify(
-                "agent:update",
-                serde_json::json!({
-                    "session_id": "session-summary",
-                    "text": "### Result\n\n**Done.**",
-                }),
-            )
-            .await
-            .unwrap();
+        core_notify(
+            &mut runtime,
+            "agent:update",
+            serde_json::json!({
+                "session_id": "session-summary",
+                "text": "### Result\n\n**Done.**",
+            }),
+        )
+        .await;
         drain_requests();
-        runtime
-            .notify(
-                "agent:completed",
-                serde_json::json!({
-                    "session_id": "session-summary",
-                    "stop_reason": "completed",
-                    "elapsed_ms": 13_000,
-                }),
-            )
-            .await
-            .unwrap();
+        core_notify(
+            &mut runtime,
+            "agent:completed",
+            serde_json::json!({
+                "session_id": "session-summary",
+                "stop_reason": "completed",
+                "elapsed_ms": 13_000,
+            }),
+        )
+        .await;
 
         let mut saw_final_blocks = false;
         let mut saw_persisted_summary = false;
@@ -8098,40 +8323,37 @@ mod tests {
             .load_plugin("agent", include_str!("../../plugins/agent.hk"))
             .await
             .unwrap();
-        runtime
-            .notify(
-                "agent:session_created",
-                serde_json::json!({ "session_id": "session-long" }),
-            )
-            .await
-            .unwrap();
+        core_notify(
+            &mut runtime,
+            "agent:session_created",
+            serde_json::json!({ "session_id": "session-long" }),
+        )
+        .await;
         drain_requests();
         submit_agent_prompt(&mut runtime, "keep the complete answer").await;
         drain_requests();
 
         let response = format!("# Complete response\n\n{}\n\nEND", "a".repeat(21_000));
-        runtime
-            .notify(
-                "agent:update",
-                serde_json::json!({
-                    "session_id": "session-long",
-                    "text": response,
-                }),
-            )
-            .await
-            .unwrap();
+        core_notify(
+            &mut runtime,
+            "agent:update",
+            serde_json::json!({
+                "session_id": "session-long",
+                "text": response,
+            }),
+        )
+        .await;
         drain_requests();
-        runtime
-            .notify(
-                "agent:completed",
-                serde_json::json!({
-                    "session_id": "session-long",
-                    "stop_reason": "completed",
-                    "elapsed_ms": 1_000,
-                }),
-            )
-            .await
-            .unwrap();
+        core_notify(
+            &mut runtime,
+            "agent:completed",
+            serde_json::json!({
+                "session_id": "session-long",
+                "stop_reason": "completed",
+                "elapsed_ms": 1_000,
+            }),
+        )
+        .await;
 
         let mut saw_complete_blocks = false;
         let mut saw_complete_storage = false;
@@ -8178,59 +8400,46 @@ mod tests {
             .await
             .unwrap();
 
+        // AgentStart is an alias of AgentNew: it opens the pane and the core
+        // starts a thread right away.
         runtime.execute_command("AgentStart").await.unwrap();
-        let request_id = match ACTION_DISPATCHER.recv_request() {
-            PluginRequest::GetConfig { request_id, key } => {
-                assert_eq!(key.as_deref(), Some("cwd"));
-                request_id
-            }
-            _ => panic!("expected current-directory request"),
-        };
-        runtime
-            .resolve_request(request_id, serde_json::json!({ "value": "/workspace" }))
-            .await
-            .unwrap();
-        assert!(matches!(
-            ACTION_DISPATCHER.recv_request(),
-            PluginRequest::AgentNewSession { cwd } if cwd == Path::new("/workspace")
-        ));
-
-        runtime
-            .notify(
-                "agent:session_created",
-                serde_json::json!({ "session_id": "session-1" }),
-            )
-            .await
-            .unwrap();
-        assert!(matches!(
-            ACTION_DISPATCHER.recv_request(),
+        core_settle(&mut runtime).await;
+        let requests = drain_collect();
+        assert!(requests.iter().any(|request| matches!(
+            request,
             PluginRequest::CreateTextPanel { id, config }
                 if id == "agent-conversation"
                     && config.side == crate::plugin::PanelSide::Right
                     && config.width == 62
                     && config.title.as_deref() == Some("Agent")
                     && config.header_actions.iter().map(|action| action.id.as_str()).eq(["activity", "clear", "new", "close"])
-        ));
-        resolve_prompt_history(&mut runtime, serde_json::json!([])).await;
-        expect_agent_model_header();
-        assert!(matches!(
-            ACTION_DISPATCHER.recv_request(),
-            PluginRequest::UpdateTextPanel { id, blocks }
-                if id == "agent-conversation"
-                    && blocks.len() == 1
-                    && blocks[0].id == "empty"
-                    && blocks[0].kind == crate::plugin::TextPanelBlockKind::Activity
-                    && blocks[0].format == crate::plugin::TextPanelBlockFormat::Plain
-        ));
-        assert!(matches!(
-            ACTION_DISPATCHER.recv_request(),
-            PluginRequest::Action(Action::Print(message)) if message == "Agent session started"
-        ));
-        assert!(matches!(
-            ACTION_DISPATCHER.recv_request(),
-            PluginRequest::SetTextPanelComposerHistory { id, history }
-                if id == "agent-conversation" && history.is_empty()
-        ));
+        )));
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| matches!(
+                    request,
+                    PluginRequest::AgentNewSession { cwd } if cwd == Path::new("/workspace")
+                ))
+                .count(),
+            1
+        );
+        let blocks = last_panel_blocks(&requests);
+        assert!(
+            blocks.len() == 1
+                && blocks[0].id == "empty"
+                && blocks[0].kind == crate::plugin::TextPanelBlockKind::Activity
+                && blocks[0].format == crate::plugin::TextPanelBlockFormat::Plain
+        );
+
+        core_notify(
+            &mut runtime,
+            "agent:session_created",
+            serde_json::json!({ "session_id": "session-1" }),
+        )
+        .await;
+        let requests = drain_collect();
+        assert!(printed_messages(&requests).contains(&"Agent session started".to_string()));
 
         runtime.execute_command("Agent").await.unwrap();
         assert!(matches!(
@@ -8238,82 +8447,58 @@ mod tests {
             PluginRequest::FocusTextPanelComposer { id } if id == "agent-conversation"
         ));
         assert!(ACTION_DISPATCHER.try_recv_request().is_none());
+        let submitted = "  inspect the workspace\ninclude all unsaved changes  ";
         runtime
             .notify(
                 "panel:event:agent-conversation",
-                serde_json::json!({
-                    "action": "submit",
-                    "text": "  inspect the workspace\ninclude all unsaved changes  ",
-                }),
+                serde_json::json!({ "action": "submit", "text": submitted }),
             )
             .await
             .unwrap();
-        assert!(matches!(
-            ACTION_DISPATCHER.recv_request(),
-            PluginRequest::SetTextPanelComposerHistory { id, history }
-                if id == "agent-conversation"
-                    && history == ["  inspect the workspace\ninclude all unsaved changes  "]
-        ));
-        assert!(matches!(
-            ACTION_DISPATCHER.recv_request(),
-            PluginRequest::UpdateTextPanel { id, blocks }
-                if id == "agent-conversation"
-                    && blocks.len() == 1
-                    && blocks[0].id == "user:1"
-                    && blocks[0].kind == crate::plugin::TextPanelBlockKind::User
-                    && blocks[0].format == crate::plugin::TextPanelBlockFormat::Plain
-                    && blocks[0].text == "  inspect the workspace\ninclude all unsaved changes  "
-        ));
-        assert!(matches!(
-            ACTION_DISPATCHER.recv_request(),
-            PluginRequest::FocusTextPanelComposer { id } if id == "agent-conversation"
-        ));
-        assert!(matches!(
-            ACTION_DISPATCHER.recv_request(),
-            PluginRequest::SetTextPanelStatus { id, status: Some(status) }
-                if id == "agent-conversation"
-                    && status.busy
-                    && status.label == "Waiting for agent…"
-                    && !status.stream
-        ));
-        assert!(matches!(
-            ACTION_DISPATCHER.recv_request(),
-            PluginRequest::Action(Action::Refresh)
-        ));
-        assert!(matches!(
-            ACTION_DISPATCHER.recv_request(),
-            PluginRequest::SetPluginStorage { plugin, key, .. }
-                if plugin == "agent" && key == "transcript"
-        ));
-        assert!(matches!(
-            ACTION_DISPATCHER.recv_request(),
-            PluginRequest::AgentPrompt { session_id, text }
-                if session_id == "session-1"
-                    && text == "  inspect the workspace\ninclude all unsaved changes  "
-        ));
-        assert!(matches!(
-            ACTION_DISPATCHER.recv_request(),
+        core_settle(&mut runtime).await;
+        let requests = drain_collect();
+        // Text is sent exactly as typed, including surrounding whitespace.
+        assert_eq!(
+            sent_agent_prompts(&requests),
+            [("session-1".to_string(), submitted.to_string())]
+        );
+        let blocks = last_panel_blocks(&requests);
+        assert!(
+            blocks.len() == 1
+                && blocks[0].id == "prompt:1"
+                && blocks[0].kind == crate::plugin::TextPanelBlockKind::User
+                && blocks[0].format == crate::plugin::TextPanelBlockFormat::Plain
+                && blocks[0].text == submitted
+        );
+        assert!(panel_statuses(&requests).contains(&Some(("Waiting for agent…".to_string(), true))));
+        assert!(requests.iter().any(|request| matches!(
+            request,
+            PluginRequest::SetTextPanelComposerHistory { history, .. } if history == &[submitted]
+        )));
+        assert!(requests.iter().any(|request| matches!(
+            request,
             PluginRequest::SetPluginStorage { plugin, key, value }
-                if plugin == "agent"
-                    && key == "prompt_history"
-                    && value == serde_json::json!(["  inspect the workspace\ninclude all unsaved changes  "])
-        ));
-        runtime
-            .notify(
-                "agent:update",
-                serde_json::json!({
-                    "session_id": "session-1",
-                    "text": "streamed output",
-                }),
-            )
-            .await
-            .unwrap();
+                if plugin == "agent" && key == "prompt_history" && value == &serde_json::json!([submitted])
+        )));
+        assert!(requests.iter().any(|request| matches!(
+            request,
+            PluginRequest::SetPluginStorage { plugin, key, .. } if plugin == "agent" && key == "transcript"
+        )));
+        core_notify(
+            &mut runtime,
+            "agent:update",
+            serde_json::json!({
+                "session_id": "session-1",
+                "text": "streamed output",
+            }),
+        )
+        .await;
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
             PluginRequest::UpdateTextPanel { id, blocks }
                 if id == "agent-conversation"
                     && blocks.len() == 2
-                    && blocks[1].id == "agent:2"
+                    && blocks[1].id == "agent:1"
                     && blocks[1].kind == crate::plugin::TextPanelBlockKind::Agent
                     && blocks[1].format == crate::plugin::TextPanelBlockFormat::Markdown
                     && blocks[1].text.is_empty()
@@ -8326,16 +8511,15 @@ mod tests {
                     && status.label == "Writing…"
                     && status.stream
         ));
-        runtime
-            .notify(
-                "agent:update",
-                serde_json::json!({
-                    "session_id": "session-1",
-                    "text": " 👋\nnext line",
-                }),
-            )
-            .await
-            .unwrap();
+        core_notify(
+            &mut runtime,
+            "agent:update",
+            serde_json::json!({
+                "session_id": "session-1",
+                "text": " 👋\nnext line",
+            }),
+        )
+        .await;
         tokio::time::sleep(Duration::from_millis(70)).await;
         for callback in runtime.poll_timer_callbacks() {
             if let PluginRequest::TimeoutCallback { timer_id } = callback {
@@ -8360,20 +8544,19 @@ mod tests {
             ACTION_DISPATCHER.recv_request(),
             PluginRequest::AppendTextPanel { id, block_id, delta }
                 if id == "agent-conversation"
-                    && block_id == "agent:2"
+                    && block_id == "agent:1"
                     && delta == "streamed output 👋\nnext line"
         ));
 
-        runtime
-            .notify(
-                "agent:update",
-                serde_json::json!({
-                    "session_id": "session-1",
-                    "text": "\n\ncontinued",
-                }),
-            )
-            .await
-            .unwrap();
+        core_notify(
+            &mut runtime,
+            "agent:update",
+            serde_json::json!({
+                "session_id": "session-1",
+                "text": "\n\ncontinued",
+            }),
+        )
+        .await;
         tokio::time::sleep(Duration::from_millis(70)).await;
         for callback in runtime.poll_timer_callbacks() {
             if let PluginRequest::TimeoutCallback { timer_id } = callback {
@@ -8395,21 +8578,20 @@ mod tests {
             ACTION_DISPATCHER.recv_request(),
             PluginRequest::AppendTextPanel { id, block_id, delta }
                 if id == "agent-conversation"
-                    && block_id == "agent:2"
+                    && block_id == "agent:1"
                     && delta == "\n\ncontinued"
         ));
 
         let large_delta = "z".repeat(20_001);
-        runtime
-            .notify(
-                "agent:update",
-                serde_json::json!({
-                    "session_id": "session-1",
-                    "text": large_delta,
-                }),
-            )
-            .await
-            .unwrap();
+        core_notify(
+            &mut runtime,
+            "agent:update",
+            serde_json::json!({
+                "session_id": "session-1",
+                "text": large_delta,
+            }),
+        )
+        .await;
         tokio::time::sleep(Duration::from_millis(70)).await;
         for callback in runtime.poll_timer_callbacks() {
             if let PluginRequest::TimeoutCallback { timer_id } = callback {
@@ -8435,75 +8617,71 @@ mod tests {
             ACTION_DISPATCHER.recv_request(),
             PluginRequest::AppendTextPanel { id, block_id, delta }
                 if id == "agent-conversation"
-                    && block_id == "agent:2"
+                    && block_id == "agent:1"
                     && delta == large_delta
         ));
 
-        runtime
-            .notify(
-                "agent:completed",
-                serde_json::json!({
-                    "session_id": "session-1",
-                    "stop_reason": "completed",
-                    "elapsed_ms": 3_723_000,
-                }),
-            )
-            .await
-            .unwrap();
-        assert!(matches!(
-            ACTION_DISPATCHER.recv_request(),
-            PluginRequest::SetPluginStorage { plugin, key, value }
-                if plugin == "agent"
-                    && key == "transcript"
-                    && value.as_str().is_some_and(|text| text.ends_with('\n'))
-        ));
-        assert!(matches!(
-            ACTION_DISPATCHER.recv_request(),
-            PluginRequest::UpdateTextPanel { id, blocks }
-                if id == "agent-conversation"
-                    && blocks.last().is_some_and(|block| {
-                        block.kind == crate::plugin::TextPanelBlockKind::Activity
-                            && block.text == "Worked for 1h 2m 3s"
-                    })
-                    && blocks.get(1).is_some_and(|block| block.kind == crate::plugin::TextPanelBlockKind::Agent)
-        ));
-        assert!(matches!(
-            ACTION_DISPATCHER.recv_request(),
-            PluginRequest::SetPluginStorage { plugin, key, value }
-                if plugin == "agent"
-                    && key == "transcript"
-                    && value.as_str().is_some_and(|text| {
-                        text.ends_with(&format!("{large_delta}\nActivity: Worked for 1h 2m 3s\n"))
-                    })
-        ));
-        assert!(matches!(
-            ACTION_DISPATCHER.recv_request(),
-            PluginRequest::SetTextPanelStatus { id, status: None }
-                if id == "agent-conversation"
-        ));
+        core_notify(
+            &mut runtime,
+            "agent:completed",
+            serde_json::json!({
+                "session_id": "session-1",
+                "stop_reason": "completed",
+                "elapsed_ms": 3_723_000,
+            }),
+        )
+        .await;
+        let requests = drain_collect();
+        let transcripts = requests
+            .iter()
+            .filter_map(|request| match request {
+                PluginRequest::SetPluginStorage { plugin, key, value }
+                    if plugin == "agent" && key == "transcript" =>
+                {
+                    value.as_str().map(str::to_string)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(transcripts.last().is_some_and(|text| {
+            text.ends_with(&format!("{large_delta}\nActivity: Worked for 1h 2m 3s\n"))
+        }));
+        let blocks = last_panel_blocks(&requests);
+        assert!(blocks.last().is_some_and(|block| {
+            block.kind == crate::plugin::TextPanelBlockKind::Activity
+                && block.text == "Worked for 1h 2m 3s"
+        }));
+        assert!(blocks
+            .get(1)
+            .is_some_and(|block| block.kind == crate::plugin::TextPanelBlockKind::Agent));
+        assert_eq!(
+            panel_statuses(&requests).last(),
+            Some(&None),
+            "the turn ends idle"
+        );
 
+        // Cancelling an idle conversation has nothing to interrupt.
         runtime.execute_command("AgentCancel").await.unwrap();
-        assert!(matches!(
-            ACTION_DISPATCHER.recv_request(),
-            PluginRequest::AgentCancel { session_id } if session_id == "session-1"
-        ));
+        core_settle(&mut runtime).await;
+        assert!(!drain_collect()
+            .iter()
+            .any(|request| matches!(request, PluginRequest::AgentCancel { .. })));
 
-        runtime
-            .notify(
-                "agent:permission_requested",
-                serde_json::json!({
-                    "request_id": "permission-1",
-                    "session_id": "session-1",
-                    "tool_call": { "tool_call_id": "tool-1" },
-                    "options": [{
-                        "option_id": "allow-once-exact",
-                        "name": "Allow once",
-                        "kind": "allow_once",
-                    }],
-                }),
-            )
-            .await
-            .unwrap();
+        core_notify(
+            &mut runtime,
+            "agent:permission_requested",
+            serde_json::json!({
+                "request_id": "permission-1",
+                "session_id": "session-1",
+                "tool_call": { "tool_call_id": "tool-1" },
+                "options": [{
+                    "option_id": "allow-once-exact",
+                    "name": "Allow once",
+                    "kind": "allow_once",
+                }],
+            }),
+        )
+        .await;
         let (permission_picker, permission_items) = recv_agent_picker("Agent permission");
         runtime
             .notify_picker(
@@ -8565,13 +8743,12 @@ mod tests {
             .load_plugin("agent", include_str!("../../plugins/agent.hk"))
             .await
             .unwrap();
-        runtime
-            .notify(
-                "agent:session_created",
-                serde_json::json!({ "session_id": "session-1" }),
-            )
-            .await
-            .unwrap();
+        core_notify(
+            &mut runtime,
+            "agent:session_created",
+            serde_json::json!({ "session_id": "session-1" }),
+        )
+        .await;
         drain_requests();
 
         submit_agent_prompt(&mut runtime, "first prompt").await;
@@ -8584,29 +8761,26 @@ mod tests {
             );
         }
         assert!(first_prompt);
-        runtime
-            .notify(
-                "agent:session_created",
-                serde_json::json!({ "session_id": "session-1" }),
-            )
-            .await
-            .unwrap();
+        core_notify(
+            &mut runtime,
+            "agent:session_created",
+            serde_json::json!({ "session_id": "session-1" }),
+        )
+        .await;
         drain_requests();
-        runtime
-            .notify(
-                "agent:update",
-                serde_json::json!({ "session_id": "session-1", "text": "original output" }),
-            )
-            .await
-            .unwrap();
+        core_notify(
+            &mut runtime,
+            "agent:update",
+            serde_json::json!({ "session_id": "session-1", "text": "original output" }),
+        )
+        .await;
         drain_requests();
-        runtime
-            .notify(
-                "agent:cancelled",
-                serde_json::json!({ "session_id": "session-1" }),
-            )
-            .await
-            .unwrap();
+        core_notify(
+            &mut runtime,
+            "agent:cancelled",
+            serde_json::json!({ "session_id": "session-1" }),
+        )
+        .await;
         let mut cancellation_notice = false;
         while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
             match request {
@@ -8620,13 +8794,12 @@ mod tests {
             }
         }
         assert!(cancellation_notice);
-        runtime
-            .notify(
-                "agent:error",
-                serde_json::json!({ "message": "replacement session could not be created" }),
-            )
-            .await
-            .unwrap();
+        core_notify(
+            &mut runtime,
+            "agent:error",
+            serde_json::json!({ "message": "replacement session could not be created" }),
+        )
+        .await;
         let mut setup_status = false;
         while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
             match request {
@@ -8683,21 +8856,19 @@ mod tests {
         assert!(status);
         assert!(queued_visible);
         assert!(refreshed);
-        runtime
-            .notify(
-                "agent:update",
-                serde_json::json!({ "session_id": "session-1", "text": " still original" }),
-            )
-            .await
-            .unwrap();
+        core_notify(
+            &mut runtime,
+            "agent:update",
+            serde_json::json!({ "session_id": "session-1", "text": " still original" }),
+        )
+        .await;
         assert!(ACTION_DISPATCHER.try_recv_request().is_none());
-        runtime
-            .notify(
-                "agent:completed",
-                serde_json::json!({ "session_id": "session-1", "stop_reason": "end_turn" }),
-            )
-            .await
-            .unwrap();
+        core_notify(
+            &mut runtime,
+            "agent:completed",
+            serde_json::json!({ "session_id": "session-1", "stop_reason": "end_turn" }),
+        )
+        .await;
         while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
             match request {
                 PluginRequest::AgentCloseSession { .. } => {
@@ -8710,6 +8881,7 @@ mod tests {
             }
         }
         runtime.execute_command("AgentSendQueued").await.unwrap();
+        core_settle(&mut runtime).await;
         let mut dispatched_prompts = Vec::new();
         while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
             match request {
@@ -8743,13 +8915,12 @@ mod tests {
             .load_plugin("agent", include_str!("../../plugins/agent.hk"))
             .await
             .unwrap();
-        runtime
-            .notify(
-                "agent:session_created",
-                serde_json::json!({ "session_id": "session-1" }),
-            )
-            .await
-            .unwrap();
+        core_notify(
+            &mut runtime,
+            "agent:session_created",
+            serde_json::json!({ "session_id": "session-1" }),
+        )
+        .await;
         drain_requests();
 
         runtime
@@ -8759,6 +8930,7 @@ mod tests {
             )
             .await
             .unwrap();
+        core_settle(&mut runtime).await;
         let mut first = false;
         let mut focused = false;
         let mut rendered = false;
@@ -8802,13 +8974,12 @@ mod tests {
         assert!(busy);
         assert!(refreshed);
 
-        runtime
-            .notify(
-                "agent:update",
-                serde_json::json!({ "session_id": "session-1", "text": "first answer" }),
-            )
-            .await
-            .unwrap();
+        core_notify(
+            &mut runtime,
+            "agent:update",
+            serde_json::json!({ "session_id": "session-1", "text": "first answer" }),
+        )
+        .await;
         drain_requests();
 
         for text in ["second prompt", "third prompt"] {
@@ -8819,6 +8990,7 @@ mod tests {
                 )
                 .await
                 .unwrap();
+            core_settle(&mut runtime).await;
         }
         let mut queued = 0;
         let mut refreshes = 0;
@@ -8854,25 +9026,23 @@ mod tests {
         assert!(second_visible);
         assert!(third_visible);
 
-        runtime
-            .notify(
-                "agent:update",
-                serde_json::json!({ "session_id": "session-1", "text": " continues" }),
-            )
-            .await
-            .unwrap();
+        core_notify(
+            &mut runtime,
+            "agent:update",
+            serde_json::json!({ "session_id": "session-1", "text": " continues" }),
+        )
+        .await;
         assert!(
             ACTION_DISPATCHER.try_recv_request().is_none(),
             "queueing must not end the active stream"
         );
 
-        runtime
-            .notify(
-                "agent:completed",
-                serde_json::json!({ "session_id": "session-1", "stop_reason": "end_turn" }),
-            )
-            .await
-            .unwrap();
+        core_notify(
+            &mut runtime,
+            "agent:completed",
+            serde_json::json!({ "session_id": "session-1", "stop_reason": "end_turn" }),
+        )
+        .await;
         let mut delivered_second = false;
         let mut refreshed_second = false;
         while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
@@ -8903,13 +9073,12 @@ mod tests {
         }
         assert!(delivered_second);
 
-        runtime
-            .notify(
-                "agent:update",
-                serde_json::json!({ "session_id": "session-1", "text": "second answer" }),
-            )
-            .await
-            .unwrap();
+        core_notify(
+            &mut runtime,
+            "agent:update",
+            serde_json::json!({ "session_id": "session-1", "text": "second answer" }),
+        )
+        .await;
         let mut ordered_before_pending = false;
         while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
             if let PluginRequest::UpdateTextPanel { blocks, .. } = request {
@@ -8920,8 +9089,9 @@ mod tests {
                 let second_agent = blocks
                     .iter()
                     .position(|block| {
+                        // Skip the first answer; user ids come from the core now.
                         block.kind == crate::plugin::TextPanelBlockKind::Agent
-                            && block.id != "agent:2"
+                            && block.id != "agent:1"
                     })
                     .unwrap();
                 let third_user = blocks
@@ -8936,13 +9106,12 @@ mod tests {
             "the active answer must render before later queued prompts"
         );
 
-        runtime
-            .notify(
-                "agent:completed",
-                serde_json::json!({ "session_id": "session-1", "stop_reason": "end_turn" }),
-            )
-            .await
-            .unwrap();
+        core_notify(
+            &mut runtime,
+            "agent:completed",
+            serde_json::json!({ "session_id": "session-1", "stop_reason": "end_turn" }),
+        )
+        .await;
         let mut delivered_third = false;
         while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
             assert!(
@@ -8964,13 +9133,12 @@ mod tests {
             .load_plugin("agent", include_str!("../../plugins/agent.hk"))
             .await
             .unwrap();
-        runtime
-            .notify(
-                "agent:session_created",
-                serde_json::json!({ "session_id": "session-1" }),
-            )
-            .await
-            .unwrap();
+        core_notify(
+            &mut runtime,
+            "agent:session_created",
+            serde_json::json!({ "session_id": "session-1" }),
+        )
+        .await;
         drain_requests();
         runtime
             .notify(
@@ -8979,14 +9147,14 @@ mod tests {
             )
             .await
             .unwrap();
+        core_settle(&mut runtime).await;
         drain_requests();
-        runtime
-            .notify(
-                "agent:update",
-                serde_json::json!({ "session_id": "session-1", "text": "first chunk" }),
-            )
-            .await
-            .unwrap();
+        core_notify(
+            &mut runtime,
+            "agent:update",
+            serde_json::json!({ "session_id": "session-1", "text": "first chunk" }),
+        )
+        .await;
         drain_requests();
 
         runtime.execute_command("AgentClear").await.unwrap();
@@ -9030,13 +9198,12 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(70)).await;
         assert!(runtime.poll_timer_callbacks().is_empty());
 
-        runtime
-            .notify(
-                "agent:update",
-                serde_json::json!({ "session_id": "session-1", "text": "after clear" }),
-            )
-            .await
-            .unwrap();
+        core_notify(
+            &mut runtime,
+            "agent:update",
+            serde_json::json!({ "session_id": "session-1", "text": "after clear" }),
+        )
+        .await;
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
             PluginRequest::UpdateTextPanel { id, blocks }
@@ -9179,13 +9346,12 @@ mod tests {
             .load_plugin("agent", include_str!("../../plugins/agent.hk"))
             .await
             .unwrap();
-        runtime
-            .notify(
-                "agent:session_created",
-                serde_json::json!({ "session_id": "session-1" }),
-            )
-            .await
-            .unwrap();
+        core_notify(
+            &mut runtime,
+            "agent:session_created",
+            serde_json::json!({ "session_id": "session-1" }),
+        )
+        .await;
         drain_requests();
 
         runtime.execute_command("AgentClose").await.unwrap();
@@ -9233,11 +9399,12 @@ mod tests {
         assert!(ACTION_DISPATCHER.try_recv_request().is_none());
 
         runtime.execute_command("AgentNew").await.unwrap();
+        core_settle(&mut runtime).await;
         let mut closed = false;
         let mut cleared = false;
         let mut reset_storage = false;
         let mut reset_draft = false;
-        let mut requested_cwd = None;
+        let mut started = false;
         let mut focused_composer = false;
         while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
             match request {
@@ -9254,10 +9421,9 @@ mod tests {
                 PluginRequest::ClearTextPanelComposer { id } => {
                     reset_draft |= id == "agent-conversation";
                 }
-                PluginRequest::GetConfig {
-                    key, request_id, ..
-                } if key.as_deref() == Some("cwd") => {
-                    requested_cwd = Some(request_id);
+                PluginRequest::AgentNewSession { cwd } => {
+                    assert!(!started, "New starts exactly one session");
+                    started = cwd == Path::new("/workspace");
                 }
                 PluginRequest::FocusTextPanelComposer { id } => {
                     focused_composer |= id == "agent-conversation";
@@ -9276,15 +9442,7 @@ mod tests {
         assert!(reset_storage);
         assert!(reset_draft);
         assert!(focused_composer);
-        let request_id = requested_cwd.expect("New starts a session immediately");
-        runtime
-            .resolve_request(request_id, serde_json::json!({"value":"/workspace"}))
-            .await
-            .unwrap();
-        assert!(
-            matches!(ACTION_DISPATCHER.recv_request(), PluginRequest::AgentNewSession { cwd } if cwd == Path::new("/workspace"))
-        );
-        drain_requests();
+        assert!(started, "New starts a session immediately");
 
         // A prompt submitted before thread/start finishes must use that same start.
         runtime
@@ -9294,19 +9452,19 @@ mod tests {
             )
             .await
             .unwrap();
+        core_settle(&mut runtime).await;
         while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
             assert!(!matches!(
                 request,
                 PluginRequest::AgentNewSession { .. } | PluginRequest::GetConfig { .. }
             ));
         }
-        runtime
-            .notify(
-                "agent:session_created",
-                serde_json::json!({"session_id":"session-2"}),
-            )
-            .await
-            .unwrap();
+        core_notify(
+            &mut runtime,
+            "agent:session_created",
+            serde_json::json!({"session_id":"session-2"}),
+        )
+        .await;
         let mut submitted = false;
         while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
             if let PluginRequest::AgentPrompt {
@@ -9318,13 +9476,12 @@ mod tests {
         }
         assert!(submitted);
 
-        runtime
-            .notify(
-                "agent:update",
-                serde_json::json!({ "session_id": "session-1", "text": "late output" }),
-            )
-            .await
-            .unwrap();
+        core_notify(
+            &mut runtime,
+            "agent:update",
+            serde_json::json!({ "session_id": "session-1", "text": "late output" }),
+        )
+        .await;
         assert!(ACTION_DISPATCHER.try_recv_request().is_none());
     }
 
@@ -9394,13 +9551,12 @@ mod tests {
             .load_plugin("agent", include_str!("../../plugins/agent.hk"))
             .await
             .unwrap();
-        runtime
-            .notify(
-                "agent:session_created",
-                serde_json::json!({ "session_id": session_id }),
-            )
-            .await
-            .unwrap();
+        core_notify(
+            &mut runtime,
+            "agent:session_created",
+            serde_json::json!({ "session_id": session_id }),
+        )
+        .await;
         drain_requests();
         runtime
     }
@@ -9410,13 +9566,12 @@ mod tests {
         let mut runtime = agent_runtime_with_session("session-1").await;
         submit_agent_prompt(&mut runtime, "first prompt").await;
         drain_requests();
-        runtime
-            .notify(
-                "agent:turn_started",
-                serde_json::json!({ "session_id": "session-1", "turn_id": "turn-2" }),
-            )
-            .await
-            .unwrap();
+        core_notify(
+            &mut runtime,
+            "agent:turn_started",
+            serde_json::json!({ "session_id": "session-1", "turn_id": "turn-2" }),
+        )
+        .await;
         drain_requests();
 
         for (event, payload) in [
@@ -9437,7 +9592,7 @@ mod tests {
                 }),
             ),
         ] {
-            runtime.notify(event, payload).await.unwrap();
+            core_notify(&mut runtime, event, payload).await;
             while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
                 match request {
                     PluginRequest::Action(Action::Print(message)) => {
@@ -9458,13 +9613,12 @@ mod tests {
         submit_agent_prompt(&mut runtime, "first prompt").await;
         runtime.execute_command("AgentClose").await.unwrap();
         drain_requests();
-        runtime
-            .notify(
-                "agent:completed",
-                serde_json::json!({ "session_id": "session-1", "stop_reason": "end_turn" }),
-            )
-            .await
-            .unwrap();
+        core_notify(
+            &mut runtime,
+            "agent:completed",
+            serde_json::json!({ "session_id": "session-1", "stop_reason": "end_turn" }),
+        )
+        .await;
 
         let mut announced = false;
         while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
@@ -9481,72 +9635,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bundled_agent_keeps_prompts_returned_by_a_lost_app_server_as_paused() {
-        let mut runtime = agent_runtime_with_session("session-1").await;
-        runtime
-            .notify(
-                "agent:prompts_returned",
-                serde_json::json!({ "session_id": "session-1", "prompts": ["held follow-up"] }),
-            )
-            .await
-            .unwrap();
-
-        let mut visible = false;
-        let mut paused = false;
-        let mut announced = false;
-        while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
-            match request {
-                PluginRequest::AgentPrompt { .. } => {
-                    panic!("returned prompts must wait for the user")
-                }
-                PluginRequest::UpdateTextPanel { blocks, .. } => {
-                    visible |= blocks.iter().any(|block| block.text == "held follow-up");
-                }
-                PluginRequest::SetTextPanelStatus {
-                    status: Some(status),
-                    ..
-                } => {
-                    paused |= status.label.contains("1 queued · paused");
-                }
-                PluginRequest::Action(Action::Print(message)) => {
-                    announced |= message.contains("Kept 1 unsent agent message");
-                }
-                _ => {}
-            }
-        }
-        assert!(visible && paused && announced);
-
-        runtime.execute_command("AgentSendQueued").await.unwrap();
-        let mut sent = false;
-        while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
-            sent |= matches!(
-                request,
-                PluginRequest::AgentPrompt { session_id, text }
-                    if session_id == "session-1" && text == "held follow-up"
-            );
-        }
-        assert!(sent, "AgentSendQueued must send the returned prompt");
-    }
-
-    #[tokio::test]
     async fn bundled_agent_explains_a_failed_cancel_and_keeps_the_turn_running() {
         let mut runtime = agent_runtime_with_session("session-1").await;
         submit_agent_prompt(&mut runtime, "first prompt").await;
-        runtime
-            .notify(
-                "agent:cancelled",
-                serde_json::json!({ "session_id": "session-1" }),
-            )
-            .await
-            .unwrap();
+        core_notify(
+            &mut runtime,
+            "agent:cancelled",
+            serde_json::json!({ "session_id": "session-1" }),
+        )
+        .await;
         drain_requests();
-        runtime
-            .notify(
-                "agent:cancel_failed",
-                serde_json::json!({ "session_id": "session-1", "message": "interrupt rejected" }),
-            )
-            .await
-            .unwrap();
+        core_notify(
+            &mut runtime,
+            "agent:cancel_failed",
+            serde_json::json!({ "session_id": "session-1", "message": "interrupt rejected" }),
+        )
+        .await;
 
         let mut explained = false;
         let mut retry_status = false;
@@ -9571,17 +9675,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bundled_agent_clears_the_archived_hint_once_a_thread_is_live() {
+        drain_requests();
+        let mut runtime = Runtime::new();
+        runtime
+            .load_plugin("agent", include_str!("../../plugins/agent.hk"))
+            .await
+            .unwrap();
+        core_notify(
+            &mut runtime,
+            "agent:transcript_restored",
+            serde_json::json!({ "transcript": "You: earlier\nAgent: answer\n" }),
+        )
+        .await;
+        runtime.execute_command("AgentOpen").await.unwrap();
+        core_settle(&mut runtime).await;
+        runtime.execute_command("AgentStart").await.unwrap();
+        core_settle(&mut runtime).await;
+        drain_requests();
+
+        core_notify(
+            &mut runtime,
+            "agent:session_created",
+            serde_json::json!({ "session_id": "session-1" }),
+        )
+        .await;
+        assert!(drain_collect().iter().any(|request| matches!(
+            request,
+            PluginRequest::SetTextPanelComposerState { id, enabled: true, status }
+                if id == "agent-conversation" && status.as_deref().unwrap_or_default().is_empty()
+        )));
+    }
+
+    #[tokio::test]
     async fn bundled_agent_keeps_a_cancelled_session_for_the_next_prompt() {
         let mut runtime = agent_runtime_with_session("session-1").await;
         submit_agent_prompt(&mut runtime, "first prompt").await;
         drain_requests();
-        runtime
-            .notify(
-                "agent:completed",
-                serde_json::json!({ "session_id": "session-1", "stop_reason": "interrupted" }),
-            )
-            .await
-            .unwrap();
+        core_notify(
+            &mut runtime,
+            "agent:completed",
+            serde_json::json!({ "session_id": "session-1", "stop_reason": "interrupted" }),
+        )
+        .await;
         while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
             assert!(
                 !matches!(request, PluginRequest::AgentCloseSession { .. }),
@@ -9597,21 +9733,19 @@ mod tests {
         let mut runtime = agent_runtime_with_session("session-1").await;
         submit_agent_prompt(&mut runtime, "first prompt").await;
         drain_requests();
-        runtime
-            .notify(
-                "agent:completed",
-                serde_json::json!({ "session_id": "session-1", "stop_reason": "end_turn" }),
-            )
-            .await
-            .unwrap();
+        core_notify(
+            &mut runtime,
+            "agent:completed",
+            serde_json::json!({ "session_id": "session-1", "stop_reason": "end_turn" }),
+        )
+        .await;
         drain_requests();
-        runtime
-            .notify(
-                "agent:cancelled",
-                serde_json::json!({ "session_id": "session-1" }),
-            )
-            .await
-            .unwrap();
+        core_notify(
+            &mut runtime,
+            "agent:cancelled",
+            serde_json::json!({ "session_id": "session-1" }),
+        )
+        .await;
 
         let mut idle = false;
         let mut stopping = false;
@@ -9632,7 +9766,12 @@ mod tests {
                 _ => {}
             }
         }
-        assert!(idle, "late cancellation must leave the completed turn idle");
+        assert!(!idle, "a late cancellation changes nothing to re-render");
+        assert_eq!(
+            AGENT_CORE.with(|core| core.borrow().lifecycle.snapshot().phase),
+            crate::editor::agent_pane::AgentPanePhase::Idle,
+            "late cancellation must leave the completed turn idle"
+        );
         assert!(!stopping, "late cancellation must not restart busy status");
 
         assert_follow_up_reuses_session(&mut runtime, "session-1").await;
@@ -9643,21 +9782,19 @@ mod tests {
         let mut runtime = agent_runtime_with_session("session-1").await;
         submit_agent_prompt(&mut runtime, "first prompt").await;
         drain_requests();
-        runtime
-            .notify(
-                "agent:update",
-                serde_json::json!({ "session_id": "session-1", "text": "streamed output" }),
-            )
-            .await
-            .unwrap();
+        core_notify(
+            &mut runtime,
+            "agent:update",
+            serde_json::json!({ "session_id": "session-1", "text": "streamed output" }),
+        )
+        .await;
         drain_requests();
-        runtime
-            .notify(
-                "agent:cancelled",
-                serde_json::json!({ "session_id": "session-1" }),
-            )
-            .await
-            .unwrap();
+        core_notify(
+            &mut runtime,
+            "agent:cancelled",
+            serde_json::json!({ "session_id": "session-1" }),
+        )
+        .await;
         let mut reset_status = false;
         let mut stopping_status = false;
         while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
@@ -9682,13 +9819,12 @@ mod tests {
         }
         assert!(reset_status);
         assert!(stopping_status);
-        runtime
-            .notify(
-                "agent:completed",
-                serde_json::json!({ "session_id": "session-1", "stop_reason": "end_turn" }),
-            )
-            .await
-            .unwrap();
+        core_notify(
+            &mut runtime,
+            "agent:completed",
+            serde_json::json!({ "session_id": "session-1", "stop_reason": "end_turn" }),
+        )
+        .await;
 
         let mut transcript_saved = false;
         while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
@@ -9727,23 +9863,21 @@ mod tests {
             let mut runtime = agent_runtime_with_session("session-1").await;
             submit_agent_prompt(&mut runtime, "first prompt").await;
             drain_requests();
-            runtime
-                .notify(
-                    "agent:update",
-                    serde_json::json!({ "session_id": "session-1", "text": "streamed output" }),
-                )
-                .await
-                .unwrap();
+            core_notify(
+                &mut runtime,
+                "agent:update",
+                serde_json::json!({ "session_id": "session-1", "text": "streamed output" }),
+            )
+            .await;
             drain_requests();
-            runtime
-                .notify(
-                    "agent:cancelled",
-                    serde_json::json!({ "session_id": "session-1" }),
-                )
-                .await
-                .unwrap();
+            core_notify(
+                &mut runtime,
+                "agent:cancelled",
+                serde_json::json!({ "session_id": "session-1" }),
+            )
+            .await;
             drain_requests();
-            runtime.notify(event, payload).await.unwrap();
+            core_notify(&mut runtime, event, payload).await;
 
             let mut transcript_saved = false;
             while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
@@ -9776,13 +9910,12 @@ mod tests {
             drain_requests();
             submit_agent_prompt(&mut runtime, "queued follow-up").await;
             drain_requests();
-            runtime
-                .notify(
-                    "agent:completed",
-                    serde_json::json!({ "session_id": "session-1", "stop_reason": "interrupted" }),
-                )
-                .await
-                .unwrap();
+            core_notify(
+                &mut runtime,
+                "agent:completed",
+                serde_json::json!({ "session_id": "session-1", "stop_reason": "interrupted" }),
+            )
+            .await;
 
             let mut paused_status = false;
             while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
@@ -9805,6 +9938,7 @@ mod tests {
 
             if resume {
                 runtime.execute_command("AgentSendQueued").await.unwrap();
+                core_settle(&mut runtime).await;
                 let mut sent = false;
                 while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
                     sent |= matches!(
@@ -9816,6 +9950,7 @@ mod tests {
                 assert!(sent, "AgentSendQueued must resume the held follow-up");
             } else {
                 runtime.execute_command("AgentDiscardQueued").await.unwrap();
+                core_settle(&mut runtime).await;
                 drain_requests();
                 assert_follow_up_reuses_session(&mut runtime, "session-1").await;
             }
@@ -9823,65 +9958,48 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bundled_agent_start_keeps_the_previous_session_until_replacement_is_created() {
+    async fn bundled_agent_start_replaces_the_session_like_new() {
         drain_requests();
         let mut runtime = Runtime::new();
         runtime
             .load_plugin("agent", include_str!("../../plugins/agent.hk"))
             .await
             .unwrap();
-        runtime
-            .notify(
-                "agent:session_created",
-                serde_json::json!({ "session_id": "session-1" }),
-            )
-            .await
-            .unwrap();
+        core_notify(
+            &mut runtime,
+            "agent:session_created",
+            serde_json::json!({ "session_id": "session-1" }),
+        )
+        .await;
         drain_requests();
 
         runtime.execute_command("AgentStart").await.unwrap();
-        let request_id = match ACTION_DISPATCHER.recv_request() {
-            PluginRequest::GetConfig { request_id, key } => {
-                assert_eq!(key.as_deref(), Some("cwd"));
-                request_id
-            }
-            _ => panic!("expected current-directory request"),
-        };
-        runtime
-            .resolve_request(request_id, serde_json::json!({ "value": "/workspace" }))
-            .await
-            .unwrap();
+        core_settle(&mut runtime).await;
+        let requests = drain_collect();
+        assert!(requests.iter().any(|request| matches!(
+            request,
+            PluginRequest::AgentForgetSession { session_id } if session_id == "session-1"
+        )));
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| matches!(request, PluginRequest::AgentNewSession { .. }))
+                .count(),
+            1
+        );
 
-        assert!(matches!(
-            ACTION_DISPATCHER.recv_request(),
-            PluginRequest::AgentNewSession { cwd } if cwd == Path::new("/workspace")
-        ));
-        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
-
-        runtime.execute_command("AgentCancel").await.unwrap();
-        assert!(matches!(
-            ACTION_DISPATCHER.recv_request(),
-            PluginRequest::AgentCancel { session_id } if session_id == "session-1"
-        ));
-        runtime
-            .notify(
-                "agent:session_created",
-                serde_json::json!({ "session_id": "session-2" }),
-            )
-            .await
-            .unwrap();
-        assert!(matches!(
-            ACTION_DISPATCHER.recv_request(),
-            PluginRequest::AgentCloseSession { session_id } if session_id == "session-1"
-        ));
-        assert!(matches!(
-            ACTION_DISPATCHER.recv_request(),
-            PluginRequest::UpdateTextPanel { id, .. } if id == "agent-conversation"
-        ));
-        assert!(matches!(
-            ACTION_DISPATCHER.recv_request(),
-            PluginRequest::Action(Action::Print(message)) if message == "Agent session started"
-        ));
+        core_notify(
+            &mut runtime,
+            "agent:session_created",
+            serde_json::json!({ "session_id": "session-2" }),
+        )
+        .await;
+        let requests = drain_collect();
+        assert!(printed_messages(&requests).contains(&"Agent session started".to_string()));
+        assert_eq!(
+            AGENT_CORE.with(|core| core.borrow().lifecycle.snapshot().session_id),
+            Some("session-2".to_string())
+        );
     }
 
     #[tokio::test]
@@ -9892,13 +10010,12 @@ mod tests {
             .load_plugin("agent", include_str!("../../plugins/agent.hk"))
             .await
             .unwrap();
-        runtime
-            .notify(
-                "agent:session_created",
-                serde_json::json!({ "session_id": "session-1" }),
-            )
-            .await
-            .unwrap();
+        core_notify(
+            &mut runtime,
+            "agent:session_created",
+            serde_json::json!({ "session_id": "session-1" }),
+        )
+        .await;
         drain_requests();
 
         submit_agent_prompt(&mut runtime, "retry this exact prompt").await;
@@ -9912,106 +10029,82 @@ mod tests {
         }
         assert!(saw_prompt);
 
-        runtime
-            .notify(
-                "agent:session_lost",
-                serde_json::json!({
-                    "session_id": "session-1",
-                    "prompt": "retry this exact prompt",
-                    "message": "no Codex session is running"
-                }),
-            )
-            .await
-            .unwrap();
-        assert!(matches!(
-            ACTION_DISPATCHER.recv_request(),
-            PluginRequest::SetTextPanelStatus { id, status: None }
-                if id == "agent-conversation"
-        ));
-        assert!(matches!(
-            ACTION_DISPATCHER.recv_request(),
+        core_notify(
+            &mut runtime,
+            "agent:session_lost",
+            serde_json::json!({
+                "session_id": "session-1",
+                "prompt": "retry this exact prompt",
+                "message": "no Codex session is running"
+            }),
+        )
+        .await;
+        let requests = drain_collect();
+        assert!(requests.iter().any(|request| matches!(
+            request,
             PluginRequest::AgentArchiveSession { session_id } if session_id == "session-1"
-        ));
-        assert!(matches!(
-            ACTION_DISPATCHER.recv_request(),
-            PluginRequest::Action(Action::Print(message))
-                if message == "no Codex session is running; retrying the saved prompt"
-        ));
-        let request_id = match ACTION_DISPATCHER.recv_request() {
-            PluginRequest::GetConfig { request_id, key } => {
-                assert_eq!(key.as_deref(), Some("cwd"));
-                request_id
-            }
-            _ => panic!("expected a current-directory request for the saved prompt"),
-        };
-        runtime
-            .resolve_request(request_id, serde_json::json!({ "value": "/workspace" }))
-            .await
-            .unwrap();
-        assert!(matches!(
-            ACTION_DISPATCHER.recv_request(),
-            PluginRequest::AgentNewSession { cwd } if cwd == Path::new("/workspace")
-        ));
-
-        runtime
-            .notify(
-                "agent:error",
-                serde_json::json!({ "message": "Codex app-server stopped" }),
-            )
-            .await
-            .unwrap();
-        assert!(matches!(
-            ACTION_DISPATCHER.recv_request(),
-            PluginRequest::SetTextPanelStatus { id, status: None }
-                if id == "agent-conversation"
-        ));
-        assert!(matches!(
-            ACTION_DISPATCHER.recv_request(),
-            PluginRequest::UpdateTextPanel { id, .. } if id == "agent-conversation"
-        ));
-        assert!(matches!(
-            ACTION_DISPATCHER.recv_request(),
-            PluginRequest::SetPluginStorage { plugin, key, .. }
-                if plugin == "agent" && key == "transcript"
-        ));
-        assert!(matches!(
-            ACTION_DISPATCHER.recv_request(),
-            PluginRequest::Action(Action::Print(message))
-                if message.contains("prompt is preserved")
-        ));
-        recv_agent_picker("Retry Codex");
-
-        runtime
-            .notify(
-                "agent:session_created",
-                serde_json::json!({ "session_id": "session-2" }),
-            )
-            .await
-            .unwrap();
-        let blocks = match ACTION_DISPATCHER.recv_request() {
-            PluginRequest::UpdateTextPanel { id, blocks } => {
-                assert_eq!(id, "agent-conversation");
-                blocks
-            }
-            _ => panic!("expected the restored conversation panel"),
-        };
+        )));
+        assert!(printed_messages(&requests)
+            .contains(&"no Codex session is running; retrying the saved prompt".to_string()));
         assert_eq!(
-            blocks
+            requests
+                .iter()
+                .filter(|request| matches!(request, PluginRequest::AgentNewSession { .. }))
+                .count(),
+            1,
+            "the core retries the unsent prompt in a new thread"
+        );
+
+        // The replacement thread cannot start either: the prompt stays queued.
+        core_notify(
+            &mut runtime,
+            "agent:error",
+            serde_json::json!({ "message": "Codex app-server stopped" }),
+        )
+        .await;
+        let requests = drain_collect();
+        let (picker, items) = find_agent_picker(&requests, "Retry Codex");
+        assert!(printed_messages(&requests)
+            .iter()
+            .any(|message| message.contains("prompt is preserved")));
+        assert!(last_panel_blocks(&requests)
+            .iter()
+            .any(|block| block.text == "retry this exact prompt"));
+
+        let retry = items
+            .iter()
+            .find(|item| item.id == "retry")
+            .unwrap()
+            .clone();
+        runtime
+            .notify_picker(picker, PickerCallback::Selected(retry))
+            .unwrap();
+        core_settle(&mut runtime).await;
+        assert!(drain_collect()
+            .iter()
+            .any(|request| matches!(request, PluginRequest::AgentNewSession { .. })));
+
+        core_notify(
+            &mut runtime,
+            "agent:session_created",
+            serde_json::json!({ "session_id": "session-2" }),
+        )
+        .await;
+        let requests = drain_collect();
+        assert_eq!(
+            sent_agent_prompts(&requests),
+            [(
+                "session-2".to_string(),
+                "retry this exact prompt".to_string()
+            )]
+        );
+        assert_eq!(
+            last_panel_blocks(&requests)
                 .iter()
                 .filter(|block| block.text == "retry this exact prompt")
                 .count(),
             1
         );
-        assert!(matches!(
-            ACTION_DISPATCHER.recv_request(),
-            PluginRequest::Action(Action::Print(message)) if message == "Agent session started"
-        ));
-        assert!(matches!(
-            ACTION_DISPATCHER.recv_request(),
-            PluginRequest::AgentPrompt { session_id, text }
-                if session_id == "session-2" && text == "retry this exact prompt"
-        ));
-        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
     }
 
     #[tokio::test]
@@ -10039,83 +10132,52 @@ mod tests {
                 ComposerCallback::Submitted("keep this prompt".to_string()),
             )
             .unwrap();
-        let cwd_request_id = recv_optimistic_agent_start(
+        recv_optimistic_agent_start(
+            &mut runtime,
             "keep this prompt",
             serde_json::json!(["keep this prompt"]),
             true,
+        )
+        .await;
+
+        core_notify(
+            &mut runtime,
+            "agent:session_lost",
+            serde_json::json!({ "message": "Codex app-server stopped" }),
+        )
+        .await;
+        let requests = drain_collect();
+        assert!(printed_messages(&requests)
+            .iter()
+            .any(|message| message.contains("prompt is preserved")));
+        find_agent_picker(&requests, "Retry Codex");
+        let blocks = last_panel_blocks(&requests);
+        assert_eq!(
+            blocks
+                .iter()
+                .filter(|block| block.text == "keep this prompt")
+                .count(),
+            1,
+            "the unsent prompt stays visible exactly once"
         );
-        runtime
-            .resolve_request(cwd_request_id, serde_json::json!({ "value": "/workspace" }))
-            .await
-            .unwrap();
-        assert!(matches!(
-            ACTION_DISPATCHER.recv_request(),
-            PluginRequest::AgentNewSession { cwd } if cwd == Path::new("/workspace")
-        ));
+        assert!(blocks
+            .iter()
+            .any(|block| block.text == "Codex app-server stopped"));
+        let snapshot = AGENT_CORE.with(|core| core.borrow().lifecycle.snapshot());
+        assert!(snapshot.paused, "the prompt waits for an explicit retry");
+        assert_eq!(snapshot.queued.len(), 1);
 
-        runtime
-            .notify(
-                "agent:session_lost",
-                serde_json::json!({ "message": "Codex app-server stopped" }),
-            )
-            .await
-            .unwrap();
-        assert!(matches!(
-            ACTION_DISPATCHER.recv_request(),
-            PluginRequest::SetTextPanelStatus { id, status: None }
-                if id == "agent-conversation"
-        ));
-        assert!(matches!(
-            ACTION_DISPATCHER.recv_request(),
-            PluginRequest::SetTextPanelStatus { id, status: None }
-                if id == "agent-conversation"
-        ));
-        assert!(matches!(
-            ACTION_DISPATCHER.recv_request(),
-            PluginRequest::UpdateTextPanel { id, blocks }
-                if id == "agent-conversation"
-                    && blocks.len() == 1
-                    && blocks[0].text == "keep this prompt"
-        ));
-        assert!(matches!(
-            ACTION_DISPATCHER.recv_request(),
-            PluginRequest::SetPluginStorage { plugin, key, .. }
-                if plugin == "agent" && key == "transcript"
-        ));
-        assert!(matches!(
-            ACTION_DISPATCHER.recv_request(),
-            PluginRequest::UpdateTextPanel { id, blocks }
-                if id == "agent-conversation"
-                    && blocks.len() == 2
-                    && blocks[0].text == "keep this prompt"
-                    && blocks[1].text == "Codex app-server stopped"
-        ));
-        assert!(matches!(
-            ACTION_DISPATCHER.recv_request(),
-            PluginRequest::SetPluginStorage { plugin, key, .. }
-                if plugin == "agent" && key == "transcript"
-        ));
-        assert!(matches!(
-            ACTION_DISPATCHER.recv_request(),
-            PluginRequest::Action(Action::Print(message))
-                if message.contains("prompt is preserved")
-        ));
-        recv_agent_picker("Retry Codex");
-
+        // Reopening goes to the pane that shows the held prompt and its actions,
+        // rather than a floating composer that could submit a second copy.
         runtime.execute_command("Agent").await.unwrap();
-        let history_request_id = match ACTION_DISPATCHER.recv_request() {
-            PluginRequest::GetPluginStorage { request_id, .. } => request_id,
-            _ => panic!("expected the saved-prompt history request"),
-        };
-        runtime
-            .resolve_request(
-                history_request_id,
-                serde_json::json!({ "value": ["keep this prompt"] }),
-            )
-            .await
-            .unwrap();
-        let (_, _, query, _) = recv_agent_composer();
-        assert_eq!(query, "keep this prompt");
+        let requests = drain_collect();
+        assert!(requests.iter().any(|request| matches!(
+            request,
+            PluginRequest::FocusTextPanelComposer { id } if id == "agent-conversation"
+        )));
+        assert!(!requests
+            .iter()
+            .any(|request| matches!(request, PluginRequest::GetPluginStorage { .. })));
     }
 
     #[tokio::test]
@@ -10126,21 +10188,24 @@ mod tests {
             .load_plugin("agent", include_str!("../../plugins/agent.hk"))
             .await
             .unwrap();
-        runtime
-            .notify(
-                "agent:session_created",
-                serde_json::json!({ "session_id": "session-1" }),
-            )
-            .await
-            .unwrap();
+        core_notify(
+            &mut runtime,
+            "agent:session_created",
+            serde_json::json!({ "session_id": "session-1" }),
+        )
+        .await;
         drain_requests();
-        runtime
-            .notify(
-                "agent:session_created",
-                serde_json::json!({ "session_id": "session-2" }),
-            )
-            .await
-            .unwrap();
+        // The pane replaces its thread through New, which the core turns into a
+        // fresh session start.
+        runtime.execute_command("AgentNew").await.unwrap();
+        core_settle(&mut runtime).await;
+        drain_requests();
+        core_notify(
+            &mut runtime,
+            "agent:session_created",
+            serde_json::json!({ "session_id": "session-2" }),
+        )
+        .await;
         drain_requests();
 
         for (event, payload) in [
@@ -10169,7 +10234,7 @@ mod tests {
                 }),
             ),
         ] {
-            runtime.notify(event, payload).await.unwrap();
+            core_notify(&mut runtime, event, payload).await;
         }
 
         assert!(ACTION_DISPATCHER.try_recv_request().is_none());
@@ -10312,7 +10377,13 @@ mod tests {
                 .take(49)
                 .cloned(),
         );
-        let _ = recv_optimistic_agent_start(&submitted, serde_json::json!(expected_saved), true);
+        recv_optimistic_agent_start(
+            &mut runtime,
+            &submitted,
+            serde_json::json!(expected_saved),
+            true,
+        )
+        .await;
     }
 
     #[tokio::test]
@@ -10352,63 +10423,34 @@ mod tests {
                 ComposerCallback::Submitted("inspect unsaved changes".to_string()),
             )
             .unwrap();
-        let cwd_request_id = recv_optimistic_agent_start(
+        recv_optimistic_agent_start(
+            &mut runtime,
             "inspect unsaved changes",
             serde_json::json!(["inspect unsaved changes"]),
             true,
-        );
-        runtime
-            .resolve_request(cwd_request_id, serde_json::json!({ "value": "/workspace" }))
-            .await
-            .unwrap();
-        assert!(matches!(
-            ACTION_DISPATCHER.recv_request(),
-            PluginRequest::AgentNewSession { cwd } if cwd == Path::new("/workspace")
-        ));
+        )
+        .await;
 
-        runtime
-            .notify(
-                "agent:error",
-                serde_json::json!({ "message": "Codex login required" }),
-            )
-            .await
-            .unwrap();
-        assert!(matches!(
-            ACTION_DISPATCHER.recv_request(),
-            PluginRequest::SetTextPanelStatus { id, status: None }
-                if id == "agent-conversation"
-        ));
-        assert!(matches!(
-            ACTION_DISPATCHER.recv_request(),
-            PluginRequest::UpdateTextPanel { id, blocks }
-                if id == "agent-conversation"
-                    && blocks.len() == 1
-                    && blocks[0].text == "inspect unsaved changes"
-        ));
-        assert!(matches!(
-            ACTION_DISPATCHER.recv_request(),
-            PluginRequest::SetPluginStorage { plugin, key, .. }
-                if plugin == "agent" && key == "transcript"
-        ));
-        assert!(matches!(
-            ACTION_DISPATCHER.recv_request(),
-            PluginRequest::UpdateTextPanel { id, blocks }
-                if id == "agent-conversation"
-                    && blocks.len() == 2
-                    && blocks[0].text == "inspect unsaved changes"
-                    && blocks[1].text == "Codex login required"
-        ));
-        assert!(matches!(
-            ACTION_DISPATCHER.recv_request(),
-            PluginRequest::SetPluginStorage { plugin, key, .. }
-                if plugin == "agent" && key == "transcript"
-        ));
-        assert!(matches!(
-            ACTION_DISPATCHER.recv_request(),
-            PluginRequest::Action(Action::Print(message))
-                if message.contains("prompt is preserved")
-        ));
-        let (setup_picker, items) = recv_agent_picker("Retry Codex");
+        core_notify(
+            &mut runtime,
+            "agent:error",
+            serde_json::json!({ "message": "Codex login required" }),
+        )
+        .await;
+        let requests = drain_collect();
+        let blocks = last_panel_blocks(&requests);
+        assert_eq!(
+            blocks
+                .iter()
+                .map(|block| block.text.as_str())
+                .collect::<Vec<_>>(),
+            ["Codex login required", "inspect unsaved changes"],
+            "the error shows above the still-queued prompt"
+        );
+        assert!(printed_messages(&requests)
+            .iter()
+            .any(|message| message.contains("prompt is preserved")));
+        let (setup_picker, items) = find_agent_picker(&requests, "Retry Codex");
         assert_eq!(
             items
                 .iter()
@@ -10430,75 +10472,29 @@ mod tests {
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
             PluginRequest::Action(Action::Print(message))
-                if message == "Agent prompt saved. Press Space A when ready to retry"
+                if message == "Agent prompt saved · :AgentSendQueued retries it"
         ));
-        runtime.execute_command("Agent").await.unwrap();
-        let history_request_id = match ACTION_DISPATCHER.recv_request() {
-            PluginRequest::GetPluginStorage {
-                plugin,
-                key,
-                request_id,
-            } => {
-                assert_eq!(plugin, "agent");
-                assert_eq!(key, "prompt_history");
-                request_id
-            }
-            _ => panic!("expected saved-prompt history request"),
-        };
-        runtime
-            .resolve_request(
-                history_request_id,
-                serde_json::json!({ "value": ["inspect unsaved changes"] }),
-            )
-            .await
-            .unwrap();
-        let (composer, title, query, history) = recv_agent_composer();
-        assert_eq!(title.as_deref(), Some("Agent prompt"));
-        assert_eq!(query, "inspect unsaved changes");
-        assert_eq!(history, ["inspect unsaved changes"]);
 
-        runtime
-            .notify_composer(
-                composer,
-                ComposerCallback::Submitted("inspect unsaved changes".to_string()),
-            )
-            .unwrap();
-        let cwd_request_id = recv_optimistic_agent_start(
-            "inspect unsaved changes",
-            serde_json::json!(["inspect unsaved changes"]),
-            false,
+        runtime.execute_command("AgentSendQueued").await.unwrap();
+        core_settle(&mut runtime).await;
+        assert!(drain_collect()
+            .iter()
+            .any(|request| matches!(request, PluginRequest::AgentNewSession { .. })));
+        core_notify(
+            &mut runtime,
+            "agent:session_created",
+            serde_json::json!({ "session_id": "session-lazy" }),
+        )
+        .await;
+        let requests = drain_collect();
+        assert!(printed_messages(&requests).contains(&"Agent session started".to_string()));
+        assert_eq!(
+            sent_agent_prompts(&requests),
+            [(
+                "session-lazy".to_string(),
+                "inspect unsaved changes".to_string()
+            )]
         );
-        runtime
-            .resolve_request(cwd_request_id, serde_json::json!({ "value": "/workspace" }))
-            .await
-            .unwrap();
-        assert!(matches!(
-            ACTION_DISPATCHER.recv_request(),
-            PluginRequest::AgentNewSession { cwd } if cwd == Path::new("/workspace")
-        ));
-
-        runtime
-            .notify(
-                "agent:session_created",
-                serde_json::json!({ "session_id": "session-lazy" }),
-            )
-            .await
-            .unwrap();
-        assert!(matches!(
-            ACTION_DISPATCHER.recv_request(),
-            PluginRequest::UpdateTextPanel { id, .. } if id == "agent-conversation"
-        ));
-        assert!(matches!(
-            ACTION_DISPATCHER.recv_request(),
-            PluginRequest::Action(Action::Print(message)) if message == "Agent session started"
-        ));
-        assert!(matches!(
-            ACTION_DISPATCHER.recv_request(),
-            PluginRequest::AgentPrompt { session_id, text }
-                if session_id == "session-lazy" && text == "inspect unsaved changes"
-        ));
-
-        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
     }
 
     #[tokio::test]
@@ -10514,13 +10510,14 @@ mod tests {
         runtime
             .notify_picker(setup_picker, PickerCallback::Selected(items[0].clone()))
             .unwrap();
-        assert!(matches!(
-            ACTION_DISPATCHER.recv_request(),
-            PluginRequest::GetConfig { key, .. } if key.as_deref() == Some("cwd")
-        ));
+        core_settle(&mut runtime).await;
+        assert!(drain_collect()
+            .iter()
+            .any(|request| matches!(request, PluginRequest::AgentNewSession { .. })));
 
         drain_requests();
         let (setup_picker, items) = open_agent_setup_picker(&mut runtime).await;
+        drain_requests();
         runtime
             .notify_picker(setup_picker, PickerCallback::Selected(items[1].clone()))
             .unwrap();
@@ -10531,13 +10528,14 @@ mod tests {
 
         drain_requests();
         let (setup_picker, _) = open_agent_setup_picker(&mut runtime).await;
+        drain_requests();
         runtime
             .notify_picker(setup_picker, PickerCallback::Cancelled)
             .unwrap();
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
             PluginRequest::Action(Action::Print(message))
-                if message == "Agent prompt saved. Press Space A when ready to retry"
+                if message == "Agent prompt saved · :AgentSendQueued retries it"
         ));
     }
 
@@ -10551,74 +10549,33 @@ mod tests {
             .unwrap();
 
         runtime.execute_command("AgentStart").await.unwrap();
-        let request_id = match ACTION_DISPATCHER.recv_request() {
-            PluginRequest::GetConfig { request_id, key } => {
-                assert_eq!(key.as_deref(), Some("cwd"));
-                request_id
-            }
-            _ => panic!("expected agent current-directory request"),
-        };
-        runtime
-            .resolve_request(request_id, serde_json::json!({ "value": "/workspace" }))
-            .await
-            .unwrap();
-        assert!(matches!(
-            ACTION_DISPATCHER.recv_request(),
+        core_settle(&mut runtime).await;
+        assert!(drain_collect().iter().any(|request| matches!(
+            request,
             PluginRequest::AgentNewSession { cwd } if cwd == Path::new("/workspace")
-        ));
-        runtime
-            .notify(
-                "agent:session_lost",
-                serde_json::json!({
-                    "session_id": "",
-                    "prompt": "",
-                    "message": "Codex live authentication was rejected by workplace policy"
-                }),
-            )
-            .await
-            .unwrap();
-        assert!(matches!(
-            ACTION_DISPATCHER.recv_request(),
-            PluginRequest::SetTextPanelStatus { id, status: None }
-                if id == "agent-conversation"
-        ));
-        assert!(matches!(
-            ACTION_DISPATCHER.recv_request(),
-            PluginRequest::CreateTextPanel { id, .. } if id == "agent-conversation"
-        ));
-        resolve_prompt_history(&mut runtime, serde_json::json!([])).await;
-        expect_agent_model_header();
-        let _ = expect_default_model_request();
-        assert!(matches!(
-            ACTION_DISPATCHER.recv_request(),
-            PluginRequest::SetTextPanelStatus { id, status: None }
-                if id == "agent-conversation"
-        ));
-        let blocks = match ACTION_DISPATCHER.recv_request() {
-            PluginRequest::UpdateTextPanel { id, blocks } => {
-                assert_eq!(id, "agent-conversation");
-                blocks
-            }
-            _ => panic!("expected persistent agent startup diagnostic"),
-        };
-        assert!(blocks.iter().any(|block| {
+        )));
+        core_notify(
+            &mut runtime,
+            "agent:session_lost",
+            serde_json::json!({
+                "session_id": "",
+                "prompt": "",
+                "message": "Codex live authentication was rejected by workplace policy"
+            }),
+        )
+        .await;
+        let requests = drain_collect();
+        assert!(last_panel_blocks(&requests).iter().any(|block| {
             block.kind == crate::plugin::TextPanelBlockKind::Error
                 && block
                     .text
                     .contains("live authentication was rejected by workplace policy")
         }));
-        assert!(matches!(
-            ACTION_DISPATCHER.recv_request(),
-            PluginRequest::SetPluginStorage { plugin, key, .. }
-                if plugin == "agent" && key == "transcript"
-        ));
-        assert!(matches!(
-            ACTION_DISPATCHER.recv_request(),
-            PluginRequest::Action(Action::Print(message))
-                if message.contains("live authentication was rejected by workplace policy")
-                    && !message.contains("prompt is preserved")
-        ));
-        let (_, items) = recv_agent_picker("Retry Codex");
+        assert!(printed_messages(&requests).iter().any(|message| {
+            message.contains("live authentication was rejected by workplace policy")
+                && !message.contains("prompt is preserved")
+        }));
+        let (_, items) = find_agent_picker(&requests, "Retry Codex");
         assert_eq!(items[0].label, "Retry Codex startup");
         assert_eq!(items[1].label, "Open Red logs");
     }
@@ -10633,17 +10590,11 @@ mod tests {
             .unwrap();
 
         let markdown = "# Accepted arguments\n\n| Argument | Meaning |\n|---|---|\n| `--root` | Set the root |\n\nTrailing paragraph.";
-        runtime
-            .notify(
-                "agent:transcript_restored",
-                serde_json::json!({
+        core_notify(&mut runtime, "agent:transcript_restored", serde_json::json!({
                     "transcript": format!(
                         "You: list the arguments\nAgent: {markdown}\nActivity: Worked for 13s\nSystem: Agent stopped: end_turn\n"
                     )
-                }),
-            )
-            .await
-            .unwrap();
+                })).await;
 
         match ACTION_DISPATCHER.recv_request() {
             PluginRequest::UpdateTextPanel { id, blocks } => {
@@ -10725,17 +10676,16 @@ mod tests {
             "### 2. Application entry point\n\n",
             "All behavior is implemented inside `main()`."
         );
-        runtime
-            .notify(
-                "agent:transcript_restored",
-                serde_json::json!({
-                    "transcript": format!(
-                        "{truncated_response}\nYou: review it again\nAgent: # Updated review\n"
-                    )
-                }),
-            )
-            .await
-            .unwrap();
+        core_notify(
+            &mut runtime,
+            "agent:transcript_restored",
+            serde_json::json!({
+                "transcript": format!(
+                    "{truncated_response}\nYou: review it again\nAgent: # Updated review\n"
+                )
+            }),
+        )
+        .await;
 
         match ACTION_DISPATCHER.recv_request() {
             PluginRequest::UpdateTextPanel { id, blocks } => {
@@ -10768,24 +10718,23 @@ mod tests {
             .await
             .unwrap();
 
-        runtime
-            .notify(
-                "agent:transcript_restored",
-                serde_json::json!({
-                    "transcript": concat!(
-                        "You: first question\n",
-                        "Agent: first answer\n",
-                        "You: second question\n",
-                        "Agent: second answer\n",
-                        "You: third question\n",
-                        "Agent: third answer\n",
-                        "You: fourth question\n",
-                        "Agent: fourth answer\n",
-                    )
-                }),
-            )
-            .await
-            .unwrap();
+        core_notify(
+            &mut runtime,
+            "agent:transcript_restored",
+            serde_json::json!({
+                "transcript": concat!(
+                    "You: first question\n",
+                    "Agent: first answer\n",
+                    "You: second question\n",
+                    "Agent: second answer\n",
+                    "You: third question\n",
+                    "Agent: third answer\n",
+                    "You: fourth question\n",
+                    "Agent: fourth answer\n",
+                )
+            }),
+        )
+        .await;
 
         match ACTION_DISPATCHER.recv_request() {
             PluginRequest::UpdateTextPanel { id, blocks } => {
@@ -10798,6 +10747,8 @@ mod tests {
             }
             _ => panic!("expected restored text panel update"),
         }
+        // The core marks a recap as pending; its snapshot re-renders the same view.
+        drain_requests();
 
         runtime.execute_command("Agent").await.unwrap();
         assert!(matches!(
@@ -10843,20 +10794,14 @@ mod tests {
             .await
             .unwrap();
 
-        runtime
-            .notify(
-                "agent:conversation_restore_pending",
-                serde_json::json!({
+        core_notify(&mut runtime, "agent:conversation_restore_pending", serde_json::json!({
                     "thread_id": "thread-restored",
                     "cwd": "/workspace",
                     "items": [
                         {"id": "user-1", "turn_id": "turn-1", "role": "user", "text": "Earlier question"},
                         {"id": "agent-1", "turn_id": "turn-1", "role": "agent", "text": "Earlier answer"}
                     ]
-                }),
-            )
-            .await
-            .unwrap();
+                })).await;
 
         let mut saw_disabled_composer = false;
         let mut saw_resume = false;
@@ -10903,20 +10848,14 @@ mod tests {
                 if id == "agent-conversation" && history == ["restored prompt"]
         ));
 
-        runtime
-            .notify(
-                "agent:session_restored",
-                serde_json::json!({
+        core_notify(&mut runtime, "agent:session_restored", serde_json::json!({
                     "thread_id": "thread-restored",
                     "cwd": "/workspace",
                     "items": [
                         {"id": "native-user", "turn_id": "native-turn", "role": "user", "text": "Earlier question"},
                         {"id": "native-agent", "turn_id": "native-turn", "role": "agent", "text": "Earlier answer"}
                     ]
-                }),
-            )
-            .await
-            .unwrap();
+                })).await;
 
         let mut saw_enabled_composer = false;
         while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
@@ -11018,14 +10957,13 @@ mod tests {
         runtime.execute_command("AgentOpen").await.unwrap();
         let late = expect_default_model_request();
         drain_requests();
-        runtime
-            .notify(
-                "agent:session_created",
-                serde_json::json!({"session_id":"thread"}),
-            )
-            .await
-            .unwrap();
-        runtime.notify("agent:model_changed", serde_json::json!({"session_id":"thread","model_info":{"model":"confirmed","effort":"low"}})).await.unwrap();
+        core_notify(
+            &mut runtime,
+            "agent:session_created",
+            serde_json::json!({"session_id":"thread"}),
+        )
+        .await;
+        core_notify(&mut runtime, "agent:model_changed", serde_json::json!({"session_id":"thread","model_info":{"model":"confirmed","effort":"low"}})).await;
         assert_eq!(take_model_header().unwrap().text, "confirmed");
         runtime.resolve_request(late, serde_json::json!({"error":"","model_info":{"model":"stale-default","effort":"high"}})).await.unwrap();
         assert!(ACTION_DISPATCHER.try_recv_request().is_none());
@@ -11310,10 +11248,7 @@ mod tests {
             .await
             .unwrap();
         let old = open_unprimed_agent(&mut runtime).await;
-        runtime
-            .notify("agent:backend_ready", serde_json::json!({}))
-            .await
-            .unwrap();
+        core_notify(&mut runtime, "agent:backend_ready", serde_json::json!({})).await;
         let fresh = expect_model_catalog_request();
         runtime
             .resolve_request(old, test_model_catalog())
@@ -11324,13 +11259,12 @@ mod tests {
         let (handle, items, options) = recv_model_picker();
         assert!(items.is_empty() && options.busy);
         assert!(ACTION_DISPATCHER.try_recv_request().is_none());
-        runtime
-            .notify(
-                "agent:session_created",
-                serde_json::json!({"session_id":"new-thread"}),
-            )
-            .await
-            .unwrap();
+        core_notify(
+            &mut runtime,
+            "agent:session_created",
+            serde_json::json!({"session_id":"new-thread"}),
+        )
+        .await;
         drain_requests();
         runtime
             .resolve_request(fresh, test_model_catalog())
@@ -11355,23 +11289,21 @@ mod tests {
             .await
             .unwrap();
         let _ = open_for_default_model(&mut runtime).await;
-        runtime
-            .notify(
-                "agent:session_created",
-                serde_json::json!({"session_id":"thread-1"}),
-            )
-            .await
-            .unwrap();
+        core_notify(
+            &mut runtime,
+            "agent:session_created",
+            serde_json::json!({"session_id":"thread-1"}),
+        )
+        .await;
         drain_requests();
-        runtime.notify("agent:model_changed", serde_json::json!({"session_id":"thread-1","model_info":{"model":"first","effort":"high"}})).await.unwrap();
+        core_notify(&mut runtime, "agent:model_changed", serde_json::json!({"session_id":"thread-1","model_info":{"model":"first","effort":"high"}})).await;
         assert_eq!(take_model_header().unwrap().text, "first");
-        runtime
-            .notify(
-                "agent:turn_started",
-                serde_json::json!({"session_id":"thread-1"}),
-            )
-            .await
-            .unwrap();
+        core_notify(
+            &mut runtime,
+            "agent:turn_started",
+            serde_json::json!({"session_id":"thread-1"}),
+        )
+        .await;
         drain_requests();
 
         let (picker, items, options) = open_test_model_picker(&mut runtime).await;
@@ -11426,26 +11358,24 @@ mod tests {
         let pending = take_model_header().unwrap();
         assert_eq!(pending.text, "first");
         assert_eq!(pending.secondary, "Next: second · low");
-        runtime
-            .notify(
-                "agent:model_changed",
-                serde_json::json!({"session_id":"foreign","model_info":{"model":"wrong"}}),
-            )
-            .await
-            .unwrap();
+        core_notify(
+            &mut runtime,
+            "agent:model_changed",
+            serde_json::json!({"session_id":"foreign","model_info":{"model":"wrong"}}),
+        )
+        .await;
         assert!(ACTION_DISPATCHER.try_recv_request().is_none());
-        runtime.notify("agent:model_changed", serde_json::json!({"session_id":"thread-1","model_info":{"model":"second","effort":"low"}})).await.unwrap();
+        core_notify(&mut runtime, "agent:model_changed", serde_json::json!({"session_id":"thread-1","model_info":{"model":"second","effort":"low"}})).await;
         assert!(
             take_model_header().is_none(),
             "running header already describes the same next model"
         );
-        runtime
-            .notify(
-                "agent:completed",
-                serde_json::json!({"session_id":"thread-1","stop_reason":"completed"}),
-            )
-            .await
-            .unwrap();
+        core_notify(
+            &mut runtime,
+            "agent:completed",
+            serde_json::json!({"session_id":"thread-1","stop_reason":"completed"}),
+        )
+        .await;
         let finished = take_model_header().unwrap();
         assert_eq!(
             (finished.text.as_str(), finished.secondary.as_str()),
@@ -11486,13 +11416,12 @@ mod tests {
             .unwrap();
         assert!(take_model_header().is_none());
         let (picker, items, _) = open_test_model_picker(&mut runtime).await;
-        runtime
-            .notify(
-                "agent:session_created",
-                serde_json::json!({"session_id":"new-thread"}),
-            )
-            .await
-            .unwrap();
+        core_notify(
+            &mut runtime,
+            "agent:session_created",
+            serde_json::json!({"session_id":"new-thread"}),
+        )
+        .await;
         drain_requests();
         runtime
             .notify_picker(picker, PickerCallback::Selected(items[0].clone()))

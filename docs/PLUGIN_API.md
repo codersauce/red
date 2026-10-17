@@ -1,6 +1,6 @@
 # Plugin compatibility
 
-Red host API version `0.20.0` is defined by
+Red host API version `0.21.0` is defined by
 [`src/plugin/host_api.json`](../src/plugin/host_api.json). That file is the canonical,
 machine-readable list of execute actions, request actions, signatures, and introduction
 versions. Runtime dispatch and the bundled-plugin corpus are checked against it in tests.
@@ -24,11 +24,11 @@ required/optional arity (`HUSK-A0002`) and obvious literal argument types
 annotations use `HUSK-A0004`. `--no-typecheck` is an unsupported development
 escape hatch; compatibility guarantees do not apply while it is enabled.
 
-Host API `0.20.0` retains the complete `0.4.0`, `0.6.0`, `0.7.0`,
+Host API `0.21.0` retains the complete `0.4.0`, `0.6.0`, `0.7.0`,
 `0.8.0`, `0.9.0`,
-`0.10.0`, `0.11.0`, `0.12.0`, `0.14.0`, `0.16.0`, `0.17.0`, `0.18.0`, and `0.19.0`
-contracts, so existing packages that declare those minors continue to load. New
-packages should target `"red_api_version": "^0.20.0"`.
+`0.10.0`, `0.11.0`, `0.12.0`, `0.14.0`, `0.16.0`, `0.17.0`, `0.18.0`, `0.19.0`,
+and `0.20.0` contracts, so existing packages that declare those minors continue
+to load. New packages should target `"red_api_version": "^0.21.0"`.
 
 ## Standalone JSON-RPC packages
 
@@ -470,6 +470,33 @@ conversation. The bundled Agent plugin renders
 the cached projection from `agent:session_restored`; a
 `agent:session_restore_failed` event converts the cached transcript to clearly
 archived context.
+
+## Agent pane lifecycle
+
+Host API `0.21.0` moves the Agent pane's conversation lifecycle into the editor
+core. The core owns the Codex thread, the turn phase, the follow-up queue, cancel
+intent, and transcript recaps; the bundled Agent plugin sends intents and renders
+the state the core publishes.
+
+| Call | Purpose |
+| --- | --- |
+| `AgentSubmit(text: String, transcript: String)` | Send a message. The core starts a thread, sends now, or queues it behind the running turn. `transcript` is the pane's visible conversation, replayed only when the message must continue in a new thread. |
+| `AgentStop()` | Interrupt the running turn. The thread is kept. |
+| `AgentSendQueued(transcript: String)` | Resume follow-ups held after a stop, failure, or lost app-server. |
+| `AgentDiscardQueued()` | Drop follow-ups that were not sent. |
+| `AgentReset(start: bool)` | Forget the current thread and queue; `start` begins the next thread right away. |
+
+After every change the core sends `agent:pane_state` with `phase` (`idle`,
+`starting`, `restoring`, `working`, or `stopping`), `session_id`, `turn_id`,
+`in_flight` (the running turn's `{ id, text }` message), `queued` (unsent
+messages, oldest first), `paused`, `stop_failed`, and `recap_pending`. Render
+queued messages from `queued` and commit `in_flight` to the transcript once per
+`id`; both come from the same snapshot, so a message never disappears between
+the queue and the transcript. The core also resumes a persisted thread itself
+after `agent:conversation_restore_pending`, so a pane using these calls must not
+also call `AgentResumeSession`.
+
+The per-session calls below remain available for other plugins and older packages.
 
 `AgentPrompt` automatically attaches bounded editor context containing the active visual selection or a roughly 80-line cursor excerpt, unsaved-state metadata, cursor/range, and intersecting diagnostics. Files outside the workspace, ignored paths, common credential/secret filenames, and binary buffers are omitted. Plugins that need to inspect or explicitly override this context can call `GetAgentContext(callback)` and `AgentPromptWithContext(session_id: String, text: String, context: Json)`; the context object accepts `uri` and `text` fields and is included in the direct Codex turn.
 
