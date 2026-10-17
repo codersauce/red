@@ -3988,6 +3988,9 @@ mod tests {
         check_api_compatibility(&metadata).unwrap();
 
         metadata.red_api_version = Some("^0.21.0".to_string());
+        check_api_compatibility(&metadata).unwrap();
+
+        metadata.red_api_version = Some("^0.22.0".to_string());
         assert!(check_api_compatibility(&metadata).is_err());
 
         metadata.red_api_version = Some("^0.5.0".to_string());

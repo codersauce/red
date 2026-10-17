@@ -118,10 +118,6 @@ impl AgentManager {
         result
     }
 
-    pub fn pane(&self) -> &super::agent_pane::AgentPaneLifecycle {
-        &self.pane
-    }
-
     pub fn take_pane_effects(&mut self) -> Vec<super::agent_pane::AgentPaneEffect> {
         std::mem::take(&mut self.pane_effects)
     }

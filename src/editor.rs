@@ -19,7 +19,7 @@ mod agent_annotations;
 mod agent_lsp;
 mod agent_manager;
 mod agent_models;
-mod agent_pane;
+pub(crate) mod agent_pane;
 mod agent_pane_host;
 mod buffer_actions;
 mod buffer_do;
@@ -2326,7 +2326,7 @@ pub enum PluginRequest {
 
 impl PluginRequest {
     /// Variant name used by the `RED_PERF` instrumentation.
-    fn label(&self) -> &'static str {
+    pub(crate) fn label(&self) -> &'static str {
         match self {
             Self::Action(_) => "Action",
             Self::AgentModelRequest { .. } => "AgentModelRequest",
@@ -11933,6 +11933,8 @@ impl Editor {
                     );
                     self.agent_manager.mark_session_inactive(&session_id);
                     self.agent_manager.discard_session_queue(&session_id);
+                    self.agent_manager
+                        .update_pane(|lifecycle| lifecycle.session_closed(&session_id));
                     let Some(bridge) = self.agent_manager.bridge() else {
                         continue;
                     };

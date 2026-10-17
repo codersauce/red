@@ -46,6 +46,9 @@ pub struct AgentPaneSnapshot {
     pub phase: AgentPanePhase,
     pub session_id: Option<String>,
     pub turn_id: Option<String>,
+    /// The message of the running turn, so the pane commits it in the same
+    /// update that removes it from the queue.
+    pub in_flight: Option<AgentPanePrompt>,
     /// Prompts not yet sent, oldest first.
     pub queued: Vec<AgentPanePrompt>,
     /// Queued prompts wait for an explicit resume after a stop, failure, or loss.
@@ -110,6 +113,11 @@ pub struct AgentPaneLifecycle {
     recap_pending: bool,
     /// Tail of the pane's visible transcript, replayed when a thread is replaced.
     transcript_tail: String,
+    /// Transcript tail when the in-flight prompt was sent, before the pane
+    /// committed it, so a retry does not replay the prompt or later errors.
+    in_flight_tail: String,
+    /// Recap for a retried prompt, taken from `in_flight_tail`.
+    retry_tail: Option<String>,
     next_prompt: u64,
 }
 
@@ -119,6 +127,7 @@ impl AgentPaneLifecycle {
             phase: self.phase(),
             session_id: self.session_id.clone(),
             turn_id: self.turn_id.clone(),
+            in_flight: self.in_flight.clone(),
             queued: self.queue.iter().cloned().collect(),
             paused: self.paused,
             stop_failed: self.stop_failed,
@@ -316,6 +325,7 @@ impl AgentPaneLifecycle {
         self.stop_requested = false;
         self.stop_failed = false;
         if let Some(prompt) = retry {
+            self.retry_tail = Some(std::mem::take(&mut self.in_flight_tail));
             self.queue.push_front(prompt);
             self.paused = false;
             return self.advance();
@@ -334,6 +344,21 @@ impl AgentPaneLifecycle {
             session_id: session_id.to_string(),
             cwd: cwd.to_string(),
         }]
+    }
+
+    /// The pane's thread was closed outside the lifecycle, for example when the
+    /// plugin deactivates; the next prompt starts a new thread.
+    pub fn session_closed(&mut self, session_id: &str) {
+        if self.session_id.as_deref() != Some(session_id) {
+            return;
+        }
+        self.session_id = None;
+        self.phase = Some(AgentPanePhase::Idle);
+        self.turn_id = None;
+        self.in_flight = None;
+        self.stop_requested = false;
+        self.stop_failed = false;
+        self.paused = !self.queue.is_empty();
     }
 
     /// The persisted thread is live again.
@@ -366,6 +391,73 @@ impl AgentPaneLifecycle {
         }
     }
 
+    /// Updates the lifecycle from an agent notification the editor sends plugins,
+    /// so the pane follows exactly the events plugins observe.
+    pub fn observe(&mut self, event: &str, payload: &serde_json::Value) -> Vec<AgentPaneEffect> {
+        let text = |key: &str| {
+            payload
+                .get(key)
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_string()
+        };
+        let session_id = text("session_id");
+        let turn_id = payload
+            .get("turn_id")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
+        match event {
+            // Adopt the thread the pane asked for, or one started for an idle pane.
+            "agent:session_created"
+                if self.phase() == AgentPanePhase::Starting
+                    || (self.phase() == AgentPanePhase::Idle && self.session_id.is_none()) =>
+            {
+                self.session_created(&session_id)
+            }
+            "agent:turn_started" => {
+                if let Some(turn_id) = turn_id {
+                    self.turn_started(&session_id, &turn_id);
+                }
+                Vec::new()
+            }
+            "agent:completed" => {
+                let outcome = match text("stop_reason").as_str() {
+                    "end_turn" | "completed" | "" => AgentTurnOutcome::Completed,
+                    _ => AgentTurnOutcome::Stopped,
+                };
+                self.turn_ended(&session_id, turn_id.as_deref(), outcome)
+                    .unwrap_or_default()
+            }
+            "agent:error" if session_id.is_empty() => {
+                self.start_failed();
+                Vec::new()
+            }
+            "agent:error" => self
+                .turn_ended(&session_id, turn_id.as_deref(), AgentTurnOutcome::Stopped)
+                .unwrap_or_default(),
+            "agent:cancelled" => {
+                self.stopping(&session_id);
+                Vec::new()
+            }
+            "agent:cancel_failed" => {
+                self.stop_failed(&session_id);
+                Vec::new()
+            }
+            // A prompt in the payload never reached Codex and is safe to retry.
+            "agent:session_lost" => self.session_lost(!text("prompt").is_empty()),
+            "agent:conversation_restore_pending" => {
+                self.restore_pending(&text("thread_id"), &text("cwd"))
+            }
+            "agent:session_restored" => self.restored(&text("thread_id")),
+            "agent:session_restore_failed" => self.restore_failed(&session_id),
+            "agent:transcript_restored" => {
+                self.archived_transcript_restored(!text("transcript").trim().is_empty());
+                Vec::new()
+            }
+            _ => Vec::new(),
+        }
+    }
+
     /// Sends the next queued prompt when the conversation can take a turn.
     fn advance(&mut self) -> Vec<AgentPaneEffect> {
         if self.paused || self.queue.is_empty() {
@@ -381,6 +473,7 @@ impl AgentPaneLifecycle {
                     return Vec::new();
                 };
                 let wire_text = self.wire_text(&prompt.text);
+                self.in_flight_tail = self.transcript_tail.clone();
                 self.phase = Some(AgentPanePhase::Working);
                 self.turn_id = None;
                 self.in_flight = Some(prompt.clone());
@@ -400,7 +493,8 @@ impl AgentPaneLifecycle {
     }
 
     fn wire_text(&mut self, text: &str) -> String {
-        let recap = &self.transcript_tail;
+        let retry_tail = self.retry_tail.take();
+        let recap = retry_tail.as_ref().unwrap_or(&self.transcript_tail);
         if !std::mem::take(&mut self.recap_pending) || recap.trim().is_empty() {
             return text.to_string();
         }
@@ -567,6 +661,24 @@ mod tests {
         let wire = dispatched(&effects);
         assert!(wire[0].starts_with("Previous conversation"));
         assert!(wire[0].ends_with("Follow-up:\nlost in transit"));
+    }
+
+    #[test]
+    fn a_retried_prompt_recaps_the_conversation_from_before_it_was_sent() {
+        let mut pane = live("s1");
+        pane.submit("first".into(), "");
+        pane.turn_started("s1", "t1");
+        pane.turn_ended("s1", Some("t1"), AgentTurnOutcome::Completed);
+        pane.submit("retry me".into(), "You: first\nAgent: done\n");
+        pane.session_lost(/*unsent*/ true);
+        // The pane has since committed the prompt and shown an error.
+        pane.start_failed();
+        pane.send_queued("You: first\nAgent: done\nYou: retry me\nError: lost\n");
+        let wire = dispatched(&pane.session_created("s2"));
+        assert!(wire[0].contains("Agent: done"));
+        assert!(!wire[0].contains("Error: lost"));
+        assert!(wire[0].ends_with("Follow-up:\nretry me"));
+        assert_eq!(wire[0].matches("retry me").count(), 1);
     }
 
     #[test]
