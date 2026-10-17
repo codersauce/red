@@ -25,21 +25,30 @@ const RELEASE_DOWNLOADS: &str = "https://github.com/codersauce/red/releases/down
 const RECEIPT_NAME: &str = ".red-install.toml";
 const LOCK_NAME: &str = ".red-update.lock";
 const MAX_METADATA_BYTES: u64 = 256 * 1024;
+const CHECKSUM_ASSET: &str = "SHA256SUMS.txt";
+const SIGNATURE_ASSET: &str = "SHA256SUMS.txt.minisig";
 const MAX_CHECKSUM_BYTES: u64 = 256 * 1024;
+const MAX_SIGNATURE_BYTES: u64 = 4 * 1024;
 const MAX_ARCHIVE_BYTES: u64 = 128 * 1024 * 1024;
 const MAX_BINARY_BYTES: u64 = 128 * 1024 * 1024;
 const MAX_COMMAND_OUTPUT_BYTES: u64 = 256 * 1024;
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Minisign keys trusted to sign `SHA256SUMS.txt`. Keep the retiring key listed for at least
+/// one release when rotating so existing installations can verify the handover.
+const RELEASE_PUBLIC_KEYS: &[&str] = &["RWRNnsasbTdAjgpMwO4feHrX57Rr4uPupGSKZxVZRDTi3IuRON8kF3hE"];
+
 #[derive(Clone, Copy)]
 struct ReleaseSource<'a> {
     api: &'a str,
     downloads: &'a str,
+    public_keys: &'a [&'a str],
 }
 
 const OFFICIAL_RELEASES: ReleaseSource<'static> = ReleaseSource {
     api: RELEASE_API,
     downloads: RELEASE_DOWNLOADS,
+    public_keys: RELEASE_PUBLIC_KEYS,
 };
 
 #[derive(Debug)]
@@ -76,6 +85,7 @@ struct Candidate {
     archive: String,
     archive_size: u64,
     checksum_size: u64,
+    signature_size: u64,
 }
 
 struct ManagedInstall {
@@ -90,13 +100,33 @@ struct CommandOutput {
     status: std::process::ExitStatus,
 }
 
+/// Prefix of `red update --auto` output when installation was postponed.
+pub const DEFERRED_PREFIX: &str = "Update deferred:";
+/// Prefix of update output announcing a newer release that wasn't installed.
+pub const AVAILABLE_PREFIX: &str = "Update available:";
+/// Prefix of update output after a newer release replaced the executable.
+pub const INSTALLED_PREFIX: &str = "Updated Red";
+
+/// A condition that blocks replacement now but should clear on its own, such as another
+/// update or a detached session holding the installation.
+#[derive(Debug)]
+struct Deferred(&'static str);
+
+impl std::fmt::Display for Deferred {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.0)
+    }
+}
+
+impl std::error::Error for Deferred {}
+
 /// Reports whether the designated latest stable Red release is newer.
 pub async fn check() -> anyhow::Result<String> {
     let current = Version::parse(env!("CARGO_PKG_VERSION"))?;
     let client = http_client()?;
     match latest_candidate(&client, &current, OFFICIAL_RELEASES).await? {
         Some(candidate) => Ok(format!(
-            "Update available: Red {} (installed {}). Run `red update`.",
+            "{AVAILABLE_PREFIX} Red {} (installed {}). Run `red update`.",
             candidate.version, current
         )),
         None => Ok(format!("Red {current} is up to date.")),
@@ -113,6 +143,23 @@ pub async fn install() -> anyhow::Result<String> {
         &crate::config::Config::path("run"),
     )
     .await
+}
+
+/// Installs unattended when the standalone updater owns this executable.
+///
+/// Package-manager and source builds only check, and transient installation locks defer the
+/// update to the next scheduled attempt instead of failing.
+pub async fn automatic() -> anyhow::Result<String> {
+    let executable = canonical_executable()?;
+    if validate_receipt(&executable).is_err() {
+        return check().await;
+    }
+    match install().await {
+        Err(error) if error.downcast_ref::<Deferred>().is_some() => {
+            Ok(format!("{DEFERRED_PREFIX} {error}"))
+        }
+        result => result,
+    }
 }
 
 async fn install_from(
@@ -134,8 +181,11 @@ async fn install_from(
         return Ok(format!("Red {installed} is already up to date."));
     };
 
-    let checksums_url = download_url(source, &candidate.tag, "SHA256SUMS.txt");
+    let checksums_url = download_url(source, &candidate.tag, CHECKSUM_ASSET);
     let checksums = download_exact_bytes(&client, &checksums_url, candidate.checksum_size).await?;
+    let signature_url = download_url(source, &candidate.tag, SIGNATURE_ASSET);
+    let signature = download_exact_bytes(&client, &signature_url, candidate.signature_size).await?;
+    verify_checksums(&checksums, &signature, &candidate.tag, source.public_keys)?;
     let expected_digest = checksum_for(&checksums, &candidate.archive)?;
     let archive_url = download_url(source, &candidate.tag, &candidate.archive);
     let mut archive = download_archive(
@@ -153,7 +203,7 @@ async fn install_from(
     replace_binary(&managed.executable, &staged)?;
 
     Ok(format!(
-        "Updated Red {installed} to {} at {}. New sessions will use it.",
+        "{INSTALLED_PREFIX} {installed} to {} at {}. New sessions will use it.",
         candidate.version,
         managed.executable.display()
     ))
@@ -201,7 +251,7 @@ impl ManagedInstall {
             .with_context(|| format!("could not open update lock {}", lock_path.display()))?;
         lock.try_lock().map_err(|error| match error {
             fs::TryLockError::WouldBlock => {
-                anyhow::anyhow!("another Red update or detached session is active")
+                anyhow::Error::new(Deferred("another Red update or detached session is active"))
             }
             fs::TryLockError::Error(error) => {
                 anyhow::Error::new(error).context("could not lock the managed Red installation")
@@ -369,7 +419,8 @@ fn select_candidate(
     }
     let archive = archive_name()?;
     let archive_asset = exact_asset(&release.assets, &archive)?;
-    let checksum_asset = exact_asset(&release.assets, "SHA256SUMS.txt")?;
+    let checksum_asset = exact_asset(&release.assets, CHECKSUM_ASSET)?;
+    let signature_asset = exact_asset(&release.assets, SIGNATURE_ASSET)?;
     anyhow::ensure!(
         archive_asset.size > 0 && archive_asset.size <= MAX_ARCHIVE_BYTES,
         "release archive size is outside Red's update limit"
@@ -378,12 +429,17 @@ fn select_candidate(
         checksum_asset.size > 0 && checksum_asset.size <= MAX_CHECKSUM_BYTES,
         "release checksum size is outside Red's update limit"
     );
+    anyhow::ensure!(
+        signature_asset.size > 0 && signature_asset.size <= MAX_SIGNATURE_BYTES,
+        "release signature size is outside Red's update limit"
+    );
     Ok(Some(Candidate {
         version,
         tag: release.tag_name.clone(),
         archive,
         archive_size: archive_asset.size,
         checksum_size: checksum_asset.size,
+        signature_size: signature_asset.size,
     }))
 }
 
@@ -487,6 +543,39 @@ async fn download_archive(
     archive.as_file().sync_all()?;
     archive.seek(SeekFrom::Start(0))?;
     Ok(archive)
+}
+
+/// Trusts `SHA256SUMS.txt` only when a release key signed it for this exact tag.
+///
+/// The trusted comment binds the signature to the tag, so a validly signed checksum list from
+/// an older release cannot be replayed under a newer release name.
+fn verify_checksums(
+    checksums: &[u8],
+    signature: &[u8],
+    tag: &str,
+    public_keys: &[&str],
+) -> anyhow::Result<()> {
+    let signature = std::str::from_utf8(signature).context("release signature was not UTF-8")?;
+    let signature = minisign_verify::Signature::decode(signature)
+        .map_err(|error| anyhow::anyhow!("release signature is malformed: {error}"))?;
+    let verified = public_keys.iter().any(|key| {
+        minisign_verify::PublicKey::from_base64(key)
+            .is_ok_and(|key| key.verify(checksums, &signature, false).is_ok())
+    });
+    anyhow::ensure!(
+        verified,
+        "{CHECKSUM_ASSET} is not signed by a trusted Red release key"
+    );
+    let expected = signature_comment(tag);
+    anyhow::ensure!(
+        signature.trusted_comment() == expected,
+        "release signature belongs to a different release (expected \"{expected}\")"
+    );
+    Ok(())
+}
+
+fn signature_comment(tag: &str) -> String {
+    format!("red {tag} {CHECKSUM_ASSET}")
 }
 
 fn checksum_for(contents: &[u8], archive: &str) -> anyhow::Result<String> {
@@ -725,10 +814,11 @@ fn replace_binary(installed: &Path, staged: &Path) -> anyhow::Result<()> {
 
 #[cfg(unix)]
 fn ensure_no_detached_owner(directory: &Path) -> anyhow::Result<()> {
-    anyhow::ensure!(
-        !crate::headless::any_session_active(directory)?,
-        "a detached Red session is active; save and stop it before updating"
-    );
+    if crate::headless::any_session_active(directory)? {
+        return Err(
+            Deferred("a detached Red session is active; save and stop it before updating").into(),
+        );
+    }
     Ok(())
 }
 
@@ -757,11 +847,68 @@ mod tests {
                     size: 1024,
                 },
                 ReleaseAsset {
-                    name: "SHA256SUMS.txt".to_string(),
+                    name: CHECKSUM_ASSET.to_string(),
                     size: 72,
+                },
+                ReleaseAsset {
+                    name: SIGNATURE_ASSET.to_string(),
+                    size: 300,
                 },
             ],
         }
+    }
+
+    /// Produces minisign-compatible prehashed signatures without the minisign CLI.
+    struct TestKey {
+        signing: ed25519_dalek::SigningKey,
+        id: [u8; 8],
+    }
+
+    impl TestKey {
+        fn new(seed: u8) -> Self {
+            Self {
+                signing: ed25519_dalek::SigningKey::from_bytes(&[seed; 32]),
+                id: [seed; 8],
+            }
+        }
+
+        fn public_key(&self) -> String {
+            use base64::Engine as _;
+
+            let mut key = b"Ed".to_vec();
+            key.extend_from_slice(&self.id);
+            key.extend_from_slice(self.signing.verifying_key().as_bytes());
+            base64::engine::general_purpose::STANDARD.encode(key)
+        }
+
+        fn sign(&self, data: &[u8], trusted_comment: &str) -> Vec<u8> {
+            use base64::Engine as _;
+            use ed25519_dalek::Signer as _;
+
+            let signature = self.signing.sign(&blake2::Blake2b512::digest(data));
+            let mut encoded = b"ED".to_vec();
+            encoded.extend_from_slice(&self.id);
+            encoded.extend_from_slice(&signature.to_bytes());
+            let mut global = signature.to_bytes().to_vec();
+            global.extend_from_slice(trusted_comment.as_bytes());
+            let global = self.signing.sign(&global);
+            let engine = base64::engine::general_purpose::STANDARD;
+            format!(
+                "untrusted comment: test signature\n{}\ntrusted comment: {trusted_comment}\n{}\n",
+                engine.encode(encoded),
+                engine.encode(global.to_bytes())
+            )
+            .into_bytes()
+        }
+    }
+
+    #[cfg(unix)]
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Fault {
+        None,
+        Checksum,
+        UntrustedKey,
+        ReplayedTag,
     }
 
     #[cfg(unix)]
@@ -788,7 +935,7 @@ mod tests {
     }
 
     #[cfg(unix)]
-    fn release_routes(valid_checksum: bool) -> HashMap<String, Vec<u8>> {
+    fn release_routes(fault: Fault, key: &TestKey) -> HashMap<String, Vec<u8>> {
         let candidate = b"#!/bin/sh\ncase \"$1\" in\n  --version) echo 'red 9.9.9' ;;\n  --self-check) echo 'red self-check ok' ;;\n  *) exit 1 ;;\nesac\n";
         let encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
         let mut builder = tar::Builder::new(encoder);
@@ -801,25 +948,41 @@ mod tests {
             .unwrap();
         let archive = builder.into_inner().unwrap().finish().unwrap();
         let archive_name = archive_name().unwrap();
-        let digest = if valid_checksum {
-            format!("{:x}", Sha256::digest(&archive))
-        } else {
+        let digest = if fault == Fault::Checksum {
             "0".repeat(64)
+        } else {
+            format!("{:x}", Sha256::digest(&archive))
         };
         let checksums = format!("{digest}  {archive_name}\n").into_bytes();
+        let signer = if fault == Fault::UntrustedKey {
+            TestKey::new(2)
+        } else {
+            TestKey::new(key.id[0])
+        };
+        let tag = if fault == Fault::ReplayedTag {
+            "v9.9.8"
+        } else {
+            "v9.9.9"
+        };
+        let signature = signer.sign(&checksums, &signature_comment(tag));
         let metadata = serde_json::to_vec(&serde_json::json!({
             "tag_name": "v9.9.9",
             "draft": false,
             "prerelease": false,
             "assets": [
                 { "name": &archive_name, "size": archive.len() },
-                { "name": "SHA256SUMS.txt", "size": checksums.len() }
+                { "name": CHECKSUM_ASSET, "size": checksums.len() },
+                { "name": SIGNATURE_ASSET, "size": signature.len() }
             ]
         }))
         .unwrap();
         HashMap::from([
             ("/latest".to_string(), metadata),
             ("/downloads/v9.9.9/SHA256SUMS.txt".to_string(), checksums),
+            (
+                "/downloads/v9.9.9/SHA256SUMS.txt.minisig".to_string(),
+                signature,
+            ),
             (format!("/downloads/v9.9.9/{archive_name}"), archive),
         ])
     }
@@ -857,13 +1020,15 @@ mod tests {
 
     #[cfg(unix)]
     async fn install_fixture(
-        valid_checksum: bool,
+        fault: Fault,
     ) -> (tempfile::TempDir, PathBuf, Vec<u8>, anyhow::Result<String>) {
         let directory = tempfile::TempDir::new().unwrap();
         let running = Version::parse(env!("CARGO_PKG_VERSION")).unwrap();
         let executable = write_managed_install(directory.path(), &running);
         let before = fs::read(&executable).unwrap();
-        let server = serve_release(release_routes(valid_checksum)).await;
+        let key = TestKey::new(1);
+        let public_key = key.public_key();
+        let server = serve_release(release_routes(fault, &key)).await;
         let api = format!("{server}/latest");
         let downloads = format!("{server}/downloads");
         let result = install_from(
@@ -872,6 +1037,7 @@ mod tests {
             ReleaseSource {
                 api: &api,
                 downloads: &downloads,
+                public_keys: &[public_key.as_str()],
             },
             &directory.path().join("run"),
         )
@@ -929,7 +1095,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn managed_install_downloads_validates_and_replaces() {
-        let (_directory, executable, before, result) = install_fixture(true).await;
+        let (_directory, executable, before, result) = install_fixture(Fault::None).await;
         let message = result.unwrap();
         let after = fs::read(&executable).unwrap();
         assert_ne!(Sha256::digest(before), Sha256::digest(after));
@@ -943,12 +1109,69 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn checksum_failure_preserves_the_installed_binary() {
-        let (_directory, executable, before, result) = install_fixture(false).await;
+        let (_directory, executable, before, result) = install_fixture(Fault::Checksum).await;
         assert!(result
             .unwrap_err()
             .to_string()
             .contains("checksum mismatch"));
         assert_eq!(fs::read(executable).unwrap(), before);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn untrusted_signature_preserves_the_installed_binary() {
+        let (_directory, executable, before, result) = install_fixture(Fault::UntrustedKey).await;
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("not signed by a trusted Red release key"));
+        assert_eq!(fs::read(executable).unwrap(), before);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn signature_for_another_tag_preserves_the_installed_binary() {
+        let (_directory, executable, before, result) = install_fixture(Fault::ReplayedTag).await;
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("belongs to a different release"));
+        assert_eq!(fs::read(executable).unwrap(), before);
+    }
+
+    #[test]
+    fn official_release_keys_are_well_formed() {
+        for key in RELEASE_PUBLIC_KEYS {
+            minisign_verify::PublicKey::from_base64(key).unwrap();
+        }
+        // The release workflow verifies its signature with this file before uploading.
+        let published = include_str!("../install/release-signing.pub");
+        let published = published.lines().last().unwrap().trim();
+        assert!(RELEASE_PUBLIC_KEYS.contains(&published));
+    }
+
+    #[test]
+    fn checksums_verify_against_any_trusted_key() {
+        let retiring = TestKey::new(3);
+        let current = TestKey::new(4);
+        let checksums = b"checksums";
+        let signature = retiring.sign(checksums, &signature_comment("v1.0.0"));
+        let keys = [current.public_key(), retiring.public_key()];
+        let keys = [keys[0].as_str(), keys[1].as_str()];
+        verify_checksums(checksums, &signature, "v1.0.0", &keys).unwrap();
+        assert!(verify_checksums(b"tampered", &signature, "v1.0.0", &keys).is_err());
+        assert!(verify_checksums(checksums, &signature, "v1.0.0", &keys[..1]).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn transient_lock_conflicts_are_deferred() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let executable = write_managed_install(directory.path(), &Version::parse("0.8.1").unwrap());
+        let owner = File::open(directory.path().join(LOCK_NAME)).unwrap();
+        owner.try_lock_shared().unwrap();
+        let error = ManagedInstall::acquire(executable).err().unwrap();
+        assert!(error.downcast_ref::<Deferred>().is_some());
     }
 
     #[cfg(unix)]

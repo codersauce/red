@@ -19,11 +19,13 @@ use crate::{
         AttentionPolicy, MessageContent, Notice, NotificationId, NotificationSource,
         NotificationTime, ProgressOutcome, ProgressPriority, Severity,
     },
+    update,
 };
 
 const CHECK_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 const STARTUP_DELAY: Duration = Duration::from_secs(1);
 const UPDATE_NOTICE_KEY: &str = "red-update-available";
+const UPDATE_FAILED_KEY: &str = "red-update-failed";
 
 #[derive(Default)]
 pub(super) struct UpdateState {
@@ -41,7 +43,11 @@ struct PendingUpdate {
 
 #[derive(Clone, Copy)]
 enum WorkerKind {
+    /// Scheduled `red update --check`.
     Check,
+    /// Scheduled `red update --auto`.
+    Auto,
+    /// User-requested `red update`.
     Install,
 }
 
@@ -118,7 +124,9 @@ impl Editor {
         let pending = self.update.pending.take().expect("pending update exists");
         match pending.kind {
             WorkerKind::Install => self.finish_manual_update(pending.notification, result),
-            WorkerKind::Check => self.finish_background_check(result),
+            WorkerKind::Check | WorkerKind::Auto => {
+                self.finish_background_update(pending.kind, result)
+            }
         }
         true
     }
@@ -148,12 +156,11 @@ impl Editor {
         let Ok(executable) = self.update_executable() else {
             return;
         };
-        self.update.pending = Some(spawn_worker(
-            executable,
-            WorkerKind::Check,
-            None,
-            Some(stamp),
-        ));
+        let kind = match self.config.updates.mode {
+            UpdateMode::Auto => WorkerKind::Auto,
+            UpdateMode::Notify | UpdateMode::Off => WorkerKind::Check,
+        };
+        self.update.pending = Some(spawn_worker(executable, kind, None, Some(stamp)));
     }
 
     fn finish_manual_update(&mut self, notification: Option<NotificationId>, result: WorkerResult) {
@@ -174,18 +181,44 @@ impl Editor {
         self.last_error = (!result.success).then_some(result.message);
     }
 
-    fn finish_background_check(&mut self, result: WorkerResult) {
-        if !result.success {
-            log!("Red update check failed: {}", result.message);
-            return;
-        }
-        if !result.message.starts_with("Update available:") {
-            return;
-        }
-        let notice = Notice::new(NotificationSource::Editor, Severity::Info, &result.message)
-            .with_key(UPDATE_NOTICE_KEY)
-            .with_attention(AttentionPolicy::IfMissed)
-            .with_details("Run :update to install it. Current editing sessions keep this version until restarted.");
+    fn finish_background_update(&mut self, kind: WorkerKind, result: WorkerResult) {
+        let notice = match background_outcome(kind, &result) {
+            BackgroundOutcome::Quiet => {
+                if !result.message.is_empty() {
+                    log!("Red update: {}", result.message);
+                }
+                return;
+            }
+            BackgroundOutcome::Available => {
+                Notice::new(NotificationSource::Editor, Severity::Info, &result.message)
+                    .with_key(UPDATE_NOTICE_KEY)
+                    .with_attention(AttentionPolicy::IfMissed)
+                    .with_details("Run :update to install it. Current editing sessions keep this version until restarted.")
+            }
+            BackgroundOutcome::Installed => {
+                Notice::new(NotificationSource::Editor, Severity::Info, &result.message)
+                    .with_key(UPDATE_NOTICE_KEY)
+                    .with_attention(AttentionPolicy::IfMissed)
+                    .with_details(format!(
+                        "This session keeps running Red {} until you restart it. Set [updates] mode = \"notify\" to install releases yourself.",
+                        env!("CARGO_PKG_VERSION")
+                    ))
+            }
+            BackgroundOutcome::Failed => {
+                log!("Red automatic update failed: {}", result.message);
+                Notice::new(
+                    NotificationSource::Editor,
+                    Severity::Warning,
+                    "Red could not install an update automatically",
+                )
+                .with_key(UPDATE_FAILED_KEY)
+                .with_attention(AttentionPolicy::IfMissed)
+                .with_details(format!(
+                    "{}\n\nThe installed version is unchanged. Red retries tomorrow; run :update to retry now.",
+                    result.message
+                ))
+            }
+        };
         if let Err(error) = self.publish_notification(notice) {
             log!("could not publish Red update notice: {error}");
         }
@@ -225,8 +258,14 @@ fn spawn_worker(
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        if matches!(kind, WorkerKind::Check) {
-            command.arg("--check");
+        match kind {
+            WorkerKind::Check => {
+                command.arg("--check");
+            }
+            WorkerKind::Auto => {
+                command.arg("--auto");
+            }
+            WorkerKind::Install => {}
         }
         let result = match command.output().await {
             Ok(output) => WorkerResult {
@@ -244,6 +283,32 @@ fn spawn_worker(
         kind,
         notification,
         result,
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum BackgroundOutcome {
+    /// Nothing the user needs to see: up to date, deferred, or a failed check.
+    Quiet,
+    Available,
+    Installed,
+    /// An unattended installation failed and left the current version in place.
+    Failed,
+}
+
+fn background_outcome(kind: WorkerKind, result: &WorkerResult) -> BackgroundOutcome {
+    if !result.success {
+        return match kind {
+            WorkerKind::Auto => BackgroundOutcome::Failed,
+            WorkerKind::Check | WorkerKind::Install => BackgroundOutcome::Quiet,
+        };
+    }
+    if result.message.starts_with(update::AVAILABLE_PREFIX) {
+        BackgroundOutcome::Available
+    } else if result.message.starts_with(update::INSTALLED_PREFIX) {
+        BackgroundOutcome::Installed
+    } else {
+        BackgroundOutcome::Quiet
     }
 }
 
@@ -295,6 +360,46 @@ mod tests {
         let stamp = directory.path().join("updates/check");
         assert!(claim_daily_check(&stamp).unwrap());
         assert!(!claim_daily_check(&stamp).unwrap());
+    }
+
+    fn worker(success: bool, message: &str) -> WorkerResult {
+        WorkerResult {
+            success,
+            message: message.to_string(),
+        }
+    }
+
+    #[test]
+    fn background_outcomes_follow_worker_output() {
+        let available = worker(true, "Update available: Red 9.9.9 (installed 0.9.1).");
+        let installed = worker(true, "Updated Red 0.9.1 to 9.9.9 at /bin/red.");
+        let deferred = worker(true, "Update deferred: a detached Red session is active");
+        let current = worker(true, "Red 0.9.1 is up to date.");
+        let failed = worker(false, "release signature is malformed");
+
+        for kind in [WorkerKind::Check, WorkerKind::Auto] {
+            assert_eq!(
+                background_outcome(kind, &available),
+                BackgroundOutcome::Available
+            );
+            assert_eq!(
+                background_outcome(kind, &deferred),
+                BackgroundOutcome::Quiet
+            );
+            assert_eq!(background_outcome(kind, &current), BackgroundOutcome::Quiet);
+        }
+        assert_eq!(
+            background_outcome(WorkerKind::Auto, &installed),
+            BackgroundOutcome::Installed
+        );
+        assert_eq!(
+            background_outcome(WorkerKind::Auto, &failed),
+            BackgroundOutcome::Failed
+        );
+        assert_eq!(
+            background_outcome(WorkerKind::Check, &failed),
+            BackgroundOutcome::Quiet
+        );
     }
 
     #[test]

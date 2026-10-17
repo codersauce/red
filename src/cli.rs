@@ -108,8 +108,11 @@ pub enum RootCommand {
 #[derive(Debug, ClapArgs)]
 pub struct UpdateArgs {
     /// Report availability without downloading or installing the release.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "auto")]
     pub check: bool,
+    /// Install unattended when this installation is managed, otherwise only check.
+    #[arg(long, hide = true)]
+    pub auto: bool,
 }
 
 #[derive(Debug, ClapArgs)]
@@ -282,7 +285,10 @@ mod tests {
         let update = Args::try_parse_from(["red", "update", "--check"]).unwrap();
         assert!(matches!(
             update.command,
-            Some(RootCommand::Update(UpdateArgs { check: true }))
+            Some(RootCommand::Update(UpdateArgs {
+                check: true,
+                auto: false
+            }))
         ));
         let update_file = Args::try_parse_from(["red", "--", "update"]).unwrap();
         assert!(update_file.command.is_none());

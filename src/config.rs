@@ -194,8 +194,12 @@ impl LoadedConfig {
 #[derive(Debug, Serialize, Deserialize, Clone, Copy, Default, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum UpdateMode {
-    /// Check once per day and notify when a stable release is available.
+    /// Check once per day and install a newer stable release in the background.
+    ///
+    /// Installations the standalone updater doesn't own fall back to notifying.
     #[default]
+    Auto,
+    /// Check once per day and notify when a stable release is available.
     Notify,
     /// Disable automatic checks; explicit update commands remain available.
     Off,
@@ -4714,9 +4718,13 @@ groups = [["\\bif\\b", "\\belse\\b", "\\bendif\\b"]]
     }
 
     #[test]
-    fn update_checks_can_be_disabled() {
+    fn update_mode_defaults_to_auto_and_can_be_overridden() {
         let defaults = Config::from_user_toml_with_overrides("", &[]).unwrap();
-        assert_eq!(defaults.updates.mode, UpdateMode::Notify);
+        assert_eq!(defaults.updates.mode, UpdateMode::Auto);
+
+        let config =
+            Config::from_user_toml_with_overrides("[updates]\nmode = \"notify\"\n", &[]).unwrap();
+        assert_eq!(config.updates.mode, UpdateMode::Notify);
 
         let config =
             Config::from_user_toml_with_overrides("[updates]\nmode = \"off\"\n", &[]).unwrap();
