@@ -333,9 +333,19 @@ impl Editor {
                 }
             })));
         }
-        let index = self.file_buffer_index(&path).ok_or_else(|| {
-            anyhow::anyhow!("read_file must open this file before requesting LSP results")
-        })?;
+        // read_file no longer opens buffers, so load one in the background for the
+        // language server without switching the user's active buffer.
+        let index = match self.file_buffer_index(&path) {
+            Some(index) => index,
+            None => {
+                anyhow::ensure!(
+                    path.is_file(),
+                    "LSP file does not exist: {}",
+                    path.display()
+                );
+                self.load_or_reuse_file_buffer(&file).await?.0
+            }
+        };
         if let EditorToolCall::LspPrepareRename {
             position,
             expected_revision,
