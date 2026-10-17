@@ -130,10 +130,6 @@ impl AgentPaneLifecycle {
         self.phase.unwrap_or(AgentPanePhase::Idle)
     }
 
-    pub fn session_id(&self) -> Option<&str> {
-        self.session_id.as_deref()
-    }
-
     /// Accepts a user message. `transcript` is the pane's visible conversation,
     /// replayed only when the message must continue in a new thread.
     pub fn submit(
@@ -209,6 +205,15 @@ impl AgentPaneLifecycle {
         effects
     }
 
+    /// Starts a thread ahead of the first prompt so the reply arrives sooner.
+    pub fn start(&mut self) -> Vec<AgentPaneEffect> {
+        if self.session_id.is_some() || self.phase() != AgentPanePhase::Idle {
+            return Vec::new();
+        }
+        self.phase = Some(AgentPanePhase::Starting);
+        vec![AgentPaneEffect::StartSession]
+    }
+
     /// A Codex thread exists. A different previous thread is closed.
     pub fn session_created(&mut self, session_id: &str) -> Vec<AgentPaneEffect> {
         let mut effects = Vec::new();
@@ -228,9 +233,10 @@ impl AgentPaneLifecycle {
 
     /// A new thread could not be started. Unsent prompts wait for a retry.
     pub fn start_failed(&mut self) {
-        if self.phase() == AgentPanePhase::Starting {
-            self.phase = Some(AgentPanePhase::Idle);
+        if self.phase() != AgentPanePhase::Starting {
+            return;
         }
+        self.phase = Some(AgentPanePhase::Idle);
         self.paused = !self.queue.is_empty();
     }
 
@@ -332,7 +338,9 @@ impl AgentPaneLifecycle {
 
     /// The persisted thread is live again.
     pub fn restored(&mut self, session_id: &str) -> Vec<AgentPaneEffect> {
-        self.session_id = Some(session_id.to_string());
+        if self.session_id.as_deref() != Some(session_id) {
+            return Vec::new();
+        }
         self.phase = Some(AgentPanePhase::Idle);
         self.recap_pending = false;
         self.advance()
@@ -340,9 +348,10 @@ impl AgentPaneLifecycle {
 
     /// The persisted thread cannot be resumed; the transcript is replayed instead.
     pub fn restore_failed(&mut self, session_id: &str) -> Vec<AgentPaneEffect> {
-        if self.session_id.as_deref() == Some(session_id) {
-            self.session_id = None;
+        if self.session_id.as_deref() != Some(session_id) {
+            return Vec::new();
         }
+        self.session_id = None;
         self.phase = Some(AgentPanePhase::Idle);
         self.recap_pending = true;
         vec![AgentPaneEffect::ForgetSession {
@@ -622,6 +631,18 @@ mod tests {
         let (_, effects) = pane.submit("again".into(), "");
         assert_eq!(effects, [AgentPaneEffect::StartSession]);
         assert_ne!(pane.snapshot().queued[0].id, "prompt:1", "ids stay unique");
+    }
+
+    #[test]
+    fn eager_start_creates_one_thread_and_a_waiting_prompt_uses_it() {
+        let mut pane = AgentPaneLifecycle::default();
+        assert_eq!(pane.start(), [AgentPaneEffect::StartSession]);
+        assert!(pane.start().is_empty(), "already starting");
+        let (result, effects) = pane.submit("hello".into(), "");
+        assert_eq!(result, AgentSubmitResult::Accepted);
+        assert!(effects.is_empty(), "waits for the thread being started");
+        assert_eq!(dispatched(&pane.session_created("s1")), ["hello"]);
+        assert!(pane.start().is_empty(), "a live thread needs no start");
     }
 
     #[test]

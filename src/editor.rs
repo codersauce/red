@@ -20,6 +20,7 @@ mod agent_lsp;
 mod agent_manager;
 mod agent_models;
 mod agent_pane;
+mod agent_pane_host;
 mod buffer_actions;
 mod buffer_do;
 mod buffer_manager;
@@ -1857,6 +1858,23 @@ pub enum PluginRequest {
     AgentCancel {
         session_id: String,
     },
+    /// Agent pane intent: send a message, starting or queueing as needed.
+    AgentSubmit {
+        text: String,
+        transcript: String,
+    },
+    /// Agent pane intent: stop the running turn.
+    AgentStop,
+    /// Agent pane intent: resume follow-ups held after a stop or failure.
+    AgentSendQueued {
+        transcript: String,
+    },
+    /// Agent pane intent: drop follow-ups that were not sent.
+    AgentDiscardQueued,
+    /// Agent pane intent: forget the thread and optionally start a new one.
+    AgentReset {
+        start: bool,
+    },
     AgentCloseSession {
         session_id: String,
     },
@@ -2318,6 +2336,11 @@ impl PluginRequest {
             Self::AgentPrompt { .. } => "AgentPrompt",
             Self::AgentPromptWithContext { .. } => "AgentPromptWithContext",
             Self::AgentCancel { .. } => "AgentCancel",
+            Self::AgentSubmit { .. } => "AgentSubmit",
+            Self::AgentStop => "AgentStop",
+            Self::AgentSendQueued { .. } => "AgentSendQueued",
+            Self::AgentDiscardQueued => "AgentDiscardQueued",
+            Self::AgentReset { .. } => "AgentReset",
             Self::AgentCloseSession { .. } => "AgentCloseSession",
             Self::AgentArchiveSession { .. } => "AgentArchiveSession",
             Self::GenerateCommitMessage { .. } => "GenerateCommitMessage",
@@ -10495,32 +10518,30 @@ impl Editor {
                     "Codex app-server stopped before the prompt was sent",
                 )
                 .await?;
-            self.plugin_registry
-                .notify(
-                    runtime,
-                    "agent:session_lost",
-                    json!({
-                        "session_id": session_id,
-                        "prompt": text,
-                        "message": message
-                    }),
-                )
-                .await?;
+            self.notify_agent(
+                runtime,
+                "agent:session_lost",
+                json!({
+                    "session_id": session_id,
+                    "prompt": text,
+                    "message": message
+                }),
+            )
+            .await?;
             return Ok(false);
         }
         if !self.agent_manager.has_bridge() {
             self.abort_agent_bridge();
-            self.plugin_registry
-                .notify(
-                    runtime,
-                    "agent:session_lost",
-                    json!({
-                        "session_id": session_id,
-                        "prompt": text,
-                        "message": "No Codex app-server session is running"
-                    }),
-                )
-                .await?;
+            self.notify_agent(
+                runtime,
+                "agent:session_lost",
+                json!({
+                    "session_id": session_id,
+                    "prompt": text,
+                    "message": "No Codex app-server session is running"
+                }),
+            )
+            .await?;
             return Ok(false);
         }
         if self.agent_manager.is_session_busy(&session_id) {
@@ -10538,13 +10559,12 @@ impl Editor {
             .set_turn_id(session_id.clone(), turn_id.clone());
         self.agent_manager
             .record_user_message(&session_id, &turn_id, &text);
-        self.plugin_registry
-            .notify(
-                runtime,
-                "agent:turn_started",
-                json!({ "session_id": session_id, "turn_id": turn_id }),
-            )
-            .await?;
+        self.notify_agent(
+            runtime,
+            "agent:turn_started",
+            json!({ "session_id": session_id, "turn_id": turn_id }),
+        )
+        .await?;
         self.agent_manager.mark_session_active(session_id.clone());
         self.agent_manager.record_turn_start(session_id.clone());
         let Some(bridge) = self.agent_manager.bridge() else {
@@ -10566,17 +10586,16 @@ impl Editor {
             let message = self
                 .finish_agent_bridge(runtime, "Codex app-server stopped while sending the prompt")
                 .await?;
-            self.plugin_registry
-                .notify(
-                    runtime,
-                    "agent:session_lost",
-                    json!({
-                        "session_id": session_id,
-                        "prompt": text,
-                        "message": message
-                    }),
-                )
-                .await?;
+            self.notify_agent(
+                runtime,
+                "agent:session_lost",
+                json!({
+                    "session_id": session_id,
+                    "prompt": text,
+                    "message": message
+                }),
+            )
+            .await?;
         }
         Ok(false)
     }
@@ -10916,13 +10935,12 @@ impl Editor {
             } else {
                 "agent:conversation_restore_pending"
             };
-            self.plugin_registry
-                .notify(
-                    runtime,
-                    event,
-                    plugin_json(serde_json::to_value(conversation)?),
-                )
-                .await?;
+            self.notify_agent(
+                runtime,
+                event,
+                plugin_json(serde_json::to_value(conversation)?),
+            )
+            .await?;
             return Ok(());
         }
         if let Some(transcript) = self
@@ -10930,13 +10948,12 @@ impl Editor {
             .plugin_storage("agent", &scoped_plugin_storage_key("agent", "transcript"))
             .and_then(Value::as_str)
         {
-            self.plugin_registry
-                .notify(
-                    runtime,
-                    "agent:transcript_restored",
-                    json!({ "transcript": transcript }),
-                )
-                .await?;
+            self.notify_agent(
+                runtime,
+                "agent:transcript_restored",
+                json!({ "transcript": transcript }),
+            )
+            .await?;
         }
         Ok(())
     }
@@ -10970,13 +10987,12 @@ impl Editor {
         // Prompts held behind a stopping turn were never sent; return them to the
         // pane instead of letting a dead app-server swallow them.
         for (session_id, prompts) in self.agent_manager.take_all_queued_prompts() {
-            self.plugin_registry
-                .notify(
-                    runtime,
-                    "agent:prompts_returned",
-                    json!({ "session_id": session_id, "prompts": prompts }),
-                )
-                .await?;
+            self.notify_agent(
+                runtime,
+                "agent:prompts_returned",
+                json!({ "session_id": session_id, "prompts": prompts }),
+            )
+            .await?;
         }
         self.agent_manager.clear_turns();
         self.agent_manager.clear_tool_requests();
@@ -11372,13 +11388,12 @@ impl Editor {
                         .reconcile_conversation(session_id, &root, thread)
                         .cloned();
                     if let Some(conversation) = conversation {
-                        self.plugin_registry
-                            .notify(
-                                runtime,
-                                "agent:session_restored",
-                                plugin_json(serde_json::to_value(conversation)?),
-                            )
-                            .await?;
+                        self.notify_agent(
+                            runtime,
+                            "agent:session_restored",
+                            plugin_json(serde_json::to_value(conversation)?),
+                        )
+                        .await?;
                     }
                     continue;
                 }
@@ -11485,7 +11500,7 @@ impl Editor {
             if let (Some(turn_id), Some(object)) = (ended_turn_id, payload.as_object_mut()) {
                 object.insert("turn_id".to_string(), json!(turn_id));
             }
-            self.plugin_registry.notify(runtime, name, payload).await?;
+            self.notify_agent(runtime, name, payload).await?;
             if let Some((session_id, prompt)) = next_prompt {
                 if self
                     .dispatch_agent_prompt(runtime, session_id, prompt.text, prompt.context)
@@ -11536,19 +11551,17 @@ impl Editor {
                 self.render(buffer)?;
             }
             if let Some(conversation) = self.agent_manager.conversation_snapshot() {
-                self.plugin_registry
-                    .notify(
-                        runtime,
-                        "agent:conversation_restore_pending",
-                        plugin_json(serde_json::to_value(conversation)?),
-                    )
-                    .await?;
+                self.notify_agent(
+                    runtime,
+                    "agent:conversation_restore_pending",
+                    plugin_json(serde_json::to_value(conversation)?),
+                )
+                .await?;
                 self.set_legacy_message(Some(format!(
                     "{message}; restoring the persisted agent session"
                 )));
             } else if !model_only_bridge {
-                self.plugin_registry
-                    .notify(runtime, "agent:session_lost", json!({ "message": message }))
+                self.notify_agent(runtime, "agent:session_lost", json!({ "message": message }))
                     .await?;
             }
         }
@@ -11727,6 +11740,8 @@ impl Editor {
         // Startup refreshes form short request chains. Drain a bounded batch so each
         // operation does not wait for a separate 10 ms editor tick.
         for _ in 0..PLUGIN_REQUESTS_PER_TICK {
+            // Boxed so the pane driver does not grow this large future's frame.
+            Box::pin(self.drain_agent_pane_effects(runtime)).await?;
             if self.agent_manager.is_task_finished() {
                 break;
             }
@@ -11758,24 +11773,22 @@ impl Editor {
                             .finish_agent_bridge(runtime, "Codex app-server stopped unexpectedly")
                             .await?;
                         if !model_only_bridge {
-                            self.plugin_registry
-                                .notify(
-                                    runtime,
-                                    "agent:session_lost",
-                                    json!({ "message": message }),
-                                )
-                                .await?;
+                            self.notify_agent(
+                                runtime,
+                                "agent:session_lost",
+                                json!({ "message": message }),
+                            )
+                            .await?;
                         }
                     }
                     self.agent_manager.mark_conversation_requested();
                     if let Err(error) = self.ensure_agent_bridge(&cwd) {
-                        self.plugin_registry
-                            .notify(
-                                runtime,
-                                "agent:error",
-                                json!({ "message": error.to_string() }),
-                            )
-                            .await?;
+                        self.notify_agent(
+                            runtime,
+                            "agent:error",
+                            json!({ "message": error.to_string() }),
+                        )
+                        .await?;
                         continue;
                     }
                     let Some(bridge) = self.agent_manager.bridge() else {
@@ -11795,9 +11808,12 @@ impl Editor {
                                 "Codex app-server stopped while starting the session",
                             )
                             .await?;
-                        self.plugin_registry
-                            .notify(runtime, "agent:session_lost", json!({ "message": message }))
-                            .await?;
+                        self.notify_agent(
+                            runtime,
+                            "agent:session_lost",
+                            json!({ "message": message }),
+                        )
+                        .await?;
                     }
                 }
                 PluginRequest::AgentResumeSession { cwd, session_id } => {
@@ -11809,10 +11825,7 @@ impl Editor {
                             version != crate::agent_conversation::AGENT_TOOL_CONTRACT_VERSION
                         })
                     {
-                        self.plugin_registry
-                            .notify(
-                                runtime,
-                                "agent:session_restore_failed",
+                        self.notify_agent(runtime, "agent:session_restore_failed",
                                 json!({
                                     "session_id": session_id,
                                     "message": "Agent tools changed after this conversation was saved; the transcript remains available and the next message will start a compatible session"
@@ -11830,16 +11843,15 @@ impl Editor {
                             .await?;
                     }
                     if let Err(error) = self.ensure_agent_bridge(&cwd) {
-                        self.plugin_registry
-                            .notify(
-                                runtime,
-                                "agent:session_restore_failed",
-                                json!({
-                                    "session_id": session_id,
-                                    "message": error.to_string()
-                                }),
-                            )
-                            .await?;
+                        self.notify_agent(
+                            runtime,
+                            "agent:session_restore_failed",
+                            json!({
+                                "session_id": session_id,
+                                "message": error.to_string()
+                            }),
+                        )
+                        .await?;
                         continue;
                     }
                     let Some(bridge) = self.agent_manager.bridge() else {
@@ -11859,13 +11871,12 @@ impl Editor {
                                 "Codex app-server stopped while restoring the session",
                             )
                             .await?;
-                        self.plugin_registry
-                            .notify(
-                                runtime,
-                                "agent:session_restore_failed",
-                                json!({ "session_id": session_id, "message": message }),
-                            )
-                            .await?;
+                        self.notify_agent(
+                            runtime,
+                            "agent:session_restore_failed",
+                            json!({ "session_id": session_id, "message": message }),
+                        )
+                        .await?;
                     }
                 }
                 PluginRequest::AgentPrompt { session_id, text } => {
@@ -11889,6 +11900,13 @@ impl Editor {
                         .dispatch_agent_prompt(runtime, session_id, text, Some((uri, context)))
                         .await?;
                 }
+                request @ (PluginRequest::AgentSubmit { .. }
+                | PluginRequest::AgentStop
+                | PluginRequest::AgentSendQueued { .. }
+                | PluginRequest::AgentDiscardQueued
+                | PluginRequest::AgentReset { .. }) => {
+                    self.handle_agent_pane_request(request);
+                }
                 PluginRequest::AgentCancel { session_id } => {
                     self.agent_manager.begin_stopping(&session_id);
                     let Some(bridge) = self.agent_manager.bridge() else {
@@ -11899,13 +11917,12 @@ impl Editor {
                         .await
                         .is_err()
                     {
-                        self.plugin_registry
-                            .notify(
-                                runtime,
-                                "agent:error",
-                                json!({ "message": "Codex app-server stopped" }),
-                            )
-                            .await?;
+                        self.notify_agent(
+                            runtime,
+                            "agent:error",
+                            json!({ "message": "Codex app-server stopped" }),
+                        )
+                        .await?;
                     }
                 }
                 PluginRequest::AgentCloseSession { session_id } => {
@@ -11924,13 +11941,12 @@ impl Editor {
                         .await
                         .is_err()
                     {
-                        self.plugin_registry
-                            .notify(
-                                runtime,
-                                "agent:error",
-                                json!({ "message": "Codex app-server stopped" }),
-                            )
-                            .await?;
+                        self.notify_agent(
+                            runtime,
+                            "agent:error",
+                            json!({ "message": "Codex app-server stopped" }),
+                        )
+                        .await?;
                     }
                 }
                 PluginRequest::AgentArchiveSession { session_id } => {
@@ -12010,13 +12026,12 @@ impl Editor {
                         .await
                         .is_err()
                     {
-                        self.plugin_registry
-                            .notify(
-                                runtime,
-                                "agent:error",
-                                json!({ "message": "Codex app-server stopped" }),
-                            )
-                            .await?;
+                        self.notify_agent(
+                            runtime,
+                            "agent:error",
+                            json!({ "message": "Codex app-server stopped" }),
+                        )
+                        .await?;
                     }
                 }
                 PluginRequest::EditHistory { request_id } => {
@@ -13420,6 +13435,7 @@ impl Editor {
                 }
             }
         }
+        Box::pin(self.drain_agent_pane_effects(runtime)).await?;
         needs_render |= self.service_shell_commands(runtime).await;
         needs_render |= self.service_red_update();
         self.resume_rpc_actions(buffer, runtime).await?;

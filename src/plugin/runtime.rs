@@ -1254,6 +1254,21 @@ impl RedHost {
                     context,
                 });
             }
+            "AgentSubmit" => {
+                let text = args.first().map(value_to_string).unwrap_or_default();
+                let transcript = args.get(1).map(value_to_string).unwrap_or_default();
+                self.send_request(PluginRequest::AgentSubmit { text, transcript });
+            }
+            "AgentStop" => self.send_request(PluginRequest::AgentStop),
+            "AgentSendQueued" => {
+                let transcript = args.first().map(value_to_string).unwrap_or_default();
+                self.send_request(PluginRequest::AgentSendQueued { transcript });
+            }
+            "AgentDiscardQueued" => self.send_request(PluginRequest::AgentDiscardQueued),
+            "AgentReset" => {
+                let start = args.first().and_then(Value::as_bool).unwrap_or(false);
+                self.send_request(PluginRequest::AgentReset { start });
+            }
             "AgentCancel" => {
                 let session_id = args
                     .first()

@@ -35,6 +35,12 @@ pub struct AgentManager {
     forgotten_conversations: HashSet<String>,
     /// Prompts submitted while their session was busy, sent once its turn ends.
     queued_prompts: HashMap<String, VecDeque<QueuedAgentPrompt>>,
+    /// The Agent pane's conversation lifecycle.
+    pane: super::agent_pane::AgentPaneLifecycle,
+    /// Effects returned by pane transitions, run at the editor's next drain point.
+    pane_effects: Vec<super::agent_pane::AgentPaneEffect>,
+    /// Last snapshot sent to the pane, so unchanged state is not re-sent.
+    published_pane: Option<super::agent_pane::AgentPaneSnapshot>,
 }
 
 /// Where a session's current turn is in its lifecycle.
@@ -44,6 +50,46 @@ pub enum AgentTurnPhase {
     Running,
     /// A cancel was sent; editor tools are refused until Codex reports the end.
     Stopping,
+}
+
+/// Return values of pane transitions that may carry effects for the editor.
+pub trait PaneTransition {
+    fn effects(&self) -> Vec<super::agent_pane::AgentPaneEffect>;
+}
+
+impl PaneTransition for () {
+    fn effects(&self) -> Vec<super::agent_pane::AgentPaneEffect> {
+        Vec::new()
+    }
+}
+
+impl PaneTransition for usize {
+    fn effects(&self) -> Vec<super::agent_pane::AgentPaneEffect> {
+        Vec::new()
+    }
+}
+
+impl PaneTransition for Vec<super::agent_pane::AgentPaneEffect> {
+    fn effects(&self) -> Vec<super::agent_pane::AgentPaneEffect> {
+        self.clone()
+    }
+}
+
+impl PaneTransition for Option<Vec<super::agent_pane::AgentPaneEffect>> {
+    fn effects(&self) -> Vec<super::agent_pane::AgentPaneEffect> {
+        self.clone().unwrap_or_default()
+    }
+}
+
+impl PaneTransition
+    for (
+        super::agent_pane::AgentSubmitResult,
+        Vec<super::agent_pane::AgentPaneEffect>,
+    )
+{
+    fn effects(&self) -> Vec<super::agent_pane::AgentPaneEffect> {
+        self.1.clone()
+    }
 }
 
 /// A prompt held until its session's previous turn has fully ended.
@@ -57,6 +103,37 @@ impl AgentManager {
     /// Creates a new, empty AgentManager instance.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Applies a pane transition and keeps its effects for the next drain.
+    pub fn update_pane<R>(
+        &mut self,
+        transition: impl FnOnce(&mut super::agent_pane::AgentPaneLifecycle) -> R,
+    ) -> R
+    where
+        R: PaneTransition,
+    {
+        let result = transition(&mut self.pane);
+        self.pane_effects.extend(result.effects());
+        result
+    }
+
+    pub fn pane(&self) -> &super::agent_pane::AgentPaneLifecycle {
+        &self.pane
+    }
+
+    pub fn take_pane_effects(&mut self) -> Vec<super::agent_pane::AgentPaneEffect> {
+        std::mem::take(&mut self.pane_effects)
+    }
+
+    /// Returns the pane snapshot when it differs from the last one published.
+    pub fn take_changed_pane_snapshot(&mut self) -> Option<super::agent_pane::AgentPaneSnapshot> {
+        let snapshot = self.pane.snapshot();
+        if self.published_pane.as_ref() == Some(&snapshot) {
+            return None;
+        }
+        self.published_pane = Some(snapshot.clone());
+        Some(snapshot)
     }
 
     /// Returns `true` if a Codex bridge connection is currently attached.
