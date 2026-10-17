@@ -285,7 +285,9 @@ prompt sent while the interrupt is still settling waits for the interrupted
 turn to end instead of racing it; if the app-server stops first, those
 messages come back to the pane as paused follow-ups. Queued follow-ups pause after a stopped or
 failed turn; the pane status shows how many are held, `:AgentSendQueued`
-resumes them, and `:AgentDiscardQueued` drops them. While a turn is in flight,
+resumes them, and `:AgentDiscardQueued` drops them. A message sent while Codex
+cannot start is held the same way: it stays visible in the pane, and the Retry
+action or `:AgentSendQueued` sends it once Codex is available. While a turn is in flight,
 the `agent_activity` statusline field (on the right by default) shows
 `agent working`, `agent following`, or `agent stopping`, plus any queued count,
 and it disappears when the agent is idle. A turn that finishes while the pane is
