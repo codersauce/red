@@ -1719,15 +1719,17 @@ fn resolve_agent_tool_path_kind(
 }
 
 /// Marks revisions minted from disk contents for files the editor has not opened.
-/// Buffer revisions are edit counters and never reach this bit.
-const AGENT_DISK_REVISION_BIT: u64 = 1 << 63;
+/// Buffer revisions are edit counters and never reach this bit. Tokens stay below
+/// 2^53 because Codex runs tool calls through JavaScript, which rounds larger
+/// integers and would turn every disk token into a stale revision.
+const AGENT_DISK_REVISION_BIT: u64 = 1 << 52;
 
 /// Returns the revision token for a file read from disk without opening a buffer.
 fn agent_disk_revision(contents: &str) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     contents.hash(&mut hasher);
-    hasher.finish() | AGENT_DISK_REVISION_BIT
+    (hasher.finish() & (AGENT_DISK_REVISION_BIT - 1)) | AGENT_DISK_REVISION_BIT
 }
 
 /// Accepts a buffer revision, or a disk token whose contents the buffer still holds,
@@ -36170,6 +36172,16 @@ mod test {
         assert_eq!(editor.current_buffer().contents(), "original\n");
         assert!(!editor.current_buffer().is_dirty());
         assert!(editor.current_buffer().has_external_file_conflict());
+    }
+
+    #[test]
+    fn agent_disk_revisions_survive_a_javascript_number_round_trip() {
+        for contents in ["", "original\n", "fn main() {}\n", &"x".repeat(10_000)] {
+            let revision = agent_disk_revision(contents);
+            assert_ne!(revision & AGENT_DISK_REVISION_BIT, 0);
+            assert!(revision < 1 << 53, "{revision} is not a safe JS integer");
+            assert_eq!(revision as f64 as u64, revision);
+        }
     }
 
     #[tokio::test]
