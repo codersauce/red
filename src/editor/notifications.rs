@@ -618,8 +618,11 @@ impl Editor {
                 } else {
                     selected.saturating_sub(1)
                 };
-                browser.selected = ids.get(next).copied();
-                browser.scroll = 0;
+                let next = ids.get(next).copied();
+                if browser.selected != next {
+                    browser.selected = next;
+                    browser.scroll = 0;
+                }
             }
             MessageAction::Search => browser.searching = true,
             MessageAction::Query(text) => {
@@ -1260,6 +1263,33 @@ mod tests {
             .is_active(Instant::now()));
         editor.handle_message_action(&MessageAction::ClearInactive);
         assert!(editor.notifications.get(first).is_none());
+    }
+
+    #[test]
+    fn list_navigation_preserves_detail_scroll_until_selection_changes() {
+        let mut editor = editor(100, 24);
+        for summary in ["older", "newer"] {
+            editor
+                .publish_notification(
+                    Notice::new(NotificationSource::Editor, Severity::Error, summary)
+                        .with_details("detail\n".repeat(40)),
+                )
+                .unwrap();
+        }
+        editor.open_messages();
+        let ids = editor.message_ids(Instant::now());
+        for (action, selected, scroll) in [
+            (MessageAction::Previous, 0, 5),
+            (MessageAction::Next, 1, 0),
+            (MessageAction::Next, 1, 5),
+            (MessageAction::Previous, 0, 0),
+        ] {
+            editor.handle_message_action(&MessageAction::ScrollTo(5));
+            editor.handle_message_action(&action);
+            let browser = editor.message_browser.as_ref().unwrap();
+            assert_eq!(browser.selected, Some(ids[selected]));
+            assert_eq!(browser.scroll, scroll);
+        }
     }
 
     #[test]
