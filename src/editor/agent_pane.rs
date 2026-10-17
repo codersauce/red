@@ -363,8 +363,12 @@ impl AgentPaneLifecycle {
 
     /// The persisted thread is live again.
     pub fn restored(&mut self, session_id: &str) -> Vec<AgentPaneEffect> {
-        if self.session_id.as_deref() != Some(session_id) {
-            return Vec::new();
+        // Adopt a live thread the editor restored without a pane request, such as
+        // after the plugin reloads, but never replace a different thread.
+        match self.session_id.as_deref() {
+            Some(current) if current != session_id => return Vec::new(),
+            Some(_) => {}
+            None => self.session_id = Some(session_id.to_string()),
         }
         self.phase = Some(AgentPanePhase::Idle);
         self.recap_pending = false;
@@ -724,6 +728,23 @@ mod tests {
             pane.submit("next".into(), "You: old\n").1,
             [AgentPaneEffect::StartSession]
         );
+    }
+
+    #[test]
+    fn an_already_live_restored_thread_is_adopted_but_never_replaces_another() {
+        let mut pane = AgentPaneLifecycle::default();
+        pane.restored("s1");
+        assert_eq!(pane.snapshot().session_id.as_deref(), Some("s1"));
+        let (_, effects) = pane.submit("continue".into(), "");
+        assert_eq!(
+            dispatched(&effects),
+            ["continue"],
+            "no new thread is started"
+        );
+
+        let mut pane = live("s1");
+        pane.restored("other");
+        assert_eq!(pane.snapshot().session_id.as_deref(), Some("s1"));
     }
 
     #[test]
