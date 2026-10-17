@@ -568,7 +568,7 @@ fn extract_binary(archive: &mut NamedTempFile, output: &mut File) -> anyhow::Res
     let mut found = false;
     for index in 0..archive.len() {
         let entry = archive.by_index(index)?;
-        if entry.name() != "red.exe" {
+        if entry.name()? != "red.exe" {
             continue;
         }
         anyhow::ensure!(
