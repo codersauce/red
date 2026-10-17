@@ -10959,9 +10959,16 @@ impl Editor {
         self.stop_inline_agent_outcomes(fallback);
         drop(self.agent_manager.take_bridge());
         self.agent_manager.clear_active_sessions();
-        let dropped_prompts = self.agent_manager.discard_all_queued_prompts();
-        if dropped_prompts > 0 {
-            log!("Codex app-server stopped with {dropped_prompts} queued prompt(s) unsent");
+        // Prompts held behind a stopping turn were never sent; return them to the
+        // pane instead of letting a dead app-server swallow them.
+        for (session_id, prompts) in self.agent_manager.take_all_queued_prompts() {
+            self.plugin_registry
+                .notify(
+                    runtime,
+                    "agent:prompts_returned",
+                    json!({ "session_id": session_id, "prompts": prompts }),
+                )
+                .await?;
         }
         self.agent_manager.clear_turns();
         self.agent_manager.clear_tool_requests();

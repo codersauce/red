@@ -251,12 +251,20 @@ impl AgentManager {
             .map_or(0, |queue| queue.len())
     }
 
-    /// Drops every queued prompt, returning how many were never sent.
-    pub fn discard_all_queued_prompts(&mut self) -> usize {
-        self.queued_prompts
+    /// Takes every unsent prompt so a lost bridge can hand them back to the pane.
+    pub fn take_all_queued_prompts(&mut self) -> Vec<(String, Vec<String>)> {
+        let mut returned = self
+            .queued_prompts
             .drain()
-            .map(|(_, queue)| queue.len())
-            .sum()
+            .map(|(session_id, queue)| {
+                (
+                    session_id,
+                    queue.into_iter().map(|prompt| prompt.text).collect(),
+                )
+            })
+            .collect::<Vec<_>>();
+        returned.sort_by(|left, right| left.0.cmp(&right.0));
+        returned
     }
 
     pub fn set_turn_id(&mut self, session_id: impl Into<String>, turn_id: impl Into<String>) {
@@ -510,6 +518,34 @@ mod tests {
         manager.restore_conversation(old);
         assert_eq!(manager.conversation_tool_contract_version("old"), Some(0));
         assert_eq!(manager.conversation_tool_contract_version("other"), None);
+    }
+
+    #[test]
+    fn a_lost_bridge_returns_prompts_held_behind_a_stopping_turn() {
+        let mut manager = AgentManager::new();
+        manager.mark_session_active("session-1");
+        manager.begin_stopping("session-1");
+        for text in ["first", "second"] {
+            manager.queue_prompt(
+                "session-1",
+                super::QueuedAgentPrompt {
+                    text: text.to_string(),
+                    context: None,
+                },
+            );
+        }
+
+        manager.clear_active_sessions();
+
+        assert_eq!(
+            manager.take_all_queued_prompts(),
+            [(
+                "session-1".to_string(),
+                vec!["first".to_string(), "second".to_string()]
+            )]
+        );
+        assert!(manager.take_all_queued_prompts().is_empty());
+        assert!(!manager.is_session_busy("session-1"));
     }
 
     #[tokio::test]

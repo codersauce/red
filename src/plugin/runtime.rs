@@ -9481,6 +9481,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bundled_agent_keeps_prompts_returned_by_a_lost_app_server_as_paused() {
+        let mut runtime = agent_runtime_with_session("session-1").await;
+        runtime
+            .notify(
+                "agent:prompts_returned",
+                serde_json::json!({ "session_id": "session-1", "prompts": ["held follow-up"] }),
+            )
+            .await
+            .unwrap();
+
+        let mut visible = false;
+        let mut paused = false;
+        let mut announced = false;
+        while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
+            match request {
+                PluginRequest::AgentPrompt { .. } => {
+                    panic!("returned prompts must wait for the user")
+                }
+                PluginRequest::UpdateTextPanel { blocks, .. } => {
+                    visible |= blocks.iter().any(|block| block.text == "held follow-up");
+                }
+                PluginRequest::SetTextPanelStatus {
+                    status: Some(status),
+                    ..
+                } => {
+                    paused |= status.label.contains("1 queued · paused");
+                }
+                PluginRequest::Action(Action::Print(message)) => {
+                    announced |= message.contains("Kept 1 unsent agent message");
+                }
+                _ => {}
+            }
+        }
+        assert!(visible && paused && announced);
+
+        runtime.execute_command("AgentSendQueued").await.unwrap();
+        let mut sent = false;
+        while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
+            sent |= matches!(
+                request,
+                PluginRequest::AgentPrompt { session_id, text }
+                    if session_id == "session-1" && text == "held follow-up"
+            );
+        }
+        assert!(sent, "AgentSendQueued must send the returned prompt");
+    }
+
+    #[tokio::test]
     async fn bundled_agent_keeps_a_cancelled_session_for_the_next_prompt() {
         let mut runtime = agent_runtime_with_session("session-1").await;
         submit_agent_prompt(&mut runtime, "first prompt").await;

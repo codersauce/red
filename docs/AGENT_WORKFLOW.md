@@ -282,7 +282,8 @@ in FIFO order. Assistant deltas stream into the conversation footer. `Ctrl-c`
 interrupts the active turn with `turn/interrupt` and keeps the same Codex
 thread, so the next prompt continues the conversation with its full context. A
 prompt sent while the interrupt is still settling waits for the interrupted
-turn to end instead of racing it. Queued follow-ups pause after a stopped or
+turn to end instead of racing it; if the app-server stops first, those
+messages come back to the pane as paused follow-ups. Queued follow-ups pause after a stopped or
 failed turn; the pane status shows how many are held, `:AgentSendQueued`
 resumes them, and `:AgentDiscardQueued` drops them. While a turn is in flight,
 the `agent_activity` statusline field (on the right by default) shows

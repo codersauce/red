@@ -22,6 +22,11 @@ struct AgentCompletedEvent {
     elapsed_ms: i64,
 }
 
+struct AgentPromptsReturnedEvent {
+    session_id: String,
+    prompts: [String],
+}
+
 struct AgentErrorEvent {
     session_id: String,
     turn_id: Option<String>,
@@ -914,26 +919,11 @@ fn submit_prompt(text: String) {
         return;
     }
     if state().turn_active {
-        let queue = state().prompt_queue;
-        if red::len(queue) >= 16 {
+        if !enqueue_prompt(text) {
             red::execute("Print", "Agent follow-up queue is full");
             return;
         }
-        let generation = red::int(state().block_generation, 0) + 1;
-        let block_id = "user:" + generation;
-        red::state_patch(AgentState { block_generation: generation });
-        queue = red::push(queue, AgentPromptQueueItem { text: text, block_id: block_id });
-        red::state_patch(AgentState { prompt_queue: queue });
-        // Pending blocks render below the active stream but do not enter the
-        // committed transcript until their FIFO turn is dispatched.
-        let queued_blocks = state().queued_prompt_blocks;
-        queued_blocks = red::push(queued_blocks, AgentTextBlock {
-            id: block_id,
-            kind: "user",
-            format: "plain",
-            text: text,
-        });
-        red::state_patch(AgentState { queued_prompt_blocks: queued_blocks });
+        let queue = state().prompt_queue;
         if state().streaming {
             red::state_patch(AgentState { stream_trimmed: true });
         }
@@ -951,6 +941,52 @@ fn submit_prompt(text: String) {
         return;
     }
     dispatch_prompt(text);
+}
+
+/// Append a follow-up to the FIFO queue and its pending block; false when full.
+fn enqueue_prompt(text: String) -> bool {
+    let queue = state().prompt_queue;
+    if red::len(queue) >= 16 {
+        return false;
+    }
+    let generation = red::int(state().block_generation, 0) + 1;
+    let block_id = "user:" + generation;
+    red::state_patch(AgentState { block_generation: generation });
+    queue = red::push(queue, AgentPromptQueueItem { text: text, block_id: block_id });
+    red::state_patch(AgentState { prompt_queue: queue });
+    // Pending blocks render below the active stream but do not enter the
+    // committed transcript until their FIFO turn is dispatched.
+    let queued_blocks = state().queued_prompt_blocks;
+    queued_blocks = red::push(queued_blocks, AgentTextBlock {
+        id: block_id,
+        kind: "user",
+        format: "plain",
+        text: text,
+    });
+    red::state_patch(AgentState { queued_prompt_blocks: queued_blocks });
+    return true;
+}
+
+/// The editor held these prompts behind a stopping turn when Codex went away;
+/// keep them as paused follow-ups so nothing the user typed is lost.
+#[red::on("agent:prompts_returned")]
+fn prompts_returned(event: AgentPromptsReturnedEvent) {
+    if !is_current_session(event.session_id) && red::string(state().session_id, "") != "" {
+        return;
+    }
+    let kept = 0;
+    for text in event.prompts {
+        if enqueue_prompt(text) {
+            kept = kept + 1;
+        }
+    }
+    if kept == 0 {
+        return;
+    }
+    red::state_patch(AgentState { queue_paused: true });
+    render_conversation();
+    render_status();
+    red::execute("Print", "Kept " + kept + " unsent agent message(s) · :AgentSendQueued to send");
 }
 
 fn dispatch_prompt(text: String) {
