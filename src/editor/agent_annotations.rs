@@ -121,7 +121,7 @@ impl Editor {
             "Agent annotation call must contain 1–{MAX_AGENT_ANNOTATIONS_PER_CALL} comments"
         );
         anyhow::ensure!(
-            self.current_buffer().revision() == expected_revision,
+            super::agent_revision_matches(self.current_buffer(), expected_revision),
             "stale editor revision: expected {expected_revision}, current {}",
             self.current_buffer().revision()
         );

@@ -348,7 +348,7 @@ impl Editor {
         } = &request.call
         {
             anyhow::ensure!(
-                self.buffer_manager[index].revision() == *expected_revision,
+                super::agent_revision_matches(&self.buffer_manager[index], *expected_revision),
                 "stale editor revision; read the file again"
             );
             anyhow::ensure!(

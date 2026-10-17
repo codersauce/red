@@ -1709,6 +1709,26 @@ fn resolve_agent_tool_path_kind(
     Ok(normalized)
 }
 
+/// Marks revisions minted from disk contents for files the editor has not opened.
+/// Buffer revisions are edit counters and never reach this bit.
+const AGENT_DISK_REVISION_BIT: u64 = 1 << 63;
+
+/// Returns the revision token for a file read from disk without opening a buffer.
+fn agent_disk_revision(contents: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    contents.hash(&mut hasher);
+    hasher.finish() | AGENT_DISK_REVISION_BIT
+}
+
+/// Accepts a buffer revision, or a disk token whose contents the buffer still holds,
+/// so an agent that read an unopened file can edit it once Red loads a buffer.
+pub(crate) fn agent_revision_matches(buffer: &Buffer, expected_revision: u64) -> bool {
+    buffer.revision() == expected_revision
+        || (expected_revision & AGENT_DISK_REVISION_BIT != 0
+            && agent_disk_revision(&buffer.contents()) == expected_revision)
+}
+
 /// Rejects agent writes to control or secret paths before any buffer changes, so
 /// a refused write never leaves a dirty buffer that a later user save could persist.
 fn ensure_agent_writable_path(root: &Path, path: &Path) -> anyhow::Result<()> {
@@ -9955,7 +9975,7 @@ impl Editor {
             .await?;
         let current_revision = self.current_buffer().revision();
         anyhow::ensure!(
-            current_revision == expected_revision,
+            agent_revision_matches(self.current_buffer(), expected_revision),
             "stale editor revision: expected {expected_revision}, current {current_revision}"
         );
         anyhow::ensure!(
@@ -10088,12 +10108,10 @@ impl Editor {
                 line_count,
             } => {
                 let path = resolve_path(&path)?;
-                let exists = path.exists();
-                if self
-                    .open_agent_buffer(&path, /*create*/ false, render_buffer)
-                    .await?
-                    .is_none()
-                {
+                let normalized = normalized_file_path(&path.to_string_lossy())?;
+                let exists = normalized.exists();
+                let open_index = self.file_buffer_index(&normalized);
+                if open_index.is_none() && !exists {
                     return Ok(json!({
                         "content": "",
                         "revision": 0,
@@ -10105,7 +10123,22 @@ impl Editor {
                         "next_line": null,
                     }));
                 }
-                let contents = self.current_buffer().contents();
+                // Reads never switch or open buffers: an open file reports its live
+                // contents, and an unopened file is read from disk with a content token.
+                let (contents, revision) = match open_index {
+                    Some(index) => (
+                        self.buffer_manager[index].contents(),
+                        self.buffer_manager[index].revision(),
+                    ),
+                    None => {
+                        let buffer =
+                            Buffer::load_or_create(Some(normalized.to_string_lossy().into_owned()))
+                                .await?;
+                        let contents = buffer.contents();
+                        let revision = agent_disk_revision(&contents);
+                        (contents, revision)
+                    }
+                };
                 let page = agent_file_page(&contents, start_line, line_count);
                 anyhow::ensure!(
                     !page.line_truncated,
@@ -10113,7 +10146,7 @@ impl Editor {
                 );
                 Ok(json!({
                     "content": page.content,
-                    "revision": self.current_buffer().revision(),
+                    "revision": revision,
                     "exists": exists,
                     "start_line": page.start_line,
                     "end_line": page.end_line,
@@ -10309,7 +10342,7 @@ impl Editor {
                     .await?;
                 let current_revision = self.current_buffer().revision();
                 anyhow::ensure!(
-                    current_revision == expected_revision,
+                    agent_revision_matches(self.current_buffer(), expected_revision),
                     "stale editor revision: expected {expected_revision}, current {current_revision}"
                 );
                 let contents = apply_text_edits(&self.current_buffer().contents(), &edits)?;
@@ -36051,6 +36084,13 @@ mod test {
         let path = root.path().join("document.rs");
         fs::write(&path, "original\n").unwrap();
         let mut editor = test_editor(/*width*/ 80, /*height*/ 24);
+        editor
+            .buffer_manager
+            .replace_buffers(vec![Buffer::load_or_create(Some(
+                path.to_string_lossy().into_owned(),
+            ))
+            .await
+            .unwrap()]);
         editor.test_set_agent_root(root.path());
         let request = |call| EditorToolRequest {
             session_id: "external-change".to_string(),
@@ -36089,11 +36129,74 @@ mod test {
 
     #[tokio::test]
     #[cfg(unix)]
+    async fn agent_reads_of_unopened_files_leave_buffers_alone_and_guard_later_writes() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("document.rs");
+        fs::write(&path, "original\n").unwrap();
+        let mut editor = test_editor(/*width*/ 80, /*height*/ 24);
+        editor.test_set_agent_root(root.path());
+        let buffers = editor.buffer_manager.len();
+        let active = editor.current_buffer().id();
+        let request = |call| EditorToolRequest {
+            session_id: "disk-read".to_string(),
+            call,
+        };
+        let read = |line_count| {
+            request(EditorToolCall::ReadFile {
+                path: "document.rs".to_string(),
+                start_line: 1,
+                line_count,
+            })
+        };
+
+        let first = editor.test_run_agent_editor_tool(read(20)).await.unwrap();
+        assert_eq!(first["content"], "original\n");
+        assert_eq!(
+            editor.buffer_manager.len(),
+            buffers,
+            "a read must not open a buffer"
+        );
+        assert_eq!(editor.current_buffer().id(), active);
+
+        fs::write(&path, "external\n").unwrap();
+        let stale = editor
+            .test_run_agent_editor_tool(request(EditorToolCall::WriteFile {
+                path: "document.rs".to_string(),
+                expected_revision: first["revision"].as_u64().unwrap(),
+                content: "agent edit\n".to_string(),
+            }))
+            .await
+            .unwrap_err();
+        assert!(stale.to_string().contains("stale editor revision"));
+        assert_eq!(fs::read_to_string(&path).unwrap(), "external\n");
+
+        let fresh = editor.test_run_agent_editor_tool(read(20)).await.unwrap();
+        let written = editor
+            .test_run_agent_editor_tool(request(EditorToolCall::WriteFile {
+                path: "document.rs".to_string(),
+                expected_revision: fresh["revision"].as_u64().unwrap(),
+                content: "agent edit\n".to_string(),
+            }))
+            .await
+            .unwrap();
+        assert_eq!(written["saved"], true, "{written}");
+        assert_eq!(fs::read_to_string(&path).unwrap(), "agent edit\n");
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
     async fn agent_file_writes_never_replace_unsaved_human_edits() {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("document.rs");
         fs::write(&path, "original\n").unwrap();
         let mut editor = test_editor(/*width*/ 80, /*height*/ 24);
+        editor
+            .buffer_manager
+            .replace_buffers(vec![Buffer::load_or_create(Some(
+                path.to_string_lossy().into_owned(),
+            ))
+            .await
+            .unwrap()]);
         editor.test_set_agent_root(root.path());
         let request = |call| EditorToolRequest {
             session_id: "unsaved-human-edit".to_string(),
@@ -36138,6 +36241,13 @@ mod test {
         let path = root.path().join("main.rs");
         fs::write(&path, "one\ntwo\nthree\nfour\nfive\n").unwrap();
         let mut editor = test_editor(/*width*/ 80, /*height*/ 24);
+        editor
+            .buffer_manager
+            .replace_buffers(vec![Buffer::load_or_create(Some(
+                path.to_string_lossy().into_owned(),
+            ))
+            .await
+            .unwrap()]);
         editor.test_set_agent_root(root.path());
         let request = |start_line, line_count| EditorToolRequest {
             session_id: "paged-read".to_string(),
