@@ -279,7 +279,12 @@ checks the account, starts a persisted thread, and submits turns with
 `turn/start`. Follow-up text and the busy indicator render before dispatch;
 follow-ups submitted during an active turn appear immediately and remain queued
 in FIFO order. Assistant deltas stream into the conversation footer. `Ctrl-c`
-interrupts the active turn with `turn/interrupt`.
+interrupts the active turn with `turn/interrupt` and keeps the same Codex
+thread, so the next prompt continues the conversation with its full context. A
+prompt sent while the interrupt is still settling waits for the interrupted
+turn to end instead of racing it. Queued follow-ups pause after a stopped or
+failed turn; the pane status shows how many are held, `:AgentSendQueued`
+resumes them, and `:AgentDiscardQueued` drops them.
 
 `Tab` or `Shift-Tab` switches between the composer and transcript, preserving
 the draft, composer editing mode, and transcript reading position. Switching
@@ -458,8 +463,11 @@ fall through to file-path or external-URL handling.
 
 Tool paths must remain below the physical workspace root. Reads and writes
 reject parent traversal, symlink components, special files, unsafe roots,
-oversized content, stale revisions, and overlapping edits. Secret-like paths
-also require `[agent] allow_sensitive_paths = true`. Reads always see the latest
+oversized content, stale revisions, and overlapping edits. Version-control
+metadata (`.git`, `.hg`, `.jj`, `.svn`) is never read, listed, or searched.
+Writes also refuse protected control paths such as Git hooks, `.red/`,
+`red.toml`, and `.vscode/tasks.json` before any buffer changes. Secret-like
+paths also require `[agent] allow_sensitive_paths = true`. Reads always see the latest
 visible editor contents, including unsaved user changes.
 
 Directory creation is confined to the same workspace and rejects ignored,
@@ -510,7 +518,9 @@ protocol is unavailable; it does not fall back to `codex exec` or native edits.
 | `:Agent` / `:AgentPrompt` | Open the prompt composer. |
 | `:AgentOpen` | Show and focus the conversation pane without opening a prompt. |
 | `:AgentModel` / `Alt+m` in the Agent pane | Choose this conversation’s model and reasoning effort. |
-| `:AgentCancel` | Interrupt the active Codex turn. |
+| `:AgentCancel` | Interrupt the active Codex turn and keep the thread. |
+| `:AgentSendQueued` | Resume follow-ups held after a stopped or failed turn. |
+| `:AgentDiscardQueued` | Drop follow-ups that have not been sent. |
 | `:AgentClear` | Clear visible conversation while retaining current context. |
 | `:AgentNew` | Close the current thread and start a new one. |
 | `:AgentClose` | Hide the conversation panel without discarding state. |

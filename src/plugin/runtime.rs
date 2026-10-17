@@ -8698,40 +8698,18 @@ mod tests {
             )
             .await
             .unwrap();
-        let mut closed = false;
-        let mut replacement_request_id = None;
         while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
             match request {
-                PluginRequest::AgentCloseSession { session_id } => {
-                    closed |= session_id == "session-1";
+                PluginRequest::AgentCloseSession { .. } => {
+                    panic!("completed cancelled stream must keep its session")
                 }
-                PluginRequest::GetConfig { request_id, key } => {
-                    assert_eq!(key.as_deref(), Some("cwd"));
-                    replacement_request_id = Some(request_id);
+                PluginRequest::AgentPrompt { .. } => {
+                    panic!("a cancelled turn must hold queued prompts")
                 }
                 _ => {}
             }
         }
-        assert!(closed, "completed cancelled stream must rotate its session");
-        runtime
-            .resolve_request(
-                replacement_request_id.expect("queued prompt must request a replacement session"),
-                serde_json::json!({ "value": "/workspace" }),
-            )
-            .await
-            .unwrap();
-        assert!(matches!(
-            ACTION_DISPATCHER.recv_request(),
-            PluginRequest::AgentNewSession { cwd } if cwd == Path::new("/workspace")
-        ));
-        runtime
-            .notify(
-                "agent:session_created",
-                serde_json::json!({ "session_id": "session-2" }),
-            )
-            .await
-            .unwrap();
-        let mut replacement_dispatched = false;
+        runtime.execute_command("AgentSendQueued").await.unwrap();
         let mut dispatched_prompts = Vec::new();
         while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
             match request {
@@ -8742,21 +8720,18 @@ mod tests {
                             .filter(|block| block.text == "concurrent prompt")
                             .count()
                             <= 1,
-                        "a queued prompt must not duplicate during session rotation"
+                        "a queued prompt must not duplicate when it is resumed"
                     );
                 }
                 PluginRequest::AgentPrompt { session_id, text } => {
-                    assert_ne!(session_id, "session-1");
-                    dispatched_prompts.push((session_id.clone(), text.clone()));
-                    replacement_dispatched = session_id == "session-2"
-                        && text.ends_with("Follow-up:\nconcurrent prompt");
+                    dispatched_prompts.push((session_id, text));
                 }
                 _ => {}
             }
         }
-        assert!(
-            replacement_dispatched,
-            "expected queued prompt on replacement session, got {dispatched_prompts:?}"
+        assert_eq!(
+            dispatched_prompts,
+            [("session-1".to_string(), "concurrent prompt".to_string())]
         );
     }
 
@@ -9389,8 +9364,30 @@ mod tests {
         ));
     }
 
-    #[tokio::test]
-    async fn bundled_agent_rotates_a_cancelled_session_before_the_next_prompt() {
+    /// Submits a follow-up and asserts it reuses `session_id` without a recap.
+    async fn assert_follow_up_reuses_session(runtime: &mut Runtime, session_id: &str) {
+        submit_agent_prompt(runtime, "next prompt").await;
+        let mut reused = false;
+        while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
+            match request {
+                PluginRequest::AgentPrompt {
+                    session_id: target,
+                    text,
+                } => {
+                    assert_eq!(target, session_id);
+                    assert_eq!(text, "next prompt", "a kept thread needs no recap");
+                    reused = true;
+                }
+                PluginRequest::AgentNewSession { .. } | PluginRequest::AgentCloseSession { .. } => {
+                    panic!("a stopped turn must keep its Codex thread")
+                }
+                _ => {}
+            }
+        }
+        assert!(reused, "follow-up must go to the existing thread");
+    }
+
+    async fn agent_runtime_with_session(session_id: &str) -> Runtime {
         drain_requests();
         let mut runtime = Runtime::new();
         runtime
@@ -9400,86 +9397,39 @@ mod tests {
         runtime
             .notify(
                 "agent:session_created",
-                serde_json::json!({ "session_id": "session-1" }),
+                serde_json::json!({ "session_id": session_id }),
             )
             .await
             .unwrap();
         drain_requests();
+        runtime
+    }
 
+    #[tokio::test]
+    async fn bundled_agent_keeps_a_cancelled_session_for_the_next_prompt() {
+        let mut runtime = agent_runtime_with_session("session-1").await;
         submit_agent_prompt(&mut runtime, "first prompt").await;
         drain_requests();
         runtime
             .notify(
                 "agent:completed",
-                serde_json::json!({ "session_id": "session-1", "stop_reason": "cancelled" }),
+                serde_json::json!({ "session_id": "session-1", "stop_reason": "interrupted" }),
             )
             .await
             .unwrap();
-        let mut closed = false;
         while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
-            closed |= matches!(
-                request,
-                PluginRequest::AgentCloseSession { session_id } if session_id == "session-1"
+            assert!(
+                !matches!(request, PluginRequest::AgentCloseSession { .. }),
+                "an interrupted turn must not close its thread"
             );
         }
-        assert!(closed, "cancelled session must be closed cleanly");
 
-        submit_agent_prompt(&mut runtime, "next prompt").await;
-        let mut config_request = None;
-        while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
-            if let PluginRequest::GetConfig { request_id, key } = request {
-                assert_eq!(key.as_deref(), Some("cwd"));
-                config_request = Some(request_id);
-            }
-        }
-        runtime
-            .resolve_request(
-                config_request.expect("next prompt must request a replacement session"),
-                serde_json::json!({ "value": "/workspace" }),
-            )
-            .await
-            .unwrap();
-        assert!(matches!(
-            ACTION_DISPATCHER.recv_request(),
-            PluginRequest::AgentNewSession { cwd } if cwd == Path::new("/workspace")
-        ));
-        runtime
-            .notify(
-                "agent:session_created",
-                serde_json::json!({ "session_id": "session-2" }),
-            )
-            .await
-            .unwrap();
-        let mut replacement_prompt = false;
-        while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
-            replacement_prompt |= matches!(
-                request,
-                PluginRequest::AgentPrompt { session_id, text }
-                    if session_id == "session-2"
-                        && text.contains("Previous conversation (the last turn was interrupted):")
-                        && text.ends_with("Follow-up:\nnext prompt")
-            );
-        }
-        assert!(replacement_prompt);
+        assert_follow_up_reuses_session(&mut runtime, "session-1").await;
     }
 
     #[tokio::test]
-    async fn bundled_agent_rotates_when_completion_wins_the_cancellation_race() {
-        drain_requests();
-        let mut runtime = Runtime::new();
-        runtime
-            .load_plugin("agent", include_str!("../../plugins/agent.hk"))
-            .await
-            .unwrap();
-        runtime
-            .notify(
-                "agent:session_created",
-                serde_json::json!({ "session_id": "session-1" }),
-            )
-            .await
-            .unwrap();
-        drain_requests();
-
+    async fn bundled_agent_late_cancellation_keeps_the_completed_session() {
+        let mut runtime = agent_runtime_with_session("session-1").await;
         submit_agent_prompt(&mut runtime, "first prompt").await;
         drain_requests();
         runtime
@@ -9498,13 +9448,12 @@ mod tests {
             .await
             .unwrap();
 
-        let mut closed = false;
         let mut idle = false;
         let mut stopping = false;
         while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
             match request {
-                PluginRequest::AgentCloseSession { session_id } => {
-                    closed |= session_id == "session-1";
+                PluginRequest::AgentCloseSession { .. } => {
+                    panic!("late cancellation must keep the session")
                 }
                 PluginRequest::SetTextPanelStatus { id, status: None } => {
                     idle |= id == "agent-conversation";
@@ -9518,66 +9467,15 @@ mod tests {
                 _ => {}
             }
         }
-        assert!(closed, "late cancellation must close the unusable session");
         assert!(idle, "late cancellation must leave the completed turn idle");
         assert!(!stopping, "late cancellation must not restart busy status");
 
-        submit_agent_prompt(&mut runtime, "next prompt").await;
-        let mut config_request = None;
-        while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
-            if let PluginRequest::GetConfig { request_id, key } = request {
-                assert_eq!(key.as_deref(), Some("cwd"));
-                config_request = Some(request_id);
-            }
-        }
-        runtime
-            .resolve_request(
-                config_request.expect("next prompt must request a replacement session"),
-                serde_json::json!({ "value": "/workspace" }),
-            )
-            .await
-            .unwrap();
-        assert!(matches!(
-            ACTION_DISPATCHER.recv_request(),
-            PluginRequest::AgentNewSession { cwd } if cwd == Path::new("/workspace")
-        ));
-        runtime
-            .notify(
-                "agent:session_created",
-                serde_json::json!({ "session_id": "session-2" }),
-            )
-            .await
-            .unwrap();
-        let mut replacement_prompt = false;
-        while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
-            replacement_prompt |= matches!(
-                request,
-                PluginRequest::AgentPrompt { session_id, text }
-                    if session_id == "session-2"
-                        && text.contains("Previous conversation (the last turn was interrupted):")
-                        && text.ends_with("Follow-up:\nnext prompt")
-            );
-        }
-        assert!(replacement_prompt);
+        assert_follow_up_reuses_session(&mut runtime, "session-1").await;
     }
 
     #[tokio::test]
-    async fn bundled_agent_rotates_when_cancellation_wins_the_completion_race() {
-        drain_requests();
-        let mut runtime = Runtime::new();
-        runtime
-            .load_plugin("agent", include_str!("../../plugins/agent.hk"))
-            .await
-            .unwrap();
-        runtime
-            .notify(
-                "agent:session_created",
-                serde_json::json!({ "session_id": "session-1" }),
-            )
-            .await
-            .unwrap();
-        drain_requests();
-
+    async fn bundled_agent_cancellation_before_completion_keeps_the_session() {
+        let mut runtime = agent_runtime_with_session("session-1").await;
         submit_agent_prompt(&mut runtime, "first prompt").await;
         drain_requests();
         runtime
@@ -9627,12 +9525,11 @@ mod tests {
             .await
             .unwrap();
 
-        let mut closed = false;
         let mut transcript_saved = false;
         while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
             match request {
-                PluginRequest::AgentCloseSession { session_id } => {
-                    closed |= session_id == "session-1";
+                PluginRequest::AgentCloseSession { .. } => {
+                    panic!("completion after cancellation must keep the session")
                 }
                 PluginRequest::SetPluginStorage { plugin, key, value } => {
                     transcript_saved |= plugin == "agent"
@@ -9643,50 +9540,13 @@ mod tests {
                 _ => {}
             }
         }
-        assert!(closed, "completed turn must close the cancelled session");
         assert!(transcript_saved, "completed stream must remain in history");
 
-        submit_agent_prompt(&mut runtime, "next prompt").await;
-        let mut config_request = None;
-        while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
-            if let PluginRequest::GetConfig { request_id, key } = request {
-                assert_eq!(key.as_deref(), Some("cwd"));
-                config_request = Some(request_id);
-            }
-        }
-        runtime
-            .resolve_request(
-                config_request.expect("next prompt must request a replacement session"),
-                serde_json::json!({ "value": "/workspace" }),
-            )
-            .await
-            .unwrap();
-        assert!(matches!(
-            ACTION_DISPATCHER.recv_request(),
-            PluginRequest::AgentNewSession { cwd } if cwd == Path::new("/workspace")
-        ));
-        runtime
-            .notify(
-                "agent:session_created",
-                serde_json::json!({ "session_id": "session-2" }),
-            )
-            .await
-            .unwrap();
-        let mut replacement_prompt = false;
-        while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
-            replacement_prompt |= matches!(
-                request,
-                PluginRequest::AgentPrompt { session_id, text }
-                    if session_id == "session-2"
-                        && text.contains("Previous conversation (the last turn was interrupted):")
-                        && text.ends_with("Follow-up:\nnext prompt")
-            );
-        }
-        assert!(replacement_prompt);
+        assert_follow_up_reuses_session(&mut runtime, "session-1").await;
     }
 
     #[tokio::test]
-    async fn bundled_agent_rotates_a_cancelled_session_after_other_terminal_events() {
+    async fn bundled_agent_keeps_a_cancelled_session_after_other_terminal_events() {
         for (event, payload, transcript_suffix) in [
             (
                 "agent:completed",
@@ -9699,20 +9559,7 @@ mod tests {
                 "Error: turn failed\n",
             ),
         ] {
-            drain_requests();
-            let mut runtime = Runtime::new();
-            runtime
-                .load_plugin("agent", include_str!("../../plugins/agent.hk"))
-                .await
-                .unwrap();
-            runtime
-                .notify(
-                    "agent:session_created",
-                    serde_json::json!({ "session_id": "session-1" }),
-                )
-                .await
-                .unwrap();
-            drain_requests();
+            let mut runtime = agent_runtime_with_session("session-1").await;
             submit_agent_prompt(&mut runtime, "first prompt").await;
             drain_requests();
             runtime
@@ -9733,12 +9580,11 @@ mod tests {
             drain_requests();
             runtime.notify(event, payload).await.unwrap();
 
-            let mut closed = false;
             let mut transcript_saved = false;
             while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
                 match request {
-                    PluginRequest::AgentCloseSession { session_id } => {
-                        closed |= session_id == "session-1";
+                    PluginRequest::AgentCloseSession { .. } => {
+                        panic!("{event} must keep the cancelled session")
                     }
                     PluginRequest::SetPluginStorage { plugin, key, value } => {
                         transcript_saved |= plugin == "agent"
@@ -9751,8 +9597,63 @@ mod tests {
                     _ => {}
                 }
             }
-            assert!(closed, "{event} must close the cancelled session");
             assert!(transcript_saved, "{event} must preserve streamed output");
+
+            assert_follow_up_reuses_session(&mut runtime, "session-1").await;
+        }
+    }
+
+    #[tokio::test]
+    async fn bundled_agent_pauses_queued_follow_ups_after_a_stopped_turn() {
+        for resume in [true, false] {
+            let mut runtime = agent_runtime_with_session("session-1").await;
+            submit_agent_prompt(&mut runtime, "first prompt").await;
+            drain_requests();
+            submit_agent_prompt(&mut runtime, "queued follow-up").await;
+            drain_requests();
+            runtime
+                .notify(
+                    "agent:completed",
+                    serde_json::json!({ "session_id": "session-1", "stop_reason": "interrupted" }),
+                )
+                .await
+                .unwrap();
+
+            let mut paused_status = false;
+            while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
+                match request {
+                    PluginRequest::AgentPrompt { .. } => {
+                        panic!("a stopped turn must not send queued follow-ups unattended")
+                    }
+                    PluginRequest::SetTextPanelStatus {
+                        id,
+                        status: Some(status),
+                    } => {
+                        paused_status |= id == "agent-conversation"
+                            && !status.busy
+                            && status.label.contains("1 queued · paused");
+                    }
+                    _ => {}
+                }
+            }
+            assert!(paused_status, "the panel must explain the paused queue");
+
+            if resume {
+                runtime.execute_command("AgentSendQueued").await.unwrap();
+                let mut sent = false;
+                while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
+                    sent |= matches!(
+                        request,
+                        PluginRequest::AgentPrompt { session_id, text }
+                            if session_id == "session-1" && text == "queued follow-up"
+                    );
+                }
+                assert!(sent, "AgentSendQueued must resume the held follow-up");
+            } else {
+                runtime.execute_command("AgentDiscardQueued").await.unwrap();
+                drain_requests();
+                assert_follow_up_reuses_session(&mut runtime, "session-1").await;
+            }
         }
     }
 

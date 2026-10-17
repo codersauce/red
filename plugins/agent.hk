@@ -244,6 +244,7 @@ struct AgentState {
     streaming: bool,
     turn_active: bool,
     prompt_queue: [AgentPromptQueueItem],
+    queue_paused: bool,
     queued_prompt_blocks: [AgentTextBlock],
     recap_pending: bool,
     restoring: bool,
@@ -297,6 +298,7 @@ fn initial_state() -> AgentState {
         streaming: false,
         turn_active: false,
         prompt_queue: [],
+        queue_paused: false,
         queued_prompt_blocks: [],
         recap_pending: false,
         restoring: false,
@@ -1019,6 +1021,15 @@ fn set_phase(phase: String, label: String) {
 fn render_status() {
     let phase = red::string(state().ui_phase, "idle");
     if phase == "idle" {
+        let paused = red::len(state().prompt_queue);
+        if state().queue_paused && paused > 0 {
+            red::execute("SetTextPanelStatus", "agent-conversation", TextPanelStatus {
+                busy: false,
+                label: paused + " queued · paused · :AgentSendQueued or :AgentDiscardQueued",
+                stream: false,
+            });
+            return;
+        }
         red::execute("SetTextPanelStatus", "agent-conversation");
         return;
     }
@@ -1614,7 +1625,7 @@ fn new_conversation() {
     red::state_patch(AgentState { cancelled_session_id: "" });
     red::state_patch(AgentState { turn_active: false });
     set_phase("idle", "");
-    red::state_patch(AgentState { prompt_queue: [] });
+    red::state_patch(AgentState { prompt_queue: [], queue_paused: false });
     red::state_patch(AgentState { recap_pending: false });
     red::state_patch(AgentState { pending_prompt: "" });
     red::state_patch(AgentState { pending_prompt_block_id: "" });
@@ -1780,25 +1791,78 @@ fn completed(event: AgentCompletedEvent) {
     }
     collapse_activity(event.elapsed_ms);
     set_phase("idle", "");
-    if session_id != "" && (stop_reason == "cancelled" || session_id == red::string(state().cancelled_session_id, "")) {
-        red::execute("AgentCloseSession", session_id);
-        red::state_patch(AgentState { session_id: "" });
-        reset_model_state();
+    // Codex keeps an interrupted thread usable, so a stopped turn keeps its
+    // conversation instead of restarting from a transcript recap.
+    let was_cancelled = session_id != "" && session_id == red::string(state().cancelled_session_id, "");
+    if was_cancelled {
         red::state_patch(AgentState { cancelled_session_id: "" });
-        red::state_patch(AgentState { recap_pending: true });
     }
     if stop_reason == "end_turn" || stop_reason == "completed" {
+        // A cancel that lost the race to completion still means "stop here".
+        if was_cancelled {
+            pause_queue();
+            return;
+        }
         submit_next_queued();
         return;
     }
     append_transcript("System", "Agent stopped: " + stop_reason);
     red::execute("Print", "Agent stopped: " + stop_reason);
+    pause_queue();
+}
+
+/// Hold queued follow-ups after a stop or error so they never run unattended.
+fn pause_queue() {
+    if red::len(state().prompt_queue) == 0 {
+        return;
+    }
+    red::state_patch(AgentState { queue_paused: true });
+    render_status();
+}
+
+#[red::command(
+    name = "AgentSendQueued",
+    title = "Send queued agent follow-ups",
+    category = "Agent",
+    description = "Resume follow-ups held after a stopped or failed turn",
+    aliases = ["resume agent queue"],
+    scope = "global",
+)]
+fn send_queued() {
+    if red::len(state().prompt_queue) == 0 {
+        red::execute("Print", "No queued agent follow-ups");
+        return;
+    }
+    red::state_patch(AgentState { queue_paused: false });
+    if state().turn_active {
+        render_status();
+        return;
+    }
     submit_next_queued();
+}
+
+#[red::command(
+    name = "AgentDiscardQueued",
+    title = "Discard queued agent follow-ups",
+    category = "Agent",
+    description = "Drop follow-ups that have not been sent to the agent",
+    aliases = ["clear agent queue"],
+    scope = "global",
+)]
+fn discard_queued() {
+    let count = red::len(state().prompt_queue);
+    for entry in state().prompt_queue {
+        remove_queued_prompt_block(red::string(entry.block_id, ""));
+    }
+    red::state_patch(AgentState { prompt_queue: [], queue_paused: false });
+    render_conversation();
+    render_status();
+    red::execute("Print", "Discarded " + count + " queued agent follow-up(s)");
 }
 
 fn submit_next_queued() {
     let queue = state().prompt_queue;
-    if red::len(queue) == 0 {
+    if red::len(queue) == 0 || state().queue_paused {
         return;
     }
     let next = queue[0];
@@ -1833,11 +1897,7 @@ fn cancelled(event: AgentSessionEvent) {
         red::state_patch(AgentState { cancelled_session_id: session_id });
     }
     if !state().turn_active && session_id != "" {
-        red::execute("AgentCloseSession", session_id);
-        red::state_patch(AgentState { session_id: "" });
-        reset_model_state();
         red::state_patch(AgentState { cancelled_session_id: "" });
-        red::state_patch(AgentState { recap_pending: true });
         red::execute("Print", "Agent cancellation requested");
         set_phase("idle", "");
         return;
@@ -1865,17 +1925,10 @@ fn failed(event: AgentErrorEvent) {
     commit_pending_prompt();
     let session_id = red::string(event.session_id, "");
     if session_id != "" && session_id == red::string(state().cancelled_session_id, "") {
-        red::execute("AgentCloseSession", session_id);
-        red::state_patch(AgentState { session_id: "" });
-        reset_model_state();
         red::state_patch(AgentState { cancelled_session_id: "" });
-        red::state_patch(AgentState { recap_pending: true });
     }
     append_transcript("Error", event.message);
-    if red::len(state().prompt_queue) > 0 {
-        submit_next_queued();
-        return;
-    }
+    pause_queue();
     if red::string(state().pending_prompt, "") != "" || state().session_id == "" {
         let has_pending_prompt = red::string(state().pending_prompt, "") != "";
         let notice = "Codex unavailable: " + event.message;

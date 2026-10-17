@@ -1102,6 +1102,16 @@ async fn start_turn(
         return Ok(());
     };
     if session.active_turn.is_some() {
+        // The editor queues prompts until the previous turn ends, so this only
+        // happens if a caller bypasses it; failing loudly keeps the prompt from
+        // disappearing without a terminal event.
+        events
+            .send(CodexEvent::Failed {
+                session_id: Some(session_id),
+                message: "Codex is still finishing the previous turn".to_string(),
+            })
+            .await
+            .ok();
         return Ok(());
     }
     session.cancelled.store(false, Ordering::Relaxed);
@@ -1838,6 +1848,12 @@ async fn send_pending_failure(
             unreachable!("early requests returned above")
         }
     };
+    if matches!(request, Pending::Interrupt { .. }) {
+        // A rejected interrupt must not block a later retry for the same turn.
+        if let Some(session) = sessions.get_mut(session_id) {
+            session.pending_interrupt_turn_id = None;
+        }
+    }
     let (event, remove_session) = sessions.get(session_id).map_or_else(
         || {
             (
@@ -2850,6 +2866,88 @@ mod tests {
             assert_eq!(update["status"], expected);
         }
         assert!(received.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn busy_turn_rejects_prompts_and_a_failed_interrupt_can_be_retried() {
+        let mut sessions = HashMap::from([(
+            "agent".into(),
+            Session {
+                model_info: None,
+                cwd: PathBuf::from("/workspace"),
+                active_turn: Some("turn".into()),
+                pending_interrupt_turn_id: None,
+                cancelled: Arc::new(AtomicBool::new(false)),
+                allow_sensitive_paths: false,
+                kind: SessionKind::Agent,
+            },
+        )]);
+        let (events, mut received) = mpsc::channel(4);
+        let mut pending = HashMap::new();
+        let mut output = Vec::new();
+        let mut next_id = 0;
+
+        start_turn(
+            "agent".into(),
+            json!([{"type": "text", "text": "follow-up"}]),
+            &mut output,
+            &events,
+            &mut pending,
+            &mut sessions,
+            &mut next_id,
+        )
+        .await
+        .unwrap();
+        assert!(
+            output.is_empty(),
+            "a busy thread must not start a second turn"
+        );
+        assert!(matches!(
+            received.try_recv(),
+            Ok(CodexEvent::Failed { session_id: Some(session_id), message })
+                if session_id == "agent" && message.contains("previous turn")
+        ));
+
+        stop_session(
+            "agent".into(),
+            false,
+            &mut output,
+            &events,
+            &mut pending,
+            &mut sessions,
+            &mut next_id,
+        )
+        .await
+        .unwrap();
+        let interrupt: Value = serde_json::from_slice(&output).unwrap();
+        output.clear();
+        handle_response(
+            json!({"id": interrupt["id"], "error": {"code": -32000, "message": "busy"}}),
+            &mut output,
+            &events,
+            &mut pending,
+            &mut sessions,
+            &mut next_id,
+            &AgentRuntimePolicy::default(),
+        )
+        .await
+        .unwrap();
+        assert!(sessions["agent"].pending_interrupt_turn_id.is_none());
+
+        stop_session(
+            "agent".into(),
+            false,
+            &mut output,
+            &events,
+            &mut pending,
+            &mut sessions,
+            &mut next_id,
+        )
+        .await
+        .unwrap();
+        let retry: Value = serde_json::from_slice(&output).unwrap();
+        assert_eq!(retry["method"], "turn/interrupt");
+        assert_eq!(retry["params"]["turnId"], "turn");
     }
 
     #[tokio::test]

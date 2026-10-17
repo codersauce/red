@@ -10482,11 +10482,14 @@ impl Editor {
                 .await?;
             return Ok(false);
         }
-        if self.agent_manager.is_session_active(&session_id) {
-            self.set_legacy_message(Some(
-                "a Codex prompt is already active for this session".to_string(),
-            ));
-            return Ok(true);
+        if self.agent_manager.is_session_busy(&session_id) {
+            // A cancelled turn keeps running until Codex confirms the interrupt;
+            // holding the prompt avoids racing that turn's terminal event.
+            self.agent_manager.queue_prompt(
+                session_id,
+                agent_manager::QueuedAgentPrompt { text, context },
+            );
+            return Ok(false);
         }
         let turn_id = uuid::Uuid::new_v4().to_string();
         self.begin_inline_agent_outcome(&session_id, &turn_id, &text)?;
@@ -10923,6 +10926,10 @@ impl Editor {
         self.stop_inline_agent_outcomes(fallback);
         drop(self.agent_manager.take_bridge());
         self.agent_manager.clear_active_sessions();
+        let dropped_prompts = self.agent_manager.discard_all_queued_prompts();
+        if dropped_prompts > 0 {
+            log!("Codex app-server stopped with {dropped_prompts} queued prompt(s) unsent");
+        }
         self.agent_manager.clear_turns();
         self.agent_manager.clear_tool_requests();
         self.agent_manager.set_root(None);
@@ -11360,14 +11367,22 @@ impl Editor {
                 ),
                 _ => {}
             }
-            if let CodexEvent::Completed { session_id, .. }
-            | CodexEvent::Cancelled { session_id }
-            | CodexEvent::Failed {
-                session_id: Some(session_id),
-                ..
-            } = &event
-            {
-                self.agent_manager.mark_session_inactive(session_id);
+            let mut next_prompt = None;
+            match &event {
+                CodexEvent::Completed { session_id, .. }
+                | CodexEvent::Failed {
+                    session_id: Some(session_id),
+                    ..
+                } => {
+                    next_prompt = self
+                        .agent_manager
+                        .finish_turn(session_id)
+                        .map(|prompt| (session_id.clone(), prompt));
+                }
+                CodexEvent::Cancelled { session_id } => {
+                    self.agent_manager.mark_session_inactive(session_id);
+                }
+                _ => {}
             }
             match &event {
                 CodexEvent::Update { session_id, .. }
@@ -11411,6 +11426,14 @@ impl Editor {
                 object.insert("elapsed_ms".to_string(), json!(elapsed_ms));
             }
             self.plugin_registry.notify(runtime, name, payload).await?;
+            if let Some((session_id, prompt)) = next_prompt {
+                if self
+                    .dispatch_agent_prompt(runtime, session_id, prompt.text, prompt.context)
+                    .await?
+                {
+                    self.render(buffer)?;
+                }
+            }
         }
         if self.agent_manager.is_task_finished()
             && self
@@ -11807,7 +11830,7 @@ impl Editor {
                         .await?;
                 }
                 PluginRequest::AgentCancel { session_id } => {
-                    self.agent_manager.mark_session_inactive(&session_id);
+                    self.agent_manager.begin_stopping(&session_id);
                     let Some(bridge) = self.agent_manager.bridge() else {
                         continue;
                     };
@@ -11832,6 +11855,7 @@ impl Editor {
                         Some("Agent session closed."),
                     );
                     self.agent_manager.mark_session_inactive(&session_id);
+                    self.agent_manager.discard_session_queue(&session_id);
                     let Some(bridge) = self.agent_manager.bridge() else {
                         continue;
                     };
@@ -38592,6 +38616,81 @@ builtin = "rust"
         assert!(!editor.agent_manager.has_bridge());
         assert!(!editor.agent_manager.is_task_finished());
         assert!(!editor.agent_manager.is_session_active("session-1"));
+        drain_plugin_requests();
+    }
+
+    #[tokio::test]
+    async fn prompt_sent_during_a_cancel_runs_after_the_interrupted_turn_ends() {
+        fn prompt_text(command: Option<CodexCommand>) -> Option<String> {
+            match command? {
+                CodexCommand::Prompt { text, .. }
+                | CodexCommand::PromptWithContext { text, .. } => Some(text),
+                _ => None,
+            }
+        }
+        drain_plugin_requests();
+        let mut editor = test_editor(/*width*/ 80, /*height*/ 24);
+        let (bridge, mut worker) = CodexBridge::channel(NonZeroUsize::new(8).unwrap());
+        editor.agent_manager.set_bridge(bridge);
+        let mut buffer =
+            RenderBuffer::new(/*width*/ 80, /*height*/ 24, &Style::default());
+        let mut runtime = Runtime::new();
+        let prompt = |text: &str| PluginRequest::AgentPrompt {
+            session_id: "session-1".to_string(),
+            text: text.to_string(),
+        };
+
+        ACTION_DISPATCHER.send_request(prompt("first"));
+        editor
+            .service_background(&mut buffer, &mut runtime)
+            .await
+            .unwrap();
+        assert_eq!(prompt_text(worker.recv().await).as_deref(), Some("first"));
+
+        ACTION_DISPATCHER.send_request(PluginRequest::AgentCancel {
+            session_id: "session-1".to_string(),
+        });
+        editor
+            .service_background(&mut buffer, &mut runtime)
+            .await
+            .unwrap();
+        assert!(matches!(
+            worker.recv().await,
+            Some(CodexCommand::Cancel { .. })
+        ));
+        // The worker acknowledges the cancel before Codex finishes the turn.
+        worker
+            .send(CodexEvent::Cancelled {
+                session_id: "session-1".to_string(),
+            })
+            .await
+            .unwrap();
+        ACTION_DISPATCHER.send_request(prompt("second"));
+        editor
+            .service_background(&mut buffer, &mut runtime)
+            .await
+            .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), worker.recv())
+                .await
+                .is_err(),
+            "the follow-up must wait for the interrupted turn to end"
+        );
+
+        worker
+            .send(CodexEvent::Completed {
+                session_id: "session-1".to_string(),
+                stop_reason: "interrupted".to_string(),
+            })
+            .await
+            .unwrap();
+        editor
+            .service_background(&mut buffer, &mut runtime)
+            .await
+            .unwrap();
+
+        assert_eq!(prompt_text(worker.recv().await).as_deref(), Some("second"));
+        assert!(editor.agent_manager.is_session_active("session-1"));
         drain_plugin_requests();
     }
 
