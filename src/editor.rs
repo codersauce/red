@@ -19,6 +19,7 @@ mod agent_annotations;
 mod agent_lsp;
 mod agent_manager;
 mod agent_models;
+mod agent_pane;
 mod buffer_actions;
 mod buffer_do;
 mod buffer_manager;
