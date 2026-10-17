@@ -51,6 +51,7 @@ mod navigation_perf_tests;
 mod notifications;
 mod package_actions;
 pub(crate) mod perf;
+mod plugin_status;
 pub mod render_buffer;
 pub mod rendering;
 #[cfg(test)]
@@ -1909,6 +1910,24 @@ pub enum PluginRequest {
     ClosePicker {
         id: i32,
     },
+    /// The registry stopped `plugin` for the session; tell the user and close
+    /// the dialogs whose callbacks it can no longer answer.
+    PluginQuarantined {
+        plugin: String,
+        stage: String,
+        path: String,
+        diagnostic: String,
+        pickers: Vec<PickerHandle>,
+        composers: Vec<ComposerHandle>,
+    },
+    /// A `request` result did not fit in `plugin`'s free heap, so its callback
+    /// was skipped instead of failing inside the plugin.
+    PluginResultDropped {
+        plugin: String,
+        request: String,
+        needed: usize,
+        available: usize,
+    },
     BufferInsert {
         x: usize,
         y: usize,
@@ -2278,6 +2297,8 @@ impl PluginRequest {
             Self::UpdatePickerBusy { .. } => "UpdatePickerBusy",
             Self::UpdatePickerPreview { .. } => "UpdatePickerPreview",
             Self::ClosePicker { .. } => "ClosePicker",
+            Self::PluginQuarantined { .. } => "PluginQuarantined",
+            Self::PluginResultDropped { .. } => "PluginResultDropped",
             Self::BufferInsert { .. } => "BufferInsert",
             Self::BufferDelete { .. } => "BufferDelete",
             Self::BufferReplace { .. } => "BufferReplace",
@@ -2907,6 +2928,7 @@ pub enum Action {
     SaveStatuslineLayout(StatuslineConfig),
     CancelStatuslineLayout(StatuslineConfig),
     ConfigDiagnostics,
+    PluginStatus,
     ReloadLanguages,
     ShowDialog,
     CloseDialog,
@@ -3945,6 +3967,10 @@ impl DetachedEditorCore {
         for (name, path) in &editor.config.plugins {
             let path = Config::resolve_plugin_path(path);
             editor.plugin_registry.add(name, path.as_str());
+        }
+        for (name, path) in &editor.config.disabled_plugin_paths {
+            let path = Config::resolve_plugin_path(path);
+            editor.plugin_registry.add_disabled(name, path.as_str());
         }
         editor.plugin_registry.initialize(&mut runtime).await?;
         editor
@@ -10565,6 +10591,10 @@ impl Editor {
                 let path = Config::resolve_plugin_path(path);
                 self.plugin_registry.add(name, path.as_str());
             }
+            for (name, path) in &self.config.disabled_plugin_paths {
+                let path = Config::resolve_plugin_path(path);
+                self.plugin_registry.add_disabled(name, path.as_str());
+            }
             self.plugin_registry.initialize(runtime).await?;
             self.plugin_registry
                 .notify(runtime, "editor:ready", json!({}))
@@ -12121,6 +12151,37 @@ impl Editor {
                         needs_render = true;
                     }
                 }
+                PluginRequest::PluginQuarantined {
+                    plugin,
+                    stage,
+                    path,
+                    diagnostic,
+                    pickers,
+                    composers,
+                } => {
+                    if self.current_dialog.as_ref().is_some_and(|dialog| {
+                        dialog
+                            .picker_id()
+                            .is_some_and(|id| pickers.iter().any(|handle| handle.get() == id))
+                            || dialog
+                                .composer_handle()
+                                .is_some_and(|handle| composers.contains(&handle))
+                    }) {
+                        self.release_current_dialog_callbacks(runtime);
+                        self.current_dialog = None;
+                    }
+                    self.publish_plugin_quarantine(&plugin, &stage, &path, &diagnostic);
+                    needs_render = true;
+                }
+                PluginRequest::PluginResultDropped {
+                    plugin,
+                    request,
+                    needed,
+                    available,
+                } => {
+                    self.publish_plugin_result_dropped(&plugin, &request, needed, available);
+                    needs_render = true;
+                }
                 PluginRequest::BufferInsert { x, y, text } => {
                     self.begin_transaction("plugin insert");
                     self.replace_range(TextRange::insertion(TextPosition::new(y, x)), &text);
@@ -13379,6 +13440,10 @@ impl Editor {
                 repeat_signature: None,
                 navigation_deferred: false,
             });
+        }
+
+        if let Some(action) = self.pending_completion_commit() {
+            self.execute(&action, buffer, runtime).await?;
         }
 
         let render_generation = self.render_generation;
@@ -16168,18 +16233,6 @@ impl Editor {
             let action = current_dialog.handle_event(ev);
             let allows_passthrough = current_dialog.allows_event_passthrough();
             if action.is_some() || !allows_passthrough {
-                let action = match (action, ev) {
-                    (
-                        Some(action),
-                        Event::Key(KeyEvent {
-                            code: KeyCode::Char(c),
-                            ..
-                        }),
-                    ) if allows_passthrough && self.is_completion_trigger_char(*c) => {
-                        Some(Self::retrigger_after_completion_commit(action, *c))
-                    }
-                    (action, _) => action,
-                };
                 return Ok(action);
             }
         }
@@ -16964,6 +17017,7 @@ impl Editor {
             | Action::OpenDiagnosticsPicker
             | Action::OpenErrorDiagnosticsPicker
             | Action::ConfigDiagnostics
+            | Action::PluginStatus
             | Action::Suspend
             | Action::ViewLogs
             | Action::OpenMessages
@@ -17463,6 +17517,9 @@ impl Editor {
         }
         if cmd == "config-diagnostics" {
             return vec![Action::ConfigDiagnostics];
+        }
+        if cmd == "plugin-status" {
+            return vec![Action::PluginStatus];
         }
         if matches!(
             cmd,
@@ -23740,6 +23797,11 @@ impl Editor {
                 self.open_config_diagnostics();
                 self.render(buffer)?;
             }
+            Action::PluginStatus => {
+                self.release_current_dialog_callbacks(runtime);
+                self.open_plugin_status();
+                self.render(buffer)?;
+            }
             Action::ReloadLanguages => {
                 match self.reload_languages().await {
                     Ok(count) => {
@@ -24323,6 +24385,9 @@ impl Editor {
                 {
                     self.apply_completion(item, *commit_character, runtime)
                         .await?;
+                } else {
+                    self.close_completion_popup();
+                    self.completion_snapshot = None;
                 }
                 self.render(buffer)?;
             }
@@ -27356,21 +27421,45 @@ impl Editor {
 
     async fn execute_plugin_command(
         &mut self,
-        _render_buffer: &mut RenderBuffer,
+        render_buffer: &mut RenderBuffer,
         runtime: &mut Runtime,
         command: &str,
     ) -> anyhow::Result<()> {
+        if let Some(warning) = self
+            .plugin_registry
+            .quarantined_command_warning(runtime, command)
+        {
+            self.set_routine_foreground_message(Severity::Warning, warning);
+            self.draw_commandline(render_buffer);
+            return Ok(());
+        }
         let document = self.current_buffer().id();
         match self
             .plugin_registry
             .start_rpc_command(runtime, command, document)
             .await
         {
-            Ok(Some(token)) => self.rpc_commands.started(token),
+            Ok(Some(token)) => {
+                if token.awaits_activation(&self.plugin_registry) {
+                    let name = crate::command::split_invocation(command).0;
+                    self.set_routine_foreground_message(
+                        Severity::Info,
+                        format!(
+                            "plugin `{}` is starting; `{name}` runs once it is ready",
+                            token.owner()
+                        ),
+                    );
+                    self.draw_commandline(render_buffer);
+                }
+                self.rpc_commands.started(token);
+            }
             Ok(None) => return self.plugin_registry.execute(runtime, command).await,
-            Err(error) => runtime.send_request(PluginRequest::Action(Action::PrintWarning(
-                error.to_string(),
-            ))),
+            // A refusal answers this keypress, so it must replace the foreground
+            // "is starting" notice instead of queuing behind it until it expires.
+            Err(error) => {
+                self.set_routine_foreground_message(Severity::Warning, error.to_string());
+                self.draw_commandline(render_buffer);
+            }
         }
         Ok(())
     }
@@ -27656,6 +27745,7 @@ impl Editor {
             "buffer_index": buffer_index,
             "document_id": pending.buffer_id,
             "revision": pending.revision,
+            "total": symbols.len(),
             "symbols": symbols,
         }))
     }
@@ -27668,6 +27758,7 @@ impl Editor {
 
         Ok(json!({
             "ok": true,
+            "total": symbols.len(),
             "symbols": symbols,
         }))
     }
@@ -27696,6 +27787,7 @@ impl Editor {
             "ok": true,
             "file": file,
             "position": position,
+            "total": references.len(),
             "references": references,
         }))
     }
@@ -30575,25 +30667,6 @@ impl Editor {
         KeyAction::Multiple(actions)
     }
 
-    fn retrigger_after_completion_commit(action: KeyAction, c: char) -> KeyAction {
-        let KeyAction::Multiple(mut actions) = action else {
-            return action;
-        };
-        let committed = actions.iter().any(|action| {
-            matches!(
-                action,
-                Action::ApplyCompletion {
-                    commit_character: Some(character),
-                    ..
-                } if *character == c
-            )
-        });
-        if committed {
-            actions.push(Action::RequestCompletionWithTrigger(c));
-        }
-        KeyAction::Multiple(actions)
-    }
-
     fn handle_trigger_char(&mut self, c: char) -> anyhow::Result<Option<KeyAction>> {
         if !self.is_completion_trigger_char(c) {
             return Ok(None);
@@ -30969,6 +31042,11 @@ impl Editor {
         commit_character: Option<char>,
         runtime: &mut Runtime,
     ) -> anyhow::Result<()> {
+        let continuation = self.coordinated_completion_continuation(item, commit_character);
+        self.close_completion_popup();
+        // Taken before the rejections below: a lingering snapshot would let a
+        // delayed response past the dismissal guard and reopen the popup.
+        let snapshot = self.completion_snapshot.take();
         if !self.config.completion.enabled {
             return Ok(());
         }
@@ -30982,8 +31060,6 @@ impl Editor {
             ));
             return Ok(());
         }
-        let continuation = self.coordinated_completion_continuation(item, commit_character);
-        let snapshot = self.completion_snapshot.take();
         if snapshot
             .as_ref()
             .is_some_and(|snapshot| !self.completion_snapshot_is_current(snapshot))
@@ -31100,6 +31176,10 @@ impl Editor {
 
         if let Some(continuation) = continuation {
             self.restore_coordinated_completion(continuation);
+        }
+
+        if let Some(character) = commit_character.filter(|c| self.is_completion_trigger_char(*c)) {
+            self.request_completion(Some(character)).await?;
         }
 
         Ok(())
@@ -35495,6 +35575,97 @@ mod test {
 
     fn drain_plugin_requests() {
         while ACTION_DISPATCHER.try_recv_request().is_some() {}
+    }
+
+    #[tokio::test]
+    async fn dropped_plugin_result_is_reported_as_a_plugin_warning() {
+        drain_plugin_requests();
+        let mut core = DetachedEditorCore::new(test_editor(100, 12)).await.unwrap();
+
+        ACTION_DISPATCHER.send_request(PluginRequest::PluginResultDropped {
+            plugin: "reader".to_string(),
+            request: "GetBufferText".to_string(),
+            needed: 70 * 1024 * 1024,
+            available: 60 * 1024 * 1024,
+        });
+        core.tick().await.unwrap();
+
+        let notice = core.editor.notifications.records().next_back().unwrap();
+        assert_eq!(notice.severity, Severity::Warning);
+        assert_eq!(notice.source.label(), "reader");
+        assert_eq!(
+            notice.content.summary,
+            "dropped a GetBufferText result too large for its memory (70.0 MiB needed, 60.0 MiB free)"
+        );
+        let details = notice.content.details.as_deref().unwrap();
+        assert!(details.contains("Request: GetBufferText"), "{details}");
+        assert!(
+            details.contains("instead of stopping the plugin"),
+            "{details}"
+        );
+    }
+
+    #[tokio::test]
+    async fn plugin_quarantine_closes_only_its_dialog_and_reports_the_plugin() {
+        drain_plugin_requests();
+        let mut core = DetachedEditorCore::new(test_editor(80, 12)).await.unwrap();
+        let owned = PickerHandle::from_raw(7);
+        let picker = Picker::new_callback(
+            Some("Workspace Symbols".to_string()),
+            &core.editor,
+            Vec::new(),
+            owned,
+            PickerOptions::default(),
+        );
+        core.editor.current_dialog = Some(Box::new(picker));
+        let quarantined = |pickers: Vec<PickerHandle>| {
+            PluginRequest::PluginQuarantined {
+            plugin: "lsp_symbols".to_string(),
+            stage: "runtime".to_string(),
+            path: "plugins/lsp_symbols.hk".to_string(),
+            diagnostic: "error[HUSK-R0001]: Husk heap byte limit exceeded\n  --> plugins/lsp_symbols.hk:413:9"
+                .to_string(),
+            pickers,
+            composers: Vec::new(),
+        }
+        };
+
+        ACTION_DISPATCHER.send_request(quarantined(vec![PickerHandle::from_raw(8)]));
+        core.tick().await.unwrap();
+        assert_eq!(
+            core.editor
+                .current_dialog
+                .as_ref()
+                .and_then(|dialog| dialog.picker_id()),
+            Some(owned.get())
+        );
+
+        ACTION_DISPATCHER.send_request(quarantined(vec![owned]));
+        core.tick().await.unwrap();
+        assert!(core.editor.current_dialog.is_none());
+
+        let editor = &core.editor;
+        assert_eq!(editor.notifications.records().len(), 1);
+        let notice = editor.notifications.records().next_back().unwrap();
+        assert_eq!(notice.severity, Severity::Error);
+        assert_eq!(notice.source.label(), "lsp_symbols");
+        assert_eq!(notice.occurrences, 2);
+        assert_eq!(
+            notice.content.summary,
+            "stopped for this session: error[HUSK-R0001]: Husk heap byte limit exceeded"
+        );
+        let details = notice.content.details.as_deref().unwrap();
+        assert!(details.contains("Stage: runtime"), "{details}");
+        assert!(
+            details.contains("Source: plugins/lsp_symbols.hk"),
+            "{details}"
+        );
+        assert!(
+            details.contains("--> plugins/lsp_symbols.hk:413:9"),
+            "{details}"
+        );
+        assert!(details.contains("Restart Red"), "{details}");
+        assert!(notice.needs_attention(Instant::now()));
     }
 
     fn collect_print_requests() -> Vec<String> {
@@ -43724,26 +43895,6 @@ builtin = "rust"
         ));
     }
 
-    #[test]
-    fn committed_trigger_character_requests_member_completion() {
-        let action = KeyAction::Multiple(vec![
-            Action::ApplyCompletion {
-                item: Box::new(completion_item("torch")),
-                commit_character: Some('.'),
-            },
-            Action::CloseDialog,
-        ]);
-
-        let KeyAction::Multiple(actions) = Editor::retrigger_after_completion_commit(action, '.')
-        else {
-            panic!("expected ordered completion actions");
-        };
-        assert!(matches!(
-            actions.last(),
-            Some(Action::RequestCompletionWithTrigger('.'))
-        ));
-    }
-
     #[tokio::test]
     async fn delayed_lsp_completion_selects_its_best_match_over_buffer_words() {
         let mut editor = completion_typing_editor();
@@ -43807,6 +43958,153 @@ builtin = "rust"
             .unwrap();
 
         assert_eq!(editor.current_buffer().contents(), "torch.many");
+        assert!(editor.current_dialog.is_none());
+    }
+
+    /// Minimal client whose managed-server identity can change mid-test.
+    struct RestartableLsp {
+        instance: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    }
+
+    #[async_trait::async_trait]
+    impl LspClient for RestartableLsp {
+        async fn initialize(&mut self) -> Result<(), crate::lsp::LspError> {
+            Ok(())
+        }
+
+        async fn did_open(
+            &mut self,
+            _file: &str,
+            _contents: &str,
+        ) -> Result<(), crate::lsp::LspError> {
+            Ok(())
+        }
+
+        async fn did_change(
+            &mut self,
+            _file: &str,
+            _contents: String,
+        ) -> Result<(), crate::lsp::LspError> {
+            Ok(())
+        }
+
+        async fn request_diagnostics(
+            &mut self,
+            _file_uri: &str,
+        ) -> Result<Option<i64>, crate::lsp::LspError> {
+            Ok(None)
+        }
+
+        async fn send_request(
+            &mut self,
+            _method: &str,
+            _params: serde_json::Value,
+            _force: bool,
+        ) -> Result<i64, crate::lsp::LspError> {
+            Ok(0)
+        }
+
+        async fn send_notification(
+            &mut self,
+            _method: &str,
+            _params: serde_json::Value,
+            _force: bool,
+        ) -> Result<(), crate::lsp::LspError> {
+            Ok(())
+        }
+
+        async fn request_completion(
+            &mut self,
+            _file_uri: &str,
+            _line: usize,
+            _character: usize,
+            _trigger_character: Option<char>,
+        ) -> Result<i64, crate::lsp::LspError> {
+            Ok(0)
+        }
+
+        async fn recv_response(
+            &mut self,
+        ) -> Result<Option<(InboundMessage, Option<String>)>, crate::lsp::LspError> {
+            Ok(None)
+        }
+
+        fn get_server_capabilities(&self) -> Option<&ServerCapabilities> {
+            None
+        }
+
+        async fn shutdown(&mut self) -> Result<(), crate::lsp::LspError> {
+            Ok(())
+        }
+
+        fn server_instance_for_file(&self, _file: &str) -> Option<u64> {
+            Some(self.instance.load(std::sync::atomic::Ordering::SeqCst))
+        }
+    }
+
+    #[tokio::test]
+    async fn rejected_stale_completion_dismisses_the_session_for_late_responses() {
+        let instance = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1));
+        let config: Config = toml::from_str(include_str!("../default_config.toml")).unwrap();
+        let lsp = Box::new(RestartableLsp {
+            instance: std::sync::Arc::clone(&instance),
+        });
+        let buffer = Buffer::new(None, "torch.man".to_string());
+        let mut editor =
+            Editor::with_size(lsp, 80, 24, config, Theme::default(), vec![buffer]).unwrap();
+        editor.test_disable_terminal_output();
+        editor.mode = Mode::Insert;
+        editor.cx = "torch.man".chars().count();
+        editor.refresh_cursor_goal();
+        editor.sync_to_window();
+
+        let mut stale_item = completion_item("manual_seed");
+        stale_item.source = Some(LspRequestSource {
+            key: "torch.py".to_string(),
+            instance: 1,
+        });
+        let request_snapshot = editor.completion_snapshot();
+        assert!(editor.show_completion_items(vec![stale_item], request_snapshot));
+        let pending_snapshot = editor.completion_snapshot.clone().unwrap();
+        editor.pending_completions.insert(
+            42,
+            PendingCompletion {
+                buffer_items: Vec::new(),
+                snapshot: pending_snapshot,
+                displayed_immediately: true,
+                superseded: false,
+            },
+        );
+
+        // The server restarts between displaying the menu and accepting the item.
+        instance.store(2, std::sync::atomic::Ordering::SeqCst);
+        let mut render_buffer = RenderBuffer::new(80, 24, &Style::default());
+        let mut runtime = Runtime::new();
+        editor
+            .process_editor_event(
+                Event::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)),
+                &mut render_buffer,
+                &mut runtime,
+                EventRenderMode::Immediate,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(editor.current_buffer().contents(), "torch.man");
+        assert!(editor.current_dialog.is_none());
+        assert!(editor.completion_snapshot.is_none());
+
+        let late_response = InboundMessage::Message(ResponseMessage {
+            id: 42,
+            result: serde_json::json!([{ "label": "manual" }]),
+            request: Some(crate::lsp::Request::new(
+                "textDocument/completion",
+                serde_json::json!({ "position": { "line": 0, "character": 9 } }),
+            )),
+        });
+        assert!(editor
+            .handle_lsp_message(&late_response, Some("textDocument/completion".to_string()))
+            .is_none());
         assert!(editor.current_dialog.is_none());
     }
 
@@ -44158,11 +44456,11 @@ builtin = "rust"
             .unwrap();
 
         let tab = Event::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
-        let KeyAction::Multiple(actions) = editor.handle_event(&tab).unwrap().unwrap() else {
-            panic!("expected completion application and close actions");
+        let KeyAction::Single(action) = editor.handle_event(&tab).unwrap().unwrap() else {
+            panic!("expected completion application action");
         };
         editor
-            .execute(&actions[0], &mut render_buffer, &mut runtime)
+            .execute(&action, &mut render_buffer, &mut runtime)
             .await
             .unwrap();
 
@@ -44171,10 +44469,6 @@ builtin = "rust"
             .last_error
             .as_deref()
             .is_some_and(|error| error.contains("stale")));
-        editor
-            .execute(&actions[1], &mut render_buffer, &mut runtime)
-            .await
-            .unwrap();
         assert!(editor.current_dialog.is_none());
     }
 
@@ -44426,12 +44720,9 @@ builtin = "rust"
         ));
         let tab = Event::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
         let action = editor.handle_event(&tab).unwrap().unwrap();
-        let KeyAction::Multiple(actions) = action else {
-            panic!("expected completion application action");
-        };
         assert!(matches!(
-            actions.first(),
-            Some(Action::ApplyCompletion { item, .. }) if item.label == "xb"
+            action,
+            KeyAction::Single(Action::ApplyCompletion { item, .. }) if item.label == "xb"
         ));
     }
 
@@ -44526,6 +44817,7 @@ builtin = "rust"
             .plugin_document_symbols_payload(&response, &pending)
             .unwrap();
         assert_eq!(payload["buffer_index"], 0);
+        assert_eq!(payload["total"], 0);
         assert_eq!(payload["document_id"], json!(pending.buffer_id));
         assert_eq!(
             editor.plugin_windows_payload()["windows"][0]["document_id"],
@@ -44821,6 +45113,7 @@ builtin = "rust"
         let symbols = payload["symbols"].as_array().unwrap();
 
         assert_eq!(payload["ok"], true);
+        assert_eq!(payload["total"], 1);
         assert_eq!(symbols.len(), 1);
         assert_eq!(symbols[0]["name"], "build");
         assert_eq!(symbols[0]["detail"], "tools");
@@ -44867,6 +45160,7 @@ builtin = "rust"
         assert_eq!(payload["file"], "/tmp/project/src/main.rs");
         assert_eq!(payload["position"]["line"], 3);
         assert_eq!(payload["position"]["character"], 5);
+        assert_eq!(payload["total"], 2);
         assert_eq!(references.len(), 2);
         assert_eq!(references[0]["file"], "/tmp/project/src/main.rs");
         assert_eq!(references[1]["file"], "/tmp/project/src/lib.rs");
@@ -44897,18 +45191,16 @@ builtin = "rust"
             )),
         };
 
-        assert_eq!(
-            editor
-                .plugin_workspace_symbols_payload(&workspace_response)
-                .unwrap()["symbols"],
-            serde_json::json!([])
-        );
-        assert_eq!(
-            editor
-                .plugin_references_payload(&references_response)
-                .unwrap()["references"],
-            serde_json::json!([])
-        );
+        let workspace = editor
+            .plugin_workspace_symbols_payload(&workspace_response)
+            .unwrap();
+        assert_eq!(workspace["symbols"], serde_json::json!([]));
+        assert_eq!(workspace["total"], 0);
+        let references = editor
+            .plugin_references_payload(&references_response)
+            .unwrap();
+        assert_eq!(references["references"], serde_json::json!([]));
+        assert_eq!(references["total"], 0);
     }
 
     #[test]

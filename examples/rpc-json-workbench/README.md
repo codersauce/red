@@ -95,8 +95,10 @@ Visual selection, pending motions, and links under Enter keep precedence over
 these panel actions.
 
 Panel and live-preview runs use background work so Cancel and Close remain
-responsive. `JsonRun` and `JsonQuery` keep their synchronous command responses;
-use `JsonCancel` to interrupt a command-triggered query. Copy writes the complete
+responsive. Use `JsonCancel` to stop these background previews. `JsonRun` and
+`JsonQuery` keep their synchronous command responses; another command in the
+same plugin reports busy until the foreground query finishes or reaches its
+timeout (five seconds by default). Copy writes the complete
 result to the system clipboard without giving the plugin read access, then shows
 a transient success message while leaving the durable ready status intact.
 `JsonCopy` provides the same explicit copy operation from the command line.

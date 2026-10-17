@@ -117,7 +117,7 @@ fn default_path_filter_score(
     Some((kind, Reverse(score)))
 }
 
-const MIN_HORIZONTAL_PREVIEW_PANE_WIDTH: usize = 40;
+pub(crate) const MIN_HORIZONTAL_PREVIEW_PANE_WIDTH: usize = 40;
 const MAX_PREVIEW_HIGHLIGHT_BYTES: usize = 64 * 1024;
 const MAX_COMPLETE_LOCATION_PREVIEW_BYTES: u64 = 32 * 1024;
 const MAX_CACHED_PREVIEW_HIGHLIGHT_SPANS: usize = 4_096;

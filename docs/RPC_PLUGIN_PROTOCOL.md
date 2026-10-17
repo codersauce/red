@@ -114,7 +114,7 @@ The version 1 initialization parameters are:
 ```json
 {
   "protocol_versions": [1],
-  "red_api_version": "0.19.0",
+  "red_api_version": "0.20.0",
   "plugin_id": "document-tools",
   "host_methods": [
     "red/DocumentCreate",
@@ -248,6 +248,12 @@ until its replacement validates, then its resources are cleared during the
 swap. Notifications and host responses enter the bounded writer queue without
 waiting for a child pipe acknowledgement. Eager plugins still initialize before
 the editor first opens.
+
+A plugin must answer `initialize` within 5 seconds, or Red quarantines it. The
+command that starts a lazy plugin waits for that answer, and Red shows that the
+plugin is starting. Another command for the same plugin is rejected with a
+"still starting" warning until the first one runs. A plugin started by an event
+rejects commands the same way until its activation finishes.
 
 ## Configuration and storage
 

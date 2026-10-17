@@ -1,6 +1,6 @@
 # Plugin compatibility
 
-Red host API version `0.19.0` is defined by
+Red host API version `0.20.0` is defined by
 [`src/plugin/host_api.json`](../src/plugin/host_api.json). That file is the canonical,
 machine-readable list of execute actions, request actions, signatures, and introduction
 versions. Runtime dispatch and the bundled-plugin corpus are checked against it in tests.
@@ -24,11 +24,11 @@ required/optional arity (`HUSK-A0002`) and obvious literal argument types
 annotations use `HUSK-A0004`. `--no-typecheck` is an unsupported development
 escape hatch; compatibility guarantees do not apply while it is enabled.
 
-Host API `0.19.0` retains the complete `0.4.0`, `0.6.0`, `0.7.0`,
+Host API `0.20.0` retains the complete `0.4.0`, `0.6.0`, `0.7.0`,
 `0.8.0`, `0.9.0`,
-`0.10.0`, `0.11.0`, `0.12.0`, `0.14.0`, `0.16.0`, `0.17.0`, and `0.18.0`
+`0.10.0`, `0.11.0`, `0.12.0`, `0.14.0`, `0.16.0`, `0.17.0`, `0.18.0`, and `0.19.0`
 contracts, so existing packages that declare those minors continue to load. New
-packages should target `"red_api_version": "^0.19.0"`.
+packages should target `"red_api_version": "^0.20.0"`.
 
 ## Standalone JSON-RPC packages
 
@@ -499,9 +499,12 @@ Codex app-server updates other than assistant text chunks are forwarded to plugi
 ## Quarantine and self-check
 
 Plugins load independently. Source, version, dependency, compile, activation, and runtime
-failures quarantine only their owner. `red --self-check` prints every bundled plugin's
-status. Required plugin dependencies must be active or the dependent plugin is
-quarantined with the dependency chain.
+failures quarantine only their owner. In the editor, `:plugin-status` lists every
+configured plugin's state for the session (active, starting, loads on first use,
+disabled, or quarantined), with the stage and full reason for each quarantine.
+`red --self-check` prints every bundled plugin's status. Required plugin dependencies must be active or the dependent plugin is
+quarantined with the dependency chain. A request result too large for a plugin's memory
+does not quarantine it; see [Oversized request results](#oversized-request-results).
 
 Plugin subprocesses inherit only the standard execution, locale, temporary-directory,
 platform, and SSH-agent environment keys. Explicit environment overrides remain
@@ -509,6 +512,26 @@ allowlisted. Process stdin is limited to 16 MiB, raw output to 2 MiB, individual
 streaming lines to 256 KiB, and pending process events to 16 (at most roughly 32 MiB
 of payload); oversized output is
 reported without letting an untrusted process grow editor memory indefinitely.
+
+## Oversized request results
+
+Each Husk plugin runs with a 64 MiB heap. Host API `0.20.0` checks each request result
+against the plugin's free heap before any plugin code runs, instead of letting the
+callback fail and quarantine the plugin:
+
+- `DocumentSymbols`, `WorkspaceSymbols`, and `References` results are delivered unchanged
+  when they fit in half of the free heap. Larger ones keep the leading entries of
+  `symbols` or `references` that fit in that half. The other half is the plugin's room to
+  work with the list, for example to build picker items from it.
+- Every successful result of those three requests includes `total`, the number of
+  entries before any trimming. A list shorter than `total` was trimmed. Failed results
+  (`ok: false`) do not include `total`, so read it only after checking `ok`.
+- Any other result is delivered unchanged when it fits in the free heap, and dropped
+  when it does not. A dropped result's callback is not called, the plugin stays active,
+  and Red shows a warning attributed to the plugin with the size it needed and the
+  space it had.
+
+Before `0.20.0`, these results quarantined the plugin.
 
 ## Edit notification boundaries
 

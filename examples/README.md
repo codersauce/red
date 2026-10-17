@@ -20,10 +20,11 @@ the [plugin API](../docs/PLUGIN_API.md#declarative-plugin-authoring).
 [`external-hello-plugin`](external-hello-plugin/) demonstrates the same
 declarative command in a standalone, installable package.
 
-[`rpc-hello-plugin`](rpc-hello-plugin/) demonstrates the baseline JSON-RPC host
-methods while remaining compatible with host API `0.21`.
+[`rpc-hello-plugin`](rpc-hello-plugin/) and
+[`rpc-hello-node-plugin`](rpc-hello-node-plugin/) demonstrate the baseline
+JSON-RPC host methods in Python and Node.js while targeting host API `0.19.0`.
 [`rpc-json-workbench`](rpc-json-workbench/) is a useful Python and `jq` plugin
-that exercises the `0.26` editable-document, live-watch, selection-context,
+that exercises the `0.19.0` editable-document, live-watch, selection-context,
 background-mutation, panel-action, and clipboard surfaces while previewing,
 exploring, applying, copying, and undoing transformations.
 

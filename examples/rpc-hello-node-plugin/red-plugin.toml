@@ -1,0 +1,15 @@
+schema_version = 1
+
+[plugin]
+id = "rpc-hello-node"
+name = "RPC Hello (Node.js)"
+version = "0.1.0"
+red_api = "^0.19.0"
+
+[rpc]
+command = "node"
+args = ["plugin.mjs"]
+
+[activation]
+commands = ["RpcApply", "RpcConfig", "RpcDocument", "RpcHello", "RpcLastEvent", "RpcPanel", "RpcPanelClose", "RpcPicker", "RpcStatusline", "RpcStatuslineClear", "RpcStorage", "RpcStorageClear", "RpcUndo"]
+events = ["file:saved"]

@@ -43,10 +43,14 @@ struct LspLocation {
     range: LspTextRange,
 }
 
+// `total` counts the server's results before Red trimmed a list too large for
+// this plugin's memory. Successful results always carry it; failures do not, so
+// read it only after checking `ok`.
 struct SymbolsResult {
     ok: bool,
     error: String,
     symbols: [LspSymbol],
+    total: i32,
 }
 
 struct ReferencesResult {
@@ -55,6 +59,7 @@ struct ReferencesResult {
     file: String,
     position: Position,
     references: [LspLocation],
+    total: i32,
 }
 
 struct LspSymbolsProgressClient {
@@ -76,6 +81,7 @@ struct LspSymbolsState {
     icon_overrides: Json,
     batch_timer: String,
     batch_index: i32,
+    batch_total: i32,
     batch_picker: Option<i32>,
     batch_kind: String,
     batch_workspace_only: bool,
@@ -96,6 +102,7 @@ fn initial_state() -> LspSymbolsState {
         icon_overrides: Json {},
         batch_timer: "",
         batch_index: 0,
+        batch_total: 0,
         batch_picker: None,
         batch_kind: "",
         batch_workspace_only: false,
@@ -120,6 +127,11 @@ fn initialize_symbol_batches() {
 
 fn state() -> LspSymbolsState {
     return red::state();
+}
+
+// Pickers show at most this many rows, so batches never retain more records.
+fn max_batch_records() -> i32 {
+    return 4096;
 }
 
 fn save_state(value: LspSymbolsState) {
@@ -359,7 +371,7 @@ fn show_document_symbols(result: SymbolsResult, request_id: i32) {
         return;
     }
 
-    if count <= 64 {
+    if count <= 64 && result.total <= count {
         let items = symbol_items(result.symbols, false);
         let handle = red::execute("OpenPicker", "Document Symbols", items, PickerOptions {
             placeholder: "Filter document symbols",
@@ -386,7 +398,7 @@ fn show_document_symbols(result: SymbolsResult, request_id: i32) {
     let current = state();
     current.picker = Some(handle);
     save_state(current);
-    start_symbol_batch(result.symbols, false, handle);
+    start_symbol_batch(result.symbols.slice(0, max_batch_records()), false, handle, result.total);
 }
 
 fn update_workspace_symbols(result: SymbolsResult, request_id: i32) {
@@ -408,10 +420,10 @@ fn update_workspace_symbols(result: SymbolsResult, request_id: i32) {
         return;
     }
 
-    let total = red::len(result.symbols);
-    if total > 64 {
-        start_symbol_batch(result.symbols, true, handle);
-        red::execute("UpdatePickerStatus", handle, "Loading 0/" + total + " symbols");
+    let received = red::len(result.symbols);
+    if received > 64 || result.total > received {
+        start_symbol_batch(result.symbols.slice(0, max_batch_records()), true, handle, result.total);
+        red::execute("UpdatePickerStatus", handle, "Loading 0/" + received + " symbols");
         return;
     }
 
@@ -423,12 +435,13 @@ fn update_workspace_symbols(result: SymbolsResult, request_id: i32) {
     red::execute("UpdatePickerBusy", handle, false);
 }
 
-fn start_symbol_batch(symbols: [LspSymbol], workspace_only: bool, handle: i32) {
+fn start_symbol_batch(symbols: [LspSymbol], workspace_only: bool, handle: i32, total: i32) {
     cancel_symbol_batch();
     let current = state();
     red::state_set("lsp_symbol_batch_symbols", symbols);
     red::state_set("lsp_symbol_batch_items", []);
     current.batch_index = 0;
+    current.batch_total = total;
     current.batch_picker = Some(handle);
     current.batch_kind = "symbols";
     current.batch_workspace_only = workspace_only;
@@ -436,17 +449,18 @@ fn start_symbol_batch(symbols: [LspSymbol], workspace_only: bool, handle: i32) {
     schedule_symbol_batch();
 }
 
-fn start_reference_batch(result: ReferencesResult, handle: i32) {
+fn start_reference_batch(references: [LspLocation], total: i32, file: String, position: Position, handle: i32) {
     cancel_symbol_batch();
     let current = state();
-    red::state_set("lsp_symbol_batch_symbols", result.references);
+    red::state_set("lsp_symbol_batch_symbols", references);
     red::state_set("lsp_symbol_batch_items", []);
     current.batch_index = 0;
+    current.batch_total = total;
     current.batch_picker = Some(handle);
     current.batch_kind = "references";
     current.batch_workspace_only = false;
-    current.reference_file = result.file;
-    current.reference_position = Some(result.position);
+    current.reference_file = file;
+    current.reference_position = Some(position);
     save_state(current);
     schedule_symbol_batch();
 }
@@ -494,7 +508,7 @@ fn symbol_batch_timeout(event: TimerEvent) {
     let kind = current.batch_kind;
     let workspace_only = current.batch_workspace_only;
     let processed = 0;
-    while index < red::len(symbols) && index < 4096 && processed < 64 {
+    while index < red::len(symbols) && processed < 64 {
         let value = symbols[index];
         if kind == "references" {
             let Some(position) = current.reference_position else {
@@ -511,7 +525,7 @@ fn symbol_batch_timeout(event: TimerEvent) {
         processed = processed + 1;
     }
 
-    // Keep the growing result out of helper-call frames and extend it once per batch.
+    // Extend the stored items once per batch, not once per record.
     let current = state();
     let items: [PickerItem] = red::extend(red::state("lsp_symbol_batch_items"), batch);
     red::state_set("lsp_symbol_batch_items", items);
@@ -523,17 +537,21 @@ fn symbol_batch_timeout(event: TimerEvent) {
     if kind == "references" {
         noun = "references";
     }
-    if index < red::len(symbols) && index < 4096 {
+    if index < red::len(symbols) {
         red::execute("UpdatePickerStatus", handle, "Loading " + index + "/" + red::len(symbols) + " " + noun);
         schedule_symbol_batch();
         return;
     }
 
-    if index < red::len(symbols) {
-        red::execute("UpdatePickerStatus", handle, red::len(items) + " " + noun + " (results truncated)");
-    } else {
-        red::execute("UpdatePickerStatus", handle, red::len(items) + " " + noun);
+    let status = red::len(items) + " " + noun;
+    if current.batch_total > red::len(symbols) {
+        status = status + " (results truncated: first " + red::len(symbols) + " of " + current.batch_total;
+        if kind == "symbols" && workspace_only {
+            status = status + "; type to narrow";
+        }
+        status = status + ")";
     }
+    red::execute("UpdatePickerStatus", handle, status);
     if kind == "references" || (kind == "symbols" && workspace_only) {
         red::execute("UpdatePickerBusy", handle, false);
     }
@@ -554,6 +572,7 @@ fn clear_symbol_batch() {
     red::state_set("lsp_symbol_batch_symbols", []);
     red::state_set("lsp_symbol_batch_items", []);
     current.batch_index = 0;
+    current.batch_total = 0;
     current.batch_picker = None;
     current.batch_kind = "";
     current.batch_workspace_only = false;
@@ -588,9 +607,11 @@ fn show_references(result: ReferencesResult, request_id: i32) {
         return;
     }
 
-    if red::len(result.references) > 64 {
-        red::execute("UpdatePickerStatus", handle, "Loading 0/" + red::len(result.references) + " references");
-        start_reference_batch(result, handle);
+    let received = red::len(result.references);
+    if received > 64 || result.total > received {
+        red::execute("UpdatePickerStatus", handle, "Loading 0/" + received + " references");
+        let references = result.references.slice(0, max_batch_records());
+        start_reference_batch(references, result.total, result.file, result.position, handle);
         return;
     }
 

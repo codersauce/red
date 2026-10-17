@@ -66,12 +66,23 @@ pub struct PluginRegistry {
     last_hot_reload_poll: Instant,
     rpc_plugins: HashMap<String, ActiveRpcPlugin>,
     rpc_activations: HashMap<String, PendingRpcPlugin>,
+    /// Plugins the configuration disabled, listed only for status views.
+    disabled: Vec<(String, String)>,
     rpc_retirements: HashMap<String, JoinHandle<()>>,
     rpc_text_panels: HashMap<String, HashMap<String, RpcTextPanel>>,
     rpc_pickers: HashMap<super::PickerHandle, RpcPicker>,
     next_rpc_picker_handle: i32,
     rpc_statuslines: BTreeMap<String, RpcStatuslineContribution>,
     rpc_statusline_dirty: bool,
+    /// Commands of plugins at the time they were quarantined, keyed by command name,
+    /// so invoking one explains why it is unavailable instead of calling it unknown.
+    quarantined_commands: HashMap<String, QuarantinedCommand>,
+}
+
+struct QuarantinedCommand {
+    plugin: String,
+    /// Keeps panel key bindings able to reach the explanation for global commands.
+    scope: CommandScope,
 }
 
 struct RpcStatuslineContribution {
@@ -154,6 +165,19 @@ pub(crate) struct RpcCommandToken {
 impl RpcCommandToken {
     pub(crate) fn id(&self) -> tokio::task::Id {
         self.id
+    }
+
+    pub(crate) fn owner(&self) -> &str {
+        &self.owner
+    }
+
+    /// Whether this command is queued behind its plugin's startup handshake.
+    pub(crate) fn awaits_activation(&self, registry: &PluginRegistry) -> bool {
+        registry
+            .rpc_activations
+            .get(&self.owner)
+            .and_then(|plugin| plugin.command.as_ref())
+            .is_some_and(|command| command.id == self.id)
     }
 
     pub(crate) fn is_pending(&self, registry: &PluginRegistry) -> bool {
@@ -241,7 +265,7 @@ struct RpcCommandResult {
 }
 
 /// Host API version used for plugin compatibility checks.
-pub const RED_HOST_API_VERSION: &str = "0.19.0";
+pub const RED_HOST_API_VERSION: &str = "0.20.0";
 pub(crate) const SUPPORTED_HOST_API_VERSIONS: &[&str] = &[
     "0.4.0",
     "0.6.0",
@@ -255,6 +279,7 @@ pub(crate) const SUPPORTED_HOST_API_VERSIONS: &[&str] = &[
     "0.16.0",
     "0.17.0",
     "0.18.0",
+    "0.19.0",
     RED_HOST_API_VERSION,
 ];
 
@@ -262,6 +287,41 @@ pub(crate) const SUPPORTED_HOST_API_VERSIONS: &[&str] = &[
 struct PluginModification {
     source: Option<SystemTime>,
     metadata: Option<SystemTime>,
+}
+
+/// One configured plugin's state, as the `:plugin-status` view shows it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PluginStatusRow {
+    pub(crate) name: String,
+    pub(crate) path: String,
+    pub(crate) state: PluginSessionState,
+    pub(crate) status: PluginStatus,
+}
+
+/// [`PluginStatus`] refined with whether a pending plugin is starting or lazy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum PluginSessionState {
+    Quarantined,
+    ReloadRejected,
+    Starting,
+    Pending,
+    Active,
+    LoadsOnFirstUse,
+    Disabled,
+}
+
+impl PluginSessionState {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Quarantined => "quarantined",
+            Self::ReloadRejected => "active, reload rejected",
+            Self::Starting => "starting",
+            Self::Pending => "pending",
+            Self::Active => "active",
+            Self::LoadsOnFirstUse => "loads on first use",
+            Self::Disabled => "disabled",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -311,12 +371,14 @@ impl PluginRegistry {
             last_hot_reload_poll: Instant::now(),
             rpc_plugins: HashMap::new(),
             rpc_activations: HashMap::new(),
+            disabled: Vec::new(),
             rpc_retirements: HashMap::new(),
             rpc_text_panels: HashMap::new(),
             rpc_pickers: HashMap::new(),
             next_rpc_picker_handle: -1,
             rpc_statuslines: BTreeMap::new(),
             rpc_statusline_dirty: false,
+            quarantined_commands: HashMap::new(),
         }
     }
 
@@ -571,7 +633,7 @@ impl PluginRegistry {
             }
             Err(error) => {
                 let diagnostic = format!("failed to load plugin metadata: {error}");
-                crate::log!("Plugin `{name}` quarantined during metadata: {diagnostic}");
+                crate::log_warn!("Plugin `{name}` quarantined during metadata: {diagnostic}");
                 self.set_status(
                     name.to_string(),
                     PluginStatus::Quarantined {
@@ -603,6 +665,60 @@ impl PluginRegistry {
         &self.statuses
     }
 
+    /// Records a plugin the configuration disabled, so status views can list it.
+    ///
+    /// It is not registered for activation and has no lifecycle status.
+    pub fn add_disabled(&mut self, name: &str, path: &str) {
+        self.disabled.push((name.to_string(), path.to_string()));
+    }
+
+    /// Describes each configured plugin's session state, in configuration order,
+    /// followed by the disabled plugins.
+    pub(crate) fn status_rows(&self) -> Vec<PluginStatusRow> {
+        let disabled = self
+            .disabled
+            .iter()
+            .filter(|(name, _)| !self.statuses.contains_key(name))
+            .map(|(name, path)| PluginStatusRow {
+                name: name.clone(),
+                path: plugin_display_path(path),
+                state: PluginSessionState::Disabled,
+                status: PluginStatus::Disabled,
+            });
+        self.plugins
+            .iter()
+            .map(|(name, path)| {
+                let status = self
+                    .statuses
+                    .get(name)
+                    .cloned()
+                    .unwrap_or(PluginStatus::Pending);
+                let state = match &status {
+                    PluginStatus::Pending if self.rpc_activations.contains_key(name) => {
+                        PluginSessionState::Starting
+                    }
+                    PluginStatus::Pending if self.metadata.get(name).is_some_and(is_lazy) => {
+                        PluginSessionState::LoadsOnFirstUse
+                    }
+                    PluginStatus::Pending => PluginSessionState::Pending,
+                    PluginStatus::Active => PluginSessionState::Active,
+                    PluginStatus::ActiveWithReloadError { .. } => {
+                        PluginSessionState::ReloadRejected
+                    }
+                    PluginStatus::Disabled => PluginSessionState::Disabled,
+                    PluginStatus::Quarantined { .. } => PluginSessionState::Quarantined,
+                };
+                PluginStatusRow {
+                    name: name.clone(),
+                    path: plugin_display_path(path),
+                    state,
+                    status,
+                }
+            })
+            .chain(disabled)
+            .collect()
+    }
+
     fn set_status(&mut self, name: String, status: PluginStatus) {
         let was_pending = matches!(self.statuses.get(&name), Some(PluginStatus::Pending));
         let is_pending = matches!(&status, PluginStatus::Pending);
@@ -618,6 +734,9 @@ impl PluginRegistry {
 
     /// Activates plugins in dependency order and quarantines independent failures.
     pub async fn initialize(&mut self, runtime: &mut Runtime) -> anyhow::Result<()> {
+        if !self.initialized {
+            self.report_metadata_quarantines(runtime);
+        }
         let mut pending = self.plugins.clone();
         pending.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
         let mut precompiled = if pending.len() >= PARALLEL_PLUGIN_STARTUP_MIN {
@@ -781,6 +900,8 @@ impl PluginRegistry {
         stage: &str,
         diagnostic: String,
     ) {
+        self.remember_quarantined_commands(runtime, name);
+        let (pickers, composers) = runtime.plugin_dialogs(name);
         if let Err(error) = runtime.unload_plugin(name) {
             crate::log!(
                 "{}",
@@ -799,15 +920,141 @@ impl PluginRegistry {
         if let Some(pending) = self.rpc_activations.remove(name) {
             pending.task.abort();
         }
-        crate::log!("Plugin `{name}` quarantined during {stage}: {diagnostic}");
+        crate::log_warn!("Plugin `{name}` quarantined during {stage}: {diagnostic}");
+        let path = plugin_display_path(path);
+        // A dependency cascade and the dependent's own revalidation can quarantine
+        // it twice for one cause; repeating that notice would tell the user nothing.
+        let repeated = matches!(
+            self.statuses.get(name),
+            Some(PluginStatus::Quarantined {
+                stage: previous_stage,
+                diagnostic: previous_diagnostic,
+                ..
+            }) if previous_stage == stage && *previous_diagnostic == diagnostic
+        );
+        if !repeated {
+            runtime.send_request(PluginRequest::PluginQuarantined {
+                plugin: name.to_string(),
+                stage: stage.to_string(),
+                path: path.clone(),
+                diagnostic: diagnostic.clone(),
+                pickers,
+                composers,
+            });
+        }
         self.set_status(
             name.to_string(),
             PluginStatus::Quarantined {
                 stage: stage.to_string(),
-                path: plugin_display_path(path),
+                path,
                 diagnostic,
             },
         );
+    }
+
+    /// Reports metadata failures from [`Self::add`], which runs before a runtime exists.
+    fn report_metadata_quarantines(&self, runtime: &Runtime) {
+        for (name, _) in &self.plugins {
+            if let Some(PluginStatus::Quarantined {
+                stage,
+                path,
+                diagnostic,
+            }) = self.statuses.get(name)
+            {
+                runtime.send_request(PluginRequest::PluginQuarantined {
+                    plugin: name.clone(),
+                    stage: stage.clone(),
+                    path: path.clone(),
+                    diagnostic: diagnostic.clone(),
+                    pickers: Vec::new(),
+                    composers: Vec::new(),
+                });
+            }
+        }
+    }
+
+    /// Records every command `name` registered or declares, before unloading drops them.
+    fn remember_quarantined_commands(&mut self, runtime: &Runtime, name: &str) {
+        let mut commands = runtime
+            .registered_commands()
+            .into_iter()
+            .filter(|command| command.plugin == name)
+            .map(|command| (command.name, command.metadata.scope))
+            .collect::<HashMap<_, _>>();
+        if let Some(active) = self.rpc_plugins.get(name) {
+            commands.extend(
+                active
+                    .commands
+                    .iter()
+                    .map(|(command, metadata)| (command.clone(), metadata.scope)),
+            );
+        }
+        if let Some(metadata) = self.metadata.get(name) {
+            // Declared activation commands run from panels while pending
+            // (`has_pending_command`), so they keep that reach unless the plugin
+            // registered a narrower scope before it was quarantined.
+            for command in metadata
+                .activation_events
+                .iter()
+                .filter_map(|event| event.strip_prefix("onCommand:"))
+            {
+                commands
+                    .entry(command.to_string())
+                    .or_insert(CommandScope::Global);
+            }
+        }
+        self.quarantined_commands
+            .retain(|_, command| command.plugin != name);
+        for (command, scope) in commands {
+            self.quarantined_commands.insert(
+                command,
+                QuarantinedCommand {
+                    plugin: name.to_string(),
+                    scope,
+                },
+            );
+        }
+    }
+
+    /// Returns the record for `command` if the plugin that owned it is still quarantined.
+    fn quarantined_command(&self, command: &str) -> Option<&QuarantinedCommand> {
+        [command, crate::command::split_invocation(command).0]
+            .into_iter()
+            .find_map(|name| self.quarantined_commands.get(name))
+            .filter(|quarantined| {
+                matches!(
+                    self.statuses.get(&quarantined.plugin),
+                    Some(PluginStatus::Quarantined { .. })
+                )
+            })
+    }
+
+    /// Explains why `command` is unavailable when no active plugin provides it
+    /// and the plugin that did is quarantined.
+    pub(crate) fn quarantined_command_warning(
+        &self,
+        runtime: &Runtime,
+        command: &str,
+    ) -> Option<String> {
+        if self.command_plugin(runtime, command).is_some() {
+            return None;
+        }
+        let quarantined = self.quarantined_command(command)?;
+        self.quarantine_explanation(command, &quarantined.plugin)
+    }
+
+    fn quarantine_explanation(&self, command: &str, plugin: &str) -> Option<String> {
+        let name = if self.quarantined_commands.contains_key(command) {
+            command
+        } else {
+            crate::command::split_invocation(command).0
+        };
+        match self.statuses.get(plugin) {
+            Some(PluginStatus::Quarantined { diagnostic, .. }) => {
+                Some(quarantined_command_message(name, plugin, diagnostic))
+            }
+            _ => None,
+        }
     }
 
     async fn load_plugin(
@@ -1250,12 +1497,12 @@ impl PluginRegistry {
         }
         let owner = runtime.command_plugin(command);
         let Some(owner) = owner else {
-            let warning = pending
-                .and_then(|(plugin, _)| self.statuses.get(&plugin))
-                .and_then(|status| match status {
-                    PluginStatus::Quarantined { diagnostic, .. } => Some(diagnostic.clone()),
-                    _ => None,
-                })
+            let quarantined = pending.map(|(plugin, _)| plugin).or_else(|| {
+                self.quarantined_command(command)
+                    .map(|quarantined| quarantined.plugin.clone())
+            });
+            let warning = quarantined
+                .and_then(|plugin| self.quarantine_explanation(command, &plugin))
                 .unwrap_or_else(|| format!("unknown plugin command `{command}`"));
             runtime.send_request(PluginRequest::Action(Action::PrintWarning(warning)));
             return Ok(());
@@ -1337,11 +1584,15 @@ impl PluginRegistry {
             .rpc_activations
             .get_mut(owner)
             .expect("pending RPC plugin activation");
-        anyhow::ensure!(
-            pending.command.is_none() && pending.notifications.is_empty(),
-            "RPC plugin `{owner}` is busy"
-        );
         let (name, raw_args) = crate::command::split_invocation(command);
+        if let Some(conflict) = starting_rpc_conflict(
+            owner,
+            name,
+            pending.command.is_some(),
+            !pending.notifications.is_empty(),
+        ) {
+            anyhow::bail!(conflict);
+        }
         let id = pending.task.id();
         pending.command = Some(PendingRpcInvocation {
             id,
@@ -1575,14 +1826,20 @@ impl PluginRegistry {
     }
 
     pub(crate) fn command_scope(&self, runtime: &Runtime, command: &str) -> Option<CommandScope> {
-        runtime.command_scope(command).or_else(|| {
-            let (plugin, name, _) = self.resolve_rpc_command(runtime, command)?;
-            self.rpc_plugins
-                .get(&plugin)?
-                .commands
-                .get(&name)
-                .map(|metadata| metadata.scope)
-        })
+        runtime
+            .command_scope(command)
+            .or_else(|| {
+                let (plugin, name, _) = self.resolve_rpc_command(runtime, command)?;
+                self.rpc_plugins
+                    .get(&plugin)?
+                    .commands
+                    .get(&name)
+                    .map(|metadata| metadata.scope)
+            })
+            .or_else(|| {
+                self.quarantined_command(command)
+                    .map(|quarantined| quarantined.scope)
+            })
     }
 
     pub(crate) fn registered_commands(&self, runtime: &Runtime) -> Vec<RegisteredPluginCommand> {
@@ -1648,7 +1905,9 @@ impl PluginRegistry {
     }
 
     pub(crate) fn has_command(&self, runtime: &Runtime, command: &str) -> bool {
-        self.command_plugin(runtime, command).is_some() || self.has_pending_command(command)
+        self.command_plugin(runtime, command).is_some()
+            || self.has_pending_command(command)
+            || self.quarantined_command(command).is_some()
     }
 
     /// Activates the pending plugin that declares `command`, if any.
@@ -2663,6 +2922,42 @@ fn plugin_display_path(plugin: &str) -> String {
         .to_string()
 }
 
+/// One-line reason from a possibly multi-line quarantine diagnostic.
+/// Explains why `command` cannot queue behind a starting RPC plugin, which runs
+/// at most one queued command, and none when an event started it.
+fn starting_rpc_conflict(
+    owner: &str,
+    command: &str,
+    command_waiting: bool,
+    events_waiting: bool,
+) -> Option<String> {
+    let reason = if command_waiting {
+        "already has a command waiting"
+    } else if events_waiting {
+        "is handling the event that started it"
+    } else {
+        return None;
+    };
+    Some(format!(
+        "plugin `{owner}` is still starting and {reason}; run `{command}` again once it is ready"
+    ))
+}
+
+pub(crate) fn quarantine_reason(diagnostic: &str) -> &str {
+    diagnostic
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("unknown error")
+}
+
+fn quarantined_command_message(command: &str, plugin: &str, diagnostic: &str) -> String {
+    format!(
+        "`{command}` is unavailable because plugin `{plugin}` was stopped: {}",
+        quarantine_reason(diagnostic)
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2671,6 +2966,14 @@ mod tests {
 
     fn drain_requests() {
         while ACTION_DISPATCHER.try_recv_request().is_some() {}
+    }
+
+    #[track_caller]
+    fn expect_quarantine_notice(plugin: &str) {
+        match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::PluginQuarantined { plugin: name, .. } => assert_eq!(name, plugin),
+            _ => panic!("expected a quarantine notice for `{plugin}`"),
+        }
     }
 
     #[test]
@@ -2741,6 +3044,15 @@ mod tests {
         assert!(matches!(
             runtime.try_recv_request(),
             Some(PluginRequest::ClosePicker { id }) if id == owner_picker.get()
+        ));
+        assert!(matches!(
+            runtime.try_recv_request(),
+            Some(PluginRequest::PluginQuarantined { plugin, stage, diagnostic, pickers, composers, .. })
+                if plugin == "owner"
+                    && stage == "runtime"
+                    && diagnostic == "connection closed"
+                    && pickers.is_empty()
+                    && composers.is_empty()
         ));
         assert!(runtime.try_recv_request().is_none());
         assert!(matches!(
@@ -2886,6 +3198,89 @@ mod tests {
             Some(PluginStatus::Quarantined { stage, diagnostic, .. })
                 if stage == "source" && diagnostic.contains(&expected_error)
         ));
+    }
+
+    #[tokio::test]
+    async fn status_rows_describe_each_plugin_in_configuration_order() {
+        drain_requests();
+
+        let dir = tempfile_dir("status-rows");
+        let lazy = dir.join("lazy");
+        fs::create_dir_all(&lazy).unwrap();
+        let manifest = lazy.join(PLUGIN_MANIFEST_FILE);
+        fs::write(
+            &manifest,
+            r#"
+                schema_version = 1
+
+                [plugin]
+                id = "lazy"
+                name = "Lazy"
+                version = "0.1.0"
+                red_api = "^0.19.0"
+
+                [rpc]
+                command = "missing-status-rows-plugin"
+
+                [activation]
+                commands = ["Lazy"]
+            "#,
+        )
+        .unwrap();
+        let working = dir.join("working.hk");
+        fs::write(&working, "pub fn activate() {}").unwrap();
+        let broken = dir.join("broken.hk");
+        fs::write(&broken, "pub fn activate( {").unwrap();
+        let mut registry = PluginRegistry::new();
+        registry.add("working", working.to_str().unwrap());
+        registry.add("lazy", manifest.to_str().unwrap());
+        registry.add("broken", broken.to_str().unwrap());
+        let mut runtime = Runtime::new();
+
+        registry.initialize(&mut runtime).await.unwrap();
+        let rows = registry.status_rows();
+
+        assert_eq!(
+            rows.iter()
+                .map(|row| (row.name.as_str(), row.state))
+                .collect::<Vec<_>>(),
+            vec![
+                ("working", PluginSessionState::Active),
+                ("lazy", PluginSessionState::LoadsOnFirstUse),
+                ("broken", PluginSessionState::Quarantined),
+            ]
+        );
+        assert!(matches!(
+            &rows[2].status,
+            PluginStatus::Quarantined { diagnostic, .. } if diagnostic.contains("HUSK-P0001")
+        ));
+        assert_eq!(rows[0].path, plugin_display_path(working.to_str().unwrap()));
+
+        registry.add_disabled("off", "/plugins/off.hk");
+        let rows = registry.status_rows();
+        assert_eq!(
+            rows.last().map(|row| (row.name.as_str(), row.state)),
+            Some(("off", PluginSessionState::Disabled))
+        );
+    }
+
+    #[test]
+    fn starting_rpc_conflict_names_what_the_plugin_is_waiting_on() {
+        assert_eq!(starting_rpc_conflict("slow", "Run", false, false), None);
+        assert_eq!(
+            starting_rpc_conflict("slow", "Run", true, true).as_deref(),
+            Some(
+                "plugin `slow` is still starting and already has a command waiting; \
+                 run `Run` again once it is ready"
+            )
+        );
+        assert_eq!(
+            starting_rpc_conflict("slow", "Run", false, true).as_deref(),
+            Some(
+                "plugin `slow` is still starting and is handling the event that started it; \
+                 run `Run` again once it is ready"
+            )
+        );
     }
 
     #[tokio::test]
@@ -3271,12 +3666,205 @@ mod tests {
             ACTION_DISPATCHER.recv_request(),
             PluginRequest::AgentCloseSession { session_id } if session_id == "session-1"
         ));
+        expect_quarantine_notice("owner");
+        assert!(registry.has_command(&runtime, "OwnerAsk"));
+        registry.execute(&mut runtime, "OwnerAsk").await.unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::Action(Action::PrintWarning(message))
+                if message.starts_with("`OwnerAsk` is unavailable because plugin `owner` was stopped: ")
+                    && message.contains("integer division by zero")
+        ));
         registry.execute(&mut runtime, "Observer").await.unwrap();
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
             PluginRequest::Action(Action::Print(message)) if message == "observer active"
         ));
         assert!(ACTION_DISPATCHER.try_recv_request().is_none());
+    }
+
+    #[tokio::test]
+    async fn quarantine_notice_names_the_dialogs_its_plugin_left_open() {
+        drain_requests();
+        let dir = tempfile_dir("quarantine-dialogs");
+        let plugin = dir.join("plugin.hk");
+        fs::write(
+            &plugin,
+            r#"
+                pub fn activate() {
+                    red::add_command("OpenChoices", choices);
+                    red::add_command("OpenPrompt", prompt);
+                    red::add_command("Crash", crash);
+                }
+                fn choices() {
+                    red::execute("OpenPicker", "Items", [], PickerOptions {}, PickerHandlers {
+                        cancelled: cancelled,
+                    });
+                }
+                fn prompt() {
+                    red::execute("OpenComposer", "Prompt", "", [], ComposerHandlers {
+                        submitted: submitted,
+                        cancelled: composer_cancelled,
+                    });
+                }
+                fn crash() { red::execute("Print", 1 / 0); }
+                fn cancelled(event: PickerCancelled) {}
+                fn submitted(prompt: String) {}
+                fn composer_cancelled(event: ComposerCancelled) {}
+            "#,
+        )
+        .unwrap();
+        let mut registry = PluginRegistry::new();
+        registry.add("dialogs", plugin.to_str().unwrap());
+        let mut runtime = Runtime::new();
+        registry.initialize(&mut runtime).await.unwrap();
+
+        registry.execute(&mut runtime, "OpenChoices").await.unwrap();
+        let picker = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::OpenCallbackPicker { handle, .. } => handle,
+            _ => panic!("expected callback picker"),
+        };
+        registry.execute(&mut runtime, "OpenPrompt").await.unwrap();
+        let composer = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::OpenCallbackComposer { handle, .. } => handle,
+            _ => panic!("expected callback composer"),
+        };
+        registry.execute(&mut runtime, "Crash").await.unwrap();
+
+        match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::PluginQuarantined {
+                plugin,
+                stage,
+                diagnostic,
+                pickers,
+                composers,
+                ..
+            } => {
+                assert_eq!(plugin, "dialogs");
+                assert_eq!(stage, "runtime");
+                assert!(diagnostic.contains("integer division by zero"));
+                assert_eq!(pickers, vec![picker]);
+                assert_eq!(composers, vec![composer]);
+            }
+            _ => panic!("expected a quarantine notice"),
+        }
+        for command in ["OpenChoices", "OpenPrompt", "Crash"] {
+            assert!(registry.has_command(&runtime, command));
+        }
+        assert!(!registry.has_command(&runtime, "NeverRegistered"));
+        assert!(registry
+            .quarantined_command_warning(&runtime, "OpenPrompt extra args")
+            .is_some_and(|warning| warning.starts_with(
+                "`OpenPrompt` is unavailable because plugin `dialogs` was stopped: "
+            )));
+        assert_eq!(
+            registry.quarantined_command_warning(&runtime, "NeverRegistered"),
+            None
+        );
+        registry.execute(&mut runtime, "OpenChoices").await.unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::Action(Action::PrintWarning(message))
+                if message.starts_with("`OpenChoices` is unavailable because plugin `dialogs` was stopped: ")
+        ));
+        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
+    }
+
+    #[tokio::test]
+    async fn metadata_quarantine_from_registration_is_reported_once_at_startup() {
+        drain_requests();
+        let dir = tempfile_dir("quarantine-metadata");
+        let plugin = dir.join("plugin.hk");
+        fs::write(&plugin, "pub fn activate() {}\n").unwrap();
+        fs::write(dir.join("package.json"), "invalid metadata").unwrap();
+        let mut registry = PluginRegistry::new();
+        registry.add("invalid", plugin.to_str().unwrap());
+        let mut runtime = Runtime::new();
+
+        registry.initialize(&mut runtime).await.unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::PluginQuarantined { plugin, stage, diagnostic, .. }
+                if plugin == "invalid"
+                    && stage == "metadata"
+                    && diagnostic.starts_with("failed to load plugin metadata")
+        ));
+        registry.initialize(&mut runtime).await.unwrap();
+        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
+    }
+
+    #[tokio::test]
+    async fn lazy_command_keeps_explaining_its_failed_activation() {
+        drain_requests();
+        let dir = tempfile_dir("quarantine-lazy");
+        let plugin = dir.join("plugin.hk");
+        fs::write(&plugin, "pub fn activate( {").unwrap();
+        fs::write(
+            dir.join("package.json"),
+            r#"{"name":"lazy","activation_events":["onCommand:LazyHello"]}"#,
+        )
+        .unwrap();
+        let mut registry = PluginRegistry::new();
+        registry.add("lazy", plugin.to_str().unwrap());
+        let mut runtime = Runtime::new();
+        registry.initialize(&mut runtime).await.unwrap();
+        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
+
+        registry.execute(&mut runtime, "LazyHello").await.unwrap();
+        expect_quarantine_notice("lazy");
+        for _ in 0..2 {
+            assert!(registry.has_command(&runtime, "LazyHello"));
+            assert_eq!(
+                registry.command_scope(&runtime, "LazyHello"),
+                Some(CommandScope::Global)
+            );
+            assert!(matches!(
+                ACTION_DISPATCHER.recv_request(),
+                PluginRequest::Action(Action::PrintWarning(message))
+                    if message.starts_with("`LazyHello` is unavailable because plugin `lazy` was stopped: ")
+            ));
+            registry.execute(&mut runtime, "LazyHello").await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn quarantined_commands_keep_their_registered_scope() {
+        drain_requests();
+        let dir = tempfile_dir("quarantine-scope");
+        let plugin = dir.join("plugin.hk");
+        fs::write(
+            &plugin,
+            r#"
+                #[red::command(name = "GlobalCrash", scope = "global")]
+                fn global_crash() { red::execute("Print", 1 / 0); }
+
+                #[red::command(name = "EditorOnly")]
+                fn editor_only() {}
+            "#,
+        )
+        .unwrap();
+        let mut registry = PluginRegistry::new();
+        registry.add("scoped", plugin.to_str().unwrap());
+        let mut runtime = Runtime::new();
+        registry.initialize(&mut runtime).await.unwrap();
+        assert_eq!(
+            registry.command_scope(&runtime, "GlobalCrash"),
+            Some(CommandScope::Global)
+        );
+
+        registry.execute(&mut runtime, "GlobalCrash").await.unwrap();
+        expect_quarantine_notice("scoped");
+
+        assert_eq!(runtime.command_plugin("GlobalCrash"), None);
+        assert_eq!(
+            registry.command_scope(&runtime, "GlobalCrash"),
+            Some(CommandScope::Global)
+        );
+        assert_eq!(
+            registry.command_scope(&runtime, "EditorOnly"),
+            Some(CommandScope::Editor)
+        );
+        assert_eq!(registry.command_scope(&runtime, "NeverRegistered"), None);
     }
 
     #[tokio::test]
@@ -3305,6 +3893,7 @@ mod tests {
             Some(PluginStatus::Quarantined { stage, .. }) if stage == "compile"
         ));
         assert_eq!(registry.statuses().get("good"), Some(&PluginStatus::Active));
+        expect_quarantine_notice("bad");
         registry.execute(&mut runtime, "StillWorks").await.unwrap();
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
@@ -3332,6 +3921,9 @@ mod tests {
         registry.initialize(&mut runtime).await.unwrap();
 
         for expected in ["alpha", "middle", "omega", "zeta"] {
+            if expected == "middle" {
+                expect_quarantine_notice("broken");
+            }
             assert!(matches!(
                 ACTION_DISPATCHER.recv_request(),
                 PluginRequest::Action(Action::Print(message)) if message == expected
@@ -3390,6 +3982,12 @@ mod tests {
 
         metadata.red_api_version = Some("^0.19.0".to_string());
         check_api_compatibility(&metadata).unwrap();
+
+        metadata.red_api_version = Some("^0.20.0".to_string());
+        check_api_compatibility(&metadata).unwrap();
+
+        metadata.red_api_version = Some("^0.21.0".to_string());
+        assert!(check_api_compatibility(&metadata).is_err());
 
         metadata.red_api_version = Some("^0.5.0".to_string());
         let error = check_api_compatibility(&metadata).unwrap_err().to_string();
@@ -3528,6 +4126,7 @@ mod tests {
                 if matches!(stage.as_str(), "compile" | "activation")
                     && diagnostic.contains("already registered")
         ));
+        expect_quarantine_notice("z-plugin");
         registry.execute(&mut runtime, "Shared").await.unwrap();
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
@@ -3605,6 +4204,7 @@ mod tests {
             Some(PluginStatus::Quarantined { stage, .. }) if stage == "version"
         ));
         assert_eq!(runtime.command_plugin("FutureCommand"), None);
+        expect_quarantine_notice("future");
 
         fs::write(&metadata, r#"{"name":"future","red_api_version":"^0.4.0"}"#).unwrap();
         registry.reload(&mut runtime).await.unwrap();
@@ -3820,6 +4420,8 @@ mod tests {
                 if stage == "dependency" && diagnostic.contains("not active")
         ));
         assert_eq!(runtime.command_plugin("RootCommand"), None);
+        expect_quarantine_notice("middle");
+        expect_quarantine_notice("root");
 
         fs::write(&leaf_metadata, r#"{"name":"leaf","version":"1.4.0"}"#).unwrap();
         registry.modified_at.remove("leaf");

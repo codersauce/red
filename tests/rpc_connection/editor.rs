@@ -102,6 +102,18 @@ impl Harness {
             .join("\n")
     }
 
+    /// The screen above the status and message lines. The status line shows the
+    /// Git branch, whose name can contain any text a test looks for.
+    fn document_screen(&self) -> String {
+        let snapshot = self.core.snapshot(None);
+        let rows = snapshot.lines.len().saturating_sub(2);
+        snapshot.lines[..rows]
+            .iter()
+            .map(|line| line.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     async fn key(&mut self, code: KeyCode) -> Result<()> {
         tokio::time::timeout(
             Duration::from_secs(2),
@@ -383,6 +395,23 @@ async fn lazy_initialization_keeps_input_responsive() -> Result<()> {
     let slow = h.package.path().join("slow");
     h.until(|_| slow.join("initialize-started").exists())
         .await?;
+    h.until(|h| {
+        h.screen()
+            .contains("plugin `slow` is starting; `RpcWait` runs once it is ready")
+    })
+    .await?;
+    h.key(KeyCode::Function(2)).await?;
+    // The refusal answers this keypress, so it must replace the "is starting"
+    // notice right away rather than wait for that notice to expire.
+    assert!(
+        h.screen().contains("plugin `slow` is still starting"),
+        "{}",
+        h.screen()
+    );
+    h.command("plugin-status").await?;
+    h.until(|h| h.screen().contains("Plugin status")).await?;
+    assert!(h.screen().contains("starting"), "{}", h.screen());
+    h.key(KeyCode::Escape).await?;
     h.text("iuser").await?;
     h.core.resize(90, 30).await?;
     assert!(h.screen().contains("userhello"));
@@ -443,7 +472,7 @@ async fn responsive_commands_and_undo() -> Result<()> {
     h.text("u").await?;
     assert_eq!(h.screen().lines().next().unwrap(), plugin_text);
     h.text("u").await?;
-    assert!(!h.screen().contains("plugin-"));
+    assert!(!h.document_screen().contains("plugin-"));
     assert!(h.screen().contains('X'));
     h.text("u").await?;
     assert!(h.screen().contains("userhello"));
@@ -459,7 +488,7 @@ async fn legacy_mutation_rejects_changed_document() -> Result<()> {
     h.until(|h| h.screen().contains("current document changed"))
         .await?;
     assert!(h.screen().contains("other"));
-    assert!(!h.screen().contains("plugin-"));
+    assert!(!h.document_screen().contains("plugin-"));
     Ok(())
 }
 
@@ -709,7 +738,7 @@ async fn explicit_path_edit_preserves_the_active_view_and_insert() -> Result<()>
     h.until(|h| h.marker("done", 1).exists() && !h.core.test_rpc_command_pending("slow"))
         .await?;
     assert!(h.screen().contains("Uhello"));
-    assert!(!h.screen().contains("plugin-"));
+    assert!(!h.document_screen().contains("plugin-"));
     h.text("V").await?;
     h.key(KeyCode::Escape).await?;
     assert!(h.screen().contains("UVhello"));

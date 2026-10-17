@@ -60,6 +60,7 @@ pub(crate) const BUILTIN_COLON_COMMANDS: &[CommandSpec] = &[
     CommandSpec::exact("plugins"),
     CommandSpec::exact("statusline"),
     CommandSpec::exact("config-diagnostics"),
+    CommandSpec::exact("plugin-status"),
     CommandSpec::new("messages", 3),
 ];
 
@@ -1256,6 +1257,15 @@ fn builtin_commands() -> Vec<BuiltinCommand> {
             Action::ViewLogs,
         ),
         builtin(
+            "debug.plugin_status",
+            "Plugin status",
+            "Extensions",
+            "See which plugins are running, starting, or stopped, and why",
+            Some(":plugin-status"),
+            &["quarantined plugins", "plugin errors", "stopped plugins"],
+            Action::PluginStatus,
+        ),
+        builtin(
             "debug.plugins",
             "Language packs",
             "Extensions",
@@ -1467,6 +1477,7 @@ fn action_label(action: &Action) -> String {
         Action::OpenWelcome => "Welcome to Red".to_string(),
         Action::StartTutorial(_) => "Take the guided Red tour".to_string(),
         Action::ConfigDiagnostics => "Configuration diagnostics".to_string(),
+        Action::PluginStatus => "Plugin status".to_string(),
         Action::OpenWhatsNew => "What’s new in Red".to_string(),
         Action::OpenDiagnosticsPicker => "Diagnostics".to_string(),
         Action::OpenErrorDiagnosticsPicker => "Errors".to_string(),
