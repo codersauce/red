@@ -1466,6 +1466,13 @@ fn agent_event_payload(event: CodexEvent) -> (&'static str, Value) {
             "agent:cancelled",
             json!({ "session_id": session_id.to_string() }),
         ),
+        CodexEvent::CancelFailed {
+            session_id,
+            message,
+        } => (
+            "agent:cancel_failed",
+            json!({ "session_id": session_id.to_string(), "message": message }),
+        ),
         CodexEvent::PermissionRequested {
             request_id,
             session_id,
@@ -38840,6 +38847,25 @@ builtin = "rust"
                 .is_err(),
             "the follow-up must wait for the interrupted turn to end"
         );
+        // A rejected interrupt leaves the turn running, so the prompt keeps waiting.
+        worker
+            .send(CodexEvent::CancelFailed {
+                session_id: "session-1".to_string(),
+                message: "interrupt rejected".to_string(),
+            })
+            .await
+            .unwrap();
+        editor
+            .service_background(&mut buffer, &mut runtime)
+            .await
+            .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), worker.recv())
+                .await
+                .is_err(),
+            "a failed cancel must not release the held follow-up"
+        );
+        assert!(editor.agent_manager.is_session_busy("session-1"));
 
         worker
             .send(CodexEvent::Completed {

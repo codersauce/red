@@ -9529,6 +9529,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bundled_agent_explains_a_failed_cancel_and_keeps_the_turn_running() {
+        let mut runtime = agent_runtime_with_session("session-1").await;
+        submit_agent_prompt(&mut runtime, "first prompt").await;
+        runtime
+            .notify(
+                "agent:cancelled",
+                serde_json::json!({ "session_id": "session-1" }),
+            )
+            .await
+            .unwrap();
+        drain_requests();
+        runtime
+            .notify(
+                "agent:cancel_failed",
+                serde_json::json!({ "session_id": "session-1", "message": "interrupt rejected" }),
+            )
+            .await
+            .unwrap();
+
+        let mut explained = false;
+        let mut retry_status = false;
+        while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
+            match request {
+                PluginRequest::Action(Action::Print(message)) => {
+                    explained |= message.contains("Could not stop the agent: interrupt rejected");
+                }
+                PluginRequest::SetTextPanelStatus {
+                    status: Some(status),
+                    ..
+                } => {
+                    retry_status |= status.busy && status.label.contains("Ctrl-C to retry");
+                }
+                PluginRequest::AgentCloseSession { .. } | PluginRequest::AgentPrompt { .. } => {
+                    panic!("a failed cancel must leave the running turn alone")
+                }
+                _ => {}
+            }
+        }
+        assert!(explained && retry_status);
+    }
+
+    #[tokio::test]
     async fn bundled_agent_keeps_a_cancelled_session_for_the_next_prompt() {
         let mut runtime = agent_runtime_with_session("session-1").await;
         submit_agent_prompt(&mut runtime, "first prompt").await;

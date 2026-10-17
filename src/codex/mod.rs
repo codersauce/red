@@ -330,6 +330,14 @@ pub enum CodexEvent {
         /// Owning session.
         session_id: String,
     },
+    /// Codex rejected `turn/interrupt`; the turn is still running and the
+    /// cancel can be retried.
+    CancelFailed {
+        /// Owning session.
+        session_id: String,
+        /// User-facing failure description.
+        message: String,
+    },
     /// App-server requested a user choice that Red can safely surface.
     PermissionRequested {
         /// App-server request identifier.
@@ -1849,9 +1857,20 @@ async fn send_pending_failure(
         }
     };
     if matches!(request, Pending::Interrupt { .. }) {
-        // A rejected interrupt must not block a later retry for the same turn.
+        // A rejected interrupt leaves the turn running: allow a retry and report
+        // it without ending the turn, so queued prompts keep waiting for it.
         if let Some(session) = sessions.get_mut(session_id) {
             session.pending_interrupt_turn_id = None;
+            if matches!(session.kind, SessionKind::Agent) && session.active_turn.is_some() {
+                events
+                    .send(CodexEvent::CancelFailed {
+                        session_id: session_id.clone(),
+                        message: message.to_string(),
+                    })
+                    .await
+                    .ok();
+                return;
+            }
         }
     }
     let (event, remove_session) = sessions.get(session_id).map_or_else(
@@ -2933,6 +2952,18 @@ mod tests {
         .await
         .unwrap();
         assert!(sessions["agent"].pending_interrupt_turn_id.is_none());
+        assert!(matches!(
+            received.try_recv(),
+            Ok(CodexEvent::Cancelled { session_id }) if session_id == "agent"
+        ));
+        assert!(
+            matches!(
+                received.try_recv(),
+                Ok(CodexEvent::CancelFailed { session_id, .. }) if session_id == "agent"
+            ),
+            "a rejected interrupt must not look like the turn ended"
+        );
+        assert_eq!(sessions["agent"].active_turn.as_deref(), Some("turn"));
 
         stop_session(
             "agent".into(),

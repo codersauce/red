@@ -1963,6 +1963,17 @@ fn cancelled(event: AgentSessionEvent) {
     set_phase("stopping", "Stopping…");
 }
 
+/// Codex refused the interrupt, so the turn keeps running; say so and let the
+/// user retry instead of leaving the pane stuck on "Stopping…".
+#[red::on("agent:cancel_failed")]
+fn cancel_failed(event: AgentErrorEvent) {
+    if !is_current_session(red::string(event.session_id, "")) {
+        return;
+    }
+    red::execute("Print", "Could not stop the agent: " + event.message + " · press Ctrl-C to try again");
+    set_phase("working", "Stop failed · Ctrl-C to retry");
+}
+
 #[red::on("agent:error")]
 fn failed(event: AgentErrorEvent) {
     if !is_current_session(red::string(event.session_id, "")) || is_stale_turn(event.turn_id) {
