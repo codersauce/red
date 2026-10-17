@@ -27454,9 +27454,12 @@ impl Editor {
                 self.rpc_commands.started(token);
             }
             Ok(None) => return self.plugin_registry.execute(runtime, command).await,
-            Err(error) => runtime.send_request(PluginRequest::Action(Action::PrintWarning(
-                error.to_string(),
-            ))),
+            // A refusal answers this keypress, so it must replace the foreground
+            // "is starting" notice instead of queuing behind it until it expires.
+            Err(error) => {
+                self.set_routine_foreground_message(Severity::Warning, error.to_string());
+                self.draw_commandline(render_buffer);
+            }
         }
         Ok(())
     }

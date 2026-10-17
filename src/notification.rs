@@ -35,6 +35,7 @@ pub enum MessageAction {
     Close,
     Next,
     Previous,
+    Select(NotificationId),
     Search,
     Query(String),
     Backspace,
@@ -47,6 +48,7 @@ pub enum MessageAction {
     Copy,
     ScrollDown,
     ScrollUp,
+    ScrollTo(usize),
 }
 
 /// Producer-local identity. Numeric LSP tokens never alias text tokens such as "1".
