@@ -11400,6 +11400,15 @@ impl Editor {
                 ),
                 _ => {}
             }
+            let ended_turn_id = match &event {
+                CodexEvent::Completed { session_id, .. }
+                | CodexEvent::Cancelled { session_id }
+                | CodexEvent::Failed {
+                    session_id: Some(session_id),
+                    ..
+                } => self.agent_manager.turn_id(session_id).map(str::to_string),
+                _ => None,
+            };
             let mut next_prompt = None;
             match &event {
                 CodexEvent::Completed { session_id, .. }
@@ -11457,6 +11466,9 @@ impl Editor {
             let (name, mut payload) = agent_event_payload(event);
             if let (Some(elapsed_ms), Some(object)) = (turn_elapsed_ms, payload.as_object_mut()) {
                 object.insert("elapsed_ms".to_string(), json!(elapsed_ms));
+            }
+            if let (Some(turn_id), Some(object)) = (ended_turn_id, payload.as_object_mut()) {
+                object.insert("turn_id".to_string(), json!(turn_id));
             }
             self.plugin_registry.notify(runtime, name, payload).await?;
             if let Some((session_id, prompt)) = next_prompt {
@@ -38727,6 +38739,41 @@ builtin = "rust"
         assert!(!editor.agent_manager.is_task_finished());
         assert!(!editor.agent_manager.is_session_active("session-1"));
         drain_plugin_requests();
+    }
+
+    #[test]
+    fn statusline_agent_activity_reports_turn_phase_and_queue() {
+        let mut editor = test_editor(/*width*/ 80, /*height*/ 24);
+        editor.config.agent.follow_tool_calls = false;
+        assert_eq!(
+            editor.statusline_agent_activity(),
+            None,
+            "idle shows nothing"
+        );
+
+        editor.agent_manager.mark_session_active("session-1");
+        assert_eq!(
+            editor.statusline_agent_activity().as_deref(),
+            Some("agent working")
+        );
+        editor.config.agent.follow_tool_calls = true;
+        assert_eq!(
+            editor.statusline_agent_activity().as_deref(),
+            Some("agent following")
+        );
+
+        editor.agent_manager.begin_stopping("session-1");
+        editor.agent_manager.queue_prompt(
+            "session-1",
+            agent_manager::QueuedAgentPrompt {
+                text: "next".to_string(),
+                context: None,
+            },
+        );
+        assert_eq!(
+            editor.statusline_agent_activity().as_deref(),
+            Some("agent stopping · 1 queued")
+        );
     }
 
     #[tokio::test]

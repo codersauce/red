@@ -161,7 +161,7 @@ color = true
 # The first three positions use the theme's accent, middle, and base shades.
 [statusline]
 left = ["mode", "diagnostics", "git_branch", "filename"]
-right = ["position", "syntax"]
+right = ["position", "syntax", "agent_activity"]
 
 # Nerd Font icons match nvim-web-devicons. "unicode" and "ascii" are
 # portable fallbacks; "none" keeps the labels while hiding their icons.

@@ -544,7 +544,11 @@ fn default_statusline_left() -> Vec<StatuslineSection> {
 }
 
 fn default_statusline_right() -> Vec<StatuslineSection> {
-    vec![StatuslineSection::Position, StatuslineSection::Syntax]
+    vec![
+        StatuslineSection::Position,
+        StatuslineSection::Syntax,
+        StatuslineSection::AgentActivity,
+    ]
 }
 
 /// A piece of editor context that can be placed on either status-line side.
@@ -4136,7 +4140,11 @@ icon_style = "{value}"
         );
         assert_eq!(
             config.statusline.right,
-            [StatuslineSection::Position, StatuslineSection::Syntax]
+            [
+                StatuslineSection::Position,
+                StatuslineSection::Syntax,
+                StatuslineSection::AgentActivity,
+            ]
         );
         assert_eq!(config.statusline.icons.style, PickerIconStyle::NerdFont);
         assert!(config.statusline.icons.color);

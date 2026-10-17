@@ -284,7 +284,11 @@ thread, so the next prompt continues the conversation with its full context. A
 prompt sent while the interrupt is still settling waits for the interrupted
 turn to end instead of racing it. Queued follow-ups pause after a stopped or
 failed turn; the pane status shows how many are held, `:AgentSendQueued`
-resumes them, and `:AgentDiscardQueued` drops them.
+resumes them, and `:AgentDiscardQueued` drops them. While a turn is in flight,
+the `agent_activity` statusline field (on the right by default) shows
+`agent working`, `agent following`, or `agent stopping`, plus any queued count,
+and it disappears when the agent is idle. A turn that finishes while the pane is
+hidden prints `Agent finished · Space A to view`.
 
 `Tab` or `Shift-Tab` switches between the composer and transcript, preserving
 the draft, composer editing mode, and transcript reading position. Switching

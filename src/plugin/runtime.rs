@@ -9406,6 +9406,81 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bundled_agent_ignores_terminal_events_from_an_earlier_turn() {
+        let mut runtime = agent_runtime_with_session("session-1").await;
+        submit_agent_prompt(&mut runtime, "first prompt").await;
+        drain_requests();
+        runtime
+            .notify(
+                "agent:turn_started",
+                serde_json::json!({ "session_id": "session-1", "turn_id": "turn-2" }),
+            )
+            .await
+            .unwrap();
+        drain_requests();
+
+        for (event, payload) in [
+            (
+                "agent:completed",
+                serde_json::json!({
+                    "session_id": "session-1",
+                    "turn_id": "turn-1",
+                    "stop_reason": "interrupted",
+                }),
+            ),
+            (
+                "agent:error",
+                serde_json::json!({
+                    "session_id": "session-1",
+                    "turn_id": "turn-1",
+                    "message": "old turn failed",
+                }),
+            ),
+        ] {
+            runtime.notify(event, payload).await.unwrap();
+            while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
+                match request {
+                    PluginRequest::Action(Action::Print(message)) => {
+                        panic!("{event} from an earlier turn printed {message:?}")
+                    }
+                    PluginRequest::SetTextPanelStatus { status: None, .. } => {
+                        panic!("{event} from an earlier turn ended the running turn")
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn bundled_agent_announces_turns_that_finish_while_the_pane_is_hidden() {
+        let mut runtime = agent_runtime_with_session("session-1").await;
+        submit_agent_prompt(&mut runtime, "first prompt").await;
+        runtime.execute_command("AgentClose").await.unwrap();
+        drain_requests();
+        runtime
+            .notify(
+                "agent:completed",
+                serde_json::json!({ "session_id": "session-1", "stop_reason": "end_turn" }),
+            )
+            .await
+            .unwrap();
+
+        let mut announced = false;
+        while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
+            announced |= matches!(
+                request,
+                PluginRequest::Action(Action::Print(message))
+                    if message == "Agent finished · Space A to view"
+            );
+        }
+        assert!(
+            announced,
+            "a hidden pane must still report the finished turn"
+        );
+    }
+
+    #[tokio::test]
     async fn bundled_agent_keeps_a_cancelled_session_for_the_next_prompt() {
         let mut runtime = agent_runtime_with_session("session-1").await;
         submit_agent_prompt(&mut runtime, "first prompt").await;
