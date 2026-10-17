@@ -257,6 +257,9 @@ impl InlineContextSnapshot {
         for (index, entry) in ignore::WalkBuilder::new(&self.root)
             .follow_links(false)
             .hidden(false)
+            .filter_entry(|entry| {
+                !crate::lsp::workspace_edit::is_vcs_metadata_path(Path::new(entry.file_name()))
+            })
             .build()
             .enumerate()
         {

@@ -330,6 +330,14 @@ pub enum CodexEvent {
         /// Owning session.
         session_id: String,
     },
+    /// Codex rejected `turn/interrupt`; the turn is still running and the
+    /// cancel can be retried.
+    CancelFailed {
+        /// Owning session.
+        session_id: String,
+        /// User-facing failure description.
+        message: String,
+    },
     /// App-server requested a user choice that Red can safely surface.
     PermissionRequested {
         /// App-server request identifier.
@@ -1102,6 +1110,16 @@ async fn start_turn(
         return Ok(());
     };
     if session.active_turn.is_some() {
+        // The editor queues prompts until the previous turn ends, so this only
+        // happens if a caller bypasses it; failing loudly keeps the prompt from
+        // disappearing without a terminal event.
+        events
+            .send(CodexEvent::Failed {
+                session_id: Some(session_id),
+                message: "Codex is still finishing the previous turn".to_string(),
+            })
+            .await
+            .ok();
         return Ok(());
     }
     session.cancelled.store(false, Ordering::Relaxed);
@@ -1838,6 +1856,23 @@ async fn send_pending_failure(
             unreachable!("early requests returned above")
         }
     };
+    if matches!(request, Pending::Interrupt { .. }) {
+        // A rejected interrupt leaves the turn running: allow a retry and report
+        // it without ending the turn, so queued prompts keep waiting for it.
+        if let Some(session) = sessions.get_mut(session_id) {
+            session.pending_interrupt_turn_id = None;
+            if matches!(session.kind, SessionKind::Agent) && session.active_turn.is_some() {
+                events
+                    .send(CodexEvent::CancelFailed {
+                        session_id: session_id.clone(),
+                        message: message.to_string(),
+                    })
+                    .await
+                    .ok();
+                return;
+            }
+        }
+    }
     let (event, remove_session) = sessions.get(session_id).map_or_else(
         || {
             (
@@ -2173,6 +2208,9 @@ fn list_file_paths(
     for entry in WalkBuilder::new(root)
         .follow_links(false)
         .hidden(false)
+        .filter_entry(|entry| {
+            !crate::lsp::workspace_edit::is_vcs_metadata_path(Path::new(entry.file_name()))
+        })
         .build()
     {
         if cancelled.load(Ordering::Relaxed) {
@@ -2850,6 +2888,100 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn busy_turn_rejects_prompts_and_a_failed_interrupt_can_be_retried() {
+        let mut sessions = HashMap::from([(
+            "agent".into(),
+            Session {
+                model_info: None,
+                cwd: PathBuf::from("/workspace"),
+                active_turn: Some("turn".into()),
+                pending_interrupt_turn_id: None,
+                cancelled: Arc::new(AtomicBool::new(false)),
+                allow_sensitive_paths: false,
+                kind: SessionKind::Agent,
+            },
+        )]);
+        let (events, mut received) = mpsc::channel(4);
+        let mut pending = HashMap::new();
+        let mut output = Vec::new();
+        let mut next_id = 0;
+
+        start_turn(
+            "agent".into(),
+            json!([{"type": "text", "text": "follow-up"}]),
+            &mut output,
+            &events,
+            &mut pending,
+            &mut sessions,
+            &mut next_id,
+        )
+        .await
+        .unwrap();
+        assert!(
+            output.is_empty(),
+            "a busy thread must not start a second turn"
+        );
+        assert!(matches!(
+            received.try_recv(),
+            Ok(CodexEvent::Failed { session_id: Some(session_id), message })
+                if session_id == "agent" && message.contains("previous turn")
+        ));
+
+        stop_session(
+            "agent".into(),
+            false,
+            &mut output,
+            &events,
+            &mut pending,
+            &mut sessions,
+            &mut next_id,
+        )
+        .await
+        .unwrap();
+        let interrupt: Value = serde_json::from_slice(&output).unwrap();
+        output.clear();
+        handle_response(
+            json!({"id": interrupt["id"], "error": {"code": -32000, "message": "busy"}}),
+            &mut output,
+            &events,
+            &mut pending,
+            &mut sessions,
+            &mut next_id,
+            &AgentRuntimePolicy::default(),
+        )
+        .await
+        .unwrap();
+        assert!(sessions["agent"].pending_interrupt_turn_id.is_none());
+        assert!(matches!(
+            received.try_recv(),
+            Ok(CodexEvent::Cancelled { session_id }) if session_id == "agent"
+        ));
+        assert!(
+            matches!(
+                received.try_recv(),
+                Ok(CodexEvent::CancelFailed { session_id, .. }) if session_id == "agent"
+            ),
+            "a rejected interrupt must not look like the turn ended"
+        );
+        assert_eq!(sessions["agent"].active_turn.as_deref(), Some("turn"));
+
+        stop_session(
+            "agent".into(),
+            false,
+            &mut output,
+            &events,
+            &mut pending,
+            &mut sessions,
+            &mut next_id,
+        )
+        .await
+        .unwrap();
+        let retry: Value = serde_json::from_slice(&output).unwrap();
+        assert_eq!(retry["method"], "turn/interrupt");
+        assert_eq!(retry["params"]["turnId"], "turn");
+    }
+
+    #[tokio::test]
     async fn interrupt_keeps_active_turn_until_terminal_notification() {
         let host = Arc::new(Mutex::new(InlineReadHost(Arc::new(StdMutex::new(
             Vec::new(),
@@ -3438,6 +3570,23 @@ mod tests {
             consented["files"],
             json!([".env", "alpha.txt", "beta.txt", "gamma.txt"])
         );
+    }
+
+    #[test]
+    fn file_listing_skips_version_control_metadata() {
+        let root = tempfile::tempdir().unwrap();
+        for directory in [".git/objects/ab", ".jj/repo", "src"] {
+            std::fs::create_dir_all(root.path().join(directory)).unwrap();
+        }
+        std::fs::write(root.path().join(".git/config"), "[remote]").unwrap();
+        std::fs::write(root.path().join(".git/objects/ab/cdef"), "blob").unwrap();
+        std::fs::write(root.path().join(".jj/repo/store"), "store").unwrap();
+        std::fs::write(root.path().join("src/main.rs"), "fn main() {}").unwrap();
+        let cancelled = AtomicBool::new(false);
+
+        let listed = list_files(root.path(), 0, MAX_FILES, &cancelled, true).unwrap();
+
+        assert_eq!(listed["files"], json!(["src/main.rs"]));
     }
 
     #[test]

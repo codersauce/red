@@ -1466,6 +1466,13 @@ fn agent_event_payload(event: CodexEvent) -> (&'static str, Value) {
             "agent:cancelled",
             json!({ "session_id": session_id.to_string() }),
         ),
+        CodexEvent::CancelFailed {
+            session_id,
+            message,
+        } => (
+            "agent:cancel_failed",
+            json!({ "session_id": session_id.to_string(), "message": message }),
+        ),
         CodexEvent::PermissionRequested {
             request_id,
             session_id,
@@ -1695,6 +1702,10 @@ fn resolve_agent_tool_path_kind(
         }
     }
     anyhow::ensure!(
+        !crate::lsp::workspace_edit::is_vcs_metadata_path(normalized.strip_prefix(root)?),
+        "editor tool path is inside version-control metadata"
+    );
+    anyhow::ensure!(
         allow_sensitive_paths || !agent_context_path_is_sensitive(&normalized),
         "editor tool path is a sensitive file; set [agent] allow_sensitive_paths = true to opt in"
     );
@@ -1703,6 +1714,38 @@ fn resolve_agent_tool_path_kind(
         "editor tool path is ignored by the workspace"
     );
     Ok(normalized)
+}
+
+/// Marks revisions minted from disk contents for files the editor has not opened.
+/// Buffer revisions are edit counters and never reach this bit.
+const AGENT_DISK_REVISION_BIT: u64 = 1 << 63;
+
+/// Returns the revision token for a file read from disk without opening a buffer.
+fn agent_disk_revision(contents: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    contents.hash(&mut hasher);
+    hasher.finish() | AGENT_DISK_REVISION_BIT
+}
+
+/// Accepts a buffer revision, or a disk token whose contents the buffer still holds,
+/// so an agent that read an unopened file can edit it once Red loads a buffer.
+pub(crate) fn agent_revision_matches(buffer: &Buffer, expected_revision: u64) -> bool {
+    buffer.revision() == expected_revision
+        || (expected_revision & AGENT_DISK_REVISION_BIT != 0
+            && agent_disk_revision(&buffer.contents()) == expected_revision)
+}
+
+/// Rejects agent writes to control or secret paths before any buffer changes, so
+/// a refused write never leaves a dirty buffer that a later user save could persist.
+fn ensure_agent_writable_path(root: &Path, path: &Path) -> anyhow::Result<()> {
+    let relative = path.strip_prefix(root)?;
+    anyhow::ensure!(
+        !crate::lsp::workspace_edit::is_protected_workspace_path(relative),
+        "editor tool cannot write protected control or secret path {}",
+        relative.display()
+    );
+    Ok(())
 }
 
 fn scoped_plugin_storage_key_for_workspace(plugin: &str, key: &str, workspace: &Path) -> String {
@@ -9888,9 +9931,10 @@ impl Editor {
         };
         #[cfg(not(unix))]
         let result = {
-            let parent = path
-                .parent()
-                .ok_or_else(|| anyhow::anyhow!("workspace file has no parent"));
+            let parent = ensure_agent_writable_path(root, path).and_then(|()| {
+                path.parent()
+                    .ok_or_else(|| anyhow::anyhow!("workspace file has no parent"))
+            });
             parent.and_then(|parent| {
                 if !parent.is_dir() {
                     crate::lsp::workspace_edit::secure_create_workspace_directory(root, parent)?;
@@ -9938,7 +9982,7 @@ impl Editor {
             .await?;
         let current_revision = self.current_buffer().revision();
         anyhow::ensure!(
-            current_revision == expected_revision,
+            agent_revision_matches(self.current_buffer(), expected_revision),
             "stale editor revision: expected {expected_revision}, current {current_revision}"
         );
         anyhow::ensure!(
@@ -10071,12 +10115,10 @@ impl Editor {
                 line_count,
             } => {
                 let path = resolve_path(&path)?;
-                let exists = path.exists();
-                if self
-                    .open_agent_buffer(&path, /*create*/ false, render_buffer)
-                    .await?
-                    .is_none()
-                {
+                let normalized = normalized_file_path(&path.to_string_lossy())?;
+                let exists = normalized.exists();
+                let open_index = self.file_buffer_index(&normalized);
+                if open_index.is_none() && !exists {
                     return Ok(json!({
                         "content": "",
                         "revision": 0,
@@ -10088,7 +10130,22 @@ impl Editor {
                         "next_line": null,
                     }));
                 }
-                let contents = self.current_buffer().contents();
+                // Reads never switch or open buffers: an open file reports its live
+                // contents, and an unopened file is read from disk with a content token.
+                let (contents, revision) = match open_index {
+                    Some(index) => (
+                        self.buffer_manager[index].contents(),
+                        self.buffer_manager[index].revision(),
+                    ),
+                    None => {
+                        let buffer =
+                            Buffer::load_or_create(Some(normalized.to_string_lossy().into_owned()))
+                                .await?;
+                        let contents = buffer.contents();
+                        let revision = agent_disk_revision(&contents);
+                        (contents, revision)
+                    }
+                };
                 let page = agent_file_page(&contents, start_line, line_count);
                 anyhow::ensure!(
                     !page.line_truncated,
@@ -10096,7 +10153,7 @@ impl Editor {
                 );
                 Ok(json!({
                     "content": page.content,
-                    "revision": self.current_buffer().revision(),
+                    "revision": revision,
                     "exists": exists,
                     "start_line": page.start_line,
                     "end_line": page.end_line,
@@ -10111,6 +10168,7 @@ impl Editor {
                 content,
             } => {
                 let path = resolve_path(&path)?;
+                ensure_agent_writable_path(&root, &path)?;
                 self.apply_agent_contents(
                     &request.session_id,
                     &path,
@@ -10128,6 +10186,7 @@ impl Editor {
                     /*is_dir*/ true,
                     allow_sensitive_paths,
                 )?;
+                ensure_agent_writable_path(&root, &path)?;
                 let created =
                     crate::lsp::workspace_edit::secure_create_workspace_directory(&root, &path)?;
                 Ok(json!({
@@ -10285,11 +10344,12 @@ impl Editor {
                 edits,
             } => {
                 let path = resolve_path(&path)?;
+                ensure_agent_writable_path(&root, &path)?;
                 self.open_agent_buffer(&path, /*create*/ true, render_buffer)
                     .await?;
                 let current_revision = self.current_buffer().revision();
                 anyhow::ensure!(
-                    current_revision == expected_revision,
+                    agent_revision_matches(self.current_buffer(), expected_revision),
                     "stale editor revision: expected {expected_revision}, current {current_revision}"
                 );
                 let contents = apply_text_edits(&self.current_buffer().contents(), &edits)?;
@@ -10462,11 +10522,14 @@ impl Editor {
                 .await?;
             return Ok(false);
         }
-        if self.agent_manager.is_session_active(&session_id) {
-            self.set_legacy_message(Some(
-                "a Codex prompt is already active for this session".to_string(),
-            ));
-            return Ok(true);
+        if self.agent_manager.is_session_busy(&session_id) {
+            // A cancelled turn keeps running until Codex confirms the interrupt;
+            // holding the prompt avoids racing that turn's terminal event.
+            self.agent_manager.queue_prompt(
+                session_id,
+                agent_manager::QueuedAgentPrompt { text, context },
+            );
+            return Ok(false);
         }
         let turn_id = uuid::Uuid::new_v4().to_string();
         self.begin_inline_agent_outcome(&session_id, &turn_id, &text)?;
@@ -10903,6 +10966,17 @@ impl Editor {
         self.stop_inline_agent_outcomes(fallback);
         drop(self.agent_manager.take_bridge());
         self.agent_manager.clear_active_sessions();
+        // Prompts held behind a stopping turn were never sent; return them to the
+        // pane instead of letting a dead app-server swallow them.
+        for (session_id, prompts) in self.agent_manager.take_all_queued_prompts() {
+            self.plugin_registry
+                .notify(
+                    runtime,
+                    "agent:prompts_returned",
+                    json!({ "session_id": session_id, "prompts": prompts }),
+                )
+                .await?;
+        }
         self.agent_manager.clear_turns();
         self.agent_manager.clear_tool_requests();
         self.agent_manager.set_root(None);
@@ -11340,14 +11414,31 @@ impl Editor {
                 ),
                 _ => {}
             }
-            if let CodexEvent::Completed { session_id, .. }
-            | CodexEvent::Cancelled { session_id }
-            | CodexEvent::Failed {
-                session_id: Some(session_id),
-                ..
-            } = &event
-            {
-                self.agent_manager.mark_session_inactive(session_id);
+            let ended_turn_id = match &event {
+                CodexEvent::Completed { session_id, .. }
+                | CodexEvent::Cancelled { session_id }
+                | CodexEvent::Failed {
+                    session_id: Some(session_id),
+                    ..
+                } => self.agent_manager.turn_id(session_id).map(str::to_string),
+                _ => None,
+            };
+            let mut next_prompt = None;
+            match &event {
+                CodexEvent::Completed { session_id, .. }
+                | CodexEvent::Failed {
+                    session_id: Some(session_id),
+                    ..
+                } => {
+                    next_prompt = self
+                        .agent_manager
+                        .finish_turn(session_id)
+                        .map(|prompt| (session_id.clone(), prompt));
+                }
+                CodexEvent::Cancelled { session_id } => {
+                    self.agent_manager.mark_session_inactive(session_id);
+                }
+                _ => {}
             }
             match &event {
                 CodexEvent::Update { session_id, .. }
@@ -11390,7 +11481,18 @@ impl Editor {
             if let (Some(elapsed_ms), Some(object)) = (turn_elapsed_ms, payload.as_object_mut()) {
                 object.insert("elapsed_ms".to_string(), json!(elapsed_ms));
             }
+            if let (Some(turn_id), Some(object)) = (ended_turn_id, payload.as_object_mut()) {
+                object.insert("turn_id".to_string(), json!(turn_id));
+            }
             self.plugin_registry.notify(runtime, name, payload).await?;
+            if let Some((session_id, prompt)) = next_prompt {
+                if self
+                    .dispatch_agent_prompt(runtime, session_id, prompt.text, prompt.context)
+                    .await?
+                {
+                    self.render(buffer)?;
+                }
+            }
         }
         if self.agent_manager.is_task_finished()
             && self
@@ -11787,7 +11889,7 @@ impl Editor {
                         .await?;
                 }
                 PluginRequest::AgentCancel { session_id } => {
-                    self.agent_manager.mark_session_inactive(&session_id);
+                    self.agent_manager.begin_stopping(&session_id);
                     let Some(bridge) = self.agent_manager.bridge() else {
                         continue;
                     };
@@ -11812,6 +11914,7 @@ impl Editor {
                         Some("Agent session closed."),
                     );
                     self.agent_manager.mark_session_inactive(&session_id);
+                    self.agent_manager.discard_session_queue(&session_id);
                     let Some(bridge) = self.agent_manager.bridge() else {
                         continue;
                     };
@@ -35847,6 +35950,55 @@ mod test {
 
     #[tokio::test]
     #[cfg(unix)]
+    async fn agent_writes_to_protected_paths_fail_before_touching_a_buffer() {
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir_all(root.path().join(".git/hooks")).unwrap();
+        fs::write(root.path().join(".git/config"), "[remote]\n").unwrap();
+        let mut editor = test_editor(/*width*/ 80, /*height*/ 24);
+        editor.test_set_agent_root(root.path());
+        let buffers = editor.buffer_manager.len();
+        let request = |call| EditorToolRequest {
+            session_id: "protected".to_string(),
+            call,
+        };
+        for path in [
+            ".git/hooks/pre-commit",
+            ".red/init.hk",
+            "red.toml",
+            ".vscode/tasks.json",
+        ] {
+            let write = editor
+                .test_run_agent_editor_tool(request(EditorToolCall::WriteFile {
+                    path: path.to_string(),
+                    expected_revision: 0,
+                    content: "echo pwned\n".to_string(),
+                }))
+                .await;
+            assert!(write.is_err(), "write_file {path}");
+            let edit = editor
+                .test_run_agent_editor_tool(request(EditorToolCall::ApplyEdits {
+                    path: path.to_string(),
+                    expected_revision: 0,
+                    edits: Vec::new(),
+                }))
+                .await;
+            assert!(edit.is_err(), "apply_edits {path}");
+        }
+        let read = editor
+            .test_run_agent_editor_tool(request(EditorToolCall::ReadFile {
+                path: ".git/config".to_string(),
+                start_line: 1,
+                line_count: 10,
+            }))
+            .await
+            .unwrap_err();
+        assert!(read.to_string().contains("version-control metadata"));
+        assert_eq!(editor.buffer_manager.len(), buffers);
+        assert!(!root.path().join(".git/hooks/pre-commit").exists());
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
     async fn agent_directory_tools_reject_ignored_protected_and_outside_paths() {
         let root = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
@@ -35958,6 +36110,13 @@ mod test {
         let path = root.path().join("document.rs");
         fs::write(&path, "original\n").unwrap();
         let mut editor = test_editor(/*width*/ 80, /*height*/ 24);
+        editor
+            .buffer_manager
+            .replace_buffers(vec![Buffer::load_or_create(Some(
+                path.to_string_lossy().into_owned(),
+            ))
+            .await
+            .unwrap()]);
         editor.test_set_agent_root(root.path());
         let request = |call| EditorToolRequest {
             session_id: "external-change".to_string(),
@@ -35996,11 +36155,74 @@ mod test {
 
     #[tokio::test]
     #[cfg(unix)]
+    async fn agent_reads_of_unopened_files_leave_buffers_alone_and_guard_later_writes() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("document.rs");
+        fs::write(&path, "original\n").unwrap();
+        let mut editor = test_editor(/*width*/ 80, /*height*/ 24);
+        editor.test_set_agent_root(root.path());
+        let buffers = editor.buffer_manager.len();
+        let active = editor.current_buffer().id();
+        let request = |call| EditorToolRequest {
+            session_id: "disk-read".to_string(),
+            call,
+        };
+        let read = |line_count| {
+            request(EditorToolCall::ReadFile {
+                path: "document.rs".to_string(),
+                start_line: 1,
+                line_count,
+            })
+        };
+
+        let first = editor.test_run_agent_editor_tool(read(20)).await.unwrap();
+        assert_eq!(first["content"], "original\n");
+        assert_eq!(
+            editor.buffer_manager.len(),
+            buffers,
+            "a read must not open a buffer"
+        );
+        assert_eq!(editor.current_buffer().id(), active);
+
+        fs::write(&path, "external\n").unwrap();
+        let stale = editor
+            .test_run_agent_editor_tool(request(EditorToolCall::WriteFile {
+                path: "document.rs".to_string(),
+                expected_revision: first["revision"].as_u64().unwrap(),
+                content: "agent edit\n".to_string(),
+            }))
+            .await
+            .unwrap_err();
+        assert!(stale.to_string().contains("stale editor revision"));
+        assert_eq!(fs::read_to_string(&path).unwrap(), "external\n");
+
+        let fresh = editor.test_run_agent_editor_tool(read(20)).await.unwrap();
+        let written = editor
+            .test_run_agent_editor_tool(request(EditorToolCall::WriteFile {
+                path: "document.rs".to_string(),
+                expected_revision: fresh["revision"].as_u64().unwrap(),
+                content: "agent edit\n".to_string(),
+            }))
+            .await
+            .unwrap();
+        assert_eq!(written["saved"], true, "{written}");
+        assert_eq!(fs::read_to_string(&path).unwrap(), "agent edit\n");
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
     async fn agent_file_writes_never_replace_unsaved_human_edits() {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("document.rs");
         fs::write(&path, "original\n").unwrap();
         let mut editor = test_editor(/*width*/ 80, /*height*/ 24);
+        editor
+            .buffer_manager
+            .replace_buffers(vec![Buffer::load_or_create(Some(
+                path.to_string_lossy().into_owned(),
+            ))
+            .await
+            .unwrap()]);
         editor.test_set_agent_root(root.path());
         let request = |call| EditorToolRequest {
             session_id: "unsaved-human-edit".to_string(),
@@ -36045,6 +36267,13 @@ mod test {
         let path = root.path().join("main.rs");
         fs::write(&path, "one\ntwo\nthree\nfour\nfive\n").unwrap();
         let mut editor = test_editor(/*width*/ 80, /*height*/ 24);
+        editor
+            .buffer_manager
+            .replace_buffers(vec![Buffer::load_or_create(Some(
+                path.to_string_lossy().into_owned(),
+            ))
+            .await
+            .unwrap()]);
         editor.test_set_agent_root(root.path());
         let request = |start_line, line_count| EditorToolRequest {
             session_id: "paged-read".to_string(),
@@ -38523,6 +38752,135 @@ builtin = "rust"
         assert!(!editor.agent_manager.has_bridge());
         assert!(!editor.agent_manager.is_task_finished());
         assert!(!editor.agent_manager.is_session_active("session-1"));
+        drain_plugin_requests();
+    }
+
+    #[test]
+    fn statusline_agent_activity_reports_turn_phase_and_queue() {
+        let mut editor = test_editor(/*width*/ 80, /*height*/ 24);
+        editor.config.agent.follow_tool_calls = false;
+        assert_eq!(
+            editor.statusline_agent_activity(),
+            None,
+            "idle shows nothing"
+        );
+
+        editor.agent_manager.mark_session_active("session-1");
+        assert_eq!(
+            editor.statusline_agent_activity().as_deref(),
+            Some("agent working")
+        );
+        editor.config.agent.follow_tool_calls = true;
+        assert_eq!(
+            editor.statusline_agent_activity().as_deref(),
+            Some("agent following")
+        );
+
+        editor.agent_manager.begin_stopping("session-1");
+        editor.agent_manager.queue_prompt(
+            "session-1",
+            agent_manager::QueuedAgentPrompt {
+                text: "next".to_string(),
+                context: None,
+            },
+        );
+        assert_eq!(
+            editor.statusline_agent_activity().as_deref(),
+            Some("agent stopping · 1 queued")
+        );
+    }
+
+    #[tokio::test]
+    async fn prompt_sent_during_a_cancel_runs_after_the_interrupted_turn_ends() {
+        fn prompt_text(command: Option<CodexCommand>) -> Option<String> {
+            match command? {
+                CodexCommand::Prompt { text, .. }
+                | CodexCommand::PromptWithContext { text, .. } => Some(text),
+                _ => None,
+            }
+        }
+        drain_plugin_requests();
+        let mut editor = test_editor(/*width*/ 80, /*height*/ 24);
+        let (bridge, mut worker) = CodexBridge::channel(NonZeroUsize::new(8).unwrap());
+        editor.agent_manager.set_bridge(bridge);
+        let mut buffer =
+            RenderBuffer::new(/*width*/ 80, /*height*/ 24, &Style::default());
+        let mut runtime = Runtime::new();
+        let prompt = |text: &str| PluginRequest::AgentPrompt {
+            session_id: "session-1".to_string(),
+            text: text.to_string(),
+        };
+
+        ACTION_DISPATCHER.send_request(prompt("first"));
+        editor
+            .service_background(&mut buffer, &mut runtime)
+            .await
+            .unwrap();
+        assert_eq!(prompt_text(worker.recv().await).as_deref(), Some("first"));
+
+        ACTION_DISPATCHER.send_request(PluginRequest::AgentCancel {
+            session_id: "session-1".to_string(),
+        });
+        editor
+            .service_background(&mut buffer, &mut runtime)
+            .await
+            .unwrap();
+        assert!(matches!(
+            worker.recv().await,
+            Some(CodexCommand::Cancel { .. })
+        ));
+        // The worker acknowledges the cancel before Codex finishes the turn.
+        worker
+            .send(CodexEvent::Cancelled {
+                session_id: "session-1".to_string(),
+            })
+            .await
+            .unwrap();
+        ACTION_DISPATCHER.send_request(prompt("second"));
+        editor
+            .service_background(&mut buffer, &mut runtime)
+            .await
+            .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), worker.recv())
+                .await
+                .is_err(),
+            "the follow-up must wait for the interrupted turn to end"
+        );
+        // A rejected interrupt leaves the turn running, so the prompt keeps waiting.
+        worker
+            .send(CodexEvent::CancelFailed {
+                session_id: "session-1".to_string(),
+                message: "interrupt rejected".to_string(),
+            })
+            .await
+            .unwrap();
+        editor
+            .service_background(&mut buffer, &mut runtime)
+            .await
+            .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), worker.recv())
+                .await
+                .is_err(),
+            "a failed cancel must not release the held follow-up"
+        );
+        assert!(editor.agent_manager.is_session_busy("session-1"));
+
+        worker
+            .send(CodexEvent::Completed {
+                session_id: "session-1".to_string(),
+                stop_reason: "interrupted".to_string(),
+            })
+            .await
+            .unwrap();
+        editor
+            .service_background(&mut buffer, &mut runtime)
+            .await
+            .unwrap();
+
+        assert_eq!(prompt_text(worker.recv().await).as_deref(), Some("second"));
+        assert!(editor.agent_manager.is_session_active("session-1"));
         drain_plugin_requests();
     }
 

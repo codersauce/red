@@ -4073,11 +4073,18 @@ impl Editor {
         Some((index + 1, matches.len()))
     }
 
-    fn statusline_agent_activity(&self) -> Option<String> {
-        if self.agent_manager.has_active_sessions() {
-            return Some("following".to_string());
-        }
-        self.agent_manager.has_bridge().then(|| "idle".to_string())
+    /// Shows the agent's turn state only while there is something to report.
+    pub(super) fn statusline_agent_activity(&self) -> Option<String> {
+        use super::agent_manager::AgentTurnPhase;
+        let phase = match self.agent_manager.turn_phase()? {
+            AgentTurnPhase::Running if self.config.agent.follow_tool_calls => "agent following",
+            AgentTurnPhase::Running => "agent working",
+            AgentTurnPhase::Stopping => "agent stopping",
+        };
+        Some(match self.agent_manager.queued_prompt_count() {
+            0 => phase.to_string(),
+            queued => format!("{phase} · {queued} queued"),
+        })
     }
 
     pub fn draw_commandline(&mut self, buffer: &mut RenderBuffer) {

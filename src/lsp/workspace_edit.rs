@@ -1346,6 +1346,41 @@ pub fn normalized_file_path(uri: &str) -> Result<String, LspError> {
     Ok(normalized_path(uri)?.to_string_lossy().into_owned())
 }
 
+/// Version-control metadata directories that automated tools never read or write.
+const VCS_METADATA_DIRS: [&str; 4] = [".git", ".hg", ".jj", ".svn"];
+
+fn lowercase_normal_components(relative: &Path) -> Vec<String> {
+    relative
+        .components()
+        .filter_map(|component| match component {
+            Component::Normal(value) => Some(value.to_string_lossy().to_ascii_lowercase()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Returns whether a workspace-relative path lies inside version-control metadata.
+pub(crate) fn is_vcs_metadata_path(relative: &Path) -> bool {
+    lowercase_normal_components(relative)
+        .iter()
+        .any(|component| VCS_METADATA_DIRS.contains(&component.as_str()))
+}
+
+/// Returns whether a workspace-relative path is a control or secret path that
+/// automated edits must never write, such as Git hooks or task runners.
+pub(crate) fn is_protected_workspace_path(relative: &Path) -> bool {
+    let components = lowercase_normal_components(relative);
+    components.iter().any(|component| {
+        VCS_METADATA_DIRS.contains(&component.as_str())
+            || component == ".ssh"
+            || component == ".red"
+            || component == "red.toml"
+            || component.starts_with(".env")
+    }) || components.windows(2).any(|parts| {
+        parts[0] == ".vscode" && (parts[1] == "tasks.json" || parts[1] == "launch.json")
+    })
+}
+
 fn ensure_safe_path(root: &Path, path: &Path) -> Result<(), LspError> {
     if !path.starts_with(root) {
         return Err(protocol_error(format!(
@@ -1366,23 +1401,7 @@ fn ensure_safe_path(root: &Path, path: &Path) -> Result<(), LspError> {
             path.display()
         )));
     }
-    let components = relative
-        .components()
-        .filter_map(|component| match component {
-            Component::Normal(value) => Some(value.to_string_lossy().to_ascii_lowercase()),
-            _ => None,
-        })
-        .collect::<Vec<_>>();
-    let protected = components.iter().any(|component| {
-        component == ".git"
-            || component == ".ssh"
-            || component == ".red"
-            || component == "red.toml"
-            || component.starts_with(".env")
-    }) || components.windows(2).any(|parts| {
-        parts[0] == ".vscode" && (parts[1] == "tasks.json" || parts[1] == "launch.json")
-    });
-    if protected {
+    if is_protected_workspace_path(relative) {
         return Err(protocol_error(format!(
             "LSP workspace edit targets a protected control or secret path: {}",
             path.display()

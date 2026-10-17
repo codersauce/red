@@ -1,7 +1,7 @@
 //! Agent manager sub-controller for Codex AI app-server integration and tool channels.
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     path::{Path, PathBuf},
     time::Instant,
 };
@@ -23,7 +23,8 @@ pub struct AgentManager {
     playback_ready_at: Option<Instant>,
     playback_response: Option<PendingEditorToolResponse>,
     playback_response_ready_at: Option<Instant>,
-    active_sessions: HashSet<String>,
+    /// Sessions with a turn in flight; absent sessions are idle.
+    turn_phases: HashMap<String, AgentTurnPhase>,
     active_turn_ids: HashMap<String, String>,
     turn_started_at: HashMap<String, Instant>,
     pending_commit_messages: HashSet<i64>,
@@ -32,6 +33,24 @@ pub struct AgentManager {
     next_model: Option<crate::codex::AgentModelSelection>,
     conversation: Option<AgentConversationSnapshot>,
     forgotten_conversations: HashSet<String>,
+    /// Prompts submitted while their session was busy, sent once its turn ends.
+    queued_prompts: HashMap<String, VecDeque<QueuedAgentPrompt>>,
+}
+
+/// Where a session's current turn is in its lifecycle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentTurnPhase {
+    /// The turn is running and may call editor tools.
+    Running,
+    /// A cancel was sent; editor tools are refused until Codex reports the end.
+    Stopping,
+}
+
+/// A prompt held until its session's previous turn has fully ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueuedAgentPrompt {
+    pub text: String,
+    pub context: Option<(String, String)>,
 }
 
 impl AgentManager {
@@ -147,28 +166,105 @@ impl AgentManager {
         }
     }
 
-    /// Marks a session as active.
+    /// Marks a session's turn as running.
     pub fn mark_session_active(&mut self, session_id: impl Into<String>) {
-        self.active_sessions.insert(session_id.into());
+        self.turn_phases
+            .insert(session_id.into(), AgentTurnPhase::Running);
     }
 
-    /// Marks a session as inactive.
+    /// Stops treating a running turn as active. A stopping turn stays busy until
+    /// `finish_turn`, because Codex has not confirmed that it ended.
     pub fn mark_session_inactive(&mut self, session_id: &str) {
-        self.active_sessions.remove(session_id);
-        self.active_turn_ids.remove(session_id);
+        if self.turn_phases.get(session_id) != Some(&AgentTurnPhase::Stopping) {
+            self.turn_phases.remove(session_id);
+            self.active_turn_ids.remove(session_id);
+        }
     }
 
     pub fn is_session_active(&self, session_id: &str) -> bool {
-        self.active_sessions.contains(session_id)
+        self.turn_phases.get(session_id) == Some(&AgentTurnPhase::Running)
     }
 
     pub fn has_active_sessions(&self) -> bool {
-        !self.active_sessions.is_empty()
+        self.turn_phases
+            .values()
+            .any(|phase| *phase == AgentTurnPhase::Running)
+    }
+
+    /// Returns the most advanced phase across sessions, for status display.
+    pub fn turn_phase(&self) -> Option<AgentTurnPhase> {
+        if self.has_active_sessions() {
+            Some(AgentTurnPhase::Running)
+        } else {
+            self.turn_phases.values().next().copied()
+        }
+    }
+
+    pub fn queued_prompt_count(&self) -> usize {
+        self.queued_prompts.values().map(VecDeque::len).sum()
     }
 
     pub fn clear_active_sessions(&mut self) {
-        self.active_sessions.clear();
+        self.turn_phases.clear();
         self.active_turn_ids.clear();
+    }
+
+    /// Records a cancel request. A running turn keeps the session busy until
+    /// Codex reports the interrupted turn's terminal event, while its editor
+    /// tools stop immediately because the session is no longer active.
+    pub fn begin_stopping(&mut self, session_id: &str) {
+        if self.is_session_active(session_id) {
+            self.turn_phases
+                .insert(session_id.to_string(), AgentTurnPhase::Stopping);
+        }
+    }
+
+    /// Returns whether a new turn must wait for this session's current turn.
+    pub fn is_session_busy(&self, session_id: &str) -> bool {
+        self.turn_phases.contains_key(session_id)
+    }
+
+    pub fn queue_prompt(&mut self, session_id: impl Into<String>, prompt: QueuedAgentPrompt) {
+        self.queued_prompts
+            .entry(session_id.into())
+            .or_default()
+            .push_back(prompt);
+    }
+
+    /// Ends a session's turn and returns the next prompt that may now start.
+    pub fn finish_turn(&mut self, session_id: &str) -> Option<QueuedAgentPrompt> {
+        self.turn_phases.remove(session_id);
+        self.active_turn_ids.remove(session_id);
+        let queue = self.queued_prompts.get_mut(session_id)?;
+        let prompt = queue.pop_front();
+        if queue.is_empty() {
+            self.queued_prompts.remove(session_id);
+        }
+        prompt
+    }
+
+    /// Drops busy state and queued prompts for a session that is being closed.
+    pub fn discard_session_queue(&mut self, session_id: &str) -> usize {
+        self.turn_phases.remove(session_id);
+        self.queued_prompts
+            .remove(session_id)
+            .map_or(0, |queue| queue.len())
+    }
+
+    /// Takes every unsent prompt so a lost bridge can hand them back to the pane.
+    pub fn take_all_queued_prompts(&mut self) -> Vec<(String, Vec<String>)> {
+        let mut returned = self
+            .queued_prompts
+            .drain()
+            .map(|(session_id, queue)| {
+                (
+                    session_id,
+                    queue.into_iter().map(|prompt| prompt.text).collect(),
+                )
+            })
+            .collect::<Vec<_>>();
+        returned.sort_by(|left, right| left.0.cmp(&right.0));
+        returned
     }
 
     pub fn set_turn_id(&mut self, session_id: impl Into<String>, turn_id: impl Into<String>) {
@@ -422,6 +518,34 @@ mod tests {
         manager.restore_conversation(old);
         assert_eq!(manager.conversation_tool_contract_version("old"), Some(0));
         assert_eq!(manager.conversation_tool_contract_version("other"), None);
+    }
+
+    #[test]
+    fn a_lost_bridge_returns_prompts_held_behind_a_stopping_turn() {
+        let mut manager = AgentManager::new();
+        manager.mark_session_active("session-1");
+        manager.begin_stopping("session-1");
+        for text in ["first", "second"] {
+            manager.queue_prompt(
+                "session-1",
+                super::QueuedAgentPrompt {
+                    text: text.to_string(),
+                    context: None,
+                },
+            );
+        }
+
+        manager.clear_active_sessions();
+
+        assert_eq!(
+            manager.take_all_queued_prompts(),
+            [(
+                "session-1".to_string(),
+                vec!["first".to_string(), "second".to_string()]
+            )]
+        );
+        assert!(manager.take_all_queued_prompts().is_empty());
+        assert!(!manager.is_session_busy("session-1"));
     }
 
     #[tokio::test]

@@ -1032,6 +1032,41 @@ async fn agent_lsp_status_and_prepare_are_typed_and_do_not_move_the_cursor() {
 }
 
 #[tokio::test]
+async fn agent_lsp_works_on_files_read_from_disk_without_switching_buffers() {
+    let root = tempfile::tempdir().unwrap();
+    let (mut editor, lsp) = agent_lsp_fixture(
+        root.path(),
+        json!({"renameProvider": {"prepareProvider": true}}),
+    );
+    std::fs::write(root.path().join("other.rs"), "fn old() {}\n").unwrap();
+    let active = editor.test_current_buffer_index();
+    let read = editor
+        .test_run_agent_editor_tool(agent_request(EditorToolCall::ReadFile {
+            path: "other.rs".into(),
+            start_line: 1,
+            line_count: 10,
+        }))
+        .await
+        .unwrap();
+
+    lsp.queue_result("textDocument/prepareRename", json!({"range": {"start": {"line": 0, "character": 3}, "end": {"line": 0, "character": 6}}, "placeholder": "old"}));
+    let result = editor
+        .test_run_agent_editor_tool(agent_request(EditorToolCall::LspPrepareRename {
+            path: "other.rs".into(),
+            position: EditorPosition {
+                line: 0,
+                character: 3,
+            },
+            expected_revision: read["revision"].as_u64().unwrap(),
+        }))
+        .await
+        .unwrap();
+
+    assert_eq!(result["placeholder"], "old");
+    assert_eq!(editor.test_current_buffer_index(), active);
+}
+
+#[tokio::test]
 async fn agent_lsp_rejects_split_surrogates_and_unsupported_operations() {
     let root = tempfile::tempdir().unwrap();
     let (mut editor, lsp) = agent_lsp_fixture(root.path(), json!({"renameProvider": true}));

@@ -7,6 +7,7 @@
 
 struct AgentSessionEvent {
     session_id: String,
+    turn_id: Option<String>,
 }
 
 struct AgentTextEvent {
@@ -16,12 +17,19 @@ struct AgentTextEvent {
 
 struct AgentCompletedEvent {
     session_id: String,
+    turn_id: Option<String>,
     stop_reason: String,
     elapsed_ms: i64,
 }
 
+struct AgentPromptsReturnedEvent {
+    session_id: String,
+    prompts: [String],
+}
+
 struct AgentErrorEvent {
     session_id: String,
+    turn_id: Option<String>,
     message: String,
 }
 
@@ -244,6 +252,7 @@ struct AgentState {
     streaming: bool,
     turn_active: bool,
     prompt_queue: [AgentPromptQueueItem],
+    queue_paused: bool,
     queued_prompt_blocks: [AgentTextBlock],
     recap_pending: bool,
     restoring: bool,
@@ -256,6 +265,7 @@ struct AgentState {
     history_open: bool,
     history_detail: [[PanelSegment]],
     ui_phase: String,
+    current_turn_id: String,
     ui_label: String,
     activity_rows: [AgentActivityRow],
     activity_history: [AgentActivityHistory],
@@ -297,6 +307,7 @@ fn initial_state() -> AgentState {
         streaming: false,
         turn_active: false,
         prompt_queue: [],
+        queue_paused: false,
         queued_prompt_blocks: [],
         recap_pending: false,
         restoring: false,
@@ -312,6 +323,7 @@ fn initial_state() -> AgentState {
             style: muted_style(),
         }]],
         ui_phase: "idle",
+        current_turn_id: "",
         ui_label: "",
         activity_rows: [],
         activity_history: [],
@@ -907,26 +919,11 @@ fn submit_prompt(text: String) {
         return;
     }
     if state().turn_active {
-        let queue = state().prompt_queue;
-        if red::len(queue) >= 16 {
+        if !enqueue_prompt(text) {
             red::execute("Print", "Agent follow-up queue is full");
             return;
         }
-        let generation = red::int(state().block_generation, 0) + 1;
-        let block_id = "user:" + generation;
-        red::state_patch(AgentState { block_generation: generation });
-        queue = red::push(queue, AgentPromptQueueItem { text: text, block_id: block_id });
-        red::state_patch(AgentState { prompt_queue: queue });
-        // Pending blocks render below the active stream but do not enter the
-        // committed transcript until their FIFO turn is dispatched.
-        let queued_blocks = state().queued_prompt_blocks;
-        queued_blocks = red::push(queued_blocks, AgentTextBlock {
-            id: block_id,
-            kind: "user",
-            format: "plain",
-            text: text,
-        });
-        red::state_patch(AgentState { queued_prompt_blocks: queued_blocks });
+        let queue = state().prompt_queue;
         if state().streaming {
             red::state_patch(AgentState { stream_trimmed: true });
         }
@@ -944,6 +941,52 @@ fn submit_prompt(text: String) {
         return;
     }
     dispatch_prompt(text);
+}
+
+/// Append a follow-up to the FIFO queue and its pending block; false when full.
+fn enqueue_prompt(text: String) -> bool {
+    let queue = state().prompt_queue;
+    if red::len(queue) >= 16 {
+        return false;
+    }
+    let generation = red::int(state().block_generation, 0) + 1;
+    let block_id = "user:" + generation;
+    red::state_patch(AgentState { block_generation: generation });
+    queue = red::push(queue, AgentPromptQueueItem { text: text, block_id: block_id });
+    red::state_patch(AgentState { prompt_queue: queue });
+    // Pending blocks render below the active stream but do not enter the
+    // committed transcript until their FIFO turn is dispatched.
+    let queued_blocks = state().queued_prompt_blocks;
+    queued_blocks = red::push(queued_blocks, AgentTextBlock {
+        id: block_id,
+        kind: "user",
+        format: "plain",
+        text: text,
+    });
+    red::state_patch(AgentState { queued_prompt_blocks: queued_blocks });
+    return true;
+}
+
+/// The editor held these prompts behind a stopping turn when Codex went away;
+/// keep them as paused follow-ups so nothing the user typed is lost.
+#[red::on("agent:prompts_returned")]
+fn prompts_returned(event: AgentPromptsReturnedEvent) {
+    if !is_current_session(event.session_id) && red::string(state().session_id, "") != "" {
+        return;
+    }
+    let kept = 0;
+    for text in event.prompts {
+        if enqueue_prompt(text) {
+            kept = kept + 1;
+        }
+    }
+    if kept == 0 {
+        return;
+    }
+    red::state_patch(AgentState { queue_paused: true });
+    render_conversation();
+    render_status();
+    red::execute("Print", "Kept " + kept + " unsent agent message(s) · :AgentSendQueued to send");
 }
 
 fn dispatch_prompt(text: String) {
@@ -1000,7 +1043,18 @@ fn turn_started(event: AgentSessionEvent) {
     if !is_current_session(event.session_id) {
         return;
     }
+    let turn_id = "";
+    if let Some(value) = event.turn_id { turn_id = value; }
+    red::state_patch(AgentState { current_turn_id: turn_id });
     set_phase("waiting", "Waiting for agent…");
+}
+
+/// Returns whether a terminal event belongs to an earlier turn than the one shown.
+fn is_stale_turn(turn_id: Option<String>) -> bool {
+    let ended = "";
+    if let Some(value) = turn_id { ended = value; }
+    let current = red::string(state().current_turn_id, "");
+    return ended != "" && current != "" && ended != current;
 }
 
 /// Update the turn phase/label and re-render the panel status row.
@@ -1019,6 +1073,15 @@ fn set_phase(phase: String, label: String) {
 fn render_status() {
     let phase = red::string(state().ui_phase, "idle");
     if phase == "idle" {
+        let paused = red::len(state().prompt_queue);
+        if state().queue_paused && paused > 0 {
+            red::execute("SetTextPanelStatus", "agent-conversation", TextPanelStatus {
+                busy: false,
+                label: paused + " queued · paused · :AgentSendQueued or :AgentDiscardQueued",
+                stream: false,
+            });
+            return;
+        }
         red::execute("SetTextPanelStatus", "agent-conversation");
         return;
     }
@@ -1614,7 +1677,7 @@ fn new_conversation() {
     red::state_patch(AgentState { cancelled_session_id: "" });
     red::state_patch(AgentState { turn_active: false });
     set_phase("idle", "");
-    red::state_patch(AgentState { prompt_queue: [] });
+    red::state_patch(AgentState { prompt_queue: [], queue_paused: false });
     red::state_patch(AgentState { recap_pending: false });
     red::state_patch(AgentState { pending_prompt: "" });
     red::state_patch(AgentState { pending_prompt_block_id: "" });
@@ -1769,7 +1832,7 @@ fn flat_transcript(blocks: [AgentTextBlock]) -> String {
 
 #[red::on("agent:completed")]
 fn completed(event: AgentCompletedEvent) {
-    if !is_current_session(event.session_id) {
+    if !is_current_session(event.session_id) || is_stale_turn(event.turn_id) {
         return;
     }
     red::state_patch(AgentState { turn_active: false });
@@ -1780,25 +1843,81 @@ fn completed(event: AgentCompletedEvent) {
     }
     collapse_activity(event.elapsed_ms);
     set_phase("idle", "");
-    if session_id != "" && (stop_reason == "cancelled" || session_id == red::string(state().cancelled_session_id, "")) {
-        red::execute("AgentCloseSession", session_id);
-        red::state_patch(AgentState { session_id: "" });
-        reset_model_state();
+    // Codex keeps an interrupted thread usable, so a stopped turn keeps its
+    // conversation instead of restarting from a transcript recap.
+    let was_cancelled = session_id != "" && session_id == red::string(state().cancelled_session_id, "");
+    if was_cancelled {
         red::state_patch(AgentState { cancelled_session_id: "" });
-        red::state_patch(AgentState { recap_pending: true });
     }
     if stop_reason == "end_turn" || stop_reason == "completed" {
+        if !state().panel_open {
+            red::execute("Print", "Agent finished · Space A to view");
+        }
+        // A cancel that lost the race to completion still means "stop here".
+        if was_cancelled {
+            pause_queue();
+            return;
+        }
         submit_next_queued();
         return;
     }
     append_transcript("System", "Agent stopped: " + stop_reason);
     red::execute("Print", "Agent stopped: " + stop_reason);
+    pause_queue();
+}
+
+/// Hold queued follow-ups after a stop or error so they never run unattended.
+fn pause_queue() {
+    if red::len(state().prompt_queue) == 0 {
+        return;
+    }
+    red::state_patch(AgentState { queue_paused: true });
+    render_status();
+}
+
+#[red::command(
+    name = "AgentSendQueued",
+    title = "Send queued agent follow-ups",
+    category = "Agent",
+    description = "Resume follow-ups held after a stopped or failed turn",
+    aliases = ["resume agent queue"],
+    scope = "global",
+)]
+fn send_queued() {
+    if red::len(state().prompt_queue) == 0 {
+        red::execute("Print", "No queued agent follow-ups");
+        return;
+    }
+    red::state_patch(AgentState { queue_paused: false });
+    if state().turn_active {
+        render_status();
+        return;
+    }
     submit_next_queued();
+}
+
+#[red::command(
+    name = "AgentDiscardQueued",
+    title = "Discard queued agent follow-ups",
+    category = "Agent",
+    description = "Drop follow-ups that have not been sent to the agent",
+    aliases = ["clear agent queue"],
+    scope = "global",
+)]
+fn discard_queued() {
+    let count = red::len(state().prompt_queue);
+    for entry in state().prompt_queue {
+        remove_queued_prompt_block(red::string(entry.block_id, ""));
+    }
+    red::state_patch(AgentState { prompt_queue: [], queue_paused: false });
+    render_conversation();
+    render_status();
+    red::execute("Print", "Discarded " + count + " queued agent follow-up(s)");
 }
 
 fn submit_next_queued() {
     let queue = state().prompt_queue;
-    if red::len(queue) == 0 {
+    if red::len(queue) == 0 || state().queue_paused {
         return;
     }
     let next = queue[0];
@@ -1833,11 +1952,7 @@ fn cancelled(event: AgentSessionEvent) {
         red::state_patch(AgentState { cancelled_session_id: session_id });
     }
     if !state().turn_active && session_id != "" {
-        red::execute("AgentCloseSession", session_id);
-        red::state_patch(AgentState { session_id: "" });
-        reset_model_state();
         red::state_patch(AgentState { cancelled_session_id: "" });
-        red::state_patch(AgentState { recap_pending: true });
         red::execute("Print", "Agent cancellation requested");
         set_phase("idle", "");
         return;
@@ -1848,9 +1963,20 @@ fn cancelled(event: AgentSessionEvent) {
     set_phase("stopping", "Stopping…");
 }
 
+/// Codex refused the interrupt, so the turn keeps running; say so and let the
+/// user retry instead of leaving the pane stuck on "Stopping…".
+#[red::on("agent:cancel_failed")]
+fn cancel_failed(event: AgentErrorEvent) {
+    if !is_current_session(red::string(event.session_id, "")) {
+        return;
+    }
+    red::execute("Print", "Could not stop the agent: " + event.message + " · press Ctrl-C to try again");
+    set_phase("working", "Stop failed · Ctrl-C to retry");
+}
+
 #[red::on("agent:error")]
 fn failed(event: AgentErrorEvent) {
-    if !is_current_session(red::string(event.session_id, "")) {
+    if !is_current_session(red::string(event.session_id, "")) || is_stale_turn(event.turn_id) {
         return;
     }
     if red::string(event.session_id, "") == "" && state().turn_active {
@@ -1865,17 +1991,10 @@ fn failed(event: AgentErrorEvent) {
     commit_pending_prompt();
     let session_id = red::string(event.session_id, "");
     if session_id != "" && session_id == red::string(state().cancelled_session_id, "") {
-        red::execute("AgentCloseSession", session_id);
-        red::state_patch(AgentState { session_id: "" });
-        reset_model_state();
         red::state_patch(AgentState { cancelled_session_id: "" });
-        red::state_patch(AgentState { recap_pending: true });
     }
     append_transcript("Error", event.message);
-    if red::len(state().prompt_queue) > 0 {
-        submit_next_queued();
-        return;
-    }
+    pause_queue();
     if red::string(state().pending_prompt, "") != "" || state().session_id == "" {
         let has_pending_prompt = red::string(state().pending_prompt, "") != "";
         let notice = "Codex unavailable: " + event.message;
