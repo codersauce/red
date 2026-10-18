@@ -232,6 +232,8 @@ impl AgentPaneLifecycle {
     /// Resumes paused follow-ups.
     pub fn send_queued(&mut self, transcript: &str) -> Vec<AgentPaneEffect> {
         self.set_transcript(transcript);
+        // Sending the queue is an answer to an interrupted turn: move on.
+        self.interrupted = None;
         self.paused = false;
         self.advance()
     }
@@ -356,9 +358,13 @@ impl AgentPaneLifecycle {
         // A stop that lost the race to completion still means "stop here".
         let hold = self.stop_requested || outcome == AgentTurnOutcome::Stopped;
         self.close_reply();
+        let in_flight = self.in_flight.take();
+        if outcome == AgentTurnOutcome::Stopped && !self.stop_requested {
+            // Cut short without the user asking: offer Retry and Continue.
+            self.interrupted = in_flight;
+        }
         self.phase = Some(AgentPanePhase::Idle);
         self.turn_id = None;
-        self.in_flight = None;
         self.stop_requested = false;
         self.stop_failed = false;
         if hold {
@@ -1268,6 +1274,31 @@ mod tests {
         );
         assert!(!pane.snapshot().resume_pending);
         assert!(pane.prepare().is_empty());
+    }
+
+    #[test]
+    fn a_turn_that_fails_on_its_own_asks_but_a_requested_stop_does_not() {
+        let mut pane = live("s1");
+        pane.submit("long task".into(), "");
+        pane.turn_started("s1", "t1");
+        pane.turn_ended("s1", Some("t1"), AgentTurnOutcome::Stopped);
+        assert_eq!(
+            pane.snapshot()
+                .interrupted
+                .map(|prompt| prompt.text)
+                .as_deref(),
+            Some("long task")
+        );
+        let wire = dispatched(&pane.resolve_interruption(AgentInterruptionChoice::Retry, ""));
+        assert!(wire[0].ends_with("long task"));
+
+        pane.turn_started("s1", "t2");
+        pane.stop();
+        pane.turn_ended("s1", Some("t2"), AgentTurnOutcome::Stopped);
+        assert!(
+            pane.snapshot().interrupted.is_none(),
+            "the user chose to stop"
+        );
     }
 
     #[test]

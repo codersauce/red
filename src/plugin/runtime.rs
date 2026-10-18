@@ -8065,13 +8065,27 @@ mod tests {
         )
         .await;
         let current = state(&runtime);
-        let last = current["transcript_blocks"]
-            .as_array()
-            .unwrap()
-            .last()
+        let blocks = current["transcript_blocks"].as_array().unwrap();
+        // The failed turn's error comes last, followed only by its recovery choices.
+        let last = blocks
+            .iter()
+            .rev()
+            .find(|block| {
+                !block["id"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .starts_with("interruption-choice:")
+            })
             .unwrap();
         assert_eq!(last["kind"], "error");
         assert_eq!(last["text"], "Connection lost");
+        assert!(blocks
+            .iter()
+            .any(|block| block["id"] == "interruption-choice:retry"));
+        assert!(!blocks.iter().any(|block| block["text"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("Codex stopped before finishing")));
         assert!(current["transcript"]
             .as_str()
             .unwrap()

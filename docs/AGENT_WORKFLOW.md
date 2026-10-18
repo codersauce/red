@@ -381,7 +381,9 @@ but sends nothing else on its own: queued follow-ups wait. The notice offers
 here** (press Tab, then `]l` to reach a choice and Enter to pick it, or run
 `:AgentRecover` or `Space A` for a picker). Typing a new message also moves on. Edits the
 interrupted turn already made stay applied, and both Retry and Continue tell
-Codex so. A crash while the agent is idle resumes quietly.
+Codex so. A turn that fails on its own while Codex keeps running (an error, or a
+stop you did not ask for) offers the same three choices under its error. A
+crash while the agent is idle resumes quietly.
 
 ## Followed editing
 

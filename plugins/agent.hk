@@ -288,6 +288,11 @@ struct AgentState {
     thought: String,
     // Prompt id of the interrupted reply whose notice is in the transcript.
     interruption_id: String,
+    // Codex itself went away (not just a failed turn), so the next
+    // interruption gets the full explanation.
+    codex_lost: bool,
+    // The shown interruption came from Codex going away.
+    interruption_lost_codex: bool,
     // Composer hint for a conversation continued from an earlier launch.
     resume_hint: String,
     // Age of that conversation while its transcript is still the saved copy,
@@ -342,6 +347,8 @@ fn initial_state() -> AgentState {
         activity_block_id: "",
         thought: "",
         interruption_id: "",
+        codex_lost: false,
+        interruption_lost_codex: false,
         resume_hint: "",
         resume_age: "",
     };
@@ -737,6 +744,7 @@ fn pane_state_changed(event: AgentPaneState) {
 
 #[red::on("agent:session_created")]
 fn session_created(event: AgentSessionEvent) {
+    red::state_patch(AgentState { codex_lost: false });
     // The core adopts the thread and sends any waiting message; the pane only
     // refreshes what it shows for the new conversation.
     if event.session_id != red::string(state().session_id, "") {
@@ -766,7 +774,7 @@ fn session_created(event: AgentSessionEvent) {
 )]
 fn prompt() {
     prepare_saved_conversation();
-    if state().interruption_id != "" {
+    if state().interruption_id != "" && state().interruption_lost_codex {
         open_conversation();
         choose_interruption();
         return;
@@ -1885,6 +1893,7 @@ fn session_lost(event: AgentSessionLostEvent) {
     if !is_current_session(red::string(event.session_id, "")) && (session_id != "" || attempted == "") {
         return;
     }
+    red::state_patch(AgentState { codex_lost: true });
     invalidate_model_catalog();
     collapse_activity(red::null());
     set_phase("idle", "");
@@ -2065,6 +2074,7 @@ fn conversation_restore_pending(event: AgentConversationEvent) {
     if shows_thread(event.thread_id) {
         // Codex stopped under us. Keep what streamed so far; the core marks a
         // running turn as interrupted and the notice follows with the snapshot.
+        red::state_patch(AgentState { codex_lost: true });
         finish_agent_message();
         collapse_activity(red::null());
     } else {
@@ -2097,6 +2107,8 @@ fn conversation_resumable(event: AgentResumableEvent) {
 
 #[red::on("agent:session_restored")]
 fn session_restored(event: AgentConversationEvent) {
+    // An interruption from the loss was already shown; a later failure is not one.
+    red::state_patch(AgentState { codex_lost: false });
     red::state_patch(AgentState { model_info: event.model_info, accepted_model: Json {}, turn_model_info: Json {} });
     if !shows_thread(event.thread_id) {
         let age = state().resume_age;
@@ -2151,13 +2163,18 @@ fn show_interruption(prompt_id: String) {
     finish_agent_message();
     collapse_activity(red::null());
     set_phase("idle", "");
-    red::state_patch(AgentState { interruption_id: prompt_id });
+    let lost_codex = state().codex_lost;
+    red::state_patch(AgentState { interruption_id: prompt_id, codex_lost: false, interruption_lost_codex: lost_codex });
     let queued = queued_count();
-    let notice = "Codex stopped before finishing this reply. The conversation is saved and edits it already made are still applied. Nothing more will be sent until you choose what to do.";
-    if queued > 0 {
-        notice = notice + " (" + queued + " queued follow-up(s) are waiting.)";
+    if lost_codex {
+        let notice = "Codex stopped before finishing this reply. The conversation is saved and edits it already made are still applied. Nothing more will be sent until you choose what to do.";
+        if queued > 0 {
+            notice = notice + " (" + queued + " queued follow-up(s) are waiting.)";
+        }
+        append_transcript_block("Error", notice, "interruption:" + prompt_id);
     }
-    append_transcript_block("Error", notice, "interruption:" + prompt_id);
+    // A turn that failed while Codex kept running already shows its error;
+    // it only needs the way forward.
     let blocks = state().transcript_blocks;
     blocks = red::push(blocks, AgentTextBlock {
         id: "interruption-choice:retry", kind: "action", format: "plain", text: "↻ Retry the message",
@@ -2174,7 +2191,9 @@ fn show_interruption(prompt_id: String) {
     red::state_patch(AgentState { transcript_blocks: blocks });
     render_conversation();
     red::execute("SetStorage", "transcript", state().transcript);
-    red::execute("PrintWarning", "Codex stopped mid-reply · Space A to choose what to do");
+    if lost_codex {
+        red::execute("PrintWarning", "Codex stopped mid-reply · Space A to choose what to do");
+    }
 }
 
 #[red::command(
