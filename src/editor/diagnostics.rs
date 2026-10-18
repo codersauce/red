@@ -363,6 +363,7 @@ mod tests {
             &InboundMessage::Notification(ParsedNotification::PublishDiagnostics(
                 TextDocumentPublishDiagnostics {
                     uri: Some(uri.to_string()),
+                    version: None,
                     diagnostics: items,
                     source: None,
                 },
