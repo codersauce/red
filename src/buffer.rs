@@ -178,6 +178,9 @@ pub struct Buffer {
     /// Whether the buffer has unsaved changes
     pub dirty: bool,
 
+    /// Counts saves, so state tied to "until the next save" can tell one has happened.
+    save_generation: u64,
+
     /// Current cursor position as (x, y) coordinates
     pub pos: (usize, usize),
 
@@ -224,6 +227,7 @@ impl Buffer {
             content,
             dirty_revision: 0,
             dirty: false,
+            save_generation: 0,
             pos: (0, 0),
             vtop: 0,
             undo_history: UndoHistory::default(),
@@ -1510,6 +1514,12 @@ impl Buffer {
         self.undo_history.mark_saved();
         self.dirty = false;
         self.dirty_revision = self.revision;
+        self.save_generation += 1;
+    }
+
+    /// Number of times this buffer has been saved.
+    pub fn save_generation(&self) -> u64 {
+        self.save_generation
     }
 
     // Helper method to convert (x,y) coordinates to character index in the rope

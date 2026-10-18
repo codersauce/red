@@ -289,6 +289,11 @@ impl EditorToolCall {
         )
     }
 
+    /// File writes may wait for the user to decide what happens to unsaved changes.
+    pub fn may_wait_for_user(&self) -> bool {
+        matches!(self, Self::WriteFile { .. } | Self::ApplyEdits { .. })
+    }
+
     /// LSP calls retain their response while the editor continues polling servers.
     pub fn is_lsp(&self) -> bool {
         matches!(
@@ -355,6 +360,10 @@ pub struct EditorToolRequest {
     pub call: EditorToolCall,
 }
 
+/// How long a file write may wait while the user decides what happens to unsaved
+/// changes in its buffer.
+pub const USER_DECISION_TOOL_TIMEOUT: Duration = Duration::from_secs(600);
+
 /// Codex tool host that forwards all editor-aware reads and writes to Red's owner task.
 #[derive(Debug, Clone)]
 pub struct EditorToolHost {
@@ -368,6 +377,11 @@ impl EditorToolHost {
     }
 
     async fn request(&self, request: EditorToolRequest) -> anyhow::Result<Value> {
+        let response_timeout = if request.call.may_wait_for_user() {
+            USER_DECISION_TOOL_TIMEOUT
+        } else {
+            Duration::from_secs(30)
+        };
         let (response_tx, response_rx) = oneshot::channel();
         timeout(
             Duration::from_secs(30),
@@ -379,7 +393,7 @@ impl EditorToolHost {
         .await
         .map_err(|_| anyhow::anyhow!("editor tool dispatcher is backpressured"))?
         .map_err(|_| anyhow::anyhow!("editor tool dispatcher stopped"))?;
-        timeout(Duration::from_secs(30), response_rx)
+        timeout(response_timeout, response_rx)
             .await
             .map_err(|_| anyhow::anyhow!("editor tool request timed out"))?
             .map_err(|_| anyhow::anyhow!("editor tool dispatcher dropped the response"))?

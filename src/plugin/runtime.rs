@@ -2154,7 +2154,10 @@ impl RedHost {
                 PluginRequest::InlayHints { request_id, range }
             }
             "GetEditorInfo" => PluginRequest::EditorInfo(request_id),
-            "EditHistory" => PluginRequest::EditHistory { request_id },
+            "EditHistory" => PluginRequest::EditHistory {
+                request_id,
+                scope: args.first().and_then(Value::as_str).map(str::to_string),
+            },
             "AgentReadDefaultModel" => PluginRequest::AgentModelRequest {
                 request_id,
                 request: crate::codex::ModelRequest::ReadDefault {
@@ -8703,7 +8706,7 @@ mod tests {
             PluginRequest::OpenWorkspace { id, .. } if id == "agent-history"
         ));
         let request_id = match ACTION_DISPATCHER.recv_request() {
-            PluginRequest::EditHistory { request_id } => request_id,
+            PluginRequest::EditHistory { request_id, .. } => request_id,
             _ => panic!("expected attributed history request"),
         };
         runtime
@@ -8733,6 +8736,120 @@ mod tests {
             ACTION_DISPATCHER.recv_request(),
             PluginRequest::CloseWorkspace { id } if id == "agent-history"
         ));
+    }
+
+    #[tokio::test]
+    async fn bundled_agent_history_labels_rows_and_shows_a_line_diff() {
+        drain_requests();
+        let mut runtime = Runtime::new();
+        runtime
+            .load_plugin("agent", include_str!("../../plugins/agent.hk"))
+            .await
+            .unwrap();
+        drain_requests();
+        let entry = |id: &str, kind: &str, file: &str, applied: bool| {
+            let mut entry = serde_json::json!({
+                "transaction_id": id,
+                "label": "edit",
+                "current": false,
+                "applied": applied,
+                "origin": { "kind": kind },
+                "file": file,
+                "age": "5m ago",
+                "added": 1,
+                "removed": 1,
+                "edits": [],
+                "document": {
+                    "path": format!("/workspace/{file}"),
+                    "lines": [
+                        { "id": format!("{id}:0"), "text": "@@ -41,2 +41,2 @@", "kind": "hunk" },
+                        { "id": format!("{id}:1"), "text": "    Ok(whole * 100 + frac)", "kind": "removed", "old_line": 42 },
+                        { "id": format!("{id}:2"), "text": "    Ok(whole * 100 + sign * frac)", "kind": "added", "new_line": 42 },
+                    ],
+                    "added": 1, "removed": 1, "total_lines": 3, "truncated": false,
+                },
+            });
+            if kind == "agent" {
+                entry["origin"] = serde_json::json!({
+                    "kind": "agent", "session_id": "s", "turn_id": "t"
+                });
+                entry["turn"] = serde_json::json!(2);
+                entry["prompt"] = serde_json::json!("Fix the sign bug");
+            }
+            entry
+        };
+        let history_request = || loop {
+            match ACTION_DISPATCHER.recv_request() {
+                PluginRequest::EditHistory { request_id, scope } => {
+                    assert_eq!(scope.as_deref(), Some("workspace"));
+                    break request_id;
+                }
+                _ => continue,
+            }
+        };
+        let workspace_update = || loop {
+            if let PluginRequest::UpdateWorkspace { id, model } = ACTION_DISPATCHER.recv_request() {
+                assert_eq!(id, "agent-history");
+                break model;
+            }
+        };
+        let text = |segments: &[crate::plugin::PanelSegment]| {
+            segments
+                .iter()
+                .map(|segment| segment.text.as_str())
+                .collect::<String>()
+        };
+
+        runtime.execute_command("AgentHistory").await.unwrap();
+        let request_id = history_request();
+        runtime
+            .resolve_request(
+                request_id,
+                serde_json::json!({
+                    "entries": [
+                        entry("agent-1", "agent", "src/parse.rs", true),
+                        entry("user-1", "user", "src/report.rs", false),
+                    ],
+                    "total": 2,
+                }),
+            )
+            .await
+            .unwrap();
+        let model = workspace_update();
+        assert_eq!(
+            text(&model.header),
+            "2 edits across 2 files · 1 by the agent"
+        );
+        assert_eq!(text(&model.rows[0].segments), "◆ src/parse.rs  +1 −1");
+        assert_eq!(text(&model.rows[0].right_segments), "turn 2 · 5m ago");
+        assert_eq!(text(&model.rows[1].segments), "· src/report.rs  +1 −1");
+        assert_eq!(text(&model.rows[1].right_segments), "you · 5m ago · undone");
+        let document = model.detail_document.expect("the newest edit is shown");
+        assert_eq!(document.path, "/workspace/src/parse.rs");
+        assert_eq!(document.lines[2].kind, "added");
+        assert_eq!(
+            model.detail_title,
+            "src/parse.rs · Agent, turn 2 · “Fix the sign bug” · 5m ago"
+        );
+
+        runtime
+            .notify(
+                "workspace:event:agent-history",
+                serde_json::json!({ "action": "a", "row": null }),
+            )
+            .await
+            .unwrap();
+        let request_id = history_request();
+        runtime
+            .resolve_request(request_id, serde_json::json!({ "entries": [], "total": 0 }))
+            .await
+            .unwrap();
+        let model = workspace_update();
+        assert!(model.detail_document.is_none());
+        assert_eq!(
+            model.detail.first().map(|row| text(row)).as_deref(),
+            Some("No agent edits yet")
+        );
     }
 
     #[tokio::test]

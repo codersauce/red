@@ -46,7 +46,9 @@ pub use action_bar::{
 pub(crate) use agent_composer::wrap_text;
 pub use agent_composer::AgentComposer;
 pub use completion::CompletionUI;
-pub use confirmation::{Confirmation, ConfirmationOptions, ConfirmationSegment};
+pub use confirmation::{
+    Confirmation, ConfirmationChoice, ConfirmationOptions, ConfirmationSegment,
+};
 pub(crate) use copilot_signin::{CopilotSignInDialog, CopilotSignInModel, CopilotSignInPhase};
 use crossterm::event::{Event, KeyCode, MouseEvent, MouseEventKind};
 pub use diagnostic_info::DiagnosticInfo;

@@ -108,9 +108,10 @@ async fn inline_agent_outcome_groups_real_writes_and_survives_completion_and_rec
     );
     editor.commit_transaction(editor.cursor_snapshot());
     start(&mut editor, "agent", "turn-1");
+    // The user's unsaved prefix keeps first.rs unsaved; second.rs is clean and saved.
     assert_eq!(
         write(&mut editor, "agent", "first.rs", "user prefix\nrenamed\n").await["saved"],
-        true
+        false
     );
     assert_eq!(
         write(&mut editor, "agent", "second.rs", "second renamed\n").await["saved"],
@@ -124,7 +125,7 @@ async fn inline_agent_outcome_groups_real_writes_and_survives_completion_and_rec
             "user prefix\nrenamed again\n"
         )
         .await["saved"],
-        true
+        false
     );
     assert_eq!(outcome(&editor).files.len(), 2);
     assert_eq!(outcome(&editor).files[0].edits.len(), 1);
@@ -228,8 +229,13 @@ async fn inline_agent_outcome_does_not_claim_interleaved_or_unrelated_edits() {
     editor.finish_inline_agent_outcome("agent", InlineAgentState::Cancelled, Some("Cancelled"));
     assert_eq!(outcome(&editor).files.len(), 1);
     assert_eq!(outcome(&editor).state, InlineAgentState::Cancelled);
+    // The interleaved user edit was unsaved, so the second agent write stays unsaved too.
     assert_eq!(
         fs::read_to_string(root.path().join("first.rs")).unwrap(),
+        "agent one\n"
+    );
+    assert_eq!(
+        editor.current_buffer().contents(),
         "user added\nagent two\n"
     );
 }

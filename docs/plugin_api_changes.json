@@ -1,6 +1,17 @@
 {
-  "api_version": "0.21.0",
+  "api_version": "0.22.0",
   "changes": [
+    {
+      "version": "0.22.0",
+      "kind": "introduced",
+      "symbols": [
+        "EditHistory.scope",
+        "EditHistory.entries.file",
+        "EditHistory.entries.document",
+        "EditHistory.total"
+      ],
+      "migration_note": "docs/PLUGIN_API.md#edit-history"
+    },
     {
       "version": "0.21.0",
       "kind": "introduced",

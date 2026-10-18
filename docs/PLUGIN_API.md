@@ -1,6 +1,6 @@
 # Plugin compatibility
 
-Red host API version `0.21.0` is defined by
+Red host API version `0.22.0` is defined by
 [`src/plugin/host_api.json`](../src/plugin/host_api.json). That file is the canonical,
 machine-readable list of execute actions, request actions, signatures, and introduction
 versions. Runtime dispatch and the bundled-plugin corpus are checked against it in tests.
@@ -24,11 +24,11 @@ required/optional arity (`HUSK-A0002`) and obvious literal argument types
 annotations use `HUSK-A0004`. `--no-typecheck` is an unsupported development
 escape hatch; compatibility guarantees do not apply while it is enabled.
 
-Host API `0.21.0` retains the complete `0.4.0`, `0.6.0`, `0.7.0`,
+Host API `0.22.0` retains the complete `0.4.0`, `0.6.0`, `0.7.0`,
 `0.8.0`, `0.9.0`,
 `0.10.0`, `0.11.0`, `0.12.0`, `0.14.0`, `0.16.0`, `0.17.0`, `0.18.0`, `0.19.0`,
-and `0.20.0` contracts, so existing packages that declare those minors continue
-to load. New packages should target `"red_api_version": "^0.21.0"`.
+`0.20.0`, and `0.21.0` contracts, so existing packages that declare those minors
+continue to load. New packages should target `"red_api_version": "^0.22.0"`.
 
 ## Standalone JSON-RPC packages
 
@@ -470,6 +470,29 @@ conversation. The bundled Agent plugin renders
 the cached projection from `agent:session_restored`; a
 `agent:session_restore_failed` event converts the cached transcript to clearly
 archived context.
+
+## Edit history
+
+`EditHistory(callback, scope?: String)` returns the attributed undo history. Without
+`scope` it covers the active buffer, as before; host API `0.22.0` adds `"workspace"`,
+which covers every open file, newest first, and `total`, the number of entries before
+the 500-entry limit.
+
+Each entry keeps the original fields (`transaction_id`, `label`, `origin`, `current`,
+`timestamp_ms`, `edits`, and the tree links) and adds:
+
+| Field | Meaning |
+| --- | --- |
+| `file` | Workspace-relative path, or the buffer name. |
+| `buffer_id` | Buffer that owns the transaction. |
+| `applied` | Whether the transaction is part of the current text (false once undone). |
+| `age` | Short relative time such as `just now` or `5m ago`. |
+| `added`, `removed` | Changed line counts. |
+| `document` | A ready-to-show unified diff in the `WorkspaceModel.detail_document` shape, with hunk headers, context and line numbers. |
+| `turn`, `prompt` | For agent edits: the one-based turn in the current conversation and an excerpt of the prompt that started it. |
+
+`RevertTransaction(transaction_id)` finds the buffer that owns the transaction, so a
+workspace history can revert edits in files other than the active one.
 
 ## Agent pane lifecycle
 
