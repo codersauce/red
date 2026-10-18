@@ -2,14 +2,15 @@
 //!
 //! Each workspace has one saved conversation under
 //! `<config>/agent/conversations/<sha256 of the workspace>.json`. Only the Red
-//! process that holds the workspace's owner claim (`<sha256>.owner`, which
-//! records its pid) writes or removes that record, so two editors open in one
-//! workspace never drive the same Codex thread: the second editor starts its
-//! own thread, and that thread is not saved for resume. A claim whose process
-//! has exited is taken over by the next editor that needs it.
+//! process holding an OS lock on `<sha256>.lock` reads it for resume, writes it,
+//! or removes it, and it keeps that lock until it exits. Two editors open in one
+//! workspace therefore never drive the same Codex thread: the second starts its
+//! own thread, which is never saved. The operating system releases the lock when
+//! its holder exits or crashes, so there is no stale claim to detect.
 
 use std::{
     collections::{HashMap, HashSet},
+    fs::TryLockError,
     fs,
     io::{self, Read as _, Write as _},
     path::{Path, PathBuf},
@@ -45,98 +46,71 @@ pub enum Claim {
     /// This editor owns the workspace's conversation.
     Owned,
     /// Another running editor owns it.
-    HeldBy(u32),
+    HeldElsewhere,
 }
 
 pub struct ConversationStore {
     directory: PathBuf,
-    pid: u32,
-    /// Workspace keys this editor has claimed.
-    claimed: HashSet<String>,
-    /// Workspaces another editor owned when this one asked, with that owner's
-    /// pid. This editor's separate thread there is never saved, even after the
-    /// owner exits, so it cannot replace the owner's conversation.
-    denied: HashMap<String, u32>,
+    /// Workspace keys this editor owns, with the locked file that holds each claim.
+    held: HashMap<String, fs::File>,
+    /// Workspaces another editor owned when this one asked, or whose ownership
+    /// could not be checked. This editor's separate thread there is never saved,
+    /// even after the owner exits, so it cannot replace the owner's conversation.
+    denied: HashSet<String>,
     /// Workspaces this editor left whose records could not be removed yet.
     retiring: Vec<PathBuf>,
 }
 
 impl ConversationStore {
     pub fn new(directory: PathBuf) -> Self {
-        Self::for_process(directory, std::process::id())
-    }
-
-    fn for_process(directory: PathBuf, pid: u32) -> Self {
         Self {
             directory,
-            pid,
-            claimed: HashSet::new(),
-            denied: HashMap::new(),
+            held: HashMap::new(),
+            denied: HashSet::new(),
             retiring: Vec::new(),
         }
     }
 
-    /// Claims a workspace's conversation for this editor unless another live
-    /// editor holds it.
-    ///
-    /// Every read or replacement of the owner file happens under an OS lock on
-    /// `<key>.lock`, and the pid is published by an atomic rename, so two
-    /// editors racing for one workspace never both see it as free.
+    /// Claims a workspace's conversation for this editor unless another running
+    /// editor holds it. A claim lasts until it is released or this process exits.
     pub fn claim(&mut self, workspace: &Path) -> io::Result<Claim> {
         let key = workspace_key(workspace);
-        if self.claimed.contains(&key) {
+        if self.held.contains_key(&key) {
             return Ok(Claim::Owned);
         }
-        if let Some(pid) = self.denied.get(&key) {
-            return Ok(Claim::HeldBy(*pid));
+        if self.denied.contains(&key) {
+            return Ok(Claim::HeldElsewhere);
         }
         ensure_private_directory(&self.directory)?;
-        let _lock = self.lock(&key)?;
-        let path = self.directory.join(format!("{key}.owner"));
-        match read_owner(&path)? {
-            Some(pid) if pid == self.pid => {}
-            Some(pid) if process_is_alive(pid) => {
-                self.denied.insert(key, pid);
-                return Ok(Claim::HeldBy(pid));
+        let file = open_private_file(&self.directory.join(format!("{key}.lock")))?;
+        match file.try_lock() {
+            Ok(()) => {
+                self.held.insert(key, file);
+                Ok(Claim::Owned)
             }
-            // Free, or left behind by an editor that exited without releasing it.
-            _ => {
-                let mut temporary = tempfile::NamedTempFile::new_in(&self.directory)?;
-                temporary.write_all(self.pid.to_string().as_bytes())?;
-                temporary.as_file().sync_all()?;
-                temporary.persist(&path).map_err(|error| error.error)?;
+            Err(TryLockError::WouldBlock) => {
+                self.denied.insert(key);
+                Ok(Claim::HeldElsewhere)
             }
+            Err(TryLockError::Error(error)) => Err(error),
         }
-        self.claimed.insert(key);
-        Ok(Claim::Owned)
     }
 
     pub fn owns(&self, workspace: &Path) -> bool {
-        self.claimed.contains(&workspace_key(workspace))
+        self.held.contains_key(&workspace_key(workspace))
     }
 
     /// Releases every claim so the next editor in these workspaces can resume.
     pub fn release_all(&mut self) {
-        for key in std::mem::take(&mut self.claimed) {
-            self.release_key(&key);
-        }
-    }
-
-    fn release_key(&self, key: &str) {
-        let Ok(_lock) = self.lock(key) else {
-            return;
-        };
-        let path = self.directory.join(format!("{key}.owner"));
-        if read_owner(&path).ok().flatten() == Some(self.pid) {
-            let _ = fs::remove_file(path);
-        }
+        // Closing each locked file releases its lock.
+        self.held.clear();
     }
 
     /// Never saves this workspace from this editor, as when its ownership could
     /// not be checked: a later save must not replace a record it could not read
     /// safely.
     pub fn refuse(&mut self, workspace: &Path) {
-        self.denied.insert(workspace_key(workspace), 0);
+        self.denied.insert(workspace_key(workspace));
     }
 
     /// This editor's conversation left `workspace`: remove its record there and
@@ -157,9 +131,7 @@ impl ConversationStore {
         for workspace in std::mem::take(&mut self.retiring) {
             match self.remove(&workspace) {
                 Ok(_) => {
-                    let key = workspace_key(&workspace);
-                    self.claimed.remove(&key);
-                    self.release_key(&key);
+                    self.held.remove(&workspace_key(&workspace));
                 }
                 Err(error) => {
                     crate::log!(
@@ -170,20 +142,6 @@ impl ConversationStore {
                 }
             }
         }
-    }
-
-    /// Holds the workspace's claim lock until the returned file is dropped.
-    fn lock(&self, key: &str) -> io::Result<fs::File> {
-        let path = self.directory.join(format!("{key}.lock"));
-        let file = match create_private_file(&path) {
-            Ok(file) => file,
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                fs::OpenOptions::new().write(true).open(&path)?
-            }
-            Err(error) => return Err(error),
-        };
-        file.lock()?;
-        Ok(file)
     }
 
     /// The conversation saved for a workspace, if it is readable and was saved
@@ -321,24 +279,15 @@ fn ensure_private_directory(directory: &Path) -> io::Result<()> {
     Ok(())
 }
 
-fn create_private_file(path: &Path) -> io::Result<fs::File> {
+fn open_private_file(path: &Path) -> io::Result<fs::File> {
     let mut options = fs::OpenOptions::new();
-    options.write(true).create_new(true);
+    options.write(true).create(true).truncate(false);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt as _;
         options.mode(0o600);
     }
     options.open(path)
-}
-
-/// The pid recorded in an owner file; unreadable or garbled contents count as no owner.
-fn read_owner(path: &Path) -> io::Result<Option<u32>> {
-    match fs::read_to_string(path) {
-        Ok(text) => Ok(text.trim().parse().ok()),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(error),
-    }
 }
 
 fn read_bounded_json<T: serde::de::DeserializeOwned>(path: &Path) -> Option<T> {
@@ -355,41 +304,8 @@ fn read_bounded_json<T: serde::de::DeserializeOwned>(path: &Path) -> Option<T> {
     serde_json::from_slice(&contents).ok()
 }
 
-#[cfg(unix)]
-fn process_is_alive(pid: u32) -> bool {
-    let Ok(pid) = i32::try_from(pid) else {
-        return false;
-    };
-    nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), /*signal*/ None).is_ok()
-}
-
-#[cfg(windows)]
-fn process_is_alive(pid: u32) -> bool {
-    use windows_sys::Win32::{
-        Foundation::{CloseHandle, GetLastError, ERROR_ACCESS_DENIED, STILL_ACTIVE},
-        System::Threading::{GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION},
-    };
-    // SAFETY: OpenProcess takes no pointers; a null handle reports failure.
-    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
-    if handle.is_null() {
-        // A process we may not query still exists; any other error means it is gone.
-        // SAFETY: reads this thread's last-error value.
-        return unsafe { GetLastError() } == ERROR_ACCESS_DENIED;
-    }
-    let mut code = 0u32;
-    // SAFETY: `handle` is a live process handle and `code` outlives the call.
-    let queried = unsafe { GetExitCodeProcess(handle, &mut code) } != 0;
-    // SAFETY: `handle` came from OpenProcess and is closed exactly once.
-    unsafe { CloseHandle(handle) };
-    queried && code == STILL_ACTIVE as u32
-}
-
-#[cfg(not(any(unix, windows)))]
-fn process_is_alive(_pid: u32) -> bool {
-    // Without a liveness check, treat a recorded owner as live; a stale claim
-    // then only costs a fresh thread, never two editors on one thread.
-    true
-}
+const HELD_ELSEWHERE_MESSAGE: &str =
+    "Agent conversation is open in another Red window; this window starts its own";
 
 /// Shortest pause between saves while nothing is streaming.
 const IDLE_SAVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
@@ -428,14 +344,12 @@ impl super::Editor {
                 self.agent_continuity_workspace = Some(workspace.to_path_buf());
                 return;
             }
-            Ok(Claim::HeldBy(pid)) => {
+            Ok(Claim::HeldElsewhere) => {
                 crate::log!(
-                    "recovered agent conversation for {} is open in Red pid {pid}; not resuming it",
+                    "recovered agent conversation for {} is open in another Red; not resuming it",
                     workspace.display()
                 );
-                format!(
-                    "Agent conversation is open in another Red (pid {pid}); this window starts its own"
-                )
+                HELD_ELSEWHERE_MESSAGE.to_string()
             }
             // Without a claim another editor may be driving the thread: fail closed.
             Err(error) => {
@@ -479,14 +393,12 @@ impl super::Editor {
                 ));
                 self.agent_continuity_workspace = Some(workspace.to_path_buf());
             }
-            Ok(Claim::HeldBy(pid)) => {
+            Ok(Claim::HeldElsewhere) => {
                 crate::log!(
-                    "agent conversation for {} is open in Red pid {pid}; starting a separate one",
+                    "agent conversation for {} is open in another Red; starting a separate one",
                     workspace.display()
                 );
-                self.set_quiet_message(Some(format!(
-                    "Agent conversation is open in another Red (pid {pid}); this window starts its own"
-                )));
+                self.set_quiet_message(Some(HELD_ELSEWHERE_MESSAGE.to_string()));
             }
             Err(error) => {
                 // Keep its history and never overwrite a record this editor
@@ -572,7 +484,7 @@ impl super::Editor {
                 match store.claim(&workspace) {
                     Ok(Claim::Owned) => store.save(&workspace, conversation).map(|_| ()),
                     // Another editor owns this workspace's conversation.
-                    Ok(Claim::HeldBy(_)) => Ok(()),
+                    Ok(Claim::HeldElsewhere) => Ok(()),
                     Err(error) => Err(error.into()),
                 }
             }
@@ -625,13 +537,13 @@ mod tests {
         let other = tempfile::tempdir().unwrap();
         let directory = config.path().join("agent/conversations");
 
-        let mut first = ConversationStore::for_process(directory.clone(), std::process::id());
+        let mut first = ConversationStore::new(directory.clone());
         assert_eq!(first.claim(workspace.path()).unwrap(), Claim::Owned);
         let saved = conversation("thread-1", workspace.path());
         assert!(first.save(workspace.path(), &saved).unwrap());
         first.release_all();
 
-        let second = ConversationStore::for_process(directory, std::process::id());
+        let second = ConversationStore::new(directory);
         let loaded = second.load(workspace.path()).unwrap();
         assert_eq!(loaded.conversation, saved);
         assert!(
@@ -645,17 +557,17 @@ mod tests {
         let config = tempfile::tempdir().unwrap();
         let workspace = tempfile::tempdir().unwrap();
         let directory = config.path().to_path_buf();
-        let mut owner = ConversationStore::for_process(directory.clone(), std::process::id());
+        let mut owner = ConversationStore::new(directory.clone());
         owner.claim(workspace.path()).unwrap();
         owner
             .save(workspace.path(), &conversation("mine", workspace.path()))
             .unwrap();
 
-        // A different pid in the same workspace while this test process is alive.
-        let mut other = ConversationStore::for_process(directory, u32::MAX - 1);
+        // A second editor in the same workspace while the owner still runs.
+        let mut other = ConversationStore::new(directory);
         assert_eq!(
             other.claim(workspace.path()).unwrap(),
-            Claim::HeldBy(std::process::id())
+            Claim::HeldElsewhere
         );
         assert!(!other
             .save(workspace.path(), &conversation("theirs", workspace.path()))
@@ -668,47 +580,41 @@ mod tests {
     }
 
     #[test]
-    fn a_claim_left_by_an_exited_editor_is_taken_over() {
+    fn an_exited_editors_claim_is_free_for_the_next_launch() {
         let config = tempfile::tempdir().unwrap();
         let workspace = tempfile::tempdir().unwrap();
-        let key = workspace_key(workspace.path());
-        fs::create_dir_all(config.path()).unwrap();
-        // pid_max is far below this on every supported platform.
-        fs::write(config.path().join(format!("{key}.owner")), "2147483000").unwrap();
+        let directory = config.path().to_path_buf();
+        let mut owner = ConversationStore::new(directory.clone());
+        assert_eq!(owner.claim(workspace.path()).unwrap(), Claim::Owned);
+        // Exiting or crashing closes the locked file, which is all a release is.
+        drop(owner);
 
-        let mut store = ConversationStore::for_process(config.path().to_path_buf(), 4242);
-        assert_eq!(store.claim(workspace.path()).unwrap(), Claim::Owned);
-        assert_eq!(
-            fs::read_to_string(config.path().join(format!("{key}.owner"))).unwrap(),
-            "4242"
-        );
-        store.release_all();
-        assert!(!config.path().join(format!("{key}.owner")).exists());
+        let mut next = ConversationStore::new(directory);
+        assert_eq!(next.claim(workspace.path()).unwrap(), Claim::Owned);
     }
 
-    #[cfg(unix)]
     #[test]
-    fn two_live_editors_racing_for_a_workspace_never_both_own_it() {
-        // Two pids that are both alive: this test process and its parent.
-        let pids = [std::process::id(), nix::unistd::getppid().as_raw() as u32];
+    fn two_editors_racing_for_a_workspace_never_both_own_it() {
         for _ in 0..50 {
             let config = tempfile::tempdir().unwrap();
             let workspace = tempfile::tempdir().unwrap();
             let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
-            let claims = pids.map(|pid| {
+            let editors = [(), ()].map(|()| {
                 let directory = config.path().to_path_buf();
                 let workspace = workspace.path().to_path_buf();
                 let barrier = barrier.clone();
                 std::thread::spawn(move || {
-                    let mut store = ConversationStore::for_process(directory, pid);
+                    let mut store = ConversationStore::new(directory);
                     barrier.wait();
                     let claim = store.claim(&workspace).unwrap();
-                    // Keep the claim: dropping the store would release it.
-                    std::mem::forget(store);
-                    claim
+                    // Return the store so neither claim is released mid-race.
+                    (claim, store)
                 })
             });
-            let claims = claims.map(|handle| handle.join().unwrap());
+            // Join both before dropping either store, or a release could let the
+            // slower thread claim after the race is over.
+            let results = editors.map(|handle| handle.join().unwrap());
+            let claims = results.each_ref().map(|(claim, _)| *claim);
             let owned = claims
                 .iter()
                 .filter(|claim| **claim == Claim::Owned)
@@ -724,16 +630,16 @@ mod tests {
         let directory = config.path().to_path_buf();
         let mut owner = ConversationStore::new(directory.clone());
         owner.claim(workspace.path()).unwrap();
-        let mut second = ConversationStore::for_process(directory, u32::MAX - 1);
+        let mut second = ConversationStore::new(directory);
         assert_eq!(
             second.claim(workspace.path()).unwrap(),
-            Claim::HeldBy(std::process::id())
+            Claim::HeldElsewhere
         );
 
         owner.release_all();
         assert_eq!(
             second.claim(workspace.path()).unwrap(),
-            Claim::HeldBy(std::process::id()),
+            Claim::HeldElsewhere,
             "its separate thread must not replace the owner's saved conversation"
         );
         assert!(!second
@@ -811,7 +717,7 @@ mod tests {
         // A third editor in the same workspace while the second is open.
         let mut third = editor();
         third.enable_agent_continuity_in(
-            ConversationStore::for_process(directory, u32::MAX - 1),
+            ConversationStore::new(directory),
             workspace.path(),
         );
         assert!(
@@ -945,7 +851,7 @@ mod tests {
             .agent_manager
             .restore_conversation(conversation("shared", workspace.path()));
         recovered.enable_agent_continuity_in(
-            ConversationStore::for_process(directory.clone(), u32::MAX - 1),
+            ConversationStore::new(directory.clone()),
             workspace.path(),
         );
         assert!(
@@ -1070,7 +976,7 @@ mod tests {
         fs::write(&record, "{}").unwrap();
         editor.persist_agent_conversation(/*force*/ true);
         assert!(!record.exists(), "the pending removal is retried");
-        let mut other = ConversationStore::for_process(directory, u32::MAX - 1);
+        let mut other = ConversationStore::new(directory);
         assert_eq!(
             other.claim(first_workspace.path()).unwrap(),
             Claim::Owned,
