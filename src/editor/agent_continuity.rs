@@ -361,7 +361,7 @@ impl super::Editor {
                 self.agent_continuity_adopted_age = Some(describe_age(saved.saved_at_ms));
                 self.agent_manager.restore_conversation(saved.conversation);
                 self.agent_continuity_saved = Some((
-                    self.agent_manager.conversation_revision(),
+                    Some(self.agent_manager.conversation_revision()),
                     std::time::Instant::now(),
                 ));
                 self.agent_continuity_workspace = Some(workspace.to_path_buf());
@@ -397,7 +397,7 @@ impl super::Editor {
             } else {
                 IDLE_SAVE_INTERVAL
             };
-            if saved == revision || (!force && at.elapsed() < interval) {
+            if saved == Some(revision) || (!force && at.elapsed() < interval) {
                 return;
             }
         }
@@ -409,7 +409,12 @@ impl super::Editor {
                     .take()
                     .filter(|previous| previous != &workspace)
                 {
-                    let _ = store.remove(&previous);
+                    if let Err(error) = store.remove(&previous) {
+                        crate::log!(
+                            "could not remove the agent conversation saved for {}: {error}",
+                            previous.display()
+                        );
+                    }
                 }
                 self.agent_continuity_workspace = Some(workspace.clone());
                 match store.claim(&workspace) {
@@ -420,15 +425,25 @@ impl super::Editor {
                 }
             }
             Some(_) => Ok(()),
-            None => match self.agent_continuity_workspace.take() {
-                Some(workspace) => store.remove(&workspace).map(|_| ()).map_err(Into::into),
+            None => match self.agent_continuity_workspace.clone() {
+                // Keep the workspace until its record is really gone, so a
+                // failed removal is retried instead of resuming a forgotten thread.
+                Some(workspace) => store
+                    .remove(&workspace)
+                    .map(|_| self.agent_continuity_workspace = None)
+                    .map_err(Into::into),
                 None => Ok(()),
             },
         };
-        if let Err(error) = result {
-            crate::log!("could not save the agent conversation: {error:#}");
-        }
-        self.agent_continuity_saved = Some((revision, std::time::Instant::now()));
+        let saved = match result {
+            Ok(()) => Some(revision),
+            Err(error) => {
+                crate::log!("could not save the agent conversation: {error:#}");
+                // Still stale: retry after the interval and on the forced exit save.
+                self.agent_continuity_saved.and_then(|(saved, _)| saved)
+            }
+        };
+        self.agent_continuity_saved = Some((saved, std::time::Instant::now()));
     }
 
     /// Final save on exit; releasing the claim lets the next launch resume.
@@ -625,6 +640,56 @@ mod tests {
         assert!(ConversationStore::new(directory)
             .load(workspace.path())
             .is_none());
+    }
+
+    #[test]
+    fn a_failed_save_is_retried_and_a_failed_removal_keeps_the_record_to_remove() {
+        let config = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let directory = config.path().join("conversations");
+        // A file where the directory should be makes every write fail.
+        fs::write(&directory, "not a directory").unwrap();
+        let mut editor = editor();
+        editor.enable_agent_continuity_in(
+            ConversationStore::new(directory.clone()),
+            workspace.path(),
+        );
+        editor
+            .agent_manager
+            .begin_conversation("thread", workspace.path());
+        editor.agent_manager.mark_session_active("thread");
+        editor.agent_manager.set_turn_id("thread", "t1");
+        editor
+            .agent_manager
+            .record_user_message("thread", "t1", "Remember HERON");
+        editor.persist_agent_conversation(/*force*/ false);
+        let current = editor.agent_manager.conversation_revision();
+        assert_ne!(
+            editor.agent_continuity_saved.map(|(saved, _)| saved),
+            Some(Some(current)),
+            "a failed write is not recorded as saved"
+        );
+
+        fs::remove_file(&directory).unwrap();
+        editor.persist_agent_conversation(/*force*/ true);
+        assert!(ConversationStore::new(directory.clone())
+            .load(workspace.path())
+            .is_some());
+
+        let record = directory.join(format!("{}.json", workspace_key(workspace.path())));
+        fs::remove_file(&record).unwrap();
+        fs::create_dir(&record).unwrap();
+        editor.agent_manager.forget_conversation("thread");
+        editor.persist_agent_conversation(/*force*/ true);
+        assert_eq!(
+            editor.agent_continuity_workspace.as_deref(),
+            Some(workspace.path()),
+            "the record is still there, so it is still ours to remove"
+        );
+
+        fs::remove_dir(&record).unwrap();
+        editor.persist_agent_conversation(/*force*/ true);
+        assert!(editor.agent_continuity_workspace.is_none());
     }
 
     #[test]

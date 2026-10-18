@@ -9758,6 +9758,75 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bundled_agent_new_forgets_a_saved_conversation_without_resuming_it() {
+        drain_requests();
+        let mut runtime = Runtime::new();
+        runtime
+            .load_plugin("agent", include_str!("../../plugins/agent.hk"))
+            .await
+            .unwrap();
+        core_notify(
+            &mut runtime,
+            "agent:conversation_resumable",
+            serde_json::json!({
+                "thread_id": "saved-thread",
+                "cwd": "/workspace",
+                "age": "2 hours ago",
+                "items": [{"id": "u1", "role": "user", "text": "Remember HERON"}]
+            }),
+        )
+        .await;
+        drain_requests();
+
+        runtime.execute_command("AgentNew").await.unwrap();
+        core_settle(&mut runtime).await;
+        let requests = collect_requests();
+        assert!(
+            !requests
+                .iter()
+                .any(|request| matches!(request, PluginRequest::AgentResumeSession { .. })),
+            "the thread being forgotten is never resumed first"
+        );
+        assert!(requests.iter().any(|request| matches!(
+            request,
+            PluginRequest::AgentForgetSession { session_id } if session_id == "saved-thread"
+        )));
+        assert!(requests
+            .iter()
+            .any(|request| matches!(request, PluginRequest::AgentNewSession { .. })));
+
+        core_notify(
+            &mut runtime,
+            "agent:session_created",
+            serde_json::json!({ "session_id": "fresh" }),
+        )
+        .await;
+        drain_requests();
+        core_notify(
+            &mut runtime,
+            "agent:session_restore_failed",
+            serde_json::json!({ "session_id": "saved-thread", "message": "thread not found" }),
+        )
+        .await;
+        let requests = collect_requests();
+        assert!(
+            !requests.iter().any(|request| matches!(
+                request,
+                PluginRequest::SetTextPanelComposerState { status: Some(status), .. }
+                    if status.contains("Archived conversation")
+            ) || matches!(
+                request,
+                PluginRequest::Action(Action::Print(message)) if message.contains("could not be restored")
+            )),
+            "a late failure of the forgotten thread leaves the fresh pane alone"
+        );
+        assert_eq!(
+            AGENT_CORE.with(|core| core.borrow().lifecycle.snapshot().session_id),
+            Some("fresh".to_string())
+        );
+    }
+
+    #[tokio::test]
     async fn bundled_agent_continues_a_saved_conversation_when_the_pane_opens() {
         drain_requests();
         let mut runtime = Runtime::new();

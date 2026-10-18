@@ -1,16 +1,10 @@
 {
-  "api_version": "0.22.0",
+  "api_version": "0.21.0",
   "changes": [
-    {
-      "version": "0.22.0",
-      "kind": "introduced",
-      "symbols": ["AgentPrepare", "AgentResolveInterruption", "agent:conversation_resumable", "agent:pane_state.interrupted", "agent:pane_state.resume_pending"],
-      "migration_note": "docs/PLUGIN_API.md#agent-conversation-continuity"
-    },
     {
       "version": "0.21.0",
       "kind": "introduced",
-      "symbols": ["AgentSubmit", "AgentStop", "AgentSendQueued", "AgentDiscardQueued", "AgentReset", "agent:pane_state"],
+      "symbols": ["AgentSubmit", "AgentStop", "AgentSendQueued", "AgentDiscardQueued", "AgentReset", "agent:pane_state", "AgentPrepare", "AgentResolveInterruption", "agent:conversation_resumable", "agent:pane_state.interrupted", "agent:pane_state.resume_pending"],
       "migration_note": "docs/PLUGIN_API.md#agent-pane-lifecycle"
     },
     {

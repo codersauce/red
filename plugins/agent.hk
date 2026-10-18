@@ -1610,6 +1610,11 @@ fn close_conversation() {
 fn new_conversation() {
     reset_model_state();
     red::state_patch(AgentState { resume_hint: "", interruption_id: "" });
+    // The saved thread is about to be forgotten; opening the pane must not
+    // resume it first.
+    let pane = state().pane;
+    pane.resume_pending = false;
+    red::state_patch(AgentState { pane: pane });
     set_phase("idle", "");
     clear_conversation();
     red::state_patch(AgentState { transcript: "" });
@@ -2213,6 +2218,12 @@ struct AgentSessionRestoreFailedEvent {
 
 #[red::on("agent:session_restore_failed")]
 fn session_restore_failed(event: AgentSessionRestoreFailedEvent) {
+    // A thread the pane already left, as after :AgentNew, failing late is not
+    // this conversation's business.
+    let failed = red::string(event.session_id, "");
+    if failed != "" && failed != red::string(state().session_id, "") {
+        return;
+    }
     // The core forgets the thread and replays the transcript on the next message.
     reset_model_state();
     ensure_conversation_panel();

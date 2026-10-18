@@ -24,11 +24,11 @@ required/optional arity (`HUSK-A0002`) and obvious literal argument types
 annotations use `HUSK-A0004`. `--no-typecheck` is an unsupported development
 escape hatch; compatibility guarantees do not apply while it is enabled.
 
-Host API `0.22.0` retains the complete `0.4.0`, `0.6.0`, `0.7.0`,
+Host API `0.21.0` retains the complete `0.4.0`, `0.6.0`, `0.7.0`,
 `0.8.0`, `0.9.0`,
 `0.10.0`, `0.11.0`, `0.12.0`, `0.14.0`, `0.16.0`, `0.17.0`, `0.18.0`, `0.19.0`,
-`0.20.0`, and `0.21.0` contracts, so existing packages that declare those minors continue
-to load. New packages should target `"red_api_version": "^0.22.0"`.
+and `0.20.0` contracts, so existing packages that declare those minors continue
+to load. New packages should target `"red_api_version": "^0.21.0"`.
 
 ## Standalone JSON-RPC packages
 
@@ -490,8 +490,8 @@ the state the core publishes.
 After every change the core sends `agent:pane_state` with `phase` (`idle`,
 `starting`, `restoring`, `working`, or `stopping`), `session_id`, `turn_id`,
 `in_flight` (the running turn's `{ id, text }` message), `queued` (unsent
-messages, oldest first), `paused`, `stop_failed`, `recap_pending`, and, since
-`0.22.0`, `interrupted` and `resume_pending`. Render
+messages, oldest first), `paused`, `stop_failed`, `recap_pending`,
+`interrupted` and `resume_pending` (see below). Render
 queued messages from `queued` and commit `in_flight` to the transcript once per
 `id`; both come from the same snapshot, so a message never disappears between
 the queue and the transcript. The core also resumes a persisted thread itself
@@ -502,7 +502,7 @@ The per-session calls below remain available for other plugins and older package
 
 ## Agent conversation continuity
 
-Host API `0.22.0` lets the Agent pane continue a conversation across launches
+Host API `0.21.0` also lets the Agent pane continue a conversation across launches
 and ask the user what to do when Codex stops in the middle of a turn.
 
 | Call | Purpose |

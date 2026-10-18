@@ -3962,8 +3962,9 @@ pub struct Editor {
     diagnostic_cache: Option<diagnostic_cache::DiagnosticCache>,
     /// Saves the Agent pane's conversation so a later launch can resume it.
     agent_continuity: Option<agent_continuity::ConversationStore>,
-    /// Conversation revision last written to `agent_continuity`, and when.
-    agent_continuity_saved: Option<(u64, Instant)>,
+    /// Conversation revision last written to `agent_continuity` (`None` if no
+    /// write has succeeded yet), and when the last attempt ran.
+    agent_continuity_saved: Option<(Option<u64>, Instant)>,
     /// Workspace of the conversation last written, so a forgotten one is removed.
     agent_continuity_workspace: Option<PathBuf>,
     /// Age of a conversation adopted from `agent_continuity` at launch.
