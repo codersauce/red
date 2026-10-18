@@ -79,12 +79,24 @@ struct EditWorker {
     deadline: Instant,
 }
 
+impl AgentLsp {
+    /// Sequence and protocol version of the stamp for a report, for tests.
+    #[cfg(test)]
+    pub(super) fn test_report(&self, uri: &str, producer: &str) -> Option<(u64, Option<i64>)> {
+        self.reports
+            .get(&(uri.to_string(), producer.to_string()))
+            .map(|stamp| (stamp.sequence, stamp.document_version))
+    }
+}
+
 struct ReportStamp {
     sequence: u64,
     revision: Option<u64>,
     received_at_ms: u128,
     /// Document version a push report says it covers, when the server sent one.
     document_version: Option<i64>,
+    /// The server that sent the report; versions are per attachment.
+    source: Option<LspRequestSource>,
 }
 
 enum StartQuery {
@@ -990,7 +1002,13 @@ impl Editor {
         )
     }
 
-    pub(super) fn record_agent_diagnostic_report(&mut self, uri: &str, producer: &str) {
+    pub(super) fn record_agent_diagnostic_report(
+        &mut self,
+        uri: &str,
+        producer: &str,
+        source: Option<&LspRequestSource>,
+        document_version: Option<i64>,
+    ) {
         self.agent_lsp.report_sequence = self.agent_lsp.report_sequence.wrapping_add(1);
         let revision = self
             .buffer_manager
@@ -1006,33 +1024,10 @@ impl Editor {
                     .duration_since(UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_millis(),
-                document_version: None,
+                document_version,
+                source: source.cloned(),
             },
         );
-    }
-
-    /// Keeps the protocol version a push report was computed for, which is the
-    /// only proof that it covers a particular text.
-    pub(super) fn record_agent_push_version(
-        &mut self,
-        uri: &str,
-        producer: &str,
-        version: Option<i64>,
-    ) {
-        let uri = lsp_normalized_file_path(uri)
-            .ok()
-            .and_then(|path| crate::lsp::file_uri(path).ok())
-            .unwrap_or_else(|| uri.to_string());
-        let latest = self.agent_lsp.report_sequence;
-        // Only the report just recorded; a rejected report must not relabel an older one.
-        if let Some(stamp) = self
-            .agent_lsp
-            .reports
-            .get_mut(&(uri, producer.to_string()))
-            .filter(|stamp| stamp.sequence == latest)
-        {
-            stamp.document_version = version;
-        }
     }
 
     fn agent_diagnostics_payload(
@@ -1107,11 +1102,16 @@ impl Editor {
                 .collect::<Vec<_>>();
             // A report that names an older document version is stale even when it
             // arrived after the latest edit.
-            let current_version = self.lsp.document_version(&path.to_string_lossy());
+            let file = path.to_string_lossy();
             let versioned_stale = stamps.iter().any(|stamp| {
-                stamp
-                    .document_version
-                    .is_some_and(|version| Some(version) != current_version)
+                stamp.document_version.is_some_and(|version| {
+                    // Each attachment numbers its own document versions.
+                    let current = match &stamp.source {
+                        Some(source) => self.lsp.document_version_for_source(&file, source),
+                        None => self.lsp.document_version(&file),
+                    };
+                    Some(version) != current
+                })
             });
             let freshness = if !self.diagnostics.contains_key(&uri) {
                 "not_received"

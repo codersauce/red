@@ -14853,19 +14853,13 @@ impl Editor {
         version: Option<i64>,
         diagnostics: &[Diagnostic],
     ) -> Option<Action> {
-        let action = self.update_diagnostics_from(
+        self.update_diagnostics_versioned(
             uri,
             source,
+            version,
             diagnostics,
             diagnostics::DiagnosticReportKind::Push,
-        );
-        if let Some(uri) = uri {
-            let producer = source
-                .map(|source| source.key.as_str())
-                .unwrap_or(diagnostics::DEFAULT_PRODUCER);
-            self.record_agent_push_version(uri, producer, version);
-        }
-        action
+        )
     }
 
     fn clear_current_buffer_diagnostics(&mut self) {
@@ -14900,6 +14894,18 @@ impl Editor {
         diagnostics: &[Diagnostic],
         kind: diagnostics::DiagnosticReportKind,
     ) -> Option<Action> {
+        self.update_diagnostics_versioned(uri, source, None, diagnostics, kind)
+    }
+
+    /// `version` is the document version a push report names, if any.
+    fn update_diagnostics_versioned(
+        &mut self,
+        uri: Option<&str>,
+        source: Option<&LspRequestSource>,
+        version: Option<i64>,
+        diagnostics: &[Diagnostic],
+        kind: diagnostics::DiagnosticReportKind,
+    ) -> Option<Action> {
         let Some(uri) = uri else {
             log!("WARN: no uri provided for diagnostics - {diagnostics:?}");
             return None;
@@ -14927,7 +14933,8 @@ impl Editor {
             .map(|source| source.key.as_str())
             .unwrap_or(diagnostics::DEFAULT_PRODUCER);
         log!("Adding diagnostics for {uri}: {diagnostics:#?}");
-        self.record_agent_diagnostic_report(&uri, producer);
+        // Only an accepted report is stamped, with the server it came from.
+        self.record_agent_diagnostic_report(&uri, producer, source, version);
         let merged = self
             .diagnostic_reports
             .update(&uri, producer, kind, diagnostics);
@@ -37195,6 +37202,38 @@ builtin = "rust"
         editor.resize_window_layout((120, 20));
         assert_eq!(editor.panel_manager.reserved_right_width(120), 55);
         assert_eq!(editor_width(&editor), 120 - 55);
+    }
+
+    #[test]
+    fn rejected_push_reports_never_relabel_an_accepted_report() {
+        let mut editor = test_editor(40, 10);
+        let uri = "file:///workspace/main.rs";
+        let diagnostic: Diagnostic = serde_json::from_value(json!({
+            "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 1}},
+            "message": "accepted",
+        }))
+        .unwrap();
+        editor.add_diagnostics_from(Some(uri), None, Some(3), std::slice::from_ref(&diagnostic));
+        let stamp = |editor: &Editor| {
+            let stamp = editor
+                .agent_lsp
+                .test_report(uri, diagnostics::DEFAULT_PRODUCER)
+                .unwrap();
+            (stamp.0, stamp.1)
+        };
+        let accepted = stamp(&editor);
+        assert_eq!(accepted.1, Some(3));
+
+        // A late report from a server that no longer owns the file is rejected
+        // and must leave the accepted report, and its version, alone.
+        let obsolete = LspRequestSource {
+            key: diagnostics::DEFAULT_PRODUCER.to_string(),
+            instance: 99,
+        };
+        assert!(editor
+            .add_diagnostics_from(Some(uri), Some(&obsolete), Some(9), &[diagnostic])
+            .is_none());
+        assert_eq!(stamp(&editor), accepted);
     }
 
     #[test]

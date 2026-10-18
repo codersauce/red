@@ -1906,11 +1906,13 @@ impl TextPanel {
     fn selected_prompt(&self, layout: &TextPanelLayout) -> Option<usize> {
         if self.scrollback.focused && self.scrollback.initialized {
             if let Some((row, _, _)) = layout.position(self.scrollback.cursor) {
+                // A queued card has no turn yet; its turn actions belong to
+                // the sent prompt above it.
                 return layout
                     .prompt_cards
                     .iter()
                     .rev()
-                    .find(|card| card.rows.start <= row)
+                    .find(|card| !card.queued && card.rows.start <= row)
                     .map(|card| card.block_index);
             }
         }
@@ -8203,6 +8205,51 @@ mod tests {
         assert!(!manager.is_compact_panel("left-chat", 100));
         assert!(manager.is_compact_panel("right-chat", 100));
         assert_eq!(manager.text_panel_width("right-chat", 100), 100);
+    }
+
+    #[test]
+    fn turn_actions_on_a_queued_card_belong_to_the_sent_prompt_above_it() {
+        let mut manager = PanelManager::default();
+        manager.create_text_panel(
+            "agent".to_string(),
+            PanelConfig {
+                side: PanelSide::Right,
+                width: 40,
+                composer: Some(TextPanelComposerConfig {
+                    placeholder: "Ask".to_string(),
+                    rows: 2,
+                }),
+                ..PanelConfig::default()
+            },
+        );
+        let block = |id: &str, kind, text: &str| TextPanelBlock {
+            id: id.to_string(),
+            kind,
+            format: TextPanelBlockFormat::Plain,
+            text: text.to_string(),
+        };
+        manager.update_text_panel(
+            "agent",
+            vec![
+                block("sent", TextPanelBlockKind::User, "sent prompt"),
+                block("answer", TextPanelBlockKind::Agent, "the answer"),
+                block("held", TextPanelBlockKind::Queued, "held prompt"),
+            ],
+            20,
+            120,
+        );
+        assert!(manager.focus_panel("agent"));
+        assert!(manager.focus_focused_text_scrollback(120));
+        // The transcript cursor sits on the queued card at the bottom.
+        manager.handle_focused_scrollback_input(
+            &Event::Key(crossterm::event::KeyEvent::from(KeyCode::Char('G'))),
+            20,
+            120,
+            1,
+        );
+        let turn = manager.selected_text_turn(120).unwrap();
+        assert_eq!(turn.prompt_id, "sent");
+        assert!(turn.has_answer);
     }
 
     #[test]
