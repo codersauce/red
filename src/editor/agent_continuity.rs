@@ -295,10 +295,31 @@ fn process_is_alive(pid: u32) -> bool {
     nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), /*signal*/ None).is_ok()
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn process_is_alive(pid: u32) -> bool {
+    use windows_sys::Win32::{
+        Foundation::{CloseHandle, GetLastError, ERROR_ACCESS_DENIED, STILL_ACTIVE},
+        System::Threading::{GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION},
+    };
+    // SAFETY: OpenProcess takes no pointers; a null handle reports failure.
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if handle.is_null() {
+        // A process we may not query still exists; any other error means it is gone.
+        // SAFETY: reads this thread's last-error value.
+        return unsafe { GetLastError() } == ERROR_ACCESS_DENIED;
+    }
+    let mut code = 0u32;
+    // SAFETY: `handle` is a live process handle and `code` outlives the call.
+    let queried = unsafe { GetExitCodeProcess(handle, &mut code) } != 0;
+    // SAFETY: `handle` came from OpenProcess and is closed exactly once.
+    unsafe { CloseHandle(handle) };
+    queried && code == STILL_ACTIVE as u32
+}
+
+#[cfg(not(any(unix, windows)))]
 fn process_is_alive(_pid: u32) -> bool {
-    // Without a cheap liveness check, treat a recorded owner as live; a stale
-    // claim then only costs a fresh thread, never two editors on one thread.
+    // Without a liveness check, treat a recorded owner as live; a stale claim
+    // then only costs a fresh thread, never two editors on one thread.
     true
 }
 
