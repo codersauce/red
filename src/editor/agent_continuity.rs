@@ -9,7 +9,7 @@
 //! has exited is taken over by the next editor that needs it.
 
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     fs,
     io::{self, Read as _, Write as _},
     path::{Path, PathBuf},
@@ -53,6 +53,10 @@ pub struct ConversationStore {
     pid: u32,
     /// Workspace keys this editor has claimed.
     claimed: HashSet<String>,
+    /// Workspaces another editor owned when this one asked, with that owner's
+    /// pid. This editor's separate thread there is never saved, even after the
+    /// owner exits, so it cannot replace the owner's conversation.
+    denied: HashMap<String, u32>,
 }
 
 impl ConversationStore {
@@ -65,6 +69,7 @@ impl ConversationStore {
             directory,
             pid,
             claimed: HashSet::new(),
+            denied: HashMap::new(),
         }
     }
 
@@ -79,12 +84,18 @@ impl ConversationStore {
         if self.claimed.contains(&key) {
             return Ok(Claim::Owned);
         }
+        if let Some(pid) = self.denied.get(&key) {
+            return Ok(Claim::HeldBy(*pid));
+        }
         ensure_private_directory(&self.directory)?;
         let _lock = self.lock(&key)?;
         let path = self.directory.join(format!("{key}.owner"));
         match read_owner(&path)? {
             Some(pid) if pid == self.pid => {}
-            Some(pid) if process_is_alive(pid) => return Ok(Claim::HeldBy(pid)),
+            Some(pid) if process_is_alive(pid) => {
+                self.denied.insert(key, pid);
+                return Ok(Claim::HeldBy(pid));
+            }
             // Free, or left behind by an editor that exited without releasing it.
             _ => {
                 let mut temporary = tempfile::NamedTempFile::new_in(&self.directory)?;
@@ -347,11 +358,43 @@ impl super::Editor {
     }
 
     fn enable_agent_continuity_in(&mut self, mut store: ConversationStore, workspace: &Path) {
-        // A --resume or detached restore already brought its own conversation.
-        if self.agent_manager.conversation().is_none() {
-            self.adopt_saved_agent_conversation(&mut store, workspace);
+        match self
+            .agent_manager
+            .conversation()
+            .map(|c| PathBuf::from(&c.cwd))
+        {
+            None => self.adopt_saved_agent_conversation(&mut store, workspace),
+            // A --resume or detached restore brought its own conversation; it
+            // may only resume that thread if no other live editor drives it.
+            Some(restored) => self.claim_restored_agent_conversation(&mut store, &restored),
         }
         self.agent_continuity = Some(store);
+    }
+
+    fn claim_restored_agent_conversation(
+        &mut self,
+        store: &mut ConversationStore,
+        workspace: &Path,
+    ) {
+        match store.claim(workspace) {
+            Ok(Claim::Owned) => self.agent_continuity_workspace = Some(workspace.to_path_buf()),
+            Ok(Claim::HeldBy(pid)) => {
+                // Its transcript stays as archived context for a new thread.
+                self.agent_manager.discard_conversation();
+                self.agent_continuity_saved = Some((
+                    Some(self.agent_manager.conversation_revision()),
+                    std::time::Instant::now(),
+                ));
+                crate::log!(
+                    "recovered agent conversation for {} is open in Red pid {pid}; not resuming it",
+                    workspace.display()
+                );
+                self.set_quiet_message(Some(format!(
+                    "Agent conversation is open in another Red (pid {pid}); this window starts its own"
+                )));
+            }
+            Err(error) => crate::log!("could not claim the recovered agent conversation: {error}"),
+        }
     }
 
     fn adopt_saved_agent_conversation(&mut self, store: &mut ConversationStore, workspace: &Path) {
@@ -576,6 +619,30 @@ mod tests {
     }
 
     #[test]
+    fn a_denied_editor_never_takes_over_after_the_owner_exits() {
+        let config = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let directory = config.path().to_path_buf();
+        let mut owner = ConversationStore::new(directory.clone());
+        owner.claim(workspace.path()).unwrap();
+        let mut second = ConversationStore::for_process(directory, u32::MAX - 1);
+        assert_eq!(
+            second.claim(workspace.path()).unwrap(),
+            Claim::HeldBy(std::process::id())
+        );
+
+        owner.release_all();
+        assert_eq!(
+            second.claim(workspace.path()).unwrap(),
+            Claim::HeldBy(std::process::id()),
+            "its separate thread must not replace the owner's saved conversation"
+        );
+        assert!(!second
+            .save(workspace.path(), &conversation("theirs", workspace.path()))
+            .unwrap());
+    }
+
+    #[test]
     fn removing_a_forgotten_conversation_means_nothing_resumes() {
         let config = tempfile::tempdir().unwrap();
         let workspace = tempfile::tempdir().unwrap();
@@ -763,6 +830,48 @@ mod tests {
         assert!(ConversationStore::new(directory)
             .load(workspace.path())
             .is_none());
+    }
+
+    #[test]
+    fn a_recovered_conversation_is_resumed_only_when_no_other_editor_owns_it() {
+        let config = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let directory = config.path().to_path_buf();
+        let mut owner = ConversationStore::new(directory.clone());
+        owner.claim(workspace.path()).unwrap();
+
+        // `red --resume` restored the same thread while the owner is still open.
+        let mut recovered = editor();
+        recovered
+            .agent_manager
+            .restore_conversation(conversation("shared", workspace.path()));
+        recovered.enable_agent_continuity_in(
+            ConversationStore::for_process(directory.clone(), u32::MAX - 1),
+            workspace.path(),
+        );
+        assert!(
+            recovered.agent_manager.conversation().is_none(),
+            "two editors must never drive one thread"
+        );
+
+        owner.release_all();
+        let mut alone = editor();
+        alone
+            .agent_manager
+            .restore_conversation(conversation("shared", workspace.path()));
+        alone.enable_agent_continuity_in(ConversationStore::new(directory), workspace.path());
+        assert_eq!(
+            alone
+                .agent_manager
+                .conversation()
+                .map(|c| c.thread_id.as_str()),
+            Some("shared")
+        );
+        assert!(alone
+            .agent_continuity
+            .as_ref()
+            .unwrap()
+            .owns(workspace.path()));
     }
 
     #[test]

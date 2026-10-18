@@ -369,9 +369,10 @@ the next message starts a new thread seeded with the recent transcript.
 
 Only one Red at a time drives a workspace's conversation. The first editor to
 use it records its process id next to the saved conversation; a second Red
-opened in the same workspace starts its own thread, says so in the status line,
-and does not overwrite the saved one. The claim is released on exit and taken
-over automatically if its editor crashed.
+opened in the same workspace, including one started with `--resume`, starts its
+own thread, says so in the status line, and never saves that thread over the
+first editor's conversation, even after the first editor exits. The claim is
+released on exit and taken over automatically if its editor crashed.
 
 If Codex stops in the middle of a reply, Red keeps everything that streamed so
 far, adds a notice to the transcript, and resumes the thread in the background,

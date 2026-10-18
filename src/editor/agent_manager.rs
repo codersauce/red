@@ -510,6 +510,14 @@ impl AgentManager {
         }
     }
 
+    /// Drops the conversation without forgetting its thread, for a recovered
+    /// conversation that another editor already drives.
+    pub fn discard_conversation(&mut self) {
+        if self.conversation.take().is_some() {
+            self.conversation_revision += 1;
+        }
+    }
+
     pub fn take_forgotten_conversation(&mut self, session_id: &str) -> bool {
         self.forgotten_conversations.remove(session_id)
     }
