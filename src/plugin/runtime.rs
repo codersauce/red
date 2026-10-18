@@ -4283,7 +4283,7 @@ impl Runtime {
             // A plugin needs heap to work through a list after it arrives, so a
             // list that only just fits still fails the callback. Trim lists past
             // half the free heap; other results can only be delivered or dropped.
-            let list_field = trimmable_result_list(&request);
+            let list_field = trimmable_result_list(&request, &payload);
             let limit = if list_field.is_some() {
                 available / 2
             } else {
@@ -4481,13 +4481,22 @@ fn validate_command_registration(
 }
 
 /// The list field a plugin can still use in part when the whole result is too large.
-fn trimmable_result_list(request: &str) -> Option<&'static str> {
+fn trimmable_result_list(request: &str, payload: &Value) -> Option<&'static str> {
     match request {
         "DocumentSymbols" | "WorkspaceSymbols" => Some("symbols"),
         "References" => Some("references"),
-        "EditHistory" => Some("entries"),
+        // Only the workspace scope promises a newest-first prefix and a `total`;
+        // an unscoped history is delivered whole or not at all, as before.
+        "EditHistory" if result_field_is(payload, "scope", "workspace") => Some("entries"),
         _ => None,
     }
+}
+
+fn result_field_is(payload: &Value, field: &str, expected: &str) -> bool {
+    let (Value::Struct { fields, .. } | Value::Object(fields)) = payload else {
+        return false;
+    };
+    matches!(fields.get(field), Some(Value::String(value)) if value.as_str() == expected)
 }
 
 /// Keeps the longest prefix of `payload.field` whose result fits in `budget` heap
@@ -19680,6 +19689,31 @@ mod tests {
     }
 
     #[test]
+    fn only_workspace_edit_histories_are_trimmable() {
+        let history = |scope: Option<&str>| {
+            Value::Object(Arc::new(BTreeMap::from_iter(
+                [("entries".to_string(), Value::Array(Arc::new(Vec::new())))]
+                    .into_iter()
+                    .chain(scope.map(|scope| ("scope".to_string(), Value::String(scope.into())))),
+            )))
+        };
+        assert_eq!(
+            trimmable_result_list("EditHistory", &history(Some("workspace"))),
+            Some("entries")
+        );
+        // Unscoped results keep the shipped contract: whole or dropped, never a prefix.
+        assert_eq!(
+            trimmable_result_list("EditHistory", &history(Some("buffer"))),
+            None
+        );
+        assert_eq!(trimmable_result_list("EditHistory", &history(None)), None);
+        assert_eq!(
+            trimmable_result_list("References", &history(None)),
+            Some("references")
+        );
+    }
+
+    #[test]
     fn trimmed_result_keeps_the_longest_prefix_that_fits() {
         let result = |count: usize| Value::Struct {
             type_name: "SymbolsResult".to_string(),
@@ -19780,7 +19814,7 @@ mod tests {
         assert!(runtime
             .resolve_request(
                 request_id,
-                serde_json::json!({ "entries": entries, "total": 300 })
+                serde_json::json!({ "scope": "workspace", "entries": entries, "total": 300 })
             )
             .await
             .unwrap());

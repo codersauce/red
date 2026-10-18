@@ -476,7 +476,8 @@ archived context.
 `EditHistory(callback, scope?: String)` returns the attributed undo history. Without
 `scope` it returns the active buffer's whole tree in node order, as before. Host API
 `0.21.0` adds `"workspace"`, which covers every open file, newest first, limited to
-500 entries, and `total`, the number of entries before that limit.
+500 entries, and `total`, the number of entries before that limit. Results carry
+`scope` (`"buffer"` or `"workspace"`).
 
 Each entry keeps the original fields (`transaction_id`, `label`, `origin`, `current`,
 `timestamp_ms`, `edits`, and the tree links) and adds:
@@ -492,7 +493,7 @@ Each entry keeps the original fields (`transaction_id`, `label`, `origin`, `curr
 | `turn`, `prompt` | For agent edits: the one-based turn in the current conversation and an excerpt of the prompt that started it. |
 
 Workspace entries leave out `edits`, whose texts are unbounded; use `document`. A
-result too large for the plugin heap is trimmed to its newest entries, and `total`
+workspace result too large for the plugin heap is trimmed to its newest entries, and `total`
 still counts them all.
 
 `RevertTransaction(transaction_id)` finds the buffer that owns the transaction, so a

@@ -189,6 +189,7 @@ impl Editor {
             entries.push(value);
         }
         json!({
+            "scope": if with_edits { "buffer" } else { "workspace" },
             "entries": entries,
             "total": total,
         })
