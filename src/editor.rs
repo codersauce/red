@@ -37207,7 +37207,9 @@ builtin = "rust"
     #[test]
     fn rejected_push_reports_never_relabel_an_accepted_report() {
         let mut editor = test_editor(40, 10);
-        let uri = "file:///workspace/main.rs";
+        let root = tempfile::tempdir().unwrap();
+        let uri = crate::lsp::file_uri(root.path().join("main.rs")).unwrap();
+        let uri = uri.as_str();
         let diagnostic: Diagnostic = serde_json::from_value(json!({
             "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 1}},
             "message": "accepted",
@@ -37217,7 +37219,7 @@ builtin = "rust"
         let stamp = |editor: &Editor| {
             let stamp = editor
                 .agent_lsp
-                .test_report(uri, diagnostics::DEFAULT_PRODUCER)
+                .test_report(diagnostics::DEFAULT_PRODUCER)
                 .unwrap();
             (stamp.0, stamp.1)
         };

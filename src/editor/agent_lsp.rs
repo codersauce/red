@@ -80,12 +80,20 @@ struct EditWorker {
 }
 
 impl AgentLsp {
-    /// Sequence and protocol version of the stamp for a report, for tests.
+    /// Sequence and protocol version of the only stamp from `producer`, for
+    /// tests. Matching by producer avoids depending on platform URI spelling.
     #[cfg(test)]
-    pub(super) fn test_report(&self, uri: &str, producer: &str) -> Option<(u64, Option<i64>)> {
-        self.reports
-            .get(&(uri.to_string(), producer.to_string()))
-            .map(|stamp| (stamp.sequence, stamp.document_version))
+    pub(super) fn test_report(&self, producer: &str) -> Option<(u64, Option<i64>)> {
+        let mut stamps = self
+            .reports
+            .iter()
+            .filter(|((_, candidate), _)| candidate == producer);
+        let (_, stamp) = stamps.next()?;
+        assert!(
+            stamps.next().is_none(),
+            "expected one report from {producer:?}"
+        );
+        Some((stamp.sequence, stamp.document_version))
     }
 }
 
