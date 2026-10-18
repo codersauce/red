@@ -199,6 +199,16 @@ impl Editor {
 fn replacement_diff(edits: &[crate::undo::TextEdit]) -> (Vec<DiffLine>, DiffStat, bool) {
     let mut lines = Vec::new();
     let mut stat = DiffStat::default();
+    let mut truncated = false;
+    // Counts cover every line; only the first MAX_PREVIEW_LINES are kept, so one
+    // whole-document replacement cannot build a huge preview.
+    let mut push = |line: DiffLine, lines: &mut Vec<DiffLine>| {
+        if lines.len() < MAX_PREVIEW_LINES {
+            lines.push(line);
+        } else {
+            truncated = true;
+        }
+    };
     for crate::undo::TextEdit::Replace {
         range,
         old_text,
@@ -206,38 +216,42 @@ fn replacement_diff(edits: &[crate::undo::TextEdit]) -> (Vec<DiffLine>, DiffStat
         ..
     } in edits
     {
-        if lines.len() >= MAX_PREVIEW_LINES {
-            return (lines, stat, true);
-        }
         let start = range.start.line + 1;
-        let old: Vec<&str> = split_lines(old_text);
-        let new: Vec<&str> = split_lines(new_text);
-        lines.push(DiffLine {
-            kind: DiffLineKind::Hunk,
-            old_line: None,
-            new_line: None,
-            text: format!("@@ line {start} @@"),
-        });
-        for (offset, text) in old.iter().enumerate() {
-            stat.removed += 1;
-            lines.push(DiffLine {
-                kind: DiffLineKind::Removed,
-                old_line: Some(start + offset),
-                new_line: None,
-                text: (*text).to_string(),
-            });
-        }
-        for (offset, text) in new.iter().enumerate() {
-            stat.added += 1;
-            lines.push(DiffLine {
-                kind: DiffLineKind::Added,
+        push(
+            DiffLine {
+                kind: DiffLineKind::Hunk,
                 old_line: None,
-                new_line: Some(start + offset),
-                text: (*text).to_string(),
-            });
+                new_line: None,
+                text: format!("@@ line {start} @@"),
+            },
+            &mut lines,
+        );
+        for (offset, text) in split_lines(old_text).into_iter().enumerate() {
+            stat.removed += 1;
+            push(
+                DiffLine {
+                    kind: DiffLineKind::Removed,
+                    old_line: Some(start + offset),
+                    new_line: None,
+                    text: text.to_string(),
+                },
+                &mut lines,
+            );
+        }
+        for (offset, text) in split_lines(new_text).into_iter().enumerate() {
+            stat.added += 1;
+            push(
+                DiffLine {
+                    kind: DiffLineKind::Added,
+                    old_line: None,
+                    new_line: Some(start + offset),
+                    text: text.to_string(),
+                },
+                &mut lines,
+            );
         }
     }
-    (lines, stat, false)
+    (lines, stat, truncated)
 }
 
 fn split_lines(text: &str) -> Vec<&str> {
@@ -300,6 +314,28 @@ mod tests {
         let text: Vec<_> = lines.iter().map(|line| line.text.as_str()).collect();
         assert_eq!(text, ["@@ line 5 @@", "old", "new one", "new two"]);
         assert_eq!(lines[3].new_line, Some(6));
+    }
+
+    #[test]
+    fn a_whole_document_replacement_keeps_a_bounded_preview_and_full_counts() {
+        let old_text: String = (0..1_000).map(|line| format!("old {line}\n")).collect();
+        let new_text: String = (0..1_500).map(|line| format!("new {line}\n")).collect();
+        let edits = vec![crate::undo::TextEdit::Replace {
+            range: TextRange::new(TextPosition::new(0, 0), TextPosition::new(1_000, 0)),
+            start_char: 0,
+            old_text,
+            new_text,
+        }];
+        let (lines, stat, truncated) = replacement_diff(&edits);
+        assert_eq!(lines.len(), MAX_PREVIEW_LINES);
+        assert!(truncated);
+        assert_eq!(
+            stat,
+            DiffStat {
+                added: 1_500,
+                removed: 1_000
+            }
+        );
     }
 
     #[test]

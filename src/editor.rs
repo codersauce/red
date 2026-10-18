@@ -12008,6 +12008,10 @@ impl Editor {
                     }
                 }
                 PluginRequest::AgentCloseSession { session_id } => {
+                    self.abandon_agent_edit_decision(
+                        Some(&session_id),
+                        "the conversation was closed",
+                    );
                     self.finish_inline_agent_outcome(
                         &session_id,
                         crate::inline_history::InlineAgentState::Cancelled,
@@ -12034,6 +12038,10 @@ impl Editor {
                     }
                 }
                 PluginRequest::AgentArchiveSession { session_id } => {
+                    self.abandon_agent_edit_decision(
+                        Some(&session_id),
+                        "the conversation was archived",
+                    );
                     self.finish_inline_agent_outcome(
                         &session_id,
                         crate::inline_history::InlineAgentState::Cancelled,
@@ -12042,6 +12050,10 @@ impl Editor {
                     self.agent_manager.mark_session_inactive(&session_id);
                 }
                 PluginRequest::AgentForgetSession { session_id } => {
+                    self.abandon_agent_edit_decision(
+                        Some(&session_id),
+                        "the conversation was reset",
+                    );
                     self.finish_inline_agent_outcome(
                         &session_id,
                         crate::inline_history::InlineAgentState::Cancelled,
@@ -36754,6 +36766,42 @@ mod test {
             .map(|index| editor.buffer_manager[index].contents())
             .unwrap();
         assert_eq!(document, original);
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn closing_a_conversation_releases_its_unsaved_edit_question() {
+        for close in ["close", "forget"] {
+            let root = tempfile::tempdir().unwrap();
+            let (mut editor, sender) = unsaved_document_editor(root.path()).await;
+            let result = send_agent_line_edit(&editor, &sender, 1, 3, "TWO").await;
+            editor.test_service_background().await.unwrap();
+            assert!(editor.agent_edit_decisions.is_waiting());
+            assert!(editor.current_dialog.is_some());
+
+            // One runtime owns the request queue the plugin request is sent to.
+            let mut runtime = Runtime::new();
+            let mut render_buffer =
+                RenderBuffer::new(/*width*/ 80, /*height*/ 24, &Style::default());
+            let session_id = "session-1".to_string();
+            ACTION_DISPATCHER.send_request(match close {
+                "close" => PluginRequest::AgentCloseSession { session_id },
+                _ => PluginRequest::AgentForgetSession { session_id },
+            });
+            editor
+                .service_background(&mut render_buffer, &mut runtime)
+                .await
+                .unwrap();
+
+            assert!(!editor.agent_edit_decisions.is_waiting(), "{close}");
+            assert!(editor.current_dialog.is_none(), "{close}");
+            assert!(result
+                .await
+                .unwrap()
+                .unwrap_err()
+                .contains("edit not applied"));
+            assert_eq!(editor.current_buffer().contents(), "human one\ntwo\n");
+        }
     }
 
     #[tokio::test]

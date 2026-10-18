@@ -8845,10 +8845,41 @@ mod tests {
             .await
             .unwrap();
         let model = workspace_update();
+        assert_eq!(text(&model.header), "0 edits");
         assert!(model.detail_document.is_none());
         assert_eq!(
             model.detail.first().map(|row| text(row)).as_deref(),
             Some("No agent edits yet")
+        );
+
+        // A capped history adds a notice row that is not itself an edit.
+        runtime
+            .notify(
+                "workspace:event:agent-history",
+                serde_json::json!({ "action": "a", "row": null }),
+            )
+            .await
+            .unwrap();
+        let request_id = history_request();
+        runtime
+            .resolve_request(
+                request_id,
+                serde_json::json!({
+                    "entries": [
+                        entry("agent-2", "agent", "src/parse.rs", true),
+                        entry("user-2", "user", "src/parse.rs", true),
+                    ],
+                    "total": 700,
+                }),
+            )
+            .await
+            .unwrap();
+        let model = workspace_update();
+        assert_eq!(model.rows.len(), 3);
+        assert_eq!(text(&model.header), "2 edits in 1 file · 1 by the agent");
+        assert_eq!(
+            text(&model.rows[2].segments),
+            "… older edits not shown; the history lists the newest 2 of 700"
         );
     }
 

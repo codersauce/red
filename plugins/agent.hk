@@ -2329,6 +2329,7 @@ fn history_empty_detail(text: String) -> [[PanelSegment]] {
 fn render_history(result: AgentHistoryResult) {
     let rows = [];
     let agent_edits = 0;
+    let shown = 0;
     let files = [];
     let selected_found = false;
     let first_row = red::null();
@@ -2338,6 +2339,7 @@ fn render_history(result: AgentHistoryResult) {
         if state().history_agent_only && !by_agent { continue; }
         if !red::contains(files, entry.file) { files = red::push(files, entry.file); }
         let row = history_row(entry);
+        shown = shown + 1;
         if first_row == red::null() { first_row = row; }
         if row.id == state().history_selected {
             selected_found = true;
@@ -2362,11 +2364,12 @@ fn render_history(result: AgentHistoryResult) {
         rows = red::push(rows, WorkspaceRow {
             id: "history-truncated",
             selectable: false,
-            segments: [PanelSegment { text: "… showing the newest " + red::len(result.entries) + " of " + total + " edits", style: muted_style() }],
+            segments: [PanelSegment { text: "… older edits not shown; the history lists the newest " + red::len(result.entries) + " of " + total, style: muted_style() }],
         });
     }
-    let summary = red::len(rows) + " edits";
-    if red::len(rows) == 1 { summary = "1 edit"; }
+    // Count edits, not the informational rows added after them.
+    let summary = shown + " edits";
+    if shown == 1 { summary = "1 edit"; }
     if red::len(files) == 1 { summary = summary + " in 1 file"; }
     if red::len(files) > 1 { summary = summary + " across " + red::len(files) + " files"; }
     if !state().history_agent_only { summary = summary + " · " + agent_edits + " by the agent"; }
