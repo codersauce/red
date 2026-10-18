@@ -1537,13 +1537,7 @@ fn clear_conversation() {
     red::state_patch(AgentState { activity_history: [] });
     red::state_patch(AgentState { thought: "" });
     // Queued messages still run after a Clear, so they stay visible.
-    let queued = [];
-    for prompt in state().pane.queued {
-        queued = red::push(queued, AgentTextBlock {
-            id: prompt.id, kind: "user", format: "plain", text: prompt.text,
-        });
-    }
-    red::execute("UpdateTextPanel", "agent-conversation", queued);
+    red::execute("UpdateTextPanel", "agent-conversation", with_unsent_prompts([]));
     red::execute("SetTextPanelComposerState", "agent-conversation", true, "Conversation view cleared · context preserved");
 }
 
@@ -2116,9 +2110,24 @@ fn render_conversation() {
     blocks = presented;
     // Messages the core has not sent yet render below the conversation. A prompt
     // returned for retry after a lost session is already in the transcript.
-    // A message held behind a running turn or a paused queue is drawn dimmed.
-    // Only the first message, sent while a thread starts, already looks sent;
-    // anything typed after it waits its turn.
+    blocks = with_unsent_prompts(blocks);
+    if red::len(blocks) == 0 {
+        blocks = [AgentTextBlock {
+            id: "empty",
+            kind: "activity",
+            format: "plain",
+            text: "Ask about this workspace, or ask for a change.\n\nEnter sends · Ctrl+J adds a line · Ctrl+P recalls\nCtrl+C stops a turn · follow-ups queue up\nOne u undoes an agent edit · :AgentHistory lists them",
+        }];
+    }
+    red::execute("UpdateTextPanel", "agent-conversation", blocks);
+    // Full replacement already contains pending deltas; never append them twice.
+    red::state_patch(AgentState { stream_delta: "", stream_trimmed: false });
+}
+
+/// Appends messages the core has not sent yet. One held behind a running turn
+/// or a paused queue is drawn dimmed; only the first message, sent while a
+/// thread starts, already looks sent, and anything typed after it waits its turn.
+fn with_unsent_prompts(blocks: [AgentTextBlock]) -> [AgentTextBlock] {
     let held = turn_running() || state().pane.paused;
     let position = 0;
     for prompt in state().pane.queued {
@@ -2135,17 +2144,7 @@ fn render_conversation() {
         }
         position = position + 1;
     }
-    if red::len(blocks) == 0 {
-        blocks = [AgentTextBlock {
-            id: "empty",
-            kind: "activity",
-            format: "plain",
-            text: "Ask about this workspace, or ask for a change.\n\nEnter sends · Ctrl+J adds a line · Ctrl+P recalls\nCtrl+C stops a turn · follow-ups queue up\nOne u undoes an agent edit · :AgentHistory lists them",
-        }];
-    }
-    red::execute("UpdateTextPanel", "agent-conversation", blocks);
-    // Full replacement already contains pending deltas; never append them twice.
-    red::state_patch(AgentState { stream_delta: "", stream_trimmed: false });
+    return blocks;
 }
 
 /// Normalize blocks from live, migrated, and restored state before they reach the panel.

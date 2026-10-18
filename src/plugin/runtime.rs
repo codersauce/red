@@ -9714,6 +9714,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bundled_agent_clear_keeps_held_follow_ups_dimmed() {
+        drain_requests();
+        let mut runtime = Runtime::new();
+        runtime
+            .load_plugin("agent", include_str!("../../plugins/agent.hk"))
+            .await
+            .unwrap();
+        runtime
+            .notify(
+                "agent:pane_state",
+                serde_json::json!({
+                    "phase": "idle", "session_id": "session-1", "turn_id": null, "in_flight": null,
+                    "queued": [{"id": "p1", "text": "held"}],
+                    "paused": true, "stop_failed": false, "recap_pending": false,
+                }),
+            )
+            .await
+            .unwrap();
+        drain_requests();
+        runtime.execute_command("AgentClear").await.unwrap();
+        let mut kinds = None;
+        while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
+            if let PluginRequest::UpdateTextPanel { blocks, .. } = request {
+                kinds = Some(
+                    blocks
+                        .iter()
+                        .map(|block| block.kind.clone())
+                        .collect::<Vec<_>>(),
+                );
+            }
+        }
+        assert_eq!(kinds.unwrap(), [crate::plugin::TextPanelBlockKind::Queued]);
+    }
+
+    #[tokio::test]
     async fn bundled_agent_names_a_requested_stop_and_gives_each_turn_one_working_verb() {
         let mut runtime = agent_runtime_with_session("session-1").await;
         let mut labels = Vec::new();
