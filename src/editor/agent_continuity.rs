@@ -57,6 +57,8 @@ pub struct ConversationStore {
     /// pid. This editor's separate thread there is never saved, even after the
     /// owner exits, so it cannot replace the owner's conversation.
     denied: HashMap<String, u32>,
+    /// Workspaces this editor left whose records could not be removed yet.
+    retiring: Vec<PathBuf>,
 }
 
 impl ConversationStore {
@@ -70,6 +72,7 @@ impl ConversationStore {
             pid,
             claimed: HashSet::new(),
             denied: HashMap::new(),
+            retiring: Vec::new(),
         }
     }
 
@@ -115,12 +118,56 @@ impl ConversationStore {
     /// Releases every claim so the next editor in these workspaces can resume.
     pub fn release_all(&mut self) {
         for key in std::mem::take(&mut self.claimed) {
-            let Ok(_lock) = self.lock(&key) else {
-                continue;
-            };
-            let path = self.directory.join(format!("{key}.owner"));
-            if read_owner(&path).ok().flatten() == Some(self.pid) {
-                let _ = fs::remove_file(path);
+            self.release_key(&key);
+        }
+    }
+
+    fn release_key(&self, key: &str) {
+        let Ok(_lock) = self.lock(key) else {
+            return;
+        };
+        let path = self.directory.join(format!("{key}.owner"));
+        if read_owner(&path).ok().flatten() == Some(self.pid) {
+            let _ = fs::remove_file(path);
+        }
+    }
+
+    /// Never saves this workspace from this editor, as when its ownership could
+    /// not be checked: a later save must not replace a record it could not read
+    /// safely.
+    pub fn refuse(&mut self, workspace: &Path) {
+        self.denied.insert(workspace_key(workspace), 0);
+    }
+
+    /// This editor's conversation left `workspace`: remove its record there and
+    /// release the claim so another editor can use that workspace. A removal
+    /// that fails stays pending and is retried by [`Self::retry_retirements`].
+    pub fn retire(&mut self, workspace: &Path) {
+        if self.owns(workspace) && !self.retiring.iter().any(|path| path == workspace) {
+            self.retiring.push(workspace.to_path_buf());
+        }
+        self.retry_retirements();
+    }
+
+    pub fn has_retirements(&self) -> bool {
+        !self.retiring.is_empty()
+    }
+
+    pub fn retry_retirements(&mut self) {
+        for workspace in std::mem::take(&mut self.retiring) {
+            match self.remove(&workspace) {
+                Ok(_) => {
+                    let key = workspace_key(&workspace);
+                    self.claimed.remove(&key);
+                    self.release_key(&key);
+                }
+                Err(error) => {
+                    crate::log!(
+                        "could not remove the agent conversation saved for {}: {error}",
+                        workspace.display()
+                    );
+                    self.retiring.push(workspace);
+                }
             }
         }
     }
@@ -439,7 +486,17 @@ impl super::Editor {
                     "Agent conversation is open in another Red (pid {pid}); this window starts its own"
                 )));
             }
-            Err(error) => crate::log!("could not claim the saved agent conversation: {error}"),
+            Err(error) => {
+                // Keep its history and never overwrite a record this editor
+                // could not claim safely.
+                crate::log!("could not claim the saved agent conversation: {error}");
+                self.archive_saved_agent_transcript(workspace, &saved.conversation);
+                store.refuse(workspace);
+                self.set_quiet_message(Some(
+                    "Could not check whether another Red uses this agent conversation; this window starts its own"
+                        .to_string(),
+                ));
+            }
         }
     }
 
@@ -486,7 +543,14 @@ impl super::Editor {
             } else {
                 IDLE_SAVE_INTERVAL
             };
-            if saved == Some(revision) || (!force && at.elapsed() < interval) {
+            if !force && at.elapsed() < interval {
+                return;
+            }
+            if saved == Some(revision) {
+                if store.has_retirements() {
+                    store.retry_retirements();
+                    self.agent_continuity_saved = Some((saved, std::time::Instant::now()));
+                }
                 return;
             }
         }
@@ -498,12 +562,9 @@ impl super::Editor {
                     .take()
                     .filter(|previous| previous != &workspace)
                 {
-                    if let Err(error) = store.remove(&previous) {
-                        crate::log!(
-                            "could not remove the agent conversation saved for {}: {error}",
-                            previous.display()
-                        );
-                    }
+                    store.retire(&previous);
+                } else if store.has_retirements() {
+                    store.retry_retirements();
                 }
                 self.agent_continuity_workspace = Some(workspace.clone());
                 match store.claim(&workspace) {
@@ -922,6 +983,97 @@ mod tests {
             .restore_conversation(conversation("shared", workspace.path()));
         recovered.enable_agent_continuity_in(ConversationStore::new(directory), workspace.path());
         assert!(recovered.agent_manager.conversation().is_none());
+    }
+
+    fn say(editor: &mut crate::editor::Editor, thread: &str, workspace: &Path, text: &str) {
+        editor.agent_manager.begin_conversation(thread, workspace);
+        editor.agent_manager.mark_session_active(thread);
+        editor.agent_manager.set_turn_id(thread, "t1");
+        editor.agent_manager.record_user_message(thread, "t1", text);
+    }
+
+    #[test]
+    fn a_saved_conversation_that_cannot_be_claimed_is_archived_and_never_overwritten() {
+        let config = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let directory = config.path().to_path_buf();
+        let mut first = editor();
+        first.enable_agent_continuity_in(
+            ConversationStore::new(directory.clone()),
+            workspace.path(),
+        );
+        say(&mut first, "saved", workspace.path(), "Remember HERON");
+        first.finish_agent_continuity();
+
+        // The claim lock cannot be opened.
+        let lock = directory.join(format!("{}.lock", workspace_key(workspace.path())));
+        fs::remove_file(&lock).ok();
+        fs::create_dir(&lock).unwrap();
+        let mut second = editor();
+        second.enable_agent_continuity_in(
+            ConversationStore::new(directory.clone()),
+            workspace.path(),
+        );
+        assert!(second.agent_manager.conversation().is_none());
+        let key = crate::editor::scoped_plugin_storage_key_for_workspace(
+            "agent",
+            "transcript",
+            workspace.path(),
+        );
+        assert_eq!(
+            second
+                .preferences
+                .plugin_storage("agent", &key)
+                .and_then(serde_json::Value::as_str),
+            Some("You: Remember HERON\n")
+        );
+
+        fs::remove_dir(&lock).unwrap();
+        say(&mut second, "other", workspace.path(), "Something else");
+        second.finish_agent_continuity();
+        assert_eq!(
+            ConversationStore::new(directory)
+                .load(workspace.path())
+                .unwrap()
+                .conversation
+                .thread_id,
+            "saved",
+            "the record it could not claim is never replaced"
+        );
+    }
+
+    #[test]
+    fn leaving_a_workspace_removes_its_record_and_releases_it_even_after_a_failure() {
+        let config = tempfile::tempdir().unwrap();
+        let first_workspace = tempfile::tempdir().unwrap();
+        let second_workspace = tempfile::tempdir().unwrap();
+        let directory = config.path().to_path_buf();
+        let mut editor = editor();
+        editor.enable_agent_continuity_in(
+            ConversationStore::new(directory.clone()),
+            first_workspace.path(),
+        );
+        say(&mut editor, "first", first_workspace.path(), "hello");
+        editor.persist_agent_conversation(/*force*/ true);
+
+        // Removing the first record fails once.
+        let record = directory.join(format!("{}.json", workspace_key(first_workspace.path())));
+        fs::remove_file(&record).unwrap();
+        fs::create_dir(&record).unwrap();
+        say(&mut editor, "second", second_workspace.path(), "hi");
+        editor.persist_agent_conversation(/*force*/ true);
+        assert!(record.is_dir(), "the failed removal is still pending");
+
+        fs::remove_dir(&record).unwrap();
+        fs::write(&record, "{}").unwrap();
+        editor.persist_agent_conversation(/*force*/ true);
+        assert!(!record.exists(), "the pending removal is retried");
+        let mut other = ConversationStore::for_process(directory, u32::MAX - 1);
+        assert_eq!(
+            other.claim(first_workspace.path()).unwrap(),
+            Claim::Owned,
+            "the workspace it left is free for another editor"
+        );
     }
 
     #[test]
