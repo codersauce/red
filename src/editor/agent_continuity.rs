@@ -434,8 +434,9 @@ impl super::Editor {
                     Err(error) => Err(error.into()),
                 }
             }
-            Some(_) => Ok(()),
-            None => match self.agent_continuity_workspace.clone() {
+            // No conversation, or a new thread with nothing in it yet (as right
+            // after :AgentNew): nothing worth resuming, so the old record goes.
+            _ => match self.agent_continuity_workspace.clone() {
                 // Keep the workspace until its record is really gone, so a
                 // failed removal is retried instead of resuming a forgotten thread.
                 Some(workspace) => store
@@ -731,6 +732,37 @@ mod tests {
         fs::remove_dir(&record).unwrap();
         editor.persist_agent_conversation(/*force*/ true);
         assert!(editor.agent_continuity_workspace.is_none());
+    }
+
+    #[test]
+    fn a_new_empty_thread_replaces_the_forgotten_record_before_its_first_message() {
+        let config = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let directory = config.path().to_path_buf();
+        let mut editor = editor();
+        editor.enable_agent_continuity_in(
+            ConversationStore::new(directory.clone()),
+            workspace.path(),
+        );
+        editor
+            .agent_manager
+            .begin_conversation("old", workspace.path());
+        editor.agent_manager.mark_session_active("old");
+        editor.agent_manager.set_turn_id("old", "t1");
+        editor
+            .agent_manager
+            .record_user_message("old", "t1", "Remember HERON");
+        editor.persist_agent_conversation(/*force*/ true);
+
+        // :AgentNew forgets the thread and the new one starts before the next save.
+        editor.agent_manager.forget_conversation("old");
+        editor
+            .agent_manager
+            .begin_conversation("fresh", workspace.path());
+        editor.finish_agent_continuity();
+        assert!(ConversationStore::new(directory)
+            .load(workspace.path())
+            .is_none());
     }
 
     #[test]
