@@ -4,7 +4,7 @@
     {
       "version": "0.21.0",
       "kind": "introduced",
-      "symbols": ["AgentSubmit", "AgentStop", "AgentSendQueued", "AgentDiscardQueued", "AgentReset", "agent:pane_state"],
+      "symbols": ["AgentSubmit", "AgentStop", "AgentSendQueued", "AgentDiscardQueued", "AgentReset", "agent:pane_state", "TextPanelBlock.kind=queued", "panel:event action=view"],
       "migration_note": "docs/PLUGIN_API.md#agent-pane-lifecycle"
     },
     {

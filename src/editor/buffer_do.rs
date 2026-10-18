@@ -8,14 +8,16 @@ impl Editor {
         &'a mut self,
         buffer: &'a mut RenderBuffer,
         runtime: &'a mut Runtime,
+        force: bool,
     ) -> BoxFuture<'a, anyhow::Result<()>> {
-        Box::pin(self.execute_write_all_impl(buffer, runtime))
+        Box::pin(self.execute_write_all_impl(buffer, runtime, force))
     }
 
     async fn execute_write_all_impl(
         &mut self,
         buffer: &mut RenderBuffer,
         runtime: &mut Runtime,
+        force: bool,
     ) -> anyhow::Result<()> {
         let original_id = self.current_buffer().id();
         let original_view = (self.cx, self.cy, self.vtop, self.vleft, self.skipcol);
@@ -59,7 +61,12 @@ impl Editor {
             }
 
             self.select_buffer_for_lsp_edit(index);
-            match self.save_action(buffer, runtime).await {
+            let saved = if force {
+                self.force_save_action(buffer, runtime).await
+            } else {
+                self.save_action(buffer, runtime).await
+            };
+            match saved {
                 Ok(_) => {
                     if self.buffer_has_pending_format_save(target) {
                         pending += 1;

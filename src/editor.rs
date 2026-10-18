@@ -2596,6 +2596,8 @@ pub enum Action {
     /// Overwrites the backing file after an explicit `:w!` or conflict confirmation.
     ForceSave,
     SaveAll,
+    /// Writes every modified buffer, overwriting changed files, after `:wqa!` or `:xa!`.
+    ForceSaveAll,
     SaveAs(String),
     /// Overwrites an explicitly selected destination after `:w! {file}`.
     ForceSaveAs(String),
@@ -3783,6 +3785,10 @@ pub struct Editor {
 
     /// Temporary presentation of one live window or docked pane.
     zoomed_pane: Option<FocusTarget>,
+    /// Compact conversation panes that are open but out of view.
+    compact_hidden_panes: std::collections::BTreeSet<String>,
+    /// Panel events raised while laying out, delivered on the next service tick.
+    pending_panel_events: Vec<plugin::panel::PanelEvent>,
 
     /// Cursor position where the current insert session began.
     insert_entry_cursor: Option<CursorSnapshot>,
@@ -4959,10 +4965,11 @@ struct ScratchBufferCommands {
     cancel: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum DeferredQuit {
     None,
-    AfterSave(BufferId),
+    /// Quit once every one of these buffers finishes its format-on-save.
+    AfterSaves(Vec<BufferId>),
     Ready,
 }
 
@@ -5722,6 +5729,8 @@ impl Editor {
             multi_cursor: None,
             pane_resize_mode: None,
             zoomed_pane: None,
+            compact_hidden_panes: Default::default(),
+            pending_panel_events: Vec::new(),
             insert_entry_cursor: None,
             generated_indent: None,
             waiting_command: None,
@@ -6528,10 +6537,11 @@ impl Editor {
             current_side,
             plugin::PanelSide::Left | plugin::PanelSide::Right
         );
+        let terminal_width = usize::from(self.size.0);
         let reserved_on_axis = if target_is_vertical {
             self.panel_manager
-                .reserved_left_width()
-                .saturating_add(self.panel_manager.reserved_right_width())
+                .reserved_left_width(terminal_width)
+                .saturating_add(self.panel_manager.reserved_right_width(terminal_width))
         } else {
             self.panel_manager
                 .reserved_top_height()
@@ -6542,11 +6552,22 @@ impl Editor {
         } else {
             reserved_on_axis
         };
+        // A conversation pane stays readable and never squeezes the editor below
+        // a usable width; the layout would hold it to both anyway.
+        let conversation = self.panel_manager.panel_has_composer(id);
         let (terminal_extent, minimum_editor, minimum_panel) = if target_is_vertical {
             (
-                usize::from(self.size.0),
-                MIN_EDITOR_WINDOW_WIDTH,
-                MIN_DOCKED_PANEL_WIDTH,
+                terminal_width,
+                if conversation {
+                    plugin::panel::MIN_COMFORTABLE_EDITOR_WIDTH
+                } else {
+                    MIN_EDITOR_WINDOW_WIDTH
+                },
+                if conversation {
+                    plugin::panel::MIN_READABLE_PANE_WIDTH
+                } else {
+                    MIN_DOCKED_PANEL_WIDTH
+                },
             )
         } else {
             (
@@ -6944,7 +6965,20 @@ impl Editor {
             self.pane_resize_mode = None;
             self.force_full_redraw = true;
         }
-        let (windows, panels) = match &self.zoomed_pane {
+        // A compact conversation pane covers the editor while it has focus, as if
+        // zoomed, and steps aside as soon as focus returns to a window.
+        let compact_focus = match (&self.zoomed_pane, self.current_focus_target()) {
+            (None, Some(FocusTarget::Panel(id)))
+                if self.panel_manager.is_compact_panel(&id, terminal_size.0) =>
+            {
+                Some(FocusTarget::Panel(id))
+            }
+            _ => None,
+        };
+        // An explicit zoom of a compact pane shows it too.
+        let shown = self.zoomed_pane.clone().or_else(|| compact_focus.clone());
+        self.sync_compact_pane_views(terminal_size.0, shown.as_ref());
+        let (windows, panels) = match self.zoomed_pane.as_ref().or(compact_focus.as_ref()) {
             Some(FocusTarget::Window(id)) => (
                 WindowPresentation::Zoomed(*id),
                 plugin::panel::PanelPresentation::Hidden,
@@ -6963,6 +6997,39 @@ impl Editor {
         };
         self.window_manager.set_presentation(windows);
         self.panel_manager.set_presentation(panels);
+    }
+
+    /// Tells a compact pane's plugin whether the pane is on screen, so it can
+    /// announce results the user cannot see (the pane is still logically open).
+    fn sync_compact_pane_views(&mut self, terminal_width: usize, shown: Option<&FocusTarget>) {
+        let hidden = self
+            .panel_manager
+            .panel_ids()
+            .into_iter()
+            .filter(|id| {
+                self.panel_manager.is_compact_panel(id, terminal_width)
+                    && !matches!(shown, Some(FocusTarget::Panel(shown)) if shown == id)
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        if hidden == self.compact_hidden_panes {
+            return;
+        }
+        self.force_full_redraw = true;
+        for id in hidden.symmetric_difference(&self.compact_hidden_panes) {
+            let view = if hidden.contains(id) {
+                "hidden"
+            } else {
+                "visible"
+            };
+            self.pending_panel_events.push(plugin::panel::PanelEvent {
+                panel_id: id.clone(),
+                action: "view".to_string(),
+                selected_index: 0,
+                row: None,
+                text: Some(view.to_string()),
+            });
+        }
+        self.compact_hidden_panes = hidden;
     }
 
     fn resize_window_layout(&mut self, terminal_size: (usize, usize)) {
@@ -7056,10 +7123,13 @@ impl Editor {
             return (0, 0);
         }
         let max_reserved = terminal_width.saturating_sub(MIN_EDITOR_WINDOW_WIDTH);
-        let reserved_left = self.panel_manager.reserved_left_width().min(max_reserved);
+        let reserved_left = self
+            .panel_manager
+            .reserved_left_width(terminal_width)
+            .min(max_reserved);
         let reserved_right = self
             .panel_manager
-            .reserved_right_width()
+            .reserved_right_width(terminal_width)
             .min(max_reserved.saturating_sub(reserved_left));
         (reserved_left, reserved_right)
     }
@@ -8732,6 +8802,7 @@ impl Editor {
                 | Action::Save
                 | Action::ForceSave
                 | Action::SaveAll
+                | Action::ForceSaveAll
                 | Action::SaveAs(_)
                 | Action::ForceSaveAs(_)
                 | Action::CompareFileOnDisk
@@ -11034,6 +11105,14 @@ impl Editor {
         runtime: &mut Runtime,
     ) -> anyhow::Result<()> {
         self.plugin_registry.poll_rpc_lifecycle(runtime).await;
+        for event in std::mem::take(&mut self.pending_panel_events) {
+            let topic = format!("panel:event:{}", event.panel_id);
+            if let Ok(payload) = serde_json::to_value(&event) {
+                self.plugin_registry
+                    .notify(runtime, &topic, payload)
+                    .await?;
+            }
+        }
         self.plugin_registry.poll_rpc_commands(runtime).await;
         self.service_rpc_host_requests(buffer, runtime).await;
         self.plugin_registry
@@ -14767,18 +14846,20 @@ impl Editor {
 
     #[cfg(test)]
     fn add_diagnostics(&mut self, uri: Option<&str>, diagnostics: &[Diagnostic]) -> Option<Action> {
-        self.add_diagnostics_from(uri, None, diagnostics)
+        self.add_diagnostics_from(uri, None, None, diagnostics)
     }
 
     fn add_diagnostics_from(
         &mut self,
         uri: Option<&str>,
         source: Option<&LspRequestSource>,
+        version: Option<i64>,
         diagnostics: &[Diagnostic],
     ) -> Option<Action> {
-        self.update_diagnostics_from(
+        self.update_diagnostics_versioned(
             uri,
             source,
+            version,
             diagnostics,
             diagnostics::DiagnosticReportKind::Push,
         )
@@ -14816,6 +14897,18 @@ impl Editor {
         diagnostics: &[Diagnostic],
         kind: diagnostics::DiagnosticReportKind,
     ) -> Option<Action> {
+        self.update_diagnostics_versioned(uri, source, None, diagnostics, kind)
+    }
+
+    /// `version` is the document version a push report names, if any.
+    fn update_diagnostics_versioned(
+        &mut self,
+        uri: Option<&str>,
+        source: Option<&LspRequestSource>,
+        version: Option<i64>,
+        diagnostics: &[Diagnostic],
+        kind: diagnostics::DiagnosticReportKind,
+    ) -> Option<Action> {
         let Some(uri) = uri else {
             log!("WARN: no uri provided for diagnostics - {diagnostics:?}");
             return None;
@@ -14843,7 +14936,8 @@ impl Editor {
             .map(|source| source.key.as_str())
             .unwrap_or(diagnostics::DEFAULT_PRODUCER);
         log!("Adding diagnostics for {uri}: {diagnostics:#?}");
-        self.record_agent_diagnostic_report(&uri, producer);
+        // Only an accepted report is stamped, with the server it came from.
+        self.record_agent_diagnostic_report(&uri, producer, source, version);
         let merged = self
             .diagnostic_reports
             .update(&uri, producer, kind, diagnostics);
@@ -15981,6 +16075,7 @@ impl Editor {
                 ParsedNotification::PublishDiagnostics(msg) => self.add_diagnostics_from(
                     msg.uri.as_deref(),
                     msg.source.as_ref(),
+                    msg.version,
                     &msg.diagnostics,
                 ),
                 ParsedNotification::Progress(progress_params) => {
@@ -17802,8 +17897,34 @@ impl Editor {
                 actions.push(Action::MoveToBottom);
             }
 
-            if cmd == "quit" {
+            // Red has one editor process, so quitting "all" is the same quit.
+            if cmd == "quit" || cmd == "qall" || cmd == "quitall" {
                 actions.push(Action::Quit(parsed.is_forced()));
+            }
+
+            // `:x` writes only a modified buffer; the "all" forms write every
+            // modified buffer. A failed write keeps the editor open.
+            if cmd == "xit" || cmd == "exit" {
+                if self.current_buffer().is_dirty() {
+                    actions.push(match (parsed.file_argument(), parsed.is_forced()) {
+                        (Some(file), true) => Action::ForceSaveAs(file),
+                        (Some(file), false) => Action::SaveAs(file),
+                        (None, true) => Action::ForceSave,
+                        (None, false) => Action::Save,
+                    });
+                }
+                actions.push(Action::Quit(false));
+            }
+
+            // The bang forces the writes, as in Vim; a failed write still keeps
+            // the editor open.
+            if cmd == "wqall" || cmd == "xall" {
+                actions.push(if parsed.is_forced() {
+                    Action::ForceSaveAll
+                } else {
+                    Action::SaveAll
+                });
+                actions.push(Action::Quit(false));
             }
 
             if cmd == "write" {
@@ -23408,7 +23529,12 @@ impl Editor {
                 self.render(buffer)?;
             }
             Action::SaveAll => {
-                self.execute_write_all(buffer, runtime).await?;
+                self.execute_write_all(buffer, runtime, /*force*/ false)
+                    .await?;
+            }
+            Action::ForceSaveAll => {
+                self.execute_write_all(buffer, runtime, /*force*/ true)
+                    .await?;
             }
             Action::SaveAs(new_file_name) => {
                 if !self.save_as_action(new_file_name, buffer, runtime).await? {
@@ -29450,31 +29576,47 @@ impl Editor {
         })
     }
 
+    /// Defers a quit when every unsaved buffer is waiting on its own
+    /// format-on-save, as after `:wq`, `:wqa`, or `:xa`; the quit then happens
+    /// once all of them are written.
     fn defer_quit_for_pending_save(&mut self) -> bool {
-        let buffer_id = self.current_buffer().id();
-        let should_defer = self.current_buffer().is_dirty()
-            && self
-                .buffer_manager
-                .iter()
-                .filter(|buffer| buffer.is_dirty())
-                .count()
-                == 1
-            && self.has_pending_format_save(buffer_id);
+        let dirty = self
+            .buffer_manager
+            .iter()
+            .filter(|buffer| buffer.is_dirty())
+            .map(Buffer::id)
+            .collect::<Vec<_>>();
+        let should_defer =
+            !dirty.is_empty() && dirty.iter().all(|id| self.has_pending_format_save(*id));
         if should_defer {
-            self.deferred_quit = DeferredQuit::AfterSave(buffer_id);
+            self.deferred_quit = DeferredQuit::AfterSaves(dirty);
         }
         should_defer
     }
 
     fn finish_deferred_quit(&mut self, buffer_id: BufferId, saved: bool) {
-        if self.deferred_quit != DeferredQuit::AfterSave(buffer_id) {
+        let DeferredQuit::AfterSaves(waiting) = &mut self.deferred_quit else {
             return;
-        }
-        self.deferred_quit = if saved {
-            DeferredQuit::Ready
-        } else {
-            DeferredQuit::None
         };
+        let Some(position) = waiting.iter().position(|id| *id == buffer_id) else {
+            return;
+        };
+        waiting.remove(position);
+        if !saved {
+            self.deferred_quit = DeferredQuit::None;
+            let name = self
+                .buffer_manager
+                .iter()
+                .find(|buffer| buffer.id() == buffer_id)
+                .map_or_else(
+                    || "a buffer".to_string(),
+                    |buffer| buffer.name().to_string(),
+                );
+            // The save error itself is already in the message history.
+            self.set_legacy_message(Some(format!("quit cancelled: {name} was not saved")));
+        } else if waiting.is_empty() {
+            self.deferred_quit = DeferredQuit::Ready;
+        }
     }
 
     fn take_deferred_quit(&mut self) -> bool {
@@ -29484,11 +29626,14 @@ impl Editor {
                 // A buffer may have changed while the asynchronous save was pending.
                 self.modified_buffers().is_empty()
             }
-            DeferredQuit::AfterSave(buffer_id) if !self.has_pending_format_save(buffer_id) => {
+            // A save that vanished without reporting back cancels the quit.
+            DeferredQuit::AfterSaves(ref waiting)
+                if waiting.iter().any(|id| !self.has_pending_format_save(*id)) =>
+            {
                 self.deferred_quit = DeferredQuit::None;
                 false
             }
-            DeferredQuit::None | DeferredQuit::AfterSave(_) => false,
+            DeferredQuit::None | DeferredQuit::AfterSaves(_) => false,
         }
     }
 
@@ -37004,6 +37149,176 @@ builtin = "rust"
                 vec![Action::PluginCommand("CancelScratch".to_string())]
             );
         }
+    }
+
+    #[test]
+    fn a_cramped_conversation_pane_covers_the_editor_only_while_focused() {
+        let mut editor = test_editor(60, 20);
+        editor.test_create_text_panel(
+            "agent",
+            plugin::PanelConfig {
+                side: plugin::PanelSide::Right,
+                width: 62,
+                composer: Some(plugin::TextPanelComposerConfig {
+                    placeholder: "Ask".to_string(),
+                    rows: 3,
+                }),
+                ..plugin::PanelConfig::default()
+            },
+        );
+        let editor_width =
+            |editor: &Editor| editor.window_manager.active_window().unwrap().inner_width();
+        // The editor keeps the whole terminal instead of 5 columns.
+        assert_eq!(editor_width(&editor), 60);
+        assert_eq!(editor.panel_manager.reserved_right_width(60), 0);
+
+        assert!(editor.test_focus_text_panel_composer("agent"));
+        editor.apply_panel_layout();
+        let placement = editor
+            .panel_manager
+            .panel_at_position(0, 5, 60, 20)
+            .unwrap();
+        assert_eq!((placement.id.as_str(), placement.width), ("agent", 60));
+        assert!(
+            editor.zoomed_pane.is_none(),
+            "compact focus is not a user zoom"
+        );
+
+        // An explicit zoom of the compact pane keeps it on screen, so the
+        // plugin must not hear that it was hidden.
+        editor.toggle_pane_zoom();
+        editor.apply_panel_layout();
+        assert!(editor.zoomed_pane.is_some());
+        editor.toggle_pane_zoom();
+        editor.apply_panel_layout();
+
+        editor.panel_manager.focus_editor();
+        editor.apply_panel_layout();
+        assert!(editor
+            .panel_manager
+            .panel_at_position(59, 5, 60, 20)
+            .is_none());
+        assert_eq!(editor_width(&editor), 60);
+        let views = editor
+            .pending_panel_events
+            .iter()
+            .map(|event| (event.action.as_str(), event.text.as_deref()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            views,
+            [
+                ("view", Some("hidden")),
+                ("view", Some("visible")),
+                ("view", Some("hidden"))
+            ]
+        );
+
+        // A wide terminal docks the same pane beside the editor again.
+        editor.resize_window_layout((120, 20));
+        assert_eq!(editor.panel_manager.reserved_right_width(120), 55);
+        assert_eq!(editor_width(&editor), 120 - 55);
+    }
+
+    #[test]
+    fn rejected_push_reports_never_relabel_an_accepted_report() {
+        let mut editor = test_editor(40, 10);
+        let root = tempfile::tempdir().unwrap();
+        let uri = crate::lsp::file_uri(root.path().join("main.rs")).unwrap();
+        let uri = uri.as_str();
+        let diagnostic: Diagnostic = serde_json::from_value(json!({
+            "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 1}},
+            "message": "accepted",
+        }))
+        .unwrap();
+        editor.add_diagnostics_from(Some(uri), None, Some(3), std::slice::from_ref(&diagnostic));
+        let stamp = |editor: &Editor| {
+            let stamp = editor
+                .agent_lsp
+                .test_report(diagnostics::DEFAULT_PRODUCER)
+                .unwrap();
+            (stamp.0, stamp.1)
+        };
+        let accepted = stamp(&editor);
+        assert_eq!(accepted.1, Some(3));
+
+        // A late report from a server that no longer owns the file is rejected
+        // and must leave the accepted report, and its version, alone.
+        let obsolete = LspRequestSource {
+            key: diagnostics::DEFAULT_PRODUCER.to_string(),
+            instance: 99,
+        };
+        assert!(editor
+            .add_diagnostics_from(Some(uri), Some(&obsolete), Some(9), &[diagnostic])
+            .is_none());
+        assert_eq!(stamp(&editor), accepted);
+    }
+
+    #[test]
+    fn quit_all_and_exit_commands_follow_vim() {
+        let mut editor = test_editor(40, 10);
+        let runtime = Runtime::new();
+        for command in ["qa", "qal", "qall", "quita", "quitall"] {
+            assert_eq!(
+                editor.handle_command(command, &runtime),
+                vec![Action::Quit(false)],
+                "{command}"
+            );
+        }
+        for command in ["qa!", "qall!", "quitall!"] {
+            assert_eq!(
+                editor.handle_command(command, &runtime),
+                vec![Action::Quit(true)],
+                "{command}"
+            );
+        }
+        for command in ["wqa", "wqall", "xa", "xall"] {
+            assert_eq!(
+                editor.handle_command(command, &runtime),
+                vec![Action::SaveAll, Action::Quit(false)],
+                "{command}"
+            );
+        }
+        for command in ["wqa!", "wqall!", "xa!", "xall!"] {
+            assert_eq!(
+                editor.handle_command(command, &runtime),
+                vec![Action::ForceSaveAll, Action::Quit(false)],
+                "{command}"
+            );
+        }
+        assert_eq!(
+            editor.handle_command("e", &runtime),
+            vec![Action::ReloadFile(false)],
+            "`:e` must stay `:edit`"
+        );
+        for command in ["x", "xit", "exi", "exit"] {
+            assert_eq!(
+                editor.handle_command(command, &runtime),
+                vec![Action::Quit(false)],
+                "a clean buffer is not rewritten by {command}"
+            );
+        }
+        editor.current_buffer_mut().insert_str(0, 0, "changed");
+        assert!(editor.current_buffer().is_dirty());
+        assert_eq!(
+            editor.handle_command("x", &runtime),
+            vec![Action::Save, Action::Quit(false)]
+        );
+        assert_eq!(
+            editor.handle_command("x!", &runtime),
+            vec![Action::ForceSave, Action::Quit(false)]
+        );
+        // Like :wq, a filename writes there instead.
+        assert_eq!(
+            editor.handle_command("x copy.txt", &runtime),
+            vec![Action::SaveAs("copy.txt".to_string()), Action::Quit(false)]
+        );
+        assert_eq!(
+            editor.handle_command("exit! copy.txt", &runtime),
+            vec![
+                Action::ForceSaveAs("copy.txt".to_string()),
+                Action::Quit(false)
+            ]
+        );
     }
 
     #[test]
@@ -48534,6 +48849,15 @@ while True:
         root: &Path,
         buffer: Buffer,
     ) -> (Editor, PathBuf, PathBuf, PathBuf) {
+        delayed_formatter_editor_with(root, vec![buffer], /*keep_serving*/ false)
+    }
+
+    #[cfg(unix)]
+    fn delayed_formatter_editor_with(
+        root: &Path,
+        buffers: Vec<Buffer>,
+        keep_serving: bool,
+    ) -> (Editor, PathBuf, PathBuf, PathBuf) {
         let server = root.join("formatter.py");
         let ready = root.join("initialize-ready");
         let release = root.join("initialize-release");
@@ -48547,6 +48871,7 @@ import sys
 import time
 
 ready, release, events = map(pathlib.Path, sys.argv[1:4])
+keep_serving = len(sys.argv) > 4
 
 def read_message():
     headers = {}
@@ -48593,7 +48918,8 @@ while True:
     if method == "textDocument/formatting":
         # Include the empty EOF line, as whole-document formatters do.
         send({"jsonrpc": "2.0", "id": message["id"], "result": [{"range": {"start": {"line": 0, "character": 0}, "end": {"line": 1, "character": 0}}, "newText": "value\n"}]})
-        break
+        if not keep_serving:
+            break
 "#,
         )
         .unwrap();
@@ -48604,12 +48930,15 @@ while True:
             "formatter".to_string(),
             crate::config::LanguageServerConfig {
                 command: "python3".to_string(),
-                args: vec![
+                args: [
                     server.to_string_lossy().into_owned(),
                     ready.to_string_lossy().into_owned(),
                     release.to_string_lossy().into_owned(),
                     events.to_string_lossy().into_owned(),
-                ],
+                ]
+                .into_iter()
+                .chain(keep_serving.then(|| "keep-serving".to_string()))
+                .collect(),
                 language_id: "rust".to_string(),
                 file_extensions: vec!["rs".to_string()],
                 filenames: Vec::new(),
@@ -48622,8 +48951,7 @@ while True:
             },
         )]);
         let lsp = Box::new(crate::lsp::LspManager::new(config.lsp.clone()));
-        let mut editor =
-            Editor::with_size(lsp, 60, 12, config, Theme::default(), vec![buffer]).unwrap();
+        let mut editor = Editor::with_size(lsp, 60, 12, config, Theme::default(), buffers).unwrap();
         editor.test_disable_terminal_output();
         (editor, ready, release, events)
     }
@@ -48809,6 +49137,114 @@ while True:
 
         assert!(editor.take_deferred_quit());
         assert!(!editor.buffer_manager[0].is_dirty());
+    }
+
+    #[cfg(unix)]
+    async fn two_dirty_formatted_buffers(
+        root: &Path,
+    ) -> (Editor, PathBuf, PathBuf, PathBuf, PathBuf) {
+        let mut buffers = Vec::new();
+        let mut paths = Vec::new();
+        for name in ["first.rs", "second.rs"] {
+            let path = root.join(name);
+            std::fs::write(&path, "value   \n").unwrap();
+            let mut buffer = Buffer::new(
+                Some(path.to_string_lossy().into_owned()),
+                "value   \n".to_string(),
+            );
+            buffer.insert_str(0, 0, "x");
+            assert!(buffer.is_dirty());
+            buffers.push(buffer);
+            paths.push(path);
+        }
+        let (editor, ready, release, _) =
+            delayed_formatter_editor_with(root, buffers, /*keep_serving*/ true);
+        let second = paths.pop().unwrap();
+        let first = paths.pop().unwrap();
+        (editor, ready, release, first, second)
+    }
+
+    #[tokio::test]
+    async fn forced_write_all_overwrites_files_changed_on_disk() {
+        for (command, forced) in [("wqa", false), ("wqa!", true), ("xa!", true)] {
+            let root = tempfile::tempdir().unwrap();
+            let path = root.path().join("changed.txt");
+            std::fs::write(&path, "original\n").unwrap();
+            let mut buffer = Buffer::load_or_create(Some(path.to_string_lossy().into_owned()))
+                .await
+                .unwrap();
+            buffer.insert_str(0, 0, "mine ");
+            let mut editor = test_editor(60, 12);
+            editor.buffer_manager.replace_buffers(vec![buffer]);
+            std::fs::write(&path, "external\n").unwrap();
+
+            editor
+                .test_execute_production_action(Action::Command(command.to_string()))
+                .await
+                .unwrap();
+
+            let on_disk = std::fs::read_to_string(&path).unwrap();
+            if forced {
+                assert_eq!(on_disk, "mine original\n", "{command}");
+                assert!(!editor.buffer_manager[0].is_dirty(), "{command}");
+            } else {
+                assert_eq!(on_disk, "external\n", "{command} must not overwrite");
+                assert!(editor.buffer_manager[0].is_dirty(), "{command}");
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn write_all_and_quit_waits_for_every_delayed_format_save() {
+        for command in ["wqa", "xa"] {
+            let root = tempfile::tempdir().unwrap();
+            let (mut editor, ready, release, first, second) =
+                two_dirty_formatted_buffers(root.path()).await;
+
+            editor
+                .test_execute_production_action(Action::Command(command.to_string()))
+                .await
+                .unwrap();
+            wait_for_formatter_initialize(&ready).await;
+            assert!(!editor.take_deferred_quit(), "{command} quit before saving");
+
+            std::fs::write(&release, "release").unwrap();
+            complete_delayed_format_save(&mut editor, &first, "value\n").await;
+            complete_delayed_format_save(&mut editor, &second, "value\n").await;
+
+            assert!(editor.take_deferred_quit(), "{command} never quit");
+            assert!(editor
+                .buffer_manager
+                .iter()
+                .all(|buffer| !buffer.is_dirty()));
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn write_all_and_quit_stays_open_when_one_delayed_save_fails() {
+        let root = tempfile::tempdir().unwrap();
+        let (mut editor, ready, release, first, second) =
+            two_dirty_formatted_buffers(root.path()).await;
+
+        editor
+            .test_execute_production_action(Action::Command("wqa".to_string()))
+            .await
+            .unwrap();
+        wait_for_formatter_initialize(&ready).await;
+        // The second file changes on disk, so its save must not overwrite it.
+        std::fs::write(&second, "external\n").unwrap();
+        std::fs::write(&release, "release").unwrap();
+        complete_delayed_format_save(&mut editor, &first, "value\n").await;
+        complete_delayed_format_save(&mut editor, &second, "external\n").await;
+
+        assert!(!editor.take_deferred_quit());
+        assert!(editor.buffer_manager.iter().any(Buffer::is_dirty));
+        assert!(editor
+            .last_error
+            .as_deref()
+            .is_some_and(|message| message.contains("quit cancelled")));
     }
 
     #[cfg(unix)]

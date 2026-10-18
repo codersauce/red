@@ -79,10 +79,32 @@ struct EditWorker {
     deadline: Instant,
 }
 
+impl AgentLsp {
+    /// Sequence and protocol version of the only stamp from `producer`, for
+    /// tests. Matching by producer avoids depending on platform URI spelling.
+    #[cfg(test)]
+    pub(super) fn test_report(&self, producer: &str) -> Option<(u64, Option<i64>)> {
+        let mut stamps = self
+            .reports
+            .iter()
+            .filter(|((_, candidate), _)| candidate == producer);
+        let (_, stamp) = stamps.next()?;
+        assert!(
+            stamps.next().is_none(),
+            "expected one report from {producer:?}"
+        );
+        Some((stamp.sequence, stamp.document_version))
+    }
+}
+
 struct ReportStamp {
     sequence: u64,
     revision: Option<u64>,
     received_at_ms: u128,
+    /// Document version a push report says it covers, when the server sent one.
+    document_version: Option<i64>,
+    /// The server that sent the report; versions are per attachment.
+    source: Option<LspRequestSource>,
 }
 
 enum StartQuery {
@@ -521,7 +543,7 @@ impl Editor {
                             "push_only",
                         )?));
                     }
-                    let sequence = self
+                    let stamp = self
                         .agent_lsp
                         .reports
                         .get(&(uri.clone(), context.lsp_source.key.clone()))
@@ -530,8 +552,35 @@ impl Editor {
                                 uri.clone(),
                                 super::diagnostics::DEFAULT_PRODUCER.to_string(),
                             ))
+                        });
+                    // A push-only server never re-reports unchanged text, so a
+                    // report that names the version the server holds for the
+                    // current text is the answer; waiting would only time out.
+                    // Arrival time proves nothing: a late report can describe
+                    // older text, so without a version keep waiting.
+                    let buffer = &self.buffer_manager[index];
+                    let current_version =
+                        (self.lsp_coordinator.last_notified_revision(buffer.id())
+                            == Some(buffer.revision()))
+                        .then(|| {
+                            self.lsp
+                                .document_version_for_source(&file, &context.lsp_source)
                         })
-                        .map_or(0, |stamp| stamp.sequence);
+                        .flatten();
+                    // The stamp must come from this very server instance: a
+                    // restarted server reuses the key and restarts its versions.
+                    if stamp.is_some_and(|stamp| {
+                        stamp.source.as_ref() == Some(&context.lsp_source)
+                            && stamp.document_version.is_some()
+                            && stamp.document_version == current_version
+                    }) {
+                        return Ok(StartQuery::Immediate(self.agent_diagnostics_payload(
+                            &request.call,
+                            &context.root,
+                            "already_reported",
+                        )?));
+                    }
+                    let sequence = stamp.map_or(0, |stamp| stamp.sequence);
                     return Ok(StartQuery::Pending {
                         id: -(crate::lsp::next_id() as i64),
                         context,
@@ -773,6 +822,24 @@ impl Editor {
                     "received",
                 )
                 .map_err(|error| error.to_string())
+            } else if matches!(
+                pending.tool.request.call,
+                EditorToolCall::LspDiagnostics { .. }
+            ) {
+                // Answer with what is known instead of a bare timeout, so the agent
+                // can still reason about the last reports and their freshness.
+                self.agent_diagnostics_payload(
+                    &pending.tool.request.call,
+                    &pending.context.root,
+                    "timeout",
+                )
+                .map(|mut payload| {
+                    payload["ok"] = json!(false);
+                    payload["status"] = json!("timeout");
+                    payload["refresh_note"] = json!("No fresh report arrived before the deadline; these are the last known diagnostics, labelled by freshness. This is not a clean bill of health.");
+                    payload
+                })
+                .map_err(|error| error.to_string())
             } else {
                 Ok(result_status("timeout", "no fresh LSP result arrived before the deadline; this is not a clean diagnostic report"))
             };
@@ -946,7 +1013,13 @@ impl Editor {
         )
     }
 
-    pub(super) fn record_agent_diagnostic_report(&mut self, uri: &str, producer: &str) {
+    pub(super) fn record_agent_diagnostic_report(
+        &mut self,
+        uri: &str,
+        producer: &str,
+        source: Option<&LspRequestSource>,
+        document_version: Option<i64>,
+    ) {
         self.agent_lsp.report_sequence = self.agent_lsp.report_sequence.wrapping_add(1);
         let revision = self
             .buffer_manager
@@ -962,6 +1035,8 @@ impl Editor {
                     .duration_since(UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_millis(),
+                document_version,
+                source: source.cloned(),
             },
         );
     }
@@ -1036,13 +1111,26 @@ impl Editor {
                         .get(&(uri.clone(), (*producer).to_string()))
                 })
                 .collect::<Vec<_>>();
+            // A report that names an older document version is stale even when it
+            // arrived after the latest edit.
+            let file = path.to_string_lossy();
+            let versioned_stale = stamps.iter().any(|stamp| {
+                stamp.document_version.is_some_and(|version| {
+                    // Each attachment numbers its own document versions.
+                    let current = match &stamp.source {
+                        Some(source) => self.lsp.document_version_for_source(&file, source),
+                        None => self.lsp.document_version(&file),
+                    };
+                    Some(version) != current
+                })
+            });
             let freshness = if !self.diagnostics.contains_key(&uri) {
                 "not_received"
             } else if self.diagnostic_reports.is_provisional(&uri) {
                 "provisional"
             } else if stamps.len() != producers.len() {
                 "not_received"
-            } else if stamps.iter().any(|stamp| stamp.revision != revision) {
+            } else if versioned_stale || stamps.iter().any(|stamp| stamp.revision != revision) {
                 "stale"
             } else {
                 "unversioned"

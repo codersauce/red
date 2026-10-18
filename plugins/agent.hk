@@ -252,6 +252,10 @@ struct AgentState {
     committed_prompt_id: String,
     panel_created: bool,
     panel_open: bool,
+    /// False while a compact (narrow-terminal) pane is open but covered by the editor.
+    panel_in_view: bool,
+    /// Turns sent in this pane, which picks the turn's working verb.
+    sent_turns: i32,
     focus_panel_on_first_prompt: bool,
     permission_request_id: String,
     prompt_history: [String],
@@ -297,6 +301,8 @@ fn initial_state() -> AgentState {
         committed_prompt_id: "",
         panel_created: false,
         panel_open: false,
+        panel_in_view: true,
+        sent_turns: 0,
         focus_panel_on_first_prompt: false,
         permission_request_id: "",
         prompt_history: [],
@@ -639,6 +645,18 @@ fn pane_turn_id() -> String {
     return turn_id;
 }
 
+/// A little personality while the agent thinks: each turn gets one verb, so the
+/// status row stays calm instead of flickering between phrases.
+fn working_verb() -> String {
+    let verbs = [
+        "Thinking…", "Pondering…", "Mulling it over…", "Reading the room…",
+        "Connecting the dots…", "Sketching a plan…", "Untangling…", "Brewing ideas…",
+    ];
+    let turn = red::int(state().sent_turns, 1) - 1;
+    if turn < 0 { turn = 0; }
+    return red::string(verbs[turn % red::len(verbs)], "Thinking…");
+}
+
 /// The core sent this message as a new turn; move it from the queue into the
 /// transcript in the same update.
 fn commit_sent_prompt(prompt: AgentPanePrompt) {
@@ -648,7 +666,8 @@ fn commit_sent_prompt(prompt: AgentPanePrompt) {
         red::state_patch(AgentState { focus_panel_on_first_prompt: false });
         red::execute("FocusTextPanelComposer", "agent-conversation");
     }
-    red::state_patch(AgentState { ui_phase: "waiting", ui_label: "Waiting for agent…" });
+    red::state_patch(AgentState { sent_turns: red::int(state().sent_turns, 0) + 1 });
+    red::state_patch(AgentState { ui_phase: "waiting", ui_label: working_verb() });
     red::execute("SetStorage", "transcript", state().transcript);
 }
 
@@ -700,7 +719,9 @@ fn pane_state_changed(event: AgentPaneState) {
         // Paint a newly queued message right away instead of on the next frame.
         red::execute("Refresh");
         if turn_running() {
-            red::execute("Print", "Agent turn is still running; follow-up queued (" + queued_count() + ")");
+            let waiting = "it sends when this turn ends";
+            if queued_count() > 1 { waiting = queued_count() + " waiting · they send in order"; }
+            red::execute("Print", "Agent is busy · follow-up queued · " + waiting);
         }
     }
 }
@@ -935,7 +956,7 @@ fn turn_started(event: AgentSessionEvent) {
     if !is_current_session(event.session_id) {
         return;
     }
-    set_phase("waiting", "Waiting for agent…");
+    set_phase("waiting", working_verb());
 }
 
 /// Returns whether a terminal event belongs to an earlier turn than the one shown.
@@ -962,7 +983,7 @@ fn render_status() {
         if state().pane.paused && queued > 0 {
             red::execute("SetTextPanelStatus", "agent-conversation", TextPanelStatus {
                 busy: false,
-                label: queued + " queued · paused · :AgentSendQueued or :AgentDiscardQueued",
+                label: queued + " held · :AgentSendQueued to send",
                 stream: false,
             });
             return;
@@ -1026,7 +1047,7 @@ fn thought_activity(update: AgentThoughtChunk) {
             render_activity();
         }
     }
-    set_phase("thinking", "Thinking…");
+    set_phase("thinking", working_verb());
 }
 
 fn tool_activity(update: AgentToolCall) {
@@ -1411,6 +1432,10 @@ fn panel_event(event: AgentPanelEvent) {
         history();
     } else if event.action == "close" {
         close_conversation();
+    } else if event.action == "view" {
+        // A compact pane on a narrow terminal steps aside while the editor has
+        // focus; it is still open, so completion notices must say where it went.
+        red::state_patch(AgentState { panel_in_view: red::string(event.text, "visible") != "hidden" });
     }
 }
 
@@ -1512,13 +1537,7 @@ fn clear_conversation() {
     red::state_patch(AgentState { activity_history: [] });
     red::state_patch(AgentState { thought: "" });
     // Queued messages still run after a Clear, so they stay visible.
-    let queued = [];
-    for prompt in state().pane.queued {
-        queued = red::push(queued, AgentTextBlock {
-            id: prompt.id, kind: "user", format: "plain", text: prompt.text,
-        });
-    }
-    red::execute("UpdateTextPanel", "agent-conversation", queued);
+    red::execute("UpdateTextPanel", "agent-conversation", with_unsent_prompts([]));
     red::execute("SetTextPanelComposerState", "agent-conversation", true, "Conversation view cleared · context preserved");
 }
 
@@ -1726,9 +1745,14 @@ fn completed(event: AgentCompletedEvent) {
     collapse_activity(event.elapsed_ms);
     set_phase("idle", "");
     if stop_reason == "end_turn" || stop_reason == "completed" {
-        if !state().panel_open {
+        if !state().panel_open || !state().panel_in_view {
             red::execute("Print", "Agent finished · Space A to view");
         }
+        return;
+    }
+    if stop_reason == "interrupted" || stop_reason == "cancelled" {
+        append_transcript("System", "Stopped at your request.");
+        red::execute("Print", "Agent stopped");
         return;
     }
     append_transcript("System", "Agent stopped: " + stop_reason);
@@ -1745,7 +1769,7 @@ fn completed(event: AgentCompletedEvent) {
 )]
 fn send_queued() {
     if queued_count() == 0 {
-        red::execute("Print", "No queued agent follow-ups");
+        red::execute("Print", "Nothing is queued");
         return;
     }
     red::execute("AgentSendQueued", red::string(state().transcript, ""));
@@ -1762,7 +1786,11 @@ fn send_queued() {
 fn discard_queued() {
     let count = queued_count();
     red::execute("AgentDiscardQueued");
-    red::execute("Print", "Discarded " + count + " queued agent follow-up(s)");
+    if count == 1 {
+        red::execute("Print", "Dropped 1 queued follow-up");
+    } else {
+        red::execute("Print", "Dropped " + count + " queued follow-ups");
+    }
 }
 
 #[red::on("agent:cancelled")]
@@ -1770,7 +1798,7 @@ fn cancelled(event: AgentSessionEvent) {
     if !is_current_session(event.session_id) {
         return;
     }
-    red::execute("Print", "Agent cancellation requested");
+    red::execute("Print", "Stopping the agent…");
 }
 
 /// Codex refused the interrupt, so the turn keeps running; say so and let the
@@ -2082,28 +2110,41 @@ fn render_conversation() {
     blocks = presented;
     // Messages the core has not sent yet render below the conversation. A prompt
     // returned for retry after a lost session is already in the transcript.
+    blocks = with_unsent_prompts(blocks);
+    if red::len(blocks) == 0 {
+        blocks = [AgentTextBlock {
+            id: "empty",
+            kind: "activity",
+            format: "plain",
+            text: "Ask about this workspace, or ask for a change.\n\nEnter sends · Ctrl+J adds a line · Ctrl+P recalls\nCtrl+C stops a turn · follow-ups queue up\nOne u undoes an agent edit · :AgentHistory lists them",
+        }];
+    }
+    red::execute("UpdateTextPanel", "agent-conversation", blocks);
+    // Full replacement already contains pending deltas; never append them twice.
+    red::state_patch(AgentState { stream_delta: "", stream_trimmed: false });
+}
+
+/// Appends messages the core has not sent yet. One held behind a running turn
+/// or a paused queue is drawn dimmed; only the first message, sent while a
+/// thread starts, already looks sent, and anything typed after it waits its turn.
+fn with_unsent_prompts(blocks: [AgentTextBlock]) -> [AgentTextBlock] {
+    let held = turn_running() || state().pane.paused;
+    let position = 0;
     for prompt in state().pane.queued {
         let shown = false;
         for block in blocks {
             if block.id == prompt.id { shown = true; }
         }
         if !shown {
+            let kind = "user";
+            if held || position > 0 { kind = "queued"; }
             blocks = red::push(blocks, AgentTextBlock {
-                id: prompt.id, kind: "user", format: "plain", text: prompt.text,
+                id: prompt.id, kind: kind, format: "plain", text: prompt.text,
             });
         }
+        position = position + 1;
     }
-    if red::len(blocks) == 0 {
-        blocks = [AgentTextBlock {
-            id: "empty",
-            kind: "activity",
-            format: "plain",
-            text: "No messages yet.\n\nEnter sends · Ctrl+J adds a line\nEsc enters Normal mode · a edits from the panel\n^C stops a running turn",
-        }];
-    }
-    red::execute("UpdateTextPanel", "agent-conversation", blocks);
-    // Full replacement already contains pending deltas; never append them twice.
-    red::state_patch(AgentState { stream_delta: "", stream_trimmed: false });
+    return blocks;
 }
 
 /// Normalize blocks from live, migrated, and restored state before they reach the panel.

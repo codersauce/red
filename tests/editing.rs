@@ -9841,7 +9841,8 @@ fn mouse_drag_selects_agent_scrollback_text_for_visual_yank() {
         "agent",
         PanelConfig {
             side: PanelSide::Right,
-            width: 24,
+            // The narrowest docked conversation pane: x = 80 - 32 = 48.
+            width: 32,
             title: Some("Agent".to_string()),
             composer: Some(TextPanelComposerConfig {
                 placeholder: "Ask".to_string(),
@@ -9866,9 +9867,9 @@ fn mouse_drag_selects_agent_scrollback_text_for_visual_yank() {
         MouseEventKind::Up(MouseButton::Left),
     ] {
         let column = if matches!(kind, MouseEventKind::Down(_)) {
-            57
+            49
         } else {
-            61
+            53
         };
         harness
             .editor
@@ -10186,7 +10187,8 @@ async fn focused_agent_composer_can_enter_and_exit_pane_resize_mode() {
         "agent",
         PanelConfig {
             side: PanelSide::Right,
-            width: 20,
+            // Conversation panes never dock below 32 columns.
+            width: 34,
             title: Some("Agent".to_string()),
             composer: Some(TextPanelComposerConfig {
                 placeholder: "Ask".to_string(),
@@ -10202,7 +10204,7 @@ async fn focused_agent_composer_can_enter_and_exit_pane_resize_mode() {
     execute_unmodified_key(&mut harness, KeyCode::Char('h')).await;
     assert_eq!(
         harness.editor.test_panel_layout("agent"),
-        Some((PanelSide::Right, 21)),
+        Some((PanelSide::Right, 35)),
         "moving the shared divider left should work while the editor is focused",
     );
     let resized_editor_size = harness.editor.test_active_window_bounds().unwrap().1;
@@ -10210,7 +10212,7 @@ async fn focused_agent_composer_can_enter_and_exit_pane_resize_mode() {
     execute_unmodified_key(&mut harness, KeyCode::Right).await;
     assert_eq!(
         harness.editor.test_panel_layout("agent"),
-        Some((PanelSide::Right, 20))
+        Some((PanelSide::Right, 34))
     );
     execute_unmodified_key(&mut harness, KeyCode::Enter).await;
 
@@ -10225,7 +10227,7 @@ async fn focused_agent_composer_can_enter_and_exit_pane_resize_mode() {
     }
     assert_eq!(
         harness.editor.test_panel_layout("agent"),
-        Some((PanelSide::Right, 22))
+        Some((PanelSide::Right, 36))
     );
 
     for key in [KeyCode::Char('j'), KeyCode::Down, KeyCode::Char('x')] {
@@ -10233,7 +10235,7 @@ async fn focused_agent_composer_can_enter_and_exit_pane_resize_mode() {
     }
     assert_eq!(
         harness.editor.test_panel_layout("agent"),
-        Some((PanelSide::Right, 22)),
+        Some((PanelSide::Right, 36)),
         "orthogonal and unsupported keys should leave the pane unchanged",
     );
     assert!(harness.statusline_row().contains("RESIZE"));
@@ -10243,7 +10245,7 @@ async fn focused_agent_composer_can_enter_and_exit_pane_resize_mode() {
     }
     assert_eq!(
         harness.editor.test_panel_layout("agent"),
-        Some((PanelSide::Right, 20))
+        Some((PanelSide::Right, 34))
     );
 
     execute_unmodified_key(&mut harness, KeyCode::Esc).await;
@@ -10253,7 +10255,7 @@ async fn focused_agent_composer_can_enter_and_exit_pane_resize_mode() {
     execute_unmodified_key(&mut harness, KeyCode::Char('l')).await;
     assert_eq!(
         harness.editor.test_panel_layout("agent"),
-        Some((PanelSide::Right, 20)),
+        Some((PanelSide::Right, 34)),
         "keys should return to the focused composer after leaving resize mode",
     );
 }
@@ -11516,7 +11518,8 @@ async fn mouse_drag_preserves_a_focused_text_composer_and_its_draft() {
         "agent",
         PanelConfig {
             side: PanelSide::Right,
-            width: 24,
+            // Conversation panes never dock below 32 columns.
+            width: 34,
             title: Some("Agent".to_string()),
             composer: Some(TextPanelComposerConfig {
                 placeholder: "Ask".to_string(),
@@ -11531,11 +11534,11 @@ async fn mouse_drag_preserves_a_focused_text_composer_and_its_draft() {
         .test_handle_event(Event::Paste("keep this follow-up".to_string()))
         .unwrap();
 
-    drag_window_divider(&mut harness, (55, 4), (50, 4)).await;
+    drag_window_divider(&mut harness, (45, 4), (40, 4)).await;
 
     assert_eq!(
         harness.editor.test_panel_layout("agent"),
-        Some((PanelSide::Right, 29)),
+        Some((PanelSide::Right, 39)),
     );
     assert_eq!(harness.editor.test_focused_panel_id(), Some("agent"));
     assert!(harness.render_cursor_position().is_some());
