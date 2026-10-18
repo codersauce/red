@@ -22236,7 +22236,7 @@ impl Editor {
                     }
                     Err(error) => {
                         self.set_routine_warning(Some(format!(
-                            "Can't revert that edit in {name}: {error}"
+                            "revert conflict in {name}: {error}; later edits changed the same text"
                         )));
                     }
                 }
