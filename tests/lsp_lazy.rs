@@ -1393,6 +1393,13 @@ async fn agent_lsp_push_only_refresh_answers_at_once_only_for_a_report_of_the_cu
         let result = editor.test_run_agent_editor_tool(refresh(1)).await.unwrap();
         assert_eq!(result["refresh_status"], "timeout", "{message}");
         assert_eq!(result["items"][0]["message"], message);
+        // A report that names an older version is labelled stale, not unversioned.
+        let freshness = if version.is_some() {
+            "stale"
+        } else {
+            "unversioned"
+        };
+        assert_eq!(result["items"][0]["freshness"], freshness, "{message}");
     }
 
     // A report for the version the server holds answers at once.

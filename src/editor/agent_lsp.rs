@@ -1105,13 +1105,21 @@ impl Editor {
                         .get(&(uri.clone(), (*producer).to_string()))
                 })
                 .collect::<Vec<_>>();
+            // A report that names an older document version is stale even when it
+            // arrived after the latest edit.
+            let current_version = self.lsp.document_version(&path.to_string_lossy());
+            let versioned_stale = stamps.iter().any(|stamp| {
+                stamp
+                    .document_version
+                    .is_some_and(|version| Some(version) != current_version)
+            });
             let freshness = if !self.diagnostics.contains_key(&uri) {
                 "not_received"
             } else if self.diagnostic_reports.is_provisional(&uri) {
                 "provisional"
             } else if stamps.len() != producers.len() {
                 "not_received"
-            } else if stamps.iter().any(|stamp| stamp.revision != revision) {
+            } else if versioned_stale || stamps.iter().any(|stamp| stamp.revision != revision) {
                 "stale"
             } else {
                 "unversioned"

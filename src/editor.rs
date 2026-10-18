@@ -6973,7 +6973,9 @@ impl Editor {
             }
             _ => None,
         };
-        self.sync_compact_pane_views(terminal_size.0, compact_focus.as_ref());
+        // An explicit zoom of a compact pane shows it too.
+        let shown = self.zoomed_pane.clone().or_else(|| compact_focus.clone());
+        self.sync_compact_pane_views(terminal_size.0, shown.as_ref());
         let (windows, panels) = match self.zoomed_pane.as_ref().or(compact_focus.as_ref()) {
             Some(FocusTarget::Window(id)) => (
                 WindowPresentation::Zoomed(*id),
@@ -37159,6 +37161,14 @@ builtin = "rust"
             editor.zoomed_pane.is_none(),
             "compact focus is not a user zoom"
         );
+
+        // An explicit zoom of the compact pane keeps it on screen, so the
+        // plugin must not hear that it was hidden.
+        editor.toggle_pane_zoom();
+        editor.apply_panel_layout();
+        assert!(editor.zoomed_pane.is_some());
+        editor.toggle_pane_zoom();
+        editor.apply_panel_layout();
 
         editor.panel_manager.focus_editor();
         editor.apply_panel_layout();

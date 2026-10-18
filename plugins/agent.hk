@@ -2116,20 +2116,24 @@ fn render_conversation() {
     blocks = presented;
     // Messages the core has not sent yet render below the conversation. A prompt
     // returned for retry after a lost session is already in the transcript.
-    // A message held behind a running turn or a paused queue is drawn dimmed;
-    // the first message, sent while a thread starts, already looks sent.
-    let held_kind = "user";
-    if turn_running() || state().pane.paused { held_kind = "queued"; }
+    // A message held behind a running turn or a paused queue is drawn dimmed.
+    // Only the first message, sent while a thread starts, already looks sent;
+    // anything typed after it waits its turn.
+    let held = turn_running() || state().pane.paused;
+    let position = 0;
     for prompt in state().pane.queued {
         let shown = false;
         for block in blocks {
             if block.id == prompt.id { shown = true; }
         }
         if !shown {
+            let kind = "user";
+            if held || position > 0 { kind = "queued"; }
             blocks = red::push(blocks, AgentTextBlock {
-                id: prompt.id, kind: held_kind, format: "plain", text: prompt.text,
+                id: prompt.id, kind: kind, format: "plain", text: prompt.text,
             });
         }
+        position = position + 1;
     }
     if red::len(blocks) == 0 {
         blocks = [AgentTextBlock {
