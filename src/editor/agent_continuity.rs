@@ -368,21 +368,26 @@ impl super::Editor {
     }
 
     fn adopt_saved_agent_conversation(&mut self, store: &mut ConversationStore, workspace: &Path) {
-        let Some(saved) = store.load(workspace) else {
+        let Some(peeked) = store.load(workspace) else {
             return;
         };
-        let compatible = saved.conversation.tool_contract_version
-            == crate::agent_conversation::AGENT_TOOL_CONTRACT_VERSION
-            && !saved.conversation.thread_id.is_empty()
-            && !saved.conversation.items.is_empty();
-        if !compatible {
-            // Not resumable, but never lost: keep it as the archived transcript
-            // that the next message recaps in a new thread.
-            self.archive_saved_agent_transcript(workspace, &saved.conversation);
-            return;
-        }
         match store.claim(workspace) {
             Ok(Claim::Owned) => {
+                // Read the record again now that this editor owns it: an owner
+                // that was still exiting may have saved a newer one after the peek.
+                let Some(saved) = store.load(workspace) else {
+                    return;
+                };
+                let compatible = saved.conversation.tool_contract_version
+                    == crate::agent_conversation::AGENT_TOOL_CONTRACT_VERSION
+                    && !saved.conversation.thread_id.is_empty()
+                    && !saved.conversation.items.is_empty();
+                if !compatible {
+                    // Not resumable, but never lost: keep it as the archived
+                    // transcript that the next message recaps in a new thread.
+                    self.archive_saved_agent_transcript(workspace, &saved.conversation);
+                    return;
+                }
                 self.agent_continuity_adopted_age = Some(describe_age(saved.saved_at_ms));
                 self.agent_manager.restore_conversation(saved.conversation);
                 // Rebuild its source annotations before anything syncs them away.
@@ -404,7 +409,7 @@ impl super::Editor {
                 // Keep its history and never overwrite a record this editor
                 // could not claim safely.
                 crate::log!("could not claim the saved agent conversation: {error}");
-                self.archive_saved_agent_transcript(workspace, &saved.conversation);
+                self.archive_saved_agent_transcript(workspace, &peeked.conversation);
                 store.refuse(workspace);
                 self.set_quiet_message(Some(
                     "Could not check whether another Red uses this agent conversation; this window starts its own"
