@@ -346,6 +346,15 @@ impl UndoHistory {
         self.current
     }
 
+    /// Borrows the retained transaction with this id, without copying any history.
+    #[must_use]
+    pub fn transaction_by_id(&self, transaction_id: &str) -> Option<&EditTransaction> {
+        self.nodes
+            .iter()
+            .map(|node| &node.transaction)
+            .find(|transaction| transaction.id == transaction_id)
+    }
+
     /// Borrows one node's transaction.
     #[must_use]
     pub fn node_transaction(&self, index: usize) -> Option<&EditTransaction> {
@@ -992,6 +1001,31 @@ mod tests {
             text.to_string(),
         );
         assert!(history.commit_transaction(CursorSnapshot::default()));
+    }
+
+    #[test]
+    fn node_accessors_find_transactions_without_projecting_the_tree() {
+        let mut history = UndoHistory::default();
+        commit_insertion(&mut history, 0, "a");
+        commit_insertion(&mut history, 1, "b");
+        let second = history.node_transaction(1).unwrap().id.clone();
+
+        assert_eq!(
+            history
+                .transaction_by_id(&second)
+                .map(|transaction| transaction.label.as_str()),
+            Some("insert")
+        );
+        assert!(history.transaction_by_id("missing").is_none());
+        assert_eq!(history.current_index(), Some(1));
+        let summaries: Vec<_> = history
+            .node_summaries()
+            .map(|(index, parent, _)| (index, parent))
+            .collect();
+        assert_eq!(summaries, [(0, None), (1, Some(0))]);
+        let entry = history.undo_tree_entry(1, false).unwrap();
+        assert!(entry.current && entry.edits.is_empty());
+        assert_eq!(history.undo_tree_entry(1, true).unwrap().edits.len(), 1);
     }
 
     #[test]

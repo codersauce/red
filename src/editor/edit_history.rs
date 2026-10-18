@@ -228,12 +228,10 @@ impl Editor {
     /// Finds the buffer whose history holds a transaction.
     pub(super) fn transaction_buffer_index(&self, transaction_id: &str) -> Option<usize> {
         self.buffer_manager.iter().position(|buffer| {
-            let history = &buffer.undo_history;
-            history.node_summaries().any(|(index, _, _)| {
-                history
-                    .node_transaction(index)
-                    .is_some_and(|transaction| transaction.id == transaction_id)
-            })
+            buffer
+                .undo_history
+                .transaction_by_id(transaction_id)
+                .is_some()
         })
     }
 }

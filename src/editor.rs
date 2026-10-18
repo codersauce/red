@@ -22217,10 +22217,10 @@ impl Editor {
                 let by_agent = self
                     .current_buffer()
                     .undo_history
-                    .undo_tree()
-                    .iter()
-                    .find(|entry| &entry.transaction_id == transaction_id)
-                    .is_some_and(|entry| matches!(entry.origin, EditOrigin::Agent { .. }));
+                    .transaction_by_id(transaction_id)
+                    .is_some_and(|transaction| {
+                        matches!(transaction.origin, EditOrigin::Agent { .. })
+                    });
                 let prepared = self
                     .current_buffer()
                     .undo_history
