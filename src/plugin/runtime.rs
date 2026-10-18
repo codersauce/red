@@ -9874,16 +9874,24 @@ mod tests {
             .iter()
             .any(|block| block.text.contains("left off 2 hours ago")));
 
+        // Red quit before saving the last reply; Codex's history is authoritative.
         core_notify(
             &mut runtime,
             "agent:session_restored",
             serde_json::json!({ "thread_id": "saved-thread", "cwd": "/workspace", "items": [
                 {"id": "u1", "role": "user", "text": "Remember HERON"},
-                {"id": "a1", "role": "agent", "text": "OK"}
+                {"id": "a1", "role": "agent", "text": "OK, I will remember HERON."}
             ]}),
         )
         .await;
-        drain_requests();
+        let blocks = last_panel_blocks(&collect_requests());
+        assert!(blocks
+            .iter()
+            .any(|block| block.text == "OK, I will remember HERON."));
+        assert!(!blocks.iter().any(|block| block.text == "OK"));
+        assert!(blocks
+            .iter()
+            .any(|block| block.text.contains("left off 2 hours ago")));
         runtime
             .notify(
                 "panel:event:agent-conversation",

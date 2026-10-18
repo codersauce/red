@@ -290,6 +290,9 @@ struct AgentState {
     interruption_id: String,
     // Composer hint for a conversation continued from an earlier launch.
     resume_hint: String,
+    // Age of that conversation while its transcript is still the saved copy,
+    // which the resumed thread's history replaces.
+    resume_age: String,
 }
 
 #[red::state]
@@ -340,6 +343,7 @@ fn initial_state() -> AgentState {
         thought: "",
         interruption_id: "",
         resume_hint: "",
+        resume_age: "",
     };
 }
 
@@ -1609,7 +1613,7 @@ fn close_conversation() {
 )]
 fn new_conversation() {
     reset_model_state();
-    red::state_patch(AgentState { resume_hint: "", interruption_id: "" });
+    red::state_patch(AgentState { resume_hint: "", resume_age: "", interruption_id: "" });
     // The saved thread is about to be forgotten; opening the pane must not
     // resume it first.
     let pane = state().pane;
@@ -2038,8 +2042,20 @@ fn transcript_restored(event: AgentTranscriptEvent) {
 /// running editor. Its transcript then stays: it holds partial replies and
 /// activity that Codex's saved history does not.
 fn shows_thread(thread_id: String) -> bool {
+    // A transcript saved by an earlier launch may be stale; Codex's copy wins.
     return thread_id != "" && red::string(state().session_id, "") == thread_id
-        && red::len(state().transcript_blocks) > 0;
+        && red::len(state().transcript_blocks) > 0 && state().resume_age == "";
+}
+
+/// The quiet divider between an earlier session's messages and this one.
+fn push_resume_divider(age: String) {
+    let blocks = state().transcript_blocks;
+    blocks = red::push(blocks, AgentTextBlock {
+        id: "resume-notice", kind: "activity", format: "plain",
+        text: "↺ Picked up where you left off " + age,
+    });
+    red::state_patch(AgentState { transcript_blocks: blocks });
+    render_conversation();
 }
 
 #[red::on("agent:conversation_restore_pending")]
@@ -2070,15 +2086,9 @@ fn conversation_resumable(event: AgentResumableEvent) {
     load_conversation(AgentConversationEvent {
         thread_id: event.thread_id, cwd: event.cwd, model_info: event.model_info, items: event.items,
     });
-    red::state_patch(AgentState { resume_hint: "Continuing · :AgentNew starts fresh" });
-    // A quiet divider between the earlier session and this one.
-    let blocks = state().transcript_blocks;
-    blocks = red::push(blocks, AgentTextBlock {
-        id: "resume-notice", kind: "activity", format: "plain",
-        text: "↺ Picked up where you left off " + red::string(event.age, "earlier"),
-    });
-    red::state_patch(AgentState { transcript_blocks: blocks });
-    render_conversation();
+    let age = red::string(event.age, "earlier");
+    red::state_patch(AgentState { resume_hint: "Continuing · :AgentNew starts fresh", resume_age: age });
+    push_resume_divider(age);
     if state().panel_created {
         red::execute("SetTextPanelComposerState", "agent-conversation", true, state().resume_hint);
     }
@@ -2089,7 +2099,12 @@ fn conversation_resumable(event: AgentResumableEvent) {
 fn session_restored(event: AgentConversationEvent) {
     red::state_patch(AgentState { model_info: event.model_info, accepted_model: Json {}, turn_model_info: Json {} });
     if !shows_thread(event.thread_id) {
+        let age = state().resume_age;
         load_conversation(event);
+        if age != "" {
+            red::state_patch(AgentState { resume_age: "" });
+            push_resume_divider(age);
+        }
     }
     set_phase("idle", "");
     red::execute("SetTextPanelComposerState", "agent-conversation", true, state().resume_hint);
@@ -2224,6 +2239,7 @@ fn session_restore_failed(event: AgentSessionRestoreFailedEvent) {
     if failed != "" && failed != red::string(state().session_id, "") {
         return;
     }
+    red::state_patch(AgentState { resume_age: "" });
     // The core forgets the thread and replays the transcript on the next message.
     reset_model_state();
     ensure_conversation_panel();

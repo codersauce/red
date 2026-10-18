@@ -70,43 +70,31 @@ impl ConversationStore {
 
     /// Claims a workspace's conversation for this editor unless another live
     /// editor holds it.
+    ///
+    /// Every read or replacement of the owner file happens under an OS lock on
+    /// `<key>.lock`, and the pid is published by an atomic rename, so two
+    /// editors racing for one workspace never both see it as free.
     pub fn claim(&mut self, workspace: &Path) -> io::Result<Claim> {
         let key = workspace_key(workspace);
         if self.claimed.contains(&key) {
             return Ok(Claim::Owned);
         }
         ensure_private_directory(&self.directory)?;
+        let _lock = self.lock(&key)?;
         let path = self.directory.join(format!("{key}.owner"));
-        for _ in 0..2 {
-            match create_private_file(&path) {
-                Ok(mut file) => {
-                    file.write_all(self.pid.to_string().as_bytes())?;
-                    file.sync_all()?;
-                    self.claimed.insert(key);
-                    return Ok(Claim::Owned);
-                }
-                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                    let owner = fs::read_to_string(&path)
-                        .ok()
-                        .and_then(|text| text.trim().parse::<u32>().ok());
-                    match owner {
-                        Some(pid) if pid == self.pid => {
-                            self.claimed.insert(key);
-                            return Ok(Claim::Owned);
-                        }
-                        Some(pid) if process_is_alive(pid) => return Ok(Claim::HeldBy(pid)),
-                        // The owner exited without releasing its claim.
-                        _ => match fs::remove_file(&path) {
-                            Ok(()) => {}
-                            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                            Err(error) => return Err(error),
-                        },
-                    }
-                }
-                Err(error) => return Err(error),
+        match read_owner(&path)? {
+            Some(pid) if pid == self.pid => {}
+            Some(pid) if process_is_alive(pid) => return Ok(Claim::HeldBy(pid)),
+            // Free, or left behind by an editor that exited without releasing it.
+            _ => {
+                let mut temporary = tempfile::NamedTempFile::new_in(&self.directory)?;
+                temporary.write_all(self.pid.to_string().as_bytes())?;
+                temporary.as_file().sync_all()?;
+                temporary.persist(&path).map_err(|error| error.error)?;
             }
         }
-        Err(io::Error::other("agent conversation claim kept changing"))
+        self.claimed.insert(key);
+        Ok(Claim::Owned)
     }
 
     pub fn owns(&self, workspace: &Path) -> bool {
@@ -116,15 +104,28 @@ impl ConversationStore {
     /// Releases every claim so the next editor in these workspaces can resume.
     pub fn release_all(&mut self) {
         for key in std::mem::take(&mut self.claimed) {
+            let Ok(_lock) = self.lock(&key) else {
+                continue;
+            };
             let path = self.directory.join(format!("{key}.owner"));
-            let owned = fs::read_to_string(&path)
-                .ok()
-                .and_then(|text| text.trim().parse::<u32>().ok())
-                == Some(self.pid);
-            if owned {
+            if read_owner(&path).ok().flatten() == Some(self.pid) {
                 let _ = fs::remove_file(path);
             }
         }
+    }
+
+    /// Holds the workspace's claim lock until the returned file is dropped.
+    fn lock(&self, key: &str) -> io::Result<fs::File> {
+        let path = self.directory.join(format!("{key}.lock"));
+        let file = match create_private_file(&path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                fs::OpenOptions::new().write(true).open(&path)?
+            }
+            Err(error) => return Err(error),
+        };
+        file.lock()?;
+        Ok(file)
     }
 
     /// The conversation saved for a workspace, if it is readable and was saved
@@ -271,6 +272,15 @@ fn create_private_file(path: &Path) -> io::Result<fs::File> {
         options.mode(0o600);
     }
     options.open(path)
+}
+
+/// The pid recorded in an owner file; unreadable or garbled contents count as no owner.
+fn read_owner(path: &Path) -> io::Result<Option<u32>> {
+    match fs::read_to_string(path) {
+        Ok(text) => Ok(text.trim().parse().ok()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
 }
 
 fn read_bounded_json<T: serde::de::DeserializeOwned>(path: &Path) -> Option<T> {
@@ -531,6 +541,37 @@ mod tests {
         );
         store.release_all();
         assert!(!config.path().join(format!("{key}.owner")).exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn two_live_editors_racing_for_a_workspace_never_both_own_it() {
+        // Two pids that are both alive: this test process and its parent.
+        let pids = [std::process::id(), nix::unistd::getppid().as_raw() as u32];
+        for _ in 0..50 {
+            let config = tempfile::tempdir().unwrap();
+            let workspace = tempfile::tempdir().unwrap();
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+            let claims = pids.map(|pid| {
+                let directory = config.path().to_path_buf();
+                let workspace = workspace.path().to_path_buf();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    let mut store = ConversationStore::for_process(directory, pid);
+                    barrier.wait();
+                    let claim = store.claim(&workspace).unwrap();
+                    // Keep the claim: dropping the store would release it.
+                    std::mem::forget(store);
+                    claim
+                })
+            });
+            let claims = claims.map(|handle| handle.join().unwrap());
+            let owned = claims
+                .iter()
+                .filter(|claim| **claim == Claim::Owned)
+                .count();
+            assert_eq!(owned, 1, "{claims:?}");
+        }
     }
 
     #[test]
