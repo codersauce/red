@@ -542,8 +542,9 @@ content, focus, selection, or scroll state. The same bounds, validation, and
 connection ownership as create apply.
 
 `red/TextPanelSetContent` replaces the panel's complete block list. Each block
-has an `id`, `text`, optional semantic `kind` (`user`, `agent`, `error`,
-`activity`, `action`, or `text`), and optional `format` (`plain`, `markdown`,
+has an `id`, `text`, optional semantic `kind` (`user`, `queued`, `agent`, `error`,
+`activity`, `action`, or `text`; `queued` is host API `0.21.0` and draws a dimmed
+prompt card for an unsent message), and optional `format` (`plain`, `markdown`,
 or `code`). Code blocks may include `language`; Red renders them verbatim with
 the active theme's syntax colors and falls back to unhighlighted preformatted
 text for omitted or unsupported languages:

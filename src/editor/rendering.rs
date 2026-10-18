@@ -1696,8 +1696,14 @@ impl Editor {
     fn can_reuse_editor_surfaces(&self) -> bool {
         let has_visible_overlay = self.overlay_manager.has_visible_content();
         let has_docked_panels = (self.current_dialog.is_some() || has_visible_overlay)
-            && (self.panel_manager.reserved_left_width() > 0
-                || self.panel_manager.reserved_right_width() > 0
+            && (self
+                .panel_manager
+                .reserved_left_width(usize::from(self.size.0))
+                > 0
+                || self
+                    .panel_manager
+                    .reserved_right_width(usize::from(self.size.0))
+                    > 0
                 || self.panel_manager.reserved_top_height() > 0
                 || self.panel_manager.reserved_bottom_height() > 0);
         self.previous_render_buffer.is_some()

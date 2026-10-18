@@ -472,6 +472,35 @@ thread; a
 `agent:session_restore_failed` event converts the cached transcript to clearly
 archived context.
 
+## Edit history
+
+`EditHistory(callback, scope?: String)` returns the attributed undo history. Without
+`scope` it returns the active buffer's whole tree in node order, as before. Host API
+`0.21.0` adds `"workspace"`, which covers every open file, newest first, limited to
+500 entries, and `total`, the number of entries before that limit. Results carry
+`scope` (`"buffer"` or `"workspace"`).
+
+Unscoped entries keep exactly the original fields (`transaction_id`, `label`,
+`origin`, `current`, `timestamp_ms`, `edits`, and the tree links). Workspace entries
+keep those fields except `edits`, and add:
+
+| Field | Meaning |
+| --- | --- |
+| `file` | Workspace-relative path, or the buffer name. |
+| `buffer_id` | Buffer that owns the transaction. |
+| `applied` | Whether the transaction is part of the current text (false once undone). |
+| `age` | Short relative time such as `just now` or `5m ago`. |
+| `added`, `removed` | Changed line counts. |
+| `document` | A ready-to-show unified diff in the `WorkspaceModel.detail_document` shape, with hunk headers, context and line numbers. |
+| `turn`, `prompt` | For agent edits: the one-based turn in the current conversation and an excerpt of the prompt that started it. |
+
+Workspace entries leave out `edits`, whose texts are unbounded; use `document`. A
+workspace result too large for the plugin heap is trimmed to its newest entries, and `total`
+still counts them all.
+
+`RevertTransaction(transaction_id)` finds the buffer that owns the transaction, so a
+workspace history can revert edits in files other than the active one.
+
 ## Agent pane lifecycle
 
 Host API `0.21.0` moves the Agent pane's conversation lifecycle into the editor
@@ -497,6 +526,12 @@ queued messages from `queued` and commit `in_flight` to the transcript once per
 the queue and the transcript. The core also resumes a persisted thread itself
 after `agent:conversation_restore_pending`, so a pane using these calls must not
 also call `AgentResumeSession`.
+
+Host API `0.21.0` also adds two text-panel surfaces for conversation panes. A
+`TextPanelBlock` with `kind: "queued"` draws a dimmed `You · queued` prompt card
+for a message that has not been sent yet. A compact conversation pane (see
+[Text panels](#text-panels)) emits `panel:event:<id>` with `action: "view"` and
+`text` set to `"hidden"` or `"visible"` when it leaves or returns to the screen.
 
 The per-session calls below remain available for other plugins and older packages.
 
@@ -525,7 +560,7 @@ queued follow-ups included, until `AgentResolveInterruption` or a new
 
 ## Text panels
 
-`CreateTextPanel`, `UpdateTextPanel`, and `AppendTextPanel` provide a source-backed conversation surface. `TextPanelBlock` accepts an `id`, `kind` (`user`, `agent`, `error`, or `text`), `format` (`plain`, `markdown`, or `code`), and `text`; `code` blocks may include a `language` name for syntax highlighting. Code rendering preserves indentation, repeated spaces, and logical blank lines while wrapping to the panel width. An omitted or unsupported language remains readable verbatim. The host preserves the source independently from its rendered layout. These calls were introduced in host API `0.2.0`; `code` and `language` require `0.19.0`.
+`CreateTextPanel`, `UpdateTextPanel`, and `AppendTextPanel` provide a source-backed conversation surface. `TextPanelBlock` accepts an `id`, `kind` (`user`, `queued`, `agent`, `error`, or `text`; `queued`, introduced in `0.21.0`, draws a dimmed prompt card for a message that has not been sent yet), `format` (`plain`, `markdown`, or `code`), and `text`; `code` blocks may include a `language` name for syntax highlighting. Code rendering preserves indentation, repeated spaces, and logical blank lines while wrapping to the panel width. An omitted or unsupported language remains readable verbatim. The host preserves the source independently from its rendered layout. These calls were introduced in host API `0.2.0`; `code` and `language` require `0.19.0`.
 
 Both row and text panels accept `side: "left"`, `"right"`, `"top"`, or
 `"bottom"` in `PanelConfig`. `width` is measured in columns for left/right panes
@@ -542,7 +577,7 @@ contrasted. Plugins do not need to configure a border to make resizing visible.
 
 A focused footer is a host-owned modal text area, not an editor file buffer. It supports Unicode-safe editing, wrapping, click-to-position cursor movement, counts, Vim word and character motions, `d`/`c`/`y` operators, inner/around text objects, Visual/Visual-line/Visual-block selections, transactional undo/redo, local yank/paste registers, dot-repeat, local macro recording, and prompt-local `/` or `?` searches. Its mode, pending operator, selection, undo tree, register, and search never alter the main editor. File writes, Ex commands, window operations, LSP requests, and plugin callbacks cannot be invoked through textarea keys.
 
-The footer uses the same Enter policy as `OpenComposer`: Enter or `Ctrl-Enter` submits; `Alt-Enter`, `Shift-Enter`, or `Ctrl-j` inserts a newline. While the footer is focused, `Ctrl-j` edits the prompt rather than scrolling the conversation. Escape enters Normal mode. In idle Normal mode, Enter submits and Escape emits `composer_blur`; Escape from Visual or Search mode first returns to Normal. `Ctrl-p`/`Ctrl-n` navigate local prompt history. In Insert mode, Up moves within a multiline draft until the first visual row, then recalls older prompts; once history navigation starts, Up/Down browse entries and Down past the newest entry restores the exact draft and cursor. `Ctrl-r` opens an empty, editable `Search prompts:` field with matching history entries previewed separately; repeated `Ctrl-r` selects older matches, Enter loads the selected match without submitting it, and Escape or `Ctrl-g` cancels. Normal-mode `Ctrl-r` remains redo, and `/` or `?` remains prompt-local text search. `Ctrl-c` remains a pane-level shortcut that emits `interrupt` without changing the composer draft or focus. Successful submission emits `panel:event:<id>` with `action: "submit"` and the complete `text`; other footer actions include `composer_focus`, `composer_blur`, `interrupt`, `clear`, `new`, `history`, and `close`. `SetPanelVisible(id, visible)` hides or restores a panel without discarding its blocks, scroll position, or draft. Replacing text-panel blocks with an empty list resets scrolling and restores tail-following. Footer panels shrink on narrow terminals while preserving an editor viewport.
+The footer uses the same Enter policy as `OpenComposer`: Enter or `Ctrl-Enter` submits; `Alt-Enter`, `Shift-Enter`, or `Ctrl-j` inserts a newline. While the footer is focused, `Ctrl-j` edits the prompt rather than scrolling the conversation. Escape enters Normal mode. In idle Normal mode, Enter submits and Escape emits `composer_blur`; Escape from Visual or Search mode first returns to Normal. `Ctrl-p`/`Ctrl-n` navigate local prompt history. In Insert mode, Up moves within a multiline draft until the first visual row, then recalls older prompts; once history navigation starts, Up/Down browse entries and Down past the newest entry restores the exact draft and cursor. `Ctrl-r` opens an empty, editable `Search prompts:` field with matching history entries previewed separately; repeated `Ctrl-r` selects older matches, Enter loads the selected match without submitting it, and Escape or `Ctrl-g` cancels. Normal-mode `Ctrl-r` remains redo, and `/` or `?` remains prompt-local text search. `Ctrl-c` remains a pane-level shortcut that emits `interrupt` without changing the composer draft or focus. Successful submission emits `panel:event:<id>` with `action: "submit"` and the complete `text`; other footer actions include `composer_focus`, `composer_blur`, `interrupt`, `clear`, `new`, `history`, and `close`. `SetPanelVisible(id, visible)` hides or restores a panel without discarding its blocks, scroll position, or draft. Replacing text-panel blocks with an empty list resets scrolling and restores tail-following. Side panels with a footer composer are responsive: at their declared width they take at most 45% of the terminal, a width the user chose by resizing still leaves the editor 40 columns, and no conversation pane docks narrower than 32 columns. Several conversation panes dock in order while each still gets 32 columns and the editor keeps 40. A pane that does not fit stops docking: it covers the editor while it has focus and steps aside when the editor does, emitting `panel:event:<id>` with `action: "view"` and `text` `"hidden"` or `"visible"` so the plugin can announce output the user cannot see.
 
 Codex app-server updates other than assistant text chunks are forwarded to plugins as `agent:activity` with the normalized `update` payload. Core editor-tool calls also emit this event with `session_update: "editor_tool"`, `status: "in_progress"`, and a concise `title` such as `Opening src/main.rs` or `Editing src/main.rs (2 changes)`. This allows status/tool/plan progress to be displayed without treating it as transcript text. Agent recovery uses `agent:conversation_restore_pending`, `AgentResumeSession`, `agent:session_restored`, and `agent:session_restore_failed`; plugins must not enable follow-up input while restoration is pending.
 

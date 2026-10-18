@@ -354,7 +354,9 @@ search, as in Vim; it can be remapped explicitly in your configuration.
 | `:w! [file]` | Explicitly overwrite a changed file or existing destination |
 | `:wa` / `:wall` | Save every modified file buffer |
 | `:wq` | Save and quit |
-| `:q` / `:q!` | Quit, or quit while discarding changes |
+| `:x` | Save if modified, then quit |
+| `:wqa` / `:xa` | Save every modified buffer, then quit (`!` overwrites files changed on disk) |
+| `:q` / `:q!` | Quit, or quit while discarding changes (`:qa` / `:qa!` work too) |
 | `:e <file>` / `:e!` | Open a file or discard local edits and reload from disk |
 | `:diffdisk` | Compare a locally edited file with its changed disk version |
 | `:<number>` / `:$` | Jump to a line or the last line |

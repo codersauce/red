@@ -10,8 +10,8 @@
 
 use std::{
     collections::{HashMap, HashSet},
-    fs::TryLockError,
     fs,
+    fs::TryLockError,
     io::{self, Read as _, Write as _},
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
@@ -565,10 +565,7 @@ mod tests {
 
         // A second editor in the same workspace while the owner still runs.
         let mut other = ConversationStore::new(directory);
-        assert_eq!(
-            other.claim(workspace.path()).unwrap(),
-            Claim::HeldElsewhere
-        );
+        assert_eq!(other.claim(workspace.path()).unwrap(), Claim::HeldElsewhere);
         assert!(!other
             .save(workspace.path(), &conversation("theirs", workspace.path()))
             .unwrap());
@@ -716,10 +713,7 @@ mod tests {
 
         // A third editor in the same workspace while the second is open.
         let mut third = editor();
-        third.enable_agent_continuity_in(
-            ConversationStore::new(directory),
-            workspace.path(),
-        );
+        third.enable_agent_continuity_in(ConversationStore::new(directory), workspace.path());
         assert!(
             third.agent_manager.conversation().is_none(),
             "a thread is never driven by two editors"

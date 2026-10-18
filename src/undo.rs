@@ -332,6 +332,57 @@ impl UndoHistory {
             .map(|node| &node.transaction)
     }
 
+    /// Index, parent and timestamp of every retained node, without copying edits.
+    pub fn node_summaries(&self) -> impl Iterator<Item = (usize, Option<usize>, u128)> + '_ {
+        self.nodes
+            .iter()
+            .enumerate()
+            .map(|(index, node)| (index, node.parent, node.transaction.timestamp_ms))
+    }
+
+    /// Node holding the history's current state.
+    #[must_use]
+    pub fn current_index(&self) -> Option<usize> {
+        self.current
+    }
+
+    /// Borrows the retained transaction with this id, without copying any history.
+    #[must_use]
+    pub fn transaction_by_id(&self, transaction_id: &str) -> Option<&EditTransaction> {
+        self.nodes
+            .iter()
+            .map(|node| &node.transaction)
+            .find(|transaction| transaction.id == transaction_id)
+    }
+
+    /// Borrows one node's transaction.
+    #[must_use]
+    pub fn node_transaction(&self, index: usize) -> Option<&EditTransaction> {
+        self.nodes.get(index).map(|node| &node.transaction)
+    }
+
+    /// Projects one node like [`Self::undo_tree`]; `edits` stays empty unless
+    /// `with_edits`, since replacement texts can be arbitrarily large.
+    #[must_use]
+    pub fn undo_tree_entry(&self, index: usize, with_edits: bool) -> Option<UndoTreeEntry> {
+        let node = self.nodes.get(index)?;
+        Some(UndoTreeEntry {
+            index,
+            parent: node.parent,
+            children: node.children.clone(),
+            current: self.current == Some(index),
+            transaction_id: node.transaction.id.clone(),
+            label: node.transaction.label.clone(),
+            origin: node.transaction.origin.clone(),
+            timestamp_ms: node.transaction.timestamp_ms,
+            edits: if with_edits {
+                node.transaction.edits.clone()
+            } else {
+                Vec::new()
+            },
+        })
+    }
+
     #[must_use]
     /// Returns a serializable projection of every retained undo branch.
     pub fn undo_tree(&self) -> Vec<UndoTreeEntry> {
@@ -950,6 +1001,31 @@ mod tests {
             text.to_string(),
         );
         assert!(history.commit_transaction(CursorSnapshot::default()));
+    }
+
+    #[test]
+    fn node_accessors_find_transactions_without_projecting_the_tree() {
+        let mut history = UndoHistory::default();
+        commit_insertion(&mut history, 0, "a");
+        commit_insertion(&mut history, 1, "b");
+        let second = history.node_transaction(1).unwrap().id.clone();
+
+        assert_eq!(
+            history
+                .transaction_by_id(&second)
+                .map(|transaction| transaction.label.as_str()),
+            Some("insert")
+        );
+        assert!(history.transaction_by_id("missing").is_none());
+        assert_eq!(history.current_index(), Some(1));
+        let summaries: Vec<_> = history
+            .node_summaries()
+            .map(|(index, parent, _)| (index, parent))
+            .collect();
+        assert_eq!(summaries, [(0, None), (1, Some(0))]);
+        let entry = history.undo_tree_entry(1, false).unwrap();
+        assert!(entry.current && entry.edits.is_empty());
+        assert_eq!(history.undo_tree_entry(1, true).unwrap().edits.len(), 1);
     }
 
     #[test]

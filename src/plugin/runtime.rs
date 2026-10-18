@@ -2160,7 +2160,10 @@ impl RedHost {
                 PluginRequest::InlayHints { request_id, range }
             }
             "GetEditorInfo" => PluginRequest::EditorInfo(request_id),
-            "EditHistory" => PluginRequest::EditHistory { request_id },
+            "EditHistory" => PluginRequest::EditHistory {
+                request_id,
+                scope: args.first().and_then(Value::as_str).map(str::to_string),
+            },
             "AgentReadDefaultModel" => PluginRequest::AgentModelRequest {
                 request_id,
                 request: crate::codex::ModelRequest::ReadDefault {
@@ -4286,7 +4289,7 @@ impl Runtime {
             // A plugin needs heap to work through a list after it arrives, so a
             // list that only just fits still fails the callback. Trim lists past
             // half the free heap; other results can only be delivered or dropped.
-            let list_field = trimmable_result_list(&request);
+            let list_field = trimmable_result_list(&request, &payload);
             let limit = if list_field.is_some() {
                 available / 2
             } else {
@@ -4484,12 +4487,22 @@ fn validate_command_registration(
 }
 
 /// The list field a plugin can still use in part when the whole result is too large.
-fn trimmable_result_list(request: &str) -> Option<&'static str> {
+fn trimmable_result_list(request: &str, payload: &Value) -> Option<&'static str> {
     match request {
         "DocumentSymbols" | "WorkspaceSymbols" => Some("symbols"),
         "References" => Some("references"),
+        // Only the workspace scope promises a newest-first prefix and a `total`;
+        // an unscoped history is delivered whole or not at all, as before.
+        "EditHistory" if result_field_is(payload, "scope", "workspace") => Some("entries"),
         _ => None,
     }
+}
+
+fn result_field_is(payload: &Value, field: &str, expected: &str) -> bool {
+    let (Value::Struct { fields, .. } | Value::Object(fields)) = payload else {
+        return false;
+    };
+    matches!(fields.get(field), Some(Value::String(value)) if value.as_str() == expected)
 }
 
 /// Keeps the longest prefix of `payload.field` whose result fits in `budget` heap
@@ -7650,7 +7663,7 @@ mod tests {
             1,
             "the sent message replaces its queued copy"
         );
-        assert!(panel_statuses(&requests).contains(&Some(("Waiting for agent…".to_string(), true))));
+        assert!(panel_statuses(&requests).contains(&Some(("Thinking…".to_string(), true))));
         assert!(requests.iter().any(|request| matches!(
             request,
             PluginRequest::SetPluginStorage { plugin, key, .. }
@@ -8496,7 +8509,7 @@ mod tests {
                 && blocks[0].format == crate::plugin::TextPanelBlockFormat::Plain
                 && blocks[0].text == submitted
         );
-        assert!(panel_statuses(&requests).contains(&Some(("Waiting for agent…".to_string(), true))));
+        assert!(panel_statuses(&requests).contains(&Some(("Thinking…".to_string(), true))));
         assert!(requests.iter().any(|request| matches!(
             request,
             PluginRequest::SetTextPanelComposerHistory { history, .. } if history == &[submitted]
@@ -8729,7 +8742,7 @@ mod tests {
             PluginRequest::OpenWorkspace { id, .. } if id == "agent-history"
         ));
         let request_id = match ACTION_DISPATCHER.recv_request() {
-            PluginRequest::EditHistory { request_id } => request_id,
+            PluginRequest::EditHistory { request_id, .. } => request_id,
             _ => panic!("expected attributed history request"),
         };
         runtime
@@ -8759,6 +8772,184 @@ mod tests {
             ACTION_DISPATCHER.recv_request(),
             PluginRequest::CloseWorkspace { id } if id == "agent-history"
         ));
+    }
+
+    #[tokio::test]
+    async fn bundled_agent_history_labels_rows_and_shows_a_line_diff() {
+        drain_requests();
+        let mut runtime = Runtime::new();
+        runtime
+            .load_plugin("agent", include_str!("../../plugins/agent.hk"))
+            .await
+            .unwrap();
+        drain_requests();
+        let entry = |id: &str, kind: &str, file: &str, applied: bool| {
+            let mut entry = serde_json::json!({
+                "transaction_id": id,
+                "label": "edit",
+                "current": false,
+                "applied": applied,
+                "origin": { "kind": kind },
+                "file": file,
+                "age": "5m ago",
+                "added": 1,
+                "removed": 1,
+                "edits": [],
+                "document": {
+                    "path": format!("/workspace/{file}"),
+                    "lines": [
+                        { "id": format!("{id}:0"), "text": "@@ -41,2 +41,2 @@", "kind": "hunk" },
+                        { "id": format!("{id}:1"), "text": "    Ok(whole * 100 + frac)", "kind": "removed", "old_line": 42 },
+                        { "id": format!("{id}:2"), "text": "    Ok(whole * 100 + sign * frac)", "kind": "added", "new_line": 42 },
+                    ],
+                    "added": 1, "removed": 1, "total_lines": 3, "truncated": false,
+                },
+            });
+            if kind == "agent" {
+                entry["origin"] = serde_json::json!({
+                    "kind": "agent", "session_id": "s", "turn_id": "t"
+                });
+                entry["turn"] = serde_json::json!(2);
+                entry["prompt"] = serde_json::json!("Fix the sign bug");
+            }
+            entry
+        };
+        let history_request = || loop {
+            match ACTION_DISPATCHER.recv_request() {
+                PluginRequest::EditHistory { request_id, scope } => {
+                    assert_eq!(scope.as_deref(), Some("workspace"));
+                    break request_id;
+                }
+                _ => continue,
+            }
+        };
+        let workspace_update = || loop {
+            if let PluginRequest::UpdateWorkspace { id, model } = ACTION_DISPATCHER.recv_request() {
+                assert_eq!(id, "agent-history");
+                break model;
+            }
+        };
+        let text = |segments: &[crate::plugin::PanelSegment]| {
+            segments
+                .iter()
+                .map(|segment| segment.text.as_str())
+                .collect::<String>()
+        };
+
+        runtime.execute_command("AgentHistory").await.unwrap();
+        let request_id = history_request();
+        runtime
+            .resolve_request(
+                request_id,
+                serde_json::json!({
+                    "entries": [
+                        entry("agent-1", "agent", "src/parse.rs", true),
+                        entry("user-1", "user", "src/report.rs", false),
+                    ],
+                    "total": 2,
+                }),
+            )
+            .await
+            .unwrap();
+        let model = workspace_update();
+        assert_eq!(
+            text(&model.header),
+            "2 edits across 2 files · 1 by the agent"
+        );
+        assert_eq!(text(&model.rows[0].segments), "◆ src/parse.rs  +1 −1");
+        assert_eq!(text(&model.rows[0].right_segments), "turn 2 · 5m ago");
+        assert_eq!(text(&model.rows[1].segments), "· src/report.rs  +1 −1");
+        assert_eq!(text(&model.rows[1].right_segments), "you · 5m ago · undone");
+        let document = model.detail_document.expect("the newest edit is shown");
+        assert_eq!(document.path, "/workspace/src/parse.rs");
+        assert_eq!(document.lines[2].kind, "added");
+        assert_eq!(
+            model.detail_title,
+            "src/parse.rs · Agent, turn 2 · “Fix the sign bug” · 5m ago"
+        );
+
+        // Selecting with the mouse (or any other navigation) shows that row's diff.
+        let clicked = serde_json::to_value(&model.rows[1]).unwrap();
+        runtime
+            .notify(
+                "workspace:event:agent-history",
+                serde_json::json!({ "action": "mouse_click", "row": clicked }),
+            )
+            .await
+            .unwrap();
+        let request_id = history_request();
+        runtime
+            .resolve_request(
+                request_id,
+                serde_json::json!({
+                    "entries": [
+                        entry("agent-1", "agent", "src/parse.rs", true),
+                        entry("user-1", "user", "src/report.rs", false),
+                    ],
+                    "total": 2,
+                }),
+            )
+            .await
+            .unwrap();
+        let model = workspace_update();
+        assert_eq!(model.detail_title, "src/report.rs · You · 5m ago");
+        assert_eq!(
+            model
+                .detail_document
+                .map(|document| document.path)
+                .as_deref(),
+            Some("/workspace/src/report.rs")
+        );
+
+        runtime
+            .notify(
+                "workspace:event:agent-history",
+                serde_json::json!({ "action": "a", "row": null }),
+            )
+            .await
+            .unwrap();
+        let request_id = history_request();
+        runtime
+            .resolve_request(request_id, serde_json::json!({ "entries": [], "total": 0 }))
+            .await
+            .unwrap();
+        let model = workspace_update();
+        assert_eq!(text(&model.header), "0 edits");
+        assert!(model.detail_document.is_none());
+        assert_eq!(
+            model.detail.first().map(|row| text(row)).as_deref(),
+            Some("No agent edits yet")
+        );
+
+        // A capped history adds a notice row that is not itself an edit.
+        runtime
+            .notify(
+                "workspace:event:agent-history",
+                serde_json::json!({ "action": "a", "row": null }),
+            )
+            .await
+            .unwrap();
+        let request_id = history_request();
+        runtime
+            .resolve_request(
+                request_id,
+                serde_json::json!({
+                    "entries": [
+                        entry("agent-2", "agent", "src/parse.rs", true),
+                        entry("user-2", "user", "src/parse.rs", true),
+                    ],
+                    "total": 700,
+                }),
+            )
+            .await
+            .unwrap();
+        let model = workspace_update();
+        assert_eq!(model.rows.len(), 3);
+        assert_eq!(text(&model.header), "2 edits in 1 file · 1 by the agent");
+        assert_eq!(
+            text(&model.rows[2].segments),
+            "… older edits not shown; the history lists the newest 2 of 700"
+        );
     }
 
     #[tokio::test]
@@ -8811,7 +9002,7 @@ mod tests {
         while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
             match request {
                 PluginRequest::Action(Action::Print(message)) => {
-                    cancellation_notice |= message == "Agent cancellation requested";
+                    cancellation_notice |= message == "Stopping the agent…";
                 }
                 PluginRequest::AgentCloseSession { .. } => {
                     panic!("cancellation must not close an active stream before completion")
@@ -8861,11 +9052,11 @@ mod tests {
                     });
                 }
                 PluginRequest::Action(Action::Print(message)) => {
-                    status |= message.contains("turn is still running");
+                    status |= message.contains("follow-up queued");
                 }
                 PluginRequest::UpdateTextPanel { blocks, .. } => {
                     queued_visible |= blocks.iter().any(|block| {
-                        block.kind == crate::plugin::TextPanelBlockKind::User
+                        block.kind == crate::plugin::TextPanelBlockKind::Queued
                             && block.text == "concurrent prompt"
                     });
                 }
@@ -8975,9 +9166,8 @@ mod tests {
                     id,
                     status: Some(status),
                 } => {
-                    busy |= id == "agent-conversation"
-                        && status.busy
-                        && status.label == "Waiting for agent…";
+                    busy |=
+                        id == "agent-conversation" && status.busy && status.label == "Thinking…";
                 }
                 PluginRequest::Action(Action::Refresh) => {
                     assert!(rendered, "the submitted text must be ready before refresh");
@@ -9026,12 +9216,13 @@ mod tests {
             match request {
                 PluginRequest::UpdateTextPanel { id, blocks } => {
                     assert_eq!(id, "agent-conversation");
+                    // Follow-ups held behind the running turn render as queued cards.
                     second_visible |= blocks.iter().any(|block| {
-                        block.kind == crate::plugin::TextPanelBlockKind::User
+                        block.kind == crate::plugin::TextPanelBlockKind::Queued
                             && block.text == "second prompt"
                     });
                     third_visible |= blocks.iter().any(|block| {
-                        block.kind == crate::plugin::TextPanelBlockKind::User
+                        block.kind == crate::plugin::TextPanelBlockKind::Queued
                             && block.text == "third prompt"
                     });
                 }
@@ -9280,7 +9471,7 @@ mod tests {
             PluginRequest::UpdateTextPanel { id, blocks }
                 if id == "agent-conversation"
                     && blocks.len() == 1
-                    && blocks[0].text.starts_with("No messages yet.")
+                    && blocks[0].text.starts_with("Ask about this workspace")
         ));
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
@@ -10041,6 +10232,159 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bundled_agent_announces_turns_that_finish_while_a_compact_pane_is_covered() {
+        let mut runtime = agent_runtime_with_session("session-1").await;
+        submit_agent_prompt(&mut runtime, "first prompt").await;
+        let finished = || {
+            let mut announced = false;
+            while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
+                announced |= matches!(
+                    request,
+                    PluginRequest::Action(Action::Print(message))
+                        if message == "Agent finished · Space A to view"
+                );
+            }
+            announced
+        };
+        for (view, expected) in [("hidden", true), ("visible", false)] {
+            runtime
+                .notify(
+                    "panel:event:agent-conversation",
+                    serde_json::json!({ "action": "view", "text": view }),
+                )
+                .await
+                .unwrap();
+            drain_requests();
+            core_notify(
+                &mut runtime,
+                "agent:completed",
+                serde_json::json!({ "session_id": "session-1", "stop_reason": "end_turn" }),
+            )
+            .await;
+            assert_eq!(finished(), expected, "pane {view}");
+            submit_agent_prompt(&mut runtime, "next prompt").await;
+        }
+    }
+
+    #[tokio::test]
+    async fn bundled_agent_draws_follow_ups_typed_while_a_thread_starts_as_queued() {
+        drain_requests();
+        let mut runtime = Runtime::new();
+        runtime
+            .load_plugin("agent", include_str!("../../plugins/agent.hk"))
+            .await
+            .unwrap();
+        drain_requests();
+        runtime
+            .notify(
+                "agent:pane_state",
+                serde_json::json!({
+                    "phase": "starting", "session_id": null, "turn_id": null, "in_flight": null,
+                    "queued": [{"id": "p1", "text": "first"}, {"id": "p2", "text": "second"}],
+                    "paused": false, "stop_failed": false, "recap_pending": false,
+                }),
+            )
+            .await
+            .unwrap();
+        let mut kinds = None;
+        while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
+            if let PluginRequest::UpdateTextPanel { blocks, .. } = request {
+                kinds = Some(
+                    blocks
+                        .iter()
+                        .map(|block| (block.text.clone(), block.kind.clone()))
+                        .collect::<Vec<_>>(),
+                );
+            }
+        }
+        // The first message is being sent as the thread starts; the second waits.
+        assert_eq!(
+            kinds.unwrap(),
+            [
+                ("first".to_string(), crate::plugin::TextPanelBlockKind::User),
+                (
+                    "second".to_string(),
+                    crate::plugin::TextPanelBlockKind::Queued
+                ),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn bundled_agent_clear_keeps_held_follow_ups_dimmed() {
+        drain_requests();
+        let mut runtime = Runtime::new();
+        runtime
+            .load_plugin("agent", include_str!("../../plugins/agent.hk"))
+            .await
+            .unwrap();
+        runtime
+            .notify(
+                "agent:pane_state",
+                serde_json::json!({
+                    "phase": "idle", "session_id": "session-1", "turn_id": null, "in_flight": null,
+                    "queued": [{"id": "p1", "text": "held"}],
+                    "paused": true, "stop_failed": false, "recap_pending": false,
+                }),
+            )
+            .await
+            .unwrap();
+        drain_requests();
+        runtime.execute_command("AgentClear").await.unwrap();
+        let mut kinds = None;
+        while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
+            if let PluginRequest::UpdateTextPanel { blocks, .. } = request {
+                kinds = Some(
+                    blocks
+                        .iter()
+                        .map(|block| block.kind.clone())
+                        .collect::<Vec<_>>(),
+                );
+            }
+        }
+        assert_eq!(kinds.unwrap(), [crate::plugin::TextPanelBlockKind::Queued]);
+    }
+
+    #[tokio::test]
+    async fn bundled_agent_names_a_requested_stop_and_gives_each_turn_one_working_verb() {
+        let mut runtime = agent_runtime_with_session("session-1").await;
+        let mut labels = Vec::new();
+        for prompt in ["first prompt", "second prompt"] {
+            submit_agent_prompt(&mut runtime, prompt).await;
+            while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
+                if let PluginRequest::SetTextPanelStatus {
+                    status: Some(status),
+                    ..
+                } = request
+                {
+                    labels.push(status.label);
+                }
+            }
+            core_notify(
+                &mut runtime,
+                "agent:completed",
+                serde_json::json!({ "session_id": "session-1", "stop_reason": "interrupted" }),
+            )
+            .await;
+            let stopped_notice = std::iter::from_fn(|| ACTION_DISPATCHER.try_recv_request())
+                .collect::<Vec<_>>()
+                .into_iter()
+                .any(|request| matches!(request, PluginRequest::Action(Action::Print(message)) if message == "Agent stopped"));
+            assert!(stopped_notice);
+        }
+        assert!(labels.contains(&"Thinking…".to_string()), "{labels:?}");
+        assert!(labels.contains(&"Pondering…".to_string()), "{labels:?}");
+        let state = {
+            let inner = runtime.inner.lock().unwrap();
+            value_to_json(inner.host.policy().typed_states.get("agent").unwrap())
+        };
+        assert!(state["transcript"]
+            .as_str()
+            .unwrap()
+            .ends_with("System: Stopped at your request.\n"));
+    }
+
+    #[tokio::test]
     async fn bundled_agent_explains_a_failed_cancel_and_keeps_the_turn_running() {
         let mut runtime = agent_runtime_with_session("session-1").await;
         submit_agent_prompt(&mut runtime, "first prompt").await;
@@ -10335,7 +10679,7 @@ mod tests {
                     } => {
                         paused_status |= id == "agent-conversation"
                             && !status.busy
-                            && status.label.contains("1 queued · paused");
+                            && status.label.contains("1 held · :AgentSendQueued");
                     }
                     _ => {}
                 }
@@ -19909,6 +20253,31 @@ mod tests {
     }
 
     #[test]
+    fn only_workspace_edit_histories_are_trimmable() {
+        let history = |scope: Option<&str>| {
+            Value::Object(Arc::new(BTreeMap::from_iter(
+                [("entries".to_string(), Value::Array(Arc::new(Vec::new())))]
+                    .into_iter()
+                    .chain(scope.map(|scope| ("scope".to_string(), Value::String(scope.into())))),
+            )))
+        };
+        assert_eq!(
+            trimmable_result_list("EditHistory", &history(Some("workspace"))),
+            Some("entries")
+        );
+        // Unscoped results keep the shipped contract: whole or dropped, never a prefix.
+        assert_eq!(
+            trimmable_result_list("EditHistory", &history(Some("buffer"))),
+            None
+        );
+        assert_eq!(trimmable_result_list("EditHistory", &history(None)), None);
+        assert_eq!(
+            trimmable_result_list("References", &history(None)),
+            Some("references")
+        );
+    }
+
+    #[test]
     fn trimmed_result_keeps_the_longest_prefix_that_fits() {
         let result = |count: usize| Value::Struct {
             type_name: "SymbolsResult".to_string(),
@@ -19964,6 +20333,79 @@ mod tests {
         assert_eq!(
             status.as_deref(),
             Some("4096 symbols (results truncated: first 4096 of 60000; type to narrow)")
+        );
+    }
+
+    #[tokio::test]
+    async fn an_edit_history_larger_than_the_plugin_heap_is_trimmed_to_its_newest_entries() {
+        drain_requests();
+        let mut runtime = Runtime::new();
+        runtime
+            .load_plugin("agent", include_str!("../../plugins/agent.hk"))
+            .await
+            .unwrap();
+        drain_requests();
+        runtime.execute_command("AgentHistory").await.unwrap();
+        let request_id = loop {
+            if let PluginRequest::EditHistory { request_id, .. } = ACTION_DISPATCHER.recv_request()
+            {
+                break request_id;
+            }
+        };
+        // Far more than the plugin heap once decoded, like many whole-file rewrites.
+        let line = "x".repeat(400_000);
+        let entries: Vec<_> = (0..300)
+            .map(|index| {
+                serde_json::json!({
+                    "transaction_id": format!("t{index}"),
+                    "label": "edit",
+                    "current": false,
+                    "applied": true,
+                    "origin": { "kind": "user" },
+                    "file": "big.rs",
+                    "age": "just now",
+                    "added": 1,
+                    "removed": 0,
+                    "document": {
+                        "path": "big.rs",
+                        "lines": [{ "id": format!("t{index}:0"), "text": line, "kind": "added", "new_line": 1 }],
+                        "added": 1, "removed": 0, "total_lines": 1, "truncated": false,
+                    },
+                })
+            })
+            .collect();
+
+        assert!(runtime
+            .resolve_request(
+                request_id,
+                serde_json::json!({ "scope": "workspace", "entries": entries, "total": 300 })
+            )
+            .await
+            .unwrap());
+
+        let model = loop {
+            match ACTION_DISPATCHER.recv_request() {
+                PluginRequest::UpdateWorkspace { model, .. } => break model,
+                PluginRequest::PluginResultDropped { .. } => {
+                    panic!("the history must be trimmed, not dropped")
+                }
+                _ => continue,
+            }
+        };
+        let kept = model.rows.len() - 1;
+        assert!((1..300).contains(&kept), "kept {kept}");
+        assert_eq!(
+            model.rows[0].id, "transaction:t0",
+            "the newest entries are kept"
+        );
+        let notice: String = model.rows[kept]
+            .segments
+            .iter()
+            .map(|segment| segment.text.as_str())
+            .collect();
+        assert!(
+            notice.ends_with(&format!("the newest {kept} of 300")),
+            "{notice}"
         );
     }
 

@@ -291,7 +291,17 @@ action or `:AgentSendQueued` sends it once Codex is available. While a turn is i
 the `agent_activity` statusline field (on the right by default) shows
 `agent working`, `agent following`, or `agent stopping`, plus any queued count,
 and it disappears when the agent is idle. A turn that finishes while the pane is
-hidden prints `Agent finished · Space A to view`.
+hidden prints `Agent finished · Space A to view`. Queued follow-ups are drawn as
+dimmed `You · queued` cards until they are sent. `Space A` always lands in the
+composer's Insert mode, even if you left it in Normal mode.
+
+The pane sizes itself to the terminal: it takes at most 45% of the width (and
+never less than 32 columns), so the editor keeps room to work. On a terminal too
+narrow for a 32-column pane beside a 40-column editor, the pane stops docking.
+It covers the whole screen while you are in it, and `Esc` back to the editor
+gives the editor the full width again; `Space A` brings the pane back. A width
+you set by dragging or resizing the pane is kept as long as the editor keeps 40
+columns.
 
 `Tab` or `Shift-Tab` switches between the composer and transcript, preserving
 the draft, composer editing mode, and transcript reading position. Switching

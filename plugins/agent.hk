@@ -185,35 +185,41 @@ struct TextPanelHeaderAction {
     compact_label: String,
 }
 
-struct AgentEdit {
-    old_text: String,
-    new_text: String,
-}
-
 struct AgentEditOrigin {
     kind: String,
-    session_id: String,
-    turn_id: String,
+    session_id: Option<String>,
+    turn_id: Option<String>,
+    name: Option<String>,
 }
 
 struct AgentHistoryEntry {
     transaction_id: String,
     label: String,
     current: bool,
+    applied: bool,
     origin: AgentEditOrigin,
-    edits: [AgentEdit],
+    file: String,
+    age: String,
+    added: i32,
+    removed: i32,
+    turn: Option<i32>,
+    prompt: Option<String>,
+    document: Json,
 }
 
 struct AgentHistoryResult {
     entries: [AgentHistoryEntry],
+    total: Option<i32>,
 }
 
 struct AgentHistoryRowData {
     transaction_id: String,
-    edits: [AgentEdit],
+    title: String,
+    document: Json,
 }
 
 struct AgentHistoryRow {
+    id: String,
     data: AgentHistoryRowData,
 }
 
@@ -265,6 +271,10 @@ struct AgentState {
     committed_prompt_id: String,
     panel_created: bool,
     panel_open: bool,
+    /// False while a compact (narrow-terminal) pane is open but covered by the editor.
+    panel_in_view: bool,
+    /// Turns sent in this pane, which picks the turn's working verb.
+    sent_turns: i32,
     focus_panel_on_first_prompt: bool,
     permission_request_id: String,
     prompt_history: [String],
@@ -278,6 +288,10 @@ struct AgentState {
     stream_trimmed: bool,
     history_open: bool,
     history_detail: [[PanelSegment]],
+    history_document: Json,
+    history_detail_title: String,
+    history_selected: String,
+    history_agent_only: bool,
     ui_phase: String,
     ui_label: String,
     activity_rows: [AgentActivityRow],
@@ -322,6 +336,8 @@ fn initial_state() -> AgentState {
         committed_prompt_id: "",
         panel_created: false,
         panel_open: false,
+        panel_in_view: true,
+        sent_turns: 0,
         focus_panel_on_first_prompt: false,
         permission_request_id: "",
         prompt_history: [],
@@ -334,10 +350,11 @@ fn initial_state() -> AgentState {
         stream_delta: "",
         stream_trimmed: false,
         history_open: false,
-        history_detail: [[PanelSegment {
-            text: "Select a transaction",
-            style: muted_style(),
-        }]],
+        history_detail: [],
+        history_document: red::null(),
+        history_detail_title: "",
+        history_selected: "",
+        history_agent_only: false,
         ui_phase: "idle",
         ui_label: "",
         activity_rows: [],
@@ -670,6 +687,18 @@ fn pane_turn_id() -> String {
     return turn_id;
 }
 
+/// A little personality while the agent thinks: each turn gets one verb, so the
+/// status row stays calm instead of flickering between phrases.
+fn working_verb() -> String {
+    let verbs = [
+        "Thinking…", "Pondering…", "Mulling it over…", "Reading the room…",
+        "Connecting the dots…", "Sketching a plan…", "Untangling…", "Brewing ideas…",
+    ];
+    let turn = red::int(state().sent_turns, 1) - 1;
+    if turn < 0 { turn = 0; }
+    return red::string(verbs[turn % red::len(verbs)], "Thinking…");
+}
+
 /// The core sent this message as a new turn; move it from the queue into the
 /// transcript in the same update.
 fn commit_sent_prompt(prompt: AgentPanePrompt) {
@@ -683,7 +712,8 @@ fn commit_sent_prompt(prompt: AgentPanePrompt) {
         red::state_patch(AgentState { focus_panel_on_first_prompt: false });
         red::execute("FocusTextPanelComposer", "agent-conversation");
     }
-    red::state_patch(AgentState { ui_phase: "waiting", ui_label: "Waiting for agent…" });
+    red::state_patch(AgentState { sent_turns: red::int(state().sent_turns, 0) + 1 });
+    red::state_patch(AgentState { ui_phase: "waiting", ui_label: working_verb() });
     red::execute("SetStorage", "transcript", state().transcript);
 }
 
@@ -737,7 +767,9 @@ fn pane_state_changed(event: AgentPaneState) {
         // Paint a newly queued message right away instead of on the next frame.
         red::execute("Refresh");
         if turn_running() {
-            red::execute("Print", "Agent turn is still running; follow-up queued (" + queued_count() + ")");
+            let waiting = "it sends when this turn ends";
+            if queued_count() > 1 { waiting = queued_count() + " waiting · they send in order"; }
+            red::execute("Print", "Agent is busy · follow-up queued · " + waiting);
         }
     }
 }
@@ -985,7 +1017,7 @@ fn turn_started(event: AgentSessionEvent) {
     if !is_current_session(event.session_id) {
         return;
     }
-    set_phase("waiting", "Waiting for agent…");
+    set_phase("waiting", working_verb());
 }
 
 /// Returns whether a terminal event belongs to an earlier turn than the one shown.
@@ -1012,7 +1044,7 @@ fn render_status() {
         if state().pane.paused && queued > 0 {
             red::execute("SetTextPanelStatus", "agent-conversation", TextPanelStatus {
                 busy: false,
-                label: queued + " queued · paused · :AgentSendQueued or :AgentDiscardQueued",
+                label: queued + " held · :AgentSendQueued to send",
                 stream: false,
             });
             return;
@@ -1076,7 +1108,7 @@ fn thought_activity(update: AgentThoughtChunk) {
             render_activity();
         }
     }
-    set_phase("thinking", "Thinking…");
+    set_phase("thinking", working_verb());
 }
 
 fn tool_activity(update: AgentToolCall) {
@@ -1464,6 +1496,10 @@ fn panel_event(event: AgentPanelEvent) {
         history();
     } else if event.action == "close" {
         close_conversation();
+    } else if event.action == "view" {
+        // A compact pane on a narrow terminal steps aside while the editor has
+        // focus; it is still open, so completion notices must say where it went.
+        red::state_patch(AgentState { panel_in_view: red::string(event.text, "visible") != "hidden" });
     }
 }
 
@@ -1565,13 +1601,7 @@ fn clear_conversation() {
     red::state_patch(AgentState { activity_history: [] });
     red::state_patch(AgentState { thought: "" });
     // Queued messages still run after a Clear, so they stay visible.
-    let queued = [];
-    for prompt in state().pane.queued {
-        queued = red::push(queued, AgentTextBlock {
-            id: prompt.id, kind: "user", format: "plain", text: prompt.text,
-        });
-    }
-    red::execute("UpdateTextPanel", "agent-conversation", queued);
+    red::execute("UpdateTextPanel", "agent-conversation", with_unsent_prompts([]));
     red::execute("SetTextPanelComposerState", "agent-conversation", true, "Conversation view cleared · context preserved");
 }
 
@@ -1787,9 +1817,14 @@ fn completed(event: AgentCompletedEvent) {
     collapse_activity(event.elapsed_ms);
     set_phase("idle", "");
     if stop_reason == "end_turn" || stop_reason == "completed" {
-        if !state().panel_open {
+        if !state().panel_open || !state().panel_in_view {
             red::execute("Print", "Agent finished · Space A to view");
         }
+        return;
+    }
+    if stop_reason == "interrupted" || stop_reason == "cancelled" {
+        append_transcript("System", "Stopped at your request.");
+        red::execute("Print", "Agent stopped");
         return;
     }
     append_transcript("System", "Agent stopped: " + stop_reason);
@@ -1806,7 +1841,7 @@ fn completed(event: AgentCompletedEvent) {
 )]
 fn send_queued() {
     if queued_count() == 0 {
-        red::execute("Print", "No queued agent follow-ups");
+        red::execute("Print", "Nothing is queued");
         return;
     }
     red::execute("AgentSendQueued", red::string(state().transcript, ""));
@@ -1823,7 +1858,11 @@ fn send_queued() {
 fn discard_queued() {
     let count = queued_count();
     red::execute("AgentDiscardQueued");
-    red::execute("Print", "Discarded " + count + " queued agent follow-up(s)");
+    if count == 1 {
+        red::execute("Print", "Dropped 1 queued follow-up");
+    } else {
+        red::execute("Print", "Dropped " + count + " queued follow-ups");
+    }
 }
 
 #[red::on("agent:cancelled")]
@@ -1831,7 +1870,7 @@ fn cancelled(event: AgentSessionEvent) {
     if !is_current_session(event.session_id) {
         return;
     }
-    red::execute("Print", "Agent cancellation requested");
+    red::execute("Print", "Stopping the agent…");
 }
 
 /// Codex refused the interrupt, so the turn keeps running; say so and let the
@@ -2336,28 +2375,41 @@ fn render_conversation() {
     blocks = presented;
     // Messages the core has not sent yet render below the conversation. A prompt
     // returned for retry after a lost session is already in the transcript.
+    blocks = with_unsent_prompts(blocks);
+    if red::len(blocks) == 0 {
+        blocks = [AgentTextBlock {
+            id: "empty",
+            kind: "activity",
+            format: "plain",
+            text: "Ask about this workspace, or ask for a change.\n\nEnter sends · Ctrl+J adds a line · Ctrl+P recalls\nCtrl+C stops a turn · follow-ups queue up\nOne u undoes an agent edit · :AgentHistory lists them",
+        }];
+    }
+    red::execute("UpdateTextPanel", "agent-conversation", blocks);
+    // Full replacement already contains pending deltas; never append them twice.
+    red::state_patch(AgentState { stream_delta: "", stream_trimmed: false });
+}
+
+/// Appends messages the core has not sent yet. One held behind a running turn
+/// or a paused queue is drawn dimmed; only the first message, sent while a
+/// thread starts, already looks sent, and anything typed after it waits its turn.
+fn with_unsent_prompts(blocks: [AgentTextBlock]) -> [AgentTextBlock] {
+    let held = turn_running() || state().pane.paused;
+    let position = 0;
     for prompt in state().pane.queued {
         let shown = false;
         for block in blocks {
             if block.id == prompt.id { shown = true; }
         }
         if !shown {
+            let kind = "user";
+            if held || position > 0 { kind = "queued"; }
             blocks = red::push(blocks, AgentTextBlock {
-                id: prompt.id, kind: "user", format: "plain", text: prompt.text,
+                id: prompt.id, kind: kind, format: "plain", text: prompt.text,
             });
         }
+        position = position + 1;
     }
-    if red::len(blocks) == 0 {
-        blocks = [AgentTextBlock {
-            id: "empty",
-            kind: "activity",
-            format: "plain",
-            text: "No messages yet.\n\nEnter sends · Ctrl+J adds a line\nEsc enters Normal mode · a edits from the panel\n^C stops a running turn",
-        }];
-    }
-    red::execute("UpdateTextPanel", "agent-conversation", blocks);
-    // Full replacement already contains pending deltas; never append them twice.
-    red::state_patch(AgentState { stream_delta: "", stream_trimmed: false });
+    return blocks;
 }
 
 /// Normalize blocks from live, migrated, and restored state before they reach the panel.
@@ -2487,64 +2539,159 @@ fn legacy_transcript_blocks(transcript: String) -> [AgentTextBlock] {
 )]
 fn history() {
     red::state_patch(AgentState { history_open: true });
+    red::state_patch(AgentState { history_selected: "" });
     red::execute("OpenWorkspace", "agent-history", WorkspaceConfig {
-        title: "Attributed edit history",
-        detail_ratio: 58,
+        title: "Edit history",
+        detail_ratio: 56,
         min_two_pane_width: 88,
+        detail_wrap: false,
     });
     refresh_history();
 }
 
 fn refresh_history() {
     if state().history_open {
-        red::request("EditHistory", render_history);
+        red::request("EditHistory", render_history, "workspace");
     }
+}
+
+fn history_title(entry: AgentHistoryEntry) -> String {
+    let title = entry.file;
+    if entry.origin.kind == "agent" {
+        title = title + " · Agent";
+        if let Some(turn) = entry.turn { title = title + ", turn " + turn; }
+        if let Some(prompt) = entry.prompt {
+            if prompt != "" { title = title + " · “" + prompt + "”"; }
+        }
+    } else if entry.origin.kind == "plugin" {
+        title = title + " · " + red::string(entry.origin.name, "plugin");
+    } else {
+        title = title + " · You";
+    }
+    return title + " · " + entry.age;
+}
+
+fn history_row(entry: AgentHistoryEntry) -> Json {
+    let by_agent = entry.origin.kind == "agent";
+    let glyph = "· ";
+    let who = "you";
+    if by_agent {
+        // The glyph already says "agent"; the turn says which request.
+        glyph = "◆ ";
+        who = "agent";
+        if let Some(turn) = entry.turn { who = "turn " + turn; }
+    } else if entry.origin.kind == "plugin" {
+        who = red::string(entry.origin.name, "plugin");
+    }
+    let change = "";
+    if entry.added > 0 { change = "+" + entry.added; }
+    if entry.removed > 0 {
+        if change != "" { change = change + " "; }
+        change = change + "−" + entry.removed;
+    }
+    let right = [PanelSegment { text: who + " · " + entry.age, style: muted_style() }];
+    if !entry.applied {
+        right = red::push(right, PanelSegment { text: " · undone", style: muted_style() });
+    }
+    let glyph_style = muted_style();
+    if by_agent { glyph_style = heading_style(); }
+    return WorkspaceRow {
+        id: "transaction:" + entry.transaction_id,
+        selectable: true,
+        segments: [
+            PanelSegment { text: glyph, style: glyph_style },
+            PanelSegment { text: entry.file, style: normal_style() },
+            PanelSegment { text: "  " + change, style: muted_style() },
+        ],
+        right_segments: right,
+        data: AgentHistoryRowData {
+            transaction_id: entry.transaction_id,
+            title: history_title(entry),
+            document: entry.document,
+        },
+    };
+}
+
+fn history_empty_detail(text: String) -> [[PanelSegment]] {
+    return [
+        [PanelSegment { text: text, style: muted_style() }],
+        [PanelSegment { text: "", style: muted_style() }],
+        [PanelSegment { text: "Edits by you and the agent in open files appear here, newest first.", style: muted_style() }],
+        [PanelSegment { text: "◆ marks the agent's edits. r reverts the selected edit as a new, undoable change.", style: muted_style() }],
+    ];
 }
 
 fn render_history(result: AgentHistoryResult) {
     let rows = [];
-    let index = 0;
-    while index < red::len(result.entries) && index < 500 {
-        let entry = result.entries[index];
-        let origin = entry.origin.kind;
-        if origin == "agent" {
-            origin = "agent " + entry.origin.session_id + "/" + entry.origin.turn_id;
+    let agent_edits = 0;
+    let shown = 0;
+    let files = [];
+    let selected_found = false;
+    let first_row = red::null();
+    for entry in result.entries {
+        let by_agent = entry.origin.kind == "agent";
+        if by_agent { agent_edits = agent_edits + 1; }
+        if state().history_agent_only && !by_agent { continue; }
+        if !red::contains(files, entry.file) { files = red::push(files, entry.file); }
+        let row = history_row(entry);
+        shown = shown + 1;
+        if first_row == red::null() { first_row = row; }
+        if row.id == state().history_selected {
+            selected_found = true;
+            show_history_detail(row.id, row.data.title, row.data.document);
         }
-        let current_marker = "  ";
-        if entry.current { current_marker = "* "; }
-        rows = red::push(rows, WorkspaceRow {
-            id: "transaction:" + entry.transaction_id,
-            selectable: true,
-            segments: [
-                PanelSegment { text: current_marker, style: heading_style() },
-                PanelSegment { text: entry.label, style: normal_style() },
-            ],
-            right_segments: [PanelSegment { text: origin, style: muted_style() }],
-            data: AgentHistoryRowData { transaction_id: entry.transaction_id, edits: entry.edits },
-        });
-        index = index + 1;
+        rows = red::push(rows, row);
     }
-    if index < red::len(result.entries) {
+    if !selected_found {
+        if first_row == red::null() {
+            red::state_patch(AgentState { history_document: red::null() });
+            red::state_patch(AgentState { history_detail_title: "" });
+            let empty = "No edits yet";
+            if state().history_agent_only { empty = "No agent edits yet"; }
+            red::state_patch(AgentState { history_detail: history_empty_detail(empty) });
+        } else {
+            show_history_detail(first_row.id, first_row.data.title, first_row.data.document);
+        }
+    }
+    let total = red::len(result.entries);
+    if let Some(value) = result.total { total = value; }
+    if total > red::len(result.entries) {
         rows = red::push(rows, WorkspaceRow {
             id: "history-truncated",
             selectable: false,
-            segments: [PanelSegment { text: "… history limited to 500 entries", style: muted_style() }],
+            segments: [PanelSegment { text: "… older edits not shown; the history lists the newest " + red::len(result.entries) + " of " + total, style: muted_style() }],
         });
     }
-    if red::len(rows) == 0 {
-        rows = red::push(rows, WorkspaceRow {
-            id: "empty",
-            selectable: false,
-            segments: [PanelSegment { text: "No edit transactions", style: muted_style() }],
-        });
-    }
+    // Count edits, not the informational rows added after them.
+    let summary = shown + " edits";
+    if shown == 1 { summary = "1 edit"; }
+    if red::len(files) == 1 { summary = summary + " in 1 file"; }
+    if red::len(files) > 1 { summary = summary + " across " + red::len(files) + " files"; }
+    if !state().history_agent_only { summary = summary + " · " + agent_edits + " by the agent"; }
+    let filter_label = "agent edits only";
+    if state().history_agent_only { filter_label = "all edits"; }
     red::execute("UpdateWorkspace", "agent-history", WorkspaceModel {
+        header: [PanelSegment { text: summary, style: muted_style() }],
         rows: rows,
         detail: state().history_detail,
-        actions: [AgentWorkspaceAction {
-            hint: AgentWorkspaceActionHint { id: "r", key: "r", label: "safe revert", priority: "essential" },
-        }],
+        detail_document: state().history_document,
+        detail_title: state().history_detail_title,
+        actions: [
+            AgentWorkspaceAction {
+                hint: AgentWorkspaceActionHint { id: "r", key: "r", label: "revert edit", priority: "essential" },
+            },
+            AgentWorkspaceAction {
+                hint: AgentWorkspaceActionHint { id: "a", key: "a", label: filter_label, priority: "essential" },
+            },
+        ],
     });
+}
+
+fn show_history_detail(id: String, title: String, document: Json) {
+    red::state_patch(AgentState { history_selected: id });
+    red::state_patch(AgentState { history_detail_title: title });
+    red::state_patch(AgentState { history_document: document });
+    red::state_patch(AgentState { history_detail: [] });
 }
 
 #[red::on("workspace:event:agent-history")]
@@ -2554,8 +2701,13 @@ fn history_event(event: AgentHistoryEvent) {
         red::execute("CloseWorkspace", "agent-history");
         return;
     }
+    if event.action == "a" {
+        red::state_patch(AgentState { history_agent_only: !state().history_agent_only });
+        refresh_history();
+        return;
+    }
     let row = event.row;
-    if row == red::null() || row.data.transaction_id == red::null() {
+    if row == red::null() || row.data == red::null() || row.data.transaction_id == red::null() {
         return;
     }
     if event.action == "r" {
@@ -2563,13 +2715,10 @@ fn history_event(event: AgentHistoryEvent) {
         refresh_history();
         return;
     }
-    if event.action == "up" || event.action == "down" || event.action == "page_up" || event.action == "page_down" {
-        let detail = [];
-        for edit in row.data.edits {
-            detail = red::push(detail, [PanelSegment { text: "- " + edit.old_text, style: warning_style() }]);
-            detail = red::push(detail, [PanelSegment { text: "+ " + edit.new_text, style: success_style() }]);
-        }
-        red::state_patch(AgentState { history_detail: detail });
+    // Any way of moving the selection (keys, mouse, scrolling, filtering) must
+    // show that row's diff, so `r` always reverts the edit on screen.
+    if row.id != state().history_selected {
+        show_history_detail(row.id, row.data.title, row.data.document);
         refresh_history();
     }
 }

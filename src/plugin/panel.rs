@@ -172,17 +172,41 @@ fn default_composer_rows() -> usize {
     3
 }
 
-fn effective_panel_width(config: &PanelConfig, terminal_width: usize) -> usize {
+/// Narrowest docked conversation pane that still reads comfortably.
+pub const MIN_READABLE_PANE_WIDTH: usize = 32;
+/// Editor columns a docked conversation pane leaves free. When a terminal is too
+/// narrow for both, the pane stops docking and covers the editor while focused.
+pub const MIN_COMFORTABLE_EDITOR_WIDTH: usize = 40;
+/// Largest share of the terminal a conversation pane takes at its default width.
+const MAX_DEFAULT_PANE_PERCENT: usize = 45;
+
+/// Preferred docked width of a side panel. Conversation panes (side panels
+/// with a composer) are responsive: at their plugin-declared width they take at
+/// most 45% of the terminal, and a user-chosen width still leaves the editor
+/// [`MIN_COMFORTABLE_EDITOR_WIDTH`] columns. No width or limit goes below
+/// [`MIN_READABLE_PANE_WIDTH`]; [`PanelManager::side_panel_widths`] decides
+/// which panes fit together and makes the rest compact.
+///
+/// `user_sized` means the width was chosen by the user (dragged, resized or
+/// restored) rather than declared by the plugin.
+fn effective_panel_width(config: &PanelConfig, user_sized: bool, terminal_width: usize) -> usize {
     if matches!(config.side, PanelSide::Top | PanelSide::Bottom) {
         return terminal_width;
     }
+    if config.composer.is_none() {
+        return config.width.min(terminal_width);
+    }
 
-    let max_width = if config.composer.is_some() {
-        terminal_width.saturating_sub(11).max(1)
+    let responsive_limit = if user_sized {
+        terminal_width.saturating_sub(MIN_COMFORTABLE_EDITOR_WIDTH + 1)
     } else {
-        terminal_width
+        terminal_width.saturating_mul(MAX_DEFAULT_PANE_PERCENT) / 100
     };
-    config.width.min(max_width)
+    config
+        .width
+        .max(MIN_READABLE_PANE_WIDTH)
+        .min(responsive_limit.max(MIN_READABLE_PANE_WIDTH))
+        .min(terminal_width.saturating_sub(11).max(1))
 }
 
 fn effective_panel_height(config: &PanelConfig, available_height: usize) -> usize {
@@ -330,6 +354,8 @@ pub struct PanelEvent {
 #[serde(rename_all = "snake_case")]
 pub enum TextPanelBlockKind {
     User,
+    /// A user message that is waiting to be sent, drawn as a dimmed prompt card.
+    Queued,
     Agent,
     Error,
     /// Muted tool/progress timeline emitted while an agent turn runs.
@@ -532,6 +558,8 @@ fn text_panel_header_rows(config: &PanelConfig) -> usize {
 pub struct TextPanel {
     pub id: String,
     pub config: PanelConfig,
+    /// The user chose this panel's width, so responsive sizing respects it.
+    user_sized: bool,
     pub blocks: Vec<TextPanelBlock>,
     block_styles: Vec<Vec<StyleInfo>>,
     pub scroll: usize,
@@ -859,6 +887,8 @@ struct TextPanelRendered {
 struct TextPanelPromptCard {
     block_index: usize,
     rows: Range<usize>,
+    /// The message has not been sent yet.
+    queued: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1030,6 +1060,7 @@ impl TextPanel {
         Self {
             id,
             config,
+            user_sized: false,
             blocks: Vec::new(),
             block_styles: Vec::new(),
             scroll: 0,
@@ -1361,21 +1392,36 @@ impl TextPanel {
         let mut searchable_rows = Vec::new();
         for (block_index, block) in self.blocks.iter().enumerate() {
             let block_start = lines.len();
-            if block.kind == TextPanelBlockKind::User {
+            if matches!(
+                block.kind,
+                TextPanelBlockKind::User | TextPanelBlockKind::Queued
+            ) {
                 let start = lines.len();
                 let framed = width >= 7;
+                let queued = block.kind == TextPanelBlockKind::Queued;
                 lines.push(RenderedTextLine::chrome(
                     "▄".repeat(width),
                     TextPanelSpanStyle::User,
                 ));
+                let label = match (framed, queued) {
+                    (true, true) => "  You · queued",
+                    (false, true) => "queued",
+                    (true, false) => "  You",
+                    (false, false) => "You",
+                };
                 lines.push(RenderedTextLine::chrome(
-                    if framed { "  You" } else { "You" }.to_string(),
+                    label.to_string(),
                     TextPanelSpanStyle::User,
                 ));
                 let content_width = width.saturating_sub(if framed { 4 } else { 0 }).max(1);
+                let text_style = if queued {
+                    TextPanelSpanStyle::Muted
+                } else {
+                    TextPanelSpanStyle::Text
+                };
                 let mut block_lines = match &block.format {
                     TextPanelBlockFormat::Plain => {
-                        wrap_plain_text(&block.text, content_width, TextPanelSpanStyle::Text)
+                        wrap_plain_text(&block.text, content_width, text_style)
                     }
                     TextPanelBlockFormat::Markdown => {
                         render_markdown_lines(&block.text, content_width)
@@ -1394,6 +1440,16 @@ impl TextPanel {
                         TextPanelSpanStyle::Text,
                     ));
                 }
+                if queued {
+                    // Dim every format alike, including markdown and code.
+                    for span in block_lines
+                        .iter_mut()
+                        .flat_map(|line| line.spans.iter_mut())
+                    {
+                        span.style = TextPanelSpanStyle::Muted;
+                        span.syntax_style = None;
+                    }
+                }
                 namespace_block_links(&mut block_lines, block_index);
                 lines.extend(block_lines.into_iter().map(|line| {
                     if framed {
@@ -1409,6 +1465,7 @@ impl TextPanel {
                 prompt_cards.push(TextPanelPromptCard {
                     block_index,
                     rows: start..lines.len(),
+                    queued,
                 });
             } else {
                 if let Some((label, style)) = block_label(&block.kind) {
@@ -1859,15 +1916,24 @@ impl TextPanel {
     fn selected_prompt(&self, layout: &TextPanelLayout) -> Option<usize> {
         if self.scrollback.focused && self.scrollback.initialized {
             if let Some((row, _, _)) = layout.position(self.scrollback.cursor) {
+                // A queued card has no turn yet; its turn actions belong to
+                // the sent prompt above it.
                 return layout
                     .prompt_cards
                     .iter()
                     .rev()
-                    .find(|card| card.rows.start <= row)
+                    .find(|card| !card.queued && card.rows.start <= row)
                     .map(|card| card.block_index);
             }
         }
-        layout.prompt_cards.last().map(|card| card.block_index)
+        // A queued message is not the turn being answered; keep the accent on
+        // the newest sent prompt.
+        layout
+            .prompt_cards
+            .iter()
+            .rev()
+            .find(|card| !card.queued)
+            .map(|card| card.block_index)
     }
 
     fn jump_to_prompt(
@@ -2768,13 +2834,6 @@ impl PanelPresentation {
         }
     }
 
-    fn width(&self, id: &str, config: &PanelConfig, terminal_width: usize) -> usize {
-        match self {
-            Self::Zoomed { id: target, size } if target == id => size.0,
-            _ => effective_panel_width(config, terminal_width),
-        }
-    }
-
     fn height(&self, id: &str, config: &PanelConfig, available_height: usize) -> usize {
         match self {
             Self::Zoomed { id: target, size } if target == id => size.1,
@@ -2822,11 +2881,21 @@ impl PanelManager {
             .zoom_size()
             .or_else(|| self.presentation.zoom_size())
         {
+            let widths = self
+                .text_panels
+                .keys()
+                .map(|id| {
+                    (
+                        id.clone(),
+                        (
+                            self.text_panel_width_in(&self.presentation, id, terminal_width),
+                            self.text_panel_width_in(&presentation, id, terminal_width),
+                        ),
+                    )
+                })
+                .collect::<HashMap<_, _>>();
             for panel in self.text_panels.values_mut() {
-                let old_width = self
-                    .presentation
-                    .width(&panel.id, &panel.config, terminal_width);
-                let width = presentation.width(&panel.id, &panel.config, terminal_width);
+                let (old_width, width) = widths[&panel.id];
                 let old_height = self
                     .presentation
                     .height(&panel.id, &panel.config, content_height);
@@ -2893,9 +2962,7 @@ impl PanelManager {
                 }
 
                 let panel = self.text_panels.get(&id)?;
-                let width = self
-                    .presentation
-                    .width(&panel.id, &panel.config, terminal_width);
+                let width = self.text_panel_width(&panel.id, terminal_width);
                 let layout = panel.layout(width);
                 let scroll_anchor = (!panel.follow_tail).then(|| {
                     (panel.scroll..layout.lines.len())
@@ -3055,12 +3122,10 @@ impl PanelManager {
                 let Some(saved) = snapshot.text else {
                     return false;
                 };
+                let width = self.text_panel_width(id, terminal_width);
                 let Some(panel) = self.text_panels.get_mut(id) else {
                     return false;
                 };
-                let width = self
-                    .presentation
-                    .width(&panel.id, &panel.config, terminal_width);
                 let panel_height = self
                     .presentation
                     .height(&panel.id, &panel.config, panel_height);
@@ -3174,10 +3239,8 @@ impl PanelManager {
         panel_height: usize,
         terminal_width: usize,
     ) {
+        let width = self.text_panel_width(id, terminal_width);
         if let Some(panel) = self.text_panels.get_mut(id) {
-            let width = self
-                .presentation
-                .width(&panel.id, &panel.config, terminal_width);
             let panel_height = self
                 .presentation
                 .height(&panel.id, &panel.config, panel_height);
@@ -3193,10 +3256,8 @@ impl PanelManager {
         panel_height: usize,
         terminal_width: usize,
     ) {
+        let width = self.text_panel_width(id, terminal_width);
         if let Some(panel) = self.text_panels.get_mut(id) {
-            let width = self
-                .presentation
-                .width(&panel.id, &panel.config, terminal_width);
             let panel_height = self
                 .presentation
                 .height(&panel.id, &panel.config, panel_height);
@@ -3218,10 +3279,8 @@ impl PanelManager {
         panel_height: usize,
         terminal_width: usize,
     ) {
+        let width = self.text_panel_width(id, terminal_width);
         if let Some(panel) = self.text_panels.get_mut(id) {
-            let width = self
-                .presentation
-                .width(&panel.id, &panel.config, terminal_width);
             let panel_height = self
                 .presentation
                 .height(&panel.id, &panel.config, panel_height);
@@ -3238,10 +3297,8 @@ impl PanelManager {
         panel_height: usize,
         terminal_width: usize,
     ) {
+        let width = self.text_panel_width(id, terminal_width);
         if let Some(panel) = self.text_panels.get_mut(id) {
-            let width = self
-                .presentation
-                .width(&panel.id, &panel.config, terminal_width);
             let panel_height = self
                 .presentation
                 .height(&panel.id, &panel.config, panel_height);
@@ -3422,8 +3479,22 @@ impl PanelManager {
 
         if changed {
             self.remember_panel_size(id, side, width);
+            self.mark_user_sized(id);
         }
         changed
+    }
+
+    fn mark_user_sized(&mut self, id: &str) {
+        let default = self.default_layouts.get(id).copied();
+        if let Some(panel) = self.text_panels.get_mut(id) {
+            panel.user_sized = default != Some((panel.config.side, panel.config.width));
+        }
+    }
+
+    fn is_user_sized(&self, id: &str) -> bool {
+        self.text_panels
+            .get(id)
+            .is_some_and(|panel| panel.user_sized)
     }
 
     /// Applies a persisted layout, including preferences for both docking axes.
@@ -3447,6 +3518,7 @@ impl PanelManager {
         if let Some(horizontal_size) = horizontal_size {
             self.remember_panel_size(id, PanelSide::Top, horizontal_size);
         }
+        self.mark_user_sized(id);
         changed
     }
 
@@ -3500,6 +3572,7 @@ impl PanelManager {
         }
         self.preferred_sizes.remove(id);
         self.remember_panel_size(id, side, size);
+        self.mark_user_sized(id);
         changed
     }
 
@@ -3549,10 +3622,8 @@ impl PanelManager {
             && (self.panels.contains_key(id) || self.text_panels.contains_key(id))
         {
             self.focused = Some(id.to_string());
+            let width = self.text_panel_width(id, usize::MAX);
             if let Some(panel) = self.text_panels.get_mut(id) {
-                let width = self
-                    .presentation
-                    .width(&panel.id, &panel.config, usize::MAX);
                 panel.focus_scrollback(width);
             }
             true
@@ -3569,10 +3640,8 @@ impl PanelManager {
         }
 
         self.focused = Some(id.to_string());
+        let width = self.text_panel_width(id, usize::MAX);
         if let Some(panel) = self.text_panels.get_mut(id) {
-            let width = self
-                .presentation
-                .width(&panel.id, &panel.config, usize::MAX);
             panel.restore_focused_region(width);
         }
         true
@@ -3788,22 +3857,107 @@ impl PanelManager {
         self.panels.get(id).map(|panel| panel.selected)
     }
 
-    pub fn reserved_left_width(&self) -> usize {
-        self.z_order
-            .iter()
-            .filter_map(|id| self.panel_config(id))
-            .filter(|config| config.side == PanelSide::Left)
-            .map(|config| config.width.saturating_add(1))
+    /// Columns docked panes take from the left of the editor at this terminal width.
+    pub fn reserved_left_width(&self, terminal_width: usize) -> usize {
+        self.reserved_side_width(PanelSide::Left, terminal_width)
+    }
+
+    /// Columns docked panes take from the right of the editor at this terminal width.
+    pub fn reserved_right_width(&self, terminal_width: usize) -> usize {
+        self.reserved_side_width(PanelSide::Right, terminal_width)
+    }
+
+    fn reserved_side_width(&self, side: PanelSide, terminal_width: usize) -> usize {
+        self.side_panel_widths(terminal_width)
+            .into_iter()
+            .filter(|(_, panel_side, _)| *panel_side == side)
+            .filter_map(|(_, _, width)| width)
+            .map(|width| width.saturating_add(1))
             .sum()
     }
 
-    pub fn reserved_right_width(&self) -> usize {
-        self.z_order
+    /// Docked widths of the visible left and right panels, in z-order. Fixed
+    /// panels keep their width; conversation panes then dock in order while
+    /// each still gets [`MIN_READABLE_PANE_WIDTH`] columns and the editor keeps
+    /// [`MIN_COMFORTABLE_EDITOR_WIDTH`]. A pane that does not fit is compact
+    /// (`None`): it reserves nothing and covers the editor while focused. The
+    /// editor's reservation, the placements, and text layout all use this one
+    /// allocation, so they always agree.
+    fn side_panel_widths(&self, terminal_width: usize) -> Vec<(String, PanelSide, Option<usize>)> {
+        let side_panels = self
+            .z_order
             .iter()
-            .filter_map(|id| self.panel_config(id))
-            .filter(|config| config.side == PanelSide::Right)
-            .map(|config| config.width.saturating_add(1))
-            .sum()
+            .filter_map(|id| Some((id, self.panel_config(id)?)))
+            .filter(|(_, config)| matches!(config.side, PanelSide::Left | PanelSide::Right))
+            .collect::<Vec<_>>();
+        let fixed: usize = side_panels
+            .iter()
+            .filter(|(_, config)| config.composer.is_none())
+            .map(|(_, config)| effective_panel_width(config, false, terminal_width) + 1)
+            .sum();
+        let mut room = terminal_width.saturating_sub(fixed);
+        side_panels
+            .into_iter()
+            .map(|(id, config)| {
+                let width = if config.composer.is_none() {
+                    Some(effective_panel_width(config, false, terminal_width))
+                } else {
+                    let preferred =
+                        effective_panel_width(config, self.is_user_sized(id), terminal_width);
+                    let width =
+                        preferred.min(room.saturating_sub(MIN_COMFORTABLE_EDITOR_WIDTH + 1));
+                    (width >= MIN_READABLE_PANE_WIDTH).then(|| {
+                        room = room.saturating_sub(width + 1);
+                        width
+                    })
+                };
+                (id.clone(), config.side, width)
+            })
+            .collect()
+    }
+
+    /// Whether a visible conversation pane is too cramped to dock beside the
+    /// editor and the panes docked before it.
+    pub(crate) fn is_compact_panel(&self, id: &str, terminal_width: usize) -> bool {
+        self.side_panel_widths(terminal_width)
+            .into_iter()
+            .any(|(panel, _, width)| panel == id && width.is_none())
+    }
+
+    /// Layout width of a text panel at this terminal width: the zoomed size, its
+    /// docked width, or the full terminal for a compact pane (the width it has
+    /// whenever it is on screen).
+    pub(crate) fn text_panel_width(&self, id: &str, terminal_width: usize) -> usize {
+        self.text_panel_width_in(&self.presentation, id, terminal_width)
+    }
+
+    fn text_panel_width_in(
+        &self,
+        presentation: &PanelPresentation,
+        id: &str,
+        terminal_width: usize,
+    ) -> usize {
+        if let PanelPresentation::Zoomed { id: target, size } = presentation {
+            if target == id {
+                return size.0;
+            }
+        }
+        if let Some((_, _, width)) = self
+            .side_panel_widths(terminal_width)
+            .into_iter()
+            .find(|(panel, _, _)| panel == id)
+        {
+            return width.unwrap_or(terminal_width);
+        }
+        self.panel_config(id).map_or(terminal_width, |config| {
+            effective_panel_width(config, self.is_user_sized(id), terminal_width)
+        })
+    }
+
+    /// Whether a panel offers a composer, which makes its docked width responsive.
+    pub(crate) fn panel_has_composer(&self, id: &str) -> bool {
+        self.panel_config(id)
+            .is_some_and(|config| config.composer.is_some())
     }
 
     /// Returns the rows reserved by visible panes above the editor.
@@ -3849,10 +4003,8 @@ impl PanelManager {
         scrolloff: usize,
     ) -> Option<PanelEvent> {
         let focused = self.focused.clone()?;
+        let width = self.text_panel_width(&focused, terminal_width);
         if let Some(panel) = self.text_panels.get_mut(&focused) {
-            let width = self
-                .presentation
-                .width(&panel.id, &panel.config, terminal_width);
             let panel_height = self
                 .presentation
                 .height(&panel.id, &panel.config, panel_height);
@@ -3917,13 +4069,12 @@ impl PanelManager {
         count: usize,
     ) -> Option<TextPanelScrollbackInput> {
         let focused = self.focused.clone()?;
+        let compact = self.is_compact_panel(&focused, terminal_width);
+        let width = self.text_panel_width(&focused, terminal_width);
         let panel = self.text_panels.get_mut(&focused)?;
         if !panel.scrollback.focused {
             return None;
         }
-        let width = self
-            .presentation
-            .width(&panel.id, &panel.config, terminal_width);
         let panel_height = self
             .presentation
             .height(&panel.id, &panel.config, panel_height);
@@ -3983,7 +4134,9 @@ impl PanelManager {
                 .composer
                 .as_ref()
                 .is_some_and(|composer| composer.enabled);
-            if composer_enabled {
+            // A compact pane covers the editor, so Esc from the transcript steps
+            // back out to it instead of cycling to the composer.
+            if composer_enabled && !compact {
                 panel.blur_scrollback();
                 if let Some(composer) = panel.composer.as_mut() {
                     composer.focused = true;
@@ -4177,10 +4330,8 @@ impl PanelManager {
         scrolloff: usize,
     ) -> Option<PanelEvent> {
         let action = if delta < 0 { "up" } else { "down" };
+        let width = self.text_panel_width(id, terminal_width);
         if let Some(panel) = self.text_panels.get_mut(id) {
-            let width = self
-                .presentation
-                .width(&panel.id, &panel.config, terminal_width);
             let panel_height = self
                 .presentation
                 .height(&panel.id, &panel.config, panel_height);
@@ -4233,7 +4384,7 @@ impl PanelManager {
             .as_ref()
             .is_some_and(|composer| composer.enabled && !composer.focused)
         {
-            self.focus_text_panel_composer(&focused)
+            self.focus_composer(&focused, /*insert*/ false)
         } else {
             self.focus_focused_text_scrollback(terminal_width)
         }
@@ -4243,12 +4394,10 @@ impl PanelManager {
         let Some(focused) = self.focused.clone() else {
             return false;
         };
+        let width = self.text_panel_width(&focused, terminal_width);
         let Some(panel) = self.text_panels.get_mut(&focused) else {
             return false;
         };
-        let width = self
-            .presentation
-            .width(&panel.id, &panel.config, terminal_width);
         panel.focus_scrollback(width);
         true
     }
@@ -4258,9 +4407,7 @@ impl PanelManager {
         terminal_width: usize,
     ) -> Option<TextPanelLinkTarget> {
         let panel = self.text_panels.get(self.focused.as_deref()?)?;
-        let width = self
-            .presentation
-            .width(&panel.id, &panel.config, terminal_width);
+        let width = self.text_panel_width(&panel.id, terminal_width);
         if panel.scrollback.focused {
             panel.layout(width).link_at(panel.scrollback.cursor)
         } else {
@@ -4381,9 +4528,7 @@ impl PanelManager {
         if all {
             Some(panel.copy_all())
         } else {
-            let width = self
-                .presentation
-                .width(&panel.id, &panel.config, terminal_width);
+            let width = self.text_panel_width(&panel.id, terminal_width);
             match panel.selected_prompt(&panel.layout(width)) {
                 Some(index) => panel.turn_text(&panel.blocks[index].id, TextPanelTurnPart::Answer),
                 None => panel.copy_last_agent(),
@@ -4393,9 +4538,7 @@ impl PanelManager {
 
     pub(crate) fn selected_text_turn(&self, terminal_width: usize) -> Option<TextPanelTurnTarget> {
         let panel = self.text_panels.get(self.focused.as_deref()?)?;
-        let width = self
-            .presentation
-            .width(&panel.id, &panel.config, terminal_width);
+        let width = self.text_panel_width(&panel.id, terminal_width);
         let index = panel.selected_prompt(&panel.layout(width))?;
         let prompt = &panel.blocks[index];
         Some(TextPanelTurnTarget {
@@ -4485,7 +4628,14 @@ impl PanelManager {
         Ok(TextPanelReuseOutcome::Loaded)
     }
 
+    /// Focuses a composer for typing, always in Insert mode.
     pub fn focus_text_panel_composer(&mut self, id: &str) -> bool {
+        self.focus_composer(id, /*insert*/ true)
+    }
+
+    /// Moves focus to a composer. `insert` is for explicit "let me type" requests
+    /// such as Space A; switching regions keeps the composer's own mode.
+    fn focus_composer(&mut self, id: &str, insert: bool) -> bool {
         if !self.z_order.iter().any(|panel_id| panel_id == id) {
             return false;
         }
@@ -4498,8 +4648,12 @@ impl PanelManager {
         if !composer.enabled {
             return false;
         }
+        if insert {
+            composer.prompt.set_mode(crate::editor::Mode::Insert);
+        }
         composer.focused = true;
         panel.blur_scrollback();
+        panel.last_focused_region = TextPanelFocusRegion::Composer;
         self.focused = Some(id.to_string());
         true
     }
@@ -4592,10 +4746,8 @@ impl PanelManager {
         terminal_width: usize,
     ) -> Option<PanelEvent> {
         let focused = self.focused.clone()?;
+        let panel_width = self.text_panel_width(&focused, terminal_width);
         let panel = self.text_panels.get_mut(&focused)?;
-        let panel_width = self
-            .presentation
-            .width(&panel.id, &panel.config, terminal_width);
         let composer = panel.composer.as_mut()?;
         if !composer.focused || !composer.enabled {
             return None;
@@ -5135,21 +5287,32 @@ impl PanelManager {
         let mut top_y = 0usize;
         let mut bottom_y = content_height;
 
+        let side_widths = self
+            .side_panel_widths(terminal_width)
+            .into_iter()
+            .map(|(id, _, width)| (id, width))
+            .collect::<HashMap<_, _>>();
         for id in &self.z_order {
             let Some(config) = self.panel_config(id) else {
                 continue;
             };
+            let side_width = side_widths.get(id).copied().flatten();
+            if side_widths.contains_key(id) && side_width.is_none() {
+                continue;
+            }
 
             let (x, y, width, height) = match config.side {
                 PanelSide::Left => {
-                    let width = effective_panel_width(config, terminal_width)
+                    let width = side_width
+                        .unwrap_or_default()
                         .min(right_x.saturating_sub(left_x));
                     let x = left_x;
                     left_x = left_x.saturating_add(width.saturating_add(1));
                     (x, reserved_top, width, side_height)
                 }
                 PanelSide::Right => {
-                    let width = effective_panel_width(config, terminal_width)
+                    let width = side_width
+                        .unwrap_or_default()
                         .min(right_x.saturating_sub(left_x));
                     right_x = right_x.saturating_sub(width);
                     let x = right_x;
@@ -6575,7 +6738,7 @@ fn render_panel_separator(
 fn block_label(kind: &TextPanelBlockKind) -> Option<(&'static str, TextPanelSpanStyle)> {
     match kind {
         // User blocks render their own prompt card and label.
-        TextPanelBlockKind::User => None,
+        TextPanelBlockKind::User | TextPanelBlockKind::Queued => None,
         TextPanelBlockKind::Agent => None,
         TextPanelBlockKind::Error => Some(("⚠ Error", TextPanelSpanStyle::Error)),
         TextPanelBlockKind::Activity | TextPanelBlockKind::Action | TextPanelBlockKind::Text => {
@@ -6586,7 +6749,7 @@ fn block_label(kind: &TextPanelBlockKind) -> Option<(&'static str, TextPanelSpan
 
 fn block_style(kind: &TextPanelBlockKind) -> TextPanelSpanStyle {
     match kind {
-        TextPanelBlockKind::User => TextPanelSpanStyle::User,
+        TextPanelBlockKind::User | TextPanelBlockKind::Queued => TextPanelSpanStyle::User,
         TextPanelBlockKind::Agent => TextPanelSpanStyle::Agent,
         TextPanelBlockKind::Error => TextPanelSpanStyle::Error,
         TextPanelBlockKind::Activity | TextPanelBlockKind::Action => TextPanelSpanStyle::Muted,
@@ -6964,7 +7127,7 @@ mod tests {
                 );
                 assert!(manager.panel_divider_at_position(12, 4, 80, 24).is_none());
                 let config = manager.panel_config("target").unwrap();
-                assert_eq!(manager.presentation.width("target", config, 80), 80);
+                assert_eq!(manager.text_panel_width("target", 80), 80);
                 assert_eq!(manager.presentation.height("target", config, 22), 22);
                 assert_eq!(manager.snapshot(80), before);
                 manager.set_presentation(PanelPresentation::Hidden);
@@ -7102,7 +7265,7 @@ mod tests {
             },
         );
 
-        assert_eq!(manager.reserved_left_width(), 25);
+        assert_eq!(manager.reserved_left_width(200), 25);
     }
 
     #[test]
@@ -7121,7 +7284,7 @@ mod tests {
             },
         );
 
-        assert_eq!(manager.reserved_right_width(), 25);
+        assert_eq!(manager.reserved_right_width(200), 25);
     }
 
     #[test]
@@ -7235,8 +7398,8 @@ mod tests {
 
         assert_eq!(manager.reserved_top_height(), 5);
         assert_eq!(manager.reserved_bottom_height(), 5);
-        assert_eq!(manager.reserved_left_width(), 13);
-        assert_eq!(manager.reserved_right_width(), 13);
+        assert_eq!(manager.reserved_left_width(200), 13);
+        assert_eq!(manager.reserved_right_width(200), 13);
         assert_eq!(
             manager.panel_placements(/*terminal_width*/ 80, /*terminal_height*/ 24),
             vec![
@@ -7671,7 +7834,7 @@ mod tests {
             );
         }
 
-        assert_eq!(manager.reserved_right_width(), 10);
+        assert_eq!(manager.reserved_right_width(200), 10);
         assert_eq!(manager.panel_at_position(16, 0, 20, 5).unwrap().id, "outer");
         assert!(manager.panel_at_position(15, 0, 20, 5).is_none());
         assert_eq!(manager.panel_at_position(11, 0, 20, 5).unwrap().id, "inner");
@@ -7915,6 +8078,295 @@ mod tests {
         let restored = manager.text_panels["agent"].composer.as_ref().unwrap();
         assert_eq!(restored.prompt.text(), "draft");
         assert!(manager.focused_text_panel_cursor_position(80, 20).is_some());
+    }
+
+    #[test]
+    fn conversation_panes_size_responsively_and_go_compact_when_cramped() {
+        let mut manager = PanelManager::default();
+        let conversation = PanelConfig {
+            side: PanelSide::Right,
+            width: 62,
+            composer: Some(TextPanelComposerConfig {
+                placeholder: "Ask".to_string(),
+                rows: 3,
+            }),
+            ..PanelConfig::default()
+        };
+        manager.create_text_panel("agent".to_string(), conversation);
+        let docked_width = |manager: &PanelManager, terminal: usize| {
+            manager
+                .panel_placements(terminal, 40)
+                .into_iter()
+                .find(|placement| placement.id == "agent")
+                .map(|placement| placement.width)
+        };
+
+        // The plugin's width wins on wide terminals, then 45% of the terminal,
+        // then the readable minimum, and below that the pane stops docking.
+        for (terminal, width) in [(180, 62), (120, 54), (100, 45), (80, 36), (73, 32)] {
+            assert!(!manager.is_compact_panel("agent", terminal), "{terminal}");
+            assert_eq!(docked_width(&manager, terminal), Some(width), "{terminal}");
+            assert_eq!(
+                manager.reserved_right_width(terminal),
+                width + 1,
+                "{terminal}"
+            );
+            assert!(terminal - width > MIN_COMFORTABLE_EDITOR_WIDTH);
+        }
+        for terminal in [72, 60, 40] {
+            assert!(manager.is_compact_panel("agent", terminal), "{terminal}");
+            assert_eq!(docked_width(&manager, terminal), None);
+            assert_eq!(manager.reserved_right_width(terminal), 0);
+        }
+
+        // A width the user chose is kept while the editor keeps 40 columns.
+        assert!(manager.update_panel_layout("agent", PanelSide::Right, 70));
+        assert_eq!(docked_width(&manager, 180), Some(70));
+        assert_eq!(docked_width(&manager, 100), Some(59));
+        assert!(manager.reset_panel_layout("agent"));
+        assert_eq!(docked_width(&manager, 100), Some(45));
+
+        // Panels without a composer keep their declared width.
+        manager.create_panel(
+            "tree".to_string(),
+            PanelConfig {
+                side: PanelSide::Left,
+                width: 30,
+                ..PanelConfig::default()
+            },
+        );
+        assert_eq!(manager.reserved_left_width(80), 31);
+        // The tree leaves too little room for both, so the conversation compacts.
+        assert!(manager.is_compact_panel("agent", 100));
+        assert!(!manager.is_compact_panel("agent", 120));
+    }
+
+    #[test]
+    fn conversation_panes_never_dock_below_the_readable_minimum() {
+        let mut manager = PanelManager::default();
+        manager.create_text_panel(
+            "agent".to_string(),
+            PanelConfig {
+                side: PanelSide::Right,
+                width: 62,
+                composer: Some(TextPanelComposerConfig {
+                    placeholder: "Ask".to_string(),
+                    rows: 3,
+                }),
+                ..PanelConfig::default()
+            },
+        );
+        // A user shrinking the pane below 32 columns still gets a readable pane.
+        assert!(manager.update_panel_layout("agent", PanelSide::Right, 12));
+        assert_eq!(
+            manager.text_panel_width("agent", 180),
+            MIN_READABLE_PANE_WIDTH
+        );
+        assert_eq!(
+            manager.reserved_right_width(180),
+            MIN_READABLE_PANE_WIDTH + 1
+        );
+        assert!(!manager.is_compact_panel("agent", 180));
+    }
+
+    #[test]
+    fn several_conversation_panes_share_the_room_beside_the_editor() {
+        let mut manager = PanelManager::default();
+        for (id, side) in [
+            ("left-chat", PanelSide::Left),
+            ("right-chat", PanelSide::Right),
+        ] {
+            manager.create_text_panel(
+                id.to_string(),
+                PanelConfig {
+                    side,
+                    width: 62,
+                    composer: Some(TextPanelComposerConfig {
+                        placeholder: "Ask".to_string(),
+                        rows: 3,
+                    }),
+                    ..PanelConfig::default()
+                },
+            );
+        }
+        let docked = |manager: &PanelManager, terminal: usize| {
+            manager
+                .panel_placements(terminal, 30)
+                .into_iter()
+                .map(|placement| placement.width + 1)
+                .sum::<usize>()
+        };
+        for terminal in [200, 180, 140, 100, 80, 60] {
+            let reserved =
+                manager.reserved_left_width(terminal) + manager.reserved_right_width(terminal);
+            // Placements and the editor's reservation always agree, and the
+            // editor keeps its 40 columns whenever anything is docked.
+            assert_eq!(docked(&manager, terminal), reserved, "{terminal}");
+            if reserved > 0 {
+                assert!(
+                    terminal - reserved >= MIN_COMFORTABLE_EDITOR_WIDTH,
+                    "{terminal}"
+                );
+            }
+        }
+        // Both fit on a wide terminal; at 100 columns only the first docks and
+        // the second becomes compact instead of overlapping the editor.
+        assert!(!manager.is_compact_panel("right-chat", 180));
+        assert!(!manager.is_compact_panel("left-chat", 100));
+        assert!(manager.is_compact_panel("right-chat", 100));
+        assert_eq!(manager.text_panel_width("right-chat", 100), 100);
+    }
+
+    #[test]
+    fn queued_cards_are_dimmed_in_every_format() {
+        let mut manager = PanelManager::default();
+        manager.create_text_panel("agent".to_string(), PanelConfig::default());
+        let formats = [
+            TextPanelBlockFormat::Plain,
+            TextPanelBlockFormat::Markdown,
+            TextPanelBlockFormat::Code(Some("rust".to_string())),
+        ];
+        let blocks = formats
+            .iter()
+            .enumerate()
+            .map(|(index, format)| TextPanelBlock {
+                id: format!("held-{index}"),
+                kind: TextPanelBlockKind::Queued,
+                format: format.clone(),
+                text: "**bold** `code` fn main() {}".to_string(),
+            })
+            .collect();
+        manager.update_text_panel("agent", blocks, 20, 120);
+        let rendered = manager.text_panels["agent"].build_rendered_lines(40);
+        let content = rendered
+            .lines
+            .iter()
+            .flat_map(|line| &line.spans)
+            .filter(|span| matches!(span.selection, TextPanelSpanSelection::Content))
+            .filter(|span| !span.text.trim().is_empty())
+            .collect::<Vec<_>>();
+        assert!(!content.is_empty());
+        assert!(
+            content
+                .iter()
+                .all(|span| span.style == TextPanelSpanStyle::Muted && span.syntax_style.is_none()),
+            "{content:#?}"
+        );
+    }
+
+    #[test]
+    fn turn_actions_on_a_queued_card_belong_to_the_sent_prompt_above_it() {
+        let mut manager = PanelManager::default();
+        manager.create_text_panel(
+            "agent".to_string(),
+            PanelConfig {
+                side: PanelSide::Right,
+                width: 40,
+                composer: Some(TextPanelComposerConfig {
+                    placeholder: "Ask".to_string(),
+                    rows: 2,
+                }),
+                ..PanelConfig::default()
+            },
+        );
+        let block = |id: &str, kind, text: &str| TextPanelBlock {
+            id: id.to_string(),
+            kind,
+            format: TextPanelBlockFormat::Plain,
+            text: text.to_string(),
+        };
+        manager.update_text_panel(
+            "agent",
+            vec![
+                block("sent", TextPanelBlockKind::User, "sent prompt"),
+                block("answer", TextPanelBlockKind::Agent, "the answer"),
+                block("held", TextPanelBlockKind::Queued, "held prompt"),
+            ],
+            20,
+            120,
+        );
+        assert!(manager.focus_panel("agent"));
+        assert!(manager.focus_focused_text_scrollback(120));
+        // The transcript cursor sits on the queued card at the bottom.
+        manager.handle_focused_scrollback_input(
+            &Event::Key(crossterm::event::KeyEvent::from(KeyCode::Char('G'))),
+            20,
+            120,
+            1,
+        );
+        let turn = manager.selected_text_turn(120).unwrap();
+        assert_eq!(turn.prompt_id, "sent");
+        assert!(turn.has_answer);
+    }
+
+    #[test]
+    fn escape_from_a_compact_transcript_returns_to_the_editor() {
+        use crossterm::event::KeyEvent;
+
+        let mut manager = PanelManager::default();
+        manager.create_text_panel(
+            "agent".to_string(),
+            PanelConfig {
+                side: PanelSide::Right,
+                width: 62,
+                composer: Some(TextPanelComposerConfig {
+                    placeholder: "Ask".to_string(),
+                    rows: 3,
+                }),
+                ..PanelConfig::default()
+            },
+        );
+        let escape = Event::Key(KeyEvent::from(KeyCode::Esc));
+        // Docked: Esc in the transcript goes back to the composer, as before.
+        assert!(manager.focus_panel("agent"));
+        assert!(manager.focus_focused_text_scrollback(120));
+        assert!(matches!(
+            manager.handle_focused_scrollback_input(&escape, 20, 120, 1),
+            Some(TextPanelScrollbackInput::Handled)
+        ));
+        // Compact: the pane covers the editor, so Esc leaves it to the editor.
+        assert!(manager.focus_focused_text_scrollback(60));
+        assert!(manager
+            .handle_focused_scrollback_input(&escape, 20, 60, 1)
+            .is_none());
+    }
+
+    #[test]
+    fn refocusing_a_composer_lands_in_insert_mode_but_region_toggles_keep_its_mode() {
+        use crossterm::event::KeyEvent;
+
+        let mut manager = PanelManager::default();
+        manager.create_text_panel(
+            "agent".to_string(),
+            PanelConfig {
+                side: PanelSide::Right,
+                width: 48,
+                composer: Some(TextPanelComposerConfig {
+                    placeholder: "Ask".to_string(),
+                    rows: 3,
+                }),
+                ..PanelConfig::default()
+            },
+        );
+        let mode = |manager: &PanelManager| {
+            manager.text_panels["agent"]
+                .composer
+                .as_ref()
+                .unwrap()
+                .prompt
+                .mode()
+        };
+        assert!(manager.focus_text_panel_composer("agent"));
+        manager.handle_focused_text_input(&Event::Key(KeyEvent::from(KeyCode::Esc)), 80);
+        assert_eq!(mode(&manager), crate::editor::Mode::Normal);
+
+        assert!(manager.focus_focused_text_scrollback(80));
+        assert!(manager.toggle_focused_text_region(80));
+        assert_eq!(mode(&manager), crate::editor::Mode::Normal);
+
+        assert!(manager.focus_focused_text_scrollback(80));
+        assert!(manager.focus_text_panel_composer("agent"));
+        assert_eq!(mode(&manager), crate::editor::Mode::Insert);
     }
 
     #[test]
@@ -8477,14 +8929,14 @@ mod tests {
         );
         assert!(manager.focus_text_panel_composer("agent"));
         let theme = Theme::default();
-        let mut buffer = RenderBuffer::new(80, 20, &theme.style);
+        let mut buffer = RenderBuffer::new(160, 20, &theme.style);
 
         manager.render(&mut buffer, &theme);
         assert!((0..20).any(|row| row_text(&buffer, row).contains("INSERT")));
 
         manager.handle_focused_text_input(
             &Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
-            80,
+            160,
         );
         manager.render(&mut buffer, &theme);
         assert!((0..20).any(|row| row_text(&buffer, row).contains("NORMAL")));
@@ -8492,7 +8944,7 @@ mod tests {
         let blur = manager
             .handle_focused_text_input(
                 &Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
-                80,
+                160,
             )
             .unwrap();
         assert_eq!(blur.action, "composer_blur");
@@ -8500,7 +8952,7 @@ mod tests {
     }
 
     #[test]
-    fn text_panel_composer_shrinks_on_narrow_terminals_and_keeps_tail_visible() {
+    fn text_panel_composer_covers_narrow_terminals_and_keeps_tail_visible() {
         let mut manager = PanelManager::default();
         manager.create_text_panel(
             "agent".to_string(),
@@ -8528,10 +8980,17 @@ mod tests {
             10,
             30,
         );
+        // Too narrow to dock beside the editor: the pane reserves nothing and
+        // only appears, full width, while it has focus (the editor zooms it).
+        assert!(manager.is_compact_panel("agent", 30));
+        assert_eq!(manager.reserved_right_width(30), 0);
+        assert!(manager.panel_at_position(29, 0, 30, 12).is_none());
+        manager.set_presentation(PanelPresentation::Zoomed {
+            id: "agent".to_string(),
+            size: (30, 10),
+        });
         let placement = manager.panel_at_position(29, 0, 30, 12).unwrap();
-        assert_eq!(placement.width, 19);
-        assert_eq!(placement.x, 11);
-        assert!(manager.panel_at_position(9, 0, 30, 12).is_none());
+        assert_eq!((placement.x, placement.width), (0, 30));
 
         let theme = Theme::default();
         let mut buffer = RenderBuffer::new(30, 12, &theme.style);
@@ -8720,7 +9179,13 @@ mod tests {
             assert_eq!(event.action, expected);
         }
 
-        let mut narrow = RenderBuffer::new(30, 12, &theme.style);
+        // Too narrow to dock: the pane covers the terminal while focused.
+        assert!(manager.is_compact_panel("agent", 20));
+        manager.set_presentation(PanelPresentation::Zoomed {
+            id: "agent".to_string(),
+            size: (20, 10),
+        });
+        let mut narrow = RenderBuffer::new(20, 12, &theme.style);
         manager.render(&mut narrow, &theme);
         assert!(row_text(&narrow, 0).contains("[C] [N] [×]"));
 
@@ -9177,8 +9642,14 @@ mod tests {
                 ..PanelConfig::default()
             },
         );
+        // Conversation panes are never docked narrower than 32 columns, so an
+        // 11-column pane is a compact pane covering an 11-column terminal.
+        manager.set_presentation(PanelPresentation::Zoomed {
+            id: "agent".to_string(),
+            size: (11, 18),
+        });
         assert!(manager.focus_text_panel_composer("agent"));
-        manager.handle_focused_text_input(&Event::Paste("one two three".to_string()), 40);
+        manager.handle_focused_text_input(&Event::Paste("one two three".to_string()), 11);
         manager
             .text_panels
             .get_mut("agent")
@@ -9190,7 +9661,7 @@ mod tests {
             .set_cursor(0);
 
         let placement = manager
-            .panel_placements(40, 20)
+            .panel_placements(11, 20)
             .into_iter()
             .find(|placement| placement.id == "agent")
             .unwrap();
@@ -9199,13 +9670,13 @@ mod tests {
             - manager.text_panels["agent"].composer_height(placement.height, placement.width)
             + 1;
         let theme = Theme::default();
-        let mut buffer = RenderBuffer::new(40, 20, &theme.style);
+        let mut buffer = RenderBuffer::new(11, 20, &theme.style);
         manager.render(&mut buffer, &theme);
         assert_eq!(text_position(&buffer, "one two"), Some(Point::new(x, y)));
         assert_eq!(text_position(&buffer, "three"), Some(Point::new(x, y + 1)));
 
         let down = Event::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
-        manager.handle_focused_text_input(&down, 40);
+        manager.handle_focused_text_input(&down, 11);
         assert_eq!(
             manager.text_panels["agent"]
                 .composer
@@ -9216,13 +9687,13 @@ mod tests {
             8
         );
         assert_eq!(
-            manager.focused_text_panel_cursor_position(40, 20),
+            manager.focused_text_panel_cursor_position(11, 20),
             Some((x, y + 1))
         );
         manager
-            .focus_panel_at_position(x + 2, y + 1, 40, 20)
+            .focus_panel_at_position(x + 2, y + 1, 11, 20)
             .unwrap();
-        manager.handle_focused_text_input(&Event::Paste("X".to_string()), 40);
+        manager.handle_focused_text_input(&Event::Paste("X".to_string()), 11);
         assert_eq!(
             manager.text_panels["agent"]
                 .composer
@@ -9233,6 +9704,11 @@ mod tests {
             "one two thXree"
         );
 
+        // At 18 columns the pane is compact and the editor zooms it while focused.
+        manager.set_presentation(PanelPresentation::Zoomed {
+            id: "agent".to_string(),
+            size: (18, 18),
+        });
         let (cursor_x, cursor_y) = manager.focused_text_panel_cursor_position(18, 20).unwrap();
         assert!(cursor_x < 18 && cursor_y < 20);
         let submitted = manager
@@ -9276,12 +9752,15 @@ mod tests {
             .set_cursor(5);
 
         assert!(manager.set_panel_visible("agent", false));
-        assert_eq!(manager.reserved_right_width(), 0);
+        assert_eq!(manager.reserved_right_width(200), 0);
         assert_eq!(manager.focused_panel_id(), None);
         assert!(!manager.focus_text_panel_composer("agent"));
 
         assert!(manager.set_panel_visible("agent", true));
-        assert_eq!(manager.reserved_right_width(), 25);
+        assert_eq!(
+            manager.reserved_right_width(200),
+            MIN_READABLE_PANE_WIDTH + 1
+        );
         assert!(manager.restore_panel_focus("agent"));
         assert!(manager.focused_text_input_active());
         let composer = manager.text_panels["agent"].composer.as_ref().unwrap();
@@ -9398,7 +9877,7 @@ mod tests {
                 text: "partial answer".to_string(),
             }],
             13,
-            100,
+            160,
         );
         assert!(manager.set_text_panel_status(
             "agent",
@@ -9409,20 +9888,20 @@ mod tests {
             }),
         ));
         let theme = Theme::default();
-        let mut buffer = RenderBuffer::new(100, 15, &theme.style);
+        let mut buffer = RenderBuffer::new(160, 15, &theme.style);
 
         manager.render(&mut buffer, &theme);
 
         let status_row = row_text(&buffer, 8);
         assert!(status_row.contains("⠋ Reading demo.txt · 0s"));
-        assert!(buffer.cells[7 * 100 + 30..8 * 100]
+        assert!(buffer.cells[7 * 160 + 90..8 * 160]
             .iter()
             .all(|cell| cell.text.trim().is_empty()));
         assert!(row_text(&buffer, 9).contains("────"));
         assert!((1..8).any(|row| row_text(&buffer, row).contains("partial answer▌")));
 
         assert!(manager.set_text_panel_status("agent", None));
-        let mut buffer = RenderBuffer::new(100, 15, &theme.style);
+        let mut buffer = RenderBuffer::new(160, 15, &theme.style);
         manager.render(&mut buffer, &theme);
         assert!(!row_text(&buffer, 8).contains("Reading demo.txt"));
         assert!((1..9).any(|row| row_text(&buffer, row).contains("partial answer")));
@@ -10053,7 +10532,7 @@ mod tests {
             16,
         );
         assert!(manager.focus_panel("agent"));
-        assert_eq!(manager.reserved_right_width(), 17);
+        assert_eq!(manager.reserved_right_width(200), 17);
 
         let top = manager.handle_focused_key("top", 4, 16, 0).unwrap();
         assert_eq!(top.selected_index, 0);
@@ -10097,13 +10576,13 @@ mod tests {
                     .join("\n"),
             }],
             15,
-            80,
+            140,
         );
         assert!(manager.focus_panel("agent"));
-        manager.handle_focused_key("top", 15, 80, 0).unwrap();
+        manager.handle_focused_key("top", 15, 140, 0).unwrap();
 
         let theme = Theme::default();
-        let mut buffer = RenderBuffer::new(80, 15, &theme.style);
+        let mut buffer = RenderBuffer::new(140, 15, &theme.style);
         manager.render(&mut buffer, &theme);
         let top = (0..15)
             .map(|row| row_text(&buffer, row))
@@ -10111,8 +10590,8 @@ mod tests {
             .join("\n");
         assert!(top.contains("SCROLLBACK NORMAL · Tab edit"));
 
-        manager.handle_focused_key("bottom", 15, 80, 0).unwrap();
-        let mut buffer = RenderBuffer::new(80, 15, &theme.style);
+        manager.handle_focused_key("bottom", 15, 140, 0).unwrap();
+        let mut buffer = RenderBuffer::new(140, 15, &theme.style);
         manager.render(&mut buffer, &theme);
         let bottom = (0..15)
             .map(|row| row_text(&buffer, row))
