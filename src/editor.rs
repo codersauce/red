@@ -10573,6 +10573,75 @@ impl Editor {
         }
     }
 
+    /// Reverts one recorded transaction in whichever open buffer owns it.
+    async fn revert_transaction(
+        &mut self,
+        transaction_id: &str,
+        buffer: &mut RenderBuffer,
+        runtime: &mut Runtime,
+    ) -> anyhow::Result<()> {
+        let Some(target) = self.transaction_buffer_index(transaction_id) else {
+            self.set_routine_warning(Some(
+                "That edit is no longer in an open buffer's history".to_string(),
+            ));
+            self.draw_commandline(buffer);
+            return Ok(());
+        };
+        let previous = self.buffer_manager.active_index();
+        if target != previous {
+            self.set_current_buffer(buffer, target).await?;
+        }
+        let name = self
+            .current_buffer()
+            .file
+            .as_deref()
+            .map(|file| self.history_display_path(file))
+            .unwrap_or_else(|| self.current_buffer().name().to_string());
+        let by_agent = self
+            .current_buffer()
+            .undo_history
+            .transaction_by_id(transaction_id)
+            .is_some_and(|transaction| matches!(transaction.origin, EditOrigin::Agent { .. }));
+        let prepared = self
+            .current_buffer()
+            .undo_history
+            .prepare_revert(transaction_id, self.current_buffer());
+        match prepared {
+            Ok(mut edits) => {
+                edits.sort_by_key(|edit| edit.start_char);
+                let who = if by_agent { "agent edit" } else { "edit" };
+                self.begin_transaction(format!("revert {who} {name}"));
+                for RevertEdit {
+                    start_char,
+                    end_char,
+                    replacement,
+                } in edits.into_iter().rev()
+                {
+                    let range = TextRange::new(
+                        self.current_buffer().char_idx_to_position(start_char),
+                        self.current_buffer().char_idx_to_position(end_char),
+                    );
+                    self.replace_range(range, &replacement);
+                }
+                self.commit_transaction(self.cursor_snapshot());
+                self.notify_change(runtime).await?;
+                self.set_quiet_message(Some(format!(
+                    "Reverted the {who} in {name}; the buffer is unsaved and u in it undoes the revert"
+                )));
+            }
+            Err(error) => {
+                self.set_routine_warning(Some(format!(
+                    "revert conflict in {name}: {error}; later edits changed the same text"
+                )));
+            }
+        }
+        if target != previous {
+            self.set_current_buffer(buffer, previous).await?;
+        }
+        self.render(buffer)?;
+        Ok(())
+    }
+
     async fn prepare_agent_follow_step(
         &mut self,
         request: &EditorToolRequest,
@@ -22352,71 +22421,11 @@ impl Editor {
             }
             Action::AgentUnsavedEditChoice(choice) => {
                 add_to_history = false;
-                self.resolve_agent_edit_decision(*choice, buffer, runtime)
-                    .await?;
+                Box::pin(self.resolve_agent_edit_decision(*choice, buffer, runtime)).await?;
             }
             Action::RevertTransaction(transaction_id) => {
-                let Some(target) = self.transaction_buffer_index(transaction_id) else {
-                    self.set_routine_warning(Some(
-                        "That edit is no longer in an open buffer's history".to_string(),
-                    ));
-                    self.draw_commandline(buffer);
-                    return Ok(false);
-                };
-                let previous = self.buffer_manager.active_index();
-                if target != previous {
-                    self.set_current_buffer(buffer, target).await?;
-                }
-                let name = self
-                    .current_buffer()
-                    .file
-                    .as_deref()
-                    .map(|file| self.history_display_path(file))
-                    .unwrap_or_else(|| self.current_buffer().name().to_string());
-                let by_agent = self
-                    .current_buffer()
-                    .undo_history
-                    .transaction_by_id(transaction_id)
-                    .is_some_and(|transaction| {
-                        matches!(transaction.origin, EditOrigin::Agent { .. })
-                    });
-                let prepared = self
-                    .current_buffer()
-                    .undo_history
-                    .prepare_revert(transaction_id, self.current_buffer());
-                match prepared {
-                    Ok(mut edits) => {
-                        edits.sort_by_key(|edit| edit.start_char);
-                        let who = if by_agent { "agent edit" } else { "edit" };
-                        self.begin_transaction(format!("revert {who} {name}"));
-                        for RevertEdit {
-                            start_char,
-                            end_char,
-                            replacement,
-                        } in edits.into_iter().rev()
-                        {
-                            let range = TextRange::new(
-                                self.current_buffer().char_idx_to_position(start_char),
-                                self.current_buffer().char_idx_to_position(end_char),
-                            );
-                            self.replace_range(range, &replacement);
-                        }
-                        self.commit_transaction(self.cursor_snapshot());
-                        self.notify_change(runtime).await?;
-                        self.set_quiet_message(Some(format!(
-                            "Reverted the {who} in {name}; the buffer is unsaved and u in it undoes the revert"
-                        )));
-                    }
-                    Err(error) => {
-                        self.set_routine_warning(Some(format!(
-                            "revert conflict in {name}: {error}; later edits changed the same text"
-                        )));
-                    }
-                }
-                if target != previous {
-                    self.set_current_buffer(buffer, previous).await?;
-                }
-                self.render(buffer)?;
+                // Boxed: `execute` nests during dot-repeat, so its future stays small.
+                Box::pin(self.revert_transaction(transaction_id, buffer, runtime)).await?;
             }
             Action::RepeatLastChange => {
                 add_to_history = false;
