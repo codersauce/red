@@ -1440,6 +1440,16 @@ impl TextPanel {
                         TextPanelSpanStyle::Text,
                     ));
                 }
+                if queued {
+                    // Dim every format alike, including markdown and code.
+                    for span in block_lines
+                        .iter_mut()
+                        .flat_map(|line| line.spans.iter_mut())
+                    {
+                        span.style = TextPanelSpanStyle::Muted;
+                        span.syntax_style = None;
+                    }
+                }
                 namespace_block_links(&mut block_lines, block_index);
                 lines.extend(block_lines.into_iter().map(|line| {
                     if framed {
@@ -8205,6 +8215,43 @@ mod tests {
         assert!(!manager.is_compact_panel("left-chat", 100));
         assert!(manager.is_compact_panel("right-chat", 100));
         assert_eq!(manager.text_panel_width("right-chat", 100), 100);
+    }
+
+    #[test]
+    fn queued_cards_are_dimmed_in_every_format() {
+        let mut manager = PanelManager::default();
+        manager.create_text_panel("agent".to_string(), PanelConfig::default());
+        let formats = [
+            TextPanelBlockFormat::Plain,
+            TextPanelBlockFormat::Markdown,
+            TextPanelBlockFormat::Code(Some("rust".to_string())),
+        ];
+        let blocks = formats
+            .iter()
+            .enumerate()
+            .map(|(index, format)| TextPanelBlock {
+                id: format!("held-{index}"),
+                kind: TextPanelBlockKind::Queued,
+                format: format.clone(),
+                text: "**bold** `code` fn main() {}".to_string(),
+            })
+            .collect();
+        manager.update_text_panel("agent", blocks, 20, 120);
+        let rendered = manager.text_panels["agent"].build_rendered_lines(40);
+        let content = rendered
+            .lines
+            .iter()
+            .flat_map(|line| &line.spans)
+            .filter(|span| matches!(span.selection, TextPanelSpanSelection::Content))
+            .filter(|span| !span.text.trim().is_empty())
+            .collect::<Vec<_>>();
+        assert!(!content.is_empty());
+        assert!(
+            content
+                .iter()
+                .all(|span| span.style == TextPanelSpanStyle::Muted && span.syntax_style.is_none()),
+            "{content:#?}"
+        );
     }
 
     #[test]

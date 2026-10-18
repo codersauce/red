@@ -567,8 +567,11 @@ impl Editor {
                                 .document_version_for_source(&file, &context.lsp_source)
                         })
                         .flatten();
+                    // The stamp must come from this very server instance: a
+                    // restarted server reuses the key and restarts its versions.
                     if stamp.is_some_and(|stamp| {
-                        stamp.document_version.is_some()
+                        stamp.source.as_ref() == Some(&context.lsp_source)
+                            && stamp.document_version.is_some()
                             && stamp.document_version == current_version
                     }) {
                         return Ok(StartQuery::Immediate(self.agent_diagnostics_payload(

@@ -1364,15 +1364,21 @@ async fn agent_lsp_push_only_refresh_answers_at_once_only_for_a_report_of_the_cu
     let root = tempfile::tempdir().unwrap();
     let (mut editor, lsp) = agent_lsp_fixture(root.path(), json!({}));
     let uri = red::lsp::file_uri(root.path().join("main.rs")).unwrap();
-    let push = |version: Option<i64>, message: &str| {
+    let file = root.path().join("main.rs").to_string_lossy().into_owned();
+    // Reports carry the server instance that sent them, as managed servers do.
+    let push = |version: Option<i64>, message: &str, instance: u64| {
         let mut params = json!({"uri": uri, "diagnostics": [sample_diagnostic(message)]});
         if let Some(version) = version {
             params["version"] = json!(version);
         }
+        let mut report: red::lsp::types::TextDocumentPublishDiagnostics =
+            serde_json::from_value(params).unwrap();
+        report.source = Some(red::lsp::LspRequestSource {
+            key: file.clone(),
+            instance,
+        });
         lsp.queue_message(red::lsp::InboundMessage::Notification(
-            red::lsp::ParsedNotification::PublishDiagnostics(
-                serde_json::from_value(params).unwrap(),
-            ),
+            red::lsp::ParsedNotification::PublishDiagnostics(report),
         ));
     };
     let refresh = |wait_ms: u64| {
@@ -1388,7 +1394,7 @@ async fn agent_lsp_push_only_refresh_answers_at_once_only_for_a_report_of_the_cu
     // Neither an unversioned report nor one for older text proves it covers
     // the current text, so the refresh keeps waiting (here until its deadline).
     for (version, message) in [(None, "unversioned"), (Some(0), "older text")] {
-        push(version, message);
+        push(version, message, 1);
         editor.test_service_background().await.unwrap();
         let result = editor.test_run_agent_editor_tool(refresh(1)).await.unwrap();
         assert_eq!(result["refresh_status"], "timeout", "{message}");
@@ -1403,7 +1409,7 @@ async fn agent_lsp_push_only_refresh_answers_at_once_only_for_a_report_of_the_cu
     }
 
     // A report for the version the server holds answers at once.
-    push(Some(1), "current text");
+    push(Some(1), "current text", 1);
     editor.test_service_background().await.unwrap();
     let result = tokio::time::timeout(
         std::time::Duration::from_secs(2),
@@ -1414,6 +1420,12 @@ async fn agent_lsp_push_only_refresh_answers_at_once_only_for_a_report_of_the_cu
     .unwrap();
     assert_eq!(result["refresh_status"], "already_reported");
     assert_eq!(result["items"][0]["message"], "current text");
+
+    // A restarted server reuses the key and its version numbers, so the old
+    // instance's report proves nothing about it: wait again.
+    lsp.restart();
+    let result = editor.test_run_agent_editor_tool(refresh(1)).await.unwrap();
+    assert_eq!(result["refresh_status"], "timeout");
 }
 
 #[tokio::test]
