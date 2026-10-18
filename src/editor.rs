@@ -17906,10 +17906,11 @@ impl Editor {
             // modified buffer. A failed write keeps the editor open.
             if cmd == "xit" || cmd == "exit" {
                 if self.current_buffer().is_dirty() {
-                    actions.push(if parsed.is_forced() {
-                        Action::ForceSave
-                    } else {
-                        Action::Save
+                    actions.push(match (parsed.file_argument(), parsed.is_forced()) {
+                        (Some(file), true) => Action::ForceSaveAs(file),
+                        (Some(file), false) => Action::SaveAs(file),
+                        (None, true) => Action::ForceSave,
+                        (None, false) => Action::Save,
                     });
                 }
                 actions.push(Action::Quit(false));
@@ -37305,6 +37306,18 @@ builtin = "rust"
         assert_eq!(
             editor.handle_command("x!", &runtime),
             vec![Action::ForceSave, Action::Quit(false)]
+        );
+        // Like :wq, a filename writes there instead.
+        assert_eq!(
+            editor.handle_command("x copy.txt", &runtime),
+            vec![Action::SaveAs("copy.txt".to_string()), Action::Quit(false)]
+        );
+        assert_eq!(
+            editor.handle_command("exit! copy.txt", &runtime),
+            vec![
+                Action::ForceSaveAs("copy.txt".to_string()),
+                Action::Quit(false)
+            ]
         );
     }
 
