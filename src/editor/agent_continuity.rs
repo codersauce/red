@@ -471,6 +471,8 @@ impl super::Editor {
             Ok(Claim::Owned) => {
                 self.agent_continuity_adopted_age = Some(describe_age(saved.saved_at_ms));
                 self.agent_manager.restore_conversation(saved.conversation);
+                // Rebuild its source annotations before anything syncs them away.
+                self.restore_agent_annotations();
                 self.agent_continuity_saved = Some((
                     Some(self.agent_manager.conversation_revision()),
                     std::time::Instant::now(),
@@ -1074,6 +1076,73 @@ mod tests {
             Claim::Owned,
             "the workspace it left is free for another editor"
         );
+    }
+
+    #[test]
+    fn a_relaunch_restores_saved_annotations_and_keeps_those_on_unopened_files() {
+        let config = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let open = workspace.path().join("open.rs");
+        let closed = workspace.path().join("closed.rs");
+        fs::write(&open, "fn main() {}\n").unwrap();
+        fs::write(&closed, "fn other() {}\n").unwrap();
+        let record =
+            |path: &Path, message: &str| crate::agent_conversation::AgentAnnotationRecord {
+                id: uuid::Uuid::new_v4().to_string(),
+                session_id: "thread".into(),
+                turn_id: "t1".into(),
+                path: path.to_string_lossy().into_owned(),
+                start_line: 0,
+                end_line: 0,
+                message: message.into(),
+                expected_fingerprint: None,
+            };
+        let mut saved = conversation("thread", workspace.path());
+        saved.annotations = vec![record(&open, "Entry point"), record(&closed, "Helper")];
+        let mut store = ConversationStore::new(config.path().to_path_buf());
+        store.claim(workspace.path()).unwrap();
+        store.save(workspace.path(), &saved).unwrap();
+        store.release_all();
+
+        let config_value = crate::config::Config::default();
+        let lsp = Box::new(crate::lsp::LspManager::new(config_value.lsp.clone()));
+        let mut editor = crate::editor::Editor::with_size(
+            lsp,
+            80,
+            24,
+            config_value,
+            crate::theme::Theme::default(),
+            vec![crate::buffer::Buffer::new(
+                Some(open.to_string_lossy().into_owned()),
+                "fn main() {}\n".to_string(),
+            )],
+        )
+        .unwrap();
+        editor.test_disable_terminal_output();
+        editor.enable_agent_continuity_in(
+            ConversationStore::new(config.path().to_path_buf()),
+            workspace.path(),
+        );
+        assert!(
+            editor
+                .inline_comments
+                .iter()
+                .any(|comment| comment.message == "Entry point"),
+            "the open file's annotation is rebuilt"
+        );
+
+        // A session snapshot syncs records from the inline comments.
+        editor.sync_agent_annotation_records();
+        let mut messages = editor
+            .agent_manager
+            .conversation()
+            .unwrap()
+            .annotations
+            .iter()
+            .map(|record| record.message.clone())
+            .collect::<Vec<_>>();
+        messages.sort();
+        assert_eq!(messages, ["Entry point", "Helper"]);
     }
 
     #[test]

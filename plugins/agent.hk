@@ -715,7 +715,7 @@ fn pane_state_changed(event: AgentPaneState) {
             red::execute("SetTextPanelComposerState", "agent-conversation", true, "Reconnecting to Codex… you can keep typing");
         } else if was == "restoring" || (session_id != "" && !had_session) {
             // A live thread replaces any "archived conversation" hint.
-            red::execute("SetTextPanelComposerState", "agent-conversation", true, state().resume_hint);
+            red::execute("SetTextPanelComposerState", "agent-conversation", true, ready_composer_hint());
         }
     }
     sync_interruption();
@@ -2123,6 +2123,15 @@ fn session_restored(event: AgentConversationEvent) {
     refresh_model_header();
 }
 
+/// What the composer says once the thread settles: archived after a failed
+/// resume, continuing after a successful one from an earlier launch.
+fn ready_composer_hint() -> String {
+    if red::string(state().session_id, "") == "" && state().pane.recap_pending {
+        return "Archived conversation · next message starts a new session";
+    }
+    return state().resume_hint;
+}
+
 /// Resumes a saved conversation as soon as the pane is about to be used.
 fn prepare_saved_conversation() {
     if state().pane.resume_pending {
@@ -2258,7 +2267,8 @@ fn session_restore_failed(event: AgentSessionRestoreFailedEvent) {
     if failed != "" && failed != red::string(state().session_id, "") {
         return;
     }
-    red::state_patch(AgentState { resume_age: "" });
+    // The next message starts a recap-seeded thread, not a continuation.
+    red::state_patch(AgentState { resume_age: "", resume_hint: "" });
     // The core forgets the thread and replays the transcript on the next message.
     reset_model_state();
     ensure_conversation_panel();

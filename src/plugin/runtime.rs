@@ -9841,6 +9841,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bundled_agent_a_saved_conversation_that_cannot_resume_says_it_is_archived() {
+        drain_requests();
+        let mut runtime = Runtime::new();
+        runtime
+            .load_plugin("agent", include_str!("../../plugins/agent.hk"))
+            .await
+            .unwrap();
+        core_notify(
+            &mut runtime,
+            "agent:conversation_resumable",
+            serde_json::json!({
+                "thread_id": "saved-thread", "cwd": "/workspace", "age": "2 hours ago",
+                "items": [{"id": "u1", "role": "user", "text": "Remember HERON"}]
+            }),
+        )
+        .await;
+        runtime.execute_command("AgentOpen").await.unwrap();
+        core_settle(&mut runtime).await;
+        drain_requests();
+        core_notify(
+            &mut runtime,
+            "agent:session_restore_failed",
+            serde_json::json!({ "session_id": "saved-thread", "message": "thread not found" }),
+        )
+        .await;
+        let hints = collect_requests()
+            .into_iter()
+            .filter_map(|request| match request {
+                PluginRequest::SetTextPanelComposerState { status, .. } => Some(status),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let last = hints.last().cloned().flatten().unwrap_or_default();
+        assert!(last.contains("Archived conversation"), "{hints:?}");
+        assert!(!hints
+            .iter()
+            .flatten()
+            .any(|hint| hint.contains("Continuing")));
+    }
+
+    #[tokio::test]
     async fn bundled_agent_continues_a_saved_conversation_when_the_pane_opens() {
         drain_requests();
         let mut runtime = Runtime::new();
