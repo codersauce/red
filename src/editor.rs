@@ -36866,6 +36866,10 @@ mod test {
         assert_eq!(entries[0]["label"], "edit 0");
         assert_eq!(entries[599]["label"], "edit 599");
         assert_eq!(entries[0]["edits"].as_array().map(Vec::len), Some(1));
+        assert!(
+            entries[0].get("document").is_none() && entries[0].get("file").is_none(),
+            "unscoped entries keep the shipped shape"
+        );
     }
 
     #[tokio::test]

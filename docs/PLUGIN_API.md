@@ -479,8 +479,9 @@ archived context.
 500 entries, and `total`, the number of entries before that limit. Results carry
 `scope` (`"buffer"` or `"workspace"`).
 
-Each entry keeps the original fields (`transaction_id`, `label`, `origin`, `current`,
-`timestamp_ms`, `edits`, and the tree links) and adds:
+Unscoped entries keep exactly the original fields (`transaction_id`, `label`,
+`origin`, `current`, `timestamp_ms`, `edits`, and the tree links). Workspace entries
+keep those fields except `edits`, and add:
 
 | Field | Meaning |
 | --- | --- |

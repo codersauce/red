@@ -127,10 +127,14 @@ impl Editor {
             // A workspace history leaves out the unbounded replacement texts; the
             // bounded `document` stands in for them.
             let mut value = serde_json::to_value(&entry).unwrap_or(Value::Null);
-            if !with_edits {
-                if let Some(fields) = value.as_object_mut() {
-                    fields.remove("edits");
-                }
+            // An unscoped request keeps the shipped entry shape exactly; previews
+            // and labels are only for the opt-in workspace scope.
+            if with_edits {
+                entries.push(value);
+                continue;
+            }
+            if let Some(fields) = value.as_object_mut() {
+                fields.remove("edits");
             }
             let (mut lines, stat, total_lines) =
                 match self.edit_previews.previews.get(&entry.transaction_id) {
@@ -247,6 +251,12 @@ fn replacement_diff(edits: &[crate::undo::TextEdit]) -> (Vec<DiffLine>, DiffStat
             lines.push(line);
         }
     };
+    // Agent hunks are applied, and recorded, bottom to top; show them in
+    // document order. The sort is stable, so sequential edits keep their order.
+    let mut edits: Vec<&crate::undo::TextEdit> = edits.iter().collect();
+    edits.sort_by_key(|crate::undo::TextEdit::Replace { range, .. }| {
+        (range.start.line, range.start.character)
+    });
     for crate::undo::TextEdit::Replace {
         range,
         old_text,
@@ -374,6 +384,25 @@ mod tests {
                 removed: 1_000
             }
         );
+    }
+
+    #[test]
+    fn fallback_diffs_list_bottom_up_agent_hunks_in_document_order() {
+        let replace = |line: usize, old: &str, new: &str| crate::undo::TextEdit::Replace {
+            range: TextRange::new(TextPosition::new(line, 0), TextPosition::new(line + 1, 0)),
+            start_char: 0,
+            old_text: old.to_string(),
+            new_text: new.to_string(),
+        };
+        // Recorded as applied: the lower hunk first.
+        let edits = vec![replace(30, "thirty\n", "30\n"), replace(2, "two\n", "2\n")];
+        let (lines, _, _) = replacement_diff(&edits);
+        let headers: Vec<_> = lines
+            .iter()
+            .filter(|line| line.kind == DiffLineKind::Hunk)
+            .map(|line| line.text.as_str())
+            .collect();
+        assert_eq!(headers, ["@@ line 3 @@", "@@ line 31 @@"]);
     }
 
     #[test]
