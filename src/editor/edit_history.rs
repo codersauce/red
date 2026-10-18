@@ -100,6 +100,13 @@ impl Editor {
                 .map(|file| self.history_display_path(file));
             for entry in tree {
                 let mut value = serde_json::to_value(&entry).unwrap_or(Value::Null);
+                // A workspace history can span many large transactions; its bounded
+                // `document` replaces the raw replacement texts.
+                if scope == EditHistoryScope::Workspace {
+                    if let Some(fields) = value.as_object_mut() {
+                        fields.remove("edits");
+                    }
+                }
                 let (mut lines, stat, total) =
                     match self.edit_previews.previews.get(&entry.transaction_id) {
                         Some(preview) => (preview.lines.clone(), preview.stat, preview.total),

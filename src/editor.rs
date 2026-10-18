@@ -36715,6 +36715,10 @@ mod test {
         let payload = editor.edit_history_payload(edit_history::EditHistoryScope::Workspace);
         let entry = &payload["entries"][0];
         assert_eq!(entry["file"], "document.rs");
+        assert!(
+            entry.get("edits").is_none(),
+            "workspace entries carry only the bounded diff"
+        );
         assert_eq!(
             (entry["turn"].clone(), entry["prompt"].clone()),
             (json!(1), json!("Rename line ten"))

@@ -4485,6 +4485,7 @@ fn trimmable_result_list(request: &str) -> Option<&'static str> {
     match request {
         "DocumentSymbols" | "WorkspaceSymbols" => Some("symbols"),
         "References" => Some("references"),
+        "EditHistory" => Some("entries"),
         _ => None,
     }
 }
@@ -8830,6 +8831,39 @@ mod tests {
         assert_eq!(
             model.detail_title,
             "src/parse.rs · Agent, turn 2 · “Fix the sign bug” · 5m ago"
+        );
+
+        // Selecting with the mouse (or any other navigation) shows that row's diff.
+        let clicked = serde_json::to_value(&model.rows[1]).unwrap();
+        runtime
+            .notify(
+                "workspace:event:agent-history",
+                serde_json::json!({ "action": "mouse_click", "row": clicked }),
+            )
+            .await
+            .unwrap();
+        let request_id = history_request();
+        runtime
+            .resolve_request(
+                request_id,
+                serde_json::json!({
+                    "entries": [
+                        entry("agent-1", "agent", "src/parse.rs", true),
+                        entry("user-1", "user", "src/report.rs", false),
+                    ],
+                    "total": 2,
+                }),
+            )
+            .await
+            .unwrap();
+        let model = workspace_update();
+        assert_eq!(model.detail_title, "src/report.rs · You · 5m ago");
+        assert_eq!(
+            model
+                .detail_document
+                .map(|document| document.path)
+                .as_deref(),
+            Some("/workspace/src/report.rs")
         );
 
         runtime
@@ -19701,6 +19735,79 @@ mod tests {
         assert_eq!(
             status.as_deref(),
             Some("4096 symbols (results truncated: first 4096 of 60000; type to narrow)")
+        );
+    }
+
+    #[tokio::test]
+    async fn an_edit_history_larger_than_the_plugin_heap_is_trimmed_to_its_newest_entries() {
+        drain_requests();
+        let mut runtime = Runtime::new();
+        runtime
+            .load_plugin("agent", include_str!("../../plugins/agent.hk"))
+            .await
+            .unwrap();
+        drain_requests();
+        runtime.execute_command("AgentHistory").await.unwrap();
+        let request_id = loop {
+            if let PluginRequest::EditHistory { request_id, .. } = ACTION_DISPATCHER.recv_request()
+            {
+                break request_id;
+            }
+        };
+        // Far more than the plugin heap once decoded, like many whole-file rewrites.
+        let line = "x".repeat(400_000);
+        let entries: Vec<_> = (0..300)
+            .map(|index| {
+                serde_json::json!({
+                    "transaction_id": format!("t{index}"),
+                    "label": "edit",
+                    "current": false,
+                    "applied": true,
+                    "origin": { "kind": "user" },
+                    "file": "big.rs",
+                    "age": "just now",
+                    "added": 1,
+                    "removed": 0,
+                    "document": {
+                        "path": "big.rs",
+                        "lines": [{ "id": format!("t{index}:0"), "text": line, "kind": "added", "new_line": 1 }],
+                        "added": 1, "removed": 0, "total_lines": 1, "truncated": false,
+                    },
+                })
+            })
+            .collect();
+
+        assert!(runtime
+            .resolve_request(
+                request_id,
+                serde_json::json!({ "entries": entries, "total": 300 })
+            )
+            .await
+            .unwrap());
+
+        let model = loop {
+            match ACTION_DISPATCHER.recv_request() {
+                PluginRequest::UpdateWorkspace { model, .. } => break model,
+                PluginRequest::PluginResultDropped { .. } => {
+                    panic!("the history must be trimmed, not dropped")
+                }
+                _ => continue,
+            }
+        };
+        let kept = model.rows.len() - 1;
+        assert!((1..300).contains(&kept), "kept {kept}");
+        assert_eq!(
+            model.rows[0].id, "transaction:t0",
+            "the newest entries are kept"
+        );
+        let notice: String = model.rows[kept]
+            .segments
+            .iter()
+            .map(|segment| segment.text.as_str())
+            .collect();
+        assert!(
+            notice.ends_with(&format!("the newest {kept} of 300")),
+            "{notice}"
         );
     }
 

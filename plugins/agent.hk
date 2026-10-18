@@ -2420,7 +2420,9 @@ fn history_event(event: AgentHistoryEvent) {
         refresh_history();
         return;
     }
-    if event.action == "up" || event.action == "down" || event.action == "page_up" || event.action == "page_down" || event.action == "home" || event.action == "end" {
+    // Any way of moving the selection (keys, mouse, scrolling, filtering) must
+    // show that row's diff, so `r` always reverts the edit on screen.
+    if row.id != state().history_selected {
         show_history_detail(row.id, row.data.title, row.data.document);
         refresh_history();
     }

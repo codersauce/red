@@ -491,6 +491,10 @@ Each entry keeps the original fields (`transaction_id`, `label`, `origin`, `curr
 | `document` | A ready-to-show unified diff in the `WorkspaceModel.detail_document` shape, with hunk headers, context and line numbers. |
 | `turn`, `prompt` | For agent edits: the one-based turn in the current conversation and an excerpt of the prompt that started it. |
 
+Workspace entries leave out `edits`, whose texts are unbounded; use `document`. A
+result too large for the plugin heap is trimmed to its newest entries, and `total`
+still counts them all.
+
 `RevertTransaction(transaction_id)` finds the buffer that owns the transaction, so a
 workspace history can revert edits in files other than the active one.
 
