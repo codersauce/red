@@ -1350,6 +1350,37 @@ async fn agent_lsp_push_only_diagnostics_do_not_claim_refresh_or_cleanliness() {
     let result = editor.test_run_agent_editor_tool(request).await.unwrap();
     assert_eq!(result["status"], "timeout");
     assert_eq!(result["ok"], false);
+    // The timeout still answers with what is known, labelled by freshness.
+    assert_eq!(result["refresh_status"], "timeout");
+    assert_eq!(result["documents"][0]["freshness"], "not_received");
+    assert!(result["refresh_note"]
+        .as_str()
+        .unwrap()
+        .contains("not a clean bill of health"));
+}
+
+#[tokio::test]
+async fn agent_lsp_push_only_refresh_answers_at_once_when_the_text_was_already_reported() {
+    let root = tempfile::tempdir().unwrap();
+    let (mut editor, lsp) = agent_lsp_fixture(root.path(), json!({}));
+    lsp.queue_message(red::lsp::InboundMessage::Notification(red::lsp::ParsedNotification::PublishDiagnostics(
+        serde_json::from_value(json!({"uri": red::lsp::file_uri(root.path().join("main.rs")).unwrap(), "diagnostics": [sample_diagnostic("push report")]})).unwrap()
+    )));
+    editor.test_service_background().await.unwrap();
+    let mut request = diagnostics_request(Some("main.rs"), true);
+    if let EditorToolCall::LspDiagnostics { wait_ms, .. } = &mut request.call {
+        *wait_ms = 20_000;
+    }
+    // A push-only server never re-reports unchanged text, so this must not wait.
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        editor.test_run_agent_editor_tool(request),
+    )
+    .await
+    .expect("refresh waited for a report that cannot come")
+    .unwrap();
+    assert_eq!(result["refresh_status"], "already_reported");
+    assert_eq!(result["items"][0]["message"], "push report");
 }
 
 #[tokio::test]

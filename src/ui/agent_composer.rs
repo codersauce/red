@@ -18,6 +18,12 @@ use super::{
     PromptInput, PromptKeyPolicy, UiAction, PROMPT_MAX_BYTES,
 };
 
+/// What a newcomer most needs to know, shown while the prompt is empty.
+const EMPTY_TIPS: [&str; 3] = [
+    "It sees the file you are in and edits through Red",
+    "Ctrl+C stops a turn; new messages queue behind it",
+    "One u undoes an agent edit · :AgentHistory lists them",
+];
 const MAX_PROMPT_BYTES: usize = PROMPT_MAX_BYTES;
 const EMPTY_STATUS: &str = "Prompt is empty";
 const OVERSIZED_STATUS: &str = "Prompt exceeds 128 KiB";
@@ -254,6 +260,13 @@ impl Component for AgentComposer {
             let placeholder =
                 truncate_display_width("What should the agent do?", self.dialog.width);
             buffer.set_text(content_x, content_y, &placeholder, &self.muted_style);
+            // A first-time welcome in the empty space, kept clear of the
+            // placeholder and the action bar; tips that do not fit are left out.
+            let rows = empty_tip_rows(self.dialog.width, body_height.saturating_sub(3));
+            let tips_y = content_y + body_height.saturating_sub(rows.len() + 1);
+            for (offset, row) in rows.iter().enumerate() {
+                buffer.set_text(content_x, tips_y + offset, row, &self.muted_style);
+            }
         } else {
             let wrapped = self.wrapped_text();
             let cursor_row = wrapped
@@ -393,6 +406,26 @@ impl Component for AgentComposer {
 
 /// Legacy display-only wrapping. Editable surfaces use `TextLayout` directly so
 /// cursor movement and hit-testing share the same source-backed projection.
+/// Bulleted, word-wrapped welcome tips that fit in `max_rows`, in order.
+fn empty_tip_rows(width: usize, max_rows: usize) -> Vec<String> {
+    let mut rows = Vec::new();
+    if width < 12 {
+        return rows;
+    }
+    for tip in EMPTY_TIPS {
+        let (lines, _) =
+            TextLayout::new(tip, LayoutOptions::word(width.saturating_sub(2))).into_parts();
+        if rows.len() + lines.len() > max_rows {
+            break;
+        }
+        for (index, line) in lines.into_iter().enumerate() {
+            let bullet = if index == 0 { "· " } else { "  " };
+            rows.push(format!("{bullet}{}", line.text.trim_start()));
+        }
+    }
+    rows
+}
+
 pub(crate) fn wrap_text(text: &str, width: usize) -> WrappedText {
     let (rows, _) = TextLayout::new(text, LayoutOptions::grapheme(width)).into_parts();
     WrappedText {
@@ -437,6 +470,27 @@ mod tests {
         history: Vec<String>,
     ) -> AgentComposer {
         AgentComposer::new(editor, title, id, query, history, "agent".to_string())
+    }
+
+    #[test]
+    fn welcome_tips_wrap_between_words_and_drop_what_does_not_fit() {
+        let wide = empty_tip_rows(70, 10);
+        assert_eq!(wide.len(), 3);
+        assert!(wide.iter().all(|row| row.starts_with("· ")));
+
+        let narrow = empty_tip_rows(32, 10);
+        assert!(narrow.len() > 3);
+        assert!(narrow
+            .iter()
+            .all(|row| crate::unicode_utils::display_width(row) <= 32));
+        assert!(narrow
+            .iter()
+            .any(|row| row.starts_with("  ") && !row.trim().is_empty()));
+        // Whole tips are dropped, never cut in the middle.
+        let cramped = empty_tip_rows(32, 3);
+        assert!(cramped.len() <= 3);
+        assert!(cramped.last().is_some_and(|row| !row.ends_with(' ')));
+        assert!(empty_tip_rows(32, 0).is_empty());
     }
 
     #[test]

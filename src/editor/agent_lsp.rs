@@ -521,7 +521,7 @@ impl Editor {
                             "push_only",
                         )?));
                     }
-                    let sequence = self
+                    let stamp = self
                         .agent_lsp
                         .reports
                         .get(&(uri.clone(), context.lsp_source.key.clone()))
@@ -530,8 +530,20 @@ impl Editor {
                                 uri.clone(),
                                 super::diagnostics::DEFAULT_PRODUCER.to_string(),
                             ))
-                        })
-                        .map_or(0, |stamp| stamp.sequence);
+                        });
+                    // A push-only server never re-reports unchanged text, so a
+                    // report for this exact revision is the answer; waiting would
+                    // only end in a timeout.
+                    if stamp.is_some_and(|stamp| {
+                        stamp.revision == Some(self.buffer_manager[index].revision())
+                    }) {
+                        return Ok(StartQuery::Immediate(self.agent_diagnostics_payload(
+                            &request.call,
+                            &context.root,
+                            "already_reported",
+                        )?));
+                    }
+                    let sequence = stamp.map_or(0, |stamp| stamp.sequence);
                     return Ok(StartQuery::Pending {
                         id: -(crate::lsp::next_id() as i64),
                         context,
@@ -772,6 +784,24 @@ impl Editor {
                     &pending.context.root,
                     "received",
                 )
+                .map_err(|error| error.to_string())
+            } else if matches!(
+                pending.tool.request.call,
+                EditorToolCall::LspDiagnostics { .. }
+            ) {
+                // Answer with what is known instead of a bare timeout, so the agent
+                // can still reason about the last reports and their freshness.
+                self.agent_diagnostics_payload(
+                    &pending.tool.request.call,
+                    &pending.context.root,
+                    "timeout",
+                )
+                .map(|mut payload| {
+                    payload["ok"] = json!(false);
+                    payload["status"] = json!("timeout");
+                    payload["refresh_note"] = json!("No fresh report arrived before the deadline; these are the last known diagnostics, labelled by freshness. This is not a clean bill of health.");
+                    payload
+                })
                 .map_err(|error| error.to_string())
             } else {
                 Ok(result_status("timeout", "no fresh LSP result arrived before the deadline; this is not a clean diagnostic report"))

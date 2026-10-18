@@ -3783,6 +3783,10 @@ pub struct Editor {
 
     /// Temporary presentation of one live window or docked pane.
     zoomed_pane: Option<FocusTarget>,
+    /// Compact conversation panes that are open but out of view.
+    compact_hidden_panes: std::collections::BTreeSet<String>,
+    /// Panel events raised while laying out, delivered on the next service tick.
+    pending_panel_events: Vec<plugin::panel::PanelEvent>,
 
     /// Cursor position where the current insert session began.
     insert_entry_cursor: Option<CursorSnapshot>,
@@ -5722,6 +5726,8 @@ impl Editor {
             multi_cursor: None,
             pane_resize_mode: None,
             zoomed_pane: None,
+            compact_hidden_panes: Default::default(),
+            pending_panel_events: Vec::new(),
             insert_entry_cursor: None,
             generated_indent: None,
             waiting_command: None,
@@ -6528,10 +6534,11 @@ impl Editor {
             current_side,
             plugin::PanelSide::Left | plugin::PanelSide::Right
         );
+        let terminal_width = usize::from(self.size.0);
         let reserved_on_axis = if target_is_vertical {
             self.panel_manager
-                .reserved_left_width()
-                .saturating_add(self.panel_manager.reserved_right_width())
+                .reserved_left_width(terminal_width)
+                .saturating_add(self.panel_manager.reserved_right_width(terminal_width))
         } else {
             self.panel_manager
                 .reserved_top_height()
@@ -6544,8 +6551,14 @@ impl Editor {
         };
         let (terminal_extent, minimum_editor, minimum_panel) = if target_is_vertical {
             (
-                usize::from(self.size.0),
-                MIN_EDITOR_WINDOW_WIDTH,
+                terminal_width,
+                // A conversation pane never squeezes the editor below a usable
+                // width; the layout would cap it there anyway.
+                if self.panel_manager.panel_has_composer(id) {
+                    plugin::panel::MIN_COMFORTABLE_EDITOR_WIDTH
+                } else {
+                    MIN_EDITOR_WINDOW_WIDTH
+                },
                 MIN_DOCKED_PANEL_WIDTH,
             )
         } else {
@@ -6944,7 +6957,18 @@ impl Editor {
             self.pane_resize_mode = None;
             self.force_full_redraw = true;
         }
-        let (windows, panels) = match &self.zoomed_pane {
+        // A compact conversation pane covers the editor while it has focus, as if
+        // zoomed, and steps aside as soon as focus returns to a window.
+        let compact_focus = match (&self.zoomed_pane, self.current_focus_target()) {
+            (None, Some(FocusTarget::Panel(id)))
+                if self.panel_manager.is_compact_panel(&id, terminal_size.0) =>
+            {
+                Some(FocusTarget::Panel(id))
+            }
+            _ => None,
+        };
+        self.sync_compact_pane_views(terminal_size.0, compact_focus.as_ref());
+        let (windows, panels) = match self.zoomed_pane.as_ref().or(compact_focus.as_ref()) {
             Some(FocusTarget::Window(id)) => (
                 WindowPresentation::Zoomed(*id),
                 plugin::panel::PanelPresentation::Hidden,
@@ -6963,6 +6987,39 @@ impl Editor {
         };
         self.window_manager.set_presentation(windows);
         self.panel_manager.set_presentation(panels);
+    }
+
+    /// Tells a compact pane's plugin whether the pane is on screen, so it can
+    /// announce results the user cannot see (the pane is still logically open).
+    fn sync_compact_pane_views(&mut self, terminal_width: usize, shown: Option<&FocusTarget>) {
+        let hidden = self
+            .panel_manager
+            .panel_ids()
+            .into_iter()
+            .filter(|id| {
+                self.panel_manager.is_compact_panel(id, terminal_width)
+                    && !matches!(shown, Some(FocusTarget::Panel(shown)) if shown == id)
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        if hidden == self.compact_hidden_panes {
+            return;
+        }
+        self.force_full_redraw = true;
+        for id in hidden.symmetric_difference(&self.compact_hidden_panes) {
+            let view = if hidden.contains(id) {
+                "hidden"
+            } else {
+                "visible"
+            };
+            self.pending_panel_events.push(plugin::panel::PanelEvent {
+                panel_id: id.clone(),
+                action: "view".to_string(),
+                selected_index: 0,
+                row: None,
+                text: Some(view.to_string()),
+            });
+        }
+        self.compact_hidden_panes = hidden;
     }
 
     fn resize_window_layout(&mut self, terminal_size: (usize, usize)) {
@@ -7056,10 +7113,13 @@ impl Editor {
             return (0, 0);
         }
         let max_reserved = terminal_width.saturating_sub(MIN_EDITOR_WINDOW_WIDTH);
-        let reserved_left = self.panel_manager.reserved_left_width().min(max_reserved);
+        let reserved_left = self
+            .panel_manager
+            .reserved_left_width(terminal_width)
+            .min(max_reserved);
         let reserved_right = self
             .panel_manager
-            .reserved_right_width()
+            .reserved_right_width(terminal_width)
             .min(max_reserved.saturating_sub(reserved_left));
         (reserved_left, reserved_right)
     }
@@ -11034,6 +11094,14 @@ impl Editor {
         runtime: &mut Runtime,
     ) -> anyhow::Result<()> {
         self.plugin_registry.poll_rpc_lifecycle(runtime).await;
+        for event in std::mem::take(&mut self.pending_panel_events) {
+            let topic = format!("panel:event:{}", event.panel_id);
+            if let Ok(payload) = serde_json::to_value(&event) {
+                self.plugin_registry
+                    .notify(runtime, &topic, payload)
+                    .await?;
+            }
+        }
         self.plugin_registry.poll_rpc_commands(runtime).await;
         self.service_rpc_host_requests(buffer, runtime).await;
         self.plugin_registry
@@ -17802,8 +17870,27 @@ impl Editor {
                 actions.push(Action::MoveToBottom);
             }
 
-            if cmd == "quit" {
+            // Red has one editor process, so quitting "all" is the same quit.
+            if cmd == "quit" || cmd == "qall" || cmd == "quitall" {
                 actions.push(Action::Quit(parsed.is_forced()));
+            }
+
+            // `:x` writes only a modified buffer; the "all" forms write every
+            // modified buffer. A failed write keeps the editor open.
+            if cmd == "xit" || cmd == "exit" {
+                if self.current_buffer().is_dirty() {
+                    actions.push(if parsed.is_forced() {
+                        Action::ForceSave
+                    } else {
+                        Action::Save
+                    });
+                }
+                actions.push(Action::Quit(false));
+            }
+
+            if cmd == "wqall" || cmd == "xall" {
+                actions.push(Action::SaveAll);
+                actions.push(Action::Quit(false));
             }
 
             if cmd == "write" {
@@ -37004,6 +37091,115 @@ builtin = "rust"
                 vec![Action::PluginCommand("CancelScratch".to_string())]
             );
         }
+    }
+
+    #[test]
+    fn a_cramped_conversation_pane_covers_the_editor_only_while_focused() {
+        let mut editor = test_editor(60, 20);
+        editor.test_create_text_panel(
+            "agent",
+            plugin::PanelConfig {
+                side: plugin::PanelSide::Right,
+                width: 62,
+                composer: Some(plugin::TextPanelComposerConfig {
+                    placeholder: "Ask".to_string(),
+                    rows: 3,
+                }),
+                ..plugin::PanelConfig::default()
+            },
+        );
+        let editor_width =
+            |editor: &Editor| editor.window_manager.active_window().unwrap().inner_width();
+        // The editor keeps the whole terminal instead of 5 columns.
+        assert_eq!(editor_width(&editor), 60);
+        assert_eq!(editor.panel_manager.reserved_right_width(60), 0);
+
+        assert!(editor.test_focus_text_panel_composer("agent"));
+        editor.apply_panel_layout();
+        let placement = editor
+            .panel_manager
+            .panel_at_position(0, 5, 60, 20)
+            .unwrap();
+        assert_eq!((placement.id.as_str(), placement.width), ("agent", 60));
+        assert!(
+            editor.zoomed_pane.is_none(),
+            "compact focus is not a user zoom"
+        );
+
+        editor.panel_manager.focus_editor();
+        editor.apply_panel_layout();
+        assert!(editor
+            .panel_manager
+            .panel_at_position(59, 5, 60, 20)
+            .is_none());
+        assert_eq!(editor_width(&editor), 60);
+        let views = editor
+            .pending_panel_events
+            .iter()
+            .map(|event| (event.action.as_str(), event.text.as_deref()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            views,
+            [
+                ("view", Some("hidden")),
+                ("view", Some("visible")),
+                ("view", Some("hidden"))
+            ]
+        );
+
+        // A wide terminal docks the same pane beside the editor again.
+        editor.resize_window_layout((120, 20));
+        assert_eq!(editor.panel_manager.reserved_right_width(120), 55);
+        assert_eq!(editor_width(&editor), 120 - 55);
+    }
+
+    #[test]
+    fn quit_all_and_exit_commands_follow_vim() {
+        let mut editor = test_editor(40, 10);
+        let runtime = Runtime::new();
+        for command in ["qa", "qal", "qall", "quita", "quitall"] {
+            assert_eq!(
+                editor.handle_command(command, &runtime),
+                vec![Action::Quit(false)],
+                "{command}"
+            );
+        }
+        for command in ["qa!", "qall!", "quitall!"] {
+            assert_eq!(
+                editor.handle_command(command, &runtime),
+                vec![Action::Quit(true)],
+                "{command}"
+            );
+        }
+        for command in ["wqa", "wqall", "xa", "xall", "wqa!", "xa!"] {
+            assert_eq!(
+                editor.handle_command(command, &runtime),
+                vec![Action::SaveAll, Action::Quit(false)],
+                "{command}"
+            );
+        }
+        assert_eq!(
+            editor.handle_command("e", &runtime),
+            vec![Action::ReloadFile(false)],
+            "`:e` must stay `:edit`"
+        );
+        for command in ["x", "xit", "exi", "exit"] {
+            assert_eq!(
+                editor.handle_command(command, &runtime),
+                vec![Action::Quit(false)],
+                "a clean buffer is not rewritten by {command}"
+            );
+        }
+        editor.current_buffer_mut().insert_str(0, 0, "changed");
+        assert!(editor.current_buffer().is_dirty());
+        assert_eq!(
+            editor.handle_command("x", &runtime),
+            vec![Action::Save, Action::Quit(false)]
+        );
+        assert_eq!(
+            editor.handle_command("x!", &runtime),
+            vec![Action::ForceSave, Action::Quit(false)]
+        );
     }
 
     #[test]

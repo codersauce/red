@@ -477,7 +477,7 @@ pub fn editor_tool_schemas(schema_key: &str) -> Vec<Value> {
         ),
         (
             "open_file",
-            "Open a workspace file in the editor and reveal a zero-based UTF-16 location.",
+            "Open a workspace file in the editor and reveal a zero-based UTF-16 location. This moves the user's view, so use it only when the user asks to see, open, or go to something; read_file reads code without disturbing them.",
             json!({
                 "type": "object",
                 "properties": {
@@ -492,7 +492,7 @@ pub fn editor_tool_schemas(schema_key: &str) -> Vec<Value> {
         ),
         (
             "select_text",
-            "Open a workspace file and create a visual selection using a half-open, zero-based UTF-16 range.",
+            "Open a workspace file and create a visual selection using a half-open, zero-based UTF-16 range. This moves the user's view and selection, so use it only when the user asks to see or select something.",
             json!({
                 "type": "object",
                 "properties": {
