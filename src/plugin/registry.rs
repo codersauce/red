@@ -265,7 +265,7 @@ struct RpcCommandResult {
 }
 
 /// Host API version used for plugin compatibility checks.
-pub const RED_HOST_API_VERSION: &str = "0.21.0";
+pub const RED_HOST_API_VERSION: &str = "0.22.0";
 pub(crate) const SUPPORTED_HOST_API_VERSIONS: &[&str] = &[
     "0.4.0",
     "0.6.0",
@@ -281,6 +281,7 @@ pub(crate) const SUPPORTED_HOST_API_VERSIONS: &[&str] = &[
     "0.18.0",
     "0.19.0",
     "0.20.0",
+    "0.21.0",
     RED_HOST_API_VERSION,
 ];
 
@@ -3991,6 +3992,9 @@ mod tests {
         check_api_compatibility(&metadata).unwrap();
 
         metadata.red_api_version = Some("^0.22.0".to_string());
+        check_api_compatibility(&metadata).unwrap();
+
+        metadata.red_api_version = Some("^0.23.0".to_string());
         assert!(check_api_compatibility(&metadata).is_err());
 
         metadata.red_api_version = Some("^0.5.0".to_string());

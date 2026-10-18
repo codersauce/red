@@ -5,7 +5,7 @@
 //! effects are queued and run by [`Editor::drain_agent_pane_effects`], which turns
 //! them into the existing agent host requests and publishes the pane snapshot.
 
-use super::agent_pane::{AgentPaneEffect, AgentSubmitResult};
+use super::agent_pane::{AgentInterruptionChoice, AgentPaneEffect, AgentSubmitResult};
 use super::*;
 
 impl Editor {
@@ -58,6 +58,18 @@ impl Editor {
                     }
                     effects
                 });
+            }
+            PluginRequest::AgentPrepare => {
+                self.agent_manager
+                    .update_pane(|lifecycle| lifecycle.prepare());
+            }
+            PluginRequest::AgentResolveInterruption { choice, transcript } => {
+                let Some(choice) = AgentInterruptionChoice::parse(&choice) else {
+                    log!("unknown agent interruption choice: {choice}");
+                    return;
+                };
+                self.agent_manager
+                    .update_pane(|lifecycle| lifecycle.resolve_interruption(choice, &transcript));
             }
             _ => unreachable!("not an Agent pane request"),
         }

@@ -349,13 +349,38 @@ and reattaching does not intentionally replace a healthy process.
 
 Red snapshots the Codex thread ID together with a structured, clean projection
 of the model-visible user and assistant messages. After an owner or machine
-restart, the Agent composer remains disabled while Red starts a replacement
-app-server and calls `thread/resume`. The returned turns reconcile the panel to
+restart, Red starts a replacement app-server and calls `thread/resume`; the
+composer stays open and a message typed meanwhile is sent once the thread is
+back. The returned turns reconcile the panel to
 the history Codex actually loaded; Red's projection keeps injected editor
 context out of the visible user message. If the persisted thread is missing or
 cannot be loaded, Red marks the transcript as archived and makes the next prompt
 start a new thread with bounded recovered context instead of pretending the old
 session is live.
+
+Quitting Red does not end the conversation. Each workspace keeps its latest
+Agent conversation under `~/.config/red/agent/conversations/`, and the next
+normal launch in that workspace continues the same Codex thread: the pane shows
+"↺ Picked up where you left off 2 hours ago" and the thread resumes when the
+pane opens or the first message is sent, so a launch that never uses the agent
+never starts Codex. `:AgentNew` forgets the saved conversation. If the thread
+cannot be resumed, for example after a Codex upgrade that changes Red's tools,
+the next message starts a new thread seeded with the recent transcript.
+
+Only one Red at a time drives a workspace's conversation. The first editor to
+use it records its process id next to the saved conversation; a second Red
+opened in the same workspace starts its own thread, says so in the status line,
+and does not overwrite the saved one. The claim is released on exit and taken
+over automatically if its editor crashed.
+
+If Codex stops in the middle of a reply, Red keeps everything that streamed so
+far, adds a notice to the transcript, and resumes the thread in the background,
+but sends nothing else on its own: queued follow-ups wait. The notice offers
+**Retry the message**, **Ask Codex to continue where it stopped**, and **Leave it
+here** (press Tab, then `]l` to reach a choice and Enter to pick it, or run
+`:AgentRecover` or `Space A` for a picker). Typing a new message also moves on. Edits the
+interrupted turn already made stay applied, and both Retry and Continue tell
+Codex so. A crash while the agent is idle resumes quietly.
 
 ## Followed editing
 
@@ -528,6 +553,7 @@ protocol is unavailable; it does not fall back to `codex exec` or native edits.
 | `:AgentCancel` | Interrupt the active Codex turn and keep the thread. |
 | `:AgentSendQueued` | Resume follow-ups held after a stopped or failed turn. |
 | `:AgentDiscardQueued` | Drop follow-ups that have not been sent. |
+| `:AgentRecover` | Retry, continue, or leave a reply that Codex stopped in the middle of. |
 | `:AgentClear` | Clear visible conversation while retaining current context. |
 | `:AgentNew` | Close the current thread and start a new one. |
 | `:AgentClose` | Hide the conversation panel without discarding state. |

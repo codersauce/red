@@ -39,6 +39,10 @@ struct AgentPaneState {
     paused: bool,
     stop_failed: bool,
     recap_pending: bool,
+    // The message whose reply Codex cut short; the core waits for a choice.
+    interrupted: Option<AgentPanePrompt>,
+    // A saved thread resumes when the pane opens or the next message is sent.
+    resume_pending: bool,
 }
 
 
@@ -84,6 +88,15 @@ struct AgentConversationEvent {
     cwd: String,
     model_info: Json,
     items: [AgentConversationItem],
+}
+
+/// A conversation saved by an earlier Red launch in this workspace.
+struct AgentResumableEvent {
+    thread_id: String,
+    cwd: String,
+    model_info: Json,
+    items: [AgentConversationItem],
+    age: String,
 }
 
 struct AgentStringValueEvent {
@@ -273,6 +286,10 @@ struct AgentState {
     activity_inspector_detail: [[PanelSegment]],
     activity_block_id: String,
     thought: String,
+    // Prompt id of the interrupted reply whose notice is in the transcript.
+    interruption_id: String,
+    // Composer hint for a conversation continued from an earlier launch.
+    resume_hint: String,
 }
 
 #[red::state]
@@ -321,6 +338,8 @@ fn initial_state() -> AgentState {
         activity_inspector_detail: [],
         activity_block_id: "",
         thought: "",
+        interruption_id: "",
+        resume_hint: "",
     };
 }
 
@@ -612,6 +631,7 @@ fn idle_pane_state() -> AgentPaneState {
     return AgentPaneState {
         phase: "idle", session_id: None, turn_id: None, in_flight: None, queued: [],
         paused: false, stop_failed: false, recap_pending: false,
+        interrupted: None, resume_pending: false,
     };
 }
 
@@ -643,6 +663,10 @@ fn pane_turn_id() -> String {
 /// transcript in the same update.
 fn commit_sent_prompt(prompt: AgentPanePrompt) {
     red::state_patch(AgentState { committed_prompt_id: prompt.id });
+    if state().resume_hint != "" {
+        red::state_patch(AgentState { resume_hint: "" });
+        red::execute("SetTextPanelComposerState", "agent-conversation", true, "");
+    }
     append_transcript_block("You", prompt.text, prompt.id);
     if state().focus_panel_on_first_prompt {
         red::state_patch(AgentState { focus_panel_on_first_prompt: false });
@@ -675,13 +699,15 @@ fn pane_state_changed(event: AgentPaneState) {
     let had_session = false;
     if let Some(value) = previous.session_id { had_session = value != ""; }
     if state().panel_created {
-        if phase == "restoring" {
-            red::execute("SetTextPanelComposerState", "agent-conversation", false, "Restoring agent session…");
+        if phase == "restoring" && was != "restoring" {
+            // Messages typed now are sent as soon as the thread is back.
+            red::execute("SetTextPanelComposerState", "agent-conversation", true, "Reconnecting to Codex… you can keep typing");
         } else if was == "restoring" || (session_id != "" && !had_session) {
             // A live thread replaces any "archived conversation" hint.
-            red::execute("SetTextPanelComposerState", "agent-conversation", true, "");
+            red::execute("SetTextPanelComposerState", "agent-conversation", true, state().resume_hint);
         }
     }
+    sync_interruption();
     let grew = queued_count() > red::len(previous.queued);
     let committed = false;
     if let Some(prompt) = state().pane.in_flight {
@@ -735,10 +761,15 @@ fn session_created(event: AgentSessionEvent) {
     scope = "global",
 )]
 fn prompt() {
+    prepare_saved_conversation();
+    if state().interruption_id != "" {
+        open_conversation();
+        choose_interruption();
+        return;
+    }
     if is_restoring() {
         ensure_conversation_panel();
-        red::execute("SetTextPanelComposerState", "agent-conversation", false, "Restoring agent session…");
-        red::execute("FocusPanel", "agent-conversation");
+        red::execute("FocusTextPanelComposer", "agent-conversation");
         return;
     }
     let has_live_session = red::string(state().session_id, "") != "";
@@ -772,6 +803,7 @@ fn toggle_conversation() {
     if state().panel_open {
         close_conversation();
     } else {
+        prepare_saved_conversation();
         let was_created = state().panel_created;
         ensure_conversation_panel();
         if !was_created {
@@ -792,6 +824,7 @@ fn toggle_conversation() {
     scope = "global",
 )]
 fn open_conversation() {
+    prepare_saved_conversation();
     let was_created = state().panel_created;
     if !was_created {
         ensure_conversation_panel();
@@ -825,6 +858,9 @@ fn ensure_conversation_panel() {
             red::request("GetStorage", docked_prompt_history_loaded, "prompt_history");
         }
         red::state_patch(AgentState { model_header_text: "", model_header_secondary: "" });
+        if state().resume_hint != "" {
+            red::execute("SetTextPanelComposerState", "agent-conversation", true, state().resume_hint);
+        }
         prefetch_models();
         refresh_model_header();
         load_default_model();
@@ -844,6 +880,8 @@ fn ensure_conversation_panel() {
 fn restore_conversation_pane(event: RestoredPanesEvent) {
     for pane in event.panels {
         if pane.id == "agent-conversation" && red::bool(pane.visible, false) {
+            // A pane reopened at launch is about to be used: resume right away.
+            prepare_saved_conversation();
             let was_created = state().panel_created;
             ensure_conversation_panel();
             if !was_created {
@@ -1401,6 +1439,9 @@ fn panel_event(event: AgentPanelEvent) {
         choose_model();
     } else if event.action == "activity" {
         toggle_activity();
+    } else if event.action == "activate_block" && red::starts_with(event.text, "interruption-choice:") {
+        let choice = red::slice(event.text, red::len("interruption-choice:"));
+        if choice != "hint" { resolve_interruption(choice); }
     } else if event.action == "activate_block" {
         activate_activity_block(event.text);
     } else if event.action == "clear" {
@@ -1568,6 +1609,7 @@ fn close_conversation() {
 )]
 fn new_conversation() {
     reset_model_state();
+    red::state_patch(AgentState { resume_hint: "", interruption_id: "" });
     set_phase("idle", "");
     clear_conversation();
     red::state_patch(AgentState { transcript: "" });
@@ -1695,6 +1737,8 @@ fn flat_transcript(blocks: [AgentTextBlock]) -> String {
     for block in blocks {
         // Live progress is presentation-only; completion saves the summary and footer.
         if block.id != "" && block.id == state().activity_block_id { continue; }
+        // Interruption choices and the resume divider are not conversation.
+        if red::starts_with(block.id, "interruption-choice:") || block.id == "resume-notice" { continue; }
         let text = red::string(block.text, "");
         if text == "" {
             continue;
@@ -1985,27 +2029,181 @@ fn transcript_restored(event: AgentTranscriptEvent) {
     render_conversation();
 }
 
+/// Whether the pane already shows this thread, as after Codex restarts under a
+/// running editor. Its transcript then stays: it holds partial replies and
+/// activity that Codex's saved history does not.
+fn shows_thread(thread_id: String) -> bool {
+    return thread_id != "" && red::string(state().session_id, "") == thread_id
+        && red::len(state().transcript_blocks) > 0;
+}
+
 #[red::on("agent:conversation_restore_pending")]
 fn conversation_restore_pending(event: AgentConversationEvent) {
     // The core resumes the thread; the pane shows the saved conversation meanwhile.
     red::state_patch(AgentState { model_info: event.model_info, accepted_model: Json {}, turn_model_info: Json {} });
-    load_conversation(event);
+    if shows_thread(event.thread_id) {
+        // Codex stopped under us. Keep what streamed so far; the core marks a
+        // running turn as interrupted and the notice follows with the snapshot.
+        finish_agent_message();
+        collapse_activity(red::null());
+    } else {
+        load_conversation(event);
+    }
     red::state_patch(AgentState { activity_block_id: "" });
     red::state_patch(AgentState { activity_rows: [] });
     red::state_patch(AgentState { thought: "" });
     ensure_conversation_panel();
     refresh_model_header();
-    red::execute("SetTextPanelComposerState", "agent-conversation", false, "Restoring agent session…");
+    red::execute("SetTextPanelComposerState", "agent-conversation", true, "Reconnecting to Codex… you can keep typing");
+}
+
+#[red::on("agent:conversation_resumable")]
+fn conversation_resumable(event: AgentResumableEvent) {
+    // Saved by an earlier launch. The core resumes the thread when the pane
+    // opens or the next message is sent.
+    red::state_patch(AgentState { model_info: event.model_info, accepted_model: Json {}, turn_model_info: Json {} });
+    load_conversation(AgentConversationEvent {
+        thread_id: event.thread_id, cwd: event.cwd, model_info: event.model_info, items: event.items,
+    });
+    red::state_patch(AgentState { resume_hint: "Continuing · :AgentNew starts fresh" });
+    // A quiet divider between the earlier session and this one.
+    let blocks = state().transcript_blocks;
+    blocks = red::push(blocks, AgentTextBlock {
+        id: "resume-notice", kind: "activity", format: "plain",
+        text: "↺ Picked up where you left off " + red::string(event.age, "earlier"),
+    });
+    red::state_patch(AgentState { transcript_blocks: blocks });
+    render_conversation();
+    if state().panel_created {
+        red::execute("SetTextPanelComposerState", "agent-conversation", true, state().resume_hint);
+    }
+    refresh_model_header();
 }
 
 #[red::on("agent:session_restored")]
 fn session_restored(event: AgentConversationEvent) {
     red::state_patch(AgentState { model_info: event.model_info, accepted_model: Json {}, turn_model_info: Json {} });
-    load_conversation(event);
+    if !shows_thread(event.thread_id) {
+        load_conversation(event);
+    }
     set_phase("idle", "");
-    red::execute("SetTextPanelComposerState", "agent-conversation", true, "");
+    red::execute("SetTextPanelComposerState", "agent-conversation", true, state().resume_hint);
     refresh_model_header();
-    red::execute("Print", "Agent session restored");
+}
+
+/// Resumes a saved conversation as soon as the pane is about to be used.
+fn prepare_saved_conversation() {
+    if state().pane.resume_pending {
+        red::execute("AgentPrepare");
+    }
+    if state().resume_hint != "" && state().panel_created {
+        red::execute("SetTextPanelComposerState", "agent-conversation", true, state().resume_hint);
+    }
+}
+
+/// Shows or retires the notice for a reply Codex cut short.
+fn sync_interruption() {
+    let shown = state().interruption_id;
+    let current = "";
+    let text = "";
+    if let Some(prompt) = state().pane.interrupted {
+        current = prompt.id;
+        text = prompt.text;
+    }
+    if current == shown {
+        return;
+    }
+    if shown != "" {
+        // Answered: the choices go, the notice stays as history.
+        let kept = [];
+        for block in state().transcript_blocks {
+            if !red::starts_with(block.id, "interruption-choice:") { kept = red::push(kept, block); }
+        }
+        red::state_patch(AgentState { transcript_blocks: kept, interruption_id: "" });
+        render_conversation();
+    }
+    if current != "" {
+        show_interruption(current);
+    }
+}
+
+fn show_interruption(prompt_id: String) {
+    finish_agent_message();
+    collapse_activity(red::null());
+    set_phase("idle", "");
+    red::state_patch(AgentState { interruption_id: prompt_id });
+    let queued = queued_count();
+    let notice = "Codex stopped before finishing this reply. The conversation is saved and edits it already made are still applied. Nothing more will be sent until you choose what to do.";
+    if queued > 0 {
+        notice = notice + " (" + queued + " queued follow-up(s) are waiting.)";
+    }
+    append_transcript_block("Error", notice, "interruption:" + prompt_id);
+    let blocks = state().transcript_blocks;
+    blocks = red::push(blocks, AgentTextBlock {
+        id: "interruption-choice:retry", kind: "action", format: "plain", text: "↻ Retry the message",
+    });
+    blocks = red::push(blocks, AgentTextBlock {
+        id: "interruption-choice:continue", kind: "action", format: "plain", text: "→ Ask Codex to continue where it stopped",
+    });
+    blocks = red::push(blocks, AgentTextBlock {
+        id: "interruption-choice:dismiss", kind: "action", format: "plain", text: "✕ Leave it here",
+    });
+    blocks = red::push(blocks, AgentTextBlock {
+        id: "interruption-choice:hint", kind: "activity", format: "plain", text: "Tab, then ]l to a choice and Enter · or :AgentRecover · or type a new message",
+    });
+    red::state_patch(AgentState { transcript_blocks: blocks });
+    render_conversation();
+    red::execute("SetStorage", "transcript", state().transcript);
+    red::execute("PrintWarning", "Codex stopped mid-reply · Space A to choose what to do");
+}
+
+#[red::command(
+    name = "AgentRecover",
+    title = "Recover an interrupted agent reply",
+    category = "Agent",
+    description = "Retry, continue, or leave a reply that Codex stopped in the middle of",
+    aliases = ["retry agent", "continue agent"],
+    scope = "global",
+)]
+fn choose_interruption() {
+    if state().interruption_id == "" {
+        red::execute("Print", "No interrupted agent reply");
+        return;
+    }
+    red::execute("OpenPicker", "Codex stopped mid-reply", [
+        PickerItem { id: "retry", label: "Retry the message", kind: "Resend" },
+        PickerItem { id: "continue", label: "Continue where it stopped", kind: "Resume" },
+        PickerItem { id: "dismiss", label: "Leave it here", kind: "Keep" },
+    ], PickerOptions {
+        placeholder: "What should happen with the cut-off reply?",
+        status: "Edits it already made stay applied · Escape decides later",
+        presentation: "compact",
+    }, PickerHandlers {
+        selected: interruption_selected,
+        cancelled: interruption_cancelled,
+    });
+}
+
+fn interruption_selected(item: PickerItem) {
+    resolve_interruption(item.id);
+}
+
+fn interruption_cancelled(event: PickerCancelled) {
+    red::execute("Print", "Interrupted reply kept · :AgentRecover decides later");
+}
+
+fn resolve_interruption(choice: String) {
+    if state().interruption_id == "" {
+        return;
+    }
+    red::execute("AgentResolveInterruption", choice, red::string(state().transcript, ""));
+    if choice == "dismiss" {
+        let message = "Left the interrupted reply as it is";
+        if queued_count() > 0 {
+            message = message + " · " + queued_count() + " queued · :AgentSendQueued sends them";
+        }
+        red::execute("Print", message);
+    }
 }
 
 struct AgentSessionRestoreFailedEvent {

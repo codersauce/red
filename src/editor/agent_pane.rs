@@ -7,7 +7,7 @@
 //! after every change. Methods only update state and return the effects the
 //! editor must run, so every transition is unit-testable without Codex.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 
 use serde::Serialize;
 
@@ -15,6 +15,8 @@ use serde::Serialize;
 pub const MAX_RECAP_CHARS: usize = 6000;
 /// Most follow-ups the pane may hold while a turn runs or the queue is paused.
 pub const MAX_QUEUED_PROMPTS: usize = 16;
+/// What the pane shows when the user asks Codex to pick up an interrupted reply.
+pub const CONTINUE_PROMPT: &str = "Continue where you stopped.";
 
 /// What the pane's conversation is doing right now.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -57,6 +59,34 @@ pub struct AgentPaneSnapshot {
     pub stop_failed: bool,
     /// The next prompt starts a new thread that is seeded with the transcript.
     pub recap_pending: bool,
+    /// The message whose turn was cut short because Codex stopped. Nothing is
+    /// sent until the user chooses what to do with it.
+    pub interrupted: Option<AgentPanePrompt>,
+    /// A saved thread is known but not resumed yet; it resumes when the pane
+    /// opens or the next message is sent.
+    pub resume_pending: bool,
+}
+
+/// What the user chose to do about a turn that Codex stopped in the middle of.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentInterruptionChoice {
+    /// Send the interrupted message again.
+    Retry,
+    /// Ask Codex to pick up where the reply stopped.
+    Continue,
+    /// Leave the reply as it is; queued follow-ups stay paused.
+    Dismiss,
+}
+
+impl AgentInterruptionChoice {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "retry" => Some(Self::Retry),
+            "continue" => Some(Self::Continue),
+            "dismiss" => Some(Self::Dismiss),
+            _ => None,
+        }
+    }
 }
 
 /// Work the editor performs for a lifecycle transition.
@@ -123,6 +153,13 @@ pub struct AgentPaneLifecycle {
     /// Thread forgotten by a reset while it was still being resumed; a late
     /// restore of it must not be adopted.
     forgotten_session: Option<String>,
+    /// Turn cut short when Codex stopped; see [`AgentPaneSnapshot::interrupted`].
+    interrupted: Option<AgentPanePrompt>,
+    /// Workspace of a saved thread that is resumed on first use.
+    resume_cwd: Option<String>,
+    /// Wire text for queued prompts whose shown text is shorter than what Codex
+    /// receives, keyed by prompt id.
+    wire_overrides: HashMap<String, String>,
     next_prompt: u64,
 }
 
@@ -137,6 +174,8 @@ impl AgentPaneLifecycle {
             paused: self.paused,
             stop_failed: self.stop_failed,
             recap_pending: self.recap_pending,
+            interrupted: self.interrupted.clone(),
+            resume_pending: self.resume_cwd.is_some(),
         }
     }
 
@@ -155,6 +194,8 @@ impl AgentPaneLifecycle {
         if self.queue.len() >= MAX_QUEUED_PROMPTS {
             return (AgentSubmitResult::QueueFull, Vec::new());
         }
+        // Writing a new message is an answer too: the user moved on.
+        self.interrupted = None;
         let prompt = self.new_prompt(text);
         let busy = matches!(
             self.phase(),
@@ -352,7 +393,18 @@ impl AgentPaneLifecycle {
     /// is retried in a new thread; a prompt that already ran is not replayed,
     /// because its edits may have applied.
     pub fn session_lost(&mut self, unsent: bool) -> Vec<AgentPaneEffect> {
-        let retry = self.in_flight.take().filter(|_| unsent);
+        let running = self.is_running();
+        let in_flight = self.in_flight.take();
+        let (retry, ran) = if unsent {
+            (in_flight, None)
+        } else {
+            (None, in_flight.filter(|_| running))
+        };
+        if ran.is_some() {
+            // The reply was cut short; ask instead of replaying or dropping it.
+            self.interrupted = ran;
+        }
+        self.resume_cwd = None;
         let had_session = self.session_id.take().is_some();
         self.close_reply();
         self.recap_pending |= had_session || retry.is_some();
@@ -371,15 +423,82 @@ impl AgentPaneLifecycle {
     }
 
     /// The editor found a persisted thread to resume.
+    /// A turn that was running when Codex stopped is held as
+    /// [`AgentPaneSnapshot::interrupted`] and nothing queued is sent until the
+    /// user decides; the thread itself resumes in the background.
     pub fn restore_pending(&mut self, session_id: &str, cwd: &str) -> Vec<AgentPaneEffect> {
+        if self.is_running() {
+            if let Some(prompt) = self.in_flight.take() {
+                self.interrupted = Some(prompt);
+            }
+            self.paused = !self.queue.is_empty();
+        }
+        self.close_reply();
         self.session_id = Some(session_id.to_string());
         self.phase = Some(AgentPanePhase::Restoring);
         self.turn_id = None;
         self.in_flight = None;
+        self.stop_requested = false;
+        self.stop_failed = false;
+        self.resume_cwd = None;
         vec![AgentPaneEffect::ResumeSession {
             session_id: session_id.to_string(),
             cwd: cwd.to_string(),
         }]
+    }
+
+    /// A thread saved by an earlier Red session in this workspace. It is resumed
+    /// lazily, when the pane opens or the next message is sent, so a launch that
+    /// never uses the agent does not start Codex.
+    pub fn resumable(&mut self, session_id: &str, cwd: &str) {
+        if self.session_id.is_some() || self.phase() != AgentPanePhase::Idle {
+            return;
+        }
+        self.session_id = Some(session_id.to_string());
+        self.resume_cwd = Some(cwd.to_string());
+        self.recap_pending = false;
+    }
+
+    /// The pane opened: resume a saved thread now so the first reply is quick.
+    pub fn prepare(&mut self) -> Vec<AgentPaneEffect> {
+        if self.phase() != AgentPanePhase::Idle {
+            return Vec::new();
+        }
+        self.resume_now().into_iter().collect()
+    }
+
+    /// Applies the user's answer about an interrupted turn.
+    pub fn resolve_interruption(
+        &mut self,
+        choice: AgentInterruptionChoice,
+        transcript: &str,
+    ) -> Vec<AgentPaneEffect> {
+        let Some(interrupted) = self.interrupted.take() else {
+            return Vec::new();
+        };
+        self.set_transcript(transcript);
+        let (shown, wire) = match choice {
+            AgentInterruptionChoice::Dismiss => {
+                self.paused = !self.queue.is_empty();
+                return Vec::new();
+            }
+            AgentInterruptionChoice::Retry => (
+                interrupted.text.clone(),
+                format!(
+                    "Codex stopped unexpectedly while you were answering this message, so your reply was cut off. Edits you already made are still applied: check the current files before redoing any work. The message again:\n{}",
+                    interrupted.text
+                ),
+            ),
+            AgentInterruptionChoice::Continue => (
+                CONTINUE_PROMPT.to_string(),
+                "Codex stopped unexpectedly while you were answering my last message. Continue from where you stopped. Edits you already made are still applied: check the current files before redoing anything.".to_string(),
+            ),
+        };
+        let prompt = self.new_prompt(shown);
+        self.wire_overrides.insert(prompt.id.clone(), wire);
+        self.queue.push_front(prompt);
+        self.paused = false;
+        self.advance()
     }
 
     /// The pane's thread was closed outside the lifecycle, for example when the
@@ -389,6 +508,7 @@ impl AgentPaneLifecycle {
             return;
         }
         self.session_id = None;
+        self.resume_cwd = None;
         self.phase = Some(AgentPanePhase::Idle);
         self.turn_id = None;
         self.in_flight = None;
@@ -411,6 +531,7 @@ impl AgentPaneLifecycle {
         }
         self.phase = Some(AgentPanePhase::Idle);
         self.recap_pending = false;
+        self.resume_cwd = None;
         self.advance()
     }
 
@@ -420,11 +541,15 @@ impl AgentPaneLifecycle {
             return Vec::new();
         }
         self.session_id = None;
+        self.resume_cwd = None;
         self.phase = Some(AgentPanePhase::Idle);
         self.recap_pending = true;
-        vec![AgentPaneEffect::ForgetSession {
+        let mut effects = vec![AgentPaneEffect::ForgetSession {
             session_id: session_id.to_string(),
-        }]
+        }];
+        // Prompts that waited for the resume continue in a new thread.
+        effects.extend(self.advance());
+        effects
     }
 
     /// Only an archived transcript survived; the next prompt replays it.
@@ -496,6 +621,10 @@ impl AgentPaneLifecycle {
                 self.restore_pending(&text("thread_id"), &text("cwd"))
             }
             "agent:session_restored" => self.restored(&text("thread_id")),
+            "agent:conversation_resumable" => {
+                self.resumable(&text("thread_id"), &text("cwd"));
+                Vec::new()
+            }
             "agent:session_restore_failed" => self.restore_failed(&session_id),
             "agent:transcript_restored" => {
                 self.archived_transcript_restored(!text("transcript").trim().is_empty());
@@ -507,8 +636,11 @@ impl AgentPaneLifecycle {
 
     /// Sends the next queued prompt when the conversation can take a turn.
     fn advance(&mut self) -> Vec<AgentPaneEffect> {
-        if self.paused || self.queue.is_empty() {
+        if self.paused || self.queue.is_empty() || self.interrupted.is_some() {
             return Vec::new();
+        }
+        if let Some(effect) = self.resume_now() {
+            return vec![effect];
         }
         match (self.phase(), self.session_id.clone()) {
             (AgentPanePhase::Idle, None) => {
@@ -519,7 +651,11 @@ impl AgentPaneLifecycle {
                 let Some(prompt) = self.queue.pop_front() else {
                     return Vec::new();
                 };
-                let wire_text = self.wire_text(&prompt.text);
+                let text = self
+                    .wire_overrides
+                    .remove(&prompt.id)
+                    .unwrap_or_else(|| prompt.text.clone());
+                let wire_text = self.wire_text(&text);
                 self.in_flight_tail = self.transcript_tail.clone();
                 // Mirror the pane committing the message to its transcript.
                 self.end_transcript_line();
@@ -535,6 +671,24 @@ impl AgentPaneLifecycle {
             }
             _ => Vec::new(),
         }
+    }
+
+    fn is_running(&self) -> bool {
+        matches!(
+            self.phase(),
+            AgentPanePhase::Working | AgentPanePhase::Stopping
+        )
+    }
+
+    /// Starts resuming a saved thread that has not been resumed yet.
+    fn resume_now(&mut self) -> Option<AgentPaneEffect> {
+        let session_id = self.session_id.clone()?;
+        if self.phase() != AgentPanePhase::Idle {
+            return None;
+        }
+        let cwd = self.resume_cwd.take()?;
+        self.phase = Some(AgentPanePhase::Restoring);
+        Some(AgentPaneEffect::ResumeSession { session_id, cwd })
     }
 
     fn set_transcript(&mut self, transcript: &str) {
@@ -915,6 +1069,205 @@ mod tests {
             pane.submit("overflow".into(), "").0,
             AgentSubmitResult::QueueFull
         );
+    }
+
+    fn crashed_mid_turn() -> AgentPaneLifecycle {
+        let mut pane = live("s1");
+        pane.submit("write an essay".into(), "");
+        pane.turn_started("s1", "t1");
+        pane.observe(
+            "agent:update",
+            &serde_json::json!({ "session_id": "s1", "text": "The first half" }),
+        );
+        pane.submit("held follow-up".into(), "");
+        let effects = pane.restore_pending("s1", "/workspace");
+        assert_eq!(
+            effects,
+            [AgentPaneEffect::ResumeSession {
+                session_id: "s1".into(),
+                cwd: "/workspace".into()
+            }],
+            "the thread still resumes in the background"
+        );
+        pane
+    }
+
+    #[test]
+    fn a_crash_mid_turn_holds_everything_and_asks_what_to_do() {
+        let mut pane = crashed_mid_turn();
+        let snapshot = pane.snapshot();
+        assert_eq!(
+            snapshot
+                .interrupted
+                .as_ref()
+                .map(|prompt| prompt.text.as_str()),
+            Some("write an essay")
+        );
+        assert!(snapshot.in_flight.is_none());
+        assert!(snapshot.paused);
+        assert!(
+            pane.restored("s1").is_empty(),
+            "nothing is sent automatically after the resume"
+        );
+        assert_eq!(pane.snapshot().queued.len(), 1);
+    }
+
+    #[test]
+    fn retrying_an_interrupted_turn_resends_it_with_a_warning_then_drains_the_queue() {
+        let mut pane = crashed_mid_turn();
+        pane.restored("s1");
+        let effects = pane.resolve_interruption(AgentInterruptionChoice::Retry, "");
+        let wire = dispatched(&effects);
+        assert!(wire[0].contains("still applied"), "{}", wire[0]);
+        assert!(wire[0].ends_with("write an essay"));
+        let snapshot = pane.snapshot();
+        assert!(snapshot.interrupted.is_none());
+        assert_eq!(
+            snapshot.in_flight.map(|prompt| prompt.text).as_deref(),
+            Some("write an essay"),
+            "the pane shows the plain message"
+        );
+        pane.turn_started("s1", "t2");
+        let effects = pane
+            .turn_ended("s1", Some("t2"), AgentTurnOutcome::Completed)
+            .unwrap();
+        assert_eq!(dispatched(&effects), ["held follow-up"]);
+    }
+
+    #[test]
+    fn continuing_an_interrupted_turn_waits_for_the_resume_to_finish() {
+        let mut pane = crashed_mid_turn();
+        let effects = pane.resolve_interruption(AgentInterruptionChoice::Continue, "");
+        assert!(effects.is_empty(), "still restoring: {effects:?}");
+        assert_eq!(pane.snapshot().queued[0].text, CONTINUE_PROMPT);
+        let wire = dispatched(&pane.restored("s1"));
+        assert!(wire[0].starts_with("Codex stopped unexpectedly"));
+        assert!(wire[0].contains("Continue from where you stopped"));
+    }
+
+    #[test]
+    fn dismissing_an_interrupted_turn_keeps_follow_ups_paused() {
+        let mut pane = crashed_mid_turn();
+        pane.restored("s1");
+        assert!(pane
+            .resolve_interruption(AgentInterruptionChoice::Dismiss, "")
+            .is_empty());
+        let snapshot = pane.snapshot();
+        assert!(snapshot.interrupted.is_none());
+        assert!(snapshot.paused);
+        assert_eq!(dispatched(&pane.send_queued("")), ["held follow-up"]);
+    }
+
+    #[test]
+    fn typing_a_new_message_answers_the_interruption() {
+        let mut pane = live("s1");
+        pane.submit("long".into(), "");
+        pane.turn_started("s1", "t1");
+        pane.restore_pending("s1", "/workspace");
+        pane.restored("s1");
+        let (_, effects) = pane.submit("something else".into(), "");
+        assert_eq!(dispatched(&effects), ["something else"]);
+        assert!(pane.snapshot().interrupted.is_none());
+    }
+
+    #[test]
+    fn an_idle_crash_resumes_quietly() {
+        let mut pane = live("s1");
+        pane.submit("done".into(), "");
+        pane.turn_started("s1", "t1");
+        pane.turn_ended("s1", Some("t1"), AgentTurnOutcome::Completed);
+        pane.restore_pending("s1", "/workspace");
+        assert!(pane.snapshot().interrupted.is_none());
+        pane.restored("s1");
+        let (_, effects) = pane.submit("next".into(), "");
+        assert_eq!(dispatched(&effects), ["next"]);
+    }
+
+    #[test]
+    fn a_turn_lost_with_its_app_server_is_never_dropped_silently() {
+        let mut pane = live("s1");
+        pane.submit("edits files".into(), "You: earlier\n");
+        pane.turn_started("s1", "t1");
+        assert!(pane.session_lost(/*unsent*/ false).is_empty());
+        assert_eq!(
+            pane.snapshot()
+                .interrupted
+                .map(|prompt| prompt.text)
+                .as_deref(),
+            Some("edits files")
+        );
+        let effects = pane.resolve_interruption(AgentInterruptionChoice::Retry, "You: earlier\n");
+        assert_eq!(effects, [AgentPaneEffect::StartSession]);
+        let wire = dispatched(&pane.session_created("s2"));
+        assert!(wire[0].starts_with("Previous conversation"), "{}", wire[0]);
+        assert!(wire[0].ends_with("edits files"));
+    }
+
+    #[test]
+    fn a_saved_thread_resumes_when_the_pane_opens_or_on_the_first_message() {
+        let mut pane = AgentPaneLifecycle::default();
+        pane.observe(
+            "agent:conversation_resumable",
+            &serde_json::json!({ "thread_id": "saved", "cwd": "/workspace" }),
+        );
+        let snapshot = pane.snapshot();
+        assert!(snapshot.resume_pending);
+        assert_eq!(snapshot.phase, AgentPanePhase::Idle);
+        assert_eq!(
+            pane.prepare(),
+            [AgentPaneEffect::ResumeSession {
+                session_id: "saved".into(),
+                cwd: "/workspace".into()
+            }]
+        );
+        assert!(pane.prepare().is_empty(), "resumes once");
+        assert!(!pane.snapshot().resume_pending);
+
+        let mut pane = AgentPaneLifecycle::default();
+        pane.resumable("saved", "/workspace");
+        let (_, effects) = pane.submit("codeword?".into(), "");
+        assert_eq!(
+            effects,
+            [AgentPaneEffect::ResumeSession {
+                session_id: "saved".into(),
+                cwd: "/workspace".into()
+            }]
+        );
+        assert_eq!(dispatched(&pane.restored("saved")), ["codeword?"]);
+    }
+
+    #[test]
+    fn a_saved_thread_that_cannot_resume_continues_in_a_new_one_with_a_recap() {
+        let mut pane = AgentPaneLifecycle::default();
+        pane.resumable("saved", "/workspace");
+        pane.submit("codeword?".into(), "You: remember HERON\n");
+        let effects = pane.restore_failed("saved");
+        assert_eq!(
+            effects,
+            [
+                AgentPaneEffect::ForgetSession {
+                    session_id: "saved".into()
+                },
+                AgentPaneEffect::StartSession
+            ]
+        );
+        let wire = dispatched(&pane.session_created("fresh"));
+        assert!(wire[0].contains("remember HERON"));
+        assert!(wire[0].ends_with("codeword?"));
+    }
+
+    #[test]
+    fn reset_forgets_a_saved_thread_before_it_is_resumed() {
+        let mut pane = AgentPaneLifecycle::default();
+        pane.resumable("saved", "/workspace");
+        assert_eq!(
+            pane.reset(),
+            [AgentPaneEffect::ForgetSession {
+                session_id: "saved".into()
+            }]
+        );
+        assert!(!pane.snapshot().resume_pending);
+        assert!(pane.prepare().is_empty());
     }
 
     #[test]
