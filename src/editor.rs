@@ -16,6 +16,7 @@
 //! model.
 
 mod agent_annotations;
+mod agent_continuity;
 mod agent_edit_decision;
 mod agent_lsp;
 pub use agent_edit_decision::AgentUnsavedChoice;
@@ -1880,6 +1881,14 @@ pub enum PluginRequest {
     AgentReset {
         start: bool,
     },
+    /// Agent pane intent: the pane opened, so resume a saved thread now.
+    AgentPrepare,
+    /// Agent pane intent: what to do about a turn Codex stopped in the middle of
+    /// (`retry`, `continue`, or `dismiss`).
+    AgentResolveInterruption {
+        choice: String,
+        transcript: String,
+    },
     AgentCloseSession {
         session_id: String,
     },
@@ -2348,6 +2357,8 @@ impl PluginRequest {
             Self::AgentSendQueued { .. } => "AgentSendQueued",
             Self::AgentDiscardQueued => "AgentDiscardQueued",
             Self::AgentReset { .. } => "AgentReset",
+            Self::AgentPrepare => "AgentPrepare",
+            Self::AgentResolveInterruption { .. } => "AgentResolveInterruption",
             Self::AgentCloseSession { .. } => "AgentCloseSession",
             Self::AgentArchiveSession { .. } => "AgentArchiveSession",
             Self::GenerateCommitMessage { .. } => "GenerateCommitMessage",
@@ -3968,6 +3979,15 @@ pub struct Editor {
     diagnostic_reports: diagnostics::DiagnosticReports,
     agent_lsp: agent_lsp::AgentLsp,
     diagnostic_cache: Option<diagnostic_cache::DiagnosticCache>,
+    /// Saves the Agent pane's conversation so a later launch can resume it.
+    agent_continuity: Option<agent_continuity::ConversationStore>,
+    /// Conversation revision last written to `agent_continuity` (`None` if no
+    /// write has succeeded yet), and when the last attempt ran.
+    agent_continuity_saved: Option<(Option<u64>, Instant)>,
+    /// Workspace of the conversation last written, so a forgotten one is removed.
+    agent_continuity_workspace: Option<PathBuf>,
+    /// Age of a conversation adopted from `agent_continuity` at launch.
+    agent_continuity_adopted_age: Option<String>,
 
     /// Indentation rules per file type
     indentation: HashMap<String, Indentation>,
@@ -5821,6 +5841,10 @@ impl Editor {
             diagnostic_reports: diagnostics::DiagnosticReports::default(),
             agent_lsp: agent_lsp::AgentLsp::default(),
             diagnostic_cache: None,
+            agent_continuity: None,
+            agent_continuity_saved: None,
+            agent_continuity_workspace: None,
+            agent_continuity_adopted_age: None,
             indentation,
             render_commands: VecDeque::new(),
             overlay_manager: plugin::OverlayManager::new(),
@@ -11053,6 +11077,7 @@ impl Editor {
         drop(storage);
         let snapshot = perf::PerfSpan::start("shutdown:session_snapshot");
         self.persist_session_snapshot(/*force*/ true);
+        self.finish_agent_continuity();
         drop(snapshot);
         let deactivate = perf::PerfSpan::start("shutdown:deactivate_plugins");
         if let Err(err) = self.plugin_registry.deactivate_all(runtime).await {
@@ -11136,6 +11161,16 @@ impl Editor {
 
     async fn restore_agent_plugin_state(&mut self, runtime: &mut Runtime) -> anyhow::Result<()> {
         if let Some(conversation) = self.agent_manager.conversation_snapshot() {
+            let adopted_age = self.take_adopted_agent_conversation_age();
+            if let Some(age) = adopted_age.filter(|_| !self.agent_manager.has_bridge()) {
+                // Saved by an earlier launch: resumed when the pane opens or the
+                // next message is sent, so an unused agent never starts Codex.
+                let mut payload = plugin_json(serde_json::to_value(conversation)?);
+                payload["age"] = Value::String(age);
+                self.notify_agent(runtime, "agent:conversation_resumable", payload)
+                    .await?;
+                return Ok(());
+            }
             let event = if self.agent_manager.has_bridge() {
                 "agent:session_restored"
             } else {
@@ -11798,6 +11833,7 @@ impl Editor {
         }
 
         self.refresh_live_inline_history(buffer, runtime).await?;
+        self.persist_agent_conversation(/*force*/ false);
 
         let signature_help_changed = self.service_signature_help().await?;
         let inline_completion_changed = self.service_inline_completion();
@@ -12135,7 +12171,9 @@ impl Editor {
                 | PluginRequest::AgentStop
                 | PluginRequest::AgentSendQueued { .. }
                 | PluginRequest::AgentDiscardQueued
-                | PluginRequest::AgentReset { .. }) => {
+                | PluginRequest::AgentReset { .. }
+                | PluginRequest::AgentPrepare
+                | PluginRequest::AgentResolveInterruption { .. }) => {
                     self.handle_agent_pane_request(request);
                 }
                 PluginRequest::AgentCancel { session_id } => {

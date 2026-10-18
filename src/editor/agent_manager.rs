@@ -32,6 +32,9 @@ pub struct AgentManager {
     model_only_bridge: bool,
     next_model: Option<crate::codex::AgentModelSelection>,
     conversation: Option<AgentConversationSnapshot>,
+    /// Bumped on every change to `conversation`, so the editor can tell when the
+    /// saved copy is out of date without comparing transcripts.
+    conversation_revision: u64,
     forgotten_conversations: HashSet<String>,
     /// Prompts submitted while their session was busy, sent once its turn ends.
     queued_prompts: HashMap<String, VecDeque<QueuedAgentPrompt>>,
@@ -423,8 +426,7 @@ impl AgentManager {
         model_info: crate::codex::AgentModelInfo,
     ) {
         if let Some(conversation) = self
-            .conversation
-            .as_mut()
+            .conversation_mut()
             .filter(|conversation| conversation.thread_id == session_id)
         {
             conversation.model_info = Some(model_info);
@@ -434,6 +436,7 @@ impl AgentManager {
     pub fn begin_conversation(&mut self, thread_id: impl Into<String>, cwd: &Path) {
         let thread_id = thread_id.into();
         self.forgotten_conversations.remove(&thread_id);
+        self.conversation_revision += 1;
         self.conversation = Some(AgentConversationSnapshot::new(
             thread_id,
             cwd.to_string_lossy(),
@@ -442,6 +445,7 @@ impl AgentManager {
 
     pub fn restore_conversation(&mut self, conversation: AgentConversationSnapshot) {
         self.root = Some(PathBuf::from(&conversation.cwd));
+        self.conversation_revision += 1;
         self.conversation = Some(conversation);
     }
 
@@ -456,12 +460,27 @@ impl AgentManager {
             .take()
             .filter(|conversation| conversation.thread_id == thread_id)
             .unwrap_or_else(|| AgentConversationSnapshot::new(thread_id, cwd.to_string_lossy()));
+        self.conversation_revision += 1;
         self.conversation = Some(cached.reconciled_with_thread(thread));
         self.conversation.as_ref()
     }
 
     pub fn conversation_snapshot(&self) -> Option<AgentConversationSnapshot> {
         self.conversation.clone()
+    }
+
+    pub fn conversation(&self) -> Option<&AgentConversationSnapshot> {
+        self.conversation.as_ref()
+    }
+
+    pub fn conversation_revision(&self) -> u64 {
+        self.conversation_revision
+    }
+
+    fn conversation_mut(&mut self) -> Option<&mut AgentConversationSnapshot> {
+        let conversation = self.conversation.as_mut()?;
+        self.conversation_revision += 1;
+        Some(conversation)
     }
 
     /// Returns the tool-contract version retained for a particular conversation.
@@ -473,7 +492,7 @@ impl AgentManager {
     }
 
     pub fn replace_annotation_records(&mut self, annotations: Vec<AgentAnnotationRecord>) {
-        if let Some(conversation) = self.conversation.as_mut() {
+        if let Some(conversation) = self.conversation_mut() {
             conversation.annotations = annotations;
         }
     }
@@ -486,7 +505,16 @@ impl AgentManager {
             .as_ref()
             .is_some_and(|conversation| conversation.thread_id == session_id)
         {
+            self.conversation_revision += 1;
             self.conversation = None;
+        }
+    }
+
+    /// Drops the conversation without forgetting its thread, for a recovered
+    /// conversation that another editor already drives.
+    pub fn discard_conversation(&mut self) {
+        if self.conversation.take().is_some() {
+            self.conversation_revision += 1;
         }
     }
 
@@ -496,8 +524,7 @@ impl AgentManager {
 
     pub fn record_user_message(&mut self, session_id: &str, turn_id: &str, text: &str) {
         if let Some(conversation) = self
-            .conversation
-            .as_mut()
+            .conversation_mut()
             .filter(|conversation| conversation.thread_id == session_id)
         {
             conversation.append_user(turn_id, text);
@@ -505,36 +532,34 @@ impl AgentManager {
     }
 
     pub fn record_agent_delta(&mut self, session_id: &str, text: &str) {
-        let Some(turn_id) = self.active_turn_ids.get(session_id) else {
+        let Some(turn_id) = self.active_turn_ids.get(session_id).cloned() else {
             return;
         };
         if let Some(conversation) = self
-            .conversation
-            .as_mut()
+            .conversation_mut()
             .filter(|conversation| conversation.thread_id == session_id)
         {
-            conversation.append_agent_delta(turn_id, text);
+            conversation.append_agent_delta(&turn_id, text);
         }
     }
 
     pub fn complete_agent_message(&mut self, session_id: &str, text: &str) {
-        let Some(turn_id) = self.active_turn_ids.get(session_id) else {
+        let Some(turn_id) = self.active_turn_ids.get(session_id).cloned() else {
             return;
         };
         let Some(conversation) = self
-            .conversation
-            .as_mut()
+            .conversation_mut()
             .filter(|conversation| conversation.thread_id == session_id)
         else {
             return;
         };
         if let Some(item) = conversation.items.iter_mut().rev().find(|item| {
             item.role == crate::agent_conversation::AgentTranscriptRole::Agent
-                && item.turn_id.as_deref() == Some(turn_id)
+                && item.turn_id.as_deref() == Some(turn_id.as_str())
         }) {
             item.text = text.to_string();
         } else {
-            conversation.append_agent_delta(turn_id, text);
+            conversation.append_agent_delta(&turn_id, text);
         }
     }
 }

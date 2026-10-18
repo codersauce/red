@@ -466,8 +466,9 @@ The host owns multiline editing, wrapping, cursor movement, and history navigati
 Host API `0.9.0` adds `AgentResumeSession(cwd, session_id)` for rejoining a
 persisted Codex thread and `AgentForgetSession(session_id)` for an explicit new
 conversation. The bundled Agent plugin renders
-`agent:conversation_restore_pending` with its composer disabled, then replaces
-the cached projection from `agent:session_restored`; a
+`agent:conversation_restore_pending` while the thread reconnects, then replaces
+the cached projection from `agent:session_restored` unless it already shows that
+thread; a
 `agent:session_restore_failed` event converts the cached transcript to clearly
 archived context.
 
@@ -518,7 +519,8 @@ the state the core publishes.
 After every change the core sends `agent:pane_state` with `phase` (`idle`,
 `starting`, `restoring`, `working`, or `stopping`), `session_id`, `turn_id`,
 `in_flight` (the running turn's `{ id, text }` message), `queued` (unsent
-messages, oldest first), `paused`, `stop_failed`, and `recap_pending`. Render
+messages, oldest first), `paused`, `stop_failed`, `recap_pending`,
+`interrupted` and `resume_pending` (see below). Render
 queued messages from `queued` and commit `in_flight` to the transcript once per
 `id`; both come from the same snapshot, so a message never disappears between
 the queue and the transcript. The core also resumes a persisted thread itself
@@ -532,6 +534,27 @@ for a message that has not been sent yet. A compact conversation pane (see
 `text` set to `"hidden"` or `"visible"` when it leaves or returns to the screen.
 
 The per-session calls below remain available for other plugins and older packages.
+
+## Agent conversation continuity
+
+Host API `0.21.0` also lets the Agent pane continue a conversation across launches
+and ask the user what to do when Codex stops in the middle of a turn.
+
+| Call | Purpose |
+| --- | --- |
+| `AgentPrepare()` | The pane is about to be used: resume a saved thread now instead of on the first message. |
+| `AgentResolveInterruption(choice: String, transcript: String)` | Answer an interrupted turn with `retry` (send the message again), `continue` (ask Codex to pick up where it stopped), or `dismiss` (leave it; queued follow-ups stay paused). |
+
+`agent:conversation_resumable` carries a conversation saved by an earlier launch
+in this workspace (the `agent:conversation_restore_pending` payload plus `age`,
+such as `"2 hours ago"`). The core does not start Codex for it; the thread
+resumes on `AgentPrepare` or the next `AgentSubmit`, and
+`agent:pane_state.resume_pending` stays true until then.
+
+When Codex stops during a turn, `agent:pane_state.interrupted` holds that turn's
+`{ id, text }` message. The core still resumes the thread, but sends nothing,
+queued follow-ups included, until `AgentResolveInterruption` or a new
+`AgentSubmit` answers it.
 
 `AgentPrompt` automatically attaches bounded editor context containing the active visual selection or a roughly 80-line cursor excerpt, unsaved-state metadata, cursor/range, and intersecting diagnostics. Files outside the workspace, ignored paths, common credential/secret filenames, and binary buffers are omitted. Plugins that need to inspect or explicitly override this context can call `GetAgentContext(callback)` and `AgentPromptWithContext(session_id: String, text: String, context: Json)`; the context object accepts `uri` and `text` fields and is included in the direct Codex turn.
 

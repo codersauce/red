@@ -332,6 +332,7 @@ async fn run_editor_inner(args: Args) -> anyhow::Result<()> {
         }
     }
     editor.enable_diagnostic_cache(Config::path("cache/lsp-diagnostics"));
+    editor.enable_agent_continuity(Config::path("agent/conversations"));
     editor.enable_update_checks(Config::path("cache/updates"));
     editor.set_session_store(session_store);
 

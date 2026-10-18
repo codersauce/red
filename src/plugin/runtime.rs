@@ -1269,6 +1269,12 @@ impl RedHost {
                 let start = args.first().and_then(Value::as_bool).unwrap_or(false);
                 self.send_request(PluginRequest::AgentReset { start });
             }
+            "AgentPrepare" => self.send_request(PluginRequest::AgentPrepare),
+            "AgentResolveInterruption" => {
+                let choice = args.first().map(value_to_string).unwrap_or_default();
+                let transcript = args.get(1).map(value_to_string).unwrap_or_default();
+                self.send_request(PluginRequest::AgentResolveInterruption { choice, transcript });
+            }
             "AgentCancel" => {
                 let session_id = args
                     .first()
@@ -4849,6 +4855,12 @@ mod tests {
                         }
                         Ok(effects)
                     }
+                    PluginRequest::AgentPrepare => Ok(lifecycle.prepare()),
+                    PluginRequest::AgentResolveInterruption { choice, transcript } => Ok(
+                        crate::editor::agent_pane::AgentInterruptionChoice::parse(&choice)
+                            .map(|choice| lifecycle.resolve_interruption(choice, &transcript))
+                            .unwrap_or_default(),
+                    ),
                     other => Err(Box::new(other)),
                 }
             });
@@ -8066,13 +8078,27 @@ mod tests {
         )
         .await;
         let current = state(&runtime);
-        let last = current["transcript_blocks"]
-            .as_array()
-            .unwrap()
-            .last()
+        let blocks = current["transcript_blocks"].as_array().unwrap();
+        // The failed turn's error comes last, followed only by its recovery choices.
+        let last = blocks
+            .iter()
+            .rev()
+            .find(|block| {
+                !block["id"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .starts_with("interruption-choice:")
+            })
             .unwrap();
         assert_eq!(last["kind"], "error");
         assert_eq!(last["text"], "Connection lost");
+        assert!(blocks
+            .iter()
+            .any(|block| block["id"] == "interruption-choice:retry"));
+        assert!(!blocks.iter().any(|block| block["text"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("Codex stopped before finishing")));
         assert!(current["transcript"]
             .as_str()
             .unwrap()
@@ -9752,6 +9778,386 @@ mod tests {
         runtime
     }
 
+    fn collect_requests() -> Vec<PluginRequest> {
+        let mut requests = Vec::new();
+        while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
+            requests.push(request);
+        }
+        requests
+    }
+
+    fn sent_prompts(requests: &[PluginRequest]) -> Vec<String> {
+        requests
+            .iter()
+            .filter_map(|request| match request {
+                PluginRequest::AgentPrompt { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Runs a turn that streams part of a reply, queues a follow-up, then loses
+    /// the app-server, the way the editor reports it.
+    async fn agent_runtime_cut_off_mid_reply() -> Runtime {
+        let mut runtime = agent_runtime_with_session("session-1").await;
+        submit_agent_prompt(&mut runtime, "write an essay").await;
+        core_notify(
+            &mut runtime,
+            "agent:update",
+            serde_json::json!({ "session_id": "session-1", "text": "The first half" }),
+        )
+        .await;
+        runtime
+            .notify(
+                "panel:event:agent-conversation",
+                serde_json::json!({ "action": "submit", "text": "held follow-up" }),
+            )
+            .await
+            .unwrap();
+        core_settle(&mut runtime).await;
+        drain_requests();
+        core_notify(
+            &mut runtime,
+            "agent:conversation_restore_pending",
+            serde_json::json!({
+                "thread_id": "session-1",
+                "cwd": "/workspace",
+                "items": [{"id": "u1", "role": "user", "text": "write an essay"}]
+            }),
+        )
+        .await;
+        runtime
+    }
+
+    #[tokio::test]
+    async fn bundled_agent_keeps_a_cut_off_reply_and_asks_before_sending_anything() {
+        let mut runtime = agent_runtime_cut_off_mid_reply().await;
+        let requests = collect_requests();
+        let blocks = last_panel_blocks(&requests);
+        assert!(
+            blocks.iter().any(
+                |block| block.kind == crate::plugin::TextPanelBlockKind::Agent
+                    && block.text == "The first half"
+            ),
+            "the partial reply stays: {blocks:?}"
+        );
+        assert!(blocks.iter().any(
+            |block| block.kind == crate::plugin::TextPanelBlockKind::Error
+                && block.text.contains("Codex stopped before finishing")
+                && block.text.contains("still applied")
+        ));
+        for choice in ["retry", "continue", "dismiss"] {
+            let id = format!("interruption-choice:{choice}");
+            assert!(
+                blocks.iter().any(|block| block.id == id
+                    && block.kind == crate::plugin::TextPanelBlockKind::Action),
+                "{id} is a keyboard-reachable action"
+            );
+        }
+        assert!(requests.iter().any(|request| matches!(
+            request,
+            PluginRequest::Action(Action::PrintWarning(message)) if message.contains("Space A")
+        )));
+        assert!(requests.iter().any(|request| matches!(
+            request,
+            PluginRequest::AgentResumeSession { session_id, .. } if session_id == "session-1"
+        )));
+
+        core_notify(
+            &mut runtime,
+            "agent:session_restored",
+            serde_json::json!({
+                "thread_id": "session-1",
+                "cwd": "/workspace",
+                "items": [{"id": "u1", "role": "user", "text": "write an essay"}]
+            }),
+        )
+        .await;
+        let requests = collect_requests();
+        assert!(
+            sent_prompts(&requests).is_empty(),
+            "nothing is sent until the user chooses"
+        );
+        let blocks = last_panel_blocks(&requests);
+        assert!(
+            blocks.is_empty() || blocks.iter().any(|block| block.text == "The first half"),
+            "the restore does not replace the visible transcript"
+        );
+
+        runtime
+            .notify(
+                "panel:event:agent-conversation",
+                serde_json::json!({ "action": "activate_block", "text": "interruption-choice:retry" }),
+            )
+            .await
+            .unwrap();
+        core_settle(&mut runtime).await;
+        let requests = collect_requests();
+        let sent = sent_prompts(&requests);
+        assert_eq!(sent.len(), 1, "{sent:?}");
+        assert!(sent[0].contains("still applied") && sent[0].ends_with("write an essay"));
+        let blocks = last_panel_blocks(&requests);
+        assert!(!blocks
+            .iter()
+            .any(|block| block.id.starts_with("interruption-choice:")));
+        assert!(blocks
+            .iter()
+            .any(|block| block.text.contains("Codex stopped before finishing")));
+    }
+
+    #[tokio::test]
+    async fn bundled_agent_space_a_asks_what_to_do_with_a_cut_off_reply() {
+        let mut runtime = agent_runtime_cut_off_mid_reply().await;
+        drain_requests();
+        runtime.execute_command("Agent").await.unwrap();
+        let requests = collect_requests();
+        let picker = requests.iter().find_map(|request| match request {
+            PluginRequest::OpenCallbackPicker { title, items, .. }
+                if title
+                    .as_deref()
+                    .is_some_and(|title| title.contains("mid-reply")) =>
+            {
+                Some(items.iter().map(|item| item.id.clone()).collect::<Vec<_>>())
+            }
+            _ => None,
+        });
+        assert_eq!(
+            picker.as_deref(),
+            Some(
+                &[
+                    "retry".to_string(),
+                    "continue".to_string(),
+                    "dismiss".to_string()
+                ][..]
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn bundled_agent_leaving_a_cut_off_reply_keeps_follow_ups_paused() {
+        let mut runtime = agent_runtime_cut_off_mid_reply().await;
+        core_notify(
+            &mut runtime,
+            "agent:session_restored",
+            serde_json::json!({ "thread_id": "session-1", "cwd": "/workspace", "items": [] }),
+        )
+        .await;
+        drain_requests();
+        runtime
+            .notify(
+                "panel:event:agent-conversation",
+                serde_json::json!({ "action": "activate_block", "text": "interruption-choice:dismiss" }),
+            )
+            .await
+            .unwrap();
+        core_settle(&mut runtime).await;
+        let requests = collect_requests();
+        assert!(sent_prompts(&requests).is_empty());
+        assert!(requests.iter().any(|request| matches!(
+            request,
+            PluginRequest::Action(Action::Print(message)) if message.contains(":AgentSendQueued")
+        )));
+        runtime.execute_command("AgentSendQueued").await.unwrap();
+        core_settle(&mut runtime).await;
+        assert_eq!(sent_prompts(&collect_requests()), ["held follow-up"]);
+    }
+
+    #[tokio::test]
+    async fn bundled_agent_new_forgets_a_saved_conversation_without_resuming_it() {
+        drain_requests();
+        let mut runtime = Runtime::new();
+        runtime
+            .load_plugin("agent", include_str!("../../plugins/agent.hk"))
+            .await
+            .unwrap();
+        core_notify(
+            &mut runtime,
+            "agent:conversation_resumable",
+            serde_json::json!({
+                "thread_id": "saved-thread",
+                "cwd": "/workspace",
+                "age": "2 hours ago",
+                "items": [{"id": "u1", "role": "user", "text": "Remember HERON"}]
+            }),
+        )
+        .await;
+        drain_requests();
+
+        runtime.execute_command("AgentNew").await.unwrap();
+        core_settle(&mut runtime).await;
+        let requests = collect_requests();
+        assert!(
+            !requests
+                .iter()
+                .any(|request| matches!(request, PluginRequest::AgentResumeSession { .. })),
+            "the thread being forgotten is never resumed first"
+        );
+        assert!(requests.iter().any(|request| matches!(
+            request,
+            PluginRequest::AgentForgetSession { session_id } if session_id == "saved-thread"
+        )));
+        assert!(requests
+            .iter()
+            .any(|request| matches!(request, PluginRequest::AgentNewSession { .. })));
+
+        core_notify(
+            &mut runtime,
+            "agent:session_created",
+            serde_json::json!({ "session_id": "fresh" }),
+        )
+        .await;
+        drain_requests();
+        core_notify(
+            &mut runtime,
+            "agent:session_restore_failed",
+            serde_json::json!({ "session_id": "saved-thread", "message": "thread not found" }),
+        )
+        .await;
+        let requests = collect_requests();
+        assert!(
+            !requests.iter().any(|request| matches!(
+                request,
+                PluginRequest::SetTextPanelComposerState { status: Some(status), .. }
+                    if status.contains("Archived conversation")
+            ) || matches!(
+                request,
+                PluginRequest::Action(Action::Print(message)) if message.contains("could not be restored")
+            )),
+            "a late failure of the forgotten thread leaves the fresh pane alone"
+        );
+        assert_eq!(
+            AGENT_CORE.with(|core| core.borrow().lifecycle.snapshot().session_id),
+            Some("fresh".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn bundled_agent_a_saved_conversation_that_cannot_resume_says_it_is_archived() {
+        drain_requests();
+        let mut runtime = Runtime::new();
+        runtime
+            .load_plugin("agent", include_str!("../../plugins/agent.hk"))
+            .await
+            .unwrap();
+        core_notify(
+            &mut runtime,
+            "agent:conversation_resumable",
+            serde_json::json!({
+                "thread_id": "saved-thread", "cwd": "/workspace", "age": "2 hours ago",
+                "items": [{"id": "u1", "role": "user", "text": "Remember HERON"}]
+            }),
+        )
+        .await;
+        runtime.execute_command("AgentOpen").await.unwrap();
+        core_settle(&mut runtime).await;
+        drain_requests();
+        core_notify(
+            &mut runtime,
+            "agent:session_restore_failed",
+            serde_json::json!({ "session_id": "saved-thread", "message": "thread not found" }),
+        )
+        .await;
+        let hints = collect_requests()
+            .into_iter()
+            .filter_map(|request| match request {
+                PluginRequest::SetTextPanelComposerState { status, .. } => Some(status),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let last = hints.last().cloned().flatten().unwrap_or_default();
+        assert!(last.contains("Archived conversation"), "{hints:?}");
+        assert!(!hints
+            .iter()
+            .flatten()
+            .any(|hint| hint.contains("Continuing")));
+    }
+
+    #[tokio::test]
+    async fn bundled_agent_continues_a_saved_conversation_when_the_pane_opens() {
+        drain_requests();
+        let mut runtime = Runtime::new();
+        runtime
+            .load_plugin("agent", include_str!("../../plugins/agent.hk"))
+            .await
+            .unwrap();
+        core_notify(
+            &mut runtime,
+            "agent:conversation_resumable",
+            serde_json::json!({
+                "thread_id": "saved-thread",
+                "cwd": "/workspace",
+                "age": "2 hours ago",
+                "items": [
+                    {"id": "u1", "role": "user", "text": "Remember HERON"},
+                    {"id": "a1", "role": "agent", "text": "OK"}
+                ]
+            }),
+        )
+        .await;
+        let requests = collect_requests();
+        assert!(
+            !requests
+                .iter()
+                .any(|request| matches!(request, PluginRequest::AgentResumeSession { .. })),
+            "nothing starts Codex until the agent is used"
+        );
+
+        runtime.execute_command("AgentOpen").await.unwrap();
+        core_settle(&mut runtime).await;
+        let requests = collect_requests();
+        assert!(requests.iter().any(|request| matches!(
+            request,
+            PluginRequest::AgentResumeSession { session_id, .. } if session_id == "saved-thread"
+        )));
+        assert!(requests.iter().any(|request| matches!(
+            request,
+            PluginRequest::SetTextPanelComposerState { status: Some(status), .. }
+                if status.contains(":AgentNew starts fresh")
+        )));
+        let blocks = last_panel_blocks(&requests);
+        assert!(blocks.iter().any(|block| block.text == "Remember HERON"));
+        assert!(blocks
+            .iter()
+            .any(|block| block.text.contains("left off 2 hours ago")));
+
+        // Red quit before saving the last reply; Codex's history is authoritative.
+        core_notify(
+            &mut runtime,
+            "agent:session_restored",
+            serde_json::json!({ "thread_id": "saved-thread", "cwd": "/workspace", "items": [
+                {"id": "u1", "role": "user", "text": "Remember HERON"},
+                {"id": "a1", "role": "agent", "text": "OK, I will remember HERON."}
+            ]}),
+        )
+        .await;
+        let blocks = last_panel_blocks(&collect_requests());
+        assert!(blocks
+            .iter()
+            .any(|block| block.text == "OK, I will remember HERON."));
+        assert!(!blocks.iter().any(|block| block.text == "OK"));
+        assert!(blocks
+            .iter()
+            .any(|block| block.text.contains("left off 2 hours ago")));
+        runtime
+            .notify(
+                "panel:event:agent-conversation",
+                serde_json::json!({ "action": "submit", "text": "What was the codeword?" }),
+            )
+            .await
+            .unwrap();
+        core_settle(&mut runtime).await;
+        let requests = collect_requests();
+        assert_eq!(
+            sent_prompts(&requests),
+            ["What was the codeword?"],
+            "same thread, no recap"
+        );
+        assert!(requests.iter().any(|request| matches!(
+            request,
+            PluginRequest::AgentPrompt { session_id, .. } if session_id == "saved-thread"
+        )));
+    }
+
     #[tokio::test]
     async fn bundled_agent_ignores_terminal_events_from_an_earlier_turn() {
         let mut runtime = agent_runtime_with_session("session-1").await;
@@ -11135,7 +11541,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bundled_agent_plugin_restores_the_bound_codex_thread_before_enabling_input() {
+    async fn bundled_agent_plugin_restores_the_bound_codex_thread_and_keeps_input_open() {
         drain_requests();
         let mut runtime = Runtime::new();
         runtime
@@ -11152,7 +11558,7 @@ mod tests {
                     ]
                 })).await;
 
-        let mut saw_disabled_composer = false;
+        let mut saw_reconnecting_composer = false;
         let mut saw_resume = false;
         let mut saw_cached_transcript = false;
         let mut history_request_id = None;
@@ -11163,8 +11569,13 @@ mod tests {
                         && blocks[0].text == "Earlier question"
                         && blocks[1].text == "Earlier answer";
                 }
-                PluginRequest::SetTextPanelComposerState { enabled: false, .. } => {
-                    saw_disabled_composer = true;
+                // A message typed while Codex reconnects is sent once it is back.
+                PluginRequest::SetTextPanelComposerState {
+                    enabled: true,
+                    status: Some(status),
+                    ..
+                } if status.contains("Reconnecting") => {
+                    saw_reconnecting_composer = true;
                 }
                 PluginRequest::AgentResumeSession { cwd, session_id } => {
                     saw_resume = cwd == Path::new("/workspace") && session_id == "thread-restored";
@@ -11182,7 +11593,7 @@ mod tests {
             }
         }
         assert!(saw_cached_transcript);
-        assert!(saw_disabled_composer);
+        assert!(saw_reconnecting_composer);
         assert!(saw_resume);
         runtime
             .resolve_request(

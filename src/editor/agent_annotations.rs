@@ -323,6 +323,27 @@ impl Editor {
                     expected_fingerprint: comment.expected_fingerprint(),
                 })
             })
+            .collect::<Vec<_>>();
+        // Annotations on files that are not open have no inline comment to
+        // sync from; keep their records so they come back with the file.
+        let unopened = self
+            .agent_manager
+            .conversation()
+            .map(|conversation| conversation.annotations.clone())
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|record| {
+                !self.buffer_manager.iter().any(|buffer| {
+                    buffer.file.as_deref().is_some_and(|file| {
+                        super::same_file_path(
+                            std::path::Path::new(file),
+                            std::path::Path::new(&record.path),
+                        )
+                    })
+                })
+            });
+        let annotations = unopened
+            .chain(annotations)
             .take(MAX_AGENT_ANNOTATIONS)
             .collect();
         self.agent_manager.replace_annotation_records(annotations);
