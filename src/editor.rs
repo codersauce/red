@@ -36834,6 +36834,37 @@ mod test {
         }
     }
 
+    #[test]
+    fn workspace_history_returns_the_newest_entries_and_counts_the_rest() {
+        let mut editor = test_editor(/*width*/ 80, /*height*/ 24);
+        editor.buffer_manager.replace_buffers(vec![Buffer::new(
+            Some("/workspace/many.rs".to_string()),
+            String::new(),
+        )]);
+        for count in 0..600 {
+            editor.begin_transaction(format!("edit {count}"));
+            editor.replace_range(
+                TextRange::insertion(TextPosition::new(0, 0)),
+                &format!("{count}\n"),
+            );
+            editor.commit_transaction(editor.cursor_snapshot());
+        }
+
+        let payload = editor.edit_history_payload(edit_history::EditHistoryScope::Workspace);
+        let entries = payload["entries"].as_array().unwrap();
+        assert_eq!(payload["total"], 600);
+        assert_eq!(entries.len(), 500);
+        assert_eq!(entries[0]["label"], "edit 599", "newest first");
+        assert_eq!(entries[499]["label"], "edit 100");
+        assert_eq!(entries[0]["applied"], true);
+
+        let buffer = editor.edit_history_payload(edit_history::EditHistoryScope::Buffer);
+        assert_eq!(
+            buffer["entries"][0]["edits"].as_array().map(Vec::len),
+            Some(1)
+        );
+    }
+
     #[tokio::test]
     #[cfg(unix)]
     async fn a_large_agent_edit_history_reports_its_full_length_without_offering_a_full_patch() {

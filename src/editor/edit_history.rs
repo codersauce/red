@@ -85,89 +85,105 @@ impl Editor {
                 })
                 .collect(),
         };
-        let mut entries = Vec::new();
-        for buffer in buffers {
-            let tree = buffer.undo_history.undo_tree();
-            let mut applied = HashSet::new();
-            let mut node = tree.iter().position(|entry| entry.current);
+        // Pick the newest entries from cheap metadata first, so only those are
+        // serialized and diffed; histories can hold thousands of large edits.
+        let mut candidates = Vec::new();
+        let mut applied: Vec<HashSet<usize>> = Vec::with_capacity(buffers.len());
+        for (slot, buffer) in buffers.iter().enumerate() {
+            let history = &buffer.undo_history;
+            let parents: HashMap<usize, Option<usize>> = history
+                .node_summaries()
+                .map(|(index, parent, timestamp)| {
+                    candidates.push((timestamp, index, slot));
+                    (index, parent)
+                })
+                .collect();
+            let mut path = HashSet::new();
+            let mut node = history.current_index();
             while let Some(index) = node {
-                applied.insert(index);
-                node = tree[index].parent;
+                path.insert(index);
+                node = parents.get(&index).copied().flatten();
             }
-            let file = buffer
-                .file
-                .as_deref()
-                .map(|file| self.history_display_path(file));
-            for entry in tree {
-                let mut value = serde_json::to_value(&entry).unwrap_or(Value::Null);
-                // A workspace history can span many large transactions; its bounded
-                // `document` replaces the raw replacement texts.
-                if scope == EditHistoryScope::Workspace {
-                    if let Some(fields) = value.as_object_mut() {
-                        fields.remove("edits");
-                    }
-                }
-                let (mut lines, stat, total) =
-                    match self.edit_previews.previews.get(&entry.transaction_id) {
-                        Some(preview) => (preview.lines.clone(), preview.stat, preview.total),
-                        None => replacement_diff(&entry.edits),
-                    };
-                // The workspace offers a full patch for truncated documents, which
-                // a history preview cannot provide, so omitted lines are noted in
-                // the diff itself and the document is complete as shown.
-                let omitted = total.saturating_sub(lines.len());
-                if omitted > 0 {
-                    lines.push(DiffLine {
-                        kind: DiffLineKind::Meta,
-                        old_line: None,
-                        new_line: None,
-                        text: format!(
-                            "… {omitted} more diff lines not shown (the preview keeps {MAX_PREVIEW_LINES})"
-                        ),
-                    });
-                }
-                let path = file.clone().unwrap_or_else(|| buffer.name().to_string());
-                value["file"] = json!(path);
-                value["buffer_id"] = json!(buffer.id());
-                value["applied"] = json!(applied.contains(&entry.index));
-                value["age"] = json!(age_label(now_ms.saturating_sub(entry.timestamp_ms)));
-                value["added"] = json!(stat.added);
-                value["removed"] = json!(stat.removed);
-                value["document"] = json!({
-                    "path": path,
-                    "lines": lines
-                        .iter()
-                        .enumerate()
-                        .map(|(index, line)| json!({
-                            "id": format!("{}:{index}", entry.transaction_id),
-                            "text": line.text,
-                            "kind": line.kind,
-                            "old_line": line.old_line,
-                            "new_line": line.new_line,
-                        }))
-                        .collect::<Vec<_>>(),
-                    "added": stat.added,
-                    "removed": stat.removed,
-                    "total_lines": total,
-                    "truncated": false,
-                });
-                if let EditOrigin::Agent { turn_id, .. } = &entry.origin {
-                    if let Some((turn, prompt)) = self.agent_turn_summary(turn_id) {
-                        value["turn"] = json!(turn);
-                        value["prompt"] = json!(prompt);
-                    }
-                }
-                entries.push((entry.timestamp_ms, entry.index, value));
-            }
+            applied.push(path);
         }
         // Newest first; within one millisecond, later nodes are newer.
-        entries.sort_by_key(|entry| std::cmp::Reverse((entry.0, entry.1)));
-        let total = entries.len();
-        let entries: Vec<Value> = entries
-            .into_iter()
-            .take(MAX_HISTORY_ENTRIES)
-            .map(|(_, _, value)| value)
-            .collect();
+        candidates.sort_by_key(|&(timestamp, index, _)| std::cmp::Reverse((timestamp, index)));
+        let total = candidates.len();
+        candidates.truncate(MAX_HISTORY_ENTRIES);
+        let with_edits = scope == EditHistoryScope::Buffer;
+        let mut entries = Vec::with_capacity(candidates.len());
+        for (_, index, slot) in candidates {
+            let buffer = buffers[slot];
+            let (Some(entry), Some(transaction)) = (
+                buffer.undo_history.undo_tree_entry(index, with_edits),
+                buffer.undo_history.node_transaction(index),
+            ) else {
+                continue;
+            };
+            // A workspace history leaves out the unbounded replacement texts; the
+            // bounded `document` stands in for them.
+            let mut value = serde_json::to_value(&entry).unwrap_or(Value::Null);
+            if !with_edits {
+                if let Some(fields) = value.as_object_mut() {
+                    fields.remove("edits");
+                }
+            }
+            let (mut lines, stat, total_lines) =
+                match self.edit_previews.previews.get(&entry.transaction_id) {
+                    Some(preview) => (preview.lines.clone(), preview.stat, preview.total),
+                    None => replacement_diff(&transaction.edits),
+                };
+            // The workspace offers a full patch for truncated documents, which a
+            // history preview cannot provide, so omitted lines are noted in the
+            // diff itself and the document is complete as shown.
+            let omitted = total_lines.saturating_sub(lines.len());
+            if omitted > 0 {
+                lines.push(DiffLine {
+                    kind: DiffLineKind::Meta,
+                    old_line: None,
+                    new_line: None,
+                    text: format!(
+                        "… {omitted} more diff lines not shown (the preview keeps {MAX_PREVIEW_LINES})"
+                    ),
+                });
+            }
+            let path = buffer
+                .file
+                .as_deref()
+                .map(|file| self.history_display_path(file))
+                .unwrap_or_else(|| buffer.name().to_string());
+            value["file"] = json!(path);
+            value["buffer_id"] = json!(buffer.id());
+            value["applied"] = json!(applied[slot].contains(&index));
+            value["age"] = json!(age_label(now_ms.saturating_sub(entry.timestamp_ms)));
+            value["added"] = json!(stat.added);
+            value["removed"] = json!(stat.removed);
+            value["document"] = json!({
+                "path": path,
+                "lines": lines
+                    .iter()
+                    .enumerate()
+                    .map(|(line_index, line)| json!({
+                        "id": format!("{}:{line_index}", entry.transaction_id),
+                        "text": line.text,
+                        "kind": line.kind,
+                        "old_line": line.old_line,
+                        "new_line": line.new_line,
+                    }))
+                    .collect::<Vec<_>>(),
+                "added": stat.added,
+                "removed": stat.removed,
+                "total_lines": total_lines,
+                "truncated": false,
+            });
+            if let EditOrigin::Agent { turn_id, .. } = &entry.origin {
+                if let Some((turn, prompt)) = self.agent_turn_summary(turn_id) {
+                    value["turn"] = json!(turn);
+                    value["prompt"] = json!(prompt);
+                }
+            }
+            entries.push(value);
+        }
         json!({
             "entries": entries,
             "total": total,
@@ -202,11 +218,12 @@ impl Editor {
     /// Finds the buffer whose history holds a transaction.
     pub(super) fn transaction_buffer_index(&self, transaction_id: &str) -> Option<usize> {
         self.buffer_manager.iter().position(|buffer| {
-            buffer
-                .undo_history
-                .undo_tree()
-                .iter()
-                .any(|entry| entry.transaction_id == transaction_id)
+            let history = &buffer.undo_history;
+            history.node_summaries().any(|(index, _, _)| {
+                history
+                    .node_transaction(index)
+                    .is_some_and(|transaction| transaction.id == transaction_id)
+            })
         })
     }
 }
