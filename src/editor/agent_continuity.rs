@@ -376,25 +376,34 @@ impl super::Editor {
         store: &mut ConversationStore,
         workspace: &Path,
     ) {
-        match store.claim(workspace) {
-            Ok(Claim::Owned) => self.agent_continuity_workspace = Some(workspace.to_path_buf()),
+        let message = match store.claim(workspace) {
+            Ok(Claim::Owned) => {
+                self.agent_continuity_workspace = Some(workspace.to_path_buf());
+                return;
+            }
             Ok(Claim::HeldBy(pid)) => {
-                // Its transcript stays as archived context for a new thread.
-                self.agent_manager.discard_conversation();
-                self.agent_continuity_saved = Some((
-                    Some(self.agent_manager.conversation_revision()),
-                    std::time::Instant::now(),
-                ));
                 crate::log!(
                     "recovered agent conversation for {} is open in Red pid {pid}; not resuming it",
                     workspace.display()
                 );
-                self.set_quiet_message(Some(format!(
+                format!(
                     "Agent conversation is open in another Red (pid {pid}); this window starts its own"
-                )));
+                )
             }
-            Err(error) => crate::log!("could not claim the recovered agent conversation: {error}"),
-        }
+            // Without a claim another editor may be driving the thread: fail closed.
+            Err(error) => {
+                crate::log!("could not claim the recovered agent conversation: {error}");
+                "Could not check whether another Red uses this agent conversation; starting a new one"
+                    .to_string()
+            }
+        };
+        // Its transcript stays as archived context for a new thread.
+        self.agent_manager.discard_conversation();
+        self.agent_continuity_saved = Some((
+            Some(self.agent_manager.conversation_revision()),
+            std::time::Instant::now(),
+        ));
+        self.set_quiet_message(Some(message));
     }
 
     fn adopt_saved_agent_conversation(&mut self, store: &mut ConversationStore, workspace: &Path) {
@@ -406,7 +415,9 @@ impl super::Editor {
             && !saved.conversation.thread_id.is_empty()
             && !saved.conversation.items.is_empty();
         if !compatible {
-            // The archived transcript still recaps it in a new thread.
+            // Not resumable, but never lost: keep it as the archived transcript
+            // that the next message recaps in a new thread.
+            self.archive_saved_agent_transcript(workspace, &saved.conversation);
             return;
         }
         match store.claim(workspace) {
@@ -429,6 +440,31 @@ impl super::Editor {
                 )));
             }
             Err(error) => crate::log!("could not claim the saved agent conversation: {error}"),
+        }
+    }
+
+    /// Makes a saved conversation the workspace's archived transcript unless the
+    /// pane already kept one there.
+    fn archive_saved_agent_transcript(
+        &mut self,
+        workspace: &Path,
+        conversation: &crate::agent_conversation::AgentConversationSnapshot,
+    ) {
+        let key = super::scoped_plugin_storage_key_for_workspace("agent", "transcript", workspace);
+        let kept = self
+            .preferences
+            .plugin_storage("agent", &key)
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|transcript| !transcript.trim().is_empty());
+        if kept || conversation.items.is_empty() {
+            return;
+        }
+        if let Err(error) = self.preferences.set_plugin_storage(
+            "agent",
+            &key,
+            serde_json::Value::String(conversation.flat_transcript()),
+        ) {
+            crate::log!("could not archive the saved agent conversation: {error}");
         }
     }
 
@@ -875,6 +911,20 @@ mod tests {
     }
 
     #[test]
+    fn a_recovered_conversation_is_not_resumed_when_ownership_cannot_be_checked() {
+        let config = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let directory = config.path().join("conversations");
+        fs::write(&directory, "not a directory").unwrap();
+        let mut recovered = editor();
+        recovered
+            .agent_manager
+            .restore_conversation(conversation("shared", workspace.path()));
+        recovered.enable_agent_continuity_in(ConversationStore::new(directory), workspace.path());
+        assert!(recovered.agent_manager.conversation().is_none());
+    }
+
+    #[test]
     fn a_conversation_from_an_older_tool_contract_is_not_resumed() {
         let config = tempfile::tempdir().unwrap();
         let workspace = tempfile::tempdir().unwrap();
@@ -891,6 +941,19 @@ mod tests {
             workspace.path(),
         );
         assert!(editor.agent_manager.conversation().is_none());
+        let key = crate::editor::scoped_plugin_storage_key_for_workspace(
+            "agent",
+            "transcript",
+            workspace.path(),
+        );
+        assert_eq!(
+            editor
+                .preferences
+                .plugin_storage("agent", &key)
+                .and_then(serde_json::Value::as_str),
+            Some("You: Remember HERON\n"),
+            "it stays as the archived transcript the next message recaps"
+        );
     }
 
     #[test]
