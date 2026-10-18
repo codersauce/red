@@ -110,8 +110,6 @@ pub(crate) enum DiffLineKind {
     Context,
     Added,
     Removed,
-    /// A note about the diff itself, such as omitted lines.
-    Meta,
 }
 
 /// One rendered line of a unified diff. Line numbers are one-based.
@@ -335,7 +333,7 @@ mod tests {
             .iter()
             .map(|line| {
                 let mark = match line.kind {
-                    DiffLineKind::Hunk | DiffLineKind::Meta => "",
+                    DiffLineKind::Hunk => "",
                     DiffLineKind::Context => " ",
                     DiffLineKind::Added => "+",
                     DiffLineKind::Removed => "-",

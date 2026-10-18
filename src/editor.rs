@@ -36941,7 +36941,8 @@ mod test {
             (json!(600), json!(600))
         );
         let note = lines.last().unwrap();
-        assert_eq!(note["kind"], "meta");
+        assert_eq!(note["kind"], "context", "meta lines are hidden by default");
+        assert!(note.get("old_line").is_none_or(Value::is_null));
         assert_eq!(
             note["text"],
             "… 801 more diff lines not shown (the preview keeps 400)"

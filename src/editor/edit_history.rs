@@ -143,11 +143,12 @@ impl Editor {
                 };
             // The workspace offers a full patch for truncated documents, which a
             // history preview cannot provide, so omitted lines are noted in the
-            // diff itself and the document is complete as shown.
+            // diff itself and the document is complete as shown. The note is an
+            // unnumbered context line: the workspace hides `meta` lines by default.
             let omitted = total_lines.saturating_sub(lines.len());
             if omitted > 0 {
                 lines.push(DiffLine {
-                    kind: DiffLineKind::Meta,
+                    kind: DiffLineKind::Context,
                     old_line: None,
                     new_line: None,
                     text: format!(
