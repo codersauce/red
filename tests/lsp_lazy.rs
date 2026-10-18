@@ -1360,27 +1360,53 @@ async fn agent_lsp_push_only_diagnostics_do_not_claim_refresh_or_cleanliness() {
 }
 
 #[tokio::test]
-async fn agent_lsp_push_only_refresh_answers_at_once_when_the_text_was_already_reported() {
+async fn agent_lsp_push_only_refresh_answers_at_once_only_for_a_report_of_the_current_version() {
     let root = tempfile::tempdir().unwrap();
     let (mut editor, lsp) = agent_lsp_fixture(root.path(), json!({}));
-    lsp.queue_message(red::lsp::InboundMessage::Notification(red::lsp::ParsedNotification::PublishDiagnostics(
-        serde_json::from_value(json!({"uri": red::lsp::file_uri(root.path().join("main.rs")).unwrap(), "diagnostics": [sample_diagnostic("push report")]})).unwrap()
-    )));
-    editor.test_service_background().await.unwrap();
-    let mut request = diagnostics_request(Some("main.rs"), true);
-    if let EditorToolCall::LspDiagnostics { wait_ms, .. } = &mut request.call {
-        *wait_ms = 20_000;
+    let uri = red::lsp::file_uri(root.path().join("main.rs")).unwrap();
+    let push = |version: Option<i64>, message: &str| {
+        let mut params = json!({"uri": uri, "diagnostics": [sample_diagnostic(message)]});
+        if let Some(version) = version {
+            params["version"] = json!(version);
+        }
+        lsp.queue_message(red::lsp::InboundMessage::Notification(
+            red::lsp::ParsedNotification::PublishDiagnostics(
+                serde_json::from_value(params).unwrap(),
+            ),
+        ));
+    };
+    let refresh = |wait_ms: u64| {
+        let mut request = diagnostics_request(Some("main.rs"), true);
+        if let EditorToolCall::LspDiagnostics { wait_ms: wait, .. } = &mut request.call {
+            *wait = wait_ms;
+        }
+        request
+    };
+    // Open the document so the server holds a version of the current text.
+    editor.test_run_agent_editor_tool(refresh(1)).await.unwrap();
+
+    // Neither an unversioned report nor one for older text proves it covers
+    // the current text, so the refresh keeps waiting (here until its deadline).
+    for (version, message) in [(None, "unversioned"), (Some(0), "older text")] {
+        push(version, message);
+        editor.test_service_background().await.unwrap();
+        let result = editor.test_run_agent_editor_tool(refresh(1)).await.unwrap();
+        assert_eq!(result["refresh_status"], "timeout", "{message}");
+        assert_eq!(result["items"][0]["message"], message);
     }
-    // A push-only server never re-reports unchanged text, so this must not wait.
+
+    // A report for the version the server holds answers at once.
+    push(Some(1), "current text");
+    editor.test_service_background().await.unwrap();
     let result = tokio::time::timeout(
         std::time::Duration::from_secs(2),
-        editor.test_run_agent_editor_tool(request),
+        editor.test_run_agent_editor_tool(refresh(20_000)),
     )
     .await
     .expect("refresh waited for a report that cannot come")
     .unwrap();
     assert_eq!(result["refresh_status"], "already_reported");
-    assert_eq!(result["items"][0]["message"], "push report");
+    assert_eq!(result["items"][0]["message"], "current text");
 }
 
 #[tokio::test]

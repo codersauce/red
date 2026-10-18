@@ -25,6 +25,10 @@ use super::LspRequestSource;
 #[serde(rename_all = "camelCase")]
 pub struct TextDocumentPublishDiagnostics {
     pub uri: Option<String>,
+    /// The document version the server computed these diagnostics for, when it
+    /// says (optional in the protocol).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<i64>,
     pub diagnostics: Vec<Diagnostic>,
     /// Managed producer identity; never serialized onto the LSP wire.
     #[serde(skip)]

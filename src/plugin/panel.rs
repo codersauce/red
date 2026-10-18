@@ -180,11 +180,12 @@ pub const MIN_COMFORTABLE_EDITOR_WIDTH: usize = 40;
 /// Largest share of the terminal a conversation pane takes at its default width.
 const MAX_DEFAULT_PANE_PERCENT: usize = 45;
 
-/// Docked width of a side panel. Conversation panes (side panels with a
-/// composer) are responsive: at their plugin-declared width they take at most
-/// 45% of the terminal, and a user-chosen width still leaves the editor
-/// [`MIN_COMFORTABLE_EDITOR_WIDTH`] columns. Neither limit goes below
-/// [`MIN_READABLE_PANE_WIDTH`]; narrower terminals use the compact overlay.
+/// Preferred docked width of a side panel. Conversation panes (side panels
+/// with a composer) are responsive: at their plugin-declared width they take at
+/// most 45% of the terminal, and a user-chosen width still leaves the editor
+/// [`MIN_COMFORTABLE_EDITOR_WIDTH`] columns. No width or limit goes below
+/// [`MIN_READABLE_PANE_WIDTH`]; [`PanelManager::side_panel_widths`] decides
+/// which panes fit together and makes the rest compact.
 ///
 /// `user_sized` means the width was chosen by the user (dragged, resized or
 /// restored) rather than declared by the plugin.
@@ -203,6 +204,7 @@ fn effective_panel_width(config: &PanelConfig, user_sized: bool, terminal_width:
     };
     config
         .width
+        .max(MIN_READABLE_PANE_WIDTH)
         .min(responsive_limit.max(MIN_READABLE_PANE_WIDTH))
         .min(terminal_width.saturating_sub(11).max(1))
 }
@@ -2820,19 +2822,6 @@ impl PanelPresentation {
         }
     }
 
-    fn width(
-        &self,
-        id: &str,
-        config: &PanelConfig,
-        user_sized: bool,
-        terminal_width: usize,
-    ) -> usize {
-        match self {
-            Self::Zoomed { id: target, size } if target == id => size.0,
-            _ => effective_panel_width(config, user_sized, terminal_width),
-        }
-    }
-
     fn height(&self, id: &str, config: &PanelConfig, available_height: usize) -> usize {
         match self {
             Self::Zoomed { id: target, size } if target == id => size.1,
@@ -2880,15 +2869,21 @@ impl PanelManager {
             .zoom_size()
             .or_else(|| self.presentation.zoom_size())
         {
+            let widths = self
+                .text_panels
+                .keys()
+                .map(|id| {
+                    (
+                        id.clone(),
+                        (
+                            self.text_panel_width_in(&self.presentation, id, terminal_width),
+                            self.text_panel_width_in(&presentation, id, terminal_width),
+                        ),
+                    )
+                })
+                .collect::<HashMap<_, _>>();
             for panel in self.text_panels.values_mut() {
-                let old_width = self.presentation.width(
-                    &panel.id,
-                    &panel.config,
-                    panel.user_sized,
-                    terminal_width,
-                );
-                let width =
-                    presentation.width(&panel.id, &panel.config, panel.user_sized, terminal_width);
+                let (old_width, width) = widths[&panel.id];
                 let old_height = self
                     .presentation
                     .height(&panel.id, &panel.config, content_height);
@@ -2955,12 +2950,7 @@ impl PanelManager {
                 }
 
                 let panel = self.text_panels.get(&id)?;
-                let width = self.presentation.width(
-                    &panel.id,
-                    &panel.config,
-                    panel.user_sized,
-                    terminal_width,
-                );
+                let width = self.text_panel_width(&panel.id, terminal_width);
                 let layout = panel.layout(width);
                 let scroll_anchor = (!panel.follow_tail).then(|| {
                     (panel.scroll..layout.lines.len())
@@ -3120,15 +3110,10 @@ impl PanelManager {
                 let Some(saved) = snapshot.text else {
                     return false;
                 };
+                let width = self.text_panel_width(id, terminal_width);
                 let Some(panel) = self.text_panels.get_mut(id) else {
                     return false;
                 };
-                let width = self.presentation.width(
-                    &panel.id,
-                    &panel.config,
-                    panel.user_sized,
-                    terminal_width,
-                );
                 let panel_height = self
                     .presentation
                     .height(&panel.id, &panel.config, panel_height);
@@ -3242,10 +3227,8 @@ impl PanelManager {
         panel_height: usize,
         terminal_width: usize,
     ) {
+        let width = self.text_panel_width(id, terminal_width);
         if let Some(panel) = self.text_panels.get_mut(id) {
-            let width =
-                self.presentation
-                    .width(&panel.id, &panel.config, panel.user_sized, terminal_width);
             let panel_height = self
                 .presentation
                 .height(&panel.id, &panel.config, panel_height);
@@ -3261,10 +3244,8 @@ impl PanelManager {
         panel_height: usize,
         terminal_width: usize,
     ) {
+        let width = self.text_panel_width(id, terminal_width);
         if let Some(panel) = self.text_panels.get_mut(id) {
-            let width =
-                self.presentation
-                    .width(&panel.id, &panel.config, panel.user_sized, terminal_width);
             let panel_height = self
                 .presentation
                 .height(&panel.id, &panel.config, panel_height);
@@ -3286,10 +3267,8 @@ impl PanelManager {
         panel_height: usize,
         terminal_width: usize,
     ) {
+        let width = self.text_panel_width(id, terminal_width);
         if let Some(panel) = self.text_panels.get_mut(id) {
-            let width =
-                self.presentation
-                    .width(&panel.id, &panel.config, panel.user_sized, terminal_width);
             let panel_height = self
                 .presentation
                 .height(&panel.id, &panel.config, panel_height);
@@ -3306,10 +3285,8 @@ impl PanelManager {
         panel_height: usize,
         terminal_width: usize,
     ) {
+        let width = self.text_panel_width(id, terminal_width);
         if let Some(panel) = self.text_panels.get_mut(id) {
-            let width =
-                self.presentation
-                    .width(&panel.id, &panel.config, panel.user_sized, terminal_width);
             let panel_height = self
                 .presentation
                 .height(&panel.id, &panel.config, panel_height);
@@ -3633,10 +3610,8 @@ impl PanelManager {
             && (self.panels.contains_key(id) || self.text_panels.contains_key(id))
         {
             self.focused = Some(id.to_string());
+            let width = self.text_panel_width(id, usize::MAX);
             if let Some(panel) = self.text_panels.get_mut(id) {
-                let width =
-                    self.presentation
-                        .width(&panel.id, &panel.config, panel.user_sized, usize::MAX);
                 panel.focus_scrollback(width);
             }
             true
@@ -3653,10 +3628,8 @@ impl PanelManager {
         }
 
         self.focused = Some(id.to_string());
+        let width = self.text_panel_width(id, usize::MAX);
         if let Some(panel) = self.text_panels.get_mut(id) {
-            let width =
-                self.presentation
-                    .width(&panel.id, &panel.config, panel.user_sized, usize::MAX);
             panel.restore_focused_region(width);
         }
         true
@@ -3883,42 +3856,90 @@ impl PanelManager {
     }
 
     fn reserved_side_width(&self, side: PanelSide, terminal_width: usize) -> usize {
-        self.z_order
-            .iter()
-            .filter(|id| !self.is_compact_panel(id, terminal_width))
-            .filter_map(|id| Some((self.panel_config(id)?, self.is_user_sized(id))))
-            .filter(|(config, _)| config.side == side)
-            .map(|(config, user_sized)| {
-                effective_panel_width(config, user_sized, terminal_width).saturating_add(1)
-            })
+        self.side_panel_widths(terminal_width)
+            .into_iter()
+            .filter(|(_, panel_side, _)| *panel_side == side)
+            .filter_map(|(_, _, width)| width)
+            .map(|width| width.saturating_add(1))
             .sum()
     }
 
-    /// Whether a visible conversation pane is too cramped to dock beside the
-    /// editor. A compact pane reserves no columns: it covers the editor while it
-    /// has focus and steps out of the way when the editor does.
-    pub(crate) fn is_compact_panel(&self, id: &str, terminal_width: usize) -> bool {
-        let Some(config) = self.panel_config(id) else {
-            return false;
-        };
-        if !self.is_visible(id)
-            || config.composer.is_none()
-            || !matches!(config.side, PanelSide::Left | PanelSide::Right)
-        {
-            return false;
-        }
-        let fixed_side_panels: usize = self
+    /// Docked widths of the visible left and right panels, in z-order. Fixed
+    /// panels keep their width; conversation panes then dock in order while
+    /// each still gets [`MIN_READABLE_PANE_WIDTH`] columns and the editor keeps
+    /// [`MIN_COMFORTABLE_EDITOR_WIDTH`]. A pane that does not fit is compact
+    /// (`None`): it reserves nothing and covers the editor while focused. The
+    /// editor's reservation, the placements, and text layout all use this one
+    /// allocation, so they always agree.
+    fn side_panel_widths(&self, terminal_width: usize) -> Vec<(String, PanelSide, Option<usize>)> {
+        let side_panels = self
             .z_order
             .iter()
-            .filter(|other| other.as_str() != id)
-            .filter_map(|other| self.panel_config(other))
-            .filter(|other| {
-                other.composer.is_none() && matches!(other.side, PanelSide::Left | PanelSide::Right)
-            })
-            .map(|other| effective_panel_width(other, false, terminal_width).saturating_add(1))
+            .filter_map(|id| Some((id, self.panel_config(id)?)))
+            .filter(|(_, config)| matches!(config.side, PanelSide::Left | PanelSide::Right))
+            .collect::<Vec<_>>();
+        let fixed: usize = side_panels
+            .iter()
+            .filter(|(_, config)| config.composer.is_none())
+            .map(|(_, config)| effective_panel_width(config, false, terminal_width) + 1)
             .sum();
-        terminal_width.saturating_sub(fixed_side_panels)
-            < MIN_READABLE_PANE_WIDTH + 1 + MIN_COMFORTABLE_EDITOR_WIDTH
+        let mut room = terminal_width.saturating_sub(fixed);
+        side_panels
+            .into_iter()
+            .map(|(id, config)| {
+                let width = if config.composer.is_none() {
+                    Some(effective_panel_width(config, false, terminal_width))
+                } else {
+                    let preferred =
+                        effective_panel_width(config, self.is_user_sized(id), terminal_width);
+                    let width =
+                        preferred.min(room.saturating_sub(MIN_COMFORTABLE_EDITOR_WIDTH + 1));
+                    (width >= MIN_READABLE_PANE_WIDTH).then(|| {
+                        room = room.saturating_sub(width + 1);
+                        width
+                    })
+                };
+                (id.clone(), config.side, width)
+            })
+            .collect()
+    }
+
+    /// Whether a visible conversation pane is too cramped to dock beside the
+    /// editor and the panes docked before it.
+    pub(crate) fn is_compact_panel(&self, id: &str, terminal_width: usize) -> bool {
+        self.side_panel_widths(terminal_width)
+            .into_iter()
+            .any(|(panel, _, width)| panel == id && width.is_none())
+    }
+
+    /// Layout width of a text panel at this terminal width: the zoomed size, its
+    /// docked width, or the full terminal for a compact pane (the width it has
+    /// whenever it is on screen).
+    pub(crate) fn text_panel_width(&self, id: &str, terminal_width: usize) -> usize {
+        self.text_panel_width_in(&self.presentation, id, terminal_width)
+    }
+
+    fn text_panel_width_in(
+        &self,
+        presentation: &PanelPresentation,
+        id: &str,
+        terminal_width: usize,
+    ) -> usize {
+        if let PanelPresentation::Zoomed { id: target, size } = presentation {
+            if target == id {
+                return size.0;
+            }
+        }
+        if let Some((_, _, width)) = self
+            .side_panel_widths(terminal_width)
+            .into_iter()
+            .find(|(panel, _, _)| panel == id)
+        {
+            return width.unwrap_or(terminal_width);
+        }
+        self.panel_config(id).map_or(terminal_width, |config| {
+            effective_panel_width(config, self.is_user_sized(id), terminal_width)
+        })
     }
 
     /// Whether a panel offers a composer, which makes its docked width responsive.
@@ -3970,10 +3991,8 @@ impl PanelManager {
         scrolloff: usize,
     ) -> Option<PanelEvent> {
         let focused = self.focused.clone()?;
+        let width = self.text_panel_width(&focused, terminal_width);
         if let Some(panel) = self.text_panels.get_mut(&focused) {
-            let width =
-                self.presentation
-                    .width(&panel.id, &panel.config, panel.user_sized, terminal_width);
             let panel_height = self
                 .presentation
                 .height(&panel.id, &panel.config, panel_height);
@@ -4039,13 +4058,11 @@ impl PanelManager {
     ) -> Option<TextPanelScrollbackInput> {
         let focused = self.focused.clone()?;
         let compact = self.is_compact_panel(&focused, terminal_width);
+        let width = self.text_panel_width(&focused, terminal_width);
         let panel = self.text_panels.get_mut(&focused)?;
         if !panel.scrollback.focused {
             return None;
         }
-        let width =
-            self.presentation
-                .width(&panel.id, &panel.config, panel.user_sized, terminal_width);
         let panel_height = self
             .presentation
             .height(&panel.id, &panel.config, panel_height);
@@ -4301,10 +4318,8 @@ impl PanelManager {
         scrolloff: usize,
     ) -> Option<PanelEvent> {
         let action = if delta < 0 { "up" } else { "down" };
+        let width = self.text_panel_width(id, terminal_width);
         if let Some(panel) = self.text_panels.get_mut(id) {
-            let width =
-                self.presentation
-                    .width(&panel.id, &panel.config, panel.user_sized, terminal_width);
             let panel_height = self
                 .presentation
                 .height(&panel.id, &panel.config, panel_height);
@@ -4367,12 +4382,10 @@ impl PanelManager {
         let Some(focused) = self.focused.clone() else {
             return false;
         };
+        let width = self.text_panel_width(&focused, terminal_width);
         let Some(panel) = self.text_panels.get_mut(&focused) else {
             return false;
         };
-        let width =
-            self.presentation
-                .width(&panel.id, &panel.config, panel.user_sized, terminal_width);
         panel.focus_scrollback(width);
         true
     }
@@ -4382,9 +4395,7 @@ impl PanelManager {
         terminal_width: usize,
     ) -> Option<TextPanelLinkTarget> {
         let panel = self.text_panels.get(self.focused.as_deref()?)?;
-        let width =
-            self.presentation
-                .width(&panel.id, &panel.config, panel.user_sized, terminal_width);
+        let width = self.text_panel_width(&panel.id, terminal_width);
         if panel.scrollback.focused {
             panel.layout(width).link_at(panel.scrollback.cursor)
         } else {
@@ -4505,9 +4516,7 @@ impl PanelManager {
         if all {
             Some(panel.copy_all())
         } else {
-            let width =
-                self.presentation
-                    .width(&panel.id, &panel.config, panel.user_sized, terminal_width);
+            let width = self.text_panel_width(&panel.id, terminal_width);
             match panel.selected_prompt(&panel.layout(width)) {
                 Some(index) => panel.turn_text(&panel.blocks[index].id, TextPanelTurnPart::Answer),
                 None => panel.copy_last_agent(),
@@ -4517,9 +4526,7 @@ impl PanelManager {
 
     pub(crate) fn selected_text_turn(&self, terminal_width: usize) -> Option<TextPanelTurnTarget> {
         let panel = self.text_panels.get(self.focused.as_deref()?)?;
-        let width =
-            self.presentation
-                .width(&panel.id, &panel.config, panel.user_sized, terminal_width);
+        let width = self.text_panel_width(&panel.id, terminal_width);
         let index = panel.selected_prompt(&panel.layout(width))?;
         let prompt = &panel.blocks[index];
         Some(TextPanelTurnTarget {
@@ -4727,10 +4734,8 @@ impl PanelManager {
         terminal_width: usize,
     ) -> Option<PanelEvent> {
         let focused = self.focused.clone()?;
+        let panel_width = self.text_panel_width(&focused, terminal_width);
         let panel = self.text_panels.get_mut(&focused)?;
-        let panel_width =
-            self.presentation
-                .width(&panel.id, &panel.config, panel.user_sized, terminal_width);
         let composer = panel.composer.as_mut()?;
         if !composer.focused || !composer.enabled {
             return None;
@@ -5270,27 +5275,33 @@ impl PanelManager {
         let mut top_y = 0usize;
         let mut bottom_y = content_height;
 
+        let side_widths = self
+            .side_panel_widths(terminal_width)
+            .into_iter()
+            .map(|(id, _, width)| (id, width))
+            .collect::<HashMap<_, _>>();
         for id in &self.z_order {
             let Some(config) = self.panel_config(id) else {
                 continue;
             };
-            if self.is_compact_panel(id, terminal_width) {
+            let side_width = side_widths.get(id).copied().flatten();
+            if side_widths.contains_key(id) && side_width.is_none() {
                 continue;
             }
 
             let (x, y, width, height) = match config.side {
                 PanelSide::Left => {
-                    let width =
-                        effective_panel_width(config, self.is_user_sized(id), terminal_width)
-                            .min(right_x.saturating_sub(left_x));
+                    let width = side_width
+                        .unwrap_or_default()
+                        .min(right_x.saturating_sub(left_x));
                     let x = left_x;
                     left_x = left_x.saturating_add(width.saturating_add(1));
                     (x, reserved_top, width, side_height)
                 }
                 PanelSide::Right => {
-                    let width =
-                        effective_panel_width(config, self.is_user_sized(id), terminal_width)
-                            .min(right_x.saturating_sub(left_x));
+                    let width = side_width
+                        .unwrap_or_default()
+                        .min(right_x.saturating_sub(left_x));
                     right_x = right_x.saturating_sub(width);
                     let x = right_x;
                     right_x = right_x.saturating_sub(1);
@@ -7104,7 +7115,7 @@ mod tests {
                 );
                 assert!(manager.panel_divider_at_position(12, 4, 80, 24).is_none());
                 let config = manager.panel_config("target").unwrap();
-                assert_eq!(manager.presentation.width("target", config, false, 80), 80);
+                assert_eq!(manager.text_panel_width("target", 80), 80);
                 assert_eq!(manager.presentation.height("target", config, 22), 22);
                 assert_eq!(manager.snapshot(80), before);
                 manager.set_presentation(PanelPresentation::Hidden);
@@ -8116,6 +8127,82 @@ mod tests {
         // The tree leaves too little room for both, so the conversation compacts.
         assert!(manager.is_compact_panel("agent", 100));
         assert!(!manager.is_compact_panel("agent", 120));
+    }
+
+    #[test]
+    fn conversation_panes_never_dock_below_the_readable_minimum() {
+        let mut manager = PanelManager::default();
+        manager.create_text_panel(
+            "agent".to_string(),
+            PanelConfig {
+                side: PanelSide::Right,
+                width: 62,
+                composer: Some(TextPanelComposerConfig {
+                    placeholder: "Ask".to_string(),
+                    rows: 3,
+                }),
+                ..PanelConfig::default()
+            },
+        );
+        // A user shrinking the pane below 32 columns still gets a readable pane.
+        assert!(manager.update_panel_layout("agent", PanelSide::Right, 12));
+        assert_eq!(
+            manager.text_panel_width("agent", 180),
+            MIN_READABLE_PANE_WIDTH
+        );
+        assert_eq!(
+            manager.reserved_right_width(180),
+            MIN_READABLE_PANE_WIDTH + 1
+        );
+        assert!(!manager.is_compact_panel("agent", 180));
+    }
+
+    #[test]
+    fn several_conversation_panes_share_the_room_beside_the_editor() {
+        let mut manager = PanelManager::default();
+        for (id, side) in [
+            ("left-chat", PanelSide::Left),
+            ("right-chat", PanelSide::Right),
+        ] {
+            manager.create_text_panel(
+                id.to_string(),
+                PanelConfig {
+                    side,
+                    width: 62,
+                    composer: Some(TextPanelComposerConfig {
+                        placeholder: "Ask".to_string(),
+                        rows: 3,
+                    }),
+                    ..PanelConfig::default()
+                },
+            );
+        }
+        let docked = |manager: &PanelManager, terminal: usize| {
+            manager
+                .panel_placements(terminal, 30)
+                .into_iter()
+                .map(|placement| placement.width + 1)
+                .sum::<usize>()
+        };
+        for terminal in [200, 180, 140, 100, 80, 60] {
+            let reserved =
+                manager.reserved_left_width(terminal) + manager.reserved_right_width(terminal);
+            // Placements and the editor's reservation always agree, and the
+            // editor keeps its 40 columns whenever anything is docked.
+            assert_eq!(docked(&manager, terminal), reserved, "{terminal}");
+            if reserved > 0 {
+                assert!(
+                    terminal - reserved >= MIN_COMFORTABLE_EDITOR_WIDTH,
+                    "{terminal}"
+                );
+            }
+        }
+        // Both fit on a wide terminal; at 100 columns only the first docks and
+        // the second becomes compact instead of overlapping the editor.
+        assert!(!manager.is_compact_panel("right-chat", 180));
+        assert!(!manager.is_compact_panel("left-chat", 100));
+        assert!(manager.is_compact_panel("right-chat", 100));
+        assert_eq!(manager.text_panel_width("right-chat", 100), 100);
     }
 
     #[test]
@@ -9461,8 +9548,14 @@ mod tests {
                 ..PanelConfig::default()
             },
         );
+        // Conversation panes are never docked narrower than 32 columns, so an
+        // 11-column pane is a compact pane covering an 11-column terminal.
+        manager.set_presentation(PanelPresentation::Zoomed {
+            id: "agent".to_string(),
+            size: (11, 18),
+        });
         assert!(manager.focus_text_panel_composer("agent"));
-        manager.handle_focused_text_input(&Event::Paste("one two three".to_string()), 80);
+        manager.handle_focused_text_input(&Event::Paste("one two three".to_string()), 11);
         manager
             .text_panels
             .get_mut("agent")
@@ -9474,7 +9567,7 @@ mod tests {
             .set_cursor(0);
 
         let placement = manager
-            .panel_placements(80, 20)
+            .panel_placements(11, 20)
             .into_iter()
             .find(|placement| placement.id == "agent")
             .unwrap();
@@ -9483,13 +9576,13 @@ mod tests {
             - manager.text_panels["agent"].composer_height(placement.height, placement.width)
             + 1;
         let theme = Theme::default();
-        let mut buffer = RenderBuffer::new(80, 20, &theme.style);
+        let mut buffer = RenderBuffer::new(11, 20, &theme.style);
         manager.render(&mut buffer, &theme);
         assert_eq!(text_position(&buffer, "one two"), Some(Point::new(x, y)));
         assert_eq!(text_position(&buffer, "three"), Some(Point::new(x, y + 1)));
 
         let down = Event::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
-        manager.handle_focused_text_input(&down, 80);
+        manager.handle_focused_text_input(&down, 11);
         assert_eq!(
             manager.text_panels["agent"]
                 .composer
@@ -9500,13 +9593,13 @@ mod tests {
             8
         );
         assert_eq!(
-            manager.focused_text_panel_cursor_position(80, 20),
+            manager.focused_text_panel_cursor_position(11, 20),
             Some((x, y + 1))
         );
         manager
-            .focus_panel_at_position(x + 2, y + 1, 80, 20)
+            .focus_panel_at_position(x + 2, y + 1, 11, 20)
             .unwrap();
-        manager.handle_focused_text_input(&Event::Paste("X".to_string()), 80);
+        manager.handle_focused_text_input(&Event::Paste("X".to_string()), 11);
         assert_eq!(
             manager.text_panels["agent"]
                 .composer
@@ -9570,7 +9663,10 @@ mod tests {
         assert!(!manager.focus_text_panel_composer("agent"));
 
         assert!(manager.set_panel_visible("agent", true));
-        assert_eq!(manager.reserved_right_width(200), 25);
+        assert_eq!(
+            manager.reserved_right_width(200),
+            MIN_READABLE_PANE_WIDTH + 1
+        );
         assert!(manager.restore_panel_focus("agent"));
         assert!(manager.focused_text_input_active());
         let composer = manager.text_panels["agent"].composer.as_ref().unwrap();

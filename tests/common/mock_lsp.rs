@@ -89,6 +89,9 @@ pub struct RecordingLsp {
     last_request: Arc<Mutex<Option<red::lsp::Request>>>,
     fail_next_did_open: bool,
     fail_next_did_change: bool,
+    /// Document versions as a real client numbers them: didOpen is 1 and every
+    /// didChange adds one.
+    versions: Arc<Mutex<std::collections::HashMap<String, i64>>>,
 }
 
 impl RecordingLsp {
@@ -347,6 +350,10 @@ impl LspClient for MockLsp {
 
 #[async_trait::async_trait]
 impl LspClient for RecordingLsp {
+    fn document_version(&self, file: &str) -> Option<i64> {
+        self.versions.lock().unwrap().get(file).copied()
+    }
+
     async fn reconfigure(&mut self, config: LspConfig) -> Result<Vec<String>, LspError> {
         self.reconfigurations.lock().unwrap().push(config);
         Ok(Vec::new())
@@ -358,6 +365,7 @@ impl LspClient for RecordingLsp {
 
     async fn did_open(&mut self, file: &str, _contents: &str) -> Result<(), LspError> {
         self.record(LspEvent::DidOpen(file.to_string()));
+        self.versions.lock().unwrap().insert(file.to_string(), 1);
         if self.fail_next_did_open {
             self.fail_next_did_open = false;
             return Err(LspError::ServerError(
@@ -369,6 +377,12 @@ impl LspClient for RecordingLsp {
 
     async fn did_change(&mut self, file: &str, _contents: String) -> Result<(), LspError> {
         self.record(LspEvent::DidChange(file.to_string()));
+        *self
+            .versions
+            .lock()
+            .unwrap()
+            .entry(file.to_string())
+            .or_default() += 1;
         if self.fail_next_did_change {
             self.fail_next_did_change = false;
             return Err(LspError::ServerError(

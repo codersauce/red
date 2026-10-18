@@ -4963,10 +4963,11 @@ struct ScratchBufferCommands {
     cancel: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum DeferredQuit {
     None,
-    AfterSave(BufferId),
+    /// Quit once every one of these buffers finishes its format-on-save.
+    AfterSaves(Vec<BufferId>),
     Ready,
 }
 
@@ -6549,17 +6550,22 @@ impl Editor {
         } else {
             reserved_on_axis
         };
+        // A conversation pane stays readable and never squeezes the editor below
+        // a usable width; the layout would hold it to both anyway.
+        let conversation = self.panel_manager.panel_has_composer(id);
         let (terminal_extent, minimum_editor, minimum_panel) = if target_is_vertical {
             (
                 terminal_width,
-                // A conversation pane never squeezes the editor below a usable
-                // width; the layout would cap it there anyway.
-                if self.panel_manager.panel_has_composer(id) {
+                if conversation {
                     plugin::panel::MIN_COMFORTABLE_EDITOR_WIDTH
                 } else {
                     MIN_EDITOR_WINDOW_WIDTH
                 },
-                MIN_DOCKED_PANEL_WIDTH,
+                if conversation {
+                    plugin::panel::MIN_READABLE_PANE_WIDTH
+                } else {
+                    MIN_DOCKED_PANEL_WIDTH
+                },
             )
         } else {
             (
@@ -14835,21 +14841,29 @@ impl Editor {
 
     #[cfg(test)]
     fn add_diagnostics(&mut self, uri: Option<&str>, diagnostics: &[Diagnostic]) -> Option<Action> {
-        self.add_diagnostics_from(uri, None, diagnostics)
+        self.add_diagnostics_from(uri, None, None, diagnostics)
     }
 
     fn add_diagnostics_from(
         &mut self,
         uri: Option<&str>,
         source: Option<&LspRequestSource>,
+        version: Option<i64>,
         diagnostics: &[Diagnostic],
     ) -> Option<Action> {
-        self.update_diagnostics_from(
+        let action = self.update_diagnostics_from(
             uri,
             source,
             diagnostics,
             diagnostics::DiagnosticReportKind::Push,
-        )
+        );
+        if let Some(uri) = uri {
+            let producer = source
+                .map(|source| source.key.as_str())
+                .unwrap_or(diagnostics::DEFAULT_PRODUCER);
+            self.record_agent_push_version(uri, producer, version);
+        }
+        action
     }
 
     fn clear_current_buffer_diagnostics(&mut self) {
@@ -16049,6 +16063,7 @@ impl Editor {
                 ParsedNotification::PublishDiagnostics(msg) => self.add_diagnostics_from(
                     msg.uri.as_deref(),
                     msg.source.as_ref(),
+                    msg.version,
                     &msg.diagnostics,
                 ),
                 ParsedNotification::Progress(progress_params) => {
@@ -29537,31 +29552,47 @@ impl Editor {
         })
     }
 
+    /// Defers a quit when every unsaved buffer is waiting on its own
+    /// format-on-save, as after `:wq`, `:wqa`, or `:xa`; the quit then happens
+    /// once all of them are written.
     fn defer_quit_for_pending_save(&mut self) -> bool {
-        let buffer_id = self.current_buffer().id();
-        let should_defer = self.current_buffer().is_dirty()
-            && self
-                .buffer_manager
-                .iter()
-                .filter(|buffer| buffer.is_dirty())
-                .count()
-                == 1
-            && self.has_pending_format_save(buffer_id);
+        let dirty = self
+            .buffer_manager
+            .iter()
+            .filter(|buffer| buffer.is_dirty())
+            .map(Buffer::id)
+            .collect::<Vec<_>>();
+        let should_defer =
+            !dirty.is_empty() && dirty.iter().all(|id| self.has_pending_format_save(*id));
         if should_defer {
-            self.deferred_quit = DeferredQuit::AfterSave(buffer_id);
+            self.deferred_quit = DeferredQuit::AfterSaves(dirty);
         }
         should_defer
     }
 
     fn finish_deferred_quit(&mut self, buffer_id: BufferId, saved: bool) {
-        if self.deferred_quit != DeferredQuit::AfterSave(buffer_id) {
+        let DeferredQuit::AfterSaves(waiting) = &mut self.deferred_quit else {
             return;
-        }
-        self.deferred_quit = if saved {
-            DeferredQuit::Ready
-        } else {
-            DeferredQuit::None
         };
+        let Some(position) = waiting.iter().position(|id| *id == buffer_id) else {
+            return;
+        };
+        waiting.remove(position);
+        if !saved {
+            self.deferred_quit = DeferredQuit::None;
+            let name = self
+                .buffer_manager
+                .iter()
+                .find(|buffer| buffer.id() == buffer_id)
+                .map_or_else(
+                    || "a buffer".to_string(),
+                    |buffer| buffer.name().to_string(),
+                );
+            // The save error itself is already in the message history.
+            self.set_legacy_message(Some(format!("quit cancelled: {name} was not saved")));
+        } else if waiting.is_empty() {
+            self.deferred_quit = DeferredQuit::Ready;
+        }
     }
 
     fn take_deferred_quit(&mut self) -> bool {
@@ -29571,11 +29602,14 @@ impl Editor {
                 // A buffer may have changed while the asynchronous save was pending.
                 self.modified_buffers().is_empty()
             }
-            DeferredQuit::AfterSave(buffer_id) if !self.has_pending_format_save(buffer_id) => {
+            // A save that vanished without reporting back cancels the quit.
+            DeferredQuit::AfterSaves(ref waiting)
+                if waiting.iter().any(|id| !self.has_pending_format_save(*id)) =>
+            {
                 self.deferred_quit = DeferredQuit::None;
                 false
             }
-            DeferredQuit::None | DeferredQuit::AfterSave(_) => false,
+            DeferredQuit::None | DeferredQuit::AfterSaves(_) => false,
         }
     }
 
@@ -48730,6 +48764,15 @@ while True:
         root: &Path,
         buffer: Buffer,
     ) -> (Editor, PathBuf, PathBuf, PathBuf) {
+        delayed_formatter_editor_with(root, vec![buffer], /*keep_serving*/ false)
+    }
+
+    #[cfg(unix)]
+    fn delayed_formatter_editor_with(
+        root: &Path,
+        buffers: Vec<Buffer>,
+        keep_serving: bool,
+    ) -> (Editor, PathBuf, PathBuf, PathBuf) {
         let server = root.join("formatter.py");
         let ready = root.join("initialize-ready");
         let release = root.join("initialize-release");
@@ -48743,6 +48786,7 @@ import sys
 import time
 
 ready, release, events = map(pathlib.Path, sys.argv[1:4])
+keep_serving = len(sys.argv) > 4
 
 def read_message():
     headers = {}
@@ -48789,7 +48833,8 @@ while True:
     if method == "textDocument/formatting":
         # Include the empty EOF line, as whole-document formatters do.
         send({"jsonrpc": "2.0", "id": message["id"], "result": [{"range": {"start": {"line": 0, "character": 0}, "end": {"line": 1, "character": 0}}, "newText": "value\n"}]})
-        break
+        if not keep_serving:
+            break
 "#,
         )
         .unwrap();
@@ -48800,12 +48845,15 @@ while True:
             "formatter".to_string(),
             crate::config::LanguageServerConfig {
                 command: "python3".to_string(),
-                args: vec![
+                args: [
                     server.to_string_lossy().into_owned(),
                     ready.to_string_lossy().into_owned(),
                     release.to_string_lossy().into_owned(),
                     events.to_string_lossy().into_owned(),
-                ],
+                ]
+                .into_iter()
+                .chain(keep_serving.then(|| "keep-serving".to_string()))
+                .collect(),
                 language_id: "rust".to_string(),
                 file_extensions: vec!["rs".to_string()],
                 filenames: Vec::new(),
@@ -48818,8 +48866,7 @@ while True:
             },
         )]);
         let lsp = Box::new(crate::lsp::LspManager::new(config.lsp.clone()));
-        let mut editor =
-            Editor::with_size(lsp, 60, 12, config, Theme::default(), vec![buffer]).unwrap();
+        let mut editor = Editor::with_size(lsp, 60, 12, config, Theme::default(), buffers).unwrap();
         editor.test_disable_terminal_output();
         (editor, ready, release, events)
     }
@@ -49005,6 +49052,84 @@ while True:
 
         assert!(editor.take_deferred_quit());
         assert!(!editor.buffer_manager[0].is_dirty());
+    }
+
+    #[cfg(unix)]
+    async fn two_dirty_formatted_buffers(
+        root: &Path,
+    ) -> (Editor, PathBuf, PathBuf, PathBuf, PathBuf) {
+        let mut buffers = Vec::new();
+        let mut paths = Vec::new();
+        for name in ["first.rs", "second.rs"] {
+            let path = root.join(name);
+            std::fs::write(&path, "value   \n").unwrap();
+            let mut buffer = Buffer::new(
+                Some(path.to_string_lossy().into_owned()),
+                "value   \n".to_string(),
+            );
+            buffer.insert_str(0, 0, "x");
+            assert!(buffer.is_dirty());
+            buffers.push(buffer);
+            paths.push(path);
+        }
+        let (editor, ready, release, _) =
+            delayed_formatter_editor_with(root, buffers, /*keep_serving*/ true);
+        let second = paths.pop().unwrap();
+        let first = paths.pop().unwrap();
+        (editor, ready, release, first, second)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn write_all_and_quit_waits_for_every_delayed_format_save() {
+        for command in ["wqa", "xa"] {
+            let root = tempfile::tempdir().unwrap();
+            let (mut editor, ready, release, first, second) =
+                two_dirty_formatted_buffers(root.path()).await;
+
+            editor
+                .test_execute_production_action(Action::Command(command.to_string()))
+                .await
+                .unwrap();
+            wait_for_formatter_initialize(&ready).await;
+            assert!(!editor.take_deferred_quit(), "{command} quit before saving");
+
+            std::fs::write(&release, "release").unwrap();
+            complete_delayed_format_save(&mut editor, &first, "value\n").await;
+            complete_delayed_format_save(&mut editor, &second, "value\n").await;
+
+            assert!(editor.take_deferred_quit(), "{command} never quit");
+            assert!(editor
+                .buffer_manager
+                .iter()
+                .all(|buffer| !buffer.is_dirty()));
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn write_all_and_quit_stays_open_when_one_delayed_save_fails() {
+        let root = tempfile::tempdir().unwrap();
+        let (mut editor, ready, release, first, second) =
+            two_dirty_formatted_buffers(root.path()).await;
+
+        editor
+            .test_execute_production_action(Action::Command("wqa".to_string()))
+            .await
+            .unwrap();
+        wait_for_formatter_initialize(&ready).await;
+        // The second file changes on disk, so its save must not overwrite it.
+        std::fs::write(&second, "external\n").unwrap();
+        std::fs::write(&release, "release").unwrap();
+        complete_delayed_format_save(&mut editor, &first, "value\n").await;
+        complete_delayed_format_save(&mut editor, &second, "external\n").await;
+
+        assert!(!editor.take_deferred_quit());
+        assert!(editor.buffer_manager.iter().any(Buffer::is_dirty));
+        assert!(editor
+            .last_error
+            .as_deref()
+            .is_some_and(|message| message.contains("quit cancelled")));
     }
 
     #[cfg(unix)]

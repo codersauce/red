@@ -83,6 +83,8 @@ struct ReportStamp {
     sequence: u64,
     revision: Option<u64>,
     received_at_ms: u128,
+    /// Document version a push report says it covers, when the server sent one.
+    document_version: Option<i64>,
 }
 
 enum StartQuery {
@@ -532,10 +534,22 @@ impl Editor {
                             ))
                         });
                     // A push-only server never re-reports unchanged text, so a
-                    // report for this exact revision is the answer; waiting would
-                    // only end in a timeout.
+                    // report that names the version the server holds for the
+                    // current text is the answer; waiting would only time out.
+                    // Arrival time proves nothing: a late report can describe
+                    // older text, so without a version keep waiting.
+                    let buffer = &self.buffer_manager[index];
+                    let current_version =
+                        (self.lsp_coordinator.last_notified_revision(buffer.id())
+                            == Some(buffer.revision()))
+                        .then(|| {
+                            self.lsp
+                                .document_version_for_source(&file, &context.lsp_source)
+                        })
+                        .flatten();
                     if stamp.is_some_and(|stamp| {
-                        stamp.revision == Some(self.buffer_manager[index].revision())
+                        stamp.document_version.is_some()
+                            && stamp.document_version == current_version
                     }) {
                         return Ok(StartQuery::Immediate(self.agent_diagnostics_payload(
                             &request.call,
@@ -992,8 +1006,33 @@ impl Editor {
                     .duration_since(UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_millis(),
+                document_version: None,
             },
         );
+    }
+
+    /// Keeps the protocol version a push report was computed for, which is the
+    /// only proof that it covers a particular text.
+    pub(super) fn record_agent_push_version(
+        &mut self,
+        uri: &str,
+        producer: &str,
+        version: Option<i64>,
+    ) {
+        let uri = lsp_normalized_file_path(uri)
+            .ok()
+            .and_then(|path| crate::lsp::file_uri(path).ok())
+            .unwrap_or_else(|| uri.to_string());
+        let latest = self.agent_lsp.report_sequence;
+        // Only the report just recorded; a rejected report must not relabel an older one.
+        if let Some(stamp) = self
+            .agent_lsp
+            .reports
+            .get_mut(&(uri, producer.to_string()))
+            .filter(|stamp| stamp.sequence == latest)
+        {
+            stamp.document_version = version;
+        }
     }
 
     fn agent_diagnostics_payload(
