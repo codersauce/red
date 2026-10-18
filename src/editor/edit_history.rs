@@ -106,11 +106,15 @@ impl Editor {
             }
             applied.push(path);
         }
-        // Newest first; within one millisecond, later nodes are newer.
-        candidates.sort_by_key(|&(timestamp, index, _)| std::cmp::Reverse((timestamp, index)));
         let total = candidates.len();
-        candidates.truncate(MAX_HISTORY_ENTRIES);
+        // The original buffer scope returns its whole tree in node order. The
+        // workspace scope is newest first, within one millisecond later nodes being
+        // newer, and capped.
         let with_edits = scope == EditHistoryScope::Buffer;
+        if !with_edits {
+            candidates.sort_by_key(|&(timestamp, index, _)| std::cmp::Reverse((timestamp, index)));
+            candidates.truncate(MAX_HISTORY_ENTRIES);
+        }
         let mut entries = Vec::with_capacity(candidates.len());
         for (_, index, slot) in candidates {
             let buffer = buffers[slot];

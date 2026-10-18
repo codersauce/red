@@ -474,9 +474,9 @@ archived context.
 ## Edit history
 
 `EditHistory(callback, scope?: String)` returns the attributed undo history. Without
-`scope` it covers the active buffer, as before; host API `0.21.0` adds `"workspace"`,
-which covers every open file, newest first, and `total`, the number of entries before
-the 500-entry limit.
+`scope` it returns the active buffer's whole tree in node order, as before. Host API
+`0.21.0` adds `"workspace"`, which covers every open file, newest first, limited to
+500 entries, and `total`, the number of entries before that limit.
 
 Each entry keeps the original fields (`transaction_id`, `label`, `origin`, `current`,
 `timestamp_ms`, `edits`, and the tree links) and adds:

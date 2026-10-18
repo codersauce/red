@@ -36858,11 +36858,14 @@ mod test {
         assert_eq!(entries[499]["label"], "edit 100");
         assert_eq!(entries[0]["applied"], true);
 
+        // Unscoped requests keep their contract: the whole tree, in node order.
         let buffer = editor.edit_history_payload(edit_history::EditHistoryScope::Buffer);
-        assert_eq!(
-            buffer["entries"][0]["edits"].as_array().map(Vec::len),
-            Some(1)
-        );
+        let entries = buffer["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), 600);
+        assert_eq!(entries[0]["index"], 0);
+        assert_eq!(entries[0]["label"], "edit 0");
+        assert_eq!(entries[599]["label"], "edit 599");
+        assert_eq!(entries[0]["edits"].as_array().map(Vec::len), Some(1));
     }
 
     #[tokio::test]
