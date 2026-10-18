@@ -36806,6 +36806,56 @@ mod test {
 
     #[tokio::test]
     #[cfg(unix)]
+    async fn a_large_agent_edit_history_reports_its_full_length_without_offering_a_full_patch() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("big.rs");
+        let original: String = (0..600).map(|line| format!("old {line}\n")).collect();
+        fs::write(&path, &original).unwrap();
+        let mut editor = test_editor(/*width*/ 100, /*height*/ 30);
+        editor.test_set_agent_root(root.path());
+        let request = |call| EditorToolRequest {
+            session_id: "big".to_string(),
+            call,
+        };
+        let read = editor
+            .test_run_agent_editor_tool(request(EditorToolCall::ReadFile {
+                path: "big.rs".to_string(),
+                start_line: 1,
+                line_count: 10,
+            }))
+            .await
+            .unwrap();
+        editor
+            .test_run_agent_editor_tool(request(EditorToolCall::WriteFile {
+                path: "big.rs".to_string(),
+                expected_revision: read["revision"].as_u64().unwrap(),
+                content: original.replace("old", "new"),
+            }))
+            .await
+            .unwrap();
+
+        let payload = editor.edit_history_payload(edit_history::EditHistoryScope::Workspace);
+        let document = &payload["entries"][0]["document"];
+        let lines = document["lines"].as_array().unwrap();
+        assert_eq!(document["total_lines"], 1 + 600 + 600);
+        assert_eq!(
+            document["truncated"], false,
+            "no full patch is available to offer"
+        );
+        assert_eq!(
+            (document["added"].clone(), document["removed"].clone()),
+            (json!(600), json!(600))
+        );
+        let note = lines.last().unwrap();
+        assert_eq!(note["kind"], "meta");
+        assert_eq!(
+            note["text"],
+            "… 801 more diff lines not shown (the preview keeps 400)"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
     async fn agent_file_writes_never_replace_unsaved_human_edits() {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("document.rs");

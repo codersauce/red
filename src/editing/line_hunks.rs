@@ -98,6 +98,8 @@ pub(crate) enum DiffLineKind {
     Context,
     Added,
     Removed,
+    /// A note about the diff itself, such as omitted lines.
+    Meta,
 }
 
 /// One rendered line of a unified diff. Line numbers are one-based.
@@ -119,13 +121,14 @@ pub(crate) struct DiffStat {
 }
 
 /// Renders `before` → `after` as unified diff lines with `context` unchanged lines
-/// around each change, stopping after `max_lines` lines.
+/// around each change. Keeps the first `max_lines` lines and also returns how many
+/// lines the whole diff has.
 pub(crate) fn unified_diff(
     before: &str,
     after: &str,
     context: usize,
     max_lines: usize,
-) -> (Vec<DiffLine>, DiffStat, bool) {
+) -> (Vec<DiffLine>, DiffStat, usize) {
     let diff = TextDiff::configure()
         .timeout(DIFF_TIMEOUT)
         .diff_lines(before, after);
@@ -133,7 +136,7 @@ pub(crate) fn unified_diff(
     let new = diff.new_slices();
     let mut lines = Vec::new();
     let mut stat = DiffStat::default();
-    let mut truncated = false;
+    let mut total = 0;
     let clean = |text: &str| text.trim_end_matches(['\n', '\r']).to_string();
     for group in diff.grouped_ops(context) {
         let (Some(first), Some(last)) = (group.first(), group.last()) else {
@@ -144,10 +147,9 @@ pub(crate) fn unified_diff(
         let old_len = last.old_range().end - old_start;
         let new_len = last.new_range().end - new_start;
         let mut push = |line: DiffLine, lines: &mut Vec<DiffLine>| {
+            total += 1;
             if lines.len() < max_lines {
                 lines.push(line);
-            } else {
-                truncated = true;
             }
         };
         push(
@@ -208,7 +210,7 @@ pub(crate) fn unified_diff(
             }
         }
     }
-    (lines, stat, truncated)
+    (lines, stat, total)
 }
 
 fn op_ranges(op: &DiffOp) -> (DiffTag, Range<usize>, Range<usize>) {
@@ -289,8 +291,8 @@ mod tests {
         let after = before
             .replace("line 5\n", "line five\n")
             .replace("line 15\n", "");
-        let (lines, stat, truncated) = unified_diff(&before, &after, 2, 100);
-        assert!(!truncated);
+        let (lines, stat, total) = unified_diff(&before, &after, 2, 100);
+        assert_eq!(total, lines.len());
         assert_eq!(
             stat,
             DiffStat {
@@ -302,7 +304,7 @@ mod tests {
             .iter()
             .map(|line| {
                 let mark = match line.kind {
-                    DiffLineKind::Hunk => "",
+                    DiffLineKind::Hunk | DiffLineKind::Meta => "",
                     DiffLineKind::Context => " ",
                     DiffLineKind::Added => "+",
                     DiffLineKind::Removed => "-",
@@ -331,8 +333,8 @@ mod tests {
         assert_eq!(lines[3].old_line, Some(5));
         assert_eq!(lines[4].new_line, Some(5));
 
-        let (lines, _, truncated) = unified_diff(&before, &after, 2, 4);
+        let (lines, _, total) = unified_diff(&before, &after, 2, 4);
         assert_eq!(lines.len(), 4);
-        assert!(truncated);
+        assert_eq!(total, 13, "the full length is kept when lines are cut");
     }
 }

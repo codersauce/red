@@ -24,7 +24,8 @@ const MAX_HISTORY_ENTRIES: usize = 500;
 struct EditPreview {
     lines: Vec<DiffLine>,
     stat: DiffStat,
-    truncated: bool,
+    /// Lines in the whole diff; `lines` holds at most MAX_PREVIEW_LINES of them.
+    total: usize,
 }
 
 #[derive(Debug, Default)]
@@ -62,15 +63,10 @@ pub(crate) enum EditHistoryScope {
 impl Editor {
     /// Keeps a readable diff of an agent transaction while both documents exist.
     pub(super) fn record_edit_preview(&mut self, transaction_id: &str, before: &str, after: &str) {
-        let (lines, stat, truncated) =
-            unified_diff(before, after, PREVIEW_CONTEXT, MAX_PREVIEW_LINES);
+        let (lines, stat, total) = unified_diff(before, after, PREVIEW_CONTEXT, MAX_PREVIEW_LINES);
         self.edit_previews.insert(
             transaction_id.to_string(),
-            EditPreview {
-                lines,
-                stat,
-                truncated,
-            },
+            EditPreview { lines, stat, total },
         );
     }
 
@@ -104,11 +100,25 @@ impl Editor {
                 .map(|file| self.history_display_path(file));
             for entry in tree {
                 let mut value = serde_json::to_value(&entry).unwrap_or(Value::Null);
-                let (lines, stat, truncated) =
+                let (mut lines, stat, total) =
                     match self.edit_previews.previews.get(&entry.transaction_id) {
-                        Some(preview) => (preview.lines.clone(), preview.stat, preview.truncated),
+                        Some(preview) => (preview.lines.clone(), preview.stat, preview.total),
                         None => replacement_diff(&entry.edits),
                     };
+                // The workspace offers a full patch for truncated documents, which
+                // a history preview cannot provide, so omitted lines are noted in
+                // the diff itself and the document is complete as shown.
+                let omitted = total.saturating_sub(lines.len());
+                if omitted > 0 {
+                    lines.push(DiffLine {
+                        kind: DiffLineKind::Meta,
+                        old_line: None,
+                        new_line: None,
+                        text: format!(
+                            "… {omitted} more diff lines not shown (the preview keeps {MAX_PREVIEW_LINES})"
+                        ),
+                    });
+                }
                 let path = file.clone().unwrap_or_else(|| buffer.name().to_string());
                 value["file"] = json!(path);
                 value["buffer_id"] = json!(buffer.id());
@@ -131,8 +141,8 @@ impl Editor {
                         .collect::<Vec<_>>(),
                     "added": stat.added,
                     "removed": stat.removed,
-                    "total_lines": lines.len(),
-                    "truncated": truncated,
+                    "total_lines": total,
+                    "truncated": false,
                 });
                 if let EditOrigin::Agent { turn_id, .. } = &entry.origin {
                     if let Some((turn, prompt)) = self.agent_turn_summary(turn_id) {
@@ -196,17 +206,16 @@ impl Editor {
 
 /// A diff rendered from a transaction's own replacements, for edits without a
 /// preview. Line numbers are those at the time of each replacement.
-fn replacement_diff(edits: &[crate::undo::TextEdit]) -> (Vec<DiffLine>, DiffStat, bool) {
+fn replacement_diff(edits: &[crate::undo::TextEdit]) -> (Vec<DiffLine>, DiffStat, usize) {
     let mut lines = Vec::new();
     let mut stat = DiffStat::default();
-    let mut truncated = false;
+    let mut total = 0;
     // Counts cover every line; only the first MAX_PREVIEW_LINES are kept, so one
     // whole-document replacement cannot build a huge preview.
     let mut push = |line: DiffLine, lines: &mut Vec<DiffLine>| {
+        total += 1;
         if lines.len() < MAX_PREVIEW_LINES {
             lines.push(line);
-        } else {
-            truncated = true;
         }
     };
     for crate::undo::TextEdit::Replace {
@@ -251,7 +260,7 @@ fn replacement_diff(edits: &[crate::undo::TextEdit]) -> (Vec<DiffLine>, DiffStat
             );
         }
     }
-    (lines, stat, truncated)
+    (lines, stat, total)
 }
 
 fn split_lines(text: &str) -> Vec<&str> {
@@ -302,8 +311,8 @@ mod tests {
             old_text: "old\n".to_string(),
             new_text: "new one\nnew two\n".to_string(),
         }];
-        let (lines, stat, truncated) = replacement_diff(&edits);
-        assert!(!truncated);
+        let (lines, stat, total) = replacement_diff(&edits);
+        assert_eq!(total, lines.len());
         assert_eq!(
             stat,
             DiffStat {
@@ -326,9 +335,9 @@ mod tests {
             old_text,
             new_text,
         }];
-        let (lines, stat, truncated) = replacement_diff(&edits);
+        let (lines, stat, total) = replacement_diff(&edits);
         assert_eq!(lines.len(), MAX_PREVIEW_LINES);
-        assert!(truncated);
+        assert_eq!(total, 1 + 1_000 + 1_500);
         assert_eq!(
             stat,
             DiffStat {
