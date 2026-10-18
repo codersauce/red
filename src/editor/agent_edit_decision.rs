@@ -41,6 +41,9 @@ pub(super) struct AgentEditDecisions {
     /// is unchanged.
     choices: HashMap<(String, PathBuf), (AgentUnsavedChoice, u64)>,
     pending: Option<PendingAgentEditDecision>,
+    /// The answer for the held write being run now. It wins even if the buffer
+    /// was saved while the question was open.
+    answering: Option<AgentUnsavedChoice>,
 }
 
 impl AgentEditDecisions {
@@ -71,6 +74,9 @@ impl Editor {
     /// A clean buffer is saved as before; a dirty one keeps them unsaved unless the
     /// user chose otherwise for this conversation and file.
     pub(super) fn agent_unsaved_choice(&self, session_id: &str, path: &Path) -> AgentUnsavedChoice {
+        if let Some(choice) = self.agent_edit_decisions.answering {
+            return choice;
+        }
         let buffer = self.current_buffer();
         if !buffer.is_dirty() {
             return AgentUnsavedChoice::SaveAll;
@@ -234,9 +240,11 @@ impl Editor {
                 (choice, generation),
             );
         }
+        self.agent_edit_decisions.answering = Some(choice);
         let result = self
             .run_staged_agent_tool(pending.tool, render_buffer, runtime)
             .await;
+        self.agent_edit_decisions.answering = None;
         // Report what happened, not what was chosen: the write can still fail, for
         // example when the buffer changed meanwhile or the save is refused.
         let error = |result: &Value| {

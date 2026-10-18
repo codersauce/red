@@ -36619,7 +36619,8 @@ mod test {
         let root = tempfile::tempdir().unwrap();
         let (mut editor, sender) = unsaved_document_editor(root.path()).await;
 
-        editor.note_user_input();
+        // A keystroke "just now" that stays recent however slowly the test runs.
+        editor.last_user_input_at = Some(Instant::now() + Duration::from_secs(60));
         let result = send_agent_line_edit(&editor, &sender, 1, 3, "TWO").await;
         editor.test_service_background().await.unwrap();
         assert!(
@@ -36796,6 +36797,31 @@ mod test {
         let message = editor.test_last_error().unwrap_or_default().to_string();
         assert!(message.starts_with("Agent edit not applied: "), "{message}");
         assert!(!message.contains("applied and saved"), "{message}");
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn a_decline_holds_even_if_the_buffer_was_saved_while_asking() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("document.rs");
+        let (mut editor, sender) = unsaved_document_editor(root.path()).await;
+        let result = send_agent_line_edit(&editor, &sender, 1, 3, "TWO").await;
+        editor.test_service_background().await.unwrap();
+        assert!(editor.current_dialog.is_some());
+
+        // A save finishes while the question is open, so the buffer is clean.
+        fs::write(&path, editor.current_buffer().contents()).unwrap();
+        editor.current_buffer_mut().mark_saved();
+        editor
+            .test_execute_production_action(Action::AgentUnsavedEditChoice(
+                AgentUnsavedChoice::Decline,
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(result.await.unwrap().unwrap()["declined"], true);
+        assert_eq!(fs::read_to_string(&path).unwrap(), "human one\ntwo\n");
+        assert_eq!(editor.current_buffer().contents(), "human one\ntwo\n");
     }
 
     #[tokio::test]
