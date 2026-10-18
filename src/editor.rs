@@ -2596,6 +2596,8 @@ pub enum Action {
     /// Overwrites the backing file after an explicit `:w!` or conflict confirmation.
     ForceSave,
     SaveAll,
+    /// Writes every modified buffer, overwriting changed files, after `:wqa!` or `:xa!`.
+    ForceSaveAll,
     SaveAs(String),
     /// Overwrites an explicitly selected destination after `:w! {file}`.
     ForceSaveAs(String),
@@ -8800,6 +8802,7 @@ impl Editor {
                 | Action::Save
                 | Action::ForceSave
                 | Action::SaveAll
+                | Action::ForceSaveAll
                 | Action::SaveAs(_)
                 | Action::ForceSaveAs(_)
                 | Action::CompareFileOnDisk
@@ -17912,8 +17915,14 @@ impl Editor {
                 actions.push(Action::Quit(false));
             }
 
+            // The bang forces the writes, as in Vim; a failed write still keeps
+            // the editor open.
             if cmd == "wqall" || cmd == "xall" {
-                actions.push(Action::SaveAll);
+                actions.push(if parsed.is_forced() {
+                    Action::ForceSaveAll
+                } else {
+                    Action::SaveAll
+                });
                 actions.push(Action::Quit(false));
             }
 
@@ -23519,7 +23528,12 @@ impl Editor {
                 self.render(buffer)?;
             }
             Action::SaveAll => {
-                self.execute_write_all(buffer, runtime).await?;
+                self.execute_write_all(buffer, runtime, /*force*/ false)
+                    .await?;
+            }
+            Action::ForceSaveAll => {
+                self.execute_write_all(buffer, runtime, /*force*/ true)
+                    .await?;
             }
             Action::SaveAs(new_file_name) => {
                 if !self.save_as_action(new_file_name, buffer, runtime).await? {
@@ -37256,10 +37270,17 @@ builtin = "rust"
                 "{command}"
             );
         }
-        for command in ["wqa", "wqall", "xa", "xall", "wqa!", "xa!"] {
+        for command in ["wqa", "wqall", "xa", "xall"] {
             assert_eq!(
                 editor.handle_command(command, &runtime),
                 vec![Action::SaveAll, Action::Quit(false)],
+                "{command}"
+            );
+        }
+        for command in ["wqa!", "wqall!", "xa!", "xall!"] {
+            assert_eq!(
+                editor.handle_command(command, &runtime),
+                vec![Action::ForceSaveAll, Action::Quit(false)],
                 "{command}"
             );
         }
@@ -49128,6 +49149,36 @@ while True:
         let second = paths.pop().unwrap();
         let first = paths.pop().unwrap();
         (editor, ready, release, first, second)
+    }
+
+    #[tokio::test]
+    async fn forced_write_all_overwrites_files_changed_on_disk() {
+        for (command, forced) in [("wqa", false), ("wqa!", true), ("xa!", true)] {
+            let root = tempfile::tempdir().unwrap();
+            let path = root.path().join("changed.txt");
+            std::fs::write(&path, "original\n").unwrap();
+            let mut buffer = Buffer::load_or_create(Some(path.to_string_lossy().into_owned()))
+                .await
+                .unwrap();
+            buffer.insert_str(0, 0, "mine ");
+            let mut editor = test_editor(60, 12);
+            editor.buffer_manager.replace_buffers(vec![buffer]);
+            std::fs::write(&path, "external\n").unwrap();
+
+            editor
+                .test_execute_production_action(Action::Command(command.to_string()))
+                .await
+                .unwrap();
+
+            let on_disk = std::fs::read_to_string(&path).unwrap();
+            if forced {
+                assert_eq!(on_disk, "mine original\n", "{command}");
+                assert!(!editor.buffer_manager[0].is_dirty(), "{command}");
+            } else {
+                assert_eq!(on_disk, "external\n", "{command} must not overwrite");
+                assert!(editor.buffer_manager[0].is_dirty(), "{command}");
+            }
+        }
     }
 
     #[cfg(unix)]

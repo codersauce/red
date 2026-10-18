@@ -1493,6 +1493,7 @@ fn action_label(action: &Action) -> String {
         Action::Save => "Save file".to_string(),
         Action::ForceSave => "Overwrite file on disk".to_string(),
         Action::SaveAll => "Save all files".to_string(),
+        Action::ForceSaveAll => "Overwrite all modified files".to_string(),
         Action::ForceSaveAs(_) => "Overwrite selected file".to_string(),
         Action::CompareFileOnDisk => "Compare with file on disk".to_string(),
         Action::NewBuffer => "New buffer".to_string(),
