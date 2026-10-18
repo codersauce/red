@@ -2481,6 +2481,25 @@ mod tests {
     }
 
     #[test]
+    fn an_unnumbered_context_note_stays_visible_after_hunks() {
+        let mut model = action_model();
+        let document = model.detail_document.as_mut().unwrap();
+        document.lines.push(WorkspaceDocumentLine {
+            id: "note".to_string(),
+            kind: "context".to_string(),
+            text: "… 801 more diff lines not shown".to_string(),
+            ..Default::default()
+        });
+        let note = document.lines.len() - 1;
+        let mut workspace = PluginWorkspace::new("history".to_string(), WorkspaceConfig::default());
+        workspace.update(model, &Theme::default());
+        assert!(
+            workspace.detail_visible.contains(&note),
+            "edit history relies on this note being shown without M"
+        );
+    }
+
+    #[test]
     fn filter_collapse_and_width_survive_model_updates() {
         let mut model = action_model();
         let mut heading = row("section:unstaged", false);

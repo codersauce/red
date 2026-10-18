@@ -8,6 +8,12 @@
       "migration_note": "docs/PLUGIN_API.md#agent-pane-lifecycle"
     },
     {
+      "version": "0.21.0",
+      "kind": "introduced",
+      "symbols": ["EditHistory.scope", "EditHistory.total", "EditHistory.entries.file", "EditHistory.entries.buffer_id", "EditHistory.entries.applied", "EditHistory.entries.age", "EditHistory.entries.added", "EditHistory.entries.removed", "EditHistory.entries.document", "EditHistory.entries.turn", "EditHistory.entries.prompt", "RevertTransaction cross-buffer"],
+      "migration_note": "docs/PLUGIN_API.md#edit-history"
+    },
+    {
       "version": "0.20.0",
       "kind": "introduced",
       "symbols": ["DocumentSymbols.total", "WorkspaceSymbols.total", "References.total", "oversized request results"],
