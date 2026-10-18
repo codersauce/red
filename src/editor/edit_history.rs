@@ -9,7 +9,7 @@
 use std::collections::VecDeque;
 
 use super::*;
-use crate::editing::{unified_diff, DiffLine, DiffLineKind, DiffStat};
+use crate::editing::{preview_line_text, unified_diff, DiffLine, DiffLineKind, DiffStat};
 
 /// Previews kept for recent agent transactions.
 const MAX_EDIT_PREVIEWS: usize = 256;
@@ -249,7 +249,7 @@ fn replacement_diff(edits: &[crate::undo::TextEdit]) -> (Vec<DiffLine>, DiffStat
                     kind: DiffLineKind::Removed,
                     old_line: Some(start + offset),
                     new_line: None,
-                    text: text.to_string(),
+                    text: preview_line_text(text),
                 },
                 &mut lines,
             );
@@ -261,7 +261,7 @@ fn replacement_diff(edits: &[crate::undo::TextEdit]) -> (Vec<DiffLine>, DiffStat
                     kind: DiffLineKind::Added,
                     old_line: None,
                     new_line: Some(start + offset),
-                    text: text.to_string(),
+                    text: preview_line_text(text),
                 },
                 &mut lines,
             );

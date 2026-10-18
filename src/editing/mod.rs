@@ -12,7 +12,9 @@ mod reflow;
 mod textarea;
 mod transaction;
 
-pub(crate) use line_hunks::{line_hunks, map_line, unified_diff, DiffLine, DiffLineKind, DiffStat};
+pub(crate) use line_hunks::{
+    line_hunks, map_line, preview_line_text, unified_diff, DiffLine, DiffLineKind, DiffStat,
+};
 pub(crate) use motion::text_object_kind_for_key;
 pub use motion::{CharacterMotion, MotionResolver, TextObjectKind, TextObjectScope};
 pub(crate) use multi_selection::{CharRange, SelectionSet};

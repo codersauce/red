@@ -13,6 +13,18 @@ use similar::{DiffOp, DiffTag, TextDiff};
 /// Bounds diffing on very large or very different files; a timed-out diff is still
 /// correct, only less minimal.
 const DIFF_TIMEOUT: Duration = Duration::from_millis(250);
+/// Longest line text a diff preview keeps, so a changed line in a minified or
+/// generated file does not copy the whole file into the preview.
+pub(crate) const MAX_DIFF_LINE_CHARS: usize = 1_000;
+
+/// Drops line endings and clips a line to [`MAX_DIFF_LINE_CHARS`].
+pub(crate) fn preview_line_text(line: &str) -> String {
+    let line = line.trim_end_matches(['\n', '\r']);
+    match line.char_indices().nth(MAX_DIFF_LINE_CHARS) {
+        Some((cut, _)) => format!("{}…", &line[..cut]),
+        None => line.to_string(),
+    }
+}
 
 /// One contiguous run of changed lines.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -137,7 +149,7 @@ pub(crate) fn unified_diff(
     let mut lines = Vec::new();
     let mut stat = DiffStat::default();
     let mut total = 0;
-    let clean = |text: &str| text.trim_end_matches(['\n', '\r']).to_string();
+    let clean = preview_line_text;
     for group in diff.grouped_ops(context) {
         let (Some(first), Some(last)) = (group.first(), group.last()) else {
             continue;
@@ -283,6 +295,25 @@ mod tests {
             "a deleted line lands on the line after it"
         );
         assert_eq!(map_line(4, &hunks), 4);
+    }
+
+    #[test]
+    fn preview_lines_are_clipped_so_minified_files_stay_small() {
+        let before = format!("{}\n", "a".repeat(50_000));
+        let after = format!("b{}\n", "a".repeat(50_000));
+        let (lines, stat, _) = unified_diff(&before, &after, 3, 100);
+        assert_eq!(
+            stat,
+            DiffStat {
+                added: 1,
+                removed: 1
+            }
+        );
+        for line in &lines {
+            assert!(line.text.chars().count() <= MAX_DIFF_LINE_CHARS + 1);
+        }
+        assert!(lines[2].text.starts_with('b') && lines[2].text.ends_with('…'));
+        assert_eq!(preview_line_text("short\r\n"), "short");
     }
 
     #[test]

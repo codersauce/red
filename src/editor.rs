@@ -11094,12 +11094,13 @@ impl Editor {
     }
 
     /// Runs an agent editor tool whose follow-mode dwell has elapsed and answers it.
+    /// Returns a copy of the result sent to the agent.
     async fn run_staged_agent_tool(
         &mut self,
         pending: PendingEditorTool,
         buffer: &mut RenderBuffer,
         runtime: &mut Runtime,
-    ) {
+    ) -> Result<Value, String> {
         let post_delay = if self.config.agent.follow_tool_calls && pending.request.call.is_edit() {
             Duration::from_millis(700)
         } else {
@@ -11125,16 +11126,17 @@ impl Editor {
             }
         }
         if post_delay.is_zero() {
-            let _ = pending.response.send(result);
+            let _ = pending.response.send(result.clone());
         } else {
             self.agent_manager.stage_playback_response(
                 PendingEditorToolResponse {
                     response: pending.response,
-                    result,
+                    result: result.clone(),
                 },
                 Instant::now() + post_delay,
             );
         }
+        result
     }
 
     async fn service_background(
@@ -11187,7 +11189,7 @@ impl Editor {
             if let Some(path) = self.agent_write_needing_decision(&pending.request) {
                 self.hold_agent_write_for_decision(pending, path);
             } else {
-                self.run_staged_agent_tool(pending, buffer, runtime).await;
+                let _ = self.run_staged_agent_tool(pending, buffer, runtime).await;
             }
         }
         self.service_agent_edit_decision(buffer)?;
@@ -36770,6 +36772,30 @@ mod test {
             .map(|index| editor.buffer_manager[index].contents())
             .unwrap();
         assert_eq!(document, original);
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn an_unsaved_edit_answer_reports_the_write_that_actually_happened() {
+        let root = tempfile::tempdir().unwrap();
+        let (mut editor, sender) = unsaved_document_editor(root.path()).await;
+        let result = send_agent_line_edit(&editor, &sender, 1, 3, "TWO").await;
+        editor.test_service_background().await.unwrap();
+        assert!(editor.current_dialog.is_some());
+
+        // The file changes on disk while the user decides, so the write is refused.
+        fs::write(root.path().join("document.rs"), "external\n").unwrap();
+        editor
+            .test_execute_production_action(Action::AgentUnsavedEditChoice(
+                AgentUnsavedChoice::SaveAll,
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(result.await.unwrap().unwrap()["applied"], false);
+        let message = editor.test_last_error().unwrap_or_default().to_string();
+        assert!(message.starts_with("Agent edit not applied: "), "{message}");
+        assert!(!message.contains("applied and saved"), "{message}");
     }
 
     #[tokio::test]

@@ -234,16 +234,39 @@ impl Editor {
                 (choice, generation),
             );
         }
-        self.set_quiet_message(Some(
-            match choice {
-                AgentUnsavedChoice::KeepUnsaved => "Agent edit applied; buffer left unsaved",
-                AgentUnsavedChoice::SaveAll => "Agent edit applied and saved",
-                AgentUnsavedChoice::Decline => "Agent edit not applied",
-            }
-            .to_string(),
-        ));
-        self.run_staged_agent_tool(pending.tool, render_buffer, runtime)
+        let result = self
+            .run_staged_agent_tool(pending.tool, render_buffer, runtime)
             .await;
+        // Report what happened, not what was chosen: the write can still fail, for
+        // example when the buffer changed meanwhile or the save is refused.
+        let error = |result: &Value| {
+            result["error"]
+                .as_str()
+                .unwrap_or("unknown error")
+                .to_string()
+        };
+        match result {
+            Ok(result) if result["declined"] == true => {
+                self.set_quiet_message(Some("Agent edit not applied".to_string()));
+            }
+            Ok(result) if result["applied"] != true => self
+                .set_routine_warning(Some(format!("Agent edit not applied: {}", error(&result)))),
+            Ok(result) if result["saved"] == true => {
+                self.set_quiet_message(Some("Agent edit applied and saved".to_string()));
+            }
+            Ok(result) if choice == AgentUnsavedChoice::SaveAll => {
+                self.set_routine_warning(Some(format!(
+                    "Agent edit applied, but saving failed: {}",
+                    error(&result)
+                )));
+            }
+            Ok(_) => {
+                self.set_quiet_message(Some("Agent edit applied; buffer left unsaved".to_string()));
+            }
+            Err(error) => {
+                self.set_routine_warning(Some(format!("Agent edit not applied: {error}")));
+            }
+        }
         Ok(())
     }
 
