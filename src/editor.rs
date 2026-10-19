@@ -2997,6 +2997,7 @@ pub enum Action {
     UpdateRed,
     OpenLearn,
     StartLearnLesson,
+    StartLearnLessonAt(String),
     ExitLearnLesson,
     RestartLearnLesson,
     FinishLearnLesson,
@@ -17914,11 +17915,17 @@ impl Editor {
         if cmd == "learn" {
             return vec![Action::OpenLearn];
         }
+        if let Some(arguments) = cmd.strip_prefix("learn ") {
+            return self.handle_learn_command(arguments.trim());
+        }
         if cmd == "welcome" {
             return vec![Action::OpenWelcome];
         }
         if let Some(arguments) = cmd.strip_prefix("tutorial") {
             if arguments.is_empty() || arguments.starts_with(' ') {
+                if let Some(number) = arguments.trim().strip_prefix("essentials ") {
+                    return self.learn_lesson_command(number);
+                }
                 return match arguments.trim() {
                     "" => vec![Action::StartTutorial(TutorialTrack::Guided)],
                     "essentials" => vec![Action::StartLearnLesson],
@@ -17928,7 +17935,9 @@ impl Editor {
                     "resume" => vec![Action::ResumeTutorial],
                     "next" if self.learn_session.is_some() => vec![Action::FinishLearnLesson],
                     "next" | "skip" => vec![Action::AdvanceTutorial],
-                    "quit" if self.learn_session.is_some() => vec![Action::ExitLearnLesson],
+                    "quit" | "exit" if self.learn_session.is_some() => {
+                        vec![Action::ExitLearnLesson]
+                    }
                     "quit" | "exit" => vec![Action::ExitTutorial],
                     _ => {
                         self.last_error = Some(
@@ -24010,18 +24019,20 @@ impl Editor {
                     .map(|entry| (entry.id.clone(), entry.action.clone()))
                     .collect::<HashMap<_, _>>();
                 let items = command_palette::picker_items(&entries);
-                let picker = Picker::builder()
+                let mut picker = Picker::builder()
                     .title("Commands")
                     .structured_items(items)
                     .filter_action(command_palette::filter_score)
                     .placeholder("Type a command, keymap, or :command")
-                    .history_key("command-palette")
                     .select_action(move |item| {
                         actions.get(&item).cloned().unwrap_or_else(|| {
                             Action::Print("command is no longer available".to_string())
                         })
-                    })
-                    .build(self);
+                    });
+                if self.learn_session.is_none() {
+                    picker = picker.history_key("command-palette");
+                }
+                let picker = picker.build(self);
                 self.release_current_dialog_callbacks(runtime);
                 self.current_dialog = Some(Box::new(picker));
                 self.render(buffer)?;
@@ -24094,7 +24105,7 @@ impl Editor {
             Action::UpdateRed => {
                 self.start_red_update();
             }
-            Action::OpenLearn | Action::FinishLearnLesson => {
+            Action::OpenLearn => {
                 if self.tutorial_controller.is_some() {
                     self.finish_tutorial(/*completed*/ false, buffer, runtime)
                         .await?;
@@ -24103,12 +24114,23 @@ impl Editor {
                 self.open_learn_hub(runtime);
                 self.render(buffer)?;
             }
-            Action::StartLearnLesson | Action::RestartLearnLesson => {
-                if self.tutorial_controller.is_some() {
-                    self.finish_tutorial(/*completed*/ false, buffer, runtime)
-                        .await?;
+            Action::StartLearnLesson => {
+                self.start_learn_lesson(self.next_learn_lesson(), buffer, runtime)
+                    .await?;
+            }
+            Action::StartLearnLessonAt(id) => {
+                if let Some(lesson) = crate::learn::Lesson::from_id(id) {
+                    self.start_learn_lesson(lesson, buffer, runtime).await?;
+                } else {
+                    self.set_legacy_message(Some("that lesson is not available yet".into()));
+                    self.render(buffer)?;
                 }
-                self.start_learn_lesson(buffer, runtime).await?;
+            }
+            Action::RestartLearnLesson => {
+                self.restart_learn_lesson(buffer, runtime).await?;
+            }
+            Action::FinishLearnLesson => {
+                self.continue_learn_lesson(buffer, runtime).await?;
             }
             Action::ExitLearnLesson => {
                 self.finish_learn_lesson(buffer, runtime)?;
@@ -35106,30 +35128,51 @@ mod test {
     fn learn_red_commands_are_explicit_and_discoverable() {
         let mut editor = test_editor(80, 24);
         let runtime = Runtime::new();
-        assert_eq!(
-            editor.handle_command("learn", &runtime),
-            vec![Action::OpenLearn]
-        );
-        assert_eq!(
-            editor.handle_command("tutorial", &runtime),
-            vec![Action::StartTutorial(TutorialTrack::Guided)]
-        );
-        assert_eq!(
-            editor.handle_command("welcome", &runtime),
-            vec![Action::OpenWelcome]
-        );
-        assert_eq!(
-            editor.handle_command("tutorial essentials", &runtime),
-            vec![Action::StartLearnLesson]
-        );
-        assert_eq!(
-            editor.handle_command("tutorial quit", &runtime),
-            vec![Action::ExitTutorial]
-        );
-        assert_eq!(
-            editor.handle_command("tutorial restart", &runtime),
-            vec![Action::StartTutorial(TutorialTrack::Guided)]
-        );
+        for (command, expected) in [
+            ("learn", Action::OpenLearn),
+            ("learn essentials", Action::StartLearnLesson),
+            ("learn next", Action::FinishLearnLesson),
+            ("learn restart", Action::RestartLearnLesson),
+            ("learn quit", Action::ExitLearnLesson),
+            ("learn exit", Action::ExitLearnLesson),
+            ("tutorial", Action::StartTutorial(TutorialTrack::Guided)),
+            (
+                "tutorial quick",
+                Action::StartTutorial(TutorialTrack::Quick),
+            ),
+            ("tutorial essentials", Action::StartLearnLesson),
+            ("tutorial quit", Action::ExitTutorial),
+            (
+                "tutorial restart",
+                Action::StartTutorial(TutorialTrack::Guided),
+            ),
+            ("welcome", Action::OpenWelcome),
+        ] {
+            assert_eq!(
+                editor.handle_command(command, &runtime),
+                vec![expected],
+                "{command}"
+            );
+        }
+        for (index, lesson) in crate::learn::Lesson::AVAILABLE.into_iter().enumerate() {
+            for prefix in ["learn", "tutorial"] {
+                let command = format!("{prefix} essentials {}", index + 1);
+                assert_eq!(
+                    editor.handle_command(&command, &runtime),
+                    vec![Action::StartLearnLessonAt(lesson.id().into())],
+                    "{command}"
+                );
+            }
+        }
+        for number in ["0", "5", "-1", "not-a-number"] {
+            assert!(editor
+                .handle_command(&format!("learn essentials {number}"), &runtime)
+                .is_empty());
+            assert_eq!(
+                editor.last_error.as_deref(),
+                Some("choose an Essentials lesson from 1 to 4")
+            );
+        }
     }
 
     #[tokio::test]
@@ -35145,6 +35188,10 @@ mod test {
 
         assert_eq!(
             editor.handle_command("tutorial quit", &runtime),
+            vec![Action::ExitLearnLesson]
+        );
+        assert_eq!(
+            editor.handle_command("tutorial exit", &runtime),
             vec![Action::ExitLearnLesson]
         );
         assert_eq!(
