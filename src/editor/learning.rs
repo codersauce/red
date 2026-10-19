@@ -1,21 +1,52 @@
-//! Lifecycle for the first Learn Red practice-buffer checkpoint.
+//! Lifecycle for Learn Red's protected practice-buffer lessons.
 
 use super::*;
-use crate::learn::{practice_action_allowed, PracticeStep, FIRST_LESSON_ID, PRACTICE_CONTENTS};
+use crate::learn::{
+    practice_action_allowed, Lesson, PracticeStep, PracticeView, PracticeWorkspace,
+};
 use crate::ui::{draw_learn_coach, CoachLayout, LearnHub};
 
 pub(super) struct LearnSession {
+    lesson: Lesson,
     pub(super) step: PracticeStep,
     practice_buffer_id: BufferId,
+    workspace: Option<PracticeWorkspace>,
     original_buffer_id: BufferId,
     original_windows: WindowManager,
     original_zoom: Option<FocusTarget>,
+    original_wrap: bool,
     original_panel_focus: Option<String>,
     original_repeat: Option<SemanticChange>,
     original_registers: HashMap<char, Content>,
 }
 
 impl Editor {
+    pub(super) fn handle_learn_command(&mut self, arguments: &str) -> Vec<Action> {
+        match arguments {
+            "essentials" => vec![Action::StartLearnLesson],
+            "next" => vec![Action::FinishLearnLesson],
+            "restart" => vec![Action::RestartLearnLesson],
+            "quit" | "exit" => vec![Action::ExitLearnLesson],
+            _ => {
+                if let Some(number) = arguments.strip_prefix("essentials ") {
+                    return self.learn_lesson_command(number);
+                }
+                self.last_error = Some("usage: learn [essentials [1-4]|next|restart|quit]".into());
+                Vec::new()
+            }
+        }
+    }
+
+    pub(super) fn learn_lesson_command(&mut self, number: &str) -> Vec<Action> {
+        match number.parse().ok().and_then(Lesson::from_number) {
+            Some(lesson) => vec![Action::StartLearnLessonAt(lesson.id().into())],
+            None => {
+                self.last_error = Some("choose an Essentials lesson from 1 to 4".into());
+                Vec::new()
+            }
+        }
+    }
+
     pub(super) fn open_learn_hub(&mut self, runtime: &mut Runtime) {
         if self.inline_assist.is_some()
             || self.workspace_manager.is_active()
@@ -33,15 +64,76 @@ impl Editor {
         self.release_current_dialog_callbacks(runtime);
         self.current_dialog = Some(Box::new(LearnHub::new(
             self,
-            self.preferences.learn_lesson_completed(FIRST_LESSON_ID),
+            Lesson::AVAILABLE.map(|lesson| self.preferences.learn_lesson_completed(lesson.id())),
         )));
     }
 
-    pub(super) async fn start_learn_lesson(
+    pub(super) fn next_learn_lesson(&self) -> Lesson {
+        Lesson::AVAILABLE
+            .into_iter()
+            .find(|lesson| !self.preferences.learn_lesson_completed(lesson.id()))
+            .unwrap_or_default()
+    }
+
+    pub(super) async fn continue_learn_lesson(
         &mut self,
         buffer: &mut RenderBuffer,
         runtime: &mut Runtime,
     ) -> anyhow::Result<()> {
+        if let Some(session) = &self.learn_session {
+            if session.step != PracticeStep::Complete {
+                self.set_legacy_message(Some(
+                    "finish this checkpoint first, or use :learn quit to leave".into(),
+                ));
+                return self.render(buffer);
+            }
+            if let Some(next) = session.lesson.next() {
+                return self.start_learn_lesson(next, buffer, runtime).await;
+            }
+        }
+        if self.tutorial_controller.is_some() {
+            self.finish_tutorial(/*completed*/ false, buffer, runtime)
+                .await?;
+        }
+        self.finish_learn_lesson(buffer, runtime)?;
+        self.open_learn_hub(runtime);
+        self.render(buffer)
+    }
+
+    pub(super) async fn restart_learn_lesson(
+        &mut self,
+        buffer: &mut RenderBuffer,
+        runtime: &mut Runtime,
+    ) -> anyhow::Result<()> {
+        let lesson = self
+            .learn_session
+            .as_ref()
+            .map_or_else(|| self.next_learn_lesson(), |session| session.lesson);
+        self.start_learn_lesson(lesson, buffer, runtime).await
+    }
+
+    // Lesson startup owns a saved window layout across an await. Keep that
+    // future out of the editor dispatcher's nested motion/replay stack frames.
+    #[inline(never)]
+    pub(super) fn start_learn_lesson<'a>(
+        &'a mut self,
+        lesson: Lesson,
+        buffer: &'a mut RenderBuffer,
+        runtime: &'a mut Runtime,
+    ) -> BoxFuture<'a, anyhow::Result<()>> {
+        Box::pin(self.start_learn_lesson_impl(lesson, buffer, runtime))
+    }
+
+    async fn start_learn_lesson_impl(
+        &mut self,
+        lesson: Lesson,
+        buffer: &mut RenderBuffer,
+        runtime: &mut Runtime,
+    ) -> anyhow::Result<()> {
+        if self.tutorial_controller.is_some() {
+            self.finish_tutorial(/*completed*/ false, buffer, runtime)
+                .await?;
+        }
         if self.learn_session.is_some() {
             self.finish_learn_lesson(buffer, runtime)?;
         }
@@ -51,6 +143,13 @@ impl Editor {
             ));
             return self.render(buffer);
         }
+        // Create owned storage before changing any editor state, so a failed
+        // setup leaves the user's current workspace untouched.
+        let workspace = if lesson == Lesson::SaveAPracticeFile {
+            Some(PracticeWorkspace::new()?)
+        } else {
+            None
+        };
         if self.inline_assist.is_some()
             || self.workspace_manager.is_active()
             || self.agent_manager.has_active_sessions()
@@ -69,10 +168,17 @@ impl Editor {
         let original_panel_focus = self.panel_manager.focused_panel_id().map(str::to_string);
         self.panel_manager.focus_editor();
         let original_zoom = self.zoomed_pane.take();
+        let original_wrap = self.wrap;
         let original_repeat = self.last_semantic_change.take();
         let original_registers = self.registers.clone();
         self.pending_semantic_change = None;
-        let practice = Buffer::new(None, PRACTICE_CONTENTS.to_string());
+        let file = workspace.as_ref().map(|workspace| {
+            workspace
+                .path("practice.txt")
+                .to_string_lossy()
+                .into_owned()
+        });
+        let practice = Buffer::new(file, lesson.contents().to_string());
         let practice_buffer_id = practice.id();
         let practice_index = self.buffer_manager.len();
         self.buffer_manager.push_buffer(practice);
@@ -84,19 +190,29 @@ impl Editor {
             ),
         );
         self.learn_session = Some(LearnSession {
-            step: PracticeStep::default(),
+            lesson,
+            step: lesson.first_step(),
             practice_buffer_id,
+            workspace,
             original_buffer_id,
             original_windows,
             original_zoom,
+            original_wrap,
             original_panel_focus,
             original_repeat,
             original_registers,
         });
         self.mode = Mode::Normal;
+        if lesson == Lesson::FindACommand {
+            self.wrap = true;
+        }
         self.splash_dismissed = true;
         self.force_full_redraw = true;
-        self.set_current_buffer(buffer, practice_index).await
+        if let Err(error) = self.set_current_buffer(buffer, practice_index).await {
+            self.finish_learn_lesson(buffer, runtime)?;
+            return Err(error);
+        }
+        Ok(())
     }
 
     pub(super) fn finish_learn_lesson(
@@ -137,6 +253,8 @@ impl Editor {
         self.last_visual_selections
             .remove(&session.practice_buffer_id);
         self.sync_with_window();
+        self.wrap = session.original_wrap;
+        self.keyboard_shortcuts = None;
         self.mode = Mode::Normal;
         self.waiting_key_action = None;
         self.command.clear();
@@ -173,10 +291,38 @@ impl Editor {
             self.render(buffer)?;
             return Ok(true);
         }
-        if !practice_action_allowed(action) {
+        if !practice_action_allowed(session.lesson, action) {
             self.set_legacy_message(Some(
-                "this practice step only edits tutorial text; use :tutorial quit to return".into(),
+                "this practice step only edits tutorial text; use :learn quit to return".into(),
             ));
+            self.render(buffer)?;
+            return Ok(true);
+        }
+        if matches!(action, Action::Save) && session.workspace.is_some() {
+            let permitted = self.current_buffer().file.as_deref().is_some_and(|file| {
+                session
+                    .workspace
+                    .as_ref()
+                    .is_some_and(|workspace| workspace.permits_file(Path::new(file)))
+            });
+            if !permitted {
+                self.set_legacy_message(Some(
+                    "practice save refused: file is outside the lesson workspace".into(),
+                ));
+            } else {
+                // Use the editor's real buffer save and transaction semantics,
+                // without running project formatters or user plugin hooks.
+                let resume_insert = self.commit_active_transaction_before_save();
+                let result = self.current_buffer_mut().save();
+                self.resume_insert_transaction_after_save(resume_insert);
+                match result {
+                    Ok(message) => self.set_notification_message(Severity::Success, Some(message)),
+                    Err(error) => {
+                        self.set_notification_message(Severity::Error, Some(error.to_string()))
+                    }
+                }
+                self.observe_learn_action(action, buffer)?;
+            }
             self.render(buffer)?;
             return Ok(true);
         }
@@ -190,7 +336,10 @@ impl Editor {
     ) -> anyhow::Result<()> {
         if matches!(
             action,
-            Action::StartLearnLesson | Action::RestartLearnLesson
+            Action::StartLearnLesson
+                | Action::StartLearnLessonAt(_)
+                | Action::RestartLearnLesson
+                | Action::FinishLearnLesson
         ) {
             return Ok(());
         }
@@ -200,15 +349,37 @@ impl Editor {
         if self.current_buffer().id() != session.practice_buffer_id {
             return Ok(());
         }
-        let original_text = self.current_buffer().contents() == PRACTICE_CONTENTS;
+        let contents = self.current_buffer().contents();
+        let position = self.cursor_text_position();
+        let cursor = (position.character, position.line);
         let mode = self.mode;
+        let view = PracticeView {
+            command_palette_open: self
+                .current_dialog
+                .as_ref()
+                .is_some_and(|dialog| dialog.shortcut_context() == "Commands"),
+            wrapping: self.wrap,
+            shortcuts_open: self.keyboard_shortcuts.is_some(),
+            file_matches_buffer: session.workspace.as_ref().is_some_and(|workspace| {
+                self.current_buffer().file.as_deref().is_some_and(|file| {
+                    workspace.permits_file(Path::new(file))
+                        && !self.current_buffer().is_dirty()
+                        && std::fs::read_to_string(file).is_ok_and(|saved| saved == contents)
+                })
+            }),
+            dirty: self.current_buffer().is_dirty(),
+        };
         let session = self
             .learn_session
             .as_mut()
             .expect("the active lesson was checked above");
-        if session.step.observe(action, mode, original_text) {
+        if session
+            .step
+            .observe(session.lesson, action, mode, &contents, cursor)
+            || session.step.observe_view(action, view)
+        {
             if session.step == PracticeStep::Complete {
-                if let Err(error) = self.preferences.complete_learn_lesson(FIRST_LESSON_ID) {
+                if let Err(error) = self.preferences.complete_learn_lesson(session.lesson.id()) {
                     log!("could not persist Learn Red progress: {error}");
                 }
             }
@@ -247,6 +418,12 @@ impl Editor {
                 .into_iter()
                 .next()
         });
-        draw_learn_coach(buffer, &self.theme, session.step, shortcut.as_deref());
+        draw_learn_coach(
+            buffer,
+            &self.theme,
+            session.lesson,
+            session.step,
+            shortcut.as_deref(),
+        );
     }
 }

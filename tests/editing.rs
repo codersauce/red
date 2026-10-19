@@ -38,6 +38,254 @@ use std::{
 static COMMAND_COMPLETION_CWD_LOCK: Mutex<()> = Mutex::new(());
 
 #[tokio::test]
+async fn learn_red_save_lesson_writes_only_its_owned_file() {
+    let mut harness = EditorHarness::with_config_and_size(
+        Buffer::new(None, "original workspace\n".into()),
+        default_key_config(),
+        140,
+        38,
+    );
+    harness.execute_action(Action::SplitVertical).await.unwrap();
+    harness
+        .execute_action(Action::Command("learn essentials 4".into()))
+        .await
+        .unwrap();
+    let path = PathBuf::from(harness.editor.test_current_buffer().file.as_ref().unwrap());
+    assert!(!path.exists());
+    let outside = tempfile::tempdir().unwrap();
+    let forbidden = outside.path().join("outside.txt");
+    for command in ["w", "w!"] {
+        harness
+            .execute_action(Action::Command(format!(
+                "{command} {}",
+                forbidden.display()
+            )))
+            .await
+            .unwrap();
+        assert!(!forbidden.exists());
+        assert_eq!(
+            harness.editor.test_current_buffer().file.as_deref(),
+            path.to_str()
+        );
+    }
+    for text in ["first ", "second "] {
+        harness
+            .execute_event(Event::Key(KeyEvent::new(
+                KeyCode::Char('i'),
+                KeyModifiers::NONE,
+            )))
+            .await
+            .unwrap();
+        for character in text.chars() {
+            harness
+                .execute_event(Event::Key(KeyEvent::new(
+                    KeyCode::Char(character),
+                    KeyModifiers::NONE,
+                )))
+                .await
+                .unwrap();
+        }
+        harness
+            .execute_event(Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)))
+            .await
+            .unwrap();
+        assert!(harness.editor.test_current_buffer().is_dirty());
+        harness
+            .execute_action(Action::Command("w".into()))
+            .await
+            .unwrap();
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            harness.buffer_contents()
+        );
+        assert!(!harness.editor.test_current_buffer().is_dirty());
+    }
+    let rows = (0..38)
+        .map(|row| harness.render_row(row).unwrap())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(rows.contains("Essentials complete!"));
+    harness
+        .execute_action(Action::Command("learn restart".into()))
+        .await
+        .unwrap();
+    assert!(!path.exists());
+    let restarted = PathBuf::from(harness.editor.test_current_buffer().file.as_ref().unwrap());
+    assert_ne!(path, restarted);
+    harness
+        .execute_action(Action::Command("learn quit".into()))
+        .await
+        .unwrap();
+    assert!(!restarted.parent().unwrap().exists());
+    harness.assert_buffer_contents("original workspace\n");
+    assert_eq!(harness.editor.test_window_count(), 2);
+}
+
+#[tokio::test]
+async fn learn_red_command_lesson_uses_the_picker_and_restores_wrap() {
+    for original_wrap in [false, true] {
+        let directory = tempfile::tempdir().unwrap();
+        let preferences_path = directory.path().join("preferences.json");
+        let mut preferences = PreferencesStore::load(&preferences_path);
+        preferences
+            .record_picker_query("command-palette", "existing query")
+            .unwrap();
+        let mut editor = Editor::test_with_size_and_preferences(
+            Box::new(MockLsp),
+            120,
+            32,
+            default_key_config(),
+            Theme::default(),
+            vec![Buffer::new(None, "original workspace\n".into())],
+            preferences,
+        )
+        .unwrap();
+        editor.test_disable_terminal_output();
+        let mut harness = EditorHarness { editor };
+        harness
+            .execute_action(Action::SetWrap(original_wrap))
+            .await
+            .unwrap();
+        // Leaving before the toggle must also restore the original setting.
+        harness
+            .execute_action(Action::Command("learn essentials 3".into()))
+            .await
+            .unwrap();
+        assert!(harness.editor.test_wrap());
+        harness
+            .execute_action(Action::Command("learn quit".into()))
+            .await
+            .unwrap();
+        assert_eq!(harness.editor.test_wrap(), original_wrap);
+        harness
+            .execute_action(Action::Command("learn essentials 3".into()))
+            .await
+            .unwrap();
+        let practice = harness.buffer_contents();
+        harness
+            .execute_action(Action::CommandPalette)
+            .await
+            .unwrap();
+        // Practice must not recall the user's normal command-picker queries.
+        harness
+            .execute_event(Event::Key(KeyEvent::new(
+                KeyCode::Char('h'),
+                KeyModifiers::CONTROL,
+            )))
+            .await
+            .unwrap();
+        for character in "Toggle line wrapping".chars() {
+            harness
+                .execute_event(Event::Key(KeyEvent::new(
+                    KeyCode::Char(character),
+                    KeyModifiers::NONE,
+                )))
+                .await
+                .unwrap();
+        }
+        for code in [KeyCode::Enter, KeyCode::F(1), KeyCode::Esc] {
+            harness
+                .execute_event(Event::Key(KeyEvent::new(code, KeyModifiers::NONE)))
+                .await
+                .unwrap();
+        }
+        assert!(!harness.editor.test_wrap());
+        assert_eq!(harness.last_error(), None);
+        assert!(
+            !harness.editor.notifications().records().any(|record| record
+                .content
+                .summary
+                .contains("this practice step only edits tutorial text"))
+        );
+        assert_eq!(
+            PreferencesStore::load(&preferences_path).picker_history("command-palette"),
+            ["existing query"]
+        );
+        assert_eq!(harness.buffer_contents(), practice);
+        let rows = (0..32)
+            .map(|row| harness.render_row(row).unwrap())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rows.contains("CHECKPOINT  ·  4/4"));
+        harness
+            .execute_action(Action::Command("learn quit".into()))
+            .await
+            .unwrap();
+        assert_eq!(harness.editor.test_wrap(), original_wrap);
+        harness.assert_buffer_contents("original workspace\n");
+    }
+}
+
+#[tokio::test]
+async fn learn_red_edit_lesson_uses_real_keys_and_restores_the_workspace() {
+    let mut harness = EditorHarness::with_config(
+        Buffer::new(None, "original workspace\n".into()),
+        default_key_config(),
+    );
+    harness.execute_action(Action::SplitVertical).await.unwrap();
+    harness
+        .execute_action(Action::Command("learn essentials 2".into()))
+        .await
+        .unwrap();
+    let practice = harness.buffer_contents();
+    assert!(practice.starts_with("let score = 41;;\n"));
+    harness
+        .execute_action(Action::Command("learn next".into()))
+        .await
+        .unwrap();
+    assert_eq!(harness.buffer_contents(), practice);
+    harness
+        .execute_action(Action::DeleteCharAtCursorPos)
+        .await
+        .unwrap();
+    harness
+        .execute_action(Action::Command("learn restart".into()))
+        .await
+        .unwrap();
+    assert_eq!(harness.buffer_contents(), practice);
+    let directory = tempfile::tempdir().unwrap();
+    let forbidden = directory.path().join("must-not-exist.rs");
+    harness
+        .execute_action(Action::SaveAs(forbidden.to_string_lossy().into_owned()))
+        .await
+        .unwrap();
+    assert!(!forbidden.exists());
+    for code in [KeyCode::Char('$'), KeyCode::Char('x'), KeyCode::Char('u')] {
+        harness
+            .execute_event(Event::Key(KeyEvent::new(code, KeyModifiers::NONE)))
+            .await
+            .unwrap();
+    }
+    assert!(harness.buffer_contents().starts_with("let score = 41;;\n"));
+    harness
+        .execute_event(Event::Key(KeyEvent::new(
+            KeyCode::Char('r'),
+            KeyModifiers::CONTROL,
+        )))
+        .await
+        .unwrap();
+    assert!(harness.buffer_contents().starts_with("let score = 41;\n"));
+    let rows = (0..24)
+        .map(|row| harness.render_row(row).unwrap())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(rows.contains(":learn next"));
+    harness
+        .execute_action(Action::Command("learn next".into()))
+        .await
+        .unwrap();
+    assert!(harness
+        .buffer_contents()
+        .starts_with("// This deliberately long line"));
+    harness
+        .execute_action(Action::Command("learn quit".into()))
+        .await
+        .unwrap();
+    harness.assert_buffer_contents("original workspace\n");
+    assert_eq!(harness.editor.test_window_count(), 2);
+}
+
+#[tokio::test]
 async fn language_reload_opens_previously_tracked_buffers_that_gain_a_route() {
     let directory = tempfile::tempdir().unwrap();
     let config_path = directory.path().join("config.toml");
