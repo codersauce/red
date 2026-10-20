@@ -1,7 +1,7 @@
 # Language extensions
 
 Red uses one language definition for syntax highlighting, exact filename and
-extension detection, comment templates, indentation, and language-server
+extension and shebang detection, comment templates, indentation, and language-server
 routing. Definitions can live in your configuration or in an installable
 external plugin package.
 
@@ -32,7 +32,32 @@ validate = true
 ```
 
 Extensions are case-insensitive and may start with a dot. Exact filenames are
-case-sensitive and take precedence over extensions. Aliases are accepted by
+case-sensitive and take precedence over extensions. When no filename or extension matches, Red reads up to 512 characters from the
+first line and checks its shebang. Bundled interpreters include `sh`, `bash`,
+`dash`, `ash`, `zsh` (using Bash syntax), `fish`, `pwsh`, `powershell`, `node`,
+`nodejs`, `lua`, `luajit`, and `husk`. No executable permission is required.
+
+Add interpreter basenames to any language definition or language-pack manifest:
+
+```toml
+[languages.python]
+shebangs = ["python", "python3", "pypy", "pypy3"]
+```
+
+This registers detection; Python highlighting still requires its language pack.
+Direct paths and common `env` forms are supported, including `env -S bash -eu`,
+`-i`, `-u NAME`, `-C DIR`, `--`, and environment assignments. Numeric interpreter
+versions such as `python3.12` fall back to the registered base name. Quoted
+commands, shell expansion, and arbitrary wrapper commands are not interpreted.
+An unknown or overlong shebang leaves the language undetected.
+
+Detection uses the current buffer, so editing the first line updates syntax even
+when it is offscreen. `:syntax <language>` overrides detection and `:syntax off`
+disables highlighting and structural operations. Shebang detection also applies
+to full-source previews. LSP routing still requires a filename or extension
+selector; this feature does not attach language servers to extensionless files.
+
+Aliases are accepted by
 `:syntax build-script`, syntax completion, and Markdown code fences.
 
 Every field is optional. A grammar-free language can still provide syntax
@@ -44,6 +69,60 @@ separate process. Explicit `[lsp.servers.<name>]` definitions and explicit
 `initialization_options` is sent in the LSP `initialize` request. Nested
 `settings` values are returned to `workspace/configuration` requests; dotted
 sections select nested objects and unknown sections resolve to JSON `null`.
+
+## Attach multiple language servers to one document
+
+Named servers with overlapping filename or extension selectors all attach to
+the document. Each receives open, change, save, and close notifications with
+its configured language ID. Diagnostics are merged for display, while an empty
+report clears only the server that published it. Code actions are collected
+from every attached server and commands are sent back to their origin.
+
+Red sends ordinary single-result requests, such as completion, hover,
+navigation, symbols, and inlay hints, to the first ready attached server that
+advertises the capability. Server configuration names provide the stable
+alphabetical tie-breaker when more than one server supports the same request.
+Unsupported requests are not sent to an earlier server simply because its name
+sorts first.
+
+For example, TypeScript and ESLint can share `.ts` and `.tsx` selectors:
+
+```toml
+[lsp.servers.eslint]
+command = "vscode-eslint-language-server"
+args = ["--stdio"]
+documents = [
+  { language_id = "typescript", file_extensions = ["ts"] },
+  { language_id = "typescriptreact", file_extensions = ["tsx"] },
+]
+root_markers = ["eslint.config.js", "package.json", ".git"]
+
+[lsp.servers.typescript]
+command = "typescript-language-server"
+args = ["--stdio"]
+documents = [
+  { language_id = "typescript", file_extensions = ["ts"] },
+  { language_id = "typescriptreact", file_extensions = ["tsx"] },
+]
+root_markers = ["tsconfig.json", "package.json", ".git"]
+```
+
+An external formatter remains independent of these attachments. A configured
+Prettier formatter continues to win under `formatting.provider = "auto"`; when
+formatting falls back to LSP, Red uses the same capable-server selection rule.
+The complete regression configuration is in
+[`tests/fixtures/multi_server_lsp/config.toml`](../tests/fixtures/multi_server_lsp/config.toml).
+
+For rust-analyzer launches, Red also reads `rust-analyzer.rustfmt.extraArgs` from
+the nearest project-local `.vscode/settings.json`. Settings files may contain comments and
+trailing commas. Red searches upward from the Cargo workspace but never beyond
+the Git repository, and applies these arguments only to that project's language
+server. Explicit `initialization_options` or `settings` in your Red configuration
+take precedence. Other VS Code settings, including executable and environment
+overrides, are not imported.
+
+To use Rust Glancer as an alternative Rust language server, see the
+[setup guide](RUST_GLANCER.md) and [configuration example](../examples/rust-glancer.toml).
 
 ## Load a native Tree-sitter grammar
 

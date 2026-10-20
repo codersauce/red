@@ -1,11 +1,14 @@
 ---
 title: "Debugging LSP Failures"
 summary: "This guide shows how to diagnose Red LSP failures by separating startup and routing problems from transport, diagnostics, completion, and fail-closed workspace edit handling."
-topics: [guides, lsp, debugging, workspace-edits]
+topics: [guides, lsp, diagnostics, debugging, workspace-edits]
 sources:
   - id: debugging
     type: file
     path: docs/DEBUGGING.md
+  - id: manager
+    type: file
+    path: src/lsp/manager.rs
   - id: client
     type: file
     path: src/lsp/client.rs
@@ -15,6 +18,15 @@ sources:
   - id: workspace-edit
     type: file
     path: src/lsp/workspace_edit.rs
+  - id: workspace-settings
+    type: file
+    path: src/lsp/workspace_settings.rs
+  - id: go-lsp-session
+    type: conversation
+    path: /Users/fcoury/.codex/sessions/2026/08/31/rollout-2026-08-31T18-03-49-01a05a10-8f88-7f70-9850-f35913a6ac1b.jsonl
+  - id: rust-glancer-session
+    type: conversation
+    path: /Users/fcoury/.codex/sessions/2026/09/19/rollout-2026-09-19T12-37-02-01a0ba50-579e-7af0-811f-98bcb98fe70f.jsonl
 ---
 
 Use this guide when language-server behavior is missing, delayed, stale, or rejected in Red. The fastest path is to identify which LSP boundary owns the failed invariant: startup and routing, JSON-RPC transport, document synchronization, diagnostics, completion, or workspace edit preparation [@debugging] [@client] [@workspace-edit]. Red intentionally keeps editor mutation outside the LSP background tasks, so server output is evidence for the editor to interpret rather than proof that visible buffers changed [@debugging].
@@ -28,6 +40,8 @@ Then search the log for `[lsp]`. The debugging guide identifies `src/lsp/manager
 ## Startup And Transport Failures
 
 If the server never becomes usable, inspect the process and initialization path before looking at editor UI. `RealLspClient::start` spawns the configured command directly with its args and environment, opens stdin/stdout/stderr, and uses bounded channels between reader, writer, and editor-side polling [@client]. Requests and notifications sent before successful initialization are queued only within the documented message and byte budgets; exceeding that queue marks initialization as failed [@client].
+
+A missing server executable is a process-start problem. Because the command is launched directly rather than through a shell, check `red --check-config`, the configured `command`, `command -v` in the same launch environment, the live process tree, and `[lsp] failed to start client ... os error 2` log entries before debugging completion or diagnostics UI [@client] [@go-lsp-session]. When `LspManager` catches a startup or initialization error it inserts the `(server, workspace)` key into `failed_clients`; later requests for that key return no client, and status reports `failed` until Red restarts or an LSP reconfiguration clears the affected key [@manager]. Installing the missing executable is therefore not enough for the already-running editor: restart Red or trigger a real LSP reconfiguration before expecting the same workspace to retry. The Go language-pack case is the concrete pattern: the pack configured a bare `gopls` command, no `gopls` child existed, and retrying required a fresh Red process after installation [@go-lsp-session].
 
 Transport failures usually show up as one of these owners:
 
@@ -45,6 +59,37 @@ Responses with an `id` and no `method` are matched as client request responses, 
 Diagnostics are deliberately debounced. The client waits 250 ms after the last document change before requesting diagnostics because typing can produce one `didChange` per keystroke [@client]. If diagnostics appear stale, check whether the server advertises diagnostic support, whether the document URI is normalized consistently, and whether the pending diagnostic entry has been flushed by polling.
 
 Completion failures need a different path. Completion requests depend on the transport request context and are later interpreted by editor UI code, so stale or replaced completion state is usually not the same issue as a failed server process. Start with the request id in `RealLspClient`, then move to [LSP Completion](../../architecture/lsp/completion) if the response arrived but UI filtering, snippet handling, or atomic edit application behaved incorrectly.
+
+## Alternative Rust Servers
+
+When replacing rust-analyzer with another Rust server, treat the change as both
+a routing test and a compatibility test. Red's configuration model can route
+`.rs` files to any `[lsp.servers.rust]` command, args, document selector, and
+root markers [@manager]. The Rust Glancer validation session used a complete
+`lsp.servers.rust` replacement instead of adding a second Rust selector, because
+that keeps one deterministic owner for `.rs` buffers and lets the same Cargo
+workspace-root logic decide whether two member crates share a client
+[@rust-glancer-session] [@manager].
+
+Check initialization and workspace settings before trusting a successful
+process start. Red imports project-local
+`rust-analyzer.rustfmt.extraArgs` and inserts rust-analyzer cache-priming
+defaults in `workspace_settings.rs`; those settings are rust-analyzer protocol
+details, not a generic Rust LSP contract [@workspace-settings]. The Glancer
+session reproduced this as a compatibility hazard and scoped the experimental
+fix around recognized rust-analyzer launch forms such as direct executables,
+absolute paths, and `rustup run ... rust-analyzer` [@rust-glancer-session].
+
+Manual validation needs real editor behavior, not just logs. In the Glancer
+session, the useful checks were: start Red with an isolated config directory,
+verify the log reports the intended server, hover a symbol, go to definition,
+format a Rust file, request completion for a module function, save a deliberate
+type error until diagnostics appear, undo and save until diagnostics clear, open
+a second Rust file inside Red's own workspace, then remove the override and run
+`:languages reload` to verify rust-analyzer still works [@rust-glancer-session].
+A null hover response in the log was not enough to fail the server: the same
+session later moved to a symbol position that returned hover contents, which
+distinguished a bad request position from broken transport [@rust-glancer-session].
 
 ## Workspace Edit Rejections
 

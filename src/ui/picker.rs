@@ -8,9 +8,11 @@
 //! terminal display columns. Selection actions are returned to the editor or plugin
 //! owner and never applied directly by this module.
 
+use super::picker_items::PickerItems;
+
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use fuzzy_matcher::skim::SkimMatcherV2;
-use fuzzy_matcher::FuzzyMatcher;
+use rayon::prelude::*;
 use ropey::{Rope, RopeSlice};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -36,24 +38,28 @@ use crate::{
     theme::{SelectionForegroundPriority, Style, Theme},
     unicode_utils::{
         byte_to_char, char_slice, delete_last_word, display_width, fit_display_width,
-        truncate_display_width,
+        is_printable_ascii, truncate_display_width,
     },
 };
 
 use super::{
-    dialog::BorderStyle, first_prompt_line, spinner_frame, ActionBar, ActionPriority, Component,
-    Dialog, IconCatalog, List, ScreenRect, UiAction, SPINNER_FRAME_INTERVAL_MS,
+    dialog::BorderStyle,
+    first_prompt_line,
+    picker_matching::{match_path, path_match_highlights, PathCandidate},
+    spinner_frame, ActionBar, ActionPriority, Component, Dialog, IconCatalog, List, ScreenRect,
+    UiAction, SPINNER_FRAME_INTERVAL_MS,
 };
 
 type SelectAction = Box<dyn Fn(String) -> Action + Send>;
-type FilterAction = Box<dyn Fn(&PickerItem, &str) -> Option<i64> + Send>;
-type FilterTieBreaker = Box<dyn Fn(&PickerItem) -> usize + Send>;
+type FilterAction = Box<dyn Fn(&PickerItem, &str) -> Option<i64> + Send + Sync>;
+type FilterTieBreaker = Box<dyn Fn(&PickerItem) -> usize + Send + Sync>;
 type FilterHighlightAction = Box<dyn Fn(&PickerItem, &str) -> PickerFilterHighlights + Send>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum PickerMatchKind {
     Exact,
     ExactIgnoreCase,
+    Filename,
     Fuzzy,
 }
 
@@ -62,26 +68,70 @@ fn default_filter_score(
     label: &str,
     query: &str,
 ) -> Option<(PickerMatchKind, Reverse<i64>)> {
-    // Keep smart-case eligibility, but rank whole labels ahead of fuzzy prefixes.
-    let score = matcher.fuzzy_match(label, query)?;
-    let kind = if label == query {
-        PickerMatchKind::Exact
+    default_path_filter_score(matcher, PathCandidate::from_path(label), label, query)
+}
+
+fn default_item_filter_score(
+    matcher: &SkimMatcherV2,
+    item: &PickerItem,
+    query: &str,
+) -> Option<(PickerMatchKind, Reverse<i64>)> {
+    let Some(path) = picker_item_search_path(item) else {
+        return default_filter_score(matcher, &item.label, query);
+    };
+    default_path_filter_score(
+        matcher,
+        PathCandidate::new(path, &item.label, item.annotation.as_deref()),
+        &item.label,
+        query,
+    )
+}
+
+fn picker_item_search_path(item: &PickerItem) -> Option<&str> {
+    item.data
+        .get("search_path")
+        .and_then(Value::as_str)
+        .or_else(|| (item.kind.as_deref() == Some("FilePath")).then_some(item.id.as_str()))
+}
+
+fn default_path_filter_score(
+    matcher: &SkimMatcherV2,
+    candidate: PathCandidate<'_>,
+    label: &str,
+    query: &str,
+) -> Option<(PickerMatchKind, Reverse<i64>)> {
+    let matched = match_path(matcher, candidate, query)?;
+    let (kind, score) = if label == query {
+        (PickerMatchKind::Exact, matched.score)
     } else if label.eq_ignore_ascii_case(query) {
-        PickerMatchKind::ExactIgnoreCase
+        (PickerMatchKind::ExactIgnoreCase, matched.score)
+    } else if candidate.has_parent() {
+        matched
+            .filename_score
+            .map_or((PickerMatchKind::Fuzzy, matched.score), |filename_score| {
+                (PickerMatchKind::Filename, filename_score)
+            })
     } else {
-        PickerMatchKind::Fuzzy
+        (PickerMatchKind::Fuzzy, matched.score)
     };
     Some((kind, Reverse(score)))
 }
 
-const MIN_HORIZONTAL_PREVIEW_PANE_WIDTH: usize = 40;
+pub(crate) const MIN_HORIZONTAL_PREVIEW_PANE_WIDTH: usize = 40;
 const MAX_PREVIEW_HIGHLIGHT_BYTES: usize = 64 * 1024;
+const MAX_COMPLETE_LOCATION_PREVIEW_BYTES: u64 = 32 * 1024;
+const MAX_CACHED_PREVIEW_HIGHLIGHT_SPANS: usize = 4_096;
 pub(crate) const MAX_UNFOCUSED_PREVIEW_BYTES: u64 = 256 * 1024;
 const MAX_LOCATION_PREVIEW_SCAN_BYTES: usize = 8 * 1024 * 1024;
 const LOCATION_PREVIEW_CACHE_CAPACITY: usize = 8;
 const COMMAND_COLUMN_GAP: usize = 2;
 const PICKER_ICON_WIDTH: usize = 2;
 const PICKER_ITEM_PREFIX_WIDTH: usize = 2 + PICKER_ICON_WIDTH;
+const MIN_TREE_GUIDE_LABEL_WIDTH: usize = 8;
+const MAX_PICKER_TREE_DEPTH: usize = 64;
+const PARALLEL_FILTER_MIN_ITEMS: usize = 1_024;
+const MAX_FILTER_HISTORY_ENTRIES: usize = 8;
+const MAX_FILTER_HISTORY_ITEMS_PER_ENTRY: usize = 16_384;
 const INTRINSIC_COLUMN_GAP: usize = 2;
 const INTRINSIC_FOOTER_GAP: usize = 4;
 
@@ -239,6 +289,15 @@ struct PreviewHighlightSpan {
     style: Style,
 }
 
+struct CachedPreviewHighlights {
+    detection_prefix: String,
+    key: String,
+    location: bool,
+    source: String,
+    source_start: usize,
+    spans: Arc<[PreviewHighlightSpan]>,
+}
+
 struct PreviewHighlighter {
     highlighter: RefCell<Option<Highlighter>>,
     registry: Arc<LanguageRegistry>,
@@ -254,7 +313,12 @@ impl PreviewHighlighter {
         }
     }
 
-    fn highlight(&self, preview: &PickerPreview, text: &str) -> Vec<PreviewHighlightSpan> {
+    fn highlight(
+        &self,
+        preview: &PickerPreview,
+        text: &str,
+        detection_prefix: &str,
+    ) -> Vec<PreviewHighlightSpan> {
         let mut highlighter = self.highlighter.borrow_mut();
         let Some(highlighter) = highlighter.as_mut() else {
             return Vec::new();
@@ -273,7 +337,13 @@ impl PreviewHighlighter {
             }
             PickerPreview::Text { language: None, .. } => Ok(Vec::new()),
             PickerPreview::Location { path, .. } => {
-                highlighter.highlight_for_file(Some(path), text)
+                let Some(language) = highlighter
+                    .language_id_for_source(Some(path), detection_prefix)
+                    .map(str::to_owned)
+                else {
+                    return Vec::new();
+                };
+                highlighter.highlight(&language, text)
             }
         }
         .unwrap_or_default();
@@ -338,25 +408,34 @@ pub struct Picker {
     matcher: SkimMatcherV2,
     select_action: Option<SelectAction>,
     filter_action: Option<FilterAction>,
+    incremental_filter: bool,
+    filtered_query: Option<String>,
+    /// Recent exact queries retained only while the authoritative items remain unchanged.
+    filtered_history: VecDeque<(String, Vec<usize>)>,
     filter_tie_breaker: Option<FilterTieBreaker>,
     filter_highlight_action: Option<FilterHighlightAction>,
     search: String,
     empty_message: Option<String>,
     theme: Theme,
     live: bool,
-    dynamic_items: Option<Vec<PickerItem>>,
+    dynamic_items: Option<PickerItems>,
+    background_filter: bool,
     visible_dynamic_items: Vec<usize>,
     command_column_widths: Cell<Option<CommandColumns>>,
+    label_first_column_widths: Cell<Option<LabelFirstColumns>>,
+    tree_prefixes: RefCell<Option<Arc<[String]>>>,
     external_filter: bool,
     status: Option<String>,
     busy_since: Option<Instant>,
     busy_frame: u64,
     key_actions: Vec<PickerKeyAction>,
+    show_preview: bool,
     preview: Option<PickerPreview>,
     item_preview_root: Option<PathBuf>,
     placeholder: Option<String>,
     preview_scroll: isize,
     preview_highlighter: PreviewHighlighter,
+    preview_highlight_cache: RefCell<Option<CachedPreviewHighlights>>,
     preview_text_cache: RefCell<VecDeque<Arc<CachedLocationPreview>>>,
     location_preview_overrides: HashMap<String, Rope>,
     history_key: Option<String>,
@@ -364,6 +443,7 @@ pub struct Picker {
     history_navigation: Option<PickerHistoryNavigation>,
     input_position: PickerInputPosition,
     icons: PickerIconsConfig,
+    tree_guides: bool,
     item_layout: PickerItemLayout,
     presentation: PickerPresentation,
     viewport_width: usize,
@@ -421,6 +501,24 @@ struct LabelFirstColumns {
     label: usize,
     annotation: usize,
     detail: usize,
+    position_line: usize,
+    position_column: usize,
+}
+
+impl LabelFirstColumns {
+    fn position_width(self) -> usize {
+        if self.position_line == 0 || self.position_column == 0 {
+            0
+        } else {
+            self.position_line + 1 + self.position_column
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PickerTreeNode<'a> {
+    id: &'a str,
+    parent_id: Option<&'a str>,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -515,6 +613,9 @@ impl Picker {
             matcher: SkimMatcherV2::default(),
             select_action: None,
             filter_action: None,
+            incremental_filter: false,
+            filtered_query: None,
+            filtered_history: VecDeque::new(),
             filter_tie_breaker: None,
             filter_highlight_action: None,
             search: String::new(),
@@ -522,18 +623,23 @@ impl Picker {
             theme: editor.theme.clone(),
             live: false,
             dynamic_items: None,
+            background_filter: false,
             visible_dynamic_items: Vec::new(),
             command_column_widths: Cell::new(None),
+            label_first_column_widths: Cell::new(None),
+            tree_prefixes: RefCell::new(None),
             external_filter: false,
             status: None,
             busy_since: None,
             busy_frame: 0,
             key_actions: Vec::new(),
+            show_preview: true,
             preview: None,
             item_preview_root: None,
             placeholder: None,
             preview_scroll: 0,
             preview_highlighter: PreviewHighlighter::new(&editor.theme, editor.language_registry()),
+            preview_highlight_cache: RefCell::new(None),
             preview_text_cache: RefCell::new(VecDeque::new()),
             location_preview_overrides: HashMap::new(),
             history_key: None,
@@ -541,6 +647,7 @@ impl Picker {
             history_navigation: None,
             input_position: editor.picker_input_position(),
             icons: editor.picker_icons(),
+            tree_guides: editor.picker_tree_guides(),
             item_layout: PickerItemLayout::Default,
             presentation,
             viewport_width: editor.vwidth(),
@@ -566,7 +673,7 @@ impl Picker {
                 let item_count = self
                     .dynamic_items
                     .as_ref()
-                    .map(Vec::len)
+                    .map(PickerItems::len)
                     .unwrap_or_else(|| self.items.len());
                 let rows = item_count.clamp(4, sizing.max_rows.max(4));
                 let height = rows.saturating_add(3).min(total_height.saturating_sub(1));
@@ -657,6 +764,7 @@ impl Picker {
         self.theme = theme.clone();
         self.preview_highlighter =
             PreviewHighlighter::new(theme, Arc::clone(&self.preview_highlighter.registry));
+        *self.preview_highlight_cache.borrow_mut() = None;
     }
 
     fn set_presentation_for_viewport(
@@ -680,7 +788,8 @@ impl Picker {
         picker.live = true;
         picker.visible_dynamic_items = (0..items.len()).collect();
         picker.list.set_item_count(items.len());
-        picker.dynamic_items = Some(items);
+        picker.dynamic_items = Some(items.into());
+        picker.install_path_filter_highlights();
         picker.external_filter = options.external_filter;
         picker.placeholder = options.placeholder;
         picker.status = options.status;
@@ -763,41 +872,127 @@ impl Picker {
         PickerBuilder::new()
     }
 
-    pub fn filter(&mut self, term: &str) {
-        if let Some(items) = &self.dynamic_items {
-            if self.external_filter || term.is_empty() {
-                self.visible_dynamic_items = (0..items.len()).collect();
-            } else {
-                let mut matches = items
+    fn install_path_filter_highlights(&mut self) {
+        if self.filter_highlight_action.is_some()
+            || !self.dynamic_items.as_ref().is_some_and(|items| {
+                items
                     .iter()
-                    .enumerate()
-                    .filter_map(|(index, item)| {
-                        self.filter_action
-                            .as_ref()
-                            .map_or_else(
-                                || default_filter_score(&self.matcher, &item.label, term),
-                                |filter| {
-                                    filter(item, term)
-                                        .map(|score| (PickerMatchKind::Fuzzy, Reverse(score)))
-                                },
-                            )
-                            .map(|score| {
-                                let tie_breaker = self
-                                    .filter_tie_breaker
-                                    .as_ref()
-                                    .map_or(0, |tie_breaker| tie_breaker(item));
-                                (index, score, tie_breaker)
-                            })
-                    })
-                    .collect::<Vec<_>>();
+                    .any(|item| picker_item_search_path(item).is_some())
+            })
+        {
+            return;
+        }
+        let matcher = SkimMatcherV2::default();
+        self.filter_highlight_action = Some(Box::new(move |item, query| {
+            if let Some(path) = picker_item_search_path(item) {
+                path_match_highlights(
+                    &matcher,
+                    PathCandidate::new(path, &item.label, item.annotation.as_deref()),
+                    query,
+                )
+            } else {
+                path_match_highlights(&matcher, PathCandidate::from_path(&item.label), query)
+            }
+        }));
+    }
+
+    pub fn filter(&mut self, term: &str) {
+        let _span = crate::editor::perf::PerfSpan::start("picker:filter");
+        if self.background_filter {
+            return;
+        }
+        if let Some(items) = &self.dynamic_items {
+            let can_reuse_history =
+                !self.external_filter && (self.incremental_filter || self.filter_action.is_none());
+            let cached = (can_reuse_history && !term.is_empty())
+                .then(|| {
+                    self.filtered_history
+                        .iter()
+                        .position(|(query, _)| query == term)
+                })
+                .flatten()
+                .and_then(|index| self.filtered_history.remove(index))
+                .map(|(_, matches)| matches);
+            let previous = if let Some(matches) = cached {
+                std::mem::replace(&mut self.visible_dynamic_items, matches)
+            } else if self.external_filter || term.is_empty() {
+                let previous = std::mem::take(&mut self.visible_dynamic_items);
+                self.visible_dynamic_items.extend(0..items.len());
+                previous
+            } else {
+                let filter_action = self.filter_action.as_ref();
+                let filter_tie_breaker = self.filter_tie_breaker.as_ref();
+                let matcher = &self.matcher;
+                let score_item = |index: usize| {
+                    let item = &items[index];
+                    filter_action
+                        .as_ref()
+                        .map_or_else(
+                            || default_item_filter_score(matcher, item, term),
+                            |filter| {
+                                filter(item, term)
+                                    .map(|score| (PickerMatchKind::Fuzzy, Reverse(score)))
+                            },
+                        )
+                        .map(|score| {
+                            let tie_breaker = filter_tie_breaker
+                                .as_ref()
+                                .map_or(0, |tie_breaker| tie_breaker(item));
+                            (index, score, tie_breaker)
+                        })
+                };
+                let can_reuse_matches = (self.incremental_filter || self.filter_action.is_none())
+                    && self
+                        .filtered_query
+                        .as_deref()
+                        .is_some_and(|previous| !previous.is_empty() && term.starts_with(previous));
+                let mut matches = if self.incremental_filter
+                    && (if can_reuse_matches {
+                        self.visible_dynamic_items.len()
+                    } else {
+                        items.len()
+                    }) >= PARALLEL_FILTER_MIN_ITEMS
+                {
+                    if can_reuse_matches {
+                        self.visible_dynamic_items
+                            .par_iter()
+                            .filter_map(|index| score_item(*index))
+                            .collect::<Vec<_>>()
+                    } else {
+                        (0..items.len())
+                            .into_par_iter()
+                            .filter_map(score_item)
+                            .collect()
+                    }
+                } else if can_reuse_matches {
+                    self.visible_dynamic_items
+                        .iter()
+                        .copied()
+                        .filter_map(score_item)
+                        .collect()
+                } else {
+                    (0..items.len()).filter_map(score_item).collect()
+                };
                 matches.sort_unstable_by_key(|(index, score, tie_breaker)| {
                     (*score, *tie_breaker, *index)
                 });
-                self.visible_dynamic_items =
-                    matches.into_iter().map(|(index, _, _)| index).collect();
+                std::mem::replace(
+                    &mut self.visible_dynamic_items,
+                    matches.into_iter().map(|(index, _, _)| index).collect(),
+                )
+            };
+            if can_reuse_history {
+                if let Some(query) = self.filtered_query.take().filter(|query| !query.is_empty()) {
+                    if previous.len() <= MAX_FILTER_HISTORY_ITEMS_PER_ENTRY {
+                        self.filtered_history.push_front((query, previous));
+                        self.filtered_history.truncate(MAX_FILTER_HISTORY_ENTRIES);
+                    }
+                }
             }
+            self.filtered_query = Some(term.to_string());
             self.list.set_item_count(self.visible_dynamic_items.len());
             self.command_column_widths.set(None);
+            self.label_first_column_widths.set(None);
             return;
         }
         if term.is_empty() {
@@ -826,6 +1021,9 @@ impl Picker {
         let previous = self.selected_item();
         self.item_preview_root = None;
         self.dynamic_items = None;
+        self.tree_prefixes.get_mut().take();
+        self.filtered_query = None;
+        self.filtered_history.clear();
         self.visible_dynamic_items.clear();
         self.items = items;
         let search = self.search.clone();
@@ -837,6 +1035,9 @@ impl Picker {
         let previous = self.selected_item();
         self.item_preview_root = Some(root);
         self.dynamic_items = None;
+        self.tree_prefixes.get_mut().take();
+        self.filtered_query = None;
+        self.filtered_history.clear();
         self.visible_dynamic_items.clear();
         self.items = items;
         let search = self.search.clone();
@@ -844,15 +1045,71 @@ impl Picker {
         self.reset_preview_scroll_if_selection_changed(previous);
     }
 
-    pub fn replace_structured_items(&mut self, items: Vec<PickerItem>) {
+    /// File-picker queries are fulfilled by a worker; keystrokes only edit text.
+    pub(crate) fn enable_background_filter(&mut self) {
+        self.background_filter = true;
+    }
+
+    pub(crate) fn apply_background_items(
+        &mut self,
+        items: PickerItems,
+        order: Vec<usize>,
+        root: PathBuf,
+        selected: Option<usize>,
+    ) {
         let previous = self.selected_item();
-        self.item_preview_root = None;
+        self.item_preview_root = Some(root);
+        let retired = self.dynamic_items.replace(items);
+        if let Some(retired) = retired {
+            rayon::spawn(move || drop(retired));
+        }
+        self.visible_dynamic_items = order;
+        self.list.set_item_count(self.visible_dynamic_items.len());
+        self.list.set_selected_index(selected.unwrap_or(0));
+        self.command_column_widths.set(None);
+        self.label_first_column_widths.set(None);
+        self.reset_preview_scroll_if_selection_changed(previous);
+    }
+
+    pub fn replace_structured_items(&mut self, items: Vec<PickerItem>) {
+        self.replace_structured_items_with_optional_preview_root(items, None);
+    }
+
+    /// Resolves previews only for the selected row instead of allocating one per file.
+    #[cfg(test)]
+    pub(crate) fn replace_structured_items_with_preview_root(
+        &mut self,
+        items: Vec<PickerItem>,
+        root: PathBuf,
+    ) {
+        self.replace_structured_items_with_optional_preview_root(items, Some(root));
+    }
+
+    fn replace_structured_items_with_optional_preview_root(
+        &mut self,
+        items: Vec<PickerItem>,
+        preview_root: Option<PathBuf>,
+    ) {
+        let previous = self.selected_item();
+        self.item_preview_root = preview_root;
         self.items.clear();
-        self.dynamic_items = Some(items);
+        self.dynamic_items = Some(items.into());
+        self.tree_prefixes.get_mut().take();
+        self.install_path_filter_highlights();
+        self.filtered_query = None;
+        self.filtered_history.clear();
         let search = self.search.clone();
         self.filter(&search);
         self.resize_to_viewport(self.viewport_width, self.viewport_height);
         self.reset_preview_scroll_if_selection_changed(previous);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn dynamic_items_for_test(&self) -> Vec<&PickerItem> {
+        self.dynamic_items
+            .as_ref()
+            .map(|items| items.iter().collect())
+            .unwrap_or_default()
     }
 
     pub fn apply_update(&mut self, id: i32, update: PickerUpdate) -> bool {
@@ -863,7 +1120,11 @@ impl Picker {
             PickerUpdate::Items(items) => {
                 let previous = self.selected_item();
                 let selected_id = self.selected_dynamic_item().map(|item| item.id.clone());
-                self.dynamic_items = Some(items);
+                self.dynamic_items = Some(items.into());
+                self.tree_prefixes.get_mut().take();
+                self.install_path_filter_highlights();
+                self.filtered_query = None;
+                self.filtered_history.clear();
                 let query = self.search.clone();
                 self.filter(&query);
                 self.resize_to_viewport(self.viewport_width, self.viewport_height);
@@ -916,7 +1177,13 @@ impl Picker {
         self.status = status;
     }
 
-    fn set_busy(&mut self, busy: bool) {
+    /// Keeps file previews aligned with structurally shared open-buffer contents.
+    pub(crate) fn set_location_preview_contents(&mut self, contents: HashMap<String, Rope>) {
+        self.location_preview_overrides = contents;
+        self.preview_text_cache.borrow_mut().clear();
+    }
+
+    pub(crate) fn set_busy(&mut self, busy: bool) {
         if busy {
             if self.busy_since.is_none() {
                 self.busy_since = Some(Instant::now());
@@ -932,7 +1199,7 @@ impl Picker {
         &self.search
     }
 
-    fn selected_item(&self) -> Option<String> {
+    pub(crate) fn selected_item(&self) -> Option<String> {
         if let Some(item) = self.selected_dynamic_item() {
             return Some(item.id.clone());
         }
@@ -1075,10 +1342,12 @@ impl Picker {
     fn custom_action(&self, event: &event::KeyEvent) -> Option<KeyAction> {
         self.dynamic_items.as_ref()?;
         let key = normalized_key(event)?;
-        let action = self
-            .key_actions
-            .iter()
-            .find(|action| action.key.to_ascii_lowercase().replace("ctrl-", "c-") == key)?;
+        let action = self.key_actions.iter().find(|action| {
+            action
+                .key
+                .split(" / ")
+                .any(|binding| binding.trim().to_ascii_lowercase().replace("ctrl-", "c-") == key)
+        })?;
         if let Some(handle) = self.callback_handle {
             return Some(KeyAction::Single(Action::NotifyPicker(
                 handle,
@@ -1286,15 +1555,134 @@ impl Picker {
             })
     }
 
+    fn tree_node(item: &PickerItem) -> Option<PickerTreeNode<'_>> {
+        if item.data.get("tree").and_then(Value::as_bool) != Some(true) {
+            return None;
+        }
+        let symbol = item.data.get("symbol")?;
+        Some(PickerTreeNode {
+            id: symbol
+                .get("id")
+                .and_then(Value::as_str)
+                .unwrap_or(item.id.as_str()),
+            parent_id: symbol.get("parent_id").and_then(Value::as_str),
+        })
+    }
+
+    /// Computes stable Snacks-style ancestry guides once per authoritative item set.
+    fn tree_prefixes(&self, items: &PickerItems) -> Option<Arc<[String]>> {
+        if self.background_filter {
+            return None;
+        }
+        if !self.tree_guides {
+            return None;
+        }
+        if let Some(prefixes) = self.tree_prefixes.borrow().as_ref() {
+            return (!prefixes.is_empty()).then(|| Arc::clone(prefixes));
+        }
+
+        let nodes = items.iter().map(Self::tree_node).collect::<Vec<_>>();
+        if nodes.iter().all(Option::is_none) {
+            self.tree_prefixes
+                .replace(Some(Arc::<[String]>::from(Vec::<String>::new())));
+            return None;
+        }
+
+        let node_indices = nodes
+            .iter()
+            .enumerate()
+            .filter_map(|(index, node)| node.as_ref().map(|node| (node.id, index)))
+            .collect::<HashMap<_, _>>();
+        let mut last_siblings = HashMap::new();
+        for (index, node) in nodes.iter().enumerate() {
+            if let Some(node) = node {
+                last_siblings.insert(node.parent_id, index);
+            }
+        }
+        let (vertical, middle, last) = if self.icons.style == PickerIconStyle::Ascii {
+            ("| ", "|-", "`-")
+        } else {
+            ("│ ", "├╴", "└╴")
+        };
+
+        let mut prefixes = vec![String::new(); items.len()];
+        for (index, node) in nodes.iter().enumerate() {
+            let Some(mut current) = node.as_ref().copied() else {
+                continue;
+            };
+            let mut current_index = index;
+            let mut segments = Vec::new();
+            for depth in 0..MAX_PICKER_TREE_DEPTH {
+                let is_last = last_siblings.get(&current.parent_id) == Some(&current_index);
+                segments.push(if depth == 0 {
+                    if is_last {
+                        last
+                    } else {
+                        middle
+                    }
+                } else if is_last {
+                    "  "
+                } else {
+                    vertical
+                });
+                let Some(parent_id) = current.parent_id else {
+                    break;
+                };
+                let Some(parent_index) = node_indices.get(parent_id).copied() else {
+                    break;
+                };
+                if parent_index == current_index {
+                    break;
+                }
+                let Some(parent) = nodes[parent_index] else {
+                    break;
+                };
+                current = parent;
+                current_index = parent_index;
+            }
+            segments.reverse();
+            prefixes[index] = segments.concat();
+        }
+
+        let prefixes: Arc<[String]> = prefixes.into();
+        self.tree_prefixes.replace(Some(Arc::clone(&prefixes)));
+        Some(prefixes)
+    }
+
+    fn visible_tree_prefix(
+        prefixes: Option<&[String]>,
+        index: usize,
+        content_width: usize,
+    ) -> &str {
+        let Some(prefix) = prefixes.and_then(|prefixes| prefixes.get(index)) else {
+            return "";
+        };
+        let available = content_width.saturating_sub(MIN_TREE_GUIDE_LABEL_WIDTH.min(content_width));
+        display_width_tail(prefix, available)
+    }
+
+    fn tree_position(item: &PickerItem) -> Option<(&str, &str)> {
+        if item.data.get("tree").and_then(Value::as_bool) != Some(true) {
+            return None;
+        }
+        let (line, column) = item.detail.as_deref()?.split_once(':')?;
+        (!line.is_empty()
+            && !column.is_empty()
+            && line.bytes().all(|digit| digit.is_ascii_digit())
+            && column.bytes().all(|digit| digit.is_ascii_digit()))
+        .then_some((line, column))
+    }
+
     fn draw_item_prefix(
         &self,
         buffer: &mut RenderBuffer,
-        x: usize,
-        y: usize,
+        position: (usize, usize),
         item: &PickerItem,
+        tree_prefix: &str,
         row_style: &Style,
         selected: bool,
     ) {
+        let (x, y) = position;
         if selected {
             let marker_style = self.semantic_foreground(
                 row_style,
@@ -1304,9 +1692,22 @@ impl Picker {
             buffer.set_text(x, y, "›", &marker_style);
         }
 
+        let mut icon_x = x + 2;
+        if !tree_prefix.is_empty() {
+            let semantic = self
+                .color_style(&[
+                    "tree.indentGuidesStroke",
+                    "editorIndentGuide.background",
+                    "editorIndentGuide.background1",
+                ])
+                .or_else(|| Some(self.theme.ui_style.muted.clone()));
+            let guide_style = self.semantic_foreground(row_style, semantic, selected);
+            buffer.set_text(icon_x, y, tree_prefix, &guide_style);
+            icon_x += display_width(tree_prefix);
+        }
         let icon = fit_display_width(self.item_icon(item), PICKER_ICON_WIDTH);
         let icon_style = self.result_icon_style(item, row_style, selected);
-        buffer.set_text(x + 2, y, &icon, &icon_style);
+        buffer.set_text(icon_x, y, &icon, &icon_style);
     }
 
     fn result_annotation_style(&self, base: &Style, selected: bool) -> Style {
@@ -1372,6 +1773,19 @@ impl Picker {
         match_style: &Style,
         matches: &[[usize; 2]],
     ) -> usize {
+        if is_printable_ascii(text) {
+            let visible = &text[..text.len().min(width)];
+            buffer.set_printable_ascii(x, y, visible, style);
+            for [start, end] in matches {
+                if start >= end || *start >= visible.len() {
+                    continue;
+                }
+                let end = (*end).min(visible.len());
+                buffer.set_printable_ascii(x + *start, y, &visible[*start..end], match_style);
+            }
+            return visible.len();
+        }
+
         let visible = truncate_display_width(text, width);
         buffer.set_text(x, y, &visible, style);
         let visible_width = display_width(&visible);
@@ -1578,7 +1992,7 @@ impl Picker {
                     .get("description")
                     .and_then(Value::as_str)
                     .unwrap_or_default();
-                let total = self.dynamic_items.as_ref().map_or(0, Vec::len);
+                let total = self.dynamic_items.as_ref().map_or(0, PickerItems::len);
                 let visible = self.visible_dynamic_items.len();
                 if description.is_empty() {
                     format!("{visible}/{total} commands")
@@ -1590,7 +2004,7 @@ impl Picker {
             .selected_dynamic_item()
             .filter(|item| item.kind.as_deref() == Some("FilePath"))
             .map(|_| {
-                let total = self.dynamic_items.as_ref().map_or(0, Vec::len);
+                let total = self.dynamic_items.as_ref().map_or(0, PickerItems::len);
                 let visible = self.visible_dynamic_items.len();
                 format!("{visible}/{total}")
             });
@@ -1673,6 +2087,7 @@ impl Picker {
         };
         let content_width = rect.width.saturating_sub(PICKER_ITEM_PREFIX_WIDTH);
         let command_columns = self.command_columns(items, content_width);
+        let tree_prefixes = self.tree_prefixes(items);
         let label_first_columns = (self.item_layout == PickerItemLayout::LabelFirst)
             .then(|| self.label_first_columns(items, content_width));
         let selected = self.list.selected_index();
@@ -1699,10 +2114,20 @@ impl Picker {
                 .filter(|matches| !matches.is_empty());
             let label_matches = derived_label_matches.unwrap_or(&item.matches);
             let y = rect.y + offset;
-            buffer.set_text(rect.x, y, &" ".repeat(rect.width), &row_style);
+            buffer.fill_ascii_spaces(rect.x, y, rect.width, &row_style);
 
-            self.draw_item_prefix(buffer, rect.x, y, item, &row_style, is_selected);
-            let x = rect.x + PICKER_ITEM_PREFIX_WIDTH;
+            let tree_prefix =
+                Self::visible_tree_prefix(tree_prefixes.as_deref(), *index, content_width);
+            let tree_width = display_width(tree_prefix);
+            self.draw_item_prefix(
+                buffer,
+                (rect.x, y),
+                item,
+                tree_prefix,
+                &row_style,
+                is_selected,
+            );
+            let x = rect.x + PICKER_ITEM_PREFIX_WIDTH + tree_width;
             if item.kind.as_deref() == Some("Command") {
                 let category = item.annotation.as_deref().unwrap_or_default().trim_end();
                 if command_columns.category > 0 {
@@ -1785,12 +2210,12 @@ impl Picker {
                     x,
                     y,
                     &item.label,
-                    columns.label,
+                    columns.label.saturating_sub(tree_width),
                     &label_style,
                     &label_match_style,
                     label_matches,
                 );
-                let mut column_x = x + columns.label;
+                let mut column_x = rect.x + PICKER_ITEM_PREFIX_WIDTH + columns.label;
                 if columns.annotation > 0 {
                     column_x += INTRINSIC_COLUMN_GAP;
                     let style = self.result_annotation_style(&row_style, is_selected);
@@ -1824,9 +2249,30 @@ impl Picker {
                         &item.detail_matches,
                     );
                 }
+                if columns.position_width() > 0 {
+                    if let Some((line, column)) = Self::tree_position(item) {
+                        let position = format!(
+                            "{line:>line_width$}:{column:>column_width$}",
+                            line_width = columns.position_line,
+                            column_width = columns.position_column,
+                        );
+                        let style = self.result_content_style(&row_style, is_selected);
+                        self.draw_text_with_matches(
+                            buffer,
+                            rect.x + rect.width - columns.position_width(),
+                            y,
+                            &position,
+                            columns.position_width(),
+                            &style,
+                            &self.result_match_style(&style),
+                            &item.detail_matches,
+                        );
+                    }
+                }
                 continue;
             }
 
+            let content_width = content_width.saturating_sub(tree_width);
             let detail_separator_width = 2;
             let min_primary_width = if item.kind.as_deref() == Some("FileMatch") {
                 let max_primary_width = content_width.saturating_sub(detail_separator_width + 8);
@@ -1975,21 +2421,55 @@ impl Picker {
     }
 
     /// Use every filtered row, not just the current page, so scrolling does not
-    /// move the columns. Labels take priority over status and descriptions.
-    fn label_first_columns(&self, items: &[PickerItem], content_width: usize) -> LabelFirstColumns {
-        let mut columns = LabelFirstColumns::default();
-        for index in &self.visible_dynamic_items {
-            let item = &items[*index];
-            columns.label = columns.label.max(display_width(&item.label));
-            columns.annotation = columns
-                .annotation
-                .max(item.annotation.as_deref().map_or(0, display_width));
-            columns.detail = columns
-                .detail
-                .max(item.detail.as_deref().map_or(0, display_width));
-        }
+    /// move the columns. Labels take priority over annotations and descriptions;
+    /// document-symbol positions occupy a stable right-aligned numeric gutter.
+    fn label_first_columns(&self, items: &PickerItems, content_width: usize) -> LabelFirstColumns {
+        let mut columns = self.label_first_column_widths.get().unwrap_or_else(|| {
+            let mut columns = LabelFirstColumns::default();
+            let tree_prefixes = self.tree_prefixes(items);
+            for index in self
+                .visible_dynamic_items
+                .iter()
+                .take(if self.background_filter {
+                    256
+                } else {
+                    usize::MAX
+                })
+            {
+                let item = &items[*index];
+                let tree_width = tree_prefixes
+                    .as_ref()
+                    .and_then(|prefixes| prefixes.get(*index))
+                    .map_or(0, |prefix| display_width(prefix));
+                columns.label = columns
+                    .label
+                    .max(display_width(&item.label).saturating_add(tree_width));
+                columns.annotation = columns
+                    .annotation
+                    .max(item.annotation.as_deref().map_or(0, display_width));
+                if let Some((line, column)) = Self::tree_position(item) {
+                    columns.position_line = columns.position_line.max(line.len());
+                    columns.position_column = columns.position_column.max(column.len());
+                } else {
+                    columns.detail = columns
+                        .detail
+                        .max(item.detail.as_deref().map_or(0, display_width));
+                }
+            }
+            self.label_first_column_widths.set(Some(columns));
+            columns
+        });
         columns.label = columns.label.min(content_width);
         let mut remaining = content_width.saturating_sub(columns.label);
+        let position_width = columns.position_width();
+        if position_width > 0 {
+            if position_width + INTRINSIC_COLUMN_GAP <= remaining {
+                remaining -= position_width + INTRINSIC_COLUMN_GAP;
+            } else {
+                columns.position_line = 0;
+                columns.position_column = 0;
+            }
+        }
         if columns.annotation > 0 && columns.annotation + INTRINSIC_COLUMN_GAP <= remaining {
             remaining -= columns.annotation + INTRINSIC_COLUMN_GAP;
         } else {
@@ -2004,7 +2484,12 @@ impl Picker {
         columns
     }
 
-    fn command_columns(&self, items: &[PickerItem], content_width: usize) -> CommandColumns {
+    fn command_columns(&self, items: &PickerItems, content_width: usize) -> CommandColumns {
+        // File indexes contain only FilePath rows. Do not scan a million rows
+        // on the UI thread looking for command metadata that cannot be present.
+        if self.background_filter {
+            return CommandColumns::default();
+        }
         let mut columns = self.command_column_widths.get().unwrap_or_else(|| {
             let mut columns = CommandColumns::default();
             for item in self
@@ -2084,7 +2569,7 @@ impl Picker {
             let y = rect.y + offset;
             let is_selected = selected == Some(item_index);
             let row_style = self.result_row_style(is_selected);
-            buffer.set_text(rect.x, y, &" ".repeat(rect.width), &row_style);
+            buffer.fill_ascii_spaces(rect.x, y, rect.width, &row_style);
             if is_selected {
                 let marker_style = self.semantic_foreground(
                     &row_style,
@@ -2116,7 +2601,7 @@ impl Picker {
             let y = rect.y + offset;
             let is_selected = selected == Some(item_index);
             let row_style = self.result_row_style(is_selected);
-            buffer.set_text(rect.x, y, &" ".repeat(rect.width), &row_style);
+            buffer.fill_ascii_spaces(rect.x, y, rect.width, &row_style);
             if is_selected {
                 let marker_style = self.semantic_foreground(
                     &row_style,
@@ -2144,12 +2629,11 @@ impl Picker {
             return Ok(());
         }
 
-        let blank_line = " ".repeat(preview_width);
         for offset in 0..preview_height {
-            buffer.set_text(
+            buffer.fill_ascii_spaces(
                 preview_x,
                 layout.rect.y + offset,
-                &blank_line,
+                preview_width,
                 &self.theme.ui_style.picker_item,
             );
         }
@@ -2192,7 +2676,12 @@ impl Picker {
             || preview_lines(text, start, preview_height),
             |line_starts| preview_lines_with_starts(text, line_starts, start, preview_height),
         );
-        let highlight_spans = self.preview_highlight_spans(preview, text, &lines);
+        let highlight_spans = self.preview_highlight_spans(
+            preview,
+            text,
+            &lines,
+            window_first_line.unwrap_or_default() == 0,
+        );
         for (offset, line) in lines.iter().enumerate() {
             let line_index = window_first_line.unwrap_or_default() + start + offset;
             let focused = focus_line == Some(line_index);
@@ -2213,9 +2702,17 @@ impl Picker {
                     SelectionForegroundPriority::Selection,
                 );
             }
-            let visible = fit_display_width(line.text, preview_width);
             let y = layout.rect.y + offset;
-            buffer.set_text(preview_x, y, &visible, &line_style);
+            if is_printable_ascii(line.text) {
+                if focused {
+                    buffer.fill_ascii_spaces(preview_x, y, preview_width, &line_style);
+                }
+                let visible = &line.text[..line.text.len().min(preview_width)];
+                buffer.set_printable_ascii(preview_x, y, visible, &line_style);
+            } else {
+                let visible = fit_display_width(line.text, preview_width);
+                buffer.set_text(preview_x, y, &visible, &line_style);
+            }
             self.draw_preview_syntax(
                 buffer,
                 preview_x,
@@ -2292,7 +2789,7 @@ impl Picker {
             return result;
         }
 
-        let complete = len <= MAX_UNFOCUSED_PREVIEW_BYTES;
+        let complete = len <= MAX_COMPLETE_LOCATION_PREVIEW_BYTES;
         let checkpoint = override_contents.is_none().then(|| {
             cache
                 .iter()
@@ -2364,12 +2861,13 @@ impl Picker {
         preview: &PickerPreview,
         text: &str,
         lines: &[PreviewLine<'_>],
-    ) -> Vec<PreviewHighlightSpan> {
+        starts_document: bool,
+    ) -> Arc<[PreviewHighlightSpan]> {
         let Some(first) = lines.first() else {
-            return Vec::new();
+            return Arc::from([]);
         };
         let Some(last) = lines.last() else {
-            return Vec::new();
+            return Arc::from([]);
         };
         let start = first.start;
         let end = floor_char_boundary(
@@ -2378,15 +2876,53 @@ impl Picker {
                 .min(start.saturating_add(MAX_PREVIEW_HIGHLIGHT_BYTES)),
         );
         if start >= end {
-            return Vec::new();
+            return Arc::from([]);
+        }
+
+        let (key, location) = match preview {
+            PickerPreview::Text {
+                language: Some(language),
+                ..
+            } => (language.as_str(), false),
+            PickerPreview::Text { language: None, .. } => return Arc::from([]),
+            PickerPreview::Location { path, .. } => (path.as_str(), true),
+        };
+        let detection_prefix = if starts_document {
+            text.chars()
+                .take(crate::highlighter::MAX_SHEBANG_CHARS + 1)
+                .collect::<String>()
+        } else {
+            String::new()
+        };
+        let source = &text[start..end];
+        if let Some(cached) = self.preview_highlight_cache.borrow().as_ref() {
+            if cached.detection_prefix == detection_prefix
+                && cached.key == key
+                && cached.location == location
+                && cached.source_start == start
+                && cached.source == source
+            {
+                return Arc::clone(&cached.spans);
+            }
         }
 
         let mut spans = self
             .preview_highlighter
-            .highlight(preview, &text[start..end]);
+            .highlight(preview, source, &detection_prefix);
         for span in &mut spans {
             span.start += start;
             span.end += start;
+        }
+        let spans: Arc<[PreviewHighlightSpan]> = Arc::from(spans);
+        if spans.len() <= MAX_CACHED_PREVIEW_HIGHLIGHT_SPANS {
+            *self.preview_highlight_cache.borrow_mut() = Some(CachedPreviewHighlights {
+                detection_prefix,
+                key: key.to_string(),
+                location,
+                source: source.to_string(),
+                source_start: start,
+                spans: Arc::clone(&spans),
+            });
         }
         spans
     }
@@ -2407,8 +2943,12 @@ impl Picker {
             return;
         }
 
-        let visible = truncate_display_width(line.text, width);
-        let visible_end = visible.len();
+        let ascii = is_printable_ascii(line.text);
+        let visible_end = if ascii {
+            line.text.len().min(width)
+        } else {
+            truncate_display_width(line.text, width).len()
+        };
         for span in spans
             .iter()
             .filter(|span| span.end > line.start && span.start < line.end)
@@ -2429,18 +2969,24 @@ impl Picker {
                 continue;
             }
 
-            let prefix = &line.text[..start];
-            let segment = &line.text[start..end];
-            let segment_x = display_width(prefix);
+            let segment_x = if ascii {
+                start
+            } else {
+                display_width(&line.text[..start])
+            };
             if segment_x >= width {
                 continue;
             }
-            let segment = truncate_display_width(segment, width - segment_x);
             let mut style = merge_preview_style(line_style, &span.style);
             if selected {
                 style = self.theme.ensure_text_contrast(&style);
             }
-            buffer.set_text(x + segment_x, y, &segment, &style);
+            if ascii {
+                buffer.set_printable_ascii(x + segment_x, y, &line.text[start..end], &style);
+            } else {
+                let segment = truncate_display_width(&line.text[start..end], width - segment_x);
+                buffer.set_text(x + segment_x, y, &segment, &style);
+            }
         }
     }
 
@@ -2528,7 +3074,12 @@ pub(crate) fn picker_kind_icon(kind: &str, style: PickerIconStyle) -> &'static s
 
 fn item_file_path(item: &PickerItem) -> Option<&str> {
     match item.kind.as_deref()? {
-        "FilePath" => Some(item.id.as_str()),
+        "FilePath" => Some(
+            item.data
+                .get("path")
+                .and_then(Value::as_str)
+                .unwrap_or(&item.id),
+        ),
         "FileMatch" => item
             .data
             .get("location")
@@ -3318,12 +3869,16 @@ impl Component for Picker {
                     return Some(action);
                 }
                 match event.code {
-                    KeyCode::Char('j') if event.modifiers.contains(KeyModifiers::CONTROL) => {
+                    KeyCode::Char('p') if event.modifiers == KeyModifiers::ALT => {
+                        Some(self.toggle_preview())
+                    }
+                    KeyCode::F(4) if event.modifiers.is_empty() => Some(self.toggle_preview()),
+                    KeyCode::Char('j' | 'n') if event.modifiers.contains(KeyModifiers::CONTROL) => {
                         let previous = self.selected_item();
                         self.list.move_down();
                         self.notify_selection_changed(previous)
                     }
-                    KeyCode::Char('k') if event.modifiers.contains(KeyModifiers::CONTROL) => {
+                    KeyCode::Char('k' | 'p') if event.modifiers.contains(KeyModifiers::CONTROL) => {
                         let previous = self.selected_item();
                         self.list.move_up();
                         self.notify_selection_changed(previous)
@@ -3512,6 +4067,10 @@ impl Component for Picker {
 }
 
 fn display_width_tail(text: &str, max_width: usize) -> &str {
+    if is_printable_ascii(text) {
+        return &text[text.len().saturating_sub(max_width)..];
+    }
+
     let mut width = 0;
     let mut start = text.len();
     for (index, grapheme) in text.grapheme_indices(true).rev() {
@@ -3526,12 +4085,19 @@ fn display_width_tail(text: &str, max_width: usize) -> &str {
 }
 
 impl Picker {
+    fn toggle_preview(&mut self) -> KeyAction {
+        self.show_preview = !self.show_preview;
+        self.sync_list_bounds();
+        KeyAction::Single(Action::Refresh)
+    }
+
     fn has_preview(&self) -> bool {
-        self.preview.is_some()
-            || self
-                .selected_dynamic_item()
-                .is_some_and(|item| item.preview.is_some())
-            || (self.item_preview_root.is_some() && self.list.selected_index().is_some())
+        self.show_preview
+            && (self.preview.is_some()
+                || self
+                    .selected_dynamic_item()
+                    .is_some_and(|item| item.preview.is_some())
+                || (self.item_preview_root.is_some() && self.list.selected_index().is_some()))
     }
 
     fn current_preview(&self) -> Option<Cow<'_, PickerPreview>> {
@@ -3546,8 +4112,12 @@ impl Picker {
         }
 
         let root = self.item_preview_root.as_ref()?;
-        let selected = self.list.selected_index()?;
-        let item = self.list.items().get(selected)?;
+        let item = if let Some(item) = self.selected_dynamic_item() {
+            item.id.as_str()
+        } else {
+            let selected = self.list.selected_index()?;
+            self.list.items().get(selected)?.as_str()
+        };
         Some(Cow::Owned(PickerPreview::Location {
             path: root.join(item).to_string_lossy().into_owned(),
             line: None,
@@ -3587,6 +4157,7 @@ pub struct PickerBuilder {
     id: Option<i32>,
     select_action: Option<SelectAction>,
     filter_action: Option<FilterAction>,
+    incremental_filter: bool,
     filter_tie_breaker: Option<FilterTieBreaker>,
     filter_highlight_action: Option<FilterHighlightAction>,
     placeholder: Option<String>,
@@ -3596,6 +4167,7 @@ pub struct PickerBuilder {
     location_preview_contents: HashMap<String, Rope>,
     content_sizing: Option<PickerContentSizing>,
     status_on_query_line: bool,
+    item_layout: PickerItemLayout,
 }
 
 impl Default for PickerBuilder {
@@ -3613,6 +4185,7 @@ impl PickerBuilder {
             id: None,
             select_action: None,
             filter_action: None,
+            incremental_filter: false,
             filter_tie_breaker: None,
             filter_highlight_action: None,
             placeholder: None,
@@ -3622,6 +4195,7 @@ impl PickerBuilder {
             location_preview_contents: HashMap::new(),
             content_sizing: None,
             status_on_query_line: false,
+            item_layout: PickerItemLayout::Default,
         }
     }
 
@@ -3641,6 +4215,12 @@ impl PickerBuilder {
         self
     }
 
+    /// Selects how structured rows divide space between names and metadata.
+    pub fn item_layout(mut self, item_layout: PickerItemLayout) -> Self {
+        self.item_layout = item_layout;
+        self
+    }
+
     #[allow(unused)]
     pub fn id(mut self, id: i32) -> Self {
         self.id = Some(id);
@@ -3655,16 +4235,24 @@ impl PickerBuilder {
     /// Sets the scorer used to filter structured picker rows for the current query.
     pub fn filter_action(
         mut self,
-        filter: impl Fn(&PickerItem, &str) -> Option<i64> + Send + 'static,
+        filter: impl Fn(&PickerItem, &str) -> Option<i64> + Send + Sync + 'static,
     ) -> Self {
         self.filter_action = Some(Box::new(filter));
+        self
+    }
+
+    /// Reuses prior matches when an extended query cannot match previously rejected rows.
+    ///
+    /// Custom scorers may opt in only when their matching predicate is prefix-monotonic.
+    pub(crate) fn incremental_filter(mut self) -> Self {
+        self.incremental_filter = true;
         self
     }
 
     /// Sets an ascending secondary sort key for structured rows with equal filter scores.
     pub fn filter_tie_breaker(
         mut self,
-        tie_breaker: impl Fn(&PickerItem) -> usize + Send + 'static,
+        tie_breaker: impl Fn(&PickerItem) -> usize + Send + Sync + 'static,
     ) -> Self {
         self.filter_tie_breaker = Some(Box::new(tie_breaker));
         self
@@ -3743,6 +4331,7 @@ impl PickerBuilder {
         let id = self.id;
         let select_action = self.select_action;
         let filter_action = self.filter_action;
+        let incremental_filter = self.incremental_filter;
         let filter_tie_breaker = self.filter_tie_breaker;
         let filter_highlight_action = self.filter_highlight_action;
         let placeholder = self.placeholder;
@@ -3752,19 +4341,22 @@ impl PickerBuilder {
         let location_preview_contents = self.location_preview_contents;
         let content_sizing = self.content_sizing;
         let status_on_query_line = self.status_on_query_line;
+        let item_layout = self.item_layout;
 
         let mut picker = Picker::new(title, editor, &items, id);
         if let Some(structured_items) = structured_items {
             picker.visible_dynamic_items = (0..structured_items.len()).collect();
             picker.list.set_item_count(structured_items.len());
-            picker.dynamic_items = Some(structured_items);
+            picker.dynamic_items = Some(structured_items.into());
         }
         if let Some(select_action) = select_action {
             picker.select_action = Some(select_action);
         }
         picker.filter_action = filter_action;
+        picker.incremental_filter = incremental_filter;
         picker.filter_tie_breaker = filter_tie_breaker;
         picker.filter_highlight_action = filter_highlight_action;
+        picker.install_path_filter_highlights();
         picker.placeholder = placeholder;
         picker.status = status;
         picker.set_busy(busy);
@@ -3775,6 +4367,7 @@ impl PickerBuilder {
         picker.location_preview_overrides = location_preview_contents;
         picker.content_sizing = content_sizing;
         picker.status_on_query_line = status_on_query_line;
+        picker.item_layout = item_layout;
         picker.resize_to_viewport(editor.vwidth(), editor.vheight());
 
         picker
@@ -3871,6 +4464,26 @@ mod tests {
             detail_matches: vec![],
             preview: None,
         }
+    }
+
+    fn document_symbol_item(
+        id: &str,
+        parent_id: Option<&str>,
+        label: &str,
+        line: usize,
+        column: usize,
+    ) -> PickerItem {
+        let mut item = dynamic_item(id, label);
+        item.kind = Some("Function".to_string());
+        item.detail = Some(format!("{line}:{column}"));
+        item.data = json!({
+            "tree": true,
+            "symbol": {
+                "id": id,
+                "parent_id": parent_id,
+            }
+        });
+        item
     }
 
     #[test]
@@ -4063,29 +4676,40 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_j_moves_picker_selection_down() {
+    fn ctrl_j_and_ctrl_n_move_picker_selection_down() {
         let editor = test_editor();
-        let items = vec!["alpha".to_string(), "bravo".to_string()];
+        let items = vec![
+            "alpha".to_string(),
+            "bravo".to_string(),
+            "charlie".to_string(),
+        ];
         let mut picker = Picker::new(Some("Files".to_string()), &editor, &items, None);
 
         picker.handle_event(&key(KeyCode::Char('j'), KeyModifiers::CONTROL));
+        picker.handle_event(&key(KeyCode::Char('n'), KeyModifiers::CONTROL));
 
         assert_eq!(
             select(&mut picker),
             Some(KeyAction::Multiple(vec![
                 Action::CloseDialog,
-                Action::Picked("bravo".to_string(), None),
+                Action::Picked("charlie".to_string(), None),
             ]))
         );
     }
 
     #[test]
-    fn ctrl_k_moves_picker_selection_up() {
+    fn ctrl_k_and_ctrl_p_move_picker_selection_up() {
         let editor = test_editor();
-        let items = vec!["alpha".to_string(), "bravo".to_string()];
+        let items = vec![
+            "alpha".to_string(),
+            "bravo".to_string(),
+            "charlie".to_string(),
+        ];
         let mut picker = Picker::new(Some("Files".to_string()), &editor, &items, None);
 
         picker.handle_event(&key(KeyCode::Down, KeyModifiers::NONE));
+        picker.handle_event(&key(KeyCode::Down, KeyModifiers::NONE));
+        picker.handle_event(&key(KeyCode::Char('p'), KeyModifiers::CONTROL));
         picker.handle_event(&key(KeyCode::Char('k'), KeyModifiers::CONTROL));
 
         assert_eq!(
@@ -4205,18 +4829,24 @@ mod tests {
     }
 
     #[test]
-    fn plain_j_still_filters_picker_items() {
+    fn plain_j_n_p_still_filter_picker_items() {
         let editor = test_editor();
-        let items = vec!["kay".to_string(), "jay".to_string()];
+        let items = vec![
+            "kay".to_string(),
+            "jupiter".to_string(),
+            "juniper".to_string(),
+        ];
         let mut picker = Picker::new(Some("Files".to_string()), &editor, &items, None);
 
         picker.handle_event(&key(KeyCode::Char('j'), KeyModifiers::NONE));
+        picker.handle_event(&key(KeyCode::Char('n'), KeyModifiers::NONE));
+        picker.handle_event(&key(KeyCode::Char('p'), KeyModifiers::NONE));
 
         assert_eq!(
             select(&mut picker),
             Some(KeyAction::Multiple(vec![
                 Action::CloseDialog,
-                Action::Picked("jay".to_string(), None),
+                Action::Picked("juniper".to_string(), None),
             ]))
         );
     }
@@ -4291,6 +4921,50 @@ mod tests {
         assert!(render_row(&buffer, layout.query_y).contains("needle"));
         assert!(render_row(&buffer, layout.results.y).contains("alpha"));
         assert_eq!(picker.cursor_position().unwrap().1, layout.query_y);
+    }
+
+    #[test]
+    fn preview_shortcuts_toggle_layout_without_losing_picker_state() {
+        let editor = test_editor_with_theme_and_size(Theme::default(), 120, 24);
+        let first = dynamic_item("one", "result-one.rs");
+        let mut second = dynamic_item("two", "result-two.rs");
+        second.preview = Some(PickerPreview::Text {
+            text: "preview text".to_string(),
+            language: None,
+        });
+        let mut picker = Picker::new_dynamic(
+            Some("Files".to_string()),
+            &editor,
+            vec![first, second],
+            15,
+            PickerOptions {
+                initial_query: "result".to_string(),
+                initial_selection: Some("two".to_string()),
+                ..PickerOptions::default()
+            },
+        );
+        let split_width = picker.layout().results.width;
+        let full_width = picker.width;
+
+        for (event, preview_visible, result_width) in [
+            (
+                key(KeyCode::Char('p'), KeyModifiers::ALT),
+                false,
+                full_width,
+            ),
+            (key(KeyCode::F(4), KeyModifiers::NONE), true, split_width),
+        ] {
+            assert_eq!(
+                picker.handle_event(&event),
+                Some(KeyAction::Single(Action::Refresh))
+            );
+            let layout = picker.layout();
+            assert_eq!(layout.preview.is_some(), preview_visible);
+            assert_eq!(layout.results.width, result_width);
+            assert_eq!(picker.list_bounds, Some(layout.results));
+            assert_eq!(picker.search, "result");
+            assert_eq!(picker.selected_dynamic_item().unwrap().id, "two");
+        }
     }
 
     #[test]
@@ -4592,6 +5266,228 @@ mod tests {
     }
 
     #[test]
+    fn picker_builder_prioritizes_editor_owned_primary_labels() {
+        let editor = test_editor_with_theme_and_size(Theme::default(), 80, 24);
+        let label = "load_review_requested_pull_requests_for_scope";
+        let mut item = dynamic_item("symbol", label);
+        item.detail = Some("crates/editor/src/really/long/document.rs:174:10".into());
+        let picker = Picker::builder()
+            .title("Document Symbols")
+            .structured_items(vec![item])
+            .item_layout(super::PickerItemLayout::LabelFirst)
+            .build(&editor);
+        let mut buffer = RenderBuffer::new(80, 24, &Style::default());
+
+        picker.draw(&mut buffer).unwrap();
+
+        let row = render_row(&buffer, picker.layout().results.y);
+        assert!(row.contains(label), "{row:?}");
+    }
+
+    #[test]
+    fn document_symbol_picker_draws_tree_guides_and_aligns_numeric_positions() {
+        let editor = test_editor_with_theme_and_size(Theme::default(), 140, 24);
+        let picker = Picker::new_dynamic(
+            Some("Document Symbols".to_string()),
+            &editor,
+            vec![
+                document_symbol_item("outer", None, "outer", 7, 2),
+                document_symbol_item("first", Some("outer"), "first_child", 28, 21),
+                document_symbol_item("second", Some("outer"), "second_child", 109, 3),
+                document_symbol_item("tail", None, "tail", 150, 5),
+            ],
+            41,
+            PickerOptions {
+                item_layout: super::PickerItemLayout::LabelFirst,
+                ..PickerOptions::default()
+            },
+        );
+        let mut buffer = RenderBuffer::new(140, 24, &Style::default());
+        picker.draw(&mut buffer).unwrap();
+
+        let rect = picker.layout().results;
+        let rows = (0..4)
+            .map(|index| render_row(&buffer, rect.y + index))
+            .collect::<Vec<_>>();
+        assert!(rows[0].contains("├╴"), "{:?}", rows[0]);
+        assert!(rows[1].contains("│ ├╴"), "{:?}", rows[1]);
+        assert!(rows[2].contains("│ └╴"), "{:?}", rows[2]);
+        assert!(rows[3].contains("└╴"), "{:?}", rows[3]);
+        for (row, expected) in rows.iter().zip(["  7: 2", " 28:21", "109: 3", "150: 5"]) {
+            assert!(row.contains(expected), "{row:?}");
+            assert_eq!(display_column(row, ":"), display_column(&rows[0], ":"));
+        }
+        assert_eq!(
+            display_column(&rows[0], ":").unwrap() + 3,
+            rect.x + rect.width
+        );
+    }
+
+    #[test]
+    fn disabled_picker_tree_guides_keep_positions_aligned() {
+        let mut config = Config::default();
+        config.picker.tree_guides = false;
+        let editor = test_editor_with_config_and_size(config, Theme::default(), 100, 20);
+        let picker = Picker::new_dynamic(
+            Some("Document Symbols".to_string()),
+            &editor,
+            vec![
+                document_symbol_item("first", None, "first_symbol", 7, 2),
+                document_symbol_item("second", None, "second_symbol", 150, 21),
+            ],
+            42,
+            PickerOptions {
+                item_layout: super::PickerItemLayout::LabelFirst,
+                ..PickerOptions::default()
+            },
+        );
+        let mut buffer = RenderBuffer::new(100, 20, &Style::default());
+        picker.draw(&mut buffer).unwrap();
+
+        let rect = picker.layout().results;
+        let first = render_row(&buffer, rect.y);
+        let second = render_row(&buffer, rect.y + 1);
+        assert!(!first.contains('├') && !first.contains('└'), "{first:?}");
+        assert_eq!(
+            display_column(&first, "first_symbol"),
+            Some(rect.x + super::PICKER_ITEM_PREFIX_WIDTH)
+        );
+        assert!(first.contains("  7: 2"), "{first:?}");
+        assert!(second.contains("150:21"), "{second:?}");
+        assert_eq!(display_column(&first, ":"), display_column(&second, ":"));
+    }
+
+    #[test]
+    fn document_symbol_positions_stop_at_the_preview_divider() {
+        let editor = test_editor_with_theme_and_size(Theme::default(), 140, 24);
+        let mut first = document_symbol_item("first", None, "first_symbol", 7, 2);
+        first.preview = Some(PickerPreview::Text {
+            text: "preview source".to_string(),
+            language: None,
+        });
+        let picker = Picker::new_dynamic(
+            Some("Document Symbols".to_string()),
+            &editor,
+            vec![
+                first,
+                document_symbol_item("second", None, "second_symbol", 150, 21),
+            ],
+            45,
+            PickerOptions {
+                item_layout: super::PickerItemLayout::LabelFirst,
+                ..PickerOptions::default()
+            },
+        );
+        let mut buffer = RenderBuffer::new(140, 24, &Style::default());
+        picker.draw(&mut buffer).unwrap();
+
+        let rect = picker.layout().results;
+        let row = render_row(&buffer, rect.y);
+        assert!(row.contains("  7: 2│preview source"), "{row:?}");
+        assert_eq!(
+            buffer.cells[rect.y * buffer.width + rect.x + rect.width].c,
+            '│'
+        );
+    }
+
+    #[test]
+    fn document_symbol_tree_guides_preserve_names_in_narrow_viewports() {
+        let editor = test_editor_with_theme_and_size(Theme::default(), 34, 18);
+        let picker = Picker::new_dynamic(
+            Some("Document Symbols".to_string()),
+            &editor,
+            vec![document_symbol_item(
+                "first",
+                None,
+                "start_structured_turn",
+                125,
+                21,
+            )],
+            46,
+            PickerOptions {
+                item_layout: super::PickerItemLayout::LabelFirst,
+                ..PickerOptions::default()
+            },
+        );
+        let mut buffer = RenderBuffer::new(34, 18, &Style::default());
+        picker.draw(&mut buffer).unwrap();
+
+        let rect = picker.layout().results;
+        let row = render_row(&buffer, rect.y);
+        assert!(row.contains("└╴"), "{row:?}");
+        assert!(row.contains("start_structured_turn"), "{row:?}");
+        assert!(!row.contains("125:21"), "{row:?}");
+        assert_eq!(
+            buffer.cells[rect.y * buffer.width + rect.x + rect.width].c,
+            '│'
+        );
+    }
+
+    #[test]
+    fn document_symbol_tree_guides_update_with_batched_items() {
+        let editor = test_editor_with_theme_and_size(Theme::default(), 100, 20);
+        let mut picker = Picker::new_dynamic(
+            Some("Document Symbols".to_string()),
+            &editor,
+            vec![document_symbol_item("first", None, "first_symbol", 7, 2)],
+            43,
+            PickerOptions {
+                item_layout: super::PickerItemLayout::LabelFirst,
+                ..PickerOptions::default()
+            },
+        );
+        let mut buffer = RenderBuffer::new(100, 20, &Style::default());
+        picker.draw(&mut buffer).unwrap();
+        assert!(render_row(&buffer, picker.layout().results.y).contains("└╴"));
+
+        assert!(picker.apply_update(
+            43,
+            PickerUpdate::Items(vec![
+                document_symbol_item("first", None, "first_symbol", 7, 2),
+                document_symbol_item("second", None, "second_symbol", 150, 21),
+            ]),
+        ));
+        let mut updated = RenderBuffer::new(100, 20, &Style::default());
+        picker.draw(&mut updated).unwrap();
+        let rect = picker.layout().results;
+        assert!(render_row(&updated, rect.y).contains("├╴"));
+        assert!(render_row(&updated, rect.y + 1).contains("└╴"));
+
+        picker.filter("second");
+        let mut filtered = RenderBuffer::new(100, 20, &Style::default());
+        picker.draw(&mut filtered).unwrap();
+        let row = render_row(&filtered, picker.layout().results.y);
+        assert!(row.contains("└╴"), "{row:?}");
+        assert!(row.contains("150:21"), "{row:?}");
+    }
+
+    #[test]
+    fn document_symbol_tree_guides_use_ascii_fallback() {
+        let mut config = Config::default();
+        config.picker.icons.style = PickerIconStyle::Ascii;
+        let editor = test_editor_with_config_and_size(config, Theme::default(), 100, 20);
+        let picker = Picker::new_dynamic(
+            Some("Document Symbols".to_string()),
+            &editor,
+            vec![
+                document_symbol_item("first", None, "first_symbol", 7, 2),
+                document_symbol_item("second", None, "second_symbol", 150, 21),
+            ],
+            44,
+            PickerOptions {
+                item_layout: super::PickerItemLayout::LabelFirst,
+                ..PickerOptions::default()
+            },
+        );
+        let mut buffer = RenderBuffer::new(100, 20, &Style::default());
+        picker.draw(&mut buffer).unwrap();
+
+        let rect = picker.layout().results;
+        assert!(render_row(&buffer, rect.y).contains("|-"));
+        assert!(render_row(&buffer, rect.y + 1).contains("`-"));
+    }
+
+    #[test]
     fn label_first_picker_keeps_model_names_and_aligns_secondary_columns() {
         let editor = test_editor_with_theme_and_size(Theme::default(), 120, 30);
         let labels = ["GPT-5.6-Sol-OAI", "GPT-5.6-Sol", "漢字 model"];
@@ -4762,7 +5658,9 @@ mod tests {
             .results
             .width
             .saturating_sub(super::PICKER_ITEM_PREFIX_WIDTH);
+        assert!(picker.label_first_column_widths.get().is_none());
         let columns = picker.label_first_columns(picker.dynamic_items.as_ref().unwrap(), width);
+        assert!(picker.label_first_column_widths.get().is_some());
         picker.list.set_selected_index(20);
         assert_eq!(
             columns,
@@ -4773,6 +5671,7 @@ mod tests {
             display_width("Longest model on the next page")
         );
         picker.filter("Model 1");
+        assert!(picker.label_first_column_widths.get().is_none());
         assert!(
             picker
                 .label_first_columns(picker.dynamic_items.as_ref().unwrap(), width)
@@ -5138,6 +6037,35 @@ mod tests {
     }
 
     #[test]
+    fn callback_picker_location_preview_uses_an_open_buffer_snapshot() {
+        let editor = test_editor();
+        let path = "/tmp/red-callback-unsaved-preview.rs".to_string();
+        let mut item = dynamic_item(&path, "unsaved.rs");
+        item.kind = Some("FilePath".to_string());
+        item.preview = Some(PickerPreview::Location {
+            path: path.clone(),
+            line: Some(0),
+            column: Some(0),
+            matches: Vec::new(),
+        });
+        let mut picker = Picker::new_callback(
+            Some("Buffers".to_string()),
+            &editor,
+            vec![item],
+            PickerHandle::from_raw(49),
+            PickerOptions::default(),
+        );
+        picker.set_location_preview_contents(HashMap::from([(
+            path.clone(),
+            Rope::from_str("let unsaved = true;\n"),
+        )]));
+
+        let preview = picker.location_preview(&path, Some(0), 0, 10);
+
+        assert_eq!(preview.text.as_ref(), "let unsaved = true;\n");
+    }
+
+    #[test]
     fn unsaved_buffer_snapshot_keeps_large_location_preview_bounded() {
         const FOCUS_LINE: usize = 4_000;
 
@@ -5365,6 +6293,29 @@ mod tests {
                 g: 165,
                 b: 132,
             })
+        );
+    }
+
+    #[test]
+    fn file_rows_with_stable_ids_use_the_path_for_their_icon() {
+        let editor = test_editor();
+        let mut item = dynamic_item("buffer:41", "main.rs");
+        item.kind = Some("FilePath".to_string());
+        item.data = json!({
+            "path": "/workspace/src/main.rs",
+            "search_path": "src/main.rs",
+        });
+        let picker = Picker::new_dynamic(
+            Some("Buffers".to_string()),
+            &editor,
+            vec![item.clone()],
+            41,
+            PickerOptions::default(),
+        );
+
+        assert_eq!(
+            picker.item_icon(&item),
+            picker_file_icon("/workspace/src/main.rs", editor.picker_icons().style)
         );
     }
 
@@ -5636,6 +6587,34 @@ mod tests {
         assert!(!Arc::ptr_eq(&first, &evicted));
 
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn moderately_large_location_previews_only_read_visible_rows() {
+        let editor = test_editor();
+        let picker = Picker::new(/*title*/ None, &editor, &[], /*id*/ None);
+        let path = std::env::temp_dir().join(format!(
+            "red-picker-visible-preview-{}.rs",
+            uuid::Uuid::new_v4()
+        ));
+        let contents = (0..1_024)
+            .map(|line| format!("let value_{line:04} = \"{}\";\n", "x".repeat(32)))
+            .collect::<String>();
+        assert!(contents.len() > super::MAX_COMPLETE_LOCATION_PREVIEW_BYTES as usize);
+        assert!(contents.len() < super::MAX_UNFOCUSED_PREVIEW_BYTES as usize);
+        std::fs::write(&path, contents).unwrap();
+
+        let preview = picker.location_preview(
+            &path.to_string_lossy(),
+            /*focus_line*/ None,
+            /*preview_scroll*/ 0,
+            /*preview_height*/ 8,
+        );
+
+        assert!(!preview.complete);
+        assert_eq!(preview.text.lines().count(), 8);
+        assert!(preview.text.starts_with("let value_0000"));
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
@@ -5964,12 +6943,47 @@ mod tests {
         };
         let lines = super::preview_lines(&text, /*start_line*/ 0, /*max_lines*/ 1);
 
-        let spans = picker.preview_highlight_spans(&preview, &text, &lines);
+        let spans = picker.preview_highlight_spans(&preview, &text, &lines, true);
 
         assert!(!spans.is_empty());
         assert!(spans
             .iter()
             .all(|span| span.end <= super::MAX_PREVIEW_HIGHLIGHT_BYTES));
+    }
+
+    #[test]
+    fn shebang_preview_uses_document_prefix_and_invalidates_cached_language() {
+        let mut theme = Theme::default();
+        theme.token_styles.push(TokenStyle {
+            name: Some("keyword".into()),
+            scope: vec!["keyword".into()],
+            style: Style {
+                bold: true,
+                ..Style::default()
+            },
+        });
+        let editor = test_editor_with_theme_and_size(theme, 120, 24);
+        let picker = Picker::new(None, &editor, &[], None);
+        let preview = PickerPreview::Location {
+            path: "script".into(),
+            line: None,
+            column: None,
+            matches: vec![],
+        };
+        let text = "#!/bin/bash\nif true; then echo hi; fi\n";
+        let lines = super::preview_lines(text, 1, 1);
+        assert!(!picker
+            .preview_highlight_spans(&preview, text, &lines, true)
+            .is_empty());
+        let changed = text.replacen("#!/bin/bash", "# plain txt", 1);
+        let lines = super::preview_lines(&changed, 1, 1);
+        assert!(picker
+            .preview_highlight_spans(&preview, &changed, &lines, true)
+            .is_empty());
+        let lines = super::preview_lines(text, 0, 2);
+        assert!(picker
+            .preview_highlight_spans(&preview, text, &lines, false)
+            .is_empty());
     }
 
     #[test]
@@ -5992,12 +7006,55 @@ mod tests {
         };
         let lines = super::preview_lines(text, /*start_line*/ 1, /*max_lines*/ 1);
 
-        let spans = picker.preview_highlight_spans(&preview, text, &lines);
+        let spans = picker.preview_highlight_spans(&preview, text, &lines, true);
 
         let keyword_start = text.find("let").unwrap();
         assert!(spans
             .iter()
             .any(|span| span.start == keyword_start && span.end == keyword_start + "let".len()));
+    }
+
+    #[test]
+    fn preview_syntax_cache_reuses_exact_source_and_invalidates_on_changes() {
+        let mut theme = Theme::default();
+        theme.token_styles.push(TokenStyle {
+            name: Some("keyword".to_string()),
+            scope: vec!["keyword".to_string()],
+            style: Style {
+                bold: true,
+                ..Style::default()
+            },
+        });
+        let editor = test_editor_with_theme_and_size(theme.clone(), 120, 24);
+        let mut picker = Picker::new(/*title*/ None, &editor, &[], /*id*/ None);
+        let text = "let first = true;\n";
+        let preview = PickerPreview::Text {
+            text: text.to_string(),
+            language: Some("rust".to_string()),
+        };
+        let lines = super::preview_lines(text, /*start_line*/ 0, /*max_lines*/ 1);
+
+        let first = picker.preview_highlight_spans(&preview, text, &lines, true);
+        let repeated = picker.preview_highlight_spans(&preview, text, &lines, true);
+        assert!(!first.is_empty());
+        assert!(Arc::ptr_eq(&first, &repeated));
+
+        let updated = "fn second() {}\n";
+        let updated_preview = PickerPreview::Text {
+            text: updated.to_string(),
+            language: Some("rust".to_string()),
+        };
+        let updated_lines =
+            super::preview_lines(updated, /*start_line*/ 0, /*max_lines*/ 1);
+        let changed =
+            picker.preview_highlight_spans(&updated_preview, updated, &updated_lines, true);
+        assert!(!Arc::ptr_eq(&first, &changed));
+
+        picker.apply_theme(&theme);
+        assert!(picker.preview_highlight_cache.borrow().is_none());
+        let rethemed =
+            picker.preview_highlight_spans(&updated_preview, updated, &updated_lines, true);
+        assert!(!Arc::ptr_eq(&changed, &rethemed));
     }
 
     #[test]
@@ -6327,6 +7384,43 @@ mod tests {
     }
 
     #[test]
+    fn callback_picker_filters_and_ranks_locally_while_emitting_queries() {
+        let editor = test_editor();
+        let handle = PickerHandle::from_raw(12);
+        let items = vec![
+            dynamic_item("scattered", "EventProcessorWithHumanOutput"),
+            dynamic_item("embedded", "ApprovalPromptContext"),
+            dynamic_item("unrelated", "WorkspaceSymbol"),
+            dynamic_item("exact", "Prompt"),
+        ];
+        let mut picker = Picker::new_callback(
+            /*title*/ Some("Workspace Symbols".to_string()),
+            &editor,
+            items,
+            handle,
+            PickerOptions::default(),
+        );
+
+        let mut action = None;
+        for character in "Prompt".chars() {
+            action = picker.handle_event(&key(KeyCode::Char(character), KeyModifiers::NONE));
+        }
+
+        assert_eq!(
+            action,
+            Some(KeyAction::Single(Action::NotifyPicker(
+                handle,
+                Box::new(PickerCallback::Query("Prompt".to_string())),
+            )))
+        );
+        let labels = visible_picker_labels(&picker);
+        assert_eq!(labels.first(), Some(&"Prompt"));
+        assert!(labels.contains(&"ApprovalPromptContext"));
+        assert!(labels.contains(&"EventProcessorWithHumanOutput"));
+        assert!(!labels.contains(&"WorkspaceSymbol"));
+    }
+
+    #[test]
     fn replacing_dynamic_items_preserves_selection_by_id() {
         let editor = test_editor();
         let items = vec![dynamic_item("a", "alpha"), dynamic_item("b", "bravo")];
@@ -6496,6 +7590,76 @@ mod tests {
         assert!(picker.list.items().is_empty());
     }
 
+    #[test]
+    fn structured_picker_refinement_restores_candidates_when_the_query_broadens() {
+        let editor = test_editor();
+        let mut picker = Picker::new_dynamic(
+            /*title*/ None,
+            &editor,
+            vec![
+                dynamic_item("needle", "needle"),
+                dynamic_item("nearby", "nearby"),
+                dynamic_item("other", "other"),
+            ],
+            /*id*/ 26,
+            PickerOptions::default(),
+        );
+
+        picker.filter("ne");
+        assert_eq!(visible_picker_labels(&picker), ["needle", "nearby"]);
+        picker.filter("need");
+        assert_eq!(visible_picker_labels(&picker), ["needle"]);
+        picker.filter("ne");
+        assert_eq!(visible_picker_labels(&picker), ["needle", "nearby"]);
+        picker.filter("");
+        assert_eq!(
+            visible_picker_labels(&picker),
+            ["needle", "nearby", "other"]
+        );
+    }
+
+    #[test]
+    fn custom_picker_filters_can_add_matches_when_a_query_is_extended() {
+        let editor = test_editor();
+        let mut picker = Picker::builder()
+            .structured_items(vec![
+                dynamic_item("first", "first"),
+                dynamic_item("second", "second"),
+            ])
+            .filter_action(|item, query| match (item.id.as_str(), query) {
+                ("first", "n") | ("second", "ne") => Some(10),
+                _ => None,
+            })
+            .build(&editor);
+
+        picker.filter("n");
+        assert_eq!(visible_picker_labels(&picker), ["first"]);
+        picker.filter("ne");
+        assert_eq!(visible_picker_labels(&picker), ["second"]);
+    }
+
+    #[test]
+    fn replacing_picker_items_invalidates_previous_refinement_candidates() {
+        let editor = test_editor();
+        let mut picker = Picker::new_dynamic(
+            /*title*/ None,
+            &editor,
+            vec![dynamic_item("old", "needle")],
+            /*id*/ 27,
+            PickerOptions::default(),
+        );
+
+        picker.filter("ne");
+        picker.filter("need");
+        picker.replace_structured_items(vec![
+            dynamic_item("other", "other"),
+            dynamic_item("new", "needlework"),
+        ]);
+        picker.filter("needle");
+
+        assert_eq!(visible_picker_labels(&picker), ["needlework"]);
+    }
+
     fn visible_picker_labels(picker: &Picker) -> Vec<&str> {
         match &picker.dynamic_items {
             Some(items) => picker
@@ -6505,6 +7669,108 @@ mod tests {
                 .collect(),
             None => picker.list.items().iter().map(String::as_str).collect(),
         }
+    }
+
+    #[test]
+    fn dynamic_file_rows_search_and_highlight_their_workspace_relative_parent() {
+        let editor = test_editor();
+        let mut first = dynamic_item("buffer:41", "main.rs");
+        first.kind = Some("FilePath".to_string());
+        first.annotation = Some("src/editor".to_string());
+        first.data = json!({
+            "path": "/workspace/src/editor/main.rs",
+            "search_path": "src/editor/main.rs",
+        });
+        let mut second = dynamic_item("buffer:42", "main.rs");
+        second.kind = Some("FilePath".to_string());
+        second.annotation = Some("docs".to_string());
+        second.data = json!({
+            "path": "/workspace/docs/main.rs",
+            "search_path": "docs/main.rs",
+        });
+        let mut scratch = dynamic_item("buffer:9", "[No Name]");
+        scratch.kind = Some("Buffer".to_string());
+        let mut picker = Picker::new_dynamic(
+            Some("Buffers".to_string()),
+            &editor,
+            vec![first, second, scratch],
+            12,
+            PickerOptions::default(),
+        );
+
+        picker.filter("editor");
+
+        assert_eq!(visible_picker_labels(&picker), ["main.rs"]);
+        let selected = picker.selected_dynamic_item().unwrap();
+        let highlights = picker.filter_highlight_action.as_ref().unwrap()(selected, "editor");
+        assert!(highlights.label.is_empty());
+        assert!(!highlights.annotation.is_empty());
+
+        picker.filter("docs/main");
+        assert_eq!(visible_picker_labels(&picker), ["main.rs"]);
+        assert_eq!(picker.selected_dynamic_item().unwrap().id, "buffer:42");
+
+        picker.filter("no name");
+        assert_eq!(visible_picker_labels(&picker), ["[No Name]"]);
+    }
+
+    #[test]
+    fn named_path_rows_preserve_parent_and_position_search() {
+        let editor = test_editor();
+        let mut reference = dynamic_item("reference", "main.rs:5:4");
+        reference.kind = Some("Reference".to_string());
+        reference.annotation = Some("src/editor".to_string());
+        reference.data = json!({ "search_path": "src/editor/main.rs:5:4" });
+        let mut worktree = dynamic_item("worktree", "red.feature");
+        worktree.kind = Some("GitWorktree".to_string());
+        worktree.annotation = Some("/workspace/code".to_string());
+        worktree.data = json!({ "search_path": "/workspace/code/red.feature" });
+        let mut picker = Picker::new_dynamic(
+            Some("Locations".to_string()),
+            &editor,
+            vec![reference, worktree],
+            31,
+            PickerOptions {
+                item_layout: super::PickerItemLayout::LabelFirst,
+                ..PickerOptions::default()
+            },
+        );
+
+        picker.filter("editor/main");
+        assert_eq!(visible_picker_labels(&picker), ["main.rs:5:4"]);
+        let selected = picker.selected_dynamic_item().unwrap();
+        let highlights = picker.filter_highlight_action.as_ref().unwrap()(selected, "editor");
+        assert!(!highlights.annotation.is_empty());
+
+        picker.filter(":5:4");
+        assert_eq!(visible_picker_labels(&picker), ["main.rs:5:4"]);
+
+        picker.filter("code/red.feature");
+        assert_eq!(visible_picker_labels(&picker), ["red.feature"]);
+    }
+
+    #[test]
+    fn async_named_path_rows_install_parent_highlights() {
+        let editor = test_editor();
+        let mut picker = Picker::new_dynamic(
+            Some("References".to_string()),
+            &editor,
+            vec![],
+            32,
+            PickerOptions::default(),
+        );
+        assert!(picker.filter_highlight_action.is_none());
+        let mut reference = dynamic_item("reference", "main.rs:5:4");
+        reference.kind = Some("Reference".to_string());
+        reference.annotation = Some("src/editor".to_string());
+        reference.data = json!({ "search_path": "src/editor/main.rs:5:4" });
+
+        assert!(picker.apply_update(32, PickerUpdate::Items(vec![reference])));
+        picker.filter("editor");
+
+        let selected = picker.selected_dynamic_item().unwrap();
+        let highlights = picker.filter_highlight_action.as_ref().unwrap()(selected, "editor");
+        assert!(!highlights.annotation.is_empty());
     }
 
     #[test]
@@ -6558,6 +7824,55 @@ mod tests {
                 &["DrawTail", "Draw", "draw"],
                 &["DrawTail", "Draw", "draw"],
             ),
+            (
+                "recap",
+                &[
+                    "/workspace/codex.fcoury-recap/src/lib.rs",
+                    "/workspace/codex.fcoury-recap/src/thread_recap.rs",
+                    "/workspace/codex.fcoury-recap/src/recap.rs",
+                    "/workspace/codex.fcoury-recap/src/app.rs",
+                ],
+                &[
+                    "/workspace/codex.fcoury-recap/src/recap.rs",
+                    "/workspace/codex.fcoury-recap/src/thread_recap.rs",
+                    "/workspace/codex.fcoury-recap/src/lib.rs",
+                    "/workspace/codex.fcoury-recap/src/app.rs",
+                ],
+            ),
+            (
+                "recap",
+                &[
+                    r"C:\workspace\codex.fcoury-recap\src\lib.rs",
+                    r"C:\workspace\codex.fcoury-recap\src\thread_recap.rs",
+                    r"C:\workspace\codex.fcoury-recap\src\recap.rs",
+                ],
+                &[
+                    r"C:\workspace\codex.fcoury-recap\src\recap.rs",
+                    r"C:\workspace\codex.fcoury-recap\src\thread_recap.rs",
+                    r"C:\workspace\codex.fcoury-recap\src\lib.rs",
+                ],
+            ),
+            (
+                "routing",
+                &[
+                    "/workspace/routing/src/lib.rs",
+                    "/workspace/other/src/app.rs",
+                ],
+                &["/workspace/routing/src/lib.rs"],
+            ),
+            (
+                "src/recap",
+                &["/workspace/lib/recap.rs", "/workspace/src/recap.rs"],
+                &["/workspace/src/recap.rs"],
+            ),
+            (
+                "Recap",
+                &[
+                    "/workspace/recap/src/recap.rs",
+                    "/workspace/recap/src/Recap.rs",
+                ],
+                &["/workspace/recap/src/Recap.rs"],
+            ),
         ];
 
         for &(query, labels, expected) in cases {
@@ -6584,6 +7899,235 @@ mod tests {
                 assert_eq!(visible_picker_labels(picker), labels);
             }
         }
+    }
+
+    #[test]
+    fn incremental_picker_filter_only_scores_previous_matches() {
+        let editor = test_editor();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let filter_calls = Arc::clone(&calls);
+        let mut picker = Picker::builder()
+            .structured_items(vec![
+                dynamic_item("alpha", "alpha"),
+                dynamic_item("alpine", "alpine"),
+                dynamic_item("beta", "beta"),
+                dynamic_item("alphabet", "alphabet"),
+            ])
+            .filter_action(move |item, query| {
+                filter_calls.fetch_add(1, Ordering::Relaxed);
+                item.label.contains(query).then_some(1)
+            })
+            .incremental_filter()
+            .build(&editor);
+
+        picker.filter("al");
+        assert_eq!(calls.swap(0, Ordering::Relaxed), 4);
+        assert_eq!(
+            visible_picker_labels(&picker),
+            ["alpha", "alpine", "alphabet"]
+        );
+
+        picker.filter("alp");
+        assert_eq!(calls.swap(0, Ordering::Relaxed), 3);
+        assert_eq!(
+            visible_picker_labels(&picker),
+            ["alpha", "alpine", "alphabet"]
+        );
+
+        picker.filter("alph");
+        assert_eq!(calls.swap(0, Ordering::Relaxed), 3);
+        assert_eq!(visible_picker_labels(&picker), ["alpha", "alphabet"]);
+
+        picker.filter("alpha");
+        assert_eq!(calls.swap(0, Ordering::Relaxed), 2);
+        assert_eq!(visible_picker_labels(&picker), ["alpha", "alphabet"]);
+    }
+
+    #[test]
+    fn incremental_picker_reuses_recent_exact_queries_without_rescoring() {
+        let editor = test_editor();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let filter_calls = Arc::clone(&calls);
+        let mut picker = Picker::builder()
+            .structured_items(vec![
+                dynamic_item("alpha", "alpha"),
+                dynamic_item("alpine", "alpine"),
+                dynamic_item("beta", "beta"),
+            ])
+            .filter_action(move |item, query| {
+                filter_calls.fetch_add(1, Ordering::Relaxed);
+                item.label.contains(query).then_some(1)
+            })
+            .incremental_filter()
+            .build(&editor);
+
+        picker.filter("al");
+        picker.filter("alp");
+        calls.store(0, Ordering::Relaxed);
+
+        picker.filter("al");
+        assert_eq!(calls.swap(0, Ordering::Relaxed), 0);
+        assert_eq!(visible_picker_labels(&picker), ["alpha", "alpine"]);
+
+        picker.filter("alp");
+        assert_eq!(calls.swap(0, Ordering::Relaxed), 0);
+        assert_eq!(visible_picker_labels(&picker), ["alpha", "alpine"]);
+    }
+
+    #[test]
+    fn incremental_picker_history_is_bounded_and_invalidated_by_new_items() {
+        let editor = test_editor();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let filter_calls = Arc::clone(&calls);
+        let mut picker = Picker::builder()
+            .structured_items(vec![
+                dynamic_item("alpha", "alpha"),
+                dynamic_item("beta", "beta"),
+            ])
+            .filter_action(move |item, query| {
+                filter_calls.fetch_add(1, Ordering::Relaxed);
+                item.label.contains(query).then_some(1)
+            })
+            .incremental_filter()
+            .build(&editor);
+
+        for index in 0..super::MAX_FILTER_HISTORY_ENTRIES + 3 {
+            picker.set_search(format!("missing{index}"));
+        }
+        assert_eq!(
+            picker.filtered_history.len(),
+            super::MAX_FILTER_HISTORY_ENTRIES
+        );
+
+        picker.set_search("al".to_string());
+        picker.set_search("be".to_string());
+        calls.store(0, Ordering::Relaxed);
+        picker.replace_structured_items(vec![
+            dynamic_item("alpine", "alpine"),
+            dynamic_item("berry", "berry"),
+        ]);
+        assert_eq!(calls.swap(0, Ordering::Relaxed), 2);
+        assert_eq!(visible_picker_labels(&picker), ["berry"]);
+
+        picker.set_search("al".to_string());
+        assert_eq!(calls.swap(0, Ordering::Relaxed), 2);
+        assert_eq!(visible_picker_labels(&picker), ["alpine"]);
+    }
+
+    #[test]
+    fn incremental_picker_does_not_retain_oversized_prior_result_sets() {
+        let editor = test_editor();
+        let item_count = super::MAX_FILTER_HISTORY_ITEMS_PER_ENTRY + 1;
+        let items = (0..item_count)
+            .map(|index| dynamic_item(&format!("item-{index}"), "alpha"))
+            .collect();
+        let mut picker = Picker::builder()
+            .structured_items(items)
+            .filter_action(|item, query| item.label.contains(query).then_some(1))
+            .incremental_filter()
+            .build(&editor);
+
+        picker.filter("a");
+        assert_eq!(picker.visible_dynamic_items.len(), item_count);
+        picker.filter("al");
+
+        assert!(picker
+            .filtered_history
+            .iter()
+            .all(|(query, _)| query != "a"));
+    }
+
+    #[test]
+    fn incremental_picker_parallel_filter_preserves_stable_order_and_narrowing() {
+        let editor = test_editor();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let filter_calls = Arc::clone(&calls);
+        let item_count = super::PARALLEL_FILTER_MIN_ITEMS * 3;
+        let items = (0..item_count)
+            .map(|index| {
+                let label = if index % 2 == 0 { "alpha" } else { "beta" };
+                dynamic_item(&format!("item-{index:04}"), label)
+            })
+            .collect();
+        let mut picker = Picker::builder()
+            .structured_items(items)
+            .filter_action(move |item, query| {
+                filter_calls.fetch_add(1, Ordering::Relaxed);
+                item.label.contains(query).then_some(1)
+            })
+            .incremental_filter()
+            .build(&editor);
+
+        picker.filter("a");
+        assert_eq!(calls.swap(0, Ordering::Relaxed), item_count);
+
+        picker.filter("al");
+        assert_eq!(calls.swap(0, Ordering::Relaxed), item_count);
+        assert_eq!(
+            picker.visible_dynamic_items,
+            (0..item_count).step_by(2).collect::<Vec<_>>(),
+        );
+
+        picker.filter("alp");
+        assert_eq!(calls.swap(0, Ordering::Relaxed), item_count / 2);
+    }
+
+    #[test]
+    fn incremental_picker_filter_rescores_all_rows_when_the_query_broadens() {
+        let editor = test_editor();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let filter_calls = Arc::clone(&calls);
+        let mut picker = Picker::builder()
+            .structured_items(vec![
+                dynamic_item("alpha", "alpha"),
+                dynamic_item("alpine", "alpine"),
+                dynamic_item("beta", "beta"),
+            ])
+            .filter_action(move |item, query| {
+                filter_calls.fetch_add(1, Ordering::Relaxed);
+                item.label.contains(query).then_some(1)
+            })
+            .incremental_filter()
+            .build(&editor);
+
+        picker.filter("alp");
+        calls.store(0, Ordering::Relaxed);
+
+        picker.filter("a");
+        assert_eq!(calls.swap(0, Ordering::Relaxed), 3);
+        assert_eq!(visible_picker_labels(&picker), ["alpha", "alpine", "beta"]);
+
+        picker.filter("be");
+        assert_eq!(calls.swap(0, Ordering::Relaxed), 3);
+        assert_eq!(visible_picker_labels(&picker), ["beta"]);
+    }
+
+    #[test]
+    fn incremental_picker_filter_includes_new_rows_after_items_are_replaced() {
+        let editor = test_editor();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let filter_calls = Arc::clone(&calls);
+        let mut picker = Picker::builder()
+            .structured_items(vec![
+                dynamic_item("alpha", "alpha"),
+                dynamic_item("beta", "beta"),
+            ])
+            .filter_action(move |item, query| {
+                filter_calls.fetch_add(1, Ordering::Relaxed);
+                item.label.contains(query).then_some(1)
+            })
+            .incremental_filter()
+            .build(&editor);
+        picker.set_search("al".to_string());
+        calls.store(0, Ordering::Relaxed);
+
+        picker.replace_structured_items(vec![
+            dynamic_item("alpine", "alpine"),
+            dynamic_item("beta", "beta"),
+        ]);
+
+        assert_eq!(calls.swap(0, Ordering::Relaxed), 2);
+        assert_eq!(visible_picker_labels(&picker), ["alpine"]);
     }
 
     #[test]
@@ -6781,23 +8325,34 @@ mod tests {
         let editor = test_editor();
         let items = vec![dynamic_item("a", "alpha")];
         let options: PickerOptions = serde_json::from_value(json!({
-            "actions": [{ "key": "c-o", "id": "openSplit" }]
+            "actions": [
+                { "key": "Alt-p / F4", "id": "openSplit" },
+                { "key": "c-n", "id": "openSplit" },
+                { "key": "c-p", "id": "openSplit" }
+            ]
         }))
         .unwrap();
         let mut picker =
             Picker::new_dynamic(/*title*/ None, &editor, items, /*id*/ 13, options);
 
-        assert_eq!(
-            picker.handle_event(&key(KeyCode::Char('o'), KeyModifiers::CONTROL)),
-            Some(KeyAction::Single(Action::NotifyPlugins(
-                "picker:action:13".to_string(),
-                json!({
-                    "action": "openSplit",
-                    "item": dynamic_item("a", "alpha"),
-                    "query": "",
-                }),
-            )))
-        );
+        for event in [
+            key(KeyCode::Char('p'), KeyModifiers::ALT),
+            key(KeyCode::F(4), KeyModifiers::NONE),
+            key(KeyCode::Char('n'), KeyModifiers::CONTROL),
+            key(KeyCode::Char('p'), KeyModifiers::CONTROL),
+        ] {
+            assert_eq!(
+                picker.handle_event(&event),
+                Some(KeyAction::Single(Action::NotifyPlugins(
+                    "picker:action:13".to_string(),
+                    json!({
+                        "action": "openSplit",
+                        "item": dynamic_item("a", "alpha"),
+                        "query": "",
+                    }),
+                )))
+            );
+        }
     }
 
     #[test]

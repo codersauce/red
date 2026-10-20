@@ -52,3 +52,5 @@ The Git plugin uses this richer path for pushes. It first spawns bounded preview
 ## Relationship To The Host API
 
 Callback-scoped dialogs sit inside the broader [Red host API](../../architecture/plugins/red-host-api). The host API schema records `OpenPicker` and `OpenComposer` as host API `0.3.0` calls, `OpenInput` and the original `OpenConfirm` as `0.4.0` calls, and `OpenConfirm.options` as a `0.9.0` addition [@api-doc]. The lifecycle registry adds failure isolation around callback delivery: if a picker, composer, or request callback fails, the registry logs the failure, quarantines the owning plugin, and treats the consumed terminal callback or request as resolved so it is not replayed [@runtime].
+
+Use [UI Components](../../reference/editor/ui-components) for the shared modal component methods, cursor placement, and sensitive-input behavior that render these dialogs. Use [Plugin Resource Ownership](../../architecture/plugins/resource-ownership) for the lifecycle of the editor-owned handles and resources that callback-scoped dialogs join.

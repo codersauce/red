@@ -473,14 +473,16 @@ impl InlineHistory {
     pub fn turn(&self, request: &str) -> Option<&InlineHistoryTurn> {
         self.conversations
             .iter()
-            .flat_map(|conversation| &conversation.turns)
+            .rev()
+            .flat_map(|conversation| conversation.turns.iter().rev())
             .find(|turn| turn.request_id == request)
     }
 
     pub fn turn_mut(&mut self, request: &str) -> Option<&mut InlineHistoryTurn> {
         self.conversations
             .iter_mut()
-            .flat_map(|conversation| &mut conversation.turns)
+            .rev()
+            .flat_map(|conversation| conversation.turns.iter_mut().rev())
             .find(|turn| turn.request_id == request)
     }
 
@@ -650,5 +652,53 @@ mod tests {
             .insert("large".into(), "x".repeat(MAX_HISTORY_BYTES));
         assert!(history.check_capacity("question", "code").is_err());
         assert_eq!(history.sources["large"].len(), MAX_HISTORY_BYTES);
+    }
+
+    #[test]
+    fn newest_first_turn_lookup_preserves_history_and_answer_sanitization() {
+        let range = TextRange::insertion(Default::default());
+        let turn = |request: &str| {
+            InlineHistoryTurn::new(
+                request.to_string(),
+                "Explain this".to_string(),
+                "source".to_string(),
+                InlineLocation {
+                    file: "src/main.rs".to_string(),
+                    range,
+                    start_char: 0,
+                    end_char: 0,
+                    detached: false,
+                    context_before: String::new(),
+                    context_after: String::new(),
+                    buffer_id: None,
+                },
+            )
+        };
+        let conversation = |id: &str, turns| InlineConversation {
+            id: id.to_string(),
+            cwd: "/workspace".to_string(),
+            file: "src/main.rs".to_string(),
+            turns,
+            resolved: false,
+            visible_request: None,
+        };
+        let mut history = InlineHistory {
+            conversations: vec![
+                conversation("first", vec![turn("oldest"), turn("older-followup")]),
+                conversation("latest", vec![turn("newest")]),
+            ],
+            sources: Default::default(),
+        };
+
+        history.append_answer("newest", "safe\u{202e}\u{7}\nanswer");
+        history.append_answer("oldest", "historical");
+        history.finish("older-followup", InlineTurnState::Completed, None);
+
+        assert_eq!(history.turn("newest").unwrap().answer, "safe\nanswer");
+        assert_eq!(history.turn("oldest").unwrap().answer, "historical");
+        assert_eq!(
+            history.turn("older-followup").unwrap().state,
+            InlineTurnState::Completed
+        );
     }
 }

@@ -4,7 +4,11 @@ use std::path::PathBuf;
 
 use serde::Serialize;
 
-use crate::{codex, config::Config};
+use crate::{
+    cli_style::{paint, BOLD_GREEN, BOLD_RED, DIM, GREEN, YELLOW},
+    codex,
+    config::Config,
+};
 
 /// Minimum Codex CLI version tested with Red's dynamic-tool app-server contract.
 pub const MINIMUM_CODEX_VERSION: &str = "0.144.1";
@@ -34,31 +38,49 @@ impl AgentCheckReport {
     #[must_use]
     /// Formats a stable multiline report for terminal output.
     pub fn format(&self) -> String {
+        self.render(false)
+    }
+
+    #[must_use]
+    /// Formats the report, dimming labels and coloring the verdicts when
+    /// `use_color` is set. The visible text matches [`Self::format`].
+    pub fn render(&self, use_color: bool) -> String {
+        let field = |label: &str, value: String| {
+            format!("{} {value}", paint(DIM, &format!("{label}:"), use_color))
+        };
         let mut lines = vec![
-            format!(
-                "agent support: {}",
-                if self.enabled { "enabled" } else { "disabled" }
-            ),
-            "backend: Codex app-server".to_string(),
-            format!("command: {}", self.command),
-            format!("minimum Codex version: {}", self.minimum_version),
-            format!("authentication: {}", self.authentication),
-            format!(
-                "agent-edit readiness: {}",
-                if self.production_ready {
-                    "ready"
+            field(
+                "agent support",
+                if self.enabled {
+                    paint(GREEN, "enabled", use_color)
                 } else {
-                    "not ready"
-                }
+                    paint(YELLOW, "disabled", use_color)
+                },
+            ),
+            field("backend", "Codex app-server".to_string()),
+            field("command", self.command.clone()),
+            field("minimum Codex version", self.minimum_version.clone()),
+            field("authentication", self.authentication.clone()),
+            field(
+                "agent-edit readiness",
+                if self.production_ready {
+                    paint(BOLD_GREEN, "ready", use_color)
+                } else {
+                    paint(BOLD_RED, "not ready", use_color)
+                },
             ),
         ];
         if let Some(executable) = &self.executable {
-            lines.push(format!("executable: {}", executable.display()));
+            lines.push(field("executable", executable.display().to_string()));
         }
         if let Some(version) = &self.installed_version {
-            lines.push(format!("installed version: {version}"));
+            lines.push(field("installed version", version.clone()));
         }
-        lines.extend(self.messages.iter().map(|message| format!("- {message}")));
+        lines.extend(
+            self.messages
+                .iter()
+                .map(|message| paint(DIM, &format!("- {message}"), use_color)),
+        );
         lines.join("\n")
     }
 }

@@ -149,7 +149,7 @@ impl Editor {
             "Agent annotation call must contain 1–{MAX_AGENT_ANNOTATIONS_PER_CALL} comments"
         );
         anyhow::ensure!(
-            self.current_buffer().revision() == expected_revision,
+            super::agent_revision_matches(self.current_buffer(), expected_revision),
             "stale editor revision: expected {expected_revision}, current {}",
             self.current_buffer().revision()
         );
@@ -253,6 +253,7 @@ impl Editor {
         &mut self,
         root: &std::path::Path,
         annotation_ids: Vec<String>,
+        allow_sensitive_paths: bool,
         frame: &mut RenderBuffer,
     ) -> anyhow::Result<Value> {
         anyhow::ensure!(
@@ -289,7 +290,8 @@ impl Editor {
                     .ok_or_else(|| {
                         anyhow::anyhow!("annotation buffer has no workspace file: {id}")
                     })?;
-                let path = super::resolve_agent_tool_path(root, path)?;
+                let path =
+                    super::resolve_agent_tool_path_with_policy(root, path, allow_sensitive_paths)?;
                 Ok((*id, path))
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
@@ -349,6 +351,27 @@ impl Editor {
                     expected_fingerprint: comment.expected_fingerprint(),
                 })
             })
+            .collect::<Vec<_>>();
+        // Annotations on files that are not open have no inline comment to
+        // sync from; keep their records so they come back with the file.
+        let unopened = self
+            .agent_manager
+            .conversation()
+            .map(|conversation| conversation.annotations.clone())
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|record| {
+                !self.buffer_manager.iter().any(|buffer| {
+                    buffer.file.as_deref().is_some_and(|file| {
+                        super::same_file_path(
+                            std::path::Path::new(file),
+                            std::path::Path::new(&record.path),
+                        )
+                    })
+                })
+            });
+        let annotations = unopened
+            .chain(annotations)
             .take(MAX_AGENT_ANNOTATIONS)
             .collect();
         self.agent_manager.replace_annotation_records(annotations);
@@ -378,9 +401,10 @@ impl Editor {
             {
                 continue;
             }
-            let Ok(resolved_path) = super::resolve_agent_tool_path(
+            let Ok(resolved_path) = super::resolve_agent_tool_path_with_policy(
                 std::path::Path::new(&conversation.cwd),
                 &record.path,
+                self.config.agent.allow_sensitive_paths,
             ) else {
                 continue;
             };

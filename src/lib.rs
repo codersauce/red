@@ -19,6 +19,7 @@ pub mod agent_tools;
 pub mod assets;
 pub mod buffer;
 pub mod cli;
+pub mod cli_style;
 pub mod clipboard;
 pub mod codex;
 pub mod color;
@@ -62,9 +63,11 @@ pub mod tutorial;
 pub mod ui;
 pub mod undo;
 pub mod unicode_utils;
+pub mod update;
 pub mod utils;
 pub mod whats_new;
 pub mod window;
+mod workspace_paths;
 
 // Test utilities for integration tests
 #[doc(hidden)]
@@ -90,6 +93,21 @@ macro_rules! log {
             {
                 let log_message = format!($($arg)*);
                 logger.log(&log_message);
+            }
+        }
+    };
+}
+
+#[macro_export]
+macro_rules! log_warn {
+    ($($arg:tt)*) => {
+        {
+            if let Some(logger) = $crate::LOGGER
+                .get_or_init(|| $crate::Logger::try_new("red.log").ok())
+                .as_ref()
+            {
+                let log_message = format!($($arg)*);
+                logger.log_with_level($crate::logger::LogLevel::Warn, &log_message);
             }
         }
     };

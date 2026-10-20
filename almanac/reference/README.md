@@ -36,6 +36,9 @@ sources:
   - id: validation
     type: file
     path: almanac/reference/validation/ci-and-validation.md
+  - id: release-campaign
+    type: file
+    path: almanac/reference/releases/release-campaign.md
   - id: agent-check
     type: file
     path: almanac/reference/agent/agent-check.md
@@ -62,6 +65,6 @@ Use [UI components](editor/ui-components) for modal component behavior, picker a
 
 ## Sessions, Validation, And Compatibility
 
-Use [Detach IPC protocol](sessions/detach-ipc-protocol) for attach authentication, client and server message shapes, render deltas, limits, heartbeat behavior, and stop control [@detach-ipc]. Use [CI and validation](validation/ci-and-validation) for local clippy policy, GitHub Actions jobs, plugin checks, nightly Rust, release archive smoke tests, and Homebrew publication behavior [@validation].
+Use [Detach IPC protocol](sessions/detach-ipc-protocol) for attach authentication, client and server message shapes, render deltas, limits, heartbeat behavior, and stop control [@detach-ipc]. Use [CI and validation](validation/ci-and-validation) for local clippy policy, GitHub Actions jobs, plugin checks, nightly Rust, release archive smoke tests, and Homebrew publication behavior [@validation]. Use [Release campaign](releases/release-campaign) for the reviewed release-message manifest, exact version resolution, and the boundary between automated Discord posts and preview-only X and Bluesky copy [@release-campaign].
 
 Use [Agent check](agent/agent-check) for `red --agent-check` report fields and Codex readiness rules [@agent-check]. Use [Vim compatibility](vim/vim-compatibility) for supported motions, modes, commands, intentional differences, and not-yet-supported behavior [@vim].

@@ -1,9 +1,11 @@
 [
   {"name":"javascript block","language":"javascript","source":"function f() {\n  if (ready) {\n\n  }\n}","line":2,"expected":4,"width":2},
+  {"name":"javascript compound closers","language":"javascript","source":"function f() {\n  const value = {\n    field: wrap({\n    }),\n    \n  };\n}","line":4,"expected":4,"width":2},
   {"name":"typescript block","language":"typescript","source":"function f(): void {\n  if (ready) {\n\n  }\n}","line":2,"expected":4,"width":2},
   {"name":"jsx block","language":"jsx","source":"function f() {\n\n}","line":1,"expected":2,"width":2},
   {"name":"tsx block","language":"tsx","source":"function f(): void {\n\n}","line":1,"expected":2,"width":2},
   {"name":"json array","language":"json","source":"{\n  \"items\": [\n\n  ]\n}","line":2,"expected":4,"width":2},
+  {"name":"json compound closers","language":"json","source":"{\n  \"items\": [{\n  }],\n  \n  \"next\": 0\n}","line":3,"expected":2,"width":2},
   {"name":"toml array","language":"toml","source":"items = [\n\n]","line":1,"expected":2,"width":2},
   {"name":"yaml flow array","language":"yaml","source":"items: [\n\n]","line":1,"expected":2,"width":2},
   {"name":"powershell block","language":"powershell","source":"function Test-Thing {\n\n}","line":1,"expected":4},
@@ -12,5 +14,7 @@
   {"name":"fish if","language":"fish","source":"if true\n\nend","line":1,"expected":4},
   {"name":"fish else","language":"fish","source":"if true\n    echo yes\nelse\n\nend","line":3,"expected":4},
   {"name":"lua function","language":"lua","source":"function f()\n\nend","line":1,"expected":4},
-  {"name":"lua branch","language":"lua","source":"if ready then\n    work()\nelse\n\nend","line":3,"expected":4}
+  {"name":"lua branch","language":"lua","source":"if ready then\n    work()\nelse\n\nend","line":3,"expected":4},
+  {"name":"lua compound closers","language":"lua","source":"local values = {\n    field = wrap(function()\n    end),\n    \n}","line":3,"expected":4},
+  {"name":"rust compound closers","language":"rust","source":"        let isolated_client = Self {\n            state: Arc::new(ModelClientState {\n            }),\n            \n        };","line":3,"expected":12}
 ]

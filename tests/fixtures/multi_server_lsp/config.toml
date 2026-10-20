@@ -1,0 +1,50 @@
+[formatting]
+provider = "auto"
+
+[languages.typescript.formatter]
+name = "Prettier"
+command = "prettier"
+args = ["--stdin-filepath", "{file}"]
+root_markers = ["prettier.config.js", "package.json", ".git"]
+
+[lsp.servers.eslint]
+command = "vscode-eslint-language-server"
+args = ["--stdio"]
+documents = [
+  { language_id = "javascript", file_extensions = ["js"] },
+  { language_id = "javascriptreact", file_extensions = ["jsx"] },
+  { language_id = "typescript", file_extensions = ["ts"] },
+  { language_id = "typescriptreact", file_extensions = ["tsx"] },
+]
+root_markers = ["eslint.config.js", "package.json", ".git"]
+
+[lsp.servers.eslint.settings.""]
+validate = "on"
+run = "onType"
+packageManager = "npm"
+workingDirectory = { mode = "auto" }
+nodePath = ""
+useESLintClass = false
+quiet = false
+options = {}
+experimental = {}
+format = false
+onIgnoredFiles = "off"
+rulesCustomizations = []
+codeActionOnSave = { mode = "all" }
+problems = { shortenToSingleLine = false }
+
+[lsp.servers.eslint.settings."".codeAction]
+disableRuleComment = { enable = true, location = "separateLine", commentStyle = "line" }
+showDocumentation = { enable = true }
+
+[lsp.servers.typescript]
+command = "typescript-language-server"
+args = ["--stdio"]
+documents = [
+  { language_id = "javascript", file_extensions = ["js"] },
+  { language_id = "javascriptreact", file_extensions = ["jsx"] },
+  { language_id = "typescript", file_extensions = ["ts"] },
+  { language_id = "typescriptreact", file_extensions = ["tsx"] },
+]
+root_markers = ["tsconfig.json", "package.json", ".git"]

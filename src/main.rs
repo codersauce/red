@@ -29,6 +29,7 @@ use crossterm::{style, QueueableCommand};
 use red::assets;
 use red::buffer::Buffer;
 use red::cli::{Args, LanguageCommand, PluginCommand, RootCommand};
+use red::cli_style;
 use red::config::{
     Config, ConfigDiagnosticSeverity, ConfigRecovery, KeyAction, Keys, LoadedConfig,
 };
@@ -43,7 +44,7 @@ use red::lsp::{LspClient, LspManager};
 use red::preferences::PreferencesStore;
 use red::session::SessionStore;
 use red::theme::{parse_vscode_theme, parse_vscode_theme_contents, Theme};
-use red::utils::{expand_user_path, same_file_path};
+use red::utils::expand_user_path;
 use red::{log, run_self_check, LOGGER};
 
 #[cfg(unix)]
@@ -86,6 +87,17 @@ async fn run() -> anyhow::Result<()> {
     args.validate_utility_args()?;
 
     match &args.command {
+        Some(RootCommand::Update(update)) => {
+            let message = if update.check {
+                red::update::check().await?
+            } else if update.auto {
+                red::update::automatic().await?
+            } else {
+                red::update::install().await?
+            };
+            cli_style::print_line(&message);
+            return Ok(());
+        }
         Some(RootCommand::Keys(keys)) => {
             return red::keyboard::inspect_keys(keys.protocol, keys.count);
         }
@@ -103,8 +115,10 @@ async fn run() -> anyhow::Result<()> {
         return stop_session(session).await;
     }
     if let Some(session) = &args.detach {
+        let session_guard = red::update::managed_session_guard().await?;
         let owner_pid = start_detached_owner(&args, session)?;
         wait_for_detached_owner(session, owner_pid).await?;
+        drop(session_guard);
         return attach_session(session).await;
     }
 
@@ -117,8 +131,13 @@ async fn run() -> anyhow::Result<()> {
 
     if args.self_check {
         let report = run_self_check().await?;
-        println!("{}", report.format());
-        println!("red self-check ok");
+        let color = cli_style::stdout_color_enabled();
+        cli_style::print_line(&report.render(color));
+        cli_style::print_line(&cli_style::paint(
+            cli_style::BOLD_GREEN,
+            "red self-check ok",
+            color,
+        ));
         return Ok(());
     }
 
@@ -141,12 +160,13 @@ async fn run() -> anyhow::Result<()> {
                 .then_with(|| left.path.cmp(&right.path))
                 .then_with(|| left.code.cmp(&right.code))
         });
+        let color = cli_style::stdout_color_enabled();
         if loaded.diagnostics.is_empty() {
-            println!("config ok");
+            cli_style::print_line(&cli_style::success("config ok", color));
             return Ok(());
         }
         for diagnostic in &loaded.diagnostics {
-            println!("{}", diagnostic.format());
+            cli_style::print_line(&render_config_diagnostic(diagnostic, color));
         }
         anyhow::bail!(
             "configuration validation failed with {} problem(s)",
@@ -168,7 +188,7 @@ async fn run() -> anyhow::Result<()> {
                 .join("\n")
         );
         let report = red::agent_check::run(&loaded.config);
-        println!("{}", report.format());
+        cli_style::print_line(&report.render(cli_style::stdout_color_enabled()));
         anyhow::ensure!(
             !args.strict || report.production_ready,
             "Codex agent-edit readiness check failed"
@@ -177,18 +197,52 @@ async fn run() -> anyhow::Result<()> {
     }
 
     if args.runtime_files {
-        print!("{}", assets::format_runtime_files(&Config::config_dir())?);
+        cli_style::print_text(&assets::render_runtime_files(
+            &Config::config_dir(),
+            cli_style::stdout_color_enabled(),
+        )?);
         return Ok(());
     }
 
     if let Some(asset) = args.eject.as_deref().or(args.eject_force.as_deref()) {
         let target =
             assets::eject_runtime_asset(asset, &Config::config_dir(), args.eject_force.is_some())?;
-        println!("Ejected {}", target.display());
+        let color = cli_style::stdout_color_enabled();
+        cli_style::print_line(&cli_style::success(
+            &format!(
+                "Ejected {}",
+                cli_style::paint(cli_style::BOLD, &target.display().to_string(), color)
+            ),
+            color,
+        ));
         return Ok(());
     }
 
     run_editor(args).await
+}
+
+/// Renders one `--check-config` diagnostic. Plain output matches
+/// [`red::config::ConfigDiagnostic::format`]; with color, the severity is
+/// colored, the setting path bolded, and the location and fallback dimmed.
+fn render_config_diagnostic(diagnostic: &red::config::ConfigDiagnostic, color: bool) -> String {
+    use cli_style::{paint, BOLD, BOLD_RED, BOLD_YELLOW, DIM};
+
+    let location = match (diagnostic.line, diagnostic.column) {
+        (Some(line), Some(column)) => format!("{}:{line}:{column}", diagnostic.source),
+        _ => diagnostic.source.to_string(),
+    };
+    let severity = match diagnostic.severity {
+        ConfigDiagnosticSeverity::Warning => paint(BOLD_YELLOW, "warning", color),
+        ConfigDiagnosticSeverity::Error => paint(BOLD_RED, "error", color),
+    };
+    format!(
+        "{}: {} {severity} at {}: {}{}",
+        paint(DIM, &location, color),
+        paint(DIM, &diagnostic.code, color),
+        paint(BOLD, &diagnostic.path, color),
+        diagnostic.message,
+        paint(DIM, &format!("; fallback: {}", diagnostic.fallback), color),
+    )
 }
 
 // Keep constructing the large interactive future out of utility-command stack
@@ -198,7 +252,17 @@ fn run_editor(args: Args) -> impl std::future::Future<Output = anyhow::Result<()
     Box::pin(run_editor_inner(args))
 }
 
+fn session_root(config_dir: &Path) -> PathBuf {
+    // The config directory may be a user-managed symlink. Resolve it before
+    // the snapshot store's no-follow traversal of the sessions directory.
+    config_dir
+        .canonicalize()
+        .unwrap_or_else(|_| config_dir.to_path_buf())
+        .join("sessions")
+}
+
 async fn run_editor_inner(args: Args) -> anyhow::Result<()> {
+    fs::create_dir_all(Config::config_dir())?;
     let config_file = Config::path("config.toml");
     let preferences_file = Config::path("preferences.json");
     let first_launch = !config_file.exists() && !preferences_file.exists();
@@ -219,7 +283,7 @@ async fn run_editor_inner(args: Args) -> anyhow::Result<()> {
         std::env::set_current_dir(root)?;
     }
 
-    let session_root = Config::path("sessions");
+    let session_root = session_root(&Config::config_dir());
     let (resumed_store, resumed_session) = if args.resume {
         let (store, snapshot) = SessionStore::load_latest_with_store(&session_root)?;
         if !snapshot.cwd.is_empty() {
@@ -267,11 +331,15 @@ async fn run_editor_inner(args: Args) -> anyhow::Result<()> {
             );
         }
     }
+    editor.enable_diagnostic_cache(Config::path("cache/lsp-diagnostics"));
+    editor.enable_agent_continuity(Config::path("agent/conversations"));
+    editor.enable_update_checks(Config::path("cache/updates"));
     editor.set_session_store(session_store);
 
     if let Some(session) = &args.core_session {
         #[cfg(unix)]
         {
+            let _session_guard = red::update::managed_session_guard().await?;
             let bound = red::headless::bind_session(&Config::path("run"), session)?;
             let core = red::editor::DetachedEditorCore::new(editor).await?;
             return red::headless::serve_editor_session(&bound, core).await;
@@ -319,7 +387,10 @@ async fn run_plugin_command(command: &PluginCommand) -> anyhow::Result<()> {
     use red::plugin::catalog::{catalog_url, PluginCatalog};
     use red::plugin::package::{PluginId, PluginPackageManager};
 
+    use cli_style::{paint, BOLD, DIM};
+
     let manager = PluginPackageManager::new(Config::config_dir());
+    let color = cli_style::stdout_color_enabled();
     match command {
         PluginCommand::Install(arguments) => {
             let installed = if let Some(path) = &arguments.path {
@@ -346,16 +417,24 @@ async fn run_plugin_command(command: &PluginCommand) -> anyhow::Result<()> {
                     .install_github_with_trust(repository, version, arguments.trust_native_grammars)
                     .await?
             };
-            println!(
-                "Installed {} {} ({})",
-                installed.id,
-                installed.version,
-                installed.package_root.display()
-            );
+            cli_style::print_line(&cli_style::success(
+                &format!(
+                    "Installed {} {} {}",
+                    paint(BOLD, installed.id.as_str(), color),
+                    installed.version,
+                    paint(
+                        DIM,
+                        &format!("({})", installed.package_root.display()),
+                        color
+                    )
+                ),
+                color,
+            ));
         }
         PluginCommand::Catalog(arguments) => {
             let url = arguments.catalog_url.clone().unwrap_or_else(catalog_url);
             let catalog = PluginCatalog::fetch(&url).await?;
+            let mut rows = Vec::new();
             for package in catalog.packages {
                 let compatibility = if package.supports_current_red_release()? {
                     "compatible"
@@ -367,42 +446,64 @@ async fn run_plugin_command(command: &PluginCommand) -> anyhow::Result<()> {
                 } else {
                     "unavailable"
                 };
-                println!(
-                    "{}\t{}\t{}\t{}\t{}",
-                    package.id,
-                    package.version,
-                    package.tier.label(),
-                    compatibility,
-                    target
-                );
+                rows.push([
+                    package.id.to_string(),
+                    package.version.to_string(),
+                    package.tier.label().to_string(),
+                    compatibility.to_string(),
+                    target.to_string(),
+                ]);
             }
+            cli_style::print_table(
+                ["NAME", "VERSION", "TIER", "STATUS", "TARGET"],
+                &rows,
+                [
+                    cli_style::style_bold,
+                    cli_style::style_plain,
+                    style_tier,
+                    style_status,
+                    style_target,
+                ],
+            );
         }
         PluginCommand::List => {
             let plugins = manager.list()?;
             if plugins.is_empty() {
-                println!("No external plugins installed.");
+                cli_style::print_line("No external plugins installed.");
             }
-            for plugin in plugins {
-                let state = if plugin.enabled {
-                    "enabled"
-                } else {
-                    "disabled"
-                };
-                let compatibility = if plugin.compatible {
-                    "compatible"
-                } else {
-                    "incompatible"
-                };
-                let companion = if plugin.has_companion {
-                    "companion"
-                } else if plugin.has_languages {
-                    "language"
-                } else {
-                    "husk"
-                };
-                println!(
-                    "{}\t{}\t{}\t{}\t{}",
-                    plugin.id, plugin.version, state, compatibility, companion
+            let rows: Vec<[String; 5]> = plugins
+                .into_iter()
+                .map(|plugin| {
+                    let state = if plugin.enabled {
+                        "enabled"
+                    } else {
+                        "disabled"
+                    };
+                    let compatibility = if plugin.compatible {
+                        "compatible"
+                    } else {
+                        "incompatible"
+                    };
+                    [
+                        plugin.id.to_string(),
+                        plugin.version.to_string(),
+                        state.to_string(),
+                        compatibility.to_string(),
+                        plugin.modality_label(),
+                    ]
+                })
+                .collect();
+            if !rows.is_empty() {
+                cli_style::print_table(
+                    ["NAME", "VERSION", "STATE", "STATUS", "MODALITY"],
+                    &rows,
+                    [
+                        cli_style::style_bold,
+                        cli_style::style_plain,
+                        style_status,
+                        style_status,
+                        cli_style::style_dim,
+                    ],
                 );
             }
         }
@@ -418,10 +519,22 @@ async fn run_plugin_command(command: &PluginCommand) -> anyhow::Result<()> {
             } else {
                 manager.update_all().await
             };
+            let error_color = cli_style::stderr_color_enabled();
             for (id, result) in results {
                 match result {
-                    Ok(plugin) => println!("Updated {} to {}", id, plugin.version),
-                    Err(error) => eprintln!("Failed to update {id}: {error:#}"),
+                    Ok(plugin) => cli_style::print_line(&cli_style::success(
+                        &format!(
+                            "Updated {} to {}",
+                            paint(BOLD, id.as_str(), color),
+                            plugin.version
+                        ),
+                        color,
+                    )),
+                    Err(error) => eprintln!(
+                        "{} {}: {error:#}",
+                        paint(cli_style::BOLD_RED, "Failed to update", error_color),
+                        paint(BOLD, id.as_str(), error_color)
+                    ),
                 }
             }
         }
@@ -435,29 +548,78 @@ async fn run_plugin_command(command: &PluginCommand) -> anyhow::Result<()> {
             let plugin = manager
                 .update_with_trust(&id, arguments.trust_native_grammars)
                 .await?;
-            println!("Updated {} to {}", plugin.id, plugin.version);
+            cli_style::print_line(&cli_style::success(
+                &format!(
+                    "Updated {} to {}",
+                    paint(BOLD, plugin.id.as_str(), color),
+                    plugin.version
+                ),
+                color,
+            ));
         }
         PluginCommand::Disable(arguments) => {
             let id = PluginId::parse(&arguments.id)?;
             manager.set_enabled(&id, false)?;
-            println!("Disabled {id}");
+            cli_style::print_line(&cli_style::success(
+                &format!("Disabled {}", paint(BOLD, id.as_str(), color)),
+                color,
+            ));
         }
         PluginCommand::Enable(arguments) => {
             let id = PluginId::parse(&arguments.id)?;
             manager.set_enabled(&id, true)?;
-            println!("Enabled {id}");
+            cli_style::print_line(&cli_style::success(
+                &format!("Enabled {}", paint(BOLD, id.as_str(), color)),
+                color,
+            ));
         }
         PluginCommand::Remove(arguments) => {
             let id = PluginId::parse(&arguments.id)?;
             manager.remove(&id, arguments.purge)?;
-            if arguments.purge {
-                println!("Removed {id} and purged its saved data");
+            let detail = if arguments.purge {
+                " and purged its saved data"
             } else {
-                println!("Removed {id}; saved data was preserved");
-            }
+                "; saved data was preserved"
+            };
+            cli_style::print_line(&cli_style::success(
+                &format!(
+                    "Removed {}{}",
+                    paint(BOLD, id.as_str(), color),
+                    paint(DIM, detail, color)
+                ),
+                color,
+            ));
         }
     }
     Ok(())
+}
+
+/// Accent trusted official packages; fade the rest.
+fn style_tier(cell: &str) -> Option<&'static str> {
+    if cell == "Official" {
+        Some(cli_style::CYAN)
+    } else {
+        Some(cli_style::DIM)
+    }
+}
+
+fn style_status(cell: &str) -> Option<&'static str> {
+    match cell {
+        "compatible" | "enabled" => Some(cli_style::GREEN),
+        "incompatible" => Some(cli_style::RED),
+        "disabled" => Some(cli_style::DIM),
+        _ => None,
+    }
+}
+
+/// Fade the host triple, which repeats on every row, so a missing artifact
+/// stands out.
+fn style_target(cell: &str) -> Option<&'static str> {
+    if cell == "unavailable" {
+        Some(cli_style::YELLOW)
+    } else {
+        Some(cli_style::DIM)
+    }
 }
 
 fn run_language_command(command: &LanguageCommand, overrides: &[String]) -> anyhow::Result<()> {
@@ -470,7 +632,11 @@ fn run_language_command(command: &LanguageCommand, overrides: &[String]) -> anyh
             &config_dir,
         )?);
         let count = red::syntax_indent::check_fixtures(&arguments.fixtures, registry)?;
-        println!("Passed {count} indentation fixtures");
+        let color = cli_style::stdout_color_enabled();
+        cli_style::print_line(&cli_style::success(
+            &format!("Passed {count} indentation fixtures"),
+            color,
+        ));
         return Ok(());
     }
     let value = match command {
@@ -521,11 +687,26 @@ fn run_language_command(command: &LanguageCommand, overrides: &[String]) -> anyh
     match command {
         LanguageCommand::Trust(_) => {
             let digest = trust.trust_path(&path)?;
-            println!("Trusted native grammar {} ({digest})", path.display());
+            let color = cli_style::stdout_color_enabled();
+            cli_style::print_line(&cli_style::success(
+                &format!(
+                    "Trusted native grammar {} {}",
+                    cli_style::paint(cli_style::BOLD, &path.display().to_string(), color),
+                    cli_style::paint(cli_style::DIM, &format!("({digest})"), color)
+                ),
+                color,
+            ));
         }
         LanguageCommand::Untrust(_) => {
             trust.revoke_path(&path)?;
-            println!("Revoked native grammar trust for {}", path.display());
+            let color = cli_style::stdout_color_enabled();
+            cli_style::print_line(&cli_style::success(
+                &format!(
+                    "Revoked native grammar trust for {}",
+                    cli_style::paint(cli_style::BOLD, &path.display().to_string(), color)
+                ),
+                color,
+            ));
         }
         LanguageCommand::CheckIndent(_) => unreachable!(),
     }
@@ -1011,14 +1192,17 @@ fn paint_detached_resize(
 }
 
 fn print_error(error: &anyhow::Error) {
-    eprintln!("{}", format_error(error));
+    eprintln!("{}", format_error(error, cli_style::stderr_color_enabled()));
 }
 
-fn format_error(error: &anyhow::Error) -> String {
+fn format_error(error: &anyhow::Error, color: bool) -> String {
     if let Some(report) = error.downcast_ref::<husk_diagnostics::Report>() {
         report.to_string()
     } else {
-        format!("Error: {error:#}")
+        format!(
+            "{} {error:#}",
+            cli_style::paint(cli_style::BOLD_RED, "Error:", color)
+        )
     }
 }
 
@@ -1051,7 +1235,14 @@ fn finalize_runtime_config(
             &manifest,
             &installed.package_root,
         );
-        let Some(entrypoint) = manifest.husk_entry(&installed.package_root) else {
+        let entrypoint = manifest.husk_entry(&installed.package_root).or_else(|| {
+            manifest.rpc.is_some().then(|| {
+                installed
+                    .package_root
+                    .join(red::plugin::package::PLUGIN_MANIFEST_FILE)
+            })
+        });
+        let Some(entrypoint) = entrypoint else {
             continue;
         };
         loaded
@@ -1191,26 +1382,27 @@ fn resolve_log_path(config_dir: &Path, configured_path: &str) -> anyhow::Result<
 }
 
 async fn load_startup_buffers(files: &[String]) -> anyhow::Result<Vec<Buffer>> {
-    let mut buffers = Vec::with_capacity(files.len());
-    for file in files {
-        let buffer = Buffer::load_or_create(Some(file.clone())).await?;
-        let duplicate = buffer.file.as_deref().is_some_and(|candidate| {
-            buffers.iter().any(|open: &Buffer| {
-                open.file
-                    .as_deref()
-                    .is_some_and(|open| same_file_path(Path::new(open), Path::new(candidate)))
-            })
-        });
-        if !duplicate {
-            buffers.push(buffer);
-        }
-    }
-    Ok(buffers)
+    red::buffer::load_startup_buffers(files).await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn session_root_resolves_a_symlinked_config_directory() {
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("config-target");
+        fs::create_dir(&target).unwrap();
+        let link = directory.path().join("red");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        assert_eq!(
+            session_root(&link),
+            target.canonicalize().unwrap().join("sessions")
+        );
+    }
 
     #[test]
     fn startup_dispatch_future_stays_small() {
@@ -1695,7 +1887,7 @@ mod tests {
     fn structured_husk_errors_do_not_get_a_rust_error_prefix() {
         let error = husk_runtime::CompiledProgram::parse("broken", "fn activate( {").unwrap_err();
 
-        let rendered = format_error(&error);
+        let rendered = format_error(&error, false);
 
         assert!(rendered.starts_with("error[HUSK-P0001]:"));
         assert!(!rendered.starts_with("Error:"));

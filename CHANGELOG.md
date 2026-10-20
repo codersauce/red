@@ -2,6 +2,353 @@
 
 All notable changes to Red are documented in this file.
 
+## [0.9.1](https://github.com/codersauce/red/compare/v0.9.0...v0.9.1)
+
+### Features
+
+- **plugins:** Show each plugin's session state and report RPC startup ([#400](https://github.com/codersauce/red/issues/400)) ([e342145](https://github.com/codersauce/red/commit/e3421450450d59d192720f0cbd84bc6706665cf7))
+- **cli:** Style utility command output with shared CLI helpers ([ff24a5e](https://github.com/codersauce/red/commit/ff24a5ee3118397df445d650d44a4a435e2866bf))
+- **cli:** Style plugin tables with shared ANSI helpers ([ea8eda9](https://github.com/codersauce/red/commit/ea8eda91e136ea1109a13436025ecf2adea0f2eb))
+
+### Bug Fixes
+
+- **husk:** Charge shared arrays and maps once against the plugin heap ([#399](https://github.com/codersauce/red/issues/399)) ([ce2ef65](https://github.com/codersauce/red/commit/ce2ef65c91b8e5f11dc73997b537a731c25c71d3))
+- **plugins:** Trim or drop request results too large for a plugin's heap ([#398](https://github.com/codersauce/red/issues/398)) ([b08fdb6](https://github.com/codersauce/red/commit/b08fdb66b5c58ef34a8ee3f339232145f4bd991c))
+- **plugins:** Surface quarantined-command explanations from any focus ([8fdd49a](https://github.com/codersauce/red/commit/8fdd49a67d516c986989c06dd3f32ab23f7db9c5))
+- **plugins:** Tell the user when a plugin is quarantined ([0991362](https://github.com/codersauce/red/commit/099136257fd0d7cd186cebab5b1bdd0f7150656c))
+- **lsp:** Keep large symbol results from exhausting the lsp_symbols heap ([0d5039b](https://github.com/codersauce/red/commit/0d5039bb700abd95be08f936a056add1498fe344))
+- **cli:** Measure table cells in terminal display columns ([6d618e6](https://github.com/codersauce/red/commit/6d618e6a27b503744ac24ab1ec9bd9b6c2ca0c9b))
+- **cli:** Exit quietly on closed stdout and silence eh_frame linker note ([62248de](https://github.com/codersauce/red/commit/62248deb284aea7880ead0500eb1d2f7bfda0867))
+- **cli:** Align plugin catalog and list output into padded columns ([945b0f6](https://github.com/codersauce/red/commit/945b0f63f6ef47e6f24bd7cc2660053d408b4547))
+- **completion:** Clear the snapshot when rejecting a stale accept ([795c589](https://github.com/codersauce/red/commit/795c58966cd0c13cb483c608b90d3a0fd93b0998))
+- **completion:** Preserve punctuation during deferred resolution ([c0b4bfb](https://github.com/codersauce/red/commit/c0b4bfb03afbbee2d5f1a755e4567fe2f7198916))
+
+### Documentation
+
+- **plugins:** Add Node.js JSON-RPC example and align host API 0.19.0 ([ef37e0e](https://github.com/codersauce/red/commit/ef37e0e5a4828c357d58a06368318e97a0d13a90))
+
+### Testing
+
+- **update:** Retry lock reacquisition after releasing the session lock ([43a98f8](https://github.com/codersauce/red/commit/43a98f818360bc4183f584bedf420b11505d04a7))
+
+## [0.9.0](https://github.com/codersauce/red/compare/v0.8.2...v0.9.0)
+
+### Features
+
+- **lsp:** Support multiple servers per document ([#383](https://github.com/codersauce/red/issues/383)) ([bf2c203](https://github.com/codersauce/red/commit/bf2c2039db6fb36b8a011cd72546d321ac28a6c9))
+- **plugins:** Add rpc message feedback ([4e49009](https://github.com/codersauce/red/commit/4e49009485894b2f1e5036852523ca4a15bf1d2d))
+- **plugins:** Refine json workbench panels ([c9bde98](https://github.com/codersauce/red/commit/c9bde98f9ee56c3fdd7bc42a28865b47270d4b3d))
+- **plugins:** Validate json workbench distribution ([8cb693d](https://github.com/codersauce/red/commit/8cb693ddefd9ee79a0970327d4e0faa65bba4165))
+- **plugins:** Explore rpc json results ([d1f0246](https://github.com/codersauce/red/commit/d1f02464ecca8dbc1824f259c3640b1329b1d3d2))
+- **plugins:** Add rpc panel actions ([811fdbf](https://github.com/codersauce/red/commit/811fdbfcc90bd8cac53c1c003cb0e6222177c19d))
+- **plugins:** Support inactive rpc document edits ([6393fbb](https://github.com/codersauce/red/commit/6393fbbb7494acbea822250dd84dbf46aff19054))
+- **plugins:** Add rpc selection context ([720dfb0](https://github.com/codersauce/red/commit/720dfb00148995eec79158c64fe279ce1ecb1ee7))
+- **plugins:** Add live rpc document previews ([cadd845](https://github.com/codersauce/red/commit/cadd84565b7fbecf30e43c09078dcbbdc6153483))
+- **plugins:** Add editable RPC documents ([dd227a2](https://github.com/codersauce/red/commit/dd227a2eab9e265bfe9760b217032b9b532b7e34))
+- **plugins:** Add reusable JSON queries ([e530906](https://github.com/codersauce/red/commit/e530906ede9038570615a85861149622271b601e))
+- **plugins:** Add JSON workbench example ([8243d16](https://github.com/codersauce/red/commit/8243d1642a49d2cc4534bb72abf7b5001ed22949))
+- **plugins:** Add rpc pickers ([c5976c1](https://github.com/codersauce/red/commit/c5976c11c17ba72677f31858d74a623745749f39))
+- **plugins:** Install rpc release artifacts ([0930c35](https://github.com/codersauce/red/commit/0930c35cf1a590eb1f0b2d2b5a00bd6030b2a327))
+- **plugins:** Add rpc config and storage ([efb3ec2](https://github.com/codersauce/red/commit/efb3ec2f75c7fa07db4937e99baed61ab8df3eca))
+- **plugins:** Restrict rpc child environments ([ab2f2c3](https://github.com/codersauce/red/commit/ab2f2c32a244bda6dec3974b6ffbb07290773482))
+- **plugins:** Keep rpc lifecycle work responsive ([6a45053](https://github.com/codersauce/red/commit/6a4505393bd0df3c609d8482125e1eb04a4c2d59))
+- **plugins:** Keep input responsive during rpc commands ([4b14665](https://github.com/codersauce/red/commit/4b14665b53e78020fb861499cc088e123bc47cc6))
+- **plugins:** Add stable rpc document targeting ([cfad830](https://github.com/codersauce/red/commit/cfad83019962c13d92a3eef00bee744ef92b63a6))
+- **plugins:** Add RPC statusline contributions ([a806156](https://github.com/codersauce/red/commit/a80615699ab5fa908f95f7c0f4eb8321d5af047f))
+- **plugins:** Add RPC text panels ([32d4e10](https://github.com/codersauce/red/commit/32d4e106034ec47ac381db5d8972d786894c35ef))
+- **plugins:** Deliver RPC editor events ([cbaeca2](https://github.com/codersauce/red/commit/cbaeca2e6787485adbbeda8190fb486c61deae1a))
+- **plugins:** Add RPC document transactions ([ff464a5](https://github.com/codersauce/red/commit/ff464a5d0b403dae9078575d9c287f6679895b28))
+- **plugins:** Add RPC document snapshots ([873705f](https://github.com/codersauce/red/commit/873705febd989b94d4070bcc587f81980abbbe86))
+- **plugins:** Activate JSON-RPC commands ([4dffa35](https://github.com/codersauce/red/commit/4dffa35dd58014c55daad30280c10962e5eb47af))
+- **plugins:** Add JSON-RPC process transport ([4d8114b](https://github.com/codersauce/red/commit/4d8114bb01fe1a3f97b3df191f3c7e71c76aae9d))
+- **plugins:** Define JSON-RPC package contract ([f377d57](https://github.com/codersauce/red/commit/f377d57a457a128797f232c00826fe7b2233332a))
+
+### Bug Fixes
+
+- **plugins:** Keep oversized rpc responses recoverable ([3a79a94](https://github.com/codersauce/red/commit/3a79a947a5e266d0f5587b56ea8a7cdc1ad6e40c))
+- **plugins:** Handle interleaved messages in rpc example ([32a6f41](https://github.com/codersauce/red/commit/32a6f410e5ae2035bf4a4db57119b3d57cb1c3e0))
+- **plugins:** Enforce edit bounds and Husk command precedence ([bb87e7f](https://github.com/codersauce/red/commit/bb87e7f4f82c7ec5a99c205a64135e25b31a0117))
+
+### Documentation
+
+- **plugins:** Plan json workbench ux ([ae8a4d4](https://github.com/codersauce/red/commit/ae8a4d4926e865f4b93b049003df11054fface14))
+
+### Testing
+
+- **plugins:** Await complete panel events ([5d56a5b](https://github.com/codersauce/red/commit/5d56a5b4c0a63265ee13b06fa049a222b631d205))
+- **plugins:** Accept native jq newlines ([17472d4](https://github.com/codersauce/red/commit/17472d4779ad3ee236de0158b005692eade043d2))
+- **plugins:** Stabilize json workbench explorer ([ccbc487](https://github.com/codersauce/red/commit/ccbc48762b2b57d48a18fd678e43d95760b9d8fc))
+- **plugins:** Stabilize rpc ci ([0eaf788](https://github.com/codersauce/red/commit/0eaf78892b93f43e111c54f1055f407ca34998e5))
+- **plugins:** Stabilize rpc ci ([bf26279](https://github.com/codersauce/red/commit/bf2627991fcbf025e966c046f0606ba9e1fca036))
+- **plugins:** Use a native absolute path in RPC package test ([f6a9754](https://github.com/codersauce/red/commit/f6a9754861cbcd4dd6f27277eca5c8e9d8968616))
+- **plugins:** Add protocol v1 envelope conformance fixture ([28f2306](https://github.com/codersauce/red/commit/28f2306e2967cfe9d3f53b886dcceb156cfcc976))
+
+### Other
+
+- Record json-rpc plugin boundary ([b71445a](https://github.com/codersauce/red/commit/b71445a8b813a0710c66822e9aa61e4f6f0ba7cc))
+- Record v0.8.2 website closeout ([26a6d98](https://github.com/codersauce/red/commit/26a6d98b11dd26f041916477ab1a049d457324c0))
+
+## [0.8.2](https://github.com/codersauce/red/compare/v0.8.1...v0.8.2)
+
+### Features
+
+- **update:** Add standalone updater ([f54a452](https://github.com/codersauce/red/commit/f54a4521ba5478e92f4176f67ac2326d88022f6c))
+
+### Testing
+
+- **installer:** Avoid parsing lock inode ([4af1613](https://github.com/codersauce/red/commit/4af1613ee54dfcdcf24fea8afd04caa4bdfc0c51))
+
+### Other
+
+- Tighten website release verification ([3dae522](https://github.com/codersauce/red/commit/3dae522b965e9ed95bf556d1657e5a296e6398e7))
+- Clarify website deploy access mode ([eb683b5](https://github.com/codersauce/red/commit/eb683b550a10116ecbe69a6bb405f2886ad7fc9e))
+- Document git workspace architecture ([d503788](https://github.com/codersauce/red/commit/d503788870b4b696bbd3cfb74c2d137bfd3e6bb7))
+- Add release and configuration hubs ([f51cc0b](https://github.com/codersauce/red/commit/f51cc0b5e0ea3cde64f2e1392c28523d58ecb6ef))
+- Clarify website deployment authority ([cfa8091](https://github.com/codersauce/red/commit/cfa80919fa27a045cc15ad84aa68b0fd15674323))
+
+## [0.8.1](https://github.com/codersauce/red/compare/v0.8.0...v0.8.1)
+
+### Features
+
+- **picker:** Add preview toggle shortcuts ([fec58b2](https://github.com/codersauce/red/commit/fec58b2ca63cd80fd1c2f3b9ca188bf8852728f6))
+
+### Bug Fixes
+
+- **picker:** Keep preview action activatable from help ([1247ef9](https://github.com/codersauce/red/commit/1247ef9a7d580fcaf04b4edfacd6b02cacc75dfb))
+- **security:** Upgrade wasmtime ([22b909c](https://github.com/codersauce/red/commit/22b909c13d2b14e9cf93eafe95d0305373d1d4a9))
+- **ci:** Support clippy 1.99 ([40bc9fb](https://github.com/codersauce/red/commit/40bc9fb91c0720f6d36d5de0b3570f153648f145))
+- **editor:** Quit after pending format save ([cfe1fe5](https://github.com/codersauce/red/commit/cfe1fe57102920303160bd24cbe798cc114864e0))
+
+### Testing
+
+- **editor:** Cover edits during deferred quit ([bd74d6a](https://github.com/codersauce/red/commit/bd74d6a1c0d745eddb60f6bcf7c5089830cf43c5))
+
+### Other
+
+- Clarify release website closeout ([2c824c0](https://github.com/codersauce/red/commit/2c824c027d277abf4e59e59f537cd79d3826adbe))
+- Improve validation and decision routing ([9974376](https://github.com/codersauce/red/commit/9974376b488f6f7421b3fb7e1c091e4171425aa0))
+- Expand lsp capability gaps ([26b786e](https://github.com/codersauce/red/commit/26b786e8ee22f28a46b2407ee2ba237bf29c317d))
+- Improve language-pack and site guidance ([2d63515](https://github.com/codersauce/red/commit/2d63515be38c450fd3596aa9cd58860435edcd15))
+- Record v0.8.0 site waypoint ([a17c471](https://github.com/codersauce/red/commit/a17c4714cff5dcfb2698a293865d10b5ef36b93a))
+- Clarify lsp and command graph ([5b52f5e](https://github.com/codersauce/red/commit/5b52f5e253a1b2ce2d06066d6fd621097fddb36f))
+- Record LSP capability gaps ([670d377](https://github.com/codersauce/red/commit/670d3776f691d8e7ae730da06e6e981a227b8462))
+- Remove stale red version guidance ([1818b1a](https://github.com/codersauce/red/commit/1818b1a1aa858432a5b8445d1d62dbfca0dbbdec))
+- Clarify Sites source branch deployment ([062080e](https://github.com/codersauce/red/commit/062080e18989472ef37e1ea548846744a22832ab))
+- Add language pack topic ([ed89e23](https://github.com/codersauce/red/commit/ed89e23973e449356c5ad1ec73afa21634201256))
+- Add website release audit gate ([117f214](https://github.com/codersauce/red/commit/117f214cd11c11cdf4922ad99f1738cbc0b6d88d))
+- Improve architecture safety routing ([5c8a891](https://github.com/codersauce/red/commit/5c8a891db9e1b46dc0e3038c4bc39010c14a43ad))
+- Record directory buffer behavior ([d4a5d55](https://github.com/codersauce/red/commit/d4a5d55c5f63a40521f58e9f579de4df2531e5b5))
+
+## [0.8.0](https://github.com/codersauce/red/compare/v0.7.0...v0.8.0)
+
+### Features
+
+- **buffers:** Browse directories in editor windows ([#370](https://github.com/codersauce/red/issues/370)) ([195efcb](https://github.com/codersauce/red/commit/195efcb94b424adedf8cc8acdf122a653335c5b0))
+- **picker:** Support ctrl-n and ctrl-p navigation ([b7d9312](https://github.com/codersauce/red/commit/b7d93120b155895a4a4d1d200a773d95cb3b49d6))
+- **lsp:** Support an opt-in rust-glancer configuration ([#364](https://github.com/codersauce/red/issues/364)) ([3fc3548](https://github.com/codersauce/red/commit/3fc3548c0f53fc6599cb3f38e6e2ff4533c38203))
+- **editor:** Add neovim-style mouse selection ([#363](https://github.com/codersauce/red/issues/363)) ([9e09527](https://github.com/codersauce/red/commit/9e0952767d35d5b8dddd3fa3bb90087938692c52))
+- **syntax:** Detect languages from shebangs ([#360](https://github.com/codersauce/red/issues/360)) ([b17d014](https://github.com/codersauce/red/commit/b17d0146b524193d976121604d025e211bd90efc))
+
+### Bug Fixes
+
+- **deps:** Update rustls past security advisory ([0c88b25](https://github.com/codersauce/red/commit/0c88b257c5399dbba9f665784ec1189db441ac01))
+- **editor:** Prevent terminal control injection ([#365](https://github.com/codersauce/red/issues/365)) ([9a0a17b](https://github.com/codersauce/red/commit/9a0a17ba429100c21a7a155d8597942fc11025b7))
+- **startup:** Avoid first-launch config warning ([#362](https://github.com/codersauce/red/issues/362)) ([bb9bd41](https://github.com/codersauce/red/commit/bb9bd41a50b6ce11bd81a9dd746b64ba43028c85))
+- **session:** Support symlinked config directories ([#361](https://github.com/codersauce/red/issues/361)) ([b57dccf](https://github.com/codersauce/red/commit/b57dccff5936ac62ae90a02195a4fff60cd2f191))
+
+### Documentation
+
+- **editor:** Document wrapped-line navigation recipe ([0a9f01c](https://github.com/codersauce/red/commit/0a9f01cecf783ac998166933623091bf47ca5556))
+
+### Other
+
+- Record website media performance check ([1006712](https://github.com/codersauce/red/commit/10067128a5dcf19beb6f0bb596c8df18ef8cbecd))
+- Update website deployment guide ([7768311](https://github.com/codersauce/red/commit/7768311ecc5e71cb4abe468bfd0a6adcb45d64cc))
+- Add website operations hub ([a175cd4](https://github.com/codersauce/red/commit/a175cd4d1fd9c0c0e11b2a87558a09a753f1ed6b))
+- Record website asset sources ([f40427a](https://github.com/codersauce/red/commit/f40427a37811f3a97ebd3ac0014b1f02b8716216))
+- Document public site deployment ([f1ca8e3](https://github.com/codersauce/red/commit/f1ca8e324278abe32875d59d999e6f922e3ee82a))
+- Split website refresh guidance ([897d27e](https://github.com/codersauce/red/commit/897d27e9203db1365dcaeb9df88f990e559bf182))
+- Clarify release campaign version states ([e056be2](https://github.com/codersauce/red/commit/e056be273b01bfa2337410877c5c1714eb3c7834))
+- Improve safety and inline assist navigation ([91bc29a](https://github.com/codersauce/red/commit/91bc29ab7748a94b1377f59847129e96a329404c))
+- Link validation guide to rendering safety ([e359bdc](https://github.com/codersauce/red/commit/e359bdca2a90572113aadfcb060e7ac20f1a6645))
+- Document terminal interaction smoke validation ([00cb494](https://github.com/codersauce/red/commit/00cb494e0015bc90674b0cf8418668d304497dec))
+- Clarify plugin compatibility routing ([2eca5ce](https://github.com/codersauce/red/commit/2eca5ce894f07ef1f5bb70690a394e77f279e8ef))
+- Connect copilot completion guide ([efa2789](https://github.com/codersauce/red/commit/efa27890869a0b77a6d057bb469d605f32b24fa4))
+- Clarify lsp architecture routing ([7eb3ad7](https://github.com/codersauce/red/commit/7eb3ad71a58293ad2987e2431ba8ba17f1c399f6))
+- Record website video guidance ([05b4cc7](https://github.com/codersauce/red/commit/05b4cc77553f1eff8e88ac83b90df95f0cb94f1e))
+- Update lsp progress and website docs guidance ([607ead1](https://github.com/codersauce/red/commit/607ead179cf0429334ca96dde14e7e98081e7844))
+- Document terminal-safe rendering controls ([2ed85f3](https://github.com/codersauce/red/commit/2ed85f3c4db4e3e2248e3b929f365cdade15a1dd))
+- Document alternative rust lsp validation ([da05237](https://github.com/codersauce/red/commit/da05237d0013b6ac2ede81c2490df2439fe53a4e))
+- Document onboarding preferences ([edd7ca7](https://github.com/codersauce/red/commit/edd7ca76b66909cbf9d979cbad1cb6570084fb32))
+- Clarify agent history revert conflicts ([3064274](https://github.com/codersauce/red/commit/306427471d4c988eaa6868ec7b437b598174366f))
+- Improve release guide routing ([c87a980](https://github.com/codersauce/red/commit/c87a980cf9a7189fff6198b139844c37ac4f01f6))
+- Route release and website work ([ead75e8](https://github.com/codersauce/red/commit/ead75e83cddc02f9755b3680e50bad5dcb96447b))
+- Refresh plugin host api version ([d135e01](https://github.com/codersauce/red/commit/d135e01acf6179da31ec8378ea6f6e73f20e756c))
+- Document inline assist architecture ([e99fb91](https://github.com/codersauce/red/commit/e99fb910eb406e168b85a2d3fcb4210c736db4bf))
+- Clarify plugin host api metadata grounding ([12d9b0c](https://github.com/codersauce/red/commit/12d9b0c4d07086e1afebab23a4db81662203582d))
+- Generalize release link guidance ([5071ea0](https://github.com/codersauce/red/commit/5071ea02c311e2bdea55b405ddc09fc52208670b))
+- Refresh editor command references ([e539336](https://github.com/codersauce/red/commit/e539336cb670f157e62057945cd46d36859872c5))
+- Clarify plugin host api routing ([76f7592](https://github.com/codersauce/red/commit/76f7592a46ba7f27321fc9c98fc40148c7da254e))
+- Clarify agent read pagination ([617c8f3](https://github.com/codersauce/red/commit/617c8f30c322ba89654d84df9f190013e97a5950))
+- Refresh arborium language-pack decision ([c67e5eb](https://github.com/codersauce/red/commit/c67e5ebeee15405f732a7ad82975c3bf3170094f))
+- Add language-pack release guide ([7a9a5ff](https://github.com/codersauce/red/commit/7a9a5ff0ed39e7e2c6184f1fb687b3a365b5fe7d))
+- Refresh command and config references ([c99e90f](https://github.com/codersauce/red/commit/c99e90fc3e5269628c404df2f2a7c165cbd28056))
+- Refresh cli and performance references ([b8d4d9c](https://github.com/codersauce/red/commit/b8d4d9cd353935bbc5455526b3daa117cc0d6bf4))
+
+## [0.7.0](https://github.com/codersauce/red/compare/v0.6.0...v0.7.0)
+
+### Features
+
+- **release:** Sharpen next release announcements ([#358](https://github.com/codersauce/red/issues/358)) ([b7c49b2](https://github.com/codersauce/red/commit/b7c49b2af3f0edadd3212e2fa2d09d71a38694db))
+- **tree:** Move reusable tree rendering into rust ([#357](https://github.com/codersauce/red/issues/357)) ([e6ccc99](https://github.com/codersauce/red/commit/e6ccc991f93dcae0cc2a3142dba0099ceadcda44))
+- **release:** Curate cross-channel release campaigns ([#350](https://github.com/codersauce/red/issues/350)) ([afc256a](https://github.com/codersauce/red/commit/afc256a6178c709657ca85ef176fb27dd4319bbd))
+- **agent:** Add lsp diagnostics and semantic rename tools ([#345](https://github.com/codersauce/red/issues/345)) ([b9fc1ff](https://github.com/codersauce/red/commit/b9fc1ffb91fe76cd4d66f3579109fa904c538aac))
+- **commands:** Add vim-style shell range filters ([#340](https://github.com/codersauce/red/issues/340)) ([7a4b344](https://github.com/codersauce/red/commit/7a4b3448607704b5d5ce5816e4f95536c11ccd32))
+- **picker:** Support file line navigation ([#339](https://github.com/codersauce/red/issues/339)) ([9fcf795](https://github.com/codersauce/red/commit/9fcf795854b29312fd12429fa57a1be586cf2c2a))
+- **commands:** Add vim-style shell execution ([#338](https://github.com/codersauce/red/issues/338)) ([f5cff19](https://github.com/codersauce/red/commit/f5cff1992c87dd65f230d9f8d4ac39c0565b7899))
+- **git:** Browse committed files in dashboard ([#337](https://github.com/codersauce/red/issues/337)) ([4cfc5ba](https://github.com/codersauce/red/commit/4cfc5badffdf672fe0461e8a4cd443707e48b91c))
+- **editor:** Format pasted text by default ([#334](https://github.com/codersauce/red/issues/334)) ([73bd541](https://github.com/codersauce/red/commit/73bd541cbc4370fb7bb9a5943218e7133f6893e4))
+- **picker:** Add configurable symbol tree guides ([#333](https://github.com/codersauce/red/issues/333)) ([def39e6](https://github.com/codersauce/red/commit/def39e64ba5431866ebb9c0371c5650c8acbf77d))
+- **editor:** Detect and resolve external file conflicts ([#330](https://github.com/codersauce/red/issues/330)) ([0c27121](https://github.com/codersauce/red/commit/0c27121ca5702bcf5931ac01948db52fd1c8a999))
+- **editor:** Add vim-style multi-cursor editing ([#326](https://github.com/codersauce/red/issues/326)) ([94f71e7](https://github.com/codersauce/red/commit/94f71e7449beb1dac2bb45d3c18ef4d9aae03235))
+- **editor:** Warn at bracket navigation boundaries ([#322](https://github.com/codersauce/red/issues/322)) ([b65a427](https://github.com/codersauce/red/commit/b65a427f89bed87356593e3beca0f4a3859ef5c0))
+- **editor:** Wrap directional window navigation ([#324](https://github.com/codersauce/red/issues/324)) ([cc7ff18](https://github.com/codersauce/red/commit/cc7ff18e6268f6c69a294cd8495aed9172cd6063))
+- **editor:** Support newlines in substitute replacements ([#320](https://github.com/codersauce/red/issues/320)) ([2cf819e](https://github.com/codersauce/red/commit/2cf819eb121157292b4417266ab8f98d4d19fba0))
+- **fidget:** Improve progress overlay rendering ([#319](https://github.com/codersauce/red/issues/319)) ([cec6375](https://github.com/codersauce/red/commit/cec6375fa7fbba99ae7a3e39be5ec5c3f71eac82))
+- **commands:** Add save-all command ([#317](https://github.com/codersauce/red/issues/317)) ([12fee08](https://github.com/codersauce/red/commit/12fee08e2bf3b6f2fc304bebf2900473586718f0))
+- **neotree:** Open file tree from insert mode ([#312](https://github.com/codersauce/red/issues/312)) ([9c461e8](https://github.com/codersauce/red/commit/9c461e85adfff27a599f11765d9a5530ea18012a))
+- **commands:** Add bufdo support ([#311](https://github.com/codersauce/red/issues/311)) ([5d1d34a](https://github.com/codersauce/red/commit/5d1d34aa2fd3a34e884eb52aee9b608bbc84be49))
+- **editing:** Add Vim-style comment formatting ([#307](https://github.com/codersauce/red/issues/307)) ([68b4a43](https://github.com/codersauce/red/commit/68b4a43095f19cd06e320d3568a78f641bb26abb))
+- **lsp:** Improve references loading feedback ([99454cd](https://github.com/codersauce/red/commit/99454cd68e1901e34eead9b3ffe9afe0cc482705))
+- **commands:** Add vim-compatible command abbreviations ([#304](https://github.com/codersauce/red/issues/304)) ([d92777c](https://github.com/codersauce/red/commit/d92777c8196fe95117459a5c4ce39a6ada26ed4c))
+- **picker:** Modernize buffer navigation ([#302](https://github.com/codersauce/red/issues/302)) ([85d225e](https://github.com/codersauce/red/commit/85d225e3fb24666563bf3d90c723d6b4edef9275))
+- **vim:** Add paragraph and sentence motions ([#303](https://github.com/codersauce/red/issues/303)) ([816abab](https://github.com/codersauce/red/commit/816abab28c51bb251d51c87cd19e9b16fe347815))
+- **buffers:** Add unnamed buffer creation ([#299](https://github.com/codersauce/red/issues/299)) ([8d86c47](https://github.com/codersauce/red/commit/8d86c47f49e5dcc8aedec7d4b87644b1015d9bc4))
+- **lsp:** Cache diagnostics across editor restarts ([#296](https://github.com/codersauce/red/issues/296)) ([e06bf54](https://github.com/codersauce/red/commit/e06bf54ee69b2b88f699629bf8d911b3f3b343b6))
+- **lsp:** Apply project-specific rustfmt settings ([#295](https://github.com/codersauce/red/issues/295)) ([83329b6](https://github.com/codersauce/red/commit/83329b6f1d4e40447320f187871c6873e9c3185b))
+- **lsp:** Show code action loading picker ([#292](https://github.com/codersauce/red/issues/292)) ([7c9ba3a](https://github.com/codersauce/red/commit/7c9ba3a01ab03ea2e6052435b012fbc19e952ce2))
+- **lsp:** Auto-import rust types from completions ([853aa21](https://github.com/codersauce/red/commit/853aa21e93b4ef38b3b8a814064b70d9466c8345))
+- **neotree:** Virtualize unbounded file trees ([#289](https://github.com/codersauce/red/issues/289)) ([dbced21](https://github.com/codersauce/red/commit/dbced21f35e6c397904d4ce6b25516644273fd87))
+- **agent:** Relax agent guardrails ([#288](https://github.com/codersauce/red/issues/288)) ([7380cba](https://github.com/codersauce/red/commit/7380cba5af5828ffcc387ecd0ab1c4882e910275))
+- **agent:** Add composer history search ([#287](https://github.com/codersauce/red/issues/287)) ([54a6253](https://github.com/codersauce/red/commit/54a62539beec4941812ea3128221661500e86495))
+- **agent:** Add source annotation walkthroughs ([#282](https://github.com/codersauce/red/issues/282)) ([94c7628](https://github.com/codersauce/red/commit/94c7628ae1119702503abb0039bb4ba83da16dcf))
+- **completion:** Add opt-in coordinated suggestions ([#281](https://github.com/codersauce/red/issues/281)) ([9181829](https://github.com/codersauce/red/commit/9181829b3e2837f6e34df3e48b0a21a0b3bb88a9))
+- **agent:** Show compact progress and create workspace directories ([#280](https://github.com/codersauce/red/issues/280)) ([ef9fc74](https://github.com/codersauce/red/commit/ef9fc744d2ae3d4c1ea40000de6a85d310cfc2d4))
+- **onboarding:** Add interactive first-run tutorial ([#275](https://github.com/codersauce/red/issues/275)) ([b281951](https://github.com/codersauce/red/commit/b2819516eeae05fa5ca5c9caba25ab78779f5b48))
+- **agent:** Add model selection to the agent pane ([f9a9801](https://github.com/codersauce/red/commit/f9a98011b5a3d62e58ce318d0af4f1c746b860e6))
+- **lsp:** Show signature help while typing ([792522e](https://github.com/codersauce/red/commit/792522e4774ed979ffea7f38b8749df025af3b0c))
+- **indent:** Add query-driven language indentation ([d91648e](https://github.com/codersauce/red/commit/d91648e2dfe6e4e5f7412463b1e2ea977795c67f))
+- **completion:** Accept selected item with enter ([#263](https://github.com/codersauce/red/issues/263)) ([b66b89b](https://github.com/codersauce/red/commit/b66b89befbe9d42bfa298a69019baac52f418b48))
+- **completion:** Add interactive snippet placeholders ([#262](https://github.com/codersauce/red/issues/262)) ([cb95bdb](https://github.com/codersauce/red/commit/cb95bdb44683dc49ecac4a4041c69d109d37b25c))
+- **formatting:** Enable format on save by default ([c25254b](https://github.com/codersauce/red/commit/c25254b8f00215e083b1bdefa1d3c062cf85d25f))
+- **neotree:** Activate items on double click ([46169f4](https://github.com/codersauce/red/commit/46169f412faa772920e7d0c5920b7c0e2aebc689))
+
+### Bug Fixes
+
+- **statusline:** Preserve styles when sections are hidden ([#356](https://github.com/codersauce/red/issues/356)) ([144da39](https://github.com/codersauce/red/commit/144da391b61468ccaedf51a2b2bb1949750d211d))
+- **editor:** Repeat visual indentation by line span ([#355](https://github.com/codersauce/red/issues/355)) ([0c8a8f8](https://github.com/codersauce/red/commit/0c8a8f80a2b4521f3e4b620f8b529e2e1fad36b2))
+- **editor:** Seed multi-cursor from visual selection ([#354](https://github.com/codersauce/red/issues/354)) ([f7ea02d](https://github.com/codersauce/red/commit/f7ea02d33835df7829d187d682c72e4da35842ec))
+- **git:** Avoid repeated full repository scans ([#353](https://github.com/codersauce/red/issues/353)) ([873bbae](https://github.com/codersauce/red/commit/873bbae1f69d58f4e0516d77f0908e58635101b3))
+- **agent:** Stabilize dynamic tool contracts ([#349](https://github.com/codersauce/red/issues/349)) ([3eb36ad](https://github.com/codersauce/red/commit/3eb36ad45a238a8c667e76cf7e071700b6d91a36))
+- **neotree:** Keep large workspaces responsive ([#344](https://github.com/codersauce/red/issues/344)) ([5862875](https://github.com/codersauce/red/commit/5862875ed0f391797945e8ffd9f008b73b811a63))
+- **editor:** Reindent pasted code without range formatting ([#341](https://github.com/codersauce/red/issues/341)) ([ae9c323](https://github.com/codersauce/red/commit/ae9c3231a03fdcced5a0f8f5ba22a200b9fffa97))
+- **editor:** Resolve recovered external-file warnings ([#336](https://github.com/codersauce/red/issues/336)) ([bec67fb](https://github.com/codersauce/red/commit/bec67fb7cbc59b8265947842619057c0bd55a3d0))
+- **session:** Scope restore state by workspace ([#335](https://github.com/codersauce/red/issues/335)) ([c821c12](https://github.com/codersauce/red/commit/c821c124a82949ae3c3c5db13e606ee585172a67))
+- **picker:** Prioritize distinctive primary labels ([#331](https://github.com/codersauce/red/issues/331)) ([183bf83](https://github.com/codersauce/red/commit/183bf83710383534ba0b163a4649cd553e5b4201))
+- **editor:** Prevent overwriting external file changes ([51b1831](https://github.com/codersauce/red/commit/51b18310fc0fb2bdb3ceacbce49a30e91782cfe3))
+- **lsp:** Refresh stale auto-import completions ([#329](https://github.com/codersauce/red/issues/329)) ([d1442f5](https://github.com/codersauce/red/commit/d1442f5be9c501c01f303c69c08d3c3c6272c071))
+- **neotree:** Restore recursive tree search ([#327](https://github.com/codersauce/red/issues/327)) ([8d09bfd](https://github.com/codersauce/red/commit/8d09bfd3d7b16420d823f5046127376fdf55adc8))
+- **editor:** Preserve indent after compound closers ([#328](https://github.com/codersauce/red/issues/328)) ([92a4af9](https://github.com/codersauce/red/commit/92a4af9b4e8f598b372e5137f2744c83db505a66))
+- **editor:** Smooth distant cursor reveals ([#325](https://github.com/codersauce/red/issues/325)) ([be96c53](https://github.com/codersauce/red/commit/be96c53bf1506623d71af4ebbe65130ce3995bb7))
+- **notifications:** Clarify command and lsp outcomes ([#321](https://github.com/codersauce/red/issues/321)) ([c4c22bc](https://github.com/codersauce/red/commit/c4c22bc22908200901a6ca9bdbf138d9d015ad76))
+- **completion:** Select top result after lsp updates ([#314](https://github.com/codersauce/red/issues/314)) ([61107d5](https://github.com/codersauce/red/commit/61107d5ce011a90f6159ea7e01d7a6b94b6632b2))
+- **notifications:** Make routine errors non-intrusive ([#318](https://github.com/codersauce/red/issues/318)) ([15bfb36](https://github.com/codersauce/red/commit/15bfb36ff21053f81203dcf8ee083eb440cf8b30))
+- **commands:** Allow bufdo to delete buffers ([#316](https://github.com/codersauce/red/issues/316)) ([4dc4054](https://github.com/codersauce/red/commit/4dc4054eec083683335523db791fb1599c868cec))
+- **lsp:** Retain diagnostics across code actions ([#315](https://github.com/codersauce/red/issues/315)) ([3ab0632](https://github.com/codersauce/red/commit/3ab0632832ca17fcdc153ede23769431afc9db13))
+- **completion:** Rebase refreshed edits from their request ([#313](https://github.com/codersauce/red/issues/313)) ([100ae37](https://github.com/codersauce/red/commit/100ae37904c6a75fb3502d901fc846d0044bcc31))
+- **editor:** Refresh plugins after buffer replacement ([#310](https://github.com/codersauce/red/issues/310)) ([61956bc](https://github.com/codersauce/red/commit/61956bc2b455d1da60b4423a9fb30617944546aa))
+- **lsp:** Improve workspace symbol filtering ([#306](https://github.com/codersauce/red/issues/306)) ([f4ebad3](https://github.com/codersauce/red/commit/f4ebad351639ce7fab6ed26ea43ca38ec90ebef7))
+- **editor:** Preserve navigation jump history ([#305](https://github.com/codersauce/red/issues/305)) ([d778dbe](https://github.com/codersauce/red/commit/d778dbeb79d2523103c71ae0bbe50524fe23b5e6))
+- **lsp:** Recover save formatting and inlay hints ([2e7702d](https://github.com/codersauce/red/commit/2e7702dcb097dab03fbb5b480b2831dcd8c02dc7))
+- **formatting:** Trim whitespace before format on save ([4b0cd5f](https://github.com/codersauce/red/commit/4b0cd5fc8e707f52aa21059225a4a8057c833c8e))
+- **lsp:** Ignore stale inlay hint responses ([4db98ba](https://github.com/codersauce/red/commit/4db98ba5ebdea484c06b7cec3b94c16a39873155))
+- **editor:** Reveal wrapped final lines ([#301](https://github.com/codersauce/red/issues/301)) ([c7408b2](https://github.com/codersauce/red/commit/c7408b2a21ee94e800a25a5c90f79000af3364ec))
+- **picker:** Prioritize filename matches ([#294](https://github.com/codersauce/red/issues/294)) ([db6c678](https://github.com/codersauce/red/commit/db6c678dc46ef402cc08915ad8c6b3ab9b4d192b))
+- **lsp:** Restore work-done progress ([#293](https://github.com/codersauce/red/issues/293)) ([9934a1a](https://github.com/codersauce/red/commit/9934a1a4266a28110be401a026f363496412aed5))
+- **diagnostics:** Preserve wrapped source text ([#291](https://github.com/codersauce/red/issues/291)) ([cb99f13](https://github.com/codersauce/red/commit/cb99f139346ec4f73712e943373dc359343c3c40))
+- **neotree:** Prevent instruction budget exhaustion in deep workspaces ([ceafbc9](https://github.com/codersauce/red/commit/ceafbc9d668a1c3521de6a4d43bd0655b5e5e48a))
+- **lsp:** Refresh and relocate stale diagnostics ([8e81a06](https://github.com/codersauce/red/commit/8e81a06faf81d0ca03eb042e2bc7a6ee8ee451b3))
+- **lsp:** Tolerate language server failures ([#286](https://github.com/codersauce/red/issues/286)) ([9dfc862](https://github.com/codersauce/red/commit/9dfc862c85726c1d9d073ae90ee08c81dd0c7899))
+- **agent:** Finish interrupted turns promptly ([#285](https://github.com/codersauce/red/issues/285)) ([ed140dd](https://github.com/codersauce/red/commit/ed140dd30ffc6a2dade180001a02d8b2865860c7))
+- **agent:** Make transcript links navigable ([#283](https://github.com/codersauce/red/issues/283)) ([fd9b8c6](https://github.com/codersauce/red/commit/fd9b8c69043e61ec1f1fe0417cddcfe479f8f78b))
+- **statusline:** Compact displayed file paths ([#284](https://github.com/codersauce/red/issues/284)) ([c7af566](https://github.com/codersauce/red/commit/c7af566882467401ad6d8f976e351df5e758fede))
+- **copilot:** Keep autocomplete enabled alongside suggestions ([#279](https://github.com/codersauce/red/issues/279)) ([6d1af35](https://github.com/codersauce/red/commit/6d1af359f8fd96e278088f25a4899f474e26bbd6))
+- **editor:** Restore the terminal promptly on quit ([#278](https://github.com/codersauce/red/issues/278)) ([5e39d4b](https://github.com/codersauce/red/commit/5e39d4bd29faf0b7220839e8c8be959c8f5c591d))
+- **copilot:** Persist enablement across restarts ([#277](https://github.com/codersauce/red/issues/277)) ([78195ba](https://github.com/codersauce/red/commit/78195ba1dfaea668ba06da3457a3bd36c6db749d))
+- **buffers:** Toggle between recently used buffers ([#276](https://github.com/codersauce/red/issues/276)) ([9b7b604](https://github.com/codersauce/red/commit/9b7b60408250e54d92e72854306546ecc7e09565))
+- **keymap:** Honor command-mode aliases across navigation contexts ([#274](https://github.com/codersauce/red/issues/274)) ([7a668a4](https://github.com/codersauce/red/commit/7a668a4cd812da88d53049f320e5c8dfcc04a09c))
+- **breadcrumbs:** Restore symbol context and abbreviate home paths ([de5420a](https://github.com/codersauce/red/commit/de5420ae63760dcafa119db28e6646b5ef89cc2f))
+- **matchit:** Handle rust lifetimes in percent motions ([eb76dc3](https://github.com/codersauce/red/commit/eb76dc314c122455b54321b29fcf9a32fad92254))
+- **copilot:** Accept inline suggestions with ctrl-l ([13659cc](https://github.com/codersauce/red/commit/13659cce06bba6f7280413e0b5884c6f0cc4420e))
+- **completion:** Preserve snippet navigation with empty popups ([af35b19](https://github.com/codersauce/red/commit/af35b195c35f973bb2fa2b98d854fcdd4b12f6de))
+- **clipboard:** Isolate editor tests from system clipboard ([ce86e79](https://github.com/codersauce/red/commit/ce86e796fbf84fe1b09fa279fef3c7557df24a95))
+- **picker:** Prioritize exact name matches ([a807fb9](https://github.com/codersauce/red/commit/a807fb98dc68d13330c01694db98af2ddd1eec6a))
+- **lsp:** Retry cancelled diagnostics quietly ([d2d9c5c](https://github.com/codersauce/red/commit/d2d9c5cf905439753326f69631c7cbaa9e1d9897))
+- **config:** Accept signature help settings ([0e82af1](https://github.com/codersauce/red/commit/0e82af1b8dd2654ed605510a139c9983afb0ba2f))
+- **lsp:** Refresh and preserve diagnostics after saving ([c338ed8](https://github.com/codersauce/red/commit/c338ed8b79ba8c45472d1250ca05724bae66dc9f))
+- **neotree:** Show symlinks as their targets ([#260](https://github.com/codersauce/red/issues/260)) ([b5add6d](https://github.com/codersauce/red/commit/b5add6db3d1fef430f5a0560c2d1a49daaa0c1e2))
+- **editor:** Keep cursor visible on matching brackets ([#259](https://github.com/codersauce/red/issues/259)) ([d80caf9](https://github.com/codersauce/red/commit/d80caf9581e1a54f4673d9fe240b1a386ef0b395))
+
+### Performance
+
+- **picker:** Stream and cache file discovery ([#352](https://github.com/codersauce/red/issues/352)) ([6af198e](https://github.com/codersauce/red/commit/6af198ebb2c294e73564010a7988452ae7dac1cf))
+- **editor:** Accelerate large repository interactions ([#332](https://github.com/codersauce/red/issues/332)) ([ae803e0](https://github.com/codersauce/red/commit/ae803e0970dcd47ad76d1e148f813d754fe779b2))
+- **runtime:** Accelerate editor and plugin hot paths ([#309](https://github.com/codersauce/red/issues/309)) ([2518f3f](https://github.com/codersauce/red/commit/2518f3fb96c72f47ce4c3c829935f71038e64203))
+- **picker:** Accelerate large workspace file searches ([#298](https://github.com/codersauce/red/issues/298)) ([e0b3093](https://github.com/codersauce/red/commit/e0b30930f0173520af896fa261afaec6c039f95d))
+- **lsp:** Batch progress updates and coalesce redraws ([#297](https://github.com/codersauce/red/issues/297)) ([f30f0b0](https://github.com/codersauce/red/commit/f30f0b00fba60f8ce241d078b67fd4b962db179c))
+- **editor:** Speed up repeated edits ([#267](https://github.com/codersauce/red/issues/267)) ([ac89827](https://github.com/codersauce/red/commit/ac89827e1a87118fe0083a08aec00fcd349c97de))
+
+### Documentation
+
+- **editor:** Clarify agent workflows and upcoming release features ([#351](https://github.com/codersauce/red/issues/351)) ([10210e8](https://github.com/codersauce/red/commit/10210e831d0ef3728b0f3dfa5792e42d03406434))
+- **perf:** Record edit replay optimization plan ([122c0b8](https://github.com/codersauce/red/commit/122c0b84996feff7ed1e69e302802d8c956edd1f))
+
+### Testing
+
+- **lsp:** Make diagnostic close fixture portable ([6ae7bf5](https://github.com/codersauce/red/commit/6ae7bf5721f1b148d2f5f2a3dc3690ea2d0ee1df))
+
+### Continuous Integration
+
+- Use smaller macOS test runners ([#343](https://github.com/codersauce/red/issues/343)) ([b232fef](https://github.com/codersauce/red/commit/b232fef10c419158c85662596979f7e669b91c3c))
+- Reduce repeated validation spend ([#342](https://github.com/codersauce/red/issues/342)) ([e8472e7](https://github.com/codersauce/red/commit/e8472e7f1436ea6cf1cedc6f8c77ec70bb69f088))
+
+### Maintenance
+
+- **branch:** Sync main before snippet fix publication ([992b69e](https://github.com/codersauce/red/commit/992b69eb1ea26730890f97dd9318f9e1fb6c0f70))
+
+### Other
+
+- Improve graph navigation ([3b6c167](https://github.com/codersauce/red/commit/3b6c167b57a67a7bb6c7f3d040518bd005e32805))
+- Document learning tutorial boundary ([e1b0193](https://github.com/codersauce/red/commit/e1b0193c76d07401786ca7a46e4ea32f5078ece1))
+- Record visual repeat and picker tab gotchas ([f02bd5f](https://github.com/codersauce/red/commit/f02bd5f687e3ae8e3d4c13e847dd9c84bac05c6c))
+- Refresh plugin package guidance ([8fd5b2e](https://github.com/codersauce/red/commit/8fd5b2e6fcbc83cb8a080df1f3ae38db6f35f3ef))
+- Document binary skew check ([097d131](https://github.com/codersauce/red/commit/097d131d140a0767f9261fcfc14eabae8603cd06))
+- Note website implementation starting point ([41a350c](https://github.com/codersauce/red/commit/41a350c3ab8230ce5d967e217903c6d0e0c56e93))
+- Clarify website positioning ([81b27b0](https://github.com/codersauce/red/commit/81b27b02185ab0d11e10e02918f214e53a631f23))
+- Tighten agent and plugin wiki graph ([63d56e0](https://github.com/codersauce/red/commit/63d56e07869a757def4cb17cbe805e3fa7d07244))
+- Document release campaign workflow ([6a3b58d](https://github.com/codersauce/red/commit/6a3b58deed9bf003380f2cbcf6a304a7e7cd87b6))
+- Refresh config and session references ([f82bccb](https://github.com/codersauce/red/commit/f82bccb2556f0cac7ab244f9ce4aa989ff5cdd79))
+- Refresh CI validation reference ([4a3a1af](https://github.com/codersauce/red/commit/4a3a1affd22a0902c01e6e4398695688186b9659))
+- Refresh validation and config references ([318871b](https://github.com/codersauce/red/commit/318871b701126b904f90b383d4829e195297ecb8))
+- Document CI runner selection ([d8cb895](https://github.com/codersauce/red/commit/d8cb8953204c1155d99adb6938b90a22af2a5e09))
+- Connect ai completion config reference ([5dae16b](https://github.com/codersauce/red/commit/5dae16baa7e851670e7fc957702486b5085e7ce1))
+- Update copilot completion guide ([c632834](https://github.com/codersauce/red/commit/c6328341199d9e6e65e54531b08d7144238d84a8))
+- Clarify completion and host api guidance ([7fb8d03](https://github.com/codersauce/red/commit/7fb8d0361b32f07b604d11fedcc5df2354595e15))
+- Clarify agent and copilot boundaries ([695dddd](https://github.com/codersauce/red/commit/695ddddf3c642cbd9154d75da36e7c05651480db))
+- Update agent tool and validation graph ([70df993](https://github.com/codersauce/red/commit/70df993af33697131c5212b9364132da12252c3c))
+- Use worktrunk for features ([c1b4601](https://github.com/codersauce/red/commit/c1b4601a29148c0ed10fb53eea74e5684dbb0cbc))
+- Refresh plugin and agent references ([fa487e4](https://github.com/codersauce/red/commit/fa487e4280e611b09ca7d9c65371e20b1d696182))
+
 ## [0.6.0](https://github.com/codersauce/red/compare/v0.5.0...v0.6.0)
 
 ### Features

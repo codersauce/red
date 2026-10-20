@@ -113,7 +113,12 @@ struct DeleteFileOptions {
 }
 
 pub fn file_uri(path: impl AsRef<Path>) -> Result<String, LspError> {
-    let path = path.as_ref().absolutize()?;
+    let path = path.as_ref();
+    let path = if path.is_absolute() {
+        path.absolutize_from(path)?
+    } else {
+        path.absolutize()?
+    };
     let path = path.to_string_lossy();
     #[cfg(windows)]
     let path = {
@@ -473,6 +478,26 @@ mod tests {
 
         assert!(uri.contains("folder%20with%20spaces/caf%C3%A9%20%231%25.rs"));
         assert_eq!(file_path(&uri).unwrap(), path.to_string_lossy().as_ref());
+    }
+
+    #[test]
+    fn absolute_file_uris_still_normalize_parent_segments() {
+        let root = std::env::current_dir().unwrap();
+        let path = root
+            .join("folder")
+            .join("nested")
+            .join("..")
+            .join("main.rs");
+
+        let uri = file_uri(&path).unwrap();
+
+        assert_eq!(
+            file_path(&uri).unwrap(),
+            root.join("folder")
+                .join("main.rs")
+                .to_string_lossy()
+                .as_ref()
+        );
     }
 
     #[test]

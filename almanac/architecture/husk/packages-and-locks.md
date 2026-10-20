@@ -1,7 +1,7 @@
 ---
 title: "Husk Packages And Locks"
 summary: "Husk packages are deterministic local source graphs described by Husk.toml and stabilized by Husk.lock when extensions are involved."
-topics: [husk, packages, locks, architecture]
+topics: [husk, packages, locks, architecture, persistence]
 sources:
   - id: package-code
     type: file

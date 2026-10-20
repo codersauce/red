@@ -239,8 +239,10 @@ mod tests {
                 "{prefix};"
             );
             dispatch(&mut editor, KeyCode::Esc);
-            // Escape from idle Normal blurs the composer; focus it for the next case.
+            // Escape from idle Normal blurs the composer; focus it (in Insert)
+            // and return to Normal for the next case.
             assert!(editor.test_focus_text_panel_composer("test"));
+            dispatch(&mut editor, KeyCode::Esc);
         }
         dispatch(&mut editor, KeyCode::Char('/'));
         assert_eq!(

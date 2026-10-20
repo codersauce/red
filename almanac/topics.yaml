@@ -23,6 +23,10 @@ topics:
     title: Red Editor
     description: The product-level editor model and its main reader entry points.
     parents: [concepts]
+  - slug: website
+    title: Website
+    description: External Red website positioning, media evidence, and runtime-claim boundaries.
+    parents: [red-editor]
   - slug: editor
     title: Editor Core
     description: Modal editing state, buffers, windows, rendering, and input handling.
@@ -36,8 +40,8 @@ topics:
     description: Public command-line surfaces for Red and Husk.
     parents: [reference]
   - slug: commands
-    title: Commands
-    description: Editor commands, command palette discovery, and keymap-derived command lookup.
+    title: Editor Commands
+    description: Editor colon commands, command palette discovery, and keymap-derived command lookup, distinct from process CLI commands.
     parents: [editor, cli]
   - slug: configuration
     title: Configuration
@@ -119,10 +123,18 @@ topics:
     title: Plugins
     description: Husk plugins, host API integration, bundled plugin assets, and plugin-owned resources.
     parents: [architecture]
+  - slug: language-packs
+    title: Language Packs
+    description: Red language packages across runtime syntax effects, catalog/source policy, release artifacts, CLI install paths, and native grammar trust.
+    parents: [plugins, syntax, release]
   - slug: host-api
     title: Host API
     description: Versioned Red host API calls and plugin-to-editor request contracts.
     parents: [plugins]
+  - slug: json-rpc-plugins
+    title: JSON-RPC Plugins
+    description: Language-agnostic external plugin process protocol, transport limits, and host-boundary decisions.
+    parents: [plugins, host-api, safety]
   - slug: filesystem
     title: Filesystem
     description: Workspace-confined file access and fail-closed path handling.
@@ -146,7 +158,7 @@ topics:
   - slug: locks
     title: Locks
     description: Lock files and reproducible package or extension state.
-    parents: [packages]
+    parents: [packages, persistence]
   - slug: extensions
     title: Extensions
     description: Husk static native modules, WebAssembly Components, and extension bundles.
@@ -167,6 +179,10 @@ topics:
     title: Completion
     description: LSP completion requests, completion UI, and completion edit application.
     parents: [lsp]
+  - slug: ai-completion
+    title: AI Completion
+    description: Optional inline AI completion surfaces that run beside ordinary language-server completion.
+    parents: [configuration, completion]
   - slug: workspace-edits
     title: Workspace Edits
     description: LSP workspace edit preparation, resource operations, and failure handling.
@@ -183,9 +199,13 @@ topics:
     title: Agent Edits
     description: Codex edit handling through Red-owned tools, attribution, followed application, and history.
     parents: [agent, safety]
+  - slug: inline-assist
+    title: Inline Assist
+    description: Source-anchored Codex questions, annotations, exact-target edits, wider same-file proposals, and retained inline history.
+    parents: [agent-edits]
   - slug: safety
     title: Safety
-    description: Fail-closed behavior, review gates, workspace confinement, and protected operations.
+    description: Fail-closed behavior, review gates, workspace confinement, terminal-output sanitization, and protected operations.
     parents: [architecture]
   - slug: sessions
     title: Sessions
@@ -203,10 +223,6 @@ topics:
     title: IPC
     description: Versioned local protocol behavior for detachable sessions.
     parents: [detach]
-  - slug: operations
-    title: Operations
-    description: Task-oriented operational workflows for sessions and maintenance.
-    parents: [guides]
   - slug: development
     title: Development
     description: Local maintainer development and validation workflow.
@@ -245,8 +261,8 @@ topics:
     parents: [red-editor]
   - slug: navigation
     title: Navigation
-    description: Wiki and editor navigation entry points.
-    parents: [onboarding]
+    description: Wiki reading-order, hub, and reader-routing entry points.
+    parents: [wiki]
   - slug: wiki
     title: Wiki
     description: CodeAlmanac wiki structure and maintenance conventions.

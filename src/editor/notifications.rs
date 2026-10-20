@@ -1,6 +1,8 @@
 //! Editor-owned notification adapters and message-browser coordination.
 
 use super::*;
+
+const NOTICE_AGE_THRESHOLD: Duration = Duration::from_secs(10);
 use crate::{
     notification::{MessageAction, Notification, NotificationCounts, NotificationState},
     ui::{MessageRow, MessagesPanel, MessagesView},
@@ -120,6 +122,28 @@ fn record_details(record: &Notification, now: Instant) -> String {
     )
 }
 
+pub(super) fn relative_notice_age(updated_at: SystemTime, now: SystemTime) -> Option<String> {
+    let elapsed = now.duration_since(updated_at).ok()?;
+    if elapsed < NOTICE_AGE_THRESHOLD {
+        return None;
+    }
+    let seconds = elapsed.as_secs();
+    let (value, unit) = if seconds < 60 {
+        (seconds, "s")
+    } else if seconds < 60 * 60 {
+        (seconds / 60, "m")
+    } else if seconds < 24 * 60 * 60 {
+        (seconds / (60 * 60), "h")
+    } else {
+        (seconds / (24 * 60 * 60), "d")
+    };
+    Some(format!("{value}{unit} ago"))
+}
+
+fn mebibytes(bytes: usize) -> String {
+    format!("{:.1} MiB", bytes as f64 / (1024.0 * 1024.0))
+}
+
 impl Editor {
     /// Transitional operation-local result plus durable notification publication.
     /// Clearing the old slot never clears notification history or active work.
@@ -131,8 +155,133 @@ impl Editor {
         self.set_message_with_attention(Severity::Info, AttentionPolicy::Quiet, message);
     }
 
+    pub(super) fn set_routine_error(&mut self, message: Option<String>) {
+        self.set_message_with_attention(Severity::Error, AttentionPolicy::Quiet, message);
+    }
+
+    pub(super) fn set_foreground_message(&mut self, severity: Severity, message: Option<String>) {
+        self.publish_foreground_message(severity, None, message);
+    }
+
+    /// Leads the bottom line with the result of a command the user just ran,
+    /// without adding to the messages that need attention.
+    pub(super) fn set_routine_foreground_message(&mut self, severity: Severity, message: String) {
+        self.publish_foreground_message(severity, Some(AttentionPolicy::Quiet), Some(message));
+    }
+
+    fn publish_foreground_message(
+        &mut self,
+        severity: Severity,
+        attention: Option<AttentionPolicy>,
+        message: Option<String>,
+    ) {
+        let Some(message) = message else {
+            self.last_error = None;
+            return;
+        };
+        let mut notice = Notice::new(NotificationSource::Editor, severity, &message)
+            .with_display_priority(DisplayPriority::Foreground)
+            .with_details(&message);
+        if let Some(attention) = attention {
+            notice = notice.with_attention(attention);
+        }
+        if let Err(error) = self.publish_notification(notice) {
+            self.notification_fallback = Some(crate::notification::single_line(truncate_chars(
+                &message, 4_096,
+            )));
+            log!("could not retain notification: {error}");
+        } else {
+            self.notification_fallback = None;
+        }
+        self.last_error = Some(message);
+    }
+
+    pub(super) fn set_routine_warning(&mut self, message: Option<String>) {
+        self.set_message_with_attention(Severity::Warning, AttentionPolicy::Quiet, message);
+    }
+
     pub(super) fn set_notification_message(&mut self, severity: Severity, message: Option<String>) {
         self.set_message_with_attention(severity, AttentionPolicy::for_severity(severity), message);
+    }
+
+    pub(super) fn set_navigation_boundary_warning(&mut self, target: &str) {
+        self.set_routine_warning(Some(format!("No more {target} to move to")));
+    }
+
+    /// Reports that the plugin registry stopped `plugin` for the rest of the session.
+    pub(super) fn publish_plugin_quarantine(
+        &mut self,
+        plugin: &str,
+        stage: &str,
+        path: &str,
+        diagnostic: &str,
+    ) {
+        let summary = format!(
+            "stopped for this session: {}",
+            crate::plugin::quarantine_reason(diagnostic)
+        );
+        let details = format!(
+            "Plugin: {plugin}\nStage: {stage}\nSource: {path}\n\n{diagnostic}\n\n\
+             Red stopped this plugin for the rest of the session, so its commands and dialogs \
+             are unavailable. Restart Red to load it again. If you are developing this \
+             plugin, saving a fix reloads it. Run :plugin-status to see every plugin's state."
+        );
+        self.publish_plugin_notice(plugin, Severity::Error, "quarantine", summary, details);
+    }
+
+    /// Reports a request result the host skipped because it did not fit in the
+    /// plugin's free heap.
+    pub(super) fn publish_plugin_result_dropped(
+        &mut self,
+        plugin: &str,
+        request: &str,
+        needed: usize,
+        available: usize,
+    ) {
+        let summary = format!(
+            "dropped a {request} result too large for its memory ({} needed, {} free)",
+            mebibytes(needed),
+            mebibytes(available)
+        );
+        let details = format!(
+            "Plugin: {plugin}\nRequest: {request}\nNeeded: {needed} bytes\nFree: {available} \
+             bytes\n\nRed skipped this result instead of stopping the plugin. The plugin keeps \
+             running, but whatever was waiting for this result will not receive it."
+        );
+        self.publish_plugin_notice(
+            plugin,
+            Severity::Warning,
+            &format!("dropped-result:{request}"),
+            summary,
+            details,
+        );
+    }
+
+    fn publish_plugin_notice(
+        &mut self,
+        plugin: &str,
+        severity: Severity,
+        key: &str,
+        summary: String,
+        details: String,
+    ) {
+        let notice = Notice::new(
+            NotificationSource::Plugin {
+                name: plugin.to_string(),
+                generation: 0,
+            },
+            severity,
+            &summary,
+        )
+        .with_key(key)
+        .with_details(details);
+        let labeled = format!("{plugin}: {summary}");
+        if let Err(error) = self.publish_notification(notice) {
+            log!("could not retain plugin notice: {error}");
+            self.set_notification_message(severity, Some(labeled));
+        } else {
+            self.last_error = Some(labeled);
+        }
     }
 
     fn set_message_with_attention(
@@ -340,10 +489,24 @@ impl Editor {
         self.refresh_message_browser();
     }
 
+    pub(super) fn open_message_notification(&mut self, id: NotificationId) {
+        self.open_messages();
+        if let Some(browser) = &mut self.message_browser {
+            browser.selected = Some(id);
+        }
+        self.refresh_message_browser();
+    }
+
     pub(super) fn close_messages(&mut self) {
         if let Some(browser) = self.message_browser.take() {
             self.current_dialog = browser.return_dialog;
         }
+    }
+
+    pub(super) fn selected_message_notification(&self) -> Option<NotificationId> {
+        self.message_browser
+            .as_ref()
+            .and_then(|browser| browser.selected)
     }
 
     pub(super) fn refresh_message_browser(&mut self) {
@@ -374,6 +537,7 @@ impl Editor {
             .map(|record| {
                 let timestamp: chrono::DateTime<chrono::Local> = record.updated_at.into();
                 MessageRow {
+                    id: record.id,
                     summary: format!("{} {}", record.severity.marker(), record.content.summary),
                     metadata: format!(
                         "{} · {} · {}{}",
@@ -410,6 +574,9 @@ impl Editor {
             searching: browser.searching,
             filter: browser.filter.label(),
             counts,
+            can_cancel: browser
+                .selected
+                .is_some_and(|id| self.shell_commands.has_notification(id)),
             feedback: browser.feedback.clone().or_else(|| {
                 self.notification_fallback
                     .as_ref()
@@ -440,14 +607,22 @@ impl Editor {
             .and_then(|id| ids.iter().position(|candidate| *candidate == id))
             .unwrap_or(0);
         match action {
+            MessageAction::Select(id) if ids.contains(id) => {
+                browser.selected = Some(*id);
+                browser.scroll = 0;
+            }
+            MessageAction::Select(_) => {}
             MessageAction::Next | MessageAction::Previous => {
                 let next = if matches!(action, MessageAction::Next) {
                     selected.saturating_add(1).min(ids.len().saturating_sub(1))
                 } else {
                     selected.saturating_sub(1)
                 };
-                browser.selected = ids.get(next).copied();
-                browser.scroll = 0;
+                let next = ids.get(next).copied();
+                if browser.selected != next {
+                    browser.selected = next;
+                    browser.scroll = 0;
+                }
             }
             MessageAction::Search => browser.searching = true,
             MessageAction::Query(text) => {
@@ -517,6 +692,7 @@ impl Editor {
             }
             MessageAction::ScrollDown => browser.scroll = browser.scroll.saturating_add(5),
             MessageAction::ScrollUp => browser.scroll = browser.scroll.saturating_sub(5),
+            MessageAction::ScrollTo(scroll) => browser.scroll = *scroll,
             MessageAction::Close => unreachable!(),
         }
         self.refresh_message_browser();
@@ -526,6 +702,28 @@ impl Editor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn relative_notice_age_uses_compact_units_after_the_threshold() {
+        let now = SystemTime::now();
+        assert_eq!(relative_notice_age(now - Duration::from_secs(9), now), None);
+        assert_eq!(
+            relative_notice_age(now - Duration::from_secs(12), now).as_deref(),
+            Some("12s ago")
+        );
+        assert_eq!(
+            relative_notice_age(now - Duration::from_secs(12 * 60), now).as_deref(),
+            Some("12m ago")
+        );
+        assert_eq!(
+            relative_notice_age(now - Duration::from_secs(2 * 60 * 60), now).as_deref(),
+            Some("2h ago")
+        );
+        assert_eq!(
+            relative_notice_age(now - Duration::from_secs(3 * 24 * 60 * 60), now).as_deref(),
+            Some("3d ago")
+        );
+    }
 
     #[test]
     fn word_backspace_updates_the_editor_owned_message_query() {
@@ -747,6 +945,116 @@ mod tests {
         assert!(editor.message_ids(Instant::now()).is_empty());
     }
 
+    #[tokio::test]
+    async fn print_warning_is_transient_and_does_not_require_acknowledgment() {
+        let mut editor = editor(100, 24);
+        let mut buffer = RenderBuffer::new(100, 24, &Style::default());
+        let mut runtime = Runtime::new();
+
+        editor
+            .execute(
+                &Action::PrintWarning("No more Git hunks to move to".to_string()),
+                &mut buffer,
+                &mut runtime,
+            )
+            .await
+            .unwrap();
+
+        let warning = editor.notifications.records().next_back().unwrap();
+        assert_eq!(warning.severity, Severity::Warning);
+        assert_eq!(warning.attention, AttentionPolicy::Quiet);
+        assert_eq!(
+            editor
+                .notifications
+                .counts(Instant::now())
+                .needs_acknowledgment,
+            0
+        );
+        assert_eq!(
+            editor.last_error.as_deref(),
+            Some("No more Git hunks to move to")
+        );
+    }
+
+    #[test]
+    fn foreground_command_result_leads_while_retained_error_stays_visible_in_badge() {
+        let mut editor = editor(120, 24);
+        editor
+            .publish_notification(Notice::new(
+                NotificationSource::Editor,
+                Severity::Error,
+                "old diagnostics failure",
+            ))
+            .unwrap();
+        editor.set_foreground_message(Severity::Success, Some(":wa — no modified buffers".into()));
+
+        let mut buffer = RenderBuffer::new(120, 24, &Style::default());
+        editor.draw_commandline(&mut buffer);
+        let row = render_text_rows(&buffer).pop().unwrap();
+
+        assert!(row.contains(":wa — no modified buffers"), "{row}");
+        assert!(row.contains("1 needs attention"), "{row}");
+        assert!(!row.contains("old diagnostics failure"), "{row}");
+    }
+
+    #[test]
+    fn routine_foreground_warning_leads_without_needing_attention() {
+        let mut editor = editor(120, 24);
+        editor
+            .publish_notification(Notice::new(
+                NotificationSource::Editor,
+                Severity::Error,
+                "plugin stopped",
+            ))
+            .unwrap();
+        editor.set_routine_foreground_message(
+            Severity::Warning,
+            "`Crash` is unavailable because plugin `crashy` was stopped".into(),
+        );
+
+        let mut buffer = RenderBuffer::new(120, 24, &Style::default());
+        editor.draw_commandline(&mut buffer);
+        let row = render_text_rows(&buffer).pop().unwrap();
+
+        assert!(row.contains("`Crash` is unavailable"), "{row}");
+        assert!(row.contains("1 needs attention"), "{row}");
+        assert!(!row.contains("plugin stopped"), "{row}");
+    }
+
+    #[test]
+    fn resurfaced_lsp_error_shows_its_source_and_age() {
+        let mut editor = editor(120, 24);
+        let now = NotificationTime::now();
+        editor
+            .notifications
+            .publish(
+                Notice::new(
+                    NotificationSource::LanguageServer {
+                        name: "rust".into(),
+                        workspace_root: "/tmp/project".into(),
+                        generation: 0,
+                    },
+                    Severity::Error,
+                    "diagnostics failed for pull_requests_screen.rs",
+                ),
+                NotificationTime {
+                    monotonic: now.monotonic,
+                    wall: now.wall - Duration::from_secs(12 * 60),
+                },
+            )
+            .unwrap();
+
+        let mut buffer = RenderBuffer::new(120, 24, &Style::default());
+        editor.draw_commandline(&mut buffer);
+        let row = render_text_rows(&buffer).pop().unwrap();
+
+        assert!(
+            row.contains("rust: diagnostics failed for pull_requests_screen.rs"),
+            "{row}"
+        );
+        assert!(row.contains("(12m ago)"), "{row}");
+    }
+
     #[test]
     fn presentation_ignores_an_empty_center_but_detects_arrivals_and_expiry() {
         let mut editor = editor(90, 12);
@@ -889,6 +1197,17 @@ mod tests {
             Severity::Error
         );
         assert_eq!(
+            editor.notifications.records().next().unwrap().attention,
+            AttentionPolicy::Quiet
+        );
+        assert_eq!(
+            editor
+                .notifications
+                .counts(Instant::now())
+                .needs_acknowledgment,
+            0
+        );
+        assert_eq!(
             editor.handle_command("messages", &runtime),
             vec![Action::OpenMessages]
         );
@@ -944,6 +1263,102 @@ mod tests {
             .is_active(Instant::now()));
         editor.handle_message_action(&MessageAction::ClearInactive);
         assert!(editor.notifications.get(first).is_none());
+    }
+
+    #[test]
+    fn list_navigation_preserves_detail_scroll_until_selection_changes() {
+        let mut editor = editor(100, 24);
+        for summary in ["older", "newer"] {
+            editor
+                .publish_notification(
+                    Notice::new(NotificationSource::Editor, Severity::Error, summary)
+                        .with_details("detail\n".repeat(40)),
+                )
+                .unwrap();
+        }
+        editor.open_messages();
+        let ids = editor.message_ids(Instant::now());
+        for (action, selected, scroll) in [
+            (MessageAction::Previous, 0, 5),
+            (MessageAction::Next, 1, 0),
+            (MessageAction::Next, 1, 5),
+            (MessageAction::Previous, 0, 0),
+        ] {
+            editor.handle_message_action(&MessageAction::ScrollTo(5));
+            editor.handle_message_action(&action);
+            let browser = editor.message_browser.as_ref().unwrap();
+            assert_eq!(browser.selected, Some(ids[selected]));
+            assert_eq!(browser.scroll, scroll);
+        }
+    }
+
+    #[test]
+    fn mouse_selects_message_details_without_acknowledging_or_editing() {
+        for width in [100, 64] {
+            let mut editor = editor(width, 24);
+            let first = editor
+                .publish_notification(
+                    Notice::new(NotificationSource::Editor, Severity::Error, "first")
+                        .with_details("selected message details"),
+                )
+                .unwrap();
+            let newer = editor
+                .publish_notification(Notice::new(
+                    NotificationSource::Editor,
+                    Severity::Warning,
+                    "newer",
+                ))
+                .unwrap();
+            editor.open_messages();
+            editor.handle_message_action(&MessageAction::ScrollTo(5));
+
+            // Click the second message's metadata line through the editor's modal route.
+            let event = Event::Mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 2,
+                row: 4,
+                modifiers: KeyModifiers::NONE,
+            });
+            let Some(KeyAction::Single(Action::MessageHistory(action))) =
+                editor.handle_event(&event).unwrap()
+            else {
+                panic!("message click did not reach the dialog");
+            };
+            editor.handle_message_action(&action);
+            let browser = editor.message_browser.as_ref().unwrap();
+            assert_eq!(browser.selected, Some(first));
+            assert_eq!(browser.scroll, 0);
+            assert!(editor
+                .notifications
+                .get(first)
+                .unwrap()
+                .is_active(Instant::now()));
+            let rendered = (0..24)
+                .map(|row| editor.test_render_row(row).unwrap())
+                .collect::<String>();
+            assert!(rendered.contains("selected message details"));
+            assert_eq!(editor.current_buffer().contents(), "hello");
+
+            // A notice may leave the active group after the click was rendered.
+            let event = Event::Mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 2,
+                row: 1,
+                modifiers: KeyModifiers::NONE,
+            });
+            let Some(KeyAction::Single(Action::MessageHistory(action))) =
+                editor.handle_event(&event).unwrap()
+            else {
+                panic!("message click did not reach the dialog");
+            };
+            editor.notifications.resolve(newer).unwrap();
+            assert_eq!(editor.message_ids(Instant::now()), vec![first, newer]);
+            editor.handle_message_action(&action);
+            assert_eq!(
+                editor.message_browser.as_ref().unwrap().selected,
+                Some(newer)
+            );
+        }
     }
 
     struct RetainedDraft;

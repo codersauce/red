@@ -1,6 +1,6 @@
 ---
 title: "Guides"
-summary: "Guide pages give maintainers task-oriented procedures for validation, plugins, LSP debugging, sessions, performance checks, releases, installers, agent history inspection, and Copilot inline completion."
+summary: "Guide pages give maintainers task-oriented procedures for validation, plugins, LSP debugging, sessions, performance checks, releases, installers, website operations, agent history inspection, and Copilot inline completion."
 topics: [guides, navigation]
 sources:
   - id: topics
@@ -12,6 +12,9 @@ sources:
   - id: plugin-guide
     type: file
     path: almanac/guides/plugins/write-a-husk-plugin.md
+  - id: language-pack-release
+    type: file
+    path: almanac/guides/plugins/release-language-pack.md
   - id: lsp-guide
     type: file
     path: almanac/guides/lsp/debugging-lsp-failures.md
@@ -30,23 +33,38 @@ sources:
   - id: release-guide
     type: file
     path: almanac/guides/releases/release-red.md
+  - id: release-hub
+    type: file
+    path: almanac/guides/releases/README.md
+  - id: release-campaign
+    type: file
+    path: almanac/reference/releases/release-campaign.md
   - id: installers-guide
     type: file
     path: almanac/guides/installers/release-installers.md
   - id: performance-guide
     type: file
     path: almanac/guides/performance/performance-checks.md
+  - id: website-guide
+    type: file
+    path: almanac/guides/website/refresh-public-site.md
+  - id: deploy-public-site
+    type: file
+    path: almanac/guides/website/deploy-public-site.md
+  - id: website-hub
+    type: file
+    path: almanac/guides/website/README.md
 ---
 
 # Guides
 
-Guide pages are the task-oriented shelf for Red maintainers. The topic graph keeps them under the `guides` root and connects individual guides to validation, plugins, LSP, sessions, release, installers, performance, agent, and operations topics [@topics]. Use this hub when you know the work you need to finish and want the procedure before reading subsystem architecture.
+Guide pages are the task-oriented shelf for Red maintainers. The topic graph keeps them under the `guides` root and connects individual guides to validation, plugins, LSP, sessions, release, installers, website, performance, agent, and AI-completion topics [@topics]. Use this hub when you know the work you need to finish and want the procedure before reading subsystem architecture.
 
 ## Everyday Development
 
 Start with [Build, Test, And Validate](development/build-test-and-validate) when preparing ordinary code changes for review, push, or CI parity. It orders local Rust tests, clippy, formatting, self-checks, plugin checks, performance gates, and release-adjacent validation by changed area [@validation-guide].
 
-Use [Write A Husk Plugin](plugins/write-a-husk-plugin) when adding or updating a plugin package, host API usage, resource registration, permissions, or plugin validation [@plugin-guide]. Use [Debugging LSP Failures](lsp/debugging-lsp-failures) when a language-server issue may involve startup, routing, transport, diagnostics, completion, or workspace edits [@lsp-guide].
+Use [Write A Husk Plugin](plugins/write-a-husk-plugin) when adding or updating a plugin package, host API usage, resource registration, permissions, or plugin validation [@plugin-guide]. Use [Release A Language Pack](plugins/release-language-pack) when publishing one first-party language pack and verifying the catalog entry Red consumes [@language-pack-release]. Use [Debugging LSP Failures](lsp/debugging-lsp-failures) when a language-server issue may involve startup, routing, transport, diagnostics, completion, or workspace edits [@lsp-guide].
 
 ## Agent And Session Operations
 
@@ -58,4 +76,18 @@ For live sessions, use [Detach And Reattach](sessions/detach-reattach) when the 
 
 Use [Performance Checks](performance/performance-checks) for deterministic CI performance gates and workstation benchmarks that catch editor, detach, interaction, and Git workspace regressions [@performance-guide].
 
-For publication work, [Release Red](releases/release-red) covers the release flow from prepare-release through tag publishing, archive smoke tests, Homebrew update, installer verification, and Discord announcement [@release-guide]. [Release Installers](installers/release-installers) narrows that to Unix and Windows installer verification, checksum handling, self-check execution, fixture tests, and latest-release smoke tests [@installers-guide].
+For publication work, start with [Release Operations](releases), then move into
+[Release Red](releases/release-red) for the editor release flow from
+prepare-release through tag publishing, archive smoke tests, Homebrew update,
+installer verification, and Discord announcement [@release-hub]
+[@release-guide]. Use [Release Campaign](../reference/releases/release-campaign)
+when the work is the reviewed release-message manifest, exact version
+resolution, or the boundary between automated Discord posting and preview-only
+social copy [@release-campaign]. [Release A Language Pack](plugins/release-language-pack)
+covers the separate first-party language-pack tag, packaging, catalog update,
+and Red-side install verification path [@language-pack-release]. [Release Installers](installers/release-installers)
+narrows Red's Unix and Windows installer verification, checksum handling,
+self-check execution, fixture tests, and latest-release smoke tests
+[@installers-guide].
+
+Use [Website Operations](website) when publication work touches `getred.dev` docs, media, installer routes, OpenAI Sites, custom domains, or rollback [@website-hub]. Within that cluster, [Refresh Public Site](website/refresh-public-site) is the content and media procedure before publishing [@website-guide], and [Deploy Public Site](website/deploy-public-site) is the production Sites procedure [@deploy-public-site].

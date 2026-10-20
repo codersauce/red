@@ -1,6 +1,6 @@
-# Husk plugin compatibility
+# Plugin compatibility
 
-Red host API version `0.14.0` is defined by
+Red host API version `0.21.0` is defined by
 [`src/plugin/host_api.json`](../src/plugin/host_api.json). That file is the canonical,
 machine-readable list of execute actions, request actions, signatures, and introduction
 versions. Runtime dispatch and the bundled-plugin corpus are checked against it in tests.
@@ -24,9 +24,78 @@ required/optional arity (`HUSK-A0002`) and obvious literal argument types
 annotations use `HUSK-A0004`. `--no-typecheck` is an unsupported development
 escape hatch; compatibility guarantees do not apply while it is enabled.
 
-Red `0.14.0` retains the complete `0.4.0`, `0.6.0`, `0.7.0`, `0.8.0`, `0.9.0`,
-`0.10.0`, `0.11.0`, `0.12.0`, and `0.13.0` contracts, so existing packages that declare those
-minors continue to load. New packages should target `"red_api_version": "^0.14.0"`.
+Host API `0.21.0` retains the complete `0.4.0`, `0.6.0`, `0.7.0`,
+`0.8.0`, `0.9.0`,
+`0.10.0`, `0.11.0`, `0.12.0`, `0.14.0`, `0.16.0`, `0.17.0`, `0.18.0`, `0.19.0`,
+and `0.20.0` contracts, so existing packages that declare those minors continue
+to load. New packages should target `"red_api_version": "^0.21.0"`.
+
+## Standalone JSON-RPC packages
+
+Host API `0.19.0` introduces the complete version 1 `[rpc]` contract for
+standalone plugins written in any language. Its bounded, owner-scoped surfaces
+cover commands, snapshots and transactions, editable documents, watches,
+pickers, configuration, storage, statusline contributions, clipboard writes,
+foreground messages, and text panels. Text panels support code highlighting, keyboard and F1 action
+discovery, and action updates that preserve panel content and UI state. Red
+validates package metadata and initialization before dispatch, starts a process
+on first invocation, and cleans up connection-owned resources on exit. See the
+[JSON-RPC plugin protocol](RPC_PLUGIN_PROTOCOL.md) for transport and method
+contracts.
+
+## Native tree panels
+
+Host API `0.18.0` adds `UpdateTreePanel(id, tree: TreePanelSpec)` for panels
+created with `CreatePanel`. A tree has a `root: PanelRow`, a `children` array of
+`TreePanelChildren { parent: String, rows: [PanelRow] }`, and an `expanded`
+array of node IDs. IDs are unique, opaque strings; the `notice:` prefix is
+reserved for loading rows. `path` remains optional.
+Each child listing names a directory node and preserves the caller's row order.
+An empty listing represents a loaded, empty directory. An expanded directory
+without a listing shows `Loading…` until the caller supplies its children.
+
+Callers supply row labels, icons, semantic styles, and right-hand decorations.
+Rust indexes the hierarchy and adds ancestry guides only when a row is displayed.
+The panel retains selection by node ID across updates and uses the existing
+keyboard, mouse, inline-search, and `panel:event:<id>` action handling. Callers
+respond to expand/collapse actions by updating `expanded` and supplying any
+newly loaded children. Duplicate node IDs, duplicate listings, and invalid
+parents are rejected before replacing the displayed model.
+
+Rust callers can construct `TreePanelModel::new(TreePanelSpec { ... })` and
+pass it to `PanelManager::update_tree_panel`. Neo-tree's filesystem adapter
+uses the same Rust layout for browsing and search, including match highlights;
+tree row construction no longer executes in the Husk interpreter.
+
+## Monotonic timing
+
+Host API `0.17.0` adds `red::execute("MonotonicTime")`, returning an `i64`
+millisecond count from an arbitrary process-local monotonic origin. Subtract two
+readings to measure elapsed time; never persist a reading or compare it across
+editor processes. Wall-clock changes do not affect it.
+
+The bundled Git plugin uses this clock to schedule idle status polls after each
+scan finishes. It waits at least five seconds and nine times the scan duration,
+targeting a 10% background scan duty cycle. Unchanged results and failures also
+back off the minimum delay up to 60 seconds. Explicit refreshes bypass the idle
+cooldown, but requests received during a scan coalesce into one follow-up rather
+than cancelling work. Failed scans retain the last successful status.
+Working-tree diff statistics run only for staged or unstaged sections that
+contain tracked changes.
+
+## Messages
+
+`Print(message)` publishes an informational editor message. Use
+`PrintWarning(message)` for a recoverable condition that needs transient warning
+styling, such as reaching the end of a navigation sequence.
+
+## Buffer selection
+
+`GetEditorInfo` includes a stable process-local `id` on every buffer summary.
+Use `OpenBufferById(id: i32)` to select that exact live buffer, including multiple
+unnamed buffers that all have the display name `[No Name]`. Buffer IDs survive
+buffer-list compaction but are not persistent across editor processes. The older
+`OpenBuffer(name: String)` call remains available for unambiguous buffer names.
 
 ## Document-symbol breadcrumbs
 
@@ -101,11 +170,15 @@ expanded in arguments and environment values. Project-local executables under
 `node_modules/.bin`, `.venv/bin`, `venv/bin`, and `vendor/bin` take precedence over
 `PATH`.
 
-The global `[formatting]` table supports `on_save` (default `true`) and a `provider` of `auto`,
-`external`, or `lsp`. `auto` prefers an installed language-pack formatter and falls
-back to LSP when the formatter is absent; a formatter that starts and fails does not
-silently switch engines. Set `formatting.on_save = false` to disable automatic
-formatting without disabling the explicit Format Document action. The legacy
+The global `[formatting]` table supports `on_save` (default `true`),
+`trim_trailing_whitespace` (default `true`), and a `provider` of `auto`, `external`,
+or `lsp`. Save-time formatting removes trailing spaces and tabs before invoking the
+formatter, except for language ids in `trim_trailing_whitespace_exclude` (default
+`["gitcommit", "markdown"]`). `auto` prefers an installed language-pack formatter and
+falls back to LSP when the formatter is absent; a formatter that starts and fails does
+not silently switch engines. Set `formatting.on_save = false` to disable automatic
+formatting and its whitespace cleanup without disabling the explicit Format Document
+action. The legacy
 `lsp.format_on_save` flag remains accepted as an alias for either boolean value.
 The modern key wins when both appear in the same config layer; later command-line
 overrides still take precedence.
@@ -141,6 +214,45 @@ snapshots. Unknown extensions survive load/save cycles, allowing a package to
 restore its workflow without Red understanding the payload.
 
 These calls were introduced in host API `0.6.0`.
+
+## Row-panel search and workspace path discovery
+
+Host API `0.16.0` adds `CancelGitStatus` and `SetPanelStatus`.
+`GetGitStatus(callback, path)` runs repository discovery, Git, and status
+indexing in the background. Git is stopped after 30 seconds; failures arrive in
+the result's `error` field. `CancelGitStatus(request_id)` cancels the calling
+plugin's request and discards its callback. The ID returned by `red::request`
+is also supplied as the callback's optional second argument, so plugins can
+reject responses from an earlier panel session. Background Git does not write
+the optional index refresh.
+
+`SetPanelStatus(id, status)` displays nonselectable footer text independently of
+row contents and the search prompt. An empty string clears it. Neo-tree uses
+this for slow Git refreshes and errors; `R` retries, and existing decorations
+remain visible but are labelled stale after a failed refresh. Directory watcher
+events are debounced, with at most one Neo-tree Git scan in flight and one
+follow-up refresh queued.
+
+Host API `0.15.0` supports an inline search prompt owned by an existing row
+panel. `OpenPanelSearch(id, initial, prefix)` focuses that prompt,
+`UpdatePanelSearch(id, status)` replaces its compact result indicator,
+`KeepPanelSearch(id)` preserves the query while returning focus to row
+navigation, and `ClosePanelSearch(id)` removes it.
+
+Input emits ordinary `panel:event:<id>` events with actions `search_query`,
+`search_move`, `search_submit`, `search_reveal`, `search_keep`, and
+`search_cancel`. The current query is provided in `text`, while `row` identifies
+the current selection. Up/Down and `Ctrl-p`/`Ctrl-n` move the selection; Enter
+submits, `Ctrl-Enter` requests reveal, `Shift-Enter` keeps the prompt, and
+Escape cancels.
+
+`SearchWorkspacePaths(callback, path, query, directories_only)` performs a
+bounded, asynchronous, ignore-aware recursive filesystem search. Its result
+contains the original `query`, `directories_only`, ranked `matches`, synthetic
+directory `children`, expanded ancestor paths, the total match count,
+`truncated`, and an optional `error`. Paths are normalized relative to the
+requested workspace root. `InvalidateWorkspacePaths(path)` drops its cached
+index after filesystem changes. Neither call grants subprocess permissions.
 
 ## Workspace file operations
 
@@ -354,16 +466,101 @@ The host owns multiline editing, wrapping, cursor movement, and history navigati
 Host API `0.9.0` adds `AgentResumeSession(cwd, session_id)` for rejoining a
 persisted Codex thread and `AgentForgetSession(session_id)` for an explicit new
 conversation. The bundled Agent plugin renders
-`agent:conversation_restore_pending` with its composer disabled, then replaces
-the cached projection from `agent:session_restored`; a
+`agent:conversation_restore_pending` while the thread reconnects, then replaces
+the cached projection from `agent:session_restored` unless it already shows that
+thread; a
 `agent:session_restore_failed` event converts the cached transcript to clearly
 archived context.
+
+## Edit history
+
+`EditHistory(callback, scope?: String)` returns the attributed undo history. Without
+`scope` it returns the active buffer's whole tree in node order, as before. Host API
+`0.21.0` adds `"workspace"`, which covers every open file, newest first, limited to
+500 entries, and `total`, the number of entries before that limit. Results carry
+`scope` (`"buffer"` or `"workspace"`).
+
+Unscoped entries keep exactly the original fields (`transaction_id`, `label`,
+`origin`, `current`, `timestamp_ms`, `edits`, and the tree links). Workspace entries
+keep those fields except `edits`, and add:
+
+| Field | Meaning |
+| --- | --- |
+| `file` | Workspace-relative path, or the buffer name. |
+| `buffer_id` | Buffer that owns the transaction. |
+| `applied` | Whether the transaction is part of the current text (false once undone). |
+| `age` | Short relative time such as `just now` or `5m ago`. |
+| `added`, `removed` | Changed line counts. |
+| `document` | A ready-to-show unified diff in the `WorkspaceModel.detail_document` shape, with hunk headers, context and line numbers. |
+| `turn`, `prompt` | For agent edits: the one-based turn in the current conversation and an excerpt of the prompt that started it. |
+
+Workspace entries leave out `edits`, whose texts are unbounded; use `document`. A
+workspace result too large for the plugin heap is trimmed to its newest entries, and `total`
+still counts them all.
+
+`RevertTransaction(transaction_id)` finds the buffer that owns the transaction, so a
+workspace history can revert edits in files other than the active one.
+
+## Agent pane lifecycle
+
+Host API `0.21.0` moves the Agent pane's conversation lifecycle into the editor
+core. The core owns the Codex thread, the turn phase, the follow-up queue, cancel
+intent, and transcript recaps; the bundled Agent plugin sends intents and renders
+the state the core publishes.
+
+| Call | Purpose |
+| --- | --- |
+| `AgentSubmit(text: String, transcript: String)` | Send a message. The core starts a thread, sends now, or queues it behind the running turn. `transcript` is the pane's visible conversation, replayed only when the message must continue in a new thread. |
+| `AgentStop()` | Interrupt the running turn. The thread is kept. |
+| `AgentSendQueued(transcript: String)` | Resume follow-ups held after a stop, failure, or lost app-server. |
+| `AgentDiscardQueued()` | Drop follow-ups that were not sent. |
+| `AgentReset(start: bool)` | Forget the current thread and queue; `start` begins the next thread right away. |
+
+After every change the core sends `agent:pane_state` with `phase` (`idle`,
+`starting`, `restoring`, `working`, or `stopping`), `session_id`, `turn_id`,
+`in_flight` (the running turn's `{ id, text }` message), `queued` (unsent
+messages, oldest first), `paused`, `stop_failed`, `recap_pending`,
+`interrupted` and `resume_pending` (see below). Render
+queued messages from `queued` and commit `in_flight` to the transcript once per
+`id`; both come from the same snapshot, so a message never disappears between
+the queue and the transcript. The core also resumes a persisted thread itself
+after `agent:conversation_restore_pending`, so a pane using these calls must not
+also call `AgentResumeSession`.
+
+Host API `0.21.0` also adds two text-panel surfaces for conversation panes. A
+`TextPanelBlock` with `kind: "queued"` draws a dimmed `You · queued` prompt card
+for a message that has not been sent yet. A compact conversation pane (see
+[Text panels](#text-panels)) emits `panel:event:<id>` with `action: "view"` and
+`text` set to `"hidden"` or `"visible"` when it leaves or returns to the screen.
+
+The per-session calls below remain available for other plugins and older packages.
+
+## Agent conversation continuity
+
+Host API `0.21.0` also lets the Agent pane continue a conversation across launches
+and ask the user what to do when Codex stops in the middle of a turn.
+
+| Call | Purpose |
+| --- | --- |
+| `AgentPrepare()` | The pane is about to be used: resume a saved thread now instead of on the first message. |
+| `AgentResolveInterruption(choice: String, transcript: String)` | Answer an interrupted turn with `retry` (send the message again), `continue` (ask Codex to pick up where it stopped), or `dismiss` (leave it; queued follow-ups stay paused). |
+
+`agent:conversation_resumable` carries a conversation saved by an earlier launch
+in this workspace (the `agent:conversation_restore_pending` payload plus `age`,
+such as `"2 hours ago"`). The core does not start Codex for it; the thread
+resumes on `AgentPrepare` or the next `AgentSubmit`, and
+`agent:pane_state.resume_pending` stays true until then.
+
+When Codex stops during a turn, `agent:pane_state.interrupted` holds that turn's
+`{ id, text }` message. The core still resumes the thread, but sends nothing,
+queued follow-ups included, until `AgentResolveInterruption` or a new
+`AgentSubmit` answers it.
 
 `AgentPrompt` automatically attaches bounded editor context containing the active visual selection or a roughly 80-line cursor excerpt, unsaved-state metadata, cursor/range, and intersecting diagnostics. Files outside the workspace, ignored paths, common credential/secret filenames, and binary buffers are omitted. Plugins that need to inspect or explicitly override this context can call `GetAgentContext(callback)` and `AgentPromptWithContext(session_id: String, text: String, context: Json)`; the context object accepts `uri` and `text` fields and is included in the direct Codex turn.
 
 ## Text panels
 
-`CreateTextPanel`, `UpdateTextPanel`, and `AppendTextPanel` provide a source-backed conversation surface. `TextPanelBlock` accepts an `id`, `kind` (`user`, `agent`, `error`, or `text`), `format` (`plain` or `markdown`), and `text`; the host preserves the source while wrapping and rendering it for the current panel width. These calls were introduced in host API `0.2.0`.
+`CreateTextPanel`, `UpdateTextPanel`, and `AppendTextPanel` provide a source-backed conversation surface. `TextPanelBlock` accepts an `id`, `kind` (`user`, `queued`, `agent`, `error`, or `text`; `queued`, introduced in `0.21.0`, draws a dimmed prompt card for a message that has not been sent yet), `format` (`plain`, `markdown`, or `code`), and `text`; `code` blocks may include a `language` name for syntax highlighting. Code rendering preserves indentation, repeated spaces, and logical blank lines while wrapping to the panel width. An omitted or unsupported language remains readable verbatim. The host preserves the source independently from its rendered layout. These calls were introduced in host API `0.2.0`; `code` and `language` require `0.19.0`.
 
 Both row and text panels accept `side: "left"`, `"right"`, `"top"`, or
 `"bottom"` in `PanelConfig`. `width` is measured in columns for left/right panes
@@ -376,12 +573,13 @@ theme's `sash.hoverBorder`, `panelTitle.activeBorder`, or `focusBorder`, then
 derives a readable accent when those colors are absent or insufficiently
 contrasted. Plugins do not need to configure a border to make resizing visible.
 
-`PanelConfig` may include `composer: Json { placeholder: String, rows: i32 }` for a persistent footer composer and `header_actions: [Json { id: String, label: String, compact_label?: String, shortcut?: String }]` for clickable, right-aligned header controls. Row panels can also set `surface: ThemeStyleSpec` and `border: ThemeStyleSpec` to resolve theme-aware panel foreground, background, and separator colors without affecting other panels. Header actions emit `panel:event:<id>` using their configured `id`; optional shortcuts trigger the same action without changing the composer draft and appear in contextual keyboard help. Compact labels are selected automatically on narrow panels, with the rightmost actions retained when space is especially limited. Focus the footer with `FocusTextPanelComposer(id)`, update its enabled/status state with `SetTextPanelComposerState(id, enabled, status?)`, and clear its draft with `ClearTextPanelComposer(id)`.
+`PanelConfig` may include `composer: Json { placeholder: String, rows: i32 }` for a persistent footer composer and `header_actions` for panel-owned actions. Existing `{ id, label, compact_label? }` declarations remain clickable header controls. Host API `0.19.0` also accepts `key`, `group`, `description`, `priority`, `enabled`, and `show_in_header`. A focused panel dispatches enabled shortcuts only from idle Normal mode; search, Visual selection, incomplete motions, composer input, and links under Enter keep precedence. Enabled hidden actions remain searchable and executable through F1; disabled actions appear after an update makes them available. `SetTextPanelActions(id, actions)` replaces the action list without recreating the panel. Row panels can also set `surface: ThemeStyleSpec` and `border: ThemeStyleSpec` to resolve theme-aware panel foreground, background, and separator colors without affecting other panels. Actions emit `panel:event:<id>` using their configured `id`; compact labels are selected automatically on narrow panels, while priority keeps essential actions visible where possible. Focus the footer with `FocusTextPanelComposer(id)`, update its enabled/status state with `SetTextPanelComposerState(id, enabled, status?)`, replace its bounded prompt history with `SetTextPanelComposerHistory(id, history)`, and clear its draft with `ClearTextPanelComposer(id)`. `SetTextPanelComposerHistory` was introduced in host API `0.15.0`; it normalizes, deduplicates, and limits supplied entries without changing the current draft.
 
-`EnterTextPanelContext(id, placeholder, options?)` gives a plugin a temporary in-pane
-surface while retaining the panel's blocks, scroll position, search state,
-status, composer draft, and composer focus. The conversation composer is hidden
-and replaced by a search field at the top of an embedded picker. Action blocks
+Host API `0.21.0` adds `EnterTextPanelContext(id, placeholder, options?)` to give
+a plugin a temporary in-pane surface while retaining the panel's blocks, scroll
+position, search state, status, composer draft, and composer focus. The
+conversation composer is hidden and replaced by a search field at the top of an
+embedded picker. Action blocks
 become selectable rows; arrows and `Ctrl-j` / `Ctrl-k` move between them, `Enter`
 emits `activate_block` for the selected row, and `Esc` or `Ctrl-c` emits
 `filter_cancel`. Editing the search field emits `filter_input` with its complete
@@ -395,20 +593,26 @@ places previews beside wide pickers and beneath narrow pickers. Request the
 contents with `AgentReadSessionPreview(callback, cwd, session_id)`, which reads
 persisted history without resuming the thread or changing conversation state.
 Call `ExitTextPanelContext(id)` to restore the retained conversation
-exactly. A second enter is ignored until the current context exits.
+exactly. `AgentListSessions`, `AgentReadSessionPreview`, `AgentSwitchSession`,
+`EnterTextPanelContext`, `ExitTextPanelContext`, and `SetTextPanelPreview` were
+introduced together in host API `0.21.0`. A second enter is ignored until the
+current context exits.
 
 A focused footer is a host-owned modal text area, not an editor file buffer. It supports Unicode-safe editing, wrapping, click-to-position cursor movement, counts, Vim word and character motions, `d`/`c`/`y` operators, inner/around text objects, Visual/Visual-line/Visual-block selections, transactional undo/redo, local yank/paste registers, dot-repeat, local macro recording, and prompt-local `/` or `?` searches. Its mode, pending operator, selection, undo tree, register, and search never alter the main editor. File writes, Ex commands, window operations, LSP requests, and plugin callbacks cannot be invoked through textarea keys.
 
-The footer uses the same Enter policy as `OpenComposer`: Enter or `Ctrl-Enter` submits; `Alt-Enter`, `Shift-Enter`, or `Ctrl-j` inserts a newline. While the footer is focused, `Ctrl-j` edits the prompt rather than scrolling the conversation. Escape enters Normal mode. In idle Normal mode, Enter submits and Escape emits `composer_blur`; Escape from Visual or Search mode first returns to Normal. `Ctrl-p`/`Ctrl-n` navigate local prompt history. `Ctrl-c` remains a pane-level shortcut that emits `interrupt` without changing the composer draft or focus. Successful submission emits `panel:event:<id>` with `action: "submit"` and the complete `text`; other footer actions include `composer_focus`, `composer_blur`, `interrupt`, `clear`, `new`, `history`, and `close`. `SetPanelVisible(id, visible)` hides or restores a panel without discarding its blocks, scroll position, or draft. Replacing text-panel blocks with an empty list resets scrolling and restores tail-following. Footer panels shrink on narrow terminals while preserving an editor viewport.
+The footer uses the same Enter policy as `OpenComposer`: Enter or `Ctrl-Enter` submits; `Alt-Enter`, `Shift-Enter`, or `Ctrl-j` inserts a newline. While the footer is focused, `Ctrl-j` edits the prompt rather than scrolling the conversation. Escape enters Normal mode. In idle Normal mode, Enter submits and Escape emits `composer_blur`; Escape from Visual or Search mode first returns to Normal. `Ctrl-p`/`Ctrl-n` navigate local prompt history. In Insert mode, Up moves within a multiline draft until the first visual row, then recalls older prompts; once history navigation starts, Up/Down browse entries and Down past the newest entry restores the exact draft and cursor. `Ctrl-r` opens an empty, editable `Search prompts:` field with matching history entries previewed separately; repeated `Ctrl-r` selects older matches, Enter loads the selected match without submitting it, and Escape or `Ctrl-g` cancels. Normal-mode `Ctrl-r` remains redo, and `/` or `?` remains prompt-local text search. `Ctrl-c` remains a pane-level shortcut that emits `interrupt` without changing the composer draft or focus. Successful submission emits `panel:event:<id>` with `action: "submit"` and the complete `text`; other footer actions include `composer_focus`, `composer_blur`, `interrupt`, `clear`, `new`, `history`, and `close`. `SetPanelVisible(id, visible)` hides or restores a panel without discarding its blocks, scroll position, or draft. Replacing text-panel blocks with an empty list resets scrolling and restores tail-following. Side panels with a footer composer are responsive: at their declared width they take at most 45% of the terminal, a width the user chose by resizing still leaves the editor 40 columns, and no conversation pane docks narrower than 32 columns. Several conversation panes dock in order while each still gets 32 columns and the editor keeps 40. A pane that does not fit stops docking: it covers the editor while it has focus and steps aside when the editor does, emitting `panel:event:<id>` with `action: "view"` and `text` `"hidden"` or `"visible"` so the plugin can announce output the user cannot see.
 
 Codex app-server updates other than assistant text chunks are forwarded to plugins as `agent:activity` with the normalized `update` payload. Core editor-tool calls also emit this event with `session_update: "editor_tool"`, `status: "in_progress"`, and a concise `title` such as `Opening src/main.rs` or `Editing src/main.rs (2 changes)`. This allows status/tool/plan progress to be displayed without treating it as transcript text. Agent recovery uses `agent:conversation_restore_pending`, `AgentResumeSession`, `agent:session_restored`, and `agent:session_restore_failed`; plugins must not enable follow-up input while restoration is pending.
 
 ## Quarantine and self-check
 
 Plugins load independently. Source, version, dependency, compile, activation, and runtime
-failures quarantine only their owner. `red --self-check` prints every bundled plugin's
-status. Required plugin dependencies must be active or the dependent plugin is
-quarantined with the dependency chain.
+failures quarantine only their owner. In the editor, `:plugin-status` lists every
+configured plugin's state for the session (active, starting, loads on first use,
+disabled, or quarantined), with the stage and full reason for each quarantine.
+`red --self-check` prints every bundled plugin's status. Required plugin dependencies must be active or the dependent plugin is
+quarantined with the dependency chain. A request result too large for a plugin's memory
+does not quarantine it; see [Oversized request results](#oversized-request-results).
 
 Plugin subprocesses inherit only the standard execution, locale, temporary-directory,
 platform, and SSH-agent environment keys. Explicit environment overrides remain
@@ -416,6 +620,26 @@ allowlisted. Process stdin is limited to 16 MiB, raw output to 2 MiB, individual
 streaming lines to 256 KiB, and pending process events to 16 (at most roughly 32 MiB
 of payload); oversized output is
 reported without letting an untrusted process grow editor memory indefinitely.
+
+## Oversized request results
+
+Each Husk plugin runs with a 64 MiB heap. Host API `0.20.0` checks each request result
+against the plugin's free heap before any plugin code runs, instead of letting the
+callback fail and quarantine the plugin:
+
+- `DocumentSymbols`, `WorkspaceSymbols`, and `References` results are delivered unchanged
+  when they fit in half of the free heap. Larger ones keep the leading entries of
+  `symbols` or `references` that fit in that half. The other half is the plugin's room to
+  work with the list, for example to build picker items from it.
+- Every successful result of those three requests includes `total`, the number of
+  entries before any trimming. A list shorter than `total` was trimmed. Failed results
+  (`ok: false`) do not include `total`, so read it only after checking `ok`.
+- Any other result is delivered unchanged when it fits in the free heap, and dropped
+  when it does not. A dropped result's callback is not called, the plugin stays active,
+  and Red shows a warning attributed to the plugin with the size it needed and the
+  space it had.
+
+Before `0.20.0`, these results quarantined the plugin.
 
 ## Edit notification boundaries
 
@@ -517,6 +741,8 @@ written. `agent:model_changed` carries `{ session_id, model_info }`, where
 For name-oriented lists, `PickerOptions.item_layout: "label_first"` reserves the
 longest filtered label, then aligns annotations and descriptions in shared columns.
 Secondary fields disappear before labels are shortened; the default layout is unchanged.
+A row with a shortened filename or directory label can set `data.search_path` to its
+complete path so filtering and match highlights still include the parent directories.
 `UpdatePickerSelection(handle, item_id)` selects a currently visible item without
 resetting the query. This is useful after populating a loading picker in place.
 

@@ -33,3 +33,5 @@ Interactive behavior is coordinated by `src/editor.rs`. Its module comment ident
 Red's agent feature is part of the editor model, not a separate file writer. The README says Red gives Codex editor context, including unsaved buffers, and follows each tool call by revealing the file and edit before it is applied and saved [@readme]. That user-facing rule is the core of [Agent-attributed edits](agent-attributed-edits).
 
 Husk plugins are also first-class editor runtime assets. The README names bundled Husk plugins for the file tree, project search, Git workspace, progress, inlay hints, symbols, themes, and agent UI, and it describes typechecking against a versioned Husk host contract before activation [@readme]. For the language side, read [Husk language](husk-language); for runtime activation, read [Plugin lifecycle and reload](../architecture/plugins/lifecycle-and-reload).
+
+For external-site product copy and media direction, use [Website Positioning](website-positioning). That page keeps `getred.dev` guidance separate from this runtime product model.

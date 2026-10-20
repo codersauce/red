@@ -27,6 +27,8 @@ mod learn;
 mod list;
 mod messages;
 mod picker;
+mod picker_items;
+mod picker_matching;
 mod prompt_buffer;
 mod rich_text;
 mod selection;
@@ -44,12 +46,15 @@ pub use action_bar::{
 pub(crate) use agent_composer::wrap_text;
 pub use agent_composer::AgentComposer;
 pub use completion::CompletionUI;
-pub use confirmation::{Confirmation, ConfirmationOptions, ConfirmationSegment};
+pub use confirmation::{
+    Confirmation, ConfirmationChoice, ConfirmationOptions, ConfirmationSegment,
+};
 pub(crate) use copilot_signin::{CopilotSignInDialog, CopilotSignInModel, CopilotSignInPhase};
 use crossterm::event::{Event, KeyCode, MouseEvent, MouseEventKind};
 pub use diagnostic_info::DiagnosticInfo;
 use dialog::Dialog;
 pub use file_picker::FilePicker;
+pub(crate) use file_picker::FilePickerCache;
 pub use geometry::OverlayLayout;
 pub(crate) use geometry::ScreenRect;
 pub use hover_info::{HoverInfo, HoverInfoFormat};
@@ -69,11 +74,11 @@ pub(crate) use keymap_hints::draw_keymap_hints;
 pub(crate) use learn::{draw_learn_coach, CoachLayout, LearnHub};
 use list::List;
 pub(crate) use messages::{MessageRow, MessagesPanel, MessagesView};
-pub(crate) use picker::MAX_UNFOCUSED_PREVIEW_BYTES;
 pub use picker::{
     LegacyPickerOptions, Picker, PickerIcon, PickerItem, PickerItemLayout, PickerOptions,
     PickerPresentation, PickerPreview, PickerUpdate,
 };
+pub(crate) use picker::{MAX_UNFOCUSED_PREVIEW_BYTES, MIN_HORIZONTAL_PREVIEW_PANE_WIDTH};
 pub(crate) use prompt_buffer::{
     first_prompt_line, normalize_prompt_newlines, PromptBuffer, PromptInput, PromptKeyPolicy,
     PROMPT_MAX_BYTES,
@@ -167,6 +172,11 @@ pub trait Component: Send {
     }
 
     fn update_picker(&mut self, _id: i32, _update: PickerUpdate) -> bool {
+        false
+    }
+
+    /// Whether this surface can consume an owned completion update directly.
+    fn accepts_completion_updates(&self) -> bool {
         false
     }
 

@@ -262,7 +262,7 @@ fn diagnostic_picker_model(
     DiagnosticPickerModel { items, actions }
 }
 
-fn diagnostic_filter_score(item: &PickerItem, query: &str) -> Option<i64> {
+pub(super) fn diagnostic_filter_score(item: &PickerItem, query: &str) -> Option<i64> {
     if query.trim().is_empty() {
         return Some(0);
     }

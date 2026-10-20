@@ -145,6 +145,44 @@ impl SyntaxIndentation {
         self.try_indent(request).unwrap_or(IndentDecision::Keep)
     }
 
+    /// Reports whether a line's first non-whitespace byte is inside an ignored syntax node.
+    pub(crate) fn line_is_ignored(
+        &mut self,
+        id: BufferId,
+        revision: u64,
+        language: &str,
+        source: &str,
+        line: usize,
+    ) -> bool {
+        if source.len() > MAX_BYTES {
+            return false;
+        }
+
+        let mut start = 0;
+        let Some(target) = source.split('\n').enumerate().find_map(|(index, text)| {
+            if index == line {
+                Some(text)
+            } else {
+                start += text.len() + 1;
+                None
+            }
+        }) else {
+            return false;
+        };
+        let first = start + target.len() - target.trim_start().len();
+
+        self.events(id, revision, language, source, start + target.len())
+            .ok()
+            .flatten()
+            .is_some_and(|events| {
+                events.iter().any(|event| {
+                    event.kind == Kind::Ignore
+                        && event.bytes.start < first
+                        && first < event.bytes.end
+                })
+            })
+    }
+
     fn try_indent(&mut self, request: IndentRequest<'_>) -> anyhow::Result<IndentDecision> {
         let IndentRequest {
             id,
@@ -231,20 +269,21 @@ impl SyntaxIndentation {
         let previous_first =
             previous_start + lines[previous].len() - lines[previous].trim_start().len();
         stack.clear();
-        for event in events
-            .iter()
-            .take_while(|e| e.bytes.start <= previous_first)
+        let first_event = events.partition_point(|event| event.bytes.start < previous_first);
+        for event in &events[..first_event] {
+            apply_event(&mut stack, event);
+        }
+        if let Some(event) = events
+            .get(first_event)
+            .filter(|event| event.bytes.start == previous_first)
         {
-            if event.bytes.start == previous_first && event.kind == Kind::Branch {
+            if event.kind == Kind::Branch {
                 if let Some(index) = stack.iter().rposition(|open| open.key == event.key) {
                     stack.truncate(index);
                 }
-                break;
+            } else if event.kind == Kind::End {
+                apply_leading_closer_group(&mut stack, &events[first_event..], source);
             }
-            if event.bytes.start == previous_first && event.kind != Kind::End {
-                break;
-            }
-            apply_event(&mut stack, event);
         }
         let delta = target_depth as isize - depth(&stack) as isize;
         let expected = columns(lines[previous], widths.1)
@@ -466,6 +505,46 @@ fn apply_event<'a>(stack: &mut Vec<&'a Event>, event: &'a Event) {
     }
 }
 
+/// Applies adjacent leading closers that unwind one visual indentation level.
+///
+/// Multiple openers on one source line contribute one level, so their matching
+/// closers must leave that level together. A closer for an opener on an earlier
+/// line starts a separate group and remains available to the ordinary depth delta.
+fn apply_leading_closer_group<'a>(stack: &mut Vec<&'a Event>, events: &'a [Event], source: &str) {
+    let Some(first) = events.first().filter(|event| event.kind == Kind::End) else {
+        return;
+    };
+    let Some(opener_line) = stack
+        .iter()
+        .rfind(|open| open.key == first.key)
+        .map(|open| open.line)
+    else {
+        apply_event(stack, first);
+        return;
+    };
+
+    let closer_line = first.line;
+    let mut previous_end = first.bytes.end;
+    apply_event(stack, first);
+    for event in &events[1..] {
+        if event.kind != Kind::End
+            || event.line != closer_line
+            || event.bytes.start < previous_end
+            || !source.as_bytes()[previous_end..event.bytes.start]
+                .iter()
+                .all(|byte| matches!(byte, b' ' | b'\t'))
+            || stack
+                .iter()
+                .rfind(|open| open.key == event.key)
+                .is_none_or(|open| open.line != opener_line)
+        {
+            break;
+        }
+        previous_end = event.bytes.end;
+        apply_event(stack, event);
+    }
+}
+
 fn depth(stack: &[&Event]) -> usize {
     stack.iter().map(|e| e.line).collect::<HashSet<_>>().len()
 }
@@ -483,7 +562,7 @@ fn point(source: &str, byte: usize) -> Point {
     )
 }
 
-fn replacement_edit(old: &str, new: &str) -> InputEdit {
+pub(crate) fn replacement_edit(old: &str, new: &str) -> InputEdit {
     let mut start = old
         .bytes()
         .zip(new.bytes())
@@ -596,7 +675,7 @@ mod tests {
         ));
         assert_eq!(
             check_fixtures(path, Arc::new(LanguageRegistry::bundled())).unwrap(),
-            14
+            18
         );
     }
 
@@ -658,6 +737,48 @@ mod tests {
             ("fn wrap() {\n    let s = r###\"{[(\"###;\n\n}", 2, 4),
             ("fn wrap() {\n    // {[(\n\n}", 2, 4),
             ("fn wrap() {\n    if ready {}\n\n}", 2, 4),
+        ] {
+            assert_eq!(
+                decision(source, line),
+                IndentDecision::Columns(expected),
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn rust_compound_closers_preserve_grouped_opener_depth() {
+        for (source, line, expected) in [
+            (
+                "        let isolated_client = Self {\n            state: Arc::new(ModelClientState {\n            }),\n            \n        };",
+                3,
+                12,
+            ),
+            (
+                "fn f() {\n    let value = wrap(Inner {\n    });\n    \n}",
+                3,
+                4,
+            ),
+            (
+                "fn f() {\n    let value = outer(inner(Inner {\n    }));\n    \n}",
+                3,
+                4,
+            ),
+            (
+                "fn f() {\n    let value = wrap(Inner {\n    } );\n    \n}",
+                3,
+                4,
+            ),
+            (
+                "fn f() {\n    outer(\n        inner(Inner {\n        }));\n    \n}",
+                4,
+                4,
+            ),
+            (
+                "fn f() {\n    outer(\n        inner(\n            value,\n        ));\n    \n}",
+                5,
+                4,
+            ),
         ] {
             assert_eq!(
                 decision(source, line),

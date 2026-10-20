@@ -1,0 +1,16 @@
+{"expected":"request","message":{"jsonrpc":"2.0","id":"plugin-1","method":"red/DocumentSnapshot","params":{}}}
+{"expected":"request","message":{"jsonrpc":"2.0","id":1,"method":"red/StatuslineClear","params":{}}}
+{"expected":"notification","message":{"jsonrpc":"2.0","method":"initialized"}}
+{"expected":"notification","message":{"jsonrpc":"2.0","method":"event/notify","params":{"name":"editor:ready","payload":{}}}}
+{"expected":"response","message":{"jsonrpc":"2.0","id":"1","result":null}}
+{"expected":"response","message":{"jsonrpc":"2.0","id":1,"error":{"code":-32602,"message":"invalid params"}}}
+{"expected":"invalid","message":[]}
+{"expected":"invalid","message":{"jsonrpc":"1.0","id":"1","method":"initialize"}}
+{"expected":"invalid","message":{"jsonrpc":"2.0","id":null,"method":"red/DocumentSnapshot","params":{}}}
+{"expected":"invalid","message":{"jsonrpc":"2.0","id":"1","method":"","params":{}}}
+{"expected":"invalid","message":{"jsonrpc":"2.0","method":"event/notify","params":[]}}
+{"expected":"invalid","message":{"jsonrpc":"2.0","id":"1","method":"red/DocumentSnapshot","result":null}}
+{"expected":"invalid","message":{"jsonrpc":"2.0","result":null}}
+{"expected":"invalid","message":{"jsonrpc":"2.0","id":"1"}}
+{"expected":"invalid","message":{"jsonrpc":"2.0","id":"1","result":null,"error":{"code":-32000,"message":"both"}}}
+{"expected":"invalid","message":{"jsonrpc":"2.0","id":"1","error":{"code":"-32602","message":"invalid params"}}}

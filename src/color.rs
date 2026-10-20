@@ -48,54 +48,51 @@ impl fmt::Display for Color {
     }
 }
 
+/// Parses named colors and RGB or RGBA hex values without allocating for hex.
 pub fn parse_rgb(s: &str) -> anyhow::Result<Color> {
-    if s.eq_ignore_ascii_case("transparent") {
-        return Ok(Color::Rgba {
-            r: 0,
-            g: 0,
-            b: 0,
-            a: 0,
-        });
-    }
-
-    let named = match s.to_ascii_lowercase().as_str() {
-        "black" => Some(Color::Rgb { r: 0, g: 0, b: 0 }),
-        "white" => Some(Color::Rgb {
-            r: 255,
-            g: 255,
-            b: 255,
-        }),
-        "red" => Some(Color::Rgb { r: 255, g: 0, b: 0 }),
-        "green" => Some(Color::Rgb { r: 0, g: 128, b: 0 }),
-        "blue" => Some(Color::Rgb { r: 0, g: 0, b: 255 }),
-        "yellow" => Some(Color::Rgb {
-            r: 255,
-            g: 255,
-            b: 0,
-        }),
-        "cyan" => Some(Color::Rgb {
-            r: 0,
-            g: 255,
-            b: 255,
-        }),
-        "magenta" => Some(Color::Rgb {
-            r: 255,
-            g: 0,
-            b: 255,
-        }),
-        "gray" | "grey" => Some(Color::Rgb {
-            r: 128,
-            g: 128,
-            b: 128,
-        }),
-        _ => None,
-    };
-    if let Some(color) = named {
-        return Ok(color);
-    }
-
     if !s.starts_with('#') {
-        anyhow::bail!("Invalid hex string: {}", s);
+        if s.eq_ignore_ascii_case("transparent") {
+            return Ok(Color::Rgba {
+                r: 0,
+                g: 0,
+                b: 0,
+                a: 0,
+            });
+        }
+
+        let named = match s.to_ascii_lowercase().as_str() {
+            "black" => Some(Color::Rgb { r: 0, g: 0, b: 0 }),
+            "white" => Some(Color::Rgb {
+                r: 255,
+                g: 255,
+                b: 255,
+            }),
+            "red" => Some(Color::Rgb { r: 255, g: 0, b: 0 }),
+            "green" => Some(Color::Rgb { r: 0, g: 128, b: 0 }),
+            "blue" => Some(Color::Rgb { r: 0, g: 0, b: 255 }),
+            "yellow" => Some(Color::Rgb {
+                r: 255,
+                g: 255,
+                b: 0,
+            }),
+            "cyan" => Some(Color::Rgb {
+                r: 0,
+                g: 255,
+                b: 255,
+            }),
+            "magenta" => Some(Color::Rgb {
+                r: 255,
+                g: 0,
+                b: 255,
+            }),
+            "gray" | "grey" => Some(Color::Rgb {
+                r: 128,
+                g: 128,
+                b: 128,
+            }),
+            _ => None,
+        };
+        return named.ok_or_else(|| anyhow::anyhow!("Invalid hex string: {}", s));
     }
 
     let hex = s.trim_start_matches('#');
@@ -357,6 +354,31 @@ mod test {
                 b: 255
             }
         );
+    }
+
+    #[test]
+    fn hex_fast_path_preserves_named_colors_transparency_and_invalid_input() {
+        assert_eq!(
+            parse_rgb("GrEy").unwrap(),
+            Color::Rgb {
+                r: 128,
+                g: 128,
+                b: 128,
+            }
+        );
+        assert_eq!(
+            parse_rgb("TRANSPARENT").unwrap(),
+            Color::Rgba {
+                r: 0,
+                g: 0,
+                b: 0,
+                a: 0,
+            }
+        );
+        assert_eq!(parse_rgb("##abc").unwrap(), parse_rgb("#abc").unwrap());
+        assert!(parse_rgb("#12").is_err());
+        assert!(parse_rgb("#gg0011").is_err());
+        assert!(parse_rgb("unrecognized").is_err());
     }
 
     #[test]

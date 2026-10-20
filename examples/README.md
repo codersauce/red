@@ -1,4 +1,10 @@
-# Red plugin examples
+# Red examples
+
+[`rust-glancer.toml`](rust-glancer.toml) configures Rust Glancer as the Rust
+language server. See the [setup guide](../docs/RUST_GLANCER.md) for installation
+and switching back to rust-analyzer.
+
+## Plugins
 
 The supported plugin example is [`example-plugin/index.hk`](example-plugin/index.hk)
 with its [`package.json`](example-plugin/package.json) metadata. Red parses and
@@ -13,6 +19,14 @@ the [plugin API](../docs/PLUGIN_API.md#declarative-plugin-authoring).
 
 [`external-hello-plugin`](external-hello-plugin/) demonstrates the same
 declarative command in a standalone, installable package.
+
+[`rpc-hello-plugin`](rpc-hello-plugin/) and
+[`rpc-hello-node-plugin`](rpc-hello-node-plugin/) demonstrate the baseline
+JSON-RPC host methods in Python and Node.js while targeting host API `0.19.0`.
+[`rpc-json-workbench`](rpc-json-workbench/) is a useful Python and `jq` plugin
+that exercises the `0.19.0` editable-document, live-watch, selection-context,
+background-mutation, panel-action, and clipboard surfaces while previewing,
+exploring, applying, copying, and undoing transformations.
 
 The `.js`, `.ts`, and JavaScript test files in this directory are historical examples
 for the removed Deno plugin runtime. They are retained for migration reference, are

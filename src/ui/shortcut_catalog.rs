@@ -49,6 +49,8 @@ pub(crate) fn surface_reference_actions(mode: &str) -> Vec<UiAction> {
                 "Move left / down / up / right",
             ),
             ("Navigation", "w / W / b / B / e / E", "Move by word"),
+            ("Navigation", "{ / }", "Previous / next paragraph"),
+            ("Navigation", "( / )", "Previous / next sentence"),
             (
                 "Navigation",
                 "0 / ^ / $",
@@ -177,6 +179,7 @@ pub(crate) fn picker_reference_actions() -> Vec<UiAction> {
             "↑ / ↓ / Ctrl+k / Ctrl+j",
             "Previous / next result",
         ),
+        ("Navigation", "Ctrl+p / Ctrl+n", "Previous / next result"),
         (
             "Navigation",
             "PageUp / PageDown / Ctrl+u / Ctrl+d",
@@ -187,6 +190,7 @@ pub(crate) fn picker_reference_actions() -> Vec<UiAction> {
             "Ctrl+b / Ctrl+f",
             "Previous / next preview or result page",
         ),
+        ("Preview", "Alt+p / F4", "Toggle preview"),
         ("History", "Ctrl+h / Ctrl+l", "Previous / next picker query"),
         (
             "Search",

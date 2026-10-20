@@ -12,7 +12,7 @@ struct PendingChanges {
     changes: Vec<TextDocumentContentChangeEvent>,
     insert_end: Option<crate::lsp::Position>,
 }
-use std::collections::{HashMap, HashSet};
+use std::collections::{hash_map::Entry, HashMap, HashSet};
 
 /// Coordinates LSP client state, opened workspace document tracking, and buffer revision delivery.
 #[derive(Debug, Default)]
@@ -75,14 +75,26 @@ impl LspCoordinator {
         self.notified_revisions.entry(id).or_insert(revision);
     }
 
+    /// A contiguous pending edit already owns the only original Rope snapshot it needs.
+    pub fn requires_before_snapshot(&self, id: BufferId, revision: u64) -> bool {
+        self.pending_changes
+            .get(&id)
+            .is_none_or(|pending| pending.after_revision != revision)
+            || self
+                .standard_line_revisions
+                .get(&id)
+                .is_none_or(|(cached_revision, _)| *cached_revision != revision)
+    }
+
     /// Records a canonical replacement before external publication. A revision
     /// gap (for example undo or a raw workspace replacement) forces full sync.
+    /// `before` is required only when [`Self::requires_before_snapshot`] returns true.
     pub fn record_edit(
         &mut self,
         id: BufferId,
         before_revision: u64,
         after_revision: u64,
-        before: Rope,
+        before: Option<Rope>,
         range: Range,
         text: &str,
     ) {
@@ -93,10 +105,16 @@ impl LspCoordinator {
             .standard_line_revisions
             .get(&id)
             .filter(|(revision, _)| *revision == before_revision)
-            .map_or_else(
-                || standard_lsp_lines(before.chars()),
-                |(_, standard)| *standard,
-            );
+            .map(|(_, standard)| *standard)
+            .or_else(|| {
+                before
+                    .as_ref()
+                    .map(|source| standard_lsp_lines(source.chars()))
+            });
+        let Some(standard_before) = standard_before else {
+            self.pending_changes.remove(&id);
+            return;
+        };
         let standard = standard_before && standard_lsp_lines(text.chars());
         self.standard_line_revisions
             .insert(id, (after_revision, standard));
@@ -111,16 +129,21 @@ impl LspCoordinator {
         {
             self.pending_changes.remove(&id);
         }
-        let pending = self
-            .pending_changes
-            .entry(id)
-            .or_insert_with(|| PendingChanges {
-                before,
-                before_revision,
-                after_revision: before_revision,
-                changes: Vec::new(),
-                insert_end: None,
-            });
+        let pending = match self.pending_changes.entry(id) {
+            Entry::Occupied(entry) => entry.into_mut(),
+            Entry::Vacant(entry) => {
+                let Some(before) = before else {
+                    return;
+                };
+                entry.insert(PendingChanges {
+                    before,
+                    before_revision,
+                    after_revision: before_revision,
+                    changes: Vec::new(),
+                    insert_end: None,
+                })
+            }
+        };
         pending.after_revision = after_revision;
         // Cache the end coordinate instead of rescanning a growing insertion.
         let insert_end = (range.start == range.end && !text.contains(['\r', '\n'])).then(|| {
@@ -200,8 +223,11 @@ mod tests {
         let id = buffer.id();
         let mut coordinator = LspCoordinator::with_buffers(std::slice::from_ref(&buffer));
         for text in ["λ", "x"] {
-            let before = buffer.contents_snapshot();
             let revision = buffer.revision();
+            let before = coordinator
+                .requires_before_snapshot(id, revision)
+                .then(|| buffer.contents_snapshot());
+            assert_eq!(before.is_some(), text == "λ");
             let offset = if text == "λ" { 1 } else { 2 };
             let position = TextPosition::new(0, offset);
             let start = buffer.position_to_lsp(position);
@@ -261,7 +287,7 @@ mod tests {
                 id,
                 revision,
                 buffer.revision(),
-                before,
+                Some(before),
                 Range { start, end: start },
                 "x",
             );

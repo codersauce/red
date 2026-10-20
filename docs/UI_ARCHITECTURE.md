@@ -15,9 +15,11 @@ workspaces retain their own interaction, ownership, and security boundaries.
 - `src/ui/dialog.rs` owns modal and popup border clipping, title and footer insets,
   optional rounded corners, and `Dialog` or `Popup` theme-role updates.
 - `src/ui/prompt_buffer.rs` owns real, unnamed, rope-backed prompt buffers, grapheme
-  cursors, Vim modes, actual undo history, bounded prompt history, and terminal-paste
-  normalization. Floating and docked agent composers read their draft, cursor, and
-  history directly from this buffer.
+  cursors, Vim modes, actual undo history, bounded prompt history, non-destructive
+  reverse-history previews, and terminal-paste normalization. Floating and docked
+  agent composers read their draft, cursor, and history directly from this buffer;
+  host surfaces opt into shell-style history keys without changing the shared Vim
+  engine.
 - `src/ui/selection.rs` owns selected-row viewport clamping and streaming
   `FollowTailViewport` state. Text panels preserve a manually interrupted tail rather
   than jumping to a newly streamed response.

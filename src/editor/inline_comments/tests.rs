@@ -12,9 +12,10 @@ use crate::{
     },
     inline_assist::{InlineAssistResult, InlineCommentInput},
     lsp::LspManager,
+    notification::Severity,
     plugin::Runtime,
     theme::{Style, Theme},
-    undo::TextRange,
+    undo::{TextPosition, TextRange},
     unicode_utils::display_width,
 };
 use crossterm::event::{
@@ -717,6 +718,51 @@ fn clearing_inline_comments_preserves_cursor_near_eof() {
     assert_eq!(editor.buffer_line(), 4);
 }
 
+#[tokio::test]
+async fn inline_comment_navigation_participates_in_the_jumplist() {
+    let mut editor = editor("zero\none\ntwo\nthree\nfour\nfive\n", 40, 10, false);
+    editor.move_to_text_position(TextPosition::new(2, 0));
+    editor.set_inline_comment("first comment");
+    editor.move_to_text_position(TextPosition::new(5, 0));
+    editor.set_inline_comment("second comment");
+    editor.move_to_text_position(TextPosition::new(0, 0));
+
+    editor
+        .test_execute_production_action(Action::NextInlineComment)
+        .await
+        .unwrap();
+    assert_eq!(editor.buffer_line(), 2);
+
+    editor
+        .test_execute_production_action(Action::JumpBack)
+        .await
+        .unwrap();
+    assert_eq!(editor.buffer_line(), 0);
+}
+
+#[tokio::test]
+async fn inline_comment_commands_warn_when_no_comment_is_available() {
+    let mut editor = editor("no comments\n", 40, 10, false);
+
+    for action in [Action::NextInlineComment, Action::ShowInlineComment] {
+        editor.test_execute_production_action(action).await.unwrap();
+        assert_eq!(
+            editor
+                .notifications()
+                .records()
+                .next_back()
+                .unwrap()
+                .severity,
+            Severity::Warning
+        );
+    }
+
+    assert_eq!(
+        editor.test_last_error(),
+        Some("no inline comment at the cursor")
+    );
+}
+
 #[test]
 fn inline_comment_navigation_preserves_treesitter_class_motions() {
     let editor = editor("class Example {}\n", 60, 12, false);
@@ -755,6 +801,30 @@ fn inline_comment_navigation_preserves_treesitter_class_motions() {
     assert_eq!(
         nested(leader, "[", "c"),
         Some(KeyAction::Single(Action::PreviousInlineComment))
+    );
+}
+
+#[tokio::test]
+async fn overlapping_inline_navigation_warns_when_nothing_is_under_the_cursor() {
+    let mut editor = editor("no comments\n", 60, 12, false);
+
+    editor
+        .test_execute_production_action(Action::NextOverlappingInlineComment)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        editor.test_last_error(),
+        Some("No more inline items to move to")
+    );
+    assert_eq!(
+        editor
+            .notifications()
+            .records()
+            .next_back()
+            .unwrap()
+            .severity,
+        Severity::Warning
     );
 }
 

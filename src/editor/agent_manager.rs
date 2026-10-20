@@ -1,7 +1,7 @@
 //! Agent manager sub-controller for Codex AI app-server integration and tool channels.
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     path::{Path, PathBuf},
     time::Instant,
 };
@@ -23,7 +23,8 @@ pub struct AgentManager {
     playback_ready_at: Option<Instant>,
     playback_response: Option<PendingEditorToolResponse>,
     playback_response_ready_at: Option<Instant>,
-    active_sessions: HashSet<String>,
+    /// Sessions with a turn in flight; absent sessions are idle.
+    turn_phases: HashMap<String, AgentTurnPhase>,
     active_turn_ids: HashMap<String, String>,
     turn_started_at: HashMap<String, Instant>,
     pending_commit_messages: HashSet<i64>,
@@ -33,13 +34,113 @@ pub struct AgentManager {
     model_only_bridge: bool,
     next_model: Option<crate::codex::AgentModelSelection>,
     conversation: Option<AgentConversationSnapshot>,
+    /// Bumped on every change to `conversation`, so the editor can tell when the
+    /// saved copy is out of date without comparing transcripts.
+    conversation_revision: u64,
     forgotten_conversations: HashSet<String>,
+    /// Prompts submitted while their session was busy, sent once its turn ends.
+    queued_prompts: HashMap<String, VecDeque<QueuedAgentPrompt>>,
+    /// The Agent pane's conversation lifecycle.
+    pane: super::agent_pane::AgentPaneLifecycle,
+    /// Effects returned by pane transitions, run at the editor's next drain point.
+    pane_effects: Vec<super::agent_pane::AgentPaneEffect>,
+    /// Last snapshot sent to the pane, so unchanged state is not re-sent.
+    published_pane: Option<super::agent_pane::AgentPaneSnapshot>,
+}
+
+/// Where a session's current turn is in its lifecycle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentTurnPhase {
+    /// The turn is running and may call editor tools.
+    Running,
+    /// A cancel was sent; editor tools are refused until Codex reports the end.
+    Stopping,
+}
+
+/// Return values of pane transitions that may carry effects for the editor.
+pub trait PaneTransition {
+    fn effects(&self) -> Vec<super::agent_pane::AgentPaneEffect>;
+}
+
+impl PaneTransition for () {
+    fn effects(&self) -> Vec<super::agent_pane::AgentPaneEffect> {
+        Vec::new()
+    }
+}
+
+impl PaneTransition for usize {
+    fn effects(&self) -> Vec<super::agent_pane::AgentPaneEffect> {
+        Vec::new()
+    }
+}
+
+impl PaneTransition for bool {
+    fn effects(&self) -> Vec<super::agent_pane::AgentPaneEffect> {
+        Vec::new()
+    }
+}
+
+impl PaneTransition for Vec<super::agent_pane::AgentPaneEffect> {
+    fn effects(&self) -> Vec<super::agent_pane::AgentPaneEffect> {
+        self.clone()
+    }
+}
+
+impl PaneTransition for Option<Vec<super::agent_pane::AgentPaneEffect>> {
+    fn effects(&self) -> Vec<super::agent_pane::AgentPaneEffect> {
+        self.clone().unwrap_or_default()
+    }
+}
+
+impl PaneTransition
+    for (
+        super::agent_pane::AgentSubmitResult,
+        Vec<super::agent_pane::AgentPaneEffect>,
+    )
+{
+    fn effects(&self) -> Vec<super::agent_pane::AgentPaneEffect> {
+        self.1.clone()
+    }
+}
+
+/// A prompt held until its session's previous turn has fully ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueuedAgentPrompt {
+    pub text: String,
+    pub context: Option<(String, String)>,
 }
 
 impl AgentManager {
     /// Creates a new, empty AgentManager instance.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Applies a pane transition and keeps its effects for the next drain.
+    pub fn update_pane<R>(
+        &mut self,
+        transition: impl FnOnce(&mut super::agent_pane::AgentPaneLifecycle) -> R,
+    ) -> R
+    where
+        R: PaneTransition,
+    {
+        let result = transition(&mut self.pane);
+        self.pane_effects.extend(result.effects());
+        result
+    }
+
+    pub fn take_pane_effects(&mut self) -> Vec<super::agent_pane::AgentPaneEffect> {
+        std::mem::take(&mut self.pane_effects)
+    }
+
+    /// Returns the pane snapshot when it differs from the last one published.
+    pub fn take_changed_pane_snapshot(&mut self) -> Option<super::agent_pane::AgentPaneSnapshot> {
+        let snapshot = self.pane.snapshot();
+        if self.published_pane.as_ref() == Some(&snapshot) {
+            return None;
+        }
+        self.published_pane = Some(snapshot.clone());
+        Some(snapshot)
     }
 
     /// Returns `true` if a Codex bridge connection is currently attached.
@@ -149,28 +250,105 @@ impl AgentManager {
         }
     }
 
-    /// Marks a session as active.
+    /// Marks a session's turn as running.
     pub fn mark_session_active(&mut self, session_id: impl Into<String>) {
-        self.active_sessions.insert(session_id.into());
+        self.turn_phases
+            .insert(session_id.into(), AgentTurnPhase::Running);
     }
 
-    /// Marks a session as inactive.
+    /// Stops treating a running turn as active. A stopping turn stays busy until
+    /// `finish_turn`, because Codex has not confirmed that it ended.
     pub fn mark_session_inactive(&mut self, session_id: &str) {
-        self.active_sessions.remove(session_id);
-        self.active_turn_ids.remove(session_id);
+        if self.turn_phases.get(session_id) != Some(&AgentTurnPhase::Stopping) {
+            self.turn_phases.remove(session_id);
+            self.active_turn_ids.remove(session_id);
+        }
     }
 
     pub fn is_session_active(&self, session_id: &str) -> bool {
-        self.active_sessions.contains(session_id)
+        self.turn_phases.get(session_id) == Some(&AgentTurnPhase::Running)
     }
 
     pub fn has_active_sessions(&self) -> bool {
-        !self.active_sessions.is_empty()
+        self.turn_phases
+            .values()
+            .any(|phase| *phase == AgentTurnPhase::Running)
+    }
+
+    /// Returns the most advanced phase across sessions, for status display.
+    pub fn turn_phase(&self) -> Option<AgentTurnPhase> {
+        if self.has_active_sessions() {
+            Some(AgentTurnPhase::Running)
+        } else {
+            self.turn_phases.values().next().copied()
+        }
+    }
+
+    pub fn queued_prompt_count(&self) -> usize {
+        self.queued_prompts.values().map(VecDeque::len).sum()
     }
 
     pub fn clear_active_sessions(&mut self) {
-        self.active_sessions.clear();
+        self.turn_phases.clear();
         self.active_turn_ids.clear();
+    }
+
+    /// Records a cancel request. A running turn keeps the session busy until
+    /// Codex reports the interrupted turn's terminal event, while its editor
+    /// tools stop immediately because the session is no longer active.
+    pub fn begin_stopping(&mut self, session_id: &str) {
+        if self.is_session_active(session_id) {
+            self.turn_phases
+                .insert(session_id.to_string(), AgentTurnPhase::Stopping);
+        }
+    }
+
+    /// Returns whether a new turn must wait for this session's current turn.
+    pub fn is_session_busy(&self, session_id: &str) -> bool {
+        self.turn_phases.contains_key(session_id)
+    }
+
+    pub fn queue_prompt(&mut self, session_id: impl Into<String>, prompt: QueuedAgentPrompt) {
+        self.queued_prompts
+            .entry(session_id.into())
+            .or_default()
+            .push_back(prompt);
+    }
+
+    /// Ends a session's turn and returns the next prompt that may now start.
+    pub fn finish_turn(&mut self, session_id: &str) -> Option<QueuedAgentPrompt> {
+        self.turn_phases.remove(session_id);
+        self.active_turn_ids.remove(session_id);
+        let queue = self.queued_prompts.get_mut(session_id)?;
+        let prompt = queue.pop_front();
+        if queue.is_empty() {
+            self.queued_prompts.remove(session_id);
+        }
+        prompt
+    }
+
+    /// Drops busy state and queued prompts for a session that is being closed.
+    pub fn discard_session_queue(&mut self, session_id: &str) -> usize {
+        self.turn_phases.remove(session_id);
+        self.queued_prompts
+            .remove(session_id)
+            .map_or(0, |queue| queue.len())
+    }
+
+    /// Takes every unsent prompt so a lost bridge can hand them back to the pane.
+    pub fn take_all_queued_prompts(&mut self) -> Vec<(String, Vec<String>)> {
+        let mut returned = self
+            .queued_prompts
+            .drain()
+            .map(|(session_id, queue)| {
+                (
+                    session_id,
+                    queue.into_iter().map(|prompt| prompt.text).collect(),
+                )
+            })
+            .collect::<Vec<_>>();
+        returned.sort_by(|left, right| left.0.cmp(&right.0));
+        returned
     }
 
     pub fn set_turn_id(&mut self, session_id: impl Into<String>, turn_id: impl Into<String>) {
@@ -280,8 +458,7 @@ impl AgentManager {
         model_info: crate::codex::AgentModelInfo,
     ) {
         if let Some(conversation) = self
-            .conversation
-            .as_mut()
+            .conversation_mut()
             .filter(|conversation| conversation.thread_id == session_id)
         {
             conversation.model_info = Some(model_info);
@@ -291,6 +468,7 @@ impl AgentManager {
     pub fn begin_conversation(&mut self, thread_id: impl Into<String>, cwd: &Path) {
         let thread_id = thread_id.into();
         self.forgotten_conversations.remove(&thread_id);
+        self.conversation_revision += 1;
         self.conversation = Some(AgentConversationSnapshot::new(
             thread_id,
             cwd.to_string_lossy(),
@@ -299,6 +477,7 @@ impl AgentManager {
 
     pub fn restore_conversation(&mut self, conversation: AgentConversationSnapshot) {
         self.root = Some(PathBuf::from(&conversation.cwd));
+        self.conversation_revision += 1;
         self.conversation = Some(conversation);
     }
 
@@ -313,6 +492,7 @@ impl AgentManager {
             .take()
             .filter(|conversation| conversation.thread_id == thread_id)
             .unwrap_or_else(|| AgentConversationSnapshot::new(thread_id, cwd.to_string_lossy()));
+        self.conversation_revision += 1;
         self.conversation = Some(cached.reconciled_with_thread(thread));
         self.conversation.as_ref()
     }
@@ -321,8 +501,30 @@ impl AgentManager {
         self.conversation.clone()
     }
 
+    pub fn conversation(&self) -> Option<&AgentConversationSnapshot> {
+        self.conversation.as_ref()
+    }
+
+    pub fn conversation_revision(&self) -> u64 {
+        self.conversation_revision
+    }
+
+    fn conversation_mut(&mut self) -> Option<&mut AgentConversationSnapshot> {
+        let conversation = self.conversation.as_mut()?;
+        self.conversation_revision += 1;
+        Some(conversation)
+    }
+
+    /// Returns the tool-contract version retained for a particular conversation.
+    pub fn conversation_tool_contract_version(&self, session_id: &str) -> Option<u32> {
+        self.conversation
+            .as_ref()
+            .filter(|conversation| conversation.thread_id == session_id)
+            .map(|conversation| conversation.tool_contract_version)
+    }
+
     pub fn replace_annotation_records(&mut self, annotations: Vec<AgentAnnotationRecord>) {
-        if let Some(conversation) = self.conversation.as_mut() {
+        if let Some(conversation) = self.conversation_mut() {
             conversation.annotations = annotations;
         }
     }
@@ -335,7 +537,16 @@ impl AgentManager {
             .as_ref()
             .is_some_and(|conversation| conversation.thread_id == session_id)
         {
+            self.conversation_revision += 1;
             self.conversation = None;
+        }
+    }
+
+    /// Drops the conversation without forgetting its thread, for a recovered
+    /// conversation that another editor already drives.
+    pub fn discard_conversation(&mut self) {
+        if self.conversation.take().is_some() {
+            self.conversation_revision += 1;
         }
     }
 
@@ -345,8 +556,7 @@ impl AgentManager {
 
     pub fn record_user_message(&mut self, session_id: &str, turn_id: &str, text: &str) {
         if let Some(conversation) = self
-            .conversation
-            .as_mut()
+            .conversation_mut()
             .filter(|conversation| conversation.thread_id == session_id)
         {
             conversation.append_user(turn_id, text);
@@ -354,36 +564,34 @@ impl AgentManager {
     }
 
     pub fn record_agent_delta(&mut self, session_id: &str, text: &str) {
-        let Some(turn_id) = self.active_turn_ids.get(session_id) else {
+        let Some(turn_id) = self.active_turn_ids.get(session_id).cloned() else {
             return;
         };
         if let Some(conversation) = self
-            .conversation
-            .as_mut()
+            .conversation_mut()
             .filter(|conversation| conversation.thread_id == session_id)
         {
-            conversation.append_agent_delta(turn_id, text);
+            conversation.append_agent_delta(&turn_id, text);
         }
     }
 
     pub fn complete_agent_message(&mut self, session_id: &str, text: &str) {
-        let Some(turn_id) = self.active_turn_ids.get(session_id) else {
+        let Some(turn_id) = self.active_turn_ids.get(session_id).cloned() else {
             return;
         };
         let Some(conversation) = self
-            .conversation
-            .as_mut()
+            .conversation_mut()
             .filter(|conversation| conversation.thread_id == session_id)
         else {
             return;
         };
         if let Some(item) = conversation.items.iter_mut().rev().find(|item| {
             item.role == crate::agent_conversation::AgentTranscriptRole::Agent
-                && item.turn_id.as_deref() == Some(turn_id)
+                && item.turn_id.as_deref() == Some(turn_id.as_str())
         }) {
             item.text = text.to_string();
         } else {
-            conversation.append_agent_delta(turn_id, text);
+            conversation.append_agent_delta(&turn_id, text);
         }
     }
 }
@@ -391,7 +599,10 @@ impl AgentManager {
 #[cfg(test)]
 mod tests {
     use super::AgentManager;
-    use crate::agent_tools::PendingEditorToolResponse;
+    use crate::{
+        agent_conversation::{AgentConversationSnapshot, AGENT_TOOL_CONTRACT_VERSION},
+        agent_tools::PendingEditorToolResponse,
+    };
     use serde_json::json;
     use std::{
         path::Path,
@@ -421,6 +632,50 @@ mod tests {
         assert!(manager.conversation_snapshot().is_none());
         assert!(manager.take_forgotten_conversation("session-1"));
         assert!(!manager.take_forgotten_conversation("session-1"));
+    }
+
+    #[test]
+    fn retained_conversations_expose_their_tool_contract_version() {
+        let mut manager = AgentManager::new();
+        manager.begin_conversation("current", Path::new("/workspace"));
+        assert_eq!(
+            manager.conversation_tool_contract_version("current"),
+            Some(AGENT_TOOL_CONTRACT_VERSION)
+        );
+
+        let mut old = AgentConversationSnapshot::new("old", "/workspace");
+        old.tool_contract_version = 0;
+        manager.restore_conversation(old);
+        assert_eq!(manager.conversation_tool_contract_version("old"), Some(0));
+        assert_eq!(manager.conversation_tool_contract_version("other"), None);
+    }
+
+    #[test]
+    fn a_lost_bridge_returns_prompts_held_behind_a_stopping_turn() {
+        let mut manager = AgentManager::new();
+        manager.mark_session_active("session-1");
+        manager.begin_stopping("session-1");
+        for text in ["first", "second"] {
+            manager.queue_prompt(
+                "session-1",
+                super::QueuedAgentPrompt {
+                    text: text.to_string(),
+                    context: None,
+                },
+            );
+        }
+
+        manager.clear_active_sessions();
+
+        assert_eq!(
+            manager.take_all_queued_prompts(),
+            [(
+                "session-1".to_string(),
+                vec!["first".to_string(), "second".to_string()]
+            )]
+        );
+        assert!(manager.take_all_queued_prompts().is_empty());
+        assert!(!manager.is_session_busy("session-1"));
     }
 
     #[tokio::test]

@@ -46,7 +46,17 @@ Insert and Normal mode basics are supported, along with Visual character, Visual
 
 Red keeps the previous Visual area as buffer-local state, separate from the text register store. Leaving Visual mode captures the selected bounds into the special `'<` and `'>` marks and records whether the area was characterwise, linewise, or blockwise plus which end was the anchor [@editor]. `gv` restores that shape and direction from the marks, and when `gv` runs while already in a Visual mode it first captures the current area so the current and previous selections exchange [@editor] [@editing-tests]. Session snapshots serialize the last-visual-selection metadata, so `gv` can restore linewise and blockwise selections after recovery when the matching marks also restore [@editor] [@editing-tests].
 
-Visual indentation is a line-range operation even for characterwise and blockwise selections. `>` and `<` capture the current Visual area for later `gv`, shift every covered line by `count * shiftwidth`, leave empty lines unchanged, saturate unindentation at column zero, commit the shift as one undo transaction, notify normal change consumers when content changes, and then return to Normal mode [@editor] [@editing-tests]. The compatibility matrix records this as supported for `[count]>` and `[count]<`, with `gv` reselecting the shifted range [@vim-doc].
+The supported Ex shell subset includes `:!{command}`, previous-command repeat
+with `:!!`, current and alternate filename expansion with `%` and `#`, and
+backslash-escaped special characters. `:%!{command}`, numeric line ranges, and
+`:'<,'>!{command}` filter the selected text through the user's shell and replace
+it with complete stdout in one undoable transaction. Every command streams
+bounded diagnostics into Messages, supports cancellation, and continues inside
+detached owners. Unlike Neovim, failed or outdated filters do not overwrite the
+original buffer. Interactive terminal programs and Normal-mode filter operators
+remain outside the supported subset [@vim-doc] [@editor].
+
+Visual indentation is a line-range operation even for characterwise and blockwise selections. `>` and `<` capture the current Visual area for later `gv`, shift every covered line by `count * shiftwidth`, leave empty lines unchanged, saturate unindentation at column zero, commit the shift as one undo transaction, notify normal change consumers when content changes, and then return to Normal mode [@editor] [@editing-tests]. Dot-repeat records the semantic shift by direction, selected line count, and count instead of replaying the motions that built the Visual area; replay applies that span from the current line and still runs trailing mapped actions or later input recorded in the same repeat recipe [@editor] [@editing-tests]. The compatibility matrix records this as supported for `[count]>` and `[count]<`, with `gv` reselecting the shifted range [@vim-doc].
 
 Search supports `/`, `?`, incremental preview, `n`, `N`, `*`, wrapscan, smartcase and ignorecase, cancellation, and highlight clearing, but search patterns use Rust `regex` syntax instead of Vim's regex dialect [@vim-doc]. Substitution supports current-line, whole-file, numeric, and last-visual ranges with `g`, `i`, and confirmation flags, while replacement syntax also follows Rust `regex` capture expansion rather than Vim magic modes or expression replacement [@vim-doc]. Tests cover search previews, failed searches, invalid regex reporting, Rust regex case options, substitution ranges, confirmation flow, and escaped delimiters [@editing-tests] [@movement-tests].
 
@@ -60,7 +70,7 @@ Integration coverage matches that contract. Movement tests cover the default key
 
 ## Intentional Differences
 
-Red implements a documented Ex subset and does not implement Vimscript [@vim-doc]. Its default keys intentionally diverge in several places: `;` is an additional command-line entry key, `W` toggles wrapping, and `Ctrl-e` opens NeoTree, though defaults can be remapped [@vim-doc]. Multi-window compatibility is also scoped to Red's published `Ctrl-w` subset rather than arbitrary Vim layouts and every resizing command [@vim-doc].
+Red implements a documented Ex subset and does not implement Vimscript [@vim-doc]. Its default keys intentionally diverge in several places: `gW` toggles wrapping and `Ctrl-e` opens NeoTree, while `:` enters command-line mode and `;` and `W` retain their Vim meanings as repeat character search and big-word motion [@default-config] [@vim-doc]. Multi-window compatibility is also scoped to Red's published `Ctrl-w` subset rather than arbitrary Vim layouts and every resizing command [@vim-doc].
 
 Regex syntax is the most visible editing-language difference. Search and substitute use Rust `regex`, including capture expansion and escaped delimiters for substitution, so behavior can be compatible at the command level while differing in pattern dialect [@vim-doc]. Future compatibility work must preserve this distinction unless the underlying parser and tests change [@vim-doc].
 

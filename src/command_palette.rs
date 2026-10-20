@@ -6,7 +6,7 @@ use fuzzy_matcher::{skim::SkimMatcherV2, FuzzyMatcher};
 use serde_json::json;
 
 use crate::{
-    command,
+    command::{self, CommandSpec},
     config::{KeyAction, Keys},
     editor::{Action, Mode, SearchDirection},
     plugin::RegisteredPluginCommand,
@@ -14,37 +14,61 @@ use crate::{
     unicode_utils::{display_width, truncate_display_width},
 };
 
-/// Colon commands handled by the built-in command parser.
-pub(crate) const BUILTIN_COLON_COMMANDS: &[&str] = &[
-    "$",
-    "quit",
-    "write",
-    "buffer-next",
-    "buffer-prev",
-    "bd",
-    "bdelete",
-    "buffer-delete",
-    "edit",
-    "split",
-    "sp",
-    "vsplit",
-    "vs",
-    "close",
-    "only",
-    "panel-layout-reset",
-    "noh",
-    "nohlsearch",
-    "set",
-    "wrap",
-    "nowrap",
-    "syntax",
-    "syn",
-    "ft",
-    "languages",
-    "plugins",
-    "statusline",
-    "config-diagnostics",
-    "messages",
+/// Built-ins and their stable Vim-compatible minimum abbreviation lengths.
+pub(crate) const BUILTIN_COLON_COMMANDS: &[CommandSpec] = &[
+    CommandSpec::exact("$"),
+    CommandSpec::new("quit", 1),
+    CommandSpec::new("write", 1),
+    CommandSpec::new("wall", 2),
+    CommandSpec::new("qall", 2),
+    CommandSpec::new("quitall", 5),
+    CommandSpec::new("wqall", 3),
+    // `xit` precedes `xall` so a bare `:x` resolves to it.
+    CommandSpec::new("xit", 1),
+    CommandSpec::new("xall", 2),
+    CommandSpec::exact("diffdisk"),
+    CommandSpec::exact("buffer-next"),
+    CommandSpec::new("bnext", 2),
+    CommandSpec::exact("buffer-prev"),
+    CommandSpec::new("bprevious", 2),
+    CommandSpec::new("buffer", 1),
+    CommandSpec::exact("b"),
+    CommandSpec::exact("b#"),
+    CommandSpec::exact("bd"),
+    CommandSpec::new("bdelete", 2),
+    CommandSpec::new("bufdo", 4),
+    CommandSpec::exact("buffer-delete"),
+    CommandSpec::new("edit", 1),
+    CommandSpec::new("exit", 3),
+    CommandSpec::new("enew", 3),
+    CommandSpec::new("new", 3),
+    CommandSpec::new("vnew", 3),
+    CommandSpec::new("saveas", 3),
+    CommandSpec::new("file", 1),
+    CommandSpec::exact("ls"),
+    CommandSpec::exact("buffers"),
+    CommandSpec::exact("files"),
+    CommandSpec::new("split", 2),
+    CommandSpec::exact("sp"),
+    CommandSpec::new("vsplit", 2),
+    CommandSpec::exact("vs"),
+    CommandSpec::new("close", 3),
+    CommandSpec::new("only", 2),
+    CommandSpec::exact("panel-layout-reset"),
+    CommandSpec::exact("noh"),
+    CommandSpec::new("nohlsearch", 3),
+    CommandSpec::new("set", 2),
+    CommandSpec::exact("wrap"),
+    CommandSpec::exact("nowrap"),
+    CommandSpec::new("syntax", 2),
+    CommandSpec::exact("syn"),
+    CommandSpec::exact("ft"),
+    CommandSpec::exact("languages"),
+    CommandSpec::exact("plugins"),
+    CommandSpec::exact("statusline"),
+    CommandSpec::exact("config-diagnostics"),
+    CommandSpec::exact("plugin-status"),
+    CommandSpec::new("messages", 3),
 ];
 
 const SPECIAL_BUILTIN_COLON_COMMANDS: &[&str] = &[
@@ -175,8 +199,9 @@ pub(crate) fn entries(
 pub(crate) fn colon_completion_names(plugin_commands: &[RegisteredPluginCommand]) -> Vec<String> {
     let mut names = BUILTIN_COLON_COMMANDS
         .iter()
-        .chain(SPECIAL_BUILTIN_COLON_COMMANDS)
-        .map(|name| (*name).to_string())
+        .map(CommandSpec::name)
+        .chain(SPECIAL_BUILTIN_COLON_COMMANDS.iter().copied())
+        .map(str::to_string)
         .collect::<Vec<_>>();
     names.extend(
         plugin_commands
@@ -510,6 +535,15 @@ fn builtin_commands() -> Vec<BuiltinCommand> {
             Action::OpenWhatsNew,
         ),
         builtin(
+            "editor.update",
+            "Update Red",
+            "Editor",
+            "Install the latest stable standalone release",
+            Some(":update"),
+            &["upgrade", "new version", "release"],
+            Action::UpdateRed,
+        ),
+        builtin(
             "editor.learn",
             "Learn Red",
             "Editor",
@@ -544,6 +578,24 @@ fn builtin_commands() -> Vec<BuiltinCommand> {
             Some(":w"),
             &[":write"],
             Action::Save,
+        ),
+        builtin(
+            "file.save_all",
+            "Save all files",
+            "File",
+            "Write every modified file buffer",
+            Some(":wa"),
+            &[":wall"],
+            Action::SaveAll,
+        ),
+        builtin(
+            "file.compare_on_disk",
+            "Compare with file on disk",
+            "File",
+            "Inspect external file changes and explicitly resolve a save conflict",
+            Some(":diffdisk"),
+            &["external changes", "save conflict", "overwrite"],
+            Action::CompareFileOnDisk,
         ),
         builtin(
             "file.save_and_quit",
@@ -591,12 +643,30 @@ fn builtin_commands() -> Vec<BuiltinCommand> {
             Action::FilePicker,
         ),
         builtin(
+            "buffer.new",
+            "New buffer",
+            "Buffer",
+            "Open an empty, unnamed buffer in the current window",
+            Some(":enew"),
+            &["new file", "unnamed buffer", "scratch buffer"],
+            Action::NewBuffer,
+        ),
+        builtin(
+            "buffer.list",
+            "List buffers",
+            "Buffer",
+            "Show open buffer numbers, names, and unsaved changes",
+            Some(":ls"),
+            &[":buffers", ":files", "open buffers"],
+            Action::ListBuffers,
+        ),
+        builtin(
             "buffer.alternate",
             "Alternate buffer",
             "Buffer",
             "Switch to the most recently used buffer",
-            None,
-            &["recent buffer", "last buffer", "toggle buffer"],
+            Some(":b#"),
+            &[":b #", "recent buffer", "last buffer", "toggle buffer"],
             Action::AlternateBuffer,
         ),
         builtin(
@@ -605,7 +675,7 @@ fn builtin_commands() -> Vec<BuiltinCommand> {
             "Buffer",
             "Switch to the next buffer",
             Some(":bn"),
-            &[":buffer-next"],
+            &[":bnext", ":buffer-next"],
             Action::NextBuffer,
         ),
         builtin(
@@ -614,7 +684,7 @@ fn builtin_commands() -> Vec<BuiltinCommand> {
             "Buffer",
             "Switch to the previous buffer",
             Some(":bp"),
-            &[":buffer-prev"],
+            &[":bprevious", ":buffer-prev"],
             Action::PreviousBuffer,
         ),
         builtin(
@@ -850,6 +920,24 @@ fn builtin_commands() -> Vec<BuiltinCommand> {
             Some(":syntax"),
             &[":syn", ":ft", "filetype", "language"],
             Action::OpenSyntaxPicker,
+        ),
+        builtin(
+            "window.new_horizontal",
+            "New buffer in horizontal split",
+            "Window",
+            "Create a horizontal split containing an empty, unnamed buffer",
+            Some(":new"),
+            &["new split", "horizontal scratch buffer"],
+            Action::SplitHorizontalNewBuffer,
+        ),
+        builtin(
+            "window.new_vertical",
+            "New buffer in vertical split",
+            "Window",
+            "Create a vertical split containing an empty, unnamed buffer",
+            Some(":vnew"),
+            &["vertical scratch buffer"],
+            Action::SplitVerticalNewBuffer,
         ),
         builtin(
             "window.split_horizontal",
@@ -1176,6 +1264,15 @@ fn builtin_commands() -> Vec<BuiltinCommand> {
             Action::ViewLogs,
         ),
         builtin(
+            "debug.plugin_status",
+            "Plugin status",
+            "Extensions",
+            "See which plugins are running, starting, or stopped, and why",
+            Some(":plugin-status"),
+            &["quarantined plugins", "plugin errors", "stopped plugins"],
+            Action::PluginStatus,
+        ),
+        builtin(
             "debug.plugins",
             "Language packs",
             "Extensions",
@@ -1387,12 +1484,20 @@ fn action_label(action: &Action) -> String {
         Action::OpenWelcome => "Welcome to Red".to_string(),
         Action::StartTutorial(_) => "Take the guided Red tour".to_string(),
         Action::ConfigDiagnostics => "Configuration diagnostics".to_string(),
+        Action::PluginStatus => "Plugin status".to_string(),
         Action::OpenWhatsNew => "What’s new in Red".to_string(),
         Action::OpenDiagnosticsPicker => "Diagnostics".to_string(),
         Action::OpenErrorDiagnosticsPicker => "Errors".to_string(),
         Action::OpenStatuslineManager => "Configure status line".to_string(),
         Action::PluginCommand(name) => humanize_identifier(name),
         Action::Save => "Save file".to_string(),
+        Action::ForceSave => "Overwrite file on disk".to_string(),
+        Action::SaveAll => "Save all files".to_string(),
+        Action::ForceSaveAll => "Overwrite all modified files".to_string(),
+        Action::ForceSaveAs(_) => "Overwrite selected file".to_string(),
+        Action::CompareFileOnDisk => "Compare with file on disk".to_string(),
+        Action::NewBuffer => "New buffer".to_string(),
+        Action::ListBuffers => "List buffers".to_string(),
         Action::Quit(_) => "Quit".to_string(),
         Action::Undo => "Undo".to_string(),
         Action::Redo => "Redo".to_string(),
@@ -1400,7 +1505,14 @@ fn action_label(action: &Action) -> String {
         Action::ToggleCommentLines(_) => "Toggle line comments".to_string(),
         Action::ToggleCommentRange(_) => "Toggle range comments".to_string(),
         Action::ToggleCommentSelection => "Toggle selected comments".to_string(),
+        Action::StartFormatOperator(_) => "Format with motion".to_string(),
+        Action::FormatTextRange(_) => "Format text range".to_string(),
+        Action::FormatSelection => "Format selected text".to_string(),
         Action::RepeatLastChange => "Repeat last change".to_string(),
+        Action::MoveToNextParagraph => "Go to next paragraph".to_string(),
+        Action::MoveToPreviousParagraph => "Go to previous paragraph".to_string(),
+        Action::MoveToNextSentence => "Go to next sentence".to_string(),
+        Action::MoveToPreviousSentence => "Go to previous sentence".to_string(),
         Action::MoveToNextCall => "Go to next function call".to_string(),
         Action::MoveToPreviousCall => "Go to previous function call".to_string(),
         Action::MoveToNextFunction => "Go to next function".to_string(),
@@ -1428,6 +1540,8 @@ fn action_label(action: &Action) -> String {
         Action::ToggleWrap => "Toggle line wrapping".to_string(),
         Action::SplitHorizontal => "Split horizontally".to_string(),
         Action::SplitVertical => "Split vertically".to_string(),
+        Action::SplitHorizontalNewBuffer => "New buffer in horizontal split".to_string(),
+        Action::SplitVerticalNewBuffer => "New buffer in vertical split".to_string(),
         Action::CloseWindow => "Close window".to_string(),
         Action::OnlyWindow => "Keep only current window".to_string(),
         Action::BalanceWindows => "Balance windows".to_string(),
@@ -1548,6 +1662,138 @@ mod tests {
             assert_eq!(entry.action, action);
             assert_eq!(entry.shortcuts, vec![shortcut]);
         }
+    }
+
+    #[test]
+    fn palette_exposes_the_unnamed_buffer_command() {
+        let entries = entries(&default_keys(), &[]);
+        let entry = entries
+            .iter()
+            .find(|entry| entry.id == "buffer.new")
+            .unwrap();
+
+        assert_eq!(entry.action, Action::NewBuffer);
+        assert_eq!(entry.colon.as_deref(), Some(":enew"));
+        assert!(colon_completion_names(&[])
+            .iter()
+            .any(|name| name == "enew"));
+        assert_eq!(
+            command::parse(BUILTIN_COLON_COMMANDS, "enew")
+                .unwrap()
+                .commands,
+            ["enew"]
+        );
+        assert_eq!(
+            command::parse(BUILTIN_COLON_COMMANDS, "ene")
+                .unwrap()
+                .commands,
+            ["enew"]
+        );
+        assert_eq!(command::parse(BUILTIN_COLON_COMMANDS, "en"), None);
+    }
+
+    #[test]
+    fn builtin_command_prefixes_do_not_conflict() {
+        for (index, command) in BUILTIN_COLON_COMMANDS.iter().enumerate() {
+            assert!(
+                !BUILTIN_COLON_COMMANDS[..index]
+                    .iter()
+                    .any(|other| other.name() == command.name()),
+                "duplicate built-in command {:?}",
+                command.name()
+            );
+
+            for length in 1..=command.name().len() {
+                let prefix = &command.name()[..length];
+                if !command.accepts_prefix(prefix)
+                    || BUILTIN_COLON_COMMANDS
+                        .iter()
+                        .any(|other| other.name() == prefix)
+                {
+                    continue;
+                }
+
+                let matches = BUILTIN_COLON_COMMANDS
+                    .iter()
+                    .filter(|other| other.accepts_prefix(prefix))
+                    .map(CommandSpec::name)
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    matches.len(),
+                    1,
+                    "built-in command prefix {prefix:?} matches {matches:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn palette_exposes_standard_buffer_and_new_split_commands() {
+        let entries = entries(&default_keys(), &[]);
+        for (id, command, action) in [
+            ("buffer.list", ":ls", Action::ListBuffers),
+            (
+                "window.new_horizontal",
+                ":new",
+                Action::SplitHorizontalNewBuffer,
+            ),
+            (
+                "window.new_vertical",
+                ":vnew",
+                Action::SplitVerticalNewBuffer,
+            ),
+        ] {
+            let entry = entries.iter().find(|entry| entry.id == id).unwrap();
+            assert_eq!(entry.colon.as_deref(), Some(command));
+            assert_eq!(entry.action, action);
+        }
+
+        let aliases = colon_completion_names(&[]);
+        for name in [
+            "b",
+            "buffer",
+            "bnext",
+            "bprevious",
+            "ls",
+            "buffers",
+            "files",
+            "new",
+            "vnew",
+            "saveas",
+            "file",
+        ] {
+            assert!(aliases.iter().any(|alias| alias == name), "{name}");
+        }
+    }
+
+    #[test]
+    fn palette_exposes_save_all() {
+        let entries = entries(&default_keys(), &[]);
+        let entry = entries
+            .iter()
+            .find(|entry| entry.id == "file.save_all")
+            .unwrap();
+
+        assert_eq!(entry.colon.as_deref(), Some(":wa"));
+        assert_eq!(entry.action, Action::SaveAll);
+        assert!(colon_completion_names(&[])
+            .iter()
+            .any(|name| name == "wall"));
+    }
+
+    #[test]
+    fn palette_exposes_disk_conflict_comparison() {
+        let entries = entries(&default_keys(), &[]);
+        let entry = entries
+            .iter()
+            .find(|entry| entry.id == "file.compare_on_disk")
+            .unwrap();
+
+        assert_eq!(entry.colon.as_deref(), Some(":diffdisk"));
+        assert_eq!(entry.action, Action::CompareFileOnDisk);
+        assert!(colon_completion_names(&[])
+            .iter()
+            .any(|name| name == "diffdisk"));
     }
 
     #[test]
@@ -1873,6 +2119,24 @@ mod tests {
             .unwrap();
 
         assert_eq!(custom.colon, None);
+    }
+
+    #[test]
+    fn vim_prefixes_shadow_plugin_names_only_after_their_minimum_length() {
+        for (name, expected) in [("ene", None), ("en", Some(":en"))] {
+            let plugin = RegisteredPluginCommand {
+                name: name.to_string(),
+                plugin: "custom".to_string(),
+                metadata: CommandMetadata::default(),
+            };
+            let entries = entries(&default_keys(), &[plugin]);
+            let custom = entries
+                .iter()
+                .find(|entry| entry.id == format!("plugin.custom.{name}"))
+                .unwrap();
+
+            assert_eq!(custom.colon.as_deref(), expected, "{name}");
+        }
     }
 
     #[test]

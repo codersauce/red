@@ -1,5 +1,7 @@
 use std::{
+    collections::VecDeque,
     path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
     sync::{Arc, Mutex},
 };
 
@@ -72,14 +74,24 @@ pub struct SavedDocument {
     pub disk_text: Option<String>,
 }
 
+type InboundQueue = Arc<Mutex<VecDeque<(InboundMessage, Option<String>)>>>;
+
 #[derive(Clone, Default)]
 pub struct RecordingLsp {
     saves: Arc<Mutex<Vec<SavedDocument>>>,
     events: Arc<Mutex<Vec<LspEvent>>>,
     reconfigurations: Arc<Mutex<Vec<LspConfig>>>,
     workspace_root: Option<PathBuf>,
+    capabilities: Option<ServerCapabilities>,
+    instance: Arc<AtomicU64>,
+    scripted: Arc<Mutex<VecDeque<(String, Value)>>>,
+    responses: InboundQueue,
+    last_request: Arc<Mutex<Option<red::lsp::Request>>>,
     fail_next_did_open: bool,
     fail_next_did_change: bool,
+    /// Document versions as a real client numbers them: didOpen is 1 and every
+    /// didChange adds one.
+    versions: Arc<Mutex<std::collections::HashMap<String, i64>>>,
 }
 
 impl RecordingLsp {
@@ -91,8 +103,46 @@ impl RecordingLsp {
             workspace_root: Some(root.to_path_buf()),
             fail_next_did_open: false,
             fail_next_did_change: false,
+            ..Self::default()
         }
     }
+    pub fn with_capabilities(mut self, capabilities: Value) -> Self {
+        self.capabilities = Some(serde_json::from_value(capabilities).unwrap());
+        self.instance.store(1, Ordering::SeqCst);
+        self
+    }
+
+    pub fn queue_result(&self, method: &str, result: Value) {
+        self.scripted
+            .lock()
+            .unwrap()
+            .push_back((method.to_string(), result));
+    }
+
+    pub fn queue_message(&self, message: InboundMessage) {
+        let method = match &message {
+            InboundMessage::Message(response) => response
+                .request
+                .as_ref()
+                .map(|request| request.method.clone()),
+            _ => None,
+        };
+        self.responses.lock().unwrap().push_back((message, method));
+    }
+
+    pub fn reply_to_last(&self, result: Value) {
+        let request = self.last_request.lock().unwrap().clone().unwrap();
+        self.queue_message(InboundMessage::Message(red::lsp::ResponseMessage {
+            id: request.id,
+            result,
+            request: Some(request),
+        }));
+    }
+
+    pub fn restart(&self) {
+        self.instance.fetch_add(1, Ordering::SeqCst);
+    }
+
     pub fn saves(&self) -> Arc<Mutex<Vec<SavedDocument>>> {
         Arc::clone(&self.saves)
     }
@@ -157,6 +207,15 @@ impl LspClient for MockLsp {
 
     async fn format_document(&mut self, _file: &str) -> Result<i64, LspError> {
         Ok(0)
+    }
+
+    async fn format_document_with_options(
+        &mut self,
+        file: &str,
+        _tab_size: usize,
+        _insert_spaces: bool,
+    ) -> Result<i64, LspError> {
+        self.format_document(file).await
     }
 
     async fn document_symbols(&mut self, _file: &str) -> Result<i64, LspError> {
@@ -291,6 +350,10 @@ impl LspClient for MockLsp {
 
 #[async_trait::async_trait]
 impl LspClient for RecordingLsp {
+    fn document_version(&self, file: &str) -> Option<i64> {
+        self.versions.lock().unwrap().get(file).copied()
+    }
+
     async fn reconfigure(&mut self, config: LspConfig) -> Result<Vec<String>, LspError> {
         self.reconfigurations.lock().unwrap().push(config);
         Ok(Vec::new())
@@ -302,6 +365,7 @@ impl LspClient for RecordingLsp {
 
     async fn did_open(&mut self, file: &str, _contents: &str) -> Result<(), LspError> {
         self.record(LspEvent::DidOpen(file.to_string()));
+        self.versions.lock().unwrap().insert(file.to_string(), 1);
         if self.fail_next_did_open {
             self.fail_next_did_open = false;
             return Err(LspError::ServerError(
@@ -313,6 +377,12 @@ impl LspClient for RecordingLsp {
 
     async fn did_change(&mut self, file: &str, _contents: String) -> Result<(), LspError> {
         self.record(LspEvent::DidChange(file.to_string()));
+        *self
+            .versions
+            .lock()
+            .unwrap()
+            .entry(file.to_string())
+            .or_default() += 1;
         if self.fail_next_did_change {
             self.fail_next_did_change = false;
             return Err(LspError::ServerError(
@@ -353,6 +423,15 @@ impl LspClient for RecordingLsp {
     async fn format_document(&mut self, file: &str) -> Result<i64, LspError> {
         self.record(LspEvent::FormatDocument(file.to_string()));
         Ok(45)
+    }
+
+    async fn format_document_with_options(
+        &mut self,
+        file: &str,
+        _tab_size: usize,
+        _insert_spaces: bool,
+    ) -> Result<i64, LspError> {
+        self.format_document(file).await
     }
 
     async fn document_symbols(&mut self, file: &str) -> Result<i64, LspError> {
@@ -466,9 +545,27 @@ impl LspClient for RecordingLsp {
     ) -> Result<i64, LspError> {
         self.record(LspEvent::SendRequest {
             method: method.to_string(),
-            params,
+            params: params.clone(),
         });
-        Ok(0)
+        if self.capabilities.is_none() {
+            return Ok(0);
+        }
+        let request = red::lsp::Request::new(method, params);
+        let id = request.id;
+        *self.last_request.lock().unwrap() = Some(request.clone());
+        let mut scripted = self.scripted.lock().unwrap();
+        if let Some(index) = scripted.iter().position(|(name, _)| name == method) {
+            let (_, result) = scripted.remove(index).unwrap();
+            self.responses.lock().unwrap().push_back((
+                InboundMessage::Message(red::lsp::ResponseMessage {
+                    id,
+                    result,
+                    request: Some(request),
+                }),
+                Some(method.to_string()),
+            ));
+        }
+        Ok(id)
     }
 
     async fn send_notification(
@@ -499,11 +596,17 @@ impl LspClient for RecordingLsp {
     async fn recv_response(
         &mut self,
     ) -> Result<Option<(InboundMessage, Option<String>)>, LspError> {
-        Ok(None)
+        Ok(self.responses.lock().unwrap().pop_front())
     }
 
     fn get_server_capabilities(&self) -> Option<&ServerCapabilities> {
-        None
+        self.capabilities.as_ref()
+    }
+
+    fn server_instance_for_file(&self, _file: &str) -> Option<u64> {
+        self.capabilities
+            .as_ref()
+            .map(|_| self.instance.load(Ordering::SeqCst))
     }
 
     fn workspace_root_for_file(&self, _file: &str) -> Option<PathBuf> {

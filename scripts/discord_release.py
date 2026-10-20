@@ -118,9 +118,12 @@ def ranked_items(items: list[str]) -> list[str]:
     return [item for _, item in [*diverse, *repeated]]
 
 
-def limited_bullets(items: list[str], limit: int, max_chars: int = 950) -> str:
+def limited_bullets(
+    items: list[str], limit: int, max_chars: int = 950, *, preserve_order: bool = False
+) -> str:
     selected: list[str] = []
-    for item in ranked_items(items)[:limit]:
+    candidates = items if preserve_order else ranked_items(items)
+    for item in candidates[:limit]:
         candidate = "\n".join([*selected, f"• {item}"])
         if len(candidate) > max_chars:
             break
@@ -128,8 +131,14 @@ def limited_bullets(items: list[str], limit: int, max_chars: int = 950) -> str:
     return "\n".join(selected)
 
 
-def build_payload(release: dict[str, Any], mention_everyone: bool = False) -> dict[str, Any]:
+def build_payload(
+    release: dict[str, Any],
+    mention_everyone: bool = False,
+    campaign: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     tag = str(release["tagName"])
+    if campaign is not None and campaign.get("version") != tag.removeprefix("v"):
+        raise ValueError("campaign version must match the announced release")
     body = str(release.get("body") or "")
     sections = release_sections(body)
     features = sections.get("Features", [])
@@ -152,11 +161,28 @@ def build_payload(release: dict[str, Any], mention_everyone: bool = False) -> di
     description = "A new release of **Red** is available."
     if count_summary:
         description = f"A new release of **Red** is available with {count_summary}."
+    if campaign is not None:
+        description = campaign["summary"]
+        if count_summary:
+            description += f"\n\nThe full release notes cover {count_summary}."
+        description += "\n\nWhat part of your editing workflow should Red make agent-aware next?"
 
     fields: list[dict[str, Any]] = []
-    feature_highlights = limited_bullets(features, 5)
+    if campaign is None:
+        feature_highlights = limited_bullets(features, 5)
+    else:
+        reviewed = [
+            story["title"]
+            for story in campaign["stories"]
+            if "discord" in story["channels"]
+        ]
+        feature_highlights = limited_bullets(reviewed[:3], 3, preserve_order=True)
     if feature_highlights:
         fields.append({"name": "✨ Highlights", "value": feature_highlights, "inline": False})
+    if campaign is not None:
+        more = limited_bullets(reviewed[3:], 4, preserve_order=True)
+        if more:
+            fields.append({"name": "More to explore", "value": more, "inline": False})
 
     polish = [*performance, *fixes]
     polish_highlights = limited_bullets(polish, 3)
@@ -181,18 +207,23 @@ def build_payload(release: dict[str, Any], mention_everyone: bool = False) -> di
         f"{len(features)} {plural(len(features), 'feature')}",
         f"{len(fixes)} {plural(len(fixes), 'fix', 'fixes')}",
     ]
+    image_url = select_image(sections) if campaign is None else campaign.get("discord_image")
     payload: dict[str, Any] = {
         "username": "Red Releases",
         "avatar_url": "https://github.com/codersauce.png",
         "allowed_mentions": {"parse": ["everyone"] if mention_everyone else []},
         "embeds": [
             {
-                "title": f"🚀 Red Editor {tag} is out!",
+                "title": (
+                    f"🚀 Red {tag}: {campaign['headline']}"
+                    if campaign is not None
+                    else f"🚀 Red Editor {tag} is out!"
+                ),
                 "url": release["url"],
                 "description": description,
                 "color": RED,
                 "fields": fields,
-                "image": {"url": select_image(sections)},
+                **({"image": {"url": image_url}} if image_url else {}),
                 "footer": {"text": " • ".join(footer_parts)},
                 **(
                     {"timestamp": release["publishedAt"]}
@@ -212,7 +243,9 @@ def markdown_preview(payload: dict[str, Any]) -> str:
     lines = [f"# {embed['title']}", "", embed["description"], ""]
     for field in embed["fields"]:
         lines.extend((f"## {field['name']}", "", field["value"], ""))
-    lines.extend((f"Image: {embed['image']['url']}", "", f"Release: {embed['url']}", ""))
+    if "image" in embed:
+        lines.extend((f"Image: {embed['image']['url']}", ""))
+    lines.extend((f"Release: {embed['url']}", ""))
     return "\n".join(lines)
 
 
@@ -221,11 +254,20 @@ def main() -> None:
     parser.add_argument("--release-json", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--summary", type=Path)
+    parser.add_argument("--campaign", type=Path)
     parser.add_argument("--mention-everyone", action="store_true")
     args = parser.parse_args()
 
     release = json.loads(args.release_json.read_text(encoding="utf-8"))
-    payload = build_payload(release, mention_everyone=args.mention_everyone)
+    campaign = None
+    if args.campaign is not None:
+        from release_campaign import load_campaign, validate_campaign
+
+        campaign = load_campaign(args.campaign)
+        validate_campaign(campaign, expected_version=release["tagName"].removeprefix("v"))
+    payload = build_payload(
+        release, mention_everyone=args.mention_everyone, campaign=campaign
+    )
     args.output.write_text(
         json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
     )

@@ -35,6 +35,7 @@ pub enum MessageAction {
     Close,
     Next,
     Previous,
+    Select(NotificationId),
     Search,
     Query(String),
     Backspace,
@@ -47,6 +48,7 @@ pub enum MessageAction {
     Copy,
     ScrollDown,
     ScrollUp,
+    ScrollTo(usize),
 }
 
 /// Producer-local identity. Numeric LSP tokens never alias text tokens such as "1".
@@ -258,6 +260,18 @@ pub enum AttentionPolicy {
     RequiresAcknowledgment,
 }
 
+/// Whether a notice should temporarily lead the bottom line.
+///
+/// Foreground notices represent the result of a user-initiated operation. They
+/// outrank older retained failures while active without acknowledging or hiding
+/// those failures.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub enum DisplayPriority {
+    #[default]
+    Normal,
+    Foreground,
+}
+
 impl AttentionPolicy {
     pub(crate) fn for_severity(severity: Severity) -> Self {
         match severity {
@@ -277,6 +291,7 @@ pub struct Notice {
     pub key: Option<NotificationKey>,
     pub lifetime: NoticeLifetime,
     pub attention: AttentionPolicy,
+    pub display_priority: DisplayPriority,
 }
 
 impl Notice {
@@ -288,6 +303,7 @@ impl Notice {
             key: None,
             lifetime: NoticeLifetime::for_severity(severity),
             attention: AttentionPolicy::for_severity(severity),
+            display_priority: DisplayPriority::Normal,
         }
     }
 
@@ -296,16 +312,25 @@ impl Notice {
         self
     }
 
+    /// Sets both the user's attention obligation and its matching foreground lifetime.
     pub fn with_attention(mut self, attention: AttentionPolicy) -> Self {
         self.attention = attention;
-        if attention == AttentionPolicy::RequiresAcknowledgment {
-            self.lifetime = NoticeLifetime::UntilAcknowledged;
-        }
+        self.lifetime = match attention {
+            AttentionPolicy::Quiet | AttentionPolicy::IfMissed => {
+                NoticeLifetime::Transient(DEFAULT_NOTICE_DURATION)
+            }
+            AttentionPolicy::RequiresAcknowledgment => NoticeLifetime::UntilAcknowledged,
+        };
         self
     }
 
     pub fn with_details(mut self, details: impl Into<String>) -> Self {
         self.content = self.content.with_details(details);
+        self
+    }
+
+    pub fn with_display_priority(mut self, display_priority: DisplayPriority) -> Self {
+        self.display_priority = display_priority;
         self
     }
 }
@@ -362,6 +387,7 @@ pub struct Notification {
     pub read: bool,
     pub attention: AttentionPolicy,
     pub(crate) content_version: u64,
+    display_priority: DisplayPriority,
     priority: ProgressPriority,
     display: DisplayState,
 }
@@ -411,8 +437,8 @@ impl Notification {
             }
     }
 
-    fn rank(&self) -> u8 {
-        match self.severity {
+    fn rank(&self) -> (DisplayPriority, u8) {
+        let severity = match self.severity {
             Severity::Error => 4,
             Severity::Warning => 3,
             _ if self.is_running() => match self.priority {
@@ -420,7 +446,8 @@ impl Notification {
                 ProgressPriority::Background => 1,
             },
             Severity::Info | Severity::Success => 0,
-        }
+        };
+        (self.display_priority, severity)
     }
 }
 
@@ -562,6 +589,7 @@ impl NotificationCenter {
             }
             record.severity = notice.severity;
             record.attention = notice.attention;
+            record.display_priority = notice.display_priority;
             record.content_version = record.content_version.wrapping_add(1);
             record.content = content;
             record.display = display;
@@ -585,6 +613,7 @@ impl NotificationCenter {
             updated_at: now.wall,
             occurrences: 1,
             read: notice.attention == AttentionPolicy::Quiet,
+            display_priority: notice.display_priority,
             priority: ProgressPriority::Background,
             display,
         });
@@ -619,6 +648,7 @@ impl NotificationCenter {
             updated_at: now.wall,
             occurrences: 1,
             read: false,
+            display_priority: DisplayPriority::Normal,
             priority,
             display: DisplayState::UntilAcknowledged,
         });

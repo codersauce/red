@@ -459,7 +459,7 @@ impl Editor {
                                     format!("Installed {} {}.", plugin.name, plugin.version)
                                 },
                                 plugin.has_languages && !plugin.has_native_grammars,
-                                plugin.has_husk || plugin.has_companion,
+                                plugin.restart_required(),
                             ),
                             Err(error) => (format!("Plugin install failed: {error}"), false, false),
                         };

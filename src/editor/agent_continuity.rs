@@ -1,0 +1,1093 @@
+//! Keeps the Agent pane's Codex thread across normal Red launches.
+//!
+//! Each workspace has one saved conversation under
+//! `<config>/agent/conversations/<sha256 of the workspace>.json`. Only the Red
+//! process holding an OS lock on `<sha256>.lock` reads it for resume, writes it,
+//! or removes it, and it keeps that lock until it exits. Two editors open in one
+//! workspace therefore never drive the same Codex thread: the second starts its
+//! own thread, which is never saved. The operating system releases the lock when
+//! its holder exits or crashes, so there is no stale claim to detect.
+
+use std::{
+    collections::{HashMap, HashSet},
+    fs,
+    fs::TryLockError,
+    io::{self, Read as _, Write as _},
+    path::{Path, PathBuf},
+    time::{SystemTime, UNIX_EPOCH},
+};
+
+use serde::{Deserialize, Serialize};
+use sha2::{Digest as _, Sha256};
+
+use crate::agent_conversation::AgentConversationSnapshot;
+
+const RECORD_VERSION: u32 = 1;
+const MAX_RECORD_BYTES: u64 = 16 * 1024 * 1024;
+
+/// A conversation saved by an earlier editor in this workspace.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SavedConversation {
+    pub saved_at_ms: u64,
+    pub conversation: AgentConversationSnapshot,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct Record {
+    version: u32,
+    workspace: String,
+    saved_at_ms: u64,
+    conversation: AgentConversationSnapshot,
+}
+
+/// Who may resume and save a workspace's conversation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Claim {
+    /// This editor owns the workspace's conversation.
+    Owned,
+    /// Another running editor owns it.
+    HeldElsewhere,
+}
+
+pub struct ConversationStore {
+    directory: PathBuf,
+    /// Workspace keys this editor owns, with the locked file that holds each claim.
+    held: HashMap<String, fs::File>,
+    /// Workspaces another editor owned when this one asked, or whose ownership
+    /// could not be checked. This editor's separate thread there is never saved,
+    /// even after the owner exits, so it cannot replace the owner's conversation.
+    denied: HashSet<String>,
+    /// Workspaces this editor left whose records could not be removed yet.
+    retiring: Vec<PathBuf>,
+}
+
+impl ConversationStore {
+    pub fn new(directory: PathBuf) -> Self {
+        Self {
+            directory,
+            held: HashMap::new(),
+            denied: HashSet::new(),
+            retiring: Vec::new(),
+        }
+    }
+
+    /// Claims a workspace's conversation for this editor unless another running
+    /// editor holds it. A claim lasts until it is released or this process exits.
+    pub fn claim(&mut self, workspace: &Path) -> io::Result<Claim> {
+        let key = workspace_key(workspace);
+        if self.held.contains_key(&key) {
+            return Ok(Claim::Owned);
+        }
+        if self.denied.contains(&key) {
+            return Ok(Claim::HeldElsewhere);
+        }
+        ensure_private_directory(&self.directory)?;
+        let file = open_private_file(&self.directory.join(format!("{key}.lock")))?;
+        match file.try_lock() {
+            Ok(()) => {
+                self.held.insert(key, file);
+                Ok(Claim::Owned)
+            }
+            Err(TryLockError::WouldBlock) => {
+                self.denied.insert(key);
+                Ok(Claim::HeldElsewhere)
+            }
+            Err(TryLockError::Error(error)) => Err(error),
+        }
+    }
+
+    pub fn owns(&self, workspace: &Path) -> bool {
+        self.held.contains_key(&workspace_key(workspace))
+    }
+
+    /// Releases every claim so the next editor in these workspaces can resume.
+    pub fn release_all(&mut self) {
+        // Closing each locked file releases its lock.
+        self.held.clear();
+    }
+
+    /// Never saves this workspace from this editor, as when its ownership could
+    /// not be checked: a later save must not replace a record it could not read
+    /// safely.
+    pub fn refuse(&mut self, workspace: &Path) {
+        self.denied.insert(workspace_key(workspace));
+    }
+
+    /// This editor's conversation left `workspace`: remove its record there and
+    /// release the claim so another editor can use that workspace. A removal
+    /// that fails stays pending and is retried by [`Self::retry_retirements`].
+    pub fn retire(&mut self, workspace: &Path) {
+        if self.owns(workspace) && !self.retiring.iter().any(|path| path == workspace) {
+            self.retiring.push(workspace.to_path_buf());
+        }
+        self.retry_retirements();
+    }
+
+    pub fn has_retirements(&self) -> bool {
+        !self.retiring.is_empty()
+    }
+
+    pub fn retry_retirements(&mut self) {
+        for workspace in std::mem::take(&mut self.retiring) {
+            match self.remove(&workspace) {
+                Ok(_) => {
+                    self.held.remove(&workspace_key(&workspace));
+                }
+                Err(error) => {
+                    crate::log!(
+                        "could not remove the agent conversation saved for {}: {error}",
+                        workspace.display()
+                    );
+                    self.retiring.push(workspace);
+                }
+            }
+        }
+    }
+
+    /// The conversation saved for a workspace, if it is readable and was saved
+    /// for exactly this workspace.
+    pub fn load(&self, workspace: &Path) -> Option<SavedConversation> {
+        let key = workspace_key(workspace);
+        let record: Record = read_bounded_json(&self.directory.join(format!("{key}.json")))?;
+        (record.version == RECORD_VERSION && record.workspace == key_source(workspace)).then_some(
+            SavedConversation {
+                saved_at_ms: record.saved_at_ms,
+                conversation: record.conversation,
+            },
+        )
+    }
+
+    /// Saves a workspace's conversation. Does nothing unless this editor owns it.
+    pub fn save(
+        &mut self,
+        workspace: &Path,
+        conversation: &AgentConversationSnapshot,
+    ) -> anyhow::Result<bool> {
+        if !self.owns(workspace) {
+            return Ok(false);
+        }
+        let record = Record {
+            version: RECORD_VERSION,
+            workspace: key_source(workspace),
+            saved_at_ms: now_ms(),
+            conversation: conversation.clone(),
+        };
+        let contents = serde_json::to_vec(&record)?;
+        anyhow::ensure!(
+            contents.len() as u64 <= MAX_RECORD_BYTES,
+            "agent conversation is too large to save"
+        );
+        ensure_private_directory(&self.directory)?;
+        let destination = self
+            .directory
+            .join(format!("{}.json", workspace_key(workspace)));
+        if let Ok(metadata) = fs::symlink_metadata(&destination) {
+            anyhow::ensure!(
+                metadata.is_file(),
+                "agent conversation destination must be a regular file"
+            );
+        }
+        let mut temporary = tempfile::NamedTempFile::new_in(&self.directory)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            temporary
+                .as_file()
+                .set_permissions(fs::Permissions::from_mode(0o600))?;
+        }
+        temporary.write_all(&contents)?;
+        temporary.as_file().sync_all()?;
+        temporary
+            .persist(&destination)
+            .map_err(|error| error.error)?;
+        Ok(true)
+    }
+
+    /// Removes a workspace's saved conversation. Does nothing unless this editor
+    /// owns it.
+    pub fn remove(&mut self, workspace: &Path) -> io::Result<bool> {
+        if !self.owns(workspace) {
+            return Ok(false);
+        }
+        let path = self
+            .directory
+            .join(format!("{}.json", workspace_key(workspace)));
+        match fs::remove_file(path) {
+            Ok(()) => Ok(true),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+}
+
+impl Drop for ConversationStore {
+    fn drop(&mut self) {
+        self.release_all();
+    }
+}
+
+/// "3 minutes ago"-style age of a saved conversation.
+pub fn describe_age(saved_at_ms: u64) -> String {
+    let seconds = now_ms().saturating_sub(saved_at_ms) / 1000;
+    let plural = |count: u64, unit: &str| {
+        if count == 1 {
+            format!("1 {unit} ago")
+        } else {
+            format!("{count} {unit}s ago")
+        }
+    };
+    match seconds {
+        0..=59 => "a moment ago".to_string(),
+        60..=3_599 => plural(seconds / 60, "minute"),
+        3_600..=86_399 => plural(seconds / 3_600, "hour"),
+        _ => plural(seconds / 86_400, "day"),
+    }
+}
+
+fn key_source(workspace: &Path) -> String {
+    fs::canonicalize(workspace)
+        .unwrap_or_else(|_| workspace.to_path_buf())
+        .to_string_lossy()
+        .into_owned()
+}
+
+fn workspace_key(workspace: &Path) -> String {
+    format!("{:x}", Sha256::digest(key_source(workspace).as_bytes()))
+}
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |elapsed| {
+            u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
+        })
+}
+
+fn ensure_private_directory(directory: &Path) -> io::Result<()> {
+    fs::create_dir_all(directory)?;
+    let metadata = fs::symlink_metadata(directory)?;
+    if !metadata.is_dir() {
+        return Err(io::Error::other(
+            "agent conversation directory must be a real directory",
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        fs::set_permissions(directory, fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
+fn open_private_file(path: &Path) -> io::Result<fs::File> {
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    options.open(path)
+}
+
+fn read_bounded_json<T: serde::de::DeserializeOwned>(path: &Path) -> Option<T> {
+    let metadata = fs::symlink_metadata(path).ok()?;
+    if !metadata.is_file() || metadata.len() > MAX_RECORD_BYTES {
+        return None;
+    }
+    let mut contents = Vec::new();
+    fs::File::open(path)
+        .ok()?
+        .take(MAX_RECORD_BYTES + 1)
+        .read_to_end(&mut contents)
+        .ok()?;
+    serde_json::from_slice(&contents).ok()
+}
+
+const HELD_ELSEWHERE_MESSAGE: &str =
+    "Agent conversation is open in another Red window; this window starts its own";
+
+/// Shortest pause between saves while nothing is streaming.
+const IDLE_SAVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+/// Shortest pause between saves while a reply streams in.
+const STREAMING_SAVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
+
+impl super::Editor {
+    /// Saves the Agent pane's conversation per workspace and adopts the one an
+    /// earlier editor saved here, so the next message continues that Codex thread.
+    pub fn enable_agent_continuity(&mut self, directory: PathBuf) {
+        let workspace = std::env::current_dir().unwrap_or_else(|_| super::get_workspace_path());
+        self.enable_agent_continuity_in(ConversationStore::new(directory), &workspace);
+    }
+
+    fn enable_agent_continuity_in(&mut self, mut store: ConversationStore, workspace: &Path) {
+        match self
+            .agent_manager
+            .conversation()
+            .map(|c| PathBuf::from(&c.cwd))
+        {
+            None => self.adopt_saved_agent_conversation(&mut store, workspace),
+            // A --resume or detached restore brought its own conversation; it
+            // may only resume that thread if no other live editor drives it.
+            Some(restored) => self.claim_restored_agent_conversation(&mut store, &restored),
+        }
+        self.agent_continuity = Some(store);
+    }
+
+    fn claim_restored_agent_conversation(
+        &mut self,
+        store: &mut ConversationStore,
+        workspace: &Path,
+    ) {
+        let message = match store.claim(workspace) {
+            Ok(Claim::Owned) => {
+                self.agent_continuity_workspace = Some(workspace.to_path_buf());
+                return;
+            }
+            Ok(Claim::HeldElsewhere) => {
+                crate::log!(
+                    "recovered agent conversation for {} is open in another Red; not resuming it",
+                    workspace.display()
+                );
+                HELD_ELSEWHERE_MESSAGE.to_string()
+            }
+            // Without a claim another editor may be driving the thread: fail closed.
+            Err(error) => {
+                crate::log!("could not claim the recovered agent conversation: {error}");
+                "Could not check whether another Red uses this agent conversation; starting a new one"
+                    .to_string()
+            }
+        };
+        // Its transcript stays as archived context for a new thread.
+        self.agent_manager.discard_conversation();
+        self.agent_continuity_saved = Some((
+            Some(self.agent_manager.conversation_revision()),
+            std::time::Instant::now(),
+        ));
+        self.set_quiet_message(Some(message));
+    }
+
+    fn adopt_saved_agent_conversation(&mut self, store: &mut ConversationStore, workspace: &Path) {
+        let Some(peeked) = store.load(workspace) else {
+            return;
+        };
+        match store.claim(workspace) {
+            Ok(Claim::Owned) => {
+                // Read the record again now that this editor owns it: an owner
+                // that was still exiting may have saved a newer one after the peek.
+                let Some(saved) = store.load(workspace) else {
+                    return;
+                };
+                let compatible = saved.conversation.tool_contract_version
+                    == crate::agent_conversation::AGENT_TOOL_CONTRACT_VERSION
+                    && !saved.conversation.thread_id.is_empty()
+                    && !saved.conversation.items.is_empty();
+                if !compatible {
+                    // Not resumable, but never lost: keep it as the archived
+                    // transcript that the next message recaps in a new thread.
+                    self.archive_saved_agent_transcript(workspace, &saved.conversation);
+                    return;
+                }
+                self.agent_continuity_adopted_age = Some(describe_age(saved.saved_at_ms));
+                self.agent_manager.restore_conversation(saved.conversation);
+                // Rebuild its source annotations before anything syncs them away.
+                self.restore_agent_annotations();
+                self.agent_continuity_saved = Some((
+                    Some(self.agent_manager.conversation_revision()),
+                    std::time::Instant::now(),
+                ));
+                self.agent_continuity_workspace = Some(workspace.to_path_buf());
+            }
+            Ok(Claim::HeldElsewhere) => {
+                crate::log!(
+                    "agent conversation for {} is open in another Red; starting a separate one",
+                    workspace.display()
+                );
+                self.set_quiet_message(Some(HELD_ELSEWHERE_MESSAGE.to_string()));
+            }
+            Err(error) => {
+                // Keep its history and never overwrite a record this editor
+                // could not claim safely.
+                crate::log!("could not claim the saved agent conversation: {error}");
+                self.archive_saved_agent_transcript(workspace, &peeked.conversation);
+                store.refuse(workspace);
+                self.set_quiet_message(Some(
+                    "Could not check whether another Red uses this agent conversation; this window starts its own"
+                        .to_string(),
+                ));
+            }
+        }
+    }
+
+    /// Makes a saved conversation the workspace's archived transcript unless the
+    /// pane already kept one there.
+    fn archive_saved_agent_transcript(
+        &mut self,
+        workspace: &Path,
+        conversation: &crate::agent_conversation::AgentConversationSnapshot,
+    ) {
+        let key = super::scoped_plugin_storage_key_for_workspace("agent", "transcript", workspace);
+        let kept = self
+            .preferences
+            .plugin_storage("agent", &key)
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|transcript| !transcript.trim().is_empty());
+        if kept || conversation.items.is_empty() {
+            return;
+        }
+        if let Err(error) = self.preferences.set_plugin_storage(
+            "agent",
+            &key,
+            serde_json::Value::String(conversation.flat_transcript()),
+        ) {
+            crate::log!("could not archive the saved agent conversation: {error}");
+        }
+    }
+
+    /// The age of a conversation adopted at launch, reported once.
+    pub(super) fn take_adopted_agent_conversation_age(&mut self) -> Option<String> {
+        self.agent_continuity_adopted_age.take()
+    }
+
+    /// Writes the conversation when it changed, at most once per interval unless
+    /// `force` is set. A forgotten conversation removes the saved one.
+    pub(super) fn persist_agent_conversation(&mut self, force: bool) {
+        let Some(store) = self.agent_continuity.as_mut() else {
+            return;
+        };
+        let revision = self.agent_manager.conversation_revision();
+        if let Some((saved, at)) = self.agent_continuity_saved {
+            let interval = if self.agent_manager.has_active_sessions() {
+                STREAMING_SAVE_INTERVAL
+            } else {
+                IDLE_SAVE_INTERVAL
+            };
+            if !force && at.elapsed() < interval {
+                return;
+            }
+            if saved == Some(revision) {
+                if store.has_retirements() {
+                    store.retry_retirements();
+                    self.agent_continuity_saved = Some((saved, std::time::Instant::now()));
+                }
+                return;
+            }
+        }
+        let result = match self.agent_manager.conversation() {
+            Some(conversation) if !conversation.items.is_empty() => {
+                let workspace = PathBuf::from(&conversation.cwd);
+                if let Some(previous) = self
+                    .agent_continuity_workspace
+                    .take()
+                    .filter(|previous| previous != &workspace)
+                {
+                    store.retire(&previous);
+                } else if store.has_retirements() {
+                    store.retry_retirements();
+                }
+                self.agent_continuity_workspace = Some(workspace.clone());
+                match store.claim(&workspace) {
+                    Ok(Claim::Owned) => store.save(&workspace, conversation).map(|_| ()),
+                    // Another editor owns this workspace's conversation.
+                    Ok(Claim::HeldElsewhere) => Ok(()),
+                    Err(error) => Err(error.into()),
+                }
+            }
+            // No conversation, or a new thread with nothing in it yet (as right
+            // after :AgentNew): nothing worth resuming, so the old record goes.
+            _ => match self.agent_continuity_workspace.clone() {
+                // Keep the workspace until its record is really gone, so a
+                // failed removal is retried instead of resuming a forgotten thread.
+                Some(workspace) => store
+                    .remove(&workspace)
+                    .map(|_| self.agent_continuity_workspace = None)
+                    .map_err(Into::into),
+                None => Ok(()),
+            },
+        };
+        let saved = match result {
+            Ok(()) => Some(revision),
+            Err(error) => {
+                crate::log!("could not save the agent conversation: {error:#}");
+                // Still stale: retry after the interval and on the forced exit save.
+                self.agent_continuity_saved.and_then(|(saved, _)| saved)
+            }
+        };
+        self.agent_continuity_saved = Some((saved, std::time::Instant::now()));
+    }
+
+    /// Final save on exit; releasing the claim lets the next launch resume.
+    pub(super) fn finish_agent_continuity(&mut self) {
+        self.persist_agent_conversation(/*force*/ true);
+        if let Some(store) = self.agent_continuity.as_mut() {
+            store.release_all();
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn conversation(thread: &str, workspace: &Path) -> AgentConversationSnapshot {
+        let mut conversation = AgentConversationSnapshot::new(thread, workspace.to_string_lossy());
+        conversation.append_user("t1", "Remember HERON");
+        conversation
+    }
+
+    #[test]
+    fn an_owner_saves_and_a_later_editor_loads_the_same_workspace_only() {
+        let config = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let directory = config.path().join("agent/conversations");
+
+        let mut first = ConversationStore::new(directory.clone());
+        assert_eq!(first.claim(workspace.path()).unwrap(), Claim::Owned);
+        let saved = conversation("thread-1", workspace.path());
+        assert!(first.save(workspace.path(), &saved).unwrap());
+        first.release_all();
+
+        let second = ConversationStore::new(directory);
+        let loaded = second.load(workspace.path()).unwrap();
+        assert_eq!(loaded.conversation, saved);
+        assert!(
+            second.load(other.path()).is_none(),
+            "workspaces stay separate"
+        );
+    }
+
+    #[test]
+    fn a_live_owner_keeps_other_editors_from_saving_or_removing() {
+        let config = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let directory = config.path().to_path_buf();
+        let mut owner = ConversationStore::new(directory.clone());
+        owner.claim(workspace.path()).unwrap();
+        owner
+            .save(workspace.path(), &conversation("mine", workspace.path()))
+            .unwrap();
+
+        // A second editor in the same workspace while the owner still runs.
+        let mut other = ConversationStore::new(directory);
+        assert_eq!(other.claim(workspace.path()).unwrap(), Claim::HeldElsewhere);
+        assert!(!other
+            .save(workspace.path(), &conversation("theirs", workspace.path()))
+            .unwrap());
+        assert!(!other.remove(workspace.path()).unwrap());
+        assert_eq!(
+            other.load(workspace.path()).unwrap().conversation.thread_id,
+            "mine"
+        );
+    }
+
+    #[test]
+    fn an_exited_editors_claim_is_free_for_the_next_launch() {
+        let config = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let directory = config.path().to_path_buf();
+        let mut owner = ConversationStore::new(directory.clone());
+        assert_eq!(owner.claim(workspace.path()).unwrap(), Claim::Owned);
+        // Exiting or crashing closes the locked file, which is all a release is.
+        drop(owner);
+
+        let mut next = ConversationStore::new(directory);
+        assert_eq!(next.claim(workspace.path()).unwrap(), Claim::Owned);
+    }
+
+    #[test]
+    fn two_editors_racing_for_a_workspace_never_both_own_it() {
+        for _ in 0..50 {
+            let config = tempfile::tempdir().unwrap();
+            let workspace = tempfile::tempdir().unwrap();
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+            let editors = [(), ()].map(|()| {
+                let directory = config.path().to_path_buf();
+                let workspace = workspace.path().to_path_buf();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    let mut store = ConversationStore::new(directory);
+                    barrier.wait();
+                    let claim = store.claim(&workspace).unwrap();
+                    // Return the store so neither claim is released mid-race.
+                    (claim, store)
+                })
+            });
+            // Join both before dropping either store, or a release could let the
+            // slower thread claim after the race is over.
+            let results = editors.map(|handle| handle.join().unwrap());
+            let claims = results.each_ref().map(|(claim, _)| *claim);
+            let owned = claims
+                .iter()
+                .filter(|claim| **claim == Claim::Owned)
+                .count();
+            assert_eq!(owned, 1, "{claims:?}");
+        }
+    }
+
+    #[test]
+    fn a_denied_editor_never_takes_over_after_the_owner_exits() {
+        let config = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let directory = config.path().to_path_buf();
+        let mut owner = ConversationStore::new(directory.clone());
+        owner.claim(workspace.path()).unwrap();
+        let mut second = ConversationStore::new(directory);
+        assert_eq!(
+            second.claim(workspace.path()).unwrap(),
+            Claim::HeldElsewhere
+        );
+
+        owner.release_all();
+        assert_eq!(
+            second.claim(workspace.path()).unwrap(),
+            Claim::HeldElsewhere,
+            "its separate thread must not replace the owner's saved conversation"
+        );
+        assert!(!second
+            .save(workspace.path(), &conversation("theirs", workspace.path()))
+            .unwrap());
+    }
+
+    #[test]
+    fn removing_a_forgotten_conversation_means_nothing_resumes() {
+        let config = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let mut store = ConversationStore::new(config.path().to_path_buf());
+        store.claim(workspace.path()).unwrap();
+        store
+            .save(workspace.path(), &conversation("old", workspace.path()))
+            .unwrap();
+        assert!(store.remove(workspace.path()).unwrap());
+        assert!(store.load(workspace.path()).is_none());
+    }
+
+    fn editor() -> crate::editor::Editor {
+        let config = crate::config::Config::default();
+        let lsp = Box::new(crate::lsp::LspManager::new(config.lsp.clone()));
+        let mut editor = crate::editor::Editor::with_size(
+            lsp,
+            80,
+            24,
+            config,
+            crate::theme::Theme::default(),
+            vec![crate::buffer::Buffer::new(None, String::new())],
+        )
+        .unwrap();
+        editor.test_disable_terminal_output();
+        editor
+    }
+
+    #[test]
+    fn an_editor_saves_its_conversation_and_the_next_launch_adopts_it() {
+        let config = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let directory = config.path().to_path_buf();
+
+        let mut first = editor();
+        first.enable_agent_continuity_in(
+            ConversationStore::new(directory.clone()),
+            workspace.path(),
+        );
+        assert!(
+            first.agent_manager.conversation().is_none(),
+            "nothing saved yet"
+        );
+        first
+            .agent_manager
+            .begin_conversation("thread-1", workspace.path());
+        first.agent_manager.mark_session_active("thread-1");
+        first.agent_manager.set_turn_id("thread-1", "t1");
+        first
+            .agent_manager
+            .record_user_message("thread-1", "t1", "Remember HERON");
+        first.finish_agent_continuity();
+
+        let mut second = editor();
+        second.enable_agent_continuity_in(
+            ConversationStore::new(directory.clone()),
+            workspace.path(),
+        );
+        let adopted = second.agent_manager.conversation().unwrap();
+        assert_eq!(adopted.thread_id, "thread-1");
+        assert_eq!(adopted.items[0].text, "Remember HERON");
+        assert_eq!(
+            second.take_adopted_agent_conversation_age().as_deref(),
+            Some("a moment ago")
+        );
+
+        // A third editor in the same workspace while the second is open.
+        let mut third = editor();
+        third.enable_agent_continuity_in(ConversationStore::new(directory), workspace.path());
+        assert!(
+            third.agent_manager.conversation().is_none(),
+            "a thread is never driven by two editors"
+        );
+    }
+
+    #[test]
+    fn forgetting_the_conversation_stops_it_from_resuming() {
+        let config = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let directory = config.path().to_path_buf();
+        let mut first = editor();
+        first.enable_agent_continuity_in(
+            ConversationStore::new(directory.clone()),
+            workspace.path(),
+        );
+        first
+            .agent_manager
+            .begin_conversation("old", workspace.path());
+        first.agent_manager.mark_session_active("old");
+        first.agent_manager.set_turn_id("old", "t1");
+        first
+            .agent_manager
+            .record_user_message("old", "t1", "hello");
+        first.persist_agent_conversation(/*force*/ true);
+        assert!(ConversationStore::new(directory.clone())
+            .load(workspace.path())
+            .is_some());
+
+        first.agent_manager.forget_conversation("old");
+        first.finish_agent_continuity();
+        assert!(ConversationStore::new(directory)
+            .load(workspace.path())
+            .is_none());
+    }
+
+    #[test]
+    fn a_failed_save_is_retried_and_a_failed_removal_keeps_the_record_to_remove() {
+        let config = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let directory = config.path().join("conversations");
+        // A file where the directory should be makes every write fail.
+        fs::write(&directory, "not a directory").unwrap();
+        let mut editor = editor();
+        editor.enable_agent_continuity_in(
+            ConversationStore::new(directory.clone()),
+            workspace.path(),
+        );
+        editor
+            .agent_manager
+            .begin_conversation("thread", workspace.path());
+        editor.agent_manager.mark_session_active("thread");
+        editor.agent_manager.set_turn_id("thread", "t1");
+        editor
+            .agent_manager
+            .record_user_message("thread", "t1", "Remember HERON");
+        editor.persist_agent_conversation(/*force*/ false);
+        let current = editor.agent_manager.conversation_revision();
+        assert_ne!(
+            editor.agent_continuity_saved.map(|(saved, _)| saved),
+            Some(Some(current)),
+            "a failed write is not recorded as saved"
+        );
+
+        fs::remove_file(&directory).unwrap();
+        editor.persist_agent_conversation(/*force*/ true);
+        assert!(ConversationStore::new(directory.clone())
+            .load(workspace.path())
+            .is_some());
+
+        let record = directory.join(format!("{}.json", workspace_key(workspace.path())));
+        fs::remove_file(&record).unwrap();
+        fs::create_dir(&record).unwrap();
+        editor.agent_manager.forget_conversation("thread");
+        editor.persist_agent_conversation(/*force*/ true);
+        assert_eq!(
+            editor.agent_continuity_workspace.as_deref(),
+            Some(workspace.path()),
+            "the record is still there, so it is still ours to remove"
+        );
+
+        fs::remove_dir(&record).unwrap();
+        editor.persist_agent_conversation(/*force*/ true);
+        assert!(editor.agent_continuity_workspace.is_none());
+    }
+
+    #[test]
+    fn a_new_empty_thread_replaces_the_forgotten_record_before_its_first_message() {
+        let config = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let directory = config.path().to_path_buf();
+        let mut editor = editor();
+        editor.enable_agent_continuity_in(
+            ConversationStore::new(directory.clone()),
+            workspace.path(),
+        );
+        editor
+            .agent_manager
+            .begin_conversation("old", workspace.path());
+        editor.agent_manager.mark_session_active("old");
+        editor.agent_manager.set_turn_id("old", "t1");
+        editor
+            .agent_manager
+            .record_user_message("old", "t1", "Remember HERON");
+        editor.persist_agent_conversation(/*force*/ true);
+
+        // :AgentNew forgets the thread and the new one starts before the next save.
+        editor.agent_manager.forget_conversation("old");
+        editor
+            .agent_manager
+            .begin_conversation("fresh", workspace.path());
+        editor.finish_agent_continuity();
+        assert!(ConversationStore::new(directory)
+            .load(workspace.path())
+            .is_none());
+    }
+
+    #[test]
+    fn a_recovered_conversation_is_resumed_only_when_no_other_editor_owns_it() {
+        let config = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let directory = config.path().to_path_buf();
+        let mut owner = ConversationStore::new(directory.clone());
+        owner.claim(workspace.path()).unwrap();
+
+        // `red --resume` restored the same thread while the owner is still open.
+        let mut recovered = editor();
+        recovered
+            .agent_manager
+            .restore_conversation(conversation("shared", workspace.path()));
+        recovered.enable_agent_continuity_in(
+            ConversationStore::new(directory.clone()),
+            workspace.path(),
+        );
+        assert!(
+            recovered.agent_manager.conversation().is_none(),
+            "two editors must never drive one thread"
+        );
+
+        owner.release_all();
+        let mut alone = editor();
+        alone
+            .agent_manager
+            .restore_conversation(conversation("shared", workspace.path()));
+        alone.enable_agent_continuity_in(ConversationStore::new(directory), workspace.path());
+        assert_eq!(
+            alone
+                .agent_manager
+                .conversation()
+                .map(|c| c.thread_id.as_str()),
+            Some("shared")
+        );
+        assert!(alone
+            .agent_continuity
+            .as_ref()
+            .unwrap()
+            .owns(workspace.path()));
+    }
+
+    #[test]
+    fn a_recovered_conversation_is_not_resumed_when_ownership_cannot_be_checked() {
+        let config = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let directory = config.path().join("conversations");
+        fs::write(&directory, "not a directory").unwrap();
+        let mut recovered = editor();
+        recovered
+            .agent_manager
+            .restore_conversation(conversation("shared", workspace.path()));
+        recovered.enable_agent_continuity_in(ConversationStore::new(directory), workspace.path());
+        assert!(recovered.agent_manager.conversation().is_none());
+    }
+
+    fn say(editor: &mut crate::editor::Editor, thread: &str, workspace: &Path, text: &str) {
+        editor.agent_manager.begin_conversation(thread, workspace);
+        editor.agent_manager.mark_session_active(thread);
+        editor.agent_manager.set_turn_id(thread, "t1");
+        editor.agent_manager.record_user_message(thread, "t1", text);
+    }
+
+    #[test]
+    fn a_saved_conversation_that_cannot_be_claimed_is_archived_and_never_overwritten() {
+        let config = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let directory = config.path().to_path_buf();
+        let mut first = editor();
+        first.enable_agent_continuity_in(
+            ConversationStore::new(directory.clone()),
+            workspace.path(),
+        );
+        say(&mut first, "saved", workspace.path(), "Remember HERON");
+        first.finish_agent_continuity();
+
+        // The claim lock cannot be opened.
+        let lock = directory.join(format!("{}.lock", workspace_key(workspace.path())));
+        fs::remove_file(&lock).ok();
+        fs::create_dir(&lock).unwrap();
+        let mut second = editor();
+        second.enable_agent_continuity_in(
+            ConversationStore::new(directory.clone()),
+            workspace.path(),
+        );
+        assert!(second.agent_manager.conversation().is_none());
+        let key = crate::editor::scoped_plugin_storage_key_for_workspace(
+            "agent",
+            "transcript",
+            workspace.path(),
+        );
+        assert_eq!(
+            second
+                .preferences
+                .plugin_storage("agent", &key)
+                .and_then(serde_json::Value::as_str),
+            Some("You: Remember HERON\n")
+        );
+
+        fs::remove_dir(&lock).unwrap();
+        say(&mut second, "other", workspace.path(), "Something else");
+        second.finish_agent_continuity();
+        assert_eq!(
+            ConversationStore::new(directory)
+                .load(workspace.path())
+                .unwrap()
+                .conversation
+                .thread_id,
+            "saved",
+            "the record it could not claim is never replaced"
+        );
+    }
+
+    #[test]
+    fn leaving_a_workspace_removes_its_record_and_releases_it_even_after_a_failure() {
+        let config = tempfile::tempdir().unwrap();
+        let first_workspace = tempfile::tempdir().unwrap();
+        let second_workspace = tempfile::tempdir().unwrap();
+        let directory = config.path().to_path_buf();
+        let mut editor = editor();
+        editor.enable_agent_continuity_in(
+            ConversationStore::new(directory.clone()),
+            first_workspace.path(),
+        );
+        say(&mut editor, "first", first_workspace.path(), "hello");
+        editor.persist_agent_conversation(/*force*/ true);
+
+        // Removing the first record fails once.
+        let record = directory.join(format!("{}.json", workspace_key(first_workspace.path())));
+        fs::remove_file(&record).unwrap();
+        fs::create_dir(&record).unwrap();
+        say(&mut editor, "second", second_workspace.path(), "hi");
+        editor.persist_agent_conversation(/*force*/ true);
+        assert!(record.is_dir(), "the failed removal is still pending");
+
+        fs::remove_dir(&record).unwrap();
+        fs::write(&record, "{}").unwrap();
+        editor.persist_agent_conversation(/*force*/ true);
+        assert!(!record.exists(), "the pending removal is retried");
+        let mut other = ConversationStore::new(directory);
+        assert_eq!(
+            other.claim(first_workspace.path()).unwrap(),
+            Claim::Owned,
+            "the workspace it left is free for another editor"
+        );
+    }
+
+    #[test]
+    fn a_relaunch_restores_saved_annotations_and_keeps_those_on_unopened_files() {
+        let config = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let open = workspace.path().join("open.rs");
+        let closed = workspace.path().join("closed.rs");
+        fs::write(&open, "fn main() {}\n").unwrap();
+        fs::write(&closed, "fn other() {}\n").unwrap();
+        let record =
+            |path: &Path, message: &str| crate::agent_conversation::AgentAnnotationRecord {
+                id: uuid::Uuid::new_v4().to_string(),
+                session_id: "thread".into(),
+                turn_id: "t1".into(),
+                path: path.to_string_lossy().into_owned(),
+                start_line: 0,
+                end_line: 0,
+                message: message.into(),
+                expected_fingerprint: None,
+            };
+        let mut saved = conversation("thread", workspace.path());
+        saved.annotations = vec![record(&open, "Entry point"), record(&closed, "Helper")];
+        let mut store = ConversationStore::new(config.path().to_path_buf());
+        store.claim(workspace.path()).unwrap();
+        store.save(workspace.path(), &saved).unwrap();
+        store.release_all();
+
+        let config_value = crate::config::Config::default();
+        let lsp = Box::new(crate::lsp::LspManager::new(config_value.lsp.clone()));
+        let mut editor = crate::editor::Editor::with_size(
+            lsp,
+            80,
+            24,
+            config_value,
+            crate::theme::Theme::default(),
+            vec![crate::buffer::Buffer::new(
+                Some(open.to_string_lossy().into_owned()),
+                "fn main() {}\n".to_string(),
+            )],
+        )
+        .unwrap();
+        editor.test_disable_terminal_output();
+        editor.enable_agent_continuity_in(
+            ConversationStore::new(config.path().to_path_buf()),
+            workspace.path(),
+        );
+        assert!(
+            editor
+                .inline_comments
+                .iter()
+                .any(|comment| comment.message == "Entry point"),
+            "the open file's annotation is rebuilt"
+        );
+
+        // A session snapshot syncs records from the inline comments.
+        editor.sync_agent_annotation_records();
+        let mut messages = editor
+            .agent_manager
+            .conversation()
+            .unwrap()
+            .annotations
+            .iter()
+            .map(|record| record.message.clone())
+            .collect::<Vec<_>>();
+        messages.sort();
+        assert_eq!(messages, ["Entry point", "Helper"]);
+    }
+
+    #[test]
+    fn a_conversation_from_an_older_tool_contract_is_not_resumed() {
+        let config = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let mut store = ConversationStore::new(config.path().to_path_buf());
+        store.claim(workspace.path()).unwrap();
+        let mut old = conversation("old-tools", workspace.path());
+        old.tool_contract_version = 0;
+        store.save(workspace.path(), &old).unwrap();
+        store.release_all();
+
+        let mut editor = editor();
+        editor.enable_agent_continuity_in(
+            ConversationStore::new(config.path().to_path_buf()),
+            workspace.path(),
+        );
+        assert!(editor.agent_manager.conversation().is_none());
+        let key = crate::editor::scoped_plugin_storage_key_for_workspace(
+            "agent",
+            "transcript",
+            workspace.path(),
+        );
+        assert_eq!(
+            editor
+                .preferences
+                .plugin_storage("agent", &key)
+                .and_then(serde_json::Value::as_str),
+            Some("You: Remember HERON\n"),
+            "it stays as the archived transcript the next message recaps"
+        );
+    }
+
+    #[test]
+    fn ages_read_naturally() {
+        let now = now_ms();
+        assert_eq!(describe_age(now), "a moment ago");
+        assert_eq!(describe_age(now - 60_000), "1 minute ago");
+        assert_eq!(describe_age(now - 2 * 3_600_000), "2 hours ago");
+        assert_eq!(describe_age(now - 3 * 86_400_000), "3 days ago");
+    }
+}

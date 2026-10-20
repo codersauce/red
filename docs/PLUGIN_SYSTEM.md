@@ -144,7 +144,7 @@ configuration and plugin-owned payloads remain intentionally dynamic.
 
 ### Text panels
 
-Text panels keep conversation content as source-backed blocks instead of flattening it into selectable rows. A block has a stable `id`, a `user`, `agent`, `error`, or `text` kind, a `plain` or `markdown` format, and its original `text`:
+Text panels keep conversation content as source-backed blocks instead of flattening it into selectable rows. A block has a stable `id`, a `user`, `agent`, `error`, or `text` kind, a `plain`, `markdown`, or verbatim `code` format, an optional code `language`, and its original `text`:
 
 ```husk
 red::execute("CreateTextPanel", "assistant", PanelConfig {
@@ -153,8 +153,8 @@ red::execute("CreateTextPanel", "assistant", PanelConfig {
     title: "Assistant",
     composer: Json { placeholder: "Ask a follow-up…", rows: 3 },
     header_actions: [
-        Json { id: "clear", label: "Clear", compact_label: "C", shortcut: "Alt-c" },
-        Json { id: "close", label: "×", compact_label: "×", shortcut: "Alt-w" },
+        Json { id: "clear", key: "Alt-c", label: "Clear", compact_label: "C" },
+        Json { id: "close", key: "Alt-w", label: "×", compact_label: "×" },
     ],
 });
 red::execute("UpdateTextPanel", "assistant", [
@@ -204,11 +204,17 @@ The Git plugin keeps its event, picker, and permissioned-process shell in
 logic, and Git argument construction live in the native, multi-file
 `plugins/git_core` Husk package. Neo-tree follows the same split: filesystem
 actions, confirmations, and panel events stay in `plugins/neotree.hk`, while
-normalized path handling, typed Git-status presentation, and bounded tree-row
-construction live in `plugins/neotree_core`. Red embeds those pure sources and
-exposes small internal bridges to the compatibility shells, so installed
-builds do not depend on checkout-relative source paths. The bridges are
-bundled-plugin implementation detail, not public plugin APIs.
+normalized path handling lives in `plugins/neotree_core`. Tree layout,
+Git-status presentation, and search-match highlights are owned by Rust. Large
+Neo-tree panels share the plugin's directory entry arrays and decorate only
+rows in the terminal viewport. Inline search delegates recursive, ignore-aware
+discovery and bounded fuzzy ranking to a shared Rust workspace-path index;
+matching paths and their ancestors use that same Rust tree renderer.
+Red embeds the pure sources and exposes small internal bridges to the
+compatibility shells, so installed builds do not depend on checkout-relative
+source paths. The filesystem bridge remains a bundled-plugin implementation
+detail. Other plugins can reuse the tree through `UpdateTreePanel` with custom
+node IDs and styled rows; see [the tree API](PLUGIN_API.md#native-tree-panels).
 
 `buffer:changed`, cursor, mode, viewport, file, theme, window, LSP, timer, picker, composer, panel, process, filesystem, workspace, and agent events are emitted by the production runtime. Subscribe only to the events a plugin needs and debounce expensive work.
 

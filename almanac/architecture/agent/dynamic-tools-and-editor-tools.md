@@ -1,7 +1,7 @@
 ---
 title: "Dynamic Tools And Editor Tools"
-summary: "Red exposes a strict Codex dynamic-tool surface that separates workspace search from editor-owned reads, navigation, UTF-16 edits, saves, and safe actions."
-topics: [architecture, agent, codex, editor, unicode, agent-edits]
+summary: "Red exposes a strict Codex dynamic-tool surface that separates workspace search from editor-owned reads, navigation, UTF-16 edits, saves, safe actions, and session-owned LSP diagnostics or rename plans."
+topics: [architecture, agent, codex, editor, unicode, agent-edits, safety]
 sources:
   - id: codex
     type: file
@@ -12,20 +12,25 @@ sources:
   - id: editor
     type: file
     path: src/editor.rs
+  - id: agent-lsp
+    type: file
+    path: src/editor/agent_lsp.rs
   - id: workflow
     type: file
     path: docs/AGENT_WORKFLOW.md
 ---
 
-Dynamic tools and editor tools are Red's app-server capability layer for Codex. The Codex worker publishes four workspace dynamic tools directly, extends them with eight strict editor-tool schemas, and routes editor-aware reads, writes, annotations, selections, and safe actions through the editor owner task [@codex] [@tools]. This layer is where the [Codex App-Server Workflow](codex-app-server-workflow) becomes editor-aware: Codex can list, search, read, open, select, annotate, run allow-listed editor actions, and request edits, but each operation is bounded, schema-checked, session-scoped, and mediated by Red [@workflow] [@editor].
+Dynamic tools and editor tools are Red's app-server capability layer for Codex. The Codex worker publishes four workspace dynamic tools directly, extends them with thirteen strict editor-tool schemas, and routes editor-aware reads, writes, annotations, selections, safe actions, diagnostics, and semantic rename plans through the editor owner task [@codex] [@tools]. This layer is where the [Codex App-Server Workflow](codex-app-server-workflow) becomes editor-aware: Codex can list, search, read, open, select, annotate, run allow-listed editor actions, inspect language-server state, and request edits, but each operation is bounded, schema-checked, session-scoped, and mediated by Red [@workflow] [@editor].
 
 ## Tool Surface
 
-The app-server worker publishes `list_files`, `search_files`, `read_file`, and `write_file` itself, then appends editor schemas for `get_editor_state`, `open_file`, `select_text`, `apply_edits`, `run_editor_action`, `create_directory`, `add_annotations`, and `dismiss_annotations` [@codex] [@tools]. `list_files` walks the workspace without following links, respects ignore files, sorts results, and stops at Red's file, entry, and time bounds [@codex]. On Unix, `search_files` reads through descriptor-relative, no-follow, nonblocking filesystem operations; the workflow states that content search is unavailable on platforms without that safe read boundary, so Codex must use `read_file` instead [@codex] [@workflow].
+The app-server worker publishes `list_files`, `search_files`, `read_file`, and `write_file` itself, then appends non-LSP editor schemas for `get_editor_state`, `open_file`, `select_text`, `apply_edits`, `run_editor_action`, `create_directory`, `add_annotations`, and `dismiss_annotations`; the structured LSP schemas are covered below [@codex] [@tools]. `list_files` walks without following links, respects ignore and sensitive-path policy, sorts results, and returns pages plus truncation metadata within Red's entry and time bounds [@codex]. On Unix, `search_files` reads through descriptor-relative, no-follow, nonblocking filesystem operations and reports bounded-scan truncation; platforms without that safe read boundary must use `read_file` [@codex] [@workflow].
 
-`read_file` and `write_file` are editor-tool-host operations. `read_file` opens the safe workspace file through Red when needed and returns editor-visible contents, the current revision, and whether the file exists [@editor]. `write_file` requires that revision, replaces the complete buffer through an agent-origin editor transaction, and saves through Red [@tools] [@editor].
+`read_file` and `write_file` are editor-tool-host operations. `read_file` opens the safe workspace file through Red when needed and returns a bounded editor-visible page, current revision, existence, line range, and continuation metadata. Any valid one-based page can start a fresh read without `expected_revision`; only a continuation that wants one stable snapshot must carry the first page's revision, and it fails if the buffer changes [@codex] [@editor]. An individual source line beyond the byte limit fails explicitly rather than returning an unrecoverable prefix [@codex]. `write_file` requires the first read revision, replaces the complete buffer through an agent-origin editor transaction, and saves through Red [@codex] [@tools] [@editor].
 
-The workflow documentation describes the same twelve-tool contract and its expected behavior, including bounded file listing, bounded search, Red-mediated reads, revision-checked writes, directory creation, editor state snapshots, file opening, UTF-16 selections, revision-checked edits, source annotations, and allow-listed navigation or LSP actions [@workflow].
+`create_directory` is the one editor tool that mutates the workspace without opening or changing an editor buffer. It creates a directory and missing parents inside the workspace, accepts an existing directory as success, and remains subject to the same workspace, ignore, protected-path, symlink, and platform support checks described by the workflow [@tools] [@workflow].
+
+The workflow documentation describes the same seventeen-tool contract and its expected behavior, including bounded file listing, bounded search, Red-mediated reads, revision-checked writes, directory creation, editor state snapshots, file opening, UTF-16 selections, revision-checked edits, source annotations, and allow-listed navigation or LSP actions [@workflow].
 
 ## Strict Editor Schemas
 
@@ -41,6 +46,32 @@ tracked source anchor, and opens the shared inline-comment card. Missing or
 dismissed IDs produce a quiet unavailable message without any fallback to
 filesystem or external-link behavior [@editor].
 
+## Structured LSP Tools
+
+The full Agent also receives `lsp_status`, `lsp_diagnostics`,
+`lsp_prepare_rename`, `lsp_preview_rename`, and `lsp_apply_edit`. Their strict
+schemas live beside the other editor tools, and tests assert that these LSP
+tools are exposed only to full-agent sessions, not inline-assist sessions
+[@tools] [@codex]. `src/editor/agent_lsp.rs` owns pending responses, deadlines,
+diagnostic metadata, and expiring rename plans, while the editor rechecks the
+active agent session before starting each request [@agent-lsp].
+
+Agent LSP requests share existing language servers but are correlated separately
+from UI and plugin requests, so they return data without opening dialogs or
+moving focus [@agent-lsp]. Rename preparation and disk validation run on
+blocking workers. The editor rechecks session ownership, server identity,
+source and target revisions, and access policy before committing text through
+its normal mutation boundary [@agent-lsp]. Resource operations are rejected
+before text changes apply, previews are bounded and expire after 120 seconds,
+and applying a plan never saves files [@agent-lsp] [@workflow].
+
+Diagnostics are collected independently of display settings. Results distinguish
+known-report coverage from project-wide verification and provisional, stale,
+unversioned, or absent reports [@workflow] [@agent-lsp]. File refresh uses a
+diagnostic pull when supported or a bounded wait for push reports, and the
+workflow documentation records filters, pagination, limits, and the explicit
+unsaved-edit contract [@workflow].
+
 ## UTF-16 Editor Boundary
 
 Codex editor tools use zero-based UTF-16 positions because they share coordinates with LSP-facing editor surfaces [@tools]. `EditorPosition` stores a line and UTF-16 code-unit character, and `EditorTextEdit` stores half-open UTF-16 replacements with UTF-8 replacement text [@tools]. The conversion helper rejects out-of-bounds lines, out-of-bounds characters, and positions that split a UTF-16 surrogate pair [@tools].
@@ -49,8 +80,8 @@ The editor applies that boundary consistently. `open_file` passes `LocationColum
 
 ## Followed Mutation And Activity
 
-Mutating editor tools are followed before they apply. `prepare_agent_follow_step` resolves the target path, opens the file, moves the cursor to the first edit range when available, renders, and delays edit execution so the user can see the target [@editor]. `apply_agent_contents` then checks the expected revision, starts an `EditOrigin::Agent` transaction, replaces the buffer, commits, notifies change consumers, renders, and saves [@editor].
+Mutating editor tools are serialized before they apply. When `agent.follow_tool_calls` is enabled, `prepare_agent_follow_step` resolves the target, opens the file, moves the cursor to the first edit range when available, renders, and delays execution so the user can see it. The default skips those deliberate playback pauses and restores the active buffer after incidental file tools; explicit navigation tools retain their focus-changing behavior [@editor]. `apply_agent_contents` still checks the expected revision, starts an `EditOrigin::Agent` transaction, replaces the buffer, commits, notifies change consumers, renders, and saves [@editor].
 
-The editor dispatcher checks more than schema validity before executing a tool. It requires an active session, requires an active workspace root, resolves relative or absolute tool paths through the workspace, rejects sensitive filenames, rejects ignored workspace paths, and rejects stale revisions before text changes apply [@editor]. Editor-tool requests travel over a bounded channel and time out if the dispatcher is backpressured or stops [@tools].
+The editor dispatcher checks more than schema validity before executing a tool. It requires an active session and workspace root, resolves paths through the workspace, rejects ignored paths, requires explicit consent for secret-like filenames, and rejects stale revisions before text changes apply [@editor]. Editor-tool requests travel over a bounded channel and time out if the dispatcher is backpressured or stops [@tools].
 
 Tool calls also shape user-facing state. `EditorToolCall::activity_title` defines concise labels for operations such as opening a file, writing a file, or editing a path, while the editor event bridge forwards app-server activity updates as `agent:activity` [@tools] [@editor]. Use [Followed Editing](followed-editing) for the write-and-save path built on top of this tool layer.

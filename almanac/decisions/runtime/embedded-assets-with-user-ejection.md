@@ -41,6 +41,6 @@ Fresh installs are self-contained. Missing user configuration is recoverable bec
 
 User customization stays explicit. A user file in the config directory shadows `$RED_RUNTIME` and embedded assets, and `red --eject` creates the file only when the user asks for a local copy [@assets] [@main]. This avoids silently materializing stale copies of bundled plugins or themes during onboarding.
 
-The asset boundary must reject unsafe specifiers. `safe_relative_path` rejects empty, absolute, parent, root, and platform-prefix paths before asset lookup, and `parse_asset_path` only accepts direct `plugins/<file>` or `themes/<file>` asset names with supported extensions [@assets]. Any new runtime asset kind should preserve that public-specifier rule.
+The asset boundary must reject unsafe specifiers. `safe_relative_path` rejects empty, absolute, parent, root, and platform-prefix paths before asset lookup, and `parse_asset_path` accepts direct `plugins/<file>` or `themes/<file>` asset names plus bare supported plugin and theme file names [@assets]. Any new runtime asset kind should preserve that public-specifier rule.
 
 Development still has an override lane. `$RED_RUNTIME` can supply plugins and themes between user and embedded layers, which is useful for source-tree development and testing without changing user config or rebuilding the binary [@assets]. Because the user layer has higher precedence, a developer must account for user-shadowed assets when debugging runtime-file behavior.

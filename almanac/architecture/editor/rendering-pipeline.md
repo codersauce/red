@@ -1,7 +1,7 @@
 ---
 title: "Rendering Pipeline"
 summary: "The rendering pipeline turns editor, window, plugin, diagnostic, and dialog state into a width-aware terminal-cell frame and flushes only the changed cells or rows."
-topics: [architecture, editor, rendering, windows, plugins]
+topics: [architecture, editor, rendering, windows, plugins, safety]
 sources:
   - id: rendering
     type: file
@@ -9,9 +9,15 @@ sources:
   - id: render-buffer
     type: file
     path: src/editor/render_buffer.rs
+  - id: picker
+    type: file
+    path: src/ui/picker.rs
   - id: display-layout
     type: file
     path: src/editor/display_layout.rs
+  - id: unicode-utils
+    type: file
+    path: src/unicode_utils.rs
   - id: splash
     type: file
     path: src/splash.rs
@@ -27,6 +33,9 @@ sources:
   - id: rio-cursor-session
     type: conversation
     path: /Users/fcoury/.codex/sessions/2026/08/06/rollout-2026-08-06T13-38-01-019fd7f0-5a30-7af2-b391-9e17d6eee593.jsonl
+  - id: ctrl-t-tab-session
+    type: conversation
+    path: /Users/fcoury/.codex/sessions/2026/08/31/rollout-2026-08-31T18-03-49-01a05a10-8f88-7f70-9850-f35913a6ac1b.jsonl
 ---
 
 The rendering pipeline composes Red's logical editor state into an in-memory terminal-cell frame before writing to the terminal. `rendering.rs` draws windows, gutters, text, separators, panels, workspace views, dialogs, plugin render commands, overlays, diagnostics, search highlights, matching brackets, cursor styling, and frame diffs [@rendering]. `RenderBuffer` is the frame model: it stores grapheme text, width, continuation cells, and style for each terminal cell so wide graphemes and styled spans can be diffed without treating a row as a byte string [@render-buffer].
@@ -37,9 +46,13 @@ Window text rendering starts with [display layout](../../concepts/editor/display
 
 The renderer asks for a layout per window, fills each visible content row, then walks graphemes from the segment's byte range while tracking display columns, tab expansion, visual offsets, and syntax highlight spans [@rendering]. This is the point where the editor's coordinate systems converge: buffer text is sliced by byte offsets from the layout, graphemes become terminal cells, tabs expand to spaces using indentation width, and styles come from a forward-only syntax style cursor [@rendering].
 
+RenderBuffer cells must contain terminal-printable text, not raw control characters. The width helper treats all-control graphemes as zero terminal columns, so an escape byte in buffer text cannot claim visible cell width while layout wraps source spans [@unicode-utils] [@display-layout]. `RenderBuffer` sanitizes character and grapheme assignments by replacing control-bearing cell text with `U+FFFD`, while `set_printable_ascii` is reserved for spans already checked as printable bytes [@render-buffer]. The final diff flush still runs `terminal_safe_cell_text` before sending a changed cell with `Print`, so a control payload that bypasses the normal `RenderBuffer` setters prints the replacement character rather than executing terminal control bytes [@rendering]. The window renderer expands buffer tabs before paint; picker preview paths are separate and must preserve the same invariant when clipping source lines and overlaying syntax or match spans [@rendering] [@picker]. The reusable older failure signature is visible as literal `0x09` bytes in terminal output: a Go-symbol picker reproduction corrupted the dialog only for tab-indented preview lines, while the same fixture with spaces rendered cleanly [@ctrl-t-tab-session].
+
 ## Full Frame Construction
 
 `Editor::render` is the full-frame entrypoint. It updates gutter width, applies panel layout, fixes cursor position, checks bounds, synchronizes editor fields back to the active window, renders each window, draws window separators, renders the startup splash if eligible, renders panels and global chrome, overlays modal workspaces and dialogs, drains plugin render commands, updates overlays, paints the cursor cell, diffs the frame, flushes changes, and advances `render_generation` [@rendering]. The [buffers and windows](buffers-and-windows) page explains the window state consumed by these steps.
+
+Statusline sections use their configured slot positions for color bands. The renderer enumerates configured left and right sections before hidden optional sections are filtered, so a filename after `diagnostics` or `git_branch` keeps the same slot style whether those optional sections have visible content or not [@rendering]. Hidden sections take no width, and absent Git or diagnostics segments do not leave a stale color band or separator in the row [@rendering].
 
 The startup splash is render-only. `splash.rs` defines the splash model and states that it is drawn during the normal render pass and never touches buffer contents [@splash]. `render_splash` only draws it over a pristine single unnamed blank buffer when splash configuration and startup-file conditions allow it, and latches it off after the pristine state first fails [@rendering].
 
@@ -59,7 +72,7 @@ The pipeline avoids repainting the whole terminal when it can. `render_buffer_ch
 
 Red's synthetic block cursor is a painted cell, not the native terminal cursor. The full render path updates terminal-cursor surface state, applies `render_cursor_cell`, diffs the frame, and then flushes changed cells [@rendering]. `render_diff` hides the native terminal cursor before writing changes, but it still moves that hidden cursor to each changed run's terminal position so text can be printed in place [@rendering]. After the flush, `draw_cursor_with_goal_refresh` keeps the native cursor hidden whenever `uses_synthetic_block_cursor` is true [@rendering].
 
-That sequence can expose terminal-emulator cursor animation bugs. In Rio, issue #1511 reports that the cursor trail animates while the native cursor is hidden in TUI applications, and the trail should be disabled when the cursor is not visible [@rio-hidden-cursor-trail]. If Red shows phantom cursor bars or trails under Rio while the Red cursor itself stays logically correct, first disable Rio's trail effect with `[effects] trail-cursor = false`; Rio documents `trail-cursor` under the effects configuration table [@rio-effects-config]. The August 2026 cursor-debugging session matched that symptom to Red's hidden-native-cursor diff flushing rather than to a Red cursor-positioning failure [@rio-cursor-session].
+That sequence can expose terminal-emulator cursor animation bugs. In Rio, issue #1511 reports that the cursor trail animates while the native cursor is hidden in TUI applications, and the trail should be disabled when the cursor is not visible [@rio-hidden-cursor-trail]. If Red shows phantom cursor bars or trails under Rio while the Red cursor itself stays logically correct, first disable Rio's trail effect with `[effects] trail-cursor = false`; Rio documents `trail-cursor` under the effects configuration table [@rio-effects-config]. A matching cursor-debugging session traced that symptom to Red's hidden-native-cursor diff flushing rather than to a Red cursor-positioning failure, so start with emulator trail settings before changing cursor math [@rio-cursor-session].
 
 ## Detached Frames
 

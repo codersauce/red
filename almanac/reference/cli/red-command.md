@@ -1,7 +1,7 @@
 ---
 title: "Red Command"
-summary: "The `red` command exposes editor startup, utility checks, plugin and language package management, runtime asset operations, detach control, config overrides, and internal hidden boundaries."
-topics: [reference, cli, startup, plugins]
+summary: "The `red` command exposes editor startup, utility checks, keyboard diagnostics, plugin management, language grammar checks, runtime asset operations, detach control, config overrides, and internal hidden boundaries."
+topics: [reference, cli, startup, plugins, language-packs]
 sources:
   - id: cli
     type: file
@@ -9,6 +9,12 @@ sources:
   - id: main
     type: file
     path: src/main.rs
+  - id: buffer
+    type: file
+    path: src/buffer.rs
+  - id: keyboard
+    type: file
+    path: src/keyboard.rs
   - id: readme
     type: file
     path: README.md
@@ -19,7 +25,7 @@ sources:
 
 # Red Command
 
-The `red` command is the public entrypoint for opening the editor, forwarding Husk subcommands, running non-interactive diagnostics, managing external plugins and native grammar trust, managing Unix detachable sessions, and copying runtime assets into user configuration [@cli] [@main]. Its argument parser is defined in `src/cli.rs`, while `src/main.rs` selects the lifecycle branch for each parsed mode before editor state is constructed [@cli] [@main].
+The `red` command is the public entrypoint for opening the editor, forwarding Husk subcommands, running non-interactive diagnostics, inspecting terminal keyboard input, managing external plugins and native grammar checks, managing Unix detachable sessions, and copying runtime assets into user configuration [@cli] [@main]. Its argument parser is defined in `src/cli.rs`, while `src/main.rs` selects the lifecycle branch for each parsed mode before editor state is constructed [@cli] [@main].
 
 ## Invocation Forms
 
@@ -27,11 +33,12 @@ The `red` command is the public entrypoint for opening the editor, forwarding Hu
 | --- | --- |
 | `red [OPTIONS] [FILES]...` | Starts the interactive editor unless a utility or detach-control flag exits earlier [@cli] [@main]. |
 | `red husk ...` | Forwards arguments to the bundled Husk CLI by rewriting the program name to `red husk` and returning through `husk_cli::run_from` [@main]. |
+| `red keys [--protocol auto|legacy|kitty|xterm] [--count <N>]` | Runs the terminal keyboard diagnostic without starting the editor; it negotiates the selected protocol, prints decoded Enter, Backspace, modified shortcuts, and hidden-key summaries, and exits on `Esc`, `Ctrl-C`, or after the optional count [@cli] [@main] [@keyboard]. |
 | `red plugin ...` | Runs non-interactive external plugin package management without starting the editor [@cli] [@main]. |
-| `red language ...` | Approves or revokes native grammar trust for configured or package-provided languages without starting the editor [@cli] [@main]. |
+| `red language ...` | Approves or revokes native grammar trust, or checks indentation fixtures against the effective language configuration, without starting the editor [@cli] [@main]. |
 | `red --version` | Uses Clap's generated version output [@cli]. |
 
-The README and getting-started guide present `red path/to/file`, multiple files, and `red -r path/to/project src/main.rs` as ordinary editor startup examples [@readme] [@getting-started].
+The README and getting-started guide present `red path/to/file`, multiple files, and `red -r path/to/project src/main.rs` as ordinary editor startup examples [@readme] [@getting-started]. Directory arguments are also normal editor targets: `red .` or `red path/to/dir` opens a generated [directory buffer](../../architecture/editor/buffers-and-windows), while regular file arguments still open text buffers [@buffer] [@getting-started].
 
 ## General Editor Options
 
@@ -41,7 +48,7 @@ The README and getting-started guide present `red path/to/file`, multiple files,
 | `-c, --config-override <TOML>` | Applies an inline TOML config override. The flag can appear multiple times and is passed to configuration loading in order [@cli] [@main]. |
 | `--resume` | Restores the latest core-owned crash-safe session snapshot and conflicts with file arguments and `--root` [@cli] [@main]. |
 | `--no-typecheck` | Sets the runtime-only `disable_plugin_typecheck` escape hatch after configuration finalization [@cli] [@main]. |
-| `FILES...` | Opens the listed files as buffers; without files, Red starts with an empty buffer [@cli] [@main]. |
+| `FILES...` | Opens the listed file or directory targets as buffers; without targets, Red starts with an empty buffer [@cli] [@main] [@buffer]. |
 
 `--resume` changes to the snapshot working directory when one is present and reconstructs buffers from the recovered snapshot rather than opening command-line files [@main].
 
@@ -56,7 +63,7 @@ The README and getting-started guide present `red path/to/file`, multiple files,
 | `--eject <ASSET>` | Copies a bundled or runtime asset into the user config directory without overwriting an existing user file [@cli] [@main]. |
 | `--eject-force <ASSET>` | Copies the asset and allows overwrite of an existing user file [@cli] [@main]. |
 
-`Args::utility_requested` includes `--runtime-files`, `--check-config`, `--agent-check`, hidden `--self-check`, `--eject`, `--eject-force`, and hidden process-editor replacement [@cli]. `Args::validate_utility_args` rejects utility modes combined with files to edit, except the hidden process-editor replacement mode, which requires exactly one target file [@cli].
+`Args::utility_requested` treats any root subcommand as a utility, and also includes `--runtime-files`, `--check-config`, `--agent-check`, hidden `--self-check`, `--eject`, `--eject-force`, and hidden process-editor replacement [@cli]. `Args::validate_utility_args` rejects utility modes combined with files to edit, except the hidden process-editor replacement mode, which requires exactly one target file [@cli].
 
 ## Plugin And Language Subcommands
 
@@ -79,8 +86,9 @@ Install and update forms accept `--trust-native-grammars` when the package inclu
 | --- | --- |
 | `red language trust <LANGUAGE_OR_PATH>` | Resolves a configured language id, enabled compatible package language id, or explicit path, then records trust for the current native grammar bytes [@cli] [@main]. |
 | `red language untrust <LANGUAGE_OR_PATH>` | Resolves the same language-or-path forms and revokes the grammar approval for that path [@cli] [@main]. |
+| `red language check-indent <FIXTURES>` | Loads user config plus any `-c` overrides, finalizes language configuration, builds the language registry, checks the JSON indentation fixture file, and prints `Passed {count} indentation fixtures` on success [@cli] [@main]. |
 
-Language trust commands load the effective user config with any `-c` overrides, resolve relative configured grammar paths under the Red config directory, and then fall back to treating the argument as a filesystem path [@main].
+Language trust commands load the effective user config with any `-c` overrides, resolve relative configured grammar paths under the Red config directory, and then fall back to treating the argument as a filesystem path [@main]. Indentation fixture checks require native grammars to have been trusted already, because the command uses the same finalized language configuration and registry as the editor [@cli] [@main].
 
 ## Detach And Attach
 

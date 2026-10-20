@@ -71,6 +71,29 @@ impl Editor {
                         | Mode::VisualLine
                         | Mode::VisualBlock
                 ) | Action::RepeatLastChange
+                    | Action::SelectNextOccurrence
+                    | Action::AddCursorUp
+                    | Action::AddCursorDown
+                    | Action::ToggleMultiCursorExtendMode
+                    | Action::ExtendMultiSelectionLeft
+                    | Action::ExtendMultiSelectionRight
+                    | Action::ExtendMultiSelectionWordForward
+                    | Action::ExtendMultiSelectionWordEnd
+                    | Action::ExtendMultiSelectionLineStart
+                    | Action::ExtendMultiSelectionLineEnd
+                    | Action::InvertMultiSelection
+                    | Action::SelectPreviousOccurrence
+                    | Action::SkipMultiSelection
+                    | Action::RemoveActiveMultiSelection
+                    | Action::ChangeMultiSelection
+                    | Action::InsertAtMultiSelectionStart
+                    | Action::AppendAtMultiSelectionEnd
+                    | Action::DeleteMultiSelection
+                    | Action::DeleteMultiSelectionBlackHole
+                    | Action::PasteAfterMultiSelection
+                    | Action::PasteBeforeMultiSelection
+                    | Action::YankMultiSelection
+                    | Action::ClearMultiSelection
                     | Action::PlayMacro(_)
                     | Action::InsertBlock
                     | Action::MoveToLineEnd
@@ -120,6 +143,8 @@ impl Editor {
                     | Action::ReplaceCharsAtCursor { .. }
                     | Action::ReplaceLineAt(_, _)
                     | Action::ReplaceSelection(_)
+                    | Action::Substitute(_)
+                    | Action::ConfirmSubstitute(_)
                     | Action::JoinLines(_)
                     | Action::JoinLinesKeepSpaces(_)
                     | Action::JoinLinesInRange { .. }
@@ -134,6 +159,9 @@ impl Editor {
                     | Action::ToggleCommentRange(_)
                     | Action::ToggleCommentSelection
                     | Action::StartCommentOperator(_)
+                    | Action::StartFormatOperator(_)
+                    | Action::FormatTextRange(_)
+                    | Action::FormatSelection
                     | Action::StartLowercaseOperator(_)
                     | Action::StartUppercaseOperator(_)
                     | Action::StartToggleCaseOperator(_)
@@ -315,6 +343,16 @@ impl Editor {
         })
     }
 
+    // Keep parsing temporaries out of recursive action futures and their 2 MiB stack.
+    #[inline(never)]
+    fn action_is_local_substitute_command(&self, action: &Action) -> bool {
+        let Action::Command(command) = action else {
+            return false;
+        };
+        matches!(self.parse_substitute_command(command), Ok(Some(_)))
+    }
+
+    #[allow(clippy::double_must_use)]
     #[async_recursion::async_recursion]
     pub(super) async fn execute_with_tracking(
         &mut self,
@@ -323,7 +361,8 @@ impl Editor {
         runtime: &mut Runtime,
         tracking: bool,
     ) -> anyhow::Result<bool> {
-        let local = Self::action_is_batch_local(action);
+        let local =
+            Self::action_is_batch_local(action) || self.action_is_local_substitute_command(action);
         let barrier = self.edit_batch.is_active() && !local;
         if barrier {
             self.publish_edit_batch(buffer, runtime).await?;
@@ -352,6 +391,7 @@ impl Editor {
         result
     }
 
+    #[allow(clippy::double_must_use)]
     #[async_recursion::async_recursion]
     pub(super) async fn handle_key_action(
         &mut self,
@@ -512,6 +552,99 @@ mod tests {
         );
         h.keys("u").await;
         assert_eq!(h.editor.current_buffer().contents(), source);
+    }
+
+    #[tokio::test]
+    async fn bounded_block_replay_batches_unicode_rows_and_preserves_undo() {
+        let source = "fn value_0() {}\r\nfn value_😀() {}\r\nfn value_2() {}\r\n";
+        let inserted = "prefix_42";
+        let mut h = Harness::new(source);
+        h.event(KeyCode::Char('v'), KeyModifiers::CONTROL).await;
+        h.keys("2jI").await;
+        h.keys(inserted).await;
+
+        let before = h.counts();
+        let replay_start = h.editor.actions.len();
+        h.keys("\u{1b}").await;
+        h.assert_one_publication(before);
+
+        let expected = source
+            .split_inclusive('\n')
+            .map(|line| format!("{inserted}{line}"))
+            .collect::<String>();
+        assert_eq!(h.editor.current_buffer().contents(), expected);
+        assert_eq!(
+            h.editor.actions[replay_start..]
+                .iter()
+                .filter(|action| matches!(action, Action::InsertString(text) if text == inserted))
+                .count(),
+            2,
+            "each secondary row should use one bounded insertion"
+        );
+        assert_eq!(
+            (h.editor.cx, h.editor.buffer_line()),
+            (inserted.len() - 1, 0)
+        );
+
+        h.keys("u").await;
+        assert_eq!(h.editor.current_buffer().contents(), source);
+        h.event(KeyCode::Char('r'), KeyModifiers::CONTROL).await;
+        assert_eq!(h.editor.current_buffer().contents(), expected);
+    }
+
+    #[tokio::test]
+    async fn substitute_publishes_one_unicode_crlf_frame_and_preserves_undo() {
+        let source = "fn value_😀() {}\r\nfn value_2() {}\r\n";
+        let expected = source.replace("value", "replacement");
+        let mut h = Harness::new(source);
+        h.keys(":%s/value/replacement/g").await;
+        let before = h.counts();
+
+        h.event(KeyCode::Enter, KeyModifiers::NONE).await;
+
+        h.assert_one_publication(before);
+        assert_eq!(h.editor.current_buffer().contents(), expected);
+
+        h.keys("u").await;
+        assert_eq!(h.editor.current_buffer().contents(), source);
+        h.event(KeyCode::Char('r'), KeyModifiers::CONTROL).await;
+        assert_eq!(h.editor.current_buffer().contents(), expected);
+    }
+
+    #[test]
+    fn first_line_replay_bounds_match_ordinary_wrapped_viewports() {
+        let long_source = format!("{}\nnext\n", "z".repeat(2_000));
+        for (source, cursor, scrolloff) in [
+            ("ordinary text\nnext line\n", 5, 3),
+            ("😀 tabs\there and wrapped text\nnext\n", 8, 3),
+            ("    indented wrapped source text\nnext\n", 20, 6),
+            (long_source.as_str(), 1_500, 3),
+        ] {
+            let mut ordinary = Harness::new(source);
+            let mut replay = Harness::new(source);
+            ordinary.editor.config.scrolloff = Some(scrolloff);
+            replay.editor.config.scrolloff = Some(scrolloff);
+            ordinary.editor.cx = cursor;
+            replay.editor.cx = cursor;
+            replay.editor.begin_edit_batch();
+
+            assert_eq!(replay.editor.check_bounds(), ordinary.editor.check_bounds());
+            assert_eq!(
+                (
+                    replay.editor.cx,
+                    replay.editor.cy,
+                    replay.editor.vtop,
+                    replay.editor.skipcol,
+                ),
+                (
+                    ordinary.editor.cx,
+                    ordinary.editor.cy,
+                    ordinary.editor.vtop,
+                    ordinary.editor.skipcol,
+                ),
+                "replay bounds diverged for cursor {cursor}, scrolloff {scrolloff}: {source:?}"
+            );
+        }
     }
 
     #[tokio::test]

@@ -1,7 +1,7 @@
 ---
 title: "Plugin Resource Ownership"
 summary: "Plugin resource ownership is Red's pattern for letting Husk plugins request UI resources while editor managers own state, rendering, validation, and teardown."
-topics: [architecture, plugins, host-api]
+topics: [architecture, plugins, host-api, ui]
 sources:
   - id: panel
     type: file

@@ -1,0 +1,19 @@
+schema_version = 1
+
+[plugin]
+id = "rpc-hello"
+name = "RPC Hello"
+version = "0.1.0"
+red_api = "^0.19.0"
+
+[rpc]
+command = "python3"
+args = ["plugin.py"]
+
+[rpc.commands]
+aarch64-pc-windows-msvc = "python"
+x86_64-pc-windows-msvc = "python"
+
+[activation]
+commands = ["RpcApply", "RpcConfig", "RpcDocument", "RpcHello", "RpcLastEvent", "RpcPanel", "RpcPanelClose", "RpcPicker", "RpcStatusline", "RpcStatuslineClear", "RpcStorage", "RpcStorageClear", "RpcUndo"]
+events = ["file:saved"]

@@ -1,7 +1,7 @@
 ---
 title: "Crash Recovery Snapshots"
 summary: "Red persists editor-owned session snapshots so a later `red --resume` can recover dirty buffers, layout, undo history, plugin pane state, plugin storage, and agent conversation context without writing recovered text to disk."
-topics: [sessions, recovery, architecture]
+topics: [sessions, recovery, persistence, architecture]
 sources:
   - id: session-store
     type: file

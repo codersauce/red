@@ -1,6 +1,6 @@
 ---
 title: "UI Components"
-summary: "Modal UI components share a Component trait for drawing, event handling, resize/theme updates, plugin handles, cursor placement, and sensitive input reporting."
+summary: "Modal UI components share a Component trait for drawing, event handling, shortcut contexts, inline/completion state, plugin handles, layout updates, cursor placement, and sensitive input reporting."
 topics: [reference, editor, ui, plugins]
 sources:
   - id: ui-core
@@ -27,30 +27,47 @@ sources:
   - id: file-picker
     type: file
     path: src/ui/file_picker.rs
+  - id: keyboard
+    type: file
+    path: src/keyboard.rs
+  - id: prompt-buffer
+    type: file
+    path: src/ui/prompt_buffer.rs
 ---
 
-Red's modal UI components implement a common `Component` trait above the editor and plugin surfaces. The trait defines drawing into a `RenderBuffer`, optional ticking, live picker updates, plugin-owned picker and composer handles, resizing, theme updates, event handling, event passthrough, sensitive-input reporting, and cursor placement [@ui-core]. Components return `KeyAction` values instead of mutating editor state directly, so the editor remains the owner of action execution and resource cleanup [@ui-core].
+Red's modal UI components implement a common `Component` trait above the editor and plugin surfaces. The trait defines drawing into a `RenderBuffer`, optional ticking, shortcut-help context, inline assist and history state, live picker and completion updates, plugin-owned picker and composer handles, resizing and overlay layout, theme updates, event handling, event passthrough, sensitive-input reporting, cursor placement, and cursor mode [@ui-core]. Components return `KeyAction` values instead of mutating editor state directly, so the editor remains the owner of action execution and resource cleanup [@ui-core].
 
 ## Component Contract
 
 | Method | Contract |
 | --- | --- |
 | `draw(&self, &mut RenderBuffer)` | Paints the component into the render buffer and returns errors to the editor [@ui-core]. |
+| `uses_full_editor_viewport()` | Marks components that use the whole editor area rather than the active split; the default is `false` [@ui-core]. |
+| `is_message_history()` | Identifies message-history surfaces; the default is `false` [@ui-core]. |
+| `has_shortcut_context()`, `shortcut_context()`, `surface_actions()`, `activate_surface_action(id)` | Provide contextual `F1` help and optional surface-local actions; the default context is `Dialog`, and the default action list is empty [@ui-core]. |
+| `inline_assist_state()`, `request_inline_assist_close()`, `is_inline_draft_confirmation()` | Let inline-assist popups preserve unsent draft state and request dismissal confirmation; the defaults report no inline draft state [@ui-core]. |
+| `is_inline_history()`, `scroll_inline_history(delta)`, `inline_comment_id()` | Identify inline history and comment surfaces and expose bounded history scrolling; the defaults report no owned inline history or comment [@ui-core]. |
 | `tick(&mut self)` | Lets asynchronous components report whether their state changed; the default returns `false` [@ui-core]. |
 | `update_picker(id, update)` | Applies live picker updates when a component owns the matching picker; the default rejects updates [@ui-core]. |
+| `accepts_completion_updates()`, `update_completion(items, filter)`, `selected_completion()` | Let a component own ordinary completion updates and expose the selected LSP completion item; the defaults reject updates and report no selection [@ui-core]. |
 | `picker_id()` | Returns the legacy numeric picker id when present [@ui-core]. |
 | `picker_handle()` | Returns a scoped plugin picker handle when the dialog is callback-owned [@ui-core]. |
 | `composer_handle()` | Returns a scoped composer handle when the dialog is callback-owned [@ui-core]. |
 | `resize(width, height)` | Recomputes component geometry and returns whether redraw is needed; the default is unchanged [@ui-core]. |
+| `update_overlay_layout(layout)` | Applies a new overlay layout to surfaces that track cursor-relative placement; the default is unchanged [@ui-core]. |
 | `set_theme(theme)` | Applies current theme styles; the default is a no-op [@ui-core]. |
 | `handle_event(event)` | Converts keys, mouse, or paste events into `KeyAction`s; the default closes on Escape or mouse down [@ui-core]. |
 | `allows_event_passthrough()` | Indicates whether ordinary editor input may also see events; the default is `false` [@ui-core]. |
+| `is_empty_completion()`, `completion_popup_bounds()` | Describe installed completion popups that draw no selectable rows and expose popup bounds for hit-testing; the defaults report no completion popup [@ui-core]. |
 | `is_sensitive_input()` | Marks prompts whose contents must not be serialized into traces or logs; the default is `false` [@ui-core]. |
 | `cursor_position()` | Returns the terminal cursor position for focused text input; the default has no cursor [@ui-core]. |
+| `cursor_mode()` | Lets a component override the editor cursor mode while focused; the default keeps the editor mode [@ui-core]. |
 
 ## Picker Components
 
 `Picker` is the structured fuzzy picker. Its component implementation accepts `PickerUpdate` values for the matching id, exposes both legacy picker ids and callback handles, resizes to the viewport, applies theme updates, edits its query from key and paste events, navigates history and result lists, and returns either editor actions or plugin callback notifications on selection and cancellation [@picker]. Query editing is grapheme-aware, while query cursor placement uses display width so the terminal cursor follows visible text width [@picker].
+
+Picker preview panes do not use the normal window text renderer. They clip preview lines, paint optional syntax spans, and paint query-match overlays inside `src/ui/picker.rs`, so preview fixes must keep all three passes on the same terminal-column mapping [@picker]. The raw-tab preview incident and terminal-cell invariant are covered by [Rendering Pipeline](../../architecture/editor/rendering-pipeline).
 
 `FilePicker` wraps `Picker` with asynchronous workspace discovery. Its `tick` method drains a channel of file-loading results, ignores stale generations, and updates the underlying picker; `Ctrl-E` toggles hidden and ignored entries and starts a new load, while an empty-query `>` opens the command palette [@file-picker]. Drawing, resize, theme updates, and cursor position delegate to the embedded picker [@file-picker].
 
@@ -78,7 +95,8 @@ on either platform when the terminal reports the modifier. Selected initial
 values in single-line prompts are cleared as a whole. Composers retain
 `Ctrl-W`; active search fields edit their own query instead of the underlying
 draft. Word boundaries remain whitespace-delimited, including punctuation
-and paths within a word.
+and paths within a word [@keyboard] [@prompt-buffer] [@input-prompt]
+[@agent-composer] [@picker].
 
 ## Resource Ownership
 

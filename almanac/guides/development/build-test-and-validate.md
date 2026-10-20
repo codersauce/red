@@ -1,7 +1,7 @@
 ---
 title: "Build, Test, And Validate"
-summary: "This guide explains the local validation path for Red changes and how to line it up with CI, plugin checks, release checks, and runtime self-checks."
-topics: [guides, development, validation, testing, ci, plugins]
+summary: "This guide explains the local validation path for Red changes and how to line it up with CI, plugin checks, release checks, terminal rendering checks, and runtime self-checks."
+topics: [guides, development, validation, testing, ci, plugins, language-packs, rendering]
 sources:
   - id: readme
     type: file
@@ -12,18 +12,51 @@ sources:
   - id: ci
     type: file
     path: .github/workflows/ci.yml
+  - id: main-ruleset
+    type: file
+    path: .github/rulesets/main.json
   - id: plugin-check
     type: file
     path: .github/workflows/plugin-check.yml
+  - id: performance
+    type: file
+    path: .github/workflows/performance.yml
   - id: test-performance
     type: file
     path: .github/workflows/test-performance.yml
+  - id: keyboard-protocol
+    type: file
+    path: scripts/test_keyboard_protocol.py
+  - id: editing-tests
+    type: file
+    path: tests/editing.rs
   - id: editor
     type: file
     path: src/editor.rs
+  - id: rendering
+    type: file
+    path: src/editor/rendering.rs
+  - id: render-buffer
+    type: file
+    path: src/editor/render_buffer.rs
+  - id: picker
+    type: file
+    path: src/ui/picker.rs
+  - id: config
+    type: file
+    path: src/config.rs
+  - id: language-doc
+    type: file
+    path: docs/LANGUAGES.md
+  - id: cargo-toml
+    type: file
+    path: Cargo.toml
   - id: terminal-cleanup-session
     type: conversation
     path: /Users/fcoury/.codex/sessions/2026/08/08/rollout-2026-08-08T00-33-51-019fdf6f-2571-7d91-8f8d-8c7dc3fe8803.jsonl
+  - id: binary-skew-session
+    type: conversation
+    path: /Users/fcoury/.codex/sessions/2026/08/30/rollout-2026-08-30T13-02-03-01a053d5-ecd3-7762-bf3f-af5ec83a4051.jsonl
 ---
 
 Use this guide when a Red change needs local confidence before review, push, or release preparation. A complete validation pass starts with the smallest command that matches the changed area, then finishes with the repository policy command for Rust changes, the relevant plugin or runtime self-checks, and any workflow-specific checks that CI will enforce [@agents] [@ci] [@plugin-check]. CI is the full contract, and the local commands here help catch the same classes of failure before waiting for GitHub Actions.
@@ -65,8 +98,8 @@ cargo clippy --all-targets --all-features -- -D warnings
 
 `AGENTS.md` requires this command before pushing Rust changes and requires every
 warning or error to be fixed [@agents]. The CI clippy job runs the same command
-on Ubuntu for pull requests and on Ubuntu, macOS, and Windows for other events
-[@ci].
+once on Ubuntu for code pull requests and manual runs; documentation-only pull
+requests and post-merge pushes skip that job [@ci].
 
 ## Match The Main CI Gates
 
@@ -80,21 +113,62 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo fmt --all -- --check
 cargo run --locked -- --self-check
 cargo run --locked --release --example husk_cursor_bench -- --assert
+cargo test --locked --manifest-path vendor/crossterm/Cargo.toml --lib red_
+cargo build --locked --bin red
+python3 scripts/test_keyboard_protocol.py
+RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --all-features --document-private-items
 python3 scripts/doctest_packages.py --no-default-features
+python3 scripts/check_markdown_links.py --self-test
+python3 scripts/check_markdown_links.py
 python3 scripts/readme_release.py --check
-python3 -m unittest tests.test_discord_release tests.test_doctest_packages tests.test_test_performance
+python3 -m json.tool .github/rulesets/main.json > /dev/null
+python3 -m unittest tests.test_release_campaign tests.test_discord_release tests.test_social_release
+python3 -m unittest tests.test_ci_policy tests.test_doctest_packages tests.test_test_performance
 ```
 
 The workflow lint job validates GitHub Actions, checks the README release
-version, and runs Discord announcement and validation-helper tests [@ci]. The
-CI `fmt` and `self-check` jobs run rustfmt and
+version, validates the main-branch ruleset recipe that protects `main` with
+`CI Gate`, and runs release-campaign, Discord, social-release, and
+validation-helper tests [@ci] [@main-ruleset]. The CI `fmt` and `self-check`
+jobs run rustfmt and
 `cargo run --locked -- --self-check`; the separate path-filtered Performance
-workflow runs the release-mode Husk cursor benchmark with `--assert`. For the
-details of the CI surface, see
-[CI And Validation](../../reference/validation/ci-and-validation); for benchmark
-thresholds and workstation baselines, see
+workflow runs the release-mode Husk cursor benchmark with `--assert`
+[@performance]. The docs job builds rustdoc with warnings denied, runs the
+doctest helper, and validates Markdown links [@ci]. The paid test job also
+validates the vendored Crossterm keyboard decoder and, on Unix runners, drives
+`red keys` through a PTY to cover legacy, Kitty CSI-u, xterm, fragmented,
+repeat, release, and automatic negotiation cases [@ci] [@keyboard-protocol].
+For the details of the CI surface, see
+[CI And Validation](../../reference/validation/ci-and-validation); for
+benchmark thresholds and workstation baselines, see
 [Performance Checks](../performance/performance-checks); for the runtime
 diagnostic itself, see [Self Check](../../reference/runtime/self-check).
+
+## Manually Smoke Terminal Interactions
+
+Automated tests cover many editor input contracts, including mouse-created
+visual selections, release-position handling, autoscroll during drag, double and
+triple click selection, Alt-drag visual blocks, Shift-click extension, panel
+focus, pane divider drags, mouse-wheel routing, and passive mouse events
+[@editing-tests]. Those tests are necessary, but they do not prove the user's
+terminal emulator, shell, and real `cargo run` path deliver the same interaction
+sequence to Red. Red is explicitly a terminal editor, so changes to mouse
+selection, Visual mode, pane resizing, focus handling, paste, terminal resize,
+keyboard protocol, or rendering should also get a short interactive smoke in a
+real terminal [@readme].
+
+Use the source-tree binary for that check:
+
+```shell
+cargo run --locked -- almanac/architecture/README.md
+```
+
+Then exercise the behavior that changed, not just startup. For mouse selection
+work, drag in an editor buffer until Red enters Visual mode, adjust or yank the
+selection when relevant, and confirm the highlight survives release. For pane or
+panel work, click, drag, scroll, resize the terminal, and return focus to the
+editor. Treat this as evidence for the terminal integration path; keep the
+focused Rust tests and clippy as the regression gates.
 
 ## Compare Test Runners And Build Settings
 
@@ -133,6 +207,16 @@ buffers do not exercise the same behavior there; guard byte-sequence assertions
 to Unix or split them into platform-specific checks, then let the Windows CI job
 execute the Windows backend [@terminal-cleanup-session] [@ci].
 
+Treat rendered user text and terminal control bytes as a separate failure class
+from cleanup escape sequences. If a smoke test shows buffer text, picker
+previews, plugin paint, or syntax overlays leaking tabs, escape bytes, or other
+controls, start with [Rendering Pipeline](../../architecture/editor/rendering-pipeline):
+`RenderBuffer` stores terminal-cell text and sanitizes control-bearing cell
+contents, while the final diff path runs a terminal-safe text check before
+printing changed cells [@render-buffer] [@rendering]. Picker previews have their
+own clipping and overlay path, so a preview-only corruption can live in
+`src/ui/picker.rs` even when ordinary window text is clean [@picker].
+
 ## Validate Bundled Husk And Plugin Changes
 
 If the change touches `crates/husk*`, `plugins/`, `src/plugin/`, `src/assets.rs`, `src/config.rs`, `src/self_check.rs`, examples, or the plugin workflow itself, run the plugin-specific checks before relying on the main suite. The plugin workflow is path-filtered to those areas and initializes the bundled runtime after targeted plugin and Husk checks [@plugin-check].
@@ -144,6 +228,8 @@ cargo test --all-features -p red --lib --bin red -- \
   husk \
   plugin::runtime::tests::lsp_symbols_ \
   plugin::runtime::tests::git_ \
+  plugin::runtime::git_refresh_tests:: \
+  plugin::runtime::tests::monotonic_time_ \
   plugin::runtime::tests::embedded_git_core_ \
   plugin::runtime::tests::neotree_ \
   plugin::runtime::tests::embedded_neotree_core_
@@ -155,6 +241,34 @@ cargo run --all-features -- --self-check
 ```
 
 Run only the relevant subset while iterating, then run the whole workflow-equivalent set when a plugin or Husk change is ready for review. The final self-check matters because Red embeds the editor defaults, plugins, themes, and runtime assets into the executable [@readme]. The startup path behind that check is described in [Runtime Lifecycle](../../architecture/startup/runtime-lifecycle).
+
+## Confirm The Binary Under Test
+
+When a freshly built or installed Red rejects an installed language-pack
+manifest, first prove which executable the shell starts before changing package
+manifests. Treat `unknown field` errors as binary-skew evidence when current
+source accepts the reported field. For example, source accepts
+`LanguageGrammarConfig.indents`, and the language guide defines `indents` as
+the Host API `^0.12.0` language-pack indentation contract [@config]
+[@language-doc]. In the recorded skew case, `red` resolved to
+`/opt/homebrew/bin/red` even after `cargo install --path .` replaced
+`~/.cargo/bin/red`; the Homebrew binary rejected
+`languages.go.grammar.indents`, while `/Users/fcoury/.cargo/bin/red plugin
+list` parsed the same installed packs as compatible [@binary-skew-session].
+
+Use `which -a red` or `whence -a red`, then run the intended binary by absolute
+path. `red --version` is not enough during unreleased `main` work because it
+reports the package version from `Cargo.toml`, not the source commit or install
+location [@cargo-toml]. In the recorded skew case, older Homebrew/local
+binaries and the newly installed Cargo binary all presented the same package
+version while only `/Users/fcoury/.cargo/bin/red` accepted the current
+language-pack manifest fields [@binary-skew-session]. Prefer
+`cargo run --locked -- ...` for source-tree validation, or make
+`~/.cargo/bin` precede Homebrew and local installer directories before testing
+an installed build. When the failure is a language-pack compatibility error,
+use [Plugin Host API](../../reference/plugins/host-api) for the accepted host
+API targets and [Official Language Pack Distribution](../../decisions/plugins/language-pack-distribution)
+for the catalog/package compatibility boundary before editing a manifest.
 
 ## Release-Adjacent Validation
 

@@ -1,4 +1,6 @@
-//! Compact, reusable Accept/Cancel confirmation dialog.
+//! Compact, reusable confirmation dialog: Accept/Cancel, or a short list of choices.
+
+use std::time::{Duration, Instant};
 
 use crossterm::event::{Event, KeyCode, KeyModifiers};
 use serde::Deserialize;
@@ -19,6 +21,9 @@ use super::{
 };
 
 const BUTTON_GAP: usize = 2;
+/// A choice dialog that opens unprompted ignores keys this soon after it appears, so
+/// keystrokes meant for the buffer cannot pick an option.
+const CHOICE_ARMING_DELAY: Duration = Duration::from_millis(350);
 
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -36,27 +41,54 @@ pub struct ConfirmationSegment {
     pub style: Style,
 }
 
+/// One option of a multi-choice confirmation.
+#[derive(Debug, Clone)]
+pub struct ConfirmationChoice {
+    pub label: String,
+    /// Picks this option directly. Leave it out for an option that must be chosen
+    /// deliberately with the arrow keys and Enter.
+    pub hotkey: Option<char>,
+    pub action: Action,
+}
+
+impl ConfirmationChoice {
+    pub fn new(label: impl Into<String>, hotkey: Option<char>, action: Action) -> Self {
+        Self {
+            label: label.into(),
+            hotkey,
+            action,
+        }
+    }
+}
+
 enum ConfirmationTarget {
     Callback(PickerHandle),
     Actions {
         accept: Box<Action>,
         cancel: Box<Action>,
     },
+    Choices {
+        actions: Vec<Action>,
+        hotkeys: Vec<Option<char>>,
+        /// Option taken by Esc and Ctrl-C.
+        cancel: usize,
+    },
 }
 
-/// A confirmation surface that defaults to the safe Cancel action.
+/// A confirmation surface that defaults to the safe option.
 pub struct Confirmation {
     dialog: Dialog,
     message: String,
     rows: Vec<Vec<ConfirmationSegment>>,
-    accept_selected: bool,
+    selected: usize,
     target: ConfirmationTarget,
-    accept_label: String,
-    cancel_label: String,
+    /// Bracketed button labels, in display order.
+    labels: Vec<String>,
     multiline: bool,
     scroll: usize,
     style: Style,
     theme: Theme,
+    armed_at: Option<Instant>,
 }
 
 impl Confirmation {
@@ -89,8 +121,8 @@ impl Confirmation {
             editor,
             title.into(),
             message.into(),
-            accept_label,
-            cancel_label,
+            vec![accept_label.to_string(), cancel_label.to_string()],
+            1,
             multiline,
             options.rows,
             ConfirmationTarget::Callback(callback_handle),
@@ -107,14 +139,12 @@ impl Confirmation {
         accept: Action,
         cancel: Action,
     ) -> Self {
-        let accept_label = accept_label.into();
-        let cancel_label = cancel_label.into();
         Self::with_target(
             editor,
             title.into(),
             message.into(),
-            &accept_label,
-            &cancel_label,
+            vec![accept_label.into(), cancel_label.into()],
+            1,
             true,
             Vec::new(),
             ConfirmationTarget::Actions {
@@ -124,26 +154,69 @@ impl Confirmation {
         )
     }
 
+    /// Creates a multiline dialog with several options. `selected` starts focused and
+    /// should be the safe one; `cancel` is taken by Esc. The dialog ignores keys for a
+    /// moment after it opens, because it may appear while the user is typing.
+    pub fn new_choices(
+        editor: &Editor,
+        title: impl Into<String>,
+        message: impl Into<String>,
+        choices: Vec<ConfirmationChoice>,
+        selected: usize,
+        cancel: usize,
+    ) -> Self {
+        assert!(
+            selected < choices.len() && cancel < choices.len(),
+            "choice indexes must name an option"
+        );
+        let labels = choices
+            .iter()
+            .map(|choice| match choice.hotkey {
+                Some(key) => format!("{key} · {}", choice.label),
+                None => choice.label.clone(),
+            })
+            .collect();
+        let hotkeys = choices.iter().map(|choice| choice.hotkey).collect();
+        let actions = choices.into_iter().map(|choice| choice.action).collect();
+        let mut confirmation = Self::with_target(
+            editor,
+            title.into(),
+            message.into(),
+            labels,
+            selected,
+            true,
+            Vec::new(),
+            ConfirmationTarget::Choices {
+                actions,
+                hotkeys,
+                cancel,
+            },
+        );
+        confirmation.armed_at = Some(Instant::now() + CHOICE_ARMING_DELAY);
+        confirmation
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn with_target(
         editor: &Editor,
         title: String,
         message: String,
-        accept_label: &str,
-        cancel_label: &str,
+        labels: Vec<String>,
+        selected: usize,
         multiline: bool,
         rows: Vec<Vec<ConfirmationSegment>>,
         target: ConfirmationTarget,
     ) -> Self {
         let style = editor.theme.ui_style.dialog.clone();
-        let accept_label = format!("[ {accept_label} ]");
-        let cancel_label = format!("[ {cancel_label} ]");
+        let labels: Vec<String> = labels
+            .into_iter()
+            .map(|label| format!("[ {label} ]"))
+            .collect();
         let (width, height) = confirmation_size(
             editor.vwidth(),
             editor.vheight(),
             &message,
-            &accept_label,
-            &cancel_label,
+            &labels,
             multiline,
             &rows,
         );
@@ -163,21 +236,34 @@ impl Confirmation {
             .with_surface_theme(&editor.theme, SurfaceRole::Dialog),
             message,
             rows,
-            accept_selected: false,
+            selected,
             target,
-            accept_label,
-            cancel_label,
+            labels,
             multiline,
             scroll: 0,
             style,
             theme: editor.theme.clone(),
+            armed_at: None,
         }
     }
 
-    fn terminal_action(&self, accepted: bool) -> KeyAction {
+    /// Delays arming, for tests that drive keys immediately.
+    #[cfg(test)]
+    fn arm_now(&mut self) {
+        self.armed_at = None;
+    }
+
+    fn cancel_index(&self) -> usize {
+        match &self.target {
+            ConfirmationTarget::Choices { cancel, .. } => *cancel,
+            _ => 1,
+        }
+    }
+
+    fn terminal_action(&self, index: usize) -> KeyAction {
         match &self.target {
             ConfirmationTarget::Callback(handle) => {
-                let callback = if accepted {
+                let callback = if index == 0 {
                     PickerCallback::Selected(PickerItem {
                         id: "accept".to_string(),
                         icon: None,
@@ -200,12 +286,15 @@ impl Confirmation {
             }
             ConfirmationTarget::Actions { accept, cancel } => KeyAction::Multiple(vec![
                 Action::CloseDialog,
-                if accepted {
+                if index == 0 {
                     accept.as_ref().clone()
                 } else {
                     cancel.as_ref().clone()
                 },
             ]),
+            ConfirmationTarget::Choices { actions, .. } => {
+                KeyAction::Multiple(vec![Action::CloseDialog, actions[index].clone()])
+            }
         }
     }
 
@@ -245,23 +334,43 @@ impl Component for Confirmation {
         self.dialog.title().unwrap_or("Confirmation")
     }
     fn surface_actions(&self) -> Vec<super::UiAction> {
-        vec![
+        let mut actions = vec![
             super::UiAction::new("select", "Enter", "Choose selected option"),
-            super::UiAction::new("cancel", "Esc", "Cancel"),
-            super::UiAction::new("accept", "y", &self.accept_label),
-            super::UiAction::new("reject", "n", &self.cancel_label),
+            super::UiAction::new("cancel", "Esc", &self.labels[self.cancel_index()]),
+        ];
+        match &self.target {
+            ConfirmationTarget::Choices { hotkeys, .. } => {
+                for (index, key) in hotkeys.iter().enumerate() {
+                    if let Some(key) = key {
+                        actions.push(super::UiAction::new(
+                            format!("choice-{index}"),
+                            key.to_string(),
+                            &self.labels[index],
+                        ));
+                    }
+                }
+            }
+            _ => {
+                actions.push(super::UiAction::new("accept", "y", &self.labels[0]));
+                actions.push(super::UiAction::new("reject", "n", &self.labels[1]));
+            }
+        }
+        actions.push(
             super::UiAction::new("options", "← / → / Tab / Shift+Tab", "Choose an option")
                 .with_priority(super::ActionPriority::Reference),
+        );
+        actions.push(
             super::UiAction::new("scroll", "↑ / ↓", "Scroll the message")
                 .with_priority(super::ActionPriority::Reference)
                 .with_enabled(self.multiline),
-        ]
+        );
+        actions
     }
 
     fn picker_handle(&self) -> Option<PickerHandle> {
         match &self.target {
             ConfirmationTarget::Callback(handle) => Some(*handle),
-            ConfirmationTarget::Actions { .. } => None,
+            ConfirmationTarget::Actions { .. } | ConfirmationTarget::Choices { .. } => None,
         }
     }
 
@@ -276,8 +385,7 @@ impl Component for Confirmation {
             viewport_width,
             viewport_height,
             &self.message,
-            &self.accept_label,
-            &self.cancel_label,
+            &self.labels,
             self.multiline,
             &self.rows,
         );
@@ -313,35 +421,36 @@ impl Component for Confirmation {
             }
         }
 
-        let buttons_width =
-            display_width(&self.accept_label) + BUTTON_GAP + display_width(&self.cancel_label);
-        let button_x = self.dialog.x + 1 + self.dialog.width.saturating_sub(buttons_width) / 2;
-        let button_y = self.dialog.y + self.dialog.height;
         let selected = self.theme.selected_style(
             &self.style,
             &self.theme.ui_style.picker_selected_item,
             crate::theme::SelectionForegroundPriority::Selection,
         );
-        buffer.set_text(
-            button_x,
-            button_y,
-            &self.accept_label,
-            if self.accept_selected {
-                &selected
-            } else {
-                &self.style
-            },
-        );
-        buffer.set_text(
-            button_x + display_width(&self.accept_label) + BUTTON_GAP,
-            button_y,
-            &self.cancel_label,
-            if self.accept_selected {
-                &self.style
-            } else {
-                &selected
-            },
-        );
+        let button_y = self.dialog.y + self.dialog.height;
+        let mut button_x = self.dialog.x
+            + 1
+            + self
+                .dialog
+                .width
+                .saturating_sub(buttons_width(&self.labels))
+                / 2;
+        for (index, label) in self.labels.iter().enumerate() {
+            let label = truncate_display_width(
+                label,
+                (self.dialog.x + 1 + self.dialog.width).saturating_sub(button_x),
+            );
+            buffer.set_text(
+                button_x,
+                button_y,
+                &label,
+                if index == self.selected {
+                    &selected
+                } else {
+                    &self.style
+                },
+            );
+            button_x += display_width(&label) + BUTTON_GAP;
+        }
         Ok(())
     }
 
@@ -349,16 +458,19 @@ impl Component for Confirmation {
         let Event::Key(key) = event else {
             return None;
         };
+        let last = self.labels.len() - 1;
+        let armed = self.armed_at.is_none_or(|at| Instant::now() >= at);
         match (key.code, key.modifiers) {
             (KeyCode::Esc, _) | (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
-                Some(self.terminal_action(false))
+                Some(self.terminal_action(self.cancel_index()))
             }
+            _ if !armed => Some(KeyAction::Single(Action::Refresh)),
             (KeyCode::Left | KeyCode::BackTab | KeyCode::Char('h') | KeyCode::Char('k'), _) => {
-                self.accept_selected = true;
+                self.selected = self.selected.saturating_sub(1);
                 Some(KeyAction::Single(Action::Refresh))
             }
             (KeyCode::Right | KeyCode::Tab | KeyCode::Char('j') | KeyCode::Char('l'), _) => {
-                self.accept_selected = false;
+                self.selected = (self.selected + 1).min(last);
                 Some(KeyAction::Single(Action::Refresh))
             }
             (KeyCode::Up, _) if self.multiline => {
@@ -369,24 +481,40 @@ impl Component for Confirmation {
                 self.scroll = self.scroll.saturating_add(1).min(self.max_scroll());
                 Some(KeyAction::Single(Action::Refresh))
             }
-            (KeyCode::Char('y' | 'Y'), _) => Some(self.terminal_action(true)),
-            (KeyCode::Char('n' | 'N'), _) => Some(self.terminal_action(false)),
-            (KeyCode::Enter, _) => Some(self.terminal_action(self.accept_selected)),
+            (KeyCode::Enter, _) => Some(self.terminal_action(self.selected)),
+            (KeyCode::Char(typed), _) => match &self.target {
+                ConfirmationTarget::Choices { hotkeys, .. } => hotkeys
+                    .iter()
+                    .position(|hotkey| *hotkey == Some(typed))
+                    .map(|index| self.terminal_action(index)),
+                _ => match typed {
+                    'y' | 'Y' => Some(self.terminal_action(0)),
+                    'n' | 'N' => Some(self.terminal_action(1)),
+                    _ => None,
+                },
+            },
             _ => None,
         }
     }
+}
+
+fn buttons_width(labels: &[String]) -> usize {
+    labels
+        .iter()
+        .map(|label| display_width(label))
+        .sum::<usize>()
+        + BUTTON_GAP * labels.len().saturating_sub(1)
 }
 
 fn confirmation_size(
     viewport_width: usize,
     viewport_height: usize,
     message: &str,
-    accept_label: &str,
-    cancel_label: &str,
+    labels: &[String],
     multiline: bool,
     rows: &[Vec<ConfirmationSegment>],
 ) -> (usize, usize) {
-    let buttons_width = display_width(accept_label) + BUTTON_GAP + display_width(cancel_label);
+    let buttons_width = buttons_width(labels);
     let message_width = message.lines().map(display_width).max().unwrap_or_default();
     let rows_width = rows
         .iter()
@@ -396,7 +524,7 @@ fn confirmation_size(
     let desired_width = message_width.max(rows_width).max(buttons_width);
     let max_width = if multiline { 76 } else { 60 };
     let width = desired_width
-        .min(max_width)
+        .min(max_width.max(buttons_width))
         .min(viewport_width.saturating_sub(2))
         .max(1);
     if !multiline {
@@ -479,21 +607,87 @@ mod tests {
         );
 
         for key_code in [KeyCode::Char('h'), KeyCode::Char('k')] {
-            confirmation.accept_selected = false;
+            confirmation.selected = 1;
             assert_eq!(
                 confirmation.handle_event(&key(key_code)),
                 Some(KeyAction::Single(Action::Refresh))
             );
-            assert!(confirmation.accept_selected);
+            assert_eq!(confirmation.selected, 0);
         }
 
         for key_code in [KeyCode::Char('j'), KeyCode::Char('l')] {
-            confirmation.accept_selected = true;
+            confirmation.selected = 0;
             assert_eq!(
                 confirmation.handle_event(&key(key_code)),
                 Some(KeyAction::Single(Action::Refresh))
             );
-            assert!(!confirmation.accept_selected);
+            assert_eq!(confirmation.selected, 1);
+        }
+    }
+
+    #[test]
+    fn choice_dialogs_ignore_early_keys_and_need_a_deliberate_pick_for_unhotkeyed_options() {
+        let editor = editor();
+        let choice = |label: &str, hotkey, print: &str| {
+            ConfirmationChoice::new(label, hotkey, Action::Print(print.to_string()))
+        };
+        let mut confirmation = Confirmation::new_choices(
+            &editor,
+            "Unsaved changes",
+            "The agent wants to edit a file you have not saved.",
+            vec![
+                choice("Apply, keep unsaved", Some('u'), "keep"),
+                choice("Apply and save", None, "save"),
+                choice("Don't apply", Some('n'), "skip"),
+            ],
+            0,
+            2,
+        );
+        let chose = |print: &str| {
+            Some(KeyAction::Multiple(vec![
+                Action::CloseDialog,
+                Action::Print(print.to_string()),
+            ]))
+        };
+
+        assert_eq!(
+            confirmation.handle_event(&key(KeyCode::Enter)),
+            Some(KeyAction::Single(Action::Refresh)),
+            "a key typed as the dialog appears is swallowed"
+        );
+        assert_eq!(confirmation.handle_event(&key(KeyCode::Esc)), chose("skip"));
+
+        confirmation.arm_now();
+        assert_eq!(confirmation.handle_event(&key(KeyCode::Char('s'))), None);
+        assert_eq!(
+            confirmation.handle_event(&key(KeyCode::Enter)),
+            chose("keep")
+        );
+        assert_eq!(
+            confirmation.handle_event(&key(KeyCode::Char('n'))),
+            chose("skip")
+        );
+        confirmation.handle_event(&key(KeyCode::Tab));
+        assert_eq!(
+            confirmation.handle_event(&key(KeyCode::Enter)),
+            chose("save")
+        );
+        confirmation.handle_event(&key(KeyCode::Tab));
+        confirmation.handle_event(&key(KeyCode::Tab));
+        assert_eq!(
+            confirmation.selected, 2,
+            "navigation stops at the last option"
+        );
+
+        let mut buffer = RenderBuffer::new(80, 20, &Style::default());
+        confirmation.draw(&mut buffer).unwrap();
+        let screen: String = buffer.cells.iter().map(|cell| cell.c).collect();
+        for label in [
+            "[ u · Apply, keep unsaved ]",
+            "[ Apply and save ]",
+            "[ n · Don't apply ]",
+        ] {
+            assert!(screen.contains(label), "{label} missing");
         }
     }
 
@@ -614,8 +808,8 @@ mod tests {
 
         confirmation.draw(&mut buffer).unwrap();
 
-        assert_eq!(confirmation.accept_label, "[ Push ]");
-        assert_eq!(confirmation.cancel_label, "[ Back ]");
+        assert_eq!(confirmation.labels[0], "[ Push ]");
+        assert_eq!(confirmation.labels[1], "[ Back ]");
         assert!(confirmation.dialog.height > 2);
         assert!(buffer
             .cells

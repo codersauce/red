@@ -713,10 +713,25 @@ pub(crate) fn render_code_lines_with_highlighter(
     }
     let language = highlighter
         .as_ref()
-        .and_then(|value| value.language_id_for_file(Some(file)))
+        .and_then(|value| value.language_id_for_source(Some(file), source))
         .unwrap_or_default()
         .to_owned();
     highlighted_code_lines(&language, source, highlighter)
+        .into_iter()
+        .flat_map(|spans| wrap_verbatim(&spans, width, &[], &[]))
+        .collect()
+}
+
+/// Render pre-highlighted source verbatim for a cached text-panel layout.
+pub(crate) fn render_code_lines(
+    source: &str,
+    width: usize,
+    styles: &[StyleInfo],
+) -> Vec<RenderedTextLine> {
+    if width == 0 {
+        return Vec::new();
+    }
+    project_highlighted_lines(source, styles, None)
         .into_iter()
         .flat_map(|spans| wrap_verbatim(&spans, width, &[], &[]))
         .collect()
@@ -736,11 +751,15 @@ pub(crate) fn render_diff_lines_with_highlighter(
     if width == 0 {
         return Vec::new();
     }
-    let language = highlighter
-        .as_ref()
-        .and_then(|value| value.language_id_for_file(Some(file)))
-        .unwrap_or_default()
-        .to_owned();
+    let detect = |source: &str| {
+        highlighter
+            .as_ref()
+            .and_then(|value| value.language_id_for_source(Some(file), source))
+            .unwrap_or_default()
+            .to_owned()
+    };
+    let old_language = detect(before);
+    let new_language = detect(after);
     let diff = similar::TextDiff::from_lines(before, after);
     let mut old_lines = BTreeSet::new();
     let mut new_lines = BTreeSet::new();
@@ -756,12 +775,12 @@ pub(crate) fn render_diff_lines_with_highlighter(
     // Parse complete programs separately for correct multiline syntax, but
     // materialize spans only for source lines actually displayed in the diff.
     let old = highlighted_code_lines_selected(
-        &language,
+        &old_language,
         before,
         highlighter.as_deref_mut(),
         Some(&old_lines),
     );
-    let new = highlighted_code_lines_selected(&language, after, highlighter, Some(&new_lines));
+    let new = highlighted_code_lines_selected(&new_language, after, highlighter, Some(&new_lines));
     let palette = DiffPalette::new(theme);
     let span = |text: String, style: Style| RenderedTextSpan {
         text,
@@ -1269,16 +1288,32 @@ fn render_table(
         })
         .collect::<Vec<_>>();
     let budget = available.saturating_sub(columns.saturating_sub(1) * gap);
+    // Shrink the widest columns first, but keep every column at least as wide as
+    // its longest word so cells wrap between words. A grid that cannot fit
+    // without breaking words reads better as key/value records.
+    let longest_words = (0..columns)
+        .map(|column| {
+            std::iter::once(&table.header[column])
+                .chain(table.rows.iter().map(|row| &row[column]))
+                .map(longest_word_width)
+                .max()
+                .unwrap_or_default()
+                .clamp(minimum_column, widths[column])
+        })
+        .collect::<Vec<_>>();
     while widths.iter().sum::<usize>() > budget {
         let Some((index, _)) = widths
             .iter()
             .enumerate()
-            .filter(|(_, width)| **width > minimum_column)
+            .filter(|(index, width)| **width > longest_words[*index])
             .max_by_key(|(_, width)| **width)
         else {
-            return render_table_records(table, width, first_prefix, continuation_prefix);
+            break;
         };
         widths[index] -= 1;
+    }
+    if widths.iter().sum::<usize>() > budget {
+        return render_table_records(table, width, first_prefix, continuation_prefix);
     }
 
     let mut lines = Vec::new();
@@ -1495,6 +1530,14 @@ fn cell_text(cell: &TableCell) -> String {
 
 fn cell_width(cell: &TableCell) -> usize {
     display_width(&cell_text(cell))
+}
+
+fn longest_word_width(cell: &TableCell) -> usize {
+    cell_text(cell)
+        .split_whitespace()
+        .map(display_width)
+        .max()
+        .unwrap_or_default()
 }
 
 fn spans_width(spans: &[RenderedTextSpan]) -> usize {
@@ -1934,6 +1977,34 @@ mod tests {
         assert!(output.iter().all(|line| !line.contains("|---|")));
         assert!(output.iter().all(|line| !line.starts_with('|')));
         assert_fits(&lines, 50);
+    }
+
+    #[test]
+    fn narrow_table_columns_wrap_between_words() {
+        let markdown = "| Area | Kind |\n|---|---|\n| Configuration settings | administrative |\n| UI | small |";
+        let output = plain(&render_markdown_lines(markdown, 29));
+
+        // Every word of the source survives intact on some rendered line.
+        for word in ["Configuration", "settings", "administrative"] {
+            assert!(
+                output
+                    .iter()
+                    .any(|line| line.split_whitespace().any(|token| token == word)),
+                "{word:?} was broken across lines: {output:#?}"
+            );
+        }
+        assert!(output.iter().any(|line| line.contains('━')));
+
+        // When the longest words cannot sit side by side, records keep them whole.
+        let markdown = "| Function | File | Purpose |\n|---|---|---|\n| format_cents | src/report.rs | Formats cents with fractional digits. |";
+        let output = plain(&render_markdown_lines(markdown, 34));
+        assert!(output.iter().all(|line| !line.contains('━')), "{output:#?}");
+        for word in ["format_cents", "src/report.rs", "fractional"] {
+            assert!(
+                output.iter().any(|line| line.contains(word)),
+                "{word:?}: {output:#?}"
+            );
+        }
     }
 
     #[test]

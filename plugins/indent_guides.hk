@@ -29,6 +29,7 @@ struct IndentViewportLayout {
     height: i32,
     cursor: ViewportCursor,
     indentation: ViewportIndentation,
+    indentation_key: String,
     rows: [ViewportRow],
 }
 
@@ -104,13 +105,18 @@ fn initialize_guides() {
 #[red::on("mode:changed")]
 fn refresh(event: EmptyEvent) {
     let layout: IndentViewportLayout = red::viewport_layout();
+    let indentation_key = red::string(layout.indentation_key, "");
+    if indentation_key == "" {
+        indentation_key = red::int(layout.revision, -1) + "";
+    }
     let key = red::int(layout.buffer_index, -1)
-        + ":" + red::int(layout.revision, -1)
+        + ":" + indentation_key
         + ":" + red::int(layout.vtop, -1)
-        + ":" + red::int(layout.cursor.x, -1)
         + ":" + red::int(layout.cursor.y, -1)
         + ":" + red::int(layout.width, -1)
-        + ":" + red::int(layout.height, -1);
+        + ":" + red::int(layout.height, -1)
+        + ":" + red::int(layout.indentation.shift_width, -1)
+        + ":" + red::int(layout.indentation.tab_width, -1);
     if key == state().layout_key {
         return;
     }

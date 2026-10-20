@@ -8,6 +8,7 @@
 use crate::{
     assets,
     buffer::Buffer,
+    cli_style::{paint, DIM, GREEN, RED, YELLOW},
     config::Config,
     editor::Editor,
     lsp::LspManager,
@@ -23,9 +24,22 @@ pub struct SelfCheckReport {
 impl SelfCheckReport {
     #[must_use]
     pub fn format(&self) -> String {
+        self.render(false)
+    }
+
+    /// Formats the report, coloring each status when `use_color` is set. The
+    /// visible text is identical either way: release CI greps these lines.
+    #[must_use]
+    pub fn render(&self, use_color: bool) -> String {
         self.plugins
             .iter()
-            .map(|(name, status)| format!("plugin {name}: {}", status_label(status)))
+            .map(|(name, status)| {
+                format!(
+                    "{} {name}: {}",
+                    paint(DIM, "plugin", use_color),
+                    paint(status_color(status), status_label(status), use_color)
+                )
+            })
             .collect::<Vec<_>>()
             .join("\n")
     }
@@ -38,6 +52,15 @@ fn status_label(status: &PluginStatus) -> &str {
         PluginStatus::ActiveWithReloadError { .. } => "active (reload rejected)",
         PluginStatus::Disabled => "disabled",
         PluginStatus::Quarantined { .. } => "quarantined",
+    }
+}
+
+fn status_color(status: &PluginStatus) -> &'static str {
+    match status {
+        PluginStatus::Active => GREEN,
+        PluginStatus::Pending | PluginStatus::ActiveWithReloadError { .. } => YELLOW,
+        PluginStatus::Disabled => DIM,
+        PluginStatus::Quarantined { .. } => RED,
     }
 }
 

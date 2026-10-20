@@ -15,6 +15,19 @@ use crate::codex::CodexToolHost;
 /// Maximum number of edits accepted in one atomic editor operation.
 pub const MAX_EDITOR_EDITS: usize = 128;
 
+/// Maximum number of source lines returned by one full-Agent file read.
+pub const MAX_AGENT_READ_LINES: usize = 1_000;
+
+/// Maximum source bytes returned by one full-Agent file read.
+pub const MAX_AGENT_READ_BYTES: usize = 256 * 1024;
+
+/// Default number of diagnostics returned by one LSP diagnostics page.
+pub const DEFAULT_LSP_DIAGNOSTIC_LIMIT: usize = 100;
+
+fn default_lsp_diagnostic_limit() -> usize {
+    DEFAULT_LSP_DIAGNOSTIC_LIMIT
+}
+
 /// Maximum annotations accepted in one Agent tool call.
 pub const MAX_AGENT_ANNOTATIONS_PER_CALL: usize = crate::inline_assist::MAX_COMMENTS;
 
@@ -58,6 +71,23 @@ pub struct EditorTextEdit {
     pub end: EditorPosition,
     /// Replacement UTF-8 text.
     pub new_text: String,
+}
+
+/// Scope of a bounded diagnostic query; workspace means known reports, not a scan.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum LspDiagnosticScope {
+    File,
+    OpenBuffers,
+    Workspace,
+}
+
+/// A half-open UTF-16 range used to filter diagnostics in one file.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct EditorLspRange {
+    pub start: EditorPosition,
+    pub end: EditorPosition,
 }
 
 /// The visual-selection mode requested by an agent.
@@ -107,6 +137,47 @@ pub enum EditorActionName {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "tool", rename_all = "snake_case", deny_unknown_fields)]
 pub enum EditorToolCall {
+    /// Inspect routing and negotiated capabilities without moving editor focus.
+    LspStatus { path: String },
+    /// Read known diagnostics, optionally refreshing one already-open file.
+    LspDiagnostics {
+        scope: LspDiagnosticScope,
+        #[serde(default)]
+        path: Option<String>,
+        #[serde(default)]
+        severity: Option<u8>,
+        #[serde(default)]
+        source: Option<String>,
+        #[serde(default)]
+        code: Option<String>,
+        #[serde(default)]
+        range: Option<EditorLspRange>,
+        #[serde(default)]
+        offset: usize,
+        #[serde(default = "default_lsp_diagnostic_limit")]
+        limit: usize,
+        #[serde(default)]
+        expected_generation: Option<u64>,
+        #[serde(default)]
+        refresh: bool,
+        #[serde(default)]
+        wait_ms: u64,
+    },
+    /// Check rename eligibility at a revision-checked UTF-16 position.
+    LspPrepareRename {
+        path: String,
+        position: EditorPosition,
+        expected_revision: u64,
+    },
+    /// Compute, validate, and retain a text-only rename without applying it.
+    LspPreviewRename {
+        path: String,
+        position: EditorPosition,
+        expected_revision: u64,
+        new_name: String,
+    },
+    /// Apply a session-owned preview to buffers, without saving any files.
+    LspApplyEdit { plan_id: String },
     /// Internal, request-bound read-only inspection for an inline provider.
     #[serde(skip)]
     InlineContext {
@@ -117,6 +188,10 @@ pub enum EditorToolCall {
     ReadFile {
         /// Workspace-relative or accepted absolute path.
         path: String,
+        /// One-based first source line to return.
+        start_line: usize,
+        /// Maximum number of source lines to return.
+        line_count: usize,
     },
     /// Replace a file with complete contents and persist it.
     WriteFile {
@@ -208,15 +283,40 @@ impl EditorToolCall {
     #[must_use]
     /// Returns whether the call changes text.
     pub fn is_edit(&self) -> bool {
+        matches!(
+            self,
+            Self::WriteFile { .. } | Self::ApplyEdits { .. } | Self::LspApplyEdit { .. }
+        )
+    }
+
+    /// File writes may wait for the user to decide what happens to unsaved changes.
+    pub fn may_wait_for_user(&self) -> bool {
         matches!(self, Self::WriteFile { .. } | Self::ApplyEdits { .. })
+    }
+
+    /// LSP calls retain their response while the editor continues polling servers.
+    pub fn is_lsp(&self) -> bool {
+        matches!(
+            self,
+            Self::LspStatus { .. }
+                | Self::LspDiagnostics { .. }
+                | Self::LspPrepareRename { .. }
+                | Self::LspPreviewRename { .. }
+                | Self::LspApplyEdit { .. }
+        )
     }
 
     #[must_use]
     /// Formats a bounded user-facing description of the in-progress call.
     pub fn activity_title(&self) -> String {
         match self {
+            Self::LspStatus { path } => format!("Inspecting language server for {path}"),
+            Self::LspDiagnostics { .. } => "Reading language-server diagnostics".to_string(),
+            Self::LspPrepareRename { path, .. } => format!("Checking rename in {path}"),
+            Self::LspPreviewRename { path, .. } => format!("Previewing rename in {path}"),
+            Self::LspApplyEdit { .. } => "Applying language-server rename (unsaved)".to_string(),
             Self::InlineContext { .. } => "Inspecting inline context".to_string(),
-            Self::ReadFile { path } => format!("Reading {path}"),
+            Self::ReadFile { path, .. } => format!("Reading {path}"),
             Self::WriteFile { path, .. } => format!("Writing {path}"),
             Self::CreateDirectory { path } => format!("Creating {path}/"),
             Self::AddAnnotations {
@@ -260,6 +360,10 @@ pub struct EditorToolRequest {
     pub call: EditorToolCall,
 }
 
+/// How long a file write may wait while the user decides what happens to unsaved
+/// changes in its buffer.
+pub const USER_DECISION_TOOL_TIMEOUT: Duration = Duration::from_secs(600);
+
 /// Codex tool host that forwards all editor-aware reads and writes to Red's owner task.
 #[derive(Debug, Clone)]
 pub struct EditorToolHost {
@@ -273,6 +377,11 @@ impl EditorToolHost {
     }
 
     async fn request(&self, request: EditorToolRequest) -> anyhow::Result<Value> {
+        let response_timeout = if request.call.may_wait_for_user() {
+            USER_DECISION_TOOL_TIMEOUT
+        } else {
+            Duration::from_secs(30)
+        };
         let (response_tx, response_rx) = oneshot::channel();
         timeout(
             Duration::from_secs(30),
@@ -284,7 +393,7 @@ impl EditorToolHost {
         .await
         .map_err(|_| anyhow::anyhow!("editor tool dispatcher is backpressured"))?
         .map_err(|_| anyhow::anyhow!("editor tool dispatcher stopped"))?;
-        timeout(Duration::from_secs(30), response_rx)
+        timeout(response_timeout, response_rx)
             .await
             .map_err(|_| anyhow::anyhow!("editor tool request timed out"))?
             .map_err(|_| anyhow::anyhow!("editor tool dispatcher dropped the response"))?
@@ -294,11 +403,19 @@ impl EditorToolHost {
 
 #[async_trait]
 impl CodexToolHost for EditorToolHost {
-    async fn read_file(&mut self, session_id: &str, path: &str) -> anyhow::Result<Value> {
+    async fn read_file(
+        &mut self,
+        session_id: &str,
+        path: &str,
+        start_line: usize,
+        line_count: usize,
+    ) -> anyhow::Result<Value> {
         self.request(EditorToolRequest {
             session_id: session_id.to_string(),
             call: EditorToolCall::ReadFile {
                 path: path.to_string(),
+                start_line,
+                line_count,
             },
         })
         .await
@@ -374,31 +491,31 @@ pub fn editor_tool_schemas(schema_key: &str) -> Vec<Value> {
         ),
         (
             "open_file",
-            "Open a workspace file in the editor and reveal a zero-based UTF-16 location.",
+            "Open a workspace file in the editor and reveal a zero-based UTF-16 location. This moves the user's view, so use it only when the user asks to see, open, or go to something; read_file reads code without disturbing them.",
             json!({
                 "type": "object",
                 "properties": {
                     "path": {"type": "string"},
-                    "line": {"type": "integer", "minimum": 0},
-                    "character": {"type": "integer", "minimum": 0},
-                    "target": {"type": "string", "enum": ["current", "horizontal", "vertical"]}
+                    "line": {"type": "integer", "minimum": 0, "default": 0},
+                    "character": {"type": "integer", "minimum": 0, "default": 0},
+                    "target": {"type": "string", "enum": ["current", "horizontal", "vertical"], "default": "current"}
                 },
-                "required": ["path", "line", "character", "target"],
+                "required": ["path"],
                 "additionalProperties": false
             }),
         ),
         (
             "select_text",
-            "Open a workspace file and create a visual selection using a half-open, zero-based UTF-16 range.",
+            "Open a workspace file and create a visual selection using a half-open, zero-based UTF-16 range. This moves the user's view and selection, so use it only when the user asks to see or select something.",
             json!({
                 "type": "object",
                 "properties": {
                     "path": {"type": "string"},
                     "start": position,
                     "end": position,
-                    "kind": {"type": "string", "enum": ["character", "line", "block"]}
+                    "kind": {"type": "string", "enum": ["character", "line", "block"], "default": "character"}
                 },
-                "required": ["path", "start", "end", "kind"],
+                "required": ["path", "start", "end"],
                 "additionalProperties": false
             }),
         ),
@@ -501,7 +618,7 @@ pub fn editor_tool_schemas(schema_key: &str) -> Vec<Value> {
             }),
         ),
     ];
-    definitions
+    let mut tools = definitions
         .into_iter()
         .map(|(name, description, schema)| {
             let mut tool = Map::from_iter([
@@ -512,7 +629,29 @@ pub fn editor_tool_schemas(schema_key: &str) -> Vec<Value> {
             tool.insert(schema_key.to_string(), schema);
             Value::Object(tool)
         })
-        .collect()
+        .collect::<Vec<_>>();
+    let lsp_definitions = [
+        ("lsp_status", "Inspect a file's language-server status and supported operations. Does not start a server. Use read_file first to open and synchronize a document.", json!({"path": {"type": "string"}}), vec!["path"]),
+        ("lsp_diagnostics", "Read bounded diagnostics for a file, open buffers, or known workspace reports. Workspace results are not a complete project check. For refresh, scope must be file and read_file must have opened it. wait_ms (0..20000) waits for a new push-only report; it never saves. Continue using expected_generation; restart at offset 0 if it changes.", json!({
+            "scope": {"type": "string", "enum": ["file", "open_buffers", "workspace"]},
+            "path": {"type": ["string", "null"]},
+            "severity": {"type": ["integer", "null"], "enum": [1, 2, 3, 4, null]},
+            "source": {"type": ["string", "null"]}, "code": {"type": ["string", "null"]},
+            "range": {"anyOf": [{"type": "null"}, {"type": "object", "properties": {"start": position, "end": position}, "required": ["start", "end"], "additionalProperties": false}]},
+            "offset": {"type": "integer", "minimum": 0, "default": 0}, "limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": DEFAULT_LSP_DIAGNOSTIC_LIMIT},
+            "expected_generation": {"type": ["integer", "null"], "minimum": 0},
+            "refresh": {"type": "boolean", "default": false}, "wait_ms": {"type": "integer", "minimum": 0, "maximum": 20000, "default": 0}
+        }), vec!["scope"]),
+        ("lsp_prepare_rename", "Check whether an already-read symbol can be renamed. Positions are zero-based UTF-16. An unsupported prepare operation does not necessarily mean rename is unsupported.", json!({"path": {"type": "string"}, "position": position, "expected_revision": {"type": "integer", "minimum": 0}}), vec!["path", "position", "expected_revision"]),
+        ("lsp_preview_rename", "Preview a semantic rename across workspace files. Read the source first and pass its revision. Returns a bounded diff and a session-owned plan_id valid for 120 seconds while captured documents remain unchanged. Does not edit or save.", json!({"path": {"type": "string"}, "position": position, "expected_revision": {"type": "integer", "minimum": 0}, "new_name": {"type": "string", "minLength": 1, "maxLength": 256}}), vec!["path", "position", "expected_revision", "new_name"]),
+        ("lsp_apply_edit", "Apply a previously returned rename plan once, after revalidating all targets. Updates visible buffers and undo history but NEVER saves files. Report unsaved changes to the user. Expired or stale plans require a new preview.", json!({"plan_id": {"type": "string"}}), vec!["plan_id"]),
+    ];
+    for (name, description, properties, required) in lsp_definitions {
+        let mut tool = json!({"type": "function", "name": name, "description": description});
+        tool[schema_key] = json!({"type": "object", "properties": properties, "required": required, "additionalProperties": false});
+        tools.push(tool);
+    }
+    tools
 }
 
 /// Validate and atomically apply half-open UTF-16 edits to text.
@@ -595,7 +734,7 @@ mod tests {
     fn tool_schemas_are_strict_and_bounded() {
         for schema_key in ["parameters", "inputSchema"] {
             let tools = editor_tool_schemas(schema_key);
-            assert_eq!(tools.len(), 8);
+            assert_eq!(tools.len(), 13);
             assert!(tools
                 .iter()
                 .all(|tool| tool[schema_key]["additionalProperties"] == false));
@@ -608,15 +747,79 @@ mod tests {
                 tools[7][schema_key]["properties"]["annotation_ids"]["maxItems"],
                 MAX_AGENT_ANNOTATIONS_PER_CALL
             );
-            assert_eq!(
-                tools[1][schema_key]["required"],
-                json!(["path", "line", "character", "target"])
-            );
+            assert_eq!(tools[1][schema_key]["required"], json!(["path"]));
             assert_eq!(
                 tools[2][schema_key]["required"],
-                json!(["path", "start", "end", "kind"])
+                json!(["path", "start", "end"])
+            );
+            let diagnostics = tools
+                .iter()
+                .find(|tool| tool["name"] == "lsp_diagnostics")
+                .expect("lsp_diagnostics schema");
+            assert_eq!(diagnostics[schema_key]["required"], json!(["scope"]));
+            assert_eq!(
+                diagnostics[schema_key]["properties"]["offset"]["default"],
+                json!(0)
+            );
+            assert_eq!(
+                diagnostics[schema_key]["properties"]["limit"]["default"],
+                json!(DEFAULT_LSP_DIAGNOSTIC_LIMIT)
+            );
+            assert_eq!(
+                diagnostics[schema_key]["properties"]["refresh"]["default"],
+                json!(false)
+            );
+            assert_eq!(
+                diagnostics[schema_key]["properties"]["wait_ms"]["default"],
+                json!(0)
             );
         }
+    }
+
+    #[test]
+    fn minimal_tool_calls_use_declared_defaults() {
+        assert_eq!(
+            EditorToolCall::parse("open_file", json!({"path": "main.rs"})).unwrap(),
+            EditorToolCall::OpenFile {
+                path: "main.rs".to_string(),
+                line: 0,
+                character: 0,
+                target: EditorOpenTarget::Current,
+            }
+        );
+        assert_eq!(
+            EditorToolCall::parse(
+                "select_text",
+                json!({
+                    "path": "main.rs",
+                    "start": {"line": 1, "character": 0},
+                    "end": {"line": 1, "character": 3}
+                })
+            )
+            .unwrap(),
+            EditorToolCall::SelectText {
+                path: "main.rs".to_string(),
+                start: position(1, 0),
+                end: position(1, 3),
+                kind: EditorSelectionKind::Character,
+            }
+        );
+        assert_eq!(
+            EditorToolCall::parse("lsp_diagnostics", json!({"scope": "workspace"})).unwrap(),
+            EditorToolCall::LspDiagnostics {
+                scope: LspDiagnosticScope::Workspace,
+                path: None,
+                severity: None,
+                source: None,
+                code: None,
+                range: None,
+                offset: 0,
+                limit: DEFAULT_LSP_DIAGNOSTIC_LIMIT,
+                expected_generation: None,
+                refresh: false,
+                wait_ms: 0,
+            }
+        );
     }
 
     #[test]

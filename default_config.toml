@@ -21,6 +21,9 @@ scrolloff = 3
 # Wrap long lines at the window edge. This matches Vim/Neovim's 'wrap'.
 wrap = true
 
+# Wrap Ctrl-w h/j/k/l focus across the opposite editor edge.
+wrap_window_navigation = true
+
 # Keep inline questions and answers in local editor recovery snapshots.
 persist_inline_history = true
 
@@ -63,6 +66,13 @@ disable_ai = false
 # Master switch for language-server diagnostics in the editor UI.
 show_diagnostics = true
 
+# Check once per day and install a newer stable Red release in the background.
+# Running sessions keep their version until restarted. Set mode to "notify" to
+# only announce new releases, or "off" to disable automatic checks; :update
+# remains available.
+[updates]
+mode = "auto"
+
 [diagnostics]
 # Show one severity-aware sign beside the line number. Supported icon styles
 # are "nerd_font", "unicode", "ascii", and "none".
@@ -73,6 +83,19 @@ icon_style = "nerd_font"
 # Override `command` only when Codex is installed outside PATH.
 [agent]
 # command = "/path/to/codex"
+# Run file tools immediately by default. Set this to true to reveal each target
+# and retain the deliberate playback pauses used by followed editing.
+follow_tool_calls = false
+# Apply edits confined to the exact inline target immediately. These edits stay
+# unsaved and undoable. Wider same-file proposals always require review.
+auto_apply_inline_edits = true
+# Explicitly opt in before secret-like filenames can enter Agent context.
+allow_sensitive_paths = false
+# Opt in to configured Codex capabilities by exact server name or category.
+enabled_mcp_servers = []
+# Supported values: apps, connectors, plugins, remote_plugin,
+# skill_mcp_dependency_install, orchestrator_mcp.
+enabled_codex_features = []
 
 [search]
 # Preview the next match while typing / or ?.
@@ -122,6 +145,8 @@ excluded_patterns = [".env", ".env.*", "*.pem", "*.key", "**/.git/**"]
 # Query input position in picker dialogs. Supported values are "bottom" and
 # "top". Bottom matches the default command-line-oriented picker layout.
 input_position = "bottom"
+# Draw hierarchy connectors before icons in tree-aware picker rows.
+tree_guides = true
 
 # Picker icons use nvim-web-devicons-compatible glyphs and colors by default
 # and require Nerd Font 3.3+. "unicode" and "ascii" are portable fallbacks;
@@ -136,7 +161,7 @@ color = true
 # The first three positions use the theme's accent, middle, and base shades.
 [statusline]
 left = ["mode", "diagnostics", "git_branch", "filename"]
-right = ["position", "syntax"]
+right = ["position", "syntax", "agent_activity"]
 
 # Nerd Font icons match nvim-web-devicons. "unicode" and "ascii" are
 # portable fallbacks; "none" keeps the labels while hiding their icons.
@@ -171,13 +196,17 @@ waiting = "steady_underscore"
 # [lsp]
 # format_on_save = false # Legacy alias for formatting.on_save.
 #
-# Supported documents are formatted on save by default. Set on_save to false
-# to disable it. The modern setting wins over the legacy alias in the same
-# config layer; command-line overrides still take precedence over the user file.
+# Pasted code is reindented and supported ranges and documents are formatted by
+# default. Set on_paste or on_save to false to disable that behavior. The modern
+# save setting wins over the legacy alias in the same config layer; command-line
+# overrides still take precedence over the user file.
 # Select an external language-pack formatter, LSP formatting, or automatic fallback:
 #
 # [formatting]
+# on_paste = true # Reindents locally; also uses LSP range formatting when supported.
 # on_save = false
+# trim_trailing_whitespace = true
+# trim_trailing_whitespace_exclude = ["gitcommit", "markdown"]
 # provider = "auto" # "auto", "external", or "lsp"
 #
 # [lsp.servers.rust]
@@ -186,6 +215,10 @@ waiting = "steady_underscore"
 # language_id = "rust"
 # file_extensions = ["rs"]
 # root_markers = ["Cargo.toml", ".git"]
+#
+# To use Rust Glancer instead, replace the Rust server section with the complete
+# examples/rust-glancer.toml example. See docs/RUST_GLANCER.md for installation,
+# diagnostics, and switching back to rust-analyzer.
 #
 # Servers that handle multiple language ids can use document selectors:
 #
@@ -210,6 +243,7 @@ waiting = "steady_underscore"
 # extensions = ["build"]
 # filenames = ["Buildfile"]
 # aliases = ["build-script"]
+# shebangs = ["build-script"]
 # comment = "# %s"
 # indent_width = 2
 #
@@ -230,6 +264,15 @@ waiting = "steady_underscore"
 # validate = true
 #
 # Apply language changes without restarting using `:languages reload`.
+
+# Manual and insert-mode comment formatting target 100 source columns by default.
+# A language definition can override this with its own text_width.
+# Set text_width to 0 to disable automatic wrapping and make gq use the viewport.
+[commenting]
+text_width = 100
+auto_wrap = true
+continue_on_enter = true
+continue_on_open_line = true
 
 # Comment templates use Neovim's commentstring format. The single %s is
 # replaced with each selected line. Add or override languages and extensions
@@ -271,6 +314,7 @@ Tab = "InsertTab"
 "Ctrl-Space" = "RequestCompletion"
 "Alt-\\" = "RequestInlineCompletion"
 "Ctrl-k" = "SignatureHelp"
+"Ctrl-e" = [ { EnterMode = "Normal" }, { PluginCommand = "NeoTree" } ]
 Esc = { EnterMode = "Normal" }
 
 [keys.normal]
@@ -280,10 +324,14 @@ Esc = { EnterMode = "Normal" }
 "e" = "MoveToNextWordEnd"
 "E" = "MoveToNextBigWordEnd"
 "B" = "MoveToPreviousBigWord"
+"{" = "MoveToPreviousParagraph"
+"}" = "MoveToNextParagraph"
+"(" = "MoveToPreviousSentence"
+")" = "MoveToNextSentence"
 "o" = "InsertLineBelowCursor"
 "O" = "InsertLineAtCursor"
 "G" = "MoveToBottom"
-"g" = { "g" = "MoveToTop", "%" = "MatchitBackward", "c" = { StartCommentOperator = 1 }, "d" = "GoToDefinition", "j" = "MoveScreenLineDown", "k" = "MoveScreenLineUp", "0" = "MoveToScreenLineStart", "^" = "MoveToScreenLineFirstNonBlank", "$" = "MoveToScreenLineEnd", "e" = "MoveToPreviousWordEnd", "E" = "MoveToPreviousBigWordEnd", "J" = { JoinLinesKeepSpaces = 2 }, "W" = "ToggleWrap", "v" = "RestoreLastVisualSelection", "u" = { StartLowercaseOperator = 1 }, "U" = { StartUppercaseOperator = 1 }, "~" = { StartToggleCaseOperator = 1 }, "-" = "SelectPreviousUndoBranch", "+" = "SelectNextUndoBranch" }
+"g" = { "g" = "MoveToTop", "%" = "MatchitBackward", "c" = { StartCommentOperator = 1 }, "q" = { StartFormatOperator = 1 }, "d" = "GoToDefinition", "j" = "MoveScreenLineDown", "k" = "MoveScreenLineUp", "0" = "MoveToScreenLineStart", "^" = "MoveToScreenLineFirstNonBlank", "$" = "MoveToScreenLineEnd", "e" = "MoveToPreviousWordEnd", "E" = "MoveToPreviousBigWordEnd", "J" = { JoinLinesKeepSpaces = 2 }, "W" = "ToggleWrap", "v" = "RestoreLastVisualSelection", "u" = { StartLowercaseOperator = 1 }, "U" = { StartUppercaseOperator = 1 }, "~" = { StartToggleCaseOperator = 1 }, "-" = "SelectPreviousUndoBranch", "+" = "SelectNextUndoBranch" }
 "u" = "Undo"
 "U" = "Redo"
 "Ctrl-r" = "Redo"
@@ -337,6 +385,9 @@ Esc = { EnterMode = "Normal" }
 # "|" = "Split" 
 # "_" = "SplitVertical"
 "Ctrl-p" = "FilePicker"
+"Ctrl-n" = "SelectNextOccurrence"
+"Ctrl-Up" = "AddCursorUp"
+"Ctrl-Down" = "AddCursorDown"
 "Ctrl-Shift-p" = "CommandPalette"
 "Alt-a" = { PluginCommand = "AgentToggle" }
 "Alt-c" = { PluginCommand = "AgentClear" }
@@ -396,6 +447,7 @@ Esc = { EnterMode = "Normal" }
 "w" = "NextWindow"
 "W" = "PreviousWindow"
 "p" = "PreviousWindow"
+"n" = "SplitHorizontalNewBuffer"
 "s" = "SplitHorizontal"
 "v" = "SplitVertical"
 "d" = "SplitVertical"
@@ -442,7 +494,7 @@ Esc = { EnterMode = "Normal" }
 "G" = { PluginCommand = "GitDashboard" }
 "?" = "CommandPalette"
 "h" = { "s" = { PluginCommand = "GitHunkStage" }, "u" = { PluginCommand = "GitHunkUnstage" }, "r" = { PluginCommand = "GitHunkReset" } }
-"c" = { "c" = { PluginCommand = "GitSubmitMessage" }, "q" = { PluginCommand = "GitCancelMessage" } }
+"c" = { "a" = "CodeAction", "c" = { PluginCommand = "GitSubmitMessage" }, "q" = { PluginCommand = "GitCancelMessage" } }
 
 [keys.normal." "."]"]
 "c" = "NextInlineComment"
@@ -468,6 +520,7 @@ Esc = { EnterMode = "Normal" }
 Esc = { EnterMode = "Normal" }
 ":" = { EnterMode = "Command" }
 "y" = [ "Yank", { EnterMode = "Normal" } ]
+"d" = [ "Delete", { EnterMode = "Normal" } ]
 "x" = [ "Delete", { EnterMode = "Normal" } ]
 "c" = "ChangeSelection"
 "p" = [ "Paste", { EnterMode = "Normal" } ]
@@ -476,7 +529,7 @@ Esc = { EnterMode = "Normal" }
 ">" = { IndentSelection = 1 }
 "<" = { UnindentSelection = 1 }
 "J" = [ { JoinLines = 2 }, { EnterMode = "Normal" } ]
-"g" = { "c" = [ "ToggleCommentSelection", { EnterMode = "Normal" } ], "J" = [ { JoinLinesKeepSpaces = 2 }, { EnterMode = "Normal" } ], "v" = "RestoreLastVisualSelection" }
+"g" = { "c" = [ "ToggleCommentSelection", { EnterMode = "Normal" } ], "q" = [ "FormatSelection", { EnterMode = "Normal" } ], "J" = [ { JoinLinesKeepSpaces = 2 }, { EnterMode = "Normal" } ], "v" = "RestoreLastVisualSelection" }
 "u" = [ { TransformSelection = "Lower" }, { EnterMode = "Normal" } ]
 "U" = [ { TransformSelection = "Upper" }, { EnterMode = "Normal" } ]
 "~" = [ { TransformSelection = "Toggle" }, { EnterMode = "Normal" } ]

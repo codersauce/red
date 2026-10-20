@@ -551,11 +551,7 @@ impl PluginWorkspace {
         if self.rows_visible.is_empty() {
             return;
         }
-        let mut next = self
-            .rows_visible
-            .iter()
-            .position(|index| *index == self.selected)
-            .unwrap_or(0);
+        let mut next = self.rows_visible.binary_search(&self.selected).unwrap_or(0);
         loop {
             let candidate = next
                 .saturating_add_signed(delta)
@@ -619,7 +615,7 @@ impl PluginWorkspace {
                 self.rows_visible.push(index);
             }
         }
-        if !self.rows_visible.contains(&self.selected) {
+        if self.rows_visible.binary_search(&self.selected).is_err() {
             self.selected = self
                 .rows_visible
                 .iter()
@@ -675,7 +671,8 @@ impl PluginWorkspace {
             selected_index: self.selected,
             row: self
                 .rows_visible
-                .contains(&self.selected)
+                .binary_search(&self.selected)
+                .is_ok()
                 .then(|| self.model.rows.get(self.selected).cloned())
                 .flatten(),
             focus: self.focus,
@@ -716,12 +713,11 @@ impl PluginWorkspace {
                     .collect()
             })
             .unwrap_or_default();
-        if !self.detail_visible.contains(&self.detail_cursor) {
+        if let Err(position) = self.detail_visible.binary_search(&self.detail_cursor) {
             self.detail_cursor = self
                 .detail_visible
-                .iter()
+                .get(position)
                 .copied()
-                .find(|index| *index >= self.detail_cursor)
                 .or_else(|| self.detail_visible.last().copied())
                 .unwrap_or(0);
         }
@@ -772,8 +768,7 @@ impl PluginWorkspace {
         }
         let position = self
             .detail_visible
-            .iter()
-            .position(|index| *index == self.detail_cursor)
+            .binary_search(&self.detail_cursor)
             .unwrap_or(0);
         self.detail_cursor = self.detail_visible[position
             .saturating_add_signed(delta)
@@ -853,13 +848,11 @@ impl PluginWorkspace {
         if let Some(target) = target {
             let current = self
                 .detail_visible
-                .iter()
-                .position(|index| *index == self.detail_cursor)
+                .binary_search(&self.detail_cursor)
                 .unwrap_or(0);
             let target = self
                 .detail_visible
-                .iter()
-                .position(|index| *index == target)
+                .binary_search(&target)
                 .unwrap_or(current);
             self.move_detail(target as isize - current as isize, visible_rows);
         }
@@ -1268,7 +1261,11 @@ impl PluginWorkspace {
             );
             actions
                 .push(UiAction::new("?", "?", "actions").with_priority(ActionPriority::Essential));
-            actions.push(UiAction::new("q", "q", "close").with_priority(ActionPriority::Essential));
+            if !actions.iter().any(|action| action.id == "q") {
+                actions.push(
+                    UiAction::new("q", "q", "close").with_priority(ActionPriority::Essential),
+                );
+            }
             actions.extend(crate::ui::reference_actions(&[
                 ("Navigation", "j / k / ↑ / ↓", "Move down / up"),
                 ("Navigation", "Ctrl+u / Ctrl+d", "Move half a page"),
@@ -1690,8 +1687,21 @@ fn highlight_document_projection(
         })
         .collect::<Vec<_>>();
     let source = source_lines.join("\n");
-    let spans = highlighter
-        .highlight_for_file(Some(&document.path), &source)
+    let first_line = document.lines.iter().find(|line| {
+        if new_side {
+            line.new_line == Some(1)
+        } else {
+            line.old_line == Some(1)
+        }
+    });
+    let language = highlighter
+        .language_id_for_source(
+            Some(&document.path),
+            first_line.map_or("", |line| line.text.as_str()),
+        )
+        .map(str::to_owned);
+    let spans = language
+        .and_then(|language| highlighter.highlight(&language, &source).ok())
         .unwrap_or_default();
     let mut result = (0..document.lines.len())
         .map(|_| Vec::new())
@@ -2471,6 +2481,25 @@ mod tests {
     }
 
     #[test]
+    fn an_unnumbered_context_note_stays_visible_after_hunks() {
+        let mut model = action_model();
+        let document = model.detail_document.as_mut().unwrap();
+        document.lines.push(WorkspaceDocumentLine {
+            id: "note".to_string(),
+            kind: "context".to_string(),
+            text: "… 801 more diff lines not shown".to_string(),
+            ..Default::default()
+        });
+        let note = document.lines.len() - 1;
+        let mut workspace = PluginWorkspace::new("history".to_string(), WorkspaceConfig::default());
+        workspace.update(model, &Theme::default());
+        assert!(
+            workspace.detail_visible.contains(&note),
+            "edit history relies on this note being shown without M"
+        );
+    }
+
+    #[test]
     fn filter_collapse_and_width_survive_model_updates() {
         let mut model = action_model();
         let mut heading = row("section:unstaged", false);
@@ -2854,6 +2883,29 @@ mod tests {
         assert_eq!(stage.focus, WorkspaceFocus::Rows);
         assert_eq!(stage.row.unwrap().id, "untracked:new-file.txt");
         assert!(stage.detail_line.is_none());
+    }
+
+    #[test]
+    fn workspace_preserves_plugin_owned_back_action() {
+        let mut workspace = PluginWorkspace::new("git".to_string(), WorkspaceConfig::default());
+        let mut model = model_with_document();
+        model.actions = vec![WorkspaceAction {
+            hint: UiAction::new("q", "q", "back"),
+            focus: String::new(),
+            sections: Vec::new(),
+            selection: String::new(),
+            change_only: false,
+            hunk_only: false,
+        }];
+        workspace.update(model, &Theme::default());
+
+        let actions = workspace.actions();
+        let quit_actions = actions
+            .iter()
+            .filter(|action| action.id == "q")
+            .collect::<Vec<_>>();
+        assert_eq!(quit_actions.len(), 1);
+        assert_eq!(quit_actions[0].label, "back");
     }
 
     #[test]

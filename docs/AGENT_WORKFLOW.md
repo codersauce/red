@@ -3,7 +3,7 @@
 Red launches the installed Codex CLI as an app-server and speaks its JSONL
 protocol directly. There is no ACP client, adapter, or companion executable.
 The bundled Husk plugin owns the terminal UI; Rust core owns the Codex process,
-thread and turn lifecycle, dynamic tools, paced following, saving, and attributed
+thread and turn lifecycle, dynamic tools, optional followed playback, saving, and attributed
 application.
 
 ## Prerequisites
@@ -41,10 +41,12 @@ native tools, four bounded project-reading tools, and four submission tools.
 opening files or moving focus. Unsaved buffers take precedence over disk.
 `read_git_diff` compares one tracked file at `HEAD` with its current buffer,
 including unsaved changes. The response identifies the exact base commit.
-Reading more context does not expand the editable target. Inline requests have
-at most 12 context reads; file reads are limited to 200 lines and 32 KiB per
-response, and files larger than 512 KiB are omitted. Results report truncation.
-Sensitive, ignored, binary, symlinked, and out-of-workspace files are excluded.
+Reading more context does not expand the editable target. File reads are limited
+to 200 lines and 32 KiB per response, and files larger than 512 KiB are omitted.
+Results report truncation.
+Ignored, binary, symlinked, and out-of-workspace files are excluded. Secret-like
+filenames are excluded by default and can be included explicitly with
+`[agent] allow_sensitive_paths = true`.
 On platforms without the safe on-disk reader, open-buffer reads remain available
 and other disk reads fail closed.
 
@@ -58,7 +60,7 @@ supplied target or replacement, and cannot escape it. Codex cannot choose a
 file. Red supplies the immutable target plus at most 20 surrounding
 lines on either side and a bounded recap of the current Agent conversation
 when it belongs to the same workspace. Current buffer contents remain
-authoritative. Red rejects sensitive/ignored/out-of-workspace and binary
+authoritative. Red rejects disallowed sensitive, ignored, out-of-workspace, and binary
 contexts, and accepts at most a 128 KiB complete replacement, 16 comments per
 result, and 4 KiB of plain text per comment. An empty comment list is a valid
 no-findings result. Follow-up
@@ -91,11 +93,13 @@ verbatim indentation and readable wrapping in narrow windows.
 
 Before applying a response, Red verifies the active buffer identity, revision,
 range, and original text. A stale response fails without changing the buffer.
-Every code-changing result waits for explicit review, including results that
-finish while their dialog is open. Enter opens the proposed diff; `a` applies
-that reviewed request, `d` declines it, and Esc returns or hides it. Enter in
-the diff does not apply it. Successful output is applied only after a completed
-turn and full validation.
+By default, a code-changing result confined to the exact requested target
+applies immediately when its original popup is still in the foreground. Set
+`[agent] auto_apply_inline_edits = false` to require review for those results.
+Background, stale, and wider-scope results always wait for review. Enter opens a
+staged diff; `a` applies that reviewed request, `d` declines it, and Esc returns
+or hides it. Enter in the diff does not apply it. Successful output is applied
+only after a completed turn and full validation.
 Code changes use one agent-attributed editor transaction and are deliberately
 not saved. Comment-only results do not alter dirty state or text undo history.
 After a code edit, Red retains an editor-generated **Applied** summary even when
@@ -258,13 +262,46 @@ draft, up to roughly 70% of the Agent pane. Longer drafts scroll within that
 space. It shrinks again when text is removed or sent, and short panes always
 retain room for the conversation.
 
+In Insert mode, Up and Down continue to move through a multiline draft. Up on
+the first visual row recalls an older prompt; once history browsing starts,
+Up/Down step through the persisted prompt MRU and Down past the newest entry
+restores the exact unsent draft and cursor. `Ctrl-r` opens an empty, editable
+`Search prompts:` field for incremental substring search over the same history.
+Matching prompts appear separately below the query. Type to narrow, press
+`Ctrl-r` again for an older match, and press Enter to load the match for editing
+without sending it. Escape or `Ctrl-g` cancels and leaves the draft unchanged.
+Normal-mode `Ctrl-r` remains redo, while `/` and `?` keep searching only within
+the current prompt.
+
 Open a workspace, press `Space A` (or run `:Agent`), type a request, and press
 Enter. Red lazily starts `codex app-server --stdio`, initializes the connection,
 checks the account, starts a persisted thread, and submits turns with
 `turn/start`. Follow-up text and the busy indicator render before dispatch;
 follow-ups submitted during an active turn appear immediately and remain queued
 in FIFO order. Assistant deltas stream into the conversation footer. `Ctrl-c`
-interrupts the active turn with `turn/interrupt`.
+interrupts the active turn with `turn/interrupt` and keeps the same Codex
+thread, so the next prompt continues the conversation with its full context. A
+prompt sent while the interrupt is still settling waits for the interrupted
+turn to end instead of racing it; if the app-server stops first, those
+messages come back to the pane as paused follow-ups. Queued follow-ups pause after a stopped or
+failed turn; the pane status shows how many are held, `:AgentSendQueued`
+resumes them, and `:AgentDiscardQueued` drops them. A message sent while Codex
+cannot start is held the same way: it stays visible in the pane, and the Retry
+action or `:AgentSendQueued` sends it once Codex is available. While a turn is in flight,
+the `agent_activity` statusline field (on the right by default) shows
+`agent working`, `agent following`, or `agent stopping`, plus any queued count,
+and it disappears when the agent is idle. A turn that finishes while the pane is
+hidden prints `Agent finished · Space A to view`. Queued follow-ups are drawn as
+dimmed `You · queued` cards until they are sent. `Space A` always lands in the
+composer's Insert mode, even if you left it in Normal mode.
+
+The pane sizes itself to the terminal: it takes at most 45% of the width (and
+never less than 32 columns), so the editor keeps room to work. On a terminal too
+narrow for a 32-column pane beside a 40-column editor, the pane stops docking.
+It covers the whole screen while you are in it, and `Esc` back to the editor
+gives the editor the full width again; `Space A` brings the pane back. A width
+you set by dragging or resizing the pane is kept as long as the editor keeps 40
+columns.
 
 `Tab` or `Shift-Tab` switches between the composer and transcript, preserving
 the draft, composer editing mode, and transcript reading position. Switching
@@ -332,13 +369,41 @@ and reattaching does not intentionally replace a healthy process.
 
 Red snapshots the Codex thread ID together with a structured, clean projection
 of the model-visible user and assistant messages. After an owner or machine
-restart, the Agent composer remains disabled while Red starts a replacement
-app-server and calls `thread/resume`. The returned turns reconcile the panel to
+restart, Red starts a replacement app-server and calls `thread/resume`; the
+composer stays open and a message typed meanwhile is sent once the thread is
+back. The returned turns reconcile the panel to
 the history Codex actually loaded; Red's projection keeps injected editor
 context out of the visible user message. If the persisted thread is missing or
 cannot be loaded, Red marks the transcript as archived and makes the next prompt
 start a new thread with bounded recovered context instead of pretending the old
 session is live.
+
+Quitting Red does not end the conversation. Each workspace keeps its latest
+Agent conversation under `~/.config/red/agent/conversations/`, and the next
+normal launch in that workspace continues the same Codex thread: the pane shows
+"↺ Picked up where you left off 2 hours ago" and the thread resumes when the
+pane opens or the first message is sent, so a launch that never uses the agent
+never starts Codex. `:AgentNew` forgets the saved conversation. If the thread
+cannot be resumed, for example after a Codex upgrade that changes Red's tools,
+the next message starts a new thread seeded with the recent transcript.
+
+Only one Red at a time drives a workspace's conversation. The first editor to
+use it holds an operating-system lock on it until it exits; a second Red opened
+in the same workspace, including one started with `--resume`, starts its own
+thread, says so in the status line, and never saves that thread over the first
+editor's conversation, even after the first editor exits. The operating system
+releases the lock when its editor exits or crashes, so the next launch resumes.
+
+If Codex stops in the middle of a reply, Red keeps everything that streamed so
+far, adds a notice to the transcript, and resumes the thread in the background,
+but sends nothing else on its own: queued follow-ups wait. The notice offers
+**Retry the message**, **Ask Codex to continue where it stopped**, and **Leave it
+here** (press Tab, then `]l` to reach a choice and Enter to pick it, or run
+`:AgentRecover` or `Space A` for a picker). Typing a new message also moves on. Edits the
+interrupted turn already made stay applied, and both Retry and Continue tell
+Codex so. A turn that fails on its own while Codex keeps running (an error, or a
+stop you did not ask for) offers the same three choices under its error. A
+crash while the agent is idle resumes quietly.
 
 ## Followed editing
 
@@ -347,8 +412,10 @@ Every Codex thread is started with:
 - `sandbox = "read-only"`
 - `approvalPolicy = "never"`
 - no execution environments
-- configured MCP servers disabled
-- apps, connectors, plugins, orchestrator MCP, and notifications disabled
+- configured MCP servers disabled unless named in `agent.enabled_mcp_servers`
+- apps, connectors, plugins, remote plugins, skill MCP dependency installation,
+  and orchestrator MCP disabled unless named in `agent.enabled_codex_features`
+- notifications disabled
 - hooks disabled unless the managed Codex policy requires them; when required,
   Codex may also load trusted user, workspace, or plugin hooks
 - Red's bounded dynamic tools and live-edit instructions
@@ -356,13 +423,13 @@ Every Codex thread is started with:
 Native command, file-change, and permission escalation requests are denied.
 Red never asks Codex to edit the workspace directly.
 
-Codex receives twelve dynamic tools:
+Codex receives these bounded dynamic tools:
 
 | Tool | Behavior |
 | --- | --- |
-| `list_files` | Lists at most 4,096 workspace files while respecting ignore files. |
-| `search_files` | Searches bounded text content and returns at most 200 matches. |
-| `read_file` | Reveals and reads the authoritative Red buffer, returning its revision. |
+| `list_files` | Lists sorted workspace files in pages of up to 4,096 while respecting ignore and sensitive-path policy; `next_offset` continues the walk result. |
+| `search_files` | Searches bounded text content, reports truncation, and returns at most 200 matches. |
+| `read_file` | Reads an authoritative Red-buffer page of up to 1,000 lines and 256 KiB, using one-based file line numbers and returning its revision and `next_line`. Any valid page may start a fresh read without `expected_revision`; continuations that must share one snapshot pass the first page's revision and restart if it changes. A single line over 256 KiB returns an explicit error rather than partial source. |
 | `write_file` | Replaces revision-checked contents through Red, creates missing parent directories, and saves the buffer. |
 | `create_directory` | Creates a workspace directory and missing parents; an existing directory is a successful no-op. |
 | `get_editor_state` | Returns bounded active-file, cursor, selection, window, diagnostic, and current-annotation state. |
@@ -372,6 +439,63 @@ Codex receives twelve dynamic tools:
 | `add_annotations` | Adds up to 16 revision-checked source annotation cards without editing or saving the file. |
 | `dismiss_annotations` | Hides visible annotation cards by stable ID without deleting source or conversation history. |
 | `run_editor_action` | Runs an allow-listed navigation or LSP action, including annotation traversal and overlap cycling. |
+| `lsp_status` | Reports a file's server, workspace, readiness, and negotiated capabilities without starting a server. |
+| `lsp_diagnostics` | Reads paginated diagnostics for a file, open buffers, or known workspace reports; supports severity, source, code, and UTF-16 range filters. |
+| `lsp_prepare_rename` | Checks rename eligibility at a revision-checked UTF-16 position when the server supports preparation. |
+| `lsp_preview_rename` | Computes a semantic rename and returns affected files, a bounded diff, and an expiring edit-plan ID without changing text. |
+| `lsp_apply_edit` | Applies a previously returned plan to buffers with agent attribution and per-file undo. **Never saves files.** |
+
+### Language-server tools
+
+Each saved conversation records the dynamic-tool contract version used to create
+its app-server thread. After an upgrade changes that contract, Red keeps the old
+transcript visible but does not resume it against an incompatible tool list; the
+next message starts a new compatible session automatically.
+
+Read the source with `read_file` before requesting diagnostics refresh or rename.
+That opens the authoritative buffer and starts its configured language server.
+Use `lsp_status` to distinguish `ready`, `starting`, `not_started`, `failed`, and
+`unsupported`; retry requests after initialization rather than interpreting a
+missing server as an empty result. Rename positions are zero-based UTF-16, and
+`expected_revision` must match the preceding read. A server that supports rename
+without `prepareRename` can still provide a rename preview.
+
+`lsp_diagnostics` returns at most 100 items per page. File scope requires `path`;
+other scopes require a null path. Optional `severity` is 1 (error), 2 (warning),
+3 (information), or 4 (hint); `source`, `code`, and file-only `range` narrow the
+results. Pass null for unused filters. Continue at `next_offset` with the returned
+`generation` as `expected_generation`, restarting at offset 0 if reports or their
+rebased positions change. Diagnostic messages and related information are bounded;
+server-specific `data` remains internal and related paths obey agent access policy.
+
+Workspace scope means known reports, not a scan or a complete project check.
+Responses expose coverage, report receipt times, observed revisions, and freshness:
+`provisional` for restored reports, `stale` after a known buffer change,
+`unversioned` when exact server-version freshness cannot be proved, and
+`not_received` before a report exists. An empty provisional or unversioned result
+is not proof that compilation passed. Collection continues when diagnostic display
+is disabled. Refresh uses document diagnostic pulls where supported; for push-only
+servers, `wait_ms` can wait up to 20 seconds for a new report. A timeout is explicit.
+The tool never saves a file to trigger compiler diagnostics.
+
+Rename previews are scoped to the active agent turn and server instance, last at
+most 120 seconds, and can be applied once. Changes to the source or affected open
+buffers invalidate a plan; unopened targets are checked against pinned disk
+snapshots before application. All targets must satisfy both the agent workspace
+policy and the originating LSP workspace boundary. Symlinks, protected paths,
+invalid edits, and file create/rename/delete operations are rejected before text
+changes. At most four previews are retained, with 64 document operations and an
+8 MiB source/prepared-content budget per request; displayed diffs are capped at
+64 KiB and report truncation.
+
+`lsp_apply_edit` changes buffers, preserves unrelated unsaved text, records one
+undo transaction per changed file, and reports `saved: false`. Review or save the
+changed buffers explicitly in Red. This differs from `apply_edits` and `write_file`,
+which save. LSP tools do not move the cursor, open pickers, or use followed-edit
+playback delays. Cancelling a turn cancels pending queries and prevents delayed
+responses from applying changes. Code actions, formatting tools, general symbol
+queries, and resource operations remain follow-up work; existing editor commands
+are unchanged.
 
 Agent annotations use zero-based, inclusive file line ranges. They share inline
 assist's source anchors, overlap projection, stale-source indicator, cards, and
@@ -394,8 +518,12 @@ fall through to file-path or external-URL handling.
 
 Tool paths must remain below the physical workspace root. Reads and writes
 reject parent traversal, symlink components, special files, unsafe roots,
-oversized content, stale revisions, and overlapping edits. Reads always see the
-latest visible editor contents, including unsaved user changes.
+oversized content, stale revisions, and overlapping edits. Version-control
+metadata (`.git`, `.hg`, `.jj`, `.svn`) is never read, listed, or searched.
+Writes also refuse protected control paths such as Git hooks, `.red/`,
+`red.toml`, and `.vscode/tasks.json` before any buffer changes. Secret-like
+paths also require `[agent] allow_sensitive_paths = true`. Reads always see the latest
+visible editor contents, including unsaved user changes.
 
 Directory creation is confined to the same workspace and rejects ignored,
 protected, symlinked, and non-directory paths. It creates at most 64 path
@@ -410,19 +538,23 @@ from the physical workspace root. It fails closed on symlinks and special files.
 Content search is unavailable on platforms without that safe read boundary;
 Codex must use `read_file` through Red instead.
 
-Following is mandatory in this first iteration. Before a file tool runs, Red
-opens the target, moves the cursor to the first affected range when available,
-renders it, and waits briefly. The operation then passes through the editor's
-transaction boundary with session/turn attribution and saves through the editor.
-Tool calls remain serialized, which provides a natural future boundary for
-pause, resume, and single-step controls.
+Tool calls remain serialized. By default they run without deliberate playback
+pauses, and incidental file tools restore the user's active buffer after they
+finish. Explicit navigation tools still change the active location. Set
+`[agent] follow_tool_calls = true` to reveal each file target, move to the first
+affected range when available, render it, and wait briefly before the operation.
+Mutations always pass through the editor's transaction boundary with
+session/turn attribution and save through the editor.
 
 ## Limits and failure behavior
 
-App-server frames are capped at 1 MiB and tool content at 960 KiB. Each turn is
-limited to 32 dynamic-tool calls. File listing, search results, search bytes,
-queues, and callback duration are bounded. Oversized or malformed frames stop
-the Codex runtime without being rendered into the terminal.
+App-server frames are capped at 1 MiB and tool content at 960 KiB. File-list
+pages, workspace-walk work, search results, search bytes, queues, and callback
+duration are bounded. File listings and reads expose continuation metadata;
+search reports when its bounded scan was truncated. There is no per-turn tool
+call count limit.
+Oversized or malformed frames stop the Codex runtime without being rendered into
+the terminal.
 
 App-server stderr is isolated from the TUI. Structured failures appear in the
 conversation and status line. A stopped process is restarted and the persisted
@@ -437,13 +569,16 @@ protocol is unavailable; it does not fall back to `codex exec` or native edits.
 
 | Command | Purpose |
 | --- | --- |
-| `Space i` | Edit the current line or visual selection in a bounded popup. |
+| `Space i` | Review, explain, or edit the enclosing function, current-line fallback, or exact visual selection in a bounded popup. |
 | `:Agent` / `:AgentPrompt` | Open the prompt composer. |
 | `:AgentToggle` / `Alt+a` | Show or hide the Agent pane. |
 | `:AgentOpen` | Show and focus the conversation pane without opening a prompt. |
 | `:AgentSessions` / `Alt+s` | Search and resume previous sessions inside the Agent pane. |
-| `:AgentModel` / `Alt+m` | Choose this conversation’s model and reasoning effort. |
-| `:AgentCancel` | Interrupt the active Codex turn. |
+| `:AgentModel` / `Alt+m` in the Agent pane | Choose this conversation’s model and reasoning effort. |
+| `:AgentCancel` | Interrupt the active Codex turn and keep the thread. |
+| `:AgentSendQueued` | Resume follow-ups held after a stopped or failed turn. |
+| `:AgentDiscardQueued` | Drop follow-ups that have not been sent. |
+| `:AgentRecover` | Retry, continue, or leave a reply that Codex stopped in the middle of. |
 | `:AgentClear` / `Alt+c` | Clear visible conversation while retaining current context. |
 | `:AgentNew` / `Alt+n` | Close the current thread and start a new one. |
 | `:AgentClose` / `Alt+w` | Hide the conversation panel without discarding state. |

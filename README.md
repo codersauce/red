@@ -7,11 +7,11 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Discord](https://img.shields.io/badge/Discord-Join%20us-7289DA?logo=discord&logoColor=white)](https://discord.gg/5PWvAUNRHU)
 
-> The modal editor for the agent era.
+> The Vim-style terminal editor where your coding agent works through your editor.
 
-Fast, familiar editing with modern code intelligence and a safer way to work
-with agents. One self-contained Rust binary. No required configuration. Your
-files stay yours.
+Vim muscle memory, editor-aware Codex agents, focused inline assistance, and
+modern code intelligence in one self-contained Rust binary. Red works without
+configuration; optional agent support requires an installed, authenticated Codex CLI.
 
 [Website](https://getred.dev) ·
 [Download](https://github.com/codersauce/red/releases/latest) ·
@@ -19,20 +19,11 @@ files stay yours.
 [Documentation](#documentation) ·
 [Community](https://discord.gg/5PWvAUNRHU)
 
-<!-- current-release: 0.6.0 -->
+<!-- current-release: 0.9.1 -->
 The current documented release is
-[v0.6.0](https://github.com/codersauce/red/releases/tag/v0.6.0).
+[v0.9.1](https://github.com/codersauce/red/releases/tag/v0.9.1).
 
 ![Red editing its Rust rendering pipeline with the project tree open](docs/images/editor-overview.jpg)
-
-## Husk language
-
-The source tree contains the extracted Husk embedding API, standalone CLI, local
-package resolver, and portable WebAssembly Component extension runtime. Start
-with the [language and embedding guide](docs/HUSK_LANGUAGE_GUIDE.md). The
-[research and implementation plan](docs/HUSK_LANGUAGE_EXTRACTION_PLAN.md) and
-[card-by-card status](docs/HUSK_IMPLEMENTATION_STATUS.md) explain the dynamic
-Rust-crate design, completed work, and remaining release-hardening tasks.
 
 ## Install
 
@@ -64,7 +55,7 @@ The PowerShell installer verifies the release checksum, installs to
 To pin a release or choose another directory:
 
 ```shell
-RED_VERSION=0.6.0 RED_INSTALL_DIR="$HOME/bin" \
+RED_VERSION=0.9.1 RED_INSTALL_DIR="$HOME/bin" \
   sh -c "$(curl --proto '=https' --tlsv1.2 -fsSL https://getred.dev/install.sh)"
 ```
 
@@ -73,25 +64,53 @@ You can also download a
 [build from source](#development). Red's editor, default configuration, themes,
 and plugins are bundled into the executable.
 
+Official standalone installations can check or install the latest stable release:
+
+```shell
+red update --check
+red update
+```
+
+Inside the editor, use `:update` or **Update Red** in the command palette. By default
+Red checks once per day and installs a newer stable release in the background after
+verifying its signed checksums; running sessions keep their version until restarted.
+Homebrew installations use `brew upgrade codersauce/tap/red`; source builds use
+your existing build process. If you installed Red before v0.8.2 or extracted an
+archive manually, rerun the official installer once into the same directory to
+enable managed updates. See [Updating Red](docs/UPDATING.md) for migration commands,
+restart behavior, and switching to notify-only or disabling automatic checks.
+
 Agent support is optional. It requires Codex CLI 0.144.1 or newer and a
 completed `codex login`.
 
 ## Why Red
 
-- **Stay in flow.** Vim-inspired modes, motions, text objects, splits, and
-  pickers are paired with tree-sitter highlighting and asynchronous language
-  tools.
-- **Find the signal.** Jump to files, commands, symbols, definitions,
-  references, diagnostics, or Git changes without leaving the keyboard.
-- **Make it yours.** Embedded Husk plugins power the file tree, project search,
-  Git workspace, and theme browser. Defaults work immediately; configuration
-  remains optional.
-- **See the work happen.** Red gives Codex editor context, including unsaved
-  buffers, and follows each tool call by revealing the file and edit before it
-  is applied and saved.
-- **Work reliably.** Atomic recovery works across platforms, and Unix
-  detach/attach sessions preserve buffers, plugins, LSP state, and running
-  agents across terminal or SSH disconnects.
+- **Keep your Vim muscle memory.** Familiar modes, motions, operators, text
+  objects, splits, and keyboard-first pickers work alongside Tree-sitter and LSP.
+- **Give your agent the real editor.** Codex sees open buffers, unsaved changes,
+  diagnostics, and selections. Its validated edits pass through Red's editor
+  transactions and save paths instead of modifying files behind the editor.
+- **Ask right where you are.** Inline assistance reviews, explains, or refactors
+  an exact selection or enclosing function; code changes stay unsaved and undoable.
+- **Keep the whole workflow in your terminal.** File search, language servers,
+  a full Git workspace, plugins, themes, and sessions are bundled with Red.
+- **Reconnect without losing your work.** On macOS and Linux, detachable
+  sessions retain buffers, plugins, LSP state, and running agents across
+  terminal or SSH disconnects.
+
+## New in v0.8.2
+
+The v0.8.2 release adds a managed updater for official standalone installations:
+
+- **Check automatically, install when you choose.** Red checks for a newer stable
+  release once per day and notifies you. Run `red update`, `:update`, or
+  **Update Red** in the command palette to install it.
+- **Verify before replacing.** The updater checks the archive's published SHA-256
+  checksum, candidate version, and bundled runtime before replacing the binary.
+  Existing editing sessions keep their current version until restarted.
+
+Use `[updates] mode = "off"` to disable automatic checks. Manual updates remain
+available. Homebrew and source builds keep their existing update process.
 
 ## First five minutes
 
@@ -101,20 +120,21 @@ Open a file:
 red path/to/file
 ```
 
-The first interactive launch offers a guided tour, release highlights, and an
-immediate exit into the editor. The tour uses a disposable practice buffer and
-safe Git/agent demonstrations; reopen it with `:welcome` or `:tutorial`.
-Starter configuration remains optional: embedded defaults, plugins, and themes
-are enough to begin editing.
+The first interactive launch offers a guided tour, release
+highlights, and an immediate exit into the editor. The tour uses a disposable
+practice buffer and safe Git/agent demonstrations; reopen it with `:welcome` or
+`:tutorial`. Starter configuration remains optional: embedded defaults,
+plugins, and themes are enough to begin editing.
 
 | Key | Action |
 | --- | --- |
 | `Space ?` | Discover commands and their effective keymaps |
 | `Space m` | Browse notifications and recent messages |
 | `Ctrl-p` | Find a file with fuzzy search and live preview |
+| `Ctrl-e`, then `/` | Open the file tree and search files or directories |
 | `Space G` | Open the Git status workspace |
 | `Space A` | Ask the agent with editor context |
-| `Space i` | Refactor the current line or visual selection inline |
+| `Space i` | Review, explain, or refactor the enclosing function or exact selection |
 | `Space t` | Browse themes with live preview |
 
 See [Getting started](docs/GETTING_STARTED.md) for editing, navigation,
@@ -122,33 +142,41 @@ configuration, language servers, Git, CLI, and troubleshooting guidance. The
 [Vim compatibility matrix](docs/VIM_COMPATIBILITY.md) is the precise,
 versioned behavior contract.
 
-## A visible agent workflow
+## Agents that understand your editor
 
 ![Red preparing a contextual agent prompt over the active source file](docs/images/agent-workflow.jpg)
 
-Agent edits happen through Red's editor transaction and save paths while you
-follow along in the active buffer.
+### The full Agent workspace
 
-1. **Ask.** Open the agent with `Space A`; Red includes a bounded selection or
-   cursor excerpt, unsaved contents, and relevant diagnostics.
-2. **Follow.** Red reveals the target file and cursor before each bounded tool
-   call, then briefly pauses so the change is readable.
-3. **Continue.** Revision-checked edits are attributed to the Codex session,
-   applied to the visible buffer, and saved to disk through Red.
+1. **Ask.** Press `Space A`; Red provides a bounded source excerpt, current
+   selection, relevant diagnostics, and authoritative unsaved buffer contents.
+2. **Work through the editor.** Codex reads and changes files only through
+   Red's workspace-confined, revision-checked editor tools. Agent edits are
+   attributed to their conversation and **saved to disk** through Red.
+3. **Keep the conversation.** Follow tool progress, queue another request, and
+   resume the same conversation without losing editor context. Source-linked
+   annotations turn explanations into navigable code walkthroughs.
 
-The integration uses the Codex app-server directly and supports persistent
-conversation, queued follow-ups, live tool progress, and explicit session
-controls. Ignored, out-of-workspace, binary, and common secret files are
-excluded from context. Read the
-[agent workflow and safety contract](docs/AGENT_WORKFLOW.md) for prerequisites,
-limits, commands, and failure behavior.
+File-tool playback is optional and disabled by default; set
+`[agent] follow_tool_calls = true` to reveal each target and pause before the
+operation. Full Agent writes still save to disk.
 
-For a smaller blast radius, press `Space i` on a line or visual selection.
-Inline assist opens beside the target, gives an ephemeral Codex thread only the
-selected text and bounded surroundings, and accepts only one complete
-replacement. The result is an unsaved, agent-attributed editor transaction;
-keep it, undo it, refine it in the same popup, or escalate the changed range to
-the full Agent panel.
+### Focused inline assistance
+
+Press `Space i` to review, explain, or refactor the enclosing function, falling
+back to the current line when syntax is unavailable. In Visual or Visual Line
+mode, the target is exactly the selected text. Requests use an ephemeral Codex
+thread with bounded read-only project context; visual-block targets are not
+supported. Inline code edits form one **unsaved, undoable editor transaction**.
+
+An exact-target edit may apply immediately when its original popup is in the
+foreground; set `[agent] auto_apply_inline_edits = false` to review it first.
+Background results and wider same-file proposals always require an explicit
+review and approval. Use `Space H` to revisit inline history or `A` to prepare
+a full Agent follow-up without sending it automatically.
+
+The [agent workflow and safety contract](docs/AGENT_WORKFLOW.md) explains
+prerequisites, path protections, exact boundaries, commands, and failure modes.
 
 ## What Red ships today
 
@@ -163,7 +191,10 @@ The current release includes:
 - command and keymap discovery, fuzzy files, buffer navigation, symbols,
   references, project search, and diagnostics
 - native Git gutter signs, hunk actions, and a full-screen workspace for
-  staging, commits, branches, remotes, stashes, logs, and rebases
+  staging, commits, Codex-generated commit messages, branches, remotes,
+  stashes, logs, and rebases
+- a persistent full Agent workspace and bounded inline assistance with
+  source-anchored comments, retained history, and reviewable local edits
 - an embedded Husk runtime with bundled file tree, search, Git, progress,
   inlay-hint, symbol, theme, and agent plugins
 - a branded startup splash, the Red theme, accessible selection and cursor
@@ -192,6 +223,11 @@ scrolloff = 8
 # show_whats_new = false
 # fetch_release_notes = false
 
+[updates]
+# "auto" installs new stable releases in the background, "notify" only announces
+# them, and "off" disables the daily check.
+mode = "auto"
+
 [search]
 ignorecase = true
 smartcase = true
@@ -210,6 +246,15 @@ servers through a unified `[languages.<id>]` configuration or an installable
 language pack. Native Tree-sitter grammars require explicit digest-bound trust;
 `:languages reload` applies validated changes without restarting the editor.
 See the [language extensions guide](docs/LANGUAGES.md).
+
+## Husk language
+
+The source tree contains the extracted Husk embedding API, standalone CLI, local
+package resolver, and portable WebAssembly Component extension runtime. Start
+with the [language and embedding guide](docs/HUSK_LANGUAGE_GUIDE.md). The
+[research and implementation plan](docs/HUSK_LANGUAGE_EXTRACTION_PLAN.md) and
+[card-by-card status](docs/HUSK_IMPLEMENTATION_STATUS.md) explain the dynamic
+Rust-crate design, completed work, and remaining release-hardening tasks.
 
 ## Plugins and themes
 

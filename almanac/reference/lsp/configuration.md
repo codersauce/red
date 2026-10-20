@@ -6,6 +6,9 @@ sources:
   - id: config
     type: file
     path: src/config.rs
+  - id: editor
+    type: file
+    path: src/editor.rs
   - id: defaults
     type: file
     path: default_config.toml
@@ -14,14 +17,17 @@ sources:
     path: docs/HUSK_LSP.md
 ---
 
-LSP configuration in Red is the TOML-backed contract for enabling language-server support, formatting on save, and routing file extensions to named server definitions. The `Config` type contains `lsp: LspConfig`, and `LspConfig` has three fields: `enabled`, `format_on_save`, and `servers` [@config]. Server definitions describe process launch, document selectors, workspace-root discovery, environment additions, initialization options, and optional workspace names [@config]. Runtime routing for these fields is described by [LSP Client Lifecycle And Routing](../../architecture/lsp/client-lifecycle-and-routing), while capability expectations are summarized by [LSP Capabilities](../../concepts/lsp/capabilities).
+LSP configuration in Red is the TOML-backed contract for enabling language-server support, formatting on paste or save, and routing file extensions to named server definitions. The `Config` type contains both `lsp: LspConfig` and `formatting: FormattingConfig`; `LspConfig` owns server enablement and routing, while `FormattingConfig` owns paste, save, whitespace, and backend selection [@config]. Server definitions describe process launch, document selectors, workspace-root discovery, environment additions, initialization options, and optional workspace names [@config]. Runtime routing for these fields is described by [LSP Client Lifecycle And Routing](../../architecture/lsp/client-lifecycle-and-routing), while capability expectations are summarized by [LSP Capabilities](../../concepts/lsp/capabilities).
 
 ## Top-Level Fields
 
 | Field | Type | Default | Meaning |
 | --- | --- | --- | --- |
 | `lsp.enabled` | boolean | `true` | Master switch for language-server activity [@config]. |
+| `formatting.on_paste` | boolean | `true` | Reindents pasted code locally and permits LSP range formatting for the changed range when LSP formatting is enabled and available [@config] [@editor]. |
 | `formatting.on_save` | boolean | `true` | Formats supported documents before saving; set to `false` to disable [@config]. |
+| `formatting.trim_trailing_whitespace` | boolean | `true` | Removes trailing spaces and tabs before save-time formatting [@config]. |
+| `formatting.trim_trailing_whitespace_exclude` | array of strings | `["gitcommit", "markdown"]` | Language ids that preserve trailing whitespace during save-time formatting [@config]. |
 | `formatting.provider` | string | `"auto"` | Selects `auto`, `external`, or `lsp` formatting [@config]. |
 | `lsp.format_on_save` | boolean | unset | Legacy alias for `formatting.on_save`; the modern key wins within the same config layer [@config]. |
 | `lsp.servers` | table of named server configs | embedded defaults | Launch and routing definitions keyed by server name [@config]. |
@@ -56,14 +62,13 @@ Red embeds default definitions for these server keys:
 | `husk` | current Red executable with `husk lsp --stdio` | `husk` for `hk`, `husk` | `Husk.toml`, `.git` [@config] |
 | `fish` | `fish-lsp start` | `fish` for `fish` | `config.fish`, `.git` [@config] |
 | `typescript` | `typescript-language-server --stdio` | TypeScript, TSX, JavaScript, and JSX selectors | `package.json`, `tsconfig.json`, `jsconfig.json`, `.git` [@config] |
-| `python` | `pyright-langserver --stdio` | `python` for `py`, `pyw` | `pyproject.toml`, `setup.py`, `requirements.txt`, `.git` [@config] |
 | `markdown` | `marksman server` | `markdown` for `md`, `markdown` | `.marksman.toml`, `.git` [@config] |
 | `json` | `vscode-json-language-server --stdio` | `json` for `json` | `package.json`, `.git` [@config] |
 | `toml` | `taplo lsp stdio` | `toml` for `toml` | `taplo.toml`, `Cargo.toml`, `.git` [@config] |
 | `yaml` | `yaml-language-server --stdio` | `yaml` for `yaml`, `yml` | `.git` [@config] |
 | `lua` | `lua-language-server` | `lua` for `lua` | Lua config markers and `.git` [@config] |
 
-The default TOML comments describe the same public set as covering Rust, Fish, Markdown, JavaScript/TypeScript, JSON, TOML, YAML, Python, and Lua [@defaults]. Husk is also embedded by code and covered by the dedicated Husk language-server documentation [@config] [@husk-doc].
+The default TOML comments describe the same public set as covering Rust, Fish, Markdown, JavaScript/TypeScript, JSON, TOML, YAML, and Lua [@defaults]. Husk is also embedded by code and covered by the dedicated Husk language-server documentation [@config] [@husk-doc].
 
 Fish syntax highlighting works without a language server. For completions, diagnostics, formatting, and navigation, install `fish-lsp`; Red automatically launches `fish-lsp start` for `.fish` files and discovers the workspace using `config.fish` or `.git` [@config] [@defaults].
 

@@ -142,14 +142,24 @@ pub(crate) struct VisibleText {
 pub(crate) struct InlineContextSnapshot {
     pub root: PathBuf,
     pub visible: BTreeMap<String, Option<VisibleText>>,
+    pub allow_sensitive_paths: bool,
 }
 
 pub(crate) fn resolve_path(root: &Path, path: &str) -> Result<(PathBuf, String)> {
+    resolve_path_with_policy(root, path, /*allow_sensitive_paths*/ false)
+}
+
+pub(crate) fn resolve_path_with_policy(
+    root: &Path,
+    path: &str,
+    allow_sensitive_paths: bool,
+) -> Result<(PathBuf, String)> {
     crate::codex::validate_workspace_root(root)?;
     let physical = crate::codex::physical_workspace_root(Path::new(path));
-    let full = crate::editor::resolve_agent_tool_path(
+    let full = crate::editor::resolve_agent_tool_path_with_policy(
         root,
         physical.to_str().context("file path is not UTF-8")?,
+        allow_sensitive_paths,
     )?;
     let relative = full.strip_prefix(root)?;
     ensure!(!relative.as_os_str().is_empty(), "expected a project file");
@@ -160,7 +170,7 @@ pub(crate) fn resolve_path(root: &Path, path: &str) -> Result<(PathBuf, String)>
                 .as_os_str()
                 .to_string_lossy()
                 .eq_ignore_ascii_case(".git")
-                && !crate::editor::agent_context_path_is_sensitive(name),
+                && (allow_sensitive_paths || !crate::editor::agent_context_path_is_sensitive(name)),
             "inline context path is restricted"
         );
     }
@@ -203,8 +213,19 @@ impl InlineContextSnapshot {
     }
 
     fn read(&self, path: &str) -> Result<(String, FileText)> {
-        let (_, relative) = resolve_path(&self.root, path)?;
-        let text = match self.visible.get(&relative) {
+        let (_, relative) = resolve_path_with_policy(&self.root, path, self.allow_sensitive_paths)?;
+        let text = self.file_text(&relative, || {
+            crate::codex::read_inline_workspace_file(&self.root, &relative, MAX_FILE_BYTES)
+        })?;
+        Ok((relative, text))
+    }
+
+    fn file_text(
+        &self,
+        path: &str,
+        read_disk: impl FnOnce() -> Result<Option<String>>,
+    ) -> Result<FileText> {
+        let text = match self.visible.get(path) {
             Some(Some(text)) => FileText {
                 content: text.content.clone(),
                 revision: Some(text.revision),
@@ -212,12 +233,8 @@ impl InlineContextSnapshot {
             },
             Some(None) => anyhow::bail!("open buffer exceeds the inline context limit"),
             None => {
-                let content = crate::codex::read_inline_workspace_file(
-                    &self.root,
-                    &relative,
-                    MAX_FILE_BYTES,
-                )?
-                .context("file is unavailable, binary, or exceeds the 512 KiB limit")?;
+                let content = read_disk()?
+                    .context("file is unavailable, binary, or exceeds the 512 KiB limit")?;
                 FileText {
                     content,
                     revision: None,
@@ -229,16 +246,20 @@ impl InlineContextSnapshot {
             !text.content.contains('\0'),
             "inline context cannot read binary data"
         );
-        Ok((relative, text))
+        Ok(text)
     }
 
     fn files(&self) -> Result<(BTreeSet<String>, bool)> {
+        crate::codex::validate_workspace_root(&self.root)?;
         let started = Instant::now();
         let mut files = BTreeSet::new();
         let mut truncated = false;
         for (index, entry) in ignore::WalkBuilder::new(&self.root)
             .follow_links(false)
             .hidden(false)
+            .filter_entry(|entry| {
+                !crate::lsp::workspace_edit::is_vcs_metadata_path(Path::new(entry.file_name()))
+            })
             .build()
             .enumerate()
         {
@@ -251,9 +272,23 @@ impl InlineContextSnapshot {
             }
             let Ok(entry) = entry else { continue };
             if entry.file_type().is_some_and(|kind| kind.is_file()) {
-                if let Some(path) = entry.path().to_str() {
-                    if let Ok((_, relative)) = resolve_path(&self.root, path) {
-                        files.insert(relative);
+                let Ok(relative) = entry.path().strip_prefix(&self.root) else {
+                    continue;
+                };
+                // The walker already enforces nested ignores and never follows
+                // symlinks; retain only the inline-specific component policy.
+                let allowed = relative.components().all(|component| {
+                    let name = Path::new(component.as_os_str());
+                    !component
+                        .as_os_str()
+                        .to_string_lossy()
+                        .eq_ignore_ascii_case(".git")
+                        && (self.allow_sensitive_paths
+                            || !crate::editor::agent_context_path_is_sensitive(name))
+                });
+                if allowed {
+                    if let Some(relative) = relative.to_str() {
+                        files.insert(relative.replace('\\', "/"));
                     }
                 }
             }
@@ -284,6 +319,8 @@ impl InlineContextSnapshot {
                     "invalid search query"
                 );
                 let (files, mut truncated) = self.files()?;
+                #[cfg(unix)]
+                let reader = crate::codex::InlineWorkspaceReader::new(&self.root)?;
                 let started = Instant::now();
                 let mut files = files.into_iter().collect::<Vec<_>>();
                 files.sort_by_key(|path| !self.visible.contains_key(path));
@@ -295,7 +332,11 @@ impl InlineContextSnapshot {
                         truncated = true;
                         break;
                     }
-                    let Ok((path, text)) = self.read(&path) else {
+                    #[cfg(unix)]
+                    let text = self.file_text(&path, || reader.read(&path, MAX_FILE_BYTES));
+                    #[cfg(not(unix))]
+                    let text = self.read(&path).map(|(_, text)| text);
+                    let Ok(text) = text else {
                         truncated = true;
                         continue;
                     };
@@ -393,6 +434,30 @@ impl InlineContextSnapshot {
         )
         }).await.context("inline diff failed")
     }
+}
+
+/// Runs the production read-only workspace listing for reproducible benchmarks.
+#[doc(hidden)]
+pub fn benchmark_workspace_file_listing(root: &Path) -> Result<Value> {
+    InlineContextSnapshot {
+        root: root.canonicalize()?,
+        visible: BTreeMap::new(),
+        allow_sensitive_paths: false,
+    }
+    .execute_read(InlineContextCall::ListFiles {})
+}
+
+/// Runs the production read-only workspace search for reproducible benchmarks.
+#[doc(hidden)]
+pub fn benchmark_workspace_content_search(root: &Path, query: &str) -> Result<Value> {
+    InlineContextSnapshot {
+        root: root.canonicalize()?,
+        visible: BTreeMap::new(),
+        allow_sensitive_paths: false,
+    }
+    .execute_read(InlineContextCall::SearchFiles {
+        query: query.to_string(),
+    })
 }
 
 fn bounded_text(text: &str, limit: usize) -> &str {

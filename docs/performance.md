@@ -65,6 +65,7 @@ python3 scripts/detach_bench.py 50 120 120 1536
 python3 scripts/interaction_bench.py typing
 python3 scripts/interaction_bench.py search --query self
 python3 scripts/interaction_bench.py picker --query src/editor.rs
+python3 scripts/interaction_bench.py signature --cycles 40
 python3 scripts/git_workspace_bench.py --files 80 --presses 120
 ```
 
@@ -87,7 +88,47 @@ python3 scripts/interaction_bench.py picker \
   --root ../codex \
   --file ../codex/codex-rs/tui/src/bottom_pane/chat_composer.rs \
   --query chat_composer.rs
+python3 scripts/interaction_bench.py signature \
+  --root ../codex \
+  --file ../codex/codex-rs/tui/src/bottom_pane/chat_composer.rs
+RED_FILE_PICKER_BENCH_ROOT=../codex \
+  cargo test --release --lib file_picker_large_workspace_performance -- --ignored --nocapture
+RED_FILE_PICKER_BENCH_ROOT=../openai RED_FILE_PICKER_VERIFY_PARITY=1 \
+  cargo test --release --lib file_picker_streaming_large_workspace_performance \
+  -- --ignored --nocapture --test-threads=1
+cargo run --release --example performance_hotspots -- completion
+cargo run --release --example performance_hotspots -- completion-backspace
+RED_COMPLETION_BENCH_FILE=../codex/codex-rs/tui/src/bottom_pane/chat_composer.rs \
+  cargo run --release --example performance_hotspots -- buffer-completion
 ```
+
+The streaming picker benchmark measures the actual discovery/query/UI handoff,
+including first results, complete discovery, cached reopen, query completion,
+input handling, rendering, and cancellation. It hashes the complete file set;
+`RED_FILE_PICKER_VERIFY_PARITY=1` also runs the original serial walker and checks
+that every eligible path is preserved. The older picker benchmark remains useful
+for isolating synchronous matching over a fixed list. Run performance measurements
+without other builds or scans competing for resources. A fresh application index
+does not imply a cold filesystem cache.
+
+File discovery uses at most eight walkers and an eight-batch queue, with at most
+512 paths per batch. Matching and sorting run outside the UI thread. The picker
+shows partial results and progress until discovery completes; errors retain any
+partial results with an explicit incomplete status. Enter waits for the current
+query rather than selecting a row from an older query. `Ctrl+r` refreshes the index;
+`Ctrl+e` changes hidden/ignored visibility and starts a separate scan.
+Automatic selection follows the best match as files arrive. Once the user navigates
+the results, updates preserve the selected path until the query changes.
+
+Completed file indexes are shared within an editor, keyed by canonical root and
+visibility. They expire after 30 seconds and refresh on the next open, keeping the
+old results searchable until the replacement finishes. Known creates, deletes,
+renames, and ignore-rule changes invalidate the relevant indexes. Ordinary saves
+of already indexed source files do not trigger rescans. External changes appear
+after explicit refresh or expiry; no recursive polling of the monorepo is added.
+The cache evicts unused indexes beyond four roots/options or 1 GiB of estimated
+row storage. Active indexes are never truncated, and refresh can temporarily hold
+both old and new snapshots. This is a cache budget, not a process memory limit.
 
 For an interactive detach audit with real plugins/background updates, start an owner
 with performance summaries enabled, leave it idle briefly, exercise the same paths,
@@ -115,7 +156,12 @@ and records:
 - wall time plus terminal output volume for the scrolling window.
 
 The interaction driver additionally records launch-to-first-paint (which includes file/config
-loading before `startup:interactive`), typing/search/picker p50/p95/p99/max, and log volume.
+loading before `startup:interactive`), typing/search/picker/signature p50/p95/p99/max, and
+log volume. The signature scenario starts a deterministic local LSP fixture, displays an
+actual parameter popup, and verifies that every requested character reached the document.
+`completion-backspace` measures bounded query-history reuse, while `buffer-completion`
+measures a complete no-match scan of either its synthetic document or
+`RED_COMPLETION_BENCH_FILE`.
 
 Release thresholds are relative to the most recent baseline on the same machine:
 

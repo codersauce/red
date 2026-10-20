@@ -43,7 +43,7 @@ Normal-mode `D` maps to `ShowLineDiagnostics`, while Space `d` opens all diagnos
 
 The diagnostic gutter namespace is `diagnostics`. When diagnostics change, the editor picks at most one sign per diagnosed line and chooses the highest-priority severity, with errors and diagnostics without a severity outranking warnings, information, and hints [@editor]. Gutter signs use the configured icon style: Nerd Font, Unicode, ASCII, or none [@editor] [@defaults]. Turning off `show_diagnostics` or `[diagnostics].gutter_signs` clears the diagnostic gutter namespace instead of leaving stale signs behind [@editor].
 
-The statusline diagnostics segment is absent when both error and warning counts are zero [@rendering]. When visible, it hides empty severities, uses the configured statusline icon style, and applies theme-derived error and warning colors with contrast adjustment against the active statusline slot [@rendering]. Because hidden sections are skipped, adding or removing the diagnostics segment changes the visible slot styling of neighboring sections [@rendering].
+The statusline diagnostics segment is absent when both error and warning counts are zero [@rendering]. When visible, it hides empty severities, uses the configured statusline icon style, and applies theme-derived error and warning colors with contrast adjustment against the active statusline slot [@rendering]. Hidden sections take no space, while remaining sections retain the styling of their configured slots when diagnostics appear or disappear [@rendering].
 
 ## Pickers
 

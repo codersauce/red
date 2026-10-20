@@ -1,7 +1,7 @@
 ---
 title: "Text Mutation Boundary"
 summary: "The text mutation boundary is the editor-controlled transaction path that turns every production text change into an undoable, attributed, notified, and renderable state update."
-topics: [architecture, editor, buffers, undo, lsp, plugins]
+topics: [architecture, editor, editing, buffers, undo, lsp, plugins]
 sources:
   - id: editor
     type: file

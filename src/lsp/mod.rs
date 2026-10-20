@@ -13,13 +13,13 @@
 
 use std::{
     fmt::{self, Display, Formatter},
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::atomic::AtomicUsize,
     time::{Duration, Instant},
 };
 
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{json, Value};
 
 pub use self::types::*;
 pub use capabilities::get_client_capabilities;
@@ -41,6 +41,8 @@ pub mod edit;
 pub mod manager;
 pub mod types;
 pub mod workspace_edit;
+mod workspace_settings;
+mod workspace_watch;
 
 /// Ordered incremental edits and their cheap, exact document snapshots.
 /// Ranges use UTF-16 coordinates in the document produced by the preceding edit.
@@ -153,6 +155,8 @@ pub struct Request {
     pub params: Value,
     /// Local enqueue time used for timeout and latency accounting.
     pub timestamp: Instant,
+    /// Managed server instance that owns this request, when routed by [`LspManager`].
+    pub source: Option<LspRequestSource>,
 }
 
 static ID: AtomicUsize = AtomicUsize::new(1);
@@ -165,8 +169,18 @@ impl Request {
             method: method.to_string(),
             params,
             timestamp: Instant::now(),
+            source: None,
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+/// Stable identity for one managed language-server process.
+pub struct LspRequestSource {
+    /// Manager key composed from the configured server name and workspace root.
+    pub key: String,
+    /// Process instance identity, changed whenever the server is restarted.
+    pub instance: u64,
 }
 
 impl Display for Request {
@@ -205,8 +219,9 @@ pub struct ServerRequest {
     pub method: String,
     /// Method-specific parameters.
     pub params: Value,
-    /// Managed client key that received the request.
-    pub source: Option<String>,
+    /// Managed server identity that received the request.
+    #[serde(skip)]
+    pub source: Option<LspRequestSource>,
 }
 
 #[derive(Debug)]
@@ -235,6 +250,7 @@ pub struct ResponseError {
     pub(crate) code: i64,
     pub(crate) message: String,
     pub(crate) data: Option<Value>,
+    pub(crate) request: Option<Request>,
 }
 
 #[derive(Debug)]
@@ -279,6 +295,11 @@ pub enum InboundMessage {
     ServerStderr(String),
     /// Transport or parsing failure not tied to one request.
     ProcessingError(LspError),
+    /// Managed server failure with the producer identity needed for owned cleanup.
+    ClientFailure {
+        source: LspRequestSource,
+        error: LspError,
+    },
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -308,6 +329,17 @@ fn parse_notification(
 /// Allocates a process-wide JSON-RPC request identifier.
 pub fn next_id() -> usize {
     ID.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+}
+
+fn text_document_params(file: &str) -> Result<Value, LspError> {
+    Ok(json!({ "textDocument": { "uri": file_uri(file)? } }))
+}
+
+fn document_position_params(file: &str, x: usize, y: usize) -> Result<Value, LspError> {
+    Ok(json!({
+        "textDocument": { "uri": file_uri(file)? },
+        "position": { "line": y, "character": x },
+    }))
 }
 
 #[async_trait::async_trait]
@@ -350,35 +382,152 @@ pub trait LspClient: std::any::Any + Send {
         Ok(())
     }
     /// Notifies the server immediately before Red saves a document.
-    async fn will_save(&mut self, file: &str) -> Result<(), LspError>;
+    async fn will_save(&mut self, file: &str) -> Result<(), LspError> {
+        self.send_notification(
+            "textDocument/willSave",
+            json!({
+                "textDocument": { "uri": file_uri(file)? },
+                "reason": 1,
+            }),
+            false,
+        )
+        .await
+    }
     /// Requests hover information at an editor position.
-    async fn hover(&mut self, file: &str, x: usize, y: usize) -> Result<i64, LspError>;
+    async fn hover(&mut self, file: &str, x: usize, y: usize) -> Result<i64, LspError> {
+        self.send_request_for_file(
+            file,
+            "textDocument/hover",
+            document_position_params(file, x, y)?,
+            false,
+        )
+        .await
+    }
     /// Requests definition locations at an editor position.
-    async fn goto_definition(&mut self, file: &str, x: usize, y: usize) -> Result<i64, LspError>;
+    async fn goto_definition(&mut self, file: &str, x: usize, y: usize) -> Result<i64, LspError> {
+        self.send_request_for_file(
+            file,
+            "textDocument/definition",
+            document_position_params(file, x, y)?,
+            false,
+        )
+        .await
+    }
     /// Requests completion candidates at an editor position.
-    async fn completion(&mut self, file: &str, x: usize, y: usize) -> Result<i64, LspError>;
+    async fn completion(&mut self, file: &str, x: usize, y: usize) -> Result<i64, LspError> {
+        let mut params = document_position_params(file, x, y)?;
+        params["context"] = json!({ "triggerKind": 1 });
+        self.send_request_for_file(file, "textDocument/completion", params, false)
+            .await
+    }
     /// Requests whole-document formatting with server defaults.
-    async fn format_document(&mut self, file: &str) -> Result<i64, LspError>;
+    async fn format_document(&mut self, file: &str) -> Result<i64, LspError> {
+        self.format_document_with_options(file, 4, true).await
+    }
     /// Requests whole-document formatting with explicit indentation options.
     async fn format_document_with_options(
         &mut self,
         file: &str,
+        tab_size: usize,
+        insert_spaces: bool,
+    ) -> Result<i64, LspError> {
+        self.send_request_for_file(
+            file,
+            "textDocument/formatting",
+            json!({
+                "textDocument": { "uri": file_uri(file)? },
+                "options": {
+                    "tabSize": tab_size,
+                    "insertSpaces": insert_spaces,
+                    "trimTrailingWhitespace": true,
+                    "insertFinalNewline": true,
+                    "trimFinalNewlines": true,
+                }
+            }),
+            false,
+        )
+        .await
+    }
+    /// Requests formatting for one document range with explicit indentation options.
+    async fn format_range_with_options(
+        &mut self,
+        _file: &str,
+        _range: Range,
         _tab_size: usize,
         _insert_spaces: bool,
     ) -> Result<i64, LspError> {
-        self.format_document(file).await
+        self.send_request_for_file(
+            _file,
+            "textDocument/rangeFormatting",
+            json!({
+                "textDocument": { "uri": file_uri(_file)? },
+                "range": _range,
+                "options": {
+                    "tabSize": _tab_size,
+                    "insertSpaces": _insert_spaces,
+                    "trimTrailingWhitespace": true,
+                    "insertFinalNewline": false,
+                    "trimFinalNewlines": false,
+                }
+            }),
+            false,
+        )
+        .await
     }
     /// Requests the symbol hierarchy for a document.
-    async fn document_symbols(&mut self, file: &str) -> Result<i64, LspError>;
+    async fn document_symbols(&mut self, file: &str) -> Result<i64, LspError> {
+        self.send_request_for_file(
+            file,
+            "textDocument/documentSymbol",
+            text_document_params(file)?,
+            false,
+        )
+        .await
+    }
     /// Requests actions applicable to a range and its known diagnostics.
     async fn code_action(
         &mut self,
         file: &str,
         range: Range,
         diagnostics: Vec<Diagnostic>,
-    ) -> Result<i64, LspError>;
+    ) -> Result<i64, LspError> {
+        self.send_request_for_file(
+            file,
+            "textDocument/codeAction",
+            json!({
+                "textDocument": { "uri": file_uri(file)? },
+                "range": range,
+                "context": { "diagnostics": diagnostics },
+            }),
+            false,
+        )
+        .await
+    }
+    /// Requests applicable actions from every capable server attached to a document.
+    async fn code_actions(
+        &mut self,
+        file: &str,
+        range: Range,
+        diagnostics: Vec<(String, Vec<Diagnostic>)>,
+    ) -> Result<Vec<i64>, LspError> {
+        let diagnostics = diagnostics
+            .into_iter()
+            .flat_map(|(_, diagnostics)| diagnostics)
+            .collect();
+        self.code_action(file, range, diagnostics)
+            .await
+            .map(|id| (id > 0).then_some(id).into_iter().collect())
+    }
     /// Requests callable signature help at an editor position.
-    async fn signature_help(&mut self, file: &str, x: usize, y: usize) -> Result<i64, LspError>;
+    async fn signature_help(&mut self, file: &str, x: usize, y: usize) -> Result<i64, LspError> {
+        self.send_request_for_file(
+            file,
+            "textDocument/signatureHelp",
+            document_position_params(file, x, y)?,
+            false,
+        )
+        .await
+    }
     /// Requests signature help with automatic-trigger and retrigger context.
     async fn signature_help_with_context(
         &mut self,
@@ -396,18 +545,62 @@ pub trait LspClient: std::any::Any + Send {
         x: usize,
         y: usize,
         new_name: &str,
-    ) -> Result<i64, LspError>;
+    ) -> Result<i64, LspError> {
+        let mut params = document_position_params(file, x, y)?;
+        params["newName"] = Value::String(new_name.to_string());
+        self.send_request_for_file(file, "textDocument/rename", params, false)
+            .await
+    }
     /// Requests document-local highlights related to an editor position.
-    async fn document_highlight(&mut self, file: &str, x: usize, y: usize)
-        -> Result<i64, LspError>;
+    async fn document_highlight(
+        &mut self,
+        file: &str,
+        x: usize,
+        y: usize,
+    ) -> Result<i64, LspError> {
+        self.send_request_for_file(
+            file,
+            "textDocument/documentHighlight",
+            document_position_params(file, x, y)?,
+            false,
+        )
+        .await
+    }
     /// Requests links embedded in a document.
-    async fn document_link(&mut self, file: &str) -> Result<i64, LspError>;
+    async fn document_link(&mut self, file: &str) -> Result<i64, LspError> {
+        self.send_request_for_file(
+            file,
+            "textDocument/documentLink",
+            text_document_params(file)?,
+            false,
+        )
+        .await
+    }
     /// Requests color literals and their ranges.
-    async fn document_color(&mut self, file: &str) -> Result<i64, LspError>;
+    async fn document_color(&mut self, file: &str) -> Result<i64, LspError> {
+        self.send_request_for_file(
+            file,
+            "textDocument/documentColor",
+            text_document_params(file)?,
+            false,
+        )
+        .await
+    }
     /// Requests foldable document ranges.
-    async fn folding_range(&mut self, file: &str) -> Result<i64, LspError>;
+    async fn folding_range(&mut self, file: &str) -> Result<i64, LspError> {
+        self.send_request_for_file(
+            file,
+            "textDocument/foldingRange",
+            text_document_params(file)?,
+            false,
+        )
+        .await
+    }
     /// Searches workspace symbols using this client's default workspace.
-    async fn workspace_symbol(&mut self, query: &str) -> Result<i64, LspError>;
+    async fn workspace_symbol(&mut self, query: &str) -> Result<i64, LspError> {
+        self.send_request("workspace/symbol", json!({ "query": query }), false)
+            .await
+    }
     /// Searches workspace symbols using the workspace associated with `file`.
     async fn workspace_symbol_for_file(
         &mut self,
@@ -423,18 +616,50 @@ pub trait LspClient: std::any::Any + Send {
         x: usize,
         y: usize,
         include_declaration: bool,
-    ) -> Result<i64, LspError>;
+    ) -> Result<i64, LspError> {
+        let mut params = document_position_params(file, x, y)?;
+        params["context"] = json!({ "includeDeclaration": include_declaration });
+        self.send_request_for_file(file, "textDocument/references", params, false)
+            .await
+    }
     /// Resolves call-hierarchy roots at an editor position.
     async fn call_hierarchy_prepare(
         &mut self,
         file: &str,
         x: usize,
         y: usize,
-    ) -> Result<i64, LspError>;
+    ) -> Result<i64, LspError> {
+        self.send_request_for_file(
+            file,
+            "textDocument/prepareCallHierarchy",
+            document_position_params(file, x, y)?,
+            false,
+        )
+        .await
+    }
     /// Requests a complete semantic-token stream.
-    async fn semantic_tokens_full(&mut self, file: &str) -> Result<i64, LspError>;
+    async fn semantic_tokens_full(&mut self, file: &str) -> Result<i64, LspError> {
+        self.send_request_for_file(
+            file,
+            "textDocument/semanticTokens/full",
+            text_document_params(file)?,
+            false,
+        )
+        .await
+    }
     /// Requests inlay hints for an LSP range.
-    async fn inlay_hint(&mut self, file: &str, range: Range) -> Result<i64, LspError>;
+    async fn inlay_hint(&mut self, file: &str, range: Range) -> Result<i64, LspError> {
+        self.send_request_for_file(
+            file,
+            "textDocument/inlayHint",
+            json!({
+                "textDocument": { "uri": file_uri(file)? },
+                "range": range,
+            }),
+            false,
+        )
+        .await
+    }
     /// Sends an arbitrary request to this client.
     ///
     /// `force` bypasses capability gating used by known high-level requests.
@@ -511,14 +736,121 @@ pub trait LspClient: std::any::Any + Send {
         self.get_server_capabilities()
     }
 
+    /// Returns capabilities for the ready server selected to handle `method`.
+    fn server_capabilities_for_method(
+        &self,
+        file: &str,
+        _method: &str,
+    ) -> Option<&ServerCapabilities> {
+        self.server_capabilities_for_file(file)
+    }
+
+    /// Returns capabilities for a previously captured managed server identity.
+    fn server_capabilities_for_source(
+        &self,
+        _source: &LspRequestSource,
+    ) -> Option<&ServerCapabilities> {
+        self.get_server_capabilities()
+    }
+
+    /// Returns the ready managed server selected to handle `method`.
+    fn request_source_for_file(&self, file: &str, method: &str) -> Option<LspRequestSource> {
+        self.server_capabilities_for_method(file, method)?;
+        Some(LspRequestSource {
+            key: file.to_string(),
+            instance: self.server_instance_for_file(file).unwrap_or_default(),
+        })
+    }
+
+    /// Returns configured managed-client keys that may handle `method` for `file`.
+    fn request_sources_for_file(&self, file: &str, method: &str) -> Vec<String> {
+        self.request_source_for_file(file, method)
+            .map(|source| vec![source.key])
+            .unwrap_or_default()
+    }
+
+    /// Returns every configured managed-client key attached to `file`.
+    fn attachment_sources_for_file(&self, file: &str) -> Vec<String> {
+        self.server_capabilities_for_file(file)
+            .map(|_| vec![file.to_string()])
+            .unwrap_or_default()
+    }
+
+    /// Reports whether a previously captured managed server identity is still current.
+    fn request_source_is_current(&self, source: &LspRequestSource) -> bool {
+        self.server_instance_for_file(&source.key)
+            .is_none_or(|instance| instance == source.instance)
+    }
+
+    /// Reports whether a current managed server still owns the open document.
+    fn request_source_owns_file(&self, source: &LspRequestSource, _file: &str) -> bool {
+        self.request_source_is_current(source)
+    }
+
+    /// Reports whether a current managed server owns the workspace containing `file`.
+    fn request_source_owns_workspace_file(&self, source: &LspRequestSource, file: &str) -> bool {
+        self.request_source_is_current(source)
+            && self
+                .workspace_root_for_source(source)
+                .is_some_and(|root| Path::new(file).starts_with(root))
+    }
+
+    /// Returns the document version owned by a specific managed server.
+    fn document_version_for_source(&self, file: &str, _source: &LspRequestSource) -> Option<i64> {
+        self.document_version(file)
+    }
+
+    /// Returns the workspace root owned by a specific managed server.
+    fn workspace_root_for_source(&self, source: &LspRequestSource) -> Option<PathBuf> {
+        self.workspace_root_for_file(&source.key)
+    }
+
     /// Returns the configured server name associated with `file`.
     fn server_name_for_file(&self, _file: &str) -> Option<String> {
         None
     }
 
+    /// Read-only lifecycle status; this must not start a server.
+    fn server_status_for_file(&self, file: &str) -> &'static str {
+        if self.server_capabilities_for_file(file).is_some() {
+            "ready"
+        } else {
+            "not_started"
+        }
+    }
+
+    /// Identity of a ready server instance, invalidated on replacement or failure.
+    fn server_instance_for_file(&self, file: &str) -> Option<u64> {
+        self.server_capabilities_for_file(file).map(|_| 0)
+    }
+
+    /// Best-effort cancellation, routed to the same server as the original request.
+    async fn cancel_request_for_file(&mut self, _file: &str, _id: i64) -> Result<(), LspError> {
+        Ok(())
+    }
+
     /// Reports whether the server associated with `file` supports formatting.
     fn supports_document_formatting(&self, _file: &str) -> bool {
         true
+    }
+
+    /// Reports whether the server associated with `file` supports range formatting.
+    fn supports_range_formatting(&self, _file: &str) -> bool {
+        false
+    }
+
+    /// Reports whether any attachment needs canonical incremental edit ranges.
+    fn requires_incremental_change(&self, file: &str) -> bool {
+        self.server_capabilities_for_file(file)
+            .is_some_and(|capabilities| {
+                matches!(
+                    capabilities
+                        .text_document_sync
+                        .as_ref()
+                        .and_then(|sync| sync.change_kind()),
+                    Some(TextDocumentSyncKind::Incremental)
+                )
+            })
     }
 
     /// Returns the most recently published LSP document version.

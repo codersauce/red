@@ -30,8 +30,9 @@ use tokio::{
 };
 
 use super::{
-    capabilities::get_client_capabilities_with_options, file_uri, InboundMessage, LspClient,
-    OutboundMessage, ResponseError, ServerRequest, ServerResponse,
+    capabilities::get_client_capabilities_with_options, file_uri,
+    workspace_watch::WorkspaceFileWatcher, InboundMessage, LspClient, OutboundMessage,
+    ResponseError, ServerRequest, ServerResponse,
 };
 use crate::config::LanguageServerConfig;
 use crate::lsp::{
@@ -39,13 +40,14 @@ use crate::lsp::{
 };
 use crate::{log, lsp::LspError};
 
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+pub(crate) const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_LSP_FRAME_BYTES: usize = 16 * 1024 * 1024;
 const MAX_LSP_HEADER_BYTES: usize = 16 * 1024;
 const MAX_LSP_STDERR_LINE_BYTES: usize = 64 * 1024;
 const MAX_LSP_STDERR_TAIL_LINES: usize = 8;
-const MAX_PENDING_LSP_MESSAGES: usize = 512;
-const MAX_PENDING_LSP_BYTES: usize = 16 * 1024 * 1024;
+pub(crate) const MAX_PENDING_LSP_MESSAGES: usize = 512;
+pub(crate) const MAX_PENDING_LSP_BYTES: usize = 16 * 1024 * 1024;
+const DOCUMENT_DIFF_BLOCK_BYTES: usize = 32;
 const SHUTDOWN_RESPONSE_TIMEOUT: Duration = Duration::from_secs(1);
 #[cfg(windows)]
 const PROCESS_EXIT_GRACE: Duration = Duration::from_millis(100);
@@ -102,7 +104,7 @@ fn json_value_size(value: &Value) -> usize {
     }
 }
 
-fn outbound_message_size(message: &OutboundMessage) -> usize {
+pub(crate) fn outbound_message_size(message: &OutboundMessage) -> usize {
     match message {
         OutboundMessage::Request(request) => request
             .method
@@ -200,6 +202,7 @@ struct LspProcessMonitor {
     stderr_closed: Arc<AtomicBool>,
     stderr_tail: Arc<Mutex<VecDeque<String>>>,
     failure_reported: bool,
+    workspace_watcher: Option<WorkspaceFileWatcher>,
 }
 
 impl LspProcessMonitor {
@@ -230,13 +233,14 @@ fn lsp_command_display(config: &LanguageServerConfig) -> String {
 
 impl RealLspClient {
     #[cfg(test)]
-    pub(super) fn with_test_channels(
+    pub(crate) fn with_test_channels(
         request_tx: mpsc::Sender<OutboundMessage>,
         response_rx: mpsc::Receiver<InboundMessage>,
         config: LanguageServerConfig,
         workspace_root: PathBuf,
     ) -> Self {
         Self {
+            instance_id: crate::lsp::next_id() as u64,
             request_tx,
             response_rx,
             files_versions: HashMap::new(),
@@ -258,11 +262,26 @@ impl RealLspClient {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn set_test_capabilities(&mut self, capabilities: ServerCapabilities) {
+        self.server_capabilities = Some(capabilities);
+    }
+
     pub async fn start(
         config: LanguageServerConfig,
         workspace_root: PathBuf,
     ) -> Result<RealLspClient, LspError> {
         let mut child = spawn_lsp_process(&config).await?;
+        let workspace_watcher = match WorkspaceFileWatcher::new(&workspace_root, &config) {
+            Ok(watcher) => Some(watcher),
+            Err(error) => {
+                log!(
+                    "[lsp] could not watch workspace {}: {error}",
+                    workspace_root.display()
+                );
+                None
+            }
+        };
         let stdin = child.stdin.take().unwrap();
         let stdout = child.stdout.take().unwrap();
         let stderr = child.stderr.take().unwrap();
@@ -369,6 +388,7 @@ impl RealLspClient {
         });
 
         Ok(RealLspClient {
+            instance_id: crate::lsp::next_id() as u64,
             request_tx,
             response_rx,
             files_versions: HashMap::new(),
@@ -389,6 +409,7 @@ impl RealLspClient {
                 stderr_closed,
                 stderr_tail,
                 failure_reported: false,
+                workspace_watcher,
             }),
             config,
             workspace_root,
@@ -535,6 +556,7 @@ async fn process_lsp_message(
             code,
             message,
             data,
+            request: None,
         }))
         .await
         .map_err(|e| LspError::ChannelInboundError(e.to_string()))?;
@@ -569,7 +591,7 @@ async fn process_lsp_message(
 
         if let Some(id) = res.get("id").and_then(Value::as_i64) {
             log!("[lsp] incoming request: id={}, method={}", id, method);
-        } else {
+        } else if method != "$/progress" {
             log!("[lsp] incoming notification: method={}", method);
         }
 
@@ -613,6 +635,7 @@ async fn process_lsp_message(
 }
 
 pub struct RealLspClient {
+    instance_id: u64,
     request_tx: mpsc::Sender<OutboundMessage>,
     response_rx: mpsc::Receiver<InboundMessage>,
     files_versions: HashMap<String, usize>,
@@ -635,6 +658,10 @@ pub struct RealLspClient {
 }
 
 impl RealLspClient {
+    pub(crate) fn instance_id(&self) -> u64 {
+        self.instance_id
+    }
+
     fn fail_server(&mut self, reason: impl Into<String>) {
         self.initialize_failed = true;
         self.initialized = false;
@@ -747,6 +774,42 @@ impl RealLspClient {
             .or_insert(next);
     }
 
+    fn schedule_workspace_diagnostics(&mut self) {
+        let documents = self.files_versions.keys().cloned().collect::<Vec<_>>();
+        for uri in documents {
+            self.schedule_diagnostics(&uri);
+        }
+    }
+
+    async fn publish_workspace_file_changes(&mut self) -> Result<(), LspError> {
+        let changes = self
+            .process_monitor
+            .as_mut()
+            .and_then(|monitor| monitor.workspace_watcher.as_mut())
+            .map(WorkspaceFileWatcher::take_changes)
+            .unwrap_or_default();
+        let mut watched_changes = Vec::with_capacity(changes.len());
+        for change in changes {
+            let uri = file_uri(&change.path)?;
+            // Open documents already have authoritative didChange/didSave streams.
+            // Replaying their disk writes as workspace changes can cancel flycheck.
+            if !self.files_versions.contains_key(&uri) {
+                watched_changes.push(json!({ "uri": uri, "type": change.kind }));
+            }
+        }
+        if watched_changes.is_empty() {
+            return Ok(());
+        }
+        self.send_notification(
+            "workspace/didChangeWatchedFiles",
+            json!({ "changes": watched_changes }),
+            false,
+        )
+        .await?;
+        self.schedule_workspace_diagnostics();
+        Ok(())
+    }
+
     /// Consume expected background diagnostic cancellations without hiding
     /// failures of user commands or leaving their request owners unresolved.
     fn handle_diagnostic_cancellation(&mut self, request: &Request, error: &ResponseError) -> bool {
@@ -794,11 +857,20 @@ impl RealLspClient {
         }
 
         // Common prefix, backed up to a char boundary.
-        let mut prefix = old_text
-            .as_bytes()
+        let old_bytes = old_text.as_bytes();
+        let new_bytes = new_text.as_bytes();
+        let shared_length = old_bytes.len().min(new_bytes.len());
+        let mut prefix = 0;
+        while shared_length.saturating_sub(prefix) >= DOCUMENT_DIFF_BLOCK_BYTES
+            && old_bytes[prefix..prefix + DOCUMENT_DIFF_BLOCK_BYTES]
+                == new_bytes[prefix..prefix + DOCUMENT_DIFF_BLOCK_BYTES]
+        {
+            prefix += DOCUMENT_DIFF_BLOCK_BYTES;
+        }
+        prefix += old_bytes[prefix..]
             .iter()
-            .zip(new_text.as_bytes())
-            .take_while(|(a, b)| a == b)
+            .zip(&new_bytes[prefix..])
+            .take_while(|(left, right)| left == right)
             .count();
         while !old_text.is_char_boundary(prefix) {
             prefix -= 1;
@@ -807,11 +879,24 @@ impl RealLspClient {
         // Common suffix of the remainders, backed up to char boundaries.
         let old_rest = &old_text[prefix..];
         let new_rest = &new_text[prefix..];
-        let mut suffix = old_rest
-            .as_bytes()
+        let old_rest_bytes = old_rest.as_bytes();
+        let new_rest_bytes = new_rest.as_bytes();
+        let shared_remainder = old_rest_bytes.len().min(new_rest_bytes.len());
+        let mut suffix = 0;
+        while shared_remainder.saturating_sub(suffix) >= DOCUMENT_DIFF_BLOCK_BYTES {
+            let old_end = old_rest_bytes.len() - suffix;
+            let new_end = new_rest_bytes.len() - suffix;
+            if old_rest_bytes[old_end - DOCUMENT_DIFF_BLOCK_BYTES..old_end]
+                != new_rest_bytes[new_end - DOCUMENT_DIFF_BLOCK_BYTES..new_end]
+            {
+                break;
+            }
+            suffix += DOCUMENT_DIFF_BLOCK_BYTES;
+        }
+        suffix += old_rest_bytes[..old_rest_bytes.len() - suffix]
             .iter()
             .rev()
-            .zip(new_rest.as_bytes().iter().rev())
+            .zip(new_rest_bytes[..new_rest_bytes.len() - suffix].iter().rev())
             .take_while(|(a, b)| a == b)
             .count();
         while !old_rest.is_char_boundary(old_rest.len() - suffix)
@@ -841,14 +926,33 @@ impl RealLspClient {
             }];
         }
 
+        let start = Self::position_at_byte(old_text, prefix);
+        let end = old_text[prefix..old_end]
+            .chars()
+            .fold(start, |mut position, character| {
+                if character == '\n' {
+                    position.line += 1;
+                    position.character = 0;
+                } else {
+                    position.character += character.len_utf16();
+                }
+                position
+            });
+
         vec![TextDocumentContentChangeEvent {
-            range: Some(Range {
-                start: Self::position_at_byte(old_text, prefix),
-                end: Self::position_at_byte(old_text, old_end),
-            }),
+            range: Some(Range { start, end }),
             range_length: None,
             text: new_text[prefix..new_end].to_string(),
         }]
+    }
+
+    /// Runs the production incremental-document diff for reproducible benchmarks.
+    #[doc(hidden)]
+    pub fn benchmark_incremental_document_change(
+        old_text: &str,
+        new_text: &str,
+    ) -> Vec<TextDocumentContentChangeEvent> {
+        Self::calculate_changes(old_text, new_text)
     }
 
     pub async fn did_open_with_language_id(
@@ -861,12 +965,51 @@ impl RealLspClient {
         let params = did_open_params(file, contents, language_id)?;
 
         let uri = file_uri(file)?;
+        if let Some(watcher) = self
+            .process_monitor
+            .as_mut()
+            .and_then(|monitor| monitor.workspace_watcher.as_mut())
+        {
+            watcher.watch_document(std::path::Path::new(&super::file_path(&uri)?));
+        }
         self.files_content
             .insert(uri.clone(), ropey::Rope::from_str(contents));
         self.files_versions.insert(uri, 1);
         <Self as LspClient>::send_notification(self, "textDocument/didOpen", params, false).await?;
 
         Ok(())
+    }
+
+    pub(crate) async fn send_prepared_request(
+        &mut self,
+        mut request: Request,
+        force: bool,
+    ) -> Result<i64, LspError> {
+        let id = request.id;
+        let method = request.method.clone();
+        request.timestamp = Instant::now();
+        let message = OutboundMessage::Request(request.clone());
+
+        if !self.initialized && !force {
+            log!(
+                "[lsp] client not initialized yet, adding request to pending: {}",
+                id
+            );
+            self.queue_pending(message)?;
+            return Ok(id);
+        }
+
+        self.pending_responses.insert(id, request);
+        self.request_tx.send(message).await?;
+        log!("[lsp] sent prepared request: id={id} method={method}");
+        Ok(id)
+    }
+
+    pub(crate) fn owns_request(&self, id: i64) -> bool {
+        self.pending_responses.contains_key(&id)
+            || self.pending_messages.iter().any(
+                |message| matches!(message, OutboundMessage::Request(request) if request.id == id),
+            )
     }
 }
 
@@ -879,24 +1022,8 @@ impl LspClient for RealLspClient {
         force: bool,
     ) -> Result<i64, LspError> {
         log!("[lsp] send_request: method={} force={force}", method);
-
-        let req = Request::new(method, params);
-        let id = req.id;
-        let msg = OutboundMessage::Request(req.clone());
-
-        if !self.initialized && !force {
-            log!(
-                "[lsp] client not initialized yet, adding request to pending: {}",
-                id
-            );
-            self.queue_pending(msg)?;
-            return Ok(id);
-        }
-
-        self.pending_responses.insert(id, req);
-        self.request_tx.send(msg).await?;
-
-        Ok(id)
+        self.send_prepared_request(Request::new(method, params), force)
+            .await
     }
 
     async fn send_notification(
@@ -1007,6 +1134,7 @@ impl LspClient for RealLspClient {
                 Some(method),
             )));
         }
+        self.publish_workspace_file_changes().await?;
         // Send the debounced diagnostics request once the document has been
         // quiet long enough. This is polled every editor tick.
         let now = Instant::now();
@@ -1165,9 +1293,35 @@ impl LspClient for RealLspClient {
                                     )));
                                 }
 
+                                error.request = Some(request);
                                 return Ok(Some((msg, Some(method))));
                             }
                         }
+                    }
+                    InboundMessage::ServerRequest(request)
+                        if request.method == "window/workDoneProgress/create" =>
+                    {
+                        self.request_tx
+                            .send(OutboundMessage::Response(ServerResponse {
+                                id: request.id.clone(),
+                                result: Some(Value::Null),
+                                error: None,
+                            }))
+                            .await?;
+                        return Ok(None);
+                    }
+                    InboundMessage::ServerRequest(request)
+                        if request.method == "workspace/diagnostic/refresh" =>
+                    {
+                        self.schedule_workspace_diagnostics();
+                        self.request_tx
+                            .send(OutboundMessage::Response(ServerResponse {
+                                id: request.id.clone(),
+                                result: Some(Value::Null),
+                                error: None,
+                            }))
+                            .await?;
+                        return Ok(None);
                     }
                     InboundMessage::ServerRequest(request)
                         if request.method == "workspace/configuration" =>
@@ -1476,297 +1630,22 @@ impl LspClient for RealLspClient {
     //     Ok(())
     // }
 
-    async fn will_save(&mut self, file: &str) -> Result<(), LspError> {
-        log!("will_save file: {}", file);
-
-        let params = json!({
-            "textDocument": {
-                "uri": file_uri(file)?,
-            },
-            "reason": 1,
-        });
-
-        self.send_notification("textDocument/willSave", params, false)
-            .await?;
-
-        Ok(())
-    }
-
-    async fn hover(&mut self, file: &str, x: usize, y: usize) -> Result<i64, LspError> {
-        let params = json!({
-            "textDocument": {
-                "uri": file_uri(file)?,
-            },
-            "position": {
-                "line": y,
-                "character": x,
-            }
-        });
-
-        self.send_request("textDocument/hover", params, false).await
-    }
-
-    async fn goto_definition(&mut self, file: &str, x: usize, y: usize) -> Result<i64, LspError> {
-        let params = json!({
-            "textDocument": {
-                "uri": file_uri(file)?,
-            },
-            "position": {
-                "line": y,
-                "character": x,
-            }
-        });
-
-        self.send_request("textDocument/definition", params, false)
-            .await
-    }
-
-    async fn completion(&mut self, file: &str, x: usize, y: usize) -> Result<i64, LspError> {
-        let params = json!({
-            "textDocument": {
-                "uri": file_uri(file)?,
-            },
-            "position": {
-                "line": y,
-                "character": x,
-            },
-            "context": {
-                "triggerKind": 1
-            }
-        });
-
-        self.send_request("textDocument/completion", params, false)
-            .await
-    }
-
-    async fn format_document(&mut self, file: &str) -> Result<i64, LspError> {
-        self.format_document_with_options(file, 4, true).await
-    }
-
-    async fn format_document_with_options(
-        &mut self,
-        file: &str,
-        tab_size: usize,
-        insert_spaces: bool,
-    ) -> Result<i64, LspError> {
-        let params = json!({
-            "textDocument": {
-                "uri": file_uri(file)?,
-            },
-            "options": {
-                "tabSize": tab_size,
-                "insertSpaces": insert_spaces,
-                "trimTrailingWhitespace": true,
-                "insertFinalNewline": true,
-                "trimFinalNewlines": true
-            }
-        });
-
-        self.send_request("textDocument/formatting", params, false)
-            .await
-    }
-
-    async fn document_symbols(&mut self, file: &str) -> Result<i64, LspError> {
-        let params = json!({
-            "textDocument": {
-                "uri": file_uri(file)?,
-            }
-        });
-
-        self.send_request("textDocument/documentSymbol", params, false)
-            .await
-    }
-
-    async fn code_action(
-        &mut self,
-        file: &str,
-        range: Range,
-        diagnostics: Vec<Diagnostic>,
-    ) -> Result<i64, LspError> {
-        let params = json!({
-            "textDocument": {
-                "uri": file_uri(file)?,
-            },
-            "range": range,
-            "context": {
-                "diagnostics": diagnostics
-            }
-        });
-
-        self.send_request("textDocument/codeAction", params, false)
-            .await
-    }
-
-    async fn document_highlight(
-        &mut self,
-        file: &str,
-        x: usize,
-        y: usize,
-    ) -> Result<i64, LspError> {
-        let params = json!({
-            "textDocument": {
-                "uri": file_uri(file)?,
-            },
-            "position": {
-                "line": y,
-                "character": x,
-            }
-        });
-
-        self.send_request("textDocument/documentHighlight", params, false)
-            .await
-    }
-
-    async fn document_link(&mut self, file: &str) -> Result<i64, LspError> {
-        let params = json!({
-            "textDocument": {
-                "uri": file_uri(file)?,
-            }
-        });
-
-        self.send_request("textDocument/documentLink", params, false)
-            .await
-    }
-
-    async fn document_color(&mut self, file: &str) -> Result<i64, LspError> {
-        let params = json!({
-            "textDocument": {
-                "uri": file_uri(file)?,
-            }
-        });
-
-        self.send_request("textDocument/documentColor", params, false)
-            .await
-    }
-
-    async fn folding_range(&mut self, file: &str) -> Result<i64, LspError> {
-        let params = json!({
-            "textDocument": {
-                "uri": file_uri(file)?,
-            }
-        });
-
-        self.send_request("textDocument/foldingRange", params, false)
-            .await
-    }
-
-    async fn workspace_symbol(&mut self, query: &str) -> Result<i64, LspError> {
-        let params = json!({
-            "query": query
-        });
-
-        self.send_request("workspace/symbol", params, false).await
-    }
-
-    async fn references(
-        &mut self,
-        file: &str,
-        x: usize,
-        y: usize,
-        include_declaration: bool,
-    ) -> Result<i64, LspError> {
-        let params = json!({
-            "textDocument": {
-                "uri": file_uri(file)?,
-            },
-            "position": {
-                "line": y,
-                "character": x,
-            },
-            "context": {
-                "includeDeclaration": include_declaration,
-            },
-        });
-
-        self.send_request("textDocument/references", params, false)
-            .await
-    }
-
-    async fn call_hierarchy_prepare(
-        &mut self,
-        file: &str,
-        x: usize,
-        y: usize,
-    ) -> Result<i64, LspError> {
-        let params = json!({
-            "textDocument": {
-                "uri": file_uri(file)?,
-            },
-            "position": {
-                "line": y,
-                "character": x,
-            }
-        });
-
-        self.send_request("textDocument/prepareCallHierarchy", params, false)
-            .await
-    }
-
-    async fn semantic_tokens_full(&mut self, file: &str) -> Result<i64, LspError> {
-        let params = json!({
-            "textDocument": {
-                "uri": file_uri(file)?,
-            }
-        });
-
-        self.send_request("textDocument/semanticTokens/full", params, false)
-            .await
-    }
-
-    async fn inlay_hint(&mut self, file: &str, range: Range) -> Result<i64, LspError> {
-        let params = json!({
-            "textDocument": {
-                "uri": file_uri(file)?,
-            },
-            "range": range
-        });
-
-        self.send_request("textDocument/inlayHint", params, false)
-            .await
-    }
-
-    async fn signature_help(&mut self, file: &str, x: usize, y: usize) -> Result<i64, LspError> {
-        self.signature_help_with_context(file, x, y, None).await
-    }
-
-    async fn signature_help_with_context(
-        &mut self,
-        file: &str,
-        x: usize,
-        y: usize,
-        context: Option<super::SignatureHelpContext>,
-    ) -> Result<i64, LspError> {
-        let mut params = json!({
-            "textDocument": {
-                "uri": file_uri(file)?,
-            },
-            "position": {
-                "line": y,
-                "character": x,
-            }
-        });
-
-        if let Some(context) = context {
-            params["context"] = serde_json::to_value(context)?;
+    fn server_status_for_file(&self, _file: &str) -> &'static str {
+        if self.initialize_failed {
+            "failed"
+        } else if self.initialized {
+            "ready"
+        } else {
+            "starting"
         }
-        self.send_request("textDocument/signatureHelp", params, false)
-            .await
     }
 
-    async fn rename(
-        &mut self,
-        file: &str,
-        x: usize,
-        y: usize,
-        new_name: &str,
-    ) -> Result<i64, LspError> {
-        let params = json!({
-            "textDocument": { "uri": file_uri(file)? },
-            "position": { "line": y, "character": x },
-            "newName": new_name,
-        });
+    fn server_instance_for_file(&self, file: &str) -> Option<u64> {
+        (self.server_status_for_file(file) == "ready").then_some(self.instance_id)
+    }
 
-        self.send_request("textDocument/rename", params, false)
+    async fn cancel_request_for_file(&mut self, _file: &str, id: i64) -> Result<(), LspError> {
+        self.send_notification("$/cancelRequest", json!({"id": id}), false)
             .await
     }
 
@@ -1782,6 +1661,18 @@ impl LspClient for RealLspClient {
             Some(
                 DocumentFormattingProviderCapability::Simple(true)
                     | DocumentFormattingProviderCapability::Options(_)
+            )
+        )
+    }
+
+    fn supports_range_formatting(&self, _file: &str) -> bool {
+        matches!(
+            self.server_capabilities.as_ref().and_then(|capabilities| {
+                capabilities.document_range_formatting_provider.as_ref()
+            }),
+            Some(
+                DocumentRangeFormattingProviderCapability::Simple(true)
+                    | DocumentRangeFormattingProviderCapability::Options(_)
             )
         )
     }
@@ -2185,8 +2076,10 @@ mod test {
             method: "textDocument/completion".to_string(),
             params: json!({}),
             timestamp: Instant::now(),
+            source: None,
         };
         let mut client = RealLspClient {
+            instance_id: crate::lsp::next_id() as u64,
             request_tx,
             response_rx,
             files_versions: HashMap::new(),
@@ -2215,6 +2108,7 @@ mod test {
                 code: -32802,
                 message: "server cancelled the request".to_string(),
                 data: Some(json!({ "retriggerRequest": true })),
+                request: None,
             }))
             .await
             .unwrap();
@@ -2352,6 +2246,96 @@ mod test {
     }
 
     #[tokio::test]
+    async fn work_done_progress_is_negotiated_created_and_forwarded() {
+        let (request_tx, mut requests) = mpsc::channel(4);
+        let (responses, response_rx) = mpsc::channel(4);
+        let config = default_language_servers().remove("rust").unwrap();
+        let mut client = RealLspClient::with_test_channels(
+            request_tx,
+            response_rx,
+            config,
+            std::env::current_dir().unwrap(),
+        );
+        client.initialized = false;
+
+        client.initialize().await.unwrap();
+
+        let Some(OutboundMessage::Request(initialize)) = requests.recv().await else {
+            panic!("expected an LSP initialize request");
+        };
+        assert_eq!(initialize.method, "initialize");
+        assert_eq!(
+            initialize.params["capabilities"]["window"]["workDoneProgress"],
+            json!(true)
+        );
+
+        let initialization = serde_json::to_vec(&json!({
+            "jsonrpc": "2.0",
+            "id": initialize.id,
+            "result": { "capabilities": {} }
+        }))
+        .unwrap();
+        process_lsp_message(&initialization, &responses)
+            .await
+            .unwrap();
+        let Some((InboundMessage::Message(_), method)) = client.recv_response().await.unwrap()
+        else {
+            panic!("expected the LSP initialization response");
+        };
+        assert_eq!(method.as_deref(), Some("initialize"));
+
+        let Some(OutboundMessage::Notification(initialized)) = requests.recv().await else {
+            panic!("expected the initialized notification");
+        };
+        assert_eq!(initialized.method, "initialized");
+
+        for token in [json!("rustAnalyzer/Indexing"), json!(7)] {
+            let create = serde_json::to_vec(&json!({
+                "jsonrpc": "2.0",
+                "id": token.clone(),
+                "method": "window/workDoneProgress/create",
+                "params": { "token": token.clone() }
+            }))
+            .unwrap();
+            process_lsp_message(&create, &responses).await.unwrap();
+
+            assert!(client.recv_response().await.unwrap().is_none());
+            let Some(OutboundMessage::Response(created)) = requests.recv().await else {
+                panic!("expected progress-token creation to receive a response");
+            };
+            assert_eq!(created.id, token);
+            assert_eq!(created.result, Some(Value::Null));
+            assert!(created.error.is_none());
+
+            for kind in ["begin", "report", "end"] {
+                let progress = serde_json::to_vec(&json!({
+                    "jsonrpc": "2.0",
+                    "method": "$/progress",
+                    "params": {
+                        "token": token.clone(),
+                        "value": { "kind": kind, "title": "Indexing" }
+                    }
+                }))
+                .unwrap();
+                process_lsp_message(&progress, &responses).await.unwrap();
+
+                let Some((
+                    InboundMessage::Notification(ParsedNotification::Progress(progress)),
+                    method,
+                )) = client.recv_response().await.unwrap()
+                else {
+                    panic!("expected the {kind} progress notification");
+                };
+                assert!(method.is_none());
+                assert_eq!(serde_json::to_value(progress.token).unwrap(), token);
+                assert_eq!(progress.value["kind"], kind);
+            }
+        }
+
+        assert!(requests.try_recv().is_err());
+    }
+
+    #[tokio::test]
     async fn server_request_id_does_not_complete_pending_client_request() {
         let (request_tx, mut request_rx) = mpsc::channel(2);
         let (response_tx, response_rx) = mpsc::channel(4);
@@ -2360,6 +2344,7 @@ mod test {
             method: "textDocument/completion".to_string(),
             params: json!({}),
             timestamp: Instant::now(),
+            source: None,
         };
         let mut config = default_language_servers()
             .remove("rust")
@@ -2369,6 +2354,7 @@ mod test {
             "flat.key": "literal"
         }));
         let mut client = RealLspClient {
+            instance_id: crate::lsp::next_id() as u64,
             request_tx,
             response_rx,
             files_versions: HashMap::new(),
@@ -2450,6 +2436,7 @@ mod test {
         let (request_tx, mut request_rx) = mpsc::channel(5);
         let (_response_tx, response_rx) = mpsc::channel(1);
         let mut client = RealLspClient {
+            instance_id: crate::lsp::next_id() as u64,
             request_tx,
             response_rx,
             files_versions: HashMap::new(),
@@ -2502,6 +2489,10 @@ mod test {
             .await
             .unwrap();
         client
+            .format_range_with_options(path.as_ref(), range.clone(), 2, true)
+            .await
+            .unwrap();
+        client
             .code_action(path.as_ref(), range.clone(), vec![diagnostic])
             .await
             .unwrap();
@@ -2515,6 +2506,22 @@ mod test {
         assert_eq!(formatting.params["textDocument"]["uri"], uri);
         assert_eq!(formatting.params["options"]["tabSize"], json!(2));
         assert_eq!(formatting.params["options"]["insertSpaces"], json!(true));
+
+        let Some(OutboundMessage::Request(range_formatting)) = request_rx.recv().await else {
+            panic!("expected range-formatting request");
+        };
+        assert_eq!(range_formatting.method, "textDocument/rangeFormatting");
+        assert_eq!(range_formatting.params["textDocument"]["uri"], uri);
+        assert_eq!(range_formatting.params["range"], json!(range));
+        assert_eq!(range_formatting.params["options"]["tabSize"], json!(2));
+        assert_eq!(
+            range_formatting.params["options"]["insertSpaces"],
+            json!(true)
+        );
+        assert_eq!(
+            range_formatting.params["options"]["insertFinalNewline"],
+            json!(false)
+        );
 
         let Some(OutboundMessage::Request(code_action)) = request_rx.recv().await else {
             panic!("expected code-action request");
@@ -2554,6 +2561,7 @@ mod test {
         let (request_tx, mut request_rx) = mpsc::channel(2);
         let (response_tx, response_rx) = mpsc::channel(2);
         let mut client = RealLspClient {
+            instance_id: crate::lsp::next_id() as u64,
             request_tx,
             response_rx,
             files_versions: HashMap::new(),
@@ -2614,6 +2622,7 @@ mod test {
         let (request_tx, mut request_rx) = mpsc::channel(4);
         let (response_tx, response_rx) = mpsc::channel(4);
         let mut client = RealLspClient {
+            instance_id: crate::lsp::next_id() as u64,
             request_tx,
             response_rx,
             files_versions: HashMap::new(),
@@ -2672,8 +2681,10 @@ mod test {
             method: "initialize".to_string(),
             params: json!({}),
             timestamp: Instant::now(),
+            source: None,
         };
         let mut client = RealLspClient {
+            instance_id: crate::lsp::next_id() as u64,
             request_tx,
             response_rx,
             files_versions: HashMap::new(),
@@ -2734,8 +2745,10 @@ mod test {
             method: "initialize".to_string(),
             params: json!({}),
             timestamp: Instant::now(),
+            source: None,
         };
         let mut client = RealLspClient {
+            instance_id: crate::lsp::next_id() as u64,
             request_tx,
             response_rx,
             files_versions: HashMap::new(),
@@ -2798,6 +2811,7 @@ mod test {
         let (request_tx, _request_rx) = mpsc::channel(1);
         let (_response_tx, response_rx) = mpsc::channel(1);
         let mut client = RealLspClient {
+            instance_id: crate::lsp::next_id() as u64,
             request_tx,
             response_rx,
             files_versions: HashMap::new(),
@@ -2857,8 +2871,10 @@ mod test {
             method: "textDocument/formatting".to_string(),
             params: json!({}),
             timestamp: Instant::now(),
+            source: None,
         };
         let mut client = RealLspClient {
+            instance_id: crate::lsp::next_id() as u64,
             request_tx,
             response_rx,
             files_versions: HashMap::new(),
@@ -2940,6 +2956,7 @@ mod test {
             code,
             message: "server cancelled the request".to_string(),
             data,
+            request: None,
         })
     }
 
@@ -3183,6 +3200,9 @@ mod test {
             };
             assert_eq!(error.id, Some(id));
             assert_eq!(error.code, code);
+            let request = error.request.as_ref().expect("response keeps its request");
+            assert_eq!(request.method, method);
+            assert_eq!(request.params["textDocument"]["uri"], DIAGNOSTIC_URI);
             assert_eq!(response_method.as_deref(), Some(method));
             assert!(client.pending_responses.is_empty());
             assert!(client.pending_diagnostics.is_empty());
@@ -3272,10 +3292,49 @@ mod test {
     }
 
     #[tokio::test]
+    async fn workspace_diagnostic_refresh_acknowledges_and_requeues_open_documents() {
+        let (request_tx, mut requests) = mpsc::channel(4);
+        let (responses, response_rx) = mpsc::channel(1);
+        let config = default_language_servers().remove("rust").unwrap();
+        let mut client = RealLspClient::with_test_channels(
+            request_tx,
+            response_rx,
+            config,
+            std::env::current_dir().unwrap(),
+        );
+        let first = "file:///workspace/src/lib.rs";
+        let second = "file:///workspace/src/recap.rs";
+        client.files_versions.insert(first.to_string(), 1);
+        client.files_versions.insert(second.to_string(), 1);
+
+        responses
+            .send(InboundMessage::ServerRequest(ServerRequest {
+                id: json!("refresh-1"),
+                method: "workspace/diagnostic/refresh".to_string(),
+                params: json!(null),
+                source: None,
+            }))
+            .await
+            .unwrap();
+
+        assert!(client.recv_response().await.unwrap().is_none());
+        let OutboundMessage::Response(response) = requests.recv().await.unwrap() else {
+            panic!("workspace diagnostic refresh must receive a JSON-RPC response");
+        };
+        assert_eq!(response.id, json!("refresh-1"));
+        assert_eq!(response.result, Some(Value::Null));
+        assert!(response.error.is_none());
+        assert_eq!(client.pending_diagnostics.len(), 2);
+        assert!(client.pending_diagnostics.contains_key(first));
+        assert!(client.pending_diagnostics.contains_key(second));
+    }
+
+    #[tokio::test]
     async fn diagnostics_debounce_is_tracked_per_document() {
         let (request_tx, mut request_rx) = mpsc::channel(4);
         let (_response_tx, response_rx) = mpsc::channel(1);
         let mut client = RealLspClient {
+            instance_id: crate::lsp::next_id() as u64,
             request_tx,
             response_rx,
             files_versions: HashMap::new(),
@@ -3339,6 +3398,7 @@ mod test {
         let (request_tx, mut request_rx) = mpsc::channel(8);
         let (_response_tx, response_rx) = mpsc::channel(1);
         let mut client = RealLspClient {
+            instance_id: crate::lsp::next_id() as u64,
             request_tx,
             response_rx,
             files_versions: HashMap::new(),
@@ -3673,6 +3733,51 @@ mod test {
         assert_eq!(range.end.line, 0);
         assert_eq!(range.end.character, 3);
         assert_eq!(change.text, "X");
+    }
+
+    #[test]
+    fn incremental_changes_preserve_unicode_at_every_comparison_block_boundary() {
+        for boundary in [31, 32, 33, 63, 64, 65] {
+            let old = format!("{}👋 unchanged suffix λe\u{301}", "a".repeat(boundary));
+            let new = format!("{}👋β unchanged suffix λe\u{301}", "a".repeat(boundary));
+            let change = single_change(&old, &new);
+            let range = change.range.as_ref().unwrap();
+
+            assert_eq!(range.start.line, 0);
+            assert_eq!(range.start.character, boundary + 2);
+            assert_eq!(range.end, range.start);
+            assert_eq!(change.text, "β");
+            assert_eq!(apply_change(&old, &change), new);
+        }
+    }
+
+    #[test]
+    fn incremental_multiline_deletions_advance_utf16_positions_once() {
+        let prefix = format!("{}\n", "before 👋 ".repeat(24));
+        let removed = "first 👋\nsecond λ\nthird";
+        let suffix = format!("\n{}", "after 👋 ".repeat(24));
+        let old = format!("{prefix}{removed}{suffix}");
+        let new = format!("{prefix}{suffix}");
+        let change = single_change(&old, &new);
+        let range = change.range.as_ref().unwrap();
+
+        assert_eq!(range.start.line, 1);
+        assert_eq!(range.start.character, 0);
+        assert_eq!(range.end.line, 3);
+        assert_eq!(range.end.character, "third".len());
+        assert!(change.text.is_empty());
+        assert_eq!(apply_change(&old, &change), new);
+    }
+
+    #[test]
+    fn incremental_changes_preserve_crlf_fallback_at_a_block_boundary() {
+        let prefix = "x".repeat(DOCUMENT_DIFF_BLOCK_BYTES - 1);
+        let old = format!("{prefix}\r\nunchanged 👋\n");
+        let new = format!("{prefix}\nunchanged 👋\n");
+        let change = single_change(&old, &new);
+
+        assert!(change.range.is_none());
+        assert_eq!(change.text, new);
     }
 
     #[test]

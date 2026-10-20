@@ -272,19 +272,34 @@ impl Editor {
         before: &str,
         after: &str,
     ) -> anyhow::Result<()> {
-        if before == after || self.active_inline_agent_request(session).is_none() {
+        self.check_inline_agent_receipts_capacity(session, &[(before, after)])
+    }
+
+    /// Reserve the complete batch before a multi-file edit mutates any buffer.
+    pub(super) fn check_inline_agent_receipts_capacity(
+        &self,
+        session: &str,
+        changes: &[(&str, &str)],
+    ) -> anyhow::Result<()> {
+        if self.active_inline_agent_request(session).is_none() {
             return Ok(());
         }
-        anyhow::ensure!(
-            before.len() <= MAX_AGENT_IMAGE_BYTES && after.len() <= MAX_AGENT_IMAGE_BYTES,
-            "file is too large for a retained inline-to-Agent review"
-        );
+        let mut added = 0usize;
+        for (before, after) in changes.iter().filter(|(before, after)| before != after) {
+            anyhow::ensure!(
+                before.len() <= MAX_AGENT_IMAGE_BYTES && after.len() <= MAX_AGENT_IMAGE_BYTES,
+                "file is too large for a retained inline-to-Agent review"
+            );
+            added = added
+                .saturating_add(serde_json::to_vec(&(before, after))?.len())
+                .saturating_add(4096);
+        }
+        if added == 0 {
+            return Ok(());
+        }
         let used = serde_json::to_vec(&self.inline_history)?.len();
-        let added = serde_json::to_vec(&(before, after))?.len();
         anyhow::ensure!(
-            used.saturating_add(added)
-                .saturating_add(MAX_ANSWER_BYTES + 4096)
-                <= MAX_HISTORY_BYTES,
+            used.saturating_add(added).saturating_add(MAX_ANSWER_BYTES) <= MAX_HISTORY_BYTES,
             "inline history is full; export or forget old conversations before editing more files"
         );
         Ok(())

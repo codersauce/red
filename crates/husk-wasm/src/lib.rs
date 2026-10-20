@@ -1029,6 +1029,9 @@ fn map_type_excluding(
             context,
             excluded_name,
         )?)),
+        Type::FixedLengthList(_) => {
+            Err(WasmDescriptorError::UnsupportedType("fixed-length-list").into())
+        }
         Type::Tuple(tuple) => Ok(TypeDescriptor::Tuple(
             tuple
                 .types()
@@ -1621,6 +1624,7 @@ fn wit_type_name(ty: &Type) -> &'static str {
         Type::Char => "char",
         Type::String => "string",
         Type::List(_) => "list",
+        Type::FixedLengthList(_) => "fixed-length-list",
         Type::Map(_) => "map",
         Type::Record(_) => "record",
         Type::Tuple(_) => "tuple",
@@ -1962,6 +1966,43 @@ mod tests {
         .unwrap()
         .to_string();
         assert!(error.contains("unsupported WIT type `u32`"), "{error}");
+    }
+
+    #[test]
+    fn rejects_unsupported_fixed_length_lists() {
+        let mut config = Config::new();
+        config
+            .wasm_component_model(true)
+            .wasm_component_model_fixed_length_lists(true);
+        let engine = Engine::new(&config).unwrap();
+        let component = Component::new(
+            &engine,
+            br#"
+                (component
+                    (type $bytes (list u8 4))
+                    (export "bytes" (type $bytes)))
+            "#,
+        )
+        .unwrap();
+        let fixed_list = component
+            .component_type()
+            .exports(&engine)
+            .find_map(|(_, export)| match export.ty {
+                ComponentItem::Type(Type::FixedLengthList(list)) => {
+                    Some(Type::FixedLengthList(list))
+                }
+                _ => None,
+            })
+            .unwrap();
+
+        let error = map_type(&fixed_list, &[], &[], "test")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("unsupported WIT type `fixed-length-list`"),
+            "{error}"
+        );
+        assert_eq!(wit_type_name(&fixed_list), "fixed-length-list");
     }
 
     #[test]

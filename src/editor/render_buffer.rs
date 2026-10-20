@@ -10,11 +10,29 @@ use crate::{
     color::{blend_color, Color},
     log,
     theme::{SelectionForegroundPriority, Style, Theme},
-    unicode_utils::display_width,
+    unicode_utils::{display_width, is_printable_ascii},
 };
 use unicode_segmentation::UnicodeSegmentation;
 
 use super::Point;
+
+const CONTROL_REPLACEMENT: char = '\u{fffd}';
+
+fn terminal_safe_char(c: char) -> char {
+    if c.is_control() {
+        CONTROL_REPLACEMENT
+    } else {
+        c
+    }
+}
+
+fn terminal_safe_grapheme(grapheme: &str) -> &str {
+    if grapheme.chars().any(char::is_control) {
+        "�"
+    } else {
+        grapheme
+    }
+}
 
 #[derive(Debug)]
 pub struct Change<'a> {
@@ -32,6 +50,7 @@ pub struct Cell {
 
 impl Cell {
     fn new(c: char, style: Style) -> Self {
+        let c = terminal_safe_char(c);
         Self {
             c,
             text: c.to_string(),
@@ -40,6 +59,7 @@ impl Cell {
     }
 
     fn from_grapheme(grapheme: &str, style: Style) -> Self {
+        let grapheme = terminal_safe_grapheme(grapheme);
         Self {
             c: grapheme.chars().next().unwrap_or(' '),
             text: grapheme.to_string(),
@@ -51,6 +71,7 @@ impl Cell {
     /// run thousands of times per frame, so avoiding a fresh `String` per
     /// cell matters.
     fn set_grapheme(&mut self, grapheme: &str, style: &Style) {
+        let grapheme = terminal_safe_grapheme(grapheme);
         self.c = grapheme.chars().next().unwrap_or(' ');
         self.text.clear();
         self.text.push_str(grapheme);
@@ -58,10 +79,23 @@ impl Cell {
     }
 
     fn set_char_in_place(&mut self, c: char, style: &Style) {
+        let c = terminal_safe_char(c);
         self.c = c;
         self.text.clear();
         self.text.push(c);
         self.style = style.clone();
+    }
+
+    /// Compares cells exactly while avoiding a general string comparison for ASCII.
+    fn matches_rendered(&self, other: &Self) -> bool {
+        if self.c != other.c || self.style != other.style {
+            return false;
+        }
+
+        match (self.text.as_bytes(), other.text.as_bytes()) {
+            ([left], [right]) => left == right,
+            (left, right) => left == right,
+        }
     }
 }
 
@@ -302,6 +336,11 @@ impl RenderBuffer {
             return;
         }
 
+        if is_printable_ascii(text) {
+            self.set_printable_ascii(x, y, text, style);
+            return;
+        }
+
         let mut cell_x = x;
         for grapheme in text.graphemes(true) {
             if cell_x >= self.width {
@@ -340,6 +379,37 @@ impl RenderBuffer {
         }
     }
 
+    /// Writes a span already verified as printable ASCII without rescanning it.
+    pub(crate) fn set_printable_ascii(&mut self, x: usize, y: usize, text: &str, style: &Style) {
+        if x >= self.width || y >= self.height {
+            return;
+        }
+        let length = text.len().min(self.width - x);
+        let start = y * self.width + x;
+        let Some(cells) = self.cells.get_mut(start..start + length) else {
+            log!("WARN: pos >= self.cells.len()");
+            return;
+        };
+        for (cell, byte) in cells.iter_mut().zip(text.bytes()) {
+            cell.set_char_in_place(char::from(byte), style);
+        }
+    }
+
+    /// Clears a single row segment whose background is already resolved.
+    pub(crate) fn fill_ascii_spaces(&mut self, x: usize, y: usize, width: usize, style: &Style) {
+        if x >= self.width || y >= self.height {
+            return;
+        }
+        let length = width.min(self.width - x);
+        let start = y * self.width + x;
+        let Some(cells) = self.cells.get_mut(start..start + length) else {
+            return;
+        };
+        for cell in cells {
+            cell.set_char_in_place(' ', style);
+        }
+    }
+
     pub fn dump_diff(&self, changes: &[Change]) -> String {
         let mut s = String::new();
 
@@ -374,10 +444,14 @@ impl RenderBuffer {
         for y in 0..self.height {
             let start = y * self.width;
             let end = start + self.width;
-            if self.cells[start..end] != other.cells[start..end] {
+            if !self.cells[start..end]
+                .iter()
+                .zip(&other.cells[start..end])
+                .all(|(cell, previous)| cell.matches_rendered(previous))
+            {
                 for x in 0..self.width {
                     let cell = &self.cells[start + x];
-                    if *cell != other.cells[start + x] {
+                    if !cell.matches_rendered(&other.cells[start + x]) {
                         changes.push(Change { x, y, cell });
                     }
                 }
@@ -534,6 +608,24 @@ mod tests {
     }
 
     #[test]
+    fn diff_detects_combining_graphemes_styles_and_single_byte_text_changes() {
+        let style = Style::default();
+        let mut previous = RenderBuffer::new(3, 1, &style);
+        previous.set_text(0, 0, "e\u{301}", &style);
+        let mut next = previous.clone();
+        next.cells[0].text = "e\u{300}".to_string();
+        next.cells[1].style.bold = true;
+        next.cells[2].text = "x".to_string();
+
+        let changes = next.diff(&previous);
+
+        assert_eq!(changes.len(), 3);
+        assert_eq!(changes[0].cell.text, "e\u{300}");
+        assert!(changes[1].cell.style.bold);
+        assert_eq!(changes[2].cell.text, "x");
+    }
+
+    #[test]
     fn diff_reports_new_cells_when_dimensions_grow() {
         let style = Style::default();
         let previous = RenderBuffer::new(1, 1, &style);
@@ -543,6 +635,74 @@ mod tests {
 
         assert_eq!(changes.len(), 1);
         assert_eq!((changes[0].x, changes[0].y), (1, 0));
+    }
+
+    #[test]
+    fn printable_ascii_writes_clip_at_the_edge_and_reuse_cell_storage() {
+        let mut buffer = RenderBuffer::new(5, 1, &Style::default());
+        buffer.cells[3].text.reserve(32);
+        let capacity = buffer.cells[3].text.capacity();
+        let style = Style {
+            bold: true,
+            ..Style::default()
+        };
+
+        buffer.set_text(2, 0, "hello", &style);
+
+        assert_eq!(
+            buffer.cells.iter().map(|cell| cell.c).collect::<String>(),
+            "  hel"
+        );
+        assert_eq!(buffer.cells[3].text.capacity(), capacity);
+        assert!(buffer.cells[2..].iter().all(|cell| cell.style == style));
+    }
+
+    #[test]
+    fn text_writes_skip_controls_and_direct_character_writes_are_safe() {
+        let style = Style::default();
+        let mut buffer = RenderBuffer::new(12, 1, &style);
+
+        buffer.set_text(0, 0, "a\u{1b}[31mb\u{009b}c", &style);
+        buffer.set_char(9, 0, '\u{0007}', &style, &Theme::default());
+
+        assert_eq!(
+            buffer
+                .cells
+                .iter()
+                .map(|cell| cell.text.as_str())
+                .collect::<String>(),
+            "a[31mbc  �  "
+        );
+        assert!(buffer
+            .cells
+            .iter()
+            .all(|cell| !cell.text.chars().any(char::is_control)));
+    }
+
+    #[test]
+    fn ascii_space_fills_clip_at_the_edge_and_preserve_other_cells() {
+        let mut buffer = RenderBuffer::new(5, 1, &Style::default());
+        buffer.set_text(0, 0, "hello", &Style::default());
+        buffer.cells[3].text.reserve(32);
+        let capacity = buffer.cells[3].text.capacity();
+        let style = Style {
+            italic: true,
+            ..Style::default()
+        };
+
+        buffer.fill_ascii_spaces(3, 0, usize::MAX, &style);
+        buffer.fill_ascii_spaces(8, 0, 2, &style);
+        buffer.fill_ascii_spaces(0, 2, 2, &style);
+
+        assert_eq!(
+            buffer.cells.iter().map(|cell| cell.c).collect::<String>(),
+            "hel  "
+        );
+        assert_eq!(buffer.cells[3].text.capacity(), capacity);
+        assert!(buffer.cells[3..].iter().all(|cell| cell.style == style));
+        assert!(buffer.cells[..3]
+            .iter()
+            .all(|cell| cell.style == Style::default()));
     }
 
     #[test]

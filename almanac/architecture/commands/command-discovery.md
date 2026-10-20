@@ -1,6 +1,6 @@
 ---
-title: "Command Discovery"
-summary: "Red discovers commands through colon parsing, effective keymaps, command-palette metadata, and registered plugin command records."
+title: "Command Discovery And Dispatch"
+summary: "Red discovers and dispatches commands through colon parsing, effective keymaps, command-palette metadata, editor action routing, and registered plugin command records."
 topics: [architecture, commands, cli, plugins]
 sources:
   - id: command-parser
@@ -15,6 +15,12 @@ sources:
   - id: editor-dispatch
     type: file
     path: src/editor.rs
+  - id: buffer-do
+    type: file
+    path: src/editor/buffer_do.rs
+  - id: shell-command
+    type: file
+    path: src/editor/shell_command.rs
   - id: default-config
     type: file
     path: default_config.toml
@@ -29,21 +35,42 @@ sources:
     path: plugins/neotree.hk
 ---
 
-# Command Discovery
+# Command Discovery And Dispatch
 
-Command discovery is the set of paths that let Red users find and execute editor actions: colon commands, configured keymaps, the command palette, and plugin-registered commands. Built-in colon input is parsed against an explicit command-name list, palette rows are built from built-in command metadata plus active plugin command metadata, and shortcut labels come from the effective configured keymaps rather than hard-coded defaults [@command-parser] [@command-palette]. The editor then dispatches selected built-in actions itself and routes plugin commands through the plugin registry [@editor-dispatch].
+Command discovery and dispatch are the paths that let Red users find and execute editor actions: colon commands, configured keymaps, the command palette, and plugin-registered commands. Built-in colon input is parsed against an explicit command-name list, palette rows are built from built-in command metadata plus active plugin command metadata, and shortcut labels come from the effective configured keymaps rather than hard-coded defaults [@command-parser] [@command-palette]. The editor then dispatches selected built-in actions itself and routes plugin commands through the plugin registry [@editor-dispatch].
 
 ## Colon Command Parsing
 
-The low-level parser in `src/command.rs` receives the authoritative built-in command list from its caller. It parses a trailing `!` as `CommandFlag::Force`, splits arguments on spaces without shell quoting, resolves exact command names, resolves conventional initial-based abbreviations such as `bn` for `buffer-next`, and supports chains such as `wq` by mapping each character to the first matching command [@command-parser]. If any command in a chain is unknown, parsing returns `None` for the whole input so a partially recognized chain cannot execute unintended commands [@command-parser].
+The low-level parser in `src/command.rs` receives authoritative built-in command specifications, including each command's stable minimum abbreviation length. It parses a trailing `!` as `CommandFlag::Force`, splits arguments on spaces without shell quoting, prioritizes exact command names and existing initial-based aliases such as `bn` for `buffer-next`, explicitly recognizes the `wq` save-and-quit chain, and resolves unambiguous Vim-style prefixes such as `ene` for `enew` [@command-parser]. Ambiguous, too-short, and unknown names are rejected instead of being decomposed into unrelated commands, preventing accidental buffer deletion, reloads, or writes [@command-parser]. The command inventory has a regression test that rejects duplicate names and conflicting executable prefixes [@command-palette].
 
-The editor adds command-specific handling around that parser. It special-cases register, join, and syntax commands before calling the built-in parser, then maps parsed command names to semantic `Action` values such as save, quit, buffer movement, deletion, edit/reload, split, wrap, syntax, and config diagnostics [@editor-dispatch]. If built-in parsing fails but the runtime has a registered plugin command with the exact input name, the editor returns `Action::PluginCommand`; otherwise it records an unknown-command error [@editor-dispatch].
+The editor adds command-specific handling around that parser. It special-cases register and join commands, uses parsed canonical names for syntax, set, and messages commands, and maps the remaining parsed command names to semantic `Action` values such as save, quit, buffer movement, deletion, edit/reload, split, and wrap [@editor-dispatch]. If built-in parsing fails but the runtime has a registered plugin command with the exact input name, the editor returns `Action::PluginCommand`; otherwise it records an unknown-command error [@editor-dispatch].
+
+`:!{command}` and explicit ranged forms such as `:%!{command}` are recognized
+before the ordinary command parser so shell quotes, whitespace, pipelines,
+redirects, and trailing force-like characters remain intact. Red expands `%`
+and `#` to the current and alternate filenames and `!` to the previous external
+command; escaped special characters remain literal, and `:!!` repeats the
+previous command. An editor-owned Tokio subprocess runs the user's shell with
+null stdin for ordinary commands or the exact selected lines on stdin for range
+filters. Sanitized Messages details stay bounded while complete raw filter
+stdout is spooled separately and applied through the canonical undo, mark, and
+LSP edit boundary only if the original buffer revision still matches. The normal
+background tick owns cancellation and completion, so detachable owners continue
+without an IPC change or terminal-mode handoff. Shell actions are excluded from
+serialized actions, plugin host APIs, agent action allowlists, and `:bufdo`;
+plugin process permissions retain their existing no-shell boundary
+[@shell-command]
+[@editor-dispatch].
+
+`:bufdo` parses its optional range as stable buffer ids rather than line numbers, snapshots matching open-buffer ids, and reparses its nested command after activating each target so line ranges such as `%` resolve against that buffer. Stable identities let `:bufdo bd` safely delete each snapshotted target without visiting the replacement blank buffer; an unforced delete stops at the first dirty buffer. Traversal also stops on parse, substitution, write, or reload errors and rejects other nested actions that could invalidate the snapshot or open interactive UI. The outer force flag is accepted for Vim compatibility; Red already preserves dirty buffers during ordinary buffer switches [@editor-dispatch] [@buffer-do].
+
+`:wa[ll]` snapshots modified buffers, writes every named target through the ordinary save pipeline, and restores the active buffer and view. Clean buffers are skipped. Dirty unnamed buffers remain open and produce an error after the named targets have been processed [@editor-dispatch] [@buffer-do].
 
 Advertising a built-in colon form is a parser and dispatch change, not only palette metadata. A built-in command that appears in docs or `CommandPaletteEntry::colon` must also be present in the built-in command list passed to `command::parse` and must map to an `Action` in `Editor::handle_command`; otherwise the palette can describe a `:<name>` form that direct colon input still reports as unknown [@command-palette] [@editor-dispatch].
 
 ## Completion Names
 
-Colon completion uses the palette module's command-name inventory rather than the parser alone. `colon_completion_names` starts with built-in colon commands, adds special built-ins such as `commands`, `command-palette`, debug commands, registers, undotree, `j`, and `join`, and then appends plugin command names that do not collide with built-in colon names [@command-palette]. The editor uses that list for command-name completion. `src/command_completion.rs` selects argument providers after a space: fixed choices for commands such as `set`, `languages`, and `Copilot`, file paths for file commands, and language ids for syntax commands. `Tab` cycles forward and `Shift-Tab` cycles backward through the original matches; typing resets the cycle. Positional choices replace only the current argument; file completion retains its existing whole-path replacement behavior. Completion never executes a command or plugin callback [@command-completion] [@editor-dispatch].
+Colon completion uses the palette module's command-name inventory rather than the parser alone. `colon_completion_names` starts with built-in colon commands, adds special built-ins such as `commands`, `command-palette`, debug commands, registers, undotree, `j`, and `join`, and then appends plugin command names that do not collide with built-in colon names [@command-palette]. The editor uses that list for command-name completion. `src/command_completion.rs` selects argument providers after a space: fixed choices for commands such as `set`, `languages`, and `Copilot`, file paths for file commands, and language ids for syntax commands. After `bufdo`, completion restarts at the nested command, including optional stable-ID ranges, and excludes recursive `bufdo` completion. `Tab` cycles forward and `Shift-Tab` cycles backward through the original matches; typing resets the cycle. Positional choices replace only the current argument; file completion retains its existing whole-path replacement behavior. Completion never executes a command or plugin callback [@command-completion] [@editor-dispatch].
 
 Built-in precedence is intentional. `colon_name_is_builtin` treats special names and anything the built-in parser can resolve as reserved, so plugin commands with those names can still be active internally but do not create alternate colon command entries in discovery surfaces [@command-palette]. This matches the plugin API boundary described in [Red Host API](../plugins/red-host-api).
 
@@ -55,7 +82,7 @@ Built-in palette entries are declared with stable ids, titles, categories, descr
 
 ## Effective Keymaps And Hints
 
-Shortcut discovery reads the current `Keys` configuration, so user overrides and embedded defaults affect palette output. `shortcuts_for_action` walks configured keymaps to find bindings for each entry's action, and `picker_items` displays the primary shortcut beside the colon form when one exists [@command-palette]. The embedded default config maps normal-mode command-palette entrypoints to `Ctrl-Shift-p`, `Alt-x`, `F1`, and leader-space `?`, and it maps many bundled plugin commands under normal-mode, window, leader, and visual bindings [@default-config].
+Shortcut discovery reads the current `Keys` configuration, so user overrides and embedded defaults affect palette output. `shortcuts_for_action` walks configured keymaps to find bindings for each entry's action, and `picker_items` displays the primary shortcut beside the colon form when one exists [@command-palette]. The embedded default config maps normal-mode command-palette entrypoints to `Ctrl-Shift-p`, `Alt-x`, and leader-space `?`, and it maps many bundled plugin commands under normal-mode, window, leader, and visual bindings [@default-config].
 
 The same module produces delayed keymap hints for nested key prefixes. `keymap_hints` takes the active prefix and immediate mapping table, labels nested groups as more keymaps, labels leaf actions with human-readable action names, and sorts groups and keys deterministically [@command-palette]. The editor maintains the active prefix, deadline, and visibility flags, shows hints after the configured delay, and clears them after a continuation or cancellation [@editor-dispatch]. The `key_hints` defaults in `default_config.toml` enable this guide with a 250 ms delay [@default-config].
 
@@ -82,6 +109,12 @@ Reference-only and other-context bindings are readable but not executable.
 
 Plugins register command discovery data through the runtime's `CommandMetadata`, which carries optional title, category, description, aliases, visibility, panel key-dispatch scope, and opt-in argument/completion metadata [@plugin-runtime]. Declarative `#[red::command]` metadata accepts `scope = "editor"` or `scope = "global"` and defaults to editor scope, while imperative `red::add_command` metadata is deserialized into the same runtime structure [@plugin-api] [@plugin-runtime]. `Runtime::registered_commands` returns active command records with command name, owning plugin, callback, and metadata sorted by command name for stable discovery UI, and `Runtime::command_scope` is the editor's lookup path when deciding whether a plugin command may run from focused panels [@plugin-runtime] [@editor-dispatch]. Because palette entries retain the owning plugin in their ids, duplicate command names have deterministic runtime behavior before discovery surfaces display them [@plugin-runtime].
 
-This command system does not make colon syntax a general shell. Arguments are split simply, command names are case-sensitive where plugin names are involved, and plugin command execution stays behind the plugin host boundary [@command-parser] [@editor-dispatch]. The CLI-level command surface is documented in [Red Command](../../reference/cli/red-command), and exact default keymaps and plugin command bindings belong in [Default Config](../../reference/configuration/default-config).
+Only explicit `:!` and ranged `:{range}!` forms grant access to the user's shell.
+Ordinary Ex
+arguments are still split simply, command names are case-sensitive where plugin
+names are involved, and plugin command execution stays behind the plugin host
+boundary [@command-parser] [@editor-dispatch]. The CLI-level command surface is
+documented in [Red Command](../../reference/cli/red-command), and exact default
+keymaps and plugin command bindings belong in [Default Config](../../reference/configuration/default-config).
 
 Plugin commands may opt in with `arguments = true` and positional `completions = [["enable", "disable"]]`. They receive one `CommandInvocation` record containing the registered name, split arguments, and raw argument text. Legacy callbacks still receive no arguments; exact registered names and built-in precedence are preserved. See [Plugin Host API](../../reference/plugins/host-api) for compatibility requirements [@plugin-api] [@plugin-runtime].

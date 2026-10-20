@@ -1122,7 +1122,7 @@ impl Editor {
             .collect::<Vec<_>>();
         indices.sort_by_key(|&(index, start)| (start, index));
         if indices.is_empty() {
-            self.set_legacy_message(Some("no inline comments in this buffer".into()));
+            self.set_routine_warning(Some("no inline comments in this buffer".into()));
             return;
         }
         let current = self.current_inline_comment_index().and_then(|index| {
@@ -1222,7 +1222,7 @@ impl Editor {
             }
             self.layout_cache.borrow_mut().clear();
         } else {
-            self.set_legacy_message(Some("no inline comment at the cursor".into()));
+            self.set_routine_warning(Some("no inline comment at the cursor".into()));
         }
     }
 
@@ -1237,7 +1237,7 @@ impl Editor {
         self.check_bounds();
         self.sync_to_window();
         let Some(index) = self.current_inline_comment_index() else {
-            self.set_legacy_message(Some("no inline comment at the cursor".into()));
+            self.set_routine_warning(Some("no inline comment at the cursor".into()));
             return;
         };
         let comment = &self.inline_comments[index];

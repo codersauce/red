@@ -1,7 +1,7 @@
 # Getting started with Red
 
-This guide covers the day-to-day editor workflow. For installation, see the
-[README](../README.md#install).
+This guide covers the day-to-day editor workflow in Red v0.8.2.
+For installation, see the [README](../README.md#install).
 
 ## First launch
 
@@ -26,8 +26,8 @@ reopen it later.
 The guided tour uses an unnamed practice buffer and simulated Git and agent
 previews; it never saves the practice buffer, changes your repository, or
 starts Codex. The full tour covers modal editing, command discovery, fuzzy
-navigation, completion, Git, reviewable agent proposals, and themes. Start or
-control it at any time:
+navigation, completion, Git, a safe local Agent demonstration, and themes.
+Start or control it at any time:
 
 ```text
 :tutorial          # start the full guided tour
@@ -41,6 +41,16 @@ A starter configuration at `~/.config/red/config.toml` remains optional. Press
 `c` on the welcome screen to create one without overwriting existing settings.
 Embedded configuration, themes, and plugins work when the file is absent.
 
+## Updating Red
+
+Red checks for a newer stable release once per day and notifies you. To update an
+official standalone installation, run `:update` or choose **Update Red** in the
+command palette. Restart your editing sessions to use the new binary.
+
+Older standalone installations need a one-time installer migration. Homebrew
+and source builds use their existing update process. See [Updating Red](UPDATING.md)
+for commands and the setting that disables automatic checks.
+
 ## Editor model
 
 Red uses Vim-inspired modes. `Esc` returns to Normal mode.
@@ -52,7 +62,7 @@ Red uses Vim-inspired modes. `Esc` returns to Normal mode.
 | Visual | `v` | Select by character |
 | Visual Line | `V` | Select whole lines |
 | Visual Block | `Ctrl-v` | Select a rectangle |
-| Command | `:` or `;` | Run named commands |
+| Command | `:` | Run named commands |
 
 The [Vim compatibility matrix](VIM_COMPATIBILITY.md) records supported behavior
 and intentional differences precisely.
@@ -100,6 +110,35 @@ Text objects include `iw` for a word and `i(`/`a(`, `i[`/`a[`, `i{`/`a{`,
 `i<`/`a<`, and quoted equivalents for delimited text. `a%` selects a matchit
 pair.
 
+## Multi-cursor editing
+
+Red supports built-in, Vim-style multi-cursor editing without an extra plugin.
+In Normal mode:
+
+| Key | Action |
+| --- | --- |
+| `Ctrl-n` | Select the word under the cursor, then add the next occurrence |
+| `Ctrl-Up` / `Ctrl-Down` | Add a cursor on the previous or next suitable line |
+| `n` / `N` | Move forward or backward through matching selections |
+| `q` / `Q` | Skip the current occurrence or remove its selection |
+| `Tab` | Enter extend mode; press again to collapse to each selection head |
+| `Shift-Left` / `Shift-Right` | Extend each selection by a grapheme |
+| `h`, `l`, `w`, `e`, `0`, `$` | Extend with Vim motions while extend mode is active |
+| `o` | Swap the anchor and head of every extended selection |
+| `c`, `i`, `a` | Replace, insert before, or append after every selection |
+| `d`, `x`, `y`, `p`, `P` | Delete, yank, or paste across the selected ranges |
+| `Esc` | Finish an insertion or clear the active multi-cursor session |
+
+From characterwise Visual mode, `Ctrl-n` uses the exact selected text as the
+seed, adds its next literal occurrence, and enters Normal-mode multi-cursor
+selection. The seed must stay on one line; multiline, Visual Line, and Visual
+Block selections remain unchanged.
+
+For example, press `Ctrl-n` twice over `foo`, type `cbar`, and press `Esc` to
+replace both selected occurrences with `bar`. One `u` undoes the entire edit.
+Selections respect complete Unicode graphemes, and vertical cursors preserve
+display columns across tabs and spaces.
+
 ## Searching
 
 - `/` and `?` search forward and backward with live preview.
@@ -129,9 +168,9 @@ Patterns use Rust regular-expression syntax. `incsearch`, `hlsearch`,
 | `Space .` | Show code actions and quick fixes |
 | `Space r` | Rename the current symbol |
 
-Ordinary completion and Copilot can be enabled independently. The default
-completion menu takes priority over Copilot ghost text. To try coordinated
-previews instead, add:
+Ordinary completion and Copilot can be enabled independently. By default, the
+completion menu takes priority over Copilot ghost text. **Coming in the next
+release:** Try coordinated previews instead by adding:
 
 ```toml
 [completion]
@@ -150,13 +189,16 @@ Ctrl-Space and language-server trigger characters. To stop only identifier-prefi
 popups, use `auto_trigger = false` instead; Ctrl-Space and language-server trigger
 characters remain available. Neither setting enables or disables Copilot.
 
-Supported documents are formatted on save by default. Red prefers an installed
-language-pack formatter and otherwise uses LSP. To disable automatic formatting,
-add this to `~/.config/red/config.toml`:
+Supported documents are formatted on save by default, and pasted ranges are
+formatted when the active language server supports range formatting. Red
+prefers an installed language-pack formatter for whole-document formatting and
+otherwise uses LSP. Disable either behavior
+in `~/.config/red/config.toml`:
 
 ```toml
 [formatting]
 on_save = false
+on_paste = false
 ```
 
 `Space f` still formats explicitly. The same section accepts
@@ -194,9 +236,9 @@ is available, its type-aware candidates are merged in and ranked ahead of
 buffer words. `Ctrl-Space` requests both sources explicitly; typing an
 identifier prefix requests them automatically. Language-server trigger
 characters such as `.` also request completion immediately. While the menu is
-open, use `Ctrl-n`/`Ctrl-p` or the arrow keys to select a candidate, `Tab` to
-accept it, and `Ctrl-e` to dismiss the menu. `Enter` continues to insert a
-newline.
+open, use `Ctrl-n`/`Ctrl-p` or the arrow keys to select a candidate, `Tab` or
+`Enter` to accept the selected item, and `Ctrl-e` to dismiss the menu. `Enter`
+inserts a newline only when no completion is selected.
 
 Tune or disable either behavior in `config.toml`:
 
@@ -226,6 +268,15 @@ root_markers = ["go.mod", ".git"]
 
 ## Finding files, buffers, and commands
 
+Open a directory in an editor window with `red .`, `red path/to/dir`,
+`:e path/to/dir`, or `:vs path/to/dir`. Use normal movement and search
+keys to navigate, Enter to open the entry under the cursor, `-` or `../` to
+go up, and `./`, `R` (or `:e!`) to refresh. Listings include hidden and ignored entries;
+directories end in `/`. They appear in the buffer list and can be revisited
+like any other buffer. Directory headers show the path and navigation help;
+listings omit line numbers, including relative numbers. Listings are read-only.
+Use Neo-tree for file operations.
+
 | Key | Action |
 | --- | --- |
 | `F1`, `:keys` | Contextual keyboard-shortcut explorer |
@@ -237,11 +288,37 @@ root_markers = ["go.mod", ".git"]
 | `Space g` | Project search using `rg` |
 | `Space t` | Theme browser |
 
+Press `Alt-p` or `F4` in the file, buffer, or project-search picker to hide or
+restore its preview. The query and selected result stay in place, and hiding
+the preview gives long result paths more room.
+
+In the file picker, append `:<line>` to a fuzzy filename query to open the
+selected file at that line. For example, `sona:123` opens `source_name.rs` at line 123.
+
 Press `F1` or click **F1 shortcuts** in an action strip to open keyboard help without closing the current pane or dialog. `Tab` switches between the current context and all Red keys; `/` searches by action or binding. `Esc` returns to exactly where you were. The **Keyboard shortcuts** command and `:keys` open the same explorer. User keymap overrides are reflected in the list.
 
 The command palette includes descriptions, effective keymaps, and accepted
 `:Command` invocations. Pause after a configured prefix such as `Space`,
 `Ctrl-w`, or `g` to display available continuations.
+
+### Searching the file tree
+
+Press `Ctrl-e` to open the Neo-tree sidebar, then `/` to search files and
+directories recursively. Results appear directly in the tree, including entries
+inside collapsed folders. Queries match complete workspace-relative paths, so
+`ui pick` can find `src/ui/file_picker.rs`; matching filename characters are
+highlighted.
+
+Use Up/Down or `Ctrl-p`/`Ctrl-n` to move between results and Enter to open a
+file or reveal a directory. `Ctrl-Enter` reveals the selected result without
+opening it, and Escape restores the tree as it appeared before the search.
+Press `D` instead of `/` to search directories only. Press `f` to apply a
+persistent filter, or `Shift-Enter` to keep an ordinary search visible; use
+`Ctrl-x` to clear either filter.
+
+Search respects the tree's Git ignore settings, includes its visible dotfiles,
+and never traverses `.git` metadata. It runs in the background without requiring
+`fd`, `find`, or additional plugin process permissions.
 
 ## Windows and buffers
 
@@ -268,16 +345,26 @@ The command palette includes descriptions, effective keymaps, and accepted
 
 ## Command mode
 
-Enter Command mode with `:` or `;`.
+Enter Command mode with `:`. By default, `;` repeats the previous character
+search, as in Vim; it can be remapped explicitly in your configuration.
 
 | Command | Action |
 | --- | --- |
 | `:w [file]` | Save, optionally under another name |
+| `:w! [file]` | Explicitly overwrite a changed file or existing destination |
+| `:wa` / `:wall` | Save every modified file buffer |
 | `:wq` | Save and quit |
-| `:q` / `:q!` | Quit, or quit while discarding changes |
-| `:e <file>` / `:e!` | Open or reload a file |
+| `:x` | Save if modified, then quit |
+| `:wqa` / `:xa` | Save every modified buffer, then quit (`!` overwrites files changed on disk) |
+| `:q` / `:q!` | Quit, or quit while discarding changes (`:qa` / `:qa!` work too) |
+| `:e <file>` / `:e!` | Open a file or discard local edits and reload from disk |
+| `:diffdisk` | Compare a locally edited file with its changed disk version |
 | `:<number>` / `:$` | Jump to a line or the last line |
 | `:bn` / `:bd` | Select the next buffer or delete a buffer |
+| `:bufdo {command}` | Run a non-interactive Ex command in every open buffer |
+| `:!{command}` / `:!!` | Run a shell command or repeat the previous one |
+| `:%!{command}` / `:2,5!{command}` | Filter the whole buffer or selected lines through a command |
+| `:'<,'>!{command}` | Filter the lines from the last Visual selection |
 | `:sp [file]` / `:vs [file]` | Open a horizontal or vertical split |
 | `:close` / `:only` | Close the window or keep only the current window |
 | `:wrap` / `:nowrap` | Enable or disable wrapping |
@@ -286,6 +373,22 @@ Enter Command mode with `:` or `;`.
 | `:join [count]` / `:join! [count]` | Join with normalized or preserved spacing |
 | `:commands` | Open the command palette |
 | `:messages` | Browse active notifications and recent messages |
+
+When format-on-save is pending, `:wq` waits for the save to finish before
+exiting. If the save fails or the buffer changes during formatting, Red stays
+open so you can resolve it.
+
+Shell commands run asynchronously in Red's working directory using `$SHELL -c`
+on Unix or `COMSPEC /C` on Windows. Output streams into the Messages view while
+the editor, language servers, and detached sessions remain responsive. Press
+`Ctrl-c` in the selected running command to cancel it, or `Esc` to return to
+editing while it continues. `%` expands to the current file, `#` to the
+alternate file, and `!` to the previous shell command; prefix those characters
+with `\` when they should remain literal. Ordinary `:!` jobs do not provide
+interactive stdin. Range filters such as `:%!sort` pipe the selected text into
+the command and replace it with stdout as one undoable edit; Visual `:` already
+prefills the `'<,'>` range. Failed, cancelled, or outdated filters leave the
+buffer unchanged, and stderr remains visible in Messages.
 
 The bottom line shows the current notification. Routine feedback such as saves
 and copies fades away without leaving a badge. The badge counts warnings or
@@ -299,6 +402,20 @@ active, needs-attention, and warning/error filters,
 scroll long details; `D` clears inactive history. Messages are retained for
 the current Red session, subject to the history limit.
 
+## Files changed outside Red
+
+Red watches open files and protects your work when another editor, formatter,
+Git operation, or agent changes them on disk. A clean buffer reloads
+automatically. A dirty buffer remains unchanged, and Red marks the conflict
+instead of overwriting either version. Deleted files stay
+open and receive their own conflict indicator.
+
+Run `:diffdisk` to compare the disk and buffer versions in a unified diff.
+The default choice keeps your local edits and leaves the disk
+untouched. Use `:e!` to discard your edits and reload, `:w <file>` to save
+them elsewhere, or `:w!` to overwrite the changed disk version deliberately.
+Ordinary `:w` and `:wall` never silently overwrite an external change.
+
 ## Git workspace
 
 The bundled Git plugin provides gutter signs and a full-screen status
@@ -309,6 +426,10 @@ workspace. Open it with `Space G`.
 - `Space c c` submits a commit message; `Space c q` cancels it.
 - The commit editor shows branch and working-tree status followed by the staged diff.
   `:w` or `:wq` submits the message and returns to the workspace; `:q` cancels.
+
+The commit menu also offers **Generate message**. With Codex installed and
+authenticated, Red drafts a message from the staged diff while using recent
+commit messages only as style examples; you can edit the draft before committing.
 
 The workspace covers staged, unstaged, untracked, and conflicted files with an
 adaptive diff pane. It also exposes synchronization, branch, remote, tag,
@@ -343,23 +464,49 @@ confirmation-gated.
 
 ## Agent workflow
 
-For a bounded one-range edit, put the cursor on a line or make a character or
-linewise visual selection and press `Space i`. Enter a request such as
-`extract the condition into a named boolean`. Red anchors a small, auto-growing
-prompt inside the initiating editor split, beside but never over the target,
-and applies the completed replacement as one unsaved transaction.
-Press Enter to keep it, `u` to undo, `r` to refine, or `A` to continue in the
-full Agent panel. Visual-block selections are rejected in this first version.
+Agent features require Codex CLI 0.144.1 or newer and a completed `codex login`.
+Run `red --agent-check` for an offline prerequisite report, or use
+`red --agent-check --strict` to return a non-zero status when setup is incomplete.
 
-Install and authenticate Codex separately, then press `Space A` from Normal or
-Visual mode. Red sends a bounded source excerpt, unsaved contents, and relevant
-diagnostics. Red reveals each file operation as it happens, applies
-revision-checked edits through the editor, and saves them with agent attribution.
+### Ask inline
 
-Run `red --agent-check` for an offline prerequisite report or
-`red --agent-check --strict` for a non-zero exit when setup is incomplete.
-See the [agent workflow and safety contract](AGENT_WORKFLOW.md) for the complete
-interaction model and command list.
+Press `Space i` to review, explain, or refactor code beside the current source.
+In Normal mode, Red targets the enclosing function when syntax information is
+available, falling back to the current line. In Visual or Visual Line mode, it
+targets exactly your selection. Visual-block targets are rejected. Enter a
+request such as `extract the condition into a named boolean` or `review this
+function for edge cases`.
+
+Inline code changes are one **unsaved, undoable editor transaction**. Comments
+and explanations never modify source. Exact foreground results apply
+immediately by default; set `[agent] auto_apply_inline_edits = false` to review
+them first. Background results and wider same-file edits always require
+explicit approval. In a review
+diff, `a` approves, `d` declines, and `Enter` does not apply the change.
+
+Use `u` to undo an applied result, `r` to refine it, `Space H` to inspect retained
+inline history, or `A` to prepare a full Agent follow-up. The follow-up remains
+an unsent draft until you submit it yourself.
+
+### Open the full Agent workspace
+
+Press `Space A` from Normal or Visual mode. Red sends a bounded source excerpt,
+selection, relevant diagnostics, and authoritative unsaved buffer contents.
+Codex reads and changes files through Red's workspace-confined editor tools;
+revision-checked Agent writes are attributed to the conversation and **saved
+to disk**. This differs intentionally from unsaved inline edits.
+
+Tool calls run without forced playback pauses by default; set
+`[agent] follow_tool_calls = true` to reveal each target and pause before it runs.
+
+Ask the Agent to explain a subsystem and follow links in its answer directly
+to source-anchored annotations. Click the model in the Agent header, press
+`Alt+m`, or run `:AgentModel` to choose the model and reasoning effort for this
+conversation without modifying global Codex
+configuration.
+
+See the [agent workflow and safety contract](AGENT_WORKFLOW.md) for the full
+interaction model, commands, path boundaries, and failure behavior.
 
 ## Configuration
 
@@ -388,6 +535,20 @@ of actions, define a nested chord, or invoke a plugin command:
 "g" = { "d" = "GoToDefinition" }
 "Ctrl-j" = { PluginCommand = "BufferPicker" }
 ```
+
+To make `j` and `k` move through wrapped text like `gj` and `gk`,
+add this to your configuration:
+
+```toml
+[keys.normal]
+j = "MoveScreenLineDown"
+k = "MoveScreenLineUp"
+```
+
+If you already have a `[keys.normal]` section, add just the two assignments to
+it. Counts follow screen lines too: `5j` moves like `5gj`. Visual modes
+inherit these bindings unless you override them; operators such as `dj` and
+`dk` still act on logical lines.
 
 Bindings to `EnterMode = "Command"` also work in panel navigation and modal
 workspaces. Normal-mode command bindings are inherited by visual modes; an

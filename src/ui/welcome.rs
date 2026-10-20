@@ -243,7 +243,7 @@ impl WelcomePanel {
         self.center(
             buffer,
             brand_row + 3,
-            "An agent that asks permission.",
+            "An agent that knows your editor.",
             palette.style(Role::Muted),
         );
 
@@ -520,7 +520,7 @@ impl TutorialDemoPanel {
         let theme = editor.theme.clone();
         let title = match kind {
             TutorialDemoKind::Git => "GIT · SAFE PRACTICE DIFF",
-            TutorialDemoKind::Agent => "AGENT · REVIEW REQUIRED",
+            TutorialDemoKind::Agent => "AGENT · SAFE PRACTICE",
         };
         let mut dialog = Dialog::new(
             Some(title.to_string()),
@@ -537,9 +537,9 @@ impl TutorialDemoPanel {
             TutorialDemoKind::Git => vec![UiAction::new("continue", "Esc", "Continue")
                 .with_priority(ActionPriority::Essential)],
             TutorialDemoKind::Agent => vec![
-                UiAction::new("accept", "a", "Accept practice change")
+                UiAction::new("accept", "a", "Apply practice change")
                     .with_priority(ActionPriority::Essential),
-                UiAction::new("reject", "r", "Reject").with_priority(ActionPriority::Essential),
+                UiAction::new("reject", "r", "Skip").with_priority(ActionPriority::Essential),
             ],
         };
         dialog.set_actions(actions);
@@ -568,11 +568,11 @@ impl Component for TutorialDemoPanel {
             TutorialDemoKind::Agent => [
                 "  Agent request: Explain and improve total_price.",
                 "",
-                "  PROPOSED CHANGE · NOT APPLIED",
+                "  SAMPLE CHANGE · NOT APPLIED",
                 "  -    prices.iter().sum()",
                 "  +    prices.iter().copied().sum()",
                 "",
-                "  Accept changes only the unnamed practice buffer.",
+                "  This demo changes only the unnamed practice buffer.",
             ],
         };
         let width = self.dialog.width.saturating_sub(4);
@@ -584,7 +584,7 @@ impl Component for TutorialDemoPanel {
                 Role::Key
             } else if line.trim_start().starts_with("-") {
                 Role::Dot
-            } else if line.contains("Sample only") || line.contains("Accept changes") {
+            } else if line.contains("Sample only") || line.contains("This demo changes") {
                 Role::Muted
             } else {
                 Role::Text
@@ -751,7 +751,7 @@ mod tests {
     }
 
     #[test]
-    fn welcome_renders_brand_choices_and_safe_agent_promise() {
+    fn welcome_renders_brand_choices_and_editor_aware_agent_promise() {
         let editor = editor(/*width*/ 100, /*height*/ 28);
         let panel = WelcomePanel::new(&editor, /*can_resume*/ false);
         let mut buffer = RenderBuffer::new(100, 28, &Style::default());
@@ -761,7 +761,7 @@ mod tests {
         assert!(rendered.contains("WELCOME TO RED"));
         assert!(rendered.contains("guided tour"));
         assert!(rendered.contains("What’s new"));
-        assert!(rendered.contains("agent that asks permission"));
+        assert!(rendered.contains("agent that knows your editor"));
     }
 
     #[test]
@@ -780,8 +780,10 @@ mod tests {
 
         panel.draw(&mut buffer).unwrap();
         let rendered = buffer.dump(false).replace('·', " ");
+        assert!(rendered.contains("SAFE PRACTICE"));
         assert!(rendered.contains("NOT APPLIED"));
         assert!(rendered.contains("unnamed practice buffer"));
+        assert!(!rendered.contains("REVIEW REQUIRED"));
     }
 
     #[test]

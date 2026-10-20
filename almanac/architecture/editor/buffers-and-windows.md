@@ -1,11 +1,14 @@
 ---
 title: "Buffers And Windows"
-summary: "Buffers and windows separate editable text identity from split-tree presentation while the editor synchronizes active cursor, viewport, jumplist, and plugin-visible window state."
+summary: "Buffers and windows separate text or generated-directory identity from split-tree presentation while the editor synchronizes active cursor, viewport, jumplist, and plugin-visible window state."
 topics: [architecture, editor, buffers, windows, sessions, plugins]
 sources:
   - id: buffer
     type: file
     path: src/buffer.rs
+  - id: directory-buffer
+    type: file
+    path: src/buffer/directory.rs
   - id: window
     type: file
     path: src/window.rs
@@ -23,13 +26,21 @@ sources:
     path: tests/movement.rs
 ---
 
-Red separates editable text from the window tree that presents it. A `Buffer` owns Ropey text, a stable process-local `BufferId`, file association, dirty state, content revision, fallback cursor state, and undo history [@buffer]. A `Window` owns a stable `WindowId`, a buffer index, terminal bounds, viewport offsets, wrapping state, cursor position, jump list, and active flag [@window]. `Editor` coordinates both sides: buffers hold content identity, windows hold per-view presentation, and rendering plus plugin snapshots synchronize the active view with the state exposed to integrations [@editor].
+Red separates buffer identity from the window tree that presents it. A `Buffer` owns Ropey text, a stable process-local `BufferId`, optional file association, optional generated-directory metadata, dirty state, content revision, fallback cursor state, and undo history [@buffer]. A `Window` owns a stable `WindowId`, a buffer index, terminal bounds, viewport offsets, wrapping state, cursor position, jump list, and active flag [@window]. `Editor` coordinates both sides: buffers hold content identity, windows hold per-view presentation, and rendering plus plugin snapshots synchronize the active view with the state exposed to integrations [@editor].
 
 ## Buffer Identity And Selection
 
 `BufferId` is process-local and stable even when the buffer's position in `Editor::buffers` changes [@buffer]. That distinction matters because many legacy editor APIs still refer to buffers by current index, while undo history, marks, LSP revision tracking, and durable snapshots need an identity that is not invalidated by closing a neighboring buffer [@editor]. The buffer itself tracks a monotonic content revision that render caches, LSP delivery, and plugin payloads can compare against [@buffer].
 
 `BufferManager` owns the open buffer vector and active buffer index. It adds buffers by making them active, can append without changing selection, removes buffers while clamping the active index, and replaces the full buffer set by resetting selection to the first buffer [@buffer-manager]. That small boundary keeps tab selection rules localized while `Editor` remains responsible for cross-cutting effects such as LSP open/close, rendering, marks, and session state.
+
+## Directory Buffers
+
+Directory buffers are generated buffer identities, not file-backed text documents. `Buffer::load_path` handles user-opened paths and creates a directory buffer when the normalized path is a directory; the internal text-only `load_or_create` path remains for regular files [@buffer]. A directory buffer has no `file`, stores its path in `directory`, exposes that path through `Buffer::path`, disables syntax highlighting after refresh, and rewrites its generated Rope contents without recording a text edit or changing `BufferId` [@buffer].
+
+The directory scan is shared with Neo-tree row data, but directory buffers pass the unfiltered mode so listings show hidden and ignored entries instead of applying workspace ignores [@directory-buffer]. Generated directory text always starts with `./` and `../`; entries are written as one physical row each, escaped with `escape_debug`, and directory names receive a trailing `/` [@buffer]. The scan sorts directories before files case-insensitively, follows symlinks only far enough to present a link as a file or directory target, and omits unsupported `other` entries [@directory-buffer].
+
+Editor actions treat directory buffers as navigable and read-only. Tests cover opening a directory from `:e`/open-file actions, reusing the same directory buffer identity when reopened, navigating into child directories and files with Enter, returning to a parent from `../`, refreshing through `./`, keeping generated rows clean, hiding line numbers in the listing, and rejecting save, rename, insert, and direct text-file open paths for directories [@editor]. Session snapshots store a separate `directory` path for these buffers; restore re-enumerates the directory instead of comparing the old generated text to disk, and an unavailable directory restores as a safe directory buffer containing the read error [@session-store] [@editor].
 
 ## Split Tree And Window Identity
 

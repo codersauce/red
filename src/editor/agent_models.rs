@@ -205,11 +205,12 @@ mod tests {
                     ("close", "×", "Alt-w"),
                 ]
                 .into_iter()
-                .map(|(id, label, shortcut)| plugin::TextPanelHeaderAction {
+                .map(|(id, label, key)| plugin::TextPanelHeaderAction {
                     id: id.into(),
+                    key: key.into(),
                     label: label.into(),
                     compact_label: None,
-                    shortcut: Some(shortcut.into()),
+                    ..Default::default()
                 })
                 .collect(),
                 ..Default::default()
@@ -231,33 +232,35 @@ mod tests {
         editor
             .panel_manager
             .handle_focused_text_input(&Event::Paste("unfinished draft".into()), 100);
+        let model_key = Event::Key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::ALT));
         for composer in [true, false] {
             if !composer {
                 editor.panel_manager.focus_focused_text_scrollback(100);
             }
-            for (key, expected) in [
-                ('m', "model"),
-                ('s', "sessions"),
-                ('n', "new"),
-                ('c', "clear"),
-                ('w', "close"),
-            ] {
-                let key = Event::Key(KeyEvent::new(KeyCode::Char(key), KeyModifiers::ALT));
-                let before = editor.panel_manager.snapshot(100);
-                let action = editor.handle_panel_event(&key, None).unwrap();
-                assert!(
-                    matches!(action, KeyAction::Multiple(actions) if actions.iter().any(|action| matches!(action, Action::NotifyPlugins(name, payload) if name == "panel:event:agent-conversation" && payload["action"] == expected))),
-                    "header shortcut did not dispatch {expected}"
-                );
-                assert_eq!(editor.panel_manager.snapshot(100), before);
-            }
-            for shortcut in ["Alt-m", "Alt-s", "Alt-n", "Alt-c", "Alt-w"] {
-                assert!(editor
-                    .panel_manager
-                    .surface_actions()
-                    .iter()
-                    .any(|action| action.key == shortcut));
-            }
+            let before = editor.panel_manager.snapshot(100);
+            let action = editor.handle_panel_event(&model_key, None).unwrap();
+            assert!(
+                matches!(action, KeyAction::Multiple(actions) if actions.iter().any(|action| matches!(action, Action::NotifyPlugins(name, payload) if name == "panel:event:agent-conversation" && payload["action"] == "model")))
+            );
+            assert_eq!(editor.panel_manager.snapshot(100), before);
+            assert!(editor
+                .panel_manager
+                .surface_actions()
+                .iter()
+                .any(|action| action.key == "Alt-m"));
+        }
+        for (key, expected) in [
+            ('s', "sessions"),
+            ('n', "new"),
+            ('c', "clear"),
+            ('w', "close"),
+        ] {
+            let key = Event::Key(KeyEvent::new(KeyCode::Char(key), KeyModifiers::ALT));
+            let action = editor.handle_panel_event(&key, None).unwrap();
+            assert!(
+                matches!(action, KeyAction::Multiple(actions) if actions.iter().any(|action| matches!(action, Action::NotifyPlugins(name, payload) if name == "panel:event:agent-conversation" && payload["action"] == expected))),
+                "header shortcut did not dispatch {expected}"
+            );
         }
         editor.panel_manager.set_text_panel_header_detail(
             "agent-conversation",

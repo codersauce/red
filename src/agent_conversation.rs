@@ -7,6 +7,13 @@ const MAX_TRANSCRIPT_ITEMS: usize = 512;
 const MAX_TRANSCRIPT_CHARS: usize = 1_048_576;
 const EDITOR_CONTEXT_MARKER: &str = "\n\nActive editor context from ";
 
+/// Version of the dynamic-tool contract registered for new full-Agent threads.
+///
+/// Codex app-server does not accept a replacement dynamic-tool catalog when a
+/// persisted thread is resumed. A recovered conversation created by another
+/// version must therefore remain readable but start a fresh compatible thread.
+pub const AGENT_TOOL_CONTRACT_VERSION: u32 = 1;
+
 /// Maximum source annotations retained with one Agent conversation.
 pub const MAX_AGENT_ANNOTATIONS: usize = 512;
 
@@ -45,6 +52,9 @@ pub struct AgentAnnotationRecord {
 pub struct AgentConversationSnapshot {
     pub thread_id: String,
     pub cwd: String,
+    /// Dynamic-tool contract registered when this Codex thread was created.
+    #[serde(default)]
+    pub tool_contract_version: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_info: Option<crate::codex::AgentModelInfo>,
     #[serde(default)]
@@ -94,6 +104,7 @@ impl AgentConversationSnapshot {
         Self {
             thread_id: thread_id.into(),
             cwd: cwd.into(),
+            tool_contract_version: AGENT_TOOL_CONTRACT_VERSION,
             model_info: None,
             items: Vec::new(),
             annotations: Vec::new(),
@@ -163,18 +174,26 @@ impl AgentConversationSnapshot {
     }
 
     fn enforce_limits(&mut self) {
-        while self.items.len() > MAX_TRANSCRIPT_ITEMS
-            || self
-                .items
+        let mut removed = self.items.len().saturating_sub(MAX_TRANSCRIPT_ITEMS);
+        let retained = &self.items[removed..];
+        let bytes = retained.iter().map(|item| item.text.len()).sum::<usize>();
+
+        // A UTF-8 string never contains more characters than bytes. Most streamed
+        // conversations are comfortably below the byte ceiling, so avoid counting
+        // every character in the entire transcript after each incoming token.
+        if bytes > MAX_TRANSCRIPT_CHARS {
+            let mut characters = retained
                 .iter()
                 .map(|item| item.text.chars().count())
-                .sum::<usize>()
-                > MAX_TRANSCRIPT_CHARS
-        {
-            if self.items.is_empty() {
-                break;
+                .sum::<usize>();
+            while characters > MAX_TRANSCRIPT_CHARS && removed < self.items.len() {
+                characters -= self.items[removed].text.chars().count();
+                removed += 1;
             }
-            self.items.remove(0);
+        }
+
+        if removed > 0 {
+            self.items.drain(..removed);
         }
     }
 }
@@ -431,6 +450,22 @@ mod tests {
     }
 
     #[test]
+    fn old_conversations_default_to_an_incompatible_tool_contract() {
+        let restored: AgentConversationSnapshot = serde_json::from_value(json!({
+            "thread_id": "old-thread",
+            "cwd": "/workspace"
+        }))
+        .unwrap();
+
+        assert_eq!(restored.tool_contract_version, 0);
+        assert_ne!(restored.tool_contract_version, AGENT_TOOL_CONTRACT_VERSION);
+        assert_eq!(
+            AgentConversationSnapshot::new("new-thread", "/workspace").tool_contract_version,
+            AGENT_TOOL_CONTRACT_VERSION
+        );
+    }
+
+    #[test]
     fn groups_multiple_agent_messages_into_one_visible_turn() {
         let thread = json!({
             "turns": [{
@@ -524,5 +559,46 @@ mod tests {
         assert_eq!(restored.annotations[0].start_line, 8);
         assert_eq!(restored.annotations[0].end_line, 9);
         assert_eq!(restored.annotations[0].expected_fingerprint, Some([7; 32]));
+    }
+
+    #[test]
+    fn transcript_limits_count_characters_instead_of_utf8_bytes() {
+        let mut conversation = AgentConversationSnapshot::new("thread", "/workspace");
+        let unicode = "界".repeat(MAX_TRANSCRIPT_CHARS / 2);
+
+        conversation.append_user("unicode", unicode.clone());
+        conversation.append_agent_delta("answer", "Still within the character limit");
+
+        assert_eq!(conversation.items.len(), 2);
+        assert_eq!(conversation.items[0].text, unicode);
+    }
+
+    #[test]
+    fn transcript_limits_remove_oldest_items_once() {
+        let mut conversation = AgentConversationSnapshot::new("thread", "/workspace");
+        conversation.items = (0..MAX_TRANSCRIPT_ITEMS + 4)
+            .map(|index| AgentTranscriptItem {
+                id: index.to_string(),
+                turn_id: None,
+                role: AgentTranscriptRole::User,
+                text: "message".to_string(),
+            })
+            .collect();
+
+        conversation.enforce_limits();
+
+        assert_eq!(conversation.items.len(), MAX_TRANSCRIPT_ITEMS);
+        assert_eq!(conversation.items[0].id, "4");
+    }
+
+    #[test]
+    fn transcript_limits_remove_complete_messages_at_character_boundary() {
+        let mut conversation = AgentConversationSnapshot::new("thread", "/workspace");
+        conversation.append_user("full", "a".repeat(MAX_TRANSCRIPT_CHARS));
+
+        conversation.append_agent_delta("answer", "界");
+
+        assert_eq!(conversation.items.len(), 1);
+        assert_eq!(conversation.items[0].text, "界");
     }
 }

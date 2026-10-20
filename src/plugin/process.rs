@@ -11,6 +11,7 @@
 
 use std::{
     collections::{HashMap, VecDeque},
+    ffi::OsString,
     io::{BufRead, BufReader, Read, Write},
     path::PathBuf,
     process::{Command, Stdio},
@@ -57,6 +58,24 @@ const INHERITED_ENVIRONMENT_KEYS: &[&str] = &[
     "HOMEDRIVE",
     "HOMEPATH",
 ];
+
+pub(crate) fn inherited_environment(
+    extra_keys: &[String],
+) -> anyhow::Result<Vec<(String, OsString)>> {
+    INHERITED_ENVIRONMENT_KEYS
+        .iter()
+        .copied()
+        .chain(extra_keys.iter().map(String::as_str))
+        .filter_map(|key| {
+            if key.is_empty() || key.contains('=') || key.contains('\0') {
+                return Some(Err(anyhow::anyhow!(
+                    "invalid inherited environment variable name `{key}`"
+                )));
+            }
+            std::env::var_os(key).map(|value| Ok((key.to_string(), value)))
+        })
+        .collect()
+}
 
 #[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
@@ -184,10 +203,8 @@ impl ProcessManager {
             })
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        for key in INHERITED_ENVIRONMENT_KEYS {
-            if let Some(value) = std::env::var_os(key) {
-                command.env(key, value);
-            }
+        for (key, value) in inherited_environment(&[])? {
+            command.env(key, value);
         }
         for (key, value) in &options.env {
             anyhow::ensure!(
@@ -344,6 +361,13 @@ impl ProcessManager {
             anyhow::bail!("plugin `{plugin_name}` does not have process permissions configured");
         }
         Ok(permissions)
+    }
+
+    pub(crate) fn inherited_environment_keys(&self, plugin_name: &str) -> Vec<String> {
+        self.permissions
+            .get(plugin_name)
+            .map(|permissions| permissions.inherit_env.clone())
+            .unwrap_or_default()
     }
 
     fn refresh_events(&mut self) {
@@ -585,6 +609,7 @@ mod tests {
             "test".to_string(),
             PluginPermissions {
                 process: commands.iter().map(|command| command.to_string()).collect(),
+                ..PluginPermissions::default()
             },
         )]))
     }
@@ -1056,6 +1081,13 @@ mod tests {
     }
 
     #[test]
+    fn rejects_invalid_inherited_environment_variable_names() {
+        for key in ["", "NAME=value", "NAME\0value"] {
+            assert!(inherited_environment(&[key.to_string()]).is_err());
+        }
+    }
+
+    #[test]
     fn enforces_per_plugin_process_limit_and_kill_is_idempotent() {
         let options = long_running_options();
         let mut manager = manager_with_commands(&[options.command.as_str()]);
@@ -1081,6 +1113,7 @@ mod tests {
         let options = long_running_options();
         let permissions = PluginPermissions {
             process: vec![options.command.clone()],
+            ..PluginPermissions::default()
         };
         let mut manager = ProcessManager::new(HashMap::from([
             ("target".to_string(), permissions.clone()),

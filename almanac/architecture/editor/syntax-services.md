@@ -1,7 +1,7 @@
 ---
 title: "Syntax Services"
 summary: "Syntax services choose a buffer language, produce byte-range highlight spans, cache viewport parses, and feed matching-token motions without making syntax choice a text mutation."
-topics: [architecture, editor, syntax, rendering, vim]
+topics: [architecture, editor, syntax, language-packs, rendering, vim]
 sources:
   - id: highlighter
     type: file
@@ -21,6 +21,12 @@ sources:
   - id: textobjects
     type: file
     path: src/textobjects.rs
+  - id: language-pack-decision
+    type: file
+    path: almanac/decisions/plugins/language-pack-distribution.md
+  - id: language-pack-release
+    type: file
+    path: almanac/guides/plugins/release-language-pack.md
 ---
 
 Syntax services in Red are editor-owned helpers for language selection, highlighting, and matching-token navigation. `Highlighter` maps filenames, extensions, and language names to bundled syntax definitions, then returns `StyleInfo` spans over UTF-8 byte ranges for the text slice it was given [@highlighter]. The editor decides which language applies to a buffer, caches parsed viewport slices by buffer revision and syntax selection, and clears those caches when the user changes syntax mode [@editor]. Match navigation uses the same current language identity, but it returns editor text positions instead of byte spans, keeping syntax services connected to [Editor Coordinate Systems](../../concepts/editor/coordinate-systems) without owning text mutation [@matchit].
@@ -33,7 +39,7 @@ The editor resolves that buffer setting before rendering. `Auto` asks the highli
 
 ## Highlight Production
 
-The highlighter owns the parser and query cache for tree-sitter languages. It builds `LanguageHighlighter` entries lazily, combining bundled highlight queries, compiling an optional injection query, and mapping capture names to theme styles [@highlighter]. Supported tree-sitter-backed languages include Rust, Markdown, JavaScript, JSX, TypeScript, TSX, JSON, TOML, YAML, Python, Bash, Fish, PowerShell, and Lua [@highlighter].
+The highlighter owns the parser and query cache for tree-sitter languages. It builds `LanguageHighlighter` entries lazily, combining bundled highlight queries, compiling an optional injection query, and mapping capture names to theme styles [@highlighter]. Supported bundled tree-sitter-backed languages include Rust, Markdown, JavaScript, JSX, TypeScript, TSX, JSON, TOML, YAML, Bash, Fish, PowerShell, and Lua [@highlighter].
 
 Husk is a special path. The `husk` language id maps `.hk` and `.husk` files, but `highlight_with_depth` bypasses tree-sitter and calls the Husk lexer, assigning theme scopes to comments, keywords, numeric and string literals, builtin types, builtin constants, builtin variables, and operators [@highlighter]. This keeps plugin-language highlighting available even though Husk syntax is not represented by a tree-sitter grammar in this module [@highlighter].
 
@@ -53,7 +59,7 @@ Matchit is separate from color highlighting but shares syntax identity. The edit
 
 ## Structural Text Objects
 
-Structural selection and navigation use a separate editor-owned `SyntaxTextObjectService`, not the viewport highlighter or reusable `TextArea` motion engine [@textobjects] [@editor]. The service resolves the active language through the same immutable registry, compiles only the requested object kind, caches the parsed syntax tree by buffer identity, content revision, and canonical language id, and progressively searches bounded byte ranges in larger documents [@highlighter] [@textobjects]. Older first-party language packs inherit validated bundled structural queries when their manifests omit them; explicit package or user queries take precedence and an incompatible fallback cannot quarantine the language [@highlighter]. Language reload replaces the registry and clears compiled queries and document captures; syntax changes invalidate the affected buffer [@editor] [@textobjects].
+Structural selection and navigation use a separate editor-owned `SyntaxTextObjectService`, not the viewport highlighter or reusable `TextArea` motion engine [@textobjects] [@editor]. The service resolves the active language through the same immutable registry, compiles only the requested object kind, caches the parsed syntax tree by buffer identity, content revision, and canonical language id, and progressively searches bounded byte ranges in larger documents [@highlighter] [@textobjects]. Older first-party language packs inherit validated bundled structural queries when their manifests omit them; explicit package or user queries take precedence and an incompatible fallback cannot quarantine the language [@highlighter]. The package and catalog policy for first-party language packs is covered by [Official Language Pack Distribution](../../decisions/plugins/language-pack-distribution), and publication is covered by [Release A Language Pack](../../guides/plugins/release-language-pack) [@language-pack-decision] [@language-pack-release]. Language reload replaces the registry and clears compiled queries and document captures; syntax changes invalidate the affected buffer [@editor] [@textobjects].
 
 Viewport highlighting is not a suitable cache for structural motions because it intentionally parses only a window-sized slice plus a margin and may begin at a nonzero line [@editor]. The separate full-buffer tree preserves the existing architecture: syntax services answer positional questions, while text changes still enter through the editor's mutation boundary rather than through parser code [@textobjects] [@editor].
 

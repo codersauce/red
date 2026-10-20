@@ -103,11 +103,36 @@ mkdir -p "$install_dir"
 staged_binary="$install_dir/.red.install.$$"
 cp "$tmp_dir/extracted/red" "$staged_binary"
 chmod 755 "$staged_binary"
+
+"$staged_binary" --version >/dev/null ||
+  fail 'downloaded red failed its version check'
+self_check_output="$(NO_COLOR=1 "$staged_binary" --self-check)" ||
+  fail 'downloaded red failed its self-check'
+[ "$(printf '%s\n' "$self_check_output" | tail -n 1)" = 'red self-check ok' ] ||
+  fail 'downloaded red returned unexpected self-check output'
+
 mv -f "$staged_binary" "$install_dir/red"
 staged_binary=""
 
+lock_file="$install_dir/.red-update.lock"
+[ ! -L "$lock_file" ] || fail "$lock_file must not be a symbolic link"
+if [ ! -e "$lock_file" ]; then
+  (umask 022 && : > "$lock_file")
+fi
+[ -f "$lock_file" ] || fail "$lock_file must be a regular file"
+
+receipt="$install_dir/.red-install.toml"
+receipt_tmp="$install_dir/.red-install.$$"
+cat > "$receipt_tmp" <<EOF
+schema_version = 1
+source = "standalone"
+target = "$target"
+EOF
+chmod 644 "$receipt_tmp"
+mv -f "$receipt_tmp" "$receipt"
+
 "$install_dir/red" --version
-NO_COLOR=1 "$install_dir/red" --self-check
+printf '%s\n' "$self_check_output"
 
 case ":${PATH:-}:" in
   *":$install_dir:"*) ;;

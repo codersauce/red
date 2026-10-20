@@ -1,7 +1,7 @@
 ---
 title: "Copilot Inline Completion"
 summary: "Enable, authenticate, and use optional GitHub Copilot ghost-text suggestions without replacing ordinary language-server completion."
-topics: [guides, agent, completion]
+topics: [guides, ai-completion, configuration, preferences]
 sources:
   - id: defaults
     type: file
@@ -15,6 +15,18 @@ sources:
   - id: preferences
     type: file
     path: src/preferences.rs
+  - id: config-reference
+    type: file
+    path: almanac/reference/configuration/default-config.md
+  - id: preferences-store
+    type: file
+    path: almanac/architecture/preferences/preferences-store.md
+  - id: agent-check
+    type: file
+    path: almanac/reference/agent/agent-check.md
+  - id: inline-assist
+    type: file
+    path: almanac/architecture/agent/inline-assist.md
 ---
 
 # Copilot Inline Completion
@@ -22,7 +34,15 @@ sources:
 Copilot is optional and disabled by default. Enabling it permits the official
 GitHub Copilot language server to process eligible source code. It runs beside
 the normal language server; it does not replace rust-analyzer, TypeScript's
-server, or other language intelligence [@transport] [@editor].
+server, or other language intelligence [@transport] [@editor]. For the ordinary
+popup-completion request, filtering, and edit path that Copilot coordinates
+with, read [LSP Completion](../../architecture/lsp/completion). For exact
+configuration defaults, use [Default Config](../../reference/configuration/default-config);
+for Codex agent readiness instead of Copilot completion, use
+[Agent Check](../../reference/agent/agent-check) [@config-reference] [@agent-check].
+For source-anchored Codex questions, annotations, replacements, and same-file
+proposals, use [Inline Assist](../../architecture/agent/inline-assist) instead
+[@inline-assist].
 
 ## Set Up
 
@@ -39,6 +59,12 @@ args = ["--stdio"]
 debounce_ms = 150
 max_file_bytes = 262144
 excluded_patterns = [".env", ".env.*", "*.pem", "*.key", "**/.git/**"]
+
+[completion]
+inline_mode = "popup_first"
+
+[keys.insert]
+"Ctrl-l" = "AcceptInlineCompletion"
 ```
 
 Alternatively, use `:Copilot enable` to opt in. Red saves `enabled = true` in
@@ -76,8 +102,10 @@ configured `copilot-language-server` can be found [@editor] [@preferences].
 Displaying the hint records `copilot_setup_hint_seen` in preferences before the
 bridge starts. Running `:Copilot signin`, `:Copilot enable`, or
 `:Copilot disable` also records the hint as seen [@editor] [@preferences].
-The hint is onboarding state, not consent or authentication state. Detecting
-an installed server never enables it. Explicit enablement is remembered in
+The hint is onboarding state inside the broader
+[Preferences Store](../../architecture/preferences/preferences-store), not
+consent or authentication state [@preferences-store]. Detecting an installed
+server never enables it. Explicit enablement is remembered in
 `[copilot].enabled`, independently of whether authentication succeeds. Red
 leaves credential management to the language server [@defaults] [@editor].
 
@@ -93,20 +121,47 @@ user [@editor].
 ## Use Suggestions
 
 Type in Insert mode and pause briefly. `Tab` accepts a visible suggestion as
-one undo step. `Esc` dismisses it and returns to Normal mode. Typing, moving the
+one undo step when no ordinary completion menu owns the key. The default insert
+binding also maps `Ctrl-l` to `AcceptInlineCompletion`, which accepts a visible
+Copilot suggestion through the same editor transaction path [@defaults]
+[@editor]. `Esc` dismisses it and returns to Normal mode. Typing, moving the
 cursor, or changing buffers invalidates stale suggestions. `Alt-\` requests a
 suggestion explicitly; `:Copilot complete` enters Insert mode and requests one
 at the current cursor [@editor].
 
-Copilot and ordinary autocomplete remain enabled together. A visible completion
-popup takes priority and hides ghost text; `Tab` and `Enter` keep accepting the
-selected popup item. When the popup closes or has no matching items, a current
-Copilot suggestion can reappear and deferred suggestions can run. `Ctrl-Space`
-opens ordinary completion, while `Alt-\` switches from that popup to an
-explicit AI request. `Ctrl-e` closes the completion popup without leaving Insert
-mode [@editor].
+Copilot and ordinary autocomplete remain enabled together. The default
+`[completion].inline_mode = "popup_first"` makes a visible completion popup take
+priority and hide ghost text; `Tab` and `Enter` keep accepting the selected
+popup item, while `Ctrl-l` is the explicit AI acceptance key if a visible
+Copilot suggestion is eligible [@defaults] [@editor]. When the popup closes or
+has no matching items, a current Copilot suggestion can reappear and deferred
+suggestions can run. `Ctrl-Space` opens ordinary completion, while `Alt-\`
+switches from that popup to an explicit AI request. `Ctrl-e` closes the
+completion popup without leaving Insert mode [@editor].
+
+Setting `[completion].inline_mode = "coordinated"` lets Red send compatible
+selected ordinary-completion text as `selectedCompletionInfo` to Copilot, then
+render an AI suffix that extends the selected completion item [@defaults]
+[@editor]. Only insertion-equivalent, side-effect-free completion items
+participate: snippet items, commands, additional text edits, incompatible ranges,
+and mismatched insertion text fall back to ordinary popup behavior [@editor]. In
+coordinated mode, `Tab` or `Enter` first accepts the ordinary completion item
+and leaves the AI suffix visible for a second acceptance; `Ctrl-l` accepts the
+combined AI edit in one undo step [@editor].
 
 This first integration supports single-line and multiline insertions at the
 cursor. Suggestions that would rewrite existing code are not accepted. Copilot
 next-edit suggestions require a separate review/preview interface and are not
 part of this feature [@editor].
+
+## Related Pages
+
+Use [Default Config](../../reference/configuration/default-config) to look up
+the `[copilot]`, `[completion]`, and `disable_ai` defaults. Use
+[LSP Completion](../../architecture/lsp/completion) when the issue is the
+ordinary popup request, filtering, or accepted-item mutation path. Use
+[Agent Check](../../reference/agent/agent-check) when the question is Codex
+app-server readiness rather than Copilot inline suggestions. Use
+[Inline Assist](../../architecture/agent/inline-assist) when the workflow is a
+bounded Codex turn over a selected source target rather than ghost-text
+completion [@inline-assist].

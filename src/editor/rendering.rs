@@ -15,7 +15,7 @@ use std::{
     fs, io,
     path::{Path, PathBuf},
     process::Command,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 
 use chrono::Local;
@@ -31,14 +31,14 @@ use crate::{
     editor::RenderCommand,
     lsp::{Diagnostic, DiagnosticSeverity},
     notification::{NotificationCounts, NotificationState, Severity},
-    plugin::DecorationAnchor,
+    plugin::{rpc::RpcStatuslineSide, DecorationAnchor},
     splash,
-    theme::{SelectionForegroundPriority, Style, Theme},
+    theme::{SelectionForegroundPriority, Style, SurfacePalette, Theme},
     ui::IconCatalog,
     undo::{TextPosition, TextRange},
     unicode_utils::{
-        char_prefix, display_width, display_width_with_tabs, fit_display_width,
-        grapheme_to_column_with_tabs, trim_line_ending, truncate_display_width,
+        char_prefix, display_width, display_width_with_tabs, fit_display_width, grapheme_len,
+        grapheme_to_column_with_tabs, is_printable_ascii, trim_line_ending, truncate_display_width,
         truncate_display_width_with_marker, TruncationSide,
     },
     utils::{expand_user_path, get_workspace_path},
@@ -47,7 +47,7 @@ use crate::{
 
 use super::{
     adjust_color_brightness, diagnostic_foreground, diagnostic_priority,
-    display_layout::{DisplayLayout, InlineCommentContent},
+    display_layout::{DisplayLayout, InlineCommentContent, LineSegment},
     inline_comments::InlineCommentConnector,
     render_buffer::Change,
     Editor, Mode, Point, Rect, RenderBuffer, StatuslineGitChanges, StyleCursor,
@@ -176,6 +176,15 @@ struct StatuslineAccent {
     minimum_contrast: Option<f32>,
 }
 
+fn rpc_statusline_segment(text: &str, style: &Style) -> StatuslineSegment {
+    StatuslineSegment {
+        text: statusline_icon_label("", text),
+        style: style.clone(),
+        accents: Vec::new(),
+        truncation_side: TruncationSide::Right,
+    }
+}
+
 struct StatuslineContext<'a> {
     mode: String,
     filename: String,
@@ -195,6 +204,7 @@ struct StatuslineContext<'a> {
     line_endings: &'static str,
     read_only: bool,
     modified: bool,
+    external_file_change: Option<super::ExternalFileChange>,
     workspace: String,
     relative_path: Option<String>,
     buffer_index: String,
@@ -228,7 +238,37 @@ fn statusline_segment(
             };
             (statusline_icon_label(glyph, branch), Vec::new())
         }
-        StatuslineSection::Filename => (format!(" {} ", context.filename), Vec::new()),
+        StatuslineSection::Filename => {
+            let text = format!(" {} ", context.filename);
+            let accents = context
+                .external_file_change
+                .and_then(|change| {
+                    let marker = if change == super::ExternalFileChange::Deleted {
+                        "[DELETED]"
+                    } else {
+                        "[CONFLICT]"
+                    };
+                    let offset = text.find(marker)?;
+                    let color = theme
+                        .colors
+                        .get("editorWarning.foreground")
+                        .copied()
+                        .unwrap_or(Color::Rgb {
+                            r: 213,
+                            g: 164,
+                            b: 88,
+                        });
+                    Some(StatuslineAccent {
+                        column: display_width(&text[..offset]),
+                        text: marker.to_string(),
+                        color,
+                        minimum_contrast: None,
+                    })
+                })
+                .into_iter()
+                .collect();
+            (text, accents)
+        }
         StatuslineSection::Syntax => {
             let syntax = context.syntax.as_deref()?;
             let icon = IconCatalog::file(
@@ -343,13 +383,18 @@ fn statusline_segment(
             )
         }
         StatuslineSection::Modified => {
-            if !context.modified {
+            if !context.modified && context.external_file_change.is_none() {
                 return None;
             }
+            let label = match context.external_file_change {
+                Some(super::ExternalFileChange::Deleted) => "deleted on disk",
+                Some(_) => "conflict",
+                None => "modified",
+            };
             (
                 statusline_icon_label(
                     statusline_section_icon(StatuslineSection::Modified, icon_style),
-                    "modified",
+                    label,
                 ),
                 Vec::new(),
             )
@@ -592,11 +637,12 @@ fn statusline_segments(
 ) -> Vec<StatuslineSegment> {
     sections
         .into_iter()
-        .filter_map(|section| statusline_segment(section, context, theme, icon_style, color_icons))
+        // Hidden sections must not shift the remaining sections into different color slots.
         .enumerate()
-        .map(|(index, mut segment)| {
+        .filter_map(|(index, section)| {
+            let mut segment = statusline_segment(section, context, theme, icon_style, color_icons)?;
             segment.style = statusline_slot_style(theme, index);
-            segment
+            Some(segment)
         })
         .collect()
 }
@@ -766,23 +812,53 @@ fn draw_statusline_segment(
     }
 }
 
-fn statusline_git_search_dir(file: Option<&str>) -> PathBuf {
-    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+fn statusline_directory_identity(path: &Path) -> Option<(u64, u64)> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let metadata = fs::metadata(path).ok()?;
+        Some((metadata.dev(), metadata.ino()))
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        None
+    }
+}
+
+fn statusline_git_search_dir(
+    file: Option<&str>,
+    previous: Option<&Path>,
+    previous_identity: Option<(u64, u64)>,
+) -> (PathBuf, Option<(u64, u64)>) {
     let Some(file) = file else {
-        return cwd;
+        let directory = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        return (directory, None);
     };
     let path = expand_user_path(file).unwrap_or_else(|_| PathBuf::from(file));
     let path = if path.is_absolute() {
         path
     } else {
-        cwd.join(path)
+        std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(path)
     };
     let search_dir = if path.is_dir() {
         path
     } else {
         path.parent().unwrap_or(&path).to_path_buf()
     };
-    search_dir.canonicalize().unwrap_or(search_dir)
+    let identity = statusline_directory_identity(&search_dir);
+    if let (Some(previous), Some(identity)) = (previous, identity) {
+        if Some(identity) == previous_identity
+            && (previous == search_dir || statusline_directory_identity(previous) == Some(identity))
+        {
+            return (previous.to_path_buf(), Some(identity));
+        }
+    }
+    (search_dir.canonicalize().unwrap_or(search_dir), identity)
 }
 
 fn git_head_path(search_dir: &Path) -> Option<PathBuf> {
@@ -1140,8 +1216,9 @@ fn queue_diff_cells(
             if change.y != y || change.x != next_x || change.cell.style != *cell_style {
                 break;
             }
-            let cell_width = display_width(change.cell.text.as_str()).max(1);
-            text.push_str(&change.cell.text);
+            let cell_text = terminal_safe_cell_text(&change.cell.text);
+            let cell_width = display_width(cell_text).max(1);
+            text.push_str(cell_text);
             next_x += cell_width;
             i += 1;
             while cell_width > 1 && i < change_set.len() {
@@ -1171,6 +1248,14 @@ fn queue_diff_cells(
     Ok(())
 }
 
+fn terminal_safe_cell_text(text: &str) -> &str {
+    if !is_printable_ascii(text) && text.chars().any(char::is_control) {
+        "�"
+    } else {
+        text
+    }
+}
+
 pub(super) fn resolve_cell_colors(cell_style: &Style, theme_style: &Style) -> (Color, Color) {
     let theme_bg = theme_style.bg.unwrap_or(Color::Rgb { r: 0, g: 0, b: 0 });
     let theme_fg = theme_style.fg.unwrap_or(Color::Rgb {
@@ -1186,6 +1271,141 @@ pub(super) fn resolve_cell_colors(cell_style: &Style, theme_style: &Style) -> (C
         .map_or(theme_bg, |bg| blend_color(bg, theme_bg));
 
     (fg, bg)
+}
+
+#[derive(Clone, Copy)]
+struct SourceSegmentGeometry {
+    x: usize,
+    y: usize,
+    width: usize,
+    tab_width: usize,
+}
+
+fn render_source_segment(
+    buffer: &mut RenderBuffer,
+    segment: &LineSegment,
+    line: &str,
+    geometry: SourceSegmentGeometry,
+    styles: &mut StyleCursor<'_>,
+    theme_style: &Style,
+    theme: &Theme,
+) {
+    let clear = |start: usize, width: usize, buffer: &mut RenderBuffer| {
+        if matches!(theme_style.bg, Some(Color::Rgba { .. })) {
+            buffer.fill_rect(start, geometry.y, width, 1, ' ', theme_style, theme);
+        } else {
+            buffer.fill_ascii_spaces(start, geometry.y, width, theme_style);
+        }
+    };
+    let text = &line[segment.start_byte..segment.end_byte];
+    if text.bytes().all(|byte| (b' '..=b'~').contains(&byte)) {
+        let skipped = segment
+            .start_col
+            .saturating_sub(segment.start_grapheme_col)
+            .min(text.len());
+        let first_column = segment.start_grapheme_col + skipped;
+        let local_x = segment.visual_offset + first_column.saturating_sub(segment.start_col);
+        let visible = &text[skipped
+            ..text
+                .len()
+                .min(skipped.saturating_add(geometry.width.saturating_sub(local_x)))];
+        if local_x > 0 {
+            clear(geometry.x, local_x.min(geometry.width), buffer);
+        }
+        let filled = local_x.saturating_add(visible.len()).min(geometry.width);
+        if filled < geometry.width {
+            clear(geometry.x + filled, geometry.width - filled, buffer);
+        }
+        if styles.is_empty() {
+            buffer.set_printable_ascii(geometry.x + local_x, geometry.y, visible, theme_style);
+            return;
+        }
+        let mut offset = 0;
+        while offset < visible.len() {
+            let source = segment.source_offset + segment.start_byte + skipped + offset;
+            let style = styles.style_at(source).unwrap_or(theme_style);
+            let end = styles
+                .next_change()
+                .map(|boundary| offset + boundary.saturating_sub(source).max(1))
+                .unwrap_or(visible.len())
+                .min(visible.len());
+            buffer.set_printable_ascii(
+                geometry.x + local_x + offset,
+                geometry.y,
+                &visible[offset..end],
+                style,
+            );
+            offset = end;
+        }
+        return;
+    }
+
+    clear(geometry.x, geometry.width, buffer);
+    let mut grapheme_col = segment.start_grapheme_col;
+    let mut byte_offset = 0;
+    while byte_offset < text.len() {
+        let remaining = &text[byte_offset..];
+        let Some(grapheme) = remaining.graphemes(true).next() else {
+            break;
+        };
+        let width = if grapheme == "\t" {
+            geometry.tab_width - (grapheme_col % geometry.tab_width)
+        } else {
+            display_width(grapheme)
+        };
+        if grapheme_col < segment.start_col {
+            grapheme_col += width;
+            byte_offset += grapheme.len();
+            continue;
+        }
+        let local_x = segment.visual_offset + grapheme_col.saturating_sub(segment.start_col);
+        if local_x >= geometry.width {
+            break;
+        }
+        let source = segment.source_offset + segment.start_byte + byte_offset;
+        let style = styles.style_at(source).unwrap_or(theme_style);
+        if grapheme.len() == 1 && matches!(grapheme.as_bytes()[0], b' '..=b'~') {
+            let available = remaining.len().min(geometry.width - local_x);
+            let boundary = styles
+                .next_change()
+                .map(|boundary| boundary.saturating_sub(source).max(1))
+                .unwrap_or(available);
+            let limit = available.min(boundary);
+            let mut length = remaining.as_bytes()[..limit]
+                .iter()
+                .position(|byte| !matches!(byte, b' '..=b'~'))
+                .unwrap_or(limit);
+            // An ASCII base may become part of the following non-ASCII
+            // grapheme, such as e plus an accent or a keycap sequence.
+            if length < remaining.len()
+                && !remaining.as_bytes()[length].is_ascii()
+                && remaining[length - 1..]
+                    .graphemes(true)
+                    .next()
+                    .is_some_and(|joined| joined.len() > 1)
+            {
+                length -= 1;
+            }
+            if length > 0 {
+                buffer.set_printable_ascii(
+                    geometry.x + local_x,
+                    geometry.y,
+                    &remaining[..length],
+                    style,
+                );
+                grapheme_col += length;
+                byte_offset += length;
+                continue;
+            }
+        }
+        if grapheme == "\t" {
+            buffer.fill_ascii_spaces(geometry.x + local_x, geometry.y, width, style);
+        } else {
+            buffer.set_text(geometry.x + local_x, geometry.y, grapheme, style);
+        }
+        grapheme_col += width;
+        byte_offset += grapheme.len();
+    }
 }
 
 impl Editor {
@@ -1205,9 +1425,12 @@ impl Editor {
         }
     }
 
-    fn update_terminal_cursor_surface(&mut self, buffer: &RenderBuffer) {
-        self.last_rendered_cursor_surface = self
-            .render_cursor_position()
+    fn update_terminal_cursor_surface(
+        &mut self,
+        buffer: &RenderBuffer,
+        cursor_position: Option<(usize, usize)>,
+    ) {
+        self.last_rendered_cursor_surface = cursor_position
             .and_then(|(x, y)| {
                 (x < buffer.width && y < buffer.height)
                     .then(|| buffer.cells.get(y * buffer.width + x))
@@ -1245,6 +1468,14 @@ impl Editor {
     }
 
     fn commit_render_buffer_changes(&mut self, changes: &[Change<'_>]) {
+        if !self.terminal_output_enabled {
+            self.last_detached_changed_rows.clear();
+            for change in changes {
+                if self.last_detached_changed_rows.last() != Some(&change.y) {
+                    self.last_detached_changed_rows.push(change.y);
+                }
+            }
+        }
         self.previous_render_buffer
             .as_mut()
             .expect("render buffer diff requires a previous frame")
@@ -1337,7 +1568,7 @@ impl Editor {
 
         // Render global UI elements
         let chrome_span = super::perf::PerfSpan::start("render:chrome");
-        self.render_ui_chrome(buffer)?;
+        self.draw_statusline(buffer);
         // A modal workspace replaces editor chrome but remains below dialogs
         // and overlays so prompts and transient menus stay interactive.
         if self.workspace_manager.is_active() {
@@ -1361,7 +1592,7 @@ impl Editor {
 
         // Update overlay positions and render them
         let overlays_span = super::perf::PerfSpan::start("render:overlays+cursor");
-        self.update_and_render_overlays(buffer)?;
+        let cursor_position = self.update_and_render_overlays(buffer)?;
         self.render_learn_coach(buffer);
         // Modal content and its action menu must be above plugin paint commands
         // and floating overlays, which may otherwise erase text or borders.
@@ -1374,9 +1605,9 @@ impl Editor {
         if let Some(help) = &self.keyboard_shortcuts {
             help.render(buffer, &self.theme)?;
         }
-        self.update_terminal_cursor_surface(buffer);
-        self.render_cursor_cell(buffer);
-        self.last_rendered_cursor_position = self.render_cursor_position();
+        self.update_terminal_cursor_surface(buffer, cursor_position);
+        self.render_cursor_cell(buffer, cursor_position);
+        self.last_rendered_cursor_position = cursor_position;
         drop(overlays_span);
 
         // Flush changes to terminal
@@ -1409,12 +1640,16 @@ impl Editor {
             )
     }
 
-    fn render_cursor_cell(&self, buffer: &mut RenderBuffer) {
+    fn render_cursor_cell(
+        &self,
+        buffer: &mut RenderBuffer,
+        cursor_position: Option<(usize, usize)>,
+    ) {
         if self.workspace_manager.is_active() || !self.uses_synthetic_block_cursor() {
             return;
         }
 
-        let Some((x, y)) = self.render_cursor_position() else {
+        let Some((x, y)) = cursor_position else {
             return;
         };
         if x >= buffer.width || y >= buffer.height {
@@ -1459,17 +1694,32 @@ impl Editor {
     }
 
     fn can_reuse_editor_surfaces(&self) -> bool {
+        let has_visible_overlay = self.overlay_manager.has_visible_content();
+        let has_docked_panels = (self.current_dialog.is_some() || has_visible_overlay)
+            && (self
+                .panel_manager
+                .reserved_left_width(usize::from(self.size.0))
+                > 0
+                || self
+                    .panel_manager
+                    .reserved_right_width(usize::from(self.size.0))
+                    > 0
+                || self.panel_manager.reserved_top_height() > 0
+                || self.panel_manager.reserved_bottom_height() > 0);
         self.previous_render_buffer.is_some()
-            && !self.signature_help.is_visible()
             && self.learn_session.is_none()
             && !self.force_full_redraw
             && self.last_rendered_window == self.window_manager.active_stable_window_id()
-            && self.current_dialog.is_none()
+            && self.current_dialog.as_ref().is_none_or(|dialog| {
+                dialog.allows_event_passthrough() && !has_docked_panels
+            })
             && self.keyboard_shortcuts.is_none()
             && !self.keymap_hints_visible
             && !self.panel_manager.has_focused_panel()
             && !self.workspace_manager.is_active()
-            && !self.overlay_manager.has_visible_content()
+            // Editor-window frames repaint overlays themselves; only preserved panes
+            // need a complete frame when a floating overlay can overlap them.
+            && (!has_visible_overlay || !has_docked_panels)
             && self.render_commands.is_empty()
             && !self.has_term()
     }
@@ -1491,12 +1741,14 @@ impl Editor {
             self.render_window(buffer, self.window_manager.active_window_id())?;
         }
         self.render_ui_chrome(buffer)?;
-        self.update_and_render_overlays(buffer)?;
+        let cursor_position = self.update_and_render_overlays(buffer)?;
         self.render_learn_coach(buffer);
         self.render_dialog(buffer)?;
-        self.update_terminal_cursor_surface(buffer);
-        self.render_cursor_cell(buffer);
-        self.last_rendered_cursor_position = self.render_cursor_position();
+        self.shortcut_help_regions
+            .clone_from(&buffer.shortcut_help_regions);
+        self.update_terminal_cursor_surface(buffer, cursor_position);
+        self.render_cursor_cell(buffer, cursor_position);
+        self.last_rendered_cursor_position = cursor_position;
 
         let changes = self.render_buffer_changes(buffer);
         self.render_diff(&changes)?;
@@ -1527,6 +1779,9 @@ impl Editor {
     }
 
     fn active_buffer_has_diagnostics(&self) -> bool {
+        if !self.config.show_diagnostics {
+            return false;
+        }
         let Ok(Some(uri)) = self.current_buffer().uri() else {
             return false;
         };
@@ -1595,8 +1850,8 @@ impl Editor {
         self.render_window_rows(buffer, active_window_id, &rows)?;
         self.draw_statusline(buffer);
         self.draw_commandline(buffer);
-        self.update_terminal_cursor_surface(buffer);
-        self.render_cursor_cell(buffer);
+        self.update_terminal_cursor_surface(buffer, new_cursor_position);
+        self.render_cursor_cell(buffer, new_cursor_position);
 
         let changes = buffer.diff_row_snapshots(&snapshots);
         self.render_diff(&changes)?;
@@ -1677,6 +1932,16 @@ impl Editor {
         line_count: usize,
         row: usize,
     ) {
+        if self.buffer_manager[window.buffer_index].directory.is_some() {
+            // Only the normal one-cell text inset remains in directory windows.
+            buffer.set_text(
+                window.position.x,
+                self.window_to_terminal_y(window, row),
+                " ",
+                &self.theme.style,
+            );
+            return;
+        }
         let lane_width = self.inline_comment_lane_width(window);
         let lane_x =
             window.position.x + self.gutter_width_for_buffer_index(window.buffer_index) + 1;
@@ -1865,9 +2130,8 @@ impl Editor {
                 self.render_inline_comment_row_in_window(buffer, window, comment);
                 continue;
             }
-            self.fill_line_in_window(buffer, term_x, term_y, content_width, &theme_style);
-
             let Some(segment) = layout.row(row) else {
+                self.fill_line_in_window(buffer, term_x, term_y, content_width, &theme_style);
                 continue;
             };
             if cached_line.as_ref().map(|(line, _)| *line) != Some(segment.line) {
@@ -1876,44 +2140,24 @@ impl Editor {
                     .map(|line| (segment.line, line));
             }
             let Some((_, line)) = cached_line.as_ref() else {
+                self.fill_line_in_window(buffer, term_x, term_y, content_width, &theme_style);
                 continue;
             };
             let line = trim_line_ending(line);
-            let mut grapheme_col = segment.start_grapheme_col;
-            for (byte_offset, grapheme) in
-                line[segment.start_byte..segment.end_byte].grapheme_indices(true)
-            {
-                if grapheme_col < segment.start_col {
-                    grapheme_col += if grapheme == "\t" {
-                        tab_width - (grapheme_col % tab_width)
-                    } else {
-                        display_width(grapheme)
-                    };
-                    continue;
-                }
-                let local_x =
-                    segment.visual_offset + grapheme_col.saturating_sub(segment.start_col);
-                if local_x >= content_width {
-                    break;
-                }
-
-                let style = style_cursor
-                    .style_at(segment.source_offset + segment.start_byte + byte_offset)
-                    .unwrap_or(&theme_style);
-                let term_x = self.window_to_terminal_x(window, content_start + local_x);
-                if grapheme == "\t" {
-                    let tab_span = tab_width - (grapheme_col % tab_width);
-                    buffer.set_text(term_x, term_y, &" ".repeat(tab_span), style);
-                } else {
-                    buffer.set_text(term_x, term_y, grapheme, style);
-                }
-
-                grapheme_col += if grapheme == "\t" {
-                    tab_width - (grapheme_col % tab_width)
-                } else {
-                    display_width(grapheme)
-                };
-            }
+            render_source_segment(
+                buffer,
+                segment,
+                line,
+                SourceSegmentGeometry {
+                    x: self.window_to_terminal_x(window, content_start),
+                    y: term_y,
+                    width: content_width,
+                    tab_width,
+                },
+                &mut style_cursor,
+                &theme_style,
+                &self.theme,
+            );
             self.render_decorations_for_segment(
                 buffer,
                 window,
@@ -2121,6 +2365,10 @@ impl Editor {
     }
 
     fn render_window_bar(&self, buffer: &mut RenderBuffer, window: &crate::window::Window) {
+        if let Some(directory) = &self.buffer_manager[window.buffer_index].directory {
+            self.render_directory_header(buffer, window, directory);
+            return;
+        }
         let Some(rendered) = self
             .window_bar_manager
             .render(window.id, window.inner_width())
@@ -2145,6 +2393,81 @@ impl Editor {
             style.bg = style.bg.or(base_style.bg);
             buffer.set_text(x, window.position.y, &segment.text, &style);
             x += display_width(&segment.text);
+        }
+    }
+
+    fn render_directory_header(
+        &self,
+        buffer: &mut RenderBuffer,
+        window: &crate::window::Window,
+        directory: &crate::buffer::directory::Directory,
+    ) {
+        let width = window.inner_width();
+        let height = self.window_content_top(window);
+        if height == 0 || width == 0 {
+            return;
+        }
+        let palette = SurfacePalette::new(&self.theme, &self.theme.ui_style.dialog);
+        let (x, y) = (window.position.x, window.position.y);
+        buffer.fill_rect(x, y, width, height, ' ', &palette.surface, &self.theme);
+        let (rail, line) = if self.config.window_borders_ascii {
+            ("|", "-")
+        } else {
+            ("┃", "━")
+        };
+        let title = " red  /  DIRECTORY ";
+        let title = truncate_display_width(title, width.saturating_sub(1));
+        buffer.set_text(x, y, rail, &palette.accent);
+        buffer.set_text(x + 1, y, &title, &palette.accent);
+
+        let count = format!(" NAME ↑ · ITEMS {} ", directory.entries.len());
+        let count_width = display_width(&count);
+        let title_end = 1 + display_width(&title);
+        if width > title_end + count_width + 2 {
+            let count_x = width - count_width;
+            buffer.set_text(
+                x + title_end,
+                y,
+                &line.repeat(count_x - title_end),
+                &palette.divider,
+            );
+            buffer.set_text(x + count_x, y, &count, &palette.secondary);
+        }
+
+        if height > 1 {
+            let path = Path::new(&directory.path);
+            let path = std::env::home_dir()
+                .and_then(|home| {
+                    path.strip_prefix(home)
+                        .ok()
+                        .map(|p| format!("~/{}", p.display()))
+                })
+                .unwrap_or_else(|| directory.path.clone());
+            let path = truncate_display_width_with_marker(
+                &path.escape_debug().to_string(),
+                width.saturating_sub(3),
+                "…",
+                TruncationSide::Left,
+            );
+            buffer.set_text(x, y + 1, rail, &palette.accent);
+            buffer.set_text(x + 2, y + 1, &path, &palette.primary);
+        }
+        if height > 2 {
+            let help = if width >= 70 {
+                " Enter Open   ./ Refresh   ../ Parent   - Up   R Reload   / Search"
+            } else {
+                " ↵ Open   - Up   R Reload   / Find"
+            };
+            buffer.set_text(x, y + 2, rail, &palette.divider);
+            buffer.set_text(
+                x + 1,
+                y + 2,
+                &truncate_display_width(help, width.saturating_sub(1)),
+                &palette.secondary,
+            );
+        }
+        if height > 3 {
+            buffer.set_text(x, y + 3, &line.repeat(width), &palette.divider);
         }
     }
 
@@ -2380,8 +2703,15 @@ impl Editor {
         Ok(())
     }
 
-    fn update_and_render_overlays(&mut self, buffer: &mut RenderBuffer) -> anyhow::Result<()> {
-        let cursor_pos = self.render_cursor_position().map(|(x, y)| Point::new(x, y));
+    fn update_and_render_overlays(
+        &mut self,
+        buffer: &mut RenderBuffer,
+    ) -> anyhow::Result<Option<(usize, usize)>> {
+        let cursor_position = self.render_cursor_position();
+        if !self.overlay_manager.has_visible_content() {
+            return Ok(cursor_position);
+        }
+        let cursor_pos = cursor_position.map(|(x, y)| Point::new(x, y));
 
         // Update positions for all overlays
         self.overlay_manager.update_positions(
@@ -2393,7 +2723,7 @@ impl Editor {
         // Render all dirty overlays
         self.overlay_manager.render_all(buffer);
 
-        Ok(())
+        Ok(cursor_position)
     }
 
     /// Renders the main editor content (text buffer) within a window
@@ -2423,53 +2753,30 @@ impl Editor {
         for segment in &layout.rows {
             let term_y = self.window_to_terminal_y(window, segment.row);
             let term_x = self.window_to_terminal_x(window, gutter_width + 1);
-            self.fill_line_in_window(buffer, term_x, term_y, content_width, &theme_style);
-
             if cached_line.as_ref().map(|(line, _)| *line) != Some(segment.line) {
                 cached_line = self.buffer_manager[window.buffer_index]
                     .get(segment.line)
                     .map(|line| (segment.line, line));
             }
             let Some((_, line)) = cached_line.as_ref() else {
+                self.fill_line_in_window(buffer, term_x, term_y, content_width, &theme_style);
                 continue;
             };
             let line = trim_line_ending(line);
-            let mut grapheme_col = segment.start_grapheme_col;
-            for (byte_offset, grapheme) in
-                line[segment.start_byte..segment.end_byte].grapheme_indices(true)
-            {
-                if grapheme_col < segment.start_col {
-                    grapheme_col += if grapheme == "\t" {
-                        tab_width - (grapheme_col % tab_width)
-                    } else {
-                        display_width(grapheme)
-                    };
-                    continue;
-                }
-                let local_x =
-                    segment.visual_offset + grapheme_col.saturating_sub(segment.start_col);
-                if local_x >= content_width {
-                    break;
-                }
-
-                let style = style_cursor
-                    .style_at(segment.source_offset + segment.start_byte + byte_offset)
-                    .unwrap_or(&theme_style);
-                let term_x = self.window_to_terminal_x(window, content_start + local_x);
-                let term_y = self.window_to_terminal_y(window, segment.row);
-                if grapheme == "\t" {
-                    let tab_span = tab_width - (grapheme_col % tab_width);
-                    buffer.set_text(term_x, term_y, &" ".repeat(tab_span), style);
-                } else {
-                    buffer.set_text(term_x, term_y, grapheme, style);
-                }
-
-                grapheme_col += if grapheme == "\t" {
-                    tab_width - (grapheme_col % tab_width)
-                } else {
-                    display_width(grapheme)
-                };
-            }
+            render_source_segment(
+                buffer,
+                segment,
+                line,
+                SourceSegmentGeometry {
+                    x: self.window_to_terminal_x(window, content_start),
+                    y: term_y,
+                    width: content_width,
+                    tab_width,
+                },
+                &mut style_cursor,
+                &theme_style,
+                &self.theme,
+            );
             self.render_decorations_for_segment(
                 buffer,
                 window,
@@ -2662,6 +2969,46 @@ impl Editor {
         self.render_search_highlights_in_window(buffer, window)?;
         self.render_matching_brackets_in_window(buffer, window, None);
 
+        let multi_cursor_ranges = self
+            .multi_cursor_render_ranges(self.buffer_manager[window.buffer_index].id(), window.id);
+        for (range, collapsed) in multi_cursor_ranges {
+            let Some(line) = self.buffer_manager[window.buffer_index].get(range.start.line) else {
+                continue;
+            };
+            let line = trim_line_ending(&line);
+            let tab_width = self.tab_width_for_buffer_index(window.buffer_index);
+            let start_col =
+                display_width_with_tabs(char_prefix(line, range.start.character), tab_width);
+            let end_col = if collapsed {
+                let next_character = (range.start.character + 1).min(line.chars().count());
+                display_width_with_tabs(char_prefix(line, next_character), tab_width)
+                    .max(start_col + 1)
+            } else {
+                display_width_with_tabs(char_prefix(line, range.end.character), tab_width)
+            };
+            let points = self.display_col_range_points_in_window(
+                window,
+                range.start.line,
+                start_col,
+                end_col,
+            );
+            if collapsed {
+                for point in points {
+                    let position = point.y * buffer.width + point.x;
+                    if let Some(cell) = buffer.cells.get_mut(position) {
+                        cell.style = self.theme.synthetic_cursor_style(&cell.style);
+                    }
+                }
+            } else {
+                buffer.apply_selection_for_points(
+                    points,
+                    &self.theme.editor_selection_style(),
+                    &self.theme,
+                    SelectionForegroundPriority::Selection,
+                );
+            }
+        }
+
         if let Some(range) = self.selected_snippet_range() {
             let selection_style = self.theme.editor_selection_style();
             for line_index in range.start.line..=range.end.line {
@@ -2834,8 +3181,12 @@ impl Editor {
             return Ok(());
         }
 
-        let active_search = self.active_search.clone();
-        let pattern = active_search
+        let current_match = self
+            .active_search
+            .as_ref()
+            .and_then(|search| search.preview);
+        let pattern = self
+            .active_search
             .as_ref()
             .map(|search| search.draft.as_str())
             .filter(|draft| !draft.is_empty())
@@ -2861,9 +3212,12 @@ impl Editor {
             .buffer_manager
             .get(window.buffer_index)
             .is_some_and(|buffer| {
-                (visible_start..=visible_end).any(|line| {
-                    buffer.line_range_byte_len(line, line + 1) > MAX_HIGHLIGHT_SLICE_BYTES
-                })
+                buffer.line_range_byte_len(visible_start, visible_end.saturating_add(1))
+                    > MAX_HIGHLIGHT_SLICE_BYTES
+                    && (visible_start..=visible_end).any(|line| {
+                        buffer.line_range_byte_len(line, line.saturating_add(1))
+                            > MAX_HIGHLIGHT_SLICE_BYTES
+                    })
             })
         {
             return Ok(());
@@ -2874,7 +3228,6 @@ impl Editor {
             Err(_) => return Ok(()),
         };
         let first_visible = matches.partition_point(|match_| match_.end_y < visible_start);
-        let current_match = active_search.as_ref().and_then(|search| search.preview);
         let current_start = current_match.map(|match_| (match_.start_x, match_.start_y));
         let cursor_start = (!self.is_search()).then(|| {
             (
@@ -2894,6 +3247,10 @@ impl Editor {
             .as_ref()
             .and_then(|style| style.bg)
             .or(match_bg);
+        let tab_width = self.tab_width_for_buffer_index(window.buffer_index);
+        let content_start = self.gutter_width_for_window(window) + 1;
+        let content_width = self.window_content_width(window);
+        let mut cached_line: Option<(usize, String, bool, std::ops::Range<usize>)> = None;
         for match_ in matches[first_visible..]
             .iter()
             .copied()
@@ -2907,13 +3264,26 @@ impl Editor {
             let end_y = match_.end_y.min(visible_end);
 
             for line_index in start_y..=end_y {
-                let line = self
-                    .buffer_manager
-                    .get(window.buffer_index)
-                    .and_then(|buffer| buffer.get(line_index))
-                    .unwrap_or_default();
-                let line = trim_line_ending(&line);
-                let line_len = line.chars().count();
+                if cached_line.as_ref().map(|(line, _, _, _)| *line) != Some(line_index) {
+                    let line = self
+                        .buffer_manager
+                        .get(window.buffer_index)
+                        .and_then(|buffer| buffer.get(line_index))
+                        .unwrap_or_default();
+                    let ascii_columns = is_printable_ascii(trim_line_ending(&line));
+                    let first_segment = layout
+                        .rows
+                        .partition_point(|segment| segment.line < line_index);
+                    let last_segment = first_segment
+                        + layout.rows[first_segment..]
+                            .partition_point(|segment| segment.line == line_index);
+                    cached_line =
+                        Some((line_index, line, ascii_columns, first_segment..last_segment));
+                }
+                let Some((_, line, ascii_columns, segments)) = cached_line.as_ref() else {
+                    continue;
+                };
+                let line = trim_line_ending(line);
                 let start_x = if line_index == match_.start_y {
                     match_.start_x
                 } else {
@@ -2922,20 +3292,53 @@ impl Editor {
                 let end_x = if line_index == match_.end_y {
                     match_.end_x
                 } else {
-                    line_len
+                    line.chars().count()
                 };
                 if end_x <= start_x {
                     continue;
                 }
 
-                let tab_width = self.tab_width_for_buffer_index(window.buffer_index);
-                let start_col = display_width_with_tabs(char_prefix(line, start_x), tab_width);
-                let end_col = display_width_with_tabs(char_prefix(line, end_x), tab_width);
-                let points =
-                    self.display_col_range_points_in_window(window, line_index, start_col, end_col);
-                if let Some(bg) = bg {
-                    buffer.set_bg_for_points(points, &bg, &self.theme);
+                let (start_col, end_col) = if *ascii_columns {
+                    (start_x, end_x)
                 } else {
+                    (
+                        display_width_with_tabs(char_prefix(line, start_x), tab_width),
+                        display_width_with_tabs(char_prefix(line, end_x), tab_width),
+                    )
+                };
+                if let Some(bg) = bg {
+                    for segment in &layout.rows[segments.clone()] {
+                        let start = start_col.max(segment.start_col);
+                        let end = end_col.min(segment.end_col);
+                        if end <= start {
+                            continue;
+                        }
+
+                        let local_start =
+                            segment.visual_offset + start.saturating_sub(segment.start_col);
+                        if local_start >= content_width {
+                            continue;
+                        }
+                        let local_end = (segment.visual_offset
+                            + end.saturating_sub(segment.start_col))
+                        .min(content_width);
+                        let terminal_y = self.window_to_terminal_y(window, segment.row);
+                        buffer.set_bg_for_range(
+                            Point::new(
+                                self.window_to_terminal_x(window, content_start + local_start),
+                                terminal_y,
+                            ),
+                            Point::new(
+                                self.window_to_terminal_x(window, content_start + local_end - 1),
+                                terminal_y,
+                            ),
+                            &bg,
+                            &self.theme,
+                        );
+                    }
+                } else {
+                    let points = self
+                        .display_col_range_points_in_window(window, line_index, start_col, end_col);
                     buffer.apply_selection_for_points(
                         points,
                         &selection_style,
@@ -3015,6 +3418,9 @@ impl Editor {
         buffer: &mut RenderBuffer,
         window: &crate::window::Window,
     ) -> anyhow::Result<()> {
+        if !self.config.show_diagnostics {
+            return Ok(());
+        }
         // Get the buffer for this window
         let window_buffer = &self.buffer_manager[window.buffer_index];
 
@@ -3072,7 +3478,10 @@ impl Editor {
             if line_width > segment.end_col {
                 continue;
             }
-            let content_end = gutter_width + 1 + line_width.saturating_sub(segment.start_col);
+            let content_end = gutter_width
+                + 1
+                + segment.visual_offset
+                + line_width.saturating_sub(segment.start_col);
             let indicator_x = content_end + 5; // Add some padding
 
             // Skip if diagnostic would be outside window
@@ -3131,7 +3540,10 @@ impl Editor {
                     }
                 }
                 Mode::VisualLine => (0, self.last_cell_for_line(y)),
-                Mode::VisualBlock => (selection.x0, selection.x1),
+                Mode::VisualBlock => (
+                    selection.x0.min(selection.x1),
+                    selection.x0.max(selection.x1),
+                ),
                 _ => unreachable!(),
             };
 
@@ -3143,8 +3555,25 @@ impl Editor {
             let start_col = grapheme_to_column_with_tabs(line, start_x, tab_width);
             let end_col = grapheme_to_column_with_tabs(line, end_x.saturating_add(1), tab_width);
             cells.extend(self.display_col_range_points_in_window(window, y, start_col, end_col));
-            if line.is_empty() && start_x == 0 && end_x == 0 {
-                cells.extend(self.display_col_range_points_in_window(window, y, 0, 1));
+            if (line.is_empty() && start_x == 0 && end_x == 0)
+                || (self.mode == Mode::Visual && end_x >= grapheme_len(line))
+            {
+                // Source segments stop before their line-ending cell. Paint that
+                // cell explicitly when the inclusive selection reaches it.
+                let column = display_width_with_tabs(line, tab_width);
+                let layout = self.layout_for_window(window);
+                if let Some(segment) = layout.segment_for_cursor(y, column) {
+                    let local_x = segment.visual_offset + column.saturating_sub(segment.start_col);
+                    if local_x < self.window_content_width(window) {
+                        cells.push(Point::new(
+                            self.window_to_terminal_x(
+                                window,
+                                self.gutter_width_for_window(window) + 1 + local_x,
+                            ),
+                            self.window_to_terminal_y(window, segment.row),
+                        ));
+                    }
+                }
             }
         }
 
@@ -3256,6 +3685,7 @@ impl Editor {
             filename,
             file_path,
             dirty,
+            external_file_change,
             position,
             buffer_index,
             cursor_line,
@@ -3279,6 +3709,7 @@ impl Editor {
                 window_buffer.name().to_string(),
                 window_buffer.file.clone(),
                 dirty,
+                window_buffer.external_file_change(),
                 format!(
                     " {}:{}{}",
                     window.vtop + window.cy + 1,
@@ -3288,9 +3719,10 @@ impl Editor {
                 window.buffer_index,
                 window.vtop + window.cy,
                 window_buffer.byte_len(),
-                if window_buffer
-                    .get(0)
-                    .is_some_and(|line| line.ends_with("\r\n"))
+                if configured(StatuslineSection::LineEndings)
+                    && window_buffer
+                        .get(0)
+                        .is_some_and(|line| line.ends_with("\r\n"))
                 {
                     "CRLF"
                 } else {
@@ -3303,11 +3735,14 @@ impl Editor {
                 current.name().to_string(),
                 current.file.clone(),
                 current.is_dirty(),
+                current.external_file_change(),
                 format!(" {}:{} ", self.vtop + self.cy + 1, self.cx + 1),
                 self.buffer_manager.active_index(),
                 self.vtop + self.cy,
                 current.byte_len(),
-                if current.get(0).is_some_and(|line| line.ends_with("\r\n")) {
+                if configured(StatuslineSection::LineEndings)
+                    && current.get(0).is_some_and(|line| line.ends_with("\r\n"))
+                {
                     "CRLF"
                 } else {
                     "LF"
@@ -3317,8 +3752,7 @@ impl Editor {
 
         let term_width = self.size.0 as usize;
         let y = self.size.1 as usize - 2;
-        let clear_line = " ".repeat(term_width);
-        buffer.set_text(0, y, &clear_line, &self.theme.statusline_style.inner_style);
+        buffer.fill_ascii_spaces(0, y, term_width, &self.theme.statusline_style.inner_style);
 
         let wants_git = configured(StatuslineSection::GitBranch)
             || configured(StatuslineSection::GitChanges)
@@ -3330,18 +3764,33 @@ impl Editor {
                 configured(StatuslineSection::GitChanges),
             );
         }
-        let current_folder = get_workspace_path();
-        let workspace_root = self
-            .statusline_git_cache
-            .repository_root
-            .clone()
-            .or_else(|| {
-                file_path
-                    .as_deref()
-                    .and_then(|file| self.lsp.workspace_root_for_file(file))
-            })
-            .unwrap_or_else(|| current_folder.clone());
-        let filename = statusline_file_name(&filename, &current_folder);
+        let current_folder = self.statusline_git_cache.working_directory.clone();
+        let workspace_root = if configured(StatuslineSection::Workspace)
+            || configured(StatuslineSection::RelativePath)
+        {
+            self.statusline_git_cache
+                .repository_root
+                .clone()
+                .or_else(|| {
+                    file_path
+                        .as_deref()
+                        .and_then(|file| self.lsp.workspace_root_for_file(file))
+                })
+                .unwrap_or_else(|| current_folder.clone())
+        } else {
+            current_folder.clone()
+        };
+        let mut filename = statusline_file_name(&filename, &current_folder);
+        if filename.is_empty() && self.buffer_manager[buffer_index].directory.is_some() {
+            filename.push('.');
+        }
+        if let Some(change) = external_file_change {
+            filename.push_str(if change == super::ExternalFileChange::Deleted {
+                " [DELETED]"
+            } else {
+                " [CONFLICT]"
+            });
+        }
         let diagnostics = configured(StatuslineSection::Diagnostics)
             .then(|| self.statusline_diagnostic_counts(buffer_index))
             .flatten();
@@ -3395,11 +3844,16 @@ impl Editor {
             .then(|| self.highlight_language_id_for_buffer_index(buffer_index))
             .flatten();
         let show_modified_separately = configured(StatuslineSection::Modified);
-        let read_only = statusline_file_is_read_only(file_path.as_deref());
-        let relative_path = statusline_relative_path(file_path.as_deref(), &workspace_root);
+        let read_only = configured(StatuslineSection::ReadOnly)
+            && statusline_file_is_read_only(file_path.as_deref());
+        let relative_path = configured(StatuslineSection::RelativePath)
+            .then(|| statusline_relative_path(file_path.as_deref(), &workspace_root))
+            .flatten();
         let context = StatuslineContext {
             mode: if self.pane_resize_mode.is_some() {
                 "RESIZE".to_string()
+            } else if let Some(multi_cursor) = self.multi_cursor_status_label() {
+                multi_cursor
             } else {
                 format_mode_name(&self.mode)
             },
@@ -3422,33 +3876,63 @@ impl Editor {
                 .as_ref()
                 .map(|recording| recording.register),
             search_matches,
-            indentation: format!("spaces:{}", self.indentation().shift_width),
+            indentation: if configured(StatuslineSection::Indentation) {
+                format!("spaces:{}", self.indentation().shift_width)
+            } else {
+                String::new()
+            },
             encoding: "utf-8",
             line_endings,
             read_only,
             modified: dirty,
-            workspace: statusline_workspace_name(&workspace_root),
+            external_file_change,
+            workspace: if configured(StatuslineSection::Workspace) {
+                statusline_workspace_name(&workspace_root)
+            } else {
+                String::new()
+            },
             relative_path,
-            buffer_index: format!("{}/{}", buffer_index + 1, self.buffer_manager.len().max(1)),
-            window_index: format!(
-                "{}/{}",
-                self.window_manager.active_window_id() + 1,
-                self.window_manager.window_count().max(1)
-            ),
-            file_size: statusline_file_size(byte_len),
+            buffer_index: if configured(StatuslineSection::BufferIndex) {
+                format!("{}/{}", buffer_index + 1, self.buffer_manager.len().max(1))
+            } else {
+                String::new()
+            },
+            window_index: if configured(StatuslineSection::WindowIndex) {
+                format!(
+                    "{}/{}",
+                    self.window_manager.active_window_id() + 1,
+                    self.window_manager.window_count().max(1)
+                )
+            } else {
+                String::new()
+            },
+            file_size: if configured(StatuslineSection::FileSize) {
+                statusline_file_size(byte_len)
+            } else {
+                String::new()
+            },
             agent_activity,
             formatter,
-            clock: Local::now().format("%H:%M").to_string(),
+            clock: if configured(StatuslineSection::Clock) {
+                Local::now().format("%H:%M").to_string()
+            } else {
+                String::new()
+            },
         };
 
         let base_style = self.theme.statusline_style.inner_style.clone();
         let icons = self.config.statusline.icons;
-        let left = statusline_segments(
+        let mut left = statusline_segments(
             left_sections,
             &context,
             &self.theme,
             icons.style,
             icons.color,
+        );
+        left.extend(
+            self.plugin_registry
+                .rpc_statuslines(RpcStatuslineSide::Left)
+                .map(|text| rpc_statusline_segment(text, &base_style)),
         );
         let mut right = statusline_segments(
             right_sections,
@@ -3458,6 +3942,12 @@ impl Editor {
             icons.color,
         );
         right.reverse();
+        right.splice(
+            ..0,
+            self.plugin_registry
+                .rpc_statuslines(RpcStatuslineSide::Right)
+                .map(|text| rpc_statusline_segment(text, &base_style)),
+        );
 
         let left_separator = self.theme.statusline_style.outer_chars[1];
         let right_separator = self.theme.statusline_style.outer_chars[2];
@@ -3475,10 +3965,24 @@ impl Editor {
         }
     }
 
+    pub(super) fn render_dirty_rpc_statusline(
+        &mut self,
+        buffer: &mut RenderBuffer,
+    ) -> anyhow::Result<()> {
+        if self.plugin_registry.take_rpc_statusline_dirty() {
+            self.render(buffer)?;
+        }
+        Ok(())
+    }
+
     fn refresh_statusline_git(&mut self, file: Option<&str>, load_changes: bool) {
         const CACHE_TTL: Duration = Duration::from_secs(2);
 
-        let search_dir = statusline_git_search_dir(file);
+        let (search_dir, search_directory_identity) = statusline_git_search_dir(
+            file,
+            self.statusline_git_cache.search_dir.as_deref(),
+            self.statusline_git_cache.search_directory_identity,
+        );
         let now = Instant::now();
         let cache_is_fresh = self.statusline_git_cache.search_dir.as_ref() == Some(&search_dir)
             && self
@@ -3491,11 +3995,12 @@ impl Editor {
         }
 
         let repository_root = git_repository_root(&search_dir);
-        let branch = git_branch_from_head(&search_dir);
+        let branch = repository_root.as_deref().and_then(git_branch_from_head);
         let changes = load_changes
             .then(|| repository_root.as_deref().and_then(git_changes_from_status))
             .flatten();
         self.statusline_git_cache.search_dir = Some(search_dir);
+        self.statusline_git_cache.search_directory_identity = search_directory_identity;
         self.statusline_git_cache.repository_root = repository_root;
         self.statusline_git_cache.branch = branch;
         self.statusline_git_cache.changes = changes;
@@ -3503,7 +4008,21 @@ impl Editor {
         self.statusline_git_cache.refreshed_at = Some(now);
     }
 
+    /// Runs an uncached production Git refresh for reproducible performance fixtures.
+    #[doc(hidden)]
+    pub fn benchmark_git_repository_discovery(&mut self, file: &str) -> Option<(&Path, &str)> {
+        self.statusline_git_cache.refreshed_at = None;
+        self.refresh_statusline_git(Some(file), false);
+        self.statusline_git_cache
+            .repository_root
+            .as_deref()
+            .zip(self.statusline_git_cache.branch.as_deref())
+    }
+
     fn statusline_diagnostic_counts(&self, buffer_index: usize) -> Option<(usize, usize)> {
+        if !self.config.show_diagnostics || self.diagnostics.is_empty() {
+            return None;
+        }
         let uri = self
             .buffer_manager
             .get(buffer_index)?
@@ -3533,8 +4052,12 @@ impl Editor {
     }
 
     fn statusline_search_position(&mut self) -> Option<(usize, usize)> {
-        let active_search = self.active_search.clone();
-        let pattern = active_search
+        let preview = self
+            .active_search
+            .as_ref()
+            .and_then(|search| search.preview);
+        let pattern = self
+            .active_search
             .as_ref()
             .map(|search| search.draft.as_str())
             .filter(|pattern| !pattern.is_empty())
@@ -3544,8 +4067,7 @@ impl Editor {
         if matches.is_empty() {
             return None;
         }
-        let current = active_search
-            .and_then(|search| search.preview)
+        let current = preview
             .map(|preview| (preview.start_y, preview.start_x))
             .unwrap_or((
                 self.buffer_line(),
@@ -3557,11 +4079,18 @@ impl Editor {
         Some((index + 1, matches.len()))
     }
 
-    fn statusline_agent_activity(&self) -> Option<String> {
-        if self.agent_manager.has_active_sessions() {
-            return Some("following".to_string());
-        }
-        self.agent_manager.has_bridge().then(|| "idle".to_string())
+    /// Shows the agent's turn state only while there is something to report.
+    pub(super) fn statusline_agent_activity(&self) -> Option<String> {
+        use super::agent_manager::AgentTurnPhase;
+        let phase = match self.agent_manager.turn_phase()? {
+            AgentTurnPhase::Running if self.config.agent.follow_tool_calls => "agent following",
+            AgentTurnPhase::Running => "agent working",
+            AgentTurnPhase::Stopping => "agent stopping",
+        };
+        Some(match self.agent_manager.queued_prompt_count() {
+            0 => phase.to_string(),
+            queued => format!("{phase} · {queued} queued"),
+        })
     }
 
     pub fn draw_commandline(&mut self, buffer: &mut RenderBuffer) {
@@ -3574,8 +4103,7 @@ impl Editor {
         }
 
         let y = self.size.1 as usize - 1;
-        let clear_line = " ".repeat(width);
-        buffer.set_text(0, y, &clear_line, &style);
+        buffer.fill_ascii_spaces(0, y, width, &style);
 
         if !self.has_term() {
             let wc = if let Some(ref waiting_command) = self.waiting_command {
@@ -3626,8 +4154,21 @@ impl Editor {
                         } => format!(" ({value}%)"),
                         _ => String::new(),
                     };
+                    let age = (!record.is_running())
+                        .then(|| {
+                            super::notifications::relative_notice_age(
+                                record.updated_at,
+                                SystemTime::now(),
+                            )
+                        })
+                        .flatten()
+                        .map(|age| format!(" ({age})"))
+                        .unwrap_or_default();
                     (
-                        format!("{prefix}{source}{}{percentage}", record.content.summary),
+                        format!(
+                            "{prefix}{source}{}{percentage}{age}",
+                            record.content.summary
+                        ),
                         Some(record.severity),
                         display_width(&prefix) + display_width(&source),
                     )
@@ -3910,9 +4451,9 @@ fn format_mode_name(mode: &Mode) -> String {
 mod tests {
     use super::*;
     use crate::{
-        buffer::Buffer,
+        buffer::{Buffer, ExternalFileChange},
         config::Config,
-        editor::display_layout::LineSegment,
+        editor::{display_layout::LineSegment, HighlightSpan},
         lsp::{LspManager, Position, Range},
         plugin::{Decoration, DecorationAnchor},
         theme::Theme,
@@ -3926,6 +4467,43 @@ mod tests {
             Editor::with_size(lsp, 60, 12, config, Theme::default(), vec![source]).unwrap();
         editor.test_disable_terminal_output();
         editor
+    }
+
+    #[test]
+    fn empty_overlays_defer_positioning_until_content_becomes_visible() {
+        let mut editor = rendering_test_editor(Buffer::new(None, "source\n".into()));
+        editor.overlay_manager.create_overlay(
+            "idle-progress".into(),
+            crate::plugin::OverlayConfig {
+                align: crate::plugin::OverlayAlignment::Top,
+                x_padding: 0,
+                ..crate::plugin::OverlayConfig::default()
+            },
+        );
+        let mut frame = RenderBuffer::new(60, 12, &editor.theme.style);
+
+        editor.render(&mut frame).unwrap();
+        let overlay = editor
+            .overlay_manager
+            .get_overlay_mut("idle-progress")
+            .unwrap();
+        assert_eq!(overlay.position, None);
+        overlay.update_content(vec![("progress".into(), Style::default())]);
+
+        editor.render(&mut frame).unwrap();
+        let overlay = editor
+            .overlay_manager
+            .get_overlay_mut("idle-progress")
+            .unwrap();
+        assert_eq!(overlay.position, Some(Point::new(/*x*/ 52, /*y*/ 0)));
+        assert!(!overlay.is_dirty());
+        assert_eq!(
+            frame.cells[52..60]
+                .iter()
+                .map(|cell| cell.c)
+                .collect::<String>(),
+            "progress"
+        );
     }
 
     #[test]
@@ -3987,6 +4565,7 @@ mod tests {
                     x_padding: 0,
                     y_padding: top + 2,
                     relative: "editor".into(),
+                    ..crate::plugin::OverlayConfig::default()
                 },
             )
             .update_content(vec![("Z".repeat(60), Style::default())]);
@@ -4263,6 +4842,253 @@ mod tests {
         }
     }
 
+    #[test]
+    fn ascii_source_spans_preserve_overlapping_highlight_boundaries() {
+        let theme = Theme::default();
+        let outer = Style {
+            fg: Some(Color::Rgb { r: 1, g: 2, b: 3 }),
+            ..Style::default()
+        };
+        let inner = Style {
+            fg: Some(Color::Rgb { r: 4, g: 5, b: 6 }),
+            ..Style::default()
+        };
+        let later = Style {
+            fg: Some(Color::Rgb { r: 7, g: 8, b: 9 }),
+            ..Style::default()
+        };
+        let spans = vec![
+            HighlightSpan {
+                start: 20,
+                end: 27,
+                order: 0,
+                priority: 7,
+                style: outer.clone(),
+            },
+            HighlightSpan {
+                start: 22,
+                end: 25,
+                order: 1,
+                priority: 3,
+                style: inner,
+            },
+            HighlightSpan {
+                start: 22,
+                end: 25,
+                order: 2,
+                priority: 3,
+                style: later.clone(),
+            },
+        ];
+        let mut cursor = StyleCursor::new(&spans);
+        let mut source = segment(0, 8, true);
+        source.end_byte = 8;
+        source.source_offset = 20;
+        let mut buffer = RenderBuffer::new(10, 1, &theme.style);
+
+        render_source_segment(
+            &mut buffer,
+            &source,
+            "abcdefgh",
+            SourceSegmentGeometry {
+                x: 0,
+                y: 0,
+                width: 10,
+                tab_width: 4,
+            },
+            &mut cursor,
+            &theme.style,
+            &theme,
+        );
+
+        assert_eq!(rendered_rows(&buffer), vec!["abcdefgh  "]);
+        assert!(buffer.cells[..2].iter().all(|cell| cell.style == outer));
+        assert!(buffer.cells[2..5].iter().all(|cell| cell.style == later));
+        assert!(buffer.cells[5..7].iter().all(|cell| cell.style == outer));
+        assert!(buffer.cells[7..]
+            .iter()
+            .all(|cell| cell.style == theme.style));
+    }
+
+    #[test]
+    fn ascii_source_repaint_clears_stale_cells_and_wrapped_indentation() {
+        let theme = Theme::default();
+        let stale = Style {
+            bold: true,
+            ..Style::default()
+        };
+        let mut buffer = RenderBuffer::new(12, 1, &stale);
+        buffer.set_text(0, 0, "XXXXXXXXXXXX", &stale);
+        let mut source = segment(0, 3, false);
+        source.end_byte = 3;
+        source.visual_offset = 2;
+        let mut cursor = StyleCursor::new(&[]);
+
+        render_source_segment(
+            &mut buffer,
+            &source,
+            "abc",
+            SourceSegmentGeometry {
+                x: 1,
+                y: 0,
+                width: 10,
+                tab_width: 4,
+            },
+            &mut cursor,
+            &theme.style,
+            &theme,
+        );
+
+        assert_eq!(rendered_rows(&buffer), vec!["X  abc     X"]);
+        assert!(buffer.cells[1..11]
+            .iter()
+            .all(|cell| cell.style == theme.style));
+        assert_eq!(buffer.cells[0].style, stale);
+        assert_eq!(buffer.cells[11].style, stale);
+    }
+
+    #[test]
+    fn unicode_and_tabs_preserve_grapheme_widths_outside_ascii_fast_path() {
+        let theme = Theme::default();
+        let accented = "e\u{301}";
+        let line = format!("a\t界{accented}");
+        let wide_style = Style {
+            italic: true,
+            ..Style::default()
+        };
+        let wide_start = line.find('界').unwrap();
+        let spans = vec![HighlightSpan {
+            start: wide_start,
+            end: wide_start + '界'.len_utf8(),
+            order: 0,
+            priority: '界'.len_utf8(),
+            style: wide_style.clone(),
+        }];
+        let mut cursor = StyleCursor::new(&spans);
+        let mut source = segment(0, 7, true);
+        source.end_byte = line.len();
+        let mut buffer = RenderBuffer::new(10, 1, &theme.style);
+
+        render_source_segment(
+            &mut buffer,
+            &source,
+            &line,
+            SourceSegmentGeometry {
+                x: 0,
+                y: 0,
+                width: 10,
+                tab_width: 4,
+            },
+            &mut cursor,
+            &theme.style,
+            &theme,
+        );
+
+        assert_eq!(buffer.cells[0].text, "a");
+        assert!(buffer.cells[1..4].iter().all(|cell| cell.text == " "));
+        assert_eq!(buffer.cells[4].text, "界");
+        assert_eq!(buffer.cells[5].text, " ");
+        assert_eq!(buffer.cells[4].style, wide_style);
+        assert_eq!(buffer.cells[5].style, wide_style);
+        assert_eq!(buffer.cells[6].text, accented);
+        assert!(buffer.cells[7..].iter().all(|cell| cell.text == " "));
+    }
+
+    #[test]
+    fn wireproxy_ansi_log_controls_never_enter_rendered_cells() {
+        const LINE: &str = "\u{1b}[2m2026-09-19T16:33:34Z\u{1b}[0m \
+            \u{1b}[32mINFO\u{1b}[0m starting wireproxy \
+            \u{1b}[3mlisten\u{1b}[0;2m=\u{1b}[0m127.0.0.1:27999";
+        const EXPECTED: &str = "[2m2026-09-19T16:33:34Z[0m \
+            [32mINFO[0m starting wireproxy \
+            [3mlisten[0;2m=[0m127.0.0.1:27999";
+        let theme = Theme::default();
+        let mut source = segment(0, display_width(LINE), true);
+        source.end_byte = LINE.len();
+        let mut cursor = StyleCursor::new(&[]);
+        let mut buffer = RenderBuffer::new(EXPECTED.len() + 2, 1, &theme.style);
+        let width = buffer.width;
+
+        render_source_segment(
+            &mut buffer,
+            &source,
+            LINE,
+            SourceSegmentGeometry {
+                x: 0,
+                y: 0,
+                width,
+                tab_width: 4,
+            },
+            &mut cursor,
+            &theme.style,
+            &theme,
+        );
+
+        let rendered = rendered_rows(&buffer).pop().unwrap();
+        assert_eq!(rendered.trim_end(), EXPECTED);
+        assert!(buffer
+            .cells
+            .iter()
+            .all(|cell| !cell.text.chars().any(char::is_control)));
+    }
+
+    #[test]
+    fn mixed_source_ascii_runs_preserve_combining_keycap_and_style_boundaries() {
+        let theme = Theme::default();
+        let line = "prefix e\u{301} middle 1\u{fe0f}\u{20e3} 👩‍💻 tail";
+        let middle = Style {
+            bold: true,
+            ..Style::default()
+        };
+        let tail = Style {
+            italic: true,
+            ..Style::default()
+        };
+        let middle_start = line.find("middle").unwrap();
+        let tail_start = line.find("tail").unwrap();
+        let spans = vec![
+            HighlightSpan {
+                start: middle_start,
+                end: middle_start + "middle".len(),
+                order: 0,
+                priority: "middle".len(),
+                style: middle.clone(),
+            },
+            HighlightSpan {
+                start: tail_start,
+                end: line.len(),
+                order: 1,
+                priority: "tail".len(),
+                style: tail.clone(),
+            },
+        ];
+        let mut cursor = StyleCursor::new(&spans);
+        let mut source = segment(0, display_width(line), true);
+        source.end_byte = line.len();
+        let mut buffer = RenderBuffer::new(40, 1, &theme.style);
+
+        render_source_segment(
+            &mut buffer,
+            &source,
+            line,
+            SourceSegmentGeometry {
+                x: 0,
+                y: 0,
+                width: 40,
+                tab_width: 4,
+            },
+            &mut cursor,
+            &theme.style,
+            &theme,
+        );
+
+        assert_eq!(buffer.cells[7].text, "e\u{301}");
+        assert!(buffer.cells[9..15].iter().all(|cell| cell.style == middle));
+        assert_eq!(buffer.cells[16].text, "1\u{fe0f}\u{20e3}");
+        assert_eq!(buffer.cells[19].text, "👩‍💻");
+        assert!(buffer.cells[22..26].iter().all(|cell| cell.style == tail));
+    }
+
     fn decoration(anchor: DecorationAnchor, text: &str) -> Decoration {
         Decoration {
             buffer_index: Some(0),
@@ -4294,6 +5120,89 @@ mod tests {
         let row = diagnostic_row(&diagnostics, 2).unwrap();
 
         assert_eq!(display_width(&row), 2);
+    }
+
+    #[test]
+    fn wrapped_diagnostic_does_not_overwrite_indented_continuation() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("wrapped-diagnostic.rs");
+        let line = format!("{}{}SOURCE_TAIL", " ".repeat(12), "x".repeat(50));
+        let source = Buffer::new(
+            Some(path.to_string_lossy().into_owned()),
+            format!("{line}\nfollowing source\n"),
+        );
+        let mut editor = rendering_test_editor(source);
+        editor.config.show_diagnostics = true;
+        let uri = editor.current_buffer().uri().unwrap().unwrap();
+        editor
+            .diagnostics
+            .insert(uri, vec![diagnostic("wrapped diagnostic")]);
+        let mut buffer = RenderBuffer::new(60, 12, &Style::default());
+
+        editor.render(&mut buffer).unwrap();
+
+        let window = editor.active_window_with_editor_view().unwrap();
+        let layout = editor.layout_for_window(&window);
+        let continuation = layout
+            .rows
+            .iter()
+            .rev()
+            .find(|segment| segment.line == 0)
+            .unwrap();
+        assert!(!continuation.first_segment);
+        assert!(continuation.visual_offset > 5);
+        let rows = rendered_rows(&buffer);
+        let row = &rows[continuation.row];
+        assert!(
+            row.contains("SOURCE_TAIL"),
+            "diagnostic overwrote source: {row}"
+        );
+        let source_end = row.find("SOURCE_TAIL").unwrap() + "SOURCE_TAIL".len();
+        let diagnostic_start = row.find('■').expect("diagnostic should remain visible");
+        assert!(
+            diagnostic_start > source_end,
+            "diagnostic overlaps source: {row}"
+        );
+    }
+
+    #[test]
+    fn wrapped_diagnostic_is_hidden_when_continuation_has_no_room() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("cramped-diagnostic.rs");
+        let line = format!("{}{}SOURCE_TAIL", " ".repeat(12), "x".repeat(75));
+        let source = Buffer::new(
+            Some(path.to_string_lossy().into_owned()),
+            format!("{line}\nfollowing source\n"),
+        );
+        let mut editor = rendering_test_editor(source);
+        let uri = editor.current_buffer().uri().unwrap().unwrap();
+        editor
+            .diagnostics
+            .insert(uri, vec![diagnostic("cramped diagnostic")]);
+        let mut buffer = RenderBuffer::new(60, 12, &Style::default());
+
+        editor.render(&mut buffer).unwrap();
+
+        let window = editor.active_window_with_editor_view().unwrap();
+        let layout = editor.layout_for_window(&window);
+        let continuation = layout
+            .rows
+            .iter()
+            .rev()
+            .find(|segment| segment.line == 0)
+            .unwrap();
+        assert!(!continuation.first_segment);
+        let rows = rendered_rows(&buffer);
+        let row = &rows[continuation.row];
+        assert!(
+            row.contains("SOURCE_TAIL"),
+            "diagnostic overwrote source: {row}"
+        );
+        assert!(
+            !row.contains('■'),
+            "cramped diagnostic should be hidden: {row}"
+        );
+        assert!(rows.iter().any(|line| line.contains("following source")));
     }
 
     #[test]
@@ -4414,17 +5323,127 @@ mod tests {
         let mut buffer = RenderBuffer::new(60, 12, &Style::default());
 
         editor.render(&mut buffer).unwrap();
+        let full_renders = editor.full_render_count;
         assert!(rendered_rows(&buffer)
             .iter()
             .any(|row| row.contains("alpha")));
 
         editor.render_edited_window_rows(&mut buffer).unwrap();
 
+        assert_eq!(
+            editor.full_render_count, full_renders,
+            "passthrough completion must reuse editor surfaces rather than repaint every surface"
+        );
         assert!(
             rendered_rows(&buffer)
                 .iter()
                 .any(|row| row.contains("alpha")),
             "edited window rows must repaint the active completion dialog"
+        );
+    }
+
+    #[test]
+    fn edited_window_rows_preserve_signature_help_without_full_repaint() {
+        let source = Buffer::new(None, "outer(value)\nsecond line\n".to_string());
+        let mut editor = rendering_test_editor(source);
+        editor.mode = crate::editor::Mode::Insert;
+        editor.cx = "outer(".len();
+        editor.signature_help.show_for_test(
+            serde_json::from_value(serde_json::json!({
+                "signatures": [{
+                    "label": "outer(value: usize)",
+                    "parameters": [{ "label": "value: usize" }]
+                }]
+            }))
+            .unwrap(),
+        );
+        editor
+            .overlay_manager
+            .create_overlay(
+                "progress".to_string(),
+                crate::plugin::OverlayConfig {
+                    align: crate::plugin::OverlayAlignment::Bottom,
+                    ..crate::plugin::OverlayConfig::default()
+                },
+            )
+            .update_content(vec![("indexing workspace".to_string(), Style::default())]);
+        let mut buffer = RenderBuffer::new(60, 12, &Style::default());
+        editor.render(&mut buffer).unwrap();
+        let full_renders = editor.full_render_count;
+        assert!(rendered_rows(&buffer)
+            .iter()
+            .any(|row| row.contains("outer(value: usize)")));
+        assert!(rendered_rows(&buffer)
+            .iter()
+            .any(|row| row.contains("indexing workspace")));
+
+        editor.render_edited_window_rows(&mut buffer).unwrap();
+
+        assert_eq!(editor.full_render_count, full_renders);
+        assert!(rendered_rows(&buffer)
+            .iter()
+            .any(|row| row.contains("outer(value: usize)")));
+        assert!(rendered_rows(&buffer)
+            .iter()
+            .any(|row| row.contains("indexing workspace")));
+    }
+
+    #[test]
+    fn edited_window_rows_keep_full_repaint_for_overlays_over_docked_panes() {
+        let source = Buffer::new(None, "hello\nworld\n".to_string());
+        let mut editor = rendering_test_editor(source);
+        editor.panel_manager.create_panel(
+            "files".to_string(),
+            crate::plugin::PanelConfig {
+                width: 12,
+                ..crate::plugin::PanelConfig::default()
+            },
+        );
+        editor
+            .overlay_manager
+            .create_overlay(
+                "progress".to_string(),
+                crate::plugin::OverlayConfig::default(),
+            )
+            .update_content(vec![("indexing workspace".to_string(), Style::default())]);
+        let mut buffer = RenderBuffer::new(60, 12, &Style::default());
+        editor.render(&mut buffer).unwrap();
+        let full_renders = editor.full_render_count;
+
+        editor.render_edited_window_rows(&mut buffer).unwrap();
+
+        assert_eq!(editor.full_render_count, full_renders + 1);
+        assert!(rendered_rows(&buffer)
+            .iter()
+            .any(|row| row.contains("indexing workspace")));
+    }
+
+    #[test]
+    fn edited_window_rows_keep_full_repaint_for_completion_over_docked_panes() {
+        let source = Buffer::new(None, "hello\nworld\n".to_string());
+        let mut editor = rendering_test_editor(source);
+        editor.panel_manager.create_panel(
+            "files".to_string(),
+            crate::plugin::PanelConfig {
+                width: 12,
+                ..crate::plugin::PanelConfig::default()
+            },
+        );
+        let mut completion = CompletionUI::new();
+        let item = serde_json::from_value(serde_json::json!({ "label": "alpha" })).unwrap();
+        completion.show(vec![item], 0, 0);
+        editor.current_dialog = Some(Box::new(completion));
+        let mut buffer = RenderBuffer::new(60, 12, &Style::default());
+
+        editor.render(&mut buffer).unwrap();
+        let full_renders = editor.full_render_count;
+
+        editor.render_edited_window_rows(&mut buffer).unwrap();
+
+        assert_eq!(
+            editor.full_render_count,
+            full_renders + 1,
+            "completion that can overlap preserved panes must repaint every surface"
         );
     }
 
@@ -4437,6 +5456,7 @@ mod tests {
             "first\nsecond\nthird\n".to_string(),
         );
         let mut editor = rendering_test_editor(source);
+        editor.config.show_diagnostics = true;
         let uri = editor.current_buffer().uri().unwrap().unwrap();
         let first = diagnostic("first visible diagnostic");
         let mut second = diagnostic("second visible diagnostic");
@@ -4549,6 +5569,54 @@ mod tests {
 
         assert!(row.contains(&relative.to_string_lossy().into_owned()));
         assert!(!row.contains(&current_folder.to_string_lossy().into_owned()));
+    }
+
+    #[test]
+    fn rendered_statusline_marks_external_conflicts_with_the_warning_color() {
+        const WIDTH: usize = 80;
+        const HEIGHT: usize = 5;
+
+        let mut source = Buffer::new(Some("document.rs".to_string()), "before\n".to_string());
+        source.set_external_file_change(Some(ExternalFileChange::Modified));
+        let mut config = Config::default();
+        config.statusline.left = vec![StatuslineSection::Filename, StatuslineSection::Modified];
+        config.statusline.right.clear();
+        let mut theme = Theme::default();
+        let warning = Color::Rgb {
+            r: 242,
+            g: 181,
+            b: 75,
+        };
+        theme
+            .colors
+            .insert("editorWarning.foreground".to_string(), warning);
+        let lsp = Box::new(LspManager::new(config.lsp.clone()));
+        let mut editor =
+            Editor::with_size(lsp, WIDTH, HEIGHT, config, theme, vec![source]).unwrap();
+
+        let frame = rendered_statusline(&mut editor, WIDTH, HEIGHT);
+        let row = editor.test_statusline_row();
+
+        assert!(row.contains("[CONFLICT]"));
+        assert!(row.contains("conflict"));
+        assert_eq!(statusline_cell(&frame, HEIGHT, "[").style.fg, Some(warning));
+    }
+
+    #[test]
+    fn rendered_statusline_marks_clean_deleted_files() {
+        let mut source = Buffer::new(Some("document.rs".to_string()), "before\n".to_string());
+        source.set_external_file_change(Some(ExternalFileChange::Deleted));
+        let mut config = Config::default();
+        config.statusline.left = vec![StatuslineSection::Filename, StatuslineSection::Modified];
+        config.statusline.right.clear();
+        let lsp = Box::new(LspManager::new(config.lsp.clone()));
+        let mut editor =
+            Editor::with_size(lsp, 80, 5, config, Theme::default(), vec![source]).unwrap();
+
+        let row = editor.test_statusline_row();
+
+        assert!(row.contains("[DELETED]"));
+        assert!(row.contains("deleted on disk"));
     }
 
     #[test]
@@ -4726,7 +5794,7 @@ mod tests {
     }
 
     #[test]
-    fn hidden_left_statusline_sections_reassign_visible_slot_styles() {
+    fn hidden_left_statusline_sections_preserve_configured_slot_styles() {
         const WIDTH: usize = 80;
         const HEIGHT: usize = 12;
 
@@ -4742,13 +5810,14 @@ mod tests {
         let source = Buffer::new(Some("zeta.py".to_string()), "value = 1\n".to_string());
         let mut editor =
             Editor::with_size(lsp, WIDTH, HEIGHT, config, theme.clone(), vec![source]).unwrap();
+        editor.config.show_diagnostics = true;
         let uri = editor.current_buffer().uri().unwrap().unwrap();
 
         let clean = rendered_statusline(&mut editor, WIDTH, HEIGHT);
         assert_eq!(
             statusline_cell(&clean, HEIGHT, "z").style,
-            statusline_slot_style(&theme, 1),
-            "filename should occupy the second visible slot when diagnostics are absent"
+            statusline_slot_style(&theme, 2),
+            "filename should keep its configured style when diagnostics are absent"
         );
 
         editor.diagnostics.insert(
@@ -4762,7 +5831,7 @@ mod tests {
         assert_eq!(
             statusline_cell(&diagnosed, HEIGHT, "z").style,
             statusline_slot_style(&theme, 2),
-            "filename should occupy the third visible slot when diagnostics are present"
+            "filename should keep its configured style when diagnostics are present"
         );
 
         let diagnostic_style = statusline_slot_style(&theme, 1);
@@ -4785,10 +5854,15 @@ mod tests {
             statusline_cell(&diagnosed, HEIGHT, "").style.fg,
             Some(expected_warning)
         );
+
+        editor.diagnostics.clear();
+        let mut cleared = diagnosed;
+        editor.draw_statusline(&mut cleared);
+        assert_eq!(cleared.cells, clean.cells);
     }
 
     #[test]
-    fn hidden_right_statusline_sections_reassign_visible_slot_styles() {
+    fn hidden_right_statusline_sections_preserve_configured_slot_styles() {
         const WIDTH: usize = 80;
         const HEIGHT: usize = 12;
 
@@ -4804,12 +5878,13 @@ mod tests {
         let source = Buffer::new(Some("zeta.py".to_string()), "value = 1\n".to_string());
         let mut editor =
             Editor::with_size(lsp, WIDTH, HEIGHT, config, theme.clone(), vec![source]).unwrap();
+        editor.config.show_diagnostics = true;
         let uri = editor.current_buffer().uri().unwrap().unwrap();
 
         let clean = rendered_statusline(&mut editor, WIDTH, HEIGHT);
         assert_eq!(
             statusline_cell(&clean, HEIGHT, "z").style,
-            statusline_slot_style(&theme, 1)
+            statusline_slot_style(&theme, 2)
         );
 
         editor.diagnostics.insert(
@@ -4824,6 +5899,63 @@ mod tests {
             statusline_cell(&diagnosed, HEIGHT, "z").style,
             statusline_slot_style(&theme, 2)
         );
+
+        editor.diagnostics.clear();
+        let mut cleared = diagnosed;
+        editor.draw_statusline(&mut cleared);
+        assert_eq!(cleared.cells, clean.cells);
+    }
+
+    #[test]
+    fn hidden_git_statusline_sections_leave_no_color_band_or_separator() {
+        const WIDTH: usize = 80;
+        const HEIGHT: usize = 5;
+
+        let directory = tempfile::tempdir().unwrap();
+        let directory = directory.path().canonicalize().unwrap();
+        let filename = directory.join("zeta.md").to_string_lossy().into_owned();
+        let mut theme = statusline_test_theme();
+        theme.statusline_style.outer_chars = [' ', '>', '<', ' '];
+
+        for right in [false, true] {
+            let mut config = Config::default();
+            config.statusline.left.clear();
+            config.statusline.right.clear();
+            let sections = vec![
+                StatuslineSection::Mode,
+                StatuslineSection::Diagnostics,
+                StatuslineSection::GitBranch,
+                StatuslineSection::Filename,
+            ];
+            if right {
+                config.statusline.right = sections;
+            } else {
+                config.statusline.left = sections;
+            }
+            let lsp = Box::new(LspManager::new(config.lsp.clone()));
+            let source = Buffer::new(Some(filename.clone()), String::new());
+            let mut editor =
+                Editor::with_size(lsp, WIDTH, HEIGHT, config, theme.clone(), vec![source]).unwrap();
+            editor.statusline_git_cache.working_directory = directory.clone();
+
+            let frame = rendered_statusline(&mut editor, WIDTH, HEIGHT);
+            assert!(editor.statusline_git_cache.branch.is_none());
+            assert_eq!(
+                statusline_cell(&frame, HEIGHT, "z").style,
+                theme.statusline_style.inner_style
+            );
+            let separator = statusline_cell(&frame, HEIGHT, if right { "<" } else { ">" });
+            assert_eq!(separator.style.fg, theme.statusline_style.outer_style.bg);
+            assert_eq!(separator.style.bg, theme.statusline_style.inner_style.bg);
+            assert_eq!(
+                editor.test_statusline_row().trim(),
+                if right {
+                    "zeta.md < NORMAL"
+                } else {
+                    "NORMAL > zeta.md"
+                }
+            );
+        }
     }
 
     #[test]
@@ -4856,6 +5988,115 @@ mod tests {
             git_branch_from_head(worktree.path()).as_deref(),
             Some("01234567")
         );
+
+        let linked_source = worktree.path().join("src/main.rs");
+        fs::create_dir_all(linked_source.parent().unwrap()).unwrap();
+        fs::write(&linked_source, "fn main() {}\n").unwrap();
+        let linked_source = linked_source.to_string_lossy().into_owned();
+        let mut editor = rendering_test_editor(Buffer::new(
+            Some(linked_source.clone()),
+            "fn main() {}\n".into(),
+        ));
+        let discovered = editor
+            .benchmark_git_repository_discovery(&linked_source)
+            .unwrap();
+
+        assert_eq!(discovered.0, worktree.path().canonicalize().unwrap());
+        assert_eq!(discovered.1, "01234567");
+    }
+
+    #[test]
+    fn git_repository_refresh_detects_new_nested_repositories() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::create_dir(directory.path().join(".git")).unwrap();
+        fs::write(
+            directory.path().join(".git/HEAD"),
+            "ref: refs/heads/outer\n",
+        )
+        .unwrap();
+        let nested = directory.path().join("packages/inner");
+        let source = nested.join("src/main.rs");
+        fs::create_dir_all(source.parent().unwrap()).unwrap();
+        fs::write(&source, "fn main() {}\n").unwrap();
+        let source = source.to_string_lossy().into_owned();
+        let mut editor =
+            rendering_test_editor(Buffer::new(Some(source.clone()), "fn main() {}\n".into()));
+
+        let outer = editor.benchmark_git_repository_discovery(&source).unwrap();
+        assert_eq!(outer.0, directory.path().canonicalize().unwrap());
+        assert_eq!(outer.1, "outer");
+
+        fs::create_dir(nested.join(".git")).unwrap();
+        fs::write(nested.join(".git/HEAD"), "ref: refs/heads/inner\n").unwrap();
+        let inner = editor.benchmark_git_repository_discovery(&source).unwrap();
+
+        assert_eq!(inner.0, nested.canonicalize().unwrap());
+        assert_eq!(inner.1, "inner");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn git_repository_refresh_invalidates_retargeted_directory_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let first = directory.path().join("first");
+        let second = directory.path().join("second");
+        for (repository, branch) in [(&first, "first"), (&second, "second")] {
+            fs::create_dir_all(repository.join(".git")).unwrap();
+            fs::create_dir_all(repository.join("src")).unwrap();
+            fs::write(
+                repository.join(".git/HEAD"),
+                format!("ref: refs/heads/{branch}\n"),
+            )
+            .unwrap();
+            fs::write(repository.join("src/main.rs"), "fn main() {}\n").unwrap();
+        }
+        let alias = directory.path().join("active");
+        symlink(&first, &alias).unwrap();
+        let source = alias.join("src/main.rs").to_string_lossy().into_owned();
+        let mut editor =
+            rendering_test_editor(Buffer::new(Some(source.clone()), "fn main() {}\n".into()));
+
+        let initial = editor.benchmark_git_repository_discovery(&source).unwrap();
+        assert_eq!(initial.0, first.canonicalize().unwrap());
+        assert_eq!(initial.1, "first");
+
+        fs::remove_file(&alias).unwrap();
+        symlink(&second, &alias).unwrap();
+        let updated = editor.benchmark_git_repository_discovery(&source).unwrap();
+
+        assert_eq!(updated.0, second.canonicalize().unwrap());
+        assert_eq!(updated.1, "second");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn git_repository_refresh_invalidates_renamed_physical_directories() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let repository = directory.path().join("original");
+        fs::create_dir_all(repository.join(".git")).unwrap();
+        fs::create_dir_all(repository.join("src")).unwrap();
+        fs::write(repository.join(".git/HEAD"), "ref: refs/heads/moving\n").unwrap();
+        fs::write(repository.join("src/main.rs"), "fn main() {}\n").unwrap();
+        let alias = directory.path().join("active");
+        symlink(&repository, &alias).unwrap();
+        let source = alias.join("src/main.rs").to_string_lossy().into_owned();
+        let mut editor =
+            rendering_test_editor(Buffer::new(Some(source.clone()), "fn main() {}\n".into()));
+        let initial = editor.benchmark_git_repository_discovery(&source).unwrap();
+        assert_eq!(initial.0, repository.canonicalize().unwrap());
+
+        let renamed = directory.path().join("renamed");
+        fs::rename(&repository, &renamed).unwrap();
+        fs::remove_file(&alias).unwrap();
+        symlink(&renamed, &alias).unwrap();
+        let updated = editor.benchmark_git_repository_discovery(&source).unwrap();
+
+        assert_eq!(updated.0, renamed.canonicalize().unwrap());
+        assert_eq!(updated.1, "moving");
     }
 
     #[test]
@@ -4926,6 +6167,59 @@ mod tests {
             .unwrap();
 
         assert!(editor.search_match_cache.is_none());
+    }
+
+    #[test]
+    fn search_highlight_ranges_preserve_tabs_controls_unicode_and_wrapping() {
+        let config = Config::default();
+        let lsp = Box::new(LspManager::new(config.lsp.clone()));
+        let source = Buffer::new(
+            None,
+            "x\u{0007}alpha\n\talpha\n👋 alpha\nabcdefghijklalpha\n".to_string(),
+        );
+        let mut editor =
+            Editor::with_size(lsp, 18, 12, config, Theme::default(), vec![source]).unwrap();
+        let highlight = Color::Rgb {
+            r: 91,
+            g: 122,
+            b: 153,
+        };
+        editor.theme.find_match_style = Some(Style {
+            bg: Some(highlight),
+            ..Style::default()
+        });
+        editor.search_term = "alpha".to_string();
+        let window = editor.window_manager.active_window().unwrap().clone();
+        let tab_width = editor.tab_width_for_buffer_index(window.buffer_index);
+        let expected: HashSet<_> = (0..4)
+            .flat_map(|line_index| {
+                let line = editor.current_buffer().get(line_index).unwrap();
+                let start = line.find("alpha").unwrap();
+                let start_col = display_width_with_tabs(&line[..start], tab_width);
+                editor.display_col_range_points_in_window(
+                    &window,
+                    line_index,
+                    start_col,
+                    start_col + "alpha".len(),
+                )
+            })
+            .map(|point| (point.x, point.y))
+            .collect();
+        assert!(!expected.is_empty());
+
+        let mut buffer = RenderBuffer::new(18, 12, &Style::default());
+        editor
+            .render_search_highlights_in_window(&mut buffer, &window)
+            .unwrap();
+
+        let actual: HashSet<_> = buffer
+            .cells
+            .iter()
+            .enumerate()
+            .filter(|(_, cell)| cell.style.bg == Some(highlight))
+            .map(|(index, _)| (index % buffer.width, index / buffer.width))
+            .collect();
+        assert_eq!(actual, expected);
     }
 
     #[test]
@@ -5341,6 +6635,33 @@ mod tests {
         let output = String::from_utf8(output).unwrap();
         assert!(!output.contains("\x1b[K"));
         assert!(output.ends_with(&" ".repeat(12)));
+    }
+
+    #[test]
+    fn terminal_diff_never_prints_control_payloads_from_a_cell() {
+        let mut buffer = RenderBuffer::new(1, 1, &Style::default());
+        for payload in [
+            "\u{1b}[31m",
+            "\u{1b}]52;c;payload\u{0007}",
+            "\u{1b}Ppayload\u{1b}\\",
+            "\u{009b}31m",
+            "\u{0007}",
+        ] {
+            buffer.cells[0].c = payload.chars().next().unwrap();
+            buffer.cells[0].text = payload.to_string();
+            let changes = [Change {
+                x: 0,
+                y: 0,
+                cell: &buffer.cells[0],
+            }];
+            let mut output = Vec::new();
+
+            queue_diff_cells(&mut output, &changes, &Style::default(), buffer.width).unwrap();
+
+            let output = String::from_utf8(output).unwrap();
+            assert!(!output.contains(payload), "unsafe payload: {payload:?}");
+            assert!(output.ends_with('�'));
+        }
     }
 
     #[test]

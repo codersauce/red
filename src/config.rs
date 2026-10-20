@@ -191,6 +191,26 @@ impl LoadedConfig {
     }
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum UpdateMode {
+    /// Check once per day and install a newer stable release in the background.
+    ///
+    /// Installations the standalone updater doesn't own fall back to notifying.
+    #[default]
+    Auto,
+    /// Check once per day and notify when a stable release is available.
+    Notify,
+    /// Disable automatic checks; explicit update commands remain available.
+    Off,
+}
+
+#[derive(Debug, Serialize, Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+pub struct UpdateConfig {
+    pub mode: UpdateMode,
+}
+
 #[derive(Debug, Serialize, Deserialize, Default)]
 /// Complete effective editor configuration.
 ///
@@ -211,6 +231,10 @@ pub struct Config {
     /// Plugin names excluded from discovery or activation.
     #[serde(default)]
     pub disabled_plugins: Vec<String>,
+    /// Name-to-path entries that `disabled_plugins` or `disable_ai` removed from
+    /// `plugins`, kept so status views can still list them.
+    #[serde(skip)]
+    pub disabled_plugin_paths: HashMap<String, String>,
     /// Capabilities granted to individual plugins.
     #[serde(default)]
     pub plugin_permissions: HashMap<String, PluginPermissions>,
@@ -225,6 +249,8 @@ pub struct Config {
     pub scrolloff: Option<usize>,
     /// Whether long lines wrap to continuation rows.
     pub wrap: Option<bool>,
+    /// Wrap directional window focus across opposite editor edges. Defaults to on.
+    pub wrap_window_navigation: Option<bool>,
     /// Show the cursor line's absolute number and distances on other lines.
     /// Defaults to off.
     pub relative_line_numbers: Option<bool>,
@@ -246,6 +272,9 @@ pub struct Config {
     /// Defaults to on.
     #[serde(default)]
     pub fetch_release_notes: Option<bool>,
+    /// Stable-release update notification policy.
+    #[serde(default)]
+    pub updates: UpdateConfig,
     /// Retain inline conversations in local editor recovery snapshots. Defaults to on.
     #[serde(default)]
     pub persist_inline_history: Option<bool>,
@@ -314,8 +343,34 @@ pub struct Config {
     pub startup_session_resumed: bool,
 }
 
-/// Direct Codex CLI launch configuration.
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Default)]
+/// Optional Codex extension categories that Red may expose to Agent sessions.
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentCodexFeature {
+    Apps,
+    Connectors,
+    Plugins,
+    RemotePlugin,
+    SkillMcpDependencyInstall,
+    OrchestratorMcp,
+}
+
+impl AgentCodexFeature {
+    /// Returns the matching Codex feature-config key when one exists.
+    pub(crate) const fn config_key(self) -> Option<&'static str> {
+        match self {
+            Self::Apps => Some("apps"),
+            Self::Connectors => Some("connectors"),
+            Self::Plugins => Some("plugins"),
+            Self::RemotePlugin => Some("remote_plugin"),
+            Self::SkillMcpDependencyInstall => Some("skill_mcp_dependency_install"),
+            Self::OrchestratorMcp => None,
+        }
+    }
+}
+
+/// Direct Codex CLI launch and Agent policy configuration.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct AgentConfig {
     /// Codex executable override. Red uses `codex` from PATH when absent.
@@ -326,6 +381,36 @@ pub struct AgentConfig {
     /// Environment additions supplied only to the Codex child process.
     #[serde(default)]
     pub env: HashMap<String, String>,
+    /// Show each file tool in the active editor with deliberate playback delays.
+    #[serde(default)]
+    pub follow_tool_calls: bool,
+    /// Apply exact-target inline edits immediately as unsaved, undoable transactions.
+    #[serde(default = "default_true")]
+    pub auto_apply_inline_edits: bool,
+    /// Permit Agent tools to inspect or change paths matching Red's secret-name heuristic.
+    #[serde(default)]
+    pub allow_sensitive_paths: bool,
+    /// Existing Codex MCP server names that Red may enable for Agent sessions.
+    #[serde(default)]
+    pub enabled_mcp_servers: Vec<String>,
+    /// Codex extension categories that Red may enable for Agent sessions.
+    #[serde(default)]
+    pub enabled_codex_features: Vec<AgentCodexFeature>,
+}
+
+impl Default for AgentConfig {
+    fn default() -> Self {
+        Self {
+            command: None,
+            args: Vec::new(),
+            env: HashMap::new(),
+            follow_tool_calls: false,
+            auto_apply_inline_edits: true,
+            allow_sensitive_paths: false,
+            enabled_mcp_servers: Vec::new(),
+            enabled_codex_features: Vec::new(),
+        }
+    }
 }
 
 /// Diagnostic presentation layered on top of the master `show_diagnostics` switch.
@@ -350,11 +435,14 @@ impl Default for DiagnosticsConfig {
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
-/// Picker input placement.
+/// Picker layout and hierarchy presentation.
 pub struct PickerConfig {
     /// Whether the query row appears above or below results.
     #[serde(default)]
     pub input_position: PickerInputPosition,
+    /// Draw hierarchy connectors for picker rows that expose tree metadata.
+    #[serde(default = "default_true")]
+    pub tree_guides: bool,
     #[serde(default)]
     pub icons: PickerIconsConfig,
 }
@@ -415,6 +503,7 @@ impl Default for PickerConfig {
     fn default() -> Self {
         Self {
             input_position: PickerInputPosition::Bottom,
+            tree_guides: true,
             icons: PickerIconsConfig::default(),
         }
     }
@@ -455,7 +544,11 @@ fn default_statusline_left() -> Vec<StatuslineSection> {
 }
 
 fn default_statusline_right() -> Vec<StatuslineSection> {
-    vec![StatuslineSection::Position, StatuslineSection::Syntax]
+    vec![
+        StatuslineSection::Position,
+        StatuslineSection::Syntax,
+        StatuslineSection::AgentActivity,
+    ]
 }
 
 /// A piece of editor context that can be placed on either status-line side.
@@ -620,6 +713,18 @@ impl Default for ClipboardConfig {
 #[serde(deny_unknown_fields)]
 /// Language-specific comment templates keyed by canonical language or extension.
 pub struct CommentingConfig {
+    /// Preferred source width for manual and automatic comment formatting.
+    #[serde(default = "default_comment_text_width")]
+    pub text_width: usize,
+    /// Wrap line comments as insert-mode typing crosses `text_width`.
+    #[serde(default = "default_true")]
+    pub auto_wrap: bool,
+    /// Continue a recognized line-comment leader after Enter in Insert mode.
+    #[serde(default = "default_true")]
+    pub continue_on_enter: bool,
+    /// Continue a recognized line-comment leader for Normal-mode `o` and `O`.
+    #[serde(default = "default_true")]
+    pub continue_on_open_line: bool,
     /// Templates containing one placeholder for the original line contents.
     #[serde(default = "default_comment_templates")]
     pub languages: HashMap<String, String>,
@@ -628,9 +733,17 @@ pub struct CommentingConfig {
 impl Default for CommentingConfig {
     fn default() -> Self {
         Self {
+            text_width: default_comment_text_width(),
+            auto_wrap: true,
+            continue_on_enter: true,
+            continue_on_open_line: true,
             languages: default_comment_templates(),
         }
     }
+}
+
+const fn default_comment_text_width() -> usize {
+    100
 }
 
 fn default_comment_templates() -> HashMap<String, String> {
@@ -677,6 +790,9 @@ pub struct PluginPermissions {
     /// not invoke a shell when launching plugin processes.
     #[serde(default)]
     pub process: Vec<String>,
+    /// Additional host environment variables inherited by this plugin's RPC process.
+    #[serde(default)]
+    pub inherit_env: Vec<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
@@ -940,18 +1056,34 @@ pub enum FormattingProvider {
 #[serde(deny_unknown_fields)]
 /// Global document formatting behavior.
 pub struct FormattingConfig {
+    /// Reindent pasted code and request language-server range formatting when available.
+    #[serde(default = "default_true")]
+    pub on_paste: bool,
     /// Format supported documents immediately before saving them. Defaults to on.
     #[serde(default = "default_true")]
     pub on_save: bool,
+    /// Remove trailing spaces and tabs before save-time formatting.
+    #[serde(default = "default_true")]
+    pub trim_trailing_whitespace: bool,
+    /// Language ids whose trailing whitespace must remain untouched.
+    #[serde(default = "default_trailing_whitespace_exclusions")]
+    pub trim_trailing_whitespace_exclude: Vec<String>,
     /// Backend selected for explicit and save-time formatting.
     #[serde(default)]
     pub provider: FormattingProvider,
 }
 
+fn default_trailing_whitespace_exclusions() -> Vec<String> {
+    vec!["gitcommit".to_string(), "markdown".to_string()]
+}
+
 impl Default for FormattingConfig {
     fn default() -> Self {
         Self {
+            on_paste: true,
             on_save: true,
+            trim_trailing_whitespace: true,
+            trim_trailing_whitespace_exclude: default_trailing_whitespace_exclusions(),
             provider: FormattingProvider::default(),
         }
     }
@@ -967,12 +1099,18 @@ pub struct LanguageConfig {
     /// Case-sensitive exact file names, such as `Dockerfile` or `Makefile`.
     #[serde(default)]
     pub filenames: Vec<String>,
+    /// Interpreter basenames recognized in a first-line shebang.
+    #[serde(default)]
+    pub shebangs: Vec<String>,
     /// Additional names accepted by syntax selection and injected fenced blocks.
     #[serde(default)]
     pub aliases: Vec<String>,
     /// Vim-style line-comment template containing a single `%s` placeholder.
     #[serde(default)]
     pub comment: Option<String>,
+    /// Preferred source width for comments in this language.
+    #[serde(default)]
+    pub text_width: Option<usize>,
     /// Preferred indentation width for files recognized as this language.
     #[serde(default)]
     pub indent_width: Option<usize>,
@@ -1627,6 +1765,7 @@ impl Config {
         let mut disabled_servers = HashSet::new();
         let mut disable_agent = false;
         let mut disable_lsp = false;
+        let mut validated_config = None;
 
         if !contents.trim().is_empty() {
             let mut user_value = match toml::from_str::<toml::Value>(contents) {
@@ -1653,38 +1792,44 @@ impl Config {
             let table = user_value.as_table().ok_or_else(|| {
                 anyhow::anyhow!("user config must contain a top-level TOML table")
             })?;
-            for (key, value) in sorted_table_entries(table) {
-                let unit_path = vec![key.to_string()];
-                if !known_top_level_field(key) {
-                    diagnostics.push(diagnostic_for_path(
-                        contents,
-                        source.clone(),
-                        "CFG101",
-                        ConfigDiagnosticSeverity::Warning,
-                        &unit_path,
-                        "unknown configuration field; it was ignored".to_string(),
-                        "no setting was applied".to_string(),
-                    ));
-                    continue;
-                }
+            validated_config = try_merge_valid_user_config(&base_value, &user_value);
+            if validated_config.is_none() {
+                for (key, value) in sorted_table_entries(table) {
+                    let unit_path = vec![key.to_string()];
+                    if !known_top_level_field(key) {
+                        diagnostics.push(diagnostic_for_path(
+                            contents,
+                            source.clone(),
+                            "CFG101",
+                            ConfigDiagnosticSeverity::Warning,
+                            &unit_path,
+                            "unknown configuration field; it was ignored".to_string(),
+                            "no setting was applied".to_string(),
+                        ));
+                        continue;
+                    }
 
-                apply_user_value(
-                    &mut base_value,
-                    value.clone(),
-                    &unit_path,
-                    contents,
-                    &source,
-                    &mut diagnostics,
-                    &mut disabled_plugins,
-                    &mut disabled_permissions,
-                    &mut disabled_servers,
-                    &mut disable_agent,
-                    &mut disable_lsp,
-                );
+                    apply_user_value(
+                        &mut base_value,
+                        value.clone(),
+                        &unit_path,
+                        contents,
+                        &source,
+                        &mut diagnostics,
+                        &mut disabled_plugins,
+                        &mut disabled_permissions,
+                        &mut disabled_servers,
+                        &mut disable_agent,
+                        &mut disable_lsp,
+                    );
+                }
             }
         }
 
-        let mut config = deserialize_config(base_value)?;
+        let mut config = match validated_config {
+            Some(config) => config,
+            None => deserialize_config(base_value)?,
+        };
         for plugin in disabled_plugins {
             config.plugins.remove(&plugin);
         }
@@ -1836,11 +1981,18 @@ impl Config {
     }
 
     fn apply_disabled_plugins(&mut self) {
+        let mut disabled = self
+            .disabled_plugins
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
         if self.disable_ai {
-            self.plugins.remove("agent");
+            disabled.push("agent");
         }
-        for plugin in &self.disabled_plugins {
-            self.plugins.remove(plugin);
+        for plugin in disabled {
+            if let Some(path) = self.plugins.remove(plugin) {
+                self.disabled_plugin_paths.insert(plugin.to_string(), path);
+            }
         }
     }
 }
@@ -1859,6 +2011,38 @@ fn deserialize_config(value: toml::Value) -> anyhow::Result<Config> {
         .map_err(|error| anyhow::anyhow!("failed to deserialize merged config: {error}"))?;
     config.apply_disabled_plugins();
     Ok(config)
+}
+
+/// Accepts ordinary valid settings together while preserving granular recovery.
+///
+/// Capability-bearing sections and dynamic entries retain their existing
+/// field-by-field validation because their replacement and quarantine rules
+/// cannot be expressed as a plain recursive table merge.
+fn try_merge_valid_user_config(base: &toml::Value, user: &toml::Value) -> Option<Config> {
+    let table = user.as_table()?;
+    if table.keys().any(|key| {
+        matches!(
+            key.as_str(),
+            "keys"
+                | "plugins"
+                | "plugin_permissions"
+                | "plugin_config"
+                | "agent"
+                | "languages"
+                | "matchit"
+        )
+    }) || table
+        .get("lsp")
+        .and_then(toml::Value::as_table)
+        .is_some_and(|lsp| lsp.contains_key("servers"))
+        || first_unknown_path(user, &[]).is_some()
+    {
+        return None;
+    }
+
+    let mut candidate = base.clone();
+    merge_config_values(&mut candidate, user.clone(), &[]);
+    deserialize_config(candidate).ok()
 }
 
 fn safe_loaded_config(path: &Path, code: &str, message: String) -> anyhow::Result<LoadedConfig> {
@@ -1908,6 +2092,7 @@ fn known_top_level_field(field: &str) -> bool {
             | "mouse_scroll_lines"
             | "scrolloff"
             | "wrap"
+            | "wrap_window_navigation"
             | "relative_line_numbers"
             | "breakindent"
             | "sidescroll"
@@ -1915,6 +2100,7 @@ fn known_top_level_field(field: &str) -> bool {
             | "splash"
             | "show_whats_new"
             | "fetch_release_notes"
+            | "updates"
             | "persist_inline_history"
             | "search"
             | "completion"
@@ -2053,10 +2239,22 @@ fn known_schema_path(path: &[String]) -> bool {
         [field] => known_top_level_field(field),
         ["keys", ..] | ["plugin_config", ..] => true,
         ["plugins", _] => true,
-        ["plugin_permissions", _] | ["plugin_permissions", _, "process"] => true,
-        ["agent", field] => matches!(*field, "adapter" | "command" | "args" | "env"),
+        ["plugin_permissions", _] | ["plugin_permissions", _, "process" | "inherit_env"] => true,
+        ["agent", field] => matches!(
+            *field,
+            "adapter"
+                | "command"
+                | "args"
+                | "env"
+                | "follow_tool_calls"
+                | "auto_apply_inline_edits"
+                | "allow_sensitive_paths"
+                | "enabled_mcp_servers"
+                | "enabled_codex_features"
+        ),
         ["agent", "env", _] => true,
         ["diagnostics", field] => matches!(*field, "gutter_signs" | "icon_style"),
+        ["updates", field] => *field == "mode",
         ["cursor", field] => matches!(
             *field,
             "normal"
@@ -2092,7 +2290,7 @@ fn known_schema_path(path: &[String]) -> bool {
             *field,
             "enabled" | "command" | "args" | "debounce_ms" | "max_file_bytes" | "excluded_patterns"
         ),
-        ["picker", "input_position"] => true,
+        ["picker", field] => matches!(*field, "input_position" | "tree_guides"),
         ["picker", "icons", field] => matches!(*field, "style" | "color"),
         ["statusline", field] => matches!(*field, "left" | "right" | "icons"),
         ["statusline", "icons", field] => matches!(*field, "style" | "color"),
@@ -2101,7 +2299,14 @@ fn known_schema_path(path: &[String]) -> bool {
             matches!(*field, "enabled" | "sync_on_yank" | "sync_on_paste")
         }
         ["lsp", field] => matches!(*field, "enabled" | "format_on_save" | "servers"),
-        ["formatting", field] => matches!(*field, "on_save" | "provider"),
+        ["formatting", field] => matches!(
+            *field,
+            "on_paste"
+                | "on_save"
+                | "trim_trailing_whitespace"
+                | "trim_trailing_whitespace_exclude"
+                | "provider"
+        ),
         ["lsp", "servers", _] => true,
         ["lsp", "servers", _, field] => matches!(
             *field,
@@ -2126,7 +2331,9 @@ fn known_schema_path(path: &[String]) -> bool {
             "extensions"
                 | "filenames"
                 | "aliases"
+                | "shebangs"
                 | "comment"
+                | "text_width"
                 | "indent_width"
                 | "grammar"
                 | "lsp"
@@ -2166,7 +2373,15 @@ fn known_schema_path(path: &[String]) -> bool {
             matches!(*field, "name" | "command" | "args" | "root_markers" | "env")
         }
         ["languages", _, "formatter", "env", _] => true,
-        ["commenting", "languages"] | ["commenting", "languages", _] => true,
+        ["commenting", field] => matches!(
+            *field,
+            "text_width"
+                | "auto_wrap"
+                | "continue_on_enter"
+                | "continue_on_open_line"
+                | "languages"
+        ),
+        ["commenting", "languages", _] => true,
         ["matchit", field] => matches!(*field, "enabled" | "pairs" | "languages"),
         ["matchit", "languages", _] | ["matchit", "languages", _, "groups"] => true,
         _ => false,
@@ -2953,6 +3168,94 @@ wrap = "yes"
     }
 
     #[test]
+    fn valid_configuration_sections_merge_once_without_losing_defaults_or_overrides() {
+        let loaded = Config::load_user_toml(
+            r#"
+scrolloff = 4
+wrap = false
+
+[search]
+ignorecase = true
+smartcase = false
+
+[completion]
+enabled = true
+auto_trigger = false
+max_buffer_words = 2048
+
+[formatting]
+on_save = false
+
+[key_hints]
+enabled = false
+delay_ms = 75
+"#,
+            Path::new("/tmp/config.toml"),
+            &["completion.max_buffer_words = 4096".to_string()],
+        )
+        .unwrap();
+
+        assert!(loaded.is_clean());
+        assert_eq!(loaded.config.scrolloff, Some(4));
+        assert_eq!(loaded.config.wrap, Some(false));
+        assert!(loaded.config.search.ignorecase);
+        assert!(!loaded.config.search.smartcase);
+        assert!(!loaded.config.completion.auto_trigger);
+        assert_eq!(loaded.config.completion.max_buffer_words, 4096);
+        assert!(!loaded.config.formatting.on_save);
+        assert!(!loaded.config.key_hints.enabled);
+        assert!(loaded.config.plugins.contains_key("theme_browser"));
+    }
+
+    #[test]
+    fn bulk_configuration_falls_back_for_unknown_and_invalid_sibling_settings() {
+        let loaded = Config::load_user_toml(
+            r#"
+scrolloff = 6
+
+[completion]
+auto_trigger = false
+debounce_ms = "soon"
+unknown_setting = true
+"#,
+            Path::new("/tmp/config.toml"),
+            &[],
+        )
+        .unwrap();
+
+        assert_eq!(loaded.recovery, ConfigRecovery::Partial);
+        assert_eq!(loaded.config.scrolloff, Some(6));
+        assert!(!loaded.config.completion.auto_trigger);
+        assert!(loaded.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "CFG102" && diagnostic.path == "completion.debounce_ms"
+        }));
+        assert!(loaded.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "CFG101" && diagnostic.path == "completion.unknown_setting"
+        }));
+    }
+
+    #[test]
+    fn bulk_configuration_never_bypasses_capability_or_dynamic_entry_validation() {
+        let base = embedded_config_value().unwrap();
+        for source in [
+            "[keys.normal]\nx = 'MoveDown'",
+            "[plugins]\ncustom = 'custom.hk'",
+            "[plugin_permissions.custom]\nprocess = ['git']",
+            "[plugin_config.custom]\nenabled = true",
+            "[agent]\ncommand = '/custom/codex'",
+            "[languages.custom]\nextensions = ['custom']",
+            "[matchit]\nenabled = true",
+            "[lsp.servers.custom]\ncommand = 'custom-lsp'",
+        ] {
+            let value = toml::from_str(source).unwrap();
+            assert!(
+                try_merge_valid_user_config(&base, &value).is_none(),
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
     fn relative_line_numbers_are_an_optional_opt_in_setting() {
         let defaults = Config::load_user_toml("", Path::new("/tmp/config.toml"), &[]).unwrap();
         assert_eq!(defaults.config.relative_line_numbers, Some(false));
@@ -2965,6 +3268,37 @@ wrap = "yes"
         .unwrap();
         assert!(enabled.is_clean());
         assert_eq!(enabled.config.relative_line_numbers, Some(true));
+    }
+
+    #[test]
+    fn wrap_window_navigation_is_enabled_by_default_and_configurable() {
+        let defaults = Config::load_user_toml("", Path::new("/tmp/config.toml"), &[]).unwrap();
+        assert_eq!(defaults.config.wrap_window_navigation, Some(true));
+
+        let disabled = Config::load_user_toml(
+            "wrap_window_navigation = false",
+            Path::new("/tmp/config.toml"),
+            &[],
+        )
+        .unwrap();
+        assert!(disabled.is_clean());
+        assert_eq!(disabled.config.wrap_window_navigation, Some(false));
+    }
+
+    #[test]
+    fn invalid_wrap_window_navigation_falls_back_independently() {
+        let loaded = Config::load_user_toml(
+            r#"wrap_window_navigation = "yes""#,
+            Path::new("/tmp/config.toml"),
+            &[],
+        )
+        .unwrap();
+
+        assert_eq!(loaded.config.wrap_window_navigation, Some(true));
+        assert!(loaded.diagnostics.iter().any(|diagnostic| {
+            diagnostic.path == "wrap_window_navigation"
+                && diagnostic.fallback == "kept the previous valid value"
+        }));
     }
 
     #[test]
@@ -3545,6 +3879,7 @@ disabled_plugins = ["fidget"]
             Some(&KeyAction::Single(Action::FilePicker))
         );
         assert!(!config.plugins.contains_key("fidget"));
+        assert!(config.disabled_plugin_paths.contains_key("fidget"));
         assert!(config.plugins.contains_key("theme_browser"));
     }
 
@@ -3575,6 +3910,40 @@ env = { NO_BROWSER = "1" }
             config.agent.env.get("NO_BROWSER").map(String::as_str),
             Some("1")
         );
+        assert!(!config.agent.follow_tool_calls);
+        assert!(config.agent.auto_apply_inline_edits);
+        assert!(!config.agent.allow_sensitive_paths);
+        assert!(config.agent.enabled_mcp_servers.is_empty());
+        assert!(config.agent.enabled_codex_features.is_empty());
+    }
+
+    #[test]
+    fn agent_runtime_policy_and_behavior_are_configurable() {
+        let config = Config::from_user_toml_with_overrides(
+            r#"
+[agent]
+follow_tool_calls = true
+auto_apply_inline_edits = false
+allow_sensitive_paths = true
+enabled_mcp_servers = ["github", "linear"]
+enabled_codex_features = ["apps", "plugins", "orchestrator_mcp"]
+"#,
+            &[],
+        )
+        .unwrap();
+
+        assert!(config.agent.follow_tool_calls);
+        assert!(!config.agent.auto_apply_inline_edits);
+        assert!(config.agent.allow_sensitive_paths);
+        assert_eq!(config.agent.enabled_mcp_servers, ["github", "linear"]);
+        assert_eq!(
+            config.agent.enabled_codex_features,
+            [
+                AgentCodexFeature::Apps,
+                AgentCodexFeature::Plugins,
+                AgentCodexFeature::OrchestratorMcp,
+            ]
+        );
     }
 
     #[test]
@@ -3584,6 +3953,30 @@ env = { NO_BROWSER = "1" }
         assert_eq!(
             config.keys.normal.get("*"),
             Some(&KeyAction::Single(Action::SearchWordUnderCursor))
+        );
+    }
+
+    #[test]
+    fn default_config_maps_ctrl_n_to_next_occurrence() {
+        let config: Config = toml::from_str(include_str!("../default_config.toml")).unwrap();
+
+        assert_eq!(
+            config.keys.normal.get("Ctrl-n"),
+            Some(&KeyAction::Single(Action::SelectNextOccurrence))
+        );
+    }
+
+    #[test]
+    fn default_config_maps_ctrl_arrows_to_vertical_cursors() {
+        let config: Config = toml::from_str(include_str!("../default_config.toml")).unwrap();
+
+        assert_eq!(
+            config.keys.normal.get("Ctrl-Up"),
+            Some(&KeyAction::Single(Action::AddCursorUp))
+        );
+        assert_eq!(
+            config.keys.normal.get("Ctrl-Down"),
+            Some(&KeyAction::Single(Action::AddCursorDown))
         );
     }
 
@@ -3657,8 +4050,22 @@ theme = "mocha.json"
         .unwrap();
 
         assert_eq!(config.picker.input_position, PickerInputPosition::Bottom);
+        assert!(config.picker.tree_guides);
         assert_eq!(config.picker.icons.style, PickerIconStyle::NerdFont);
         assert!(config.picker.icons.color);
+    }
+
+    #[test]
+    fn picker_tree_guides_can_be_disabled() {
+        let loaded = Config::load_user_toml(
+            "[picker]\ntree_guides = false\n",
+            Path::new("/tmp/config.toml"),
+            &[],
+        )
+        .unwrap();
+
+        assert!(!loaded.config.picker.tree_guides);
+        assert!(loaded.diagnostics.is_empty(), "{:?}", loaded.diagnostics);
     }
 
     #[test]
@@ -3733,7 +4140,11 @@ icon_style = "{value}"
         );
         assert_eq!(
             config.statusline.right,
-            [StatuslineSection::Position, StatuslineSection::Syntax]
+            [
+                StatuslineSection::Position,
+                StatuslineSection::Syntax,
+                StatuslineSection::AgentActivity,
+            ]
         );
         assert_eq!(config.statusline.icons.style, PickerIconStyle::NerdFont);
         assert!(config.statusline.icons.color);
@@ -3874,6 +4285,23 @@ input_position = "left"
     }
 
     #[test]
+    fn default_config_maps_vim_paragraph_and_sentence_motions() {
+        let config: Config = toml::from_str(include_str!("../default_config.toml")).unwrap();
+
+        for (key, action) in [
+            ("{", Action::MoveToPreviousParagraph),
+            ("}", Action::MoveToNextParagraph),
+            ("(", Action::MoveToPreviousSentence),
+            (")", Action::MoveToNextSentence),
+        ] {
+            assert_eq!(
+                config.keys.normal.get(key),
+                Some(&KeyAction::Single(action))
+            );
+        }
+    }
+
+    #[test]
     fn default_config_preserves_wrap_toggle_under_gw() {
         let config: Config = toml::from_str(include_str!("../default_config.toml")).unwrap();
         let Some(KeyAction::Nested(g)) = config.keys.normal.get("g") else {
@@ -3928,7 +4356,7 @@ input_position = "left"
     }
 
     #[test]
-    fn default_config_maps_normal_and_visual_comment_operators() {
+    fn default_config_maps_normal_and_visual_comment_and_format_operators() {
         let config: Config = toml::from_str(include_str!("../default_config.toml")).unwrap();
 
         let Some(KeyAction::Nested(normal_g)) = config.keys.normal.get("g") else {
@@ -3937,6 +4365,10 @@ input_position = "left"
         assert_eq!(
             normal_g.get("c"),
             Some(&KeyAction::Single(Action::StartCommentOperator(1)))
+        );
+        assert_eq!(
+            normal_g.get("q"),
+            Some(&KeyAction::Single(Action::StartFormatOperator(1)))
         );
 
         let Some(KeyAction::Nested(visual_g)) = config.keys.visual.get("g") else {
@@ -3949,12 +4381,23 @@ input_position = "left"
                 Action::EnterMode(Mode::Normal),
             ]))
         );
+        assert_eq!(
+            visual_g.get("q"),
+            Some(&KeyAction::Multiple(vec![
+                Action::FormatSelection,
+                Action::EnterMode(Mode::Normal),
+            ]))
+        );
     }
 
     #[test]
     fn comment_configuration_defaults_cover_line_and_wrapping_comments() {
         let config = Config::default();
 
+        assert_eq!(config.commenting.text_width, 100);
+        assert!(config.commenting.auto_wrap);
+        assert!(config.commenting.continue_on_enter);
+        assert!(config.commenting.continue_on_open_line);
         assert_eq!(config.commenting.languages["fish"], "# %s");
         assert_eq!(config.commenting.languages["rust"], "// %s");
         assert!(!config.commenting.languages.contains_key("python"));
@@ -3962,6 +4405,38 @@ input_position = "left"
         assert_eq!(config.commenting.languages["html"], "<!-- %s -->");
         assert_eq!(config.commenting.languages["css"], "/* %s */");
         assert!(!config.commenting.languages.contains_key("json"));
+    }
+
+    #[test]
+    fn comment_formatting_supports_global_and_language_overrides() {
+        let loaded = Config::load_user_toml(
+            "[commenting]\ntext_width = 88\nauto_wrap = false\ncontinue_on_enter = false\ncontinue_on_open_line = false\n[languages.rust]\ntext_width = 92\n",
+            Path::new("/tmp/config.toml"),
+            &[],
+        )
+        .unwrap();
+
+        assert_eq!(loaded.config.commenting.text_width, 88);
+        assert!(!loaded.config.commenting.auto_wrap);
+        assert!(!loaded.config.commenting.continue_on_enter);
+        assert!(!loaded.config.commenting.continue_on_open_line);
+        assert_eq!(loaded.config.languages["rust"].text_width, Some(92));
+    }
+
+    #[test]
+    fn invalid_comment_formatting_field_recovers_independently() {
+        let loaded = Config::load_user_toml(
+            "[commenting]\nauto_wrap = \"yes\"\ncontinue_on_enter = false\n",
+            Path::new("/tmp/config.toml"),
+            &[],
+        )
+        .unwrap();
+
+        assert!(loaded.config.commenting.auto_wrap);
+        assert!(!loaded.config.commenting.continue_on_enter);
+        assert!(loaded.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "CFG102" && diagnostic.path == "commenting.auto_wrap"
+        }));
     }
 
     #[test]
@@ -4166,6 +4641,22 @@ groups = [["\\bif\\b", "\\belse\\b", "\\bendif\\b"]]
             leader.get("."),
             Some(&KeyAction::Single(Action::CodeAction))
         );
+        let Some(KeyAction::Nested(code)) = leader.get("c") else {
+            panic!("expected a Space c code-action mapping");
+        };
+        assert_eq!(code.get("a"), Some(&KeyAction::Single(Action::CodeAction)));
+        assert_eq!(
+            code.get("c"),
+            Some(&KeyAction::Single(Action::PluginCommand(
+                "GitSubmitMessage".to_string()
+            )))
+        );
+        assert_eq!(
+            code.get("q"),
+            Some(&KeyAction::Single(Action::PluginCommand(
+                "GitCancelMessage".to_string()
+            )))
+        );
         assert_eq!(
             leader.get("r"),
             Some(&KeyAction::Single(Action::StartRename))
@@ -4183,7 +4674,9 @@ groups = [["\\bif\\b", "\\belse\\b", "\\bendif\\b"]]
         assert_eq!(config.show_whats_new, Some(true));
         assert_eq!(config.fetch_release_notes, Some(true));
         assert_eq!(config.persist_inline_history, Some(true));
+        assert_eq!(config.wrap_window_navigation, Some(true));
         assert!(known_top_level_field("persist_inline_history"));
+        assert!(known_top_level_field("wrap_window_navigation"));
         assert_eq!(
             config.keys.normal.get("F1"),
             Some(&KeyAction::Single(Action::KeyboardShortcuts))
@@ -4230,6 +4723,20 @@ groups = [["\\bif\\b", "\\belse\\b", "\\bendif\\b"]]
 
         assert!(!config.key_hints.enabled);
         assert_eq!(config.key_hints.delay_ms, 750);
+    }
+
+    #[test]
+    fn update_mode_defaults_to_auto_and_can_be_overridden() {
+        let defaults = Config::from_user_toml_with_overrides("", &[]).unwrap();
+        assert_eq!(defaults.updates.mode, UpdateMode::Auto);
+
+        let config =
+            Config::from_user_toml_with_overrides("[updates]\nmode = \"notify\"\n", &[]).unwrap();
+        assert_eq!(config.updates.mode, UpdateMode::Notify);
+
+        let config =
+            Config::from_user_toml_with_overrides("[updates]\nmode = \"off\"\n", &[]).unwrap();
+        assert_eq!(config.updates.mode, UpdateMode::Off);
     }
 
     #[test]
@@ -4327,6 +4834,25 @@ max_buffer_words = 20
             Some(&KeyAction::Single(Action::PluginCommand(
                 "AgentOpen".to_string()
             )))
+        );
+    }
+
+    #[test]
+    fn default_config_maps_ctrl_e_to_neotree_in_normal_and_insert_modes() {
+        let config: Config = toml::from_str(include_str!("../default_config.toml")).unwrap();
+
+        assert_eq!(
+            config.keys.normal.get("Ctrl-e"),
+            Some(&KeyAction::Single(Action::PluginCommand(
+                "NeoTree".to_string()
+            )))
+        );
+        assert_eq!(
+            config.keys.insert.get("Ctrl-e"),
+            Some(&KeyAction::Multiple(vec![
+                Action::EnterMode(Mode::Normal),
+                Action::PluginCommand("NeoTree".to_string()),
+            ]))
         );
     }
 
@@ -4488,7 +5014,7 @@ theme = "theme/nightfox.json"
     }
 
     #[test]
-    fn plugin_process_permissions_accept_executable_allowlists() {
+    fn plugin_permissions_accept_process_and_environment_allowlists() {
         let config: Config = toml::from_str(
             r#"
 theme = "theme/nightfox.json"
@@ -4497,6 +5023,7 @@ theme = "theme/nightfox.json"
 
 [plugin_permissions.project_search]
 process = ["rg", "/usr/bin/git"]
+inherit_env = ["PROJECT_SEARCH_TOKEN"]
 "#,
         )
         .unwrap();
@@ -4505,6 +5032,7 @@ process = ["rg", "/usr/bin/git"]
             config.plugin_permissions.get("project_search"),
             Some(&PluginPermissions {
                 process: vec!["rg".to_string(), "/usr/bin/git".to_string()],
+                inherit_env: vec!["PROJECT_SEARCH_TOKEN".to_string()],
             })
         );
     }
@@ -4575,18 +5103,44 @@ workspace_name = "frontend"
 
     #[test]
     fn formatting_defaults_to_on_for_missing_fields_and_files() {
+        assert!(Config::default().formatting.on_paste);
         assert!(Config::default().formatting.on_save);
-        assert!(toml::from_str::<FormattingConfig>("").unwrap().on_save);
+        assert!(Config::default().formatting.trim_trailing_whitespace);
+        assert_eq!(
+            Config::default()
+                .formatting
+                .trim_trailing_whitespace_exclude,
+            ["gitcommit", "markdown"]
+        );
+        let formatting = toml::from_str::<FormattingConfig>("").unwrap();
+        assert!(formatting.on_paste);
+        assert!(formatting.on_save);
         let config: Config = toml::from_str("theme = \"red.json\"\n[keys]").unwrap();
+        assert!(config.formatting.on_paste);
         assert!(config.formatting.on_save);
         let config: Config = toml::from_str(assets::DEFAULT_CONFIG).unwrap();
+        assert!(config.formatting.on_paste);
         assert!(config.formatting.on_save);
         assert_eq!(config.formatting.provider, FormattingProvider::Auto);
 
         let directory = tempfile::tempdir().unwrap();
         let loaded = Config::load_user_file(&directory.path().join("missing.toml"), &[]).unwrap();
         assert!(loaded.is_clean());
+        assert!(loaded.config.formatting.on_paste);
         assert!(loaded.config.formatting.on_save);
+    }
+
+    #[test]
+    fn formatting_on_paste_can_be_disabled_and_overridden() {
+        let loaded = Config::load_user_toml(
+            "[formatting]\non_paste = false",
+            Path::new("/tmp/config.toml"),
+            &["formatting.on_paste = true".to_string()],
+        )
+        .unwrap();
+
+        assert!(loaded.is_clean());
+        assert!(loaded.config.formatting.on_paste);
     }
 
     #[test]

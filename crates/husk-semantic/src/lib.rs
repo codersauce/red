@@ -9,6 +9,7 @@ mod stdlib_index;
 
 pub use stdlib_index::{InferenceStrategy, MethodKey, StdlibIndex, StdlibMethodInfo};
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
 
@@ -255,6 +256,14 @@ pub fn filter_items_by_cfg(file: &File, flags: &HashSet<String>) -> File {
     }
 }
 
+fn filtered_items_by_cfg<'a>(file: &'a File, flags: &HashSet<String>) -> Cow<'a, File> {
+    if file.items.iter().all(|item| item_passes_cfg(item, flags)) {
+        Cow::Borrowed(file)
+    } else {
+        Cow::Owned(filter_items_by_cfg(file, flags))
+    }
+}
+
 fn native_profile_errors(file: &File) -> Vec<SemanticError> {
     let mut errors = Vec::new();
     for item in &file.items {
@@ -366,7 +375,7 @@ pub enum SemanticProfile {
 /// Run semantic analysis (name resolution + type checking) over the given file with options.
 pub fn analyze_file_with_options(file: &File, opts: SemanticOptions) -> SemanticResult {
     // Filter items based on cfg predicates
-    let filtered_file = filter_items_by_cfg(file, &opts.cfg_flags);
+    let filtered_file = filtered_items_by_cfg(file, &opts.cfg_flags);
 
     let symbols = ModuleSymbols::from_file(&filtered_file);
 
@@ -423,7 +432,7 @@ pub fn analyze_file_with_declarations_and_options(
     declarations: &[File],
     opts: SemanticOptions,
 ) -> SemanticResult {
-    let filtered_file = filter_items_by_cfg(file, &opts.cfg_flags);
+    let filtered_file = filtered_items_by_cfg(file, &opts.cfg_flags);
     let symbols = ModuleSymbols::from_file(&filtered_file);
     let mut checker = TypeChecker::new(opts.profile, opts.module_path.clone());
     if opts.prelude {
@@ -6437,6 +6446,36 @@ mod tests {
             kind: PatternKind::Binding(id.clone()),
             span: id.span,
         }
+    }
+
+    #[test]
+    fn unchanged_conditional_compilation_borrows_the_existing_syntax_tree() {
+        let file = parse_str("fn preserved() { let value = 42; }")
+            .file
+            .unwrap();
+        let flags = HashSet::new();
+
+        let filtered = filtered_items_by_cfg(&file, &flags);
+
+        assert!(matches!(filtered, Cow::Borrowed(_)));
+        assert!(std::ptr::eq(filtered.as_ref(), &file));
+    }
+
+    #[test]
+    fn excluded_conditional_items_still_produce_a_filtered_syntax_tree() {
+        let file = parse_str("#[cfg(test)] fn excluded() {} fn preserved() {}")
+            .file
+            .unwrap();
+        let flags = HashSet::new();
+
+        let filtered = filtered_items_by_cfg(&file, &flags);
+
+        assert!(matches!(filtered, Cow::Owned(_)));
+        assert_eq!(filtered.items.len(), 1);
+        assert!(matches!(
+            &filtered.items[0].kind,
+            ItemKind::Fn { name, .. } if name.name == "preserved"
+        ));
     }
 
     #[test]

@@ -58,16 +58,23 @@ impl GutterSignManager {
         if self.namespaces.get(&namespace) == Some(&signs) {
             return false;
         }
-        self.namespaces.insert(namespace, signs);
-        self.rebuild_index();
+        let previous = self.namespaces.insert(namespace.clone(), signs);
+        if let Some(previous) = previous {
+            Self::remove_indexed(&mut self.line_index, &namespace, &previous);
+        }
+        Self::insert_indexed(
+            &mut self.line_index,
+            &namespace,
+            &self.namespaces[&namespace],
+        );
         true
     }
 
     pub fn clear(&mut self, namespace: &str) -> bool {
-        if self.namespaces.remove(namespace).is_none() {
+        let Some(previous) = self.namespaces.remove(namespace) else {
             return false;
-        }
-        self.rebuild_index();
+        };
+        Self::remove_indexed(&mut self.line_index, namespace, &previous);
         true
     }
 
@@ -87,27 +94,49 @@ impl GutterSignManager {
             .collect()
     }
 
-    fn rebuild_index(&mut self) {
-        self.line_index.clear();
-        for (namespace, signs) in &self.namespaces {
-            for sign in signs {
-                self.line_index
-                    .entry((sign.buffer_index, sign.line))
-                    .or_default()
-                    .push(IndexedGutterSign {
-                        namespace: namespace.clone(),
-                        sign: sign.clone(),
-                    });
+    fn remove_indexed(
+        line_index: &mut HashMap<(usize, usize), Vec<IndexedGutterSign>>,
+        namespace: &str,
+        signs: &[GutterSign],
+    ) {
+        for sign in signs {
+            let key = (sign.buffer_index, sign.line);
+            let remove_line = line_index.get_mut(&key).is_some_and(|indexed| {
+                if let Some(position) = indexed
+                    .iter()
+                    .position(|current| current.namespace == namespace)
+                {
+                    indexed.remove(position);
+                }
+                indexed.is_empty()
+            });
+            if remove_line {
+                line_index.remove(&key);
             }
         }
-        for signs in self.line_index.values_mut() {
-            signs.sort_by(|left, right| {
-                right
-                    .sign
-                    .priority
-                    .cmp(&left.sign.priority)
-                    .then_with(|| left.namespace.cmp(&right.namespace))
+    }
+
+    fn insert_indexed(
+        line_index: &mut HashMap<(usize, usize), Vec<IndexedGutterSign>>,
+        namespace: &str,
+        signs: &[GutterSign],
+    ) {
+        for sign in signs {
+            let indexed = line_index
+                .entry((sign.buffer_index, sign.line))
+                .or_default();
+            let position = indexed.partition_point(|current| {
+                current.sign.priority > sign.priority
+                    || (current.sign.priority == sign.priority
+                        && current.namespace.as_str() <= namespace)
             });
+            indexed.insert(
+                position,
+                IndexedGutterSign {
+                    namespace: namespace.to_string(),
+                    sign: sign.clone(),
+                },
+            );
         }
     }
 }
@@ -181,5 +210,50 @@ mod tests {
         .unwrap();
 
         assert_eq!(sign.priority, 10);
+    }
+
+    #[test]
+    fn replacing_one_namespace_preserves_collision_order_and_unrelated_lines() {
+        let mut manager = GutterSignManager::default();
+        manager.set("git".to_string(), vec![sign(10, "+")]);
+        manager.set("diagnostics".to_string(), vec![sign(20, "!")]);
+        manager.set("annotations".to_string(), vec![sign(20, "?")]);
+
+        let mut relocated = sign(30, "*");
+        relocated.line = 7;
+        manager.set("diagnostics".to_string(), vec![relocated]);
+
+        assert_eq!(
+            manager.visible_sign(1, 2).map(|sign| sign.text.as_str()),
+            Some("?")
+        );
+        assert_eq!(
+            manager.visible_sign(1, 7).map(|sign| sign.text.as_str()),
+            Some("*")
+        );
+        assert!(manager.clear("annotations"));
+        assert_eq!(
+            manager.visible_sign(1, 2).map(|sign| sign.text.as_str()),
+            Some("+")
+        );
+    }
+
+    #[test]
+    fn replacing_duplicate_signs_removes_only_their_namespace() {
+        let mut manager = GutterSignManager::default();
+        manager.set("first".to_string(), vec![sign(10, "+"), sign(5, "-")]);
+        manager.set("second".to_string(), vec![sign(15, "!")]);
+
+        manager.set("first".to_string(), vec![sign(20, "*")]);
+
+        assert_eq!(
+            manager.visible_sign(1, 2).map(|sign| sign.text.as_str()),
+            Some("*")
+        );
+        assert!(manager.clear("first"));
+        assert_eq!(
+            manager.visible_sign(1, 2).map(|sign| sign.text.as_str()),
+            Some("!")
+        );
     }
 }

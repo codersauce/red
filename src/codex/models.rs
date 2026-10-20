@@ -432,7 +432,7 @@ mod tests {
             active_turn: Some("turn-1".into()),
             pending_interrupt_turn_id: None,
             cancelled: Arc::new(AtomicBool::new(false)),
-            tool_calls: 0,
+            allow_sensitive_paths: false,
             kind,
         }
     }

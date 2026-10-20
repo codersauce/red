@@ -61,7 +61,7 @@ impl Editor {
                         matches!(action, Action::PreviousOverlappingInlineComment),
                     );
                 } else {
-                    self.set_legacy_message(Some("no inline item at the cursor".into()));
+                    self.set_navigation_boundary_warning("inline items");
                 }
                 self.render(buffer)?;
             }
@@ -687,7 +687,8 @@ impl Editor {
                     )
                     .await?;
                 }
-                self.plugin_registry.execute(runtime, "AgentOpen").await?;
+                self.execute_plugin_command(buffer, runtime, "AgentOpen")
+                    .await?;
                 // AgentOpen queues pane creation/restoration first. Stage the draft
                 // only after those requests have been processed.
                 runtime.send_request(PluginRequest::Action(Action::StageInlineAssistHandoff {

@@ -7,6 +7,8 @@
 // watchers, processes, timers, panels, workspace state, and gutter namespaces.
 // Picker callbacks are owner-scoped: each menu item carries its flow context, while the
 // active prompt handle is retained only so query changes update the correct picker.
+// Status refreshes never replace an in-flight scan. Polls start after completion,
+// while explicit refreshes coalesce into one follow-up and idle work backs off.
 
 struct GitEntry {
     path: String,
@@ -35,6 +37,11 @@ struct GitState {
     unstaged: [GitEntry],
     untracked: [GitEntry],
     conflicted: [GitEntry],
+    truncated: bool,
+}
+
+struct GitCommitFiles {
+    entries: [GitEntry],
     truncated: bool,
 }
 
@@ -265,6 +272,12 @@ struct GitPluginState {
     process: String,
     status_initialized: bool,
     status_output: String,
+    status_pending_output: String,
+    status_error: String,
+    status_started_ms: i64,
+    status_forced: bool,
+    refresh_pending: bool,
+    poll_delay_ms: i64,
     refresh_forced: bool,
     idle_polls: i32,
     refresh_timer: String,
@@ -277,6 +290,13 @@ struct GitPluginState {
     staged_sign_glyphs: GitSignGlyphs,
     root: String,
     state: GitState,
+    commit_view_oid: String,
+    commit_view_label: String,
+    commit_view_entries: [GitEntry],
+    commit_view_truncated: bool,
+    commit_view_process: String,
+    commit_view_output: String,
+    commit_view_error: String,
     hunk_action: String,
     hunk_path: String,
     hunk_patch: String,
@@ -305,6 +325,7 @@ struct GitPluginState {
     prompt_kind: String,
     prompt_picker: Option<i32>,
     capture_kind: String,
+    capture_process: String,
     capture_output: String,
     operation: String,
     operation_jobs: [OperationJob],
@@ -379,6 +400,12 @@ fn initial_state() -> GitPluginState {
         process: "",
         status_initialized: false,
         status_output: "",
+        status_pending_output: "",
+        status_error: "",
+        status_started_ms: 0,
+        status_forced: false,
+        refresh_pending: false,
+        poll_delay_ms: 5000,
         refresh_forced: true,
         idle_polls: 0,
         refresh_timer: "",
@@ -403,6 +430,13 @@ fn initial_state() -> GitPluginState {
         },
         root: ".",
         state: empty_state(),
+        commit_view_oid: "",
+        commit_view_label: "",
+        commit_view_entries: [],
+        commit_view_truncated: false,
+        commit_view_process: "",
+        commit_view_output: "",
+        commit_view_error: "",
         hunk_action: "",
         hunk_path: "",
         hunk_patch: "",
@@ -430,6 +464,7 @@ fn initial_state() -> GitPluginState {
         prompt_kind: "",
         prompt_picker: None,
         capture_kind: "",
+        capture_process: "",
         capture_output: "",
         operation: "",
         operation_jobs: [],
@@ -554,6 +589,10 @@ fn dashboard() {
 
 fn close_dashboard() {
     cancel_detail_timer();
+    let commit_process = red::string(plugin_state().commit_view_process, "");
+    if commit_process != "" {
+        red::execute("KillProcess", commit_process);
+    }
     if plugin_state().stats_process != "" {
         red::execute("KillProcess", plugin_state().stats_process);
         red::state_patch(GitPluginState { stats_process: "" });
@@ -563,12 +602,24 @@ fn close_dashboard() {
         red::execute("KillProcess", detail_process);
         red::state_patch(GitPluginState { detail_process: "" });
     }
-    red::state_patch(GitPluginState { dashboard_open: false });
+    red::state_patch(GitPluginState {
+        dashboard_open: false,
+        commit_view_oid: "",
+        commit_view_label: "",
+        commit_view_entries: [],
+        commit_view_truncated: false,
+        commit_view_process: "",
+        commit_view_output: "",
+        commit_view_error: "",
+    });
     red::execute("CloseWorkspace", "git-dashboard");
 }
 
 fn schedule_poll() {
-    red::state_patch(GitPluginState { poll_timer: red::execute("SetTimeout", 5000) });
+    red::execute("CancelTimeout", plugin_state().poll_timer);
+    red::state_patch(GitPluginState {
+        poll_timer: red::execute("SetTimeout", plugin_state().poll_delay_ms),
+    });
 }
 
 #[red::on("filesystem:changed:1502")]
@@ -621,10 +672,9 @@ fn timeout_callback(event: TimerEvent) {
         refresh();
         return;
     }
-    if event.timer_id == plugin_state().poll_timer {
+    if event.timer_id != "" && event.timer_id == plugin_state().poll_timer {
         red::state_patch(GitPluginState { poll_timer: "" });
-        refresh();
-        schedule_poll();
+        if plugin_state().process == "" { refresh(); }
     }
 }
 
@@ -641,10 +691,25 @@ fn force_refresh() {
 }
 
 fn refresh() {
-    let previous = red::string(plugin_state().process, "");
-    if previous != "" {
-        red::execute("KillProcess", previous);
+    if plugin_state().process != "" {
+        red::state_patch(GitPluginState { refresh_pending: true });
+        return;
     }
+    red::execute("CancelTimeout", plugin_state().refresh_timer);
+    red::state_patch(GitPluginState {
+        refresh_timer: "",
+        refresh_pending: false,
+        status_pending_output: "",
+        status_started_ms: red::execute("MonotonicTime"),
+        status_forced: plugin_state().refresh_forced || plugin_state().status_error != "",
+        refresh_forced: false,
+    });
+    // Keep a bounded retry armed if SpawnProcess throws before returning an ID.
+    let retry_delay = plugin_state().poll_delay_ms * (2 as i64);
+    let retry_limit = 60000 as i64;
+    if retry_delay > retry_limit { retry_delay = retry_limit; }
+    red::state_patch(GitPluginState { poll_delay_ms: retry_delay });
+    schedule_poll();
     let process_id = red::execute("SpawnProcess", Process {
         command: "git",
         args: red::git_core("status_args"),
@@ -657,13 +722,27 @@ fn refresh() {
         raw_output: true,
         cwd: red::string(plugin_state().root, "."),
     });
-    red::state_patch(GitPluginState { process: process_id });
+    red::execute("CancelTimeout", plugin_state().poll_timer);
+    red::state_patch(GitPluginState { process: process_id, poll_timer: "", status_error: "" });
     red::on("process:" + process_id, status_event);
 }
 
 #[red::config("cwd")]
 fn git_cwd_loaded(event: GitStringValueEvent) {
     let cwd = red::string(event.value, ".");
+    if cwd != plugin_state().root {
+        cancel_status();
+        if plugin_state().capture_process != "" {
+            red::execute("KillProcess", plugin_state().capture_process);
+            red::state_patch(GitPluginState { capture_process: "" });
+        }
+        red::execute("UnwatchDirectory", 1502);
+        red::state_patch(GitPluginState {
+            state: empty_state(), status_initialized: false, status_output: "",
+            refresh_forced: true, poll_delay_ms: 5000, watch_path: "",
+        });
+        schedule_poll();
+    }
     red::state_patch(GitPluginState { root: cwd });
     capture_git("root", ["rev-parse", "--show-toplevel"]);
 }
@@ -766,37 +845,77 @@ fn status_event(event: ProcessEvent) {
     match event {
         ProcessEvent::Stdout { process_id, line, plugin_name } => {
             if process_id == plugin_state().process {
-                update_status(line);
+                red::state_patch(GitPluginState { status_pending_output: line });
             }
         }
         ProcessEvent::Error { process_id, message, plugin_name } => {
             if process_id == plugin_state().process {
-                render_error(message);
+                red::state_patch(GitPluginState { status_error: message });
             }
         }
         ProcessEvent::Exit { process_id, code, plugin_name } => {
             if process_id != plugin_state().process {
                 return;
             }
-            red::state_patch(GitPluginState { process: "" });
-            let exit_code = 0;
+            let exit_code = -1;
             if let Some(value) = code {
                 exit_code = value;
             }
-            if exit_code != 0 {
-                render_error("git status exited with " + exit_code);
-            }
+            finish_status(exit_code);
         }
         ProcessEvent::Stderr { process_id, line, plugin_name } => {}
     }
 }
 
-fn update_status(output: String) {
+fn finish_status(exit_code: i32) {
+    let current = plugin_state();
+    let now: i64 = red::execute("MonotonicTime");
+    let elapsed = now - current.status_started_ms;
+    let successful = exit_code == 0 && current.status_error == "";
+    let changed = !current.status_initialized || current.status_pending_output != current.status_output;
+    let delay = 5000 as i64;
+    if !successful || (!changed && !current.status_forced) {
+        delay = current.poll_delay_ms;
+    }
+    // Nine milliseconds of cooldown per millisecond spent scanning targets a
+    // 10% background duty cycle, independent of repository size or CPU count.
+    let cost_delay = elapsed * (9 as i64);
+    if delay < cost_delay { delay = cost_delay; }
+    red::state_patch(GitPluginState { process: "", poll_delay_ms: delay });
+    // Rendering or follow-up work can fail independently of the scan. Keep
+    // polling alive even if one of those callbacks throws.
+    schedule_poll();
+    red::log("[git-status] completed elapsed_ms=" + elapsed + " success=" + successful + " next_poll_ms=" + delay);
+    if successful {
+        update_status(current.status_pending_output, current.status_forced);
+    } else {
+        let error = current.status_error;
+        if error == "" { error = "git status exited with " + exit_code; }
+        red::state_patch(GitPluginState { status_error: error });
+        if current.status_initialized { render_dashboard(); } else { render_error(error); }
+    }
+    // A callback such as safe-sync can already have started the next scan.
+    if plugin_state().process != "" { return; }
+    if plugin_state().refresh_pending {
+        refresh();
+    }
+}
+
+fn cancel_status() {
+    red::execute("CancelTimeout", plugin_state().refresh_timer);
+    red::execute("CancelTimeout", plugin_state().poll_timer);
+    let process = plugin_state().process;
+    red::state_patch(GitPluginState {
+        process: "", refresh_pending: false, status_pending_output: "", status_error: "",
+        refresh_timer: "", poll_timer: "",
+    });
+    if process != "" { red::execute("KillProcess", process); }
+}
+
+fn update_status(output: String, forced: bool) {
     let initialized = plugin_state().status_initialized;
     let changed = !initialized || output != red::string(plugin_state().status_output, "");
-    let forced = plugin_state().refresh_forced;
     red::state_patch(GitPluginState { status_initialized: true });
-    red::state_patch(GitPluginState { refresh_forced: false });
     if changed {
         red::state_patch(GitPluginState { status_output: output });
         red::state_patch(GitPluginState { state: parse_status(output) });
@@ -818,7 +937,7 @@ fn update_status(output: String) {
     let safe_sync_pending = plugin_state().safe_sync_pending;
     if changed || forced {
         render_dashboard();
-        if plugin_state().dashboard_open { refresh_stats(); }
+        if plugin_state().dashboard_open && plugin_state().commit_view_oid == "" { refresh_stats(); }
     }
     if changed || forced {
         red::request("GetWindows", sign_windows_loaded);
@@ -837,6 +956,31 @@ fn refresh_selected_detail(render_loading: bool) {
         return;
     }
     let path = red::string(plugin_state().detail_path, "");
+    if plugin_state().commit_view_oid != "" {
+        if plugin_state().commit_view_process != "" {
+            return;
+        }
+        let entries = plugin_state().commit_view_entries;
+        if red::len(entries) == 0 {
+            clear_detail("This commit has no file changes.", true);
+            if render_loading { render_dashboard(); }
+            return;
+        }
+        let entry = entries[0];
+        for candidate in entries {
+            if candidate.path == path {
+                entry = candidate;
+            }
+        }
+        show_detail(Some(GitWorkspaceRow {
+            data: Some(GitWorkspaceRowData {
+                section: "commit",
+                path: entry.path,
+                entry: Some(entry),
+            }),
+        }), render_loading);
+        return;
+    }
     let state = plugin_state().state;
     if path == "" {
         for section in ["conflicted", "staged", "unstaged", "untracked"] {
@@ -1257,36 +1401,67 @@ fn render_dashboard() {
     let state = plugin_state().state;
     let stats = plugin_state().stats;
     let rows: [GitWorkspaceRow] = [];
-    if red::string(plugin_state().operation, "") != "" {
-        rows = red::push(rows, GitWorkspaceRow {
-            id: "section:operation",
-            selectable: false,
-            segments: [PanelSegment {
-                text: "Ongoing " + red::string(plugin_state().operation, ""),
-                style: warning_style(),
-            }],
-        });
+    if plugin_state().commit_view_oid != "" {
+        rows = append_section(rows, "Commit changes", "commit", plugin_state().commit_view_entries, stats);
+        if plugin_state().commit_view_truncated {
+            rows = red::push(rows, GitWorkspaceRow {
+                id: "commit-truncated",
+                selectable: false,
+                segments: [PanelSegment {
+                    text: "… commit limited to 500 entries",
+                    style: muted_style(),
+                }],
+            });
+        }
+        if red::len(rows) == 0 {
+            let message = "This commit has no file changes";
+            if plugin_state().commit_view_process != "" {
+                message = "Loading commit files…";
+            } else if plugin_state().commit_view_error != "" {
+                message = "Could not load commit: " + bounded_git_error(plugin_state().commit_view_error);
+            }
+            rows = red::push(rows, GitWorkspaceRow {
+                id: "commit-empty",
+                selectable: false,
+                segments: [PanelSegment { text: message, style: muted_style() }],
+            });
+        }
+    } else {
+        if red::string(plugin_state().operation, "") != "" {
+            rows = red::push(rows, GitWorkspaceRow {
+                id: "section:operation",
+                selectable: false,
+                segments: [PanelSegment {
+                    text: "Ongoing " + red::string(plugin_state().operation, ""),
+                    style: warning_style(),
+                }],
+            });
+        }
+        rows = append_section(rows, "Conflicts", "conflicted", state.conflicted, stats);
+        rows = append_section(rows, "Staged", "staged", state.staged, stats);
+        rows = append_section(rows, "Unstaged", "unstaged", state.unstaged, stats);
+        rows = append_section(rows, "Untracked", "untracked", state.untracked, stats);
+        if red::bool(state.truncated, false) {
+            rows = red::push(rows, GitWorkspaceRow {
+                id: "status-truncated",
+                selectable: false,
+                segments: [PanelSegment {
+                    text: "… status limited to 500 entries",
+                    style: muted_style(),
+                }],
+            });
+        }
+        if red::len(rows) == 0 {
+            rows = red::push(rows, GitWorkspaceRow {
+                id: "clean",
+                selectable: false,
+                segments: [PanelSegment { text: "Working tree clean", style: success_style() }],
+            });
+        }
     }
-    rows = append_section(rows, "Conflicts", "conflicted", state.conflicted, stats);
-    rows = append_section(rows, "Staged", "staged", state.staged, stats);
-    rows = append_section(rows, "Unstaged", "unstaged", state.unstaged, stats);
-    rows = append_section(rows, "Untracked", "untracked", state.untracked, stats);
-    if red::bool(state.truncated, false) {
-        rows = red::push(rows, GitWorkspaceRow {
-            id: "status-truncated",
-            selectable: false,
-            segments: [PanelSegment {
-                text: "… status limited to 500 entries",
-                style: muted_style(),
-            }],
-        });
-    }
-    if red::len(rows) == 0 {
-        rows = red::push(rows, GitWorkspaceRow {
-            id: "clean",
-            selectable: false,
-            segments: [PanelSegment { text: "Working tree clean", style: success_style() }],
-        });
+    let status = plugin_state().detail_status;
+    if plugin_state().status_error != "" {
+        status = "Git status stale: " + bounded_git_error(plugin_state().status_error);
     }
     red::execute("UpdateWorkspace", "git-dashboard", GitWorkspaceModel {
         header: header_segments(state),
@@ -1294,7 +1469,7 @@ fn render_dashboard() {
         detail: plugin_state().detail,
         detail_document: plugin_state().detail_document,
         actions: dashboard_actions(),
-        status: plugin_state().detail_status,
+        status: status,
         detail_title: plugin_state().detail_path,
     });
 }
@@ -1313,6 +1488,15 @@ fn dashboard_action(id: String, key: String, label: String, focus: String, secti
 }
 
 fn dashboard_actions() -> [GitWorkspaceAction] {
+    if plugin_state().commit_view_oid != "" {
+        return [
+            dashboard_action("q", "q", "back", "", [], "essential"),
+            dashboard_action("activate", "Enter", "open", "", [], "primary"),
+            dashboard_action("L", "L", "full patch", "detail", [], "secondary"),
+            dashboard_action("r", "r", "refresh", "", [], "secondary"),
+            dashboard_action("l", "l", "log", "rows", [], "secondary"),
+        ];
+    }
     return [
         dashboard_action("s", "s", "stage {scope}", "", ["unstaged", "untracked"], "essential"),
         dashboard_action("u", "u", "unstage {scope}", "", ["staged"], "essential"),
@@ -1353,14 +1537,15 @@ fn append_section(rows: [GitWorkspaceRow], title: String, section: String, entri
     let status_style = section_style(section);
     let secondary_style = muted_style();
     let display_entries: [GitDisplayEntry] = red::git_core("display_entries", entries);
+    let entry_index = 0;
     for display in display_entries {
-        let entry = display.entry;
+        let entry = entries[entry_index];
         rows = red::push(rows, GitWorkspaceRow {
             id: section + ":" + entry.path,
             selectable: true,
             depth: 1,
             path: Some(entry.path),
-            segments: entry_path_segments(display, secondary_style),
+            segments: entry_path_segments(display, entry, secondary_style),
             right_segments: entry_stat_segments(display, section, status_style, stats),
             data: Some(GitWorkspaceRowData {
                 section: section,
@@ -1368,6 +1553,7 @@ fn append_section(rows: [GitWorkspaceRow], title: String, section: String, entri
                 entry: Some(entry),
             }),
         });
+        entry_index = entry_index + 1;
     }
     return rows;
 }
@@ -1388,8 +1574,26 @@ fn entry_stat_segments(display: GitDisplayEntry, section: String, status_style: 
 
 fn refresh_stats() {
     if plugin_state().stats_process != "" { red::execute("KillProcess", plugin_state().stats_process); }
-    red::state_patch(GitPluginState { stats: Json {} });
-    start_stats("staged");
+    red::state_patch(GitPluginState { stats: Json {}, stats_process: "" });
+    if plugin_state().commit_view_oid != "" {
+        start_commit_stats();
+        return;
+    }
+    // A full worktree diff can be as expensive as status. Only scan sections
+    // with tracked changes whose statistics can actually appear in the list.
+    if red::len(plugin_state().state.staged) > 0 { start_stats("staged"); }
+    else if red::len(plugin_state().state.unstaged) > 0 { start_stats("unstaged"); }
+}
+
+fn start_commit_stats() {
+    let process_id = red::execute("SpawnProcess", Process {
+        command: "git",
+        args: ["show", "--format=", "--first-parent", "--numstat", "-z", "--find-renames", plugin_state().commit_view_oid],
+        raw_output: true,
+        cwd: plugin_state().root,
+    });
+    red::state_patch(GitPluginState { stats_process: process_id, stats_section: "commit", stats_output: "" });
+    red::on("process:" + process_id, stats_event);
 }
 
 fn start_stats(section: String) {
@@ -1431,7 +1635,7 @@ fn stats_event(event: ProcessEvent) {
                 index = index + 1;
             }
             red::state_patch(GitPluginState { stats: stats, stats_process: "" });
-            if section == "staged" && plugin_state().dashboard_open { start_stats("unstaged"); }
+            if section == "staged" && plugin_state().dashboard_open && plugin_state().commit_view_oid == "" && red::len(plugin_state().state.unstaged) > 0 { start_stats("unstaged"); }
             else { render_dashboard(); }
         }
         ProcessEvent::Error { process_id, message, plugin_name } => {
@@ -1441,15 +1645,14 @@ fn stats_event(event: ProcessEvent) {
     }
 }
 
-fn entry_path_segments(display: GitDisplayEntry, secondary_style: Style) -> [PanelSegment] {
-    let entry = display.entry;
+fn entry_path_segments(display: GitDisplayEntry, entry: GitEntry, secondary_style: Style) -> [PanelSegment] {
     let segments = [
         PanelSegment { text: display.filename },
     ];
     if display.parent != "" {
         segments = red::push(segments, PanelSegment { text: "  " + display.parent, style: secondary_style });
     }
-    if entry.kind == "renamed" {
+    if entry.kind == "renamed" || entry.kind == "copied" {
         if let Some(original_path) = entry.original_path {
             segments = red::push(segments, PanelSegment {
                 text: "  ← " + original_path,
@@ -1469,12 +1672,19 @@ fn header_segments(state: GitState) -> [PanelSegment] {
     if red::string(state.upstream, "") != "" {
         tracking = " → " + state.upstream;
     }
-    return [
+    let segments = [
         PanelSegment { text: branch, style: branch_style() },
         PanelSegment { text: tracking, style: muted_style() },
         PanelSegment { text: "  ↑" + state.ahead + " ↓" + state.behind, style: muted_style() },
         PanelSegment { text: operation_header(), style: warning_style() },
     ];
+    if plugin_state().commit_view_oid != "" {
+        segments = red::push(segments, PanelSegment {
+            text: "  ·  " + plugin_state().commit_view_label,
+            style: heading_style(),
+        });
+    }
+    return segments;
 }
 
 fn operation_header() -> String {
@@ -1531,11 +1741,19 @@ fn workspace_event(event: GitWorkspaceEvent) {
         return;
     }
     if event.action == "q" || event.action == "escape" {
-        close_dashboard();
+        if plugin_state().commit_view_oid != "" {
+            close_commit_view();
+        } else {
+            close_dashboard();
+        }
         return;
     }
     if event.action == "r" {
-        force_refresh();
+        if plugin_state().commit_view_oid != "" {
+            open_commit_view(plugin_state().commit_view_oid, plugin_state().commit_view_label);
+        } else {
+            force_refresh();
+        }
         return;
     }
     if event.action == "$" {
@@ -1576,6 +1794,12 @@ fn workspace_event(event: GitWorkspaceEvent) {
                 return;
             }
         }
+    }
+    if plugin_state().commit_view_oid != "" {
+        if event.action == "l" {
+            log_view();
+        }
+        return;
     }
     if event.focus == "detail" && (
         event.action == "s" || event.action == "u" || event.action == "x" ||
@@ -1693,9 +1917,19 @@ fn show_detail(row: Option<GitWorkspaceRow>, render_loading: bool) {
     red::state_patch(GitPluginState { detail_error: "", detail_status: "Loading " + data.path + "…" });
     red::state_patch(GitPluginState { detail_path: data.path });
     red::state_patch(GitPluginState { detail_section: data.section });
+    let args = red::git_core("detail_diff_args", data.section, data.path);
+    if data.section == "commit" {
+        args = ["show", "--format=", "--first-parent", "--find-renames", "--no-ext-diff", "--color=never", plugin_state().commit_view_oid, "--"];
+        if let Some(entry) = data.entry {
+            if let Some(original_path) = entry.original_path {
+                args = red::push(args, original_path);
+            }
+        }
+        args = red::push(args, data.path);
+    }
     let process_id = red::execute("SpawnProcess", Process {
         command: "git",
-        args: red::git_core("detail_diff_args", data.section, data.path),
+        args: args,
         raw_output: true,
         cwd: red::string(plugin_state().root, "."),
     });
@@ -2608,6 +2842,15 @@ fn open_items(title: String, items: [PickerItem]) {
     open_menu_picker(title, items, "Filter");
 }
 
+fn open_name_first_items(title: String, items: [PickerItem]) {
+    red::execute("OpenPicker", title, items, PickerOptions {
+        placeholder: "Filter",
+        item_layout: "label_first",
+    }, PickerHandlers {
+        selected: menu_selected,
+    });
+}
+
 fn open_menu_picker(title: String, items: [PickerItem], placeholder: String) {
     red::execute("OpenPicker", title, items, PickerOptions {
         placeholder: placeholder,
@@ -2704,6 +2947,9 @@ fn prompt_submitted(item: PickerItem) {
 }
 
 fn capture_git(kind: String, args: [String]) {
+    if plugin_state().capture_process != "" {
+        red::execute("KillProcess", plugin_state().capture_process);
+    }
     red::state_patch(GitPluginState { capture_kind: kind });
     red::state_patch(GitPluginState { capture_output: "" });
     record_command(args);
@@ -2713,17 +2959,23 @@ fn capture_git(kind: String, args: [String]) {
         raw_output: true,
         cwd: red::string(plugin_state().root, "."),
     });
+    red::state_patch(GitPluginState { capture_process: process_id });
     red::on("process:" + process_id, capture_event);
 }
 
 fn capture_event(event: ProcessEvent) {
     match event {
         ProcessEvent::Stdout { process_id, line, plugin_name } => {
+            if process_id != plugin_state().capture_process { return; }
             red::state_patch(GitPluginState {
                 capture_output: plugin_state().capture_output + line,
             });
         }
-        ProcessEvent::Exit { process_id, code, plugin_name } => capture_finished(),
+        ProcessEvent::Exit { process_id, code, plugin_name } => {
+            if process_id != plugin_state().capture_process { return; }
+            red::state_patch(GitPluginState { capture_process: "" });
+            capture_finished();
+        }
         ProcessEvent::Stderr { process_id, line, plugin_name } => {}
         ProcessEvent::Error { process_id, message, plugin_name } => {}
     }
@@ -2746,8 +2998,6 @@ fn capture_finished() {
     } else if kind == "detail" {
         red::state_patch(GitPluginState { detail: detail_lines(output) });
         render_dashboard();
-    } else if kind == "log-detail" {
-        open_detail_items(output);
     } else if kind == "branches-checkout" || kind == "branches-delete" || kind == "branches-merge" || kind == "branches-rebase" {
         open_line_items(kind, "Branches", output);
     } else if kind == "tags-delete" {
@@ -2785,23 +3035,6 @@ fn open_line_items(kind: String, title: String, output: String) {
     }
     items = red::push(items, PickerItem { id: "Cancel", label: "Cancel", kind: "Cancel" });
     open_items(title, items);
-}
-
-fn open_detail_items(output: String) {
-    let items = [];
-    let lines = red::split(output, "\n");
-    let index = 0;
-    while index < red::len(lines) && index < 500 {
-        items = red::push(items, PickerItem {
-            id: "detail:" + index,
-            label: lines[index],
-            kind: "Text",
-            data: Json { menu_kind: "log-detail-view" },
-        });
-        index = index + 1;
-    }
-    items = red::push(items, PickerItem { id: "Close", label: "Close", kind: "Close" });
-    open_items("Commit details", items);
 }
 
 fn open_tag_push_items(output: String) {
@@ -2898,17 +3131,27 @@ fn open_worktree_items(output: String) {
         let line = lines[index];
         if red::starts_with(line, "worktree ") {
             let path = red::slice(line, 9);
+            let normalized = red::replace_all(path, "\\", "/");
+            let parts = red::split(normalized, "/");
+            let name = red::string(parts[red::len(parts) - 1], normalized);
+            let parents = [];
+            let part_index = 0;
+            while part_index < red::len(parts) - 1 {
+                parents = red::push(parents, parts[part_index]);
+                part_index = part_index + 1;
+            }
             items = red::push(items, PickerItem {
                 id: path,
-                label: path,
+                label: name,
                 kind: "GitWorktree",
-                data: Json { menu_kind: "worktrees", value: path },
+                annotation: red::join(parents, "/"),
+                data: Json { menu_kind: "worktrees", value: path, search_path: normalized },
             });
         }
         index = index + 1;
     }
     items = red::push(items, PickerItem { id: "Cancel", label: "Cancel", kind: "Cancel" });
-    open_items("Worktrees", items);
+    open_name_first_items("Worktrees", items);
 }
 
 fn open_log_items(output: String) {
@@ -2917,16 +3160,20 @@ fn open_log_items(output: String) {
         if red::trim(line) != "" {
             let clean = red::trim(line);
             let fields = red::split(clean, "\t");
-            items = red::push(items, PickerItem {
-                id: fields[0],
-                label: fields[1] + " " + fields[4],
-                kind: "GitCommit",
-                detail: fields[2] + " " + fields[3],
-                data: Json { menu_kind: "log-select", oid: fields[0] },
-            });
+            if red::len(fields) >= 5 {
+                let graph_fields = red::split(red::trim(fields[0]), " ");
+                let oid = graph_fields[red::len(graph_fields) - 1];
+                items = red::push(items, PickerItem {
+                    id: oid,
+                    label: fields[1] + " " + fields[4],
+                    kind: "GitCommit",
+                    detail: fields[2] + " " + fields[3],
+                    data: Json { menu_kind: "log-select", oid: oid },
+                });
+            }
         }
     }
-    open_items("Git log", items);
+    open_name_first_items("Git log", items);
 }
 
 fn start_rebase_plan(output: String) {
@@ -3149,11 +3396,12 @@ fn operation_item_selected(value: String) {
 fn log_item_selected(kind: String, item: PickerItem, value: String) {
     if kind == "log-select" {
         red::state_patch(GitPluginState { log_oid: item.data.oid });
-        open_choices("log-action", item.label, ["Show details", "Cherry-pick", "Revert", "Create branch", "Create tag", "Cancel"]);
+        red::state_patch(GitPluginState { commit_view_label: item.label });
+        open_choices("log-action", item.label, ["Open", "Cherry-pick", "Revert", "Create branch", "Create tag", "Cancel"]);
     } else {
         let oid = red::string(plugin_state().log_oid, "");
-        if value == "Show details" {
-            capture_git("log-detail", ["show", "--stat", "--patch", "--color=never", oid]);
+        if value == "Open" {
+            open_commit_view(oid, red::string(plugin_state().commit_view_label, oid));
         } else if value == "Cherry-pick" {
             run_simple_git(["cherry-pick", oid]);
         } else if value == "Revert" {
@@ -3164,6 +3412,122 @@ fn log_item_selected(kind: String, item: PickerItem, value: String) {
             open_prompt("log-tag-create", "Tag name", "");
         }
     }
+}
+
+fn open_commit_view(oid: String, label: String) {
+    let previous = red::string(plugin_state().commit_view_process, "");
+    if previous != "" {
+        red::execute("KillProcess", previous);
+    }
+    let stats_process = red::string(plugin_state().stats_process, "");
+    if stats_process != "" {
+        red::execute("KillProcess", stats_process);
+    }
+    clear_detail("Loading commit files…", true);
+    red::state_patch(GitPluginState {
+        commit_view_oid: oid,
+        commit_view_label: label,
+        commit_view_entries: [],
+        commit_view_truncated: false,
+        commit_view_output: "",
+        commit_view_error: "",
+        detail_suppressed: false,
+        stats: Json {},
+        stats_process: "",
+    });
+    let args = ["show", "--format=", "--first-parent", "--name-status", "-z", "--find-renames", oid];
+    record_command(args);
+    let process_id = red::execute("SpawnProcess", Process {
+        command: "git",
+        args: args,
+        raw_output: true,
+        cwd: red::string(plugin_state().root, "."),
+    });
+    red::state_patch(GitPluginState { commit_view_process: process_id });
+    red::on("process:" + process_id, commit_view_event);
+    render_dashboard();
+}
+
+fn commit_view_event(event: ProcessEvent) {
+    match event {
+        ProcessEvent::Stdout { process_id, line, plugin_name } => {
+            if process_id == plugin_state().commit_view_process {
+                red::state_patch(GitPluginState {
+                    commit_view_output: plugin_state().commit_view_output + line,
+                });
+            }
+        }
+        ProcessEvent::Stderr { process_id, line, plugin_name } => {
+            if process_id == plugin_state().commit_view_process {
+                red::state_patch(GitPluginState {
+                    commit_view_error: plugin_state().commit_view_error + line,
+                });
+            }
+        }
+        ProcessEvent::Exit { process_id, code, plugin_name } => {
+            if process_id != plugin_state().commit_view_process {
+                return;
+            }
+            red::state_patch(GitPluginState { commit_view_process: "" });
+            let exit_code = 1;
+            if let Some(value) = code {
+                exit_code = value;
+            }
+            if exit_code != 0 {
+                if plugin_state().commit_view_error == "" {
+                    red::state_patch(GitPluginState {
+                        commit_view_error: "git show exited with code " + exit_code,
+                    });
+                }
+                clear_detail("Could not load commit changes.", true);
+                render_dashboard();
+                return;
+            }
+            let files: GitCommitFiles = red::git_core("parse_commit_files", plugin_state().commit_view_output);
+            red::state_patch(GitPluginState {
+                commit_view_entries: files.entries,
+                commit_view_truncated: files.truncated,
+            });
+            refresh_selected_detail(true);
+            refresh_stats();
+        }
+        ProcessEvent::Error { process_id, message, plugin_name } => {
+            if process_id == plugin_state().commit_view_process {
+                red::state_patch(GitPluginState {
+                    commit_view_process: "",
+                    commit_view_error: message,
+                });
+                clear_detail("Could not load commit changes.", true);
+                render_dashboard();
+            }
+        }
+    }
+}
+
+fn close_commit_view() {
+    let process_id = red::string(plugin_state().commit_view_process, "");
+    if process_id != "" {
+        red::execute("KillProcess", process_id);
+    }
+    let stats_process = red::string(plugin_state().stats_process, "");
+    if stats_process != "" {
+        red::execute("KillProcess", stats_process);
+    }
+    clear_detail("Select a change to inspect its diff.", true);
+    red::state_patch(GitPluginState {
+        commit_view_oid: "",
+        commit_view_label: "",
+        commit_view_entries: [],
+        commit_view_truncated: false,
+        commit_view_process: "",
+        commit_view_output: "",
+        commit_view_error: "",
+        detail_suppressed: false,
+        stats: Json {},
+        stats_process: "",
+    });
+    refresh_selected_detail(true);
+    force_refresh();
 }
 
 fn rebase_item_selected(value: String) {
@@ -3753,7 +4117,11 @@ fn hunk_windows_loaded(result: GitWindowsResult) {
             buffer_index = red::int(window.buffer_index, -1);
         }
     }
+    let action = red::string(plugin_state().hunk_action, "");
     if path == "" {
+        if action == "next" || action == "previous" {
+            print_hunk_boundary(action == "next");
+        }
         return;
     }
     red::state_patch(GitPluginState { hunk_path: path });
@@ -3761,7 +4129,6 @@ fn hunk_windows_loaded(result: GitWindowsResult) {
     red::state_patch(GitPluginState { hunk_path: repository_path(path) });
     red::state_patch(GitPluginState { hunk_buffer: buffer_index });
     red::state_patch(GitPluginState { hunk_selection: None });
-    let action = red::string(plugin_state().hunk_action, "");
     if action == "stage" {
         red::request("GetBufferText", hunk_buffer_text);
         return;
@@ -3862,7 +4229,7 @@ fn hunk_cursor_loaded(cursor: GitCursorPosition) {
         selected = patch_for_hunk(patch, red::int(cursor.y, 0));
     }
     if selected == "" {
-        red::execute("Print", "No Git hunk under cursor");
+        red::execute("PrintWarning", "No Git hunk under cursor");
         return;
     }
     red::state_patch(GitPluginState { hunk_patch: selected });
@@ -3908,15 +4275,11 @@ fn navigate_patch(patch: String, cursor_line: i32, forward: bool) {
         print_hunk_boundary(forward);
         return;
     }
-    red::execute("SetCursorPosition", 0, target);
+    red::execute("SetCursorPosition", 0, target, true);
 }
 
-fn print_hunk_boundary(forward: bool) {
-    if forward {
-        red::execute("Print", "No next Git hunk");
-    } else {
-        red::execute("Print", "No previous Git hunk");
-    }
+fn print_hunk_boundary(_forward: bool) {
+    red::execute("PrintWarning", "No more Git hunks to move to");
 }
 
 fn hunk_starts(patch: String) -> [i32] {
@@ -3983,19 +4346,12 @@ fn apply_hunk_check_finished(event: ProcessEvent) {
 
 #[red::lifecycle("deactivate")]
 fn deactivate() {
+    cancel_status();
     cancel_detail_timer();
     for job in plugin_state().operation_jobs {
         red::execute("KillProcess", job.id);
     }
     red::state_patch(GitPluginState { operation_jobs: [] });
-    let refresh_timer = red::string(plugin_state().refresh_timer, "");
-    if refresh_timer != "" {
-        red::execute("CancelTimeout", refresh_timer);
-    }
-    let poll_timer = red::string(plugin_state().poll_timer, "");
-    if poll_timer != "" {
-        red::execute("CancelTimeout", poll_timer);
-    }
     let push_done_timer = red::string(plugin_state().push_done_timer, "");
     if push_done_timer != "" {
         red::execute("CancelTimeout", push_done_timer);
@@ -4009,10 +4365,12 @@ fn deactivate() {
         red::execute("CancelTimeout", git_task_done_timer);
     }
     for process_id in [
+        plugin_state().capture_process,
         red::string(plugin_state().git_task_process, ""),
         red::string(plugin_state().commit_process, ""),
         red::string(plugin_state().commit_context_process, ""),
         red::string(plugin_state().commit_history_process, ""),
+        red::string(plugin_state().commit_view_process, ""),
     ] {
         if process_id != "" { red::execute("KillProcess", process_id); }
     }
@@ -4024,8 +4382,6 @@ fn deactivate() {
     if push_process != "" {
         red::execute("KillProcess", push_process);
     }
-    red::state_patch(GitPluginState { refresh_timer: "" });
-    red::state_patch(GitPluginState { poll_timer: "" });
     red::state_patch(GitPluginState { push_done_timer: "" });
     red::state_patch(GitPluginState { git_task_busy_timer: "" });
     red::state_patch(GitPluginState { git_task_done_timer: "" });

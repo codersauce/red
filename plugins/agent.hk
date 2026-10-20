@@ -7,6 +7,7 @@
 
 struct AgentSessionEvent {
     session_id: String,
+    turn_id: Option<String>,
 }
 
 struct AgentTextEvent {
@@ -16,12 +17,38 @@ struct AgentTextEvent {
 
 struct AgentCompletedEvent {
     session_id: String,
+    turn_id: Option<String>,
     stop_reason: String,
     elapsed_ms: i64,
 }
 
+/// A message the core holds before, or while, it is sent.
+struct AgentPanePrompt {
+    id: String,
+    text: String,
+}
+
+/// Lifecycle snapshot published by the editor core in `agent:pane_state`.
+/// The core owns the session, turn phase, and follow-up queue; the pane renders it.
+struct AgentPaneState {
+    phase: String,
+    session_id: Option<String>,
+    turn_id: Option<String>,
+    in_flight: Option<AgentPanePrompt>,
+    queued: [AgentPanePrompt],
+    paused: bool,
+    stop_failed: bool,
+    recap_pending: bool,
+    // The message whose reply Codex cut short; the core waits for a choice.
+    interrupted: Option<AgentPanePrompt>,
+    // A saved thread resumes when the pane opens or the next message is sent.
+    resume_pending: bool,
+}
+
+
 struct AgentErrorEvent {
     session_id: String,
+    turn_id: Option<String>,
     message: String,
 }
 
@@ -63,6 +90,15 @@ struct AgentConversationEvent {
     items: [AgentConversationItem],
 }
 
+/// A conversation saved by an earlier Red launch in this workspace.
+struct AgentResumableEvent {
+    thread_id: String,
+    cwd: String,
+    model_info: Json,
+    items: [AgentConversationItem],
+    age: String,
+}
+
 struct AgentStringValueEvent {
     value: String,
 }
@@ -70,11 +106,6 @@ struct AgentStringValueEvent {
 struct AgentStoredValueEvent {
     // Plugin storage may be absent or contain an arbitrary prior-version payload.
     value: Json,
-}
-
-struct AgentPromptQueueItem {
-    text: String,
-    block_id: String,
 }
 
 struct AgentActivityRow {
@@ -150,40 +181,46 @@ struct TextPanelComposerConfig {
 
 struct TextPanelHeaderAction {
     id: String,
+    key: String,
     label: String,
     compact_label: String,
-    shortcut: String,
-}
-
-struct AgentEdit {
-    old_text: String,
-    new_text: String,
 }
 
 struct AgentEditOrigin {
     kind: String,
-    session_id: String,
-    turn_id: String,
+    session_id: Option<String>,
+    turn_id: Option<String>,
+    name: Option<String>,
 }
 
 struct AgentHistoryEntry {
     transaction_id: String,
     label: String,
     current: bool,
+    applied: bool,
     origin: AgentEditOrigin,
-    edits: [AgentEdit],
+    file: String,
+    age: String,
+    added: i32,
+    removed: i32,
+    turn: Option<i32>,
+    prompt: Option<String>,
+    document: Json,
 }
 
 struct AgentHistoryResult {
     entries: [AgentHistoryEntry],
+    total: Option<i32>,
 }
 
 struct AgentHistoryRowData {
     transaction_id: String,
-    edits: [AgentEdit],
+    title: String,
+    document: Json,
 }
 
 struct AgentHistoryRow {
+    id: String,
     data: AgentHistoryRowData,
 }
 
@@ -244,28 +281,23 @@ struct AgentState {
     session_browser_preview_debounce: String,
     session_browser_preview_cache: Json,
     session_switch_target: String,
-    session_switch_previous: String,
     model_header_text: String,
     model_header_secondary: String,
     session_id: String,
+    pane: AgentPaneState,
+    committed_prompt_id: String,
     panel_created: bool,
-    session_starting: bool,
     panel_open: bool,
+    /// False while a compact (narrow-terminal) pane is open but covered by the editor.
+    panel_in_view: bool,
+    /// Turns sent in this pane, which picks the turn's working verb.
+    sent_turns: i32,
     focus_panel_on_first_prompt: bool,
     permission_request_id: String,
     prompt_history: [String],
-    pending_prompt: String,
-    pending_prompt_block_id: String,
-    pending_prompt_is_replay: bool,
     transcript: String,
     transcript_blocks: [AgentTextBlock],
     streaming: bool,
-    turn_active: bool,
-    prompt_queue: [AgentPromptQueueItem],
-    queued_prompt_blocks: [AgentTextBlock],
-    recap_pending: bool,
-    restoring: bool,
-    cancelled_session_id: String,
     stream_block_id: String,
     block_generation: i32,
     stream_timer: String,
@@ -273,6 +305,10 @@ struct AgentState {
     stream_trimmed: bool,
     history_open: bool,
     history_detail: [[PanelSegment]],
+    history_document: Json,
+    history_detail_title: String,
+    history_selected: String,
+    history_agent_only: bool,
     ui_phase: String,
     ui_label: String,
     activity_rows: [AgentActivityRow],
@@ -281,6 +317,18 @@ struct AgentState {
     activity_inspector_detail: [[PanelSegment]],
     activity_block_id: String,
     thought: String,
+    // Prompt id of the interrupted reply whose notice is in the transcript.
+    interruption_id: String,
+    // Codex itself went away (not just a failed turn), so the next
+    // interruption gets the full explanation.
+    codex_lost: bool,
+    // The shown interruption came from Codex going away.
+    interruption_lost_codex: bool,
+    // Composer hint for a conversation continued from an earlier launch.
+    resume_hint: String,
+    // Age of that conversation while its transcript is still the saved copy,
+    // which the resumed thread's history replaces.
+    resume_age: String,
 }
 
 #[red::state]
@@ -314,38 +362,32 @@ fn initial_state() -> AgentState {
         session_browser_preview_debounce: "",
         session_browser_preview_cache: Json {},
         session_switch_target: "",
-        session_switch_previous: "",
         model_header_text: "",
         model_header_secondary: "",
         session_id: "",
-        session_starting: false,
+        pane: idle_pane_state(),
+        committed_prompt_id: "",
         panel_created: false,
         panel_open: false,
+        panel_in_view: true,
+        sent_turns: 0,
         focus_panel_on_first_prompt: false,
         permission_request_id: "",
         prompt_history: [],
-        pending_prompt: "",
-        pending_prompt_block_id: "",
-        pending_prompt_is_replay: false,
         transcript: "",
         transcript_blocks: [],
         streaming: false,
-        turn_active: false,
-        prompt_queue: [],
-        queued_prompt_blocks: [],
-        recap_pending: false,
-        restoring: false,
-        cancelled_session_id: "",
         stream_block_id: "",
         block_generation: 0,
         stream_timer: "",
         stream_delta: "",
         stream_trimmed: false,
         history_open: false,
-        history_detail: [[PanelSegment {
-            text: "Select a transaction",
-            style: muted_style(),
-        }]],
+        history_detail: [],
+        history_document: red::null(),
+        history_detail_title: "",
+        history_selected: "",
+        history_agent_only: false,
         ui_phase: "idle",
         ui_label: "",
         activity_rows: [],
@@ -354,6 +396,11 @@ fn initial_state() -> AgentState {
         activity_inspector_detail: [],
         activity_block_id: "",
         thought: "",
+        interruption_id: "",
+        codex_lost: false,
+        interruption_lost_codex: false,
+        resume_hint: "",
+        resume_age: "",
     };
 }
 
@@ -399,7 +446,7 @@ struct AgentDefaultModelResult {
 // Preview only: opening a pane must not create a conversation or change settings.
 fn load_default_model() {
     if state().session_id != "" || state().default_model_loading
-        || state().pending_prompt != "" || state().restoring { return; }
+        || pane_phase() != "idle" { return; }
     red::state_patch(AgentState { default_model_loading: true });
     red::request("AgentReadDefaultModel", default_model_loaded);
 }
@@ -479,7 +526,7 @@ fn refresh_model_header() {
         secondary = "Next: " + model_description(next);
         compact = text + " → " + model_name(next);
     }
-    if state().restoring { secondary = "restoring…"; compact = ""; }
+    if is_restoring() { secondary = "restoring…"; compact = ""; }
     if text == state().model_header_text && secondary == state().model_header_secondary { return; }
     red::state_patch(AgentState { model_header_text: text, model_header_secondary: secondary });
     red::execute("SetTextPanelHeaderDetail", "agent-conversation", Json {
@@ -490,7 +537,7 @@ fn refresh_model_header() {
 #[red::on("agent:model_changed")]
 fn model_changed(event: AgentModelChangedEvent) {
     if event.session_id == "" || event.session_id != state().session_id { return; }
-    if state().turn_active && model_name(state().turn_model_info) == "" {
+    if turn_running() && model_name(state().turn_model_info) == "" {
         red::state_patch(AgentState { turn_model_info: event.model_info });
     }
     red::state_patch(AgentState { model_info: event.model_info, accepted_model: Json {} });
@@ -507,7 +554,7 @@ fn model_changed(event: AgentModelChangedEvent) {
 )]
 fn choose_model() {
     if state().session_browser_open { close_session_browser(); }
-    if state().restoring {
+    if is_restoring() {
         red::execute("Print", "Wait for the agent session to finish restoring");
         return;
     }
@@ -663,8 +710,12 @@ fn model_picker_cancelled(event: PickerCancelled) {
     scope = "global",
 )]
 fn choose_session() {
-    if state().turn_active || state().session_starting || state().restoring {
+    if pane_phase() != "idle" {
         red::execute("Print", "Wait for the current agent operation to finish");
+        return;
+    }
+    if queued_count() > 0 || state().interruption_id != "" {
+        red::execute("Print", "Send, discard, or resolve held Agent follow-ups before switching sessions");
         return;
     }
     if state().session_browser_open {
@@ -1036,7 +1087,7 @@ fn activate_session_browser_block(block_id: String) {
 }
 
 fn session_selected(item: Json) {
-    if state().turn_active || state().session_starting || state().restoring {
+    if pane_phase() != "idle" {
         red::execute("Print", "The Agent state changed; choose the session again");
         return;
     }
@@ -1055,11 +1106,7 @@ fn session_selected(item: Json) {
     let resume = red::bool(item.is_red, false);
     let cwd = state().session_browser_cwd;
     close_session_browser();
-    red::state_patch(AgentState {
-        session_switch_target: target,
-        session_switch_previous: state().session_id,
-        restoring: true,
-    });
+    red::state_patch(AgentState { session_switch_target: target });
     let label = "Continuing in Red…";
     if resume { label = "Resuming session…"; }
     set_phase("restoring", label);
@@ -1071,60 +1118,137 @@ fn state() -> AgentState {
     return red::state();
 }
 
-#[red::command(
-    name = "AgentStart",
-    title = "Start agent session",
-    category = "Agent",
-    description = "Start a new agent session",
-    aliases = ["new chat"],
-    scope = "global",
-)]
-fn start() {
-    if state().session_starting { return; }
-    red::state_patch(AgentState { session_starting: true });
-    red::request("GetConfig", cwd_loaded, "cwd");
+fn idle_pane_state() -> AgentPaneState {
+    return AgentPaneState {
+        phase: "idle", session_id: None, turn_id: None, in_flight: None, queued: [],
+        paused: false, stop_failed: false, recap_pending: false,
+        interrupted: None, resume_pending: false,
+    };
 }
 
-fn cwd_loaded(result: AgentStringValueEvent) {
-    red::execute("AgentNewSession", red::string(result.value, "."));
+/// The core's phase: idle, starting, restoring, working, or stopping.
+fn pane_phase() -> String {
+    return red::string(state().pane.phase, "idle");
+}
+
+fn turn_running() -> bool {
+    let phase = pane_phase();
+    return phase == "working" || phase == "stopping";
+}
+
+fn is_restoring() -> bool {
+    return pane_phase() == "restoring";
+}
+
+fn queued_count() -> i32 {
+    return red::len(state().pane.queued);
+}
+
+fn pane_turn_id() -> String {
+    let turn_id = "";
+    if let Some(value) = state().pane.turn_id { turn_id = value; }
+    return turn_id;
+}
+
+/// A little personality while the agent thinks: each turn gets one verb, so the
+/// status row stays calm instead of flickering between phrases.
+fn working_verb() -> String {
+    let verbs = [
+        "Thinking…", "Pondering…", "Mulling it over…", "Reading the room…",
+        "Connecting the dots…", "Sketching a plan…", "Untangling…", "Brewing ideas…",
+    ];
+    let turn = red::int(state().sent_turns, 1) - 1;
+    if turn < 0 { turn = 0; }
+    return red::string(verbs[turn % red::len(verbs)], "Thinking…");
+}
+
+/// The core sent this message as a new turn; move it from the queue into the
+/// transcript in the same update.
+fn commit_sent_prompt(prompt: AgentPanePrompt) {
+    red::state_patch(AgentState { committed_prompt_id: prompt.id });
+    if state().resume_hint != "" {
+        red::state_patch(AgentState { resume_hint: "" });
+        red::execute("SetTextPanelComposerState", "agent-conversation", true, "");
+    }
+    append_transcript_block("You", prompt.text, prompt.id);
+    if state().focus_panel_on_first_prompt {
+        red::state_patch(AgentState { focus_panel_on_first_prompt: false });
+        red::execute("FocusTextPanelComposer", "agent-conversation");
+    }
+    red::state_patch(AgentState { sent_turns: red::int(state().sent_turns, 0) + 1 });
+    red::state_patch(AgentState { ui_phase: "waiting", ui_label: working_verb() });
+    red::execute("SetStorage", "transcript", state().transcript);
+}
+
+/// The core republishes lifecycle state after every change; the pane mirrors it.
+#[red::on("agent:pane_state")]
+fn pane_state_changed(event: AgentPaneState) {
+    let previous = state().pane;
+    let session_id = "";
+    if let Some(value) = event.session_id { session_id = value; }
+    if session_id != red::string(state().session_id, "") && session_id == "" {
+        reset_model_state();
+    }
+    red::state_patch(AgentState { pane: event, session_id: session_id });
+    let phase = pane_phase();
+    let was = red::string(previous.phase, "idle");
+    if phase == "stopping" && was != "stopping" {
+        // Restart elapsed time so the status measures cancellation latency.
+        red::execute("SetTextPanelStatus", "agent-conversation");
+    }
+    if phase != "working" && phase != "stopping" && (was == "working" || was == "stopping") {
+        red::state_patch(AgentState { turn_model_info: Json {} });
+        refresh_model_header();
+    }
+    let had_session = false;
+    if let Some(value) = previous.session_id { had_session = value != ""; }
+    if state().panel_created {
+        if phase == "restoring" && was != "restoring" {
+            // Messages typed now are sent as soon as the thread is back.
+            red::execute("SetTextPanelComposerState", "agent-conversation", true, "Reconnecting to Codex… you can keep typing");
+        } else if was == "restoring" || (session_id != "" && !had_session) {
+            // A live thread replaces any "archived conversation" hint.
+            red::execute("SetTextPanelComposerState", "agent-conversation", true, ready_composer_hint());
+        }
+    }
+    sync_interruption();
+    let grew = queued_count() > red::len(previous.queued);
+    let committed = false;
+    if let Some(prompt) = state().pane.in_flight {
+        if prompt.id != state().committed_prompt_id {
+            commit_sent_prompt(prompt);
+            committed = true;
+        }
+    }
+    render_conversation();
+    render_status();
+    if committed {
+        // Paint the sent message before the turn starts streaming.
+        red::execute("Refresh");
+    }
+    if grew {
+        // Paint a newly queued message right away instead of on the next frame.
+        red::execute("Refresh");
+        if turn_running() {
+            let waiting = "it sends when this turn ends";
+            if queued_count() > 1 { waiting = queued_count() + " waiting · they send in order"; }
+            red::execute("Print", "Agent is busy · follow-up queued · " + waiting);
+        }
+    }
 }
 
 #[red::on("agent:session_created")]
 fn session_created(event: AgentSessionEvent) {
-    red::state_patch(AgentState { session_starting: false });
-    let previous_session_id = red::string(state().session_id, "");
-    let pending = red::string(state().pending_prompt, "");
-    let pending_block_id = red::string(state().pending_prompt_block_id, "");
-    let replay = state().pending_prompt_is_replay;
-    red::state_patch(AgentState { session_id: event.session_id });
-    red::state_patch(AgentState { restoring: false });
-    if previous_session_id != event.session_id || (pending != "" && replay) {
-        red::state_patch(AgentState { turn_active: false });
-    }
-    if previous_session_id != event.session_id {
-        red::state_patch(AgentState { cancelled_session_id: "", model_info: Json {}, turn_model_info: Json {} });
-    }
-    if previous_session_id != "" && previous_session_id != event.session_id {
-        red::execute("AgentCloseSession", previous_session_id);
+    red::state_patch(AgentState { codex_lost: false });
+    // The core adopts the thread and sends any waiting message; the pane only
+    // refreshes what it shows for the new conversation.
+    if event.session_id != red::string(state().session_id, "") {
+        red::state_patch(AgentState { model_info: Json {}, turn_model_info: Json {} });
     }
     ensure_conversation_panel();
     render_conversation();
     refresh_model_header();
     red::execute("Print", "Agent session started");
-    if pending == "" && !state().turn_active && state().ui_label == "Starting agent…" {
-        set_phase("idle", "");
-    }
-    if pending != "" {
-        red::state_patch(AgentState { pending_prompt: "" });
-        red::state_patch(AgentState { pending_prompt_block_id: "" });
-        red::state_patch(AgentState { pending_prompt_is_replay: false });
-        if replay {
-            red::state_patch(AgentState { turn_active: true });
-            red::execute("AgentPrompt", event.session_id, pending);
-        } else {
-            dispatch_prompt_block(pending, pending_block_id);
-        }
-    }
 }
 
 #[red::command(
@@ -1145,22 +1269,28 @@ fn session_created(event: AgentSessionEvent) {
 )]
 fn prompt() {
     if state().session_browser_open { close_session_browser(); }
-    if state().restoring {
+    prepare_saved_conversation();
+    if state().interruption_id != "" && state().interruption_lost_codex {
+        open_conversation();
+        choose_interruption();
+        return;
+    }
+    if is_restoring() {
         ensure_conversation_panel();
-        red::execute("SetTextPanelComposerState", "agent-conversation", false, "Restoring agent session…");
-        red::execute("FocusPanel", "agent-conversation");
+        red::execute("FocusTextPanelComposer", "agent-conversation");
         return;
     }
     let has_live_session = red::string(state().session_id, "") != "";
-    let has_restored_conversation = red::string(state().pending_prompt, "") == ""
+    let has_restored_conversation = queued_count() == 0
         && red::trim(red::string(state().transcript, "")) != "";
-    if has_live_session || has_restored_conversation {
+    // A held prompt lives in the pane, where its paused status and actions show.
+    if has_live_session || has_restored_conversation || pane_phase() != "idle" || queued_count() > 0 {
         let was_created = state().panel_created;
         ensure_conversation_panel();
         if !was_created {
             render_conversation();
         }
-        if !has_live_session && state().recap_pending {
+        if !has_live_session && state().pane.recap_pending {
             red::execute("SetTextPanelComposerState", "agent-conversation", true, "Archived conversation · next message starts a new session");
         }
         red::execute("FocusTextPanelComposer", "agent-conversation");
@@ -1181,6 +1311,7 @@ fn toggle_conversation() {
     if state().panel_open {
         close_conversation();
     } else {
+        prepare_saved_conversation();
         let was_created = state().panel_created;
         ensure_conversation_panel();
         if !was_created {
@@ -1201,6 +1332,7 @@ fn toggle_conversation() {
     scope = "global",
 )]
 fn open_conversation() {
+    prepare_saved_conversation();
     let was_created = state().panel_created;
     if !was_created {
         ensure_conversation_panel();
@@ -1221,14 +1353,22 @@ fn ensure_conversation_panel() {
             title: "Agent",
             composer: TextPanelComposerConfig { placeholder: "Ask a follow-up…", rows: 3 },
             header_actions: [
-                TextPanelHeaderAction { id: "sessions", label: "Sessions", compact_label: "S", shortcut: "Alt-s" },
-                TextPanelHeaderAction { id: "new", label: "New", compact_label: "N", shortcut: "Alt-n" },
-                TextPanelHeaderAction { id: "clear", label: "Clear", compact_label: "C", shortcut: "Alt-c" },
-                TextPanelHeaderAction { id: "close", label: "×", compact_label: "×", shortcut: "Alt-w" },
+                TextPanelHeaderAction { id: "sessions", key: "Alt-s", label: "Sessions", compact_label: "S" },
+                TextPanelHeaderAction { id: "new", key: "Alt-n", label: "New", compact_label: "N" },
+                TextPanelHeaderAction { id: "clear", key: "Alt-c", label: "Clear", compact_label: "C" },
+                TextPanelHeaderAction { id: "close", key: "Alt-w", label: "×", compact_label: "×" },
             ],
         });
         red::state_patch(AgentState { panel_created: true });
+        if red::len(state().prompt_history) > 0 {
+            sync_text_panel_prompt_history();
+        } else {
+            red::request("GetStorage", docked_prompt_history_loaded, "prompt_history");
+        }
         red::state_patch(AgentState { model_header_text: "", model_header_secondary: "" });
+        if state().resume_hint != "" {
+            red::execute("SetTextPanelComposerState", "agent-conversation", true, state().resume_hint);
+        }
         prefetch_models();
         refresh_model_header();
         load_default_model();
@@ -1248,6 +1388,8 @@ fn ensure_conversation_panel() {
 fn restore_conversation_pane(event: RestoredPanesEvent) {
     for pane in event.panels {
         if pane.id == "agent-conversation" && red::bool(pane.visible, false) {
+            // A pane reopened at launch is about to be used: resume right away.
+            prepare_saved_conversation();
             let was_created = state().panel_created;
             ensure_conversation_panel();
             if !was_created {
@@ -1259,7 +1401,35 @@ fn restore_conversation_pane(event: RestoredPanesEvent) {
 }
 
 fn prompt_history_loaded(result: AgentStoredValueEvent) {
+    let history = merged_prompt_history(result);
+    red::state_patch(AgentState { prompt_history: history });
+    sync_text_panel_prompt_history();
+    red::execute(
+        "OpenComposer",
+        "Agent prompt",
+        "",
+        history,
+        ComposerHandlers {
+            submitted: prompt_submitted,
+            cancelled: prompt_cancelled,
+        }
+    );
+}
+
+fn docked_prompt_history_loaded(result: AgentStoredValueEvent) {
+    let history = merged_prompt_history(result);
+    red::state_patch(AgentState { prompt_history: history });
+    sync_text_panel_prompt_history();
+}
+
+fn merged_prompt_history(result: AgentStoredValueEvent) -> [String] {
     let history = [];
+    for entry in state().prompt_history {
+        let text = red::string(entry, "");
+        if red::trim(text) != "" && !red::contains(history, text) && red::len(history) < 50 {
+            history = red::push(history, text);
+        }
+    }
     if result.value != red::null() {
         for entry in result.value {
             let text = red::string(entry, "");
@@ -1268,17 +1438,17 @@ fn prompt_history_loaded(result: AgentStoredValueEvent) {
             }
         }
     }
-    red::state_patch(AgentState { prompt_history: history });
-    red::execute(
-        "OpenComposer",
-        "Agent prompt",
-        red::string(state().pending_prompt, ""),
-        history,
-        ComposerHandlers {
-            submitted: prompt_submitted,
-            cancelled: prompt_cancelled,
-        }
-    );
+    return history;
+}
+
+fn sync_text_panel_prompt_history() {
+    if state().panel_created {
+        red::execute(
+            "SetTextPanelComposerHistory",
+            "agent-conversation",
+            state().prompt_history
+        );
+    }
 }
 
 fn prompt_submitted(text: String) {
@@ -1292,135 +1462,14 @@ fn prompt_submitted(text: String) {
         }
     }
     red::state_patch(AgentState { prompt_history: history });
-    if state().session_id == "" {
-        stage_pending_prompt(text);
-        red::execute("SetStorage", "prompt_history", history);
-        start();
-        return;
-    }
-    submit_prompt(text);
+    sync_text_panel_prompt_history();
     red::execute("SetStorage", "prompt_history", history);
-}
-
-/// Paint the first submitted message before starting or retrying Codex.
-fn stage_pending_prompt(text: String) {
     ensure_conversation_panel();
-    let previous = red::string(state().pending_prompt, "");
-    let block_id = red::string(state().pending_prompt_block_id, "");
-    let replay = state().pending_prompt_is_replay;
-    if previous != text || (!replay && block_id == "") {
-        remove_queued_prompt_block(block_id);
-        let generation = red::int(state().block_generation, 0) + 1;
-        block_id = "user:" + generation;
-        red::state_patch(AgentState { block_generation: generation });
-        let queued_blocks = state().queued_prompt_blocks;
-        queued_blocks = red::push(queued_blocks, AgentTextBlock {
-            id: block_id,
-            kind: "user",
-            format: "plain",
-            text: text,
-        });
-        red::state_patch(AgentState { queued_prompt_blocks: queued_blocks });
-        red::state_patch(AgentState { pending_prompt_block_id: block_id });
-        red::state_patch(AgentState { pending_prompt_is_replay: false });
+    if state().streaming {
+        red::state_patch(AgentState { stream_trimmed: true });
     }
-    red::state_patch(AgentState { pending_prompt: text });
-    render_conversation();
-    if state().focus_panel_on_first_prompt {
-        red::state_patch(AgentState { focus_panel_on_first_prompt: false });
-        red::execute("FocusTextPanelComposer", "agent-conversation");
-    }
-    set_phase("waiting", "Starting agent…");
-    red::execute("Refresh");
-}
-
-fn submit_prompt(text: String) {
-    if red::trim(text) == "" {
-        return;
-    }
-    if state().turn_active {
-        let queue = state().prompt_queue;
-        if red::len(queue) >= 16 {
-            red::execute("Print", "Agent follow-up queue is full");
-            return;
-        }
-        let generation = red::int(state().block_generation, 0) + 1;
-        let block_id = "user:" + generation;
-        red::state_patch(AgentState { block_generation: generation });
-        queue = red::push(queue, AgentPromptQueueItem { text: text, block_id: block_id });
-        red::state_patch(AgentState { prompt_queue: queue });
-        // Pending blocks render below the active stream but do not enter the
-        // committed transcript until their FIFO turn is dispatched.
-        let queued_blocks = state().queued_prompt_blocks;
-        queued_blocks = red::push(queued_blocks, AgentTextBlock {
-            id: block_id,
-            kind: "user",
-            format: "plain",
-            text: text,
-        });
-        red::state_patch(AgentState { queued_prompt_blocks: queued_blocks });
-        if state().streaming {
-            red::state_patch(AgentState { stream_trimmed: true });
-        }
-        render_conversation();
-        render_status();
-        red::execute("Refresh");
-        red::execute("Print", "Agent turn is still running; follow-up queued (" + red::len(queue) + ")");
-        return;
-    }
-    if red::string(state().session_id, "") == "" {
-        red::state_patch(AgentState { pending_prompt: text });
-        red::state_patch(AgentState { pending_prompt_block_id: "" });
-        red::state_patch(AgentState { pending_prompt_is_replay: false });
-        start();
-        return;
-    }
-    dispatch_prompt(text);
-}
-
-fn dispatch_prompt(text: String) {
-    dispatch_prompt_block(text, "");
-}
-
-/// Promote an optional optimistic queue block, paint the busy state, and only
-/// then persist and hand the turn to the agent bridge.
-fn dispatch_prompt_block(text: String, block_id: String) {
-    let wire_text = text;
-    let focus_conversation = state().focus_panel_on_first_prompt;
-    if state().recap_pending {
-        let recap = red::string(state().transcript, "");
-        if red::len(recap) > 6000 {
-            recap = red::slice(recap, red::len(recap) - 6000);
-        }
-        if red::trim(recap) != "" {
-            wire_text = "Previous conversation (the last turn was interrupted):\n" + recap + "\n\nFollow-up:\n" + text;
-        }
-        red::state_patch(AgentState { recap_pending: false });
-    }
-    remove_queued_prompt_block(block_id);
-    red::state_patch(AgentState { turn_active: true });
-    append_transcript_block("You", text, block_id);
-    if focus_conversation {
-        red::state_patch(AgentState { focus_panel_on_first_prompt: false });
-        red::execute("FocusTextPanelComposer", "agent-conversation");
-    }
-    set_phase("waiting", "Waiting for agent…");
-    red::execute("Refresh");
-    red::execute("SetStorage", "transcript", state().transcript);
-    red::execute("AgentPrompt", state().session_id, wire_text);
-}
-
-fn remove_queued_prompt_block(block_id: String) {
-    if block_id == "" {
-        return;
-    }
-    let queued_blocks = [];
-    for block in state().queued_prompt_blocks {
-        if block.id != block_id {
-            queued_blocks = red::push(queued_blocks, block);
-        }
-    }
-    red::state_patch(AgentState { queued_prompt_blocks: queued_blocks });
+    // The core decides whether to start a thread, send now, or queue.
+    red::execute("AgentSubmit", text, red::string(state().transcript, ""));
 }
 
 #[red::on("agent:turn_started")]
@@ -1432,34 +1481,55 @@ fn turn_started(event: AgentSessionEvent) {
     if !is_current_session(event.session_id) {
         return;
     }
-    set_phase("waiting", "Waiting for agent…");
+    set_phase("waiting", working_verb());
+}
+
+/// Returns whether a terminal event belongs to an earlier turn than the one shown.
+fn is_stale_turn(turn_id: Option<String>) -> bool {
+    let ended = "";
+    if let Some(value) = turn_id { ended = value; }
+    let current = pane_turn_id();
+    return ended != "" && current != "" && ended != current;
 }
 
 /// Update the turn phase/label and re-render the panel status row.
 fn set_phase(phase: String, label: String) {
     red::state_patch(AgentState { ui_phase: phase });
     red::state_patch(AgentState { ui_label: label });
-    if phase == "idle" && !state().turn_active {
-        red::state_patch(AgentState { turn_model_info: Json {} });
-        refresh_model_header();
-    }
     render_status();
 }
 
 /// Single writer for the panel status row; every phase change funnels here so
 /// queue depth and streaming state are never clobbered by individual events.
 fn render_status() {
-    let phase = red::string(state().ui_phase, "idle");
+    let phase = pane_phase();
+    let queued = queued_count();
     if phase == "idle" {
+        if state().pane.paused && queued > 0 {
+            red::execute("SetTextPanelStatus", "agent-conversation", TextPanelStatus {
+                busy: false,
+                label: queued + " held · :AgentSendQueued to send",
+                stream: false,
+            });
+            return;
+        }
         red::execute("SetTextPanelStatus", "agent-conversation");
         return;
     }
-    let label = red::string(state().ui_label, "");
-    if label == "" {
-        label = "Working…";
+    let label = "Working…";
+    if phase == "starting" {
+        label = "Starting agent…";
+    } else if phase == "restoring" {
+        label = "Restoring session…";
+    } else if phase == "stopping" {
+        label = "Stopping…";
+    } else if state().pane.stop_failed {
+        label = "Stop failed · Ctrl-C to retry";
+    } else if red::string(state().ui_label, "") != "" {
+        label = state().ui_label;
     }
-    let queued = red::len(state().prompt_queue);
-    if queued > 0 {
+    // While a thread starts, the waiting message is the next turn, not a backlog.
+    if queued > 0 && (phase == "working" || phase == "stopping") {
         label = label + " · " + queued + " queued";
     }
     red::execute("SetTextPanelStatus", "agent-conversation", TextPanelStatus {
@@ -1502,7 +1572,7 @@ fn thought_activity(update: AgentThoughtChunk) {
             render_activity();
         }
     }
-    set_phase("thinking", "Thinking…");
+    set_phase("thinking", working_verb());
 }
 
 fn tool_activity(update: AgentToolCall) {
@@ -1638,15 +1708,73 @@ fn short_activity_row(row: AgentActivityRow) -> String {
         else if red::starts_with(title, "Editing ") { title = "Edited " + red::slice(title, 8); }
         else if red::starts_with(title, "Creating ") { title = "Created " + red::slice(title, 9); }
         else if red::starts_with(title, "Searching for ") { title = "Searched for " + red::slice(title, 14); }
+        else if red::starts_with(title, "Checking language-server status for ") {
+            title = "Checked language-server status for " + red::slice(title, 36);
+        }
+        else if red::starts_with(title, "Checking diagnostics for ") {
+            title = "Checked diagnostics for " + red::slice(title, 25);
+        }
+        else if red::starts_with(title, "Checking rename support for ") {
+            title = "Checked rename support for " + red::slice(title, 28);
+        }
+        else if red::starts_with(title, "Previewing rename in ") {
+            title = "Previewed rename in " + red::slice(title, 21);
+        }
+        else if red::starts_with(title, "Applying language-server edits") {
+            title = "Applied language-server edits";
+        }
     }
     let reason = "";
     if row.status == "failed" {
-        reason = "failed";
-        if red::len(red::split(row.detail, "outside workspace")) > 1 { reason = "outside workspace"; }
-        else if red::len(red::split(row.detail, "not found")) > 1 { reason = "not found"; }
+        reason = failed_activity_reason(row.detail);
         title = title + " — " + reason;
     }
     return "  " + activity_glyph(row.status) + " " + title;
+}
+
+/// Turn bounded tool errors into a useful one-line recovery hint.
+///
+/// Keep the original detail in the activity inspector; this only controls the
+/// compact conversation preview. Matching is case-insensitive so errors from
+/// the editor and language servers present consistently.
+fn failed_activity_reason(detail: String) -> String {
+    let detail = red::lower(detail);
+    if red::len(red::split(detail, "outside workspace")) > 1 {
+        return "outside workspace";
+    }
+    if red::len(red::split(detail, "not found")) > 1 {
+        return "not found";
+    }
+    if red::len(red::split(detail, "stale revision")) > 1
+        || red::len(red::split(detail, "file changed")) > 1
+        || red::len(red::split(detail, "changed since")) > 1
+        || red::len(red::split(detail, "revision mismatch")) > 1
+        || red::len(red::split(detail, "revision changed")) > 1 {
+        return "file changed; reread";
+    }
+    if red::len(red::split(detail, "timed out")) > 1
+        || red::len(red::split(detail, "timeout")) > 1
+        || red::len(red::split(detail, "deadline exceeded")) > 1 {
+        return "timed out; retry";
+    }
+    if red::len(red::split(detail, "not ready")) > 1
+        || red::len(red::split(detail, "still starting")) > 1
+        || red::len(red::split(detail, "server is starting")) > 1 {
+        return "not ready; retry";
+    }
+    if red::len(red::split(detail, "invalid range")) > 1
+        || red::len(red::split(detail, "line range")) > 1
+        || red::len(red::split(detail, "out of bounds")) > 1
+        || red::len(red::split(detail, "must be between")) > 1
+        || red::len(red::split(detail, "must be >=")) > 1 {
+        return "invalid range";
+    }
+    if red::len(red::split(detail, "invalid argument")) > 1
+        || red::len(red::split(detail, "invalid parameter")) > 1
+        || red::len(red::split(detail, "invalid scope")) > 1 {
+        return "invalid argument";
+    }
+    return "failed";
 }
 
 /// Keep disclosure small even when the full turn used many tools.
@@ -1838,6 +1966,9 @@ fn panel_event(event: AgentPanelEvent) {
         choose_session();
     } else if event.action == "activity" {
         toggle_activity();
+    } else if event.action == "activate_block" && red::starts_with(event.text, "interruption-choice:") {
+        let choice = red::slice(event.text, red::len("interruption-choice:"));
+        if choice != "hint" { resolve_interruption(choice); }
     } else if event.action == "activate_block" {
         if state().session_browser_open {
             activate_session_browser_block(event.text);
@@ -1852,6 +1983,10 @@ fn panel_event(event: AgentPanelEvent) {
         history();
     } else if event.action == "close" {
         close_conversation();
+    } else if event.action == "view" {
+        // A compact pane on a narrow terminal steps aside while the editor has
+        // focus; it is still open, so completion notices must say where it went.
+        red::state_patch(AgentState { panel_in_view: red::string(event.text, "visible") != "hidden" });
     }
 }
 
@@ -1950,12 +2085,12 @@ fn clear_conversation() {
     if state().session_browser_open { close_session_browser(); }
     reset_stream_render();
     red::state_patch(AgentState { transcript_blocks: [] });
-    red::state_patch(AgentState { queued_prompt_blocks: [] });
     red::state_patch(AgentState { activity_block_id: "" });
     red::state_patch(AgentState { activity_rows: [] });
     red::state_patch(AgentState { activity_history: [] });
     red::state_patch(AgentState { thought: "" });
-    red::execute("UpdateTextPanel", "agent-conversation", []);
+    // Queued messages still run after a Clear, so they stay visible.
+    red::execute("UpdateTextPanel", "agent-conversation", with_unsent_prompts([]));
     red::execute("SetTextPanelComposerState", "agent-conversation", true, "Conversation view cleared · context preserved");
 }
 
@@ -1989,6 +2124,14 @@ fn close_conversation() {
 }
 
 #[red::command(
+    name = "AgentStart",
+    title = "Start agent session",
+    category = "Agent",
+    description = "Start a new agent conversation",
+    aliases = ["new chat"],
+    scope = "global",
+)]
+#[red::command(
     name = "AgentNew",
     title = "Start new agent conversation",
     category = "Agent",
@@ -1998,28 +2141,18 @@ fn close_conversation() {
 )]
 fn new_conversation() {
     if state().session_browser_open { close_session_browser(); }
-    if state().session_starting && state().session_id == "" {
-        open_conversation();
+    if state().session_switch_target != "" {
+        red::execute("Print", "Wait for the selected Agent session to finish restoring");
         return;
     }
-    let session_id = red::string(state().session_id, "");
-    if session_id != "" {
-        if !state().restoring {
-            red::execute("AgentCloseSession", session_id);
-        }
-    }
-    red::execute("AgentForgetSession", session_id);
-    red::state_patch(AgentState { session_id: "" });
     reset_model_state();
-    red::state_patch(AgentState { restoring: false });
-    red::state_patch(AgentState { cancelled_session_id: "" });
-    red::state_patch(AgentState { turn_active: false });
+    red::state_patch(AgentState { resume_hint: "", resume_age: "", interruption_id: "" });
+    // The saved thread is about to be forgotten; opening the pane must not
+    // resume it first.
+    let pane = state().pane;
+    pane.resume_pending = false;
+    red::state_patch(AgentState { pane: pane });
     set_phase("idle", "");
-    red::state_patch(AgentState { prompt_queue: [] });
-    red::state_patch(AgentState { recap_pending: false });
-    red::state_patch(AgentState { pending_prompt: "" });
-    red::state_patch(AgentState { pending_prompt_block_id: "" });
-    red::state_patch(AgentState { pending_prompt_is_replay: false });
     clear_conversation();
     red::state_patch(AgentState { transcript: "" });
     red::execute("SetStorage", "transcript", "");
@@ -2028,8 +2161,8 @@ fn new_conversation() {
     render_conversation();
     red::execute("SetTextPanelComposerState", "agent-conversation", true, "");
     load_default_model();
-    set_phase("waiting", "Starting agent…");
-    start();
+    // The core forgets the old thread and starts the next one right away.
+    red::execute("AgentReset", true);
 }
 
 fn prompt_cancelled(event: ComposerCancelled) {}
@@ -2043,10 +2176,7 @@ fn prompt_cancelled(event: ComposerCancelled) {}
     scope = "global",
 )]
 fn cancel() {
-    let session_id = state().session_id;
-    if session_id != "" {
-        red::execute("AgentCancel", session_id);
-    }
+    red::execute("AgentStop");
 }
 
 #[red::on("agent:update")]
@@ -2149,6 +2279,8 @@ fn flat_transcript(blocks: [AgentTextBlock]) -> String {
     for block in blocks {
         // Live progress is presentation-only; completion saves the summary and footer.
         if block.id != "" && block.id == state().activity_block_id { continue; }
+        // Interruption choices and the resume divider are not conversation.
+        if red::starts_with(block.id, "interruption-choice:") || block.id == "resume-notice" { continue; }
         let text = red::string(block.text, "");
         if text == "" {
             continue;
@@ -2170,58 +2302,62 @@ fn flat_transcript(blocks: [AgentTextBlock]) -> String {
 
 #[red::on("agent:completed")]
 fn completed(event: AgentCompletedEvent) {
-    if !is_current_session(event.session_id) {
+    if !is_current_session(event.session_id) || is_stale_turn(event.turn_id) {
         return;
     }
-    red::state_patch(AgentState { turn_active: false });
-    let session_id = red::string(event.session_id, "");
     let stop_reason = red::string(event.stop_reason, "end_turn");
     if stop_reason == "end_turn" || stop_reason == "completed" {
         finish_agent_turn();
     }
     collapse_activity(event.elapsed_ms);
     set_phase("idle", "");
-    if session_id != "" && (stop_reason == "cancelled" || session_id == red::string(state().cancelled_session_id, "")) {
-        red::execute("AgentCloseSession", session_id);
-        red::state_patch(AgentState { session_id: "" });
-        reset_model_state();
-        red::state_patch(AgentState { cancelled_session_id: "" });
-        red::state_patch(AgentState { recap_pending: true });
-    }
     if stop_reason == "end_turn" || stop_reason == "completed" {
-        submit_next_queued();
+        if !state().panel_open || !state().panel_in_view {
+            red::execute("Print", "Agent finished · Space A to view");
+        }
+        return;
+    }
+    if stop_reason == "interrupted" || stop_reason == "cancelled" {
+        append_transcript("System", "Stopped at your request.");
+        red::execute("Print", "Agent stopped");
         return;
     }
     append_transcript("System", "Agent stopped: " + stop_reason);
     red::execute("Print", "Agent stopped: " + stop_reason);
-    submit_next_queued();
 }
 
-fn submit_next_queued() {
-    let queue = state().prompt_queue;
-    if red::len(queue) == 0 {
+#[red::command(
+    name = "AgentSendQueued",
+    title = "Send queued agent follow-ups",
+    category = "Agent",
+    description = "Resume follow-ups held after a stopped or failed turn",
+    aliases = ["resume agent queue"],
+    scope = "global",
+)]
+fn send_queued() {
+    if queued_count() == 0 {
+        red::execute("Print", "Nothing is queued");
         return;
     }
-    let next = queue[0];
-    let remaining = [];
-    let index = 0;
-    for entry in queue {
-        if index > 0 {
-            remaining = red::push(remaining, entry);
-        }
-        index = index + 1;
+    red::execute("AgentSendQueued", red::string(state().transcript, ""));
+}
+
+#[red::command(
+    name = "AgentDiscardQueued",
+    title = "Discard queued agent follow-ups",
+    category = "Agent",
+    description = "Drop follow-ups that have not been sent to the agent",
+    aliases = ["clear agent queue"],
+    scope = "global",
+)]
+fn discard_queued() {
+    let count = queued_count();
+    red::execute("AgentDiscardQueued");
+    if count == 1 {
+        red::execute("Print", "Dropped 1 queued follow-up");
+    } else {
+        red::execute("Print", "Dropped " + count + " queued follow-ups");
     }
-    red::state_patch(AgentState { prompt_queue: remaining });
-    let text = red::string(next.text, red::string(next, ""));
-    let block_id = red::string(next.block_id, "");
-    if red::string(state().session_id, "") == "" {
-        red::state_patch(AgentState { pending_prompt: text });
-        red::state_patch(AgentState { pending_prompt_block_id: block_id });
-        red::state_patch(AgentState { pending_prompt_is_replay: false });
-        start();
-        return;
-    }
-    dispatch_prompt_block(text, block_id);
 }
 
 #[red::on("agent:cancelled")]
@@ -2229,56 +2365,35 @@ fn cancelled(event: AgentSessionEvent) {
     if !is_current_session(event.session_id) {
         return;
     }
-    let session_id = red::string(event.session_id, "");
-    if session_id != "" {
-        red::state_patch(AgentState { cancelled_session_id: session_id });
-    }
-    if !state().turn_active && session_id != "" {
-        red::execute("AgentCloseSession", session_id);
-        red::state_patch(AgentState { session_id: "" });
-        reset_model_state();
-        red::state_patch(AgentState { cancelled_session_id: "" });
-        red::state_patch(AgentState { recap_pending: true });
-        red::execute("Print", "Agent cancellation requested");
-        set_phase("idle", "");
+    red::execute("Print", "Stopping the agent…");
+}
+
+/// Codex refused the interrupt, so the turn keeps running; say so and let the
+/// user retry instead of leaving the pane stuck on "Stopping…".
+#[red::on("agent:cancel_failed")]
+fn cancel_failed(event: AgentErrorEvent) {
+    if !is_current_session(red::string(event.session_id, "")) {
         return;
     }
-    red::execute("Print", "Agent cancellation requested");
-    // Restart elapsed time so the status measures cancellation latency, not turn age.
-    red::execute("SetTextPanelStatus", "agent-conversation");
-    set_phase("stopping", "Stopping…");
+    red::execute("Print", "Could not stop the agent: " + event.message + " · press Ctrl-C to try again");
 }
 
 #[red::on("agent:error")]
 fn failed(event: AgentErrorEvent) {
-    if !is_current_session(red::string(event.session_id, "")) {
+    if !is_current_session(red::string(event.session_id, "")) || is_stale_turn(event.turn_id) {
         return;
     }
-    if red::string(event.session_id, "") == "" && state().turn_active {
+    if red::string(event.session_id, "") == "" && turn_running() {
         red::execute("Print", "Agent setup failed while a turn is active: " + event.message);
         return;
     }
-    red::state_patch(AgentState { session_starting: false });
     ensure_conversation_panel();
-    red::state_patch(AgentState { turn_active: false });
     collapse_activity(red::null());
     set_phase("idle", "");
-    commit_pending_prompt();
-    let session_id = red::string(event.session_id, "");
-    if session_id != "" && session_id == red::string(state().cancelled_session_id, "") {
-        red::execute("AgentCloseSession", session_id);
-        red::state_patch(AgentState { session_id: "" });
-        reset_model_state();
-        red::state_patch(AgentState { cancelled_session_id: "" });
-        red::state_patch(AgentState { recap_pending: true });
-    }
     append_transcript("Error", event.message);
-    if red::len(state().prompt_queue) > 0 {
-        submit_next_queued();
-        return;
-    }
-    if red::string(state().pending_prompt, "") != "" || state().session_id == "" {
-        let has_pending_prompt = red::string(state().pending_prompt, "") != "";
+    if red::string(state().session_id, "") == "" {
+        // The core kept any unsent message queued and paused; retry resumes it.
+        let has_pending_prompt = queued_count() > 0;
         let notice = "Codex unavailable: " + event.message;
         if has_pending_prompt {
             notice = notice + ". Your prompt is preserved";
@@ -2304,20 +2419,6 @@ fn failed(event: AgentErrorEvent) {
     }
 }
 
-/// Preserve an optimistic startup message before appending its failure.
-fn commit_pending_prompt() {
-    let text = red::string(state().pending_prompt, "");
-    let block_id = red::string(state().pending_prompt_block_id, "");
-    if text == "" || block_id == "" {
-        return;
-    }
-    remove_queued_prompt_block(block_id);
-    append_transcript_block("You", text, block_id);
-    red::execute("SetStorage", "transcript", state().transcript);
-    red::state_patch(AgentState { pending_prompt_block_id: "" });
-    red::state_patch(AgentState { pending_prompt_is_replay: true });
-}
-
 #[red::on("agent:session_lost")]
 fn session_lost(event: AgentSessionLostEvent) {
     let session_id = red::string(state().session_id, "");
@@ -2326,23 +2427,17 @@ fn session_lost(event: AgentSessionLostEvent) {
     if !is_current_session(red::string(event.session_id, "")) && (session_id != "" || attempted == "") {
         return;
     }
+    red::state_patch(AgentState { codex_lost: true });
     invalidate_model_catalog();
-    red::state_patch(AgentState { turn_active: false });
     collapse_activity(red::null());
     set_phase("idle", "");
     if session_id != "" {
         red::execute("AgentArchiveSession", session_id);
-        red::state_patch(AgentState { recap_pending: true });
     }
-    red::state_patch(AgentState { session_id: "" });
     reset_model_state();
-    red::state_patch(AgentState { cancelled_session_id: "" });
     if attempted != "" {
-        red::state_patch(AgentState { pending_prompt: attempted });
-        red::state_patch(AgentState { pending_prompt_block_id: "" });
-        red::state_patch(AgentState { pending_prompt_is_replay: true });
+        // The core retries a message that never reached Codex in a new thread.
         red::execute("Print", message + "; retrying the saved prompt");
-        start();
     } else {
         failed(AgentErrorEvent { session_id: "", message: message });
     }
@@ -2350,14 +2445,18 @@ fn session_lost(event: AgentSessionLostEvent) {
 
 fn setup_selected(item: PickerItem) {
     if item.id == "retry" {
-        start();
+        if queued_count() > 0 {
+            red::execute("AgentSendQueued", red::string(state().transcript, ""));
+        } else {
+            red::execute("AgentReset", true);
+        }
     } else if item.id == "logs" {
         red::execute("ViewLogs");
     }
 }
 
 fn setup_cancelled(event: PickerCancelled) {
-    red::execute("Print", "Agent prompt saved. Press Space A when ready to retry");
+    red::execute("Print", "Agent prompt saved · :AgentSendQueued retries it");
 }
 
 #[red::on("agent:credential_ready")]
@@ -2365,8 +2464,8 @@ fn setup_cancelled(event: PickerCancelled) {
 fn setup_ready(event: EmptyEvent) {
     invalidate_model_catalog();
     if state().panel_created { prefetch_models(); }
-    if red::string(state().pending_prompt, "") != "" {
-        start();
+    if queued_count() > 0 && red::string(state().session_id, "") == "" {
+        red::execute("AgentSendQueued", red::string(state().transcript, ""));
     }
 }
 
@@ -2479,46 +2578,224 @@ fn transcript_restored(event: AgentTranscriptEvent) {
     red::state_patch(AgentState { stream_block_id: "" });
     red::state_patch(AgentState { stream_delta: "" });
     red::state_patch(AgentState { stream_trimmed: false });
-    red::state_patch(AgentState { recap_pending: red::trim(transcript) != "" });
+    render_conversation();
+}
+
+/// Whether the pane already shows this thread, as after Codex restarts under a
+/// running editor. Its transcript then stays: it holds partial replies and
+/// activity that Codex's saved history does not.
+fn shows_thread(thread_id: String) -> bool {
+    // A transcript saved by an earlier launch may be stale; Codex's copy wins.
+    return thread_id != "" && red::string(state().session_id, "") == thread_id
+        && red::len(state().transcript_blocks) > 0 && state().resume_age == "";
+}
+
+/// The quiet divider between an earlier session's messages and this one.
+fn push_resume_divider(age: String) {
+    let blocks = state().transcript_blocks;
+    blocks = red::push(blocks, AgentTextBlock {
+        id: "resume-notice", kind: "activity", format: "plain",
+        text: "↺ Picked up where you left off " + age,
+    });
+    red::state_patch(AgentState { transcript_blocks: blocks });
     render_conversation();
 }
 
 #[red::on("agent:conversation_restore_pending")]
 fn conversation_restore_pending(event: AgentConversationEvent) {
+    // The core resumes the thread; the pane shows the saved conversation meanwhile.
+    // A bridge restart abandons any session switch that had not completed.
+    red::state_patch(AgentState { session_switch_target: "" });
     red::state_patch(AgentState { model_info: event.model_info, accepted_model: Json {}, turn_model_info: Json {} });
-    load_conversation(event);
-    red::state_patch(AgentState { session_id: event.thread_id });
-    red::state_patch(AgentState { restoring: true });
-    red::state_patch(AgentState { turn_active: false });
+    if shows_thread(event.thread_id) {
+        // Codex stopped under us. Keep what streamed so far; the core marks a
+        // running turn as interrupted and the notice follows with the snapshot.
+        red::state_patch(AgentState { codex_lost: true });
+        finish_agent_message();
+        collapse_activity(red::null());
+    } else {
+        load_conversation(event);
+    }
     red::state_patch(AgentState { activity_block_id: "" });
     red::state_patch(AgentState { activity_rows: [] });
     red::state_patch(AgentState { thought: "" });
     ensure_conversation_panel();
     refresh_model_header();
-    set_phase("restoring", "Restoring session…");
-    red::execute("SetTextPanelComposerState", "agent-conversation", false, "Restoring agent session…");
-    red::execute("AgentResumeSession", event.cwd, event.thread_id);
+    red::execute("SetTextPanelComposerState", "agent-conversation", true, "Reconnecting to Codex… you can keep typing");
+}
+
+#[red::on("agent:conversation_resumable")]
+fn conversation_resumable(event: AgentResumableEvent) {
+    // Saved by an earlier launch. The core resumes the thread when the pane
+    // opens or the next message is sent.
+    red::state_patch(AgentState { model_info: event.model_info, accepted_model: Json {}, turn_model_info: Json {} });
+    load_conversation(AgentConversationEvent {
+        thread_id: event.thread_id, cwd: event.cwd, model_info: event.model_info, items: event.items,
+    });
+    let age = red::string(event.age, "earlier");
+    red::state_patch(AgentState { resume_hint: "Continuing · :AgentNew starts fresh", resume_age: age });
+    push_resume_divider(age);
+    if state().panel_created {
+        red::execute("SetTextPanelComposerState", "agent-conversation", true, state().resume_hint);
+    }
+    refresh_model_header();
 }
 
 #[red::on("agent:session_restored")]
 fn session_restored(event: AgentConversationEvent) {
-    let previous_session_id = red::string(state().session_switch_previous, "");
+    let switching = state().session_switch_target != "";
+    // An interruption from the loss was already shown; a later failure is not one.
+    red::state_patch(AgentState { codex_lost: false });
     red::state_patch(AgentState { model_info: event.model_info, accepted_model: Json {}, turn_model_info: Json {} });
-    load_conversation(event);
-    red::state_patch(AgentState { session_id: event.thread_id });
-    red::state_patch(AgentState {
-        restoring: false,
-        session_switch_target: "",
-        session_switch_previous: "",
-    });
-    red::state_patch(AgentState { recap_pending: false });
-    set_phase("idle", "");
-    red::execute("SetTextPanelComposerState", "agent-conversation", true, "");
-    refresh_model_header();
-    if previous_session_id != "" && previous_session_id != event.thread_id {
-        red::execute("AgentCloseSession", previous_session_id);
+    if switching {
+        red::state_patch(AgentState { resume_hint: "", resume_age: "" });
     }
-    red::execute("Print", "Agent session restored");
+    if !shows_thread(event.thread_id) {
+        let age = state().resume_age;
+        load_conversation(event);
+        if age != "" {
+            red::state_patch(AgentState { resume_age: "" });
+            push_resume_divider(age);
+        }
+    }
+    red::state_patch(AgentState { session_switch_target: "" });
+    set_phase("idle", "");
+    red::execute("SetTextPanelComposerState", "agent-conversation", true, state().resume_hint);
+    refresh_model_header();
+    if switching {
+        red::execute("Print", "Agent session restored");
+    }
+}
+
+/// What the composer says once the thread settles: archived after a failed
+/// resume, continuing after a successful one from an earlier launch.
+fn ready_composer_hint() -> String {
+    if red::string(state().session_id, "") == "" && state().pane.recap_pending {
+        return "Archived conversation · next message starts a new session";
+    }
+    return state().resume_hint;
+}
+
+/// Resumes a saved conversation as soon as the pane is about to be used.
+fn prepare_saved_conversation() {
+    if state().pane.resume_pending {
+        red::execute("AgentPrepare");
+    }
+    if state().resume_hint != "" && state().panel_created {
+        red::execute("SetTextPanelComposerState", "agent-conversation", true, state().resume_hint);
+    }
+}
+
+/// Shows or retires the notice for a reply Codex cut short.
+fn sync_interruption() {
+    let shown = state().interruption_id;
+    let current = "";
+    let text = "";
+    if let Some(prompt) = state().pane.interrupted {
+        current = prompt.id;
+        text = prompt.text;
+    }
+    if current == shown {
+        return;
+    }
+    if shown != "" {
+        // Answered: the choices go, the notice stays as history.
+        let kept = [];
+        for block in state().transcript_blocks {
+            if !red::starts_with(block.id, "interruption-choice:") { kept = red::push(kept, block); }
+        }
+        red::state_patch(AgentState { transcript_blocks: kept, interruption_id: "" });
+        render_conversation();
+    }
+    if current != "" {
+        show_interruption(current);
+    }
+}
+
+fn show_interruption(prompt_id: String) {
+    finish_agent_message();
+    collapse_activity(red::null());
+    set_phase("idle", "");
+    let lost_codex = state().codex_lost;
+    red::state_patch(AgentState { interruption_id: prompt_id, codex_lost: false, interruption_lost_codex: lost_codex });
+    let queued = queued_count();
+    if lost_codex {
+        let notice = "Codex stopped before finishing this reply. The conversation is saved and edits it already made are still applied. Nothing more will be sent until you choose what to do.";
+        if queued > 0 {
+            notice = notice + " (" + queued + " queued follow-up(s) are waiting.)";
+        }
+        append_transcript_block("Error", notice, "interruption:" + prompt_id);
+    }
+    // A turn that failed while Codex kept running already shows its error;
+    // it only needs the way forward.
+    let blocks = state().transcript_blocks;
+    blocks = red::push(blocks, AgentTextBlock {
+        id: "interruption-choice:retry", kind: "action", format: "plain", text: "↻ Retry the message",
+    });
+    blocks = red::push(blocks, AgentTextBlock {
+        id: "interruption-choice:continue", kind: "action", format: "plain", text: "→ Ask Codex to continue where it stopped",
+    });
+    blocks = red::push(blocks, AgentTextBlock {
+        id: "interruption-choice:dismiss", kind: "action", format: "plain", text: "✕ Leave it here",
+    });
+    blocks = red::push(blocks, AgentTextBlock {
+        id: "interruption-choice:hint", kind: "activity", format: "plain", text: "Tab, then ]l to a choice and Enter · or :AgentRecover · or type a new message",
+    });
+    red::state_patch(AgentState { transcript_blocks: blocks });
+    render_conversation();
+    red::execute("SetStorage", "transcript", state().transcript);
+    if lost_codex {
+        red::execute("PrintWarning", "Codex stopped mid-reply · Space A to choose what to do");
+    }
+}
+
+#[red::command(
+    name = "AgentRecover",
+    title = "Recover an interrupted agent reply",
+    category = "Agent",
+    description = "Retry, continue, or leave a reply that Codex stopped in the middle of",
+    aliases = ["retry agent", "continue agent"],
+    scope = "global",
+)]
+fn choose_interruption() {
+    if state().interruption_id == "" {
+        red::execute("Print", "No interrupted agent reply");
+        return;
+    }
+    red::execute("OpenPicker", "Codex stopped mid-reply", [
+        PickerItem { id: "retry", label: "Retry the message", kind: "Resend" },
+        PickerItem { id: "continue", label: "Continue where it stopped", kind: "Resume" },
+        PickerItem { id: "dismiss", label: "Leave it here", kind: "Keep" },
+    ], PickerOptions {
+        placeholder: "What should happen with the cut-off reply?",
+        status: "Edits it already made stay applied · Escape decides later",
+        presentation: "compact",
+    }, PickerHandlers {
+        selected: interruption_selected,
+        cancelled: interruption_cancelled,
+    });
+}
+
+fn interruption_selected(item: PickerItem) {
+    resolve_interruption(item.id);
+}
+
+fn interruption_cancelled(event: PickerCancelled) {
+    red::execute("Print", "Interrupted reply kept · :AgentRecover decides later");
+}
+
+fn resolve_interruption(choice: String) {
+    if state().interruption_id == "" {
+        return;
+    }
+    red::execute("AgentResolveInterruption", choice, red::string(state().transcript, ""));
+    if choice == "dismiss" {
+        let message = "Left the interrupted reply as it is";
+        if queued_count() > 0 {
+            message = message + " · " + queued_count() + " queued · :AgentSendQueued sends them";
+        }
+        red::execute("Print", message);
+    }
 }
 
 struct AgentSessionRestoreFailedEvent {
@@ -2529,22 +2806,23 @@ struct AgentSessionRestoreFailedEvent {
 #[red::on("agent:session_restore_failed")]
 fn session_restore_failed(event: AgentSessionRestoreFailedEvent) {
     if state().session_switch_target != "" && event.session_id == state().session_switch_target {
-        red::state_patch(AgentState {
-            restoring: false,
-            session_switch_target: "",
-            session_switch_previous: "",
-        });
+        red::state_patch(AgentState { session_switch_target: "" });
         set_phase("idle", "");
-        red::execute("SetTextPanelComposerState", "agent-conversation", true, "");
+        red::execute("SetTextPanelComposerState", "agent-conversation", true, ready_composer_hint());
         refresh_model_header();
         red::execute("Print", "Could not switch Agent sessions: " + event.message);
         return;
     }
-    red::state_patch(AgentState { session_id: "" });
+    // A thread the pane already left, as after :AgentNew, failing late is not
+    // this conversation's business.
+    let failed = red::string(event.session_id, "");
+    if failed != "" && failed != red::string(state().session_id, "") {
+        return;
+    }
+    // The next message starts a recap-seeded thread, not a continuation.
+    red::state_patch(AgentState { resume_age: "", resume_hint: "" });
+    // The core forgets the thread and replays the transcript on the next message.
     reset_model_state();
-    red::state_patch(AgentState { restoring: false });
-    red::state_patch(AgentState { recap_pending: red::trim(red::string(state().transcript, "")) != "" });
-    red::execute("AgentForgetSession", event.session_id);
     ensure_conversation_panel();
     set_phase("idle", "");
     red::execute("SetTextPanelComposerState", "agent-conversation", true, "Archived conversation · next message starts a new session");
@@ -2609,20 +2887,43 @@ fn render_conversation() {
         }
     }
     blocks = presented;
-    for block in state().queued_prompt_blocks {
-        blocks = red::push(blocks, block);
-    }
+    // Messages the core has not sent yet render below the conversation. A prompt
+    // returned for retry after a lost session is already in the transcript.
+    blocks = with_unsent_prompts(blocks);
     if red::len(blocks) == 0 {
         blocks = [AgentTextBlock {
             id: "empty",
             kind: "activity",
             format: "plain",
-            text: "No messages yet.\n\nCtrl+Enter sends · Enter adds a line\nEsc enters Normal mode · a edits from the panel\n^C stops a running turn",
+            text: "Ask about this workspace, or ask for a change.\n\nEnter sends · Ctrl+J adds a line · Ctrl+P recalls\nCtrl+C stops a turn · follow-ups queue up\nOne u undoes an agent edit · :AgentHistory lists them",
         }];
     }
     red::execute("UpdateTextPanel", "agent-conversation", blocks);
     // Full replacement already contains pending deltas; never append them twice.
     red::state_patch(AgentState { stream_delta: "", stream_trimmed: false });
+}
+
+/// Appends messages the core has not sent yet. One held behind a running turn
+/// or a paused queue is drawn dimmed; only the first message, sent while a
+/// thread starts, already looks sent, and anything typed after it waits its turn.
+fn with_unsent_prompts(blocks: [AgentTextBlock]) -> [AgentTextBlock] {
+    let held = turn_running() || state().pane.paused;
+    let position = 0;
+    for prompt in state().pane.queued {
+        let shown = false;
+        for block in blocks {
+            if block.id == prompt.id { shown = true; }
+        }
+        if !shown {
+            let kind = "user";
+            if held || position > 0 { kind = "queued"; }
+            blocks = red::push(blocks, AgentTextBlock {
+                id: prompt.id, kind: kind, format: "plain", text: prompt.text,
+            });
+        }
+        position = position + 1;
+    }
+    return blocks;
 }
 
 /// Normalize blocks from live, migrated, and restored state before they reach the panel.
@@ -2752,64 +3053,159 @@ fn legacy_transcript_blocks(transcript: String) -> [AgentTextBlock] {
 )]
 fn history() {
     red::state_patch(AgentState { history_open: true });
+    red::state_patch(AgentState { history_selected: "" });
     red::execute("OpenWorkspace", "agent-history", WorkspaceConfig {
-        title: "Attributed edit history",
-        detail_ratio: 58,
+        title: "Edit history",
+        detail_ratio: 56,
         min_two_pane_width: 88,
+        detail_wrap: false,
     });
     refresh_history();
 }
 
 fn refresh_history() {
     if state().history_open {
-        red::request("EditHistory", render_history);
+        red::request("EditHistory", render_history, "workspace");
     }
+}
+
+fn history_title(entry: AgentHistoryEntry) -> String {
+    let title = entry.file;
+    if entry.origin.kind == "agent" {
+        title = title + " · Agent";
+        if let Some(turn) = entry.turn { title = title + ", turn " + turn; }
+        if let Some(prompt) = entry.prompt {
+            if prompt != "" { title = title + " · “" + prompt + "”"; }
+        }
+    } else if entry.origin.kind == "plugin" {
+        title = title + " · " + red::string(entry.origin.name, "plugin");
+    } else {
+        title = title + " · You";
+    }
+    return title + " · " + entry.age;
+}
+
+fn history_row(entry: AgentHistoryEntry) -> Json {
+    let by_agent = entry.origin.kind == "agent";
+    let glyph = "· ";
+    let who = "you";
+    if by_agent {
+        // The glyph already says "agent"; the turn says which request.
+        glyph = "◆ ";
+        who = "agent";
+        if let Some(turn) = entry.turn { who = "turn " + turn; }
+    } else if entry.origin.kind == "plugin" {
+        who = red::string(entry.origin.name, "plugin");
+    }
+    let change = "";
+    if entry.added > 0 { change = "+" + entry.added; }
+    if entry.removed > 0 {
+        if change != "" { change = change + " "; }
+        change = change + "−" + entry.removed;
+    }
+    let right = [PanelSegment { text: who + " · " + entry.age, style: muted_style() }];
+    if !entry.applied {
+        right = red::push(right, PanelSegment { text: " · undone", style: muted_style() });
+    }
+    let glyph_style = muted_style();
+    if by_agent { glyph_style = heading_style(); }
+    return WorkspaceRow {
+        id: "transaction:" + entry.transaction_id,
+        selectable: true,
+        segments: [
+            PanelSegment { text: glyph, style: glyph_style },
+            PanelSegment { text: entry.file, style: normal_style() },
+            PanelSegment { text: "  " + change, style: muted_style() },
+        ],
+        right_segments: right,
+        data: AgentHistoryRowData {
+            transaction_id: entry.transaction_id,
+            title: history_title(entry),
+            document: entry.document,
+        },
+    };
+}
+
+fn history_empty_detail(text: String) -> [[PanelSegment]] {
+    return [
+        [PanelSegment { text: text, style: muted_style() }],
+        [PanelSegment { text: "", style: muted_style() }],
+        [PanelSegment { text: "Edits by you and the agent in open files appear here, newest first.", style: muted_style() }],
+        [PanelSegment { text: "◆ marks the agent's edits. r reverts the selected edit as a new, undoable change.", style: muted_style() }],
+    ];
 }
 
 fn render_history(result: AgentHistoryResult) {
     let rows = [];
-    let index = 0;
-    while index < red::len(result.entries) && index < 500 {
-        let entry = result.entries[index];
-        let origin = entry.origin.kind;
-        if origin == "agent" {
-            origin = "agent " + entry.origin.session_id + "/" + entry.origin.turn_id;
+    let agent_edits = 0;
+    let shown = 0;
+    let files = [];
+    let selected_found = false;
+    let first_row = red::null();
+    for entry in result.entries {
+        let by_agent = entry.origin.kind == "agent";
+        if by_agent { agent_edits = agent_edits + 1; }
+        if state().history_agent_only && !by_agent { continue; }
+        if !red::contains(files, entry.file) { files = red::push(files, entry.file); }
+        let row = history_row(entry);
+        shown = shown + 1;
+        if first_row == red::null() { first_row = row; }
+        if row.id == state().history_selected {
+            selected_found = true;
+            show_history_detail(row.id, row.data.title, row.data.document);
         }
-        let current_marker = "  ";
-        if entry.current { current_marker = "* "; }
-        rows = red::push(rows, WorkspaceRow {
-            id: "transaction:" + entry.transaction_id,
-            selectable: true,
-            segments: [
-                PanelSegment { text: current_marker, style: heading_style() },
-                PanelSegment { text: entry.label, style: normal_style() },
-            ],
-            right_segments: [PanelSegment { text: origin, style: muted_style() }],
-            data: AgentHistoryRowData { transaction_id: entry.transaction_id, edits: entry.edits },
-        });
-        index = index + 1;
+        rows = red::push(rows, row);
     }
-    if index < red::len(result.entries) {
+    if !selected_found {
+        if first_row == red::null() {
+            red::state_patch(AgentState { history_document: red::null() });
+            red::state_patch(AgentState { history_detail_title: "" });
+            let empty = "No edits yet";
+            if state().history_agent_only { empty = "No agent edits yet"; }
+            red::state_patch(AgentState { history_detail: history_empty_detail(empty) });
+        } else {
+            show_history_detail(first_row.id, first_row.data.title, first_row.data.document);
+        }
+    }
+    let total = red::len(result.entries);
+    if let Some(value) = result.total { total = value; }
+    if total > red::len(result.entries) {
         rows = red::push(rows, WorkspaceRow {
             id: "history-truncated",
             selectable: false,
-            segments: [PanelSegment { text: "… history limited to 500 entries", style: muted_style() }],
+            segments: [PanelSegment { text: "… older edits not shown; the history lists the newest " + red::len(result.entries) + " of " + total, style: muted_style() }],
         });
     }
-    if red::len(rows) == 0 {
-        rows = red::push(rows, WorkspaceRow {
-            id: "empty",
-            selectable: false,
-            segments: [PanelSegment { text: "No edit transactions", style: muted_style() }],
-        });
-    }
+    // Count edits, not the informational rows added after them.
+    let summary = shown + " edits";
+    if shown == 1 { summary = "1 edit"; }
+    if red::len(files) == 1 { summary = summary + " in 1 file"; }
+    if red::len(files) > 1 { summary = summary + " across " + red::len(files) + " files"; }
+    if !state().history_agent_only { summary = summary + " · " + agent_edits + " by the agent"; }
+    let filter_label = "agent edits only";
+    if state().history_agent_only { filter_label = "all edits"; }
     red::execute("UpdateWorkspace", "agent-history", WorkspaceModel {
+        header: [PanelSegment { text: summary, style: muted_style() }],
         rows: rows,
         detail: state().history_detail,
-        actions: [AgentWorkspaceAction {
-            hint: AgentWorkspaceActionHint { id: "r", key: "r", label: "safe revert", priority: "essential" },
-        }],
+        detail_document: state().history_document,
+        detail_title: state().history_detail_title,
+        actions: [
+            AgentWorkspaceAction {
+                hint: AgentWorkspaceActionHint { id: "r", key: "r", label: "revert edit", priority: "essential" },
+            },
+            AgentWorkspaceAction {
+                hint: AgentWorkspaceActionHint { id: "a", key: "a", label: filter_label, priority: "essential" },
+            },
+        ],
     });
+}
+
+fn show_history_detail(id: String, title: String, document: Json) {
+    red::state_patch(AgentState { history_selected: id });
+    red::state_patch(AgentState { history_detail_title: title });
+    red::state_patch(AgentState { history_document: document });
+    red::state_patch(AgentState { history_detail: [] });
 }
 
 #[red::on("workspace:event:agent-history")]
@@ -2819,8 +3215,13 @@ fn history_event(event: AgentHistoryEvent) {
         red::execute("CloseWorkspace", "agent-history");
         return;
     }
+    if event.action == "a" {
+        red::state_patch(AgentState { history_agent_only: !state().history_agent_only });
+        refresh_history();
+        return;
+    }
     let row = event.row;
-    if row == red::null() || row.data.transaction_id == red::null() {
+    if row == red::null() || row.data == red::null() || row.data.transaction_id == red::null() {
         return;
     }
     if event.action == "r" {
@@ -2828,13 +3229,10 @@ fn history_event(event: AgentHistoryEvent) {
         refresh_history();
         return;
     }
-    if event.action == "up" || event.action == "down" || event.action == "page_up" || event.action == "page_down" {
-        let detail = [];
-        for edit in row.data.edits {
-            detail = red::push(detail, [PanelSegment { text: "- " + edit.old_text, style: warning_style() }]);
-            detail = red::push(detail, [PanelSegment { text: "+ " + edit.new_text, style: success_style() }]);
-        }
-        red::state_patch(AgentState { history_detail: detail });
+    // Any way of moving the selection (keys, mouse, scrolling, filtering) must
+    // show that row's diff, so `r` always reverts the edit on screen.
+    if row.id != state().history_selected {
+        show_history_detail(row.id, row.data.title, row.data.document);
         refresh_history();
     }
 }
@@ -2852,7 +3250,6 @@ fn permission_requested(event: AgentPermissionEvent) {
             label: option.name,
             kind: "Permission",
             annotation: red::string(option.kind, "permission") + " · " + option.option_id,
-            detail: "Codex permission option " + option.option_id,
             data: Json { option_id: option.option_id },
         });
     }
@@ -2860,6 +3257,7 @@ fn permission_requested(event: AgentPermissionEvent) {
         placeholder: "Choose an exact option from the agent",
         status: red::len(items) + " options",
         presentation: "compact",
+        item_layout: "label_first",
     }, PickerHandlers {
         selected: permission_selected,
         cancelled: permission_cancelled,
@@ -2907,9 +3305,7 @@ fn deactivate() {
         red::execute("AgentCloseSession", session_id);
     }
     red::execute("SetTextPanelStatus", "agent-conversation");
-    red::state_patch(AgentState { session_id: "" });
     reset_model_state();
-    red::state_patch(AgentState { cancelled_session_id: "" });
     red::state_patch(AgentState { permission_request_id: "" });
     let timer = red::string(state().stream_timer, "");
     if timer != "" {

@@ -12,6 +12,27 @@ sources:
   - id: cargo
     type: file
     path: Cargo.toml
+  - id: learning
+    type: file
+    path: almanac/architecture/editor/learning-and-tutorial.md
+  - id: agent-hub
+    type: file
+    path: almanac/architecture/agent/README.md
+  - id: sessions-hub
+    type: file
+    path: almanac/architecture/sessions/README.md
+  - id: release-guide
+    type: file
+    path: almanac/guides/releases/release-red.md
+  - id: release-hub
+    type: file
+    path: almanac/guides/releases/README.md
+  - id: website-positioning
+    type: file
+    path: almanac/concepts/website-positioning.md
+  - id: website-operations
+    type: file
+    path: almanac/guides/website/README.md
 ---
 
 Red is a modal terminal editor with a self-contained Rust binary, embedded runtime assets, optional Codex agent integration, Husk plugins, language tooling, crash recovery, and Unix detachable sessions. The quickest path through this wiki is to start with the [Red editor concept](concepts/red-editor), then follow the architecture page for the subsystem you need to change. The repository README describes Red as "the modal editor for the agent era" and highlights its bundled defaults, safer agent workflow, Husk runtime, recovery, and detach support [@readme].
@@ -21,6 +42,8 @@ For page-type browsing, use [Concepts](concepts) for repo-specific mental models
 ## Start With The Product Model
 
 Use [Red editor](concepts/red-editor) to understand the basic mental model before reading subsystem pages. Red combines Vim-inspired modes and motions with tree-sitter highlighting, language servers, command discovery, file and buffer pickers, Git tooling, embedded Husk plugins, and optional Codex support [@readme]. The user guide shows the everyday workflow: launch with `red path/to/file`, use Normal, Insert, Visual, Visual Line, Visual Block, and Command modes, and discover commands with `Space ?`, `F1`, `Alt-x`, or `Ctrl-Shift-p` [@getting-started-doc].
+
+Use [Learning and tutorial](architecture/editor/learning-and-tutorial) when the onboarding path itself is the work. `:learn` and `:tutorial` share some user-facing words, but the architecture page explains which commands open the Learn hub, the Essentials practice checkpoint, the guided tour, or contextual lesson controls [@learning].
 
 For startup behavior, read [Runtime lifecycle](architecture/startup/runtime-lifecycle) and [Red command](reference/cli/red-command). The command-line contract includes ordinary file opening, `-r` workspace roots, inline config overrides, runtime asset listing, asset ejection, Codex setup checks, crash resume, and Unix detach/attach modes [@getting-started-doc].
 
@@ -32,7 +55,7 @@ Read [Plugin architecture](architecture/plugins) when changing bundled plugins o
 
 ## Agent Work
 
-Read [Agent-attributed edits](concepts/agent-attributed-edits) before changing agent behavior. The README states the user-facing contract: Codex receives editor context, Red reveals each tool call, and edits apply and save through the editor [@readme]. The deeper reading order starts at [Agent architecture](architecture/agent), then continues through the Codex app-server flow, followed editing, dynamic tools, and history guide.
+Read [Agent-attributed edits](concepts/agent-attributed-edits) before changing agent behavior. The README states the user-facing contract: Codex receives editor context, Red reveals each tool call, and edits apply and save through the editor [@readme]. The deeper reading order starts at [Agent architecture](architecture/agent), then continues through Codex app-server process control, dynamic tool definitions, followed editing, attributed edit history, and operational inspection [@agent-hub].
 
 ## Husk Work
 
@@ -41,7 +64,12 @@ Read [Husk language](concepts/husk-language) before touching the scripting langu
 ## Sessions And Recovery
 
 Read [Detach versus recovery](concepts/sessions/detach-vs-recovery) when deciding whether a problem concerns a live owner process or a persisted snapshot. The README distinguishes Unix detach/attach sessions, which preserve live editor state across terminal or SSH disconnects, from atomic crash recovery, which restores persisted work after an editor crash or restart [@readme].
+Then use [Sessions architecture](architecture/sessions) for the implementation split, [Detach and reattach](guides/sessions/detach-reattach) when the owner process is still alive, and [Resume after crash](guides/sessions/resume-after-crash) when the task is persisted snapshot recovery [@sessions-hub].
 
 ## Development Path
 
 For local work, start with [Build, test, and validate](guides/development/build-test-and-validate). The README lists the expected development loop as `cargo build`, `cargo test --all-targets --all-features`, and `cargo clippy --all-targets --all-features -- -D warnings` after cloning the repository [@readme].
+
+For publication work, start with [Release Operations](guides/releases) instead of the generic validation guide. That hub routes editor releases, reviewed campaign copy, release workflow mechanics, installer smoke tests, public-site coordination, and language-pack publication before [Release Red](guides/releases/release-red) takes over the editor release runbook [@release-hub] [@release-guide].
+
+For external-site work, start with [Website positioning](concepts/website-positioning) to keep `getred.dev` audience, media, installer URL, and prototype-language constraints separate from shipped editor runtime claims [@website-positioning]. Then use [Website operations](guides/website) for the content refresh, media, deployment, domain, and rollback reading path [@website-operations].

@@ -9,6 +9,8 @@ mod embedding;
 mod stdlib;
 
 use std::{
+    borrow::Cow,
+    cell::RefCell,
     collections::{BTreeMap, HashMap, HashSet},
     fmt,
     sync::Arc,
@@ -251,7 +253,7 @@ impl Value {
     /// Converts JSON into Husk's shared runtime representation.
     #[must_use]
     pub fn from_json(value: serde_json::Value) -> Self {
-        json_to_value(&value)
+        json_into_value(value)
     }
 
     /// Converts a runtime value into its JSON boundary representation.
@@ -750,10 +752,10 @@ impl CompiledProgram {
             )));
         }
 
-        let mut declarations = options.declarations.clone();
+        let mut declarations = Cow::Borrowed(options.declarations.as_slice());
         for module in &options.modules {
             module.validate()?;
-            declarations.push(module_declaration_ast(module)?);
+            declarations.to_mut().push(module_declaration_ast(module)?);
         }
 
         let semantic = if options.typecheck {
@@ -1149,6 +1151,16 @@ impl CompiledProgram {
     #[must_use]
     pub fn semantic_result(&self) -> Option<&SemanticResult> {
         self.semantic.as_deref()
+    }
+
+    /// Release parsing and type-checking data after host validation is complete.
+    ///
+    /// Executable HIR, diagnostics sources, annotations, and module descriptors
+    /// remain intact, so the program can still be loaded and activated normally.
+    pub fn discard_analysis(&mut self) {
+        self.syntax = Arc::new(File { items: Vec::new() });
+        self.semantic = None;
+        self.module_semantics = Arc::new(BTreeMap::new());
     }
 
     /// Semantic results for every source module in a compiled package.
@@ -1865,10 +1877,133 @@ struct HeapSlot {
     object: Option<HeapObject>,
 }
 
+/// Shared array and map storage held by heap cells, charged once however many
+/// cells hold it.
+///
+/// Each entry counts the cells and accounted parent storage that refer to it,
+/// and keeps the storage alive so its address cannot be reused while counted.
+/// Counted storage never changes: every runtime write goes through
+/// `Arc::make_mut` on a clone of a cell's value, which copies storage this
+/// table also holds.
+#[derive(Debug, Clone, Default)]
+struct SharedStorage {
+    entries: HashMap<usize, (SharedRef, usize)>,
+}
+
+#[derive(Debug, Clone)]
+enum SharedRef {
+    List(Arc<Vec<Value>>),
+    Map(Arc<BTreeMap<String, Value>>),
+}
+
+impl SharedStorage {
+    /// Records one more holder of `value` and returns the bytes that are newly
+    /// charged: the value itself, plus the contents of storage nothing else holds.
+    fn acquire(&mut self, value: &Value) -> usize {
+        std::mem::size_of::<Value>().saturating_add(match value {
+            Value::Array(values) | Value::Tuple(values) => self.acquire_list(values),
+            Value::Object(fields) => self.acquire_map(fields),
+            Value::Struct { type_name, fields } => {
+                type_name.len().saturating_add(self.acquire_map(fields))
+            }
+            Value::Variant {
+                type_name,
+                case,
+                fields,
+            } => type_name
+                .len()
+                .saturating_add(case.len())
+                .saturating_add(self.acquire_list(fields)),
+            value => heap_value_size(value).saturating_sub(std::mem::size_of::<Value>()),
+        })
+    }
+
+    /// Drops one holder of `value` and returns the bytes no longer charged.
+    /// Mirrors [`SharedStorage::acquire`] for the same value.
+    fn release(&mut self, value: &Value) -> usize {
+        std::mem::size_of::<Value>().saturating_add(match value {
+            Value::Array(values) | Value::Tuple(values) => self.release_storage(shared_key(values)),
+            Value::Object(fields) => self.release_storage(shared_key(fields)),
+            Value::Struct { type_name, fields } => type_name
+                .len()
+                .saturating_add(self.release_storage(shared_key(fields))),
+            Value::Variant {
+                type_name,
+                case,
+                fields,
+            } => type_name
+                .len()
+                .saturating_add(case.len())
+                .saturating_add(self.release_storage(shared_key(fields))),
+            value => heap_value_size(value).saturating_sub(std::mem::size_of::<Value>()),
+        })
+    }
+
+    fn acquire_list(&mut self, values: &Arc<Vec<Value>>) -> usize {
+        if self.hold(shared_key(values)) {
+            return 0;
+        }
+        self.entries
+            .insert(shared_key(values), (SharedRef::List(Arc::clone(values)), 1));
+        values
+            .iter()
+            .map(|value| self.acquire(value))
+            .fold(0, usize::saturating_add)
+    }
+
+    fn acquire_map(&mut self, fields: &Arc<BTreeMap<String, Value>>) -> usize {
+        if self.hold(shared_key(fields)) {
+            return 0;
+        }
+        self.entries
+            .insert(shared_key(fields), (SharedRef::Map(Arc::clone(fields)), 1));
+        fields
+            .iter()
+            .map(|(name, value)| name.len().saturating_add(self.acquire(value)))
+            .fold(0, usize::saturating_add)
+    }
+
+    fn hold(&mut self, key: usize) -> bool {
+        match self.entries.get_mut(&key) {
+            Some((_, holders)) => {
+                *holders += 1;
+                true
+            }
+            None => false,
+        }
+    }
+
+    fn release_storage(&mut self, key: usize) -> usize {
+        let Some((_, holders)) = self.entries.get_mut(&key) else {
+            return 0;
+        };
+        *holders -= 1;
+        if *holders > 0 {
+            return 0;
+        }
+        let (storage, _) = self.entries.remove(&key).expect("entry was just found");
+        match storage {
+            SharedRef::List(values) => values
+                .iter()
+                .map(|value| self.release(value))
+                .fold(0, usize::saturating_add),
+            SharedRef::Map(fields) => fields
+                .iter()
+                .map(|(name, value)| name.len().saturating_add(self.release(value)))
+                .fold(0, usize::saturating_add),
+        }
+    }
+}
+
+fn shared_key<T>(storage: &Arc<T>) -> usize {
+    Arc::as_ptr(storage) as usize
+}
+
 #[derive(Debug, Clone)]
 struct RuntimeHeap {
     slots: Vec<HeapSlot>,
     free: Vec<u32>,
+    shared: SharedStorage,
     live_objects: usize,
     live_closures: usize,
     live_bytes: usize,
@@ -1881,6 +2016,7 @@ impl Default for RuntimeHeap {
         Self {
             slots: Vec::new(),
             free: Vec::new(),
+            shared: SharedStorage::default(),
             live_objects: 0,
             live_closures: 0,
             live_bytes: 0,
@@ -1903,9 +2039,17 @@ impl RuntimeHeap {
                 self.max_objects
             );
         }
-        let object_bytes = heap_object_size(&object);
+        let object_bytes = match &object {
+            HeapObject::Cell(value) => {
+                std::mem::size_of::<HeapObject>().saturating_add(self.shared.acquire(value))
+            }
+            HeapObject::Closure(_) => heap_object_size(&object),
+        };
         let next_bytes = self.live_bytes.saturating_add(object_bytes);
         if next_bytes > self.max_bytes {
+            if let HeapObject::Cell(value) = &object {
+                self.shared.release(value);
+            }
             anyhow::bail!(
                 "Husk heap byte limit exceeded (requested {object_bytes} bytes with {} of {} bytes live)",
                 self.live_bytes,
@@ -1966,28 +2110,36 @@ impl RuntimeHeap {
     }
 
     fn set_cell(&mut self, handle: CellHandle, value: Value) -> anyhow::Result<()> {
-        let old_bytes = match self.object(handle)? {
-            HeapObject::Cell(current) => heap_value_size(current),
-            HeapObject::Closure(_) => {
-                anyhow::bail!("Husk heap handle does not refer to a cell");
-            }
+        let HeapObject::Cell(cell) = self.object_mut(handle)? else {
+            anyhow::bail!("Husk heap handle does not refer to a cell");
         };
-        let new_bytes = heap_value_size(&value);
+        // Take the old value out instead of cloning it: strings and JSON clone deeply.
+        let current = std::mem::replace(cell, Value::Unit);
+        // Charge the new value before releasing the old one, so storage they
+        // share stays counted instead of being released and charged again.
+        let new_bytes = self.shared.acquire(&value);
+        let old_bytes = self.shared.release(&current);
         let next_bytes = self
             .live_bytes
             .saturating_sub(old_bytes)
             .saturating_add(new_bytes);
         if next_bytes > self.max_bytes {
+            self.shared.acquire(&current);
+            self.shared.release(&value);
+            let live_without_old = self.live_bytes.saturating_sub(old_bytes);
+            let HeapObject::Cell(cell) = self.object_mut(handle)? else {
+                unreachable!("cell kind was checked above");
+            };
+            *cell = current;
             anyhow::bail!(
-                "Husk heap byte limit exceeded (value needs {new_bytes} bytes with {} of {} bytes live)",
-                self.live_bytes.saturating_sub(old_bytes),
+                "Husk heap byte limit exceeded (value needs {new_bytes} bytes with {live_without_old} of {} bytes live)",
                 self.max_bytes
             );
         }
-        let HeapObject::Cell(current) = self.object_mut(handle)? else {
-            unreachable!("cell kind was checked before taking a mutable borrow");
+        let HeapObject::Cell(cell) = self.object_mut(handle)? else {
+            unreachable!("cell kind was checked above");
         };
-        *current = value;
+        *cell = value;
         self.live_bytes = next_bytes;
         Ok(())
     }
@@ -2044,12 +2196,21 @@ impl RuntimeHeap {
         {
             return;
         }
-        let object_bytes = slot.object.as_ref().map_or(0, heap_object_size);
-        slot.object = None;
+        let object = slot.object.take().expect("cell kind was checked above");
         slot.generation = slot.generation.wrapping_add(1).max(1);
+        let object_bytes = self.object_bytes_released(&object);
         self.free.push(handle.slot);
         self.live_objects = self.live_objects.saturating_sub(1);
         self.live_bytes = self.live_bytes.saturating_sub(object_bytes);
+    }
+
+    fn object_bytes_released(&mut self, object: &HeapObject) -> usize {
+        match object {
+            HeapObject::Cell(value) => {
+                std::mem::size_of::<HeapObject>().saturating_add(self.shared.release(value))
+            }
+            HeapObject::Closure(_) => heap_object_size(object),
+        }
     }
 
     fn reachable_handles(
@@ -2122,9 +2283,14 @@ impl RuntimeHeap {
                 slot.marked = false;
                 continue;
             }
-            let is_closure = matches!(slot.object, Some(HeapObject::Closure(_)));
-            let object_bytes = slot.object.as_ref().map_or(0, heap_object_size);
-            slot.object = None;
+            let object = slot.object.take().expect("checked above");
+            let is_closure = matches!(object, HeapObject::Closure(_));
+            let object_bytes = match &object {
+                HeapObject::Cell(value) => {
+                    std::mem::size_of::<HeapObject>().saturating_add(self.shared.release(value))
+                }
+                HeapObject::Closure(_) => heap_object_size(&object),
+            };
             slot.generation = slot.generation.wrapping_add(1).max(1);
             self.free
                 .push(u32::try_from(index).expect("allocated heap indices fit in u32"));
@@ -2133,6 +2299,17 @@ impl RuntimeHeap {
             self.live_bytes = self.live_bytes.saturating_sub(object_bytes);
         }
     }
+}
+
+/// Heap bytes charged for storing `value` in one variable or parameter cell
+/// when no other cell holds any of its arrays or maps.
+///
+/// Arrays and maps that cells share are charged once, so a value whose storage
+/// is already held is charged less. For a value built outside the runtime,
+/// such as a host result, this is the exact charge.
+#[must_use]
+pub fn heap_cell_size(value: &Value) -> usize {
+    std::mem::size_of::<HeapObject>().saturating_add(heap_value_size(value))
 }
 
 fn heap_object_size(object: &HeapObject) -> usize {
@@ -2170,17 +2347,20 @@ fn heap_object_size(object: &HeapObject) -> usize {
     })
 }
 
-fn heap_value_size(value: &Value) -> usize {
+/// Heap bytes `value` accounts for inside a cell, including the contents of its
+/// arrays and maps.
+#[must_use]
+pub fn heap_value_size(value: &Value) -> usize {
     std::mem::size_of::<Value>().saturating_add(match value {
         Value::String(value) => value.len(),
         Value::Array(values) | Value::Tuple(values) => values
             .iter()
             .map(heap_value_size)
             .fold(0, usize::saturating_add),
-        Value::Object(values) | Value::Struct { fields: values, .. } => values
-            .iter()
-            .map(|(name, value)| name.len().saturating_add(heap_value_size(value)))
-            .fold(0, usize::saturating_add),
+        Value::Object(values) => heap_fields_size(values),
+        Value::Struct { type_name, fields } => {
+            type_name.len().saturating_add(heap_fields_size(fields))
+        }
         Value::Variant {
             type_name,
             case,
@@ -2212,6 +2392,13 @@ fn heap_value_size(value: &Value) -> usize {
         | Value::Range { .. }
         | Value::Closure(_) => 0,
     })
+}
+
+fn heap_fields_size(fields: &BTreeMap<String, Value>) -> usize {
+    fields
+        .iter()
+        .map(|(name, value)| name.len().saturating_add(heap_value_size(value)))
+        .fold(0, usize::saturating_add)
 }
 
 fn heap_json_size(value: &serde_json::Value) -> usize {
@@ -3139,6 +3326,13 @@ impl Vm {
     /// Set live heap object and approximate byte limits for this instance.
     pub fn set_heap_limits(&mut self, max_objects: usize, max_bytes: usize) {
         self.heap.set_limits(max_objects, max_bytes);
+    }
+
+    /// Heap bytes the next call can still allocate, after collecting the
+    /// unreachable objects that the call itself would collect first.
+    pub fn available_heap_bytes(&mut self) -> usize {
+        self.collect_heap_before_call(&[]);
+        self.heap.max_bytes.saturating_sub(self.heap.live_bytes)
     }
 
     /// Set the maximum number of explicitly retained closure handles.
@@ -5561,9 +5755,9 @@ fn iterable_values(value: Value) -> anyhow::Result<Box<dyn Iterator<Item = Value
                 (0..length).map(move |index| values[index].clone()),
             ))
         }
-        Value::Json(serde_json::Value::Array(values)) => Ok(Box::new(
-            values.into_iter().map(|value| json_to_value(&value)),
-        )),
+        Value::Json(serde_json::Value::Array(values)) => {
+            Ok(Box::new(values.into_iter().map(json_into_value)))
+        }
         Value::String(value) => Ok(Box::new(
             value
                 .chars()
@@ -5601,6 +5795,108 @@ fn enum_constructor_path(path: &str) -> Option<(&str, &str)> {
     (is_type && is_case).then_some((type_name, case))
 }
 
+const SCALAR_JSON_OBJECT_CACHE_SLOTS: usize = 32;
+
+type ScalarJsonObjectCacheEntry = (u64, Arc<BTreeMap<String, Value>>);
+
+thread_local! {
+    static SCALAR_JSON_OBJECT_CACHE: RefCell<[Option<ScalarJsonObjectCacheEntry>; SCALAR_JSON_OBJECT_CACHE_SLOTS]> =
+        const { RefCell::new([const { None }; SCALAR_JSON_OBJECT_CACHE_SLOTS]) };
+}
+
+fn scalar_json_object_fingerprint(
+    values: &serde_json::Map<String, serde_json::Value>,
+) -> Option<u64> {
+    if values.len() != 2 {
+        return None;
+    }
+
+    let mut fingerprint = 0xcbf2_9ce4_8422_2325_u64;
+    for (name, value) in values {
+        for byte in name.bytes() {
+            fingerprint ^= u64::from(byte);
+            fingerprint = fingerprint.wrapping_mul(0x0100_0000_01b3);
+        }
+        let encoded = match value {
+            serde_json::Value::Bool(value) => u64::from(*value),
+            serde_json::Value::Number(value) => value.as_i64()? as u64,
+            _ => return None,
+        };
+        fingerprint ^= encoded;
+        fingerprint = fingerprint.wrapping_mul(0x0100_0000_01b3);
+    }
+    Some(fingerprint)
+}
+
+fn cached_scalar_json_object(
+    values: &serde_json::Map<String, serde_json::Value>,
+    fingerprint: u64,
+) -> Option<Arc<BTreeMap<String, Value>>> {
+    SCALAR_JSON_OBJECT_CACHE.with(|cache| {
+        let cache = cache.borrow();
+        let (cached_fingerprint, cached) =
+            cache[(fingerprint as usize) & (SCALAR_JSON_OBJECT_CACHE_SLOTS - 1)].as_ref()?;
+        if *cached_fingerprint != fingerprint || cached.len() != values.len() {
+            return None;
+        }
+        cached
+            .iter()
+            .zip(values)
+            .all(|((cached_name, cached_value), (name, value))| {
+                cached_name == name
+                    && match (cached_value, value) {
+                        (Value::Bool(cached), serde_json::Value::Bool(value)) => cached == value,
+                        (Value::Int(cached), serde_json::Value::Number(value)) => {
+                            value.as_i64() == Some(*cached)
+                        }
+                        _ => false,
+                    }
+            })
+            .then(|| Arc::clone(cached))
+    })
+}
+
+fn json_into_value(value: serde_json::Value) -> Value {
+    match value {
+        serde_json::Value::Null => Value::Null,
+        serde_json::Value::Bool(value) => Value::Bool(value),
+        serde_json::Value::Number(value) => {
+            if let Some(integer) = value.as_i64() {
+                Value::Int(integer)
+            } else if let Some(float) = value.as_f64() {
+                Value::Float(float)
+            } else {
+                Value::Json(serde_json::Value::Number(value))
+            }
+        }
+        serde_json::Value::String(value) => Value::String(value),
+        serde_json::Value::Array(values) => {
+            Value::Array(Arc::new(values.into_iter().map(json_into_value).collect()))
+        }
+        serde_json::Value::Object(values) => {
+            let fingerprint = scalar_json_object_fingerprint(&values);
+            if let Some(cached) =
+                fingerprint.and_then(|key| cached_scalar_json_object(&values, key))
+            {
+                return Value::Object(cached);
+            }
+            let mut object = BTreeMap::new();
+            for (key, value) in values {
+                object.insert(key, json_into_value(value));
+            }
+            let object = Arc::new(object);
+            if let Some(fingerprint) = fingerprint {
+                SCALAR_JSON_OBJECT_CACHE.with(|cache| {
+                    cache.borrow_mut()
+                        [(fingerprint as usize) & (SCALAR_JSON_OBJECT_CACHE_SLOTS - 1)] =
+                        Some((fingerprint, Arc::clone(&object)));
+                });
+            }
+            Value::Object(object)
+        }
+    }
+}
+
 fn json_to_value(value: &serde_json::Value) -> Value {
     match value {
         serde_json::Value::Null => Value::Null,
@@ -5618,12 +5914,13 @@ fn json_to_value(value: &serde_json::Value) -> Value {
         serde_json::Value::Array(values) => {
             Value::Array(Arc::new(values.iter().map(json_to_value).collect()))
         }
-        serde_json::Value::Object(values) => Value::Object(Arc::new(
-            values
-                .iter()
-                .map(|(key, value)| (key.clone(), json_to_value(value)))
-                .collect(),
-        )),
+        serde_json::Value::Object(values) => {
+            let mut object = BTreeMap::new();
+            for (key, value) in values {
+                object.insert(key.clone(), json_to_value(value));
+            }
+            Value::Object(Arc::new(object))
+        }
     }
 }
 
@@ -6321,6 +6618,104 @@ mod tests {
     }
 
     #[test]
+    fn owned_json_conversion_preserves_nested_values_and_unicode() {
+        let json = serde_json::json!({
+            "text": "héllo 🦀",
+            "values": [null, true, -42, 3.25, { "nested": "世界" }],
+        });
+
+        let runtime = Value::from_json(json.clone());
+
+        assert_eq!(runtime.to_json(), json);
+        assert!(matches!(runtime, Value::Object(_)));
+    }
+
+    #[test]
+    fn repeated_scalar_json_objects_share_copy_on_write_storage() {
+        let json = serde_json::json!({ "tabs": false, "width": 8 });
+        let Value::Object(mut first) = Value::from_json(json.clone()) else {
+            panic!("scalar JSON records must remain runtime objects");
+        };
+        let Value::Object(second) = Value::from_json(json) else {
+            panic!("scalar JSON records must remain runtime objects");
+        };
+
+        assert!(Arc::ptr_eq(&first, &second));
+        Arc::make_mut(&mut first).insert("width".to_string(), Value::Int(12));
+
+        assert_eq!(first.get("width"), Some(&Value::Int(12)));
+        assert_eq!(second.get("width"), Some(&Value::Int(8)));
+    }
+
+    #[test]
+    fn scalar_json_cache_distinguishes_booleans_and_integer_values() {
+        let first = Value::from_json(serde_json::json!({ "flag": true, "value": 1 }));
+        let second = Value::from_json(serde_json::json!({ "flag": false, "value": 1 }));
+        let third = Value::from_json(serde_json::json!({ "flag": true, "value": 2 }));
+
+        assert_eq!(
+            first.to_json(),
+            serde_json::json!({ "flag": true, "value": 1 })
+        );
+        assert_eq!(
+            second.to_json(),
+            serde_json::json!({ "flag": false, "value": 1 })
+        );
+        assert_eq!(
+            third.to_json(),
+            serde_json::json!({ "flag": true, "value": 2 })
+        );
+    }
+
+    #[test]
+    fn scalar_json_cache_does_not_retain_string_or_nested_values() {
+        for json in [
+            serde_json::json!({ "label": "private", "value": 1 }),
+            serde_json::json!({ "nested": { "value": 1 }, "flag": true }),
+            serde_json::json!({ "ratio": 1.5, "flag": true }),
+        ] {
+            let Value::Object(first) = Value::from_json(json.clone()) else {
+                panic!("JSON records must remain runtime objects");
+            };
+            let Value::Object(second) = Value::from_json(json) else {
+                panic!("JSON records must remain runtime objects");
+            };
+
+            assert!(!Arc::ptr_eq(&first, &second));
+        }
+    }
+
+    #[test]
+    fn discarding_analysis_preserves_executable_compiled_program() {
+        let mut program = CompiledProgram::compile_at(
+            "optimized",
+            "plugins/optimized.hk",
+            "pub fn answer() -> i32 { return 42; }",
+            &CompileOptions::default(),
+        )
+        .unwrap();
+        let expected_functions = program.hir_functions();
+        assert!(!program.syntax().items.is_empty());
+        assert!(program.semantic_result().is_some());
+
+        program.discard_analysis();
+
+        assert!(program.syntax().items.is_empty());
+        assert!(program.semantic_result().is_none());
+        assert_eq!(program.hir_functions(), expected_functions);
+
+        let mut host = TestHost;
+        let mut vm = Vm::new();
+        vm.load_compiled_plugin("optimized", program, &mut host)
+            .unwrap();
+        assert_eq!(
+            vm.call_export("optimized", "answer", Vec::new(), &mut host)
+                .unwrap(),
+            Value::Int(42)
+        );
+    }
+
+    #[test]
     fn same_named_interface_rejects_colliding_root_function() {
         let function = FunctionDescriptor::new("add", Vec::new(), TypeDescriptor::I32).unwrap();
         let interface = InterfaceDescriptor::new("math", vec![function.clone()]).unwrap();
@@ -6784,6 +7179,177 @@ mod tests {
         assert!(rendered.contains("help: a similarly named field exists: `ui_style`"));
         assert!(rendered.contains("while calling `header_style` in plugin `fidget`"));
         assert!(rendered.contains("while calling `inspect` in plugin `fidget`"));
+    }
+
+    #[test]
+    fn available_heap_bytes_predicts_whether_an_argument_fits() {
+        let mut host = TestHost;
+        let mut vm = Vm::new();
+        vm.load_plugin("sink", "pub fn take(values: [String]) {}", &mut host)
+            .unwrap();
+        let values = Value::Array(Arc::new(
+            (0..1_000)
+                .map(|index| Value::String(format!("value-{index}")))
+                .collect(),
+        ));
+        let needed = heap_cell_size(&values);
+        let live = vm.heap.live_bytes;
+
+        vm.set_heap_limits(1_000_000, live + needed - 1);
+        assert_eq!(vm.available_heap_bytes(), needed - 1);
+        let error = vm
+            .call_export("sink", "take", vec![values.clone()], &mut host)
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("heap byte limit exceeded"),
+            "{error}"
+        );
+
+        vm.set_heap_limits(1_000_000, live + needed);
+        assert_eq!(vm.available_heap_bytes(), needed);
+        vm.call_export("sink", "take", vec![values], &mut host)
+            .unwrap();
+    }
+
+    fn shared_values(count: usize) -> Value {
+        Value::Array(Arc::new(
+            (0..count)
+                .map(|index| Value::String(format!("value-{index:06}")))
+                .collect(),
+        ))
+    }
+
+    #[test]
+    fn unshared_value_is_charged_exactly_its_heap_value_size() {
+        let value = Value::Struct {
+            type_name: "SymbolsResult".to_string(),
+            fields: Arc::new(BTreeMap::from([
+                ("ok".to_string(), Value::Bool(true)),
+                ("symbols".to_string(), shared_values(3)),
+                (
+                    "kind".to_string(),
+                    Value::Variant {
+                        type_name: "Kind".to_string(),
+                        case: "Function".to_string(),
+                        fields: Arc::new(vec![Value::Tuple(Arc::new(vec![Value::Int(1)]))]),
+                    },
+                ),
+                (
+                    "raw".to_string(),
+                    Value::Json(serde_json::json!({ "a": [1, "b"] })),
+                ),
+            ])),
+        };
+        let mut shared = SharedStorage::default();
+
+        assert_eq!(shared.acquire(&value), heap_value_size(&value));
+        assert_eq!(shared.release(&value), heap_value_size(&value));
+        assert!(shared.entries.is_empty());
+    }
+
+    #[test]
+    fn shared_array_is_charged_once_however_many_cells_hold_it() {
+        let mut host = TestHost;
+        let mut vm = Vm::new();
+        vm.load_plugin(
+            "sharing",
+            r#"
+                pub fn take(values: [String]) {
+                    let kept = values;
+                    let again = kept;
+                    forward(again, kept);
+                }
+                fn forward(first: [String], second: [String]) {
+                    let last = first;
+                }
+                pub fn noop() {}
+            "#,
+            &mut host,
+        )
+        .unwrap();
+        let values = shared_values(10_000);
+        let needed = heap_cell_size(&values);
+        let live = vm.heap.live_bytes;
+        // Room for the array once, not for the six cells that hold it.
+        vm.set_heap_limits(1_000_000, live + needed + 4 * 1024);
+
+        vm.call_export("sharing", "take", vec![values], &mut host)
+            .unwrap();
+        vm.call_export("sharing", "noop", Vec::new(), &mut host)
+            .unwrap();
+        assert_eq!(vm.heap.live_bytes, live);
+        assert!(vm.heap.shared.entries.is_empty());
+    }
+
+    #[test]
+    fn copying_a_shared_array_to_change_it_is_charged() {
+        let mut host = TestHost;
+        let mut vm = Vm::new();
+        vm.load_plugin(
+            "copies",
+            r#"
+                pub fn grow(values: [String]) {
+                    let mut copy = values;
+                    copy.push("extra");
+                }
+                pub fn take(values: [String]) {
+                    let kept = values;
+                }
+            "#,
+            &mut host,
+        )
+        .unwrap();
+        let values = shared_values(10_000);
+        let needed = heap_cell_size(&values);
+        let live = vm.heap.live_bytes;
+        vm.set_heap_limits(1_000_000, live + needed + 4 * 1024);
+
+        let error = vm
+            .call_export("copies", "grow", vec![values.clone()], &mut host)
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("heap byte limit exceeded"),
+            "{error}"
+        );
+
+        // The failed write left the original array counted once, not leaked.
+        vm.call_export("copies", "take", vec![values], &mut host)
+            .unwrap();
+        assert_eq!(vm.heap.live_bytes, live);
+        assert!(vm.heap.shared.entries.is_empty());
+    }
+
+    #[test]
+    fn growing_an_array_past_the_heap_limit_still_fails() {
+        let mut host = TestHost;
+        let mut vm = Vm::new();
+        vm.load_plugin(
+            "runaway",
+            r#"
+                pub fn grow(chunk: String) {
+                    let mut items = [];
+                    for index in 0..1000 {
+                        items.push(chunk);
+                    }
+                }
+            "#,
+            &mut host,
+        )
+        .unwrap();
+        vm.set_heap_limits(1_000_000, vm.heap.live_bytes + 256 * 1024);
+
+        let error = vm
+            .call_export(
+                "runaway",
+                "grow",
+                vec![Value::String("x".repeat(1024))],
+                &mut host,
+            )
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("heap byte limit exceeded"),
+            "{error}"
+        );
     }
 
     #[test]

@@ -22,7 +22,13 @@ struct RecordingHost {
 
 #[async_trait]
 impl CodexToolHost for RecordingHost {
-    async fn read_file(&mut self, _: &str, path: &str) -> anyhow::Result<Value> {
+    async fn read_file(
+        &mut self,
+        _: &str,
+        path: &str,
+        _: usize,
+        _: usize,
+    ) -> anyhow::Result<Value> {
         Ok(json!({"content": format!("unsaved:{path}")}))
     }
 
@@ -55,6 +61,9 @@ import json, os, sys
 assert "features.hooks=false" not in sys.argv
 assert "features.codex_hooks=false" not in sys.argv
 assert "--session-source" not in sys.argv
+for feature in ("apps", "connectors", "plugins", "remote_plugin", "skill_mcp_dependency_install"):
+    assert f"features.{feature}=false" in sys.argv
+assert "orchestrator.mcp.enabled=false" in sys.argv
 
 def send(value):
     print(json.dumps(value), flush=True)
@@ -84,6 +93,8 @@ for line in sys.stdin:
             "get_editor_state", "open_file", "select_text", "apply_edits",
             "run_editor_action", "create_directory", "add_annotations",
             "dismiss_annotations",
+            "lsp_status", "lsp_diagnostics", "lsp_prepare_rename",
+            "lsp_preview_rename", "lsp_apply_edit",
         }
         tool_names = [tool["name"] for tool in message["params"]["dynamicTools"]]
         assert len(tool_names) == len(expected_tools) and set(tool_names) == expected_tools, tool_names

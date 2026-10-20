@@ -19,16 +19,19 @@ fn quiet_feedback_is_retained_without_unread_attention() {
     for notice in [
         notice(Severity::Success, "saved"),
         notice(Severity::Info, "copied").with_attention(AttentionPolicy::Quiet),
+        notice(Severity::Error, "unknown command").with_attention(AttentionPolicy::Quiet),
     ] {
         center.publish(notice, now).unwrap();
     }
     for at in [now, later(now, 10)] {
         let counts = center.counts(at.monotonic);
-        assert_eq!(counts.total, 2);
+        assert_eq!(counts.total, 3);
         assert_eq!(counts.unread, 0);
         assert_eq!(counts.unseen, 0);
         assert_eq!(counts.needs_acknowledgment, 0);
     }
+    assert_eq!(center.counts(now.monotonic).active, 3);
+    assert_eq!(center.counts(later(now, 10).monotonic).active, 0);
 }
 
 #[test]
@@ -116,6 +119,27 @@ fn acknowledgement_hides_an_error_without_deleting_it() {
     center.acknowledge(id).unwrap();
     assert_eq!(center.counts(now.monotonic).active, 0);
     assert!(center.get(id).is_some());
+}
+
+#[test]
+fn foreground_result_temporarily_leads_without_hiding_an_older_error() {
+    let now = NotificationTime::now();
+    let mut center = NotificationCenter::default();
+    let error = center
+        .publish(notice(Severity::Error, "diagnostics failed"), now)
+        .unwrap();
+    let result = center
+        .publish(
+            notice(Severity::Success, ":wa — no modified buffers")
+                .with_display_priority(DisplayPriority::Foreground),
+            now,
+        )
+        .unwrap();
+
+    assert_eq!(center.primary(now.monotonic).unwrap().id, result);
+    assert_eq!(center.counts(now.monotonic).needs_acknowledgment, 1);
+    assert_eq!(center.primary(later(now, 5).monotonic).unwrap().id, error);
+    assert!(center.get(error).is_some());
 }
 
 #[test]

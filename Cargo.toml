@@ -1,9 +1,20 @@
 [package]
 name = "red"
-version = "0.6.0"
+version = "0.9.1"
 edition = "2021"
 default-run = "red"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lints.rust]
+# Apple's ld notes that the debug binary's __eh_frame outgrows the 16MB compact
+# unwind limit; that only slows panic unwinding and cannot be avoided at this
+# binary size, so don't surface the linker message on every build.
+linker_messages = "allow"
+
+[[test]]
+name = "rpc_connection"
+path = "tests/rpc_connection.rs"
+harness = false
 
 [workspace]
 members = [
@@ -81,10 +92,13 @@ ignore = "0.4.25"
 json_comments = "0.2.2"
 lazy_static = "1.5.0"
 libloading = "0.8.9"
+minisign-verify = "0.3.0"
 nix = { version = "0.28.0", features = ["fs", "process", "signal"] }
+notify = "8.2.0"
 once_cell = "1.19.0"
 path-absolutize = "3.1.1"
 pulldown-cmark = "0.13"
+rayon = "1.12.0"
 regex = "1.11.1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 ropey = "1.6.1"
@@ -115,16 +129,23 @@ tree-sitter-rust = "0.24.2"
 tree-sitter-toml-ng = "0.7.0"
 tree-sitter-typescript = "0.23.2"
 tree-sitter-yaml = "0.7.2"
+unicode-ident = "1.0"
 unicode-linebreak = "0.1"
 unicode-segmentation = "1.12.0"
 unicode-width = "0.2"
 uuid = { version = "1.12.0", features = ["v4", "v5"] }
+
+[dev-dependencies]
+base64 = "0.22.1"
+blake2 = "0.10.6"
+ed25519-dalek = "2.1.1"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 base64 = "0.22.1"
 core-foundation = "0.9.4"
 
 [target.'cfg(windows)'.dependencies]
+self-replace = "1.5.0"
 windows-sys = { version = "0.61.2", features = [
     "Wdk_Foundation",
     "Wdk_Storage_FileSystem",
@@ -137,3 +158,4 @@ windows-sys = { version = "0.61.2", features = [
     "Win32_System_Threading",
     "Win32_UI_Shell",
 ] }
+zip = { version = "9.0.4", default-features = false, features = ["deflate-flate2"] }

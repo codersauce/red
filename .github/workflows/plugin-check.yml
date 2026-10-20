@@ -15,6 +15,7 @@ on:
       - 'src/config.rs'
       - 'src/plugin/**'
       - 'src/self_check.rs'
+      - 'tests/test_json_workbench.py'
   pull_request:
     paths:
       - '.github/workflows/plugin-check.yml'
@@ -28,6 +29,7 @@ on:
       - 'src/config.rs'
       - 'src/plugin/**'
       - 'src/self_check.rs'
+      - 'tests/test_json_workbench.py'
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
@@ -43,6 +45,25 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
+  rpc-json-workbench:
+    name: Test JSON-RPC workbench (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.9'
+
+      - name: Exercise plugin transport and subprocess lifecycle
+        run: python -m unittest tests.test_json_workbench
+
   bundled-plugins:
     name: Parse and initialize bundled Husk plugins
     runs-on: ubuntu-latest
@@ -64,6 +85,8 @@ jobs:
             husk \
             plugin::runtime::tests::lsp_symbols_ \
             plugin::runtime::tests::git_ \
+            plugin::runtime::git_refresh_tests:: \
+            plugin::runtime::tests::monotonic_time_ \
             plugin::runtime::tests::embedded_git_core_ \
             plugin::runtime::tests::neotree_ \
             plugin::runtime::tests::embedded_neotree_core_

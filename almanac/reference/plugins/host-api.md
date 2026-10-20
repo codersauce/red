@@ -12,6 +12,9 @@ sources:
   - id: registry
     type: file
     path: src/plugin/registry.rs
+  - id: package
+    type: file
+    path: src/plugin/package.rs
   - id: api-doc
     type: file
     path: docs/PLUGIN_API.md
@@ -20,7 +23,7 @@ sources:
     path: docs/plugin_api_changes.json
 ---
 
-The Plugin Host API reference identifies the files that define Red's Husk plugin contract and the rules for changing it. The canonical schema is `src/plugin/host_api.json`; it declares version `0.14.0` and lists host calls by `name`, `kind`, `signature`, and `introduced` [@schema]. The implementation embeds that schema in `src/plugin/api.rs`, validates literal plugin calls against it, and tests that runtime dispatch remains covered by the schema [@api]. This page does not copy the full schema; open the schema when exact call names or signatures are needed.
+The Plugin Host API reference identifies the files that define Red's Husk and JSON-RPC plugin contracts and the rules for changing them. The canonical schema is `src/plugin/host_api.json`; it declares the pending version `0.19.0` and lists Husk host calls by `name`, `kind`, `signature`, and `introduced` [@schema]. The implementation embeds that schema in `src/plugin/api.rs`, validates literal Husk calls against it, and tests that runtime dispatch remains covered by the schema [@api]. This page does not copy the full schema; open the schema and the JSON-RPC protocol when exact call names or signatures are needed.
 
 ## Source Of Truth
 
@@ -28,11 +31,12 @@ The Plugin Host API reference identifies the files that define Red's Husk plugin
 | --- | --- |
 | `src/plugin/host_api.json` | Canonical machine-readable list of host `execute` and `request` calls, signatures, and introduction versions [@schema]. |
 | `src/plugin/api.rs` | Embedded schema loader, static validator, diagnostic families, and schema coverage tests [@api]. |
-| `src/plugin/registry.rs` | Runtime compatibility gate; `RED_HOST_API_VERSION` is `0.14.0`, and `0.4.0`, `0.6.0`, `0.7.0`, `0.8.0`, `0.9.0`, `0.10.0`, `0.11.0`, and `0.12.0` remain accepted for existing packages [@registry]. |
-| `docs/PLUGIN_API.md` | Human compatibility guide, migration notes, and behavioral descriptions for plugin authors [@api-doc]. |
-| `docs/plugin_api_changes.json` | Versioned change manifest that records introduced symbols and migration note anchors [@changes]. |
+| `src/plugin/registry.rs` | Runtime compatibility gate; `RED_HOST_API_VERSION` is the pending `0.19.0`, and the accepted compatibility set preserves released contracts through `0.18.0` [@registry]. |
+| `src/plugin/package.rs` | Current `red-plugin.toml` schema, package validation, and package-to-registry metadata adaptation [@package]. |
+| `docs/PLUGIN_API.md` | Human compatibility guide, migration notes, and behavioral descriptions for plugin authors; it currently names legacy `red_api_version` package syntax rather than current `red-plugin.toml` fields [@api-doc] [@package]. |
+| `docs/plugin_api_changes.json` | Versioned change manifest that records introduced symbols and migration note anchors through the pending `0.19.0` contract [@changes]. |
 
-Use code as the authority for runtime behavior and the schema as the authority for the public host call inventory. The prose guide is useful for compatibility intent and migration guidance, but it should not be treated as a replacement for the schema and validator [@api] [@api-doc].
+Use code as the authority for runtime behavior and the schema as the authority for the public host call inventory. The prose guide is useful for compatibility intent and migration guidance, but when its stated host version or target range conflicts with `src/plugin/host_api.json` or `src/plugin/registry.rs`, use the schema and registry until the guide is refreshed [@schema] [@registry] [@api-doc].
 
 ## Schema Shape
 
@@ -49,7 +53,7 @@ The validator treats literal `red::execute("...")` and `red::request("...")` cal
 
 ## Current Version And Notable Introductions
 
-The current host API version is `0.14.0` [@schema] [@registry]. The schema marks `AgentReadDefaultModel`, `AgentListModels`, `AgentSetModel`, `SetTextPanelHeaderDetail`, and `UpdatePickerSelection` as `0.14.0` calls [@schema]. The change manifest also records `PickerOptions.item_layout`, `agent:model_changed`, and `agent:model_rerouted` as `0.14.0` introductions, `GetWindows.document_id`, `GetWindows.breadcrumb_components`, `DocumentSymbols.document_id`, `file:saved.document_id`, and `red::document_symbol_chain` as `0.13.0` introductions, language-pack indentation symbols as `0.12.0`, command argument metadata as `0.11.0`, and language-pack formatter settings as `0.10.0` [@changes].
+The current pending host API version is `0.19.0`; it contains the complete unreleased JSON-RPC version 1 contract, including release artifacts, document identities and transactions, editable documents, watches, pickers, configuration, storage, statusline contributions, foreground messages, clipboard writes, and text panels [@registry] [@changes]. The last released `0.18.0` contract adds `UpdateTreePanel` for native tree panels, and the change manifest records the related `TreePanelSpec` and `TreePanelChildren` symbols [@schema] [@changes]. Version `0.17.0` adds `MonotonicTime` for process-local elapsed-time measurements [@schema]. The schema marks `SetPanelStatus` and `CancelGitStatus` as `0.16.0` calls [@schema]. It marks `PrintWarning`, `OpenPanelSearch`, `UpdatePanelSearch`, `KeepPanelSearch`, `ClosePanelSearch`, `InvalidateWorkspacePaths`, `SetTextPanelComposerHistory`, and stable-identity `OpenBufferById` as `0.15.0` calls; the change manifest also records `GetEditorInfo.buffers.id` at that version [@schema] [@changes]. It marks `AgentReadDefaultModel`, `AgentListModels`, `AgentSetModel`, `SetTextPanelHeaderDetail`, and `UpdatePickerSelection` as `0.14.0` calls [@schema]. The change manifest also records `PickerOptions.item_layout`, `agent:model_changed`, and `agent:model_rerouted` as `0.14.0` introductions, `GetWindows.document_id`, `GetWindows.breadcrumb_components`, `DocumentSymbols.document_id`, `file:saved.document_id`, and `red::document_symbol_chain` as `0.13.0` introductions, language-pack indentation symbols as `0.12.0`, command argument metadata as `0.11.0`, and language-pack formatter settings as `0.10.0` [@changes].
 
 The schema marks `AgentResumeSession`, `AgentForgetSession`, and `UpdateOverlayBusy` as `0.9.0` calls, and the `OpenConfirm` signature accepts an optional `options?: Json` argument [@schema]. The change manifest also records the agent conversation-restore events `agent:conversation_restore_pending`, `agent:session_restored`, and `agent:session_restore_failed`, plus `OpenConfirm.options`, as `0.9.0` introductions [@changes].
 
@@ -59,7 +63,7 @@ The schema's call list is the exact lookup source for current signatures. Exampl
 
 ## Compatibility Rules
 
-Plugin packages may declare a semver range in `red_api_version`; Red checks that range before activation and quarantines malformed or incompatible packages without stopping unrelated plugins [@api-doc]. The registry accepts `0.4.0`, `0.6.0`, `0.7.0`, `0.8.0`, `0.9.0`, `0.10.0`, `0.11.0`, `0.12.0`, and the current `0.14.0` host API version, so existing packages can remain on earlier supported minors while new packages should target `^0.14.0` unless they intentionally avoid newer host calls [@registry] [@api-doc]. Because pre-1.0 caret ranges do not cross minor versions, compatibility checks test the declared range against every supported host API version instead of only the current version [@registry]. The documented pre-1.0 policy is:
+Current external packages declare a semver range as `[plugin].red_api` in `red-plugin.toml`; Red validates that range when loading the package and adapts it into the registry's legacy `red_api_version` metadata field before activation [@package] [@registry]. Older adjacent `package.json` metadata can still provide `red_api_version` directly, and malformed or incompatible ranges quarantine only the owner while unrelated plugins continue [@registry]. The registry preserves released compatibility targets through `0.18.0` and accepts the single pending `0.19.0` target, so existing packages can remain on their supported minor while packages using the unreleased JSON-RPC surface should target `[plugin].red_api = "^0.19.0"` [@schema] [@registry]. Because pre-1.0 caret ranges do not cross minor versions, compatibility checks test the declared range against every supported host API version instead of only the current version [@registry]. The documented pre-1.0 policy is:
 
 | Release kind | Compatibility rule |
 | --- | --- |
@@ -67,7 +71,7 @@ Plugin packages may declare a semver range in `red_api_version`; Red checks that
 | Minor | Add calls and fields, and possibly deprecate calls [@api-doc]. |
 | Removal or incompatible change | Requires a host-API minor bump, a change manifest entry, and a migration note [@api-doc]. |
 
-When changing host calls, update the schema, the runtime dispatch, and the change manifest together. The validator tests are designed to catch schema/runtime drift and missing introduction metadata [@api].
+When changing host calls, update the schema, runtime dispatch, protocol documentation, examples, and change manifest together. During an unreleased release train, fold additive work into its single pending host API version instead of creating an implementation-phase version. The validator tests are designed to catch schema/runtime drift and missing introduction metadata [@api].
 
 ## Related Pages
 

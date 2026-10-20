@@ -1,15 +1,50 @@
 //! Parsing of built-in colon-command abbreviations, arguments, and force flags.
 //!
-//! Parsing receives the authoritative command-name list from the caller. Exact names,
-//! conventional initial-based abbreviations, and command chains are resolved before
-//! arguments are returned; unknown input fails as a whole so a partially recognized
-//! chain cannot execute unintended commands.
+//! Parsing receives authoritative command specifications from the caller. Exact names,
+//! conventional initial-based aliases, explicitly bounded Vim-style prefixes, and the
+//! `wq` command chain are resolved before arguments are returned. Ambiguous or unknown
+//! names never decompose into unrelated commands, preventing unintended editor changes.
 
 /// Accepted values for the first `:set` argument.
 pub(crate) const SET_OPTIONS: &[&str] = &["relativenumber", "rnu", "norelativenumber", "nornu"];
 
 /// Accepted `:languages` operations.
 pub(crate) const LANGUAGE_COMMANDS: &[&str] = &["reload"];
+
+/// A built-in command and the shortest prefix permitted to invoke it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CommandSpec {
+    name: &'static str,
+    min_prefix_len: usize,
+}
+
+impl CommandSpec {
+    /// Creates a command with an explicitly declared minimum prefix length.
+    ///
+    /// Command names are ASCII, so prefix lengths are measured in bytes.
+    pub const fn new(name: &'static str, min_prefix_len: usize) -> Self {
+        assert!(min_prefix_len > 0);
+        assert!(min_prefix_len <= name.len());
+        Self {
+            name,
+            min_prefix_len,
+        }
+    }
+
+    /// Creates a command that has no implicit prefix abbreviations.
+    pub const fn exact(name: &'static str) -> Self {
+        Self::new(name, name.len())
+    }
+
+    /// Returns the canonical name used for dispatch and completion.
+    pub const fn name(&self) -> &'static str {
+        self.name
+    }
+
+    pub(crate) fn accepts_prefix(&self, input: &str) -> bool {
+        input.len() >= self.min_prefix_len && self.name.starts_with(input)
+    }
+}
 
 /// Splits an exact plugin command name from its unexpanded argument text.
 pub(crate) fn split_invocation(input: &str) -> (&str, &str) {
@@ -42,22 +77,27 @@ impl ParsedCommand {
         self.flags.contains(&CommandFlag::Force)
     }
 
-    /// Reassembles the single unexpanded path consumed by file commands.
+    /// Reassembles the unexpanded argument text following the command name.
     ///
-    /// Splitting and joining on literal spaces preserves whitespace inside the
-    /// path, including repeated spaces returned by command completion.
+    /// Splitting and joining on literal spaces preserves repeated spaces returned
+    /// by command completion and nested command arguments.
+    pub(crate) fn argument_text(&self) -> Option<String> {
+        let arguments = self.args.join(" ");
+        let arguments = arguments.trim_start();
+        (!arguments.is_empty()).then(|| arguments.to_string())
+    }
+
+    /// Reassembles the single unexpanded path consumed by file commands.
     pub(crate) fn file_argument(&self) -> Option<String> {
-        let path = self.args.join(" ");
-        let path = path.trim_start();
-        (!path.is_empty()).then(|| path.to_string())
+        self.argument_text()
     }
 }
 
-/// Resolves a command line against the supplied canonical command names.
+/// Resolves a command line against the supplied built-in command specifications.
 ///
-/// Returns `None` when any command in a chain is unknown. Arguments are split on spaces
-/// without shell quoting or expansion.
-pub fn parse(commands: &[&str], input: &str) -> Option<ParsedCommand> {
+/// Returns `None` for unknown or ambiguous command names. Only the intentional `wq`
+/// chain is recognized. Arguments are split without shell quoting or expansion.
+pub fn parse(commands: &[CommandSpec], input: &str) -> Option<ParsedCommand> {
     let mut parts = input.splitn(2, ' ');
     let (flags, input) = parse_flags(parts.next()?);
     let args = parts
@@ -85,31 +125,39 @@ fn parse_flags(input: &str) -> (Vec<CommandFlag>, &str) {
     }
 }
 
-fn parse_commands(commands: &[&str], input: &str) -> Vec<String> {
-    for command in commands {
-        if &input == command {
-            return vec![command.to_string()];
-        }
+fn parse_commands(commands: &[CommandSpec], input: &str) -> Vec<String> {
+    if let Some(command) = commands.iter().find(|command| command.name == input) {
+        return vec![command.name.to_string()];
     }
 
     if let Some(command) = commands.iter().find(|command| {
         command
+            .name
             .split('-')
             .filter_map(|part| part.chars().next())
             .eq(input.chars())
     }) {
-        return vec![(*command).to_string()];
+        return vec![command.name.to_string()];
     }
 
-    let mut result = Vec::new();
-    for c in input.chars() {
-        let Some(command) = commands.iter().find(|cmd| cmd.starts_with(c)) else {
-            return Vec::new();
-        };
-        result.push(command.to_string());
+    if input == "wq"
+        && commands.iter().any(|command| command.name == "write")
+        && commands.iter().any(|command| command.name == "quit")
+    {
+        return vec!["write".to_string(), "quit".to_string()];
     }
 
-    result
+    let mut matches = commands
+        .iter()
+        .filter(|command| command.accepts_prefix(input));
+    let Some(command) = matches.next() else {
+        return Vec::new();
+    };
+    if matches.next().is_some() {
+        return Vec::new();
+    }
+
+    vec![command.name.to_string()]
 }
 
 #[cfg(test)]
@@ -118,7 +166,13 @@ mod test {
 
     #[test]
     fn test_parse() {
-        let commands = ["quit", "write", "edit", "buffer-next", "buffer-previous"];
+        let commands = [
+            CommandSpec::new("quit", 1),
+            CommandSpec::new("write", 1),
+            CommandSpec::new("edit", 1),
+            CommandSpec::exact("buffer-next"),
+            CommandSpec::exact("buffer-previous"),
+        ];
         assert_eq!(
             parse(&commands, "quit"),
             Some(ParsedCommand {
@@ -171,10 +225,15 @@ mod test {
 
     #[test]
     fn file_arguments_preserve_spaces_and_literal_bangs() {
-        let commands = ["edit", "write", "split", "vsplit"];
+        let commands = [
+            CommandSpec::new("edit", 1),
+            CommandSpec::new("write", 1),
+            CommandSpec::new("split", 2),
+            CommandSpec::new("vsplit", 2),
+        ];
         let path = "dir/name  with spaces.txt!";
 
-        for command in commands {
+        for command in commands.iter().map(CommandSpec::name) {
             let parsed = parse(&commands, &format!("{command} {path}")).unwrap();
             assert_eq!(parsed.file_argument().as_deref(), Some(path));
             assert!(!parsed.is_forced());
@@ -189,7 +248,13 @@ mod test {
 
     #[test]
     fn test_parse_command() {
-        let commands = ["quit", "write", "edit", "buffer-next", "buffer-previous"];
+        let commands = [
+            CommandSpec::new("quit", 1),
+            CommandSpec::new("write", 1),
+            CommandSpec::new("edit", 1),
+            CommandSpec::exact("buffer-next"),
+            CommandSpec::exact("buffer-previous"),
+        ];
         assert_eq!(parse_commands(&commands, "quit"), vec!["quit"]);
         assert_eq!(parse_commands(&commands, "q"), vec!["quit"]);
         assert_eq!(parse_commands(&commands, "wq"), vec!["write", "quit"]);
@@ -199,10 +264,104 @@ mod test {
 
     #[test]
     fn unknown_commands_do_not_partially_resolve_to_builtins() {
-        let commands = ["quit", "write", "edit", "buffer-next", "buffer-previous"];
+        let commands = [
+            CommandSpec::new("quit", 1),
+            CommandSpec::new("write", 1),
+            CommandSpec::new("edit", 1),
+            CommandSpec::exact("buffer-next"),
+            CommandSpec::exact("buffer-previous"),
+        ];
 
         assert_eq!(parse(&commands, "DefinitelyNotACommand"), None);
         assert_eq!(parse(&commands, "wzq"), None);
+    }
+
+    #[test]
+    fn unknown_names_never_expand_into_unrelated_command_chains() {
+        let commands = [
+            CommandSpec::new("quit", 1),
+            CommandSpec::new("write", 1),
+            CommandSpec::new("edit", 1),
+            CommandSpec::exact("noh"),
+            CommandSpec::exact("languages"),
+            CommandSpec::new("split", 2),
+            CommandSpec::exact("bd"),
+        ];
+
+        for unknown in ["enew", "new", "vnew", "ls", "ew", "lss"] {
+            assert_eq!(parse(&commands, unknown), None, "{unknown}");
+        }
+
+        assert_eq!(parse(&commands, "wq!").unwrap().commands, ["write", "quit"]);
+    }
+
+    #[test]
+    fn vim_prefixes_respect_explicit_minimum_lengths() {
+        let commands = [
+            CommandSpec::new("edit", 1),
+            CommandSpec::new("enew", 3),
+            CommandSpec::new("write", 1),
+            CommandSpec::new("wall", 2),
+            CommandSpec::new("saveas", 3),
+            CommandSpec::new("set", 2),
+            CommandSpec::new("syntax", 2),
+        ];
+
+        for (input, expected) in [
+            ("e", "edit"),
+            ("ed", "edit"),
+            ("edi", "edit"),
+            ("ene", "enew"),
+            ("enew", "enew"),
+            ("w", "write"),
+            ("wa", "wall"),
+            ("wal", "wall"),
+            ("wall", "wall"),
+            ("sav", "saveas"),
+            ("save", "saveas"),
+            ("se", "set"),
+            ("sy", "syntax"),
+        ] {
+            assert_eq!(parse(&commands, input).unwrap().commands, [expected]);
+        }
+
+        for input in ["en", "sa", "eneww"] {
+            assert_eq!(parse(&commands, input), None, "{input}");
+        }
+
+        assert_eq!(
+            parse(&commands, "ene!").unwrap(),
+            ParsedCommand {
+                commands: vec!["enew".to_string()],
+                flags: vec![CommandFlag::Force],
+                ..Default::default()
+            }
+        );
+    }
+
+    #[test]
+    fn ambiguous_prefixes_are_rejected_instead_of_selecting_by_order() {
+        let commands = [
+            CommandSpec::new("release", 3),
+            CommandSpec::new("reload", 3),
+        ];
+
+        assert_eq!(parse(&commands, "rel"), None);
+        assert_eq!(parse(&commands, "rele").unwrap().commands, ["release"]);
+        assert_eq!(parse(&commands, "relo").unwrap().commands, ["reload"]);
+    }
+
+    #[test]
+    fn exact_names_take_precedence_over_longer_command_prefixes() {
+        let commands = [
+            CommandSpec::new("buffer", 1),
+            CommandSpec::exact("b"),
+            CommandSpec::exact("buffers"),
+        ];
+
+        assert_eq!(parse(&commands, "b").unwrap().commands, ["b"]);
+        assert_eq!(parse(&commands, "buf").unwrap().commands, ["buffer"]);
+        assert_eq!(parse(&commands, "buffers").unwrap().commands, ["buffers"]);
     }
 
     #[test]

@@ -26,9 +26,11 @@ pub mod package;
 pub mod panel;
 pub mod process;
 mod registry;
+pub mod rpc;
 mod runtime;
 mod text_link;
 pub mod timer_stats;
+mod tree;
 pub mod window_bar;
 pub mod workspace;
 
@@ -37,7 +39,7 @@ pub use document::{DocumentEdit, DocumentSnapshot};
 pub use gutter::{GutterSign, GutterSignManager};
 pub use location::{LocationColumnEncoding, OpenLocationTarget, PluginLocation};
 pub use metadata::PluginMetadata;
-pub use overlay::{OverlayAlignment, OverlayConfig, OverlayManager};
+pub use overlay::{OverlayAlignment, OverlayConfig, OverlayManager, OverlayOverflow};
 pub use panel::{
     PanelConfig, PanelManager, PanelManagerSnapshot, PanelRow, PanelRowKind, PanelSegment,
     PanelSessionSnapshot, PanelSide, PanelSnapshotKind, TextPanelBlock, TextPanelBlockFormat,
@@ -45,11 +47,15 @@ pub use panel::{
     TextPanelContextOptions, TextPanelHeaderAction, TextPanelHeaderDetail, TextPanelPreview,
     TextPanelSessionSnapshot, TextPanelSnapshotFocus, TextPanelStatus,
 };
+pub(crate) use registry::{
+    quarantine_reason, PluginSessionState, PluginStatusRow, RpcCommandToken, RpcHost,
+};
 pub use registry::{PluginRegistry, PluginStatus, RED_HOST_API_VERSION};
 pub use runtime::{
     CommandMetadata, CommandScope, ComposerHandle, PickerHandle, RegisteredPluginCommand,
     RequestId, Runtime,
 };
+pub use tree::{TreePanelChildren, TreePanelModel, TreePanelSpec};
 
 pub(crate) fn husk_lsp_declarations() -> &'static str {
     runtime::RED_HOST_DECLARATIONS

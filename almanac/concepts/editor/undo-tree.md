@@ -1,7 +1,7 @@
 ---
 title: "Undo Tree"
 summary: "Red keeps a buffer-local branching undo history whose revisions drive dirty state and whose replay returns concrete edits for editor-side maintenance."
-topics: [concepts, editor, undo, persistence]
+topics: [concepts, editor, undo, persistence, history]
 sources:
   - id: undo
     type: file

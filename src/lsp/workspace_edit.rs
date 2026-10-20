@@ -34,7 +34,9 @@ use {
     std::os::fd::{AsRawFd, FromRawFd},
 };
 
-use super::{apply_text_edits, file_path, file_uri, LspError, WorkspaceEditOperation};
+use super::{
+    apply_text_edits, file_path, file_uri, text_edit_char_range, LspError, WorkspaceEditOperation,
+};
 
 const MAX_WORKSPACE_EDIT_OPERATIONS: usize = 1024;
 #[cfg(unix)]
@@ -54,6 +56,14 @@ pub struct OpenWorkspaceDocument {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreparedWorkspaceTextEdit {
+    /// Unicode scalar offsets in the document contents before this batch.
+    pub start: usize,
+    pub end: usize,
+    pub new_text: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PreparedWorkspaceDocument {
     pub index: Option<usize>,
     pub original_uri: Option<String>,
@@ -61,6 +71,8 @@ pub struct PreparedWorkspaceDocument {
     pub original_contents: String,
     pub contents: String,
     pub text_changed: bool,
+    /// Validated batches in protocol order, sorted by range within each batch.
+    pub edit_batches: Vec<Vec<PreparedWorkspaceTextEdit>>,
 }
 
 #[derive(Debug)]
@@ -90,6 +102,7 @@ struct VirtualDocument {
     dirty: bool,
     exists: bool,
     text_changed: bool,
+    edit_batches: Vec<Vec<PreparedWorkspaceTextEdit>>,
     resource_changed: bool,
 }
 
@@ -106,6 +119,7 @@ impl VirtualDocument {
             dirty: false,
             exists: false,
             text_changed: false,
+            edit_batches: Vec::new(),
             resource_changed: true,
         }
     }
@@ -182,6 +196,7 @@ pub fn prepare_workspace_edit(
                     dirty: document.dirty,
                     exists: true,
                     text_changed: false,
+                    edit_batches: Vec::new(),
                     resource_changed: false,
                 },
             )
@@ -233,6 +248,7 @@ pub fn prepare_workspace_edit(
                             dirty: false,
                             exists: true,
                             text_changed: false,
+                            edit_batches: Vec::new(),
                             resource_changed: false,
                         },
                     );
@@ -272,7 +288,32 @@ pub fn prepare_workspace_edit(
                 }
 
                 let updated = apply_text_edits(&document.contents, &edit.edits)?;
-                document.text_changed |= updated != document.contents;
+                if updated != document.contents {
+                    let mut prepared = edit
+                        .edits
+                        .iter()
+                        .enumerate()
+                        .map(|(index, edit)| {
+                            let (start, end) =
+                                text_edit_char_range(&document.contents, &edit.range)?;
+                            Ok((
+                                start,
+                                end,
+                                index,
+                                PreparedWorkspaceTextEdit {
+                                    start,
+                                    end,
+                                    new_text: edit.new_text.clone(),
+                                },
+                            ))
+                        })
+                        .collect::<Result<Vec<_>, LspError>>()?;
+                    prepared.sort_by_key(|(start, end, index, _)| (*start, *end, *index));
+                    document
+                        .edit_batches
+                        .push(prepared.into_iter().map(|(_, _, _, edit)| edit).collect());
+                    document.text_changed = true;
+                }
                 document.contents = updated;
             }
             WorkspaceEditOperation::Create {
@@ -322,6 +363,7 @@ pub fn prepare_workspace_edit(
                         dirty: false,
                         exists: true,
                         text_changed: false,
+                        edit_batches: Vec::new(),
                         resource_changed: true,
                     },
                 );
@@ -408,6 +450,7 @@ pub fn prepare_workspace_edit(
                         dirty: false,
                         exists: true,
                         text_changed: false,
+                        edit_batches: Vec::new(),
                         resource_changed: true,
                     }
                 };
@@ -486,6 +529,7 @@ pub fn prepare_workspace_edit(
             original_contents: document.original_contents,
             contents: document.contents,
             text_changed: document.text_changed,
+            edit_batches: document.edit_batches,
         })
         .collect::<Vec<_>>();
     prepared_documents.sort_by(|left, right| left.uri.cmp(&right.uri));
@@ -1302,6 +1346,41 @@ pub fn normalized_file_path(uri: &str) -> Result<String, LspError> {
     Ok(normalized_path(uri)?.to_string_lossy().into_owned())
 }
 
+/// Version-control metadata directories that automated tools never read or write.
+const VCS_METADATA_DIRS: [&str; 4] = [".git", ".hg", ".jj", ".svn"];
+
+fn lowercase_normal_components(relative: &Path) -> Vec<String> {
+    relative
+        .components()
+        .filter_map(|component| match component {
+            Component::Normal(value) => Some(value.to_string_lossy().to_ascii_lowercase()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Returns whether a workspace-relative path lies inside version-control metadata.
+pub(crate) fn is_vcs_metadata_path(relative: &Path) -> bool {
+    lowercase_normal_components(relative)
+        .iter()
+        .any(|component| VCS_METADATA_DIRS.contains(&component.as_str()))
+}
+
+/// Returns whether a workspace-relative path is a control or secret path that
+/// automated edits must never write, such as Git hooks or task runners.
+pub(crate) fn is_protected_workspace_path(relative: &Path) -> bool {
+    let components = lowercase_normal_components(relative);
+    components.iter().any(|component| {
+        VCS_METADATA_DIRS.contains(&component.as_str())
+            || component == ".ssh"
+            || component == ".red"
+            || component == "red.toml"
+            || component.starts_with(".env")
+    }) || components.windows(2).any(|parts| {
+        parts[0] == ".vscode" && (parts[1] == "tasks.json" || parts[1] == "launch.json")
+    })
+}
+
 fn ensure_safe_path(root: &Path, path: &Path) -> Result<(), LspError> {
     if !path.starts_with(root) {
         return Err(protocol_error(format!(
@@ -1322,23 +1401,7 @@ fn ensure_safe_path(root: &Path, path: &Path) -> Result<(), LspError> {
             path.display()
         )));
     }
-    let components = relative
-        .components()
-        .filter_map(|component| match component {
-            Component::Normal(value) => Some(value.to_string_lossy().to_ascii_lowercase()),
-            _ => None,
-        })
-        .collect::<Vec<_>>();
-    let protected = components.iter().any(|component| {
-        component == ".git"
-            || component == ".ssh"
-            || component == ".red"
-            || component == "red.toml"
-            || component.starts_with(".env")
-    }) || components.windows(2).any(|parts| {
-        parts[0] == ".vscode" && (parts[1] == "tasks.json" || parts[1] == "launch.json")
-    });
-    if protected {
+    if is_protected_workspace_path(relative) {
         return Err(protocol_error(format!(
             "LSP workspace edit targets a protected control or secret path: {}",
             path.display()
@@ -1646,6 +1709,22 @@ mod tests {
             assert_eq!(prepared.documents[0].index, open.then_some(0));
             assert_eq!(prepared.documents[0].uri, uri(&path));
             assert_eq!(prepared.documents[0].contents, "before base after");
+            assert_eq!(
+                prepared.documents[0].edit_batches,
+                vec![
+                    vec![PreparedWorkspaceTextEdit {
+                        start: 0,
+                        end: 0,
+                        new_text: "before ".to_string(),
+                    }],
+                    vec![PreparedWorkspaceTextEdit {
+                        start: 11,
+                        end: 11,
+                        new_text: " after".to_string(),
+                    }],
+                ],
+                "open: {open}"
+            );
             assert_eq!(fs::read_to_string(&path).unwrap(), "base");
         }
     }
@@ -2509,6 +2588,7 @@ mod tests {
                 dirty: true,
                 exists: true,
                 text_changed: true,
+                edit_batches: Vec::new(),
                 resource_changed: false,
             },
         )]);

@@ -53,12 +53,41 @@ jobs:
           if [[ "$MENTION_EVERYONE" == "true" ]]; then
             mention_args+=(--mention-everyone)
           fi
+          campaign_args=()
+          if python3 scripts/release_campaign.py validate --version "${TAG_NAME#v}"; then
+            campaign_args+=(--campaign release/campaign.toml)
+          else
+            echo "No matching reviewed campaign; using changelog-only announcement."
+          fi
           python3 scripts/discord_release.py \
             --release-json "$RUNNER_TEMP/release.json" \
             --output "$RUNNER_TEMP/discord-release.json" \
             --summary "$RUNNER_TEMP/discord-release.md" \
-            "${mention_args[@]}"
+            "${mention_args[@]}" \
+            "${campaign_args[@]}"
           cat "$RUNNER_TEMP/discord-release.md" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Preview X and Bluesky announcements
+        run: |
+          set -euo pipefail
+          if ! python3 scripts/release_campaign.py validate --version "${TAG_NAME#v}"; then
+            echo "No matching reviewed social previews are available." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          for channel in x bluesky; do
+            python3 scripts/release_campaign.py render \
+              --channel "$channel" \
+              --version "${TAG_NAME#v}" \
+              --output "$RUNNER_TEMP/red-release-${channel}.md"
+            python3 scripts/social_release.py \
+              --platform "$channel" \
+              --text-file "$RUNNER_TEMP/red-release-${channel}.md" \
+              --json > "$RUNNER_TEMP/red-release-${channel}.json"
+            {
+              printf '\n## %s preview (not posted)\n\n' "$channel"
+              cat "$RUNNER_TEMP/red-release-${channel}.md"
+            } >> "$GITHUB_STEP_SUMMARY"
+          done
 
       - name: Check webhook configuration
         if: env.DRY_RUN != 'true'
