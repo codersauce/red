@@ -234,7 +234,15 @@ for line in sys.stdin:
         assert params["approvalPolicy"] == "never"
         assert params["threadSource"] == "red"
         assert params["serviceName"] == "red"
-        assert len(params["dynamicTools"]) == 12
+        expected_tools = {
+            "list_files", "search_files", "read_file", "write_file",
+            "get_editor_state", "open_file", "select_text", "apply_edits",
+            "run_editor_action", "create_directory", "add_annotations",
+            "dismiss_annotations", "lsp_status", "lsp_diagnostics",
+            "lsp_prepare_rename", "lsp_preview_rename", "lsp_apply_edit",
+        }
+        tool_names = [tool["name"] for tool in params["dynamicTools"]]
+        assert len(tool_names) == len(expected_tools) and set(tool_names) == expected_tools, tool_names
         send({"id": ident, "result": {"thread": {"id":"red-fork", "turns":[]}}})
     elif method == "thread/inject_items":
         assert params["threadId"] == "red-fork"

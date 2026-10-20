@@ -5172,9 +5172,13 @@ impl PanelManager {
         panel_height: usize,
         terminal_width: usize,
     ) -> bool {
+        let width = self.text_panel_width(id, terminal_width);
         let Some(panel) = self.text_panels.get_mut(id) else {
             return false;
         };
+        let height = self
+            .presentation
+            .height(&panel.id, &panel.config, panel_height);
         let Some(context) = panel.temporary_context.as_mut() else {
             return false;
         };
@@ -5183,12 +5187,6 @@ impl PanelManager {
         }
         context.preview = preview;
         panel.invalidate_layout();
-        let width = self
-            .presentation
-            .width(&panel.id, &panel.config, terminal_width);
-        let height = self
-            .presentation
-            .height(&panel.id, &panel.config, panel_height);
         panel.sync_picker_selection(height, width);
         true
     }
@@ -8958,6 +8956,7 @@ mod tests {
     #[test]
     fn temporary_picker_preview_reflows_without_affecting_session_hit_testing() {
         for (panel_width, side_by_side) in [(48, false), (100, true)] {
+            let terminal_width = if side_by_side { 240 } else { 120 };
             let mut manager = PanelManager::default();
             manager.create_text_panel(
                 "agent".to_string(),
@@ -8981,7 +8980,7 @@ mod tests {
                     text: "Selected conversation\n1h ago · Red".to_string(),
                 }],
                 24,
-                120,
+                terminal_width,
             );
             assert!(manager.set_text_panel_preview(
                 "agent",
@@ -8992,10 +8991,10 @@ mod tests {
                     ..TextPanelPreview::default()
                 }),
                 24,
-                120,
+                terminal_width,
             ));
             let theme = Theme::default();
-            let mut frame = RenderBuffer::new(120, 24, &theme.style);
+            let mut frame = RenderBuffer::new(terminal_width, 24, &theme.style);
             manager.render(&mut frame, &theme);
             let session = text_position(&frame, "Selected conversation").unwrap();
             let preview = text_position(&frame, "LAST EXCHANGE").unwrap();
@@ -9008,11 +9007,11 @@ mod tests {
                 assert!(preview.y > session.y);
             }
             assert!(matches!(
-                manager.text_action_at_position(session.x, session.y, 120, 24),
+                manager.text_action_at_position(session.x, session.y, terminal_width, 24),
                 Some(TextPanelLinkTarget::PanelAction { block_id, .. }) if block_id == "session:one"
             ));
             assert!(manager
-                .text_action_at_position(prompt.x, prompt.y, 120, 24)
+                .text_action_at_position(prompt.x, prompt.y, terminal_width, 24)
                 .is_none());
             let shortcut = manager.header_shortcut_event("Alt-p").unwrap();
             assert_eq!(shortcut.action, "session_preview");
