@@ -1217,6 +1217,23 @@ impl RedHost {
                     .to_string();
                 self.send_request(PluginRequest::AgentResumeSession { cwd, session_id });
             }
+            "AgentSwitchSession" => {
+                let cwd = args
+                    .first()
+                    .and_then(Value::as_str)
+                    .map_or_else(|| PathBuf::from("."), PathBuf::from);
+                let session_id = args
+                    .get(1)
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("AgentSwitchSession requires a session id"))?
+                    .to_string();
+                let resume = args.get(2).and_then(red_value_to_bool).unwrap_or(false);
+                self.send_request(PluginRequest::AgentSwitchSession {
+                    cwd,
+                    session_id,
+                    resume,
+                });
+            }
             "AgentPrompt" => {
                 let session_id = args
                     .first()
@@ -1949,6 +1966,51 @@ impl RedHost {
                     status,
                 });
             }
+            "EnterTextPanelContext" => {
+                let id = args
+                    .first()
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("EnterTextPanelContext requires a panel id"))?
+                    .to_string();
+                let placeholder = args
+                    .get(1)
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("EnterTextPanelContext requires a placeholder"))?
+                    .to_string();
+                let options = args
+                    .get(2)
+                    .map(value_to_json)
+                    .map(serde_json::from_value::<crate::plugin::TextPanelContextOptions>)
+                    .transpose()?
+                    .unwrap_or_default();
+                self.send_request(PluginRequest::EnterTextPanelContext {
+                    id,
+                    placeholder,
+                    options,
+                });
+            }
+            "ExitTextPanelContext" => {
+                let id = args
+                    .first()
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("ExitTextPanelContext requires a panel id"))?
+                    .to_string();
+                self.send_request(PluginRequest::ExitTextPanelContext { id });
+            }
+            "SetTextPanelPreview" => {
+                let id = args
+                    .first()
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("SetTextPanelPreview requires a panel id"))?
+                    .to_string();
+                let preview = match args.get(1).map(value_to_json) {
+                    None | Some(serde_json::Value::Null) => None,
+                    Some(value) => Some(serde_json::from_value::<crate::plugin::TextPanelPreview>(
+                        value,
+                    )?),
+                };
+                self.send_request(PluginRequest::SetTextPanelPreview { id, preview });
+            }
             "SetTextPanelComposerHistory" => {
                 let id = args
                     .first()
@@ -2174,6 +2236,51 @@ impl RedHost {
                 request_id,
                 request: crate::codex::ModelRequest::List,
             },
+            "AgentListSessions" => {
+                let cwd = args
+                    .first()
+                    .and_then(Value::as_str)
+                    .map_or_else(|| PathBuf::from("."), PathBuf::from);
+                let scope = match args.get(1).and_then(Value::as_str).unwrap_or("red") {
+                    "red" => crate::codex::AgentSessionScope::Red,
+                    "workspace" => crate::codex::AgentSessionScope::Workspace,
+                    "all" => crate::codex::AgentSessionScope::All,
+                    value => anyhow::bail!("unknown Agent session scope `{value}`"),
+                };
+                let query = args.get(2).map(value_to_string).unwrap_or_default();
+                let exclude_session_id = args
+                    .get(3)
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string);
+                PluginRequest::AgentSessionRequest {
+                    request_id,
+                    request: crate::codex::AgentSessionListRequest {
+                        cwd,
+                        scope,
+                        query,
+                        exclude_session_id,
+                    },
+                }
+            }
+            "AgentReadSessionPreview" => {
+                let cwd = args
+                    .first()
+                    .and_then(Value::as_str)
+                    .map_or_else(|| PathBuf::from("."), PathBuf::from);
+                let session_id = args
+                    .get(1)
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.is_empty())
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("AgentReadSessionPreview requires a session id")
+                    })?
+                    .to_string();
+                PluginRequest::AgentSessionPreview {
+                    request_id,
+                    request: crate::codex::AgentSessionPreviewRequest { cwd, session_id },
+                }
+            }
             "AgentSetModel" => {
                 let session_id = args
                     .first()
@@ -8451,7 +8558,16 @@ mod tests {
                     && config.side == crate::plugin::PanelSide::Right
                     && config.width == 62
                     && config.title.as_deref() == Some("Agent")
-                    && config.header_actions.iter().map(|action| action.id.as_str()).eq(["activity", "clear", "new", "close"])
+                    && config
+                        .header_actions
+                        .iter()
+                        .map(|action| (action.id.as_str(), action.key.as_str()))
+                        .eq([
+                            ("sessions", "Alt-s"),
+                            ("new", "Alt-n"),
+                            ("clear", "Alt-c"),
+                            ("close", "Alt-w"),
+                        ])
         )));
         assert_eq!(
             requests
@@ -9497,6 +9613,566 @@ mod tests {
             ACTION_DISPATCHER.recv_request(),
             PluginRequest::FocusTextPanelComposer { id } if id == "agent-conversation"
         ));
+        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
+    }
+
+    #[tokio::test]
+    async fn bundled_agent_session_browser_cycles_scope_and_continues_in_the_same_pane() {
+        drain_requests();
+        let mut runtime = Runtime::new();
+        runtime
+            .load_plugin("agent", include_str!("../../plugins/agent.hk"))
+            .await
+            .unwrap();
+
+        let _catalog = open_unprimed_agent(&mut runtime).await;
+        runtime.execute_command("AgentSessions").await.unwrap();
+        let cwd_request = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::GetConfig { request_id, key } if key.as_deref() == Some("cwd") => {
+                request_id
+            }
+            _ => panic!("expected workspace request before entering the panel browser"),
+        };
+        runtime
+            .resolve_request(cwd_request, serde_json::json!({"value": "/workspace"}))
+            .await
+            .unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::EnterTextPanelContext { id, placeholder, options }
+                if id == "agent-conversation"
+                    && placeholder == "Search previous sessions…"
+                    && options.key == "/workspace"
+                    && options.query.is_empty()
+        ));
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::SetTextPanelHeaderDetail { id, detail: Some(detail) }
+                if id == "agent-conversation"
+                    && detail.text == "Previous sessions"
+                    && detail.secondary == "Red"
+                    && detail.shortcut.as_deref() == Some("Alt-s")
+        ));
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::UpdateTextPanel { id, blocks }
+                if id == "agent-conversation"
+                    && blocks.iter().any(|block| block.id == "session-browser:loading")
+        ));
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::SetTextPanelStatus { id, status: Some(status) }
+                if id == "agent-conversation" && status.busy
+        ));
+        let initial_request = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::AgentSessionRequest {
+                request_id,
+                request,
+            } => {
+                assert_eq!(request.cwd, PathBuf::from("/workspace"));
+                assert_eq!(request.scope, crate::codex::AgentSessionScope::Red);
+                assert!(request.query.is_empty());
+                request_id
+            }
+            _ => panic!("expected Red session request"),
+        };
+        runtime
+            .resolve_request(
+                initial_request,
+                serde_json::json!({"sessions": [], "error": ""}),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::SetTextPanelStatus { id, status: None } if id == "agent-conversation"
+        ));
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::UpdateTextPanel { id, blocks }
+                if id == "agent-conversation"
+                    && blocks.iter().any(|block| block.id == "session-browser:empty")
+        ));
+
+        runtime
+            .notify(
+                "panel:event:agent-conversation",
+                serde_json::json!({"action":"filter_input","text":"needle"}),
+            )
+            .await
+            .unwrap();
+        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
+        tokio::time::sleep(Duration::from_millis(175)).await;
+        for callback in runtime.poll_timer_callbacks() {
+            if let PluginRequest::TimeoutCallback { timer_id } = callback {
+                runtime
+                    .notify("timeout:callback", serde_json::json!({"timer_id":timer_id}))
+                    .await
+                    .unwrap();
+            }
+        }
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::SetTextPanelStatus { status: Some(status), .. } if status.busy
+        ));
+        let search_request = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::AgentSessionRequest {
+                request_id,
+                request,
+            } => {
+                assert_eq!(request.scope, crate::codex::AgentSessionScope::Red);
+                assert_eq!(request.query, "needle");
+                request_id
+            }
+            _ => panic!("expected debounced in-pane session search"),
+        };
+        runtime
+            .resolve_request(
+                search_request,
+                serde_json::json!({"sessions": [], "error": ""}),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::SetTextPanelStatus { status: None, .. }
+        ));
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::UpdateTextPanel { .. }
+        ));
+
+        runtime
+            .notify(
+                "panel:event:agent-conversation",
+                serde_json::json!({"action":"session_scope","text":""}),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::SetTextPanelHeaderDetail { detail: Some(detail), .. }
+                if detail.secondary == "This workspace"
+        ));
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::UpdateTextPanel { blocks, .. }
+                if blocks.iter().any(|block| block.id == "session-browser:loading")
+        ));
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::SetTextPanelStatus { status: Some(status), .. } if status.busy
+        ));
+        let workspace_request = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::AgentSessionRequest {
+                request_id,
+                request,
+            } => {
+                assert_eq!(request.scope, crate::codex::AgentSessionScope::Workspace);
+                assert_eq!(request.query, "needle");
+                request_id
+            }
+            _ => panic!("expected workspace session request"),
+        };
+        let listed_sessions = serde_json::json!({
+            "sessions": [
+                {
+                    "id": "foreign-thread",
+                    "cwd": "/workspace",
+                    "label": "Earlier conversation",
+                    "detail": "2h ago · Codex CLI · workspace",
+                    "snippet": "",
+                    "source": "Codex CLI",
+                    "time_group": "Recent",
+                    "is_red": false,
+                    "updated_at": 42
+                },
+                {
+                    "id": "another-thread",
+                    "cwd": "/workspace",
+                    "label": "Another conversation",
+                    "detail": "3h ago · Red · workspace",
+                    "snippet": "",
+                    "source": "Red",
+                    "time_group": "Recent",
+                    "is_red": true,
+                    "updated_at": 41
+                }
+            ],
+            "error": ""
+        });
+        runtime
+            .resolve_request(workspace_request, listed_sessions.clone())
+            .await
+            .unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::SetTextPanelStatus { status: None, .. }
+        ));
+        let session_block_id = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::UpdateTextPanel { id, blocks } if id == "agent-conversation" => {
+                assert!(blocks.iter().any(|block| {
+                    block.id == "session-browser:group:Recent" && block.text == "Recent"
+                }));
+                let session = blocks
+                    .iter()
+                    .find(|block| block.id.starts_with("session-browser:session:"))
+                    .expect("foreign session is rendered inside the Agent pane");
+                assert!(session.text.contains("Earlier conversation"));
+                assert!(session.text.contains("Continue in Red"));
+                session.id.clone()
+            }
+            _ => panic!("expected in-pane session blocks"),
+        };
+
+        runtime
+            .notify(
+                "panel:event:agent-conversation",
+                serde_json::json!({"action":"session_preview","text":session_block_id}),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::SetTextPanelPreview { id, preview: Some(preview) }
+                if id == "agent-conversation"
+                    && preview.session_id == "foreign-thread"
+                    && preview.loading
+        ));
+        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
+        tokio::time::sleep(Duration::from_millis(140)).await;
+        for callback in runtime.poll_timer_callbacks() {
+            if let PluginRequest::TimeoutCallback { timer_id } = callback {
+                runtime
+                    .notify("timeout:callback", serde_json::json!({"timer_id":timer_id}))
+                    .await
+                    .unwrap();
+            }
+        }
+        let first_preview_request = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::AgentSessionPreview {
+                request_id,
+                request,
+            } => {
+                assert_eq!(request.cwd, PathBuf::from("/workspace"));
+                assert_eq!(request.session_id, "foreign-thread");
+                request_id
+            }
+            _ => panic!("preview should load only after its debounce"),
+        };
+        runtime
+            .resolve_request(
+                first_preview_request,
+                serde_json::json!({
+                    "session_id":"foreign-thread",
+                    "prompt":"Why is startup failing?",
+                    "response":"The hook was unavailable.",
+                    "error":""
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::SetTextPanelPreview { preview: Some(preview), .. }
+                if preview.prompt == "Why is startup failing?"
+                    && preview.response == "The hook was unavailable."
+                    && !preview.loading
+        ));
+
+        runtime
+            .notify(
+                "panel:event:agent-conversation",
+                serde_json::json!({"action":"session_preview","text":session_block_id}),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::SetTextPanelPreview { preview: None, .. }
+        ));
+        runtime
+            .notify(
+                "panel:event:agent-conversation",
+                serde_json::json!({"action":"session_preview","text":session_block_id}),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::SetTextPanelPreview { preview: Some(preview), .. }
+                if preview.session_id == "foreign-thread"
+                    && preview.response == "The hook was unavailable."
+        ));
+        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
+
+        runtime
+            .notify(
+                "panel:event:agent-conversation",
+                serde_json::json!({
+                    "action":"down",
+                    "text":"session-browser:session:another-thread"
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::SetTextPanelPreview { preview: Some(preview), .. }
+                if preview.session_id == "another-thread" && preview.loading
+        ));
+        tokio::time::sleep(Duration::from_millis(140)).await;
+        for callback in runtime.poll_timer_callbacks() {
+            if let PluginRequest::TimeoutCallback { timer_id } = callback {
+                runtime
+                    .notify("timeout:callback", serde_json::json!({"timer_id":timer_id}))
+                    .await
+                    .unwrap();
+            }
+        }
+        let stale_preview_request = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::AgentSessionPreview {
+                request_id,
+                request,
+            } if request.session_id == "another-thread" => request_id,
+            _ => panic!("selection movement should load the newly focused session"),
+        };
+        runtime
+            .notify(
+                "panel:event:agent-conversation",
+                serde_json::json!({"action":"up","text":session_block_id}),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::SetTextPanelPreview { preview: Some(preview), .. }
+                if preview.session_id == "foreign-thread"
+                    && preview.response == "The hook was unavailable."
+        ));
+        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
+        runtime
+            .resolve_request(
+                stale_preview_request,
+                serde_json::json!({
+                    "session_id":"another-thread",
+                    "prompt":"Stale question",
+                    "response":"Stale answer",
+                    "error":""
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
+
+        runtime
+            .notify(
+                "panel:event:agent-conversation",
+                serde_json::json!({"action":"filter_cancel","text":""}),
+            )
+            .await
+            .unwrap();
+        let mut exited_picker = false;
+        while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
+            if let PluginRequest::ExitTextPanelContext { id } = request {
+                assert_eq!(id, "agent-conversation");
+                exited_picker = true;
+            }
+        }
+        assert!(exited_picker);
+
+        runtime.execute_command("AgentSessions").await.unwrap();
+        let other_cwd_request = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::GetConfig { request_id, key } if key.as_deref() == Some("cwd") => {
+                request_id
+            }
+            _ => panic!("expected workspace request for the other project"),
+        };
+        runtime
+            .resolve_request(other_cwd_request, serde_json::json!({"value":"/other"}))
+            .await
+            .unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::EnterTextPanelContext { options, .. }
+                if options.key == "/other" && options.query.is_empty()
+        ));
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::SetTextPanelHeaderDetail { detail: Some(detail), .. }
+                if detail.secondary == "Red"
+        ));
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::UpdateTextPanel { .. }
+        ));
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::SetTextPanelStatus { status: Some(status), .. } if status.busy
+        ));
+        let other_request = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::AgentSessionRequest {
+                request_id,
+                request,
+            } => {
+                assert_eq!(request.cwd, PathBuf::from("/other"));
+                assert_eq!(request.scope, crate::codex::AgentSessionScope::Red);
+                assert!(request.query.is_empty());
+                request_id
+            }
+            _ => panic!("another workspace must not inherit the previous picker state"),
+        };
+        runtime
+            .resolve_request(other_request, serde_json::json!({"sessions":[],"error":""}))
+            .await
+            .unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::SetTextPanelStatus { status: None, .. }
+        ));
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::UpdateTextPanel { .. }
+        ));
+        runtime
+            .notify(
+                "panel:event:agent-conversation",
+                serde_json::json!({"action":"filter_cancel","text":""}),
+            )
+            .await
+            .unwrap();
+        while ACTION_DISPATCHER.try_recv_request().is_some() {}
+
+        runtime.execute_command("AgentSessions").await.unwrap();
+        let reopened_cwd_request = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::GetConfig { request_id, key } if key.as_deref() == Some("cwd") => {
+                request_id
+            }
+            _ => panic!("expected workspace request while reopening the session picker"),
+        };
+        runtime
+            .resolve_request(
+                reopened_cwd_request,
+                serde_json::json!({"value": "/workspace"}),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::EnterTextPanelContext { id, options, .. }
+                if id == "agent-conversation"
+                    && options.key == "/workspace"
+                    && options.query == "needle"
+        ));
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::SetTextPanelHeaderDetail { detail: Some(detail), .. }
+                if detail.secondary == "This workspace"
+        ));
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::UpdateTextPanel { blocks, .. }
+                if blocks.iter().any(|block| block.id == "session-browser:loading")
+        ));
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::SetTextPanelPreview { preview: Some(preview), .. }
+                if preview.session_id == "foreign-thread" && preview.loading
+        ));
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::SetTextPanelStatus { status: Some(status), .. } if status.busy
+        ));
+        let reopened_request = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::AgentSessionRequest {
+                request_id,
+                request,
+            } => {
+                assert_eq!(request.scope, crate::codex::AgentSessionScope::Workspace);
+                assert_eq!(request.query, "needle");
+                request_id
+            }
+            _ => panic!("expected restored workspace scope and query"),
+        };
+        runtime
+            .resolve_request(reopened_request, listed_sessions)
+            .await
+            .unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::SetTextPanelStatus { status: None, .. }
+        ));
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::UpdateTextPanel { blocks, .. }
+                if blocks.iter().any(|block| block.id == session_block_id)
+        ));
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::SetTextPanelPreview { preview: Some(preview), .. }
+                if preview.session_id == "foreign-thread"
+                    && preview.response == "The hook was unavailable."
+        ));
+
+        // Enter must not activate an old row while the new query is debouncing.
+        runtime
+            .notify(
+                "panel:event:agent-conversation",
+                serde_json::json!({"action":"filter_input","text":"different query"}),
+            )
+            .await
+            .unwrap();
+        runtime
+            .notify(
+                "panel:event:agent-conversation",
+                serde_json::json!({"action":"activate_block","text":session_block_id}),
+            )
+            .await
+            .unwrap();
+        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
+        runtime
+            .notify(
+                "panel:event:agent-conversation",
+                serde_json::json!({"action":"filter_input","text":"needle"}),
+            )
+            .await
+            .unwrap();
+        runtime
+            .notify(
+                "panel:event:agent-conversation",
+                serde_json::json!({"action":"activate_block","text":session_block_id}),
+            )
+            .await
+            .unwrap();
+        let mut switched = false;
+        let mut exited_context = false;
+        for _ in 0..8 {
+            match ACTION_DISPATCHER.recv_request() {
+                PluginRequest::AgentSwitchSession {
+                    cwd,
+                    session_id,
+                    resume,
+                } => {
+                    assert_eq!(cwd, PathBuf::from("/workspace"));
+                    assert_eq!(session_id, "foreign-thread");
+                    assert!(!resume);
+                    switched = true;
+                    break;
+                }
+                PluginRequest::ExitTextPanelContext { id } => {
+                    assert_eq!(id, "agent-conversation");
+                    exited_context = true;
+                }
+                PluginRequest::SetTextPanelStatus { id, .. }
+                | PluginRequest::SetTextPanelHeaderDetail { id, .. }
+                | PluginRequest::SetTextPanelComposerState { id, .. } => {
+                    assert_eq!(id, "agent-conversation");
+                }
+                _ => panic!("session switch opened another surface"),
+            }
+        }
+        assert!(exited_context);
+        assert!(switched);
         assert!(ACTION_DISPATCHER.try_recv_request().is_none());
     }
 

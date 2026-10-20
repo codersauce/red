@@ -177,7 +177,7 @@ mod tests {
     }
 
     #[test]
-    fn model_shortcut_precedes_composer_input_and_preserves_focus_and_draft() {
+    fn agent_header_shortcuts_precede_composer_input_and_preserve_focus_and_draft() {
         let config = Config::default();
         let lsp = Box::new(crate::lsp::LspManager::new(config.lsp.clone()));
         let mut editor = Editor::with_size(
@@ -198,6 +198,21 @@ mod tests {
                     placeholder: "Ask".into(),
                     rows: 3,
                 }),
+                header_actions: [
+                    ("sessions", "Sessions", "Alt-s"),
+                    ("new", "New", "Alt-n"),
+                    ("clear", "Clear", "Alt-c"),
+                    ("close", "×", "Alt-w"),
+                ]
+                .into_iter()
+                .map(|(id, label, key)| plugin::TextPanelHeaderAction {
+                    id: id.into(),
+                    key: key.into(),
+                    label: label.into(),
+                    compact_label: None,
+                    ..Default::default()
+                })
+                .collect(),
                 ..Default::default()
             },
         );
@@ -217,13 +232,13 @@ mod tests {
         editor
             .panel_manager
             .handle_focused_text_input(&Event::Paste("unfinished draft".into()), 100);
-        let key = Event::Key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::ALT));
+        let model_key = Event::Key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::ALT));
         for composer in [true, false] {
             if !composer {
                 editor.panel_manager.focus_focused_text_scrollback(100);
             }
             let before = editor.panel_manager.snapshot(100);
-            let action = editor.handle_panel_event(&key, None).unwrap();
+            let action = editor.handle_panel_event(&model_key, None).unwrap();
             assert!(
                 matches!(action, KeyAction::Multiple(actions) if actions.iter().any(|action| matches!(action, Action::NotifyPlugins(name, payload) if name == "panel:event:agent-conversation" && payload["action"] == "model")))
             );
@@ -234,6 +249,70 @@ mod tests {
                 .iter()
                 .any(|action| action.key == "Alt-m"));
         }
+        for (key, expected) in [
+            ('s', "sessions"),
+            ('n', "new"),
+            ('c', "clear"),
+            ('w', "close"),
+        ] {
+            let key = Event::Key(KeyEvent::new(KeyCode::Char(key), KeyModifiers::ALT));
+            let action = editor.handle_panel_event(&key, None).unwrap();
+            assert!(
+                matches!(action, KeyAction::Multiple(actions) if actions.iter().any(|action| matches!(action, Action::NotifyPlugins(name, payload) if name == "panel:event:agent-conversation" && payload["action"] == expected))),
+                "header shortcut did not dispatch {expected}"
+            );
+        }
+        editor.panel_manager.set_text_panel_header_detail(
+            "agent-conversation",
+            Some(plugin::TextPanelHeaderDetail {
+                text: "Previous sessions".into(),
+                secondary: "Red".into(),
+                compact_text: "Red".into(),
+                action: Some("session_scope".into()),
+                shortcut: Some("Alt-s".into()),
+            }),
+        );
+        assert_eq!(
+            editor
+                .panel_manager
+                .header_shortcut_event("Alt-s")
+                .unwrap()
+                .action,
+            "session_scope"
+        );
+        assert_eq!(
+            editor
+                .panel_manager
+                .surface_actions()
+                .iter()
+                .filter(|action| action.key == "Alt-s")
+                .count(),
+            1
+        );
+        assert!(editor.panel_manager.enter_text_panel_context(
+            "agent-conversation",
+            "Search previous sessions".to_string(),
+        ));
+        let preview_key = Event::Key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::ALT));
+        let preview = editor.handle_panel_event(&preview_key, None).unwrap();
+        assert!(matches!(
+            preview,
+            KeyAction::Multiple(actions)
+                if actions.iter().any(|action| matches!(
+                    action,
+                    Action::NotifyPlugins(name, payload)
+                        if name == "panel:event:agent-conversation"
+                            && payload["action"] == "session_preview"
+                ))
+        ));
+        assert!(editor
+            .panel_manager
+            .surface_actions()
+            .iter()
+            .any(|action| action.key == "Alt-p"));
+        assert!(editor
+            .panel_manager
+            .exit_text_panel_context("agent-conversation"));
         editor
             .panel_manager
             .create_text_panel("other".into(), plugin::PanelConfig::default());

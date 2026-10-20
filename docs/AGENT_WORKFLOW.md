@@ -309,6 +309,19 @@ away from an unfinished transcript search cancels it and restores its starting
 position. In transcript Normal mode, `]l` jumps to the next link and `[l` to the
 previous one, wrapping at the ends. Enter opens the link under the cursor.
 
+The Agent pane's **Sessions** header action, `Alt-s`, and `:AgentSessions` open
+a picker inside the same pane. Its search field replaces the conversation
+composer, and matching sessions appear newest first. Move between sessions with
+the arrow keys or `Ctrl-j` / `Ctrl-k`, press `Enter` to continue the selected
+conversation, and use `Alt-s` to cycle between **Red**, **This workspace**,
+and **All Codex**. `Esc` or `Ctrl-c` returns to the conversation with its
+transcript position and unsent draft restored. Red identifies its conversations
+by their thread source or persisted originator, even when Codex's CLI labels the
+underlying app-server session as VS Code.
+Sessions with an unknown or older editor-tool contract continue in a fresh Red
+thread with their user and assistant history, so subsequent turns use the current
+editor tools.
+
 In the conversation transcript's Normal mode, `[p` jumps backward to a user
 prompt and `]p` jumps forward. From an answer, the first backward jump returns
 to that turn's prompt; repeating it visits earlier prompts. Jumps reveal the
@@ -324,7 +337,7 @@ tool errors. A quiet `Worked for …` footer appears below the answer. Errors th
 stop the request still appear separately. Click a summary (or move to it with
 `[l` / `]l` and press Enter) to expand that turn's five most recent actions.
 Select **View all details** to inspect full paths and bounded error text.
-**Activity** in the pane header and `:AgentActivity` toggle the latest turn.
+`:AgentActivity` toggles the latest turn.
 **New** starts a fresh Codex session and focuses the pane composer directly,
 without opening another ask popup. Details are
 bounded and retained for the current conversation view; restored conversations
@@ -561,15 +574,18 @@ protocol is unavailable; it does not fall back to `codex exec` or native edits.
 | --- | --- |
 | `Space i` | Review, explain, or edit the enclosing function, current-line fallback, or exact visual selection in a bounded popup. |
 | `:Agent` / `:AgentPrompt` | Open the prompt composer. |
+| `:AgentToggle` / `Alt+a` | Show or hide the Agent pane. |
 | `:AgentOpen` | Show and focus the conversation pane without opening a prompt. |
+| `:AgentSessions` / `Alt+s` | Search and resume previous sessions inside the Agent pane. |
 | `:AgentModel` / `Alt+m` in the Agent pane | Choose this conversation’s model and reasoning effort. |
 | `:AgentCancel` | Interrupt the active Codex turn and keep the thread. |
 | `:AgentSendQueued` | Resume follow-ups held after a stopped or failed turn. |
 | `:AgentDiscardQueued` | Drop follow-ups that have not been sent. |
 | `:AgentRecover` | Retry, continue, or leave a reply that Codex stopped in the middle of. |
-| `:AgentClear` | Clear visible conversation while retaining current context. |
-| `:AgentNew` | Close the current thread and start a new one. |
-| `:AgentClose` | Hide the conversation panel without discarding state. |
+| `:AgentClear` / `Alt+c` | Clear visible conversation while retaining current context. |
+| `:AgentNew` / `Alt+n` | Close the current thread and start a new one. |
+| `:AgentClose` / `Alt+w` | Hide the conversation panel without discarding state. |
+| `:AgentActivity` | Expand or collapse the latest activity summary. |
 | `:AgentHistory` | Inspect attributed agent transactions. |
 
 ### Choosing a model

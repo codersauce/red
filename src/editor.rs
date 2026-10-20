@@ -24,6 +24,7 @@ mod agent_manager;
 mod agent_models;
 pub(crate) mod agent_pane;
 mod agent_pane_host;
+mod agent_sessions;
 mod buffer_actions;
 mod buffer_do;
 mod buffer_manager;
@@ -1412,6 +1413,12 @@ fn agent_event_payload(event: CodexEvent) -> (&'static str, Value) {
         CodexEvent::ModelRequestCompleted { .. } => {
             unreachable!("model results use private callbacks")
         }
+        CodexEvent::SessionListCompleted { .. } => {
+            unreachable!("session-list results use private callbacks")
+        }
+        CodexEvent::SessionPreviewCompleted { .. } => {
+            unreachable!("session-preview results use private callbacks")
+        }
         CodexEvent::SessionModelRerouted { session_id, model } => (
             "agent:model_rerouted",
             json!({"session_id": session_id, "model": model}),
@@ -1840,6 +1847,14 @@ pub enum PluginRequest {
         request_id: RequestId,
         request: crate::codex::ModelRequest,
     },
+    AgentSessionRequest {
+        request_id: RequestId,
+        request: crate::codex::AgentSessionListRequest,
+    },
+    AgentSessionPreview {
+        request_id: RequestId,
+        request: crate::codex::AgentSessionPreviewRequest,
+    },
     SetTextPanelHeaderDetail {
         id: String,
         detail: Option<plugin::TextPanelHeaderDetail>,
@@ -1850,6 +1865,11 @@ pub enum PluginRequest {
     AgentResumeSession {
         cwd: PathBuf,
         session_id: String,
+    },
+    AgentSwitchSession {
+        cwd: PathBuf,
+        session_id: String,
+        resume: bool,
     },
     AgentPrompt {
         session_id: String,
@@ -2214,6 +2234,18 @@ pub enum PluginRequest {
         enabled: bool,
         status: Option<String>,
     },
+    EnterTextPanelContext {
+        id: String,
+        placeholder: String,
+        options: plugin::TextPanelContextOptions,
+    },
+    ExitTextPanelContext {
+        id: String,
+    },
+    SetTextPanelPreview {
+        id: String,
+        preview: Option<plugin::TextPanelPreview>,
+    },
     SetTextPanelComposerHistory {
         id: String,
         history: Vec<String>,
@@ -2346,9 +2378,12 @@ impl PluginRequest {
         match self {
             Self::Action(_) => "Action",
             Self::AgentModelRequest { .. } => "AgentModelRequest",
+            Self::AgentSessionRequest { .. } => "AgentSessionRequest",
+            Self::AgentSessionPreview { .. } => "AgentSessionPreview",
             Self::SetTextPanelHeaderDetail { .. } => "SetTextPanelHeaderDetail",
             Self::AgentNewSession { .. } => "AgentNewSession",
             Self::AgentResumeSession { .. } => "AgentResumeSession",
+            Self::AgentSwitchSession { .. } => "AgentSwitchSession",
             Self::AgentPrompt { .. } => "AgentPrompt",
             Self::AgentPromptWithContext { .. } => "AgentPromptWithContext",
             Self::AgentCancel { .. } => "AgentCancel",
@@ -2440,6 +2475,9 @@ impl PluginRequest {
             Self::AppendTextPanel { .. } => "AppendTextPanel",
             Self::FocusTextPanelComposer { .. } => "FocusTextPanelComposer",
             Self::SetTextPanelComposerState { .. } => "SetTextPanelComposerState",
+            Self::EnterTextPanelContext { .. } => "EnterTextPanelContext",
+            Self::ExitTextPanelContext { .. } => "ExitTextPanelContext",
+            Self::SetTextPanelPreview { .. } => "SetTextPanelPreview",
             Self::SetTextPanelComposerHistory { .. } => "SetTextPanelComposerHistory",
             Self::SetTextPanelStatus { .. } => "SetTextPanelStatus",
             Self::ClearTextPanelComposer { .. } => "ClearTextPanelComposer",
@@ -11266,6 +11304,24 @@ impl Editor {
                 )
                 .await?;
         }
+        for request_id in self.agent_manager.take_pending_session_requests() {
+            self.plugin_registry
+                .resolve_request(
+                    runtime,
+                    RequestId::from_raw(request_id),
+                    json!({"sessions": [], "error": message.clone()}),
+                )
+                .await?;
+        }
+        for request_id in self.agent_manager.take_pending_session_previews() {
+            self.plugin_registry
+                .resolve_request(
+                    runtime,
+                    RequestId::from_raw(request_id),
+                    agent_sessions::session_preview_payload(&Err(message.clone())),
+                )
+                .await?;
+        }
         Ok(message)
     }
 
@@ -11420,6 +11476,28 @@ impl Editor {
                         runtime,
                         RequestId::from_raw(*request_id),
                         agent_models::model_result_payload(result),
+                    )
+                    .await?;
+                continue;
+            }
+            if let CodexEvent::SessionListCompleted { request_id, result } = &event {
+                self.agent_manager.finish_session_request(*request_id);
+                self.plugin_registry
+                    .resolve_request(
+                        runtime,
+                        RequestId::from_raw(*request_id),
+                        agent_sessions::session_result_payload(result),
+                    )
+                    .await?;
+                continue;
+            }
+            if let CodexEvent::SessionPreviewCompleted { request_id, result } = &event {
+                self.agent_manager.finish_session_preview(*request_id);
+                self.plugin_registry
+                    .resolve_request(
+                        runtime,
+                        RequestId::from_raw(*request_id),
+                        agent_sessions::session_preview_payload(result),
                     )
                     .await?;
                 continue;
@@ -11655,6 +11733,7 @@ impl Editor {
                         .reconcile_conversation(session_id, &root, thread)
                         .cloned();
                     if let Some(conversation) = conversation {
+                        self.restore_agent_annotations();
                         self.notify_agent(
                             runtime,
                             "agent:session_restored",
@@ -12031,6 +12110,20 @@ impl Editor {
                     self.handle_agent_model_request(runtime, request_id, request)
                         .await?;
                 }
+                PluginRequest::AgentSessionRequest {
+                    request_id,
+                    request,
+                } => {
+                    self.handle_agent_session_request(runtime, request_id, request)
+                        .await?;
+                }
+                PluginRequest::AgentSessionPreview {
+                    request_id,
+                    request,
+                } => {
+                    self.handle_agent_session_preview(runtime, request_id, request)
+                        .await?;
+                }
                 PluginRequest::SetTextPanelHeaderDetail { id, detail } => {
                     needs_render |= self.panel_manager.set_text_panel_header_detail(&id, detail);
                 }
@@ -12137,6 +12230,76 @@ impl Editor {
                             .finish_agent_bridge(
                                 runtime,
                                 "Codex app-server stopped while restoring the session",
+                            )
+                            .await?;
+                        self.notify_agent(
+                            runtime,
+                            "agent:session_restore_failed",
+                            json!({ "session_id": session_id, "message": message }),
+                        )
+                        .await?;
+                    }
+                }
+                PluginRequest::AgentSwitchSession {
+                    cwd,
+                    session_id,
+                    resume,
+                } => {
+                    let accepted = self
+                        .agent_manager
+                        .update_pane(|lifecycle| lifecycle.switch_pending(&session_id));
+                    if !accepted {
+                        self.notify_agent(
+                            runtime,
+                            "agent:session_restore_failed",
+                            json!({
+                                "session_id": session_id,
+                                "message": "The Agent conversation is busy, has held follow-ups, or is already selected"
+                            }),
+                        )
+                        .await?;
+                        continue;
+                    }
+                    self.agent_manager.mark_conversation_requested();
+                    if self.agent_manager.is_task_finished() {
+                        let _ = self
+                            .finish_agent_bridge(
+                                runtime,
+                                "Codex app-server stopped before switching sessions",
+                            )
+                            .await?;
+                    }
+                    if let Err(error) = self.ensure_agent_bridge(&cwd) {
+                        self.notify_agent(
+                            runtime,
+                            "agent:session_restore_failed",
+                            json!({
+                                "session_id": session_id,
+                                "message": error.to_string()
+                            }),
+                        )
+                        .await?;
+                        continue;
+                    }
+                    let Some(bridge) = self.agent_manager.bridge() else {
+                        continue;
+                    };
+                    let tool_contract_version = if resume {
+                        self.agent_manager
+                            .conversation_tool_contract_version(&session_id)
+                    } else {
+                        None
+                    };
+                    let command = agent_sessions::session_switch_command(
+                        cwd,
+                        session_id.clone(),
+                        tool_contract_version,
+                    );
+                    if bridge.send(command).await.is_err() {
+                        let message = self
+                            .finish_agent_bridge(
+                                runtime,
+                                "Codex app-server stopped while switching sessions",
                             )
                             .await?;
                         self.notify_agent(
@@ -13382,6 +13545,34 @@ impl Editor {
                         .panel_manager
                         .set_text_panel_composer_state(&id, enabled, status)
                     {
+                        needs_render = true;
+                    }
+                }
+                PluginRequest::EnterTextPanelContext {
+                    id,
+                    placeholder,
+                    options,
+                } => {
+                    if self.panel_manager.enter_text_panel_context_with_options(
+                        &id,
+                        placeholder,
+                        options,
+                    ) {
+                        needs_render = true;
+                    }
+                }
+                PluginRequest::ExitTextPanelContext { id } => {
+                    if self.panel_manager.exit_text_panel_context(&id) {
+                        needs_render = true;
+                    }
+                }
+                PluginRequest::SetTextPanelPreview { id, preview } => {
+                    if self.panel_manager.set_text_panel_preview(
+                        &id,
+                        preview,
+                        usize::from(self.size.1.saturating_sub(2)),
+                        usize::from(self.size.0),
+                    ) {
                         needs_render = true;
                     }
                 }

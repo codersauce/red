@@ -36,8 +36,10 @@ use tokio::{
 
 mod activity;
 mod models;
+mod sessions;
 mod tool_error;
 pub use models::{AgentModelInfo, AgentModelSelection, ModelRequest};
+pub use sessions::{AgentSessionListRequest, AgentSessionPreviewRequest, AgentSessionScope};
 
 use crate::agent_tools::{editor_tool_schemas, EditorToolCall, EditorToolRequest};
 use crate::config::AgentCodexFeature;
@@ -139,6 +141,13 @@ pub enum CodexCommand {
         request_id: i64,
         request: ModelRequest,
     },
+    /// Lists persisted interactive Codex conversations without creating a thread.
+    SessionList {
+        request_id: i64,
+        request: AgentSessionListRequest,
+    },
+    /// Reads the latest persisted exchange without resuming or mutating a thread.
+    SessionPreview { request_id: i64, session_id: String },
     /// Starts a conversation with an explicitly selected model.
     NewSessionWithModel {
         cwd: PathBuf,
@@ -187,6 +196,13 @@ pub enum CodexCommand {
         /// Codex thread identifier stored with Red's session snapshot.
         session_id: String,
     },
+    /// Imports a foreign Codex conversation into a Red-owned thread with editor tools.
+    ContinueSession {
+        /// Active Red workspace root applied to the continued conversation.
+        cwd: PathBuf,
+        /// Existing Codex thread whose history should be continued.
+        session_id: String,
+    },
     /// Submits plain user text to a session.
     Prompt {
         /// Red session identifier.
@@ -229,6 +245,16 @@ pub enum CodexCommand {
 pub enum CodexEvent {
     /// Result for a private plugin model request.
     ModelRequestCompleted {
+        request_id: i64,
+        result: std::result::Result<Value, String>,
+    },
+    /// Result for Red's private persisted-session picker request.
+    SessionListCompleted {
+        request_id: i64,
+        result: std::result::Result<Value, String>,
+    },
+    /// Side-effect-free latest-exchange preview for the session picker.
+    SessionPreviewCompleted {
         request_id: i64,
         result: std::result::Result<Value, String>,
     },
@@ -508,7 +534,9 @@ impl ThreadRequest {
         matches!(
             self,
             Self::Agent {
-                launch: SessionLaunch::New | SessionLaunch::Resume { .. },
+                launch: SessionLaunch::New
+                    | SessionLaunch::Resume { .. }
+                    | SessionLaunch::Continue { .. },
                 ..
             }
         )
@@ -521,6 +549,10 @@ enum SessionLaunch {
     Resume {
         session_id: String,
     },
+    Continue {
+        source_session_id: String,
+        source_thread: Value,
+    },
     Inline {
         request_id: String,
         prompt: String,
@@ -530,6 +562,21 @@ enum SessionLaunch {
 
 enum Pending {
     Model(models::PendingModelRequest),
+    Sessions(sessions::PendingSessionRequest),
+    SessionPreview {
+        request_id: i64,
+        session_id: String,
+    },
+    ContinueRead {
+        cwd: PathBuf,
+        source_session_id: String,
+    },
+    ContinueInject {
+        source_session_id: String,
+        session_id: String,
+        source_thread: Value,
+        model_info: Option<AgentModelInfo>,
+    },
     Config {
         request: ThreadRequest,
     },
@@ -897,6 +944,34 @@ async fn handle_command(
             )
             .await?;
         }
+        CodexCommand::SessionList {
+            request_id,
+            request,
+        } => {
+            sessions::handle_command(request_id, request, input, pending, next_id).await?;
+        }
+        CodexCommand::SessionPreview {
+            request_id,
+            session_id,
+        } => {
+            let id = rpc_id(next_id);
+            pending.insert(
+                id.clone(),
+                Pending::SessionPreview {
+                    request_id,
+                    session_id: session_id.clone(),
+                },
+            );
+            write_message(
+                input,
+                &json!({
+                    "id": id,
+                    "method": "thread/read",
+                    "params": {"threadId": session_id, "includeTurns": true}
+                }),
+            )
+            .await?;
+        }
         CodexCommand::NewSessionWithModel { cwd, selection } => {
             start_thread_request(
                 ThreadRequest::Agent {
@@ -1020,6 +1095,25 @@ async fn handle_command(
                 input,
                 pending,
                 next_id,
+            )
+            .await?;
+        }
+        CodexCommand::ContinueSession { cwd, session_id } => {
+            let id = rpc_id(next_id);
+            pending.insert(
+                id.clone(),
+                Pending::ContinueRead {
+                    cwd,
+                    source_session_id: session_id.clone(),
+                },
+            );
+            write_message(
+                input,
+                &json!({
+                    "id": id,
+                    "method": "thread/read",
+                    "params": {"threadId": session_id, "includeTurns": true}
+                }),
             )
             .await?;
         }
@@ -1495,6 +1589,109 @@ async fn handle_response(
         )
         .await;
     }
+    if let Pending::Sessions(request) = request {
+        return sessions::handle_response(request, message, input, events, pending, next_id).await;
+    }
+    if let Pending::SessionPreview {
+        request_id,
+        session_id,
+    } = request
+    {
+        let result = sessions::session_preview(&session_id, &message);
+        events
+            .send(CodexEvent::SessionPreviewCompleted { request_id, result })
+            .await
+            .ok();
+        return Ok(());
+    }
+    if let Pending::ContinueRead {
+        cwd,
+        source_session_id,
+    } = request
+    {
+        if let Some(error) = message.get("error") {
+            events
+                .send(CodexEvent::SessionRestoreFailed {
+                    session_id: source_session_id,
+                    message: error["message"]
+                        .as_str()
+                        .unwrap_or("Codex could not read the selected session")
+                        .to_string(),
+                })
+                .await
+                .ok();
+            return Ok(());
+        }
+        let Some(source_thread) = message
+            .pointer("/result/thread")
+            .filter(|thread| thread.is_object())
+            .cloned()
+        else {
+            events
+                .send(CodexEvent::SessionRestoreFailed {
+                    session_id: source_session_id,
+                    message: "Codex returned an invalid session history".to_string(),
+                })
+                .await
+                .ok();
+            return Ok(());
+        };
+        start_thread_request(
+            ThreadRequest::Agent {
+                cwd,
+                selection: None,
+                launch: SessionLaunch::Continue {
+                    source_session_id,
+                    source_thread,
+                },
+            },
+            input,
+            pending,
+            next_id,
+        )
+        .await?;
+        return Ok(());
+    }
+    if let Pending::ContinueInject {
+        source_session_id,
+        session_id,
+        mut source_thread,
+        model_info,
+    } = request
+    {
+        if let Some(error) = message.get("error") {
+            sessions.remove(&session_id);
+            events
+                .send(CodexEvent::SessionRestoreFailed {
+                    session_id: source_session_id,
+                    message: error["message"]
+                        .as_str()
+                        .unwrap_or("Codex could not import the selected session")
+                        .to_string(),
+                })
+                .await
+                .ok();
+            return Ok(());
+        }
+        source_thread["id"] = json!(session_id);
+        events
+            .send(CodexEvent::SessionRestored {
+                session_id: session_id.clone(),
+                thread: source_thread,
+            })
+            .await
+            .ok();
+        if let Some(model_info) = model_info {
+            events
+                .send(CodexEvent::SessionModelChanged {
+                    session_id,
+                    model_info,
+                })
+                .await
+                .ok();
+        }
+        return Ok(());
+    }
     if let Some(error) = message.get("error") {
         let message = error["message"]
             .as_str()
@@ -1573,7 +1770,8 @@ async fn handle_response(
                         "config": config,
                         "dynamicTools": tool_definitions(),
                         "baseInstructions": INSTRUCTIONS,
-                        "serviceName": "red"
+                        "serviceName": "red",
+                        "threadSource": "red"
                     }
                 }),
                 ThreadRequest::Agent {
@@ -1589,6 +1787,25 @@ async fn handle_response(
                         "sandbox": "read-only",
                         "config": config,
                         "baseInstructions": INSTRUCTIONS
+                    }
+                }),
+                ThreadRequest::Agent {
+                    launch: SessionLaunch::Continue { .. },
+                    ..
+                } => json!({
+                    "id": id,
+                    "method": "thread/start",
+                    "params": {
+                        "cwd": cwd,
+                        "ephemeral": false,
+                        "approvalPolicy": "never",
+                        "sandbox": "read-only",
+                        "environments": [],
+                        "config": config,
+                        "dynamicTools": tool_definitions(),
+                        "baseInstructions": INSTRUCTIONS,
+                        "serviceName": "red",
+                        "threadSource": "red"
                     }
                 }),
                 ThreadRequest::Agent {
@@ -1653,6 +1870,10 @@ async fn handle_response(
                     launch: SessionLaunch::New | SessionLaunch::Inline { .. },
                     ..
                 }
+                | ThreadRequest::Agent {
+                    launch: SessionLaunch::Continue { .. },
+                    ..
+                }
                 | ThreadRequest::CommitMessage { .. } => None,
             };
             if session_id.is_empty()
@@ -1680,7 +1901,9 @@ async fn handle_response(
                             Some(inline_input(prompt, context)),
                             Some(launch),
                         ),
-                        SessionLaunch::New | SessionLaunch::Resume { .. } => {
+                        SessionLaunch::New
+                        | SessionLaunch::Resume { .. }
+                        | SessionLaunch::Continue { .. } => {
                             (SessionKind::Agent, None, Some(launch))
                         }
                     },
@@ -1709,14 +1932,17 @@ async fn handle_response(
                         kind,
                     },
                 );
-                let model_event = sessions
+                let model_info = sessions
                     .get(&session_id)
                     .filter(|session| matches!(session.kind, SessionKind::Agent))
-                    .and_then(|session| session.model_info.clone())
-                    .map(|model_info| CodexEvent::SessionModelChanged {
-                        session_id: session_id.clone(),
-                        model_info,
-                    });
+                    .and_then(|session| session.model_info.clone());
+                let model_event =
+                    model_info
+                        .clone()
+                        .map(|model_info| CodexEvent::SessionModelChanged {
+                            session_id: session_id.clone(),
+                            model_info,
+                        });
                 match launch {
                     Some(SessionLaunch::New) => {
                         events
@@ -1735,6 +1961,43 @@ async fn handle_response(
                             })
                             .await
                             .ok();
+                    }
+                    Some(SessionLaunch::Continue {
+                        source_session_id,
+                        mut source_thread,
+                    }) => {
+                        let items = continuation_items(&source_thread);
+                        if items.is_empty() {
+                            source_thread["id"] = json!(session_id);
+                            events
+                                .send(CodexEvent::SessionRestored {
+                                    session_id,
+                                    thread: source_thread,
+                                })
+                                .await
+                                .ok();
+                        } else {
+                            let id = rpc_id(next_id);
+                            pending.insert(
+                                id.clone(),
+                                Pending::ContinueInject {
+                                    source_session_id,
+                                    session_id: session_id.clone(),
+                                    source_thread,
+                                    model_info,
+                                },
+                            );
+                            write_message(
+                                input,
+                                &json!({
+                                    "id": id,
+                                    "method": "thread/inject_items",
+                                    "params": {"threadId": session_id, "items": items}
+                                }),
+                            )
+                            .await?;
+                            return Ok(());
+                        }
                     }
                     Some(SessionLaunch::Inline { request_id, .. }) => {
                         events
@@ -1774,6 +2037,16 @@ async fn handle_response(
             }
         }
         Pending::Model(_) => unreachable!("model responses are handled separately"),
+        Pending::Sessions(_) => unreachable!("session-list responses are handled separately"),
+        Pending::SessionPreview { .. } => {
+            unreachable!("session-preview responses are handled separately")
+        }
+        Pending::ContinueRead { .. } => {
+            unreachable!("continuation reads are handled separately")
+        }
+        Pending::ContinueInject { .. } => {
+            unreachable!("continuation injection is handled separately")
+        }
         Pending::Turn { session_id } => {
             let turn_id = message
                 .pointer("/result/turn/id")
@@ -1816,6 +2089,15 @@ async fn send_thread_failure(
             message: message.to_string(),
         },
         ThreadRequest::Agent {
+            launch: SessionLaunch::Continue {
+                source_session_id, ..
+            },
+            ..
+        } => CodexEvent::SessionRestoreFailed {
+            session_id: source_session_id.clone(),
+            message: message.to_string(),
+        },
+        ThreadRequest::Agent {
             launch: SessionLaunch::Inline { request_id, .. },
             ..
         } => CodexEvent::InlineFailed {
@@ -1841,7 +2123,13 @@ async fn send_pending_failure(
         Pending::Config { request }
         | Pending::Requirements { request, .. }
         | Pending::Start { request } => Some(request),
-        Pending::Model(_) | Pending::Turn { .. } | Pending::Interrupt { .. } => None,
+        Pending::Model(_)
+        | Pending::Sessions(_)
+        | Pending::SessionPreview { .. }
+        | Pending::ContinueRead { .. }
+        | Pending::ContinueInject { .. }
+        | Pending::Turn { .. }
+        | Pending::Interrupt { .. } => None,
     };
     if let Some(request) = early_request {
         send_thread_failure(request, message, events).await;
@@ -1850,6 +2138,10 @@ async fn send_pending_failure(
     let session_id = match request {
         Pending::Turn { session_id } | Pending::Interrupt { session_id, .. } => session_id,
         Pending::Model(_)
+        | Pending::Sessions(_)
+        | Pending::SessionPreview { .. }
+        | Pending::ContinueRead { .. }
+        | Pending::ContinueInject { .. }
         | Pending::Config { .. }
         | Pending::Requirements { .. }
         | Pending::Start { .. } => {
@@ -2581,6 +2873,46 @@ fn inline_tool_definitions() -> Value {
         .unwrap_or_default();
     tools.extend(crate::inline_context::tool_definitions());
     Value::Array(tools)
+}
+
+fn continuation_items(thread: &Value) -> Vec<Value> {
+    thread["turns"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .flat_map(|turn| turn["items"].as_array().into_iter().flatten())
+        .filter_map(|item| match item["type"].as_str() {
+            Some("userMessage") => {
+                let content = item["content"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter(|content| content["type"].as_str() == Some("text"))
+                    .map(|content| {
+                        json!({
+                            "type": "input_text",
+                            "text": content["text"].as_str().unwrap_or_default()
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                (!content.is_empty())
+                    .then(|| json!({"type": "message", "role": "user", "content": content}))
+            }
+            Some("agentMessage") => {
+                item["text"]
+                    .as_str()
+                    .filter(|text| !text.is_empty())
+                    .map(|text| {
+                        json!({
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [{"type": "output_text", "text": text}]
+                        })
+                    })
+            }
+            _ => None,
+        })
+        .collect()
 }
 
 fn inline_input(prompt: &str, context: &str) -> Value {

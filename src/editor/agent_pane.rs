@@ -157,6 +157,10 @@ pub struct AgentPaneLifecycle {
     interrupted: Option<AgentPanePrompt>,
     /// Workspace of a saved thread that is resumed on first use.
     resume_cwd: Option<String>,
+    /// Persisted thread selected in the session browser while its replacement loads.
+    switch_target: Option<String>,
+    /// Live thread retained until the selected replacement restores successfully.
+    switch_previous_session: Option<String>,
     /// Wire text for queued prompts whose shown text is shorter than what Codex
     /// receives, keyed by prompt id.
     wire_overrides: HashMap<String, String>,
@@ -433,6 +437,10 @@ impl AgentPaneLifecycle {
     /// [`AgentPaneSnapshot::interrupted`] and nothing queued is sent until the
     /// user decides; the thread itself resumes in the background.
     pub fn restore_pending(&mut self, session_id: &str, cwd: &str) -> Vec<AgentPaneEffect> {
+        // A bridge restart resumes the persisted pane conversation. Any
+        // user-requested switch that was still in flight is abandoned.
+        self.switch_target = None;
+        self.switch_previous_session = None;
         if self.is_running() {
             if let Some(prompt) = self.in_flight.take() {
                 self.interrupted = Some(prompt);
@@ -471,6 +479,25 @@ impl AgentPaneLifecycle {
             return Vec::new();
         }
         self.resume_now().into_iter().collect()
+    }
+
+    /// Begins a user-requested switch while retaining the current thread until
+    /// the selected conversation has restored successfully.
+    pub fn switch_pending(&mut self, session_id: &str) -> bool {
+        if self.phase() != AgentPanePhase::Idle
+            || session_id.is_empty()
+            || self.session_id.as_deref() == Some(session_id)
+            || self.in_flight.is_some()
+            || !self.queue.is_empty()
+            || self.interrupted.is_some()
+        {
+            return false;
+        }
+        self.switch_previous_session.clone_from(&self.session_id);
+        self.switch_target = Some(session_id.to_string());
+        self.phase = Some(AgentPanePhase::Restoring);
+        self.turn_id = None;
+        true
     }
 
     /// Applies the user's answer about an interrupted turn.
@@ -525,6 +552,21 @@ impl AgentPaneLifecycle {
 
     /// The persisted thread is live again.
     pub fn restored(&mut self, session_id: &str) -> Vec<AgentPaneEffect> {
+        if self.switch_target.take().is_some() {
+            let previous = self.switch_previous_session.take();
+            self.forgotten_session = None;
+            self.session_id = Some(session_id.to_string());
+            self.phase = Some(AgentPanePhase::Idle);
+            self.recap_pending = false;
+            self.resume_cwd = None;
+            let mut effects = previous
+                .filter(|previous| previous != session_id)
+                .map(|session_id| AgentPaneEffect::CloseSession { session_id })
+                .into_iter()
+                .collect::<Vec<_>>();
+            effects.extend(self.advance());
+            return effects;
+        }
         if self.forgotten_session.as_deref() == Some(session_id) {
             return Vec::new();
         }
@@ -543,6 +585,12 @@ impl AgentPaneLifecycle {
 
     /// The persisted thread cannot be resumed; the transcript is replayed instead.
     pub fn restore_failed(&mut self, session_id: &str) -> Vec<AgentPaneEffect> {
+        if self.switch_target.as_deref() == Some(session_id) {
+            self.switch_target = None;
+            self.session_id = self.switch_previous_session.take();
+            self.phase = Some(AgentPanePhase::Idle);
+            return Vec::new();
+        }
         if self.session_id.as_deref() != Some(session_id) {
             return Vec::new();
         }
@@ -1028,6 +1076,77 @@ mod tests {
         let mut pane = live("s1");
         pane.restored("other");
         assert_eq!(pane.snapshot().session_id.as_deref(), Some("s1"));
+    }
+
+    #[test]
+    fn switching_threads_keeps_the_previous_thread_until_the_replacement_restores() {
+        let mut pane = live("old");
+        assert!(pane.switch_pending("selected"));
+        assert_eq!(pane.phase(), AgentPanePhase::Restoring);
+        assert_eq!(pane.snapshot().session_id.as_deref(), Some("old"));
+
+        assert_eq!(
+            pane.restored("new"),
+            [AgentPaneEffect::CloseSession {
+                session_id: "old".into()
+            }]
+        );
+        assert_eq!(pane.phase(), AgentPanePhase::Idle);
+        assert_eq!(pane.snapshot().session_id.as_deref(), Some("new"));
+    }
+
+    #[test]
+    fn a_failed_thread_switch_returns_to_the_previous_thread() {
+        let mut pane = live("old");
+        assert!(pane.switch_pending("selected"));
+
+        assert!(pane.restore_failed("selected").is_empty());
+        let snapshot = pane.snapshot();
+        assert_eq!(snapshot.phase, AgentPanePhase::Idle);
+        assert_eq!(snapshot.session_id.as_deref(), Some("old"));
+        assert!(!snapshot.recap_pending);
+    }
+
+    #[test]
+    fn switching_threads_does_not_move_held_prompts_to_another_conversation() {
+        let mut pane = live("old");
+        pane.submit("running".into(), "");
+        pane.turn_started("old", "turn");
+        pane.submit("held".into(), "");
+        assert_eq!(
+            pane.stop(),
+            [AgentPaneEffect::Interrupt {
+                session_id: "old".into()
+            }]
+        );
+        assert!(pane
+            .turn_ended("old", Some("turn"), AgentTurnOutcome::Stopped)
+            .unwrap()
+            .is_empty());
+
+        assert_eq!(pane.phase(), AgentPanePhase::Idle);
+        assert!(pane.snapshot().paused);
+        assert!(!pane.switch_pending("selected"));
+        assert_eq!(pane.snapshot().session_id.as_deref(), Some("old"));
+    }
+
+    #[test]
+    fn a_bridge_restart_abandons_an_in_flight_thread_switch() {
+        let mut pane = live("old");
+        assert!(pane.switch_pending("selected"));
+
+        assert_eq!(
+            pane.restore_pending("old", "/workspace"),
+            [AgentPaneEffect::ResumeSession {
+                session_id: "old".into(),
+                cwd: "/workspace".into()
+            }]
+        );
+        assert!(pane.restored("new").is_empty());
+        assert_eq!(pane.snapshot().session_id.as_deref(), Some("old"));
+        assert_eq!(pane.phase(), AgentPanePhase::Restoring);
+        assert!(pane.restored("old").is_empty());
+        assert_eq!(pane.phase(), AgentPanePhase::Idle);
     }
 
     #[test]

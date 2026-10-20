@@ -29,6 +29,8 @@ pub struct AgentManager {
     turn_started_at: HashMap<String, Instant>,
     pending_commit_messages: HashSet<i64>,
     pending_model_requests: HashSet<i64>,
+    pending_session_requests: HashSet<i64>,
+    pending_session_preview_requests: HashSet<i64>,
     model_only_bridge: bool,
     next_model: Option<crate::codex::AgentModelSelection>,
     conversation: Option<AgentConversationSnapshot>,
@@ -67,6 +69,12 @@ impl PaneTransition for () {
 }
 
 impl PaneTransition for usize {
+    fn effects(&self) -> Vec<super::agent_pane::AgentPaneEffect> {
+        Vec::new()
+    }
+}
+
+impl PaneTransition for bool {
     fn effects(&self) -> Vec<super::agent_pane::AgentPaneEffect> {
         Vec::new()
     }
@@ -394,6 +402,30 @@ impl AgentManager {
 
     pub fn take_pending_model_requests(&mut self) -> Vec<i64> {
         self.pending_model_requests.drain().collect()
+    }
+
+    pub fn mark_session_request_pending(&mut self, request_id: i64) {
+        self.pending_session_requests.insert(request_id);
+    }
+
+    pub fn finish_session_request(&mut self, request_id: i64) {
+        self.pending_session_requests.remove(&request_id);
+    }
+
+    pub fn take_pending_session_requests(&mut self) -> Vec<i64> {
+        self.pending_session_requests.drain().collect()
+    }
+
+    pub fn mark_session_preview_pending(&mut self, request_id: i64) {
+        self.pending_session_preview_requests.insert(request_id);
+    }
+
+    pub fn finish_session_preview(&mut self, request_id: i64) {
+        self.pending_session_preview_requests.remove(&request_id);
+    }
+
+    pub fn take_pending_session_previews(&mut self) -> Vec<i64> {
+        self.pending_session_preview_requests.drain().collect()
     }
 
     pub fn mark_model_only_bridge(&mut self) {

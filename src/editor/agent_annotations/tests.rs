@@ -170,6 +170,60 @@ async fn transcript_annotation_links_switch_buffers_open_cards_and_expire_safely
 }
 
 #[tokio::test]
+async fn resumed_annotation_links_reopen_source_files_with_their_original_ids() {
+    let root = tempfile::tempdir().unwrap();
+    let annotated = root.path().join("annotated.rs");
+    std::fs::write(&annotated, "first\nsecond\n").unwrap();
+    let mut editor = fixture(root.path());
+    let id = Uuid::new_v4();
+    let output = json!({
+        "ok": true,
+        "path": "annotated.rs",
+        "annotations": [{
+            "id": id.to_string(),
+            "href": format!("red://annotation/{id}"),
+            "start_line": 1,
+            "end_line": 1,
+            "message": "Recovered annotation"
+        }]
+    });
+    let thread = json!({"turns": [{"id": "restored-turn", "items": [{
+        "id": "annotation-call",
+        "type": "dynamicToolCall",
+        "tool": "add_annotations",
+        "arguments": {"path": "annotated.rs", "expected_revision": 0},
+        "status": "completed",
+        "success": true,
+        "contentItems": [{"type": "inputText", "text": output.to_string()}]
+    }]}]});
+
+    editor
+        .agent_manager
+        .reconcile_conversation("restored-session", root.path(), &thread);
+    editor.restore_agent_annotations();
+    assert!(!editor
+        .inline_comments
+        .iter()
+        .any(|comment| comment.id == id));
+
+    editor
+        .test_execute_production_action(Action::OpenAgentAnnotation(id))
+        .await
+        .unwrap();
+
+    assert_eq!(editor.current_buffer().file.as_deref(), annotated.to_str());
+    assert_eq!(
+        editor.agent_annotation_state()["current"]["id"],
+        id.to_string()
+    );
+    assert_eq!(
+        editor.agent_annotation_state()["current"]["message"],
+        "Recovered annotation"
+    );
+    assert!(editor.current_dialog.is_some());
+}
+
+#[tokio::test]
 async fn agent_annotation_guards_revisions_ranges_messages_and_duplicate_dismissals() {
     let root = tempfile::tempdir().unwrap();
     let mut editor = fixture(root.path());

@@ -27,6 +27,34 @@ impl Editor {
         frame: &mut RenderBuffer,
         runtime: &mut Runtime,
     ) -> anyhow::Result<()> {
+        if !self.inline_comments.iter().any(|comment| {
+            comment.id == id
+                && matches!(comment.origin, InlineCommentOrigin::AgentAnnotation { .. })
+                && self.inline_comment_visible(comment)
+        }) {
+            let target = self
+                .agent_manager
+                .conversation_snapshot()
+                .and_then(|conversation| {
+                    conversation
+                        .annotations
+                        .into_iter()
+                        .find(|record| record.id == id.to_string())
+                        .map(|record| (conversation.cwd, record.path))
+                });
+            if let Some((root, path)) = target {
+                if let Ok(path) = super::resolve_agent_tool_path(std::path::Path::new(&root), &path)
+                {
+                    if self
+                        .open_agent_buffer(&path, /*create*/ false, frame)
+                        .await?
+                        .is_some()
+                    {
+                        self.restore_agent_annotations();
+                    }
+                }
+            }
+        }
         let target_buffer = self
             .inline_comments
             .iter()

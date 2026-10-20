@@ -181,6 +181,7 @@ struct TextPanelComposerConfig {
 
 struct TextPanelHeaderAction {
     id: String,
+    key: String,
     label: String,
     compact_label: String,
 }
@@ -264,6 +265,22 @@ struct AgentState {
     model_picker_session: String,
     model_picker_loading: bool,
     model_selection: Json,
+    session_browser_open: bool,
+    session_browser_scope: String,
+    session_browser_query: String,
+    session_browser_cwd: String,
+    session_browser_request: i32,
+    session_browser_debounce: String,
+    session_browser_results: [Json],
+    session_browser_results_query: String,
+    session_browser_views: Json,
+    session_browser_selected: String,
+    session_browser_selected_index: i32,
+    session_browser_preview_open: bool,
+    session_browser_preview_request: i32,
+    session_browser_preview_debounce: String,
+    session_browser_preview_cache: Json,
+    session_switch_target: String,
     model_header_text: String,
     model_header_secondary: String,
     session_id: String,
@@ -329,6 +346,22 @@ fn initial_state() -> AgentState {
         model_picker_session: "",
         model_picker_loading: false,
         model_selection: Json {},
+        session_browser_open: false,
+        session_browser_scope: "red",
+        session_browser_query: "",
+        session_browser_cwd: "",
+        session_browser_request: -1,
+        session_browser_debounce: "",
+        session_browser_results: [],
+        session_browser_results_query: "",
+        session_browser_views: Json {},
+        session_browser_selected: "",
+        session_browser_selected_index: 0,
+        session_browser_preview_open: false,
+        session_browser_preview_request: -1,
+        session_browser_preview_debounce: "",
+        session_browser_preview_cache: Json {},
+        session_switch_target: "",
         model_header_text: "",
         model_header_secondary: "",
         session_id: "",
@@ -393,6 +426,18 @@ struct AgentModelsResult {
     error: String,
 }
 
+struct AgentSessionsResult {
+    sessions: [Json],
+    error: String,
+}
+
+struct AgentSessionPreviewResult {
+    session_id: String,
+    prompt: String,
+    response: String,
+    error: String,
+}
+
 struct AgentDefaultModelResult {
     model_info: Json,
     error: String,
@@ -454,6 +499,10 @@ fn reset_model_state() {
 
 fn refresh_model_header() {
     if !state().panel_created { return; }
+    if state().session_browser_open {
+        refresh_session_browser_header();
+        return;
+    }
     let current = state().model_info;
     if model_name(current) == "" { current = next_model_info(); }
     let running = state().turn_model_info;
@@ -504,6 +553,7 @@ fn model_changed(event: AgentModelChangedEvent) {
     scope = "global",
 )]
 fn choose_model() {
+    if state().session_browser_open { close_session_browser(); }
     if is_restoring() {
         red::execute("Print", "Wait for the agent session to finish restoring");
         return;
@@ -649,6 +699,420 @@ fn model_set(result: AgentModelSetResult) {
 
 fn model_picker_cancelled(event: PickerCancelled) {
     red::state_patch(AgentState { model_picker: None });
+}
+
+#[red::command(
+    name = "AgentSessions",
+    title = "Resume agent session",
+    category = "Agent",
+    description = "Search and resume a previous Codex conversation in the Agent pane",
+    aliases = ["resume session", "switch session", "previous agent session"],
+    scope = "global",
+)]
+fn choose_session() {
+    if pane_phase() != "idle" {
+        red::execute("Print", "Wait for the current agent operation to finish");
+        return;
+    }
+    if queued_count() > 0 || state().interruption_id != "" {
+        red::execute("Print", "Send, discard, or resolve held Agent follow-ups before switching sessions");
+        return;
+    }
+    if state().session_browser_open {
+        close_session_browser();
+        return;
+    }
+    ensure_conversation_panel();
+    red::state_patch(AgentState {
+        session_browser_open: true,
+        session_browser_cwd: "",
+        session_browser_request: -1,
+        session_browser_results: [],
+        session_browser_results_query: "",
+    });
+    red::request("GetConfig", session_browser_cwd_loaded, "cwd");
+}
+
+fn session_browser_cwd_loaded(result: AgentStringValueEvent) {
+    if !state().session_browser_open { return; }
+    let cwd = red::string(result.value, ".");
+    let previous = state().session_browser_views[cwd];
+    let scope = "red";
+    let query = "";
+    let selected = "";
+    let selected_index = 0;
+    let preview = false;
+    if previous != red::null() {
+        scope = red::string(previous.scope, "red");
+        query = red::string(previous.query, "");
+        selected = red::string(previous.selected, "");
+        selected_index = red::int(previous.selected_index, 0);
+        preview = red::bool(previous.preview, false);
+    }
+    red::state_patch(AgentState {
+        session_browser_cwd: cwd,
+        session_browser_scope: scope,
+        session_browser_query: query,
+        session_browser_selected: selected,
+        session_browser_selected_index: selected_index,
+        session_browser_preview_open: preview,
+        session_browser_preview_request: -1,
+        session_browser_preview_debounce: "",
+    });
+    red::execute("EnterTextPanelContext", "agent-conversation", "Search previous sessions…", Json {
+        key: cwd, query: query,
+    });
+    refresh_session_browser_header();
+    render_session_browser([], "", true);
+    if preview {
+        red::execute("SetTextPanelPreview", "agent-conversation", Json {
+            session_id: selected, loading: true,
+        });
+    }
+    request_sessions();
+}
+
+fn session_scope_label() -> String {
+    if state().session_browser_scope == "workspace" { return "This workspace"; }
+    if state().session_browser_scope == "all" { return "All Codex"; }
+    return "Red";
+}
+
+fn refresh_session_browser_header() {
+    if !state().session_browser_open { return; }
+    let scope = session_scope_label();
+    red::execute("SetTextPanelHeaderDetail", "agent-conversation", Json {
+        text: "Previous sessions", secondary: scope, compact_text: scope,
+        action: "session_scope", shortcut: "Alt-s",
+    });
+}
+
+fn request_sessions() {
+    if !state().session_browser_open { return; }
+    red::execute("SetTextPanelStatus", "agent-conversation", TextPanelStatus {
+        busy: true, label: "Searching " + session_scope_label() + " sessions…", stream: false,
+    });
+    let request = red::request(
+        "AgentListSessions",
+        sessions_loaded,
+        state().session_browser_cwd,
+        state().session_browser_scope,
+        state().session_browser_query,
+        state().session_id
+    );
+    red::state_patch(AgentState { session_browser_request: request });
+}
+
+fn sessions_loaded(result: AgentSessionsResult, request_id: i32) {
+    if request_id != state().session_browser_request { return; }
+    red::state_patch(AgentState { session_browser_request: -1 });
+    if !state().session_browser_open { return; }
+    red::execute("SetTextPanelStatus", "agent-conversation");
+    let error = red::string(result.error, "");
+    if error != "" {
+        red::state_patch(AgentState { session_browser_results: [] });
+        red::state_patch(AgentState { session_browser_results_query: state().session_browser_query });
+        render_session_browser([], "Could not load sessions: " + error, false);
+        return;
+    }
+    red::state_patch(AgentState {
+        session_browser_results: result.sessions,
+        session_browser_results_query: state().session_browser_query,
+    });
+    restore_session_browser_selection(result.sessions);
+    render_session_browser(result.sessions, "", false);
+    if state().session_browser_preview_open { queue_session_preview(); }
+}
+
+fn restore_session_browser_selection(sessions: [Json]) {
+    let selected = red::string(state().session_browser_selected, "");
+    let selected_index = red::int(state().session_browser_selected_index, 0);
+    let index = 0;
+    let found = false;
+    for session in sessions {
+        if red::string(session.id, "") == selected {
+            selected_index = index;
+            found = true;
+        }
+        index = index + 1;
+    }
+    if !found && red::len(sessions) > 0 {
+        if selected_index >= red::len(sessions) { selected_index = red::len(sessions) - 1; }
+        if selected_index < 0 { selected_index = 0; }
+        selected = red::string(sessions[selected_index].id, "");
+    }
+    if red::len(sessions) == 0 {
+        selected = "";
+        selected_index = 0;
+    }
+    red::state_patch(AgentState {
+        session_browser_selected: selected,
+        session_browser_selected_index: selected_index,
+    });
+}
+
+fn render_session_browser(sessions: [Json], error: String, loading: bool) {
+    if !state().session_browser_open { return; }
+    let blocks = [];
+    if loading {
+        blocks = red::push(blocks, AgentTextBlock {
+            id: "session-browser:loading", kind: "text", format: "plain", text: "Loading sessions…",
+        });
+    }
+    if error != "" {
+        blocks = red::push(blocks, AgentTextBlock {
+            id: "session-browser:error", kind: "error", format: "plain", text: error,
+        });
+    }
+    let current_group = "";
+    for session in sessions {
+        let group = red::string(session.time_group, "Earlier");
+        if group != current_group {
+            blocks = red::push(blocks, AgentTextBlock {
+                id: "session-browser:group:" + group,
+                kind: "text", format: "plain", text: group,
+            });
+            current_group = group;
+        }
+        let detail = red::string(session.detail, "");
+        let snippet = red::string(session.snippet, "");
+        if !red::bool(session.is_red, false) { detail = detail + " · Continue in Red"; }
+        if snippet != "" { detail = detail + " · " + snippet; }
+        blocks = red::push(blocks, AgentTextBlock {
+            id: "session-browser:session:" + red::string(session.id, ""),
+            kind: "action", format: "plain",
+            text: red::string(session.label, "Untitled session") + "\n" + detail,
+        });
+    }
+    if !loading && error == "" && red::len(sessions) == 0 {
+        let message = "No previous sessions in this scope";
+        if red::trim(state().session_browser_query) != "" { message = "No matching sessions"; }
+        blocks = red::push(blocks, AgentTextBlock {
+            id: "session-browser:empty", kind: "text", format: "plain", text: message,
+        });
+    }
+    red::execute("UpdateTextPanel", "agent-conversation", blocks);
+}
+
+fn session_browser_query_changed(query: String) {
+    if !state().session_browser_open || query == state().session_browser_query { return; }
+    red::state_patch(AgentState { session_browser_query: query, session_browser_request: -1 });
+    let previous = red::string(state().session_browser_debounce, "");
+    if previous != "" { red::execute("CancelTimeout", previous); }
+    let timer = red::execute("SetTimeout", 150);
+    red::state_patch(AgentState { session_browser_debounce: timer });
+}
+
+#[red::on("timeout:callback")]
+fn session_browser_timeout(event: TimerEvent) {
+    if event.timer_id == state().session_browser_preview_debounce {
+        red::state_patch(AgentState { session_browser_preview_debounce: "" });
+        request_session_preview();
+        return;
+    }
+    if event.timer_id != state().session_browser_debounce { return; }
+    red::state_patch(AgentState { session_browser_debounce: "" });
+    request_sessions();
+}
+
+fn session_browser_selection_changed(block_id: String) {
+    if !state().session_browser_open { return; }
+    let index = 0;
+    for session in state().session_browser_results {
+        let id = red::string(session.id, "");
+        if block_id == "session-browser:session:" + id {
+            if id == state().session_browser_selected { return; }
+            red::state_patch(AgentState {
+                session_browser_selected: id,
+                session_browser_selected_index: index,
+                session_browser_preview_request: -1,
+            });
+            if state().session_browser_preview_open { queue_session_preview(); }
+            return;
+        }
+        index = index + 1;
+    }
+}
+
+fn toggle_session_preview() {
+    if !state().session_browser_open { return; }
+    let open = !state().session_browser_preview_open;
+    let previous = red::string(state().session_browser_preview_debounce, "");
+    if previous != "" { red::execute("CancelTimeout", previous); }
+    red::state_patch(AgentState {
+        session_browser_preview_open: open,
+        session_browser_preview_request: -1,
+        session_browser_preview_debounce: "",
+    });
+    if !open {
+        red::execute("SetTextPanelPreview", "agent-conversation");
+        return;
+    }
+    queue_session_preview();
+}
+
+fn queue_session_preview() {
+    if !state().session_browser_open || !state().session_browser_preview_open { return; }
+    let selected = red::string(state().session_browser_selected, "");
+    if selected == "" {
+        red::execute("SetTextPanelPreview", "agent-conversation", Json {
+            error: "Select a session to preview",
+        });
+        return;
+    }
+    let item = red::null();
+    for session in state().session_browser_results {
+        if red::string(session.id, "") == selected { item = session; }
+    }
+    if item == red::null() { return; }
+    let cached = state().session_browser_preview_cache[selected];
+    if cached != red::null() {
+        if cached.updated_at == item.updated_at {
+            red::execute("SetTextPanelPreview", "agent-conversation", Json {
+                session_id: selected,
+                prompt: red::string(cached.prompt, ""),
+                response: red::string(cached.response, ""),
+            });
+            return;
+        }
+    }
+    let previous = red::string(state().session_browser_preview_debounce, "");
+    if previous != "" { red::execute("CancelTimeout", previous); }
+    red::execute("SetTextPanelPreview", "agent-conversation", Json {
+        session_id: selected, loading: true,
+    });
+    let timer = red::execute("SetTimeout", 120);
+    red::state_patch(AgentState { session_browser_preview_debounce: timer });
+}
+
+fn request_session_preview() {
+    if !state().session_browser_open || !state().session_browser_preview_open { return; }
+    let selected = red::string(state().session_browser_selected, "");
+    if selected == "" { return; }
+    let request = red::request(
+        "AgentReadSessionPreview",
+        session_preview_loaded,
+        state().session_browser_cwd,
+        selected
+    );
+    red::state_patch(AgentState { session_browser_preview_request: request });
+}
+
+fn session_preview_loaded(result: AgentSessionPreviewResult, request_id: i32) {
+    if request_id != state().session_browser_preview_request { return; }
+    red::state_patch(AgentState { session_browser_preview_request: -1 });
+    if !state().session_browser_open || !state().session_browser_preview_open { return; }
+    let error = red::string(result.error, "");
+    if error != "" {
+        red::execute("SetTextPanelPreview", "agent-conversation", Json { error: error });
+        return;
+    }
+    let id = red::string(result.session_id, "");
+    if id == "" || id != state().session_browser_selected { return; }
+    let item = red::null();
+    for session in state().session_browser_results {
+        if red::string(session.id, "") == id { item = session; }
+    }
+    if item == red::null() { return; }
+    let prompt = red::string(result.prompt, "");
+    let response = red::string(result.response, "");
+    let cache = state().session_browser_preview_cache;
+    cache[id] = Json { updated_at: item.updated_at, prompt: prompt, response: response };
+    red::state_patch(AgentState { session_browser_preview_cache: cache });
+    red::execute("SetTextPanelPreview", "agent-conversation", Json {
+        session_id: id, prompt: prompt, response: response,
+    });
+}
+
+fn cycle_session_scope() {
+    if !state().session_browser_open { return; }
+    let scope = "red";
+    if state().session_browser_scope == "red" { scope = "workspace"; }
+    else if state().session_browser_scope == "workspace" { scope = "all"; }
+    red::state_patch(AgentState {
+        session_browser_scope: scope,
+        session_browser_results: [],
+        session_browser_results_query: "",
+    });
+    refresh_session_browser_header();
+    render_session_browser([], "", true);
+    request_sessions();
+}
+
+fn close_session_browser() {
+    if !state().session_browser_open { return; }
+    let debounce = red::string(state().session_browser_debounce, "");
+    if debounce != "" { red::execute("CancelTimeout", debounce); }
+    let cwd = red::string(state().session_browser_cwd, "");
+    if cwd != "" {
+        let views = state().session_browser_views;
+        views[cwd] = Json {
+            scope: state().session_browser_scope,
+            query: state().session_browser_query,
+            selected: state().session_browser_selected,
+            selected_index: state().session_browser_selected_index,
+            preview: state().session_browser_preview_open,
+        };
+        red::state_patch(AgentState { session_browser_views: views });
+    }
+    let preview_timer = red::string(state().session_browser_preview_debounce, "");
+    if preview_timer != "" { red::execute("CancelTimeout", preview_timer); }
+    red::state_patch(AgentState {
+        session_browser_open: false,
+        session_browser_request: -1,
+        session_browser_debounce: "",
+        session_browser_results: [],
+        session_browser_results_query: "",
+        session_browser_preview_open: false,
+        session_browser_preview_request: -1,
+        session_browser_preview_debounce: "",
+    });
+    red::execute("SetTextPanelStatus", "agent-conversation");
+    red::execute("ExitTextPanelContext", "agent-conversation");
+    red::state_patch(AgentState { model_header_text: "", model_header_secondary: "" });
+    refresh_model_header();
+}
+
+fn activate_session_browser_block(block_id: String) {
+    if block_id == "session-browser:back" {
+        close_session_browser();
+        return;
+    }
+    for session in state().session_browser_results {
+        if block_id == "session-browser:session:" + red::string(session.id, "") {
+            session_selected(session);
+            return;
+        }
+    }
+}
+
+fn session_selected(item: Json) {
+    if state().session_browser_query != state().session_browser_results_query { return; }
+    if pane_phase() != "idle" {
+        red::execute("Print", "The Agent state changed; choose the session again");
+        return;
+    }
+    let target = red::string(item.id, "");
+    if target == "" { return; }
+    let selected_index = 0;
+    let index = 0;
+    for session in state().session_browser_results {
+        if red::string(session.id, "") == target { selected_index = index; }
+        index = index + 1;
+    }
+    red::state_patch(AgentState {
+        session_browser_selected: target,
+        session_browser_selected_index: selected_index,
+    });
+    let resume = red::bool(item.is_red, false);
+    let cwd = state().session_browser_cwd;
+    close_session_browser();
+    red::state_patch(AgentState { session_switch_target: target });
+    let label = "Continuing in Red…";
+    if resume { label = "Resuming session…"; }
+    set_phase("restoring", label);
+    red::execute("SetTextPanelComposerState", "agent-conversation", false, label);
+    red::execute("AgentSwitchSession", cwd, target, resume);
 }
 
 fn state() -> AgentState {
@@ -805,6 +1269,7 @@ fn session_created(event: AgentSessionEvent) {
     scope = "global",
 )]
 fn prompt() {
+    if state().session_browser_open { close_session_browser(); }
     prepare_saved_conversation();
     if state().interruption_id != "" && state().interruption_lost_codex {
         open_conversation();
@@ -889,10 +1354,10 @@ fn ensure_conversation_panel() {
             title: "Agent",
             composer: TextPanelComposerConfig { placeholder: "Ask a follow-up…", rows: 3 },
             header_actions: [
-                TextPanelHeaderAction { id: "activity", label: "Activity", compact_label: "A" },
-                TextPanelHeaderAction { id: "clear", label: "Clear", compact_label: "C" },
-                TextPanelHeaderAction { id: "new", label: "New", compact_label: "N" },
-                TextPanelHeaderAction { id: "close", label: "×", compact_label: "×" },
+                TextPanelHeaderAction { id: "sessions", key: "Alt-s", label: "Sessions", compact_label: "S" },
+                TextPanelHeaderAction { id: "new", key: "Alt-n", label: "New", compact_label: "N" },
+                TextPanelHeaderAction { id: "clear", key: "Alt-c", label: "Clear", compact_label: "C" },
+                TextPanelHeaderAction { id: "close", key: "Alt-w", label: "×", compact_label: "×" },
             ],
         });
         red::state_patch(AgentState { panel_created: true });
@@ -1470,7 +1935,18 @@ fn format_turn_elapsed(elapsed_ms: i64) -> String {
 
 #[red::on("panel:event:agent-conversation")]
 fn panel_event(event: AgentPanelEvent) {
-    if event.action == "submit" {
+    if event.action == "filter_input" && state().session_browser_open {
+        session_browser_query_changed(red::string(event.text, ""));
+    } else if event.action == "filter_submit" && state().session_browser_open {
+        let query = red::string(event.text, "");
+        session_browser_query_changed(query);
+        if query == state().session_browser_results_query
+            && red::len(state().session_browser_results) > 0 {
+            session_selected(state().session_browser_results[0]);
+        }
+    } else if event.action == "filter_cancel" && state().session_browser_open {
+        close_session_browser();
+    } else if event.action == "submit" {
         let text = red::string(event.text, "");
         if red::trim(text) != "" {
             prompt_submitted(text);
@@ -1481,13 +1957,25 @@ fn panel_event(event: AgentPanelEvent) {
         cancel();
     } else if event.action == "model" {
         choose_model();
+    } else if event.action == "session_scope" {
+        cycle_session_scope();
+    } else if event.action == "session_preview" && state().session_browser_open {
+        toggle_session_preview();
+    } else if (event.action == "up" || event.action == "down") && state().session_browser_open {
+        session_browser_selection_changed(event.text);
+    } else if event.action == "sessions" {
+        choose_session();
     } else if event.action == "activity" {
         toggle_activity();
     } else if event.action == "activate_block" && red::starts_with(event.text, "interruption-choice:") {
         let choice = red::slice(event.text, red::len("interruption-choice:"));
         if choice != "hint" { resolve_interruption(choice); }
     } else if event.action == "activate_block" {
-        activate_activity_block(event.text);
+        if state().session_browser_open {
+            activate_session_browser_block(event.text);
+        } else {
+            activate_activity_block(event.text);
+        }
     } else if event.action == "clear" {
         clear_conversation();
     } else if event.action == "new" {
@@ -1511,6 +1999,7 @@ fn panel_event(event: AgentPanelEvent) {
     scope = "global",
 )]
 fn toggle_activity() {
+    if state().session_browser_open { close_session_browser(); }
     let history = state().activity_history;
     if red::len(history) > 0 { activate_activity_block(history[red::len(history) - 1].id); }
     else { render_conversation(); }
@@ -1594,6 +2083,7 @@ fn activity_inspector_event(event: AgentActivityWorkspaceEvent) {
     scope = "global",
 )]
 fn clear_conversation() {
+    if state().session_browser_open { close_session_browser(); }
     reset_stream_render();
     red::state_patch(AgentState { transcript_blocks: [] });
     red::state_patch(AgentState { activity_block_id: "" });
@@ -1626,6 +2116,7 @@ fn reset_stream_render() {
     scope = "global",
 )]
 fn close_conversation() {
+    if state().session_browser_open { close_session_browser(); }
     if state().panel_open {
         red::execute("SetPanelVisible", "agent-conversation", false);
         red::state_patch(AgentState { panel_open: false });
@@ -1650,6 +2141,11 @@ fn close_conversation() {
     scope = "global",
 )]
 fn new_conversation() {
+    if state().session_browser_open { close_session_browser(); }
+    if state().session_switch_target != "" {
+        red::execute("Print", "Wait for the selected Agent session to finish restoring");
+        return;
+    }
     reset_model_state();
     red::state_patch(AgentState { resume_hint: "", resume_age: "", interruption_id: "" });
     // The saved thread is about to be forgotten; opening the pane must not
@@ -2109,6 +2605,8 @@ fn push_resume_divider(age: String) {
 #[red::on("agent:conversation_restore_pending")]
 fn conversation_restore_pending(event: AgentConversationEvent) {
     // The core resumes the thread; the pane shows the saved conversation meanwhile.
+    // A bridge restart abandons any session switch that had not completed.
+    red::state_patch(AgentState { session_switch_target: "" });
     red::state_patch(AgentState { model_info: event.model_info, accepted_model: Json {}, turn_model_info: Json {} });
     if shows_thread(event.thread_id) {
         // Codex stopped under us. Keep what streamed so far; the core marks a
@@ -2146,9 +2644,13 @@ fn conversation_resumable(event: AgentResumableEvent) {
 
 #[red::on("agent:session_restored")]
 fn session_restored(event: AgentConversationEvent) {
+    let switching = state().session_switch_target != "";
     // An interruption from the loss was already shown; a later failure is not one.
     red::state_patch(AgentState { codex_lost: false });
     red::state_patch(AgentState { model_info: event.model_info, accepted_model: Json {}, turn_model_info: Json {} });
+    if switching {
+        red::state_patch(AgentState { resume_hint: "", resume_age: "" });
+    }
     if !shows_thread(event.thread_id) {
         let age = state().resume_age;
         load_conversation(event);
@@ -2157,9 +2659,13 @@ fn session_restored(event: AgentConversationEvent) {
             push_resume_divider(age);
         }
     }
+    red::state_patch(AgentState { session_switch_target: "" });
     set_phase("idle", "");
     red::execute("SetTextPanelComposerState", "agent-conversation", true, state().resume_hint);
     refresh_model_header();
+    if switching {
+        red::execute("Print", "Agent session restored");
+    }
 }
 
 /// What the composer says once the thread settles: archived after a failed
@@ -2300,6 +2806,14 @@ struct AgentSessionRestoreFailedEvent {
 
 #[red::on("agent:session_restore_failed")]
 fn session_restore_failed(event: AgentSessionRestoreFailedEvent) {
+    if state().session_switch_target != "" && event.session_id == state().session_switch_target {
+        red::state_patch(AgentState { session_switch_target: "" });
+        set_phase("idle", "");
+        red::execute("SetTextPanelComposerState", "agent-conversation", true, ready_composer_hint());
+        refresh_model_header();
+        red::execute("Print", "Could not switch Agent sessions: " + event.message);
+        return;
+    }
     // A thread the pane already left, as after :AgentNew, failing late is not
     // this conversation's business.
     let failed = red::string(event.session_id, "");
@@ -2349,6 +2863,7 @@ fn load_conversation(event: AgentConversationEvent) {
 }
 
 fn render_conversation() {
+    if state().session_browser_open { return; }
     let blocks = normalize_transcript_blocks(state().transcript_blocks);
     red::state_patch(AgentState { transcript_blocks: blocks });
     let presented = [];

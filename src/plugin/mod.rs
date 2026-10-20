@@ -43,8 +43,9 @@ pub use overlay::{OverlayAlignment, OverlayConfig, OverlayManager, OverlayOverfl
 pub use panel::{
     PanelConfig, PanelManager, PanelManagerSnapshot, PanelRow, PanelRowKind, PanelSegment,
     PanelSessionSnapshot, PanelSide, PanelSnapshotKind, TextPanelBlock, TextPanelBlockFormat,
-    TextPanelBlockKind, TextPanelComposerConfig, TextPanelComposerSnapshot, TextPanelHeaderAction,
-    TextPanelHeaderDetail, TextPanelSessionSnapshot, TextPanelSnapshotFocus, TextPanelStatus,
+    TextPanelBlockKind, TextPanelComposerConfig, TextPanelComposerSnapshot,
+    TextPanelContextOptions, TextPanelHeaderAction, TextPanelHeaderDetail, TextPanelPreview,
+    TextPanelSessionSnapshot, TextPanelSnapshotFocus, TextPanelStatus,
 };
 pub(crate) use registry::{
     quarantine_reason, PluginSessionState, PluginStatusRow, RpcCommandToken, RpcHost,
