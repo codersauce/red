@@ -318,6 +318,9 @@ and **All Codex**. `Esc` or `Ctrl-c` returns to the conversation with its
 transcript position and unsent draft restored. Red identifies its conversations
 by their thread source or persisted originator, even when Codex's CLI labels the
 underlying app-server session as VS Code.
+Sessions with an unknown or older editor-tool contract continue in a fresh Red
+thread with their user and assistant history, so subsequent turns use the current
+editor tools.
 
 In the conversation transcript's Normal mode, `[p` jumps backward to a user
 prompt and `]p` jumps forward. From an answer, the first backward jump returns

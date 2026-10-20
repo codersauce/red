@@ -3,6 +3,19 @@
 use super::*;
 use crate::codex::{AgentSessionListRequest, AgentSessionPreviewRequest};
 
+/// Unknown or obsolete tool catalogs must be replaced by a fresh Red thread.
+pub(super) fn session_switch_command(
+    cwd: PathBuf,
+    session_id: String,
+    tool_contract_version: Option<u32>,
+) -> CodexCommand {
+    if tool_contract_version == Some(crate::agent_conversation::AGENT_TOOL_CONTRACT_VERSION) {
+        CodexCommand::ResumeSession { cwd, session_id }
+    } else {
+        CodexCommand::ContinueSession { cwd, session_id }
+    }
+}
+
 pub(super) fn session_result_payload(result: &Result<Value, String>) -> Value {
     match result {
         Ok(value) => {
@@ -109,6 +122,24 @@ impl Editor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn browser_resumes_only_sessions_with_a_known_compatible_tool_catalog() {
+        for version in [None, Some(0)] {
+            assert!(matches!(
+                session_switch_command(PathBuf::from("/workspace"), "old".into(), version),
+                CodexCommand::ContinueSession { session_id, .. } if session_id == "old"
+            ));
+        }
+        assert!(matches!(
+            session_switch_command(
+                PathBuf::from("/workspace"),
+                "compatible".into(),
+                Some(crate::agent_conversation::AGENT_TOOL_CONTRACT_VERSION),
+            ),
+            CodexCommand::ResumeSession { session_id, .. } if session_id == "compatible"
+        ));
+    }
 
     #[test]
     fn session_callback_adds_empty_error_without_renaming_fields() {

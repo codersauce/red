@@ -12284,17 +12284,17 @@ impl Editor {
                     let Some(bridge) = self.agent_manager.bridge() else {
                         continue;
                     };
-                    let command = if resume {
-                        CodexCommand::ResumeSession {
-                            cwd,
-                            session_id: session_id.clone(),
-                        }
+                    let tool_contract_version = if resume {
+                        self.agent_manager
+                            .conversation_tool_contract_version(&session_id)
                     } else {
-                        CodexCommand::ContinueSession {
-                            cwd,
-                            session_id: session_id.clone(),
-                        }
+                        None
                     };
+                    let command = agent_sessions::session_switch_command(
+                        cwd,
+                        session_id.clone(),
+                        tool_contract_version,
+                    );
                     if bridge.send(command).await.is_err() {
                         let message = self
                             .finish_agent_bridge(

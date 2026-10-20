@@ -10114,6 +10114,29 @@ mod tests {
                     && preview.response == "The hook was unavailable."
         ));
 
+        // Enter must not activate an old row while the new query is debouncing.
+        runtime
+            .notify(
+                "panel:event:agent-conversation",
+                serde_json::json!({"action":"filter_input","text":"different query"}),
+            )
+            .await
+            .unwrap();
+        runtime
+            .notify(
+                "panel:event:agent-conversation",
+                serde_json::json!({"action":"activate_block","text":session_block_id}),
+            )
+            .await
+            .unwrap();
+        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
+        runtime
+            .notify(
+                "panel:event:agent-conversation",
+                serde_json::json!({"action":"filter_input","text":"needle"}),
+            )
+            .await
+            .unwrap();
         runtime
             .notify(
                 "panel:event:agent-conversation",

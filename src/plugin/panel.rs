@@ -4166,6 +4166,7 @@ impl PanelManager {
         };
         if let Some(detail) = &panel.header_detail {
             if let (Some(action), Some(shortcut)) = (&detail.action, &detail.shortcut) {
+                actions.retain(|action| action.key != *shortcut);
                 let (label, description) = if action == "session_scope" {
                     ("scope", "Change which sessions are shown")
                 } else {
@@ -4708,6 +4709,12 @@ impl PanelManager {
             }
         }
 
+        if key
+            .modifiers
+            .intersects(KeyModifiers::ALT | KeyModifiers::SUPER)
+        {
+            return None;
+        }
         let control = key.modifiers.contains(KeyModifiers::CONTROL);
         let motion = match key.code {
             KeyCode::Left | KeyCode::Char('h') if !control => TextPanelMotion::Left,
@@ -5361,7 +5368,7 @@ impl PanelManager {
                     } else {
                         "composer_input"
                     };
-                    (action, Some(composer.prompt.text()))
+                    (action, temporary_context.then(|| composer.prompt.text()))
                 }
                 PromptInput::Submit => match composer.take_submission() {
                     Some(text) => {
@@ -5397,7 +5404,7 @@ impl PanelManager {
                     } else {
                         "composer_input"
                     };
-                    (action, Some(composer.prompt.text()))
+                    (action, temporary_context.then(|| composer.prompt.text()))
                 }
                 PromptInput::Unhandled => return None,
             };

@@ -896,7 +896,7 @@ fn render_session_browser(sessions: [Json], error: String, loading: bool) {
 
 fn session_browser_query_changed(query: String) {
     if !state().session_browser_open || query == state().session_browser_query { return; }
-    red::state_patch(AgentState { session_browser_query: query });
+    red::state_patch(AgentState { session_browser_query: query, session_browser_request: -1 });
     let previous = red::string(state().session_browser_debounce, "");
     if previous != "" { red::execute("CancelTimeout", previous); }
     let timer = red::execute("SetTimeout", 150);
@@ -1087,6 +1087,7 @@ fn activate_session_browser_block(block_id: String) {
 }
 
 fn session_selected(item: Json) {
+    if state().session_browser_query != state().session_browser_results_query { return; }
     if pane_phase() != "idle" {
         red::execute("Print", "The Agent state changed; choose the session again");
         return;
