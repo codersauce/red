@@ -8802,9 +8802,6 @@ impl Editor {
     }
 
     fn move_screen_line(&mut self, delta: isize) {
-        let Some(window) = self.window_manager.active_window().cloned() else {
-            return;
-        };
         let line_index = self.buffer_line();
         let display_col = self.current_cursor_display_col();
         let width = self.active_content_width();
@@ -8824,27 +8821,13 @@ impl Editor {
             return;
         }
 
-        let layout = self.layout_for_window(&window);
-        let Some(current_index) = layout.rows.iter().position(|segment| {
-            segment.line == line_index && segment.contains_cursor_col(display_col)
-        }) else {
-            return;
-        };
-        let target_index = if delta < 0 {
-            current_index.saturating_sub(delta.unsigned_abs())
-        } else {
-            (current_index + delta as usize).min(layout.rows.len().saturating_sub(1))
-        };
-        let Some(target) = layout.rows.get(target_index) else {
-            return;
-        };
-        let target_display_col = target
-            .start_col
-            .saturating_add(display_col.saturating_sub(layout.rows[current_index].start_col))
-            .min(target.end_col.saturating_sub(1));
-        self.vtop = target.line.saturating_sub(self.cy);
-        self.cy = target.line.saturating_sub(self.vtop);
-        self.move_to_display_col_on_current_line(target_display_col);
+        // Without wrapping, each source line is one screen line. Resolve the
+        // destination beyond the visible layout and scroll only when needed.
+        let target_line = line_index
+            .saturating_add_signed(delta)
+            .min(self.last_navigable_line());
+        self.reveal_cursor_destination(target_line);
+        self.move_to_display_col_on_current_line(display_col);
         self.refresh_cursor_goal();
     }
 

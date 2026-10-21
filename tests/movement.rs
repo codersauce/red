@@ -609,6 +609,53 @@ async fn test_wrap_uses_skipcol_for_deep_wrapped_cursor() {
 }
 
 #[tokio::test]
+async fn test_nowrap_screen_line_motion_preserves_viewport_until_scroll_margin() {
+    for scrolloff in [0, 3] {
+        let config = Config {
+            wrap: Some(false),
+            scrolloff: Some(scrolloff),
+            ..Default::default()
+        };
+        let contents = (0..80)
+            .map(|line| format!("Line {line} {}", "long text ".repeat(10)))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut screen = EditorHarness::with_config_and_size(
+            Buffer::new(None, contents.clone()),
+            config.clone(),
+            40,
+            12,
+        );
+        let mut logical =
+            EditorHarness::with_config_and_size(Buffer::new(None, contents), config, 40, 12);
+
+        for (screen_action, logical_action) in [
+            (Action::MoveScreenLineDown, Action::MoveDown),
+            (Action::MoveScreenLineUp, Action::MoveUp),
+        ] {
+            for _ in 0..85 {
+                screen.execute_action(screen_action.clone()).await.unwrap();
+                logical
+                    .execute_action(logical_action.clone())
+                    .await
+                    .unwrap();
+                assert_eq!(screen.cursor_position(), logical.cursor_position());
+                assert_eq!(
+                    screen.viewport_top(),
+                    logical.viewport_top(),
+                    "{screen_action:?}, scrolloff={scrolloff}, cursor={:?}",
+                    screen.cursor_position()
+                );
+                assert_eq!(
+                    screen.render_cursor_position(),
+                    logical.render_cursor_position()
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
 async fn test_screen_line_down_updates_rendered_cursor_without_lag() {
     let content = format!(
         "{}\n{}",
