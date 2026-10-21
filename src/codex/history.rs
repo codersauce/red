@@ -58,6 +58,9 @@ pub(super) struct PendingHistory {
     turns: Vec<Value>,
     text_bytes: usize,
     pages: usize,
+    /// Set once a page falls back to summaries, which drop the tool calls that
+    /// carry annotations, so the history is incomplete even at its last page.
+    summarized: bool,
 }
 
 /// Starts reading a thread's newest turns for `purpose`.
@@ -82,6 +85,7 @@ pub(super) async fn start(
             turns: Vec::new(),
             text_bytes: 0,
             pages: 0,
+            summarized: false,
         },
         input,
         pending,
@@ -130,6 +134,7 @@ pub(super) async fn handle_response(
         if code == Some(FRAME_TOO_LARGE_CODE) && state.view == TurnView::Full {
             // Tool output made this page too large: keep going with messages only.
             state.view = TurnView::Summary;
+            state.summarized = true;
             return request_page(state, input, pending, next_id).await;
         }
         if code == Some(METHOD_NOT_FOUND) && state.pages == 0 {
@@ -210,11 +215,12 @@ async fn finish(
         purpose,
         session_id,
         mut turns,
+        summarized,
         ..
     } = state;
     turns.reverse();
     let mut thread = json!({"id": session_id, "turns": turns});
-    if !complete {
+    if !complete || summarized {
         thread["historyTruncated"] = json!(true);
     }
     // A failed first page has nothing to show, except for a resumed thread,

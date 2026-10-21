@@ -852,7 +852,9 @@ async fn resume_persisted_thread(legacy: bool) {
             assert_eq!(session_id, "thread-red");
             assert_eq!(thread["turns"].as_array().unwrap().len(), 1);
             assert_eq!(thread["turns"][0]["items"][1]["text"], "earlier answer");
-            assert!(thread.get("historyTruncated").is_none());
+            // Summaries drop the tool calls that carry annotations, so the
+            // paged fallback must not claim a complete history.
+            assert_eq!(thread.get("historyTruncated").is_some(), !legacy);
         }
         other => panic!("expected restored session, got {other:?}"),
     }
