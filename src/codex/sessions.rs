@@ -10,6 +10,9 @@ use std::{
 
 const PAGE_LIMIT: usize = 100;
 const MAX_SESSIONS: usize = 4096;
+/// Sessions shown at once. Searching reaches older ones, and a long list costs
+/// the plugin more to render than a person will scroll through.
+const MAX_LISTED_SESSIONS: usize = 200;
 const MAX_PAGES: usize = 100;
 const MAX_SESSION_METADATA_BYTES: u64 = 64 * 1024;
 const MAX_SESSION_PREVIEW_CHARS: usize = 12 * 1024;
@@ -52,8 +55,14 @@ pub struct AgentSessionSummary {
 pub(super) struct PendingSessionRequest {
     request_id: i64,
     request: AgentSessionListRequest,
-    threads: Vec<(Value, String)>,
+    /// Every thread id seen so far, listed or not.
+    seen: HashSet<String>,
+    sessions: Vec<AgentSessionSummary>,
     cursors: HashSet<String>,
+    cursor: Option<String>,
+    /// Threads per page. Older Codex threads can carry a whole pasted prompt as
+    /// their preview, so a page too large to read is retried at half the size.
+    limit: usize,
 }
 
 impl PendingSessionRequest {
@@ -147,7 +156,6 @@ fn interactive_source_kinds(scope: AgentSessionScope) -> Value {
 
 async fn list_page(
     state: PendingSessionRequest,
-    cursor: Option<String>,
     input: &mut (impl AsyncWrite + Unpin),
     pending: &mut HashMap<String, Pending>,
     next_id: &mut u64,
@@ -158,8 +166,8 @@ async fn list_page(
         (
             "thread/list",
             json!({
-                "limit": PAGE_LIMIT,
-                "cursor": cursor,
+                "limit": state.limit,
+                "cursor": state.cursor,
                 "archived": false,
                 "sortKey": "updated_at",
                 "sortDirection": "desc",
@@ -172,8 +180,8 @@ async fn list_page(
             "thread/search",
             json!({
                 "searchTerm": query,
-                "limit": PAGE_LIMIT,
-                "cursor": cursor,
+                "limit": state.limit,
+                "cursor": state.cursor,
                 "archived": false,
                 "sortKey": "updated_at",
                 "sortDirection": "desc",
@@ -203,10 +211,12 @@ pub(super) async fn handle_command(
         PendingSessionRequest {
             request_id,
             request,
-            threads: Vec::new(),
+            seen: HashSet::new(),
+            sessions: Vec::new(),
             cursors: HashSet::new(),
+            cursor: None,
+            limit: PAGE_LIMIT,
         },
-        None,
         input,
         pending,
         next_id,
@@ -224,6 +234,22 @@ pub(super) async fn handle_response(
 ) -> Result<()> {
     let request_id = request.request_id();
     if let Some(error) = message.get("error") {
+        if error["code"].as_i64() == Some(FRAME_TOO_LARGE_CODE) {
+            if request.limit > 1 {
+                let limit = request.limit / 2;
+                return list_page(
+                    PendingSessionRequest { limit, ..request },
+                    input,
+                    pending,
+                    next_id,
+                )
+                .await;
+            }
+            // One thread alone is too large to list; show the ones before it.
+            if !request.sessions.is_empty() {
+                return finish(request.sessions, true, request_id, events).await;
+            }
+        }
         complete(
             events,
             request_id,
@@ -245,7 +271,14 @@ pub(super) async fn handle_response(
         return Ok(());
     };
     let searching = !request.request.query.trim().is_empty();
-    let mut threads = request.threads;
+    let PendingSessionRequest {
+        request: list_request,
+        mut seen,
+        mut sessions,
+        mut cursors,
+        limit,
+        ..
+    } = request;
     for entry in page {
         let (thread, snippet) = if searching {
             (&entry["thread"], clean_text(&entry["snippet"]))
@@ -255,20 +288,19 @@ pub(super) async fn handle_response(
         let Some(id) = thread["id"].as_str().filter(|id| !id.is_empty()) else {
             continue;
         };
-        if !threads
-            .iter()
-            .any(|(existing, _)| existing["id"].as_str() == Some(id))
-        {
-            threads.push((thread.clone(), snippet));
+        if seen.insert(id.to_string()) {
+            sessions.extend(summarize(&list_request, thread, snippet));
         }
     }
-    if let Some(cursor) = message
+    let next_cursor = message
         .pointer("/result/nextCursor")
         .and_then(Value::as_str)
-        .filter(|cursor| !cursor.is_empty())
-    {
-        let mut cursors = request.cursors;
-        if threads.len() > MAX_SESSIONS
+        .filter(|cursor| !cursor.is_empty());
+    if sessions.len() >= MAX_LISTED_SESSIONS {
+        return finish(sessions, next_cursor.is_some(), request_id, events).await;
+    }
+    if let Some(cursor) = next_cursor {
+        if seen.len() > MAX_SESSIONS
             || cursors.len() >= MAX_PAGES
             || !cursors.insert(cursor.to_string())
         {
@@ -282,11 +314,13 @@ pub(super) async fn handle_response(
             list_page(
                 PendingSessionRequest {
                     request_id,
-                    request: request.request,
-                    threads,
+                    request: list_request,
+                    seen,
+                    sessions,
                     cursors,
+                    cursor: Some(cursor.to_string()),
+                    limit,
                 },
-                Some(cursor.to_string()),
                 input,
                 pending,
                 next_id,
@@ -295,18 +329,30 @@ pub(super) async fn handle_response(
         }
         return Ok(());
     }
+    finish(sessions, false, request_id, events).await
+}
 
-    let mut sessions = threads
-        .into_iter()
-        .filter_map(|(thread, snippet)| summarize(&request.request, &thread, snippet))
-        .collect::<Vec<_>>();
+/// Reports the most recent sessions; `more` says older ones were left out.
+async fn finish(
+    mut sessions: Vec<AgentSessionSummary>,
+    more: bool,
+    request_id: i64,
+    events: &mpsc::Sender<CodexEvent>,
+) -> Result<()> {
     sessions.sort_by(|left, right| {
         right
             .updated_at
             .cmp(&left.updated_at)
             .then_with(|| right.id.cmp(&left.id))
     });
-    complete(events, request_id, Ok(json!({"sessions": sessions}))).await;
+    let more = more || sessions.len() > MAX_LISTED_SESSIONS;
+    sessions.truncate(MAX_LISTED_SESSIONS);
+    complete(
+        events,
+        request_id,
+        Ok(json!({"sessions": sessions, "more": more})),
+    )
+    .await;
     Ok(())
 }
 

@@ -110,6 +110,9 @@ for line in sys.stdin:
         if os.environ.get("RED_MOCK_RESUME_ERROR"):
             send({"id": ident, "error": {"code": -32602, "message": "stored thread is unavailable"}})
             continue
+        if message["params"].get("excludeTurns") and not os.environ.get("RED_MOCK_LEGACY_RESUME"):
+            send({"id": ident, "result": {"thread": {"id": "thread-red", "ephemeral": False, "turns": []}}})
+            continue
         send({"id": ident, "result": {"thread": {
             "id": "thread-red",
             "ephemeral": False,
@@ -122,6 +125,22 @@ for line in sys.stdin:
                 ]
             }]
         }}})
+    elif method == "thread/turns/list":
+        params = message["params"]
+        assert params["threadId"] == "thread-red"
+        assert params["sortDirection"] == "desc"
+        if params["itemsView"] == "full":
+            # Tool output too large for one frame: Red should retry with summaries.
+            send({"id": ident, "result": {"data": [{"id": "huge", "items": [{"type": "commandExecution", "aggregatedOutput": "x" * (9 * 1024 * 1024)}]}], "nextCursor": None}})
+            continue
+        send({"id": ident, "result": {"data": [{
+            "id": "restored-turn",
+            "status": "completed",
+            "items": [
+                {"id": "restored-user", "type": "userMessage", "content": [{"type": "text", "text": "earlier question"}]},
+                {"id": "restored-agent", "type": "agentMessage", "text": "earlier answer"}
+            ]
+        }], "nextCursor": None}})
     elif method == "turn/start":
         assert message["params"]["input"][0]["text"] == "update the file"
         context = message["params"]["input"][1]["text"]
@@ -206,11 +225,24 @@ for line in sys.stdin:
                 {"id":"red-old", "cwd":"/workspace", "ephemeral":False, "threadSource":"red", "source":"appServer", "name":None, "preview":"Older Red", "updatedAt":10},
                 {"id":"ephemeral", "cwd":"/workspace", "ephemeral":True, "threadSource":"red", "source":"appServer", "name":"Hidden", "preview":"", "updatedAt":50}
             ], "nextCursor":"page-2"}})
+        elif params["limit"] > 50:
+            # Old threads keep whole pasted prompts as previews: too large for one page.
+            assert params["cursor"] == "page-2"
+            send({"id": ident, "result": {"data": [
+                {"id":"huge-preview", "cwd":"/workspace", "ephemeral":False, "threadSource":"red", "source":"vscode", "name":None, "preview":"x" * (9 * 1024 * 1024), "updatedAt":15}
+            ], "nextCursor":None}})
         else:
             assert params["cursor"] == "page-2"
             send({"id": ident, "result": {"data": [
                 {"id":"red-new", "cwd":"/workspace", "ephemeral":False, "threadSource":"red", "source":"vscode", "name":"Newer Red", "preview":"", "updatedAt":20}
             ], "nextCursor":None}})
+    elif method == "thread/search" and params["searchTerm"] == "many":
+        # More matches than Red lists: it should stop without asking for the next page.
+        assert params.get("cursor") is None
+        send({"id": ident, "result": {"data": [
+            {"thread":{"id":f"many-{n}", "cwd":"/workspace", "ephemeral":False, "threadSource":"user", "source":"cli", "name":f"Many {n}", "preview":"", "updatedAt":1000 - n}, "snippet":"many"}
+            for n in range(250)
+        ], "nextCursor":"more"}})
     elif method == "thread/search":
         assert params["searchTerm"] == "needle"
         assert params["sortKey"] == "updated_at"
@@ -219,11 +251,30 @@ for line in sys.stdin:
             {"thread":{"id":"workspace-hit", "cwd":"/workspace", "ephemeral":False, "threadSource":"user", "source":"cli", "name":"Hit", "preview":"", "updatedAt":25}, "snippet":"a matching needle"},
             {"thread":{"id":"other-hit", "cwd":"/other", "ephemeral":False, "threadSource":"user", "source":"cli", "name":"Other", "preview":"", "updatedAt":35}, "snippet":"needle elsewhere"}
         ], "nextCursor":None}})
+    elif method == "thread/turns/list":
+        assert params["sortDirection"] == "desc"
+        assert params["itemsView"] == "summary"
+        if params["threadId"] == "huge":
+            send({"id": ident, "result": {"data": [{"id": "t", "items": [{"type": "agentMessage", "text": "x" * (9 * 1024 * 1024)}]}], "nextCursor": None}})
+        elif params["threadId"] == "legacy-server":
+            send({"id": ident, "error": {"code": -32601, "message": "method not found"}})
+        elif params.get("cursor") is None:
+            assert params["threadId"] == "foreign"
+            send({"id": ident, "result": {"data": [{"id":"new-turn", "items":[
+                {"id":"new-user", "type":"userMessage", "content":[{"type":"text", "text":"Later question"}]},
+                {"id":"new-agent", "type":"agentMessage", "text":"Later answer"}
+            ]}], "nextCursor": "older"}})
+        else:
+            assert params["cursor"] == "older"
+            send({"id": ident, "result": {"data": [{"id":"old-turn", "items":[
+                {"id":"old-user", "type":"userMessage", "content":[{"type":"text", "text":"Earlier question"}]},
+                {"id":"old-agent", "type":"agentMessage", "text":"Earlier answer"}
+            ]}], "nextCursor": None}})
     elif method == "thread/read":
-        assert params["threadId"] == "foreign"
+        assert params["threadId"] == "legacy-server"
         assert params["includeTurns"] is True
         send({"id": ident, "result": {"thread": {
-            "id":"foreign", "cwd":"/elsewhere", "turns":[{"id":"old-turn", "items":[
+            "id":"legacy-server", "cwd":"/elsewhere", "turns":[{"id":"old-turn", "items":[
                 {"id":"old-user", "type":"userMessage", "content":[{"type":"text", "text":"Earlier question"}]},
                 {"id":"old-agent", "type":"agentMessage", "text":"Earlier answer"}
             ]}]
@@ -248,7 +299,9 @@ for line in sys.stdin:
         assert params["threadId"] == "red-fork"
         assert params["items"] == [
             {"type":"message", "role":"user", "content":[{"type":"input_text", "text":"Earlier question"}]},
-            {"type":"message", "role":"assistant", "content":[{"type":"output_text", "text":"Earlier answer"}]}
+            {"type":"message", "role":"assistant", "content":[{"type":"output_text", "text":"Earlier answer"}]},
+            {"type":"message", "role":"user", "content":[{"type":"input_text", "text":"Later question"}]},
+            {"type":"message", "role":"assistant", "content":[{"type":"output_text", "text":"Later answer"}]}
         ]
         send({"id": ident, "result": {}})
 "#,
@@ -330,6 +383,30 @@ async fn direct_app_server_lists_searches_and_continues_sessions_for_red() {
     }
 
     bridge
+        .send(CodexCommand::SessionList {
+            request_id: 46,
+            request: AgentSessionListRequest {
+                cwd: std::path::PathBuf::from("/workspace"),
+                scope: AgentSessionScope::All,
+                query: "many".into(),
+                exclude_session_id: None,
+            },
+        })
+        .await
+        .unwrap();
+    match next_event(&mut bridge, &mut task).await {
+        CodexEvent::SessionListCompleted {
+            request_id: 46,
+            result: Ok(result),
+        } => {
+            assert_eq!(result["sessions"].as_array().unwrap().len(), 200);
+            assert_eq!(result["sessions"][0]["id"], "many-0");
+            assert_eq!(result["more"], true);
+        }
+        event => panic!("unexpected capped session list: {event:?}"),
+    }
+
+    bridge
         .send(CodexCommand::SessionPreview {
             request_id: 43,
             session_id: "foreign".into(),
@@ -342,10 +419,42 @@ async fn direct_app_server_lists_searches_and_continues_sessions_for_red() {
             result: Ok(result),
         } => {
             assert_eq!(result["session_id"], "foreign");
-            assert_eq!(result["prompt"], "Earlier question");
-            assert_eq!(result["response"], "Earlier answer");
+            assert_eq!(result["prompt"], "Later question");
+            assert_eq!(result["response"], "Later answer");
         }
         event => panic!("unexpected read-only session preview: {event:?}"),
+    }
+
+    // A response too large to read fails only its own request.
+    bridge
+        .send(CodexCommand::SessionPreview {
+            request_id: 44,
+            session_id: "huge".into(),
+        })
+        .await
+        .unwrap();
+    match next_event(&mut bridge, &mut task).await {
+        CodexEvent::SessionPreviewCompleted {
+            request_id: 44,
+            result: Err(message),
+        } => assert!(message.contains("MiB response"), "{message}"),
+        event => panic!("unexpected oversized preview: {event:?}"),
+    }
+
+    // An app-server without turn paging still previews through thread/read.
+    bridge
+        .send(CodexCommand::SessionPreview {
+            request_id: 45,
+            session_id: "legacy-server".into(),
+        })
+        .await
+        .unwrap();
+    match next_event(&mut bridge, &mut task).await {
+        CodexEvent::SessionPreviewCompleted {
+            request_id: 45,
+            result: Ok(result),
+        } => assert_eq!(result["response"], "Earlier answer"),
+        event => panic!("unexpected legacy preview: {event:?}"),
     }
 
     bridge
@@ -705,18 +814,29 @@ async fn direct_app_server_generates_commit_messages_without_tools_or_agent_even
 
 #[tokio::test]
 async fn direct_app_server_resumes_a_persisted_thread_with_history() {
+    resume_persisted_thread(false).await;
+}
+
+#[tokio::test]
+async fn direct_app_server_resumes_from_an_app_server_without_turn_paging() {
+    resume_persisted_thread(true).await;
+}
+
+/// The paged path also skips a full-history page too large to read and
+/// retries it as message summaries.
+async fn resume_persisted_thread(legacy: bool) {
     let _serial = MOCK_CODEX_TEST_LOCK.lock().await;
     let directory = tempfile::tempdir().unwrap();
     let codex = mock_codex(directory.path());
     let host = RecordingHost {
         writes: Arc::new(Mutex::new(Vec::new())),
     };
-    let (mut bridge, mut task) = start_codex(
-        CodexProcessSpec::new(codex, directory.path()),
-        host,
-        NonZeroUsize::new(32).unwrap(),
-    )
-    .unwrap();
+    let mut spec = CodexProcessSpec::new(codex, directory.path());
+    if legacy {
+        spec.environment
+            .insert("RED_MOCK_LEGACY_RESUME".into(), "true".into());
+    }
+    let (mut bridge, mut task) = start_codex(spec, host, NonZeroUsize::new(32).unwrap()).unwrap();
 
     bridge
         .send(CodexCommand::ResumeSession {
@@ -730,7 +850,9 @@ async fn direct_app_server_resumes_a_persisted_thread_with_history() {
     match event {
         CodexEvent::SessionRestored { session_id, thread } => {
             assert_eq!(session_id, "thread-red");
+            assert_eq!(thread["turns"].as_array().unwrap().len(), 1);
             assert_eq!(thread["turns"][0]["items"][1]["text"], "earlier answer");
+            assert!(thread.get("historyTruncated").is_none());
         }
         other => panic!("expected restored session, got {other:?}"),
     }
@@ -932,6 +1054,8 @@ for line in sys.stdin:
         send({"method":"turn/completed","params":{"threadId":"model-thread","turn":{"id":"running-turn","status":"completed"}}})
     elif method == "thread/resume":
         send({"id":ident,"result":dict(info("second","low"),thread={"id":"model-thread","turns":[]})})
+    elif method == "thread/turns/list":
+        send({"id":ident,"result":{"data":[],"nextCursor":None}})
     elif method == "turn/interrupt":
         raise AssertionError("changing the model must not interrupt the running turn")
 "#).unwrap();

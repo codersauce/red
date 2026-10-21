@@ -145,8 +145,13 @@ impl AgentConversationSnapshot {
     /// is authoritative once it has returned at least one transcript item.
     #[must_use]
     pub fn reconciled_with_thread(mut self, thread: &Value) -> Self {
+        // Red reads only the newest turns of a long thread, which miss annotations
+        // added earlier, so that partial replay only fills an empty record.
+        let truncated = thread.get("historyTruncated").and_then(Value::as_bool) == Some(true);
         if let Some(annotations) = annotation_records_from_thread(&self, thread) {
-            self.annotations = annotations;
+            if !truncated || self.annotations.is_empty() {
+                self.annotations = annotations;
+            }
         }
         let parsed = transcript_items_from_thread(thread);
         if parsed.is_empty() {
@@ -559,6 +564,45 @@ mod tests {
         assert_eq!(restored.annotations[0].start_line, 8);
         assert_eq!(restored.annotations[0].end_line, 9);
         assert_eq!(restored.annotations[0].expected_fingerprint, Some([7; 32]));
+    }
+
+    #[test]
+    fn truncated_history_only_replays_annotations_into_an_empty_record() {
+        let saved = "00000000-0000-4000-8000-000000000001";
+        let recent = "00000000-0000-4000-8000-000000000002";
+        let add = annotation_tool_item(
+            "add_annotations",
+            json!({"path": "src/main.rs"}),
+            json!({
+                "ok": true,
+                "path": "src/main.rs",
+                "annotations": [{"id": recent, "start_line": 3, "end_line": 3, "message": "Recent note"}]
+            }),
+        );
+        let thread = json!({
+            "historyTruncated": true,
+            "turns": [{"id": "turn-9", "items": [add]}]
+        });
+        let mut cached = AgentConversationSnapshot::new("thread-1", "/workspace");
+        cached.annotations.push(AgentAnnotationRecord {
+            id: saved.to_string(),
+            session_id: "thread-1".to_string(),
+            turn_id: "turn-1".to_string(),
+            path: "src/lib.rs".to_string(),
+            start_line: 1,
+            end_line: 1,
+            message: "Saved note".to_string(),
+            expected_fingerprint: None,
+        });
+
+        let kept = cached.reconciled_with_thread(&thread);
+        let filled = AgentConversationSnapshot::new("thread-1", "/workspace")
+            .reconciled_with_thread(&thread);
+
+        assert_eq!(kept.annotations.len(), 1);
+        assert_eq!(kept.annotations[0].id, saved);
+        assert_eq!(filled.annotations.len(), 1);
+        assert_eq!(filled.annotations[0].id, recent);
     }
 
     #[test]
