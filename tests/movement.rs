@@ -611,7 +611,7 @@ async fn test_wrap_uses_skipcol_for_deep_wrapped_cursor() {
 #[tokio::test]
 async fn test_nowrap_screen_line_motion_preserves_viewport_until_scroll_margin() {
     for scrolloff in [0, 3] {
-        let config = Config {
+        let config = || Config {
             wrap: Some(false),
             scrolloff: Some(scrolloff),
             ..Default::default()
@@ -622,12 +622,12 @@ async fn test_nowrap_screen_line_motion_preserves_viewport_until_scroll_margin()
             .join("\n");
         let mut screen = EditorHarness::with_config_and_size(
             Buffer::new(None, contents.clone()),
-            config.clone(),
+            config(),
             40,
             12,
         );
         let mut logical =
-            EditorHarness::with_config_and_size(Buffer::new(None, contents), config, 40, 12);
+            EditorHarness::with_config_and_size(Buffer::new(None, contents), config(), 40, 12);
 
         for (screen_action, logical_action) in [
             (Action::MoveScreenLineDown, Action::MoveDown),
