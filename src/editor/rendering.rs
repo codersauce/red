@@ -1490,6 +1490,9 @@ impl Editor {
     /// Renders the entire editor state to the terminal
     /// This is the main entry point for all rendering operations
     pub fn render(&mut self, buffer: &mut RenderBuffer) -> anyhow::Result<()> {
+        if let Some(message) = self.clipboard_notice.take() {
+            self.set_quiet_message(Some(message));
+        }
         if self.render_is_deferred() {
             self.request_motion_render(super::MotionRender::Full);
             return Ok(());

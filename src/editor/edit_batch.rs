@@ -361,6 +361,17 @@ impl Editor {
         runtime: &mut Runtime,
         tracking: bool,
     ) -> anyhow::Result<bool> {
+        // Resolve an explicit paste's client clipboard here, outside the large
+        // recursive dispatcher to avoid growing its stack footprint.
+        if matches!(
+            action,
+            Action::Paste
+                | Action::PasteBefore
+                | Action::PasteAfterMultiSelection
+                | Action::PasteBeforeMultiSelection
+        ) {
+            self.refresh_default_register_from_system_clipboard().await;
+        }
         let local =
             Self::action_is_batch_local(action) || self.action_is_local_substitute_command(action);
         let barrier = self.edit_batch.is_active() && !local;

@@ -97,6 +97,8 @@ pub struct Args {
 pub enum RootCommand {
     /// Check for or install the latest stable Red release.
     Update(UpdateArgs),
+    /// Diagnose clipboard transport without reading or changing clipboard contents.
+    Clipboard(ClipboardArgs),
     /// Inspect how this terminal reports composer keyboard shortcuts.
     Keys(KeyboardArgs),
     /// Install and manage external plugin packages.
@@ -113,6 +115,13 @@ pub struct UpdateArgs {
     /// Install unattended when this installation is managed, otherwise only check.
     #[arg(long, hide = true)]
     pub auto: bool,
+}
+
+#[derive(Debug, ClapArgs)]
+pub struct ClipboardArgs {
+    /// Replace the destination clipboard with a harmless token for a manual paste check.
+    #[arg(long)]
+    pub test_copy: bool,
 }
 
 #[derive(Debug, ClapArgs)]

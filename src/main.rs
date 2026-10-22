@@ -30,6 +30,7 @@ use red::assets;
 use red::buffer::Buffer;
 use red::cli::{Args, LanguageCommand, PluginCommand, RootCommand};
 use red::cli_style;
+use red::clipboard::{ClipboardProvider as _, SessionClipboard};
 use red::config::{
     Config, ConfigDiagnosticSeverity, ConfigRecovery, KeyAction, Keys, LoadedConfig,
 };
@@ -96,6 +97,24 @@ async fn run() -> anyhow::Result<()> {
                 red::update::install().await?
             };
             cli_style::print_line(&message);
+            return Ok(());
+        }
+        Some(RootCommand::Clipboard(options)) => {
+            let loaded =
+                Config::load_user_file(&Config::path("config.toml"), &args.config_overrides)?;
+            anyhow::ensure!(
+                loaded.is_clean(),
+                "invalid configuration; run red --check-config"
+            );
+            let mut clipboard = SessionClipboard::new(&loaded.config.clipboard);
+            cli_style::print_line(&clipboard.diagnostic());
+            if options.test_copy {
+                let outcome = clipboard.copy(&clipboard.test_text(), &mut stdout())?;
+                cli_style::print_line(&format!(
+                    "{}; paste in a client-side application to verify",
+                    SessionClipboard::report(Ok(outcome))
+                ));
+            }
             return Ok(());
         }
         Some(RootCommand::Keys(keys)) => {
@@ -803,6 +822,7 @@ async fn attach_session(session: &str) -> anyhow::Result<()> {
         terminal::enable_raw_mode()?;
         let mut terminal_guard = DetachedTerminalGuard::default();
         let mut output = std::io::BufWriter::with_capacity(1 << 20, stdout());
+        let mut clipboard = SessionClipboard::new(&client.clipboard_config);
         output
             .execute(event::EnableBracketedPaste)?
             .execute(event::EnableFocusChange)?
@@ -855,6 +875,13 @@ async fn attach_session(session: &str) -> anyhow::Result<()> {
                         }
                         event::Event::Paste(text) => {
                             let delta = send_detached_paste(&mut client, text).await?;
+                            let delta = deliver_detached_clipboard(
+                                &mut client,
+                                &mut clipboard,
+                                &mut output,
+                                delta,
+                            )
+                            .await?;
                             paint_detached_if_changed(
                                 &mut output,
                                 &mut rows,
@@ -863,7 +890,13 @@ async fn attach_session(session: &str) -> anyhow::Result<()> {
                             )?;
                         }
                         event::Event::Mouse(event) => {
-                            let delta = client.input(DetachedInput::Mouse { event }).await?;
+                            let delta = send_detached_input(
+                                &mut client,
+                                &mut clipboard,
+                                &mut output,
+                                DetachedInput::Mouse { event },
+                            )
+                            .await?;
                             paint_detached_if_changed(
                                 &mut output,
                                 &mut rows,
@@ -873,7 +906,13 @@ async fn attach_session(session: &str) -> anyhow::Result<()> {
                         }
                         event::Event::Key(key) => {
                             if let Some(input) = detached_key_input(key) {
-                                let delta = client.input(input).await?;
+                                let delta = send_detached_input(
+                                    &mut client,
+                                    &mut clipboard,
+                                    &mut output,
+                                    input,
+                                )
+                                .await?;
                                 paint_detached_if_changed(
                                     &mut output,
                                     &mut rows,
@@ -886,6 +925,9 @@ async fn attach_session(session: &str) -> anyhow::Result<()> {
                 }
                 if last_heartbeat.elapsed() >= DETACHED_RENDER_POLL_INTERVAL {
                     let delta = client.heartbeat().await?;
+                    let delta =
+                        deliver_detached_clipboard(&mut client, &mut clipboard, &mut output, delta)
+                            .await?;
                     paint_detached_if_changed(&mut output, &mut rows, &delta, &mut last_revision)?;
                     last_heartbeat = Instant::now();
                 }
@@ -906,6 +948,47 @@ async fn attach_session(session: &str) -> anyhow::Result<()> {
         let _ = session;
         anyhow::bail!("detach is currently available on Linux and macOS; use --resume on Windows")
     }
+}
+
+#[cfg(unix)]
+async fn send_detached_input(
+    client: &mut red::headless::HeadlessClient<tokio::net::UnixStream>,
+    clipboard: &mut SessionClipboard,
+    output: &mut impl std::io::Write,
+    input: DetachedInput,
+) -> anyhow::Result<red::headless::RenderDelta> {
+    let delta = client.input_with_provider(input, clipboard).await?;
+    deliver_detached_clipboard(client, clipboard, output, delta).await
+}
+
+#[cfg(unix)]
+async fn deliver_detached_clipboard(
+    client: &mut red::headless::HeadlessClient<tokio::net::UnixStream>,
+    clipboard: &mut SessionClipboard,
+    output: &mut impl std::io::Write,
+    mut delta: red::headless::RenderDelta,
+) -> anyhow::Result<red::headless::RenderDelta> {
+    if let Some(text) = client.take_clipboard_write() {
+        let message = SessionClipboard::report(clipboard.copy(&text, output));
+        let feedback = client.clipboard_result(message).await?;
+        // The first delta has not been painted yet. Preserve all its rows while
+        // overlaying the newer feedback; otherwise edits accompanying a copy vanish.
+        for patch in feedback.lines {
+            if let Some(previous) = delta
+                .lines
+                .iter_mut()
+                .find(|previous| previous.row == patch.row)
+            {
+                *previous = patch;
+            } else {
+                delta.lines.push(patch);
+            }
+        }
+        delta.revision = feedback.revision;
+        delta.cursor = feedback.cursor;
+        delta.cursor_state = feedback.cursor_state;
+    }
+    Ok(delta)
 }
 
 #[cfg(unix)]

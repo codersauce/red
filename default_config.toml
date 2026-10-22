@@ -73,6 +73,19 @@ show_diagnostics = true
 [updates]
 mode = "auto"
 
+[clipboard]
+# auto uses native desktop APIs locally and OSC 52 through SSH, Herdr, or tmux.
+# Explicit choices: native, osc52, none. Auto falls back to OSC 52 if native initialization fails.
+enabled = true
+backend = "auto"
+sync_on_yank = true
+sync_on_paste = true
+# OSC 52 UTF-8 bytes before base64 encoding. Maximum 262144; no truncation.
+# Native clipboard reads and writes do not use this terminal-specific limit.
+max_bytes = 65536
+# Remote p uses Red's register; use terminal paste for client clipboard text.
+# `red clipboard` diagnoses routing; --test-copy explicitly copies a test token.
+
 [diagnostics]
 # Show one severity-aware sign beside the line number. Supported icon styles
 # are "nerd_font", "unicode", "ascii", and "none".

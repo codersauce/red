@@ -1,6 +1,6 @@
 ---
 title: "Detach IPC Protocol"
-summary: "Red detach IPC protocol version 3 is a newline-delimited JSON protocol for authenticated local clients, terminal input, render deltas, detach, and stop control."
+summary: "Red detach IPC protocol version 4 carries authenticated terminal input, transient clipboard operations, render deltas, detach, and stop control."
 topics: [sessions, detach, ipc, reference]
 sources:
   - id: headless-ipc
@@ -14,11 +14,11 @@ sources:
     path: docs/DETACH.md
 ---
 
-The detach IPC protocol connects a local terminal client to a running [detachable editor core](../../architecture/sessions/detachable-editor-core). Protocol version 3 uses newline-delimited JSON frames over an ordered local byte stream, authenticates named Unix sessions with a reconnect token, sends terminal-independent input, and returns render deltas capped by frame and terminal-size limits [@headless-ipc]. This page is lookup material for message shapes, limits, and expected responses; operational steps belong in [Detach and reattach](../../guides/sessions/detach-reattach).
+The detach IPC protocol connects a local terminal client to a running [detachable editor core](../../architecture/sessions/detachable-editor-core). Protocol version 4 uses newline-delimited JSON frames over an ordered local byte stream, authenticates named Unix sessions with a reconnect token, sends terminal-independent input, and returns render deltas capped by frame and terminal-size limits [@headless-ipc]. This page is lookup material for message shapes, limits, and expected responses; operational steps belong in [Detach and reattach](../../guides/sessions/detach-reattach).
 
 ## Version And Framing
 
-`IPC_PROTOCOL_VERSION` is `3` [@headless-ipc]. The documented protocol version is also 3, and users are told to stop an older owner before attaching a version-3 client because protocol versions are intentionally not mixed across a running session [@detach-doc].
+`IPC_PROTOCOL_VERSION` is `4` [@headless-ipc]. Stop an older owner before attaching a version-4 client because protocol versions are intentionally not mixed across a running session [@detach-doc].
 
 Every frame is one JSON value followed by a newline. Reads reject a frame that exceeds 2 MiB before the newline arrives, reject an EOF that occurs after a partial frame, and deserialize the complete frame as JSON [@headless-ipc]. Writes serialize JSON, require the encoded frame to be below the same 2 MiB limit, append a newline, flush, and time out after five seconds [@headless-ipc].
 
@@ -37,6 +37,8 @@ All client messages use a tagged JSON field named `type`, with snake-case varian
 | `connect` | `protocol_version`, `reconnect_token`, `last_revision`, `columns`, `rows`, `focused` | Authenticates and attaches a rendering client. `columns` and `rows` default to 80 by 24, and `focused` defaults to true when omitted [@headless-ipc]. |
 | `stop_control` | `protocol_version`, `reconnect_token` | Authenticates a control-only stop request before an interactive attachment exists [@headless-ipc]. |
 | `input` | `sequence`, `event` | Applies one ordered terminal-independent input event and expects a render response with the same sequence [@headless-ipc]. |
+| `clipboard_read_result` | `result` | Replies to an in-flight paste's clipboard request with optional text or an error. Never sent speculatively [@headless-ipc]. |
+| `clipboard_result` | `message` | Reports copy delivery status and returns a control render. Does not include clipboard contents [@headless-ipc]. |
 | `resize` | `columns`, `rows` | Updates viewport dimensions and returns a control render with sequence 0 [@headless-ipc]. |
 | `focus` | `focused` | Updates interactive focus and returns a control render with sequence 0 [@headless-ipc]. |
 | `heartbeat` | none | Renews the client lease and returns render changes newer than the client revision [@headless-ipc]. |
@@ -62,13 +64,21 @@ All server messages use a tagged JSON field named `type`, with snake-case varian
 
 | Message | Fields | Meaning |
 | --- | --- | --- |
-| `connected` | `protocol_version`, `render` | Confirms handshake success and returns the initial render [@headless-ipc]. |
+| `connected` | `protocol_version`, `render`, `clipboard` | Confirms handshake success and returns the initial render and clipboard policy for the current attachment [@headless-ipc]. |
+| `clipboard_read` | none | Requests clipboard text only while executing a paste action [@headless-ipc]. |
+| `clipboard_write` | `text`, `final_chunk` | Carries one transient copy effect before an input or heartbeat render response. Reassembled before terminal delivery; never included in snapshots [@headless-ipc]. |
 | `render` | `sequence`, `delta` | Returns a render delta. Input responses use the input sequence; resize, focus, and heartbeat use sequence 0 [@headless-ipc]. |
 | `detached` | none | Confirms a clean detach [@headless-ipc]. |
 | `stopped` | none | Confirms a stop request [@headless-ipc]. |
 | `error` | `message` | Returns a protocol or editor error safe for the client to show [@headless-ipc]. |
 
 `RenderDelta` contains a monotonic `revision`, a list of `LinePatch` entries, and a cursor tuple [@headless-ipc]. A reconnecting client can send `last_revision`; when it matches the owner's current revision, the owner may return an empty line set instead of a full repaint [@headless-ipc].
+
+Clipboard payloads are capped at 1 MiB, with writes split into IPC chunks of at most
+128 KiB on UTF-8 boundaries. Clipboard read replies have a three-second deadline.
+Each attachment retains at most its final pending copy. Inputs and heartbeats deliver
+transient effects; snapshots and reconnects never replay copies from prior attachments.
+The attachment resolves the configured backend using its current environment [@headless-ipc].
 
 ## Limits And Timeouts
 

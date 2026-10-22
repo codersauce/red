@@ -6931,6 +6931,33 @@ async fn deleting_default_register_writes_system_clipboard() {
 }
 
 #[tokio::test]
+async fn failed_clipboard_copy_reports_failure_and_preserves_internal_paste() {
+    struct FailingClipboard;
+    impl red::clipboard::ClipboardProvider for FailingClipboard {
+        fn get_text(&mut self) -> anyhow::Result<Option<String>> {
+            Ok(None)
+        }
+        fn set_text(&mut self, _text: &str) -> anyhow::Result<()> {
+            anyhow::bail!("clipboard permission denied")
+        }
+    }
+    let mut harness = EditorHarness::with_config(
+        Buffer::new(None, "one\ntwo\nthree".into()),
+        default_key_config(),
+    );
+    harness
+        .editor
+        .test_set_clipboard(Box::new(FailingClipboard));
+    type_normal_keys(&mut harness, "yy").await;
+    assert!(harness
+        .last_error()
+        .is_some_and(|message| message.contains("permission denied")
+            && message.contains("kept in Red's register")));
+    type_normal_keys(&mut harness, "p").await;
+    harness.assert_buffer_contents("one\none\ntwo\nthree");
+}
+
+#[tokio::test]
 async fn paste_reads_external_system_clipboard_text() {
     let mut harness = EditorHarness::with_content("abc");
     harness

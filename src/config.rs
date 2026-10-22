@@ -697,6 +697,15 @@ pub struct ClipboardConfig {
     /// Prefer system clipboard text for paste operations.
     #[serde(default = "default_true")]
     pub sync_on_paste: bool,
+    /// Delivery transport, resolved again for each attached terminal.
+    #[serde(default)]
+    pub backend: crate::clipboard::ClipboardBackend,
+    /// Largest OSC 52 payload in UTF-8 bytes; native clipboard behavior is unchanged.
+    #[serde(
+        default = "crate::clipboard::default_max_bytes",
+        deserialize_with = "crate::clipboard::deserialize_max_bytes"
+    )]
+    pub max_bytes: usize,
 }
 
 impl Default for ClipboardConfig {
@@ -705,6 +714,8 @@ impl Default for ClipboardConfig {
             enabled: true,
             sync_on_yank: true,
             sync_on_paste: true,
+            backend: crate::clipboard::ClipboardBackend::Auto,
+            max_bytes: crate::clipboard::default_max_bytes(),
         }
     }
 }
@@ -2296,7 +2307,10 @@ fn known_schema_path(path: &[String]) -> bool {
         ["statusline", "icons", field] => matches!(*field, "style" | "color"),
         ["key_hints", field] => matches!(*field, "enabled" | "delay_ms"),
         ["clipboard", field] => {
-            matches!(*field, "enabled" | "sync_on_yank" | "sync_on_paste")
+            matches!(
+                *field,
+                "enabled" | "sync_on_yank" | "sync_on_paste" | "backend" | "max_bytes"
+            )
         }
         ["lsp", field] => matches!(*field, "enabled" | "format_on_save" | "servers"),
         ["formatting", field] => matches!(

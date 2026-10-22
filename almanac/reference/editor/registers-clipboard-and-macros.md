@@ -28,6 +28,12 @@ The default register is `'"'` [@editor-core]. `set_register` writes to the syste
 
 The clipboard boundary is a trait. `ClipboardProvider` supports fallible `get_text` and `set_text`, `NativeClipboardProvider` delegates to `arboard`, `DisabledClipboardProvider` treats clipboard operations as unavailable no-ops, and `MemoryClipboardProvider` gives tests and embedded callers deterministic shared text [@clipboard]. Tests assert that yanking and deleting through the default register write the system clipboard, paste can read external clipboard text, and uppercase visual paste preserves the clipboard while replacing the selection [@editing-tests].
 
+`SessionClipboard` selects native, OSC 52, or disabled delivery for the
+current terminal. Clipboard writes share the terminal output writer; detached writes
+are transient IPC effects rather than render state. SSH and tmux copying never reads
+the remote host's clipboard. `p` retains Red's register unless a native clipboard provider supplies text. See [Clipboard transports](../../../docs/CLIPBOARD.md)
+for configuration, limits, diagnostics, and terminal permission requirements.
+
 ## Dot Repeat
 
 Dot repeat uses `last_repeatable_change`, not the macro register store. The editor records an input recipe for the last completed content-changing command and finalizes it only when the change succeeds [@editor-core]. Tests assert that dot repeats direct changes at the current cursor, treats an insert session as one semantic change, preserves literal periods inserted by the user, recomputes operator motions at the new cursor, applies a count before dot as repeated playback, and does not replace the last repeatable change after a failed change [@editing-tests].

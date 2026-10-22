@@ -952,7 +952,6 @@ impl Editor {
             return false;
         }
         let extending = self.multi_cursor_is_extending();
-        self.refresh_default_register_from_system_clipboard();
         let Some(content) = self.registers.get(&super::DEFAULT_REGISTER).cloned() else {
             return false;
         };
