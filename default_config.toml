@@ -74,25 +74,17 @@ show_diagnostics = true
 mode = "auto"
 
 [clipboard]
-# auto uses native desktop APIs locally, tmux's client transport inside tmux,
-# and OSC 52 in SSH sessions. Explicit choices: native, osc52, tmux, command, none.
+# auto uses native desktop APIs locally and OSC 52 through SSH, Herdr, or tmux.
+# Explicit choices: native, osc52, none. Auto falls back to OSC 52 if native initialization fails.
 enabled = true
 backend = "auto"
 sync_on_yank = true
 sync_on_paste = true
-# UTF-8 bytes before base64 encoding. Maximum 262144; never silently truncates.
+# OSC 52 UTF-8 bytes before base64 encoding. Maximum 262144; no truncation.
+# Native clipboard reads and writes do not use this terminal-specific limit.
 max_bytes = 65536
-# Explicit escape wrapping: none, tmux, screen. Passthrough must be allowed by
-# the multiplexer; Red never changes its permissions. GNU Screen auto-detects
-# wrapping and uses a conservative small-payload limit.
-passthrough = "none"
-# tmux_client = "/dev/pts/3" # optional, for a session with multiple clients
-# Command arrays are trusted user configuration, executed without a shell.
-# copy_command = ["my-clipboard-helper", "copy"] # contents arrive on stdin
-# paste_command = ["my-clipboard-helper", "paste"] # optional UTF-8 stdout
-# OSC 52 and tmux never read the remote host clipboard. Use the terminal's
-# paste shortcut for local clipboard text, or p for Red's internal register.
-# Run `red clipboard` to diagnose, or `red clipboard --test-copy` to copy a token.
+# Remote p uses Red's register; use terminal paste for client clipboard text.
+# `red clipboard` diagnoses routing; --test-copy explicitly copies a test token.
 
 [diagnostics]
 # Show one severity-aware sign beside the line number. Supported icon styles

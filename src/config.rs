@@ -700,24 +700,12 @@ pub struct ClipboardConfig {
     /// Delivery transport, resolved again for each attached terminal.
     #[serde(default)]
     pub backend: crate::clipboard::ClipboardBackend,
-    /// Largest UTF-8 clipboard payload; excess text remains in Red's register.
+    /// Largest OSC 52 payload in UTF-8 bytes; native clipboard behavior is unchanged.
     #[serde(
         default = "crate::clipboard::default_max_bytes",
         deserialize_with = "crate::clipboard::deserialize_max_bytes"
     )]
     pub max_bytes: usize,
-    /// Explicit escape wrapping for multiplexers without a native OSC 52 relay.
-    #[serde(default)]
-    pub passthrough: crate::clipboard::Passthrough,
-    /// Optional exact tmux client tty, required when client selection is ambiguous.
-    #[serde(default)]
-    pub tmux_client: Option<String>,
-    /// Explicit executable and arguments. Copied text is passed only on stdin.
-    #[serde(default)]
-    pub copy_command: Vec<String>,
-    /// Optional trusted read command; terminal clipboard reads are otherwise disabled.
-    #[serde(default)]
-    pub paste_command: Vec<String>,
 }
 
 impl Default for ClipboardConfig {
@@ -728,10 +716,6 @@ impl Default for ClipboardConfig {
             sync_on_paste: true,
             backend: crate::clipboard::ClipboardBackend::Auto,
             max_bytes: crate::clipboard::default_max_bytes(),
-            passthrough: crate::clipboard::Passthrough::None,
-            tmux_client: None,
-            copy_command: Vec::new(),
-            paste_command: Vec::new(),
         }
     }
 }
@@ -2325,15 +2309,7 @@ fn known_schema_path(path: &[String]) -> bool {
         ["clipboard", field] => {
             matches!(
                 *field,
-                "enabled"
-                    | "sync_on_yank"
-                    | "sync_on_paste"
-                    | "backend"
-                    | "max_bytes"
-                    | "passthrough"
-                    | "tmux_client"
-                    | "copy_command"
-                    | "paste_command"
+                "enabled" | "sync_on_yank" | "sync_on_paste" | "backend" | "max_bytes"
             )
         }
         ["lsp", field] => matches!(*field, "enabled" | "format_on_save" | "servers"),

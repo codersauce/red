@@ -898,11 +898,11 @@ async fn serve_editor_connection(
                 let mut core = core.lock().await;
                 let delta =
                     input_with_client_clipboard(&mut core, event, &mut reader, &mut writer).await?;
-                let clipboard_writes = core.take_clipboard_writes();
+                let clipboard_write = core.take_clipboard_write();
                 client_revision = delta.revision;
                 let stopped = core.stopped();
                 drop(core);
-                for text in clipboard_writes {
+                if let Some(text) = clipboard_write {
                     write_clipboard_effect(&mut writer, &text).await?;
                 }
                 write_frame(&mut writer, &ServerMessage::Render { sequence, delta }).await?;
@@ -942,7 +942,13 @@ async fn serve_editor_connection(
                 .await?;
             }
             ClientMessage::Heartbeat => {
-                let delta = core.lock().await.snapshot(Some(client_revision));
+                let mut core = core.lock().await;
+                let delta = core.snapshot(Some(client_revision));
+                let copy = core.take_clipboard_write();
+                drop(core);
+                if let Some(text) = copy {
+                    write_clipboard_effect(&mut writer, &text).await?;
+                }
                 client_revision = delta.revision;
                 write_frame(
                     &mut writer,
@@ -1081,7 +1087,7 @@ async fn input_with_client_clipboard(
                 let response = read_frame_with_timeout(reader, Duration::from_secs(3), "clipboard client read timed out").await?;
                 let Some(ClientMessage::ClipboardReadResult { result }) = response else { anyhow::bail!("expected clipboard read response"); };
                 match &result {
-                    Ok(Some(text)) => anyhow::ensure!(text.len() <= crate::clipboard::MAX_CLIPBOARD_BYTES, "clipboard read exceeds 256 KiB"),
+                    Ok(Some(text)) => anyhow::ensure!(text.len() <= crate::clipboard::MAX_CLIPBOARD_BYTES, "clipboard read exceeds 1 MiB"),
                     Err(message) => anyhow::ensure!(message.len() <= 4096, "clipboard read error too large"),
                     _ => {}
                 }
@@ -1256,7 +1262,7 @@ where
     /// Render returned by the successful connection handshake.
     pub initial_render: RenderDelta,
     pub clipboard_config: crate::config::ClipboardConfig,
-    clipboard_writes: Vec<String>,
+    clipboard_write: Option<String>,
 }
 
 impl<S> HeadlessClient<S>
@@ -1323,7 +1329,7 @@ where
             next_sequence: 1,
             initial_render: render,
             clipboard_config,
-            clipboard_writes: Vec::new(),
+            clipboard_write: None,
         })
     }
 
@@ -1336,8 +1342,8 @@ where
         self.input_with_clipboard(event, None).await
     }
 
-    pub fn take_clipboard_writes(&mut self) -> Vec<String> {
-        std::mem::take(&mut self.clipboard_writes)
+    pub fn take_clipboard_write(&mut self) -> Option<String> {
+        self.clipboard_write.take()
     }
 
     pub async fn clipboard_result(&mut self, message: String) -> anyhow::Result<RenderDelta> {
@@ -1368,8 +1374,16 @@ where
     ) -> anyhow::Result<RenderDelta> {
         let sequence = self.next_sequence;
         self.next_sequence = self.next_sequence.saturating_add(1);
-        self.clipboard_writes.clear();
+        self.clipboard_write = None;
         write_frame(&mut self.writer, &ClientMessage::Input { sequence, event }).await?;
+        self.expect_render(sequence, clipboard).await
+    }
+
+    async fn expect_render(
+        &mut self,
+        sequence: u64,
+        clipboard: &mut dyn crate::clipboard::ClipboardProvider,
+    ) -> anyhow::Result<RenderDelta> {
         let mut pending_copy = String::new();
         let mut copy_in_progress = false;
         loop {
@@ -1381,24 +1395,8 @@ where
             .await?
             {
                 Some(ServerMessage::ClipboardRead) => {
-                    let result = clipboard
-                        .read_text()
-                        .await
-                        .and_then(|text| {
-                            anyhow::ensure!(
-                                text.as_ref().is_none_or(
-                                    |text| text.len() <= crate::clipboard::MAX_CLIPBOARD_BYTES
-                                ),
-                                "clipboard read exceeds 256 KiB"
-                            );
-                            Ok(text)
-                        })
-                        .map_err(|error| error.to_string());
-                    write_frame(
-                        &mut self.writer,
-                        &ClientMessage::ClipboardReadResult { result },
-                    )
-                    .await?;
+                    let message = clipboard_read_result(clipboard.read_text().await);
+                    write_frame(&mut self.writer, &message).await?;
                 }
                 Some(ServerMessage::Render {
                     sequence: response_sequence,
@@ -1409,19 +1407,18 @@ where
                 }
                 Some(ServerMessage::ClipboardWrite { text, final_chunk }) => {
                     anyhow::ensure!(
-                        self.clipboard_writes.is_empty(),
+                        self.clipboard_write.is_none(),
                         "multiple clipboard effects for one input"
                     );
                     anyhow::ensure!(
                         pending_copy.len().saturating_add(text.len())
                             <= crate::clipboard::MAX_CLIPBOARD_BYTES,
-                        "clipboard effect exceeds 256 KiB"
+                        "clipboard effect exceeds 1 MiB"
                     );
                     pending_copy.push_str(&text);
                     copy_in_progress = !final_chunk;
                     if final_chunk {
-                        self.clipboard_writes
-                            .push(std::mem::take(&mut pending_copy));
+                        self.clipboard_write = Some(std::mem::take(&mut pending_copy));
                     }
                 }
                 Some(ServerMessage::Error { message }) => anyhow::bail!(message),
@@ -1480,16 +1477,32 @@ where
     }
 
     async fn expect_control_render(&mut self) -> anyhow::Result<RenderDelta> {
-        match read_frame_with_timeout(
-            &mut self.reader,
-            CLIENT_RESPONSE_TIMEOUT,
-            "detach IPC control response timed out",
-        )
-        .await?
-        {
-            Some(ServerMessage::Render { sequence: 0, delta }) => Ok(delta),
-            Some(ServerMessage::Error { message }) => anyhow::bail!(message),
-            other => anyhow::bail!("unexpected control response: {other:?}"),
+        self.expect_render(0, &mut crate::clipboard::DisabledClipboardProvider)
+            .await
+    }
+}
+
+// Native text can expand sixfold when JSON escapes control characters. Report a
+// bounded failure rather than disconnecting and losing the in-flight paste.
+fn clipboard_read_result(result: anyhow::Result<Option<String>>) -> ClientMessage {
+    let result = result
+        .and_then(|text| {
+            anyhow::ensure!(
+                text.as_ref()
+                    .is_none_or(|text| text.len() <= crate::clipboard::MAX_CLIPBOARD_BYTES),
+                "clipboard read exceeds 1 MiB"
+            );
+            Ok(text)
+        })
+        .map_err(|error| error.to_string().chars().take(1024).collect());
+    let message = ClientMessage::ClipboardReadResult { result };
+    if serde_json::to_vec(&message).is_ok_and(|bytes| bytes.len() < MAX_FRAME_BYTES) {
+        message
+    } else {
+        ClientMessage::ClipboardReadResult {
+            result: Err(
+                "clipboard text exceeds the detach frame limit; using Red's register".into(),
+            ),
         }
     }
 }
@@ -1704,9 +1717,27 @@ mod tests {
         assert!(serde_json::to_vec(&message).unwrap().len() < MAX_FRAME_BYTES);
     }
 
+    #[test]
+    fn escaped_clipboard_reads_report_a_bounded_error_without_disconnect() {
+        let plain =
+            clipboard_read_result(Ok(Some("x".repeat(crate::clipboard::MAX_CLIPBOARD_BYTES))));
+        assert!(matches!(
+            plain,
+            ClientMessage::ClipboardReadResult {
+                result: Ok(Some(_))
+            }
+        ));
+        let escaped =
+            clipboard_read_result(Ok(Some("\0".repeat(crate::clipboard::MAX_CLIPBOARD_BYTES))));
+        assert!(matches!(
+            escaped,
+            ClientMessage::ClipboardReadResult { result: Err(_) }
+        ));
+    }
+
     #[tokio::test]
     async fn clipboard_ipc_chunks_reassemble_unicode_without_repeating_writes() {
-        let text = "👻\n".repeat(40_000);
+        let text = "\0👻\n".repeat(crate::clipboard::MAX_CLIPBOARD_BYTES / 6);
         let (mut writer, reader) = tokio::io::duplex(1024);
         let mut reader = BufReader::new(reader);
         let receive = async {
@@ -1726,7 +1757,7 @@ mod tests {
                 }
             }
             assert_eq!(assembled, text);
-            assert_eq!(chunks, 2);
+            assert!(chunks > 1);
         };
         let (sent, ()) = tokio::join!(write_clipboard_effect(&mut writer, &text), receive);
         sent.unwrap();

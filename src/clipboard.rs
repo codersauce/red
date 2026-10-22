@@ -8,12 +8,10 @@ use anyhow::Context;
 use std::sync::{Arc, Mutex};
 
 mod transport;
-pub use transport::{
-    default_max_bytes, deserialize_max_bytes, ClipboardBackend, Passthrough, SessionClipboard,
-};
+pub use transport::{default_max_bytes, deserialize_max_bytes, ClipboardBackend, SessionClipboard};
 
-/// Bound shared by command output and detach IPC, independent of configured limits.
-pub const MAX_CLIPBOARD_BYTES: usize = 256 * 1024;
+/// Detached clipboard IPC bound; preserves the existing plugin copy limit.
+pub const MAX_CLIPBOARD_BYTES: usize = 1024 * 1024;
 
 /// A terminal write is not an acknowledgment from the desktop clipboard.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -53,7 +51,7 @@ pub trait ClipboardProvider: Send {
     }
 }
 
-/// Per-input bridge for the detached owner. Effects are consumed once, never snapshotted.
+/// Attachment-owned clipboard bridge. Writes are consumed once, never snapshotted.
 #[derive(Clone, Default)]
 pub(crate) struct ClientClipboard {
     state: Arc<Mutex<ClientClipboardState>>,
@@ -62,7 +60,7 @@ pub(crate) struct ClientClipboard {
 #[derive(Default)]
 struct ClientClipboardState {
     text: Option<String>,
-    writes: Vec<String>,
+    write: Option<String>,
     accepting: bool,
     reader: Option<tokio::sync::mpsc::UnboundedSender<ClipboardReadRequest>>,
 }
@@ -76,17 +74,28 @@ impl ClientClipboard {
     }
     pub fn begin_input(&self, text: Option<String>) {
         let mut state = self.state.lock().unwrap();
-        state.text = text;
-        state.writes.clear();
+        state.text = text.or_else(|| state.write.clone());
         state.accepting = true;
     }
 
-    pub fn finish_input(&self) -> Vec<String> {
+    pub fn finish_input(&self) {
         let mut state = self.state.lock().unwrap();
-        state.accepting = false;
         state.text = None;
         state.reader = None;
-        std::mem::take(&mut state.writes)
+    }
+
+    pub fn set_attached(&self, attached: bool) {
+        let mut state = self.state.lock().unwrap();
+        state.accepting = attached;
+        if !attached {
+            state.write = None;
+            state.text = None;
+            state.reader = None;
+        }
+    }
+
+    pub fn take_write(&self) -> Option<String> {
+        self.state.lock().unwrap().write.take()
     }
 }
 
@@ -121,17 +130,16 @@ impl ClipboardProvider for ClientClipboard {
     fn set_text(&mut self, text: &str) -> anyhow::Result<()> {
         anyhow::ensure!(
             text.len() <= MAX_CLIPBOARD_BYTES,
-            "clipboard payload exceeds the 256 KiB safety limit; text kept in Red's register"
+            "clipboard payload exceeds the 1 MiB safety limit; text kept in Red's register"
         );
         let mut state = self.state.lock().unwrap();
         anyhow::ensure!(
             state.accepting,
-            "clipboard delivery requires an attached user input"
+            "clipboard delivery requires an attached client"
         );
         state.text = Some(text.to_owned());
         // Only the last write in one input matters; macros must not grow the queue unboundedly.
-        state.writes.clear();
-        state.writes.push(text.to_owned());
+        state.write = Some(text.to_owned());
         Ok(())
     }
 
@@ -244,5 +252,41 @@ impl ClipboardProvider for MemoryClipboardProvider {
 impl From<Arc<Mutex<Option<String>>>> for MemoryClipboardProvider {
     fn from(text: Arc<Mutex<Option<String>>>) -> Self {
         Self { text }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn detached_background_copies_require_an_attachment_and_never_replay() {
+        let mut clipboard = ClientClipboard::default();
+        assert!(clipboard.set_text("unattached").is_err());
+        clipboard.set_attached(true);
+        clipboard.set_text("first").unwrap();
+        clipboard.set_text("latest").unwrap();
+        clipboard.begin_input(None);
+        assert_eq!(clipboard.get_text().unwrap().as_deref(), Some("latest"));
+        clipboard.finish_input();
+        assert_eq!(clipboard.take_write().as_deref(), Some("latest"));
+        assert!(clipboard.take_write().is_none());
+        clipboard.set_text("discard on disconnect").unwrap();
+        clipboard.set_attached(false);
+        clipboard.set_attached(true);
+        assert!(clipboard.take_write().is_none());
+    }
+
+    #[test]
+    fn detached_copy_preserves_the_existing_one_mib_plugin_limit() {
+        let mut clipboard = ClientClipboard::default();
+        clipboard.set_attached(true);
+        clipboard
+            .set_text(&"x".repeat(MAX_CLIPBOARD_BYTES))
+            .unwrap();
+        assert!(clipboard
+            .set_text(&"x".repeat(MAX_CLIPBOARD_BYTES + 1))
+            .is_err());
+        assert_eq!(clipboard.take_write().unwrap().len(), MAX_CLIPBOARD_BYTES);
     }
 }

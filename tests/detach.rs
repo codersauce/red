@@ -61,11 +61,12 @@ for line in sys.stdin:
 async fn clipboard_delivery_is_transient_and_paste_uses_the_current_client() {
     struct CountingClipboard {
         reads: usize,
+        text: Option<String>,
     }
     impl red::clipboard::ClipboardProvider for CountingClipboard {
         fn get_text(&mut self) -> anyhow::Result<Option<String>> {
             self.reads += 1;
-            Ok(None)
+            Ok(self.text.take())
         }
         fn set_text(&mut self, _text: &str) -> anyhow::Result<()> {
             Ok(())
@@ -90,11 +91,14 @@ async fn clipboard_delivery_is_transient_and_paste_uses_the_current_client() {
         key_kind: red::headless::KeyKind::Press,
     };
     let client = async {
-        let mut clipboard = CountingClipboard { reads: 0 };
+        let mut clipboard = CountingClipboard {
+            reads: 0,
+            text: None,
+        };
         let mut first = connect_session(directory.path(), "clipboard", None, (80, 24))
             .await
             .unwrap();
-        assert!(first.take_clipboard_writes().is_empty());
+        assert!(first.take_clipboard_write().is_none());
         first
             .input_with_provider(key('y'), &mut clipboard)
             .await
@@ -107,9 +111,9 @@ async fn clipboard_delivery_is_transient_and_paste_uses_the_current_client() {
             clipboard.reads, 0,
             "yanking must not read the user's clipboard"
         );
-        assert_eq!(first.take_clipboard_writes(), vec!["alpha 👻\n"]);
+        assert_eq!(first.take_clipboard_write().as_deref(), Some("alpha 👻\n"));
         first.heartbeat().await.unwrap();
-        assert!(first.take_clipboard_writes().is_empty());
+        assert!(first.take_clipboard_write().is_none());
         let feedback = first
             .clipboard_result("clipboard permission denied; text kept in Red's register".into())
             .await
@@ -123,11 +127,16 @@ async fn clipboard_delivery_is_transient_and_paste_uses_the_current_client() {
         let mut second = connect_session(directory.path(), "clipboard", None, (80, 24))
             .await
             .unwrap();
-        assert!(second.take_clipboard_writes().is_empty());
-        second
+        assert!(second.take_clipboard_write().is_none());
+        clipboard.text = Some("\0".repeat(red::clipboard::MAX_CLIPBOARD_BYTES));
+        let paste = second
             .input_with_provider(key('p'), &mut clipboard)
             .await
             .unwrap();
+        assert!(paste
+            .lines
+            .iter()
+            .any(|line| line.text.contains("clipboard read failed")));
         assert_eq!(
             clipboard.reads, 1,
             "read only in response to the actual paste action"
@@ -146,7 +155,7 @@ async fn clipboard_delivery_is_transient_and_paste_uses_the_current_client() {
             .lines
             .iter()
             .any(|line| line.text.contains("from this client")));
-        assert!(third.take_clipboard_writes().is_empty());
+        assert!(third.take_clipboard_write().is_none());
         third.stop().await.unwrap();
     };
     let (server, ()) = tokio::join!(serve_editor_session(&session, core), client);

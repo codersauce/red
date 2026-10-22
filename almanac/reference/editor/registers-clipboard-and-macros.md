@@ -28,11 +28,10 @@ The default register is `'"'` [@editor-core]. `set_register` writes to the syste
 
 The clipboard boundary is a trait. `ClipboardProvider` supports fallible `get_text` and `set_text`, `NativeClipboardProvider` delegates to `arboard`, `DisabledClipboardProvider` treats clipboard operations as unavailable no-ops, and `MemoryClipboardProvider` gives tests and embedded callers deterministic shared text [@clipboard]. Tests assert that yanking and deleting through the default register write the system clipboard, paste can read external clipboard text, and uppercase visual paste preserves the clipboard while replacing the selection [@editing-tests].
 
-`SessionClipboard` selects native, OSC 52, tmux, command, or disabled delivery for the
+`SessionClipboard` selects native, OSC 52, or disabled delivery for the
 current terminal. Clipboard writes share the terminal output writer; detached writes
 are transient IPC effects rather than render state. SSH and tmux copying never reads
-the remote host's clipboard. `p` retains Red's register unless a native or explicitly
-configured read provider supplies text. See [Clipboard transports](../../../docs/CLIPBOARD.md)
+the remote host's clipboard. `p` retains Red's register unless a native clipboard provider supplies text. See [Clipboard transports](../../../docs/CLIPBOARD.md)
 for configuration, limits, diagnostics, and terminal permission requirements.
 
 ## Dot Repeat

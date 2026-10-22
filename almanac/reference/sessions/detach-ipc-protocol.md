@@ -66,7 +66,7 @@ All server messages use a tagged JSON field named `type`, with snake-case varian
 | --- | --- | --- |
 | `connected` | `protocol_version`, `render`, `clipboard` | Confirms handshake success and returns the initial render and clipboard policy for the current attachment [@headless-ipc]. |
 | `clipboard_read` | none | Requests clipboard text only while executing a paste action [@headless-ipc]. |
-| `clipboard_write` | `text`, `final_chunk` | Carries one transient copy effect before its input's render response. Reassembled before terminal delivery; never included in snapshots [@headless-ipc]. |
+| `clipboard_write` | `text`, `final_chunk` | Carries one transient copy effect before an input or heartbeat render response. Reassembled before terminal delivery; never included in snapshots [@headless-ipc]. |
 | `render` | `sequence`, `delta` | Returns a render delta. Input responses use the input sequence; resize, focus, and heartbeat use sequence 0 [@headless-ipc]. |
 | `detached` | none | Confirms a clean detach [@headless-ipc]. |
 | `stopped` | none | Confirms a stop request [@headless-ipc]. |
@@ -74,11 +74,11 @@ All server messages use a tagged JSON field named `type`, with snake-case varian
 
 `RenderDelta` contains a monotonic `revision`, a list of `LinePatch` entries, and a cursor tuple [@headless-ipc]. A reconnecting client can send `last_revision`; when it matches the owner's current revision, the owner may return an empty line set instead of a full repaint [@headless-ipc].
 
-Clipboard payloads are capped at 256 KiB, with writes split into IPC chunks of at most
+Clipboard payloads are capped at 1 MiB, with writes split into IPC chunks of at most
 128 KiB on UTF-8 boundaries. Clipboard read replies have a three-second deadline.
-Each input retains at most its final copy; snapshots, background ticks, and reconnects
-never deliver clipboard effects. The attachment resolves the configured backend using
-its current environment [@headless-ipc].
+Each attachment retains at most its final pending copy. Inputs and heartbeats deliver
+transient effects; snapshots and reconnects never replay copies from prior attachments.
+The attachment resolves the configured backend using its current environment [@headless-ipc].
 
 ## Limits And Timeouts
 

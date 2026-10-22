@@ -30,7 +30,6 @@ use red::assets;
 use red::buffer::Buffer;
 use red::cli::{Args, LanguageCommand, PluginCommand, RootCommand};
 use red::cli_style;
-
 use red::clipboard::{ClipboardProvider as _, SessionClipboard};
 use red::config::{
     Config, ConfigDiagnosticSeverity, ConfigRecovery, KeyAction, Keys, LoadedConfig,
@@ -108,13 +107,13 @@ async fn run() -> anyhow::Result<()> {
                 "invalid configuration; run red --check-config"
             );
             let mut clipboard = SessionClipboard::new(&loaded.config.clipboard);
-            println!("{}", clipboard.diagnostic());
+            cli_style::print_line(&clipboard.diagnostic());
             if options.test_copy {
                 let outcome = clipboard.copy(&clipboard.test_text(), &mut stdout())?;
-                println!(
+                cli_style::print_line(&format!(
                     "{}; paste in a client-side application to verify",
                     SessionClipboard::report(Ok(outcome))
-                );
+                ));
             }
             return Ok(());
         }
@@ -926,6 +925,9 @@ async fn attach_session(session: &str) -> anyhow::Result<()> {
                 }
                 if last_heartbeat.elapsed() >= DETACHED_RENDER_POLL_INTERVAL {
                     let delta = client.heartbeat().await?;
+                    let delta =
+                        deliver_detached_clipboard(&mut client, &mut clipboard, &mut output, delta)
+                            .await?;
                     paint_detached_if_changed(&mut output, &mut rows, &delta, &mut last_revision)?;
                     last_heartbeat = Instant::now();
                 }
@@ -966,7 +968,7 @@ async fn deliver_detached_clipboard(
     output: &mut impl std::io::Write,
     mut delta: red::headless::RenderDelta,
 ) -> anyhow::Result<red::headless::RenderDelta> {
-    for text in client.take_clipboard_writes() {
+    if let Some(text) = client.take_clipboard_write() {
         let message = SessionClipboard::report(clipboard.copy(&text, output));
         let feedback = client.clipboard_result(message).await?;
         // The first delta has not been painted yet. Preserve all its rows while

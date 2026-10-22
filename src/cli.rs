@@ -97,7 +97,6 @@ pub struct Args {
 pub enum RootCommand {
     /// Check for or install the latest stable Red release.
     Update(UpdateArgs),
-
     /// Diagnose clipboard transport without reading or changing clipboard contents.
     Clipboard(ClipboardArgs),
     /// Inspect how this terminal reports composer keyboard shortcuts.

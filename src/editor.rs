@@ -4088,7 +4088,6 @@ pub struct Editor {
 pub struct DetachedEditorCore {
     editor: Editor,
     client_clipboard: crate::clipboard::ClientClipboard,
-    clipboard_writes: Vec<String>,
     runtime: Runtime,
     render_buffer: RenderBuffer,
     revision: u64,
@@ -4149,7 +4148,6 @@ impl DetachedEditorCore {
         Ok(Self {
             editor,
             client_clipboard,
-            clipboard_writes: Vec::new(),
             runtime,
             render_buffer,
             revision: 0,
@@ -4201,7 +4199,7 @@ impl DetachedEditorCore {
         self.input_with_clipboard(event, None).await
     }
 
-    /// Clipboard snapshots and effects belong only to this input, never to a reconnect.
+    /// Scope client clipboard reads to this input; writes remain transient attachment effects.
     pub async fn input_with_clipboard(
         &mut self,
         event: crate::headless::InputEvent,
@@ -4209,15 +4207,15 @@ impl DetachedEditorCore {
     ) -> anyhow::Result<crate::headless::RenderDelta> {
         self.client_clipboard.begin_input(clipboard);
         let result = self.process_input(event).await;
-        self.clipboard_writes = self.client_clipboard.finish_input();
+        self.client_clipboard.finish_input();
         if result.is_err() {
-            self.clipboard_writes.clear();
+            self.client_clipboard.take_write();
         }
         result
     }
 
-    pub fn take_clipboard_writes(&mut self) -> Vec<String> {
-        std::mem::take(&mut self.clipboard_writes)
+    pub fn take_clipboard_write(&mut self) -> Option<String> {
+        self.client_clipboard.take_write()
     }
 
     #[cfg(unix)]
@@ -4369,7 +4367,6 @@ impl DetachedEditorCore {
 
     pub fn clear_pending_paste(&mut self) {
         self.pending_paste.clear();
-        self.clipboard_writes.clear();
         self.client_clipboard.finish_input();
     }
 
@@ -4429,6 +4426,7 @@ impl DetachedEditorCore {
 
     /// Starts exposure only for the exact frame successfully sent to a client.
     pub fn mark_frame_presented(&mut self, revision: u64) {
+        self.client_clipboard.set_attached(true);
         self.editor.notification_client_attached = true;
         if self.revision == revision {
             self.editor.notification_frame_presented(Instant::now());
@@ -4438,6 +4436,7 @@ impl DetachedEditorCore {
     }
 
     pub fn client_disconnected(&mut self) {
+        self.client_clipboard.set_attached(false);
         self.editor.mouse_selection.gesture = None;
         self.editor.mouse_selection.last_click = None;
         self.editor.notification_client_attached = false;
@@ -27324,7 +27323,7 @@ impl Editor {
             return Err(Self::rpc_error(-32004, "system clipboard is unavailable"));
         }
         self.clipboard
-            .set_text(&params.text)
+            .copy(&params.text, &mut self.stdout)
             .map_err(|error| Self::rpc_error(-32003, error))?;
         Ok(Value::Null)
     }
@@ -41432,6 +41431,28 @@ builtin = "rust"
             .unwrap_err();
             assert_eq!(invalid.code, -32602);
         }
+    }
+
+    #[tokio::test]
+    async fn detached_rpc_clipboard_copies_are_frontend_owned_and_discarded_on_disconnect() {
+        let mut core = DetachedEditorCore::new(test_editor(80, 24)).await.unwrap();
+        let payload = json!({"text": "x".repeat(RPC_CLIPBOARD_MAX_BYTES)});
+        assert!(core.editor.rpc_clipboard_write_request(&payload).is_err());
+        core.mark_frame_presented(core.revision);
+        // RPC requests may arrive during background service, outside an input.
+        assert_eq!(
+            core.editor.rpc_clipboard_write_request(&payload).unwrap(),
+            Value::Null
+        );
+        assert_eq!(
+            core.take_clipboard_write().unwrap().len(),
+            RPC_CLIPBOARD_MAX_BYTES
+        );
+        core.editor.rpc_clipboard_write_request(&payload).unwrap();
+        core.client_disconnected();
+        core.mark_frame_presented(core.revision);
+        assert!(core.take_clipboard_write().is_none());
+        core.shutdown().await;
     }
 
     #[tokio::test]
