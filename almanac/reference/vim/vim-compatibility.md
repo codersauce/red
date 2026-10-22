@@ -51,7 +51,7 @@ with `:!!`, current and alternate filename expansion with `%` and `#`, and
 backslash-escaped special characters. `:%!{command}`, numeric line ranges, and
 `:'<,'>!{command}` filter the selected text through the user's shell and replace
 it with complete stdout in one undoable transaction. Every command streams
-bounded diagnostics into Messages, supports cancellation, and continues inside
+bounded diagnostics into the `:jobs` output view, supports cancellation, and continues inside
 detached owners. Unlike Neovim, failed or outdated filters do not overwrite the
 original buffer. Interactive terminal programs and Normal-mode filter operators
 remain outside the supported subset [@vim-doc] [@editor].

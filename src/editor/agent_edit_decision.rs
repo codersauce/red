@@ -263,6 +263,12 @@ impl Editor {
                 self.set_quiet_message(Some("Agent edit applied and saved".to_string()));
             }
             Ok(result) if choice == AgentUnsavedChoice::SaveAll => {
+                if let Some(id) = self
+                    .file_buffer_index(&pending.path)
+                    .map(|index| self.buffer_manager[index].id())
+                {
+                    self.report_issue(format!("save:{}", id.as_u64()), format!("Agent edits in {} were not saved: {}. Open that buffer and retry :w, use :saveas <file>, or deliberately discard it.", pending.path.display(), error(&result)));
+                }
                 self.set_routine_warning(Some(format!(
                     "Agent edit applied, but saving failed: {}",
                     error(&result)

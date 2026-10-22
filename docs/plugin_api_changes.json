@@ -4,7 +4,7 @@
     {
       "version": "0.21.0",
       "kind": "introduced",
-      "symbols": ["AgentSubmit", "AgentStop", "AgentSendQueued", "AgentDiscardQueued", "AgentReset", "AgentPrepare", "AgentResolveInterruption", "AgentListSessions", "AgentReadSessionPreview", "AgentSwitchSession", "EnterTextPanelContext", "ExitTextPanelContext", "SetTextPanelPreview", "TextPanelContextOptions", "TextPanelPreview", "agent:pane_state", "agent:conversation_resumable", "agent:pane_state.interrupted", "agent:pane_state.resume_pending", "TextPanelBlock.kind=queued", "panel:event action=view", "panel:event action=filter_input", "panel:event action=filter_cancel", "panel:event action=session_preview"],
+      "symbols": ["PublishIssue", "ResolveIssue", "red/IssuePublish", "red/IssueResolve", "AgentSubmit", "AgentStop", "AgentSendQueued", "AgentDiscardQueued", "AgentReset", "AgentPrepare", "AgentResolveInterruption", "AgentListSessions", "AgentReadSessionPreview", "AgentSwitchSession", "EnterTextPanelContext", "ExitTextPanelContext", "SetTextPanelPreview", "TextPanelContextOptions", "TextPanelPreview", "agent:pane_state", "agent:conversation_resumable", "agent:pane_state.interrupted", "agent:pane_state.resume_pending", "TextPanelBlock.kind=queued", "panel:event action=view", "panel:event action=filter_input", "panel:event action=filter_cancel", "panel:event action=session_preview"],
       "migration_note": "docs/PLUGIN_API.md#agent-pane-lifecycle"
     },
     {

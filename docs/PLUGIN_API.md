@@ -85,7 +85,8 @@ contain tracked changes.
 
 ## Messages
 
-`Print(message)` publishes an informational editor message. Use
+`Print(message)` displays transient informational status without retaining an
+inbox entry. Use
 `PrintWarning(message)` for a recoverable condition that needs transient warning
 styling, such as reaching the end of a navigation sequence.
 
@@ -752,3 +753,30 @@ The header compacts its buttons before dropping secondary text. An optional
 `compact_text` preserves essential state in the shortened label. Clicking the visible
 detail emits the configured panel action; the shortcut works while the panel is focused and is included in contextual
 help. Omitting detail clears it. Draft, focus, scroll, and panel layout survive.
+
+### Actionable issues
+
+In pending host API `0.21.0`, `Print` and `PrintWarning` display transient status.
+They do not create Messages entries, regardless of severity. Use these for
+command results, progress, successful copies and ordinary rejected commands.
+
+`red::execute("PublishIssue", key, message, remedy)` publishes an unresolved
+condition requiring user action. `key` is a nonempty stable string (at most 128
+UTF-8 bytes), scoped by the host to the calling plugin. `message` and `remedy`
+are nonempty strings of at most 1024 bytes each. The remedy must explain how to
+address the condition. Repeated publication with the same active key updates
+one entry. Reading an issue does not resolve it; users can explicitly dismiss it.
+
+Call `red::execute("ResolveIssue", key)` when the condition clears or the user
+intentionally abandons the work. Plugins cannot resolve another plugin's issue.
+Use a conversation/document/operation identity in the key when several owners
+can need attention concurrently. Resolve old issues when their owner is retired.
+For example:
+
+```husk
+red::execute("PublishIssue", "account", "Sign-in expired", "Run :AccountSignIn to sign in again");
+// After successful sign-in:
+red::execute("ResolveIssue", "account");
+```
+
+Shell and update output is available through `:jobs`, separately from Messages.

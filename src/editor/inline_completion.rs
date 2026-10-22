@@ -475,11 +475,12 @@ impl Editor {
     fn report_copilot_save_error(&mut self, enabled: bool, saved: anyhow::Result<()>) {
         if let Err(error) = saved {
             let state = if enabled { "enabled" } else { "disabled" };
-            self.set_notification_message(
-                Severity::Warning,
-                Some(format!(
-                    "Copilot {state} for this session only; couldn't save configuration: {error:#}"
-                )),
+            let command = if enabled { "enable" } else { "disable" };
+            self.report_issue("copilot-preferences".into(), format!("Copilot {state} for this session only; couldn't save configuration: {error:#}. Repair configuration permissions, then repeat :Copilot {command}."));
+        } else {
+            self.resolve_issue(
+                &crate::notification::NotificationSource::Editor,
+                "copilot-preferences",
             );
         }
     }
@@ -1823,7 +1824,7 @@ mod tests {
         assert!(editor
             .notifications
             .records()
-            .any(|notice| notice.severity == Severity::Warning
+            .any(|notice| notice.severity == Severity::Error
                 && notice
                     .content
                     .summary
@@ -1954,23 +1955,18 @@ mod tests {
         assert!(editor.current_dialog.is_none());
         assert!(editor.inline_completion.sign_in.is_none());
         assert_eq!(editor.last_error.as_deref(), Some("Copilot signed in"));
-        assert!(editor
-            .notifications()
-            .records()
-            .any(|notice| notice.content.summary == "Copilot signed in"));
+        assert_eq!(editor.notifications().records().count(), 0);
     }
 
     #[test]
-    fn copilot_status_is_published_as_a_visible_notification() {
+    fn copilot_status_is_transient_feedback() {
         let mut editor = editor("foo");
         editor.inline_completion.status = "Signed in".into();
 
         editor.handle_copilot_command("status");
 
-        assert!(editor
-            .notifications()
-            .records()
-            .any(|notice| notice.content.summary == "Copilot: Signed in"));
+        assert_eq!(editor.last_error.as_deref(), Some("Copilot: Signed in"));
+        assert_eq!(editor.notifications().records().count(), 0);
     }
 
     #[tokio::test]

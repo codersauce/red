@@ -1,6 +1,8 @@
 {
   "version": "0.21.0",
   "calls": [
+    { "name": "PublishIssue", "kind": "execute", "signature": "(key: String, message: String, remedy: String)", "introduced": "0.21.0" },
+    { "name": "ResolveIssue", "kind": "execute", "signature": "(key: String)", "introduced": "0.21.0" },
     { "name": "Print", "kind": "execute", "signature": "(message: String)", "introduced": "0.1.0" },
     { "name": "PrintWarning", "kind": "execute", "signature": "(message: String)", "introduced": "0.15.0" },
     { "name": "FilePicker", "kind": "execute", "signature": "()", "introduced": "0.1.0" },

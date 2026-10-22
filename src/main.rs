@@ -969,7 +969,11 @@ async fn deliver_detached_clipboard(
     mut delta: red::headless::RenderDelta,
 ) -> anyhow::Result<red::headless::RenderDelta> {
     if let Some(text) = client.take_clipboard_write() {
-        let message = SessionClipboard::report(clipboard.copy(&text, output));
+        let outcome = clipboard.copy(&text, output);
+        if outcome.is_ok() {
+            return Ok(delta);
+        }
+        let message = SessionClipboard::report(outcome);
         let feedback = client.clipboard_result(message).await?;
         // The first delta has not been painted yet. Preserve all its rows while
         // overlaying the newer feedback; otherwise edits accompanying a copy vanish.

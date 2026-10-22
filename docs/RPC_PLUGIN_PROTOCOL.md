@@ -135,6 +135,8 @@ The version 1 initialization parameters are:
     "red/TextPanelDispose",
     "red/ClipboardWrite",
     "red/MessageShow",
+    "red/IssuePublish",
+    "red/IssueResolve",
     "red/StatuslineSet",
     "red/StatuslineClear",
     "red/PickerOpen"
@@ -590,10 +592,10 @@ confirming that a result was copied:
 `message` must contain a non-whitespace character, may not contain control
 characters, and is limited to 1024 UTF-8 bytes. `severity` is optional, defaults
 to `info`, and also accepts `success`, `warning`, or `error`. The method returns
-`null` after publishing through Red's existing foreground notification path.
-Presentation duration and acknowledgment follow Red's severity policy, and the
-message remains available in notification history after its transient display
-expires. Use statusline contributions for durable state instead.
+`null` after displaying transient foreground status. Severity controls styling,
+not retention: these messages never enter the Messages inbox. Use statusline
+contributions for ongoing state, and the explicit issue requests below for
+unresolved conditions that require user action.
 
 ## Statusline contributions
 
@@ -705,3 +707,19 @@ Transport corruption, queue overflow, process exit, or a missed lifecycle
 deadline disconnects and quarantines it. A timed-out mutation is never retried:
 if its reply was lost, the plugin must request a fresh document snapshot to
 reconcile the outcome.
+
+### Actionable issues (host API 0.21.0)
+
+`red/MessageShow` remains immediate, severity-styled feedback and does not retain
+an inbox entry. Two explicit requests are advertised for unresolved conditions:
+
+- `red/IssuePublish`: `{ "key": "account", "message": "Sign-in expired", "remedy": "Run :AccountSignIn to sign in again" }`
+- `red/IssueResolve`: `{ "key": "account" }`
+
+Both return `null`. Keys are scoped to the authenticated plugin owner and limited
+to 128 UTF-8 bytes. Message and remedy are limited to 1024 bytes each. Required
+text must be nonempty and contain no control characters. Repeated publication
+updates the active entry; the producer resolves it when the condition clears.
+Reading the entry is not resolution. A plugin cannot resolve another plugin's
+issue. Progress, command output and success confirmations use their existing
+presentation APIs, not issues.

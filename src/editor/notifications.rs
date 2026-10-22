@@ -44,6 +44,12 @@ impl MessageFilter {
     }
 }
 
+pub(super) struct TransientMessage {
+    pub(super) text: String,
+    pub(super) severity: Severity,
+    pub(super) until: Instant,
+}
+
 pub(super) struct MessageBrowser {
     return_dialog: Option<Box<dyn Component>>,
     selected: Option<NotificationId>,
@@ -54,6 +60,7 @@ pub(super) struct MessageBrowser {
     filter: MessageFilter,
     scroll: usize,
     feedback: Option<String>,
+    tasks: bool,
 }
 
 /// Last observed notification state. The default matches a new, empty center so
@@ -63,6 +70,7 @@ pub(super) struct NotificationPresentation {
     revision: u64,
     counts: NotificationCounts,
     frame: u64,
+    status_until: Option<Instant>,
 }
 
 const NOTIFICATION_SEEN_AFTER: Duration = Duration::from_secs(1);
@@ -145,63 +153,108 @@ fn mebibytes(bytes: usize) -> String {
 }
 
 impl Editor {
-    /// Transitional operation-local result plus durable notification publication.
-    /// Clearing the old slot never clears notification history or active work.
+    /// Operation-local feedback never enters the actionable inbox.
     pub(super) fn set_legacy_message(&mut self, message: Option<String>) {
         self.set_notification_message(Severity::Info, message);
     }
 
     pub(super) fn set_quiet_message(&mut self, message: Option<String>) {
-        self.set_message_with_attention(Severity::Info, AttentionPolicy::Quiet, message);
+        self.set_notification_message(Severity::Info, message);
     }
 
     pub(super) fn set_routine_error(&mut self, message: Option<String>) {
-        self.set_message_with_attention(Severity::Error, AttentionPolicy::Quiet, message);
+        self.set_notification_message(Severity::Error, message);
     }
 
     pub(super) fn set_foreground_message(&mut self, severity: Severity, message: Option<String>) {
-        self.publish_foreground_message(severity, None, message);
+        self.set_notification_message(severity, message);
     }
 
-    /// Leads the bottom line with the result of a command the user just ran,
-    /// without adding to the messages that need attention.
     pub(super) fn set_routine_foreground_message(&mut self, severity: Severity, message: String) {
-        self.publish_foreground_message(severity, Some(AttentionPolicy::Quiet), Some(message));
-    }
-
-    fn publish_foreground_message(
-        &mut self,
-        severity: Severity,
-        attention: Option<AttentionPolicy>,
-        message: Option<String>,
-    ) {
-        let Some(message) = message else {
-            self.last_error = None;
-            return;
-        };
-        let mut notice = Notice::new(NotificationSource::Editor, severity, &message)
-            .with_display_priority(DisplayPriority::Foreground)
-            .with_details(&message);
-        if let Some(attention) = attention {
-            notice = notice.with_attention(attention);
-        }
-        if let Err(error) = self.publish_notification(notice) {
-            self.notification_fallback = Some(crate::notification::single_line(truncate_chars(
-                &message, 4_096,
-            )));
-            log!("could not retain notification: {error}");
-        } else {
-            self.notification_fallback = None;
-        }
-        self.last_error = Some(message);
+        self.set_notification_message(severity, Some(message));
     }
 
     pub(super) fn set_routine_warning(&mut self, message: Option<String>) {
-        self.set_message_with_attention(Severity::Warning, AttentionPolicy::Quiet, message);
+        self.set_notification_message(Severity::Warning, message);
     }
 
     pub(super) fn set_notification_message(&mut self, severity: Severity, message: Option<String>) {
-        self.set_message_with_attention(severity, AttentionPolicy::for_severity(severity), message);
+        self.transient_message = message
+            .as_ref()
+            .filter(|text| !text.is_empty())
+            .map(|text| TransientMessage {
+                text: crate::notification::single_line(truncate_chars(text, 4_096)),
+                severity,
+                until: Instant::now() + Duration::from_secs(5),
+            });
+        self.last_error = message;
+    }
+
+    /// Publish only an unresolved condition with a concrete remedy. Producers own
+    /// its stable key and must resolve it when that condition no longer applies.
+    pub(super) fn report_issue(&mut self, key: String, message: String) {
+        let notice = Notice::new(NotificationSource::Editor, Severity::Error, &message)
+            .with_key(key)
+            .with_details(&message);
+        if let Err(error) = self.publish_notification(notice) {
+            log!("could not retain issue: {error}");
+            self.notification_fallback = Some(message.clone());
+        } else {
+            self.notification_fallback = None;
+        }
+        self.set_notification_message(Severity::Error, Some(message));
+    }
+
+    pub(super) fn resolve_issue(&mut self, source: &NotificationSource, key: &str) {
+        let key = crate::notification::NotificationKey::from(key);
+        let ids: Vec<_> = self
+            .notifications
+            .records()
+            .filter(|record| {
+                &record.source == source
+                    && record.key.as_ref() == Some(&key)
+                    && !record.is_dismissed()
+            })
+            .map(|record| record.id)
+            .collect();
+        for id in ids {
+            let _ = self.notifications.resolve(id);
+        }
+    }
+
+    pub(super) fn publish_plugin_issue(
+        &mut self,
+        owner: &str,
+        key: &str,
+        message: &str,
+        remedy: &str,
+    ) {
+        self.publish_plugin_notice(
+            owner,
+            Severity::Error,
+            &format!("issue:{key}"),
+            message.to_string(),
+            format!("{message}\n\n{remedy}"),
+        );
+    }
+
+    pub(super) fn resolve_plugin_issue(&mut self, owner: &str, key: &str) {
+        self.resolve_issue(
+            &NotificationSource::Plugin {
+                name: owner.to_string(),
+                generation: 0,
+            },
+            &format!("issue:{key}"),
+        );
+    }
+
+    pub(super) fn report_save_failure(&mut self, message: String) {
+        let id = self.current_buffer().id();
+        self.report_issue(
+            format!("save:{}", id.as_u64()),
+            format!("{} was not saved: {message}. Retry :w, use :saveas <file>, or discard the buffer deliberately.", self.current_buffer().name()),
+        );
+        self.set_notification_message(Severity::Error, Some(message));
     }
 
     pub(super) fn set_navigation_boundary_warning(&mut self, target: &str) {
@@ -248,13 +301,8 @@ impl Editor {
              bytes\n\nRed skipped this result instead of stopping the plugin. The plugin keeps \
              running, but whatever was waiting for this result will not receive it."
         );
-        self.publish_plugin_notice(
-            plugin,
-            Severity::Warning,
-            &format!("dropped-result:{request}"),
-            summary,
-            details,
-        );
+        log!("{summary}: {details}");
+        self.set_routine_warning(Some(format!("{plugin}: {summary}")));
     }
 
     fn publish_plugin_notice(
@@ -282,28 +330,6 @@ impl Editor {
         } else {
             self.last_error = Some(labeled);
         }
-    }
-
-    fn set_message_with_attention(
-        &mut self,
-        severity: Severity,
-        attention: AttentionPolicy,
-        message: Option<String>,
-    ) {
-        if let Some(message) = message.as_ref().filter(|message| !message.is_empty()) {
-            let notice = Notice::new(NotificationSource::Editor, severity, message)
-                .with_attention(attention)
-                .with_details(message);
-            if let Err(error) = self.publish_notification(notice) {
-                self.notification_fallback = Some(crate::notification::single_line(
-                    truncate_chars(message, 4_096),
-                ));
-                log!("could not retain notification: {error}");
-            } else {
-                self.notification_fallback = None;
-            }
-        }
-        self.last_error = message;
     }
 
     pub(super) fn notification_presentation_changed(&mut self) -> bool {
@@ -365,7 +391,7 @@ impl Editor {
 
     fn notification_presentation_changed_at(&mut self, now: Instant) -> bool {
         self.advance_notification_exposure(now);
-        let mut counts = self.notifications.counts(now);
+        let mut counts = self.notifications.inbox_counts(now);
         counts.active += usize::from(self.notification_fallback.is_some());
         let frame = if !self.has_term()
             && self
@@ -383,6 +409,11 @@ impl Editor {
             revision: self.notifications.revision(),
             counts,
             frame,
+            status_until: self
+                .transient_message
+                .as_ref()
+                .filter(|status| now < status.until)
+                .map(|status| status.until),
         };
         if self.notification_presentation == presentation {
             return false;
@@ -399,6 +430,57 @@ impl Editor {
     }
 
     pub(super) fn sync_persistent_notifications(&mut self) {
+        let resolved: Vec<_> = self
+            .notifications
+            .records()
+            .filter_map(|record| {
+                if record.source != NotificationSource::Editor {
+                    return None;
+                }
+                let crate::notification::NotificationKey::Text(key) = record.key.as_ref()? else {
+                    return None;
+                };
+                let raw = key.strip_prefix("save:")?.parse::<u64>().ok()?;
+                (!self
+                    .buffer_manager
+                    .iter()
+                    .any(|buffer| buffer.id().as_u64() == raw && buffer.is_dirty()))
+                .then_some(record.id)
+            })
+            .collect();
+        for id in resolved {
+            if self
+                .notifications
+                .get(id)
+                .is_some_and(|record| !record.is_dismissed())
+            {
+                let _ = self.notifications.resolve(id);
+            }
+        }
+
+        let plugin_states = self.plugin_registry.status_rows();
+        let resolved: Vec<_> = self
+            .notifications
+            .records()
+            .filter_map(|record| {
+                let NotificationSource::Plugin { name, .. } = &record.source else {
+                    return None;
+                };
+                let row = plugin_states.iter().find(|row| &row.name == name);
+                let quarantine = record.key.as_ref()
+                    == Some(&crate::notification::NotificationKey::from("quarantine"));
+                let cleared = row.is_some_and(|row| {
+                    matches!(row.state, crate::plugin::PluginSessionState::Disabled)
+                }) || (quarantine
+                    && row.is_some_and(|row| {
+                        matches!(row.state, crate::plugin::PluginSessionState::Active)
+                    }));
+                (cleared && !record.is_dismissed()).then_some(record.id)
+            })
+            .collect();
+        for id in resolved {
+            let _ = self.notifications.resolve(id);
+        }
         let config = self.config_diagnostics_banner();
         self.sync_persistent_notification("configuration", config, true);
         let recovery = self.session_manager.warning().map(str::to_string);
@@ -453,11 +535,13 @@ impl Editor {
             .notifications
             .records()
             .filter(|record| {
-                (browser.filter.includes(record, now)
-                    || (matches!(browser.filter, MessageFilter::Attention)
-                        && browser.viewed_attention == Some(record.id)
-                        && browser.selected == Some(record.id)
-                        && !record.is_dismissed()))
+                (browser.tasks == !matches!(record.state, NotificationState::Notice))
+                    && (browser.tasks || !record.is_dismissed())
+                    && (browser.filter.includes(record, now)
+                        || (matches!(browser.filter, MessageFilter::Attention)
+                            && browser.viewed_attention == Some(record.id)
+                            && browser.selected == Some(record.id)
+                            && !record.is_dismissed()))
                     && (query.is_empty()
                         || record.source.label().to_lowercase().contains(&query)
                         || record.severity.label().contains(&query)
@@ -474,6 +558,10 @@ impl Editor {
     }
 
     pub(super) fn open_messages(&mut self) {
+        self.open_notification_browser(/*tasks*/ false);
+    }
+
+    fn open_notification_browser(&mut self, tasks: bool) {
         if self.message_browser.is_none() {
             self.message_browser = Some(MessageBrowser {
                 return_dialog: self.current_dialog.take(),
@@ -484,17 +572,34 @@ impl Editor {
                 filter: MessageFilter::All,
                 scroll: 0,
                 feedback: None,
+                tasks,
             });
+        }
+        if let Some(browser) = &mut self.message_browser {
+            if browser.tasks != tasks {
+                browser.tasks = tasks;
+                browser.selected = None;
+                browser.viewed_attention = None;
+                browser.filter = MessageFilter::All;
+                browser.query.clear();
+                browser.searching = false;
+                browser.scroll = 0;
+                browser.feedback = None;
+            }
         }
         self.refresh_message_browser();
     }
 
     pub(super) fn open_message_notification(&mut self, id: NotificationId) {
-        self.open_messages();
+        self.open_tasks();
         if let Some(browser) = &mut self.message_browser {
             browser.selected = Some(id);
         }
         self.refresh_message_browser();
+    }
+
+    pub(super) fn open_tasks(&mut self) {
+        self.open_notification_browser(/*tasks*/ true);
     }
 
     pub(super) fn close_messages(&mut self) {
@@ -558,14 +663,19 @@ impl Editor {
             .and_then(|id| self.notifications.get(id))
             .map(|record| record_details(record, now))
             .unwrap_or_else(|| {
-                "Messages will appear here as you work. Press f to change the filter.".to_string()
+                if browser.tasks { "Shell and update output appears here. Use :jobs to reopen it." } else { "No unresolved issues. Routine feedback stays in the status line; :jobs opens command output." }.to_string()
             });
-        let mut counts = self.notifications.counts(now);
+        let mut counts = if browser.tasks {
+            self.notifications.task_counts(now)
+        } else {
+            self.notifications.inbox_counts(now)
+        };
         if let Some(fallback) = &self.notification_fallback {
             counts.active += 1;
             detail = format!("Latest message could not be retained:\n{fallback}\n\n{detail}");
         }
         let view = MessagesView {
+            tasks: browser.tasks,
             rows,
             selected,
             detail,
@@ -675,8 +785,12 @@ impl Editor {
                 }
             }
             MessageAction::ClearInactive => {
-                let removed = self.notifications.clear_inactive(now);
-                browser.feedback = Some(format!("Cleared {removed} inactive messages"));
+                let removed = if browser.tasks {
+                    self.notifications.clear_inactive(now)
+                } else {
+                    0
+                };
+                browser.feedback = Some(format!("Cleared {removed} completed jobs"));
             }
             MessageAction::Copy => {
                 if let Some(record) = browser.selected.and_then(|id| self.notifications.get(id)) {
@@ -760,6 +874,113 @@ mod tests {
         .unwrap();
         editor.test_disable_terminal_output();
         editor
+    }
+
+    #[tokio::test]
+    async fn failed_save_remains_one_issue_until_the_buffer_is_saved() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut editor = editor(100, 24);
+        // A directory cannot be replaced with this file's contents.
+        editor.current_buffer_mut().file = Some(dir.path().to_string_lossy().into_owned());
+        editor.current_buffer_mut().insert_str(0, 0, "unsaved ");
+        editor
+            .test_execute_production_action(Action::Save)
+            .await
+            .unwrap();
+        editor
+            .test_execute_production_action(Action::Save)
+            .await
+            .unwrap();
+        assert_eq!(editor.notifications.inbox_counts(Instant::now()).total, 1);
+        let id = editor.notifications.records().next().unwrap().id;
+        editor.notifications.mark_read(id).unwrap();
+        editor.sync_persistent_notifications();
+        assert_eq!(editor.notifications.inbox_counts(Instant::now()).total, 1);
+        let target = dir.path().join("saved.txt");
+        editor
+            .test_execute_production_action(Action::SaveAs(target.to_string_lossy().into_owned()))
+            .await
+            .unwrap();
+        editor.sync_persistent_notifications();
+        assert_eq!(editor.notifications.inbox_counts(Instant::now()).total, 0);
+        assert_eq!(std::fs::read_to_string(target).unwrap(), "unsaved hello");
+    }
+
+    #[test]
+    fn routine_feedback_is_transient_even_when_it_is_an_error() {
+        let mut editor = editor(100, 24);
+        for _ in 0..100 {
+            editor.set_quiet_message(Some("clipboard copy sent".into()));
+            editor.set_routine_warning(Some("Pattern not found".into()));
+            editor.set_notification_message(Severity::Error, Some("command failed".into()));
+        }
+        assert_eq!(editor.notifications.counts(Instant::now()).total, 0);
+        let mut buffer = RenderBuffer::new(100, 24, &Style::default());
+        editor.draw_commandline(&mut buffer);
+        assert!(render_text_rows(&buffer)
+            .last()
+            .unwrap()
+            .contains("command failed"));
+        editor.transient_message.as_mut().unwrap().until = Instant::now();
+        editor.draw_commandline(&mut buffer);
+        assert!(!render_text_rows(&buffer)
+            .last()
+            .unwrap()
+            .contains("command failed"));
+        editor.open_messages();
+        assert!(editor.message_ids(Instant::now()).is_empty());
+    }
+
+    #[test]
+    fn issues_coalesce_and_resolve_without_losing_job_output() {
+        let mut editor = editor(100, 24);
+        editor.report_issue("save:test".into(), "Save failed; retry :w".into());
+        editor.report_issue("save:test".into(), "Save still failed; retry :w".into());
+        let id = editor.notifications.records().next().unwrap().id;
+        assert_eq!(editor.notifications.get(id).unwrap().occurrences, 2);
+        let job = editor
+            .notifications
+            .begin_progress(
+                NotificationSource::Editor,
+                "test-job",
+                crate::notification::MessageContent::new("shell output"),
+                crate::notification::ProgressPriority::UserInitiated,
+                NotificationTime::now(),
+            )
+            .unwrap();
+        editor.open_tasks();
+        assert!(!editor.notifications.get(id).unwrap().read);
+        editor.open_messages();
+        assert_eq!(editor.message_ids(Instant::now()), vec![id]);
+        editor.notifications.mark_read(id).unwrap();
+        assert_eq!(editor.notifications.inbox_counts(Instant::now()).total, 1);
+        editor.open_tasks();
+        assert_eq!(editor.message_ids(Instant::now()), vec![job]);
+        editor.resolve_issue(&NotificationSource::Editor, "save:test");
+        editor.open_messages();
+        assert!(editor.message_ids(Instant::now()).is_empty());
+        assert_eq!(editor.notifications.inbox_counts(Instant::now()).total, 0);
+        editor.open_tasks();
+        assert_eq!(editor.message_ids(Instant::now()), vec![job]);
+    }
+
+    #[test]
+    fn rpc_issues_require_a_remedy_and_cannot_resolve_another_plugins_issue() {
+        let mut editor = editor(100, 24);
+        let publish = crate::plugin::rpc::ISSUE_PUBLISH_METHOD;
+        let resolve = crate::plugin::rpc::ISSUE_RESOLVE_METHOD;
+        assert!(editor
+            .rpc_issue_request("one", publish, &json!({"key":"auth", "message":"Sign in"}))
+            .is_err());
+        editor.rpc_issue_request("one", publish, &json!({"key":"auth", "message":"Sign in", "remedy":"Open account settings and sign in"})).unwrap();
+        editor
+            .rpc_issue_request("two", resolve, &json!({"key":"auth"}))
+            .unwrap();
+        assert_eq!(editor.notifications.inbox_counts(Instant::now()).total, 1);
+        editor
+            .rpc_issue_request("one", resolve, &json!({"key":"auth"}))
+            .unwrap();
+        assert_eq!(editor.notifications.inbox_counts(Instant::now()).total, 0);
     }
 
     fn publish_info(editor: &mut Editor, text: &str, now: NotificationTime) -> NotificationId {
@@ -960,9 +1181,9 @@ mod tests {
             .await
             .unwrap();
 
-        let warning = editor.notifications.records().next_back().unwrap();
+        let warning = editor.transient_message.as_ref().unwrap();
         assert_eq!(warning.severity, Severity::Warning);
-        assert_eq!(warning.attention, AttentionPolicy::Quiet);
+        assert_eq!(editor.notifications.records().count(), 0);
         assert_eq!(
             editor
                 .notifications
@@ -1089,7 +1310,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bottom_line_keeps_multiple_messages_after_unrelated_actions() {
+    async fn routine_messages_clear_after_unrelated_actions() {
         let mut editor = editor(90, 12);
         let mut buffer = RenderBuffer::new(90, 12, &Style::default());
         let mut runtime = Runtime::new();
@@ -1108,8 +1329,8 @@ mod tests {
             .await
             .unwrap();
         let row = render_text_rows(&buffer).pop().unwrap();
-        assert!(row.contains("second message"), "{row}");
-        assert!(row.contains("1 missed"), "{row}");
+        assert!(!row.contains("second message"), "{row}");
+        assert!(!row.contains("missed"), "{row}");
         assert!(editor.last_error.is_none());
 
         editor.mode = Mode::Command;
@@ -1117,7 +1338,7 @@ mod tests {
         editor.draw_commandline(&mut buffer);
         let row = render_text_rows(&buffer).pop().unwrap();
         assert!(row.starts_with(":write pending.txt"));
-        assert!(row.contains("2 missed"));
+        assert!(!row.contains("missed"));
     }
 
     #[test]
@@ -1173,33 +1394,30 @@ mod tests {
         assert!(
             row.contains("save failed")
                 && row.contains("1 needs attention")
-                && row.contains("2 running"),
+                && !row.contains("2 running"),
             "{row}"
         );
         editor.notifications.acknowledge(error).unwrap();
         editor.draw_commandline(&mut buffer);
         let row = render_text_rows(&buffer).pop().unwrap();
         assert!(
-            row.contains("pushing commits (40%)") && row.contains("2 running"),
+            row.contains("pushing commits (40%)") && !row.contains("2 running"),
             "{row}"
         );
     }
 
     #[test]
-    fn ordinary_command_errors_are_retained_and_messages_is_discoverable() {
+    fn ordinary_command_errors_are_transient_and_messages_is_discoverable() {
         let mut editor = editor(100, 24);
         let runtime = Runtime::new();
         assert!(editor
             .handle_command("DefinitelyNotACommand", &runtime)
             .is_empty());
         assert_eq!(
-            editor.notifications.records().next().unwrap().severity,
+            editor.transient_message.as_ref().unwrap().severity,
             Severity::Error
         );
-        assert_eq!(
-            editor.notifications.records().next().unwrap().attention,
-            AttentionPolicy::Quiet
-        );
+        assert_eq!(editor.notifications.records().count(), 0);
         assert_eq!(
             editor
                 .notifications
@@ -1262,7 +1480,7 @@ mod tests {
             .unwrap()
             .is_active(Instant::now()));
         editor.handle_message_action(&MessageAction::ClearInactive);
-        assert!(editor.notifications.get(first).is_none());
+        assert!(editor.notifications.get(first).unwrap().is_dismissed());
     }
 
     #[test]
@@ -1352,11 +1570,11 @@ mod tests {
                 panic!("message click did not reach the dialog");
             };
             editor.notifications.resolve(newer).unwrap();
-            assert_eq!(editor.message_ids(Instant::now()), vec![first, newer]);
+            assert_eq!(editor.message_ids(Instant::now()), vec![first]);
             editor.handle_message_action(&action);
             assert_eq!(
                 editor.message_browser.as_ref().unwrap().selected,
-                Some(newer)
+                Some(first)
             );
         }
     }
@@ -1429,7 +1647,7 @@ mod tests {
     #[test]
     fn bottom_line_click_opens_history_over_a_workspace() {
         let mut editor = editor(100, 24);
-        editor.set_legacy_message(Some("message".to_string()));
+        editor.report_issue("test".into(), "message; fix it".into());
         editor
             .workspace_manager
             .open("git".to_string(), plugin::WorkspaceConfig::default());

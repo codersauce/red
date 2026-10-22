@@ -504,13 +504,15 @@ impl Editor {
                 if *reload_languages {
                     match self.reload_languages().await {
                         Ok(_) => message.push_str(" Language definitions reloaded."),
-                        Err(error) => message.push_str(&format!(
-                            " The package was changed, but language reload failed: {error}"
-                        )),
+                        Err(error) => {
+                            message.push_str(&format!(" The package was changed, but language reload failed: {error}. Fix configuration and run :languages reload."));
+                            self.report_issue("languages".into(), message.clone());
+                        }
                     }
                 }
                 if *restart_plugins {
                     message.push_str(" Restart Red to refresh plugin code.");
+                    self.report_issue("package-restart".into(), message.clone());
                 }
                 self.set_legacy_message(Some(message.clone()));
                 let manager = plugin::package::PluginPackageManager::new(Config::config_dir());

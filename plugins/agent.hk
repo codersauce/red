@@ -1240,6 +1240,7 @@ fn pane_state_changed(event: AgentPaneState) {
 
 #[red::on("agent:session_created")]
 fn session_created(event: AgentSessionEvent) {
+    resolve_agent_issue();
     red::state_patch(AgentState { codex_lost: false });
     // The core adopts the thread and sends any waiting message; the pane only
     // refreshes what it shows for the new conversation.
@@ -1482,6 +1483,7 @@ fn turn_started(event: AgentSessionEvent) {
     if !is_current_session(event.session_id) {
         return;
     }
+    resolve_agent_issue();
     set_phase("waiting", working_verb());
 }
 
@@ -2306,6 +2308,7 @@ fn completed(event: AgentCompletedEvent) {
     if !is_current_session(event.session_id) || is_stale_turn(event.turn_id) {
         return;
     }
+    resolve_agent_issue();
     let stop_reason = red::string(event.stop_reason, "end_turn");
     if stop_reason == "end_turn" || stop_reason == "completed" {
         finish_agent_turn();
@@ -2352,6 +2355,7 @@ fn send_queued() {
     scope = "global",
 )]
 fn discard_queued() {
+    resolve_agent_issue();
     let count = queued_count();
     red::execute("AgentDiscardQueued");
     if count == 1 {
@@ -2376,7 +2380,7 @@ fn cancel_failed(event: AgentErrorEvent) {
     if !is_current_session(red::string(event.session_id, "")) {
         return;
     }
-    red::execute("Print", "Could not stop the agent: " + event.message + " · press Ctrl-C to try again");
+    report_agent_issue("Could not stop the agent: " + event.message + " · press Ctrl-C to try again");
 }
 
 #[red::on("agent:error")]
@@ -2399,7 +2403,7 @@ fn failed(event: AgentErrorEvent) {
         if has_pending_prompt {
             notice = notice + ". Your prompt is preserved";
         }
-        red::execute("Print", notice);
+        report_agent_issue(notice);
         let retry_label = "Retry Codex startup";
         if has_pending_prompt {
             retry_label = "Retry the saved prompt";
@@ -2416,7 +2420,7 @@ fn failed(event: AgentErrorEvent) {
             cancelled: setup_cancelled,
         });
     } else {
-        red::execute("Print", "Agent error: " + event.message);
+        report_agent_issue("Agent error: " + event.message);
     }
 }
 
@@ -2457,7 +2461,7 @@ fn setup_selected(item: PickerItem) {
 }
 
 fn setup_cancelled(event: PickerCancelled) {
-    red::execute("Print", "Agent prompt saved · :AgentSendQueued retries it");
+    report_agent_issue("Agent prompt saved · :AgentSendQueued retries it");
 }
 
 #[red::on("agent:credential_ready")]
@@ -2746,7 +2750,7 @@ fn show_interruption(prompt_id: String) {
     render_conversation();
     red::execute("SetStorage", "transcript", state().transcript);
     if lost_codex {
-        red::execute("PrintWarning", "Codex stopped mid-reply · Space A to choose what to do");
+        report_agent_issue("Codex stopped mid-reply · Space A to choose what to do");
     }
 }
 
@@ -2789,6 +2793,7 @@ fn resolve_interruption(choice: String) {
     if state().interruption_id == "" {
         return;
     }
+    resolve_agent_issue();
     red::execute("AgentResolveInterruption", choice, red::string(state().transcript, ""));
     if choice == "dismiss" {
         let message = "Left the interrupted reply as it is";
@@ -3313,4 +3318,15 @@ fn deactivate() {
         red::execute("CancelTimeout", timer);
         red::state_patch(AgentState { stream_timer: "" });
     }
+}
+
+// Messages contains only decisions that outlive the current interaction.
+fn report_agent_issue(message: String) {
+    red::execute("PublishIssue", "agent:" + red::string(state().session_id, ""), message,
+        "Open Agent with Space A; retry/recover the turn, send held prompts with :AgentSendQueued, or discard them with :AgentDiscardQueued.");
+}
+
+fn resolve_agent_issue() {
+    red::execute("ResolveIssue", "agent:" + red::string(state().session_id, ""));
+    red::execute("ResolveIssue", "agent:");
 }
