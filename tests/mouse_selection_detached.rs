@@ -3,7 +3,6 @@ mod common;
 use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use red::{
     buffer::Buffer,
-    clipboard::MemoryClipboardProvider,
     config::Config,
     editor::DetachedEditorCore,
     headless::{InputEvent, KeyCode, KeyKind, RenderDelta},
@@ -29,13 +28,10 @@ async fn forwarded_mouse_selection_survives_release_and_yanks_the_highlighted_te
     config.plugins.clear();
     config.splash = Some(false);
     config.scrolloff = Some(0);
-    let clipboard = MemoryClipboardProvider::default();
-    let clipboard_text = clipboard.shared_text();
-    let mut harness = common::EditorHarness::with_config(
+    let harness = common::EditorHarness::with_config(
         Buffer::new(None, "alpha beta gamma\nsecond line".to_string()),
         config,
     );
-    harness.editor.test_set_clipboard(Box::new(clipboard));
     let mut core = DetachedEditorCore::new(harness.editor).await.unwrap();
     let before = core.snapshot(None);
     let original_background = style_at(&before, 0, 11).bg;
@@ -84,7 +80,8 @@ async fn forwarded_mouse_selection_survives_release_and_yanks_the_highlighted_te
     })
     .await
     .unwrap();
-    assert_eq!(clipboard_text.lock().unwrap().as_deref(), Some("beta"));
+    assert_eq!(core.take_clipboard_write().as_deref(), Some("beta"));
+    assert!(core.take_clipboard_write().is_none());
     assert_eq!(
         style_at(&core.snapshot(None), 0, 11).bg,
         original_background

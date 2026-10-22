@@ -1342,6 +1342,7 @@ where
         self.input_with_clipboard(event, None).await
     }
 
+    /// Consumes the latest copy, retained across responses such as paste chunks.
     pub fn take_clipboard_write(&mut self) -> Option<String> {
         self.clipboard_write.take()
     }
@@ -1374,7 +1375,6 @@ where
     ) -> anyhow::Result<RenderDelta> {
         let sequence = self.next_sequence;
         self.next_sequence = self.next_sequence.saturating_add(1);
-        self.clipboard_write = None;
         write_frame(&mut self.writer, &ClientMessage::Input { sequence, event }).await?;
         self.expect_render(sequence, clipboard).await
     }
@@ -1386,6 +1386,7 @@ where
     ) -> anyhow::Result<RenderDelta> {
         let mut pending_copy = String::new();
         let mut copy_in_progress = false;
+        let mut copy_complete = false;
         loop {
             match read_frame_with_timeout(
                 &mut self.reader,
@@ -1407,8 +1408,8 @@ where
                 }
                 Some(ServerMessage::ClipboardWrite { text, final_chunk }) => {
                     anyhow::ensure!(
-                        self.clipboard_write.is_none(),
-                        "multiple clipboard effects for one input"
+                        !copy_complete,
+                        "multiple clipboard effects for one response"
                     );
                     anyhow::ensure!(
                         pending_copy.len().saturating_add(text.len())
@@ -1418,6 +1419,7 @@ where
                     pending_copy.push_str(&text);
                     copy_in_progress = !final_chunk;
                     if final_chunk {
+                        copy_complete = true;
                         self.clipboard_write = Some(std::mem::take(&mut pending_copy));
                     }
                 }
@@ -1848,6 +1850,70 @@ mod tests {
 
         drop(replacement);
         drop(stale_listener);
+    }
+
+    #[tokio::test]
+    async fn clipboard_effect_survives_subsequent_paste_chunks_until_consumed() {
+        let (client_stream, server_stream) = tokio::io::duplex(4096);
+        let server = tokio::spawn(async move {
+            let (reader, mut writer) = tokio::io::split(server_stream);
+            let mut reader = BufReader::new(reader);
+            let owner = HeadlessOwner::new("");
+            assert!(matches!(
+                read_frame(&mut reader).await.unwrap(),
+                Some(ClientMessage::Connect { .. })
+            ));
+            write_frame(
+                &mut writer,
+                &ServerMessage::Connected {
+                    protocol_version: IPC_PROTOCOL_VERSION,
+                    render: owner.snapshot(None),
+                    clipboard: crate::config::ClipboardConfig::default(),
+                },
+            )
+            .await
+            .unwrap();
+            for chunk in 0..3 {
+                let Some(ClientMessage::Input {
+                    sequence,
+                    event: InputEvent::PasteChunk { final_chunk, .. },
+                }) = read_frame(&mut reader).await.unwrap()
+                else {
+                    panic!("expected paste chunk");
+                };
+                assert_eq!(final_chunk, chunk == 2);
+                if chunk == 0 {
+                    write_clipboard_effect(&mut writer, "background plugin copy 👻")
+                        .await
+                        .unwrap();
+                }
+                write_frame(
+                    &mut writer,
+                    &ServerMessage::Render {
+                        sequence,
+                        delta: owner.snapshot(None),
+                    },
+                )
+                .await
+                .unwrap();
+            }
+        });
+        let mut client = HeadlessClient::connect(client_stream, None).await.unwrap();
+        for chunk in 0..3 {
+            client
+                .input(InputEvent::PasteChunk {
+                    text: "x".repeat(128 * 1024),
+                    final_chunk: chunk == 2,
+                })
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            client.take_clipboard_write().as_deref(),
+            Some("background plugin copy 👻")
+        );
+        assert!(client.take_clipboard_write().is_none());
+        server.await.unwrap();
     }
 
     #[tokio::test]
