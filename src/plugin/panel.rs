@@ -1333,18 +1333,28 @@ impl TextPanel {
             .map_or(&[], |context| context.tabs.as_slice())
     }
 
-    /// Selects a picker tab by id, or the one after the selected tab.
-    fn select_picker_tab(&mut self, id: Option<&str>) -> Option<String> {
+    /// Selects a picker tab by id.
+    fn select_picker_tab(&mut self, id: &str) -> Option<String> {
         let context = self.temporary_context.as_mut()?;
-        let tab = match id {
-            Some(id) => context.tabs.iter().find(|tab| tab.id == id)?,
-            None => {
-                let current = context.tabs.iter().position(|tab| tab.id == context.tab);
-                let next = current.map_or(0, |index| index + 1) % context.tabs.len().max(1);
-                context.tabs.get(next)?
-            }
-        };
+        let tab = context.tabs.iter().find(|tab| tab.id == id)?;
         context.tab = tab.id.clone();
+        Some(context.tab.clone())
+    }
+
+    /// Selects the tab `step` places after the selected one, wrapping around.
+    fn step_picker_tab(&mut self, step: isize) -> Option<String> {
+        let context = self.temporary_context.as_mut()?;
+        let count = context.tabs.len() as isize;
+        if count == 0 {
+            return None;
+        }
+        let current = context
+            .tabs
+            .iter()
+            .position(|tab| tab.id == context.tab)
+            .map_or(-1, |index| index as isize);
+        let next = (current + step).rem_euclid(count) as usize;
+        context.tab = context.tabs[next].id.clone();
         Some(context.tab.clone())
     }
 
@@ -4458,13 +4468,22 @@ impl PanelManager {
 
     pub(crate) fn header_shortcut_event(&mut self, key: &str) -> Option<PanelEvent> {
         let panel = self.text_panels.get_mut(self.focused.as_deref()?)?;
-        let tab_shortcut = panel
+        // Tab and Shift-Tab move between tabs, as does the declared shortcut.
+        let step = panel
             .temporary_context
             .as_ref()
             .filter(|context| !context.tabs.is_empty())
-            .is_some_and(|context| context.tab_shortcut.eq_ignore_ascii_case(key));
-        if tab_shortcut {
-            let tab = panel.select_picker_tab(None)?;
+            .and_then(|context| {
+                if key == "Tab" || context.tab_shortcut.eq_ignore_ascii_case(key) {
+                    Some(1)
+                } else if matches!(key, "BackTab" | "Shift-BackTab" | "Shift-Tab") {
+                    Some(-1)
+                } else {
+                    None
+                }
+            });
+        if let Some(step) = step {
+            let tab = panel.step_picker_tab(step)?;
             return Some(PanelEvent {
                 panel_id: panel.id.clone(),
                 action: "context_tab".to_string(),
@@ -5693,7 +5712,7 @@ impl PanelManager {
                         column >= *start && column < start + display_width(label) + 2
                     })
                     .map(|(_, tab, _)| tab.id.clone())?;
-                let tab = panel.select_picker_tab(Some(&tab))?;
+                let tab = panel.select_picker_tab(&tab)?;
                 return Some(PanelEvent {
                     panel_id: panel.id.clone(),
                     action: "context_tab".to_string(),
@@ -6858,7 +6877,9 @@ fn text_panel_picker_tabs_layout(panel: &TextPanel, width: usize) -> TextPanelPi
         context.tabs.iter().map(|tab| (tab, compact(tab))).collect(),
         selected,
     ];
-    let shortcut_width = display_width(&context.tab_shortcut);
+    // Tab always moves between tabs, so it is the hint shown.
+    const SHORTCUT: &str = "Tab";
+    let shortcut_width = display_width(SHORTCUT);
     let tabs_width = |tabs: &[(&TextPanelContextTab, &str)]| {
         tabs.iter()
             .map(|(_, label)| display_width(label) + 2)
@@ -6882,8 +6903,8 @@ fn text_panel_picker_tabs_layout(panel: &TextPanel, width: usize) -> TextPanelPi
         })
         .collect();
     let shortcut = Some(used + 3)
-        .filter(|start| shortcut_width > 0 && start + shortcut_width <= width)
-        .map(|start| (start, context.tab_shortcut.as_str()));
+        .filter(|start| start + shortcut_width <= width)
+        .map(|start| (start, SHORTCUT));
     TextPanelPickerTabsLayout { tabs, shortcut }
 }
 
@@ -9301,7 +9322,7 @@ mod tests {
         manager.render(&mut buffer, &theme);
         let tabs = text_position(&buffer, "This workspace").unwrap();
         let row = row_text(&buffer, tabs.y);
-        assert!(row.contains(" Red   This workspace   All Codex    Alt-s"));
+        assert!(row.contains(" Red   This workspace   All Codex    Tab"));
         // The tabs row replaces the scope hint, and every hint shown is whole.
         let hints = row_text(&buffer, tabs.y + 1);
         assert!(hints.contains("Alt-P peek"));
@@ -9318,14 +9339,18 @@ mod tests {
         assert_eq!(event.text.as_deref(), Some("all"));
         let event = manager.header_shortcut_event("Alt-s").unwrap();
         assert_eq!(event.text.as_deref(), Some("red"));
+        let event = manager.header_shortcut_event("Shift-BackTab").unwrap();
+        assert_eq!(event.text.as_deref(), Some("all"));
+        let event = manager.header_shortcut_event("Tab").unwrap();
+        assert_eq!(event.text.as_deref(), Some("red"));
 
         // Narrower panes switch to compact labels, then to the selected tab.
         let panel = &manager.text_panels["agent"];
         let palette = text_panel_palette(&theme, &panel.config);
         for (width, expected) in [
-            (30, " Red   Here   All    Alt-s"),
-            (13, " Red    Alt-s"),
-            (12, " Red"),
+            (30, " Red   Here   All    Tab"),
+            (11, " Red    Tab"),
+            (10, " Red"),
         ] {
             let mut narrow = RenderBuffer::new(80, 1, &theme.style);
             render_text_panel_picker_tabs(&mut narrow, panel, Point::new(0, 0), width, &palette);

@@ -590,8 +590,9 @@ if the old selection disappears, the nearest remaining row is selected instead.
 The options can also hold `tabs: [Json { id, label, compact_label? }]`, the
 selected `tab` id, and a `tab_shortcut` key. The host shows the tabs in a row
 under the search field, using the compact labels, and then only the selected
-tab, when the pane is too narrow. Clicking a tab, or pressing the shortcut for
-the next one, selects it and emits `context_tab` with its id as `text`.
+tab, when the pane is too narrow. Clicking a tab, or pressing `Tab`,
+`Shift-Tab` or the shortcut to move to the next or previous one, selects it and
+emits `context_tab` with its id as `text`.
 `Alt-p` emits `session_preview`; plugins can display read-only latest-turn
 details with `SetTextPanelPreview(id, Json { session_id, prompt, response,
 loading?, error? })`, or hide them by omitting the second argument. The host
