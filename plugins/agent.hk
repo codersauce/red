@@ -2726,13 +2726,15 @@ fn session_restored(event: AgentConversationEvent) {
     // An interruption from the loss was already shown; a later failure is not one.
     red::state_patch(AgentState { codex_lost: false });
     red::state_patch(AgentState { model_info: event.model_info, accepted_model: Json {}, turn_model_info: Json {} });
-    // The thread's model follows in its own event, which can arrive before the
-    // pane state names the restored thread.
-    red::state_patch(AgentState { session_id: event.thread_id });
     if switching {
         red::state_patch(AgentState { resume_hint: "", resume_age: "" });
     }
-    if !shows_thread(event.thread_id) {
+    // Decided before naming the thread below, which would make it look shown.
+    let shown = shows_thread(event.thread_id);
+    // The thread's model follows in its own event, which can arrive before the
+    // pane state names the restored thread.
+    red::state_patch(AgentState { session_id: event.thread_id });
+    if !shown {
         let age = state().resume_age;
         load_conversation(event);
         if age != "" {

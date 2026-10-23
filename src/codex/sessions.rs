@@ -314,11 +314,15 @@ pub(super) async fn handle_response(
         .and_then(Value::as_str)
         .filter(|cursor| !cursor.is_empty())
         .map(str::to_string);
-    if request.sessions.len() >= MAX_LISTED_SESSIONS {
-        let more = request.more || next_cursor.is_some() || wants_contents(&request);
-        return finish(request.sessions, more, request_id, events).await;
-    }
-    if let Some(cursor) = next_cursor {
+    // Each phase stops at the cap, and `finish` keeps the newest of both, so
+    // title matches filling the list don't hide newer matches in the text.
+    let phase_matches = match request.phase {
+        ListPhase::Titles => request.sessions.len(),
+        ListPhase::Contents => request.seen.len(),
+    };
+    if phase_matches >= MAX_LISTED_SESSIONS {
+        request.more |= next_cursor.is_some();
+    } else if let Some(cursor) = next_cursor {
         if request.seen.len() <= MAX_SESSIONS
             && request.cursors.len() < MAX_PAGES
             && request.cursors.insert(cursor.clone())

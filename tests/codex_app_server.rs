@@ -256,6 +256,11 @@ for line in sys.stdin:
             send({"id": ident, "result": {"data": [
                 {"id":"red-new", "cwd":"/workspace", "ephemeral":False, "threadSource":"red", "source":"vscode", "name":"Newer Red", "preview":"", "updatedAt":20}
             ], "nextCursor":None}})
+    elif method == "thread/search" and params["searchTerm"] == "many":
+        # Only the text matches: newer than every title match.
+        send({"id": ident, "result": {"data": [
+            {"thread":{"id":"many-in-text", "cwd":"/workspace", "ephemeral":False, "threadSource":"user", "source":"cli", "name":"Text only", "preview":"", "updatedAt":2000}, "snippet":"many words"}
+        ], "nextCursor":None}})
     elif method == "thread/search":
         assert params["searchTerm"] == "NEEDLE"
         assert params["sortKey"] == "updated_at"
@@ -441,7 +446,7 @@ async fn direct_app_server_lists_searches_and_continues_sessions_for_red() {
                 scope: AgentSessionScope::All,
                 query: "many".into(),
                 exclude_session_id: None,
-                // Already capped by titles, so the text search is skipped.
+                // Titles fill the list, but the text search still runs.
                 search_contents: true,
             },
         })
@@ -453,7 +458,8 @@ async fn direct_app_server_lists_searches_and_continues_sessions_for_red() {
             result: Ok(result),
         } => {
             assert_eq!(result["sessions"].as_array().unwrap().len(), 200);
-            assert_eq!(result["sessions"][0]["id"], "many-0");
+            assert_eq!(result["sessions"][0]["id"], "many-in-text");
+            assert_eq!(result["sessions"][1]["id"], "many-0");
             assert_eq!(result["more"], true);
         }
         event => panic!("unexpected capped session list: {event:?}"),

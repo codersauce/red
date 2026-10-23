@@ -12436,15 +12436,25 @@ mod tests {
         }
         assert!(saw_enabled_composer);
 
-        // A thread chosen in the session picker announces its model before the
-        // pane state names it.
+        // A thread chosen in the session picker replaces the transcript shown,
+        // and announces its model before the pane state names it.
         runtime
             .notify(
                 "agent:session_restored",
-                serde_json::json!({"thread_id": "thread-picked", "cwd": "/workspace", "items": []}),
+                serde_json::json!({"thread_id": "thread-picked", "cwd": "/workspace", "items": [
+                    {"id": "picked-user", "turn_id": "picked-turn", "role": "user", "text": "Picked question"},
+                    {"id": "picked-agent", "turn_id": "picked-turn", "role": "agent", "text": "Picked answer"}
+                ]}),
             )
             .await
             .unwrap();
+        let mut saw_picked_transcript = false;
+        while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
+            if let PluginRequest::UpdateTextPanel { blocks, .. } = request {
+                saw_picked_transcript |= blocks.iter().any(|block| block.text == "Picked answer");
+            }
+        }
+        assert!(saw_picked_transcript);
         runtime
             .notify(
                 "agent:model_changed",
