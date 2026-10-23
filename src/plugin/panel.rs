@@ -483,6 +483,22 @@ pub struct TextPanelStatus {
 pub struct TextPanelContextOptions {
     pub key: String,
     pub query: String,
+    /// Views the picker switches between, shown as a row of tabs.
+    pub tabs: Vec<TextPanelContextTab>,
+    /// The id of the selected tab.
+    pub tab: String,
+    /// The key that selects the next tab.
+    pub tab_shortcut: String,
+}
+
+/// One view of an embedded picker; choosing it emits `context_tab` with its id.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct TextPanelContextTab {
+    pub id: String,
+    pub label: String,
+    /// A shorter label for panes too narrow for every full one.
+    pub compact_label: String,
 }
 
 /// Read-only conversation detail rendered inside an embedded session picker.
@@ -614,6 +630,9 @@ struct TextPanelContext {
     selected_index: usize,
     restore_scroll: Option<usize>,
     preview: Option<TextPanelPreview>,
+    tabs: Vec<TextPanelContextTab>,
+    tab: String,
+    tab_shortcut: String,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1228,6 +1247,9 @@ impl TextPanel {
             selected_index: remembered.selected_index,
             restore_scroll: Some(remembered.scroll),
             preview: None,
+            tabs: options.tabs,
+            tab: options.tab,
+            tab_shortcut: options.tab_shortcut,
         });
         self.viewport = FollowTailViewport::default();
         self.viewport.scroll_to_top();
@@ -1302,7 +1324,40 @@ impl TextPanel {
             .saturating_sub(text_panel_header_rows(&self.config))
             .saturating_sub(self.status_height())
             .saturating_sub(1)
-            .min(EMBEDDED_PICKER_CHROME_ROWS)
+            .min(EMBEDDED_PICKER_CHROME_ROWS + usize::from(!self.picker_tabs().is_empty()))
+    }
+
+    fn picker_tabs(&self) -> &[TextPanelContextTab] {
+        self.temporary_context
+            .as_ref()
+            .map_or(&[], |context| context.tabs.as_slice())
+    }
+
+    /// Selects a picker tab by id, or the one after the selected tab.
+    fn select_picker_tab(&mut self, id: Option<&str>) -> Option<String> {
+        let context = self.temporary_context.as_mut()?;
+        let tab = match id {
+            Some(id) => context.tabs.iter().find(|tab| tab.id == id)?,
+            None => {
+                let current = context.tabs.iter().position(|tab| tab.id == context.tab);
+                let next = current.map_or(0, |index| index + 1) % context.tabs.len().max(1);
+                context.tabs.get(next)?
+            }
+        };
+        context.tab = tab.id.clone();
+        Some(context.tab.clone())
+    }
+
+    /// Pane actions not shown in the header, listed under the composer instead.
+    fn composer_actions(&self) -> impl Iterator<Item = &TextPanelHeaderAction> {
+        self.config
+            .header_actions
+            .iter()
+            .filter(|action| !action.show_in_header && action.enabled)
+    }
+
+    fn composer_chrome_rows(&self) -> usize {
+        COMPOSER_CHROME_ROWS + usize::from(self.composer_actions().next().is_some())
     }
 
     fn selected_picker_action(&self) -> Option<&str> {
@@ -1627,20 +1682,17 @@ impl TextPanel {
         // Retain one transcript row. If even one input row and its chrome do
         // not fit, hide the composer rather than drawing outside the pane.
         let available = available.saturating_sub(1);
-        if available <= COMPOSER_CHROME_ROWS {
+        let chrome = self.composer_chrome_rows();
+        if available <= chrome {
             return 0;
         }
-        let minimum = composer
-            .config
-            .rows
-            .max(1)
-            .saturating_add(COMPOSER_CHROME_ROWS);
+        let minimum = composer.config.rows.max(1).saturating_add(chrome);
         let cap = panel_height.saturating_mul(COMPOSER_MAX_HEIGHT_PERCENT) / 100;
         let desired = composer
             .layout(TextPanelContentMetrics::new(panel_width).width)
             .rows()
             .len()
-            .saturating_add(COMPOSER_CHROME_ROWS);
+            .saturating_add(chrome);
         desired.max(minimum).min(cap.max(minimum)).min(available)
     }
 
@@ -4141,7 +4193,7 @@ impl PanelManager {
             return Vec::new();
         };
         let mut actions = if panel.temporary_context.is_some() {
-            vec![
+            let mut actions = vec![
                 UiAction::new("picker_select", "Enter", "resume session")
                     .with_group("Session picker"),
                 UiAction::new("picker_previous", "Up", "previous session")
@@ -4151,7 +4203,18 @@ impl PanelManager {
                     .with_group("Session picker"),
                 UiAction::new("session_preview", "Alt-p", "toggle session preview")
                     .with_group("Session picker"),
-            ]
+            ];
+            if let Some(context) = panel
+                .temporary_context
+                .as_ref()
+                .filter(|context| !context.tabs.is_empty() && !context.tab_shortcut.is_empty())
+            {
+                actions.push(
+                    UiAction::new("context_tab", &context.tab_shortcut, "next scope")
+                        .with_group("Session picker"),
+                );
+            }
+            actions
         } else {
             let mut actions = if panel.action_shortcuts_active() {
                 panel
@@ -4393,8 +4456,23 @@ impl PanelManager {
             .sum()
     }
 
-    pub(crate) fn header_shortcut_event(&self, key: &str) -> Option<PanelEvent> {
-        let panel = self.text_panels.get(self.focused.as_deref()?)?;
+    pub(crate) fn header_shortcut_event(&mut self, key: &str) -> Option<PanelEvent> {
+        let panel = self.text_panels.get_mut(self.focused.as_deref()?)?;
+        let tab_shortcut = panel
+            .temporary_context
+            .as_ref()
+            .filter(|context| !context.tabs.is_empty())
+            .is_some_and(|context| context.tab_shortcut.eq_ignore_ascii_case(key));
+        if tab_shortcut {
+            let tab = panel.select_picker_tab(None)?;
+            return Some(PanelEvent {
+                panel_id: panel.id.clone(),
+                action: "context_tab".to_string(),
+                selected_index: panel.scroll,
+                row: None,
+                text: Some(tab),
+            });
+        }
         if panel.temporary_context.is_some() && key.eq_ignore_ascii_case("Alt-p") {
             return Some(PanelEvent {
                 panel_id: panel.id.clone(),
@@ -5535,7 +5613,7 @@ impl PanelManager {
         let row = position.row;
         let column = position.column;
         let composer_height = panel.composer_height(placement.height, placement.width);
-        let rows = composer_height.checked_sub(COMPOSER_CHROME_ROWS)?;
+        let rows = composer_height.checked_sub(panel.composer_chrome_rows())?;
         if rows == 0 {
             return None;
         }
@@ -5600,11 +5678,31 @@ impl PanelManager {
                 }
             }
 
-            if panel.temporary_context.is_some()
-                && y == placement
-                    .y
-                    .saturating_add(text_panel_header_rows(&panel.config))
+            let picker_top = placement
+                .y
+                .saturating_add(text_panel_header_rows(&panel.config));
+            if !panel.picker_tabs().is_empty()
+                && panel.picker_header_rows(placement.height) > 1
+                && y == picker_top + 1
             {
+                let column = metrics.column(placement.x, x);
+                let tab = text_panel_picker_tabs_layout(panel, metrics.width)
+                    .tabs
+                    .into_iter()
+                    .find(|(start, _, label)| {
+                        column >= *start && column < start + display_width(label) + 2
+                    })
+                    .map(|(_, tab, _)| tab.id.clone())?;
+                let tab = panel.select_picker_tab(Some(&tab))?;
+                return Some(PanelEvent {
+                    panel_id: panel.id.clone(),
+                    action: "context_tab".to_string(),
+                    selected_index: panel.scroll,
+                    row: None,
+                    text: Some(tab),
+                });
+            }
+            if panel.temporary_context.is_some() && y == picker_top {
                 if let Some(composer) = panel.composer.as_mut() {
                     composer.focused = true;
                     let column = x.saturating_sub(metrics.x(placement.x).saturating_add(2));
@@ -5624,6 +5722,25 @@ impl PanelManager {
             let composer_top = placement
                 .y
                 .saturating_add(placement.height.saturating_sub(composer_height));
+            let chrome = panel.composer_chrome_rows();
+            if composer_height > chrome
+                && chrome > COMPOSER_CHROME_ROWS
+                && y + 1 == composer_top + composer_height
+            {
+                let column = metrics.column(placement.x, x);
+                return text_panel_composer_actions_layout(panel, metrics.width)
+                    .into_iter()
+                    .find(|(start, _, text)| {
+                        column >= *start && column < start + display_width(text)
+                    })
+                    .map(|(_, action, _)| PanelEvent {
+                        panel_id: panel.id.clone(),
+                        action: action.id.clone(),
+                        selected_index: panel.scroll,
+                        row: None,
+                        text: None,
+                    });
+            }
             let action = if composer_height > 0
                 && y >= composer_top
                 && panel
@@ -5637,7 +5754,7 @@ impl PanelManager {
                     let cursor_row = wrapped
                         .position(composer.prompt.display_cursor())
                         .map_or(0, |position| position.row);
-                    let rows = composer_height.saturating_sub(COMPOSER_CHROME_ROWS);
+                    let rows = composer_height.saturating_sub(chrome);
                     let first = cursor_row.saturating_sub(rows.saturating_sub(1));
                     let row = first.saturating_add(y.saturating_sub(composer_top + 1));
                     let column = x.saturating_sub(metrics.x(placement.x).saturating_add(2));
@@ -6276,23 +6393,15 @@ fn render_text_panel(
         );
     }
     for (start, action, label) in header_actions {
-        let x = content_position.x + start;
-        buffer.set_text(x, position.y, "[", &palette.divider);
         buffer.set_text(
-            x + 1,
+            content_position.x + start + 1,
             position.y,
             &label,
             if action.enabled {
-                &palette.accent
+                &palette.secondary
             } else {
                 &palette.muted
             },
-        );
-        buffer.set_text(
-            x + 1 + display_width(&label),
-            position.y,
-            "]",
-            &palette.divider,
         );
     }
     if title_rows > 0 {
@@ -6555,11 +6664,27 @@ fn render_text_panel(
             content_position,
             metrics.width,
             content_height + status_height,
-            composer_height.saturating_sub(COMPOSER_CHROME_ROWS),
+            composer_height.saturating_sub(panel.composer_chrome_rows()),
             overflow,
             &palette,
             theme,
         );
+        if panel.composer_chrome_rows() > COMPOSER_CHROME_ROWS {
+            let y = composer_top + composer_height - 1;
+            for (start, action, _) in text_panel_composer_actions_layout(panel, metrics.width) {
+                let x = content_position.x + start;
+                if start > 0 {
+                    buffer.set_text(x - 2, y, "·", &palette.divider);
+                }
+                buffer.set_text(x, y, &action.key, &palette.accent);
+                buffer.set_text(
+                    x + display_width(&action.key) + 1,
+                    y,
+                    &action.label,
+                    &palette.secondary,
+                );
+            }
+        }
         let context = format!(
             "{} · {}",
             panel.config.title.as_deref().unwrap_or("Text panel"),
@@ -6621,37 +6746,200 @@ fn render_text_panel_picker_header(
             style,
         );
     }
-    if rows > 1 {
-        render_picker_fragments(
+    let mut row = 1;
+    let tabs = !panel.picker_tabs().is_empty();
+    if tabs && rows > row {
+        render_text_panel_picker_tabs(
             buffer,
-            Point::new(position.x, y.saturating_add(1)),
+            panel,
+            Point::new(position.x, y.saturating_add(row)),
             width,
-            &[
-                ("↑↓", &palette.accent),
-                (" select", &palette.secondary),
-                ("  ·  ", &palette.divider),
-                ("Enter", &palette.accent),
-                (" resume", &palette.secondary),
-                ("  ·  ", &palette.divider),
-                ("Esc", &palette.accent),
-                (" back", &palette.secondary),
-                ("  ·  ", &palette.divider),
-                ("Alt-P", &palette.accent),
-                (" peek", &palette.secondary),
-                ("  ·  ", &palette.divider),
-                ("Alt-S", &palette.accent),
-                (" scope", &palette.secondary),
-            ],
+            palette,
         );
+        row += 1;
     }
-    if rows > 2 {
+    if rows > row {
+        let mut hints = vec![
+            ("↑↓", "select"),
+            ("Enter", "resume"),
+            ("Esc", "back"),
+            ("Alt-P", "peek"),
+        ];
+        // The tabs row names its own shortcut.
+        if !tabs {
+            hints.push(("Alt-S", "scope"));
+        }
+        render_picker_hints(
+            buffer,
+            Point::new(position.x, y.saturating_add(row)),
+            width,
+            &hints,
+            palette,
+        );
+        row += 1;
+    }
+    if rows > row {
         buffer.set_text(
             position.x,
-            y.saturating_add(2),
+            y.saturating_add(row),
             &"─".repeat(width),
             &palette.divider,
         );
     }
+}
+
+/// Paints whole `key label` hints, leaving out those that no longer fit.
+fn render_picker_hints(
+    buffer: &mut RenderBuffer,
+    position: Point,
+    width: usize,
+    hints: &[(&str, &str)],
+    palette: &TextPanelPalette,
+) {
+    const SEPARATOR: &str = "  ·  ";
+    let mut used = 0usize;
+    for (index, (key, label)) in hints.iter().enumerate() {
+        let separator = if index == 0 {
+            0
+        } else {
+            display_width(SEPARATOR)
+        };
+        let end = used + separator + display_width(key) + 1 + display_width(label);
+        if end > width {
+            break;
+        }
+        if separator > 0 {
+            buffer.set_text(position.x + used, position.y, SEPARATOR, &palette.divider);
+        }
+        let x = position.x + used + separator;
+        buffer.set_text(x, position.y, key, &palette.accent);
+        buffer.set_text(
+            x + display_width(key) + 1,
+            position.y,
+            label,
+            &palette.secondary,
+        );
+        used = end;
+    }
+}
+
+#[derive(Default)]
+struct TextPanelPickerTabsLayout<'a> {
+    /// Each tab's start column, the tab, and the label shown for it.
+    tabs: Vec<(usize, &'a TextPanelContextTab, &'a str)>,
+    shortcut: Option<(usize, &'a str)>,
+}
+
+/// Places the tabs, each padded by a cell on either side, then their shortcut.
+/// Narrower panes use compact labels, and then show only the selected tab.
+fn text_panel_picker_tabs_layout(panel: &TextPanel, width: usize) -> TextPanelPickerTabsLayout<'_> {
+    let Some(context) = panel.temporary_context.as_ref() else {
+        return TextPanelPickerTabsLayout::default();
+    };
+    fn compact(tab: &TextPanelContextTab) -> &str {
+        if tab.compact_label.is_empty() {
+            &tab.label
+        } else {
+            &tab.compact_label
+        }
+    }
+    let selected = context
+        .tabs
+        .iter()
+        .filter(|tab| tab.id == context.tab)
+        .map(|tab| (tab, compact(tab)))
+        .collect::<Vec<_>>();
+    let candidates = [
+        context
+            .tabs
+            .iter()
+            .map(|tab| (tab, tab.label.as_str()))
+            .collect::<Vec<_>>(),
+        context.tabs.iter().map(|tab| (tab, compact(tab))).collect(),
+        selected,
+    ];
+    let shortcut_width = display_width(&context.tab_shortcut);
+    let tabs_width = |tabs: &[(&TextPanelContextTab, &str)]| {
+        tabs.iter()
+            .map(|(_, label)| display_width(label) + 2)
+            .sum::<usize>()
+            + tabs.len().saturating_sub(1)
+    };
+    let tabs = candidates
+        .iter()
+        .find(|tabs| tabs_width(tabs) <= width)
+        .or(candidates.last())
+        .cloned()
+        .unwrap_or_default();
+    let used = tabs_width(&tabs);
+    let mut start = 0;
+    let tabs = tabs
+        .into_iter()
+        .map(|(tab, label)| {
+            let current = start;
+            start += display_width(label) + 3;
+            (current, tab, label)
+        })
+        .collect();
+    let shortcut = Some(used + 3)
+        .filter(|start| shortcut_width > 0 && start + shortcut_width <= width)
+        .map(|start| (start, context.tab_shortcut.as_str()));
+    TextPanelPickerTabsLayout { tabs, shortcut }
+}
+
+fn render_text_panel_picker_tabs(
+    buffer: &mut RenderBuffer,
+    panel: &TextPanel,
+    position: Point,
+    width: usize,
+    palette: &TextPanelPalette,
+) {
+    let selected = panel
+        .temporary_context
+        .as_ref()
+        .map_or("", |context| context.tab.as_str());
+    let card = SurfaceCardPalette::new(palette, true, SurfaceCardColors::default());
+    let active = Style {
+        bold: true,
+        ..card.content.accent.clone()
+    };
+    let layout = text_panel_picker_tabs_layout(panel, width);
+    for (start, tab, label) in layout.tabs {
+        let style = if tab.id == selected {
+            &active
+        } else {
+            &palette.secondary
+        };
+        buffer.set_text(
+            position.x + start,
+            position.y,
+            &fit_display_width(&format!(" {label} "), width.saturating_sub(start)),
+            style,
+        );
+    }
+    if let Some((start, shortcut)) = layout.shortcut {
+        buffer.set_text(position.x + start, position.y, shortcut, &palette.muted);
+    }
+}
+
+/// Places the pane actions listed under the composer as `key label` pieces.
+fn text_panel_composer_actions_layout(
+    panel: &TextPanel,
+    width: usize,
+) -> Vec<(usize, &TextPanelHeaderAction, String)> {
+    let mut placed = Vec::new();
+    let mut used = 0usize;
+    for action in panel.composer_actions() {
+        let text = format!("{} {}", action.key, action.label);
+        let start = if placed.is_empty() { 0 } else { used + 3 };
+        let end = start + display_width(&text);
+        if end > width {
+            break;
+        }
+        placed.push((start, action, text));
+        used = end;
+    }
+    placed
 }
 
 fn picker_item_text_inset(width: usize) -> usize {
@@ -8893,6 +9181,7 @@ mod tests {
         let alpha = TextPanelContextOptions {
             key: "/alpha".to_string(),
             query: "needle".to_string(),
+            ..TextPanelContextOptions::default()
         };
         assert!(manager.enter_text_panel_context_with_options(
             "agent",
@@ -8960,7 +9249,7 @@ mod tests {
             "Search".to_string(),
             TextPanelContextOptions {
                 key: "/beta".to_string(),
-                query: String::new(),
+                ..TextPanelContextOptions::default()
             },
         ));
         manager.update_text_panel("agent", blocks(&["one", "two"]), 8, 80);
@@ -8968,6 +9257,128 @@ mod tests {
             manager.text_panels["agent"].selected_picker_action(),
             Some("one")
         );
+    }
+
+    #[test]
+    fn picker_tabs_show_the_scope_and_switch_it_by_click_or_shortcut() {
+        let mut manager = PanelManager::default();
+        manager.create_text_panel(
+            "agent".to_string(),
+            PanelConfig {
+                title: Some("Agent".to_string()),
+                composer: Some(TextPanelComposerConfig {
+                    placeholder: "Ask".to_string(),
+                    rows: 2,
+                }),
+                ..PanelConfig::default()
+            },
+        );
+        let tab = |id: &str, label: &str, compact_label: &str| TextPanelContextTab {
+            id: id.to_string(),
+            label: label.to_string(),
+            compact_label: compact_label.to_string(),
+        };
+        assert!(manager.enter_text_panel_context_with_options(
+            "agent",
+            "Search".to_string(),
+            TextPanelContextOptions {
+                tabs: vec![
+                    tab("red", "Red", ""),
+                    tab("workspace", "This workspace", "Here"),
+                    tab("all", "All Codex", "All"),
+                ],
+                tab: "red".to_string(),
+                tab_shortcut: "Alt-s".to_string(),
+                ..TextPanelContextOptions::default()
+            },
+        ));
+        let theme = Theme::default();
+        manager.set_presentation(PanelPresentation::Zoomed {
+            id: "agent".to_string(),
+            size: (80, 20),
+        });
+        let mut buffer = RenderBuffer::new(80, 20, &theme.style);
+        manager.render(&mut buffer, &theme);
+        let tabs = text_position(&buffer, "This workspace").unwrap();
+        let row = row_text(&buffer, tabs.y);
+        assert!(row.contains(" Red   This workspace   All Codex    Alt-s"));
+        // The tabs row replaces the scope hint, and every hint shown is whole.
+        let hints = row_text(&buffer, tabs.y + 1);
+        assert!(hints.contains("Alt-P peek"));
+        assert!(!hints.contains("scope"));
+        let red = text_position(&buffer, " Red ").unwrap();
+        assert!(buffer.cells[red.y * buffer.width + red.x + 1].style.bold);
+
+        let event = manager
+            .focus_panel_at_position(tabs.x + 2, tabs.y, 80, 20)
+            .unwrap();
+        assert_eq!(event.action, "context_tab");
+        assert_eq!(event.text.as_deref(), Some("workspace"));
+        let event = manager.header_shortcut_event("Alt-s").unwrap();
+        assert_eq!(event.text.as_deref(), Some("all"));
+        let event = manager.header_shortcut_event("Alt-s").unwrap();
+        assert_eq!(event.text.as_deref(), Some("red"));
+
+        // Narrower panes switch to compact labels, then to the selected tab.
+        let panel = &manager.text_panels["agent"];
+        let palette = text_panel_palette(&theme, &panel.config);
+        for (width, expected) in [
+            (30, " Red   Here   All    Alt-s"),
+            (13, " Red    Alt-s"),
+            (12, " Red"),
+        ] {
+            let mut narrow = RenderBuffer::new(80, 1, &theme.style);
+            render_text_panel_picker_tabs(&mut narrow, panel, Point::new(0, 0), width, &palette);
+            assert_eq!(row_text(&narrow, 0).trim_end(), expected);
+        }
+    }
+
+    #[test]
+    fn composer_lists_the_pane_actions_left_out_of_the_header() {
+        let mut manager = PanelManager::default();
+        let action =
+            |id: &str, key: &str, label: &str, show_in_header: bool| TextPanelHeaderAction {
+                id: id.to_string(),
+                key: key.to_string(),
+                label: label.to_string(),
+                show_in_header,
+                ..TextPanelHeaderAction::default()
+            };
+        manager.create_text_panel(
+            "agent".to_string(),
+            PanelConfig {
+                title: Some("Agent".to_string()),
+                composer: Some(TextPanelComposerConfig {
+                    placeholder: "Ask".to_string(),
+                    rows: 2,
+                }),
+                header_actions: vec![
+                    action("sessions", "Alt-s", "sessions", false),
+                    action("new", "Alt-n", "new", false),
+                    action("close", "Alt-w", "×", true),
+                ],
+                ..PanelConfig::default()
+            },
+        );
+        let theme = Theme::default();
+        let mut buffer = RenderBuffer::new(80, 20, &theme.style);
+        manager.render(&mut buffer, &theme);
+        assert!(row_text(&buffer, 0).contains("×"));
+        assert!(!row_text(&buffer, 0).contains("sessions"));
+        let actions = text_position(&buffer, "Alt-s sessions · Alt-n new").unwrap();
+        // The row sits under the composer's own footer.
+        assert!(row_text(&buffer, actions.y - 1).contains("NAV"));
+        let new = text_position(&buffer, "Alt-n").unwrap();
+        let event = manager
+            .focus_panel_at_position(new.x, new.y, 80, 20)
+            .unwrap();
+        assert_eq!(event.action, "new");
+
+        // The picker hides the composer, and the row with it.
+        assert!(manager.enter_text_panel_context("agent", "Search".to_string()));
+        let mut picker = RenderBuffer::new(80, 20, &theme.style);
+        manager.render(&mut picker, &theme);
+        assert!(text_position(&picker, "Alt-n").is_none());
     }
 
     #[test]
@@ -10598,7 +11009,7 @@ mod tests {
         manager.render(&mut wide, &theme);
         let wide_header = row_text(&wide, 0);
         assert!(wide_header.contains("Agent"));
-        assert!(wide_header.contains("[Clear] [New] [×]"));
+        assert!(wide_header.contains("Clear   New   ×"));
 
         for (label, expected) in [("Clear", "clear"), ("New", "new"), ("×", "close")] {
             let start = wide_header.find(label).unwrap();
@@ -10614,7 +11025,7 @@ mod tests {
         });
         let mut narrow = RenderBuffer::new(20, 12, &theme.style);
         manager.render(&mut narrow, &theme);
-        assert!(row_text(&narrow, 0).contains("[C] [N] [×]"));
+        assert!(row_text(&narrow, 0).contains("C   N   ×"));
 
         let actions = text_panel_header_actions(&manager.text_panels["agent"].config, 4);
         assert_eq!(actions.len(), 1);

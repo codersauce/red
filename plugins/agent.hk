@@ -184,6 +184,8 @@ struct TextPanelHeaderAction {
     key: String,
     label: String,
     compact_label: String,
+    description: String,
+    show_in_header: bool,
 }
 
 struct AgentEditOrigin {
@@ -768,7 +770,12 @@ fn session_browser_cwd_loaded(result: AgentStringValueEvent) {
         session_browser_preview_debounce: "",
     });
     red::execute("EnterTextPanelContext", "agent-conversation", "Search previous sessions…", Json {
-        key: cwd, query: query,
+        key: cwd, query: query, tab: scope, tab_shortcut: "Alt-s",
+        tabs: [
+            Json { id: "red", label: "Red", compact_label: "Red" },
+            Json { id: "workspace", label: "This workspace", compact_label: "Here" },
+            Json { id: "all", label: "All Codex", compact_label: "All" },
+        ],
     });
     refresh_session_browser_header();
     render_session_browser([], "", true, false, false);
@@ -788,10 +795,9 @@ fn session_scope_label() -> String {
 
 fn refresh_session_browser_header() {
     if !state().session_browser_open { return; }
-    let scope = session_scope_label();
+    // The scope is shown, and changed, by the picker's tabs.
     red::execute("SetTextPanelHeaderDetail", "agent-conversation", Json {
-        text: "Previous sessions", secondary: scope, compact_text: scope,
-        action: "session_scope", shortcut: "Alt-s",
+        text: "Previous sessions",
     });
 }
 
@@ -1071,11 +1077,10 @@ fn session_preview_loaded(result: AgentSessionPreviewResult, request_id: i32) {
     });
 }
 
-fn cycle_session_scope() {
+fn select_session_scope(scope: String) {
     if !state().session_browser_open { return; }
-    let scope = "red";
-    if state().session_browser_scope == "red" { scope = "workspace"; }
-    else if state().session_browser_scope == "workspace" { scope = "all"; }
+    if scope != "red" && scope != "workspace" && scope != "all" { return; }
+    if scope == state().session_browser_scope { return; }
     red::state_patch(AgentState {
         session_browser_scope: scope,
         session_browser_results: [],
@@ -1408,10 +1413,23 @@ fn ensure_conversation_panel() {
             title: "Agent",
             composer: TextPanelComposerConfig { placeholder: "Ask a follow-up…", rows: 3 },
             header_actions: [
-                TextPanelHeaderAction { id: "sessions", key: "Alt-s", label: "Sessions", compact_label: "S" },
-                TextPanelHeaderAction { id: "new", key: "Alt-n", label: "New", compact_label: "N" },
-                TextPanelHeaderAction { id: "clear", key: "Alt-c", label: "Clear", compact_label: "C" },
-                TextPanelHeaderAction { id: "close", key: "Alt-w", label: "×", compact_label: "×" },
+                // Listed under the composer; only closing stays in the header.
+                TextPanelHeaderAction {
+                    id: "sessions", key: "Alt-s", label: "sessions", compact_label: "sessions",
+                    description: "Browse previous sessions", show_in_header: false,
+                },
+                TextPanelHeaderAction {
+                    id: "new", key: "Alt-n", label: "new", compact_label: "new",
+                    description: "Start a new conversation", show_in_header: false,
+                },
+                TextPanelHeaderAction {
+                    id: "clear", key: "Alt-c", label: "clear", compact_label: "clear",
+                    description: "Clear the conversation", show_in_header: false,
+                },
+                TextPanelHeaderAction {
+                    id: "close", key: "Alt-w", label: "×", compact_label: "×",
+                    description: "Close the pane", show_in_header: true,
+                },
             ],
         });
         red::state_patch(AgentState { panel_created: true });
@@ -2012,8 +2030,8 @@ fn panel_event(event: AgentPanelEvent) {
         cancel();
     } else if event.action == "model" {
         choose_model();
-    } else if event.action == "session_scope" {
-        cycle_session_scope();
+    } else if event.action == "context_tab" {
+        select_session_scope(red::string(event.text, ""));
     } else if event.action == "session_preview" && state().session_browser_open {
         // Peek at the row the host shows as selected.
         session_browser_selection_changed(red::string(event.text, ""));

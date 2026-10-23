@@ -9682,14 +9682,17 @@ mod tests {
                     && placeholder == "Search previous sessions…"
                     && options.key == "/workspace"
                     && options.query.is_empty()
+                    && options.tab == "red"
+                    && options.tab_shortcut == "Alt-s"
+                    && options.tabs.iter().map(|tab| tab.id.as_str()).eq(["red", "workspace", "all"])
         ));
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
             PluginRequest::SetTextPanelHeaderDetail { id, detail: Some(detail) }
                 if id == "agent-conversation"
                     && detail.text == "Previous sessions"
-                    && detail.secondary == "Red"
-                    && detail.shortcut.as_deref() == Some("Alt-s")
+                    && detail.secondary.is_empty()
+                    && detail.shortcut.is_none()
         ));
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
@@ -9821,14 +9824,14 @@ mod tests {
         runtime
             .notify(
                 "panel:event:agent-conversation",
-                serde_json::json!({"action":"session_scope","text":""}),
+                serde_json::json!({"action":"context_tab","text":"workspace"}),
             )
             .await
             .unwrap();
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
             PluginRequest::SetTextPanelHeaderDetail { detail: Some(detail), .. }
-                if detail.secondary == "This workspace"
+                if detail.text == "Previous sessions"
         ));
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
@@ -10105,12 +10108,11 @@ mod tests {
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
             PluginRequest::EnterTextPanelContext { options, .. }
-                if options.key == "/other" && options.query.is_empty()
+                if options.key == "/other" && options.query.is_empty() && options.tab == "red"
         ));
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
-            PluginRequest::SetTextPanelHeaderDetail { detail: Some(detail), .. }
-                if detail.secondary == "Red"
+            PluginRequest::SetTextPanelHeaderDetail { .. }
         ));
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
@@ -10173,11 +10175,11 @@ mod tests {
                 if id == "agent-conversation"
                     && options.key == "/workspace"
                     && options.query == "needle"
+                    && options.tab == "workspace"
         ));
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
-            PluginRequest::SetTextPanelHeaderDetail { detail: Some(detail), .. }
-                if detail.secondary == "This workspace"
+            PluginRequest::SetTextPanelHeaderDetail { .. }
         ));
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
