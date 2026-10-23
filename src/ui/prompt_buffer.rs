@@ -277,6 +277,13 @@ impl PromptBuffer {
         changed
     }
 
+    pub(crate) fn delete_to_line_start(&mut self) -> bool {
+        self.cancel_history_search();
+        let changed = self.area.delete_to_line_start();
+        self.detach_history_after_edit(changed);
+        changed
+    }
+
     /// Selects the previous submitted prompt while preserving the current draft.
     pub(crate) fn history_previous(&mut self) -> bool {
         if self.history.is_empty() {
@@ -418,6 +425,12 @@ impl PromptBuffer {
                 if modifiers.contains(KeyModifiers::CONTROL) && self.mode() != Mode::Search =>
             {
                 self.delete_previous_word();
+                PromptInput::Changed
+            }
+            KeyCode::Char('u' | 'U')
+                if modifiers.contains(KeyModifiers::CONTROL) && self.mode() == Mode::Insert =>
+            {
+                self.delete_to_line_start();
                 PromptInput::Changed
             }
             KeyCode::Char('r' | 'R')
@@ -798,6 +811,17 @@ mod tests {
 
     fn composer(text: &str) -> PromptBuffer {
         PromptBuffer::new(text).with_key_policy(PromptKeyPolicy::EnterSends)
+    }
+
+    #[test]
+    fn control_u_deletes_to_the_start_of_the_line_in_insert_mode() {
+        let mut prompt = composer("first line\nsecond line");
+        prompt.handle_event(&key(KeyCode::Char('u'), KeyModifiers::CONTROL), 40);
+        assert_eq!(prompt.text(), "first line\n");
+        prompt.handle_event(&key(KeyCode::Char('u'), KeyModifiers::CONTROL), 40);
+        assert_eq!(prompt.text(), "first line\n");
+        assert!(prompt.undo());
+        assert_eq!(prompt.text(), "first line\nsecond line");
     }
 
     #[test]

@@ -5,7 +5,11 @@ use serde_json::Value;
 
 const MAX_TRANSCRIPT_ITEMS: usize = 512;
 const MAX_TRANSCRIPT_CHARS: usize = 1_048_576;
-const EDITOR_CONTEXT_MARKER: &str = "\n\nActive editor context from ";
+/// Red sends the active editor's excerpt as a text item after the prompt.
+pub(crate) const EDITOR_CONTEXT_PREFIX: &str = "Active editor context from ";
+/// Red resends an interrupted conversation's tail ahead of the next prompt.
+pub(crate) const RECAP_PREFIX: &str = "Previous conversation (the last turn was interrupted):";
+pub(crate) const RECAP_FOLLOW_UP: &str = "\n\nFollow-up:\n";
 
 /// Version of the dynamic-tool contract registered for new full-Agent threads.
 ///
@@ -382,15 +386,46 @@ fn transcript_items_from_thread(thread: &Value) -> Vec<AgentTranscriptItem> {
 }
 
 fn clean_persisted_user_text(text: &str) -> String {
-    text.split_once(EDITOR_CONTEXT_MARKER)
+    match typed_prompt(text) {
+        "" => text,
+        prompt => prompt,
+    }
+    .to_string()
+}
+
+/// What the person typed, without the editor context and recap Red sent with
+/// it. Codex joins a turn's text items with no separator in a thread preview.
+pub(crate) fn typed_prompt(text: &str) -> &str {
+    let text = match text.strip_prefix(RECAP_PREFIX) {
+        Some(recap) => recap
+            .rsplit_once(RECAP_FOLLOW_UP)
+            .map_or("", |(_, follow_up)| follow_up),
+        None => text,
+    };
+    text.split_once(EDITOR_CONTEXT_PREFIX)
         .map_or(text, |(prompt, _)| prompt)
-        .to_string()
+        .trim_end()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn restored_prompts_leave_out_the_recap_and_context_red_sent() {
+        assert_eq!(
+            clean_persisted_user_text(
+                "Previous conversation (the last turn was interrupted):\nYou: earlier\nAgent: partial\n\nFollow-up:\nTry again\n\nActive editor context from file:///a.rs:\n\n```text\nx\n```"
+            ),
+            "Try again"
+        );
+        assert_eq!(
+            typed_prompt("Fix it.Active editor context from file:///a.rs:"),
+            "Fix it."
+        );
+        assert_eq!(clean_persisted_user_text("Plain prompt"), "Plain prompt");
+    }
 
     fn annotation_tool_item(tool: &str, arguments: Value, output: Value) -> Value {
         json!({

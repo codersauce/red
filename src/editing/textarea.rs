@@ -359,6 +359,17 @@ impl TextArea {
         self.replace_graphemes(start, self.state.cursor, "", start, "delete previous word")
     }
 
+    /// Removes everything between the start of the cursor's line and the cursor.
+    pub fn delete_to_line_start(&mut self) -> bool {
+        let text = self.text();
+        let end = grapheme_to_byte(&text, self.state.cursor);
+        let start = grapheme_len(&text[..text[..end].rfind('\n').map_or(0, |index| index + 1)]);
+        if start == self.state.cursor {
+            return false;
+        }
+        self.replace_graphemes(start, self.state.cursor, "", start, "delete to line start")
+    }
+
     /// Undoes one transaction and restores its exact grapheme cursor snapshot.
     pub fn undo(&mut self) -> bool {
         self.finish_insert_recipe();

@@ -1,6 +1,7 @@
 //! Discovery of persisted Codex conversations for Red's session picker.
 
 use super::*;
+use crate::agent_conversation::{typed_prompt, EDITOR_CONTEXT_PREFIX, RECAP_PREFIX};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashSet,
@@ -31,6 +32,9 @@ pub struct AgentSessionListRequest {
     pub scope: AgentSessionScope,
     pub query: String,
     pub exclude_session_id: Option<String>,
+    /// Also search conversation text, which Codex does by scanning every
+    /// rollout and can take many seconds. Otherwise a query matches titles.
+    pub search_contents: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -49,13 +53,25 @@ pub struct AgentSessionSummary {
     pub source: String,
     pub time_group: String,
     pub is_red: bool,
+    /// A Red thread from this workspace rejoins as itself; anything else
+    /// continues in a new thread here.
+    pub resumable: bool,
     pub updated_at: i64,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ListPhase {
+    /// `thread/list`, filtered by title when there is a query.
+    Titles,
+    /// `thread/search` over conversation text.
+    Contents,
 }
 
 pub(super) struct PendingSessionRequest {
     request_id: i64,
     request: AgentSessionListRequest,
-    /// Every thread id seen so far, listed or not.
+    phase: ListPhase,
+    /// Every thread id this phase has seen, listed or not.
     seen: HashSet<String>,
     sessions: Vec<AgentSessionSummary>,
     cursors: HashSet<String>,
@@ -63,6 +79,8 @@ pub(super) struct PendingSessionRequest {
     /// Threads per page. Older Codex threads can carry a whole pasted prompt as
     /// their preview, so a page too large to read is retried at half the size.
     limit: usize,
+    /// Matching threads were left out.
+    more: bool,
 }
 
 impl PendingSessionRequest {
@@ -136,10 +154,12 @@ fn preview_item_text(item: &Value) -> String {
                 .into_iter()
                 .flatten()
                 .filter_map(|part| part["text"].as_str())
+                .filter(|text| !text.starts_with(EDITOR_CONTEXT_PREFIX))
                 .collect::<Vec<_>>()
                 .join("\n")
         });
-    text.trim()
+    typed_prompt(&text)
+        .trim()
         .chars()
         .take(MAX_SESSION_PREVIEW_CHARS)
         .collect()
@@ -161,11 +181,11 @@ async fn list_page(
     next_id: &mut u64,
 ) -> Result<()> {
     let id = rpc_id(next_id);
-    let query = state.request.query.trim();
-    let (method, mut params) = if query.is_empty() {
-        (
-            "thread/list",
-            json!({
+    let (method, params) = match state.phase {
+        ListPhase::Titles => {
+            // The state DB answers without rescanning every rollout, which
+            // took seconds with a thousand threads.
+            let mut params = json!({
                 "limit": state.limit,
                 "cursor": state.cursor,
                 "archived": false,
@@ -173,13 +193,17 @@ async fn list_page(
                 "sortDirection": "desc",
                 "modelProviders": [],
                 "sourceKinds": interactive_source_kinds(state.request.scope),
-            }),
-        )
-    } else {
-        (
+                "useStateDbOnly": true,
+            });
+            if state.request.scope != AgentSessionScope::All {
+                params["cwd"] = json!(workspace_paths(&state.request.cwd));
+            }
+            ("thread/list", params)
+        }
+        ListPhase::Contents => (
             "thread/search",
             json!({
-                "searchTerm": query,
+                "searchTerm": state.request.query.trim(),
                 "limit": state.limit,
                 "cursor": state.cursor,
                 "archived": false,
@@ -187,11 +211,8 @@ async fn list_page(
                 "sortDirection": "desc",
                 "sourceKinds": interactive_source_kinds(state.request.scope),
             }),
-        )
+        ),
     };
-    if query.is_empty() && state.request.scope == AgentSessionScope::Workspace {
-        params["cwd"] = json!(state.request.cwd);
-    }
     pending.insert(id.clone(), Pending::Sessions(state));
     write_message(
         input,
@@ -211,11 +232,13 @@ pub(super) async fn handle_command(
         PendingSessionRequest {
             request_id,
             request,
+            phase: ListPhase::Titles,
             seen: HashSet::new(),
             sessions: Vec::new(),
             cursors: HashSet::new(),
             cursor: None,
             limit: PAGE_LIMIT,
+            more: false,
         },
         input,
         pending,
@@ -225,7 +248,7 @@ pub(super) async fn handle_command(
 }
 
 pub(super) async fn handle_response(
-    request: PendingSessionRequest,
+    mut request: PendingSessionRequest,
     message: Value,
     input: &mut (impl AsyncWrite + Unpin),
     events: &mpsc::Sender<CodexEvent>,
@@ -234,31 +257,21 @@ pub(super) async fn handle_response(
 ) -> Result<()> {
     let request_id = request.request_id();
     if let Some(error) = message.get("error") {
-        if error["code"].as_i64() == Some(FRAME_TOO_LARGE_CODE) {
-            if request.limit > 1 {
-                let limit = request.limit / 2;
-                return list_page(
-                    PendingSessionRequest { limit, ..request },
-                    input,
-                    pending,
-                    next_id,
-                )
-                .await;
-            }
-            // One thread alone is too large to list; show the ones before it.
-            if !request.sessions.is_empty() {
-                return finish(request.sessions, true, request_id, events).await;
-            }
+        if error["code"].as_i64() == Some(FRAME_TOO_LARGE_CODE) && request.limit > 1 {
+            request.limit /= 2;
+            return list_page(request, input, pending, next_id).await;
         }
-        complete(
-            events,
-            request_id,
-            Err(error["message"]
-                .as_str()
-                .unwrap_or("Codex session search failed")
-                .to_string()),
-        )
-        .await;
+        let message = error["message"]
+            .as_str()
+            .unwrap_or("Codex session search failed")
+            .to_string();
+        // One thread too large to list, or a failed text search, still leaves
+        // the sessions found before it.
+        if !request.sessions.is_empty() {
+            crate::log!("Codex session listing stopped early: {message}");
+            return finish(request.sessions, true, request_id, events).await;
+        }
+        complete(events, request_id, Err(message)).await;
         return Ok(());
     }
     let Some(page) = message.pointer("/result/data").and_then(Value::as_array) else {
@@ -270,66 +283,94 @@ pub(super) async fn handle_response(
         .await;
         return Ok(());
     };
-    let searching = !request.request.query.trim().is_empty();
-    let PendingSessionRequest {
-        request: list_request,
-        mut seen,
-        mut sessions,
-        mut cursors,
-        limit,
-        ..
-    } = request;
+    let terms = search_terms(&request.request.query);
     for entry in page {
-        let (thread, snippet) = if searching {
-            (&entry["thread"], clean_text(&entry["snippet"]))
-        } else {
-            (entry, String::new())
+        let (thread, snippet) = match request.phase {
+            ListPhase::Titles => (entry, String::new()),
+            ListPhase::Contents => (&entry["thread"], clean_text(&entry["snippet"])),
         };
         let Some(id) = thread["id"].as_str().filter(|id| !id.is_empty()) else {
             continue;
         };
-        if seen.insert(id.to_string()) {
-            sessions.extend(summarize(&list_request, thread, snippet));
+        if !request.seen.insert(id.to_string()) {
+            continue;
         }
+        if let Some(listed) = request.sessions.iter_mut().find(|session| session.id == id) {
+            // A title match also found in the text gains its snippet.
+            if listed.snippet.is_empty() {
+                listed.snippet = snippet;
+            }
+            continue;
+        }
+        if request.phase == ListPhase::Titles && !title_matches(thread, &terms) {
+            continue;
+        }
+        request
+            .sessions
+            .extend(summarize(&request.request, thread, snippet));
     }
     let next_cursor = message
         .pointer("/result/nextCursor")
         .and_then(Value::as_str)
-        .filter(|cursor| !cursor.is_empty());
-    if sessions.len() >= MAX_LISTED_SESSIONS {
-        return finish(sessions, next_cursor.is_some(), request_id, events).await;
+        .filter(|cursor| !cursor.is_empty())
+        .map(str::to_string);
+    if request.sessions.len() >= MAX_LISTED_SESSIONS {
+        let more = request.more || next_cursor.is_some() || wants_contents(&request);
+        return finish(request.sessions, more, request_id, events).await;
     }
     if let Some(cursor) = next_cursor {
-        if seen.len() > MAX_SESSIONS
-            || cursors.len() >= MAX_PAGES
-            || !cursors.insert(cursor.to_string())
+        if request.seen.len() <= MAX_SESSIONS
+            && request.cursors.len() < MAX_PAGES
+            && request.cursors.insert(cursor.clone())
         {
-            complete(
-                events,
-                request_id,
-                Err("Codex session-list pagination did not finish".into()),
-            )
-            .await;
-        } else {
-            list_page(
-                PendingSessionRequest {
-                    request_id,
-                    request: list_request,
-                    seen,
-                    sessions,
-                    cursors,
-                    cursor: Some(cursor.to_string()),
-                    limit,
-                },
-                input,
-                pending,
-                next_id,
-            )
-            .await?;
+            request.cursor = Some(cursor);
+            return list_page(request, input, pending, next_id).await;
         }
-        return Ok(());
+        // Too many threads to read through; list what was found.
+        request.more = true;
     }
-    finish(sessions, false, request_id, events).await
+    if wants_contents(&request) {
+        request.phase = ListPhase::Contents;
+        request.seen.clear();
+        request.cursors.clear();
+        request.cursor = None;
+        request.limit = PAGE_LIMIT;
+        return list_page(request, input, pending, next_id).await;
+    }
+    finish(request.sessions, request.more, request_id, events).await
+}
+
+/// Whether a title search still has the conversation text to search.
+fn wants_contents(request: &PendingSessionRequest) -> bool {
+    request.phase == ListPhase::Titles
+        && request.request.search_contents
+        && !request.request.query.trim().is_empty()
+}
+
+fn search_terms(query: &str) -> Vec<String> {
+    query.split_whitespace().map(str::to_lowercase).collect()
+}
+
+/// Whether every term appears, ignoring case, in the thread's name or prompt.
+fn title_matches(thread: &Value, terms: &[String]) -> bool {
+    if terms.is_empty() {
+        return true;
+    }
+    let mut title = thread["name"].as_str().unwrap_or_default().to_lowercase();
+    title.push('\n');
+    title.push_str(&typed_prompt(thread["preview"].as_str().unwrap_or_default()).to_lowercase());
+    terms.iter().all(|term| title.contains(term.as_str()))
+}
+
+/// The workspace as Codex may have recorded it, before and after resolving links.
+fn workspace_paths(cwd: &Path) -> Vec<PathBuf> {
+    let mut paths = vec![cwd.to_path_buf()];
+    if let Ok(canonical) = cwd.canonicalize() {
+        if canonical != cwd {
+            paths.push(canonical);
+        }
+    }
+    paths
 }
 
 /// Reports the most recent sessions; `more` says older ones were left out.
@@ -373,16 +414,13 @@ fn summarize(
     if request.scope == AgentSessionScope::Red && !is_red {
         return None;
     }
-    if request.scope == AgentSessionScope::Workspace && !same_path(&request.cwd, Path::new(&cwd)) {
+    if request.scope != AgentSessionScope::All && !same_path(&request.cwd, Path::new(&cwd)) {
         return None;
     }
     let source = source_label(&thread["source"], is_red);
     let updated_at = thread["updatedAt"].as_i64().unwrap_or_default();
-    let label = nonempty(&thread["name"])
-        .or_else(|| nonempty(&thread["preview"]))
-        .map(|value| clean_text(&Value::String(value)))
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| "Untitled session".to_string());
+    let label = session_label(thread);
+    let resumable = is_red && same_path(&request.cwd, Path::new(&cwd));
     let location = Path::new(&cwd)
         .file_name()
         .and_then(|name| name.to_str())
@@ -399,31 +437,42 @@ fn summarize(
         source,
         time_group: session_time_group(age).to_string(),
         is_red,
+        resumable,
         updated_at,
     })
+}
+
+fn session_label(thread: &Value) -> String {
+    if let Some(name) = nonempty(&thread["name"]) {
+        return clean_text(&Value::String(name));
+    }
+    let preview = thread["preview"].as_str().unwrap_or_default();
+    let prompt = clean_text(&Value::String(typed_prompt(preview).to_string()));
+    if !prompt.is_empty() {
+        prompt
+    } else if preview.starts_with(RECAP_PREFIX) {
+        "Continued conversation".to_string()
+    } else {
+        "Untitled session".to_string()
+    }
 }
 
 fn is_red_thread(thread: &Value) -> bool {
     if thread["threadSource"].as_str() == Some("red") {
         return true;
     }
+    // Codex records the originator for newer threads, which saves reading
+    // the rollout.
+    if let Some(originator) = thread["originator"].as_str() {
+        return originator == "red";
+    }
     if thread["source"].as_str() != Some("vscode") {
         return false;
     }
 
-    let Some(path) = thread["path"].as_str() else {
+    let Some(line) = thread["path"].as_str().and_then(first_rollout_line) else {
         return false;
     };
-    let Ok(file) = std::fs::File::open(path) else {
-        return false;
-    };
-    let mut line = String::new();
-    if BufReader::new(std::io::Read::take(file, MAX_SESSION_METADATA_BYTES))
-        .read_line(&mut line)
-        .is_err()
-    {
-        return false;
-    }
     let Ok(metadata) = serde_json::from_str::<Value>(&line) else {
         return false;
     };
@@ -433,6 +482,23 @@ fn is_red_thread(thread: &Value) -> bool {
             .pointer("/payload/originator")
             .and_then(Value::as_str)
             == Some("red")
+}
+
+/// A rollout's first line, which holds its session metadata. Codex compresses
+/// older rollouts in place, though its thread list still names the plain file.
+fn first_rollout_line(path: &str) -> Option<String> {
+    let reader: Box<dyn std::io::Read> = match std::fs::File::open(path) {
+        Ok(file) => Box::new(file),
+        Err(_) => {
+            let file = std::fs::File::open(format!("{path}.zst")).ok()?;
+            Box::new(ruzstd::decoding::StreamingDecoder::new(file).ok()?)
+        }
+    };
+    let mut line = String::new();
+    BufReader::new(std::io::Read::take(reader, MAX_SESSION_METADATA_BYTES))
+        .read_line(&mut line)
+        .ok()?;
+    Some(line)
 }
 
 fn nonempty(value: &Value) -> Option<String> {
@@ -516,6 +582,7 @@ mod tests {
             scope: AgentSessionScope::Red,
             query: String::new(),
             exclude_session_id: Some("current".into()),
+            search_contents: false,
         };
         let mut thread = json!({
             "id": "other",
@@ -538,6 +605,52 @@ mod tests {
         assert_eq!(cli_summary.label, "Fix the picker");
         assert_eq!(cli_summary.source, "Red");
         assert!(cli_summary.is_red);
+    }
+
+    #[test]
+    fn labels_and_previews_leave_out_what_red_sends_with_a_prompt() {
+        let thread = |preview: &str| json!({"id": "thread", "name": null, "preview": preview});
+        assert_eq!(
+            session_label(&thread(
+                "Reply with OK.Active editor context from file:///a.rs:\n\n```text\nx\n```"
+            )),
+            "Reply with OK."
+        );
+        assert_eq!(
+            session_label(&thread(
+                "Previous conversation (the last turn was interrupted):\nYou: earlier\n\nFollow-up:\nTry   again"
+            )),
+            "Try again"
+        );
+        assert_eq!(
+            session_label(&thread(
+                "Previous conversation (the last turn was interrupted):\nYou: cut"
+            )),
+            "Continued conversation"
+        );
+
+        let response = json!({"result":{"thread":{"id":"thread","turns":[{"items":[
+            {"type":"userMessage","content":[
+                {"type":"text","text":"Fix the parser"},
+                {"type":"text","text":"Active editor context from file:///a.rs:\n\n```text\nx\n```"}
+            ]},
+            {"type":"agentMessage","text":"Fixed"}
+        ]}]}}});
+        assert_eq!(
+            session_preview("thread", &response).unwrap()["prompt"],
+            "Fix the parser"
+        );
+    }
+
+    #[test]
+    fn title_search_matches_every_word_ignoring_case() {
+        let thread = json!({"name": "Fix the Session Picker", "preview": "unused"});
+        assert!(title_matches(&thread, &search_terms("picker fix")));
+        assert!(!title_matches(&thread, &search_terms("picker parser")));
+        let unnamed =
+            json!({"name": null, "preview": "Speed up LISTING.Active editor context from x"});
+        assert!(title_matches(&unnamed, &search_terms("listing")));
+        assert!(!title_matches(&unnamed, &search_terms("editor")));
     }
 
     #[test]
@@ -592,6 +705,7 @@ mod tests {
             scope: AgentSessionScope::Workspace,
             query: String::new(),
             exclude_session_id: None,
+            search_contents: false,
         };
         let thread = json!({
             "id": "other",
@@ -625,6 +739,7 @@ mod tests {
             scope: AgentSessionScope::Red,
             query: String::new(),
             exclude_session_id: None,
+            search_contents: false,
         };
         let mut thread = json!({
             "id": "legacy-red",
@@ -643,5 +758,23 @@ mod tests {
 
         thread["id"] = json!("different-session");
         assert!(summarize(&request, &thread, String::new()).is_none());
+
+        // An older rollout Codex has since compressed in place.
+        let compressed = directory.path().join("compressed.jsonl");
+        std::fs::write(
+            directory.path().join("compressed.jsonl.zst"),
+            [
+                0x28, 0xb5, 0x2f, 0xfd, 0x04, 0x58, 0x1d, 0x02, 0x00, 0xd2, 0xc4, 0x0f, 0x15, 0xa0,
+                0xa5, 0x6d, 0x14, 0x94, 0x4a, 0xb5, 0x90, 0xb9, 0xbf, 0xa7, 0xbf, 0x53, 0x15, 0xc4,
+                0xb7, 0x71, 0x7f, 0x70, 0xb1, 0x02, 0x42, 0x4a, 0xbe, 0xab, 0xcb, 0x9a, 0xc6, 0x08,
+                0x0a, 0x50, 0xd3, 0xc2, 0x77, 0x1d, 0xee, 0xbb, 0xd7, 0x32, 0x32, 0xe0, 0xf2, 0xa1,
+                0x51, 0xf9, 0x2c, 0x07, 0xc7, 0x8a, 0x85, 0xcd, 0x7c, 0x00, 0x48, 0xe2, 0xee, 0xd7,
+                0xe5, 0x97, 0x63, 0x8c, 0x02, 0x00, 0x46, 0xd4, 0xb7, 0x75,
+            ],
+        )
+        .unwrap();
+        thread["id"] = json!("compressed-red");
+        thread["path"] = json!(compressed);
+        assert!(summarize(&request, &thread, String::new()).unwrap().is_red);
     }
 }

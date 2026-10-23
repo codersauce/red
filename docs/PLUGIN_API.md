@@ -593,10 +593,20 @@ loading?, error? })`, or hide them by omitting the second argument. The host
 places previews beside wide pickers and beneath narrow pickers. Request the
 contents with `AgentReadSessionPreview(callback, cwd, session_id)`, which reads
 persisted history without resuming the thread or changing conversation state.
-`AgentListSessions(callback, cwd, scope, query, exclude_session_id)` answers
-with `Json { sessions, more?, error? }`: at most the 200 most recently updated
-matches, with `more` set when older ones were left out, which a query can
-still find.
+`AgentListSessions(callback, cwd, scope, query, exclude_session_id,
+search_contents?)` answers with `Json { sessions, more?, error? }`: at most the
+200 most recently updated matches, with `more` set when older ones were left
+out, which a query can still find. The `red` and `workspace` scopes list threads
+started in `cwd`; `all` lists every interactive thread. A query matches every
+word, ignoring case, against each thread's name and first prompt. With
+`search_contents` set, it also searches conversation text, which Codex does by
+scanning every saved conversation and can take many seconds, so list titles
+first and search contents second. Each session has `id`, `cwd`, `label`,
+`detail`, `snippet`, `source`, `time_group`, `updated_at`, `is_red`, and
+`resumable`, which is set for a Red thread from `cwd`; pass it as
+`AgentSwitchSession`'s `resume` argument, since any other session continues in
+a new thread. In a picker context, replacing the blocks with an empty list also
+selects the first row of the next update.
 Call `ExitTextPanelContext(id)` to restore the retained conversation
 exactly. `AgentListSessions`, `AgentReadSessionPreview`, `AgentSwitchSession`,
 `EnterTextPanelContext`, `ExitTextPanelContext`, and `SetTextPanelPreview` were

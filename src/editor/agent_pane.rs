@@ -776,9 +776,8 @@ impl AgentPaneLifecycle {
         if !std::mem::take(&mut self.recap_pending) || recap.trim().is_empty() {
             return text.to_string();
         }
-        format!(
-            "Previous conversation (the last turn was interrupted):\n{recap}\n\nFollow-up:\n{text}"
-        )
+        use crate::agent_conversation::{RECAP_FOLLOW_UP, RECAP_PREFIX};
+        format!("{RECAP_PREFIX}\n{recap}{RECAP_FOLLOW_UP}{text}")
     }
 
     fn new_prompt(&mut self, text: String) -> AgentPanePrompt {

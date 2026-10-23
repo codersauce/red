@@ -212,18 +212,38 @@ for line in sys.stdin:
         send({"id": ident, "result": {"config": {"mcp_servers": {}}, "origins": {}}})
     elif method == "configRequirements/read":
         send({"id": ident, "result": {"requirements": None}})
+    elif method == "thread/list" and params["sourceKinds"] != ["appServer", "vscode"]:
+        assert params["useStateDbOnly"] is True
+        assert params["sourceKinds"] == ["cli", "vscode", "appServer", "unknown"]
+        if "cwd" in params:
+            assert "/workspace" in params["cwd"]
+            send({"id": ident, "result": {"data": [
+                {"id":"needle-title", "cwd":"/workspace", "ephemeral":False, "threadSource":"user", "source":"cli", "name":"Find the Needle", "preview":"", "updatedAt":30},
+                {"id":"workspace-hit", "cwd":"/workspace", "ephemeral":False, "threadSource":"user", "source":"cli", "name":"Hit", "preview":"", "updatedAt":25}
+            ], "nextCursor":None}})
+        else:
+            # More matches than Red lists: it should stop without asking for the next page.
+            assert params.get("cursor") is None
+            send({"id": ident, "result": {"data": [
+                {"id":f"many-{n}", "cwd":"/workspace", "ephemeral":False, "threadSource":"user", "source":"cli", "name":f"Many {n}", "preview":"", "updatedAt":1000 - n}
+                for n in range(250)
+            ], "nextCursor":"more"}})
     elif method == "thread/list":
         assert params["sortKey"] == "updated_at"
         assert params["sortDirection"] == "desc"
-        assert params["sourceKinds"] == ["appServer", "vscode"]
         assert params["modelProviders"] == []
+        assert params["useStateDbOnly"] is True
+        assert "/workspace" in params["cwd"]
         if params.get("cursor") is None:
             send({"id": ident, "result": {"data": [
                 {"id":"current", "cwd":"/workspace", "ephemeral":False, "threadSource":"red", "source":"vscode", "name":"Current", "preview":"", "updatedAt":40},
                 {"id":"foreign", "cwd":"/workspace", "ephemeral":False, "threadSource":"user", "source":"appServer", "name":"Foreign", "preview":"", "updatedAt":30},
                 {"id":"red-legacy", "cwd":"/workspace", "ephemeral":False, "threadSource":None, "source":"vscode", "path":os.path.join(os.path.dirname(sys.argv[0]), "red-legacy.jsonl"), "name":"Legacy Red", "preview":"", "updatedAt":25},
                 {"id":"red-old", "cwd":"/workspace", "ephemeral":False, "threadSource":"red", "source":"appServer", "name":None, "preview":"Older Red", "updatedAt":10},
-                {"id":"ephemeral", "cwd":"/workspace", "ephemeral":True, "threadSource":"red", "source":"appServer", "name":"Hidden", "preview":"", "updatedAt":50}
+                {"id":"ephemeral", "cwd":"/workspace", "ephemeral":True, "threadSource":"red", "source":"appServer", "name":"Hidden", "preview":"", "updatedAt":50},
+                {"id":"red-elsewhere", "cwd":"/other", "ephemeral":False, "threadSource":"red", "source":"vscode", "name":"Elsewhere", "preview":"", "updatedAt":45},
+                {"id":"red-originator", "cwd":"/workspace", "ephemeral":False, "threadSource":None, "originator":"red", "source":"vscode", "name":None, "preview":"Fix the parser.Active editor context from file:///parser.rs:\n\n```text\nsource\n```", "updatedAt":12},
+                {"id":"tui-originator", "cwd":"/workspace", "ephemeral":False, "threadSource":None, "originator":"codex-tui", "source":"vscode", "path":os.path.join(os.path.dirname(sys.argv[0]), "red-legacy.jsonl"), "name":"TUI", "preview":"", "updatedAt":11}
             ], "nextCursor":"page-2"}})
         elif params["limit"] > 50:
             # Old threads keep whole pasted prompts as previews: too large for one page.
@@ -236,20 +256,14 @@ for line in sys.stdin:
             send({"id": ident, "result": {"data": [
                 {"id":"red-new", "cwd":"/workspace", "ephemeral":False, "threadSource":"red", "source":"vscode", "name":"Newer Red", "preview":"", "updatedAt":20}
             ], "nextCursor":None}})
-    elif method == "thread/search" and params["searchTerm"] == "many":
-        # More matches than Red lists: it should stop without asking for the next page.
-        assert params.get("cursor") is None
-        send({"id": ident, "result": {"data": [
-            {"thread":{"id":f"many-{n}", "cwd":"/workspace", "ephemeral":False, "threadSource":"user", "source":"cli", "name":f"Many {n}", "preview":"", "updatedAt":1000 - n}, "snippet":"many"}
-            for n in range(250)
-        ], "nextCursor":"more"}})
     elif method == "thread/search":
-        assert params["searchTerm"] == "needle"
+        assert params["searchTerm"] == "NEEDLE"
         assert params["sortKey"] == "updated_at"
         assert params["sourceKinds"] == ["cli", "vscode", "appServer", "unknown"]
         send({"id": ident, "result": {"data": [
             {"thread":{"id":"workspace-hit", "cwd":"/workspace", "ephemeral":False, "threadSource":"user", "source":"cli", "name":"Hit", "preview":"", "updatedAt":25}, "snippet":"a matching needle"},
-            {"thread":{"id":"other-hit", "cwd":"/other", "ephemeral":False, "threadSource":"user", "source":"cli", "name":"Other", "preview":"", "updatedAt":35}, "snippet":"needle elsewhere"}
+            {"thread":{"id":"other-hit", "cwd":"/other", "ephemeral":False, "threadSource":"user", "source":"cli", "name":"Other", "preview":"", "updatedAt":35}, "snippet":"needle elsewhere"},
+            {"thread":{"id":"needle-title", "cwd":"/workspace", "ephemeral":False, "threadSource":"user", "source":"cli", "name":"Find the Needle", "preview":"", "updatedAt":30}, "snippet":"the needle itself"}
         ], "nextCursor":None}})
     elif method == "thread/turns/list":
         assert params["sortDirection"] == "desc"
@@ -339,6 +353,7 @@ async fn direct_app_server_lists_searches_and_continues_sessions_for_red() {
                 scope: AgentSessionScope::Red,
                 query: String::new(),
                 exclude_session_id: Some("current".into()),
+                search_contents: false,
             },
         })
         .await
@@ -348,12 +363,18 @@ async fn direct_app_server_lists_searches_and_continues_sessions_for_red() {
             request_id: 41,
             result: Ok(result),
         } => {
-            assert_eq!(result["sessions"].as_array().unwrap().len(), 3);
-            assert_eq!(result["sessions"][0]["id"], "red-legacy");
+            let ids = result["sessions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|session| session["id"].as_str().unwrap())
+                .collect::<Vec<_>>();
+            assert_eq!(ids, ["red-legacy", "red-new", "red-originator", "red-old"]);
             assert_eq!(result["sessions"][0]["source"], "Red");
-            assert_eq!(result["sessions"][1]["id"], "red-new");
+            assert_eq!(result["sessions"][0]["resumable"], true);
             assert_eq!(result["sessions"][1]["source"], "Red");
-            assert_eq!(result["sessions"][2]["id"], "red-old");
+            // Red's editor context is not part of the title.
+            assert_eq!(result["sessions"][2]["label"], "Fix the parser.");
         }
         event => panic!("unexpected Red session list: {event:?}"),
     }
@@ -364,8 +385,9 @@ async fn direct_app_server_lists_searches_and_continues_sessions_for_red() {
             request: AgentSessionListRequest {
                 cwd: std::path::PathBuf::from("/workspace"),
                 scope: AgentSessionScope::Workspace,
-                query: "needle".into(),
+                query: "NEEDLE".into(),
                 exclude_session_id: None,
+                search_contents: false,
             },
         })
         .await
@@ -375,11 +397,40 @@ async fn direct_app_server_lists_searches_and_continues_sessions_for_red() {
             request_id: 42,
             result: Ok(result),
         } => {
+            // Titles match quickly and ignoring case, without a text search.
             assert_eq!(result["sessions"].as_array().unwrap().len(), 1);
-            assert_eq!(result["sessions"][0]["id"], "workspace-hit");
-            assert_eq!(result["sessions"][0]["snippet"], "a matching needle");
+            assert_eq!(result["sessions"][0]["id"], "needle-title");
+            assert_eq!(result["sessions"][0]["snippet"], "");
+            assert_eq!(result["sessions"][0]["resumable"], false);
         }
-        event => panic!("unexpected workspace search: {event:?}"),
+        event => panic!("unexpected workspace title search: {event:?}"),
+    }
+
+    bridge
+        .send(CodexCommand::SessionList {
+            request_id: 47,
+            request: AgentSessionListRequest {
+                cwd: std::path::PathBuf::from("/workspace"),
+                scope: AgentSessionScope::Workspace,
+                query: "NEEDLE".into(),
+                exclude_session_id: None,
+                search_contents: true,
+            },
+        })
+        .await
+        .unwrap();
+    match next_event(&mut bridge, &mut task).await {
+        CodexEvent::SessionListCompleted {
+            request_id: 47,
+            result: Ok(result),
+        } => {
+            assert_eq!(result["sessions"].as_array().unwrap().len(), 2);
+            assert_eq!(result["sessions"][0]["id"], "needle-title");
+            assert_eq!(result["sessions"][0]["snippet"], "the needle itself");
+            assert_eq!(result["sessions"][1]["id"], "workspace-hit");
+            assert_eq!(result["sessions"][1]["snippet"], "a matching needle");
+        }
+        event => panic!("unexpected workspace text search: {event:?}"),
     }
 
     bridge
@@ -390,6 +441,8 @@ async fn direct_app_server_lists_searches_and_continues_sessions_for_red() {
                 scope: AgentSessionScope::All,
                 query: "many".into(),
                 exclude_session_id: None,
+                // Already capped by titles, so the text search is skipped.
+                search_contents: true,
             },
         })
         .await

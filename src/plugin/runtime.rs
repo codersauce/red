@@ -2282,6 +2282,7 @@ impl RedHost {
                     value => anyhow::bail!("unknown Agent session scope `{value}`"),
                 };
                 let query = args.get(2).map(value_to_string).unwrap_or_default();
+                let search_contents = args.get(4).and_then(Value::as_bool).unwrap_or(false);
                 let exclude_session_id = args
                     .get(3)
                     .and_then(Value::as_str)
@@ -2294,6 +2295,7 @@ impl RedHost {
                         scope,
                         query,
                         exclude_session_id,
+                        search_contents,
                     },
                 }
             }
@@ -9773,9 +9775,47 @@ mod tests {
             ACTION_DISPATCHER.recv_request(),
             PluginRequest::SetTextPanelStatus { status: None, .. }
         ));
+        // A new query starts over at the first row.
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
-            PluginRequest::UpdateTextPanel { .. }
+            PluginRequest::UpdateTextPanel { blocks, .. } if blocks.is_empty()
+        ));
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::UpdateTextPanel { blocks, .. }
+                if blocks.iter().any(|block| block.text.contains("searching conversation text"))
+        ));
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::SetTextPanelStatus { status: Some(status), .. }
+                if status.busy && status.label == "Searching conversation text…"
+        ));
+        let contents_request = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::AgentSessionRequest {
+                request_id,
+                request,
+            } => {
+                assert_eq!(request.query, "needle");
+                assert!(request.search_contents);
+                request_id
+            }
+            _ => panic!("titles are listed before the slower text search"),
+        };
+        runtime
+            .resolve_request(
+                contents_request,
+                serde_json::json!({"sessions": [], "error": ""}),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::SetTextPanelStatus { status: None, .. }
+        ));
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::UpdateTextPanel { blocks, .. }
+                if blocks.iter().any(|block| block.text == "No matching sessions")
         ));
 
         runtime
@@ -9832,6 +9872,7 @@ mod tests {
                     "source": "Red",
                     "time_group": "Recent",
                     "is_red": true,
+                    "resumable": true,
                     "updated_at": 41
                 }
             ],
@@ -9839,6 +9880,39 @@ mod tests {
         });
         runtime
             .resolve_request(workspace_request, listed_sessions.clone())
+            .await
+            .unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::SetTextPanelStatus { status: None, .. }
+        ));
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::UpdateTextPanel { blocks, .. } if blocks.is_empty()
+        ));
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::UpdateTextPanel { blocks, .. }
+                if blocks.iter().any(|block| block.text.contains("Continue in Red"))
+        ));
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::SetTextPanelStatus { status: Some(status), .. }
+                if status.busy && status.label == "Searching conversation text…"
+        ));
+        let workspace_contents_request = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::AgentSessionRequest {
+                request_id,
+                request,
+            } => {
+                assert_eq!(request.query, "needle");
+                assert!(request.search_contents);
+                request_id
+            }
+            _ => panic!("expected the workspace text search"),
+        };
+        runtime
+            .resolve_request(workspace_contents_request, listed_sessions.clone())
             .await
             .unwrap();
         assert!(matches!(
@@ -10149,6 +10223,22 @@ mod tests {
                 if preview.session_id == "foreign-thread"
                     && preview.response == "The hook was unavailable."
         ));
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::SetTextPanelStatus { status: Some(status), .. }
+                if status.busy && status.label == "Searching conversation text…"
+        ));
+        let _reopened_contents_request = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::AgentSessionRequest {
+                request_id,
+                request,
+            } => {
+                assert_eq!(request.query, "needle");
+                assert!(request.search_contents);
+                request_id
+            }
+            _ => panic!("expected the restored query to search text too"),
+        };
 
         // Enter must not activate an old row while the new query is debouncing.
         runtime
@@ -12343,6 +12433,37 @@ mod tests {
             }
         }
         assert!(saw_enabled_composer);
+
+        // A thread chosen in the session picker announces its model before the
+        // pane state names it.
+        runtime
+            .notify(
+                "agent:session_restored",
+                serde_json::json!({"thread_id": "thread-picked", "cwd": "/workspace", "items": []}),
+            )
+            .await
+            .unwrap();
+        runtime
+            .notify(
+                "agent:model_changed",
+                serde_json::json!({
+                    "session_id": "thread-picked",
+                    "model_info": {"model": "picked-model", "effort": "high"}
+                }),
+            )
+            .await
+            .unwrap();
+        let mut header = None;
+        while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
+            if let PluginRequest::SetTextPanelHeaderDetail {
+                detail: Some(detail),
+                ..
+            } = request
+            {
+                header = Some(detail.text);
+            }
+        }
+        assert_eq!(header.as_deref(), Some("picked-model"));
     }
 
     fn expect_default_model_request() -> RequestId {

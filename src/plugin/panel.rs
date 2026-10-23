@@ -1339,6 +1339,7 @@ impl TextPanel {
             .iter()
             .position(|action| *action == selected)
             .unwrap_or_default();
+        let first_selected = context.selected_index == 0;
         if let Some(scroll) = context.restore_scroll.take() {
             self.scroll = scroll;
             self.viewport.restore(scroll, false);
@@ -1362,7 +1363,10 @@ impl TextPanel {
             return;
         };
         let visible = self.visible_rows(panel_height, panel_width);
-        if *first < self.scroll {
+        if first_selected && *last < visible {
+            // Keep the headings above the first row in view.
+            self.scroll = 0;
+        } else if *first < self.scroll {
             self.scroll = *first;
         } else if *last >= self.scroll.saturating_add(visible) {
             self.scroll = last.saturating_add(1).saturating_sub(visible);
@@ -1423,6 +1427,12 @@ impl TextPanel {
             self.viewport.reset();
             self.scroll = self.viewport.offset();
             self.follow_tail = self.viewport.is_following();
+            // A picker starting over, as for a new scope or query, selects its first row.
+            if let Some(context) = self.temporary_context.as_mut() {
+                context.selected_action = None;
+                context.selected_index = 0;
+                context.restore_scroll = None;
+            }
         }
         self.blocks = blocks;
         self.refresh_block_styles(highlighter);
@@ -8958,6 +8968,68 @@ mod tests {
             manager.text_panels["agent"].selected_picker_action(),
             Some("one")
         );
+    }
+
+    #[test]
+    fn temporary_picker_starts_over_at_its_first_row_and_heading() {
+        let mut manager = PanelManager::default();
+        manager.create_text_panel(
+            "agent".to_string(),
+            PanelConfig {
+                title: Some("Agent".to_string()),
+                composer: Some(TextPanelComposerConfig {
+                    placeholder: "Ask".to_string(),
+                    rows: 2,
+                }),
+                ..PanelConfig::default()
+            },
+        );
+        let blocks = |ids: &[&str]| {
+            let mut blocks = vec![TextPanelBlock {
+                id: "group".to_string(),
+                kind: TextPanelBlockKind::Text,
+                format: TextPanelBlockFormat::Plain,
+                text: "Recent".to_string(),
+            }];
+            blocks.extend(ids.iter().map(|id| TextPanelBlock {
+                id: (*id).to_string(),
+                kind: TextPanelBlockKind::Action,
+                format: TextPanelBlockFormat::Plain,
+                text: format!("Session {id}\n1h ago"),
+            }));
+            blocks
+        };
+        assert!(manager.enter_text_panel_context("agent", "Search".to_string()));
+        manager.update_text_panel("agent", blocks(&["one", "two", "three", "four"]), 10, 80);
+        for _ in 0..3 {
+            manager.handle_focused_key("down", 10, 80, 0);
+        }
+        assert!(manager.text_panels["agent"].scroll > 0);
+
+        // A different list keeps the row position of a selection that went away.
+        manager.update_text_panel("agent", blocks(&["five", "six", "seven", "eight"]), 10, 80);
+        assert_eq!(
+            manager.text_panels["agent"].selected_picker_action(),
+            Some("eight")
+        );
+        // After an empty update it starts over at the first row.
+        manager.update_text_panel("agent", Vec::new(), 10, 80);
+        manager.update_text_panel("agent", blocks(&["five", "six", "seven", "eight"]), 10, 80);
+        assert_eq!(
+            manager.text_panels["agent"].selected_picker_action(),
+            Some("five")
+        );
+        assert_eq!(manager.text_panels["agent"].scroll, 0);
+
+        // Moving back up to the first row brings its heading back into view.
+        for _ in 0..3 {
+            manager.handle_focused_key("down", 10, 80, 0);
+        }
+        assert!(manager.text_panels["agent"].scroll > 0);
+        for _ in 0..3 {
+            manager.handle_focused_key("up", 10, 80, 0);
+        }
+        assert_eq!(manager.text_panels["agent"].scroll, 0);
     }
 
     #[test]

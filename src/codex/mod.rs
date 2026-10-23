@@ -1143,7 +1143,10 @@ async fn handle_command(
                     {"type": "text", "text": text},
                     {
                         "type": "text",
-                        "text": format!("Active editor context from {uri}:\n\n```text\n{context}\n```")
+                        "text": format!(
+                            "{}{uri}:\n\n```text\n{context}\n```",
+                            crate::agent_conversation::EDITOR_CONTEXT_PREFIX
+                        )
                     }
                 ]),
                 input,
