@@ -10,7 +10,7 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 
-use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
+use notify::{Event, EventKind, RecursiveMode, Watcher};
 
 use crate::config::LanguageServerConfig;
 
@@ -26,9 +26,28 @@ pub(super) struct WorkspaceFileChange {
     pub(super) kind: u8,
 }
 
-/// Keeps the native watcher alive while its callback hands events to the LSP tick.
+/// Owns the native watcher on a dedicated thread so registration cannot hold up LSP startup.
+struct NativeWatchWorker {
+    // Disconnecting wakes the worker; native teardown also stays off the editor thread.
+    _stop: mpsc::Sender<()>,
+}
+
+impl NativeWatchWorker {
+    fn spawn<T: 'static>(initialize: impl FnOnce() -> T + Send + 'static) -> std::io::Result<Self> {
+        let (stop, stopped) = mpsc::channel();
+        std::thread::Builder::new()
+            .name("red-lsp-file-watch".into())
+            .spawn(move || {
+                let _watcher = initialize();
+                let _ = stopped.recv();
+            })?;
+        Ok(Self { _stop: stop })
+    }
+}
+
+/// Receives native events while retaining directory polling during registration or failure.
 pub(super) struct WorkspaceFileWatcher {
-    _watcher: RecommendedWatcher,
+    _worker: NativeWatchWorker,
     events: Receiver<WorkspaceFileChange>,
     filter: Arc<WorkspaceWatchFilter>,
     open_directories: HashMap<PathBuf, HashMap<PathBuf, FileFingerprint>>,
@@ -112,20 +131,41 @@ impl WorkspaceFileWatcher {
         let filter = Arc::new(WorkspaceWatchFilter::new(root, config));
         let callback_filter = Arc::clone(&filter);
         let (sender, events) = mpsc::channel();
-        let mut watcher =
-            notify::recommended_watcher(move |event: notify::Result<Event>| match event {
-                Ok(event) => {
-                    for change in callback_filter.changes(event) {
-                        if sender.send(change).is_err() {
-                            break;
+        let root = root.to_path_buf();
+        let worker = NativeWatchWorker::spawn(move || {
+            let _span = crate::editor::perf::PerfSpan::with_detail(
+                "lsp:workspace_watch_register",
+                root.display().to_string(),
+            );
+            let result = (|| {
+                let mut watcher =
+                    notify::recommended_watcher(move |event: notify::Result<Event>| match event {
+                        Ok(event) => {
+                            for change in callback_filter.changes(event) {
+                                if sender.send(change).is_err() {
+                                    break;
+                                }
+                            }
                         }
-                    }
+                        Err(error) => crate::log!("[lsp] workspace file watcher error: {error}"),
+                    })?;
+                watcher.watch(&root, RecursiveMode::Recursive)?;
+                Ok::<_, notify::Error>(watcher)
+            })();
+            match result {
+                Ok(watcher) => Some(watcher),
+                Err(error) => {
+                    crate::log!(
+                        "[lsp] could not watch workspace {}: {error}",
+                        root.display()
+                    );
+                    None
                 }
-                Err(error) => crate::log!("[lsp] workspace file watcher error: {error}"),
-            })?;
-        watcher.watch(root, RecursiveMode::Recursive)?;
+            }
+        })
+        .map_err(notify::Error::io)?;
         Ok(Self {
-            _watcher: watcher,
+            _worker: worker,
             events,
             filter,
             open_directories: HashMap::new(),
@@ -260,5 +300,86 @@ mod tests {
         assert_eq!(changes.len(), 1);
         assert_eq!(changes[0].path, root.join("src/lib.rs"));
         assert_eq!(changes[0].kind, CHANGED);
+    }
+
+    #[test]
+    fn blocked_native_registration_does_not_block_startup_or_drop() {
+        use std::{sync::mpsc, time::Duration};
+
+        struct DropSignal(mpsc::Sender<()>);
+        impl Drop for DropSignal {
+            fn drop(&mut self) {
+                let _ = self.0.send(());
+            }
+        }
+
+        let (started, entered) = mpsc::channel();
+        let (release, blocked) = mpsc::channel::<()>();
+        let (dropped, finished) = mpsc::channel();
+        let worker = super::NativeWatchWorker::spawn(move || {
+            started.send(()).unwrap();
+            let _ = blocked.recv();
+            DropSignal(dropped)
+        })
+        .unwrap();
+        entered.recv_timeout(Duration::from_secs(2)).unwrap();
+        // Neither construction nor drop waits for initialization. Once the OS call
+        // returns, the retired worker must still release its native watcher.
+        drop(worker);
+        drop(release);
+        finished.recv_timeout(Duration::from_secs(2)).unwrap();
+    }
+
+    #[test]
+    fn directory_fallback_reports_changes_while_native_registration_is_pending() {
+        use super::{
+            NativeWatchWorker, WorkspaceFileWatcher, CREATED, DELETED, OPEN_DIRECTORY_POLL_INTERVAL,
+        };
+        use std::{
+            collections::HashMap,
+            sync::{mpsc, Arc},
+            time::Instant,
+        };
+
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let config = default_language_servers().remove("rust").unwrap();
+        let (release, blocked) = mpsc::channel::<()>();
+        let worker = NativeWatchWorker::spawn(move || {
+            let _ = blocked.recv();
+        })
+        .unwrap();
+        let (_sender, events) = mpsc::channel();
+        let mut watcher = WorkspaceFileWatcher {
+            _worker: worker,
+            events,
+            filter: Arc::new(WorkspaceWatchFilter::new(root, &config)),
+            open_directories: HashMap::new(),
+            last_directory_poll: Instant::now(),
+        };
+        watcher.watch_document(&root.join("main.rs"));
+        let path = root.join("new.rs");
+        std::fs::write(&path, "fn helper() {}\n").unwrap();
+        std::fs::write(root.join("ignored.txt"), "ignored").unwrap();
+        watcher.last_directory_poll = Instant::now() - OPEN_DIRECTORY_POLL_INTERVAL;
+        let changes = watcher.take_changes();
+        assert_eq!(
+            changes,
+            vec![super::WorkspaceFileChange {
+                path: path.clone(),
+                kind: CREATED
+            }]
+        );
+        std::fs::remove_file(&path).unwrap();
+        watcher.last_directory_poll = Instant::now() - OPEN_DIRECTORY_POLL_INTERVAL;
+        assert_eq!(
+            watcher.take_changes(),
+            vec![super::WorkspaceFileChange {
+                path,
+                kind: DELETED
+            }]
+        );
+        drop(watcher);
+        drop(release);
     }
 }

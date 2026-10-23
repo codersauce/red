@@ -3,7 +3,10 @@
 use std::{
     collections::{HashMap, HashSet},
     path::{Path, PathBuf},
-    sync::mpsc::{self, Receiver},
+    sync::{
+        mpsc::{self, Receiver},
+        Arc, Condvar, Mutex,
+    },
     time::{Duration, Instant, SystemTime},
 };
 
@@ -21,8 +24,121 @@ use super::{Editor, RenderBuffer};
 const OPEN_FILE_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
 struct NativeFileWatcher {
-    watcher: RecommendedWatcher,
+    worker: WatchWorker,
     events: Receiver<notify::Result<Event>>,
+}
+
+#[derive(Default)]
+struct WatchMailbox {
+    pending: Option<HashSet<PathBuf>>,
+    stopped: bool,
+}
+
+/// A latest-value mailbox: neither submission nor drop waits for native OS calls.
+struct WatchWorker(Arc<(Mutex<WatchMailbox>, Condvar)>);
+
+impl WatchWorker {
+    fn spawn(
+        mut reconcile: impl FnMut(HashSet<PathBuf>) + Send + 'static,
+    ) -> std::io::Result<Self> {
+        let shared = Arc::new((Mutex::new(WatchMailbox::default()), Condvar::new()));
+        let worker_shared = Arc::clone(&shared);
+        std::thread::Builder::new()
+            .name("red-file-watch".into())
+            .spawn(move || loop {
+                let paths = {
+                    let (lock, wake) = &*worker_shared;
+                    let mut mailbox = lock.lock().unwrap();
+                    while mailbox.pending.is_none() && !mailbox.stopped {
+                        mailbox = wake.wait(mailbox).unwrap();
+                    }
+                    if mailbox.stopped {
+                        break;
+                    }
+                    mailbox.pending.take().unwrap()
+                };
+                reconcile(paths);
+            })?;
+        Ok(Self(shared))
+    }
+
+    fn submit(&self, paths: HashSet<PathBuf>) {
+        let (lock, wake) = &*self.0;
+        lock.lock().unwrap().pending = Some(paths);
+        wake.notify_one();
+    }
+}
+
+impl Drop for WatchWorker {
+    fn drop(&mut self) {
+        let (lock, wake) = &*self.0;
+        lock.lock().unwrap().stopped = true;
+        wake.notify_one();
+        // The worker owns and drops the native watcher, including any blocking
+        // stream shutdown. An in-progress OS call may finish after the editor exits.
+    }
+}
+
+impl NativeFileWatcher {
+    fn spawn() -> std::io::Result<Self> {
+        let (sender, events) = mpsc::channel();
+        let mut native: Option<RecommendedWatcher> = None;
+        let mut attempted = false;
+        let mut directories = HashSet::new();
+        let worker = WatchWorker::spawn(move |paths| {
+            let _span = super::perf::PerfSpan::start("file_watch:worker_reconcile");
+            if !attempted {
+                attempted = true;
+                let sender = sender.clone();
+                match notify::recommended_watcher(move |event| {
+                    let _ = sender.send(event);
+                }) {
+                    Ok(watcher) => native = Some(watcher),
+                    Err(error) => {
+                        crate::log!("[editor] native open-file watcher unavailable: {error}")
+                    }
+                }
+            }
+            let Some(native) = &mut native else {
+                return;
+            };
+            let desired = paths
+                .iter()
+                .filter_map(|path| existing_parent(path))
+                .collect::<HashSet<_>>();
+            for directory in directories
+                .difference(&desired)
+                .cloned()
+                .collect::<Vec<_>>()
+            {
+                let _span = super::perf::PerfSpan::with_detail(
+                    "file_watch:unwatch",
+                    directory.display().to_string(),
+                );
+                if let Err(error) = native.unwatch(&directory) {
+                    crate::log!("[editor] failed to stop watching {directory:?}: {error}");
+                }
+                directories.remove(&directory);
+            }
+            for directory in desired
+                .difference(&directories)
+                .cloned()
+                .collect::<Vec<_>>()
+            {
+                let _span = super::perf::PerfSpan::with_detail(
+                    "file_watch:watch",
+                    directory.display().to_string(),
+                );
+                match native.watch(&directory, RecursiveMode::NonRecursive) {
+                    Ok(()) => {
+                        directories.insert(directory);
+                    }
+                    Err(error) => crate::log!("[editor] failed to watch {directory:?}: {error}"),
+                }
+            }
+        })?;
+        Ok(Self { worker, events })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -79,7 +195,7 @@ struct TrackedFile {
 pub(super) struct OpenFileWatcher {
     native: Option<NativeFileWatcher>,
     native_attempted: bool,
-    directories: HashSet<PathBuf>,
+    submitted_paths: HashSet<PathBuf>,
     files: HashMap<BufferId, TrackedFile>,
     last_poll: Instant,
 }
@@ -89,7 +205,7 @@ impl Default for OpenFileWatcher {
         Self {
             native: None,
             native_attempted: false,
-            directories: HashSet::new(),
+            submitted_paths: HashSet::new(),
             files: HashMap::new(),
             last_poll: Instant::now(),
         }
@@ -163,39 +279,24 @@ impl OpenFileWatcher {
     }
 
     fn sync_directories(&mut self, watched: &[(BufferId, PathBuf)]) {
+        let _span = super::perf::PerfSpan::start("file_watch:submit");
         if !watched.is_empty() && self.native.is_none() && !self.native_attempted {
             self.native_attempted = true;
-            let (sender, events) = mpsc::channel();
-            match notify::recommended_watcher(move |event| {
-                let _ = sender.send(event);
-            }) {
-                Ok(watcher) => self.native = Some(NativeFileWatcher { watcher, events }),
-                Err(error) => {
-                    crate::log!("[editor] native open-file watcher unavailable: {error}")
-                }
+            match NativeFileWatcher::spawn() {
+                Ok(native) => self.native = Some(native),
+                Err(error) => crate::log!("[editor] could not start file-watch worker: {error}"),
             }
         }
-
-        let desired = watched
+        let paths = watched
             .iter()
-            .filter_map(|(_, path)| existing_parent(path))
+            .map(|(_, path)| path.clone())
             .collect::<HashSet<_>>();
-        let Some(native) = &mut self.native else {
-            self.directories.clear();
-            return;
-        };
-
-        for directory in self.directories.difference(&desired) {
-            if let Err(error) = native.watcher.unwatch(directory) {
-                crate::log!("[editor] failed to stop watching {:?}: {error}", directory);
+        if paths != self.submitted_paths {
+            if let Some(native) = &self.native {
+                native.worker.submit(paths.clone());
             }
+            self.submitted_paths = paths;
         }
-        for directory in desired.difference(&self.directories) {
-            if let Err(error) = native.watcher.watch(directory, RecursiveMode::NonRecursive) {
-                crate::log!("[editor] failed to watch {:?}: {error}", directory);
-            }
-        }
-        self.directories = desired;
     }
 
     #[cfg(test)]
@@ -493,6 +594,76 @@ mod tests {
             .service_open_file_changes(&mut frame, &mut runtime)
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn blocked_registration_keeps_input_polling_and_shutdown_responsive() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("watched.rs");
+        std::fs::write(&path, "before\n").unwrap();
+        let buffer = Buffer::new(Some(path.to_string_lossy().into_owned()), "before\n".into());
+        let mut editor = editor_with_buffers(vec![buffer]);
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let worker = super::WatchWorker::spawn(move |_| {
+            let _ = entered_tx.send(());
+            let _ = release_rx.recv();
+        })
+        .unwrap();
+        let (_events_tx, events) = std::sync::mpsc::channel();
+        editor.open_file_watcher.native = Some(super::NativeFileWatcher { worker, events });
+        poll_editor(&mut editor).await;
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        editor
+            .test_execute_production_action(Action::MoveRight)
+            .await
+            .unwrap();
+        assert_eq!(editor.cx, 1);
+        std::fs::write(&path, "outside\n").unwrap();
+        poll_editor(&mut editor).await;
+        assert_eq!(editor.current_buffer().contents(), "outside\n");
+        // Drop must not join the blocked worker either.
+        drop(editor);
+        drop(release_tx);
+    }
+
+    #[test]
+    fn worker_coalesces_pending_directory_sets() {
+        let (seen_tx, seen_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let mut first = true;
+        let worker = super::WatchWorker::spawn(move |paths| {
+            seen_tx.send(paths).unwrap();
+            if first {
+                first = false;
+                let _ = release_rx.recv();
+            }
+        })
+        .unwrap();
+        let paths = |name: &str| std::collections::HashSet::from([std::path::PathBuf::from(name)]);
+        worker.submit(paths("first"));
+        assert_eq!(
+            seen_rx
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .unwrap(),
+            paths("first")
+        );
+        worker.submit(paths("obsolete"));
+        worker.submit(paths("latest"));
+        release_tx.send(()).unwrap();
+        assert_eq!(
+            seen_rx
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .unwrap(),
+            paths("latest")
+        );
+        worker.submit(std::collections::HashSet::new());
+        assert!(seen_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
