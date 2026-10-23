@@ -418,6 +418,8 @@ fn run_registry_fixture() -> Result<()> {
             "red/TextPanelDispose",
             "red/ClipboardWrite",
             "red/MessageShow",
+            "red/IssuePublish",
+            "red/IssueResolve",
             "red/StatuslineSet",
             "red/StatuslineClear",
             "red/PickerOpen"

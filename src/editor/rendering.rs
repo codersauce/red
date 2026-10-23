@@ -4119,7 +4119,11 @@ impl Editor {
             let wc_width = if wc.is_empty() { 0 } else { 10.min(width) };
 
             let now = Instant::now();
-            let mut counts = self.notifications.counts(now);
+            let mut counts = self.notifications.inbox_counts(now);
+            let status = self
+                .transient_message
+                .as_ref()
+                .filter(|status| now < status.until);
             let primary = self.notifications.primary(now);
             let (message, severity, summary_offset) =
                 if let Some(fallback) = &self.notification_fallback {
@@ -4130,6 +4134,13 @@ impl Editor {
                         Some(Severity::Error),
                         0,
                     )
+                } else if let Some(status) = status {
+                    let text = if status.severity == Severity::Info {
+                        status.text.clone()
+                    } else {
+                        format!("{} {}", status.severity.marker(), status.text)
+                    };
+                    (text, Some(status.severity), 0)
                 } else if let Some(record) = primary {
                     let prefix = if record.is_running() {
                         format!(
@@ -4181,7 +4192,11 @@ impl Editor {
             let available = width.saturating_sub(wc_width);
             let has_message = !message.is_empty() || self.inline_completion_notice_available();
             let candidate = primary
-                .filter(|_| self.notification_fallback.is_none())
+                .filter(|record| {
+                    self.notification_fallback.is_none()
+                        && status.is_none()
+                        && matches!(record.state, NotificationState::Notice)
+                })
                 .and_then(|record| {
                     super::notifications::NotificationExposureKey::for_record(record).map(|key| {
                         (

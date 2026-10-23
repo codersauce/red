@@ -55,7 +55,7 @@ fn reading_information_does_not_acknowledge_a_warning() {
 }
 
 #[test]
-fn successful_progress_is_only_attention_worthy_if_missed() {
+fn successful_progress_is_retained_as_task_output_without_attention() {
     let now = NotificationTime::now();
     let mut center = NotificationCenter::default();
     let id = start(&mut center, "push", ProgressPriority::UserInitiated, now);
@@ -68,8 +68,8 @@ fn successful_progress_is_only_attention_worthy_if_missed() {
             now,
         )
         .unwrap();
-    assert_eq!(center.get(id).unwrap().attention, AttentionPolicy::IfMissed);
-    assert_eq!(center.counts(later(now, 10).monotonic).unseen, 1);
+    assert_eq!(center.get(id).unwrap().attention, AttentionPolicy::Quiet);
+    assert_eq!(center.counts(later(now, 10).monotonic).unseen, 0);
     center.mark_read(id).unwrap();
     assert_eq!(center.counts(later(now, 10).monotonic).unseen, 0);
 }
@@ -173,7 +173,7 @@ fn progress_updates_and_completion_retain_one_identity() {
     assert_eq!(center.records().len(), 1);
     assert_eq!(center.get(id).unwrap().created_at, now.wall);
     assert_eq!(center.counts(later(now, 3).monotonic).running, 0);
-    assert_eq!(center.counts(later(now, 3).monotonic).unread, 1);
+    assert_eq!(center.counts(later(now, 3).monotonic).unread, 0);
     assert_eq!(center.counts(later(now, 7).monotonic).active, 0);
     assert_eq!(
         center.update_progress(id, MessageContent::new("late"), None, later(now, 8)),
@@ -182,7 +182,7 @@ fn progress_updates_and_completion_retain_one_identity() {
 }
 
 #[test]
-fn failed_progress_stays_active_until_acknowledged() {
+fn failed_progress_expires_but_keeps_output_in_jobs() {
     let now = NotificationTime::now();
     let mut center = NotificationCenter::default();
     let id = start(&mut center, "push", ProgressPriority::UserInitiated, now);
@@ -196,7 +196,7 @@ fn failed_progress_stays_active_until_acknowledged() {
         .unwrap();
 
     assert_eq!(center.get(id).unwrap().severity, Severity::Error);
-    assert_eq!(center.counts(later(now, 600).monotonic).active, 1);
+    assert_eq!(center.counts(later(now, 600).monotonic).active, 0);
     center.acknowledge(id).unwrap();
     assert_eq!(center.counts(now.monotonic).active, 0);
     assert_eq!(

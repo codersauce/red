@@ -25,6 +25,7 @@ pub(crate) struct MessageRow {
 }
 
 pub(crate) struct MessagesView {
+    pub tasks: bool,
     pub rows: Vec<MessageRow>,
     pub selected: usize,
     pub detail: String,
@@ -194,12 +195,17 @@ impl Component for MessagesPanel {
             UiAction::new("browse", "j/k", "browse"),
             UiAction::new("search", "/", "search"),
             UiAction::new("filter", "f", "filter"),
-            essential("acknowledge", "Enter", "acknowledge"),
+            essential("acknowledge", "Enter", "dismiss"),
             UiAction::new("copy", "y", "copy"),
-            UiAction::new("clear", "D", "clear inactive").with_priority(ActionPriority::Secondary),
             UiAction::new("scroll", "Ctrl-d/u", "details").with_priority(ActionPriority::Secondary),
             essential("close", "Esc", "return"),
         ];
+        if self.view.tasks {
+            actions.push(
+                UiAction::new("clear", "D", "clear completed")
+                    .with_priority(ActionPriority::Secondary),
+            );
+        }
         if self.view.can_cancel {
             actions.insert(0, essential("cancel", "Ctrl-c", "cancel command"));
         }
@@ -221,11 +227,18 @@ impl Component for MessagesPanel {
         let visible = layout.visible;
         let first = layout.first;
         let title = if self.view.searching {
-            format!("Messages /{}", self.view.query)
+            format!(
+                "{} /{}",
+                if self.view.tasks { "Jobs" } else { "Messages" },
+                self.view.query
+            )
         } else {
             format!(
-                "Messages · {} · {} active · {} retained",
-                self.view.filter, self.view.counts.active, self.view.counts.total
+                "{} · {} · {} active · {} retained",
+                if self.view.tasks { "Jobs" } else { "Messages" },
+                self.view.filter,
+                self.view.counts.active,
+                self.view.counts.total
             )
         };
         let dialog = Dialog::new(
@@ -312,7 +325,11 @@ impl Component for MessagesPanel {
             .with_context(if self.view.searching {
                 "SEARCH"
             } else {
-                "MESSAGES"
+                if self.view.tasks {
+                    "JOBS"
+                } else {
+                    "MESSAGES"
+                }
             })
             .with_status(self.view.feedback.as_deref())
             .render(
@@ -380,7 +397,7 @@ impl Component for MessagesPanel {
             KeyCode::Char('/') => MessageAction::Search,
             KeyCode::Char('f') => MessageAction::CycleFilter,
             KeyCode::Enter | KeyCode::Char('d') => MessageAction::Acknowledge,
-            KeyCode::Char('D') => MessageAction::ClearInactive,
+            KeyCode::Char('D') if self.view.tasks => MessageAction::ClearInactive,
             KeyCode::Char('y') => MessageAction::Copy,
             KeyCode::PageDown => MessageAction::ScrollDown,
             KeyCode::PageUp => MessageAction::ScrollUp,
@@ -440,6 +457,7 @@ mod tests {
         let mut center = NotificationCenter::default();
         MessagesPanel::new(
             MessagesView {
+                tasks: false,
                 rows: (0..18)
                     .map(|index| {
                         message_row(&mut center, format!("message {index}"), "details".into())
@@ -549,6 +567,7 @@ mod tests {
     fn word_backspace_routes_only_active_message_search() {
         let mut panel = MessagesPanel::new(
             MessagesView {
+                tasks: false,
                 rows: vec![],
                 selected: 0,
                 detail: String::new(),
@@ -594,6 +613,7 @@ mod tests {
     fn control_c_only_cancels_a_selected_running_shell_command() {
         let mut panel = MessagesPanel::new(
             MessagesView {
+                tasks: false,
                 rows: vec![],
                 selected: 0,
                 detail: String::new(),
@@ -640,6 +660,7 @@ mod tests {
         for (viewport_width, list_width) in [(120, 46), (64, 60)] {
             let mut panel = MessagesPanel::new(
                 MessagesView {
+                    tasks: false,
                     rows: vec![
                         message_row(&mut center, "short".into(), "details".into()),
                         message_row(&mut center, "界".repeat(80), "👋".repeat(80)),

@@ -55,6 +55,7 @@ impl Editor {
                 continue;
             }
             if self.buffer_manager[index].file.is_none() {
+                self.report_issue(format!("save:{}", target.as_u64()), format!("Buffer {} could not be saved because it has no file name. Select it and use :saveas <file>, or discard it deliberately.", target.as_u64()));
                 first_error
                     .get_or_insert_with(|| format!("No file name for buffer {}", target.as_u64()));
                 continue;

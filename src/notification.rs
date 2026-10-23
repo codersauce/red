@@ -696,15 +696,15 @@ impl NotificationCenter {
         }
         record.state = NotificationState::Finished(outcome);
         record.severity = outcome.severity();
-        record.attention = match outcome {
-            ProgressOutcome::Failed => AttentionPolicy::RequiresAcknowledgment,
-            ProgressOutcome::Succeeded | ProgressOutcome::Cancelled => AttentionPolicy::IfMissed,
-        };
+        // Completed task output remains available in :jobs without becoming an
+        // inbox obligation. A producer must publish a separate actionable issue.
+        record.attention = AttentionPolicy::Quiet;
         record.content_version = record.content_version.wrapping_add(1);
         record.content = content.bounded();
         record.updated_at = now.wall;
-        record.display = NoticeLifetime::for_severity(record.severity).display_state(now.monotonic);
-        record.read = false;
+        record.display =
+            NoticeLifetime::Transient(DEFAULT_NOTICE_DURATION).display_state(now.monotonic);
+        record.read = true;
         self.changed();
         Ok(())
     }
@@ -744,6 +744,30 @@ impl NotificationCenter {
     pub fn counts(&self, now: Instant) -> NotificationCounts {
         let mut counts = NotificationCounts::default();
         for record in &self.records {
+            counts.total += 1;
+            counts.active += usize::from(record.is_active(now));
+            counts.running += usize::from(record.is_running());
+            counts.unread += usize::from(!record.read);
+            counts.needs_acknowledgment += usize::from(record.needs_acknowledgment(now));
+            counts.unseen += usize::from(record.is_unseen());
+        }
+        counts
+    }
+
+    pub fn inbox_counts(&self, now: Instant) -> NotificationCounts {
+        self.count_records(now, false)
+    }
+
+    pub fn task_counts(&self, now: Instant) -> NotificationCounts {
+        self.count_records(now, true)
+    }
+
+    fn count_records(&self, now: Instant, tasks: bool) -> NotificationCounts {
+        let mut counts = NotificationCounts::default();
+        for record in self.records.iter().filter(|record| {
+            tasks == !matches!(record.state, NotificationState::Notice)
+                && (tasks || !record.is_dismissed())
+        }) {
             counts.total += 1;
             counts.active += usize::from(record.is_active(now));
             counts.running += usize::from(record.is_running());

@@ -202,7 +202,13 @@ fn inline_completion_notice_preserves_errors_commands_and_narrow_layouts() {
         .unwrap()
         .0
         .clone();
-    editor.set_notification_message(Severity::Error, Some("important error".into()));
+    editor
+        .publish_notification(crate::notification::Notice::new(
+            crate::notification::NotificationSource::Editor,
+            Severity::Error,
+            "important error",
+        ))
+        .unwrap();
     let error = editor.notifications.primary(Instant::now()).unwrap().id;
     assert!(editor
         .inline_completion_click(&click(columns.start))
@@ -247,7 +253,13 @@ fn inline_completion_link_and_message_history_share_the_bottom_line() {
         .0
         .clone();
 
-    editor.set_notification_message(Severity::Error, Some("save failed".into()));
+    editor
+        .publish_notification(crate::notification::Notice::new(
+            crate::notification::NotificationSource::Editor,
+            Severity::Error,
+            "save failed",
+        ))
+        .unwrap();
     let error = editor.notifications.primary(Instant::now()).unwrap().id;
     assert!(editor
         .inline_completion_click(&click(old_columns.start))
@@ -258,9 +270,9 @@ fn inline_completion_link_and_message_history_share_the_bottom_line() {
     assert!(editor.inline_completion_notice.hit.is_none());
 
     editor.notifications.acknowledge(error).unwrap();
-    // The compatibility slot may outlive the displayed notification. It must
-    // not turn a visible completion link into an inert one.
-    assert!(editor.last_error.is_some());
+    // The compatibility slot may outlive the displayed issue. It must not
+    // turn a visible completion link into an inert one.
+    editor.last_error = Some("save failed".into());
     let text = row(&mut editor);
     assert!(text.starts_with("Inline finished"), "{text}");
     assert!(!text.contains(":messages"), "{text}");
@@ -290,13 +302,13 @@ fn inline_completion_link_and_message_history_share_the_bottom_line() {
 }
 
 #[tokio::test]
-async fn inline_action_feedback_is_retained_in_messages() {
+async fn inline_action_feedback_is_transient() {
     let mut editor = editor();
     action(&mut editor, Action::OpenLatestInlineCompletion).await;
-    let notice = editor.notifications.records().last().unwrap();
+    assert_eq!(editor.notifications.records().count(), 0);
+    let notice = editor.transient_message.as_ref().unwrap();
     assert!(notice
-        .content
-        .summary
+        .text
         .starts_with("no background inline completion yet"));
     assert!(row(&mut editor).starts_with("no background inline completion yet"));
 }
@@ -330,7 +342,13 @@ fn inline_completion_notice_does_not_expire_before_it_can_be_seen() {
     let mut editor = editor();
     start(&mut editor, "first", "one", 0);
     editor.park_inline_assist();
-    editor.set_notification_message(Severity::Error, Some("important error".into()));
+    editor
+        .publish_notification(crate::notification::Notice::new(
+            crate::notification::NotificationSource::Editor,
+            Severity::Error,
+            "important error",
+        ))
+        .unwrap();
     let error = editor.notifications.primary(Instant::now()).unwrap().id;
     finish(&mut editor, "one", None);
     assert!(row(&mut editor).starts_with("× important error"));

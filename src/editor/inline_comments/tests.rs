@@ -747,12 +747,7 @@ async fn inline_comment_commands_warn_when_no_comment_is_available() {
     for action in [Action::NextInlineComment, Action::ShowInlineComment] {
         editor.test_execute_production_action(action).await.unwrap();
         assert_eq!(
-            editor
-                .notifications()
-                .records()
-                .next_back()
-                .unwrap()
-                .severity,
+            editor.transient_message.as_ref().unwrap().severity,
             Severity::Warning
         );
     }
@@ -818,12 +813,7 @@ async fn overlapping_inline_navigation_warns_when_nothing_is_under_the_cursor() 
         Some("No more inline items to move to")
     );
     assert_eq!(
-        editor
-            .notifications()
-            .records()
-            .next_back()
-            .unwrap()
-            .severity,
+        editor.transient_message.as_ref().unwrap().severity,
         Severity::Warning
     );
 }

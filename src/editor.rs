@@ -157,8 +157,8 @@ use crate::{
     },
     matchit::{self, MatchDirection, MatchMotion},
     notification::{
-        AttentionPolicy, DisplayPriority, MessageAction, Notice, NotificationCenter,
-        NotificationError, NotificationId, NotificationSource, NotificationTime, Severity,
+        MessageAction, Notice, NotificationCenter, NotificationError, NotificationId,
+        NotificationSource, NotificationTime, Severity,
     },
     plugin::{self, ComposerHandle, PickerHandle, PluginRegistry, RequestId, Runtime},
     preferences::{PanelLayoutPreference, PreferencesStore},
@@ -3120,6 +3120,17 @@ pub enum Action {
     Print(String),
     PrintWarning(String),
     OpenMessages,
+    OpenTasks,
+    PublishIssue {
+        owner: String,
+        key: String,
+        message: String,
+        remedy: String,
+    },
+    ResolveIssue {
+        owner: String,
+        key: String,
+    },
     MessageHistory(MessageAction),
     /// Executes an explicit user-entered Ex shell command outside plugin APIs.
     #[serde(skip)]
@@ -3971,6 +3982,8 @@ pub struct Editor {
 
     /// Session-local notification records, independent of the legacy display slot.
     notifications: NotificationCenter,
+    transient_message: Option<notifications::TransientMessage>,
+    recovery_issue_buffers: HashMap<String, HashSet<BufferId>>,
     /// Explicit user-owned shell jobs and their bounded background output.
     shell_commands: shell_command::ShellCommandState,
     update: update::UpdateState,
@@ -4965,6 +4978,16 @@ struct RpcMessageShowParams {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct RpcIssueParams {
+    key: String,
+    #[serde(default)]
+    message: String,
+    #[serde(default)]
+    remedy: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RpcStatuslineSetParams {
     text: String,
     #[serde(default)]
@@ -5500,6 +5523,22 @@ impl Editor {
         self.config.lsp = loaded.config.lsp;
         self.mark_diagnostic_cache_dirty();
         self.config.formatting = loaded.config.formatting;
+        self.resolve_issue(&NotificationSource::Editor, "languages");
+        let retired: Vec<_> = self
+            .notifications
+            .records()
+            .filter_map(|record| {
+                let crate::notification::NotificationKey::Text(key) = record.key.as_ref()? else {
+                    return None;
+                };
+                (record.source == NotificationSource::Editor
+                    && (key.starts_with("formatter:") || key.starts_with("lsp:")))
+                .then_some(record.id)
+            })
+            .collect();
+        for id in retired {
+            let _ = self.notifications.resolve(id);
+        }
         self.config.commenting = loaded.config.commenting;
         self.config_diagnostics = loaded.diagnostics;
         self.config_diagnostics_acknowledged = self.config_diagnostics.is_empty();
@@ -5517,7 +5556,7 @@ impl Editor {
     }
 
     fn config_diagnostics_banner(&self) -> Option<String> {
-        (!self.config_diagnostics_acknowledged && !self.config_diagnostics.is_empty()).then(|| {
+        (!self.config_diagnostics.is_empty()).then(|| {
             format!(
                 "Config: {} problem{}; fallbacks active - :config-diagnostics",
                 self.config_diagnostics.len(),
@@ -5907,6 +5946,8 @@ impl Editor {
             search_match_history: VecDeque::new(),
             search_highlights_suppressed: false,
             notifications: NotificationCenter::default(),
+            transient_message: None,
+            recovery_issue_buffers: HashMap::new(),
             shell_commands: shell_command::ShellCommandState::default(),
             update: update::UpdateState::default(),
             message_browser: None,
@@ -6779,12 +6820,13 @@ impl Editor {
             self.preferences.clear_panel_layouts(&workspace)
         };
         let preference_changed = match preference_changed {
-            Ok(changed) => changed,
+            Ok(changed) => {
+                self.resolve_issue(&NotificationSource::Editor, "panel-layout");
+                changed
+            }
             Err(error) => {
                 log!("failed to reset panel layout preferences: {error}");
-                self.set_legacy_message(Some(format!(
-                    "unable to save panel layout reset: {error}"
-                )));
+                self.report_issue("panel-layout".into(), format!("Unable to save panel layout reset: {error}. Repair preference-file permissions and retry :panel-layout-reset."));
                 false
             }
         };
@@ -10159,6 +10201,7 @@ impl Editor {
         };
         match result {
             Ok(message) => {
+                self.resolve_buffer_issues(self.current_buffer().id());
                 self.notify_lsp_saved().await;
                 self.sync_inline_change_summaries();
                 if let Some(file) = self.current_buffer().file.clone() {
@@ -16241,11 +16284,6 @@ impl Editor {
             .as_deref()
             .and_then(|file| self.lsp.server_name_for_file(file))
             .unwrap_or_else(|| "language server".to_string());
-        let workspace_root = file
-            .as_deref()
-            .and_then(|file| self.lsp.workspace_root_for_file(file))
-            .map(|root| root.to_string_lossy().into_owned())
-            .unwrap_or_default();
         let mut details = format!(
             "Server: {server_name}\nRequest: {}\nCode: {}",
             request.method, error.code
@@ -16260,21 +16298,12 @@ impl Editor {
         }
         details.push_str("\n\n");
         details.push_str(&error.message);
-        let notice = Notice::new(
-            NotificationSource::LanguageServer {
-                name: server_name,
-                workspace_root,
-                generation: 0,
-            },
-            Severity::Error,
-            &summary,
-        )
-        .with_details(details);
-        if let Err(publish_error) = self.publish_notification(notice) {
-            log!("could not retain contextual LSP error: {publish_error}");
+        log!("{details}");
+        if !matches!(
+            request.method.as_str(),
+            "textDocument/completion" | "textDocument/diagnostic" | "textDocument/inlayHint"
+        ) {
             self.set_notification_message(Severity::Error, Some(summary));
-        } else {
-            self.last_error = Some(summary);
         }
         true
     }
@@ -16323,6 +16352,18 @@ impl Editor {
 
         match msg {
             InboundMessage::Message(msg) => {
+                if let Some(source) = msg
+                    .request
+                    .as_ref()
+                    .and_then(|request| request.source.as_ref())
+                {
+                    if self.lsp.request_source_is_current(source) {
+                        self.resolve_issue(
+                            &crate::notification::NotificationSource::Editor,
+                            &format!("lsp:{}", source.key),
+                        );
+                    }
+                }
                 if let Some(ref method) = method {
                     if method == "initialize" && self.diagnostic_reports.has_provisional() {
                         return Some(Action::RefreshDiagnostics);
@@ -16753,14 +16794,17 @@ impl Editor {
                 }
             }
             InboundMessage::ProcessingError(error_msg) => {
-                Some(Action::Print(error_msg.to_string()))
+                log!("LSP processing error: {error_msg}");
+                None
             }
             InboundMessage::ClientFailure { source, error } => {
                 self.remove_lsp_diagnostics_for_source(source);
-                Some(Action::Print(error.to_string()))
+                self.report_issue(format!("lsp:{}", source.key), format!("Language server {} stopped: {error}. Run :languages reload, repair its configuration, or disable it.", source.key));
+                None
             }
             InboundMessage::ServerStderr(message) => {
-                Some(Action::Print(format!("LSP server error: {message}")))
+                log!("LSP stderr: {message}");
+                None
             }
         }
     }
@@ -17676,6 +17720,9 @@ impl Editor {
             | Action::PluginStatus
             | Action::Suspend
             | Action::ViewLogs
+            | Action::PublishIssue { .. }
+            | Action::ResolveIssue { .. }
+            | Action::OpenTasks
             | Action::OpenMessages
             | Action::ListPlugins
             | Action::SplitHorizontal
@@ -18269,6 +18316,10 @@ impl Editor {
                 _ => None,
             })
             .unwrap_or(name);
+
+        if canonical_name == "jobs" && arguments.is_empty() {
+            return vec![Action::OpenTasks];
+        }
 
         if canonical_name == "messages" && arguments.is_empty() {
             return vec![Action::OpenMessages];
@@ -24217,6 +24268,7 @@ impl Editor {
                         self.current_buffer_mut().mark_saved();
                         let id = self.current_buffer().id();
                         self.resolve_external_file_notification(id);
+                        self.resolve_buffer_issues(id);
                         self.set_legacy_message(Some(format!(
                             "{file:?} {}L, {}B read",
                             self.current_buffer().len(),
@@ -24458,6 +24510,10 @@ impl Editor {
                     Ok(()) => {
                         self.config.statusline = statusline.clone();
                         self.current_dialog = None;
+                        self.resolve_issue(
+                            &crate::notification::NotificationSource::Editor,
+                            "status-line-layout",
+                        );
                         self.set_quiet_message(Some("saved status-line layout".to_string()));
                     }
                     Err(error) => {
@@ -24496,7 +24552,7 @@ impl Editor {
                         )));
                     }
                     Err(error) => {
-                        self.set_legacy_message(Some(format!("language reload failed: {error:#}")));
+                        self.report_issue("languages".into(), format!("Language reload failed: {error:#}. Fix configuration and retry :languages reload."));
                     }
                 }
                 self.render(buffer)?;
@@ -24597,6 +24653,24 @@ impl Editor {
             Action::PrintWarning(msg) => {
                 self.set_routine_warning(Some(msg.clone()));
                 self.draw_commandline(buffer);
+            }
+            Action::PublishIssue {
+                owner,
+                key,
+                message,
+                remedy,
+            } => {
+                self.publish_plugin_issue(owner, key, message, remedy);
+                self.render(buffer)?;
+            }
+            Action::ResolveIssue { owner, key } => {
+                self.resolve_plugin_issue(owner, key);
+                self.render(buffer)?;
+            }
+            Action::OpenTasks => {
+                add_to_history = false;
+                self.open_tasks();
+                self.render(buffer)?;
             }
             Action::OpenMessages => {
                 add_to_history = false;
@@ -26246,7 +26320,7 @@ impl Editor {
         }
 
         match self.clipboard.copy(text, &mut self.stdout) {
-            Ok(CopyOutcome::Written | CopyOutcome::Deferred) => {}
+            Ok(CopyOutcome::Written | CopyOutcome::Sent | CopyOutcome::Deferred) => {}
             result => self.clipboard_notice = Some(SessionClipboard::report(result)),
         }
     }
@@ -26843,6 +26917,7 @@ impl Editor {
         self.sync_to_window();
         let removed_id = self.current_buffer().id();
         self.resolve_external_file_notification(removed_id);
+        self.resolve_buffer_issues(removed_id);
         self.detach_inline_history_buffer(removed_id);
         self.inline_comments
             .retain(|comment| comment.anchor.buffer_id != removed_id);
@@ -27518,6 +27593,24 @@ impl Editor {
         Ok(Value::Null)
     }
 
+    fn rpc_issue_request(
+        &mut self,
+        owner: &str,
+        method: &str,
+        params: &Value,
+    ) -> std::result::Result<Value, plugin::rpc::RpcErrorObject> {
+        let params: RpcIssueParams = Self::rpc_params(method, params)?;
+        Self::validate_rpc_single_line_text(method, "key", &params.key, 128)?;
+        if method == plugin::rpc::ISSUE_PUBLISH_METHOD {
+            Self::validate_rpc_single_line_text(method, "message", &params.message, 1024)?;
+            Self::validate_rpc_single_line_text(method, "remedy", &params.remedy, 1024)?;
+            self.publish_plugin_issue(owner, &params.key, &params.message, &params.remedy);
+        } else {
+            self.resolve_plugin_issue(owner, &params.key);
+        }
+        Ok(Value::Null)
+    }
+
     fn rpc_statusline_clear_request(
         &mut self,
         owner: &str,
@@ -28095,6 +28188,9 @@ impl Editor {
             plugin::rpc::STATUSLINE_SET_METHOD => self.rpc_statusline_set_request(owner, params),
             plugin::rpc::STATUSLINE_CLEAR_METHOD => {
                 self.rpc_statusline_clear_request(owner, params)
+            }
+            plugin::rpc::ISSUE_PUBLISH_METHOD | plugin::rpc::ISSUE_RESOLVE_METHOD => {
+                self.rpc_issue_request(owner, method, params)
             }
             plugin::rpc::MESSAGE_SHOW_METHOD => {
                 self.rpc_message_show_request(render_buffer, params)
@@ -30408,14 +30504,32 @@ impl Editor {
                     "Recovered agent transcript as archived context, but it could not be persisted; start a new session to continue"
                         .to_string()
                 }));
-            } else if !transcript_persisted {
-                self.set_legacy_message(Some(
-                    "Recovered buffers and agent transcript; transcript could not be persisted"
-                        .to_string(),
-                ));
+            }
+            if !transcript_persisted {
+                self.report_issue("recovery-transcript".into(), "Recovered transcript could not be persisted. Open Agent and export/copy it before closing Red.".into());
+            }
+        }
+        let mut unique_paths = SnapshotFileIdentities::default();
+        let mut divergent_buffers = HashSet::new();
+        let mut duplicate_buffers = HashSet::new();
+        for (index, saved) in snapshot.buffers.iter().enumerate() {
+            let Some(path) = saved.path.as_deref() else {
+                continue;
+            };
+            let id = self.buffer_manager[index].id();
+            if divergences.iter().any(|divergence| divergence.path == path) {
+                divergent_buffers.insert(id);
+            }
+            if normalized_file_path(path)
+                .ok()
+                .is_some_and(|path| !unique_paths.insert(path))
+            {
+                duplicate_buffers.insert(id);
             }
         }
         if !divergences.is_empty() {
+            self.recovery_issue_buffers
+                .insert("recovery-files".into(), divergent_buffers);
             let mut warning = format!(
                 "Recovered unsaved state; {} file(s) changed on disk (see recovery report)",
                 divergences.len()
@@ -30427,9 +30541,11 @@ impl Editor {
             {
                 warning.push_str("; agent transcript could not be persisted");
             }
-            self.set_legacy_message(Some(warning));
+            self.report_issue("recovery-files".into(), format!("{warning}. Compare the recovered buffers with disk, then save or discard them."));
         }
         if duplicate_file_count > 0 {
+            self.recovery_issue_buffers
+                .insert("recovery-duplicates".into(), duplicate_buffers);
             let warning = format!(
                 "Recovered {duplicate_file_count} duplicate file buffer(s) as unnamed buffers to preserve their contents"
             );
@@ -30437,7 +30553,10 @@ impl Editor {
                 Some(existing) => format!("{existing}; {warning}"),
                 None => warning,
             };
-            self.set_legacy_message(Some(message));
+            self.report_issue(
+                "recovery-duplicates".into(),
+                format!("{message}. Save, merge, or discard the unnamed recovered buffers."),
+            );
         }
         self.recompute_window_cursor_goals();
         self.sync_with_window();
@@ -31666,17 +31785,13 @@ impl Editor {
         let uri = match self.current_buffer().uri() {
             Ok(uri) => uri,
             Err(error) => {
-                self.set_legacy_message(Some(format!(
-                    "could not resolve completion document: {error}"
-                )));
+                log!("could not resolve completion document: {error}");
                 return Ok(displayed_immediately);
             }
         };
         if let Some(uri) = uri {
             if let Err(error) = self.ensure_current_buffer_lsp_opened().await {
-                self.set_legacy_message(Some(format!(
-                    "could not open LSP completion document: {error}"
-                )));
+                log!("could not open LSP completion document: {error}");
                 return Ok(displayed_immediately);
             }
             let position = self.cursor_lsp_position();
@@ -31692,9 +31807,7 @@ impl Editor {
             {
                 Ok(request_id) => request_id,
                 Err(error) => {
-                    self.set_legacy_message(Some(format!(
-                        "LSP completion request failed: {error}"
-                    )));
+                    log!("LSP completion request failed: {error}");
                     return Ok(displayed_immediately);
                 }
             };
@@ -32304,6 +32417,7 @@ impl Editor {
         };
         let saved = match result {
             Ok(message) => {
+                self.resolve_buffer_issues(buffer_id);
                 self.set_notification_message(
                     if warning.is_some() {
                         Severity::Warning
@@ -32330,7 +32444,7 @@ impl Editor {
                     self.restore_lsp_format_save_identity(buffer_id, uri, previous_file)
                         .await;
                 }
-                self.set_legacy_message(Some(error.to_string()));
+                self.report_save_failure(error.to_string());
                 false
             }
         };
@@ -32582,6 +32696,7 @@ impl Editor {
             Ok(msg) => {
                 let id = self.current_buffer().id();
                 self.resolve_external_file_notification(id);
+                self.resolve_buffer_issues(id);
                 let severity = if format_warning.is_some() {
                     Severity::Warning
                 } else {
@@ -32603,7 +32718,7 @@ impl Editor {
                 }
             }
             Err(e) => {
-                self.set_notification_message(Severity::Error, Some(e.to_string()));
+                self.report_save_failure(e.to_string());
             }
         }
         Ok(true)
@@ -32731,6 +32846,7 @@ impl Editor {
             Ok(msg) => {
                 let id = self.current_buffer().id();
                 self.resolve_external_file_notification(id);
+                self.resolve_buffer_issues(id);
                 let severity = if format_warning.is_some() {
                     Severity::Warning
                 } else {
@@ -32798,7 +32914,7 @@ impl Editor {
                         .await;
                     }
                 }
-                self.set_notification_message(Severity::Error, Some(e.to_string()));
+                self.report_save_failure(e.to_string());
             }
         }
         Ok(true)
@@ -33015,11 +33131,18 @@ impl Editor {
         let Some(formatted) =
             crate::formatter::format_document(&definition, &file_path, &contents).await?
         else {
+            if self.config.formatting.provider == FormattingProvider::External {
+                self.report_issue(format!("formatter:{name}"), format!("Formatter {name} is unavailable. Install its executable or change the configured formatter, then retry formatting."));
+            }
             return Ok(ExternalFormatOutcome::Unavailable { name });
         };
         anyhow::ensure!(
             self.current_buffer().revision() == revision,
             "formatter result is stale because the document changed"
+        );
+        self.resolve_issue(
+            &crate::notification::NotificationSource::Editor,
+            &format!("formatter:{}", formatted.name),
         );
         if formatted.contents == contents {
             return Ok(ExternalFormatOutcome::Unchanged {
@@ -36319,19 +36442,12 @@ mod test {
         });
         core.tick().await.unwrap();
 
-        let notice = core.editor.notifications.records().next_back().unwrap();
-        assert_eq!(notice.severity, Severity::Warning);
-        assert_eq!(notice.source.label(), "reader");
-        assert_eq!(
-            notice.content.summary,
-            "dropped a GetBufferText result too large for its memory (70.0 MiB needed, 60.0 MiB free)"
-        );
-        let details = notice.content.details.as_deref().unwrap();
-        assert!(details.contains("Request: GetBufferText"), "{details}");
-        assert!(
-            details.contains("instead of stopping the plugin"),
-            "{details}"
-        );
+        assert_eq!(core.editor.notifications.records().count(), 0);
+        let status = core.editor.transient_message.as_ref().unwrap();
+        assert_eq!(status.severity, Severity::Warning);
+        assert!(status
+            .text
+            .contains("reader: dropped a GetBufferText result"));
     }
 
     #[tokio::test]
@@ -41536,8 +41652,8 @@ builtin = "rust"
             .last()
             .unwrap()
             .contains("JSON result copied"));
-        let message = editor.notifications().records().next_back().unwrap();
-        assert_eq!(message.content.summary, "JSON result copied");
+        let message = editor.transient_message.as_ref().unwrap();
+        assert_eq!(message.text, "JSON result copied");
         assert_eq!(message.severity, Severity::Success);
 
         for params in [
@@ -41549,7 +41665,7 @@ builtin = "rust"
         ] {
             assert_eq!(request!(params).await.unwrap_err().code, -32602);
         }
-        assert_eq!(editor.notifications().records().count(), 1);
+        assert_eq!(editor.notifications().records().count(), 0);
     }
 
     #[tokio::test]
@@ -42417,13 +42533,14 @@ builtin = "rust"
             .last()
             .unwrap()
             .contains("fatal: index.lock already exists"));
-        let retained = editor.notifications().records().next().unwrap();
-        assert_eq!(retained.content.summary, "fatal: index.lock already exists");
+        assert_eq!(editor.notifications().records().count(), 0);
+        let retained = editor.transient_message.as_ref().unwrap();
+        assert_eq!(retained.text, "fatal: index.lock already exists");
         assert_eq!(retained.severity, Severity::Info);
     }
 
     #[tokio::test]
-    async fn notification_history_survives_legacy_action_resets() {
+    async fn routine_feedback_does_not_survive_legacy_action_resets() {
         let mut editor = test_editor(60, 8);
         let mut buffer = RenderBuffer::new(60, 8, &Style::default());
         let mut runtime = Runtime::new();
@@ -42444,14 +42561,8 @@ builtin = "rust"
             .unwrap();
 
         assert!(editor.last_error.is_none());
-        let retained = editor.notifications().records().collect::<Vec<_>>();
-        assert_eq!(retained.len(), 2);
-        assert_eq!(retained[0].content.summary, "first full details");
-        assert_eq!(
-            retained[0].content.details.as_deref(),
-            Some("first\nfull details")
-        );
-        assert_eq!(retained[1].content.summary, "second");
+        assert_eq!(editor.notifications().records().count(), 0);
+        assert!(editor.transient_message.is_none());
     }
 
     #[tokio::test]
@@ -47022,7 +47133,7 @@ builtin = "rust"
 
         assert_eq!(editor.last_error.as_deref(), Some("No definition found"));
         assert_eq!(
-            editor.notifications.records().next_back().unwrap().severity,
+            editor.transient_message.as_ref().unwrap().severity,
             Severity::Warning
         );
     }
@@ -47045,11 +47156,10 @@ builtin = "rust"
     }
 
     #[test]
-    fn correlated_lsp_error_has_contextual_summary_and_details() {
+    fn background_lsp_error_does_not_create_an_inbox_obligation() {
         let mut editor = test_editor(80, 10);
         let path = Path::new("/tmp/project/src/pull_requests_screen.rs");
         let uri = crate::lsp::file_uri(path).unwrap();
-        let expected_document = lsp_file_path(&uri).unwrap();
         let message = InboundMessage::Error(crate::lsp::ResponseError {
             id: Some(42),
             code: -32603,
@@ -47067,44 +47177,12 @@ builtin = "rust"
             editor.handle_lsp_message(&message, Some("textDocument/diagnostic".to_string()));
 
         assert!(action.is_none());
-        assert_eq!(
-            editor.last_error.as_deref(),
-            Some("diagnostics failed for pull_requests_screen.rs")
-        );
-        let record = editor
-            .notifications
-            .records()
-            .find(|record| {
-                record.content.summary == "diagnostics failed for pull_requests_screen.rs"
-            })
-            .unwrap();
-        let NotificationSource::LanguageServer { name, .. } = &record.source else {
-            panic!("expected a language-server notification");
-        };
-        assert!(!name.is_empty());
-        assert_eq!(
-            record.content.summary,
-            "diagnostics failed for pull_requests_screen.rs"
-        );
-        let details = record.content.details.as_deref().unwrap();
-        assert!(details.contains(&format!("Server: {name}")), "{details}");
-        assert!(
-            details.contains("Request: textDocument/diagnostic"),
-            "{details}"
-        );
-        assert!(details.contains("Code: -32603"), "{details}");
-        assert!(
-            details.contains(&format!("Document: {expected_document}")),
-            "{details}"
-        );
-        assert!(
-            details.contains("request handler panicked: template arguments were missing"),
-            "{details}"
-        );
+        assert!(editor.last_error.is_none());
+        assert_eq!(editor.notifications.records().count(), 0);
     }
 
     #[test]
-    fn lsp_processing_error_produces_a_visible_print_action() {
+    fn lsp_processing_error_stays_out_of_the_inbox() {
         let mut editor = test_editor(40, 10);
         let message = InboundMessage::ProcessingError(crate::lsp::LspError::ServerError(
             "husk lsp exited".to_string(),
@@ -47112,25 +47190,20 @@ builtin = "rust"
 
         let action = editor.handle_lsp_message(&message, None);
 
-        assert!(matches!(
-            action,
-            Some(Action::Print(message)) if message.contains("husk lsp exited")
-        ));
+        assert!(action.is_none());
+        assert_eq!(editor.notifications.records().count(), 0);
     }
 
     #[test]
-    fn lsp_server_stderr_is_visible_without_becoming_a_processing_error() {
+    fn lsp_server_stderr_stays_out_of_the_inbox() {
         let mut editor = test_editor(40, 10);
         let message =
             InboundMessage::ServerStderr("thread 'main' panicked in a cargo child".to_string());
 
         let action = editor.handle_lsp_message(&message, None);
 
-        assert!(matches!(
-            action,
-            Some(Action::Print(message))
-                if message.contains("LSP server error") && message.contains("cargo child")
-        ));
+        assert!(action.is_none());
+        assert_eq!(editor.notifications.records().count(), 0);
     }
 
     #[test]
@@ -47581,9 +47654,9 @@ builtin = "rust"
             editor.last_error.as_deref(),
             Some("No diagnostics on the current line")
         );
-        let warning = editor.notifications.records().next_back().unwrap();
+        let warning = editor.transient_message.as_ref().unwrap();
         assert_eq!(warning.severity, Severity::Warning);
-        assert_eq!(warning.attention, AttentionPolicy::Quiet);
+        assert_eq!(editor.notifications.records().count(), 0);
     }
 
     #[tokio::test]
@@ -47653,9 +47726,9 @@ builtin = "rust"
             editor.last_error.as_deref(),
             Some("No more valid diagnostics to move to")
         );
-        let warning = editor.notifications.records().next_back().unwrap();
+        let warning = editor.transient_message.as_ref().unwrap();
         assert_eq!(warning.severity, Severity::Warning);
-        assert_eq!(warning.attention, AttentionPolicy::Quiet);
+        assert_eq!(editor.notifications.records().count(), 0);
 
         editor
             .execute(&Action::PreviousDiagnostic, &mut buffer, &mut runtime)
@@ -47688,7 +47761,7 @@ builtin = "rust"
             Some("No more valid diagnostics to move to")
         );
         assert_eq!(
-            editor.notifications.records().next_back().unwrap().severity,
+            editor.transient_message.as_ref().unwrap().severity,
             Severity::Warning
         );
     }

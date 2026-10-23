@@ -69,6 +69,7 @@ pub(crate) const BUILTIN_COLON_COMMANDS: &[CommandSpec] = &[
     CommandSpec::exact("config-diagnostics"),
     CommandSpec::exact("plugin-status"),
     CommandSpec::new("messages", 3),
+    CommandSpec::new("jobs", 2),
 ];
 
 const SPECIAL_BUILTIN_COLON_COMMANDS: &[&str] = &[
@@ -419,12 +420,21 @@ pub(crate) fn keymap_hints(
 fn builtin_commands() -> Vec<BuiltinCommand> {
     vec![
         builtin(
+            "editor.jobs",
+            "Jobs",
+            "Editor",
+            "Inspect shell and update output; cancel running shell commands",
+            Some(":jobs"),
+            &["shell output", "tasks"],
+            Action::OpenTasks,
+        ),
+        builtin(
             "editor.messages",
             "Messages",
             "Editor",
-            "Browse active notifications and recent message history",
+            "Review unresolved problems that need your attention",
             Some(":messages"),
-            &["notifications", "message history", "errors"],
+            &["notifications", "issues", "errors"],
             Action::OpenMessages,
         ),
         builtin(

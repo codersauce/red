@@ -25,7 +25,6 @@ use crate::{
 const CHECK_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 const STARTUP_DELAY: Duration = Duration::from_secs(1);
 const UPDATE_NOTICE_KEY: &str = "red-update-available";
-const UPDATE_FAILED_KEY: &str = "red-update-failed";
 
 #[derive(Default)]
 pub(super) struct UpdateState {
@@ -190,33 +189,21 @@ impl Editor {
                 return;
             }
             BackgroundOutcome::Available => {
-                Notice::new(NotificationSource::Editor, Severity::Info, &result.message)
-                    .with_key(UPDATE_NOTICE_KEY)
-                    .with_attention(AttentionPolicy::IfMissed)
-                    .with_details("Run :update to install it. Current editing sessions keep this version until restarted.")
+                self.set_quiet_message(Some(format!("{}. Run :update to install.", result.message)));
+                return;
             }
             BackgroundOutcome::Installed => {
                 Notice::new(NotificationSource::Editor, Severity::Info, &result.message)
                     .with_key(UPDATE_NOTICE_KEY)
-                    .with_attention(AttentionPolicy::IfMissed)
+                    .with_attention(AttentionPolicy::RequiresAcknowledgment)
                     .with_details(format!(
                         "This session keeps running Red {} until you restart it. Set [updates] mode = \"notify\" to install releases yourself.",
                         env!("CARGO_PKG_VERSION")
                     ))
             }
             BackgroundOutcome::Failed => {
-                log!("Red automatic update failed: {}", result.message);
-                Notice::new(
-                    NotificationSource::Editor,
-                    Severity::Warning,
-                    "Red could not install an update automatically",
-                )
-                .with_key(UPDATE_FAILED_KEY)
-                .with_attention(AttentionPolicy::IfMissed)
-                .with_details(format!(
-                    "{}\n\nThe installed version is unchanged. Red retries tomorrow; run :update to retry now.",
-                    result.message
-                ))
+                log!("Red automatic update failed (will retry): {}", result.message);
+                return;
             }
         };
         if let Err(error) = self.publish_notification(notice) {

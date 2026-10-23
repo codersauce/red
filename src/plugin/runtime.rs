@@ -1149,6 +1149,40 @@ impl RedHost {
 
     fn execute(&mut self, plugin: &str, action: &str, args: &[Value]) -> anyhow::Result<Value> {
         match action {
+            "PublishIssue" => {
+                let key = args.first().and_then(Value::as_str).unwrap_or_default();
+                let message = args.get(1).and_then(Value::as_str).unwrap_or_default();
+                let remedy = args.get(2).and_then(Value::as_str).unwrap_or_default();
+                anyhow::ensure!(
+                    !key.trim().is_empty() && key.len() <= 128,
+                    "PublishIssue requires a key of 1..128 bytes"
+                );
+                anyhow::ensure!(
+                    !message.trim().is_empty() && message.len() <= 1024,
+                    "PublishIssue requires a message of 1..1024 bytes"
+                );
+                anyhow::ensure!(
+                    !remedy.trim().is_empty() && remedy.len() <= 1024,
+                    "PublishIssue requires an actionable remedy of 1..1024 bytes"
+                );
+                self.send_request(PluginRequest::Action(Action::PublishIssue {
+                    owner: plugin.to_string(),
+                    key: key.into(),
+                    message: message.into(),
+                    remedy: remedy.into(),
+                }));
+            }
+            "ResolveIssue" => {
+                let key = args.first().and_then(Value::as_str).unwrap_or_default();
+                anyhow::ensure!(
+                    !key.trim().is_empty() && key.len() <= 128,
+                    "ResolveIssue requires a key of 1..128 bytes"
+                );
+                self.send_request(PluginRequest::Action(Action::ResolveIssue {
+                    owner: plugin.to_string(),
+                    key: key.into(),
+                }));
+            }
             "Print" => {
                 let message = args.first().map(value_to_string).unwrap_or_default();
                 self.send_request(PluginRequest::Action(Action::Print(message)));
@@ -4885,7 +4919,9 @@ mod tests {
         requests
             .iter()
             .filter_map(|request| match request {
-                PluginRequest::Action(Action::Print(message)) => Some(message.clone()),
+                PluginRequest::Action(
+                    Action::Print(message) | Action::PublishIssue { message, .. },
+                ) => Some(message.clone()),
                 _ => None,
             })
             .collect()
@@ -10532,7 +10568,7 @@ mod tests {
         }
         assert!(requests.iter().any(|request| matches!(
             request,
-            PluginRequest::Action(Action::PrintWarning(message)) if message.contains("Space A")
+            PluginRequest::Action(Action::PublishIssue { message, .. }) if message.contains("Space A")
         )));
         assert!(requests.iter().any(|request| matches!(
             request,
@@ -10662,6 +10698,10 @@ mod tests {
         runtime.execute_command("AgentNew").await.unwrap();
         core_settle(&mut runtime).await;
         let requests = collect_requests();
+        assert!(requests.iter().any(|request| matches!(request,
+            PluginRequest::Action(Action::ResolveIssue { owner, key })
+            if owner == "agent" && key == "agent:saved-thread"
+        )));
         assert!(
             !requests
                 .iter()
@@ -11082,7 +11122,7 @@ mod tests {
         let mut retry_status = false;
         while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
             match request {
-                PluginRequest::Action(Action::Print(message)) => {
+                PluginRequest::Action(Action::PublishIssue { message, .. }) => {
                     explained |= message.contains("Could not stop the agent: interrupt rejected");
                 }
                 PluginRequest::SetTextPanelStatus {
@@ -11902,7 +11942,7 @@ mod tests {
             .unwrap();
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
-            PluginRequest::Action(Action::Print(message))
+            PluginRequest::Action(Action::PublishIssue { message, .. })
                 if message == "Agent prompt saved · :AgentSendQueued retries it"
         ));
 
@@ -11965,7 +12005,7 @@ mod tests {
             .unwrap();
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
-            PluginRequest::Action(Action::Print(message))
+            PluginRequest::Action(Action::PublishIssue { message, .. })
                 if message == "Agent prompt saved · :AgentSendQueued retries it"
         ));
     }
