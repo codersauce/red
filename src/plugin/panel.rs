@@ -6056,7 +6056,16 @@ impl PanelManager {
             .into_iter()
             .map(|(id, _, width)| (id, width))
             .collect::<HashMap<_, _>>();
-        for id in &self.z_order {
+        // Fixed-width side panels, like the file tree, stay at the outer edge,
+        // and conversation panes sit between them and the editor.
+        let mut order = self.z_order.iter().collect::<Vec<_>>();
+        order.sort_by_key(|id| {
+            self.panel_config(id).is_some_and(|config| {
+                matches!(config.side, PanelSide::Left | PanelSide::Right)
+                    && config.composer.is_some()
+            })
+        });
+        for id in order {
             let Some(config) = self.panel_config(id) else {
                 continue;
             };
@@ -9278,6 +9287,41 @@ mod tests {
             manager.text_panels["agent"].selected_picker_action(),
             Some("one")
         );
+    }
+
+    #[test]
+    fn file_tree_stays_outside_a_conversation_pane_on_the_same_side() {
+        let mut manager = PanelManager::default();
+        manager.create_text_panel(
+            "agent".to_string(),
+            PanelConfig {
+                side: PanelSide::Left,
+                width: 40,
+                composer: Some(TextPanelComposerConfig {
+                    placeholder: "Ask".to_string(),
+                    rows: 2,
+                }),
+                ..PanelConfig::default()
+            },
+        );
+        manager.create_panel(
+            "tree".to_string(),
+            PanelConfig {
+                side: PanelSide::Left,
+                width: 20,
+                ..PanelConfig::default()
+            },
+        );
+        let placements = manager.panel_placements(160, 40);
+        let x = |id: &str| {
+            placements
+                .iter()
+                .find(|placement| placement.id == id)
+                .unwrap()
+                .x
+        };
+        assert_eq!(x("tree"), 0);
+        assert_eq!(x("agent"), 21);
     }
 
     #[test]

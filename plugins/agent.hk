@@ -1408,7 +1408,7 @@ fn open_conversation() {
 fn ensure_conversation_panel() {
     if !state().panel_created {
         red::execute("CreateTextPanel", "agent-conversation", PanelConfig {
-            side: "right",
+            side: "left",
             width: 62,
             title: "Agent",
             composer: TextPanelComposerConfig { placeholder: "Ask a follow-up…", rows: 3 },

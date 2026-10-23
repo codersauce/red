@@ -295,6 +295,12 @@ hidden prints `Agent finished · Space A to view`. Queued follow-ups are drawn a
 dimmed `You · queued` cards until they are sent. `Space A` always lands in the
 composer's Insert mode, even if you left it in Normal mode.
 
+The pane docks on the left. When the file tree is open too, the tree keeps the
+outer edge and the pane sits between it and the editor. With the pane focused,
+`Ctrl-w L` moves it to the right and `Ctrl-w H` back; Red remembers the side for
+each workspace, and `:panel-layout-reset agent-conversation` returns it to the
+left.
+
 The pane sizes itself to the terminal: it takes at most 45% of the width (and
 never less than 32 columns), so the editor keeps room to work. On a terminal too
 narrow for a 32-column pane beside a 40-column editor, the pane stops docking.

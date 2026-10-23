@@ -8593,7 +8593,7 @@ mod tests {
             request,
             PluginRequest::CreateTextPanel { id, config }
                 if id == "agent-conversation"
-                    && config.side == crate::plugin::PanelSide::Right
+                    && config.side == crate::plugin::PanelSide::Left
                     && config.width == 62
                     && config.title.as_deref() == Some("Agent")
                     && config
