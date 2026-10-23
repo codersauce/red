@@ -1,5 +1,5 @@
 schema_version = 1
-version = "next"
+version = "0.10.0"
 headline = "Pick up any Codex conversation, and updates that install themselves"
 summary = "Red v0.10.0 keeps Agent conversations going across relaunches, lets you resume or continue any previous Codex session from the Agent pane, and makes agent edits gentler on your work. Updates now install in the background with signed checksums, and copying works over SSH, Herdr, and tmux."
 website = "https://github.com/codersauce/red/releases/latest"
