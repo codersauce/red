@@ -4,7 +4,14 @@
 //! compact histogram when the editor exits. `RED_PERF=trace` also logs each
 //! individual span for short, targeted investigations.
 
-use std::{collections::BTreeMap, sync::Mutex, time::Instant};
+use std::{
+    collections::BTreeMap,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Mutex,
+    },
+    time::Instant,
+};
 
 use once_cell::sync::Lazy;
 
@@ -35,6 +42,9 @@ struct Recorder {
     counters: BTreeMap<String, u64>,
     gauges: BTreeMap<String, u64>,
 }
+
+static TRACE_START: Lazy<Instant> = Lazy::new(Instant::now);
+static NEXT_SPAN: AtomicU64 = AtomicU64::new(1);
 
 static RECORDER: Lazy<Mutex<Recorder>> = Lazy::new(|| Mutex::new(Recorder::default()));
 
@@ -117,6 +127,7 @@ impl Drop for PerfSession {
 
 /// Times a section of code and records it for the session summary.
 pub(crate) struct PerfSpan {
+    id: u64,
     label: &'static str,
     detail: String,
     start: Instant,
@@ -131,9 +142,19 @@ impl PerfSpan {
         if !enabled() {
             return None;
         }
+        let id = NEXT_SPAN.fetch_add(1, Ordering::Relaxed);
+        let detail = detail.into();
+        if *MODE == Mode::Trace {
+            log!(
+                "[PERF] begin id={id} t={}us thread={:?} {label} {detail}",
+                TRACE_START.elapsed().as_micros(),
+                std::thread::current().id()
+            );
+        }
         Some(Self {
+            id,
             label,
-            detail: detail.into(),
+            detail,
             start: Instant::now(),
         })
     }
@@ -155,7 +176,11 @@ impl Drop for PerfSpan {
             .or_default()
             .push(micros);
         if *MODE == Mode::Trace {
-            log!("[PERF] {key}: {micros}us");
+            log!(
+                "[PERF] end id={} t={}us {key}: {micros}us",
+                self.id,
+                TRACE_START.elapsed().as_micros()
+            );
         }
     }
 }

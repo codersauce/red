@@ -11458,6 +11458,7 @@ impl Editor {
         buffer: &mut RenderBuffer,
         runtime: &mut Runtime,
     ) -> anyhow::Result<()> {
+        let _span = perf::PerfSpan::start("editor:background");
         self.plugin_registry.poll_rpc_lifecycle(runtime).await;
         for event in std::mem::take(&mut self.pending_panel_events) {
             let topic = format!("panel:event:{}", event.panel_id);
@@ -14047,6 +14048,8 @@ impl Editor {
         runtime: &mut Runtime,
         render_mode: EventRenderMode,
     ) -> anyhow::Result<ProcessedEvent> {
+        let _span =
+            perf::enabled().then(|| perf::PerfSpan::with_detail("editor:input", format!("{ev:?}")));
         self.rpc_commands.interrupt(&ev);
         if matches!(
             ev,

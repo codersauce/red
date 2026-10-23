@@ -52,7 +52,8 @@ const SHUTDOWN_RESPONSE_TIMEOUT: Duration = Duration::from_secs(1);
 #[cfg(windows)]
 const PROCESS_EXIT_GRACE: Duration = Duration::from_millis(100);
 #[cfg(not(windows))]
-const PROCESS_EXIT_GRACE: Duration = Duration::from_secs(5);
+// Bound interactive exit latency after the server has received its exit notification.
+const PROCESS_EXIT_GRACE: Duration = Duration::from_millis(500);
 
 /// Idle time after the last document change before diagnostics are
 /// requested. Typing produces one didChange per keystroke; requesting
@@ -271,7 +272,11 @@ impl RealLspClient {
         config: LanguageServerConfig,
         workspace_root: PathBuf,
     ) -> Result<RealLspClient, LspError> {
-        let mut child = spawn_lsp_process(&config).await?;
+        let _span = crate::editor::perf::PerfSpan::start("lsp:start");
+        let mut child = {
+            let _span = crate::editor::perf::PerfSpan::start("lsp:spawn_process");
+            spawn_lsp_process(&config).await?
+        };
         let workspace_watcher = match WorkspaceFileWatcher::new(&workspace_root, &config) {
             Ok(watcher) => Some(watcher),
             Err(error) => {
