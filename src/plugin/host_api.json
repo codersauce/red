@@ -20,7 +20,7 @@
     { "name": "SetTheme", "kind": "execute", "signature": "(theme: String)", "introduced": "0.1.0" },
     { "name": "AgentReadDefaultModel", "kind": "request", "signature": "(callback: fn(Json))", "introduced": "0.14.0" },
     { "name": "AgentListModels", "kind": "request", "signature": "(callback: fn(Json))", "introduced": "0.14.0" },
-    { "name": "AgentListSessions", "kind": "request", "signature": "(callback: fn(Json), cwd: String, scope: String, query: String, exclude_session_id: String)", "introduced": "0.21.0" },
+    { "name": "AgentListSessions", "kind": "request", "signature": "(callback: fn(Json), cwd: String, scope: String, query: String, exclude_session_id: String, search_contents?: bool)", "introduced": "0.21.0" },
     { "name": "AgentReadSessionPreview", "kind": "request", "signature": "(callback: fn(Json), cwd: String, session_id: String)", "introduced": "0.21.0" },
     { "name": "AgentSetModel", "kind": "request", "signature": "(callback: fn(Json), session_id: String, selection: Json)", "introduced": "0.14.0" },
     { "name": "SetTextPanelHeaderDetail", "kind": "execute", "signature": "(id: String, detail?: Json)", "introduced": "0.14.0" },

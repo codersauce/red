@@ -574,7 +574,7 @@ theme's `sash.hoverBorder`, `panelTitle.activeBorder`, or `focusBorder`, then
 derives a readable accent when those colors are absent or insufficiently
 contrasted. Plugins do not need to configure a border to make resizing visible.
 
-`PanelConfig` may include `composer: Json { placeholder: String, rows: i32 }` for a persistent footer composer and `header_actions` for panel-owned actions. Existing `{ id, label, compact_label? }` declarations remain clickable header controls. Host API `0.19.0` also accepts `key`, `group`, `description`, `priority`, `enabled`, and `show_in_header`. A focused panel dispatches enabled shortcuts only from idle Normal mode; search, Visual selection, incomplete motions, composer input, and links under Enter keep precedence. Enabled hidden actions remain searchable and executable through F1; disabled actions appear after an update makes them available. `SetTextPanelActions(id, actions)` replaces the action list without recreating the panel. Row panels can also set `surface: ThemeStyleSpec` and `border: ThemeStyleSpec` to resolve theme-aware panel foreground, background, and separator colors without affecting other panels. Actions emit `panel:event:<id>` using their configured `id`; compact labels are selected automatically on narrow panels, while priority keeps essential actions visible where possible. Focus the footer with `FocusTextPanelComposer(id)`, update its enabled/status state with `SetTextPanelComposerState(id, enabled, status?)`, replace its bounded prompt history with `SetTextPanelComposerHistory(id, history)`, and clear its draft with `ClearTextPanelComposer(id)`. `SetTextPanelComposerHistory` was introduced in host API `0.15.0`; it normalizes, deduplicates, and limits supplied entries without changing the current draft.
+`PanelConfig` may include `composer: Json { placeholder: String, rows: i32 }` for a persistent footer composer and `header_actions` for panel-owned actions. Existing `{ id, label, compact_label? }` declarations remain clickable header controls. Host API `0.19.0` also accepts `key`, `group`, `description`, `priority`, `enabled`, and `show_in_header`. In a panel with a composer, enabled actions with `show_in_header: false` are listed as clickable `key label` hints on a row under the composer. A focused panel dispatches enabled shortcuts only from idle Normal mode; search, Visual selection, incomplete motions, composer input, and links under Enter keep precedence. Enabled hidden actions remain searchable and executable through F1; disabled actions appear after an update makes them available. `SetTextPanelActions(id, actions)` replaces the action list without recreating the panel. Row panels can also set `surface: ThemeStyleSpec` and `border: ThemeStyleSpec` to resolve theme-aware panel foreground, background, and separator colors without affecting other panels. Actions emit `panel:event:<id>` using their configured `id`; compact labels are selected automatically on narrow panels, while priority keeps essential actions visible where possible. Focus the footer with `FocusTextPanelComposer(id)`, update its enabled/status state with `SetTextPanelComposerState(id, enabled, status?)`, replace its bounded prompt history with `SetTextPanelComposerHistory(id, history)`, and clear its draft with `ClearTextPanelComposer(id)`. `SetTextPanelComposerHistory` was introduced in host API `0.15.0`; it normalizes, deduplicates, and limits supplied entries without changing the current draft.
 
 Host API `0.21.0` adds `EnterTextPanelContext(id, placeholder, options?)` to give
 a plugin a temporary in-pane surface while retaining the panel's blocks, scroll
@@ -587,16 +587,32 @@ emits `activate_block` for the selected row, and `Esc` or `Ctrl-c` emits
 contents. Passing `Json { key: String, query: String }` restores the initial
 query and the selection and scroll position previously remembered for that key;
 if the old selection disappears, the nearest remaining row is selected instead.
+The options can also hold `tabs: [Json { id, label, compact_label? }]`, the
+selected `tab` id, and a `tab_shortcut` key. The host shows the tabs in a row
+under the search field, using the compact labels, and then only the selected
+tab, when the pane is too narrow. Clicking a tab, or pressing `Tab`,
+`Shift-Tab` or the shortcut to move to the next or previous one, selects it and
+emits `context_tab` with its id as `text`.
 `Alt-p` emits `session_preview`; plugins can display read-only latest-turn
 details with `SetTextPanelPreview(id, Json { session_id, prompt, response,
 loading?, error? })`, or hide them by omitting the second argument. The host
 places previews beside wide pickers and beneath narrow pickers. Request the
 contents with `AgentReadSessionPreview(callback, cwd, session_id)`, which reads
 persisted history without resuming the thread or changing conversation state.
-`AgentListSessions(callback, cwd, scope, query, exclude_session_id)` answers
-with `Json { sessions, more?, error? }`: at most the 200 most recently updated
-matches, with `more` set when older ones were left out, which a query can
-still find.
+`AgentListSessions(callback, cwd, scope, query, exclude_session_id,
+search_contents?)` answers with `Json { sessions, more?, error? }`: at most the
+200 most recently updated matches, with `more` set when older ones were left
+out, which a query can still find. The `red` and `workspace` scopes list threads
+started in `cwd`; `all` lists every interactive thread. A query matches every
+word, ignoring case, against each thread's name and first prompt. With
+`search_contents` set, it also searches conversation text, which Codex does by
+scanning every saved conversation and can take many seconds, so list titles
+first and search contents second. Each session has `id`, `cwd`, `label`,
+`detail`, `snippet`, `source`, `time_group`, `updated_at`, `is_red`, and
+`resumable`, which is set for a Red thread from `cwd`; pass it as
+`AgentSwitchSession`'s `resume` argument, since any other session continues in
+a new thread. In a picker context, replacing the blocks with an empty list also
+selects the first row of the next update.
 Call `ExitTextPanelContext(id)` to restore the retained conversation
 exactly. `AgentListSessions`, `AgentReadSessionPreview`, `AgentSwitchSession`,
 `EnterTextPanelContext`, `ExitTextPanelContext`, and `SetTextPanelPreview` were

@@ -184,6 +184,8 @@ struct TextPanelHeaderAction {
     key: String,
     label: String,
     compact_label: String,
+    description: String,
+    show_in_header: bool,
 }
 
 struct AgentEditOrigin {
@@ -270,6 +272,10 @@ struct AgentState {
     session_browser_query: String,
     session_browser_cwd: String,
     session_browser_request: i32,
+    /// The pending request also searches conversation text.
+    session_browser_searching_contents: bool,
+    /// The next results start from their first row, after a new scope or query.
+    session_browser_reset_selection: bool,
     session_browser_debounce: String,
     session_browser_results: [Json],
     session_browser_results_query: String,
@@ -351,6 +357,8 @@ fn initial_state() -> AgentState {
         session_browser_query: "",
         session_browser_cwd: "",
         session_browser_request: -1,
+        session_browser_searching_contents: false,
+        session_browser_reset_selection: false,
         session_browser_debounce: "",
         session_browser_results: [],
         session_browser_results_query: "",
@@ -728,6 +736,7 @@ fn choose_session() {
         session_browser_open: true,
         session_browser_cwd: "",
         session_browser_request: -1,
+        session_browser_reset_selection: false,
         session_browser_results: [],
         session_browser_results_query: "",
     });
@@ -761,16 +770,21 @@ fn session_browser_cwd_loaded(result: AgentStringValueEvent) {
         session_browser_preview_debounce: "",
     });
     red::execute("EnterTextPanelContext", "agent-conversation", "Search previous sessions…", Json {
-        key: cwd, query: query,
+        key: cwd, query: query, tab: scope, tab_shortcut: "Alt-s",
+        tabs: [
+            Json { id: "red", label: "Red", compact_label: "Red" },
+            Json { id: "workspace", label: "This workspace", compact_label: "Here" },
+            Json { id: "all", label: "All Codex", compact_label: "All" },
+        ],
     });
     refresh_session_browser_header();
-    render_session_browser([], "", true, false);
+    render_session_browser([], "", true, false, false);
     if preview {
         red::execute("SetTextPanelPreview", "agent-conversation", Json {
             session_id: selected, loading: true,
         });
     }
-    request_sessions();
+    request_sessions(false);
 }
 
 fn session_scope_label() -> String {
@@ -781,17 +795,20 @@ fn session_scope_label() -> String {
 
 fn refresh_session_browser_header() {
     if !state().session_browser_open { return; }
-    let scope = session_scope_label();
+    // The scope is shown, and changed, by the picker's tabs.
     red::execute("SetTextPanelHeaderDetail", "agent-conversation", Json {
-        text: "Previous sessions", secondary: scope, compact_text: scope,
-        action: "session_scope", shortcut: "Alt-s",
+        text: "Previous sessions",
     });
 }
 
-fn request_sessions() {
+/// Lists sessions; with `contents`, a query also searches conversation text,
+/// which Codex does slowly, so titles are listed first.
+fn request_sessions(contents: bool) {
     if !state().session_browser_open { return; }
+    let label = "Searching " + session_scope_label() + " sessions…";
+    if contents { label = "Searching conversation text…"; }
     red::execute("SetTextPanelStatus", "agent-conversation", TextPanelStatus {
-        busy: true, label: "Searching " + session_scope_label() + " sessions…", stream: false,
+        busy: true, label: label, stream: false,
     });
     let request = red::request(
         "AgentListSessions",
@@ -799,30 +816,46 @@ fn request_sessions() {
         state().session_browser_cwd,
         state().session_browser_scope,
         state().session_browser_query,
-        state().session_id
+        state().session_id,
+        contents
     );
-    red::state_patch(AgentState { session_browser_request: request });
+    red::state_patch(AgentState {
+        session_browser_request: request,
+        session_browser_searching_contents: contents,
+    });
 }
 
 fn sessions_loaded(result: AgentSessionsResult, request_id: i32) {
     if request_id != state().session_browser_request { return; }
-    red::state_patch(AgentState { session_browser_request: -1 });
+    let searched_contents = state().session_browser_searching_contents;
+    red::state_patch(AgentState { session_browser_request: -1, session_browser_searching_contents: false });
     if !state().session_browser_open { return; }
     red::execute("SetTextPanelStatus", "agent-conversation");
+    if state().session_browser_reset_selection {
+        // An empty update moves the host's selection back to the first row.
+        red::state_patch(AgentState {
+            session_browser_reset_selection: false,
+            session_browser_selected: "",
+            session_browser_selected_index: 0,
+        });
+        red::execute("UpdateTextPanel", "agent-conversation", []);
+    }
     let error = red::string(result.error, "");
     if error != "" {
         red::state_patch(AgentState { session_browser_results: [] });
         red::state_patch(AgentState { session_browser_results_query: state().session_browser_query });
-        render_session_browser([], "Could not load sessions: " + error, false, false);
+        render_session_browser([], "Could not load sessions: " + error, false, false, false);
         return;
     }
     red::state_patch(AgentState {
         session_browser_results: result.sessions,
         session_browser_results_query: state().session_browser_query,
     });
+    let search_contents = !searched_contents && red::trim(state().session_browser_query) != "";
     restore_session_browser_selection(result.sessions);
-    render_session_browser(result.sessions, "", false, red::bool(result.more, false));
+    render_session_browser(result.sessions, "", false, red::bool(result.more, false), search_contents);
     if state().session_browser_preview_open { queue_session_preview(); }
+    if search_contents { request_sessions(true); }
 }
 
 fn restore_session_browser_selection(sessions: [Json]) {
@@ -838,6 +871,7 @@ fn restore_session_browser_selection(sessions: [Json]) {
         index = index + 1;
     }
     if !found && red::len(sessions) > 0 {
+        // Matches the host, which keeps the row position of a selection that went away.
         if selected_index >= red::len(sessions) { selected_index = red::len(sessions) - 1; }
         if selected_index < 0 { selected_index = 0; }
         selected = red::string(sessions[selected_index].id, "");
@@ -852,7 +886,7 @@ fn restore_session_browser_selection(sessions: [Json]) {
     });
 }
 
-fn render_session_browser(sessions: [Json], error: String, loading: bool, more: bool) {
+fn render_session_browser(sessions: [Json], error: String, loading: bool, more: bool, searching: bool) {
     if !state().session_browser_open { return; }
     let blocks = [];
     if loading {
@@ -877,7 +911,11 @@ fn render_session_browser(sessions: [Json], error: String, loading: bool, more: 
         }
         let detail = red::string(session.detail, "");
         let snippet = red::string(session.snippet, "");
-        if !red::bool(session.is_red, false) { detail = detail + " · Continue in Red"; }
+        if !red::bool(session.resumable, false) {
+            // Elsewhere, even a Red session continues in a new thread here.
+            if red::bool(session.is_red, false) { detail = detail + " · Continue here"; }
+            else { detail = detail + " · Continue in Red"; }
+        }
         if snippet != "" { detail = detail + " · " + snippet; }
         blocks = red::push(blocks, AgentTextBlock {
             id: "session-browser:session:" + red::string(session.id, ""),
@@ -886,14 +924,18 @@ fn render_session_browser(sessions: [Json], error: String, loading: bool, more: 
         });
     }
     if more {
+        let text = "Showing the " + red::len(sessions) + " most recent · type to search older sessions";
+        if red::trim(state().session_browser_query) != "" {
+            text = "Showing the " + red::len(sessions) + " most recent matches";
+        }
         blocks = red::push(blocks, AgentTextBlock {
-            id: "session-browser:more", kind: "text", format: "plain",
-            text: "Showing the " + red::len(sessions) + " most recent · type to search older sessions",
+            id: "session-browser:more", kind: "text", format: "plain", text: text,
         });
     }
     if !loading && error == "" && red::len(sessions) == 0 {
         let message = "No previous sessions in this scope";
-        if red::trim(state().session_browser_query) != "" { message = "No matching sessions"; }
+        if searching { message = "No matching titles · searching conversation text…"; }
+        else if red::trim(state().session_browser_query) != "" { message = "No matching sessions"; }
         blocks = red::push(blocks, AgentTextBlock {
             id: "session-browser:empty", kind: "text", format: "plain", text: message,
         });
@@ -903,7 +945,11 @@ fn render_session_browser(sessions: [Json], error: String, loading: bool, more: 
 
 fn session_browser_query_changed(query: String) {
     if !state().session_browser_open || query == state().session_browser_query { return; }
-    red::state_patch(AgentState { session_browser_query: query, session_browser_request: -1 });
+    red::state_patch(AgentState {
+        session_browser_query: query,
+        session_browser_request: -1,
+        session_browser_reset_selection: true,
+    });
     let previous = red::string(state().session_browser_debounce, "");
     if previous != "" { red::execute("CancelTimeout", previous); }
     let timer = red::execute("SetTimeout", 150);
@@ -919,7 +965,7 @@ fn session_browser_timeout(event: TimerEvent) {
     }
     if event.timer_id != state().session_browser_debounce { return; }
     red::state_patch(AgentState { session_browser_debounce: "" });
-    request_sessions();
+    request_sessions(false);
 }
 
 fn session_browser_selection_changed(block_id: String) {
@@ -1031,19 +1077,19 @@ fn session_preview_loaded(result: AgentSessionPreviewResult, request_id: i32) {
     });
 }
 
-fn cycle_session_scope() {
+fn select_session_scope(scope: String) {
     if !state().session_browser_open { return; }
-    let scope = "red";
-    if state().session_browser_scope == "red" { scope = "workspace"; }
-    else if state().session_browser_scope == "workspace" { scope = "all"; }
+    if scope != "red" && scope != "workspace" && scope != "all" { return; }
+    if scope == state().session_browser_scope { return; }
     red::state_patch(AgentState {
         session_browser_scope: scope,
         session_browser_results: [],
         session_browser_results_query: "",
+        session_browser_reset_selection: true,
     });
     refresh_session_browser_header();
-    render_session_browser([], "", true, false);
-    request_sessions();
+    render_session_browser([], "", true, false, false);
+    request_sessions(false);
 }
 
 fn close_session_browser() {
@@ -1067,6 +1113,8 @@ fn close_session_browser() {
     red::state_patch(AgentState {
         session_browser_open: false,
         session_browser_request: -1,
+        session_browser_searching_contents: false,
+        session_browser_reset_selection: false,
         session_browser_debounce: "",
         session_browser_results: [],
         session_browser_results_query: "",
@@ -1111,7 +1159,7 @@ fn session_selected(item: Json) {
         session_browser_selected: target,
         session_browser_selected_index: selected_index,
     });
-    let resume = red::bool(item.is_red, false);
+    let resume = red::bool(item.resumable, false);
     let cwd = state().session_browser_cwd;
     close_session_browser();
     red::state_patch(AgentState { session_switch_target: target });
@@ -1360,15 +1408,28 @@ fn open_conversation() {
 fn ensure_conversation_panel() {
     if !state().panel_created {
         red::execute("CreateTextPanel", "agent-conversation", PanelConfig {
-            side: "right",
+            side: "left",
             width: 62,
             title: "Agent",
             composer: TextPanelComposerConfig { placeholder: "Ask a follow-up…", rows: 3 },
             header_actions: [
-                TextPanelHeaderAction { id: "sessions", key: "Alt-s", label: "Sessions", compact_label: "S" },
-                TextPanelHeaderAction { id: "new", key: "Alt-n", label: "New", compact_label: "N" },
-                TextPanelHeaderAction { id: "clear", key: "Alt-c", label: "Clear", compact_label: "C" },
-                TextPanelHeaderAction { id: "close", key: "Alt-w", label: "×", compact_label: "×" },
+                // Listed under the composer; only closing stays in the header.
+                TextPanelHeaderAction {
+                    id: "sessions", key: "Alt-s", label: "sessions", compact_label: "sessions",
+                    description: "Browse previous sessions", show_in_header: false,
+                },
+                TextPanelHeaderAction {
+                    id: "new", key: "Alt-n", label: "new", compact_label: "new",
+                    description: "Start a new conversation", show_in_header: false,
+                },
+                TextPanelHeaderAction {
+                    id: "clear", key: "Alt-c", label: "clear", compact_label: "clear",
+                    description: "Clear the conversation", show_in_header: false,
+                },
+                TextPanelHeaderAction {
+                    id: "close", key: "Alt-w", label: "×", compact_label: "×",
+                    description: "Close the pane", show_in_header: true,
+                },
             ],
         });
         red::state_patch(AgentState { panel_created: true });
@@ -1969,9 +2030,11 @@ fn panel_event(event: AgentPanelEvent) {
         cancel();
     } else if event.action == "model" {
         choose_model();
-    } else if event.action == "session_scope" {
-        cycle_session_scope();
+    } else if event.action == "context_tab" {
+        select_session_scope(red::string(event.text, ""));
     } else if event.action == "session_preview" && state().session_browser_open {
+        // Peek at the row the host shows as selected.
+        session_browser_selection_changed(red::string(event.text, ""));
         toggle_session_preview();
     } else if (event.action == "up" || event.action == "down") && state().session_browser_open {
         session_browser_selection_changed(event.text);
@@ -2666,7 +2729,12 @@ fn session_restored(event: AgentConversationEvent) {
     if switching {
         red::state_patch(AgentState { resume_hint: "", resume_age: "" });
     }
-    if !shows_thread(event.thread_id) {
+    // Decided before naming the thread below, which would make it look shown.
+    let shown = shows_thread(event.thread_id);
+    // The thread's model follows in its own event, which can arrive before the
+    // pane state names the restored thread.
+    red::state_patch(AgentState { session_id: event.thread_id });
+    if !shown {
         let age = state().resume_age;
         load_conversation(event);
         if age != "" {
