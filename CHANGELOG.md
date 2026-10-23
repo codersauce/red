@@ -2,6 +2,95 @@
 
 All notable changes to Red are documented in this file.
 
+## [0.10.0](https://github.com/codersauce/red/compare/v0.9.1...v0.10.0)
+
+### Features
+
+- **messages:** Keep only actionable issues in the inbox ([#418](https://github.com/codersauce/red/issues/418)) ([7776ac8](https://github.com/codersauce/red/commit/7776ac8d731826e9570de6a64118aa5d1c6febcf))
+- **clipboard:** Forward copies through Herdr and SSH ([#417](https://github.com/codersauce/red/issues/417)) ([9166ce8](https://github.com/codersauce/red/commit/9166ce8552e25314d043a399e20e0306c11acca8))
+- **agent:** Resume previous conversations ([#414](https://github.com/codersauce/red/issues/414)) ([068407b](https://github.com/codersauce/red/commit/068407bbae64ac1edc0733e3ad375989a35b7c44))
+- **learn:** Complete the essentials track ([#413](https://github.com/codersauce/red/issues/413)) ([133069a](https://github.com/codersauce/red/commit/133069acdd0bad5d1e41e911a0c84e44dd4dc23e))
+- **agent:** Make the pane fit any terminal and feel friendlier ([9526594](https://github.com/codersauce/red/commit/95265946833a3f56df9f6fc889050c98f3ac9939))
+- **agent:** Minimal agent edits, ask before saving unsaved work, readable history ([9290228](https://github.com/codersauce/red/commit/929022808516c21639f471731b7c6910af028361))
+- **agent:** Resume conversations on relaunch and ask after a mid-turn crash ([c79009c](https://github.com/codersauce/red/commit/c79009c6620498ec9beba5f8aa144dd622ffb5cc))
+- **agent:** Track turn phases, scope terminal events to turns, and surface turn state ([98924ee](https://github.com/codersauce/red/commit/98924eef58208e5cd7a05f60adb7c7f50e10748d))
+- **update:** Sign release checksums and install updates automatically ([7737f04](https://github.com/codersauce/red/commit/7737f0429387683b175074ba66e222da2d5baae4))
+
+### Bug Fixes
+
+- **agent:** Make the session picker fast and readable ([#420](https://github.com/codersauce/red/issues/420)) ([aa02c9f](https://github.com/codersauce/red/commit/aa02c9fe379c3f9cf910e033fd633feac8ec0320))
+- **agent:** Read long Codex sessions in pages ([#416](https://github.com/codersauce/red/issues/416)) ([ba90111](https://github.com/codersauce/red/commit/ba901118bb7eead7a0363ecf1f21adfd665a7872))
+- **editor:** Keep native file watching off the UI thread ([#419](https://github.com/codersauce/red/issues/419)) ([4b3a16f](https://github.com/codersauce/red/commit/4b3a16f76ea914b6fa5cf42529d1efea7098b324))
+- **editor:** Preserve viewport during non-wrapped screen-line motion ([#415](https://github.com/codersauce/red/issues/415)) ([9f88d50](https://github.com/codersauce/red/commit/9f88d50cff75a8872beca2020f7c5befc1bbf448))
+- **agent:** Read the saved conversation again after claiming it ([00a0e1b](https://github.com/codersauce/red/commit/00a0e1b2b38d8a95866d23a87ea5cca60c46c0e9))
+- **editor:** Keep execute's future small enough for nested dot-repeat ([bbf0722](https://github.com/codersauce/red/commit/bbf0722d9db80c0564638e353ed6ba8c4e426345))
+- **editor:** Write :x and :exit to a given filename ([d6f5242](https://github.com/codersauce/red/commit/d6f5242f0f87c2b411d1e824235e86c638c3fa60))
+- **editor:** Make :wqa! and :xa! force their writes ([95b20f3](https://github.com/codersauce/red/commit/95b20f3f51cbc0b948dbcdb247d48e2e3661d256))
+- **agent:** Keep held follow-ups dimmed after Clear ([250a760](https://github.com/codersauce/red/commit/250a76049c6ad7527a35c6fd68a1d5405de13a3f))
+- **agent:** Tie the diagnostics shortcut to the server instance; dim queued cards in every format ([2e20393](https://github.com/codersauce/red/commit/2e2039384319e238cdc91d2c5657de282c6773f3))
+- **agent:** Stamp only accepted diagnostics, compare versions per server, skip queued cards in turn actions ([d474be9](https://github.com/codersauce/red/commit/d474be9497782c2f3a92e05f1b4e6eca9051e042))
+- **agent:** Queue later startup messages, label stale versions, keep zoomed compact panes in view ([5f6dec2](https://github.com/codersauce/red/commit/5f6dec292badac1e1a9b9b34678c0b4c5feb5878))
+- **agent:** Address review of the responsive pane and quit commands ([15167fc](https://github.com/codersauce/red/commit/15167fc981e9e5708fedec00acb7930300075261))
+- **history:** Show the omitted-lines note without toggling metadata ([5e53ce6](https://github.com/codersauce/red/commit/5e53ce6d0acfb8c2cb4fb0b8d5c0e5ca8a77894c))
+- **agent:** Apply the user's answer to the held edit even after a save ([9fab75f](https://github.com/codersauce/red/commit/9fab75f63eb4067c2b33c0d6bc0b74bba1d03f1e))
+- **history:** Keep unscoped entries lean and fallback hunks in order ([505f0ca](https://github.com/codersauce/red/commit/505f0ca22a9e6566127ecb2b4cf9376fd20c4133))
+- **history:** Trim only workspace-scoped EditHistory results ([7298366](https://github.com/codersauce/red/commit/7298366e7ee66207d736de2af656a0e4716058f4))
+- **history:** Keep unscoped EditHistory complete and in node order ([9c5d065](https://github.com/codersauce/red/commit/9c5d065582b218eb9e424d924ad6ce1ca3727b5e))
+- **agent:** Report the real outcome of a held edit and clip preview lines ([fb458c5](https://github.com/codersauce/red/commit/fb458c567671bed4e74b8ece4cf4cae35d8552d4))
+- **history:** Follow every selection change and bound workspace payloads ([928de2e](https://github.com/codersauce/red/commit/928de2e48353d38e3b190d19569ab7dc224fd386))
+- **history:** Report full diff length and note omitted preview lines ([d925053](https://github.com/codersauce/red/commit/d925053b89e7a4085055b72d0c07ae04f9c867fc))
+- **agent:** Address review of the edit UX changes ([320f08f](https://github.com/codersauce/red/commit/320f08f74a7aef4629ce0906e729777110221b39))
+- **history:** Keep the revert conflict wording selective-revert callers match ([c4288c4](https://github.com/codersauce/red/commit/c4288c41881dcd843bd21417019ed28e64c09f75))
+- **agent:** Restore saved annotations and keep the archived hint ([8b974fa](https://github.com/codersauce/red/commit/8b974fab34144ab8ab71163d15b5404a1aa88f86))
+- **agent:** Offer Retry and Continue after a turn fails on its own ([42bd6e3](https://github.com/codersauce/red/commit/42bd6e33ba51e2ddd70e0970d3c0305f472fb909))
+- **agent:** Keep unclaimable records and retire workspaces cleanly ([fb32c0e](https://github.com/codersauce/red/commit/fb32c0ee8f39c0a4102aa3a76fc9ff8a234d0fd2))
+- **agent:** Fail closed on claim errors and archive incompatible conversations ([61b9c3f](https://github.com/codersauce/red/commit/61b9c3fd0d1f467951e1cce1c8515aa1300b3ede))
+- **agent:** Never let two editors drive or save one conversation ([0d62995](https://github.com/codersauce/red/commit/0d62995eb950bce59caf548794c27160e2d1c0ae))
+- **agent:** Drop the forgotten record when a new thread is still empty ([c370470](https://github.com/codersauce/red/commit/c3704702a2631e2eb0e58b57d62fa357a7c89aae))
+- **agent:** Reconcile relaunched transcripts and make owner claims atomic ([74d8b39](https://github.com/codersauce/red/commit/74d8b39dd9b112a8f1ff6d997845703a7fa21d6d))
+- **agent:** Address review of conversation continuity ([da61805](https://github.com/codersauce/red/commit/da6180585f51c6f1d36d7a89f566dd914324e506))
+- **agent:** Check conversation-owner liveness on Windows ([2b0d8f7](https://github.com/codersauce/red/commit/2b0d8f7211c31340dc229de1d4ec79daabed8c1c))
+- **agent:** Make pair-mode edits work on the first try ([e717f22](https://github.com/codersauce/red/commit/e717f227de98367b667fba7b0e11f1553e309cd5))
+- **agent:** Keep pane retries, resets, and recaps consistent ([a142fc6](https://github.com/codersauce/red/commit/a142fc61cc13dfe63381b9a0bd96d2685c95bc0b))
+- **agent:** Adopt an already-live restored thread in the pane lifecycle ([1b7560d](https://github.com/codersauce/red/commit/1b7560df3ac49c98c891af74803f8f53dd5f2a02))
+- **agent:** Keep the turn running when Codex rejects an interrupt ([e532e29](https://github.com/codersauce/red/commit/e532e291f6bcfd9ad8ae2aed8faa9b6acdc78eb0))
+- **agent:** Load unopened files for LSP tools without switching buffers ([f2c23a6](https://github.com/codersauce/red/commit/f2c23a6f50d0eb0fa03ea1dc3daf1c45c799ee57))
+- **agent:** Return held prompts to the pane when the app-server stops ([7226222](https://github.com/codersauce/red/commit/7226222c05d14de641a2b5ad018e89510173c666))
+- **agent:** Read files without opening or switching buffers ([342cdc3](https://github.com/codersauce/red/commit/342cdc3aec3720adadd3ba8edcae45997ba77e5a))
+- **agent:** Keep the thread on cancel and hold prompts until the turn ends ([3673dce](https://github.com/codersauce/red/commit/3673dce9eb1121a3d41c7893b6a06be88887c108))
+- **agent:** Refuse protected writes and VCS metadata before touching buffers ([1911122](https://github.com/codersauce/red/commit/19111229e507eb68f153ebd3c9012933f579a128))
+- **update:** Handle fallible zip entry names after zip 9 upgrade ([a8ef58a](https://github.com/codersauce/red/commit/a8ef58a6d01030cb571919693fc7b25d3384e7f6))
+- **deps:** Bump zip to 9.0.4 for RUSTSEC-2026-0367/0368/0369 ([137c0a6](https://github.com/codersauce/red/commit/137c0a6fc90ade2621e6dfd298297c3007a53d36))
+- **messages:** Preserve detail scroll at list boundaries ([58e075e](https://github.com/codersauce/red/commit/58e075ed4bc37192052fa0e63cf4284051b84446))
+- **ci:** Integrate rpc startup notification fix ([8a0aad0](https://github.com/codersauce/red/commit/8a0aad0abf43927612683ad8d8cd1bac863063e5))
+- **plugins:** Show a starting plugin's refusal immediately ([9fe7cd9](https://github.com/codersauce/red/commit/9fe7cd9046978da581e3549f31f6811f63c85798))
+- **messages:** Support mouse selection and scrolling ([613c689](https://github.com/codersauce/red/commit/613c68937f3e455800b28904faa392c85c7610db))
+
+### Performance
+
+- **history:** Find a transaction to revert without cloning the tree ([91ae60f](https://github.com/codersauce/red/commit/91ae60fd5b6529ebccb97485a4608d335f379e5e))
+- **history:** Cap workspace history before serializing entries ([dd5a3b4](https://github.com/codersauce/red/commit/dd5a3b4d15231d826a82a8437ab6dbee2a1af27b))
+
+### Documentation
+
+- **plugin-api:** Give edit history its own 0.21.0 change entry ([d363d22](https://github.com/codersauce/red/commit/d363d228f23aa6774843490d2c289dda926113b8))
+
+### Refactoring
+
+- **agent:** Own a workspace conversation by holding an OS lock ([a35a773](https://github.com/codersauce/red/commit/a35a773cfebb497fb55043903aa120e7462b7279))
+- **agent:** Render the Agent pane from core lifecycle snapshots ([457c075](https://github.com/codersauce/red/commit/457c075b5a22e0f5c7322e8741297f931e0e0657))
+- **agent:** Drive the pane lifecycle from agent events and new host intents ([497a777](https://github.com/codersauce/red/commit/497a77737a122d97c349ba5e7674a6d66da88a6b))
+- **agent:** Add a core-owned lifecycle state machine for the Agent pane ([bf6bfc4](https://github.com/codersauce/red/commit/bf6bfc4ca97bb19018deba2bb28067000906e026))
+
+### Testing
+
+- **agent:** Find diagnostics stamps without depending on URI spelling ([6229977](https://github.com/codersauce/red/commit/6229977b4ec167dc3342193e40e6928ab92a31e3))
+- **update:** Keep Unix-only fixtures out of Windows test builds ([95ca248](https://github.com/codersauce/red/commit/95ca248294ac36a860209bd221ee56af79f5b4c9))
+
+### Maintenance
+
+- **release:** Write the v0.10.0 release campaign ([#421](https://github.com/codersauce/red/issues/421)) ([50d24ce](https://github.com/codersauce/red/commit/50d24cebaf804dabc92401781f6c7130ea6ce133))
+
 ## [0.9.1](https://github.com/codersauce/red/compare/v0.9.0...v0.9.1)
 
 ### Features
