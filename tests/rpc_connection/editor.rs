@@ -255,9 +255,8 @@ async fn rpc_panel_actions_are_owner_routed() -> Result<()> {
         .screen()
         .lines()
         .next()
-        .and_then(|line| line.find("[Run]"))
-        .context("rendered Run action")?
-        + 1;
+        .and_then(|line| line.rfind("Run"))
+        .context("rendered Run action")?;
     h.core
         .input(InputEvent::Mouse {
             event: MouseEvent {
