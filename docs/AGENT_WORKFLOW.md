@@ -315,13 +315,20 @@ away from an unfinished transcript search cancels it and restores its starting
 position. In transcript Normal mode, `]l` jumps to the next link and `[l` to the
 previous one, wrapping at the ends. Enter opens the link under the cursor.
 
-The Agent pane's **Sessions** header action, `Alt-s`, and `:AgentSessions` open
-a picker inside the same pane. Its search field replaces the conversation
-composer, and matching sessions appear newest first. Move between sessions with
-the arrow keys or `Ctrl-j` / `Ctrl-k`, press `Enter` to continue the selected
-conversation, and use `Alt-s` to cycle between **Red**, **This workspace**,
-and **All Codex**. `Esc` or `Ctrl-c` returns to the conversation with its
-transcript position and unsent draft restored. Red identifies its conversations
+`Alt-s` (also listed under the composer as **Alt-s sessions**) and
+`:AgentSessions` open a picker inside the same pane. Its search field replaces
+the conversation composer, and matching sessions appear newest first. The tabs
+under the search field choose the scope: **Red** lists Red sessions from this
+workspace, **This workspace** every Codex session started here, and **All
+Codex** every interactive Codex session. Press `Tab` or `Shift-Tab`, press
+`Alt-s` again, or click a tab to switch. Typing matches session titles and first
+prompts right away, then searches conversation text, which Codex takes longer
+to do. Move between sessions with the arrow keys or `Ctrl-j` / `Ctrl-k`, press
+`Alt-p` to peek at the latest exchange, and press `Enter` to continue the
+selected conversation: a Red session from this workspace resumes in place, and
+any other session continues in a new thread with its recent history. `Esc` or
+`Ctrl-c` returns to the conversation with its transcript position and unsent
+draft restored. Red identifies its conversations
 by their thread source or persisted originator, even when Codex's CLI labels the
 underlying app-server session as VS Code.
 Sessions with an unknown or older editor-tool contract continue in a fresh Red
