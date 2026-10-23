@@ -1,44 +1,76 @@
 schema_version = 1
-version = "0.9.1"
-headline = "More reliable completion, symbol search, and plugins"
-summary = "Red v0.9.1 fixes completion after punctuation and keeps large language-server results from stopping plugins. It also makes plugin failures easier to diagnose and improves terminal command output."
+version = "next"
+headline = "Pick up any Codex conversation, and updates that install themselves"
+summary = "Red v0.10.0 keeps Agent conversations going across relaunches, lets you resume or continue any previous Codex session from the Agent pane, and makes agent edits gentler on your work. Updates now install in the background with signed checksums, and copying works over SSH, Herdr, and tmux."
 website = "https://github.com/codersauce/red/releases/latest"
 
-x_post = """{launch}. Fixes for completion after punctuation and large symbol searches, clearer plugin startup and failure messages, and an in-editor plugin status view.
+x_post = """{launch}. Resume any previous Codex session from the Agent pane with Alt-s, keep conversations across relaunches, and get updates installed in the background with signed checksums.
 
 {url}"""
-bluesky_post = """{launch}. A maintenance release for completion, large symbol searches, and plugin memory handling. Inspect current-session plugin state with :plugin-status, and get clearer startup and failure messages.
+bluesky_post = """{launch}. Agent conversations now survive a relaunch, and Alt-s opens a searchable list of your previous Codex sessions. Updates install in the background with signed checksums, and copying works over SSH, Herdr, and tmux.
 
 {url}"""
 
 [[stories]]
-id = "punctuation-completion"
-title = "Keep member completion working as you type"
-summary = "Typing through a completion and continuing with punctuation preserves the period and requests members after the updated text reaches the language server. Late completion responses no longer discard punctuation or dismiss the new member menu."
-status = "improved"
-pull_requests = [390]
+id = "agent-sessions"
+title = "Pick up a previous Codex conversation"
+summary = "Press Alt-s in the Agent pane, or run :AgentSessions, to browse previous Codex sessions from Red, this workspace, or all of Codex, switching with Tab. Type to search titles, then conversation text; Alt-p peeks at the latest exchange. A Red session from this workspace resumes in place, and any other conversation continues in a new thread with its recent history."
+status = "new"
+pull_requests = [414, 416, 420]
 channels = ["github", "discord", "x", "bluesky", "in_app"]
 
 [[stories]]
-id = "large-symbol-results"
-title = "Search large symbol lists without stopping the plugin"
-summary = "Large symbol and reference results are trimmed to fit the receiving plugin's memory budget, with the original count retained for truncated-result messages. Other oversized request results produce a warning rather than stopping the plugin. Shared arrays and maps are counted once against the Husk heap while new copies still respect the limit."
-status = "improved"
-pull_requests = [393, 398, 399]
-channels = ["github", "discord", "in_app"]
-
-[[stories]]
-id = "plugin-diagnostics"
-title = "Inspect plugin state and understand startup failures"
-summary = "Run :plugin-status to inspect plugins in the current editor session, including starting, active, disabled, and quarantined states. Startup notices explain pending commands, executable failures retain their cause, and commands from stopped plugins explain why they are unavailable."
+id = "conversation-continuity"
+title = "Keep the conversation after a relaunch or a crash"
+summary = "Quitting and reopening Red in a workspace resumes the same Codex thread instead of starting over. If Codex stops in the middle of a reply, the pane keeps what streamed, holds queued follow-ups, and asks whether to retry, continue, or leave it. Only one editor can drive a workspace's conversation at a time."
 status = "new"
-pull_requests = [396, 400]
+pull_requests = [409]
+channels = ["github", "discord", "bluesky", "in_app"]
+
+[[stories]]
+id = "automatic-updates"
+title = "Install updates in the background"
+summary = "Official standalone installations now install a new stable release in the background, verified like red update, and new sessions use it. Release checksums are signed with minisign, and the updater checks the signature before installing. Set [updates] mode = \"notify\" to install yourself, or \"off\" to stop checking. Homebrew and source builds keep their own update process."
+status = "improved"
+pull_requests = [402]
+channels = ["github", "discord", "x", "bluesky", "in_app"]
+
+[[stories]]
+id = "agent-edits"
+title = "Agent edits that respect your work"
+summary = "Agent edits change only the lines they need, so your cursor and view stay put and one u undoes the whole edit. When the agent edits a buffer with unsaved changes, Red asks before saving them. :AgentHistory shows readable diffs across every file the agent touched."
+status = "improved"
+pull_requests = [406, 408, 410]
 channels = ["github", "discord", "in_app"]
 
 [[stories]]
-id = "terminal-output"
-title = "Read terminal command output more easily"
-summary = "Plugin lists and catalog results use aligned columns measured in terminal display width, including Unicode text. Utility commands share consistent styling, and closed output pipes exit quietly."
+id = "agent-pane"
+title = "An Agent pane that fits your terminal"
+summary = "The Agent pane now opens on the left, beside the file tree, and sizes itself to the terminal; on a narrow one it takes the whole screen while you use it. Sessions, New, and Clear sit under the composer, and a turn that fails on its own offers Retry and Continue."
 status = "improved"
-pull_requests = [391]
+pull_requests = [411, 420]
 channels = ["github", "discord", "in_app"]
+
+[[stories]]
+id = "remote-clipboard"
+title = "Copy over SSH, Herdr, and tmux"
+summary = "Yanks, transcript copies, and plugin clipboard writes reach your local clipboard through OSC 52 when Red runs over SSH, inside Herdr, or in tmux, and use the native clipboard on a local desktop. Set [clipboard] backend to override the choice."
+status = "new"
+pull_requests = [417]
+channels = ["github", "discord", "in_app"]
+
+[[stories]]
+id = "messages-inbox"
+title = "Messages that need your attention"
+summary = ":messages is now an inbox of problems that need you, such as a failed save or a file changed on disk, and each one clears when it is fixed. Routine feedback stays in the status line, and shell and update output moved to :jobs."
+status = "improved"
+pull_requests = [404, 418]
+channels = ["github", "discord", "in_app"]
+
+[[stories]]
+id = "learn-essentials"
+title = "Finish the Essentials lessons"
+summary = "All four Essentials lessons in :learn now run, covering editing, finding commands, and saving a practice file. Red remembers your progress, and :learn next, :learn restart, and :learn quit move you through it without touching your project."
+status = "improved"
+pull_requests = [413]
+channels = ["github", "in_app"]
