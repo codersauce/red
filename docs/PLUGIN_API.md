@@ -593,6 +593,10 @@ loading?, error? })`, or hide them by omitting the second argument. The host
 places previews beside wide pickers and beneath narrow pickers. Request the
 contents with `AgentReadSessionPreview(callback, cwd, session_id)`, which reads
 persisted history without resuming the thread or changing conversation state.
+`AgentListSessions(callback, cwd, scope, query, exclude_session_id)` answers
+with `Json { sessions, more?, error? }`: at most the 200 most recently updated
+matches, with `more` set when older ones were left out, which a query can
+still find.
 Call `ExitTextPanelContext(id)` to restore the retained conversation
 exactly. `AgentListSessions`, `AgentReadSessionPreview`, `AgentSwitchSession`,
 `EnterTextPanelContext`, `ExitTextPanelContext`, and `SetTextPanelPreview` were

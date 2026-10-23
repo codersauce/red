@@ -429,6 +429,7 @@ struct AgentModelsResult {
 struct AgentSessionsResult {
     sessions: [Json],
     error: String,
+    more: bool,
 }
 
 struct AgentSessionPreviewResult {
@@ -763,7 +764,7 @@ fn session_browser_cwd_loaded(result: AgentStringValueEvent) {
         key: cwd, query: query,
     });
     refresh_session_browser_header();
-    render_session_browser([], "", true);
+    render_session_browser([], "", true, false);
     if preview {
         red::execute("SetTextPanelPreview", "agent-conversation", Json {
             session_id: selected, loading: true,
@@ -812,7 +813,7 @@ fn sessions_loaded(result: AgentSessionsResult, request_id: i32) {
     if error != "" {
         red::state_patch(AgentState { session_browser_results: [] });
         red::state_patch(AgentState { session_browser_results_query: state().session_browser_query });
-        render_session_browser([], "Could not load sessions: " + error, false);
+        render_session_browser([], "Could not load sessions: " + error, false, false);
         return;
     }
     red::state_patch(AgentState {
@@ -820,7 +821,7 @@ fn sessions_loaded(result: AgentSessionsResult, request_id: i32) {
         session_browser_results_query: state().session_browser_query,
     });
     restore_session_browser_selection(result.sessions);
-    render_session_browser(result.sessions, "", false);
+    render_session_browser(result.sessions, "", false, red::bool(result.more, false));
     if state().session_browser_preview_open { queue_session_preview(); }
 }
 
@@ -851,7 +852,7 @@ fn restore_session_browser_selection(sessions: [Json]) {
     });
 }
 
-fn render_session_browser(sessions: [Json], error: String, loading: bool) {
+fn render_session_browser(sessions: [Json], error: String, loading: bool, more: bool) {
     if !state().session_browser_open { return; }
     let blocks = [];
     if loading {
@@ -882,6 +883,12 @@ fn render_session_browser(sessions: [Json], error: String, loading: bool) {
             id: "session-browser:session:" + red::string(session.id, ""),
             kind: "action", format: "plain",
             text: red::string(session.label, "Untitled session") + "\n" + detail,
+        });
+    }
+    if more {
+        blocks = red::push(blocks, AgentTextBlock {
+            id: "session-browser:more", kind: "text", format: "plain",
+            text: "Showing the " + red::len(sessions) + " most recent · type to search older sessions",
         });
     }
     if !loading && error == "" && red::len(sessions) == 0 {
@@ -1035,7 +1042,7 @@ fn cycle_session_scope() {
         session_browser_results_query: "",
     });
     refresh_session_browser_header();
-    render_session_browser([], "", true);
+    render_session_browser([], "", true, false);
     request_sessions();
 }
 
@@ -1199,6 +1206,9 @@ fn pane_state_changed(event: AgentPaneState) {
     }
     if phase != "working" && phase != "stopping" && (was == "working" || was == "stopping") {
         red::state_patch(AgentState { turn_model_info: Json {} });
+        refresh_model_header();
+    } else if was == "restoring" && phase != "restoring" {
+        // Clear the header's "restoring…" once the thread is back.
         refresh_model_header();
     }
     let had_session = false;

@@ -35,6 +35,7 @@ use tokio::{
 };
 
 mod activity;
+mod history;
 mod models;
 mod sessions;
 mod tool_error;
@@ -46,7 +47,9 @@ use crate::config::AgentCodexFeature;
 use crate::inline_assist::InlineAssistResult;
 use crate::inline_context::InlineContextCall;
 
-const APP_FRAME_BYTES: usize = 1024 * 1024;
+const APP_FRAME_BYTES: usize = 8 * 1024 * 1024;
+/// JSON-RPC error code Red reports for a frame it discarded as too large.
+const FRAME_TOO_LARGE_CODE: i64 = -32099;
 const STDERR_TAIL_BYTES: usize = 32 * 1024;
 const TOOL_CONTENT_BYTES: usize = 960 * 1024;
 const MAX_FILES: usize = 4096;
@@ -563,6 +566,7 @@ enum SessionLaunch {
 enum Pending {
     Model(models::PendingModelRequest),
     Sessions(sessions::PendingSessionRequest),
+    History(history::PendingHistory),
     SessionPreview {
         request_id: i64,
         session_id: String,
@@ -704,10 +708,10 @@ async fn run<H: CodexToolHost>(
             "Codex is not authenticated; run `codex login` and try again"
         );
 
-    let (lines_tx, mut lines_rx) = mpsc::channel::<Result<Value>>(128);
+    let (lines_tx, mut lines_rx) = mpsc::channel::<Result<Frame>>(128);
     tokio::spawn(async move {
         loop {
-            let result = read_message(&mut output).await;
+            let result = read_frame(&mut output).await;
             let done = matches!(&result, Ok(None));
             let message = result.and_then(|value| value.context("Codex app-server stopped"));
             if lines_tx.send(message).await.is_err() || done {
@@ -740,8 +744,24 @@ async fn run<H: CodexToolHost>(
                 let Some(message) = message else {
                     anyhow::bail!("Codex app-server output channel stopped");
                 };
+                let message = match message? {
+                    Frame::Message(message) => message,
+                    Frame::Oversized { id, bytes } => {
+                        let reason = frame_too_large_message(bytes);
+                        crate::log!("Skipped an oversized Codex app-server frame: {reason}");
+                        let Some(id) = id else { continue };
+                        let error = json!({"code": FRAME_TOO_LARGE_CODE, "message": reason});
+                        if !pending.contains_key(&id_key(&id)) {
+                            // A server request Red cannot read: refuse it so Codex
+                            // does not wait for an answer.
+                            write_message(&mut input, &json!({"id": id, "error": error})).await?;
+                            continue;
+                        }
+                        json!({"id": id, "error": error})
+                    }
+                };
                 handle_message(
-                    message?,
+                    message,
                     &mut input,
                     &events,
                     &mut pending,
@@ -954,21 +974,12 @@ async fn handle_command(
             request_id,
             session_id,
         } => {
-            let id = rpc_id(next_id);
-            pending.insert(
-                id.clone(),
-                Pending::SessionPreview {
-                    request_id,
-                    session_id: session_id.clone(),
-                },
-            );
-            write_message(
+            history::start(
+                history::HistoryPurpose::Preview { request_id },
+                session_id,
                 input,
-                &json!({
-                    "id": id,
-                    "method": "thread/read",
-                    "params": {"threadId": session_id, "includeTurns": true}
-                }),
+                pending,
+                next_id,
             )
             .await?;
         }
@@ -1099,21 +1110,12 @@ async fn handle_command(
             .await?;
         }
         CodexCommand::ContinueSession { cwd, session_id } => {
-            let id = rpc_id(next_id);
-            pending.insert(
-                id.clone(),
-                Pending::ContinueRead {
-                    cwd,
-                    source_session_id: session_id.clone(),
-                },
-            );
-            write_message(
+            history::start(
+                history::HistoryPurpose::Continue { cwd },
+                session_id,
                 input,
-                &json!({
-                    "id": id,
-                    "method": "thread/read",
-                    "params": {"threadId": session_id, "includeTurns": true}
-                }),
+                pending,
+                next_id,
             )
             .await?;
         }
@@ -1592,6 +1594,9 @@ async fn handle_response(
     if let Pending::Sessions(request) = request {
         return sessions::handle_response(request, message, input, events, pending, next_id).await;
     }
+    if let Pending::History(request) = request {
+        return history::handle_response(request, message, input, events, pending, next_id).await;
+    }
     if let Pending::SessionPreview {
         request_id,
         session_id,
@@ -1782,6 +1787,7 @@ async fn handle_response(
                     "method": "thread/resume",
                     "params": {
                         "threadId": session_id,
+                        "excludeTurns": true,
                         "cwd": cwd,
                         "approvalPolicy": "never",
                         "sandbox": "read-only",
@@ -1951,16 +1957,29 @@ async fn handle_response(
                             .ok();
                     }
                     Some(SessionLaunch::Resume { .. }) => {
-                        events
-                            .send(CodexEvent::SessionRestored {
+                        // An app-server that ignores `excludeTurns` already sent the history.
+                        let thread = message
+                            .pointer("/result/thread")
+                            .cloned()
+                            .unwrap_or_else(|| json!({}));
+                        if thread["turns"]
+                            .as_array()
+                            .is_some_and(|turns| !turns.is_empty())
+                        {
+                            events
+                                .send(CodexEvent::SessionRestored { session_id, thread })
+                                .await
+                                .ok();
+                        } else {
+                            return history::start(
+                                history::HistoryPurpose::Resume { model_info },
                                 session_id,
-                                thread: message
-                                    .pointer("/result/thread")
-                                    .cloned()
-                                    .unwrap_or_else(|| json!({})),
-                            })
-                            .await
-                            .ok();
+                                input,
+                                pending,
+                                next_id,
+                            )
+                            .await;
+                        }
                     }
                     Some(SessionLaunch::Continue {
                         source_session_id,
@@ -2038,6 +2057,7 @@ async fn handle_response(
         }
         Pending::Model(_) => unreachable!("model responses are handled separately"),
         Pending::Sessions(_) => unreachable!("session-list responses are handled separately"),
+        Pending::History(_) => unreachable!("history pages are handled separately"),
         Pending::SessionPreview { .. } => {
             unreachable!("session-preview responses are handled separately")
         }
@@ -2125,6 +2145,7 @@ async fn send_pending_failure(
         | Pending::Start { request } => Some(request),
         Pending::Model(_)
         | Pending::Sessions(_)
+        | Pending::History(_)
         | Pending::SessionPreview { .. }
         | Pending::ContinueRead { .. }
         | Pending::ContinueInject { .. }
@@ -2139,6 +2160,7 @@ async fn send_pending_failure(
         Pending::Turn { session_id } | Pending::Interrupt { session_id, .. } => session_id,
         Pending::Model(_)
         | Pending::Sessions(_)
+        | Pending::History(_)
         | Pending::SessionPreview { .. }
         | Pending::ContinueRead { .. }
         | Pending::ContinueInject { .. }
@@ -2997,21 +3019,78 @@ async fn request(
     .context("Codex app-server setup timed out")?
 }
 
+/// One newline-delimited app-server frame.
+enum Frame {
+    Message(Value),
+    /// A frame over the size limit, skipped without buffering the rest of it.
+    /// `id` comes from its opening bytes, so the request it answers can fail
+    /// alone instead of taking the whole connection down.
+    Oversized {
+        id: Option<Value>,
+        bytes: usize,
+    },
+}
+
 async fn read_message(reader: &mut (impl AsyncBufReadExt + Unpin)) -> Result<Option<Value>> {
+    match read_frame(reader).await? {
+        None => Ok(None),
+        Some(Frame::Message(message)) => Ok(Some(message)),
+        Some(Frame::Oversized { .. }) => anyhow::bail!("Codex app-server frame exceeds the limit"),
+    }
+}
+
+async fn read_frame(reader: &mut (impl AsyncBufReadExt + Unpin)) -> Result<Option<Frame>> {
     let mut line = Vec::new();
-    let bytes = reader
+    let bytes = (&mut *reader)
         .take((APP_FRAME_BYTES + 1) as u64)
         .read_until(b'\n', &mut line)
         .await?;
     if bytes == 0 {
         return Ok(None);
     }
+    if line.last() == Some(&b'\n') {
+        line.pop();
+        return Ok(Some(Frame::Message(serde_json::from_slice(&line)?)));
+    }
     anyhow::ensure!(
-        line.len() <= APP_FRAME_BYTES && line.last() == Some(&b'\n'),
-        "Codex app-server frame exceeds the limit"
+        line.len() > APP_FRAME_BYTES,
+        "Codex app-server stopped in the middle of a frame"
     );
-    line.pop();
-    Ok(Some(serde_json::from_slice(&line)?))
+    let id = frame_id(&line);
+    let mut bytes = line.len();
+    drop(line);
+    loop {
+        let available = reader.fill_buf().await?;
+        anyhow::ensure!(
+            !available.is_empty(),
+            "Codex app-server stopped in the middle of a frame"
+        );
+        if let Some(end) = available.iter().position(|byte| *byte == b'\n') {
+            reader.consume(end + 1);
+            bytes += end;
+            return Ok(Some(Frame::Oversized { id, bytes }));
+        }
+        let length = available.len();
+        reader.consume(length);
+        bytes += length;
+    }
+}
+
+/// Reads the id of a frame that starts with one, as app-server responses do.
+fn frame_id(prefix: &[u8]) -> Option<Value> {
+    let rest = prefix.strip_prefix(br#"{"id":"#)?;
+    serde_json::Deserializer::from_slice(rest)
+        .into_iter::<Value>()
+        .next()?
+        .ok()
+        .filter(|id| id.is_string() || id.is_number())
+}
+
+fn frame_too_large_message(bytes: usize) -> String {
+    format!(
+        "Codex sent a {:.1} MiB response, more than Red reads at once",
+        bytes as f64 / (1024.0 * 1024.0)
+    )
 }
 
 async fn write_message(writer: &mut (impl AsyncWrite + Unpin), message: &Value) -> Result<()> {
@@ -3317,6 +3396,36 @@ mod tests {
         let retry: Value = serde_json::from_slice(&output).unwrap();
         assert_eq!(retry["method"], "turn/interrupt");
         assert_eq!(retry["params"]["turnId"], "turn");
+    }
+
+    #[tokio::test]
+    async fn oversized_frames_are_skipped_and_keep_their_request_id() {
+        let mut stream = Vec::new();
+        stream.extend_from_slice(br#"{"id":"red-7","result":{"data":""#);
+        stream.extend(std::iter::repeat_n(b'x', APP_FRAME_BYTES + 10));
+        stream.extend_from_slice(b"\"}}\n");
+        stream.extend_from_slice(br#"{"method":"note","params":""#);
+        stream.extend(std::iter::repeat_n(b'y', APP_FRAME_BYTES));
+        stream.extend_from_slice(b"\"}\n");
+        stream.extend_from_slice(b"{\"id\":\"red-8\",\"result\":{}}\n");
+        let mut reader = tokio::io::BufReader::new(stream.as_slice());
+
+        match read_frame(&mut reader).await.unwrap() {
+            Some(Frame::Oversized { id, bytes }) => {
+                assert_eq!(id, Some(json!("red-7")));
+                assert!(bytes > APP_FRAME_BYTES);
+            }
+            _ => panic!("expected the oversized response to be skipped"),
+        }
+        assert!(matches!(
+            read_frame(&mut reader).await.unwrap(),
+            Some(Frame::Oversized { id: None, .. })
+        ));
+        match read_frame(&mut reader).await.unwrap() {
+            Some(Frame::Message(message)) => assert_eq!(message["id"], "red-8"),
+            _ => panic!("expected the next frame to be read normally"),
+        }
+        assert!(read_frame(&mut reader).await.unwrap().is_none());
     }
 
     #[tokio::test]
