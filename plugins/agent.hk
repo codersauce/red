@@ -2148,6 +2148,7 @@ fn new_conversation() {
         red::execute("Print", "Wait for the selected Agent session to finish restoring");
         return;
     }
+    resolve_agent_issue();
     reset_model_state();
     red::state_patch(AgentState { resume_hint: "", resume_age: "", interruption_id: "" });
     // The saved thread is about to be forgotten; opening the pane must not

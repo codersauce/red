@@ -31,7 +31,7 @@ fn dialog_text(harness: &mut EditorHarness) -> String {
 }
 
 #[tokio::test]
-async fn message_history_routes_real_keys_through_search_acknowledgement_and_clear() {
+async fn actionable_inbox_routes_real_keys_through_search_and_dismissal() {
     let config: Config = toml::from_str(include_str!("../default_config.toml")).unwrap();
     let mut harness = EditorHarness::with_config_and_size(
         Buffer::new(None, "unchanged buffer".to_string()),
@@ -48,29 +48,45 @@ async fn message_history_routes_real_keys_through_search_acknowledgement_and_cle
     assert!(status.contains("unknown command \"bad-two\""), "{status}");
     assert!(!status.contains(":messages"), "{status}");
 
+    assert_eq!(harness.editor.notifications().records().count(), 0);
+    for key in ["issue-one", "issue-two"] {
+        harness
+            .editor
+            .publish_notification(
+                red::notification::Notice::new(
+                    red::notification::NotificationSource::Editor,
+                    red::notification::Severity::Error,
+                    key,
+                )
+                .with_key(key)
+                .with_details("Retry the operation or discard the pending work"),
+            )
+            .unwrap();
+    }
+
     text(&mut harness, " m").await;
     let dialog = dialog_text(&mut harness);
     assert!(dialog.contains("2 active · 2 retained"), "{dialog}");
-    assert!(dialog.contains("bad-one") && dialog.contains("bad-two"));
+    assert!(dialog.contains("issue-one") && dialog.contains("issue-two"));
 
-    text(&mut harness, "/bad-one").await;
+    text(&mut harness, "/issue-one").await;
     key(&mut harness, KeyCode::Enter).await;
     let dialog = dialog_text(&mut harness);
-    assert!(dialog.contains("bad-one") && !dialog.contains("bad-two"));
+    assert!(dialog.contains("issue-one") && !dialog.contains("issue-two"));
     key(&mut harness, KeyCode::Enter).await;
-    let counts = harness.editor.notifications().counts(Instant::now());
-    assert_eq!((counts.active, counts.total), (1, 2));
+    let counts = harness.editor.notifications().inbox_counts(Instant::now());
+    assert_eq!((counts.active, counts.total), (1, 1));
 
-    key(&mut harness, KeyCode::Char('f')).await;
+    // The dismissed issue is absent even though the search remains active.
     assert!(dialog_text(&mut harness).contains("No matching messages"));
     key(&mut harness, KeyCode::Char('D')).await;
-    let counts = harness.editor.notifications().counts(Instant::now());
+    let counts = harness.editor.notifications().inbox_counts(Instant::now());
     assert_eq!((counts.active, counts.total), (1, 1));
     key(&mut harness, KeyCode::Esc).await;
 
     text(&mut harness, " m").await;
     let dialog = dialog_text(&mut harness);
-    assert!(dialog.contains("bad-two") && !dialog.contains("bad-one"));
+    assert!(dialog.contains("issue-two") && !dialog.contains("issue-one"));
     key(&mut harness, KeyCode::Enter).await;
     key(&mut harness, KeyCode::Char('D')).await;
     assert!(dialog_text(&mut harness).contains("0 active · 0 retained"));

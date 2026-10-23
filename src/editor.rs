@@ -3983,6 +3983,7 @@ pub struct Editor {
     /// Session-local notification records, independent of the legacy display slot.
     notifications: NotificationCenter,
     transient_message: Option<notifications::TransientMessage>,
+    recovery_issue_buffers: HashMap<String, HashSet<BufferId>>,
     /// Explicit user-owned shell jobs and their bounded background output.
     shell_commands: shell_command::ShellCommandState,
     update: update::UpdateState,
@@ -5946,6 +5947,7 @@ impl Editor {
             search_highlights_suppressed: false,
             notifications: NotificationCenter::default(),
             transient_message: None,
+            recovery_issue_buffers: HashMap::new(),
             shell_commands: shell_command::ShellCommandState::default(),
             update: update::UpdateState::default(),
             message_browser: None,
@@ -10199,6 +10201,7 @@ impl Editor {
         };
         match result {
             Ok(message) => {
+                self.resolve_buffer_issues(self.current_buffer().id());
                 self.notify_lsp_saved().await;
                 self.sync_inline_change_summaries();
                 if let Some(file) = self.current_buffer().file.clone() {
@@ -24265,6 +24268,7 @@ impl Editor {
                         self.current_buffer_mut().mark_saved();
                         let id = self.current_buffer().id();
                         self.resolve_external_file_notification(id);
+                        self.resolve_buffer_issues(id);
                         self.set_legacy_message(Some(format!(
                             "{file:?} {}L, {}B read",
                             self.current_buffer().len(),
@@ -26913,6 +26917,7 @@ impl Editor {
         self.sync_to_window();
         let removed_id = self.current_buffer().id();
         self.resolve_external_file_notification(removed_id);
+        self.resolve_buffer_issues(removed_id);
         self.detach_inline_history_buffer(removed_id);
         self.inline_comments
             .retain(|comment| comment.anchor.buffer_id != removed_id);
@@ -30504,7 +30509,27 @@ impl Editor {
                 self.report_issue("recovery-transcript".into(), "Recovered transcript could not be persisted. Open Agent and export/copy it before closing Red.".into());
             }
         }
+        let mut unique_paths = SnapshotFileIdentities::default();
+        let mut divergent_buffers = HashSet::new();
+        let mut duplicate_buffers = HashSet::new();
+        for (index, saved) in snapshot.buffers.iter().enumerate() {
+            let Some(path) = saved.path.as_deref() else {
+                continue;
+            };
+            let id = self.buffer_manager[index].id();
+            if divergences.iter().any(|divergence| divergence.path == path) {
+                divergent_buffers.insert(id);
+            }
+            if normalized_file_path(path)
+                .ok()
+                .is_some_and(|path| !unique_paths.insert(path))
+            {
+                duplicate_buffers.insert(id);
+            }
+        }
         if !divergences.is_empty() {
+            self.recovery_issue_buffers
+                .insert("recovery-files".into(), divergent_buffers);
             let mut warning = format!(
                 "Recovered unsaved state; {} file(s) changed on disk (see recovery report)",
                 divergences.len()
@@ -30519,6 +30544,8 @@ impl Editor {
             self.report_issue("recovery-files".into(), format!("{warning}. Compare the recovered buffers with disk, then save or discard them."));
         }
         if duplicate_file_count > 0 {
+            self.recovery_issue_buffers
+                .insert("recovery-duplicates".into(), duplicate_buffers);
             let warning = format!(
                 "Recovered {duplicate_file_count} duplicate file buffer(s) as unnamed buffers to preserve their contents"
             );
@@ -32390,6 +32417,7 @@ impl Editor {
         };
         let saved = match result {
             Ok(message) => {
+                self.resolve_buffer_issues(buffer_id);
                 self.set_notification_message(
                     if warning.is_some() {
                         Severity::Warning
@@ -32668,6 +32696,7 @@ impl Editor {
             Ok(msg) => {
                 let id = self.current_buffer().id();
                 self.resolve_external_file_notification(id);
+                self.resolve_buffer_issues(id);
                 let severity = if format_warning.is_some() {
                     Severity::Warning
                 } else {
@@ -32817,6 +32846,7 @@ impl Editor {
             Ok(msg) => {
                 let id = self.current_buffer().id();
                 self.resolve_external_file_notification(id);
+                self.resolve_buffer_issues(id);
                 let severity = if format_warning.is_some() {
                     Severity::Warning
                 } else {

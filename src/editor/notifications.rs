@@ -429,6 +429,25 @@ impl Editor {
         true
     }
 
+    /// A successful write or deliberate discard handles the buffer's outstanding work.
+    pub(super) fn resolve_buffer_issues(&mut self, id: super::BufferId) {
+        self.resolve_issue(
+            &NotificationSource::Editor,
+            &format!("save:{}", id.as_u64()),
+        );
+        let mut resolved = Vec::new();
+        for (key, buffers) in &mut self.recovery_issue_buffers {
+            buffers.remove(&id);
+            if buffers.is_empty() {
+                resolved.push(key.clone());
+            }
+        }
+        for key in resolved {
+            self.recovery_issue_buffers.remove(&key);
+            self.resolve_issue(&NotificationSource::Editor, &key);
+        }
+    }
+
     pub(super) fn sync_persistent_notifications(&mut self) {
         let resolved: Vec<_> = self
             .notifications
@@ -444,7 +463,7 @@ impl Editor {
                 (!self
                     .buffer_manager
                     .iter()
-                    .any(|buffer| buffer.id().as_u64() == raw && buffer.is_dirty()))
+                    .any(|buffer| buffer.id().as_u64() == raw))
                 .then_some(record.id)
             })
             .collect();
@@ -904,6 +923,72 @@ mod tests {
         editor.sync_persistent_notifications();
         assert_eq!(editor.notifications.inbox_counts(Instant::now()).total, 0);
         assert_eq!(std::fs::read_to_string(target).unwrap(), "unsaved hello");
+    }
+
+    #[tokio::test]
+    async fn clean_buffer_failed_save_as_stays_until_success() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut editor = editor(100, 24);
+        editor.current_buffer_mut().mark_saved();
+        editor
+            .test_execute_production_action(Action::SaveAs(
+                dir.path().to_string_lossy().into_owned(),
+            ))
+            .await
+            .unwrap();
+        assert!(!editor.current_buffer().is_dirty());
+        editor.sync_persistent_notifications();
+        assert_eq!(editor.notifications.inbox_counts(Instant::now()).total, 1);
+        editor
+            .test_execute_production_action(Action::SaveAs(
+                dir.path().join("saved.txt").to_string_lossy().into_owned(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(editor.notifications.inbox_counts(Instant::now()).total, 0);
+    }
+
+    #[tokio::test]
+    async fn recovered_buffers_resolve_only_after_every_buffer_is_handled() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("original.txt");
+        std::fs::write(&path, "original").unwrap();
+        let mut source = editor(100, 24);
+        source.current_buffer_mut().file = Some(path.to_string_lossy().into_owned());
+        source.buffer_manager.push_buffer(Buffer::new(
+            Some(path.to_string_lossy().into_owned()),
+            "duplicate".into(),
+        ));
+        let snapshot = source.test_session_snapshot();
+        std::fs::write(&path, "changed externally").unwrap();
+        let mut recovered = editor(100, 24);
+        recovered.buffer_manager = crate::editor::buffer_manager::BufferManager::with_buffers(
+            Editor::buffers_from_session_snapshot(&snapshot),
+        );
+        recovered.restore_session_snapshot(&snapshot).unwrap();
+        assert_eq!(
+            recovered.notifications.inbox_counts(Instant::now()).total,
+            2
+        );
+        recovered
+            .test_execute_production_action(Action::SaveAs(
+                dir.path().join("first.txt").to_string_lossy().into_owned(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            recovered.notifications.inbox_counts(Instant::now()).total,
+            2
+        );
+        recovered.buffer_manager.set_active_index(1);
+        recovered
+            .test_execute_production_action(Action::DeleteBuffer(true))
+            .await
+            .unwrap();
+        assert_eq!(
+            recovered.notifications.inbox_counts(Instant::now()).total,
+            0
+        );
     }
 
     #[test]

@@ -10698,6 +10698,10 @@ mod tests {
         runtime.execute_command("AgentNew").await.unwrap();
         core_settle(&mut runtime).await;
         let requests = collect_requests();
+        assert!(requests.iter().any(|request| matches!(request,
+            PluginRequest::Action(Action::ResolveIssue { owner, key })
+            if owner == "agent" && key == "agent:saved-thread"
+        )));
         assert!(
             !requests
                 .iter()
