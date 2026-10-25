@@ -14192,7 +14192,14 @@ impl Editor {
                 .handle_resolved_key_action(&ev, &action, buffer, runtime)
                 .await;
             self.defer_motion_render = was_deferring;
-            let should_quit = result?;
+            let should_quit = match result {
+                Err(error) if error.is::<crate::lsp::LspError>() => {
+                    self.report_lsp_failure("editor command", &error);
+                    self.render(buffer)?;
+                    false
+                }
+                result => result?,
+            };
             drop(action_span);
             if should_quit {
                 self.finish_semantic_change_event();
@@ -26823,13 +26830,13 @@ impl Editor {
         let file = self.buffer_manager[index].file.clone();
         if self.config.lsp.enabled {
             if let Some(file) = &file {
-                self.ensure_buffer_lsp_opened(index).await?;
-                let snapshot = self.buffer_manager[index].contents_snapshot();
-                if let Some(change) = self.lsp_coordinator.pending_change(id, revision, snapshot) {
-                    self.lsp.did_change_edits(file, change).await?;
-                } else {
-                    let contents = self.buffer_manager[index].contents();
-                    self.lsp.did_change(file, contents).await?;
+                match self.sync_buffer_lsp_change(index, file).await {
+                    Err(error) if error.is::<crate::lsp::LspError>() => {
+                        // The buffer has already changed. Finish publishing it to
+                        // plugins even when the language server cannot receive it.
+                        self.report_lsp_failure("sync document", &error);
+                    }
+                    result => result?,
                 }
             }
         }
@@ -26853,6 +26860,21 @@ impl Editor {
             .notify(runtime, "buffer:changed", buffer_info)
             .await?;
         self.lsp_coordinator.record_notified_revision(id, revision);
+        Ok(())
+    }
+
+    async fn sync_buffer_lsp_change(&mut self, index: usize, file: &str) -> anyhow::Result<()> {
+        self.ensure_buffer_lsp_opened(index).await?;
+        let source = &self.buffer_manager[index];
+        if let Some(change) = self.lsp_coordinator.pending_change(
+            source.id(),
+            source.revision(),
+            source.contents_snapshot(),
+        ) {
+            self.lsp.did_change_edits(file, change).await?;
+        } else {
+            self.lsp.did_change(file, source.contents()).await?;
+        }
         Ok(())
     }
 
@@ -27024,21 +27046,21 @@ impl Editor {
     async fn request_diagnostics(&mut self) -> anyhow::Result<()> {
         if let Some(uri) = self.current_buffer().uri()? {
             if let Err(error) = self.ensure_current_buffer_lsp_opened().await {
-                self.report_diagnostics_lsp_failure("open document", &error);
+                self.report_lsp_failure("open document", &error);
                 return Ok(());
             }
             if let Err(error) = self.lsp.request_diagnostics(&uri).await {
-                self.report_diagnostics_lsp_failure("request diagnostics", &error);
+                self.report_lsp_failure("request diagnostics", &error);
             }
         }
         Ok(())
     }
 
-    fn report_diagnostics_lsp_failure(&mut self, operation: &str, error: &dyn std::fmt::Display) {
+    fn report_lsp_failure(&mut self, operation: &str, error: &dyn std::fmt::Display) {
         log!(
             "{}",
             json!({
-                "event": "lsp_diagnostics_unavailable",
+                "event": "lsp_unavailable",
                 "level": "warn",
                 "service": "red",
                 "operation": operation,

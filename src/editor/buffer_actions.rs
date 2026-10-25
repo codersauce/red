@@ -115,7 +115,7 @@ impl Editor {
                     .sync_lsp_document_identity(previous_uri.as_deref(), index)
                     .await
                 {
-                    self.report_diagnostics_lsp_failure("rename document", &error);
+                    self.report_lsp_failure("rename document", &error);
                 } else {
                     self.set_legacy_message(Some(format!("{file:?}")));
                 }

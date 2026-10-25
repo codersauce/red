@@ -7452,6 +7452,106 @@ async fn delete_word_action_preserves_line_breaks_and_deletes_through_eof() {
 }
 
 #[tokio::test]
+async fn joining_lines_survives_lsp_sync_failure_and_remains_undoable() {
+    for (lsp, failure) in [
+        (RecordingLsp::failing_next_did_open(), "didOpen"),
+        (RecordingLsp::failing_next_did_change(), "didChange"),
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("AGENTS.md");
+        let contents = "alpha\nbeta\ngamma\ndelta\n";
+        fs::write(&path, contents).unwrap();
+        let mut config = default_key_config();
+        config.formatting.on_save = false;
+        let mut editor = Editor::test_with_size(
+            Box::new(lsp),
+            80,
+            24,
+            config,
+            Theme::default(),
+            vec![Buffer::new(
+                Some(path.to_string_lossy().into_owned()),
+                contents.to_string(),
+            )],
+        )
+        .unwrap();
+        editor.test_disable_terminal_output();
+        let mut harness = EditorHarness { editor };
+
+        type_normal_keys(&mut harness, "J").await;
+
+        harness.assert_buffer_contents("alpha beta\ngamma\ndelta\n");
+        assert!(harness.editor.test_current_buffer().is_dirty());
+        assert!(harness.editor.test_last_error().is_some_and(|error| {
+            error.contains("Language server unavailable") && error.contains(failure)
+        }));
+
+        type_normal_keys(&mut harness, "j.").await;
+        harness.assert_buffer_contents("alpha beta\ngamma delta\n");
+        type_normal_keys(&mut harness, "uu").await;
+        harness.assert_buffer_contents(contents);
+        type_normal_keys(&mut harness, "J").await;
+        harness.assert_buffer_contents("alpha beta\ngamma\ndelta\n");
+        harness
+            .editor
+            .test_execute_production_action(Action::Save)
+            .await
+            .unwrap();
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "alpha beta\ngamma\ndelta\n"
+        );
+        assert!(!harness.editor.test_current_buffer().is_dirty());
+    }
+}
+
+#[tokio::test]
+async fn unavailable_markdown_lsp_does_not_abort_commands_or_later_edits() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("AGENTS.md");
+    fs::write(&path, "alpha\nbeta\n").unwrap();
+    let mut config = default_key_config();
+    config.formatting.on_save = false;
+    config.lsp.servers.get_mut("markdown").unwrap().command = directory
+        .path()
+        .join("missing-language-server")
+        .to_string_lossy()
+        .into_owned();
+    let lsp = red::lsp::LspManager::new(config.lsp.clone());
+    let mut editor = Editor::test_with_size(
+        Box::new(lsp),
+        80,
+        24,
+        config,
+        Theme::default(),
+        vec![Buffer::new(
+            Some(path.to_string_lossy().into_owned()),
+            "alpha\nbeta\n".to_string(),
+        )],
+    )
+    .unwrap();
+    editor.test_disable_terminal_output();
+    let mut harness = EditorHarness { editor };
+
+    for keys in ["K", "gd"] {
+        type_normal_keys(&mut harness, keys).await;
+        assert!(harness
+            .editor
+            .test_last_error()
+            .is_some_and(|error| error.contains("language server unavailable")));
+        harness.assert_buffer_contents("alpha\nbeta\n");
+    }
+    type_normal_keys(&mut harness, "J").await;
+    harness.assert_buffer_contents("alpha beta\n");
+    harness
+        .editor
+        .test_execute_production_action(Action::Save)
+        .await
+        .unwrap();
+    assert_eq!(fs::read_to_string(&path).unwrap(), "alpha beta\n");
+}
+
+#[tokio::test]
 async fn test_join_lines() {
     for (contents, keys, expected, cursor) in [
         ("alpha\n    beta", "J", "alpha beta", (5, 0)),
