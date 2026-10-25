@@ -1943,6 +1943,17 @@ mod test {
             .unwrap();
 
         tokio::time::timeout(Duration::from_secs(10), async {
+            // Pipe EOF can precede the child's exit status becoming available.
+            // This test expects the exit report, so wait for the process as well
+            // as the readers before polling the client.
+            let status = client
+                .child
+                .as_mut()
+                .expect("real LSP client must own its child process")
+                .wait()
+                .await
+                .unwrap();
+            assert_eq!(status.code(), Some(23));
             loop {
                 let process_monitor = client
                     .process_monitor
@@ -1957,7 +1968,7 @@ mod test {
             }
         })
         .await
-        .expect("exited language server pipes must close");
+        .expect("language server must exit and its pipes must close");
 
         let (message, method) = tokio::time::timeout(Duration::from_secs(10), async {
             loop {
@@ -1973,8 +1984,14 @@ mod test {
             panic!("expected exited server to produce a processing error");
         };
         assert!(method.is_none());
-        assert!(error.to_string().contains("exit status: 23"));
-        assert!(error.to_string().contains("error: husk lsp is unavailable"));
+        assert!(
+            error.to_string().contains("exit status: 23"),
+            "unexpected server failure: {error}"
+        );
+        assert!(
+            error.to_string().contains("error: husk lsp is unavailable"),
+            "missing server stderr: {error}"
+        );
 
         let (message, method) = client.recv_response().await.unwrap().unwrap();
         let InboundMessage::RequestError { id, error } = message else {
