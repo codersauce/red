@@ -70,7 +70,8 @@ impl Editor {
                         | Mode::Visual
                         | Mode::VisualLine
                         | Mode::VisualBlock
-                ) | Action::RepeatLastChange
+                ) | Action::Vimlet { .. }
+                    | Action::RepeatLastChange
                     | Action::SelectNextOccurrence
                     | Action::AddCursorUp
                     | Action::AddCursorDown

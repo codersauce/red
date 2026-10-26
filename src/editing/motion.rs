@@ -68,6 +68,15 @@ struct BoundaryMotion {
     ends_at_buffer: bool,
 }
 
+fn word_motion(destination: vimlet::WordDestination, big_word: bool) -> vimlet::Motion {
+    let class = if big_word {
+        vimlet::WordClass::BigWord
+    } else {
+        vimlet::WordClass::Word
+    };
+    vimlet::Motion::Word { destination, class }
+}
+
 /// Resolve motions against a canonical scalar-coordinate cursor position.
 #[derive(Debug, Clone, Copy)]
 pub struct MotionResolver<'buffer> {
@@ -85,187 +94,36 @@ impl<'buffer> MotionResolver<'buffer> {
     /// Computes the range consumed by `w` or `W`, preserving Vim's `cw` semantics.
     #[must_use]
     pub fn word_range(&self, count: u16, change_word: bool, big_word: bool) -> Option<TextRange> {
-        if count > 0 && self.buffer.is_ascii() {
-            return self.ascii_word_range(count, change_word, big_word);
-        }
-        let start = self.cursor;
-        let start_index = self.buffer.position_to_char_idx(start);
-        let snapshot = self.buffer.contents_snapshot();
-        let contents = snapshot.slice(start_index..).to_string();
-        let characters = contents.chars().collect::<Vec<_>>();
-        let mut end = 0;
-        characters.get(end)?;
-        let word_kind = |character: char| {
-            if character.is_whitespace() {
-                0
-            } else if big_word || character.is_alphanumeric() || character == '_' {
-                1
-            } else {
-                2
-            }
-        };
-        let word_kinds = contents
-            .graphemes(true)
-            .flat_map(|grapheme| {
-                let kind = word_kind(grapheme.chars().next().unwrap_or_default());
-                grapheme.chars().map(move |_| kind)
-            })
-            .collect::<Vec<_>>();
-        let preserve_trailing_whitespace = change_word
-            && characters
-                .get(end)
-                .is_some_and(|character| !character.is_whitespace());
-
-        for index in 0..count {
-            let Some(&character) = characters.get(end) else {
-                break;
-            };
-            let final_motion = index + 1 == count;
-            if matches!(character, '\r' | '\n') {
-                if final_motion && (change_word || (!big_word && index > 0)) {
-                    break;
-                }
-                end += 1;
-                if character == '\r' && characters.get(end) == Some(&'\n') {
-                    end += 1;
-                }
-                if !final_motion {
-                    while characters
-                        .get(end)
-                        .is_some_and(|next| next.is_whitespace() && !matches!(next, '\r' | '\n'))
-                    {
-                        end += 1;
-                    }
-                }
-                continue;
-            }
-
-            let kind = word_kinds[end];
-            while word_kinds.get(end) == Some(&kind)
-                && characters
-                    .get(end)
-                    .is_some_and(|next| !matches!(next, '\r' | '\n'))
-            {
-                end += 1;
-            }
-            if !preserve_trailing_whitespace || index + 1 < count {
-                while characters
-                    .get(end)
-                    .is_some_and(|&next| next.is_whitespace() && !matches!(next, '\r' | '\n'))
-                {
-                    end += 1;
-                }
-                if !final_motion {
-                    if change_word {
-                        while characters.get(end).is_some_and(|next| next.is_whitespace()) {
-                            end += 1;
-                        }
-                    } else if let Some(&line_ending @ ('\r' | '\n')) = characters.get(end) {
-                        end += 1;
-                        if line_ending == '\r' && characters.get(end) == Some(&'\n') {
-                            end += 1;
-                        }
-                        while characters.get(end).is_some_and(|next| {
-                            next.is_whitespace() && !matches!(next, '\r' | '\n')
-                        }) {
-                            end += 1;
-                        }
-                    }
-                }
-            }
-        }
-
-        let end = self.buffer.char_idx_to_position(start_index + end);
-        (start != end || change_word).then(|| TextRange::new(start, end))
+        self.word_operator_range(count, change_word, big_word)
+            .map(|(range, _)| range)
     }
 
-    fn ascii_word_range(&self, count: u16, change_word: bool, big_word: bool) -> Option<TextRange> {
-        let start = self.cursor;
-        let start_index = self.buffer.position_to_char_idx(start);
-        let snapshot = self.buffer.contents_snapshot();
-        let mut characters = snapshot.chars_at(start_index).peekable();
-        let first = *characters.peek()?;
-        let mut length = 0;
-        let preserve_trailing_whitespace = change_word && !first.is_whitespace();
-        let kind = |character: char| {
-            if character.is_whitespace() {
-                0
-            } else if big_word || character.is_alphanumeric() || character == '_' {
-                1
-            } else {
-                2
-            }
+    pub(crate) fn word_operator_range(
+        &self,
+        count: u16,
+        change_word: bool,
+        big_word: bool,
+    ) -> Option<(TextRange, bool)> {
+        let rope = self.buffer.contents_snapshot();
+        let resolver = vimlet::MotionResolver::new(
+            &rope,
+            vimlet::ByteOffset(self.buffer.position_to_byte_idx(self.cursor)),
+        );
+        let motion = word_motion(vimlet::WordDestination::NextStart, big_word);
+        let operator = if change_word {
+            vimlet::Operator::Change
+        } else {
+            vimlet::Operator::Delete
         };
-
-        for index in 0..count {
-            let Some(&character) = characters.peek() else {
-                break;
-            };
-            let final_motion = index + 1 == count;
-            if matches!(character, '\r' | '\n') {
-                if final_motion && (change_word || (!big_word && index > 0)) {
-                    break;
-                }
-                characters.next();
-                length += 1;
-                if character == '\r' && characters.peek() == Some(&'\n') {
-                    characters.next();
-                    length += 1;
-                }
-                if !final_motion {
-                    while characters
-                        .peek()
-                        .is_some_and(|next| next.is_whitespace() && !matches!(next, '\r' | '\n'))
-                    {
-                        characters.next();
-                        length += 1;
-                    }
-                }
-                continue;
-            }
-
-            let current_kind = kind(character);
-            while characters
-                .peek()
-                .is_some_and(|next| !matches!(next, '\r' | '\n') && kind(*next) == current_kind)
-            {
-                characters.next();
-                length += 1;
-            }
-            if !preserve_trailing_whitespace || !final_motion {
-                while characters
-                    .peek()
-                    .is_some_and(|next| next.is_whitespace() && !matches!(next, '\r' | '\n'))
-                {
-                    characters.next();
-                    length += 1;
-                }
-                if !final_motion {
-                    if change_word {
-                        while characters.peek().is_some_and(char::is_ascii_whitespace) {
-                            characters.next();
-                            length += 1;
-                        }
-                    } else if let Some(&line_ending @ ('\r' | '\n')) = characters.peek() {
-                        characters.next();
-                        length += 1;
-                        if line_ending == '\r' && characters.peek() == Some(&'\n') {
-                            characters.next();
-                            length += 1;
-                        }
-                        while characters.peek().is_some_and(|next| {
-                            next.is_whitespace() && !matches!(next, '\r' | '\n')
-                        }) {
-                            characters.next();
-                            length += 1;
-                        }
-                    }
-                }
-            }
-        }
-
-        let end = self.buffer.char_idx_to_position(start_index + length);
-        (start != end || change_word).then(|| TextRange::new(start, end))
+        let target = resolver.operator_range(motion, usize::from(count), operator)?;
+        let range = target.ranges.first()?;
+        Some((
+            TextRange::new(
+                self.buffer.byte_idx_to_position(range.start.0)?,
+                self.buffer.byte_idx_to_position(range.end.0)?,
+            ),
+            target.shape == vimlet::Shape::Line,
+        ))
     }
 
     /// Computes the destination of `w`, `b`, `e`, `ge`, and their WORD variants.
@@ -277,91 +135,22 @@ impl<'buffer> MotionResolver<'buffer> {
         end: bool,
         big_word: bool,
     ) -> Option<TextPosition> {
-        let characters = self.buffer.contents_snapshot();
-        let character_count = characters.len_chars();
-        if character_count == 0 {
-            return None;
-        }
+        use vimlet::WordDestination::{NextEnd, NextStart, PreviousEnd, PreviousStart};
 
-        let word_kind = |character: char| {
-            if character.is_whitespace() {
-                0
-            } else if big_word || character.is_alphanumeric() || character == '_' {
-                1
-            } else {
-                2
-            }
+        let destination = match (backward, end) {
+            (false, false) => NextStart,
+            (false, true) => NextEnd,
+            (true, false) => PreviousStart,
+            (true, true) => PreviousEnd,
         };
-        let mut cursor = self
-            .buffer
-            .position_to_char_idx(self.cursor)
-            .min(character_count.saturating_sub(1));
-        let mut target = None;
-
-        for _ in 0..count {
-            if backward {
-                if end && !characters.char(cursor).is_whitespace() {
-                    let kind = word_kind(characters.char(cursor));
-                    while cursor > 0 && word_kind(characters.char(cursor - 1)) == kind {
-                        cursor -= 1;
-                    }
-                }
-                if cursor == 0 {
-                    break;
-                }
-                cursor -= 1;
-                while cursor > 0 && characters.char(cursor).is_whitespace() {
-                    cursor -= 1;
-                }
-                if characters.char(cursor).is_whitespace() {
-                    break;
-                }
-                let found_end = cursor;
-                let kind = word_kind(characters.char(cursor));
-                while cursor > 0 && word_kind(characters.char(cursor - 1)) == kind {
-                    cursor -= 1;
-                }
-                target = Some(if end { found_end } else { cursor });
-            } else {
-                if characters.char(cursor).is_whitespace() {
-                    while cursor < character_count && characters.char(cursor).is_whitespace() {
-                        cursor += 1;
-                    }
-                } else {
-                    let kind = word_kind(characters.char(cursor));
-                    let mut group_end = cursor;
-                    while group_end + 1 < character_count
-                        && word_kind(characters.char(group_end + 1)) == kind
-                    {
-                        group_end += 1;
-                    }
-                    if end && cursor < group_end {
-                        cursor = group_end;
-                        target = Some(cursor);
-                        continue;
-                    }
-                    cursor = group_end.saturating_add(1);
-                    while cursor < character_count && characters.char(cursor).is_whitespace() {
-                        cursor += 1;
-                    }
-                }
-
-                if cursor >= character_count {
-                    break;
-                }
-                if end {
-                    let kind = word_kind(characters.char(cursor));
-                    while cursor + 1 < character_count
-                        && word_kind(characters.char(cursor + 1)) == kind
-                    {
-                        cursor += 1;
-                    }
-                }
-                target = Some(cursor);
-            }
-        }
-
-        target.map(|index| self.buffer.char_idx_to_position(index))
+        let rope = self.buffer.contents_snapshot();
+        let cursor = vimlet::ByteOffset(self.buffer.position_to_byte_idx(self.cursor));
+        let resolver = vimlet::MotionResolver::new(&rope, cursor);
+        let target = resolver.resolve(word_motion(destination, big_word), usize::from(count))?;
+        let position = resolver.normal_cursor(target.position.0);
+        (position != cursor.0)
+            .then(|| self.buffer.byte_idx_to_position(position))
+            .flatten()
     }
 
     /// Resolves `{` or `}`, treating only genuinely empty lines as paragraph boundaries.

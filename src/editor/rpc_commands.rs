@@ -321,6 +321,12 @@ impl Editor {
         runtime: &mut Runtime,
     ) -> anyhow::Result<bool> {
         self.repeater = None;
+        if matches!(action, KeyAction::Single(Action::RepeatLastChange))
+            && matches!(self.last_semantic_change, Some(SemanticChange::Vimlet))
+        {
+            self.repeat_file_vim(times, buffer, runtime).await?;
+            return Ok(false);
+        }
         for index in 0..times {
             let checkpoint = self.rpc_command_checkpoint();
             if self

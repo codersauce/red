@@ -586,9 +586,13 @@ impl TextArea {
             };
             pos = next;
         }
-        let start = if operator { pos.min(origin) } else { pos };
-        let end = if operator { pos.max(origin) } else { pos };
-        HostOutcome::Target(ResolvedRange::character(start, end))
+        if operator {
+            MotionResolver::new(&text, ByteOffset(origin))
+                .exclusive_range(ByteOffset(pos))
+                .map_or(HostOutcome::Rejected, HostOutcome::Target)
+        } else {
+            HostOutcome::Target(ResolvedRange::character(pos, pos))
+        }
     }
 }
 
