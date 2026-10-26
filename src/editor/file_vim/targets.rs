@@ -170,6 +170,20 @@ impl Editor {
         let [prefix, key] = id.to_be_bytes();
         let key = char::from(key);
         let (range, shape) = match prefix {
+            b'g' if key == 'c' => {
+                let Some(range) = self.comment_text_object_range() else {
+                    return HostOutcome::Rejected;
+                };
+                (range, Shape::Line)
+            }
+            b'%' => {
+                let Some(range) = self.matchit_motion_range(crate::editor::MatchDirection::Forward)
+                else {
+                    self.set_routine_warning(Some("match not found".into()));
+                    return HostOutcome::Rejected;
+                };
+                (range, Shape::Character)
+            }
             b'[' | b']' => {
                 let Some(kind) = crate::editor::structural_motion_kind(key) else {
                     return HostOutcome::Rejected;

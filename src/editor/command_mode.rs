@@ -158,8 +158,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn command_aliases_do_not_steal_editor_text_or_find_targets() {
+    #[tokio::test]
+    async fn command_aliases_do_not_steal_editor_text_or_find_targets() {
         let mut editor = editor();
         editor.mode = Mode::Insert;
         assert_eq!(
@@ -167,14 +167,21 @@ mod tests {
             Some(KeyAction::Single(Action::InsertCharAtCursorPos(';')))
         );
         editor.mode = Mode::Normal;
-        dispatch(&mut editor, KeyCode::Char('f'));
-        assert_eq!(
-            dispatch(&mut editor, KeyCode::Char(';')),
-            Some(KeyAction::Single(Action::FindCharForward {
-                target: ';',
-                count: 1
-            }))
-        );
+        let mut frame = RenderBuffer::new(80, 24, &Style::default());
+        let mut runtime = Runtime::new();
+        for character in ['f', ';'] {
+            editor
+                .process_editor_event(
+                    key(KeyCode::Char(character)),
+                    &mut frame,
+                    &mut runtime,
+                    EventRenderMode::Immediate,
+                )
+                .await
+                .unwrap();
+        }
+        assert_eq!(editor.mode, Mode::Normal);
+        assert_eq!(editor.cx, 3);
         editor.mode = Mode::Command;
         assert_eq!(dispatch(&mut editor, KeyCode::Char(';')), None);
         assert_eq!(editor.command, ";");

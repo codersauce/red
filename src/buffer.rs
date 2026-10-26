@@ -925,25 +925,6 @@ impl Buffer {
         self.last_navigable_line() + 1
     }
 
-    /// Reports whether a logical line contains only its LF or CRLF terminator.
-    ///
-    /// Whitespace-only lines remain nonempty, matching Vim paragraph semantics.
-    pub(crate) fn line_is_empty(&self, line: usize) -> bool {
-        self.content
-            .get_line(line)
-            .is_some_and(Self::line_slice_is_empty)
-    }
-
-    /// Checks one borrowed rope line without allocating or flattening its text.
-    pub(crate) fn line_slice_is_empty(line: RopeSlice<'_>) -> bool {
-        match line.len_chars() {
-            0 => true,
-            1 => matches!(line.char(0), '\n' | '\r'),
-            2 => line.char(0) == '\r' && line.char(1) == '\n',
-            _ => false,
-        }
-    }
-
     /// Returns true if the buffer is empty
     pub fn is_empty(&self) -> bool {
         self.content.len_bytes() == 0
@@ -2347,15 +2328,17 @@ mod test {
     }
 
     #[test]
-    fn empty_line_checks_distinguish_crlf_from_whitespace_and_missing_lines() {
+    fn paragraph_motion_skips_whitespace_only_crlf_lines() {
         let buffer = Buffer::new(None, "alpha\r\n\r\n  \r\n\n終わり".to_string());
-
-        assert!(!buffer.line_is_empty(0));
-        assert!(buffer.line_is_empty(1));
-        assert!(!buffer.line_is_empty(2));
-        assert!(buffer.line_is_empty(3));
-        assert!(!buffer.line_is_empty(4));
-        assert!(!buffer.line_is_empty(5));
+        let motion = crate::editing::MotionResolver::new(&buffer, TextPosition::new(0, 0));
+        assert_eq!(
+            motion.paragraph_target(1, false),
+            Some(TextPosition::new(1, 0))
+        );
+        assert_eq!(
+            motion.paragraph_target(2, false),
+            Some(TextPosition::new(3, 0))
+        );
     }
 
     #[test]
