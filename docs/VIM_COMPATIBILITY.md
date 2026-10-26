@@ -1,6 +1,6 @@
 # Red Vim compatibility matrix
 
-**Matrix version:** 1.10
+**Matrix version:** 1.11
 **Tracked against:** Red v0.8.0
 **Status vocabulary:** **supported**, **intentional difference**, **not yet supported**
 
@@ -38,6 +38,7 @@ the corresponding integration tests.
 | Count before dot | **supported** | `N.` replays the completed change N times. A failed/no-op change does not replace the previous definition. |
 | Dot after confirmed substitute | **not yet supported** | The substitute is undoable as one transaction, but confirmation answers are not a reusable dot recipe. |
 | Macro record/play | **supported** | `q{register}`, `@{register}`, `@@`, counts, uppercase append, and recursion/instruction limits. |
+| Macro playback across an RPC | **supported** | Playback resumes after the command completes. Nested calls and counts share the same limit of 10,000 keys across waits. New user input cancels the remaining keys and mapped actions. Red also discards them if the active buffer or its revision differs at completion. |
 | Macro inspection/editing | **supported** | `:registers` lists notation; `:register {name} {key-notation}` validates and replaces it. |
 | Macro event policy | **intentional difference** | Only normalized key press/repeat events are recorded. Mouse, paste, resize, focus, plugin callbacks, LSP messages, and other asynchronous/background events are ignored, so playback is deterministic. |
 

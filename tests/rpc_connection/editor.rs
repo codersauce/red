@@ -211,6 +211,9 @@ pub(super) async fn run() -> Result<()> {
     vimlet_change_resumes_after_rpc_or_cancels_on_new_input()
         .await
         .context("file change in a suspended macro")?;
+    macro_tail_is_discarded_after_rpc_edits_the_buffer()
+        .await
+        .context("stale macro after plugin edit")?;
     nested_macro_keeps_its_recursion_limit()
         .await
         .context("nested macro budget")?;
@@ -562,6 +565,32 @@ async fn vimlet_change_resumes_after_rpc_or_cancels_on_new_input() -> Result<()>
     Ok(())
 }
 
+async fn macro_tail_is_discarded_after_rpc_edits_the_buffer() -> Result<()> {
+    let mut h = Harness::new(KeyAction::Multiple(vec![
+        Action::PluginCommand("RpcEdit".into()),
+        Action::InsertString("stale mapping".into()),
+    ]))
+    .await?;
+    h.command("register b Qistale macro<Esc>").await?;
+    h.command("register a @bistale outer<Esc>").await?;
+    h.text("2@a").await?;
+    h.until(|h| h.marker("started", 1).exists()).await?;
+    h.release(1)?;
+    h.until(|h| {
+        h.screen()
+            .contains("macro stopped because the document changed")
+    })
+    .await?;
+    assert!(
+        h.document_screen().contains("plugin-hello"),
+        "{}",
+        h.screen()
+    );
+    assert!(!h.document_screen().contains("stale"), "{}", h.screen());
+    assert!(!h.marker("started", 2).exists());
+    Ok(())
+}
+
 async fn nested_macro_keeps_its_recursion_limit() -> Result<()> {
     let mut h = Harness::new(KeyAction::Multiple(vec![
         Action::PluginCommand("RpcWait".into()),
@@ -720,14 +749,14 @@ async fn nested_macro_events_survive_a_second_wait() -> Result<()> {
     .await?;
     h.command("register b iB<Esc>").await?;
     h.command("register a QiA<Esc>").await?;
-    h.text("@a").await?;
-    for index in 1..=2 {
+    h.text("2@a").await?;
+    for index in 1..=4 {
         h.until(|h| h.marker("started", index).exists()).await?;
         h.release(index)?;
     }
-    h.until(|h| h.marker("done", 2).exists() && !h.core.test_rpc_command_pending("slow"))
+    h.until(|h| h.marker("done", 4).exists() && !h.core.test_rpc_command_pending("slow"))
         .await?;
-    assert!(h.screen().contains("ABhello"), "{}", h.screen());
+    assert!(h.screen().contains("ABABhello"), "{}", h.screen());
     Ok(())
 }
 

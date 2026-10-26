@@ -899,7 +899,7 @@ mod tests {
             .is_err());
         assert_eq!(h.editor.edit_batch.depth, 0);
         assert_eq!(h.editor.edit_batch.suspended, 0);
-        assert_eq!(h.editor.macro_replay_depth, 0);
+        assert!(h.editor.macro_playback.is_none());
         assert!(h.editor.edit_batch.changed.is_empty());
         h.keys("iY\u{1b}").await;
         assert!(h.editor.current_buffer().contents().starts_with("Yx"));

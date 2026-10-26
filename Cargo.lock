@@ -3576,7 +3576,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 [[package]]
 name = "vimlet"
 version = "0.1.0"
-source = "git+https://github.com/codersauce/vimlet.git?rev=db0101aed155b2197ee84fe12af94938be9e3636#db0101aed155b2197ee84fe12af94938be9e3636"
+source = "git+https://github.com/codersauce/vimlet.git?rev=9c6bc7823d9c1045458163d956f204fbc2bd0763#9c6bc7823d9c1045458163d956f204fbc2bd0763"
 dependencies = [
  "ropey",
  "unicode-segmentation",

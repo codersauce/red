@@ -263,9 +263,9 @@ fn keyboard_repeat_drain_excludes_counts_operators_and_macro_state() {
     });
     assert!(!editor.should_drain_repeated_motion(&key('j'), &motion));
     editor.macro_recording = None;
-    editor.macro_replay_depth = 1;
+    editor.macro_playback = Some(vimlet::MacroPlayback::default());
     assert!(!editor.should_drain_repeated_motion(&key('j'), &motion));
-    editor.macro_replay_depth = 0;
+    editor.macro_playback = None;
     editor.replaying_semantic_change = true;
     assert!(!editor.should_drain_repeated_motion(&key('j'), &motion));
 }
