@@ -8,18 +8,7 @@ use crate::{
     unicode_utils::trim_line_ending,
 };
 
-/// Direction and inclusion policy for Vim's single-character search motions.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CharacterMotion {
-    /// `f{character}` lands on the next matching character.
-    Find,
-    /// `t{character}` lands immediately before the next matching character.
-    Till,
-    /// `F{character}` lands on the previous matching character.
-    FindBackward,
-    /// `T{character}` lands immediately after the previous matching character.
-    TillBackward,
-}
+pub use vimlet::CharacterMotion;
 
 /// Whether a text object includes its surrounding delimiters or whitespace.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
