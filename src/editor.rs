@@ -1094,12 +1094,6 @@ struct MacroRecording {
     events: Vec<Event>,
 }
 
-#[derive(Debug, Clone)]
-struct MacroReplayEvent {
-    event: Event,
-    depth: usize,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 /// Parsed and line-resolved substitute command awaiting execution.
 pub struct SubstituteCommand {
@@ -4055,9 +4049,7 @@ pub struct Editor {
     pending_macro_action: Option<PendingMacroAction>,
     macro_recording: Option<MacroRecording>,
     last_played_macro: Option<char>,
-    macro_replay_depth: usize,
-    macro_instructions_remaining: usize,
-    macro_replay_queue: VecDeque<MacroReplayEvent>,
+    macro_playback: Option<vimlet::MacroPlayback<Event>>,
 
     /// Buffer-local, file-global, and special Vim marks. Anchors use flat Unicode
     /// character coordinates and are transformed at the canonical edit boundary.
@@ -6118,9 +6110,7 @@ impl Editor {
             pending_macro_action: None,
             macro_recording: None,
             last_played_macro: None,
-            macro_replay_depth: 0,
-            macro_instructions_remaining: 0,
-            macro_replay_queue: VecDeque::new(),
+            macro_playback: None,
             pending_mark_action: None,
             local_marks: HashMap::new(),
             global_marks: HashMap::new(),
@@ -15384,7 +15374,7 @@ impl Editor {
             && self.pending_operator.is_none()
             && self.waiting_key_action.is_none()
             && self.macro_recording.is_none()
-            && self.macro_replay_depth == 0
+            && self.macro_playback.is_none()
             && !self.replaying_semantic_change
             && !matches!(action, KeyAction::Repeating(_, _))
             && Self::key_action_is_pure_motion(action)
@@ -15785,6 +15775,7 @@ impl Editor {
     async fn play_macro(
         &mut self,
         register: char,
+        count: u16,
         buffer: &mut RenderBuffer,
         runtime: &mut Runtime,
     ) -> anyhow::Result<()> {
@@ -15792,14 +15783,10 @@ impl Editor {
             self.set_legacy_message(Some("macro register must be a letter or digit".to_string()));
             return Ok(());
         };
-        let depth = self.macro_replay_depth.saturating_add(1);
-        if depth > MACRO_MAX_REPLAY_DEPTH {
-            self.set_legacy_message(Some(format!(
-                "macro recursion limit ({MACRO_MAX_REPLAY_DEPTH}) reached"
-            )));
-            return Ok(());
-        }
         let Some(content) = self.registers.get(&register) else {
+            if let Some(playback) = &mut self.macro_playback {
+                playback.cancel();
+            }
             self.set_legacy_message(Some(format!("macro register @{register} is empty")));
             return Ok(());
         };
@@ -15811,21 +15798,24 @@ impl Editor {
             }
         };
 
-        self.last_played_macro = Some(register);
-
-        for event in events.into_iter().rev() {
-            self.macro_replay_queue
-                .push_front(MacroReplayEvent { event, depth });
-        }
-
-        // A nested @ invocation only expands the active replay queue. The outermost
-        // invocation owns the iterative driver, so self-recursive registers cannot
-        // consume the async call stack before the deterministic limits fire.
-        if self.macro_replay_depth > 0 {
+        let nested = self.macro_playback.is_some();
+        let playback = self.macro_playback.get_or_insert_with(|| {
+            vimlet::MacroPlayback::with_limits(vimlet::Limits {
+                macro_depth: MACRO_MAX_REPLAY_DEPTH,
+                macro_steps: MACRO_MAX_REPLAY_EVENTS,
+                ..vimlet::Limits::default()
+            })
+        });
+        if playback.push(events, usize::from(count)).is_err() {
+            self.set_legacy_message(Some(format!(
+                "macro recursion limit ({MACRO_MAX_REPLAY_DEPTH}) reached"
+            )));
             return Ok(());
         }
-
-        self.macro_instructions_remaining = MACRO_MAX_REPLAY_EVENTS;
+        self.last_played_macro = Some(register);
+        if nested {
+            return Ok(());
+        }
         self.drain_macro_replay(buffer, runtime).await
     }
 
@@ -15835,22 +15825,21 @@ impl Editor {
         runtime: &mut Runtime,
     ) -> anyhow::Result<()> {
         let result = async {
-            while let Some(replay) = self.macro_replay_queue.pop_front() {
+            while let Some(playback) = &mut self.macro_playback {
+                let event = match playback.next_key() {
+                    Ok(Some(event)) => event,
+                    Ok(None) => break,
+                    Err(_) => {
+                        self.set_legacy_message(Some(format!(
+                            "macro instruction limit ({MACRO_MAX_REPLAY_EVENTS}) reached"
+                        )));
+                        break;
+                    }
+                };
                 let checkpoint = self.rpc_command_checkpoint();
-                if self.macro_instructions_remaining == 0 {
-                    self.set_legacy_message(Some(format!(
-                        "macro instruction limit ({MACRO_MAX_REPLAY_EVENTS}) reached"
-                    )));
-                    self.macro_replay_queue.clear();
-                    break;
-                }
-                self.macro_instructions_remaining -= 1;
-                self.macro_replay_depth = replay.depth;
-                if let Some(action) =
-                    self.handle_event_with_runtime(&replay.event, Some(runtime))?
-                {
+                if let Some(action) = self.handle_event_with_runtime(&event, Some(runtime))? {
                     if self
-                        .handle_resolved_key_action(&replay.event, &action, buffer, runtime)
+                        .handle_resolved_key_action(&event, &action, buffer, runtime)
                         .await?
                     {
                         anyhow::bail!("macro attempted to quit the editor");
@@ -15867,8 +15856,7 @@ impl Editor {
             Ok(())
         }
         .await;
-        self.macro_replay_depth = 0;
-        self.macro_replay_queue.clear();
+        self.macro_playback = None;
         result
     }
 
@@ -23414,7 +23402,7 @@ impl Editor {
             }
             Action::PlayMacro(register) => {
                 *add_to_history = false;
-                self.play_macro(*register, buffer, runtime).await?;
+                self.play_macro(*register, 1, buffer, runtime).await?;
             }
             Action::SetMark(mark) => {
                 *add_to_history = false;
@@ -44872,7 +44860,7 @@ builtin = "rust"
         let generation_before_motion = editor.render_generation;
 
         editor
-            .play_macro('a', &mut render_buffer, &mut runtime)
+            .play_macro('a', 1, &mut render_buffer, &mut runtime)
             .await
             .unwrap();
 

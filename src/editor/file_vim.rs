@@ -59,7 +59,7 @@ impl PendingOperator {
 }
 
 impl Editor {
-    fn file_version(&self) -> DocumentVersion {
+    pub(super) fn file_version(&self) -> DocumentVersion {
         let buffer = self.current_buffer();
         DocumentVersion {
             id: buffer.id().as_u64(),

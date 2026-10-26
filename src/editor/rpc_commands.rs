@@ -16,9 +16,7 @@ struct RpcSequence {
 }
 
 struct RpcReplayContext {
-    macro_events: VecDeque<MacroReplayEvent>,
-    macro_depth: usize,
-    macro_budget: usize,
+    playback: Option<(vimlet::DocumentVersion, vimlet::MacroPlayback<Event>)>,
     semantic: bool,
 }
 
@@ -60,17 +58,16 @@ impl RpcCommands {
 impl Editor {
     fn take_rpc_replay_context(&mut self) -> RpcReplayContext {
         RpcReplayContext {
-            macro_events: std::mem::take(&mut self.macro_replay_queue),
-            macro_depth: self.macro_replay_depth,
-            macro_budget: self.macro_instructions_remaining,
+            playback: self
+                .macro_playback
+                .take()
+                .map(|stack| (self.file_version(), stack)),
             semantic: self.replaying_semantic_change,
         }
     }
 
     fn restore_rpc_replay_context(&mut self, context: RpcReplayContext) {
-        self.macro_replay_queue = context.macro_events;
-        self.macro_replay_depth = context.macro_depth;
-        self.macro_instructions_remaining = context.macro_budget;
+        self.macro_playback = context.playback.map(|(_, stack)| stack);
         self.replaying_semantic_change = context.semantic;
     }
 
@@ -179,7 +176,7 @@ impl Editor {
         runtime: &mut Runtime,
     ) -> anyhow::Result<()> {
         if self.rpc_commands.resuming
-            || self.macro_replay_depth > 0
+            || self.macro_playback.is_some()
             || self.replaying_semantic_change
         {
             return Ok(());
@@ -225,6 +222,17 @@ impl Editor {
         buffer: &mut RenderBuffer,
         runtime: &mut Runtime,
     ) -> anyhow::Result<()> {
+        if sequence
+            .replay
+            .playback
+            .as_ref()
+            .is_some_and(|(version, _)| *version != self.file_version())
+        {
+            self.set_legacy_message(Some(
+                "macro stopped because the document changed during RPC".into(),
+            ));
+            return Ok(());
+        }
         let previous = self.take_rpc_replay_context();
         self.restore_rpc_replay_context(sequence.replay);
         let result = self.run_rpc_sequence(sequence.tails, buffer, runtime).await;
@@ -321,6 +329,13 @@ impl Editor {
         runtime: &mut Runtime,
     ) -> anyhow::Result<bool> {
         self.repeater = None;
+        if times == 0 {
+            return Ok(false);
+        }
+        if let KeyAction::Single(Action::PlayMacro(register)) = action {
+            self.play_macro(*register, times, buffer, runtime).await?;
+            return Ok(false);
+        }
         if matches!(action, KeyAction::Single(Action::RepeatLastChange))
             && matches!(self.last_semantic_change, Some(SemanticChange::Vimlet))
         {
