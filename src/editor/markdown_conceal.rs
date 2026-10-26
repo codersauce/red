@@ -259,12 +259,7 @@ impl super::Editor {
             let anchor = self.selection_start.map_or(line, |point| point.y);
             return Some(anchor.min(line)..anchor.max(line) + 1);
         }
-        if self.is_insert()
-            || self.is_search()
-            || self.pending_operator.is_some()
-            || self.pending_replace
-            || self.pending_character_motion.is_some()
-        {
+        if self.is_insert() || self.is_search() || self.file_vim.pending() {
             return Some(line..line + 1);
         }
         let concealments = self.markdown_line_concealments(window)?;

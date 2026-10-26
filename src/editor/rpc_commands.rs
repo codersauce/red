@@ -336,9 +336,7 @@ impl Editor {
             self.play_macro(*register, times, buffer, runtime).await?;
             return Ok(false);
         }
-        if matches!(action, KeyAction::Single(Action::RepeatLastChange))
-            && matches!(self.last_semantic_change, Some(SemanticChange::Vimlet))
-        {
+        if matches!(action, KeyAction::Single(Action::RepeatLastChange)) {
             self.repeat_file_vim(times, buffer, runtime).await?;
             return Ok(false);
         }

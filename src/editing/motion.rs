@@ -1,72 +1,10 @@
 //! Unicode-aware Vim motion and text-object resolution over an ordinary buffer.
 
-use unicode_segmentation::UnicodeSegmentation;
-
 use crate::{
     buffer::Buffer,
     undo::{TextPosition, TextRange},
-    unicode_utils::trim_line_ending,
 };
-
-pub use vimlet::CharacterMotion;
-
-/// Whether a text object includes its surrounding delimiters or whitespace.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TextObjectScope {
-    /// Select only the object's contents.
-    Inner,
-    /// Include surrounding delimiters or adjacent whitespace.
-    Around,
-}
-
-/// Text objects supported consistently by editor windows and embedded text areas.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TextObjectKind {
-    /// A Vim keyword or punctuation word.
-    Word,
-    /// A whitespace-delimited Vim WORD.
-    BigWord,
-    /// A sentence, including its terminating punctuation and closing delimiters.
-    Sentence,
-    /// A paragraph or blank-line group.
-    Paragraph,
-    /// The innermost surrounding delimiter pair.
-    Delimited {
-        /// Opening delimiter.
-        open: char,
-        /// Closing delimiter.
-        close: char,
-    },
-    /// A same-line, unescaped quoted string.
-    Quote(char),
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TextUnitKind {
-    Keyword,
-    Punctuation,
-    Symbol,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SentenceUnitKind {
-    Text,
-    Whitespace,
-    Paragraph,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct SentenceUnit {
-    start: usize,
-    end: usize,
-    kind: SentenceUnitKind,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct BoundaryMotion {
-    position: TextPosition,
-    ends_at_buffer: bool,
-}
+pub use vimlet::{CharacterMotion, TextObjectKind, TextObjectScope};
 
 fn word_motion(destination: vimlet::WordDestination, big_word: bool) -> vimlet::Motion {
     let class = if big_word {
@@ -104,17 +42,26 @@ impl<'buffer> MotionResolver<'buffer> {
         change_word: bool,
         big_word: bool,
     ) -> Option<(TextRange, bool)> {
-        let rope = self.buffer.contents_snapshot();
-        let resolver = vimlet::MotionResolver::new(
-            &rope,
-            vimlet::ByteOffset(self.buffer.position_to_byte_idx(self.cursor)),
-        );
         let motion = word_motion(vimlet::WordDestination::NextStart, big_word);
         let operator = if change_word {
             vimlet::Operator::Change
         } else {
             vimlet::Operator::Delete
         };
+        self.operator_range(motion, count, operator)
+    }
+
+    fn operator_range(
+        &self,
+        motion: vimlet::Motion,
+        count: u16,
+        operator: vimlet::Operator,
+    ) -> Option<(TextRange, bool)> {
+        let rope = self.buffer.contents_snapshot();
+        let resolver = vimlet::MotionResolver::new(
+            &rope,
+            vimlet::ByteOffset(self.buffer.position_to_byte_idx(self.cursor)),
+        );
         let target = resolver.operator_range(motion, usize::from(count), operator)?;
         let range = target.ranges.first()?;
         Some((
@@ -156,238 +103,46 @@ impl<'buffer> MotionResolver<'buffer> {
     /// Resolves `{` or `}`, treating only genuinely empty lines as paragraph boundaries.
     #[must_use]
     pub fn paragraph_target(&self, count: u16, backward: bool) -> Option<TextPosition> {
-        self.paragraph_motion(count, backward)
-            .map(|motion| motion.position)
+        self.boundary_target(vimlet::Motion::Paragraph { backward }, count)
     }
 
-    /// Resolves `(` or `)`, including paragraph boundaries and closing punctuation.
+    /// Resolve a sentence boundary in Red's scalar coordinates.
     #[must_use]
     pub fn sentence_target(&self, count: u16, backward: bool) -> Option<TextPosition> {
-        self.sentence_motion(count, backward)
-            .map(|motion| motion.position)
+        self.boundary_target(vimlet::Motion::Sentence { backward }, count)
     }
 
-    /// Resolves an exclusive paragraph operator motion and its effective register shape.
+    fn boundary_target(&self, motion: vimlet::Motion, count: u16) -> Option<TextPosition> {
+        let rope = self.buffer.contents_snapshot();
+        let resolver = vimlet::MotionResolver::new(
+            &rope,
+            vimlet::ByteOffset(self.buffer.position_to_byte_idx(self.cursor)),
+        );
+        let target = resolver.resolve(motion, usize::from(count))?;
+        let last = self.buffer.last_navigable_line();
+        let end = vimlet::TextSource::line_end(&rope, rope.line_to_byte(last));
+        self.buffer
+            .byte_idx_to_position(resolver.normal_cursor(target.position.0.min(end)))
+    }
+
+    /// Resolve a paragraph operator and preserve its register shape.
     #[must_use]
     pub fn paragraph_range(&self, count: u16, backward: bool) -> Option<(TextRange, bool)> {
-        self.boundary_motion_range(self.paragraph_motion(count, backward)?, backward)
+        self.operator_range(
+            vimlet::Motion::Paragraph { backward },
+            count,
+            vimlet::Operator::Delete,
+        )
     }
 
-    /// Resolves an exclusive sentence operator motion and its effective register shape.
+    /// Resolve a sentence operator and preserve its register shape.
     #[must_use]
     pub fn sentence_range(&self, count: u16, backward: bool) -> Option<(TextRange, bool)> {
-        self.boundary_motion_range(self.sentence_motion(count, backward)?, backward)
-    }
-
-    fn paragraph_motion(&self, count: u16, backward: bool) -> Option<BoundaryMotion> {
-        if self.buffer.is_empty() {
-            return None;
-        }
-
-        let last_line = self.buffer.last_navigable_line();
-        let mut line = self.cursor.line.min(last_line);
-        let contents = self.buffer.contents_snapshot();
-        let is_empty = |candidate: usize| self.buffer.line_is_empty(candidate);
-
-        for _ in 0..count.max(1) {
-            if backward {
-                if line == 0 {
-                    return Some(BoundaryMotion {
-                        position: TextPosition::new(0, 0),
-                        ends_at_buffer: false,
-                    });
-                }
-
-                let mut skip_empty = is_empty(line);
-                let mut boundary = 0;
-                for (offset, candidate_line) in contents.lines_at(line).reversed().enumerate() {
-                    let candidate = line - offset - 1;
-                    let empty = Buffer::line_slice_is_empty(candidate_line);
-                    if skip_empty && empty && candidate > 0 {
-                        continue;
-                    }
-                    skip_empty = false;
-                    if empty || candidate == 0 {
-                        boundary = candidate;
-                        break;
-                    }
-                }
-                line = boundary;
-            } else {
-                let mut skip_empty = is_empty(line);
-                let mut boundary = None;
-                for (offset, candidate_line) in contents.lines_at(line + 1).enumerate() {
-                    let candidate = line + offset + 1;
-                    if candidate > last_line {
-                        break;
-                    }
-                    let empty = Buffer::line_slice_is_empty(candidate_line);
-                    if skip_empty && empty {
-                        continue;
-                    }
-                    skip_empty = false;
-                    if empty {
-                        boundary = Some(candidate);
-                        break;
-                    }
-                }
-                let Some(boundary) = boundary else {
-                    return Some(BoundaryMotion {
-                        position: self.last_cursor_position(),
-                        ends_at_buffer: true,
-                    });
-                };
-                line = boundary;
-            }
-        }
-
-        Some(BoundaryMotion {
-            position: TextPosition::new(line, 0),
-            ends_at_buffer: false,
-        })
-    }
-
-    fn sentence_motion(&self, count: u16, backward: bool) -> Option<BoundaryMotion> {
-        if self.buffer.is_empty() {
-            return None;
-        }
-
-        let mut cursor = self.buffer.position_to_char_idx(self.cursor);
-        if !backward && count <= 1 && self.cursor.line == self.buffer.last_navigable_line() {
-            let contents = self.buffer.contents_snapshot();
-            let mut remaining = contents.chars_at(cursor);
-            if remaining.next().is_some_and(|character| {
-                !character.is_whitespace() && !matches!(character, '.' | '!' | '?')
-            }) && remaining.all(|character| !matches!(character, '.' | '!' | '?' | '\n' | '\r'))
-            {
-                return Some(BoundaryMotion {
-                    position: self.last_cursor_position(),
-                    ends_at_buffer: true,
-                });
-            }
-        }
-        let units = self.sentence_units();
-
-        for _ in 0..count.max(1) {
-            if backward {
-                let mut index = units.partition_point(|unit| unit.start < cursor);
-                while index > 0 && units[index - 1].kind == SentenceUnitKind::Whitespace {
-                    index -= 1;
-                }
-                let Some(previous) = index.checked_sub(1).and_then(|index| units.get(index)) else {
-                    return Some(BoundaryMotion {
-                        position: TextPosition::new(0, 0),
-                        ends_at_buffer: false,
-                    });
-                };
-                cursor = previous.start;
-            } else {
-                let mut index = units.partition_point(|unit| unit.start <= cursor);
-                while units
-                    .get(index)
-                    .is_some_and(|unit| unit.kind == SentenceUnitKind::Whitespace)
-                {
-                    index += 1;
-                }
-                let Some(next) = units.get(index) else {
-                    return Some(BoundaryMotion {
-                        position: self.last_cursor_position(),
-                        ends_at_buffer: true,
-                    });
-                };
-                cursor = next.start;
-            }
-        }
-
-        Some(BoundaryMotion {
-            position: self.buffer.char_idx_to_position(cursor),
-            ends_at_buffer: false,
-        })
-    }
-
-    fn boundary_motion_range(
-        &self,
-        motion: BoundaryMotion,
-        backward: bool,
-    ) -> Option<(TextRange, bool)> {
-        let cursor = self.cursor;
-        let target = motion.position;
-        let first_non_blank = self
-            .buffer
-            .contents_snapshot()
-            .get_line(cursor.line)
-            .and_then(|line| {
-                line.chars()
-                    .position(|character| !character.is_whitespace())
-            })
-            .unwrap_or_default();
-
-        if backward {
-            if cursor == target {
-                return None;
-            }
-            let linewise = target.line < cursor.line
-                && target.character == 0
-                && cursor.character <= first_non_blank;
-            return Some((TextRange::new(target, cursor), linewise));
-        }
-
-        if motion.ends_at_buffer {
-            let end = self.buffer.char_idx_to_position(self.buffer.char_len());
-            if cursor == end {
-                return None;
-            }
-            let linewise = target.line > cursor.line && cursor.character <= first_non_blank;
-            let start = if linewise {
-                TextPosition::new(cursor.line, 0)
-            } else {
-                cursor
-            };
-            return Some((TextRange::new(start, end), linewise));
-        }
-
-        if cursor == target {
-            return None;
-        }
-        if target.line > cursor.line && target.character == 0 {
-            if cursor.character <= first_non_blank {
-                return Some((
-                    TextRange::new(TextPosition::new(cursor.line, 0), target),
-                    true,
-                ));
-            }
-            let previous_line = target.line - 1;
-            let end = TextPosition::new(previous_line, self.line_character_len(previous_line));
-            return (cursor != end).then(|| (TextRange::new(cursor, end), false));
-        }
-
-        Some((TextRange::new(cursor, target), false))
-    }
-
-    fn last_cursor_position(&self) -> TextPosition {
-        let line = self.buffer.last_navigable_line();
-        if self.buffer.is_ascii() {
-            let contents = self.buffer.contents_snapshot();
-            let Some(source) = contents.get_line(line) else {
-                return TextPosition::new(line, 0);
-            };
-            let mut length = source.len_chars();
-            if source.get_char(length.saturating_sub(1)) == Some('\n') {
-                length -= 1;
-            }
-            if source.get_char(length.saturating_sub(1)) == Some('\r') {
-                length -= 1;
-            }
-            return TextPosition::new(line, length.saturating_sub(1));
-        }
-        let Some(contents) = self.buffer.get(line) else {
-            return TextPosition::new(line, 0);
-        };
-        let contents = trim_line_ending(&contents);
-        let character = contents.graphemes(true).next_back().map_or(0, |grapheme| {
-            contents.chars().count() - grapheme.chars().count()
-        });
-        TextPosition::new(line, character)
+        self.operator_range(
+            vimlet::Motion::Sentence { backward },
+            count,
+            vimlet::Operator::Delete,
+        )
     }
 
     /// Finds the requested character on the current logical line.
@@ -434,7 +189,7 @@ impl<'buffer> MotionResolver<'buffer> {
         self.text_object_with_count(scope, kind, 1)
     }
 
-    /// Resolves a text object, honoring sentence-object counts without changing legacy objects.
+    /// Resolve a counted Vim text object and convert its byte endpoints to scalar positions.
     #[must_use]
     pub fn text_object_with_count(
         &self,
@@ -442,571 +197,24 @@ impl<'buffer> MotionResolver<'buffer> {
         kind: TextObjectKind,
         count: u16,
     ) -> Option<TextRange> {
-        match kind {
-            TextObjectKind::Word => self.word_text_object(scope, false),
-            TextObjectKind::BigWord => self.word_text_object(scope, true),
-            TextObjectKind::Sentence => self.sentence_text_object(scope, count),
-            TextObjectKind::Paragraph => self.paragraph_text_object(scope),
-            TextObjectKind::Delimited { open, close } => {
-                self.delimited_text_object(scope, open, close)
-            }
-            TextObjectKind::Quote(quote) => self.quote_text_object(scope, quote),
-        }
-    }
-
-    fn word_text_object(&self, scope: TextObjectScope, big_word: bool) -> Option<TextRange> {
-        if self.buffer.is_ascii() {
-            return self.ascii_word_text_object(scope, big_word);
-        }
-        let line_index = self.cursor.line;
-        let line = self.buffer.get(line_index)?;
-        let chars = trim_line_ending(&line).chars().collect::<Vec<_>>();
-        if chars.is_empty() {
-            return None;
-        }
-
-        let unit_kinds = trim_line_ending(&line)
-            .graphemes(true)
-            .flat_map(|grapheme| {
-                let first = grapheme.chars().next().unwrap_or_default();
-                let kind = if big_word && !first.is_whitespace() {
-                    Some(TextUnitKind::Keyword)
-                } else {
-                    text_unit_kind(first)
-                };
-                grapheme.chars().map(move |_| kind)
-            })
-            .collect::<Vec<_>>();
-        let unit_kind = |index: usize| unit_kinds.get(index).copied().flatten();
-        let cursor = self.cursor.character.min(chars.len().saturating_sub(1));
-        let target = if unit_kind(cursor).is_some() {
-            cursor
+        let rope = self.buffer.contents_snapshot();
+        let resolver = vimlet::MotionResolver::new(
+            &rope,
+            vimlet::ByteOffset(self.buffer.position_to_byte_idx(self.cursor)),
+        );
+        let byte = self.buffer.position_to_byte_idx(self.cursor);
+        let start = resolver.previous(byte);
+        let resolver = if byte > 0 && resolver.next(start) > byte {
+            vimlet::MotionResolver::new(&rope, vimlet::ByteOffset(start))
         } else {
-            (cursor..chars.len())
-                .find(|index| unit_kind(*index).is_some())
-                .or_else(|| (0..=cursor).rev().find(|index| unit_kind(*index).is_some()))?
+            resolver
         };
-
-        let kind = unit_kind(target)?;
-        let mut start = target;
-        while start > 0 && unit_kind(start - 1) == Some(kind) {
-            start -= 1;
-        }
-        let mut end = target + 1;
-        while end < chars.len() && unit_kind(end) == Some(kind) {
-            end += 1;
-        }
-
-        if scope == TextObjectScope::Around {
-            if end < chars.len() && chars[end].is_whitespace() {
-                while end < chars.len() && chars[end].is_whitespace() {
-                    end += 1;
-                }
-            } else {
-                while start > 0 && chars[start - 1].is_whitespace() {
-                    start -= 1;
-                }
-            }
-        }
-
+        let target = resolver.text_object(scope, kind, usize::from(count))?;
+        let range = target.ranges.first()?;
         Some(TextRange::new(
-            TextPosition::new(line_index, start),
-            TextPosition::new(line_index, end),
+            self.buffer.byte_idx_to_position(range.start.0)?,
+            self.buffer.byte_idx_to_position(range.end.0)?,
         ))
-    }
-
-    fn ascii_word_text_object(&self, scope: TextObjectScope, big_word: bool) -> Option<TextRange> {
-        let line_index = self.cursor.line;
-        if line_index > self.buffer.len() {
-            return None;
-        }
-        let length = self.buffer.line_char_len_without_ending(line_index);
-        if length == 0 {
-            return None;
-        }
-        let contents = self.buffer.contents_snapshot();
-        let line = contents.get_line(line_index)?;
-        let unit_kind = |index| {
-            let character = line.get_char(index)?;
-            if big_word && !character.is_whitespace() {
-                Some(TextUnitKind::Keyword)
-            } else {
-                text_unit_kind(character)
-            }
-        };
-        let cursor = self.cursor.character.min(length - 1);
-        let target = if unit_kind(cursor).is_some() {
-            cursor
-        } else {
-            (cursor..length)
-                .find(|index| unit_kind(*index).is_some())
-                .or_else(|| (0..=cursor).rev().find(|index| unit_kind(*index).is_some()))?
-        };
-        let kind = unit_kind(target)?;
-        let mut start = target;
-        while start > 0 && unit_kind(start - 1) == Some(kind) {
-            start -= 1;
-        }
-        let mut end = target + 1;
-        while end < length && unit_kind(end) == Some(kind) {
-            end += 1;
-        }
-
-        if scope == TextObjectScope::Around {
-            if end < length && line.get_char(end).is_some_and(char::is_whitespace) {
-                while end < length && line.get_char(end).is_some_and(char::is_whitespace) {
-                    end += 1;
-                }
-            } else {
-                while start > 0 && line.get_char(start - 1).is_some_and(char::is_whitespace) {
-                    start -= 1;
-                }
-            }
-        }
-        Some(TextRange::new(
-            TextPosition::new(line_index, start),
-            TextPosition::new(line_index, end),
-        ))
-    }
-
-    fn sentence_text_object(&self, scope: TextObjectScope, count: u16) -> Option<TextRange> {
-        if count <= 1 && self.cursor.line == self.buffer.last_navigable_line() {
-            let contents = self.buffer.contents_snapshot();
-            if let Some(line) = contents.get_line(self.cursor.line) {
-                let follows_boundary = self.cursor.line == 0
-                    || contents
-                        .get_line(self.cursor.line - 1)
-                        .is_some_and(Buffer::line_slice_is_empty);
-                let first = line.get_char(0);
-                if follows_boundary
-                    && first.is_some_and(|character| !character.is_whitespace())
-                    && self.cursor.character < line.len_chars()
-                    && line
-                        .chars()
-                        .all(|character| !matches!(character, '.' | '!' | '?' | '\n' | '\r'))
-                {
-                    return Some(TextRange::new(
-                        TextPosition::new(self.cursor.line, 0),
-                        self.buffer.char_idx_to_position(self.buffer.char_len()),
-                    ));
-                }
-            }
-        }
-        let units = self.sentence_units();
-        let cursor = self.buffer.position_to_char_idx(self.cursor);
-        let current = units
-            .iter()
-            .position(|unit| unit.start <= cursor && cursor < unit.end)?;
-        let mut first = current;
-        let mut last = current;
-
-        if scope == TextObjectScope::Inner {
-            for _ in 1..count.max(1) {
-                let Some(next) = units.get(last + 1) else {
-                    break;
-                };
-                if next.kind == SentenceUnitKind::Paragraph
-                    && units[current].kind != SentenceUnitKind::Paragraph
-                {
-                    break;
-                }
-                last += 1;
-            }
-        } else if units[current].kind == SentenceUnitKind::Whitespace {
-            for _ in 0..count.max(1) {
-                if units
-                    .get(last + 1)
-                    .is_some_and(|unit| unit.kind != SentenceUnitKind::Whitespace)
-                {
-                    last += 1;
-                }
-                if last + 1 < units.len() && count > 1 {
-                    last += 1;
-                }
-            }
-        } else {
-            for index in 0..count.max(1) {
-                if index > 0 {
-                    let Some(next) = units.get(last + 1) else {
-                        break;
-                    };
-                    if next.kind != SentenceUnitKind::Whitespace {
-                        last += 1;
-                    }
-                }
-                if units
-                    .get(last + 1)
-                    .is_some_and(|unit| unit.kind == SentenceUnitKind::Whitespace)
-                {
-                    last += 1;
-                }
-            }
-            if last + 1 == units.len()
-                && first > 0
-                && units[first - 1].kind == SentenceUnitKind::Whitespace
-            {
-                first -= 1;
-            }
-        }
-
-        Some(TextRange::new(
-            self.buffer.char_idx_to_position(units[first].start),
-            self.buffer.char_idx_to_position(units[last].end),
-        ))
-    }
-
-    fn sentence_units(&self) -> Vec<SentenceUnit> {
-        let snapshot = self.buffer.contents_snapshot();
-        let contents = snapshot.to_string();
-        let characters = contents.chars().collect::<Vec<_>>();
-        if characters.is_empty() {
-            return Vec::new();
-        }
-
-        let mut char_index = 0;
-        let paragraph_boundaries = snapshot
-            .lines()
-            .take(self.buffer.last_navigable_line() + 1)
-            .filter_map(|line| {
-                let start = char_index;
-                char_index += line.len_chars();
-                Buffer::line_slice_is_empty(line).then_some(start)
-            })
-            .collect::<Vec<_>>();
-        let mut units = Vec::with_capacity(paragraph_boundaries.len().saturating_mul(4));
-        let mut start = 0;
-        let mut paragraph_index = 0;
-
-        while start < characters.len() {
-            while paragraph_boundaries
-                .get(paragraph_index)
-                .is_some_and(|boundary| *boundary < start)
-            {
-                paragraph_index += 1;
-            }
-            if paragraph_boundaries.get(paragraph_index) == Some(&start) {
-                let mut end = start;
-                while end < characters.len()
-                    && paragraph_boundaries.get(paragraph_index) == Some(&end)
-                {
-                    if characters[end] == '\r' {
-                        end += 1;
-                    }
-                    if characters.get(end) == Some(&'\n') {
-                        end += 1;
-                        paragraph_index += 1;
-                    } else {
-                        break;
-                    }
-                }
-                if end == start {
-                    break;
-                }
-                units.push(SentenceUnit {
-                    start,
-                    end,
-                    kind: SentenceUnitKind::Paragraph,
-                });
-                start = end;
-                continue;
-            }
-
-            let boundary = paragraph_boundaries
-                .get(paragraph_index)
-                .copied()
-                .unwrap_or(characters.len());
-            let mut end = boundary;
-            for index in start..boundary {
-                if !matches!(characters[index], '.' | '!' | '?') {
-                    continue;
-                }
-                let mut candidate = index + 1;
-                while matches!(characters.get(candidate), Some(')' | ']' | '"' | '\'')) {
-                    candidate += 1;
-                }
-                if candidate < characters.len()
-                    && !matches!(characters[candidate], ' ' | '\t' | '\r' | '\n')
-                {
-                    continue;
-                }
-                end = candidate;
-                if characters.get(end) == Some(&'\r') {
-                    end += 1;
-                }
-                if characters.get(end) == Some(&'\n') {
-                    end += 1;
-                }
-                break;
-            }
-
-            units.push(SentenceUnit {
-                start,
-                end,
-                kind: SentenceUnitKind::Text,
-            });
-            start = end;
-            while start < characters.len()
-                && characters[start].is_whitespace()
-                && paragraph_boundaries.get(paragraph_index) != Some(&start)
-            {
-                start += 1;
-            }
-            if start > end {
-                units.push(SentenceUnit {
-                    start: end,
-                    end: start,
-                    kind: SentenceUnitKind::Whitespace,
-                });
-            }
-        }
-
-        units
-    }
-
-    fn paragraph_text_object(&self, scope: TextObjectScope) -> Option<TextRange> {
-        if self.buffer.is_empty() {
-            return None;
-        }
-
-        let last_line = self.buffer.last_navigable_line();
-        let cursor_line = self.cursor.line.min(last_line);
-        let contents = self.buffer.contents_snapshot();
-        let is_blank = |line: ropey::RopeSlice<'_>| line.chars().all(char::is_whitespace);
-        let mut first_line = cursor_line;
-        let mut last_exclusive = cursor_line + 1;
-        let cursor_is_blank = contents.get_line(cursor_line).is_some_and(is_blank);
-
-        for (offset, line) in contents.lines_at(cursor_line).reversed().enumerate() {
-            if is_blank(line) != cursor_is_blank {
-                break;
-            }
-            first_line = cursor_line - offset - 1;
-        }
-        for (offset, line) in contents.lines_at(cursor_line + 1).enumerate() {
-            let candidate = cursor_line + offset + 1;
-            if candidate > last_line || is_blank(line) != cursor_is_blank {
-                break;
-            }
-            last_exclusive = candidate + 1;
-        }
-        if scope == TextObjectScope::Around && last_exclusive <= last_line {
-            let start = last_exclusive;
-            for (offset, line) in contents.lines_at(start).enumerate() {
-                let candidate = start + offset;
-                if candidate > last_line || is_blank(line) == cursor_is_blank {
-                    break;
-                }
-                last_exclusive = candidate + 1;
-            }
-        }
-
-        let ends_at_eof = last_exclusive > last_line;
-        let start = if ends_at_eof && first_line > 0 {
-            if scope == TextObjectScope::Around {
-                let boundary = first_line;
-                for (offset, line) in contents.lines_at(boundary).reversed().enumerate() {
-                    if !is_blank(line) {
-                        break;
-                    }
-                    first_line = boundary - offset - 1;
-                }
-                if first_line > 0 {
-                    let previous_line = first_line - 1;
-                    TextPosition::new(previous_line, self.line_character_len(previous_line))
-                } else {
-                    TextPosition::new(0, 0)
-                }
-            } else {
-                TextPosition::new(first_line - 1, self.line_character_len(first_line - 1))
-            }
-        } else {
-            TextPosition::new(first_line, 0)
-        };
-        let end = if ends_at_eof {
-            TextPosition::new(last_line, self.line_character_len(last_line))
-        } else {
-            TextPosition::new(last_exclusive, 0)
-        };
-        (start != end).then(|| TextRange::new(start, end))
-    }
-
-    fn delimited_text_object(
-        &self,
-        scope: TextObjectScope,
-        open: char,
-        close: char,
-    ) -> Option<TextRange> {
-        let contents = self.buffer.contents_snapshot();
-        let cursor = self.buffer.position_to_char_idx(self.cursor);
-        if cursor >= contents.len_chars() {
-            return None;
-        }
-        let start = if contents.get_char(cursor) == Some(close) {
-            cursor
-        } else {
-            cursor + 1
-        };
-        let mut depth = 0usize;
-        let open_index =
-            contents
-                .chars_at(start)
-                .reversed()
-                .enumerate()
-                .find_map(|(offset, character)| {
-                    if character == close {
-                        depth += 1;
-                    } else if character == open {
-                        if depth == 0 {
-                            return Some(start - offset - 1);
-                        }
-                        depth -= 1;
-                    }
-                    None
-                })?;
-        depth = 0;
-        let close_index =
-            contents
-                .chars_at(open_index)
-                .enumerate()
-                .find_map(|(offset, character)| {
-                    if character == open {
-                        depth += 1;
-                    } else if character == close {
-                        depth = depth.saturating_sub(1);
-                        if depth == 0 {
-                            return Some(open_index + offset);
-                        }
-                    }
-                    None
-                })?;
-        if cursor > close_index {
-            return None;
-        }
-        let (start, end) = match scope {
-            TextObjectScope::Inner => (open_index + 1, close_index),
-            TextObjectScope::Around => (open_index, close_index + 1),
-        };
-        Some(TextRange::new(
-            self.buffer.char_idx_to_position(start),
-            self.buffer.char_idx_to_position(end),
-        ))
-    }
-
-    fn quote_text_object(&self, scope: TextObjectScope, quote: char) -> Option<TextRange> {
-        let contents = self.buffer.contents_snapshot();
-        let source = contents.get_line(self.cursor.line)?;
-        let mut length = source.len_chars();
-        if source.get_char(length.saturating_sub(1)) == Some('\n') {
-            length -= 1;
-        }
-        if source.get_char(length.saturating_sub(1)) == Some('\r') {
-            length -= 1;
-        }
-        let line = source.slice(..length);
-        let mut start = None;
-        let ascii = self.buffer.is_ascii();
-        let mut chunk_start = 0usize;
-        let mut previous_backslashes = 0usize;
-        for chunk in line.chunks() {
-            for (byte, _) in chunk.match_indices(quote) {
-                let local_backslashes = chunk[..byte]
-                    .bytes()
-                    .rev()
-                    .take_while(|character| *character == b'\\')
-                    .count();
-                let backslashes = if local_backslashes == byte {
-                    previous_backslashes.saturating_add(local_backslashes)
-                } else {
-                    local_backslashes
-                };
-                if !backslashes.is_multiple_of(2) {
-                    continue;
-                }
-                let index = chunk_start
-                    + if ascii {
-                        byte
-                    } else {
-                        chunk[..byte].chars().count()
-                    };
-                if let Some(open) = start.take() {
-                    if open <= self.cursor.character && self.cursor.character <= index {
-                        let (first, last) = match scope {
-                            TextObjectScope::Inner => (open + 1, index),
-                            TextObjectScope::Around => (open, index + 1),
-                        };
-                        return Some(TextRange::new(
-                            TextPosition::new(self.cursor.line, first),
-                            TextPosition::new(self.cursor.line, last),
-                        ));
-                    }
-                } else {
-                    start = Some(index);
-                }
-            }
-            let trailing_backslashes = chunk
-                .bytes()
-                .rev()
-                .take_while(|character| *character == b'\\')
-                .count();
-            previous_backslashes = if trailing_backslashes == chunk.len() {
-                previous_backslashes.saturating_add(trailing_backslashes)
-            } else {
-                trailing_backslashes
-            };
-            chunk_start += if ascii {
-                chunk.len()
-            } else {
-                chunk.chars().count()
-            };
-        }
-        None
-    }
-
-    fn line_character_len(&self, line: usize) -> usize {
-        if line > self.buffer.len() {
-            return 0;
-        }
-        self.buffer.line_char_len_without_ending(line)
-    }
-}
-
-pub(crate) fn text_object_kind_for_key(character: char) -> Option<TextObjectKind> {
-    match character {
-        'w' => Some(TextObjectKind::Word),
-        'W' => Some(TextObjectKind::BigWord),
-        's' => Some(TextObjectKind::Sentence),
-        'p' => Some(TextObjectKind::Paragraph),
-        '(' | ')' | 'b' => Some(TextObjectKind::Delimited {
-            open: '(',
-            close: ')',
-        }),
-        '[' | ']' => Some(TextObjectKind::Delimited {
-            open: '[',
-            close: ']',
-        }),
-        '{' | '}' | 'B' => Some(TextObjectKind::Delimited {
-            open: '{',
-            close: '}',
-        }),
-        '<' | '>' => Some(TextObjectKind::Delimited {
-            open: '<',
-            close: '>',
-        }),
-        '"' | 'q' => Some(TextObjectKind::Quote('"')),
-        '\'' | '`' => Some(TextObjectKind::Quote(character)),
-        _ => None,
-    }
-}
-
-fn text_unit_kind(character: char) -> Option<TextUnitKind> {
-    if character.is_whitespace() {
-        None
-    } else if character.is_alphanumeric() || character == '_' {
-        Some(TextUnitKind::Keyword)
-    } else if character.is_ascii_punctuation() {
-        Some(TextUnitKind::Punctuation)
-    } else {
-        Some(TextUnitKind::Symbol)
     }
 }
 
@@ -1128,8 +336,8 @@ mod tests {
         let empty = Buffer::new(None, String::new());
         let resolver = MotionResolver::new(&empty, TextPosition::new(/*line*/ 0, /*character*/ 0));
         assert_eq!(
-            resolver.last_cursor_position(),
-            TextPosition::new(/*line*/ 0, /*character*/ 0)
+            resolver.sentence_target(1, false),
+            Some(TextPosition::new(/*line*/ 0, /*character*/ 0))
         );
     }
 
@@ -1168,7 +376,13 @@ mod tests {
                             [start, end] if *start <= cursor && cursor <= *end => {
                                 Some(match scope {
                                     TextObjectScope::Inner => (start + 1, *end),
-                                    TextObjectScope::Around => (*start, end + 1),
+                                    TextObjectScope::Around => {
+                                        let trailing = characters[end + 1..]
+                                            .iter()
+                                            .take_while(|c| c.is_whitespace())
+                                            .count();
+                                        (*start, end + 1 + trailing)
+                                    }
                                 })
                             }
                             _ => None,
@@ -1418,9 +632,8 @@ mod tests {
                             .count()
                     })
                     .unwrap_or_default();
-                assert_eq!(resolver.line_character_len(line), expected);
+                assert_eq!(buffer.line_char_len_without_ending(line), expected);
             }
-            assert_eq!(resolver.line_character_len(buffer.len() + 1), 0);
         }
     }
 
@@ -1499,28 +712,16 @@ mod tests {
                         assert_eq!(actual, expected, "{text:?} at {cursor} {scope:?}");
                     }
 
-                    let quotes = characters
-                        .iter()
-                        .enumerate()
-                        .filter_map(|(index, character)| {
-                            if *character != '"' {
-                                return None;
-                            }
-                            let slash_count = characters[..index]
-                                .iter()
-                                .rev()
-                                .take_while(|value| **value == '\\')
-                                .count();
-                            (slash_count % 2 == 0).then_some(index)
-                        })
-                        .collect::<Vec<_>>();
-                    let expected = quotes.chunks(2).find_map(|pair| match pair {
-                        [start, end] if *start <= cursor && cursor <= *end => Some(match scope {
-                            TextObjectScope::Inner => (start + 1, *end),
-                            TextObjectScope::Around => (*start, end + 1),
-                        }),
-                        _ => None,
-                    });
+                    let byte = buffer.position_to_byte_idx(TextPosition::new(0, cursor));
+                    let expected = vimlet::MotionResolver::new(&text, vimlet::ByteOffset(byte))
+                        .text_object(scope, TextObjectKind::Quote('"'), 1)
+                        .map(|range| {
+                            let r = range.ranges[0];
+                            (
+                                text[..r.start.0].chars().count(),
+                                text[..r.end.0].chars().count(),
+                            )
+                        });
                     let actual = resolver
                         .text_object(scope, TextObjectKind::Quote('"'))
                         .map(|range| (range.start.character, range.end.character));
@@ -1541,69 +742,29 @@ mod tests {
             "\talpha\tbeta\t",
             "___ symbols + punctuation",
         ] {
-            let buffer = Buffer::new(None, text.to_string());
+            let buffer = Buffer::new(Some("words.txt".into()), text.to_string());
             let chars = text.chars().collect::<Vec<_>>();
             for cursor in 0..=chars.len() + 1 {
                 for big_word in [false, true] {
                     for scope in [TextObjectScope::Inner, TextObjectScope::Around] {
-                        let unit_kind = |index: usize| {
-                            let character = *chars.get(index)?;
-                            if big_word && !character.is_whitespace() {
-                                Some(super::TextUnitKind::Keyword)
-                            } else {
-                                super::text_unit_kind(character)
-                            }
-                        };
-                        let expected = if chars.is_empty() {
-                            None
+                        let byte = buffer.position_to_byte_idx(TextPosition::new(0, cursor));
+                        let kind = if big_word {
+                            TextObjectKind::BigWord
                         } else {
-                            let bounded = cursor.min(chars.len() - 1);
-                            let target = if unit_kind(bounded).is_some() {
-                                Some(bounded)
-                            } else {
-                                (bounded..chars.len())
-                                    .find(|index| unit_kind(*index).is_some())
-                                    .or_else(|| {
-                                        (0..=bounded)
-                                            .rev()
-                                            .find(|index| unit_kind(*index).is_some())
-                                    })
-                            };
-                            target.map(|target| {
-                                let kind = unit_kind(target);
-                                let mut start = target;
-                                while start > 0 && unit_kind(start - 1) == kind {
-                                    start -= 1;
-                                }
-                                let mut end = target + 1;
-                                while end < chars.len() && unit_kind(end) == kind {
-                                    end += 1;
-                                }
-                                if scope == TextObjectScope::Around {
-                                    if end < chars.len() && chars[end].is_whitespace() {
-                                        while end < chars.len() && chars[end].is_whitespace() {
-                                            end += 1;
-                                        }
-                                    } else {
-                                        while start > 0 && chars[start - 1].is_whitespace() {
-                                            start -= 1;
-                                        }
-                                    }
-                                }
-                                (start, end)
-                            })
+                            TextObjectKind::Word
                         };
-                        let resolver = MotionResolver::new(&buffer, TextPosition::new(0, cursor));
-                        let actual = resolver
-                            .text_object(
-                                scope,
-                                if big_word {
-                                    TextObjectKind::BigWord
-                                } else {
-                                    TextObjectKind::Word
-                                },
-                            )
-                            .map(|range| (range.start.character, range.end.character));
+                        let actual = MotionResolver::new(&buffer, TextPosition::new(0, cursor))
+                            .text_object(scope, kind)
+                            .map(|r| (r.start.character, r.end.character));
+                        let expected = vimlet::MotionResolver::new(&text, vimlet::ByteOffset(byte))
+                            .text_object(scope, kind, 1)
+                            .map(|range| {
+                                let r = range.ranges[0];
+                                (
+                                    text[..r.start.0].chars().count(),
+                                    text[..r.end.0].chars().count(),
+                                )
+                            });
                         assert_eq!(
                             actual, expected,
                             "{text:?} at {cursor}, big={big_word}, {scope:?}"

@@ -1,7 +1,7 @@
 # Red Vim compatibility matrix
 
-**Matrix version:** 1.11
-**Tracked against:** Red v0.8.0
+**Matrix version:** 1.12
+**Tracked against:** Red v0.10.0 with the Vimlet file adapter
 **Status vocabulary:** **supported**, **intentional difference**, **not yet supported**
 
 “Real Vim keys” means the rows marked **supported** below. It does not mean complete
@@ -19,7 +19,7 @@ the corresponding integration tests.
 | Structural motions | **supported** | Tree-sitter-backed `]m`/`[m` move between calls, `]f`/`[f` between functions, and `]c`/`[c` between classes. Counts, operator-pending forms such as `d2]f`, Visual selections, and window-local jumps are supported without wrapping past the document boundary. |
 | Bracket navigation boundaries | **supported** | The default `]%`, `]c`, `]d`, `]f`, `]h`, `]i`, and `]m` navigation commands leave the cursor in place and show a transient, target-specific warning when no eligible target exists. Their `[` counterparts provide the same feedback at the start boundary. Diagnostic navigation does not wrap between the first and last diagnostic. |
 | Operators | **supported** | `d`, `c`, and `y` with horizontal, line, vertical, file-boundary, line-start/end, small/big-word, previous-word-end, paragraph, sentence, find/till, match, supported text-object, and structural-motion targets. Paragraph/sentence operators preserve Neovim's exclusive-motion and linewise conversion rules; `cw` and `cW` preserve trailing whitespace like Vim. |
-| Text objects | **supported** | Inner/around small words, big words, sentences, paragraphs, parentheses, brackets, braces, single quotes, double quotes, and backticks. Counted `is`/`as` distinguish sentence text from its adjacent whitespace. |
+| Text objects | **supported** | Inner/around small words, big words, sentences, paragraphs, parentheses, brackets, braces, angle brackets, single quotes, double quotes, and backticks. Around-quote objects include adjacent whitespace. Counted `is`/`as` distinguish sentence text from its adjacent whitespace. |
 | Structural text objects | **supported** | Syntax-aware `am`/`im` select calls, `af`/`if` functions, `ac`/`ic` classes, and `ak`/`ik` comments. Objects work in Visual mode and with delete, change, yank, and case transforms. Outer functions and classes produce linewise selections and registers. |
 | Structural swaps | **supported** | `Space ] a`/`Space [ a` exchange adjacent parameters and `Space ] m`/`Space [ m` exchange adjacent functions in the same syntax container. Separators remain in place; each swap supports one-step undo, dot-repeat, macros, and jumplist navigation. |
 | `r{char}` | **supported** | Replaces one or a counted run of graphemes and is one undoable change. A count longer than the remaining line is rejected without editing. |
@@ -32,10 +32,10 @@ the corresponding integration tests.
 
 | Area | Status | Red behavior |
 |---|---|---|
-| Default register | **supported** | Yank, delete, change, `p`, and `P`; characterwise paste preserves Neovim cursor placement for single-line and multiline text. Default-register writes also update the configured system clipboard. |
+| Default register | **supported** | Yank, delete, change, `p`, and `P`; characterwise paste preserves Neovim cursor placement for single-line and multiline text. Vimlet maintains the automatic yank (`0`), numbered delete and small-delete registers. A linewise register ends with a newline. Red sends default-register writes to the configured clipboard. |
 | Named text-register prefix (`"a`) | **not yet supported** | Named storage exists for macros, but interactive text-operation register selection is not implemented. |
-| Dot-repeat (`.`) | **supported** | Replays the last completed content-changing input recipe through normal key resolution. Covered: direct changes, operator+motion, operator+text object, insert sessions, paste, replace, indent, open-line, and visual-block insert. |
-| Count before dot | **supported** | `N.` replays the completed change N times. A failed/no-op change does not replace the previous definition. |
+| Dot-repeat (`.`) | **supported** | Vimlet replays the semantic edit at the current cursor. Red supplies the steps for plugin commands and compound editor mappings. |
+| Count before dot | **supported** | `N.` replaces the count on a Vimlet change. A failed operator target preserves the previous change. Entering Insert and immediately escaping installs an empty change. |
 | Dot after confirmed substitute | **not yet supported** | The substitute is undoable as one transaction, but confirmation answers are not a reusable dot recipe. |
 | Macro record/play | **supported** | `q{register}`, `@{register}`, `@@`, counts, uppercase append, and recursion/instruction limits. |
 | Macro playback across an RPC | **supported** | Playback resumes after the command completes. Nested calls and counts share the same limit of 10,000 keys across waits. New user input cancels the remaining keys and mapped actions. Red also discards them if the active buffer or its revision differs at completion. |
@@ -46,10 +46,10 @@ the corresponding integration tests.
 
 | Area | Status | Red behavior |
 |---|---|---|
-| Insert / Normal | **supported** | `i`, `a`, `I`, `A`, `o`, `O`, Escape, newline, backspace, tab, and bracketed paste. |
+| Insert / Normal | **supported** | `i`, `a`, `I`, `A`, `o`, `O`, Escape, newline, backspace, tab, and bracketed paste. A cursor motion during insertion breaks the undo group. Escaping immediately after `i` moves left within the line. |
 | Visual character | **supported** | Motions, supported text objects, yank/delete/change/paste, and Unicode selections. |
 | Visual line | **supported** | Linewise yank/delete/change/paste, including whole-document and interior replacements. |
-| Visual block | **supported** | Block delete/change/insert, one-transaction replay, undo/redo, and dot-repeat for block insert. |
+| Visual block | **supported** | Block delete, change, put, `I` and `A` use the selected rectangle. `I` skips rows shorter than the left edge, and `A` pads to the right edge. The insertion forms one undo group. |
 | Mouse selection | **supported** | Left-click positions the cursor; dragging enters characterwise Visual mode, and release retains the selection for motions, `y`, `d`, `c`, Escape, and `gv`. Double-click selects words or matching delimiters, triple-click selects lines, and quadruple-click selects a block; dragging extends the chosen shape. Shift-left adjusts the nearest selection endpoint, and Alt-left creates a block from the existing cursor. Insert-origin selection returns to Insert when it ends. Viewport-edge dragging scrolls the originating window. Modifier gestures require the terminal to deliver those modifiers. Terminal-native selection and Neovim's right-click popup behavior are outside this support. |
 | Multi-cursor selections | **supported** | In Normal mode, `Ctrl-n` selects successive whole-word occurrences; from a single-line characterwise Visual selection, it uses the exact selected text and immediately adds the next literal occurrence. `Ctrl-Up` / `Ctrl-Down` add vertical cursors while preserving display columns. `n` / `N` navigate matches, `q` skips, and `Q` removes the active selection. `Tab` toggles extend mode; Shift-arrows and `h`, `l`, `w`, `e`, `0`, and `$` extend complete Unicode graphemes, and `o` reverses each anchor. `c`, `i`, `a`, `d`, `x`, `y`, `p`, and `P` apply across selections. Insert, change, delete, and paste are grouped into one undoable edit. |
 | Restore Visual selection | **supported** | `gv` restores the previous buffer-local Visual area with its character, line, or block shape and original direction. In Visual mode it exchanges the current and previous areas. Selection metadata survives session recovery, while `<` and `>` continue to track edits. |

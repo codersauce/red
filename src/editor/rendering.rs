@@ -4066,9 +4066,10 @@ impl Editor {
             current_symbol,
             selection,
             recording: self
-                .macro_recording
-                .as_ref()
-                .map(|recording| recording.register),
+                .file_vim
+                .session
+                .recording()
+                .map(|r| r.to_ascii_lowercase()),
             search_matches,
             indentation: if configured(StatuslineSection::Indentation) {
                 format!("spaces:{}", self.indentation().shift_width)

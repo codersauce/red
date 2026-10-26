@@ -45,7 +45,7 @@ impl TextArea {
                 self.delete_previous_word();
                 return TextAreaOutcome::Changed;
             }
-            Event::Key(key) => match modal_key(*key) {
+            Event::Key(key) => match crate::keyboard::modal_key(*key) {
                 Some(key) => key,
                 None => return TextAreaOutcome::Unhandled,
             },
@@ -617,26 +617,4 @@ pub(super) fn index_from(rope: &Rope, (mut byte, index): (usize, usize), target:
         }
     }
     index
-}
-
-fn modal_key(key: KeyEvent) -> Option<Key> {
-    Some(match key.code {
-        KeyCode::Char(c) if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            Key::Ctrl(c.to_ascii_lowercase())
-        }
-        KeyCode::Char(_) if key.modifiers.contains(KeyModifiers::ALT) => return None,
-        KeyCode::Char('\n') | KeyCode::Enter => Key::Enter,
-        KeyCode::Char(c) => Key::Char(c),
-        KeyCode::Esc => Key::Escape,
-        KeyCode::Backspace => Key::Backspace,
-        KeyCode::Delete => Key::Delete,
-        KeyCode::Left => Key::Left,
-        KeyCode::Right => Key::Right,
-        KeyCode::Up => Key::Up,
-        KeyCode::Down => Key::Down,
-        KeyCode::Home => Key::Home,
-        KeyCode::End => Key::End,
-        KeyCode::Tab => Key::Tab,
-        _ => return None,
-    })
 }

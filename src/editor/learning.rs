@@ -17,6 +17,7 @@ pub(super) struct LearnSession {
     original_wrap: bool,
     original_panel_focus: Option<String>,
     original_repeat: Option<SemanticChange>,
+    original_vim: Box<file_vim::FileVim>,
     original_registers: HashMap<char, Content>,
 }
 
@@ -170,6 +171,7 @@ impl Editor {
         let original_zoom = self.zoomed_pane.take();
         let original_wrap = self.wrap;
         let original_repeat = self.last_semantic_change.take();
+        let original_vim = std::mem::take(&mut self.file_vim);
         let original_registers = self.registers.clone();
         self.pending_semantic_change = None;
         let file = workspace.as_ref().map(|workspace| {
@@ -200,6 +202,7 @@ impl Editor {
             original_wrap,
             original_panel_focus,
             original_repeat,
+            original_vim,
             original_registers,
         });
         self.mode = Mode::Normal;
@@ -245,6 +248,7 @@ impl Editor {
         }
         self.zoomed_pane = session.original_zoom;
         self.last_semantic_change = session.original_repeat;
+        self.file_vim = session.original_vim;
         self.pending_semantic_change = None;
         self.registers = session.original_registers;
         self.local_marks.remove(&session.practice_buffer_id);
