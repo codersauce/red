@@ -20,6 +20,70 @@ fn event(character: char) -> Event {
 }
 
 #[test]
+fn change_word_repeats_at_the_new_cursor_as_a_separate_undo_group() {
+    let mut area = TextArea::new("one two");
+    area.set_cursor(0);
+    area.set_mode(Mode::Normal);
+    for ch in "cwX\u{1b}w.".chars() {
+        assert_eq!(area.handle_event(&event(ch), 80), TextAreaOutcome::Changed);
+    }
+    assert_eq!(area.text(), "X X");
+    assert_eq!(area.mode(), Mode::Normal);
+    area.handle_event(&event('u'), 80);
+    assert_eq!(area.text(), "X two");
+    area.handle_event(&event('u'), 80);
+    assert_eq!(area.text(), "one two");
+}
+
+#[test]
+fn suspended_search_cannot_delete_a_newer_draft() {
+    let mut area = TextArea::new("one two");
+    area.set_cursor(0);
+    area.set_mode(Mode::Normal);
+    for ch in "d/two".chars() {
+        area.handle_event(&event(ch), 80);
+    }
+    assert_eq!(area.mode(), Mode::Search);
+    assert!(area.insert("updated "));
+    area.handle_event(
+        &Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        80,
+    );
+    assert_eq!(area.text(), "updated one two");
+    assert_eq!(area.mode(), Mode::Normal);
+    assert!(!area.state().has_pending_input());
+    assert!(area.register().text.is_empty());
+}
+
+#[test]
+fn repeated_till_advances_past_an_adjacent_match_on_the_same_line() {
+    let mut area = TextArea::new("start\naX界X");
+    area.set_mode(Mode::Normal);
+    area.set_cursor(6);
+    for key in "tX;".chars() {
+        area.handle_event(&event(key), 80);
+    }
+    assert_eq!(area.cursor(), 8);
+    assert_eq!(area.buffer().pos, (2, 1));
+}
+
+#[test]
+fn delete_through_a_character_match_includes_its_combining_mark() {
+    let text = "abcd e\u{301}z";
+    let mut area = TextArea::new(text);
+    area.set_mode(Mode::Normal);
+    area.set_cursor(0);
+    for key in "dfe".chars() {
+        area.handle_event(&event(key), 80);
+    }
+    assert_eq!(area.text(), "z");
+    assert_eq!(area.register().text, "abcd e\u{301}");
+    assert!(area.undo());
+    assert_eq!(area.text(), text);
+    assert_eq!(area.cursor(), 0);
+}
+
+#[test]
 fn word_wrapped_vertical_motion_uses_the_display_projection() {
     let text = "one two three";
     let options = LayoutOptions::word(7);

@@ -22974,10 +22974,16 @@ impl Editor {
                 if started_transaction {
                     self.begin_transaction("insert line below");
                 }
-                self.replace_range(
-                    TextRange::insertion(TextPosition::new(line + 1, 0)),
-                    &format!("{inserted_prefix}\n"),
-                );
+                let next_line = TextPosition::new(line + 1, 0);
+                let document = self.current_buffer();
+                let start = document.char_idx_to_position(document.position_to_char_idx(next_line));
+                // At unterminated EOF the separator belongs before the new line's indentation.
+                let text = if start.line == line {
+                    format!("\n{inserted_prefix}")
+                } else {
+                    format!("{inserted_prefix}\n")
+                };
+                self.replace_range(TextRange::insertion(start), &text);
                 self.cy += 1;
                 self.cx = grapheme_len(inserted_prefix);
                 self.mode = Mode::Insert;
