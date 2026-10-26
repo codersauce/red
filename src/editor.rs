@@ -36,6 +36,7 @@ mod diagnostics_picker;
 mod display_layout;
 mod edit_batch;
 mod edit_history;
+mod file_vim;
 mod file_watch;
 mod inline_actions;
 mod inline_agent_outcomes;
@@ -996,6 +997,7 @@ struct KeySignature {
 
 #[derive(Debug, Clone)]
 enum SemanticChange {
+    Vimlet,
     Input(Vec<Event>),
     Recipe(Vec<SemanticChangeStep>),
 }
@@ -1019,6 +1021,7 @@ enum VisualLineShiftDirection {
 
 #[derive(Debug)]
 struct PendingSemanticChange {
+    vimlet: bool,
     buffer_id: BufferId,
     base_revision: u64,
     events: Vec<Event>,
@@ -2633,6 +2636,12 @@ impl PickerCallback {
 /// serializes their execution through its event loop and canonical edit
 /// transaction boundary.
 pub enum Action {
+    /// A resolved modal command from file input. The host executes it against the active revision.
+    #[serde(skip)]
+    Vimlet {
+        key: char,
+        command: vimlet::Command,
+    },
     /// Starts an editor-owned pointer gesture in terminal-cell coordinates.
     MousePress {
         column: u16,
@@ -3912,6 +3921,7 @@ pub struct Editor {
     /// the edit transaction returns to a stable Normal-mode boundary.
     last_semantic_change: Option<SemanticChange>,
     pending_semantic_change: Option<PendingSemanticChange>,
+    file_vim: Box<file_vim::FileVim>,
     replaying_semantic_change: bool,
 
     /// Vim-style macro state. Register contents are stored as editable key notation;
@@ -5916,6 +5926,7 @@ impl Editor {
             actions: vec![],
             last_semantic_change: None,
             pending_semantic_change: None,
+            file_vim: Default::default(),
             replaying_semantic_change: false,
             pending_macro_action: None,
             macro_recording: None,
@@ -14544,6 +14555,7 @@ impl Editor {
                 return;
             }
             self.pending_semantic_change = Some(PendingSemanticChange {
+                vimlet: false,
                 buffer_id: self.current_buffer().id(),
                 base_revision: self.current_buffer().revision(),
                 events: Vec::new(),
@@ -14607,7 +14619,9 @@ impl Editor {
             .take()
             .expect("completed semantic change must exist");
         if self.current_buffer().revision() != change.base_revision && !change.events.is_empty() {
-            self.last_semantic_change = Some(if let Some(mut recipe) = change.repeat_recipe {
+            self.last_semantic_change = Some(if change.vimlet {
+                SemanticChange::Vimlet
+            } else if let Some(mut recipe) = change.repeat_recipe {
                 recipe.steps.extend(
                     change
                         .events
@@ -14999,6 +15013,7 @@ impl Editor {
     ) -> BoxFuture<'a, anyhow::Result<()>> {
         Box::pin(async move {
             let steps = match change {
+                SemanticChange::Vimlet => return self.repeat_file_vim(0, buffer, runtime).await,
                 SemanticChange::Input(events) => {
                     events.into_iter().map(SemanticChangeStep::Input).collect()
                 }
@@ -20069,6 +20084,41 @@ impl Editor {
     }
 
     fn handle_pending_operator(&mut self, pending: PendingOperator, c: char) -> Option<KeyAction> {
+        let shared_target = match pending.step {
+            PendingOperatorStep::Operator if matches!(c, '/' | '?') => {
+                Some(vimlet::EditTarget::Host(vimlet::TargetRequest::Search {
+                    backward: c == '?',
+                    repeat: false,
+                }))
+            }
+            PendingOperatorStep::Operator if matches!(c, 'w' | 'W' | 'e' | 'E' | 'b' | 'B') => {
+                Some(file_vim::word_target(c))
+            }
+            PendingOperatorStep::StructuralMotion { backward }
+                if structural_motion_kind(c).is_some() =>
+            {
+                Some(file_vim::syntax_target(
+                    if backward { b'[' } else { b']' },
+                    c,
+                ))
+            }
+            PendingOperatorStep::TextObjectScope(scope)
+                if SyntaxObjectKind::for_text_object_key(c).is_some() =>
+            {
+                Some(file_vim::syntax_target(
+                    if scope == TextObjectScope::Inner {
+                        b'i'
+                    } else {
+                        b'a'
+                    },
+                    c,
+                ))
+            }
+            _ => None,
+        };
+        if let Some(action) = shared_target.and_then(|target| pending.vim_command(c, target)) {
+            return Some(action);
+        }
         match pending.step {
             PendingOperatorStep::Operator => match c {
                 '0'..='9' if c != '0' || pending.motion_count.is_some() => {
@@ -20130,24 +20180,20 @@ impl Editor {
                     });
                     Some(KeyAction::None)
                 }
-                'w' => self.operator_action_for_range(
-                    pending.operator,
-                    self.word_motion_range(
-                        pending.count(),
-                        pending.operator == EditOperator::Change,
-                        false,
-                    ),
-                    "no word under cursor",
-                ),
-                'W' => self.operator_action_for_range(
-                    pending.operator,
-                    self.word_motion_range(
-                        pending.count(),
-                        pending.operator == EditOperator::Change,
-                        true,
-                    ),
-                    "no word under cursor",
-                ),
+                'w' | 'W' => {
+                    let range =
+                        MotionResolver::new(self.current_buffer(), self.cursor_text_position())
+                            .word_operator_range(
+                                pending.count(),
+                                pending.operator == EditOperator::Change,
+                                c == 'W',
+                            );
+                    self.operator_action_for_boundary_range(
+                        pending.operator,
+                        range,
+                        "no word under cursor",
+                    )
+                }
                 'h' => self.operator_action_for_range(
                     pending.operator,
                     self.horizontal_motion_range(pending.count(), true),
@@ -21676,6 +21722,9 @@ impl Editor {
             self.render(buffer)?;
             return Ok(false);
         }
+        if self.file_vim.inserting() && self.continue_file_vim(action, buffer, runtime).await? {
+            return Ok(false);
+        }
         let sensitive_action = matches!(
             action,
             Action::NotifyPlugin(_, _, _) | Action::RunShell(_) | Action::RunShellFilter { .. }
@@ -22187,6 +22236,10 @@ impl Editor {
                     self.notify_change(runtime).await?;
                 }
                 self.render(buffer)?;
+            }
+            Action::Vimlet { key, command } => {
+                self.run_file_vim_command(*key, *command, buffer, runtime)
+                    .await?;
             }
             Action::ChangeTextRange(range) => {
                 let start = range.start;
@@ -23836,45 +23889,17 @@ impl Editor {
                 self.config.relative_line_numbers = Some(*enabled);
                 self.render(buffer)?;
             }
-            Action::MoveToNextWord => {
-                let line = self.buffer_line();
-                let char_cx = self.next_word_search_char_on_line(self.cx, line);
-                let next_word = self.current_buffer().find_next_word((char_cx, line));
-
-                if let Some((x, y)) = next_word {
-                    self.cx = self.char_to_grapheme_on_line(x, y);
-                    if self.is_within_viewport(y) {
-                        self.cy = y - self.vtop;
-                    } else {
-                        self.go_to_line(y + 1, buffer, runtime, GoToLinePosition::Top)
-                            .await?;
-                    }
-                    self.finish_cursor_motion(buffer, false)?;
-                }
-            }
-            Action::MoveToPreviousWord => {
-                let line = self.buffer_line();
-                let char_cx = self.grapheme_to_char_on_line(self.cx, line);
-                let previous_word = self.current_buffer().find_prev_word((char_cx, line));
-
-                if let Some((x, y)) = previous_word {
-                    self.cx = self.char_to_grapheme_on_line(x, y);
-                    if self.is_within_viewport(y) {
-                        self.cy = y - self.vtop;
-                    } else {
-                        self.go_to_line(y + 1, buffer, runtime, GoToLinePosition::Top)
-                            .await?;
-                    }
-                    self.finish_cursor_motion(buffer, false)?;
-                }
-            }
-            Action::MoveToNextBigWord
+            Action::MoveToNextWord
+            | Action::MoveToPreviousWord
+            | Action::MoveToNextBigWord
             | Action::MoveToNextWordEnd
             | Action::MoveToPreviousWordEnd
             | Action::MoveToNextBigWordEnd
             | Action::MoveToPreviousBigWord
             | Action::MoveToPreviousBigWordEnd => {
                 let (backward, end, big_word) = match action {
+                    Action::MoveToNextWord => (false, false, false),
+                    Action::MoveToPreviousWord => (true, false, false),
                     Action::MoveToNextBigWord => (false, false, true),
                     Action::MoveToNextWordEnd => (false, true, false),
                     Action::MoveToPreviousWordEnd => (true, true, false),
@@ -24051,6 +24076,10 @@ impl Editor {
             }
             Action::CommitSearch => {
                 add_to_history = false;
+                if self.file_vim.search.is_some() {
+                    self.finish_file_search(true, buffer, runtime).await?;
+                    return Ok(false);
+                }
                 let Some(session) = self.active_search.clone() else {
                     return Ok(false);
                 };
@@ -24101,6 +24130,10 @@ impl Editor {
             }
             Action::CancelSearch => {
                 add_to_history = false;
+                if self.file_vim.search.is_some() {
+                    self.finish_file_search(false, buffer, runtime).await?;
+                    return Ok(false);
+                }
                 self.cancel_active_search();
                 self.render(buffer)?;
             }
@@ -24961,6 +24994,16 @@ impl Editor {
                     // Suspend is not supported on Windows
                     // Just ignore the action
                 }
+            }
+            Action::Yank | Action::Delete
+                if self.mode == Mode::VisualBlock && self.selection.is_some() =>
+            {
+                let (key, op) = if *action == Action::Yank {
+                    ('y', vimlet::Operator::Yank)
+                } else {
+                    ('d', vimlet::Operator::Delete)
+                };
+                self.file_block_operator(key, op, buffer, runtime).await?;
             }
             Action::Yank => {
                 if self.selection.is_some() && self.yank(DEFAULT_REGISTER) {

@@ -208,6 +208,9 @@ pub(super) async fn run() -> Result<()> {
     macro_tail_waits_for_completion()
         .await
         .context("macro continuation")?;
+    vimlet_change_resumes_after_rpc_or_cancels_on_new_input()
+        .await
+        .context("file change in a suspended macro")?;
     nested_macro_keeps_its_recursion_limit()
         .await
         .context("nested macro budget")?;
@@ -536,6 +539,26 @@ async fn macro_tail_waits_for_completion() -> Result<()> {
     assert!(!h.screen().contains("Zhello"));
     h.release(2)?;
     h.until(|h| h.screen().contains("Zhello")).await?;
+    Ok(())
+}
+
+async fn vimlet_change_resumes_after_rpc_or_cancels_on_new_input() -> Result<()> {
+    let mut h = Harness::new(KeyAction::Single(Action::PluginCommand("RpcWait".into()))).await?;
+    h.command("register a QcwX<Esc>").await?;
+    h.text("@a").await?;
+    h.until(|h| h.marker("started", 1).exists()).await?;
+    assert!(h.document_screen().contains("hello"));
+    h.release(1)?;
+    h.until(|h| !h.document_screen().contains("hello") && h.document_screen().contains('X'))
+        .await?;
+    h.text("u@a").await?;
+    h.until(|h| h.marker("started", 2).exists()).await?;
+    h.text("iuser").await?;
+    h.key(KeyCode::Escape).await?;
+    h.release(2)?;
+    h.until(|h| h.marker("done", 2).exists() && !h.core.test_rpc_command_pending("slow"))
+        .await?;
+    assert!(h.document_screen().contains("userhello"), "{}", h.screen());
     Ok(())
 }
 
