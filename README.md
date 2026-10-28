@@ -259,6 +259,16 @@ including nested formatting, reference links, and URL/email autolinks. Markdown
 delimiters remain visible in both Normal and Insert mode, so navigation and
 editing use the original source positions.
 
+In Normal mode, press `gx` on a Markdown link's label or destination, or choose
+**Follow link** in the command palette. Web links open in your browser and email
+links in your mail app. Local files open in Red relative to the Markdown file's
+directory, reusing open buffers and their unsaved edits. `#heading` and
+`guide.md#heading` jump to headings; duplicate headings use `-1`, `-2`, and so on.
+Source links such as `src/main.rs:42:3` or `src/main.rs#L42` also work. Use
+`Ctrl-o` and `Ctrl-i` to go back and forward. Reference links, autolinks, and
+links in rendered tables follow the same rules; missing targets leave you in
+place. Link navigation is available for Markdown documents up to 2 MiB.
+
 Add new highlighting, exact filenames, comment syntax, indentation, and language
 servers through a unified `[languages.<id>]` configuration or an installable
 language pack. Native Tree-sitter grammars require explicit digest-bound trust;

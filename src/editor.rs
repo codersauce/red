@@ -51,6 +51,7 @@ mod inline_notifications;
 mod keyboard_shortcuts;
 mod learning;
 mod lsp_coordinator;
+mod markdown_links;
 mod markdown_tables;
 mod mouse;
 mod multi_cursor;
@@ -2879,6 +2880,8 @@ pub enum Action {
     MoveToFilePos(String, usize, usize),
     OpenLocation(plugin::PluginLocation, plugin::OpenLocationTarget),
     OpenExternalUrl(String),
+    /// Follows the Markdown link at the source cursor without requiring an LSP.
+    FollowLink,
     MoveToNextWord,
     MoveToPreviousWord,
     MoveToNextBigWord,
@@ -3721,6 +3724,7 @@ pub struct Editor {
     /// Memoized display layout, shared by the many per-frame layout queries.
     layout_cache: std::cell::RefCell<HashMap<LayoutCacheKey, std::sync::Arc<DisplayLayout>>>,
     markdown_table_cache: RefCell<HashMap<BufferId, markdown_tables::CachedTables>>,
+    markdown_link_cache: RefCell<HashMap<BufferId, markdown_links::CachedLinks>>,
 
     /// Window manager handling splits and layout
     window_manager: WindowManager,
@@ -5859,6 +5863,7 @@ impl Editor {
             bracket_match_cache: None,
             layout_cache: std::cell::RefCell::new(HashMap::new()),
             markdown_table_cache: RefCell::new(HashMap::new()),
+            markdown_link_cache: RefCell::new(HashMap::new()),
             window_manager,
             stdout,
             keyboard_protocol: crate::keyboard::KeyboardProtocol::default(),
@@ -23691,11 +23696,20 @@ impl Editor {
                 self.execute_with_tracking(&Action::MoveTo(*x, *y), buffer, runtime, false)
                     .await?;
             }
+            Action::FollowLink => {
+                if let Err(error) = self.follow_markdown_link(buffer, runtime).await {
+                    self.set_legacy_message(Some(error.to_string()));
+                    self.render(buffer)?;
+                }
+            }
             Action::OpenExternalUrl(url) => {
                 let lowercase = url.to_ascii_lowercase();
-                if !lowercase.starts_with("https://") && !lowercase.starts_with("http://") {
+                if !lowercase.starts_with("https://")
+                    && !lowercase.starts_with("http://")
+                    && !lowercase.starts_with("mailto:")
+                {
                     self.set_legacy_message(Some(
-                        "Only HTTP and HTTPS links can be opened".to_string(),
+                        "Only HTTP, HTTPS and mailto links can be opened".to_string(),
                     ));
                     return Ok(false);
                 }
@@ -25822,6 +25836,7 @@ impl Editor {
                         | crate::inline_history::HistoryAction::ShowAnnotations,
                 )
                 | Action::OpenLocation(_, _)
+                | Action::FollowLink
                 | Action::OpenFile(_)
                 | Action::OpenBuffer(_)
                 | Action::OpenBufferById(_)

@@ -151,7 +151,7 @@ fn whitespace_tokens(text: &str) -> impl Iterator<Item = (usize, &str)> {
         })
 }
 
-fn parse_source_location(value: &str) -> Option<(String, usize, usize)> {
+pub(crate) fn parse_source_location(value: &str) -> Option<(String, usize, usize)> {
     if value.is_empty() || value.contains("://") {
         return None;
     }

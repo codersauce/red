@@ -349,7 +349,7 @@ Esc = { EnterMode = "Normal" }
 "o" = "InsertLineBelowCursor"
 "O" = "InsertLineAtCursor"
 "G" = "MoveToBottom"
-"g" = { "g" = "MoveToTop", "%" = "MatchitBackward", "c" = { StartCommentOperator = 1 }, "q" = { StartFormatOperator = 1 }, "d" = "GoToDefinition", "j" = "MoveScreenLineDown", "k" = "MoveScreenLineUp", "0" = "MoveToScreenLineStart", "^" = "MoveToScreenLineFirstNonBlank", "$" = "MoveToScreenLineEnd", "e" = "MoveToPreviousWordEnd", "E" = "MoveToPreviousBigWordEnd", "J" = { JoinLinesKeepSpaces = 2 }, "W" = "ToggleWrap", "v" = "RestoreLastVisualSelection", "u" = { StartLowercaseOperator = 1 }, "U" = { StartUppercaseOperator = 1 }, "~" = { StartToggleCaseOperator = 1 }, "-" = "SelectPreviousUndoBranch", "+" = "SelectNextUndoBranch" }
+"g" = { "g" = "MoveToTop", "%" = "MatchitBackward", "c" = { StartCommentOperator = 1 }, "q" = { StartFormatOperator = 1 }, "d" = "GoToDefinition", "x" = "FollowLink", "j" = "MoveScreenLineDown", "k" = "MoveScreenLineUp", "0" = "MoveToScreenLineStart", "^" = "MoveToScreenLineFirstNonBlank", "$" = "MoveToScreenLineEnd", "e" = "MoveToPreviousWordEnd", "E" = "MoveToPreviousBigWordEnd", "J" = { JoinLinesKeepSpaces = 2 }, "W" = "ToggleWrap", "v" = "RestoreLastVisualSelection", "u" = { StartLowercaseOperator = 1 }, "U" = { StartUppercaseOperator = 1 }, "~" = { StartToggleCaseOperator = 1 }, "-" = "SelectPreviousUndoBranch", "+" = "SelectNextUndoBranch" }
 "u" = "Undo"
 "U" = "Redo"
 "Ctrl-r" = "Redo"

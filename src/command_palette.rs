@@ -1158,6 +1158,15 @@ fn builtin_commands() -> Vec<BuiltinCommand> {
             Action::GoToDefinition,
         ),
         builtin(
+            "editor.follow_link",
+            "Follow link",
+            "Navigation",
+            "Open the Markdown link under the cursor",
+            None,
+            &["markdown", "url", "anchor", "gx"],
+            Action::FollowLink,
+        ),
+        builtin(
             "lsp.hover",
             "Show hover documentation",
             "LSP",
@@ -1548,6 +1557,7 @@ fn action_label(action: &Action) -> String {
         Action::PreviousBuffer => "Previous buffer".to_string(),
         Action::FilePicker => "Find file".to_string(),
         Action::GoToDefinition => "Go to definition".to_string(),
+        Action::FollowLink => "Follow link".to_string(),
         Action::FormatDocument => "Format document".to_string(),
         Action::CodeAction => "Show code actions".to_string(),
         Action::StartRename => "Rename symbol".to_string(),

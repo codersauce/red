@@ -62,8 +62,10 @@ pub(crate) fn husk_lsp_declarations() -> &'static str {
 }
 #[cfg(test)]
 pub(crate) use text_link::markdown_link_target;
-pub(crate) use text_link::{annotation_link_destination, TextPanelLinkTarget};
-pub(crate) use text_link::{TextPanelFileLocation, TextPanelLink};
+pub(crate) use text_link::{
+    annotation_link_destination, parse_source_location, TextPanelFileLocation, TextPanelLink,
+    TextPanelLinkTarget,
+};
 pub use window_bar::{
     RenderedWindowBar, WindowBarConfig, WindowBarEdge, WindowBarHitRegion, WindowBarManager,
     WindowBarOverflow, WindowBarSegment, WindowBarSemanticStyle, WindowBarStyle,
