@@ -2137,6 +2137,9 @@ impl Editor {
                 self.fill_line_in_window(buffer, term_x, term_y, content_width, &theme_style);
                 continue;
             };
+            if self.render_projected_segment_in_window(buffer, window, segment) {
+                continue;
+            }
             if cached_line.as_ref().map(|(line, _)| *line) != Some(segment.line) {
                 cached_line = self.buffer_manager[window.buffer_index]
                     .get(segment.line)
@@ -2202,7 +2205,7 @@ impl Editor {
             .filter(|segment| segment.line == buffer_y && local_rows.contains(&segment.row))
         {
             let term_y = self.window_to_terminal_y(window, segment.row);
-            buffer.set_bg_for_range(
+            buffer.set_default_bg_for_range(
                 Point::new(start_x, term_y),
                 Point::new(end_x, term_y),
                 &bg,
@@ -2729,6 +2732,83 @@ impl Editor {
         Ok(cursor_position)
     }
 
+    /// Use the same projection for full frames and cursor-only row repaints.
+    fn render_projected_segment_in_window(
+        &mut self,
+        buffer: &mut RenderBuffer,
+        window: &crate::window::Window,
+        segment: &LineSegment,
+    ) -> bool {
+        let Some(projection) = &segment.projection else {
+            return false;
+        };
+        let term_y = self.window_to_terminal_y(window, segment.row);
+        let term_x = self.window_to_terminal_x(window, self.gutter_width_for_window(window) + 1);
+        let content_width = self.window_content_width(window);
+        let theme_style = self.theme.style.clone();
+        self.fill_line_in_window(buffer, term_x, term_y, content_width, &theme_style);
+        for glyph in &projection.glyphs {
+            let mut style = if glyph.style.chrome {
+                self.theme.gutter_style.fallback_bg(&theme_style)
+            } else if glyph.style.code {
+                self.theme
+                    .get_style("markup.raw.block.markdown")
+                    .unwrap_or_else(|| theme_style.clone())
+                    .fallback_bg(&theme_style)
+            } else if glyph.style.link {
+                self.theme
+                    .get_style("markup.underline.link.markdown")
+                    .unwrap_or_else(|| theme_style.clone())
+                    .fallback_bg(&theme_style)
+            } else {
+                theme_style.clone()
+            };
+            style.bold |= glyph.style.bold;
+            style.italic |= glyph.style.italic;
+            style.underline |= glyph.style.link;
+            let mut column = glyph.column;
+            for grapheme in glyph.text.graphemes(true) {
+                let width = display_width(grapheme);
+                if column >= segment.projection_left
+                    && column + width <= segment.projection_left + content_width
+                {
+                    buffer.set_text(
+                        term_x + column - segment.projection_left,
+                        term_y,
+                        grapheme,
+                        &style,
+                    );
+                }
+                column += width;
+            }
+        }
+        if projection.width > segment.projection_left + content_width && content_width >= 4 {
+            buffer.set_text(
+                term_x + content_width - 1,
+                term_y,
+                if self.config.window_borders_ascii {
+                    ">"
+                } else {
+                    "›"
+                },
+                &self.theme.gutter_style,
+            );
+        }
+        if segment.projection_left > 0 && content_width >= 4 {
+            buffer.set_text(
+                term_x,
+                term_y,
+                if self.config.window_borders_ascii {
+                    "<"
+                } else {
+                    "‹"
+                },
+                &self.theme.gutter_style,
+            );
+        }
+        true
+    }
+
     /// Renders the main editor content (text buffer) within a window
     fn render_main_content_in_window(
         &mut self,
@@ -2756,6 +2836,9 @@ impl Editor {
         for segment in &layout.rows {
             let term_y = self.window_to_terminal_y(window, segment.row);
             let term_x = self.window_to_terminal_x(window, gutter_width + 1);
+            if self.render_projected_segment_in_window(buffer, window, segment) {
+                continue;
+            }
             if cached_line.as_ref().map(|(line, _)| *line) != Some(segment.line) {
                 cached_line = self.buffer_manager[window.buffer_index]
                     .get(segment.line)
@@ -2959,7 +3042,7 @@ impl Editor {
                     let start_x = window.position.x + gutter_width + 1;
                     let end_x = window.position.x + window.inner_width() - 1;
 
-                    buffer.set_bg_for_range(
+                    buffer.set_default_bg_for_range(
                         Point::new(start_x, term_y),
                         Point::new(end_x, term_y),
                         &bg,
@@ -3311,6 +3394,20 @@ impl Editor {
                 };
                 if let Some(bg) = bg {
                     for segment in &layout.rows[segments.clone()] {
+                        if segment.projection.is_some() {
+                            for point in self
+                                .display_col_range_points_in_window(
+                                    window, line_index, start_col, end_col,
+                                )
+                                .into_iter()
+                                .filter(|point| {
+                                    point.y == self.window_to_terminal_y(window, segment.row)
+                                })
+                            {
+                                buffer.set_bg_for_range(point, point, &bg, &self.theme);
+                            }
+                            continue;
+                        }
                         let start = start_col.max(segment.start_col);
                         let end = end_col.min(segment.end_col);
                         if end <= start {
@@ -3377,6 +3474,32 @@ impl Editor {
             .iter()
             .filter(|segment| segment.line == line_index)
         {
+            if let Some(projection) = &segment.projection {
+                for glyph in &projection.glyphs {
+                    if !glyph
+                        .source
+                        .as_ref()
+                        .is_some_and(|source| source.start < end_col && start_col < source.end)
+                    {
+                        continue;
+                    }
+                    for column in glyph.column..glyph.column + glyph.width {
+                        if column < segment.projection_left
+                            || column >= segment.projection_left + content_width
+                        {
+                            continue;
+                        }
+                        points.push(Point::new(
+                            self.window_to_terminal_x(
+                                window,
+                                content_start + column - segment.projection_left,
+                            ),
+                            self.window_to_terminal_y(window, segment.row),
+                        ));
+                    }
+                }
+                continue;
+            }
             let start = start_col.max(segment.start_col);
             let end = end_col.min(segment.end_col);
             if end <= start {
@@ -3478,13 +3601,15 @@ impl Editor {
                 trim_line_ending(&line),
                 self.tab_width_for_buffer_index(window.buffer_index),
             );
-            if line_width > segment.end_col {
+            if segment.projection.is_none() && line_width > segment.end_col {
                 continue;
             }
             let content_end = gutter_width
                 + 1
-                + segment.visual_offset
-                + line_width.saturating_sub(segment.start_col);
+                + segment.projection.as_ref().map_or_else(
+                    || segment.visual_offset + line_width.saturating_sub(segment.start_col),
+                    |projection| projection.width.saturating_sub(segment.projection_left),
+                );
             let indicator_x = content_end + 5; // Add some padding
 
             // Skip if diagnostic would be outside window
@@ -3566,7 +3691,8 @@ impl Editor {
                 let column = display_width_with_tabs(line, tab_width);
                 let layout = self.layout_for_window(window);
                 if let Some(segment) = layout.segment_for_cursor(y, column) {
-                    let local_x = segment.visual_offset + column.saturating_sub(segment.start_col);
+                    let local_x = segment
+                        .screen_col_for_display_col(column, self.window_content_width(window));
                     if local_x < self.window_content_width(window) {
                         cells.push(Point::new(
                             self.window_to_terminal_x(
@@ -3793,6 +3919,11 @@ impl Editor {
             } else {
                 " [CONFLICT]"
             });
+        }
+        if let Some(destination) = self.markdown_link_destination() {
+            if let Some(index) = self.window_manager.window_index(destination) {
+                filename.push_str(&format!(" [links → {}]", index + 1));
+            }
         }
         let diagnostics = configured(StatuslineSection::Diagnostics)
             .then(|| self.statusline_diagnostic_counts(buffer_index))
@@ -4488,6 +4619,31 @@ mod tests {
     }
 
     #[test]
+    fn markdown_inline_code_background_survives_full_and_partial_line_highlights() {
+        let mut editor = rendering_test_editor(Buffer::new(
+            Some("inline.md".to_string()),
+            "plain `code` tail\n".to_string(),
+        ));
+        editor.apply_theme("red.json", false).unwrap();
+        let mut frame = RenderBuffer::new(60, 12, &editor.theme.style);
+        editor.render(&mut frame).unwrap();
+        let window = editor.active_window_with_editor_view().unwrap();
+        let start = editor.gutter_width_for_window(&window) + 1;
+        let code_background = frame.cells[start + 7].style.bg;
+        let line_background = editor.theme.line_highlight_style.as_ref().unwrap().bg;
+        assert_ne!(code_background, editor.theme.style.bg);
+        assert_ne!(code_background, line_background);
+        assert_eq!(frame.cells[start + 1].style.bg, line_background);
+
+        editor
+            .render_main_content_rows_in_window(&mut frame, &window, &[0])
+            .unwrap();
+        editor.render_line_highlight_rows_in_window(&mut frame, &window, &[0]);
+        assert_eq!(frame.cells[start + 7].style.bg, code_background);
+        assert_eq!(frame.cells[start + 1].style.bg, line_background);
+    }
+
+    #[test]
     fn empty_overlays_defer_positioning_until_content_becomes_visible() {
         let mut editor = rendering_test_editor(Buffer::new(None, "source\n".into()));
         editor.overlay_manager.create_overlay(
@@ -4854,6 +5010,8 @@ mod tests {
             end_byte: 0,
             start_grapheme_col: start_col,
             source_offset: 0,
+            projection: None,
+            projection_left: 0,
             first_segment,
             last_segment: true,
             visual_offset: 0,

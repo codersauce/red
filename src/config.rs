@@ -249,6 +249,11 @@ pub struct Config {
     pub scrolloff: Option<usize>,
     /// Whether long lines wrap to continuation rows.
     pub wrap: Option<bool>,
+    /// Render tables in Markdown buffers, revealing source while editing. Defaults to on.
+    pub markdown_tables: Option<bool>,
+    /// Focus after opening a Markdown link in its remembered split.
+    #[serde(default)]
+    pub markdown_link_split_focus: MarkdownLinkSplitFocus,
     /// Wrap directional window focus across opposite editor edges. Defaults to on.
     pub wrap_window_navigation: Option<bool>,
     /// Show the cursor line's absolute number and distances on other lines.
@@ -683,6 +688,17 @@ pub enum PickerInputPosition {
     /// Place input after results.
     #[default]
     Bottom,
+}
+
+/// Which pane retains focus when a Markdown link opens in its destination.
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum MarkdownLinkSplitFocus {
+    /// Keep reading the source document.
+    #[default]
+    Source,
+    /// Inspect the opened destination immediately.
+    Target,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
@@ -2103,6 +2119,8 @@ fn known_top_level_field(field: &str) -> bool {
             | "mouse_scroll_lines"
             | "scrolloff"
             | "wrap"
+            | "markdown_tables"
+            | "markdown_link_split_focus"
             | "wrap_window_navigation"
             | "relative_line_numbers"
             | "breakindent"
@@ -4725,6 +4743,34 @@ groups = [["\\bif\\b", "\\belse\\b", "\\bendif\\b"]]
         assert_eq!(config.key_hints, KeyHintsConfig::default());
         assert!(config.key_hints.enabled);
         assert_eq!(config.key_hints.delay_ms, 250);
+    }
+
+    #[test]
+    fn markdown_link_split_focus_loads_defaults_and_recovers_invalid_user_values() {
+        let path = Path::new("config.toml");
+        for (source, expected, diagnostics) in [
+            ("", MarkdownLinkSplitFocus::Source, 0),
+            (
+                "markdown_link_split_focus = 'target'",
+                MarkdownLinkSplitFocus::Target,
+                0,
+            ),
+            (
+                "markdown_link_split_focus = 'unknown'",
+                MarkdownLinkSplitFocus::Source,
+                1,
+            ),
+        ] {
+            let loaded = Config::load_user_toml(source, path, &[]).unwrap();
+            assert_eq!(loaded.config.markdown_link_split_focus, expected);
+            assert_eq!(loaded.diagnostics.len(), diagnostics);
+        }
+        assert!(Config::load_user_toml(
+            "",
+            path,
+            &["markdown_link_split_focus = 'unknown'".into()]
+        )
+        .is_err());
     }
 
     #[test]

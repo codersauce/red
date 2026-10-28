@@ -10,6 +10,55 @@ use unicode_segmentation::UnicodeSegmentation;
 
 use crate::unicode_utils::{display_width, grapheme_len};
 
+/// Fit columns by capping the widest first, while preserving each minimum.
+/// Returns `None` when even the minimum widths exceed the available cells.
+pub(crate) fn fit_column_widths(
+    preferred: &[usize],
+    minimum: &[usize],
+    budget: usize,
+) -> Option<Vec<usize>> {
+    if preferred.len() != minimum.len()
+        || preferred
+            .iter()
+            .zip(minimum)
+            .any(|(width, min)| width < min)
+        || minimum.iter().sum::<usize>() > budget
+    {
+        return None;
+    }
+    if preferred.iter().sum::<usize>() <= budget {
+        return Some(preferred.to_vec());
+    }
+    let mut low = 0;
+    let mut high = preferred.iter().copied().max().unwrap_or(0);
+    while low < high {
+        let cap = low + (high - low).div_ceil(2);
+        let total = preferred
+            .iter()
+            .zip(minimum)
+            .map(|(width, min)| (*width).min(cap).max(*min))
+            .sum::<usize>();
+        if total <= budget {
+            low = cap;
+        } else {
+            high = cap - 1;
+        }
+    }
+    let mut widths = preferred
+        .iter()
+        .zip(minimum)
+        .map(|(width, min)| (*width).min(low).max(*min))
+        .collect::<Vec<_>>();
+    let mut remaining = budget - widths.iter().sum::<usize>();
+    for (width, preferred) in widths.iter_mut().zip(preferred) {
+        if remaining > 0 && *width == low && *width < *preferred {
+            *width += 1;
+            remaining -= 1;
+        }
+    }
+    Some(widths)
+}
+
 /// How a view chooses its soft line breaks.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum WrapMode {
@@ -422,6 +471,16 @@ mod tests {
 
     fn position(row: usize, column: usize) -> DisplayPosition {
         DisplayPosition { row, column }
+    }
+
+    #[test]
+    fn table_columns_fit_the_budget_without_growing_pinned_minimums() {
+        assert_eq!(
+            fit_column_widths(&[100, 100, 100], &[8, 0, 0], 15),
+            Some(vec![8, 4, 3])
+        );
+        assert_eq!(fit_column_widths(&[12, 3], &[3, 3], 9), Some(vec![6, 3]));
+        assert_eq!(fit_column_widths(&[12, 3], &[3, 3], 5), None);
     }
 
     #[test]

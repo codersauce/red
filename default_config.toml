@@ -21,6 +21,15 @@ scrolloff = 3
 # Wrap long lines at the window edge. This matches Vim/Neovim's 'wrap'.
 wrap = true
 
+# Render Markdown pipe tables as aligned grids in Normal mode. Editing or
+# selecting a table reveals its original source. :markdown-tables toggles the
+# presentation in the current split without changing the file.
+markdown_tables = true
+
+# Keep focus in the Markdown source when a link opens in its remembered split.
+# Set to "target" to focus the destination. Config changes apply on restart.
+markdown_link_split_focus = "source"
+
 # Wrap Ctrl-w h/j/k/l focus across the opposite editor edge.
 wrap_window_navigation = true
 
@@ -344,7 +353,7 @@ Esc = { EnterMode = "Normal" }
 "o" = "InsertLineBelowCursor"
 "O" = "InsertLineAtCursor"
 "G" = "MoveToBottom"
-"g" = { "g" = "MoveToTop", "%" = "MatchitBackward", "c" = { StartCommentOperator = 1 }, "q" = { StartFormatOperator = 1 }, "d" = "GoToDefinition", "j" = "MoveScreenLineDown", "k" = "MoveScreenLineUp", "0" = "MoveToScreenLineStart", "^" = "MoveToScreenLineFirstNonBlank", "$" = "MoveToScreenLineEnd", "e" = "MoveToPreviousWordEnd", "E" = "MoveToPreviousBigWordEnd", "J" = { JoinLinesKeepSpaces = 2 }, "W" = "ToggleWrap", "v" = "RestoreLastVisualSelection", "u" = { StartLowercaseOperator = 1 }, "U" = { StartUppercaseOperator = 1 }, "~" = { StartToggleCaseOperator = 1 }, "-" = "SelectPreviousUndoBranch", "+" = "SelectNextUndoBranch" }
+"g" = { "g" = "MoveToTop", "%" = "MatchitBackward", "c" = { StartCommentOperator = 1 }, "q" = { StartFormatOperator = 1 }, "d" = "GoToDefinition", "x" = "FollowLink", "T" = "ToggleMarkdownTask", "j" = "MoveScreenLineDown", "k" = "MoveScreenLineUp", "0" = "MoveToScreenLineStart", "^" = "MoveToScreenLineFirstNonBlank", "$" = "MoveToScreenLineEnd", "e" = "MoveToPreviousWordEnd", "E" = "MoveToPreviousBigWordEnd", "J" = { JoinLinesKeepSpaces = 2 }, "W" = "ToggleWrap", "v" = "RestoreLastVisualSelection", "u" = { StartLowercaseOperator = 1 }, "U" = { StartUppercaseOperator = 1 }, "~" = { StartToggleCaseOperator = 1 }, "-" = "SelectPreviousUndoBranch", "+" = "SelectNextUndoBranch" }
 "u" = "Undo"
 "U" = "Redo"
 "Ctrl-r" = "Redo"
@@ -448,6 +457,7 @@ Esc = { EnterMode = "Normal" }
 "m" = "MoveToNextCall"
 
 [keys.normal."Ctrl-w"]
+"x" = "FollowLinkInSplit"
 "a" = { PluginCommand = "AgentOpen" }
 "h" = "MoveWindowLeft"
 "H" = "MoveWindowToLeft"

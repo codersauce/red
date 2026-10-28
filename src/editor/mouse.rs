@@ -185,7 +185,7 @@ impl Editor {
         };
         let buffer = &self.buffer_manager[window.buffer_index];
         let line = buffer.get(segment.line).unwrap_or_default();
-        let display_col = segment.start_col + content_x.saturating_sub(segment.visual_offset);
+        let display_col = segment.display_col_for_screen_col(content_x);
         let x = column_to_grapheme_with_tabs(
             trim_line_ending(&line),
             display_col,
@@ -284,6 +284,15 @@ impl Editor {
             } else {
                 Point::new(self.cx, self.buffer_line())
             };
+            // Leaving Visual mode can collapse source back into a table. Hit
+            // test the layout visible at the time of the press, before that
+            // mode transition moves cells or changes wrapped row heights.
+            let visual_table_layout =
+                (same_window && self.is_visual() && self.markdown_tables_enabled(&window))
+                    .then(|| self.layout_for_window(&window));
+            let visual_table_point = visual_table_layout
+                .as_ref()
+                .map(|_| self.mouse_buffer_point(&window, pointer));
             let previous_mode = self.mode;
             if self.is_visual() {
                 self.execute_enter_mode(Mode::Normal, buffer, runtime)
@@ -313,7 +322,7 @@ impl Editor {
                 }
                 return Ok(());
             }
-            let layout = self.layout_for_window(&window);
+            let layout = visual_table_layout.unwrap_or_else(|| self.layout_for_window(&window));
             let content_x = pointer
                 .x
                 .saturating_sub(window.position.x + self.gutter_width_for_window(&window) + 1);
@@ -328,7 +337,8 @@ impl Editor {
                 }
                 return Ok(());
             }
-            let point = self.mouse_buffer_point(&window, pointer);
+            let point =
+                visual_table_point.unwrap_or_else(|| self.mouse_buffer_point(&window, pointer));
             self.clear_multi_cursor();
             self.execute(&Action::SetCursor(point.x, point.y), buffer, runtime)
                 .await?;
@@ -433,6 +443,16 @@ impl Editor {
                 }
                 return Ok(());
             }
+            // Entering Visual mode reveals a Markdown table. Resolve the first
+            // drag against the grid that was actually under the pointer.
+            let initial_table_point = (!gesture.started && self.active_has_markdown_tables())
+                .then(|| self.active_window_with_editor_view())
+                .flatten()
+                .filter(|window| {
+                    let top = window.position.y + self.window_content_top(window);
+                    (top..top + self.window_content_height(window)).contains(&pointer.y)
+                })
+                .map(|window| self.mouse_buffer_point(&window, pointer));
             if !gesture.started {
                 if self.is_insert() {
                     self.execute_enter_mode(Mode::Normal, buffer, runtime)
@@ -466,7 +486,8 @@ impl Editor {
                 self.mouse_selection.gesture = None;
                 return Ok(());
             };
-            let mut point = self.mouse_buffer_point(&window, pointer);
+            let mut point =
+                initial_table_point.unwrap_or_else(|| self.mouse_buffer_point(&window, pointer));
             let anchor = if gesture.unit == SelectionUnit::Word {
                 let (start, end, _) = self.mouse_word_span(point);
                 if gesture.reverse_initial && pointer == gesture.press_pointer {

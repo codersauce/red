@@ -246,6 +246,52 @@ setting that ships with Red. Custom themes go in `~/.config/red/themes/`, and
 custom Husk plugins go in `~/.config/red/plugins/`. Run `red --runtime-files`
 to see every visible runtime asset and its source.
 
+Markdown files show pipe tables as aligned grids in Normal mode, with wrapped
+cells, column alignment, and inline formatting. Enter Insert or Visual mode in
+a table to reveal its original Markdown; Escape restores the grid. The display
+does not reformat the file or add undo entries. Use `:markdown-tables` (also in
+the command palette) to toggle this per split, or set `markdown_tables = false`
+to default to source. Fenced code, nested tables, malformed rows with extra cells,
+and documents larger than 2 MiB stay in source form.
+
+Markdown source also highlights **bold**, *emphasis*, `inline code`, and links,
+including nested formatting, reference links, and URL/email autolinks. Markdown
+delimiters remain visible in both Normal and Insert mode, so navigation and
+editing use the original source positions.
+
+List markers and task checkboxes retain their source characters and indentation.
+Ordered-list numbers are emphasized separately from their punctuation, and checked
+tasks highlight the `x` or `X` without dimming the item text. In Normal mode, press
+`gT` anywhere on a task's first source line, or choose **Toggle task** in the command
+palette, to switch between `[ ]` and `[x]`. Nested tasks and tasks in block quotes
+work too; code examples are left alone. Each toggle preserves the cursor and is
+one undo step. The action is `ToggleMarkdownTask` for custom keybindings and is
+available for Markdown documents up to 2 MiB.
+
+In Normal mode, press `gx` on a Markdown link's label or destination, or choose
+**Follow link** in the command palette. Web links open in your browser and email
+links in your mail app. Local files open in Red relative to the Markdown file's
+directory, reusing open buffers and their unsaved edits. `#heading` and
+`guide.md#heading` jump to headings; duplicate headings use `-1`, `-2`, and so on.
+Source links such as `src/main.rs:42:3` or `src/main.rs#L42` also work. Use
+`Ctrl-o` and `Ctrl-i` to go back and forward. Reference links, autolinks, and
+links in rendered tables follow the same rules; missing targets leave you in
+place. Link navigation is available for Markdown documents up to 2 MiB.
+
+Press `Ctrl-w x`, or choose **Open link in split**, to keep the Markdown document
+visible while opening a local link in a split to its right. That source pane
+remembers the destination: later `gx` or `Ctrl-w x` opens reuse it. A `[links → N]`
+indicator in the source's filename identifies the destination pane number.
+Focus stays in the source by default; set `markdown_link_split_focus = "target"`
+in your config and restart Red to focus the opened file instead.
+
+The destination has its own `Ctrl-o`/`Ctrl-i` history. Changing files there keeps
+it assigned, and unsaved edits remain in their buffers. **Clear link destination**
+in the command palette releases it without closing the pane. Closing either pane
+or changing the source document also clears the association; ordinary `gx` then
+opens in the current pane again. Associations are independent for each source pane
+and last only for the current session. Web and email links still open externally.
+
 Add new highlighting, exact filenames, comment syntax, indentation, and language
 servers through a unified `[languages.<id>]` configuration or an installable
 language pack. Native Tree-sitter grammars require explicit digest-bound trust;

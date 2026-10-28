@@ -1,0 +1,129 @@
+<div id="red-link-focus" class="viz-carousel" aria-label="Focus after opening a Markdown link">
+  <section data-variant="Keep document focus" data-policy="source">
+    <div class="focus-stage">
+      <div class="terminal-viewport"><button class="terminal-grid" type="button" aria-label="Proposed Red terminal. Use j and k, gx, and Control-w w."><span class="screen"></span></button></div>
+      <div class="viz-controls">
+        <button type="button" class="btn btn-primary" data-action="open">Open link · gx</button>
+        <button type="button" class="btn" data-action="down">Down · j</button>
+        <button type="button" class="btn" data-action="switch">Switch pane · Ctrl-w w</button>
+        <button type="button" class="btn btn-ghost" data-action="reset">Restart</button>
+      </div>
+      <div class="text-small" data-feedback aria-live="polite">Proposed behavior · 80 columns × 13 rows</div>
+    </div>
+  </section>
+  <section data-variant="Focus opened file" data-policy="target" hidden>
+    <div class="focus-stage">
+      <div class="terminal-viewport"><button class="terminal-grid" type="button" aria-label="Proposed Red terminal. Use j and k, gx, and Control-w w."><span class="screen"></span></button></div>
+      <div class="viz-controls">
+        <button type="button" class="btn btn-primary" data-action="open">Open link · gx</button>
+        <button type="button" class="btn" data-action="down">Down · j</button>
+        <button type="button" class="btn" data-action="switch">Switch pane · Ctrl-w w</button>
+        <button type="button" class="btn btn-ghost" data-action="reset">Restart</button>
+      </div>
+      <div class="text-small" data-feedback aria-live="polite">Proposed behavior · 80 columns × 13 rows</div>
+    </div>
+  </section>
+</div>
+<style>
+  #red-link-focus .focus-stage { display: grid; gap: 12px; }
+  #red-link-focus .terminal-viewport { max-width: 100%; overflow-x: auto; }
+  #red-link-focus .terminal-grid {
+    display: block; border: 0; margin: 0; padding: 0; width: 80ch;
+    background: light-dark(#fafafa, #101013); color: light-dark(#22222a, #d5d5dd);
+    font: 14px/20px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-kerning: none; font-variant-ligatures: none; letter-spacing: 0;
+    text-align: left; white-space: pre;
+  }
+  #red-link-focus .screen { display: block; width: 80ch; white-space: pre; }
+  #red-link-focus .cursor { background: #e5484d; color: #101013; }
+  #red-link-focus .status { background: light-dark(#e8e8ec, #28282e); }
+</style>
+<script>
+(() => {
+  const root = document.getElementById('red-link-focus');
+  const links = [
+    { label: 'Xatu refresh path', file: 'owned_transcript.rs', line: 159, code: 'fn refresh_owned_transcript() {' },
+    { label: 'Offset test', file: 'owned_transcript_tests.rs', line: 570, code: 'fn renders_at_nonzero_offset() {' },
+    { label: 'Event dispatch', file: 'event_dispatch.rs', line: 439, code: 'match event {' }
+  ];
+  const fit = (text, width) => text.slice(0, width).padEnd(width, ' ');
+  root.querySelectorAll('[data-policy]').forEach(section => {
+    const terminal = section.querySelector('.terminal-grid');
+    const screen = section.querySelector('.screen');
+    const feedback = section.querySelector('[data-feedback]');
+    let selected = 0;
+    let opened = null;
+    let focus = 'source';
+    let targetOffset = 0;
+    let prefix = '';
+    let message = 'Choose a link, then open it.';
+
+    function render() {
+      const active = opened === null ? null : links[opened];
+      const left = [' REPORT.md', '', ' 31 ## Review findings', ' 32',
+        ...links.map((link, i) => ` ${33 + i} [${link.label}]`), '',
+        '    Each source remembers its target.', '', '', ''];
+      const right = [active ? ` ${active.file}` : ' Link destination', '',
+        active ? ` ${active.line + targetOffset} ${active.code}` : ' Open a reference to show its file.',
+        active ? '     // linked source context' : '', active ? ' }' : '', '', '', '', '', '', '', ''];
+      const lines = left.map((line, i) => fit(line, 39) + '|' + fit(right[i] || '', 40));
+      lines.push(fit(` NORMAL | ${focus === 'source' ? 'REPORT.md' : (active?.file || 'Link destination')} | focus: ${focus === 'source' ? 'document' : 'opened file'}`, 80));
+      const cursorRow = focus === 'source' ? 4 + selected : 2;
+      const cursorCol = focus === 'source' ? 5 : 45;
+      screen.replaceChildren();
+      lines.forEach((line, row) => {
+        const span = document.createElement('span');
+        if (row === 12) span.className = 'status';
+        if (row === cursorRow) {
+          span.append(document.createTextNode(line.slice(0, cursorCol)));
+          const cursor = document.createElement('span');
+          cursor.className = 'cursor';
+          cursor.textContent = line[cursorCol];
+          span.append(cursor, document.createTextNode(line.slice(cursorCol + 1)));
+        } else span.textContent = line;
+        screen.append(span, document.createTextNode(row === 12 ? '' : '\n'));
+      });
+      terminal.dataset.activePane = focus;
+      terminal.dataset.selectedLink = String(selected);
+      terminal.dataset.openedLink = opened === null ? '' : String(opened);
+      feedback.textContent = message;
+    }
+
+    function action(name) {
+      prefix = '';
+      if (name === 'reset') {
+        selected = 0; opened = null; focus = 'source'; targetOffset = 0;
+        message = 'Proposed behavior · 80 columns × 13 rows';
+      } else if (name === 'switch') {
+        focus = focus === 'source' ? 'target' : 'source';
+        message = `Focus: ${focus === 'source' ? 'Markdown document' : 'destination pane'}.`;
+      } else if (name === 'down' || name === 'up') {
+        const delta = name === 'down' ? 1 : -1;
+        if (focus === 'source') {
+          selected = Math.max(0, Math.min(links.length - 1, selected + delta));
+          message = `Selected reference: ${links[selected].label}.`;
+        } else {
+          targetOffset = Math.max(0, targetOffset + delta);
+          message = 'Movement is in the destination; the report selection stays put.';
+        }
+      } else if (name === 'open') {
+        if (focus === 'source') {
+          opened = selected; targetOffset = 0; focus = section.dataset.policy;
+          message = focus === 'source' ? 'Opened in the same destination. j/k still navigates the report.' : 'Opened in the destination. Switch back to choose the next report link.';
+        } else message = 'No Markdown link under the cursor in this source-code example.';
+      }
+      render();
+    }
+    section.querySelectorAll('[data-action]').forEach(button => button.addEventListener('click', () => action(button.dataset.action)));
+    terminal.addEventListener('keydown', event => {
+      if (event.ctrlKey && event.key.toLowerCase() === 'w') { event.preventDefault(); prefix = 'window'; return; }
+      if (prefix === 'window' && ['w', 'h', 'l'].includes(event.key)) { event.preventDefault(); action('switch'); return; }
+      if (event.key === 'g') { event.preventDefault(); prefix = 'g'; return; }
+      if (prefix === 'g' && event.key === 'x') { event.preventDefault(); action('open'); return; }
+      prefix = '';
+      if (event.key === 'j' || event.key === 'k') { event.preventDefault(); action(event.key === 'j' ? 'down' : 'up'); }
+    });
+    render();
+  });
+})();
+</script>

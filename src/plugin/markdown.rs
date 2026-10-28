@@ -1277,7 +1277,7 @@ fn render_table(
         return render_table_records(table, width, first_prefix, continuation_prefix);
     }
 
-    let mut widths = (0..columns)
+    let widths = (0..columns)
         .map(|column| {
             std::iter::once(&table.header[column])
                 .chain(table.rows.iter().map(|row| &row[column]))
@@ -1301,20 +1301,10 @@ fn render_table(
                 .clamp(minimum_column, widths[column])
         })
         .collect::<Vec<_>>();
-    while widths.iter().sum::<usize>() > budget {
-        let Some((index, _)) = widths
-            .iter()
-            .enumerate()
-            .filter(|(index, width)| **width > longest_words[*index])
-            .max_by_key(|(_, width)| **width)
-        else {
-            break;
-        };
-        widths[index] -= 1;
-    }
-    if widths.iter().sum::<usize>() > budget {
+    let Some(widths) = crate::text_layout::fit_column_widths(&widths, &longest_words, budget)
+    else {
         return render_table_records(table, width, first_prefix, continuation_prefix);
-    }
+    };
 
     let mut lines = Vec::new();
     push_table_row(

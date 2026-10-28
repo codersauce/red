@@ -158,6 +158,7 @@ impl Editor {
                     | Action::ToggleCommentLines(_)
                     | Action::ToggleCommentRange(_)
                     | Action::ToggleCommentSelection
+                    | Action::ToggleMarkdownTask
                     | Action::StartCommentOperator(_)
                     | Action::StartFormatOperator(_)
                     | Action::FormatTextRange(_)
