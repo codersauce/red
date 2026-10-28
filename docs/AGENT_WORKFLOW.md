@@ -19,6 +19,10 @@ The check is offline. It locates `codex`, reads `codex --version`, and reports
 whether the installed version supports Red's app-server contract.
 Authentication is verified by `account/read` when the first session starts.
 
+To follow a Claude Code, Codex CLI, or Gemini CLI process that is already
+editing the project, use [agent watch](AGENT_WATCH.md). That mode only reads
+session logs and does not drive Red's Codex agent.
+
 ## Inline assist
 
 `Space i` is the limited-blast-radius path for code changes, explanations, and

@@ -1,4 +1,7 @@
 //! Terminal cursor state shared by native and detached renderers.
+//!
+//! `NO_COLOR` still suppresses color in streamed CLI output. The editor theme
+//! is the interface, so interactive painting opts back into ANSI color.
 
 use std::io::{self, Write};
 
@@ -6,6 +9,18 @@ use crossterm::{cursor, QueueableCommand as _};
 use serde::{Deserialize, Serialize};
 
 use crate::{color::Color, config::CursorShape};
+
+/// Paint theme colors even when `NO_COLOR` is set.
+///
+/// Crossterm treats a non-empty `NO_COLOR` as a process-wide ban on
+/// foreground and background sequences. That is right for `red update` and
+/// other utility output, and wrong for a full-screen editor: without those
+/// sequences the theme, syntax highlighting, and edit tint all disappear.
+/// Call this before the first interactive frame. It does not change
+/// [`crate::cli_style`], which keeps honoring `NO_COLOR`.
+pub fn enable_theme_color() {
+    crossterm::style::force_color_output(true);
+}
 
 /// The native cursor to display after a complete frame. `None` means hidden.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -60,6 +75,32 @@ impl CursorState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn theme_color_is_painted_when_no_color_is_set() {
+        // Crossterm's color switch is process-global. Leave it enabled so a
+        // later paint does not straddle the transition. Do not change the
+        // `NO_COLOR` environment variable; CLI styling reads that directly.
+        crossterm::style::force_color_output(false);
+        let suppressed = crossterm::style::Colored::ForegroundColor(crossterm::style::Color::Rgb {
+            r: 12,
+            g: 34,
+            b: 56,
+        })
+        .to_string();
+        assert!(
+            suppressed.is_empty(),
+            "NO_COLOR should suppress streamed color, got {suppressed}"
+        );
+        enable_theme_color();
+        let painted = crossterm::style::Colored::ForegroundColor(crossterm::style::Color::Rgb {
+            r: 12,
+            g: 34,
+            b: 56,
+        })
+        .to_string();
+        assert_eq!(painted, "38;2;12;34;56");
+    }
 
     #[test]
     fn hidden_cursor_emits_no_style_or_position_commands() {

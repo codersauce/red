@@ -183,6 +183,23 @@ a full Agent follow-up without sending it automatically.
 The [agent workflow and safety contract](docs/AGENT_WORKFLOW.md) explains
 prerequisites, path protections, exact boundaries, commands, and failure modes.
 
+## Watch an external agent
+
+Red can follow a coding agent that is already working in the project. Claude
+Code, Codex CLI, and Gemini CLI write session logs as they read and edit
+files. `red --agent-watch` opens those files in a read-only follow mode, jumps
+to the changed lines, and shows what the agent is doing. `q` returns to normal
+editing. From inside Red, use `:agent-watch` and `:agent-watch stop`.
+
+```shell
+red --agent-watch
+red --agent-watch=/path/to/project
+```
+
+This is separate from Red's own Codex agent. It does not launch an agent or
+send it input. See [Agent watch](docs/AGENT_WATCH.md) for keys, session
+locations, and limits.
+
 ## What Red ships today
 
 The current release includes:
@@ -350,6 +367,7 @@ platform details.
 | [Language extensions](docs/LANGUAGES.md) | Custom syntax, trusted Tree-sitter grammars, language packs, LSP settings, and live reload |
 | [Vim compatibility](docs/VIM_COMPATIBILITY.md) | Supported behavior and intentional differences |
 | [Agent workflow](docs/AGENT_WORKFLOW.md) | Codex prerequisites, review model, commands, and safety |
+| [Agent watch](docs/AGENT_WATCH.md) | Follow Claude Code, Codex CLI, or Gemini CLI in the editor |
 | [Plugin system](docs/PLUGIN_SYSTEM.md) | Husk lifecycle, runtime architecture, and validation |
 | [Plugin API](docs/PLUGIN_API.md) | Versioned host API for plugin authors |
 | [Detach and attach](docs/DETACH.md) | Persistent Unix sessions |

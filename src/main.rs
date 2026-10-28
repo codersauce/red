@@ -354,6 +354,10 @@ async fn run_editor_inner(args: Args) -> anyhow::Result<()> {
     editor.enable_agent_continuity(Config::path("agent/conversations"));
     editor.enable_update_checks(Config::path("cache/updates"));
     editor.set_session_store(session_store);
+    if let Some(path) = args.agent_watch.as_deref() {
+        let directory = (path != ".").then(|| PathBuf::from(path));
+        editor.begin_agent_watch(directory)?;
+    }
 
     if let Some(session) = &args.core_session {
         #[cfg(unix)]
@@ -820,6 +824,7 @@ async fn attach_session(session: &str) -> anyhow::Result<()> {
             red::headless::connect_session(&Config::path("run"), session, None, size).await?;
         let mut rows = Vec::new();
         terminal::enable_raw_mode()?;
+        red::terminal_output::enable_theme_color();
         let mut terminal_guard = DetachedTerminalGuard::default();
         let mut output = std::io::BufWriter::with_capacity(1 << 20, stdout());
         let mut clipboard = SessionClipboard::new(&client.clipboard_config);

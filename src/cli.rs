@@ -40,6 +40,20 @@ pub struct Args {
     #[clap(long = "agent-check")]
     pub agent_check: bool,
 
+    /// Follow a Claude Code, Codex, or Gemini CLI session in this project.
+    ///
+    /// `--agent-watch` uses the working directory. `--agent-watch=DIR` watches
+    /// another directory. The view is read-only until you press `q`.
+    #[clap(
+        long = "agent-watch",
+        value_name = "DIR",
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = ".",
+        conflicts_with_all = ["attach", "stop", "process_editor_replace"]
+    )]
+    pub agent_watch: Option<String>,
+
     /// Exit non-zero when the Codex prerequisite check is not agent-edit ready.
     #[clap(long, requires = "agent_check")]
     pub strict: bool,
@@ -264,6 +278,9 @@ impl Args {
         } else if self.utility_requested() && !self.files.is_empty() {
             anyhow::bail!("runtime utility flags cannot be used with files to edit");
         }
+        if self.agent_watch.is_some() && self.command.is_some() {
+            anyhow::bail!("--agent-watch cannot be combined with a utility command");
+        }
         Ok(())
     }
 }
@@ -335,6 +352,15 @@ mod tests {
         assert!(args.agent_check);
         assert!(args.strict);
         assert!(args.utility_requested());
+
+        let args = Args::try_parse_from(["red", "--agent-watch"]).unwrap();
+        assert_eq!(args.agent_watch.as_deref(), Some("."));
+        let args = Args::try_parse_from(["red", "--agent-watch=/tmp/proj", "snake.js"]).unwrap();
+        assert_eq!(args.agent_watch.as_deref(), Some("/tmp/proj"));
+        assert_eq!(args.files, ["snake.js"]);
+        let args = Args::try_parse_from(["red", "--agent-watch", "snake.js"]).unwrap();
+        assert_eq!(args.agent_watch.as_deref(), Some("."));
+        assert_eq!(args.files, ["snake.js"]);
 
         let args = Args::try_parse_from(["red", "--resume"]).unwrap();
         assert!(args.resume);

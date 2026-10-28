@@ -19,6 +19,7 @@ mod agent_annotations;
 mod agent_continuity;
 mod agent_edit_decision;
 mod agent_lsp;
+mod agent_watch;
 pub use agent_edit_decision::AgentUnsavedChoice;
 mod agent_manager;
 mod agent_models;
@@ -3675,6 +3676,8 @@ pub struct Editor {
 
     /// Domain sub-controller managing background AI agent state and tool channels
     agent_manager: agent_manager::AgentManager,
+    /// Read-only follow mode for an external Claude Code, Codex, or Gemini CLI session.
+    agent_watch: Option<agent_watch::FollowSession>,
     /// Agent writes waiting for, and answers about, the user's unsaved changes.
     agent_edit_decisions: agent_edit_decision::AgentEditDecisions,
     /// Last key or paste, so unprompted questions wait for a pause in typing.
@@ -5846,6 +5849,7 @@ impl Editor {
             session_manager,
             lsp_coordinator,
             agent_manager,
+            agent_watch: None,
             agent_edit_decisions: Default::default(),
             last_user_input_at: None,
             edit_previews: Default::default(),
@@ -11081,6 +11085,7 @@ impl Editor {
 
     async fn run_interactive(&mut self, runtime: &mut Runtime) -> anyhow::Result<()> {
         let interactive_startup = perf::PerfSpan::start("startup:interactive");
+        crate::terminal_output::enable_theme_color();
         terminal::enable_raw_mode()?;
         self.terminal_active = true;
         self.stdout
@@ -11159,6 +11164,7 @@ impl Editor {
         for prepared in startup_highlighters {
             self.highlighter.finish_prepared_language(prepared);
         }
+        self.poll_agent_watch(&mut buffer, runtime).await?;
         self.render(&mut buffer)?;
         self.mark_whats_new_presented();
         drop(interactive_startup);
@@ -11583,6 +11589,7 @@ impl Editor {
             .await;
         self.service_mouse_selection(buffer, runtime).await?;
         self.service_open_file_changes(buffer, runtime).await?;
+        self.poll_agent_watch(buffer, runtime).await?;
         if self.agent_lsp.has_work() {
             self.service_agent_lsp(buffer, runtime).await?;
         }
@@ -17133,6 +17140,10 @@ impl Editor {
             }
         }
 
+        if self.agent_watch_captures(ev) {
+            return Ok(self.handle_agent_watch_input(ev));
+        }
+
         Ok(match self.mode {
             Mode::Normal => self.handle_normal_event(ev),
             Mode::Insert => self.handle_insert_event(ev)?,
@@ -18192,6 +18203,12 @@ impl Editor {
                     }
                 };
             }
+        }
+
+        let (watch_name, watch_args) = cmd.split_once(' ').unwrap_or((cmd, ""));
+        let watch_name = watch_name.strip_suffix('!').unwrap_or(watch_name);
+        if watch_name == "agent-watch" || watch_name == "AgentWatch" {
+            return self.agent_watch_command(watch_args);
         }
 
         if cmd == "Copilot" || cmd.starts_with("Copilot ") {
@@ -38363,7 +38380,19 @@ builtin = "rust"
             )
             .await
             .unwrap();
-        assert_eq!(editor.command, "ag");
+        assert_eq!(editor.command, "agent-watch");
+
+        editor.test_set_commandline(Mode::Command, "AG");
+        editor
+            .process_editor_event(
+                Event::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)),
+                &mut buffer,
+                &mut runtime,
+                EventRenderMode::Immediate,
+            )
+            .await
+            .unwrap();
+        assert_eq!(editor.command, "AG");
     }
 
     #[tokio::test]
