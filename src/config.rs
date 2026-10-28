@@ -249,6 +249,8 @@ pub struct Config {
     pub scrolloff: Option<usize>,
     /// Whether long lines wrap to continuation rows.
     pub wrap: Option<bool>,
+    /// Render tables in Markdown buffers, revealing source while editing. Defaults to on.
+    pub markdown_tables: Option<bool>,
     /// Wrap directional window focus across opposite editor edges. Defaults to on.
     pub wrap_window_navigation: Option<bool>,
     /// Show the cursor line's absolute number and distances on other lines.
@@ -2103,6 +2105,7 @@ fn known_top_level_field(field: &str) -> bool {
             | "mouse_scroll_lines"
             | "scrolloff"
             | "wrap"
+            | "markdown_tables"
             | "wrap_window_navigation"
             | "relative_line_numbers"
             | "breakindent"

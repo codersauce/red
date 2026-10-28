@@ -158,7 +158,7 @@ fn break_indent_width(line: &str, width: usize, options: BreakIndentOptions) -> 
     )
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LineSegment {
     pub line: usize,
     pub row: usize,
@@ -180,10 +180,16 @@ pub struct LineSegment {
     /// segments; on wrapped continuations it aligns the text with the
     /// line's indentation (vim's 'breakindent').
     pub visual_offset: usize,
+    /// A table row maps disjoint cell ranges instead of one linear source slice.
+    pub(super) projection: Option<std::sync::Arc<super::markdown_tables::ProjectedRow>>,
+    pub(super) projection_left: usize,
 }
 
 impl LineSegment {
     pub fn contains_display_col(&self, col: usize) -> bool {
+        if let Some(projection) = &self.projection {
+            return projection.contains(col);
+        }
         if self.start_col == self.end_col {
             return col == self.start_col;
         }
@@ -194,11 +200,27 @@ impl LineSegment {
     /// Includes the insertion caret after the final character, but keeps
     /// boundaries between wrapped segments exclusive on the preceding row.
     pub fn contains_cursor_col(&self, col: usize) -> bool {
+        if self.projection.is_some() {
+            return self.contains_display_col(col);
+        }
         self.contains_display_col(col) || (self.last_segment && col == self.end_col)
     }
 
     pub fn screen_col_for_display_col(&self, col: usize, width: usize) -> usize {
+        if let Some(projection) = &self.projection {
+            return projection
+                .column_for_source(col)
+                .saturating_sub(self.projection_left)
+                .min(width.saturating_sub(1));
+        }
         (self.visual_offset + col.saturating_sub(self.start_col)).min(width.saturating_sub(1))
+    }
+
+    pub fn display_col_for_screen_col(&self, col: usize) -> usize {
+        if let Some(projection) = &self.projection {
+            return projection.source_for_column(col + self.projection_left);
+        }
+        self.start_col + col.saturating_sub(self.visual_offset)
     }
 }
 
@@ -300,7 +322,7 @@ impl DisplayLayout {
             &line[..cursor_byte],
             config.break_indent.tab_width,
         );
-        let Some(mut anchor) = self.segment_for_cursor(line_index, cursor_col).copied() else {
+        let Some(mut anchor) = self.segment_for_cursor(line_index, cursor_col).cloned() else {
             return self;
         };
         let start_row = anchor.row;
@@ -449,6 +471,16 @@ pub struct LayoutConfig {
 }
 
 pub fn layout_lines(lines: &[String], line_count: usize, config: LayoutConfig) -> DisplayLayout {
+    layout_lines_with_tables(lines, line_count, config, None, None)
+}
+
+pub(super) fn layout_lines_with_tables(
+    lines: &[String],
+    line_count: usize,
+    config: LayoutConfig,
+    tables: Option<&super::markdown_tables::TableLayout>,
+    reveal: Option<&std::ops::Range<usize>>,
+) -> DisplayLayout {
     if config.content_width == 0 || config.height == 0 {
         return DisplayLayout::default();
     }
@@ -474,24 +506,36 @@ pub fn layout_lines(lines: &[String], line_count: usize, config: LayoutConfig) -
         } else {
             0
         };
-        let segments = if config.wrap {
-            wrap_line_segments_with_limit(
-                line,
-                line_index,
-                config.content_width,
-                line_skipcol,
-                config.break_indent,
-                config.height - row,
-            )
-        } else {
-            nowrap_line_segment(
-                line,
-                line_index,
-                config.content_width,
-                config.vleft,
-                config.break_indent.tab_width,
-            )
-        };
+        let segments =
+            if let Some(table) = tables.and_then(|tables| tables.line(line_index, reveal)) {
+                table
+                    .rows
+                    .iter()
+                    .filter(|segment| line_skipcol == 0 || segment.start_col >= line_skipcol)
+                    .map(|segment| {
+                        let mut segment = segment.clone();
+                        segment.projection_left = config.vleft;
+                        segment
+                    })
+                    .collect()
+            } else if config.wrap {
+                wrap_line_segments_with_limit(
+                    line,
+                    line_index,
+                    config.content_width,
+                    line_skipcol,
+                    config.break_indent,
+                    config.height - row,
+                )
+            } else {
+                nowrap_line_segment(
+                    line,
+                    line_index,
+                    config.content_width,
+                    config.vleft,
+                    config.break_indent.tab_width,
+                )
+            };
 
         for mut segment in segments {
             if row >= config.height {
@@ -573,6 +617,8 @@ fn wrap_line_segments_with_limit(
                     end_byte: byte_offset,
                     start_grapheme_col: start_col,
                     source_offset: 0,
+                    projection: None,
+                    projection_left: 0,
                     first_segment,
                     last_segment: false,
                     visual_offset: if first_segment { 0 } else { indent },
@@ -605,6 +651,8 @@ fn wrap_line_segments_with_limit(
             end_byte: line.len(),
             start_grapheme_col: start_col,
             source_offset: 0,
+            projection: None,
+            projection_left: 0,
             first_segment,
             last_segment: true,
             visual_offset: if first_segment { 0 } else { indent },
@@ -651,6 +699,8 @@ fn wrap_line_segments_with_limit(
             end_byte: start_byte,
             start_grapheme_col,
             source_offset: 0,
+            projection: None,
+            projection_left: 0,
             first_segment,
             last_segment: start_col == line_width,
             visual_offset: if first_segment { 0 } else { indent },
@@ -660,7 +710,7 @@ fn wrap_line_segments_with_limit(
     segments
 }
 
-fn nowrap_line_segment(
+pub(super) fn nowrap_line_segment(
     line: &str,
     line_index: usize,
     width: usize,
@@ -712,6 +762,8 @@ fn nowrap_line_segment(
         end_byte,
         start_grapheme_col,
         source_offset: 0,
+        projection: None,
+        projection_left: 0,
         first_segment: true,
         last_segment: end_byte == line.len(),
         visual_offset: 0,

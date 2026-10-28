@@ -21,6 +21,11 @@ scrolloff = 3
 # Wrap long lines at the window edge. This matches Vim/Neovim's 'wrap'.
 wrap = true
 
+# Render Markdown pipe tables as aligned grids in Normal mode. Editing or
+# selecting a table reveals its original source. :markdown-tables toggles the
+# presentation in the current split without changing the file.
+markdown_tables = true
+
 # Wrap Ctrl-w h/j/k/l focus across the opposite editor edge.
 wrap_window_navigation = true
 

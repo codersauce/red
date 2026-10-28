@@ -246,6 +246,14 @@ setting that ships with Red. Custom themes go in `~/.config/red/themes/`, and
 custom Husk plugins go in `~/.config/red/plugins/`. Run `red --runtime-files`
 to see every visible runtime asset and its source.
 
+Markdown files show pipe tables as aligned grids in Normal mode, with wrapped
+cells, column alignment, and inline formatting. Enter Insert or Visual mode in
+a table to reveal its original Markdown; Escape restores the grid. The display
+does not reformat the file or add undo entries. Use `:markdown-tables` (also in
+the command palette) to toggle this per split, or set `markdown_tables = false`
+to default to source. Fenced code, nested tables, malformed rows with extra cells,
+and documents larger than 2 MiB stay in source form.
+
 Add new highlighting, exact filenames, comment syntax, indentation, and language
 servers through a unified `[languages.<id>]` configuration or an installable
 language pack. Native Tree-sitter grammars require explicit digest-bound trust;

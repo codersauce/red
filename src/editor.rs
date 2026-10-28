@@ -51,6 +51,7 @@ mod inline_notifications;
 mod keyboard_shortcuts;
 mod learning;
 mod lsp_coordinator;
+mod markdown_tables;
 mod mouse;
 mod multi_cursor;
 #[cfg(test)]
@@ -192,8 +193,8 @@ use crate::{
 };
 
 use self::display_layout::{
-    layout_lines, leading_whitespace_display_width, wrap_line_segments, BreakIndentOptions,
-    DisplayLayout, LayoutConfig,
+    leading_whitespace_display_width, wrap_line_segments, BreakIndentOptions, DisplayLayout,
+    LayoutConfig,
 };
 
 thread_local! {
@@ -986,6 +987,8 @@ struct RenderedViewport {
     bounds: (usize, usize, usize, usize),
     content_top: usize,
     gutter_width: usize,
+    markdown_tables: bool,
+    markdown_reveal: Option<(usize, usize)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2915,6 +2918,7 @@ pub enum Action {
     ScrollCursorToViewEnd,
     ToggleWrap,
     SetWrap(bool),
+    ToggleMarkdownTables,
     SetRelativeLineNumbers(bool),
 
     DeletePreviousChar,
@@ -3411,6 +3415,9 @@ struct LayoutCacheKey {
     line_count_override: Option<usize>,
     break_indent: BreakIndentOptions,
     inline_prediction: Option<u64>,
+    markdown_tables: bool,
+    markdown_reveal: Option<std::ops::Range<usize>>,
+    markdown_ascii: bool,
 }
 
 #[derive(Debug)]
@@ -3713,6 +3720,7 @@ pub struct Editor {
 
     /// Memoized display layout, shared by the many per-frame layout queries.
     layout_cache: std::cell::RefCell<HashMap<LayoutCacheKey, std::sync::Arc<DisplayLayout>>>,
+    markdown_table_cache: RefCell<HashMap<BufferId, markdown_tables::CachedTables>>,
 
     /// Window manager handling splits and layout
     window_manager: WindowManager,
@@ -5850,6 +5858,7 @@ impl Editor {
             highlight_cache: HashMap::new(),
             bracket_match_cache: None,
             layout_cache: std::cell::RefCell::new(HashMap::new()),
+            markdown_table_cache: RefCell::new(HashMap::new()),
             window_manager,
             stdout,
             keyboard_protocol: crate::keyboard::KeyboardProtocol::default(),
@@ -6389,6 +6398,10 @@ impl Editor {
             ),
             content_top: self.window_content_top(window),
             gutter_width: self.gutter_width_for_window(window),
+            markdown_tables: self.markdown_tables_enabled(window),
+            markdown_reveal: self
+                .markdown_reveal_range(window)
+                .map(|range| (range.start, range.end)),
         })
     }
 
@@ -7542,6 +7555,9 @@ impl Editor {
             line_count_override,
             break_indent,
             inline_prediction: prediction.map(|suggestion| suggestion.snapshot.generation),
+            markdown_tables: self.markdown_tables_enabled(window),
+            markdown_reveal: self.markdown_reveal_range(window),
+            markdown_ascii: self.config.window_borders_ascii,
         };
         if let Some(layout) = self.layout_cache.borrow().get(&key) {
             return layout.clone();
@@ -7570,7 +7586,15 @@ impl Editor {
             skipcol: window.skipcol,
             break_indent,
         };
-        let mut layout = layout_lines(&lines, line_count, layout_config).with_inline_comments(
+        let tables = self.markdown_table_layout(window);
+        let mut layout = display_layout::layout_lines_with_tables(
+            &lines,
+            line_count,
+            layout_config,
+            tables.as_deref(),
+            key.markdown_reveal.as_ref(),
+        )
+        .with_inline_comments(
             &comments,
             self.window_content_width(window),
             self.window_content_height(window),
@@ -8450,9 +8474,21 @@ impl Editor {
         line_index: usize,
         width: usize,
     ) -> Vec<self::display_layout::LineSegment> {
+        if let Some(segments) = self.markdown_line_segments(line_index, width) {
+            return segments;
+        }
         let Some(line) = self.current_buffer().get(line_index) else {
             return Vec::new();
         };
+        if !self.wrap {
+            return display_layout::nowrap_line_segment(
+                trim_line_ending(&line),
+                line_index,
+                usize::MAX,
+                0,
+                self.active_tab_width(),
+            );
+        }
         wrap_line_segments(
             trim_line_ending(&line),
             line_index,
@@ -8511,7 +8547,10 @@ impl Editor {
     /// A wheel gesture owns the viewport. Move an offscreen cursor onto the
     /// nearest visible source segment instead of scrolling back to find it.
     fn clamp_cursor_to_scrolled_viewport(&mut self) {
-        if !self.wrap && !self.has_inline_comments(self.current_buffer().id()) {
+        if !self.wrap
+            && !self.has_inline_comments(self.current_buffer().id())
+            && !self.active_has_markdown_tables()
+        {
             return;
         }
         let Some(window) = self.active_window_with_editor_view() else {
@@ -8528,14 +8567,17 @@ impl Editor {
             .iter()
             .filter(|segment| bounds.contains(&segment.row))
             .min_by_key(|segment| {
-                let nearest_col = display_col.clamp(segment.start_col, segment.end_col);
+                let nearest_col = segment.projection.as_ref().map_or_else(
+                    || display_col.clamp(segment.start_col, segment.end_col),
+                    |projection| projection.nearest_source_column(display_col),
+                );
                 (
                     segment.line.abs_diff(line),
                     !segment.contains_cursor_col(display_col),
                     nearest_col.abs_diff(display_col),
                 )
             })
-            .copied()
+            .cloned()
         else {
             return;
         };
@@ -8545,18 +8587,25 @@ impl Editor {
         } else {
             target.end_col.saturating_sub(1).max(target.start_col)
         };
-        self.move_to_display_col_on_current_line(display_col.clamp(target.start_col, end_col));
+        let column = target.projection.as_ref().map_or_else(
+            || display_col.clamp(target.start_col, end_col),
+            |projection| projection.nearest_source_column(display_col),
+        );
+        self.move_to_display_col_on_current_line(column);
     }
 
     fn scroll_wrapped_viewport_down_one_screen_line(&mut self) -> bool {
-        if !self.wrap && !self.has_inline_comments(self.current_buffer().id()) {
+        if !self.wrap
+            && !self.has_inline_comments(self.current_buffer().id())
+            && !self.active_has_markdown_tables()
+        {
             return false;
         }
         let Some(window) = self.active_window_with_editor_view() else {
             return false;
         };
         let layout = self.layout_for_window(&window);
-        let Some(next_top) = layout.rows.get(1).copied() else {
+        let Some(next_top) = layout.rows.get(1).cloned() else {
             return false;
         };
 
@@ -8566,11 +8615,14 @@ impl Editor {
     }
 
     fn scroll_wrapped_viewport_up_one_screen_line(&mut self) -> bool {
-        if !self.wrap && !self.has_inline_comments(self.current_buffer().id()) {
+        if !self.wrap
+            && !self.has_inline_comments(self.current_buffer().id())
+            && !self.active_has_markdown_tables()
+        {
             return false;
         }
 
-        if !self.wrap {
+        if !self.wrap && !self.active_has_markdown_tables() {
             let Some(previous_line) = self.vtop.checked_sub(1) else {
                 return false;
             };
@@ -8605,7 +8657,7 @@ impl Editor {
             return false;
         };
         let segments = self.wrapped_line_segments_for_width(previous_line, width);
-        let Some(previous_top) = segments.last().copied() else {
+        let Some(previous_top) = segments.last().cloned() else {
             return false;
         };
 
@@ -8627,7 +8679,10 @@ impl Editor {
             self.last_navigable_line()
         };
 
-        if !self.wrap && !self.has_inline_comments(self.current_buffer().id()) {
+        if !self.wrap
+            && !self.has_inline_comments(self.current_buffer().id())
+            && !self.active_has_markdown_tables()
+        {
             let scrolloff = self
                 .config
                 .scrolloff
@@ -8775,11 +8830,14 @@ impl Editor {
             .iter()
             .position(|segment| segment.contains_cursor_col(display_col))
             .or_else(|| segments.len().checked_sub(1))?;
-        let current = segments[current_index];
+        let current = &segments[current_index];
         // Preserve the screen column across rows: with break-indent the same
         // screen x maps to different line columns on different rows.
-        let screen_x = current.visual_offset + display_col.saturating_sub(current.start_col);
+        let screen_x = current.screen_col_for_display_col(display_col, width);
         let target_col = |target: &self::display_layout::LineSegment| {
+            if target.projection.is_some() {
+                return target.display_col_for_screen_col(screen_x);
+            }
             target
                 .start_col
                 .saturating_add(screen_x.saturating_sub(target.visual_offset))
@@ -8795,8 +8853,8 @@ impl Editor {
                 let segments = self.wrapped_line_segments_for_width(line, width);
                 let available_after = segments.len().saturating_sub(index + 1);
                 if remaining <= available_after {
-                    let target = segments[index + remaining];
-                    return Some((target.line, target_col(&target)));
+                    let target = &segments[index + remaining];
+                    return Some((target.line, target_col(target)));
                 }
 
                 remaining = remaining.saturating_sub(available_after + 1);
@@ -8821,7 +8879,8 @@ impl Editor {
 
         loop {
             if remaining <= index {
-                let target = self.wrapped_line_segments_for_width(line, width)[index - remaining];
+                let target =
+                    self.wrapped_line_segments_for_width(line, width)[index - remaining].clone();
                 return Some((target.line, target_col(&target)));
             }
 
@@ -8833,8 +8892,8 @@ impl Editor {
             let segments = self.wrapped_line_segments_for_width(line, width);
             index = segments.len().saturating_sub(1);
             if remaining == 0 {
-                let target = segments.get(index).copied()?;
-                return Some((target.line, target_col(&target)));
+                let target = segments.get(index)?;
+                return Some((target.line, target_col(target)));
             }
         }
     }
@@ -9242,7 +9301,8 @@ impl Editor {
 
     fn check_bounds(&mut self) -> bool {
         let old_position = (self.cx, self.cy, self.vtop);
-        let has_comments = self.has_inline_comments(self.current_buffer().id());
+        let has_comments = self.has_inline_comments(self.current_buffer().id())
+            || self.active_has_markdown_tables();
         let last_line = if self.is_insert() {
             self.current_buffer().len()
         } else {
@@ -18604,6 +18664,9 @@ impl Editor {
             if cmd == "nowrap" {
                 actions.push(Action::SetWrap(false));
             }
+            if cmd == "markdown-tables" {
+                actions.push(Action::ToggleMarkdownTables);
+            }
 
             if cmd == "statusline" {
                 actions.push(Action::OpenStatuslineManager);
@@ -21508,6 +21571,7 @@ impl Editor {
                 return Ok(true);
             }
             let old_mode = self.mode;
+            let markdown_anchor = self.markdown_cursor_screen_row();
             let insert_return_cursor = self
                 .take_mouse_insert_return(new_mode)
                 .then(|| self.cursor_snapshot());
@@ -21585,6 +21649,9 @@ impl Editor {
                 self.start_selection();
             } else {
                 self.selection = None;
+            }
+            if let Some(row) = markdown_anchor {
+                self.restore_markdown_cursor_row(row);
             }
             self.render(buffer)?;
 
@@ -23730,49 +23797,61 @@ impl Editor {
             }
             Action::ScrollUp => {
                 let scroll_lines = self.config.mouse_scroll_lines.unwrap_or(3);
-                let old_vtop = self.vtop;
-                self.vtop = self.vtop.saturating_sub(scroll_lines);
-                let scrolled_lines = old_vtop - self.vtop;
-                if scrolled_lines > 0 {
-                    let viewport_height = self.vheight().max(1);
-                    let scrolloff = self
-                        .config
-                        .scrolloff
-                        .unwrap_or(0)
-                        .min(viewport_height.saturating_sub(1));
-                    let max_cy = viewport_height.saturating_sub(scrolloff).saturating_sub(1);
-                    self.cy = self.cy.saturating_add(scrolled_lines).min(max_cy);
-                    self.skipcol = 0;
-                    self.clamp_cursor_to_scrolled_viewport();
+                if self.active_has_markdown_tables() {
+                    self.scroll_markdown_viewport(false, scroll_lines);
                     self.sync_to_window();
                     self.render_motion_frame(buffer)?;
+                } else {
+                    let old_vtop = self.vtop;
+                    self.vtop = self.vtop.saturating_sub(scroll_lines);
+                    let scrolled_lines = old_vtop - self.vtop;
+                    if scrolled_lines > 0 {
+                        let viewport_height = self.vheight().max(1);
+                        let scrolloff = self
+                            .config
+                            .scrolloff
+                            .unwrap_or(0)
+                            .min(viewport_height.saturating_sub(1));
+                        let max_cy = viewport_height.saturating_sub(scrolloff).saturating_sub(1);
+                        self.cy = self.cy.saturating_add(scrolled_lines).min(max_cy);
+                        self.skipcol = 0;
+                        self.clamp_cursor_to_scrolled_viewport();
+                        self.sync_to_window();
+                        self.render_motion_frame(buffer)?;
+                    }
                 }
             }
             Action::ScrollDown => {
                 let scroll_lines = self.config.mouse_scroll_lines.unwrap_or(3);
-                let viewport_height = self.vheight().max(1);
-                let last_line = self.last_navigable_line();
-                let max_vtop = if self.wrap || self.has_inline_comments(self.current_buffer().id())
-                {
-                    last_line
-                } else {
-                    last_line.saturating_sub(viewport_height.saturating_sub(1))
-                };
-                let old_vtop = self.vtop;
-                let new_vtop = self.vtop.saturating_add(scroll_lines).min(max_vtop);
-                let scrolled_lines = new_vtop.saturating_sub(old_vtop);
-                if scrolled_lines > 0 {
-                    self.vtop = new_vtop;
-                    let scrolloff = self
-                        .config
-                        .scrolloff
-                        .unwrap_or(0)
-                        .min(viewport_height.saturating_sub(1));
-                    self.cy = self.cy.saturating_sub(scrolled_lines).max(scrolloff);
-                    self.skipcol = 0;
-                    self.clamp_cursor_to_scrolled_viewport();
+                if self.active_has_markdown_tables() {
+                    self.scroll_markdown_viewport(true, scroll_lines);
                     self.sync_to_window();
                     self.render_motion_frame(buffer)?;
+                } else {
+                    let viewport_height = self.vheight().max(1);
+                    let last_line = self.last_navigable_line();
+                    let max_vtop =
+                        if self.wrap || self.has_inline_comments(self.current_buffer().id()) {
+                            last_line
+                        } else {
+                            last_line.saturating_sub(viewport_height.saturating_sub(1))
+                        };
+                    let old_vtop = self.vtop;
+                    let new_vtop = self.vtop.saturating_add(scroll_lines).min(max_vtop);
+                    let scrolled_lines = new_vtop.saturating_sub(old_vtop);
+                    if scrolled_lines > 0 {
+                        self.vtop = new_vtop;
+                        let scrolloff = self
+                            .config
+                            .scrolloff
+                            .unwrap_or(0)
+                            .min(viewport_height.saturating_sub(1));
+                        self.cy = self.cy.saturating_sub(scrolled_lines).max(scrolloff);
+                        self.skipcol = 0;
+                        self.clamp_cursor_to_scrolled_viewport();
+                        self.sync_to_window();
+                        self.render_motion_frame(buffer)?;
+                    }
                 }
             }
             Action::ScrollViewLeft => {
@@ -23816,6 +23895,18 @@ impl Editor {
             }
             Action::ToggleWrap => {
                 self.wrap = !self.wrap;
+                self.vleft = 0;
+                self.skipcol = 0;
+                self.render(buffer)?;
+            }
+            Action::ToggleMarkdownTables => {
+                let enabled = self
+                    .window_manager
+                    .active_window()
+                    .is_some_and(|window| self.markdown_tables_enabled(window));
+                if let Some(window) = self.window_manager.active_window_mut() {
+                    window.markdown_tables = Some(!enabled);
+                }
                 self.vleft = 0;
                 self.skipcol = 0;
                 self.render(buffer)?;
@@ -31372,6 +31463,11 @@ impl Editor {
         let line = self.current_line_contents().unwrap_or_default();
         let line = line.trim_end_matches('\n');
         let display_col = grapheme_to_column_with_tabs(line, self.cx, self.active_tab_width());
+
+        if self.active_has_markdown_tables() {
+            self.ensure_markdown_cursor_visible(buffer_line, display_col, width);
+            return;
+        }
 
         if !self.wrap {
             self.skipcol = 0;

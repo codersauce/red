@@ -449,16 +449,37 @@ impl RenderBuffer {
                 .zip(&other.cells[start..end])
                 .all(|(cell, previous)| cell.matches_rendered(previous))
             {
-                for x in 0..self.width {
-                    let cell = &self.cells[start + x];
-                    if !cell.matches_rendered(&other.cells[start + x]) {
-                        changes.push(Change { x, y, cell });
-                    }
-                }
+                self.diff_row(y, &other.cells[start..end], &mut changes);
             }
         }
 
         changes
+    }
+
+    fn diff_row<'a>(&'a self, y: usize, previous: &[Cell], changes: &mut Vec<Change<'a>>) {
+        let start = y * self.width;
+        let row = &self.cells[start..start + self.width];
+        for (x, cell) in row.iter().enumerate() {
+            let width = if cell.text.len() == 1 {
+                1
+            } else {
+                display_width(&cell.text).max(1)
+            };
+            // An overlay can overwrite just the continuation of a wide glyph.
+            // Restoring that cell must repaint its head too: printing a space
+            // into the continuation would erase the entire terminal glyph.
+            if row[x..(x + width).min(row.len())]
+                .iter()
+                .enumerate()
+                .any(|(offset, cell)| {
+                    previous
+                        .get(x + offset)
+                        .is_none_or(|old| !cell.matches_rendered(old))
+                })
+            {
+                changes.push(Change { x, y, cell });
+            }
+        }
     }
 
     pub fn snapshot_rows(&self, rows: &[usize]) -> Vec<(usize, Vec<Cell>)> {
@@ -486,17 +507,7 @@ impl RenderBuffer {
             if *row >= self.height {
                 continue;
             }
-            let start = row * self.width;
-            for (x, old_cell) in old_cells.iter().enumerate().take(self.width) {
-                let pos = start + x;
-                if pos >= self.cells.len() {
-                    break;
-                }
-                let cell = &self.cells[pos];
-                if cell != old_cell {
-                    changes.push(Change { x, y: *row, cell });
-                }
-            }
+            self.diff_row(*row, old_cells, &mut changes);
         }
 
         changes
@@ -605,6 +616,29 @@ mod tests {
         assert_eq!(changes.len(), 1);
         assert_eq!((changes[0].x, changes[0].y), (2, 1));
         assert_eq!(changes[0].cell.text, "x");
+    }
+
+    #[test]
+    fn diff_restores_wide_glyph_after_overlay_covers_its_continuation() {
+        let style = Style::default();
+        for glyph in ["界", "🙂", "👩‍💻"] {
+            let mut restored = RenderBuffer::new(5, 1, &style);
+            restored.set_text(1, 0, glyph, &style);
+            let mut overlay = restored.clone();
+            overlay.set_text(2, 0, "╭", &style);
+            let snapshots = overlay.snapshot_rows(&[0]);
+
+            for changes in [
+                restored.diff(&overlay),
+                restored.diff_row_snapshots(&snapshots),
+            ] {
+                assert_eq!(changes.len(), 2);
+                assert_eq!((changes[0].x, changes[0].y), (1, 0));
+                assert_eq!(changes[0].cell.text, glyph);
+                assert_eq!((changes[1].x, changes[1].y), (2, 0));
+                assert_eq!(changes[1].cell.text, " ");
+            }
+        }
     }
 
     #[test]
