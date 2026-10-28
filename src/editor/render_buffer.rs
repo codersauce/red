@@ -231,6 +231,24 @@ impl RenderBuffer {
         }
     }
 
+    /// Paint a row highlight beneath explicit syntax and decoration backgrounds.
+    pub(super) fn set_default_bg_for_range(
+        &mut self,
+        start: Point,
+        end: Point,
+        bg: &Color,
+        theme: &Theme,
+    ) {
+        for y in start.y..end.y.saturating_add(1).min(self.height) {
+            for x in start.x..end.x.saturating_add(1).min(self.width) {
+                let background = self.cells[y * self.width + x].style.bg;
+                if background.is_none() || background == theme.style.bg {
+                    self.set_bg(x, y, bg, theme);
+                }
+            }
+        }
+    }
+
     pub fn set_bg(&mut self, x: usize, y: usize, bg: &Color, theme: &Theme) {
         if x >= self.width || y >= self.height {
             return;

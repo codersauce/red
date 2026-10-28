@@ -254,6 +254,11 @@ the command palette) to toggle this per split, or set `markdown_tables = false`
 to default to source. Fenced code, nested tables, malformed rows with extra cells,
 and documents larger than 2 MiB stay in source form.
 
+Markdown source also highlights **bold**, *emphasis*, `inline code`, and links,
+including nested formatting, reference links, and URL/email autolinks. Markdown
+delimiters remain visible in both Normal and Insert mode, so navigation and
+editing use the original source positions.
+
 Add new highlighting, exact filenames, comment syntax, indentation, and language
 servers through a unified `[languages.<id>]` configuration or an installable
 language pack. Native Tree-sitter grammars require explicit digest-bound trust;

@@ -28,6 +28,8 @@ use crate::{
     utils::expand_user_path,
 };
 
+mod markdown_inline;
+
 #[derive(Clone, Copy)]
 struct BundledLanguageDefinition {
     id: &'static str,
@@ -762,7 +764,7 @@ impl Highlighter {
             .query
             .capture_names()
             .iter()
-            .map(|scope| self.theme.get_style(scope))
+            .map(|scope| capture_style(&self.theme, &pending.language_id, scope))
             .collect();
         self.highlighters.insert(
             pending.language_id,
@@ -834,13 +836,15 @@ impl Highlighter {
             .or_else(|| self.language_id_for_extension(name))
     }
 
-    /// Returns the bundled canonical language identifiers in display order.
+    /// Returns canonical editor languages in display order, excluding the
+    /// Markdown inline grammar used only inside block-language injections.
     pub fn language_ids(&self) -> Vec<&str> {
         let mut language_ids = self
             .registry
             .languages
             .keys()
             .map(String::as_str)
+            .filter(|language| *language != "markdown_inline")
             .collect::<Vec<_>>();
         language_ids.sort_unstable();
         language_ids
@@ -869,6 +873,7 @@ impl Highlighter {
                     .filter(|(name, _)| name.starts_with(&prefix))
                     .map(|(_, language)| language.as_str()),
             )
+            .filter(|language| *language != "markdown_inline")
             .collect::<Vec<_>>();
         language_ids.sort_unstable();
         language_ids.dedup();
@@ -1276,11 +1281,17 @@ impl Highlighter {
         }
 
         let definition = self.registry.languages.get(language_id)?;
-        if !bundled_highlight_definition(definition, language_id)
-            || (language_id == "markdown"
-                && definition.injection_query.as_deref() != Some(MARKDOWN_INJECTION_QUERY))
-        {
+        if !bundled_highlight_definition(definition, language_id) {
             return None;
+        }
+        if language_id == "markdown" {
+            let inline = self.registry.languages.get("markdown_inline")?;
+            if definition.injection_query.as_deref() != Some(MARKDOWN_INJECTION_QUERY)
+                || !bundled_highlight_definition(inline, "markdown_inline")
+                || inline.injection_query.is_some()
+            {
+                return None;
+            }
         }
 
         let cached = self.cached_highlight.as_mut()?;
@@ -1360,7 +1371,7 @@ impl Highlighter {
             let capture_styles = query
                 .capture_names()
                 .iter()
-                .map(|scope| self.theme.get_style(scope))
+                .map(|scope| capture_style(&self.theme, language_id, scope))
                 .collect();
             let injection_query = definition
                 .injection_query
@@ -1412,11 +1423,16 @@ impl Highlighter {
                         let capture_name = highlighter.query.capture_names()[cap.index as usize];
                         if let Some(style) = highlighter.capture_styles[cap.index as usize].as_ref()
                         {
-                            let captured = StyleInfo {
-                                start,
-                                end,
-                                style: style.clone(),
-                            };
+                            let mut style = style.clone();
+                            if language_id == "markdown_inline" {
+                                markdown_inline::inherit_inline_style(
+                                    node,
+                                    capture_name,
+                                    &mut style,
+                                    &self.theme,
+                                );
+                            }
+                            let captured = StyleInfo { start, end, style };
                             if capture_refines_equal_range(capture_name) {
                                 refinement_colors.push(captured);
                             } else {
@@ -1459,6 +1475,7 @@ impl Highlighter {
             })
             .collect::<Vec<_>>();
 
+        let block_color_count = colors.len();
         for injection in injections {
             let Some(injected_code) = code.get(injection.content_start..injection.content_end)
             else {
@@ -1470,10 +1487,39 @@ impl Highlighter {
                 color.start += injection.content_start;
                 color.end += injection.content_start;
             }
+            if language_id == "markdown" && injection.language_id == "markdown_inline" {
+                // Inline formatting retains the containing heading's attributes.
+                // Other language injections continue to own their entire style.
+                if let Some(block) = colors[..block_color_count]
+                    .iter()
+                    .filter(|span| {
+                        span.start <= injection.content_start && span.end >= injection.content_end
+                    })
+                    .min_by_key(|span| span.end - span.start)
+                {
+                    for color in &mut injected_colors {
+                        color.style.fg = color.style.fg.or(block.style.fg);
+                        color.style.bg = color.style.bg.or(block.style.bg);
+                        color.style.bold |= block.style.bold;
+                        color.style.italic |= block.style.italic;
+                        color.style.underline |= block.style.underline;
+                    }
+                }
+            }
             colors.extend(injected_colors);
         }
 
         Ok(colors)
+    }
+}
+
+fn capture_style(theme: &Theme, language_id: &str, scope: &str) -> Option<Style> {
+    if language_id == "markdown_inline"
+        || (language_id == "markdown" && scope == "markup.underline.link.markdown")
+    {
+        markdown_inline::capture_style(theme, scope)
+    } else {
+        theme.get_style(scope)
     }
 }
 
@@ -1542,6 +1588,7 @@ fn bundled_highlight_definition(definition: &RuntimeLanguageDefinition, language
     let expected_queries = match language_id {
         "rust" => &[tree_sitter_rust::HIGHLIGHTS_QUERY][..],
         "markdown" => &[MARKDOWN_HIGHLIGHT_QUERY][..],
+        "markdown_inline" => &[markdown_inline::HIGHLIGHT_QUERY][..],
         "javascript" => JAVASCRIPT_HIGHLIGHT_QUERIES,
         "jsx" => JSX_HIGHLIGHT_QUERIES,
         "typescript" => TYPESCRIPT_HIGHLIGHT_QUERIES,
@@ -1708,6 +1755,16 @@ fn stable_bundled_token(
                 return None;
             }
             let removed = previous_source.get(edit.start_byte..edit.old_end_byte)?;
+            // Whitespace or letters can change delimiter flanking even when the
+            // edit does not touch markup. Only plain headings use this shortcut.
+            let previous = previous_source.get(token.byte_range())?;
+            let end = token.end_byte().checked_add_signed(delta)?;
+            let updated = source.get(token.start_byte()..end)?;
+            if previous.contains(['*', '_', '`', '[', ']', '\\', '<', '>', '&'])
+                || updated.contains(['*', '_', '`', '[', ']', '\\', '<', '>', '&'])
+            {
+                return None;
+            }
             if inserted.chars().chain(removed.chars()).any(|character| {
                 character.is_control()
                     || matches!(
@@ -2120,6 +2177,8 @@ fn powershell_sensitive_identifier(identifier: &str) -> bool {
 fn capture_refines_equal_range(scope: &str) -> bool {
     match scope {
         "property" | "escape" | "string.escape" => true,
+        // A link label can have exactly the same range as its formatted content.
+        "markup.bold.markdown" | "markup.italic.markdown" | "markup.inline.raw.markdown" => true,
         scope if scope.starts_with("keyword.directive") => true,
         _ => false,
     }
@@ -2251,6 +2310,16 @@ fn language_definitions() -> Vec<BundledLanguageDefinition> {
             highlight_queries: &[MARKDOWN_HIGHLIGHT_QUERY],
             textobject_queries: &[include_str!("queries/textobjects/markdown.scm")],
             injection_query: Some(MARKDOWN_INJECTION_QUERY),
+            specialized: None,
+        },
+        BundledLanguageDefinition {
+            id: "markdown_inline",
+            extensions: &[],
+            filenames: &[],
+            language: Some(|| tree_sitter_md::INLINE_LANGUAGE.into()),
+            highlight_queries: &[markdown_inline::HIGHLIGHT_QUERY],
+            textobject_queries: &[],
+            injection_query: None,
             specialized: None,
         },
         BundledLanguageDefinition {
@@ -2755,6 +2824,9 @@ const MARKDOWN_HIGHLIGHT_QUERY: &str = r#"
 "#;
 
 const MARKDOWN_INJECTION_QUERY: &str = r#"
+([(inline) (pipe_table_cell)] @injection.content
+  (#set! injection.language "markdown_inline"))
+
 (fenced_code_block
   (info_string
     (language) @injection.language)
@@ -2918,6 +2990,7 @@ mod tests {
         for (language, source) in [
             ("rust", "fn greeting(value: usize) -> usize { value }\n"),
             ("markdown", "# Example\n\n```rust\nfn greet() {}\n```\n"),
+            ("markdown_inline", "**bold** and *italic* with `code`"),
             ("yaml", "root:\n  enabled: true\n"),
         ] {
             let mut prepared = highlighter();
@@ -5151,6 +5224,7 @@ mod tests {
         assert_eq!(highlighter.matching_language_ids("ru"), vec!["rust"]);
         assert_eq!(highlighter.matching_language_ids("ym"), vec!["yaml"]);
         assert_eq!(highlighter.matching_language_ids(".rs"), vec!["rust"]);
+        assert_eq!(highlighter.matching_language_ids("mark"), vec!["markdown"]);
         assert_eq!(
             highlighter.matching_language_ids("ts"),
             vec!["tsx", "typescript"]

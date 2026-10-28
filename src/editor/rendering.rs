@@ -2205,7 +2205,7 @@ impl Editor {
             .filter(|segment| segment.line == buffer_y && local_rows.contains(&segment.row))
         {
             let term_y = self.window_to_terminal_y(window, segment.row);
-            buffer.set_bg_for_range(
+            buffer.set_default_bg_for_range(
                 Point::new(start_x, term_y),
                 Point::new(end_x, term_y),
                 &bg,
@@ -3042,7 +3042,7 @@ impl Editor {
                     let start_x = window.position.x + gutter_width + 1;
                     let end_x = window.position.x + window.inner_width() - 1;
 
-                    buffer.set_bg_for_range(
+                    buffer.set_default_bg_for_range(
                         Point::new(start_x, term_y),
                         Point::new(end_x, term_y),
                         &bg,
@@ -4611,6 +4611,31 @@ mod tests {
             Editor::with_size(lsp, 60, 12, config, Theme::default(), vec![source]).unwrap();
         editor.test_disable_terminal_output();
         editor
+    }
+
+    #[test]
+    fn markdown_inline_code_background_survives_full_and_partial_line_highlights() {
+        let mut editor = rendering_test_editor(Buffer::new(
+            Some("inline.md".to_string()),
+            "plain `code` tail\n".to_string(),
+        ));
+        editor.apply_theme("red.json", false).unwrap();
+        let mut frame = RenderBuffer::new(60, 12, &editor.theme.style);
+        editor.render(&mut frame).unwrap();
+        let window = editor.active_window_with_editor_view().unwrap();
+        let start = editor.gutter_width_for_window(&window) + 1;
+        let code_background = frame.cells[start + 7].style.bg;
+        let line_background = editor.theme.line_highlight_style.as_ref().unwrap().bg;
+        assert_ne!(code_background, editor.theme.style.bg);
+        assert_ne!(code_background, line_background);
+        assert_eq!(frame.cells[start + 1].style.bg, line_background);
+
+        editor
+            .render_main_content_rows_in_window(&mut frame, &window, &[0])
+            .unwrap();
+        editor.render_line_highlight_rows_in_window(&mut frame, &window, &[0]);
+        assert_eq!(frame.cells[start + 7].style.bg, code_background);
+        assert_eq!(frame.cells[start + 1].style.bg, line_background);
     }
 
     #[test]
