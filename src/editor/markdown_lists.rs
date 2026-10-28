@@ -173,11 +173,17 @@ mod tests {
         );
         assert_eq!(editor.cursor_snapshot(), cursor);
         assert!(editor.current_buffer().is_dirty());
-        editor.test_execute_action(Action::Undo).await.unwrap();
+        key(&mut editor, 'u').await;
         assert_eq!(editor.current_buffer().contents(), source);
         assert_eq!(editor.cursor_snapshot(), cursor);
         assert!(!editor.current_buffer().is_dirty());
-        editor.test_execute_action(Action::Redo).await.unwrap();
+        editor
+            .test_execute_event(Event::Key(KeyEvent::new(
+                KeyCode::Char('r'),
+                KeyModifiers::CONTROL,
+            )))
+            .await
+            .unwrap();
         assert_eq!(editor.cursor_snapshot(), cursor);
         editor.test_execute_action(Action::MoveDown).await.unwrap();
         key(&mut editor, '.').await;

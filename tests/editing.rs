@@ -2325,6 +2325,25 @@ async fn counted_replace_and_dot_recompute_at_the_new_cursor() {
     harness.assert_buffer_contents("XXXd\nXXXh");
 }
 
+#[tokio::test]
+async fn dot_preserves_the_last_edit_across_counted_keyboard_undo_and_redo() {
+    let buffer = Buffer::new(None, "abc\ndef\nghi".to_string());
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+    type_normal_keys(&mut harness, "rXj.2u").await;
+    harness.assert_buffer_contents("abc\ndef\nghi");
+    harness
+        .execute_event(Event::Key(KeyEvent::new(
+            KeyCode::Char('r'),
+            KeyModifiers::CONTROL,
+        )))
+        .await
+        .unwrap();
+    type_normal_keys(&mut harness, "j.").await;
+    harness.assert_buffer_contents("Xbc\nXef\nghi");
+    type_normal_keys(&mut harness, "uj.").await;
+    harness.assert_buffer_contents("Xbc\ndef\nXhi");
+}
+
 #[test]
 fn dot_repeats_linewise_paste_and_visual_block_insert() {
     // Pin the normal test-thread budget even when RUST_MIN_STACK is larger.

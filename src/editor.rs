@@ -14730,6 +14730,18 @@ impl Editor {
         }
     }
 
+    fn advance_semantic_change_past_history(&mut self, previous_revision: u64) {
+        let document = self.current_buffer();
+        let (buffer_id, revision) = (document.id(), document.revision());
+        if let Some(change) = &mut self.pending_semantic_change {
+            // Undo/redo changes the revision without creating a new edit to repeat.
+            // Keep any actual edits already recorded by a compound mapping.
+            if change.buffer_id == buffer_id && change.base_revision == previous_revision {
+                change.base_revision = revision;
+            }
+        }
+    }
+
     fn replace_pending_semantic_change_event(&mut self, step: SemanticChangeStep) {
         let Some(pending) = &mut self.pending_semantic_change else {
             return;
@@ -22804,12 +22816,16 @@ impl Editor {
                 self.render(buffer)?;
             }
             Action::Undo => {
+                let revision = self.current_buffer().revision();
                 self.snippet_session = None;
                 self.undo_transaction(buffer, runtime).await?;
+                self.advance_semantic_change_past_history(revision);
             }
             Action::Redo => {
+                let revision = self.current_buffer().revision();
                 self.snippet_session = None;
                 self.redo_transaction(buffer, runtime).await?;
+                self.advance_semantic_change_past_history(revision);
             }
             Action::SelectPreviousUndoBranch => {
                 add_to_history = false;
