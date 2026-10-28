@@ -3317,6 +3317,12 @@ pub enum GoToLinePosition {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) enum CursorGoal {
     DisplayCol(usize),
+    /// Keep the requested screen column even when a short row clamps the cursor.
+    /// Physical-line motions use the most recent source display column instead.
+    ScreenCol {
+        screen_col: usize,
+        display_col: usize,
+    },
     LineEnd,
 }
 
@@ -3324,6 +3330,12 @@ impl Default for CursorGoal {
     fn default() -> Self {
         Self::DisplayCol(0)
     }
+}
+
+struct ScreenLineTarget {
+    line: usize,
+    display_col: usize,
+    screen_col: usize,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -8420,7 +8432,7 @@ impl Editor {
 
     pub(crate) fn display_col_for_cursor_goal(&self, line: &str, goal: CursorGoal) -> usize {
         match goal {
-            CursorGoal::DisplayCol(display_col) => {
+            CursorGoal::DisplayCol(display_col) | CursorGoal::ScreenCol { display_col, .. } => {
                 let required_width = display_col.saturating_add(usize::from(!self.is_insert()));
                 let tab_width = self.active_tab_width();
                 let mut width = 0;
@@ -8447,7 +8459,7 @@ impl Editor {
 
     fn grapheme_for_cursor_goal(&self, line: &str, goal: CursorGoal) -> usize {
         match goal {
-            CursorGoal::DisplayCol(display_col) => {
+            CursorGoal::DisplayCol(display_col) | CursorGoal::ScreenCol { display_col, .. } => {
                 let max_cursor_x = self.max_cursor_x_for_line_length(grapheme_len(line));
                 column_to_grapheme_with_tabs(line, display_col, self.active_tab_width())
                     .min(max_cursor_x)
@@ -8457,6 +8469,9 @@ impl Editor {
     }
 
     fn apply_cursor_goal_to_current_line(&mut self) {
+        if let CursorGoal::ScreenCol { display_col, .. } = self.cursor_goal {
+            self.cursor_goal = CursorGoal::DisplayCol(display_col);
+        }
         if let Some(line) = self.current_line_contents() {
             let line = trim_line_ending(&line);
             self.cx = self.grapheme_for_cursor_goal(line, self.cursor_goal);
@@ -8825,11 +8840,7 @@ impl Editor {
         display_col: usize,
         delta: isize,
         width: usize,
-    ) -> Option<(usize, usize)> {
-        if delta == 0 {
-            return Some((line_index, display_col));
-        }
-
+    ) -> Option<ScreenLineTarget> {
         let segments = self.wrapped_line_segments_for_width(line_index, width);
         let current_index = segments
             .iter()
@@ -8838,15 +8849,32 @@ impl Editor {
         let current = &segments[current_index];
         // Preserve the screen column across rows: with break-indent the same
         // screen x maps to different line columns on different rows.
-        let screen_x = current.screen_col_for_display_col(display_col, width);
-        let target_col = |target: &self::display_layout::LineSegment| {
-            if target.projection.is_some() {
-                return target.display_col_for_screen_col(screen_x);
+        let screen_col = match self.cursor_goal {
+            CursorGoal::ScreenCol { screen_col, .. } => screen_col,
+            _ => current.screen_col_for_display_col(display_col, width),
+        };
+        let unchanged = ScreenLineTarget {
+            line: line_index,
+            display_col,
+            screen_col,
+        };
+        if delta == 0 {
+            return Some(unchanged);
+        }
+        let target_position = |target: &self::display_layout::LineSegment| {
+            let display_col = if target.projection.is_some() {
+                target.display_col_for_screen_col(screen_col)
+            } else {
+                target
+                    .start_col
+                    .saturating_add(screen_col.saturating_sub(target.visual_offset))
+                    .min(target.end_col.saturating_sub(1))
+            };
+            ScreenLineTarget {
+                line: target.line,
+                display_col,
+                screen_col,
             }
-            target
-                .start_col
-                .saturating_add(screen_x.saturating_sub(target.visual_offset))
-                .min(target.end_col.saturating_sub(1))
         };
 
         if delta > 0 {
@@ -8859,12 +8887,12 @@ impl Editor {
                 let available_after = segments.len().saturating_sub(index + 1);
                 if remaining <= available_after {
                     let target = &segments[index + remaining];
-                    return Some((target.line, target_col(target)));
+                    return Some(target_position(target));
                 }
 
                 remaining = remaining.saturating_sub(available_after + 1);
                 if line >= self.last_navigable_line() {
-                    return Some((line_index, display_col));
+                    return Some(unchanged);
                 }
                 line += 1;
                 index = 0;
@@ -8873,7 +8901,7 @@ impl Editor {
                         .wrapped_line_segments_for_width(line, width)
                         .first()?
                         .to_owned();
-                    return Some((target.line, target_col(&target)));
+                    return Some(target_position(&target));
                 }
             }
         }
@@ -8886,19 +8914,19 @@ impl Editor {
             if remaining <= index {
                 let target =
                     self.wrapped_line_segments_for_width(line, width)[index - remaining].clone();
-                return Some((target.line, target_col(&target)));
+                return Some(target_position(&target));
             }
 
             remaining = remaining.saturating_sub(index + 1);
             let Some(previous_line) = line.checked_sub(1) else {
-                return Some((line_index, display_col));
+                return Some(unchanged);
             };
             line = previous_line;
             let segments = self.wrapped_line_segments_for_width(line, width);
             index = segments.len().saturating_sub(1);
             if remaining == 0 {
                 let target = segments.get(index)?;
-                return Some((target.line, target_col(target)));
+                return Some(target_position(target));
             }
         }
     }
@@ -8968,16 +8996,19 @@ impl Editor {
         let display_col = self.current_cursor_display_col();
         let width = self.active_content_width();
         if self.wrap {
-            if let Some((target_line, target_display_col)) =
+            if let Some(target) =
                 self.wrapped_screen_line_target(line_index, display_col, delta, width)
             {
-                if target_line < self.vtop {
-                    self.vtop = target_line;
+                if target.line < self.vtop {
+                    self.vtop = target.line;
                     self.skipcol = 0;
                 }
-                self.cy = target_line.saturating_sub(self.vtop);
-                self.move_to_display_col_on_current_line(target_display_col);
-                self.refresh_cursor_goal();
+                self.cy = target.line.saturating_sub(self.vtop);
+                self.move_to_display_col_on_current_line(target.display_col);
+                self.cursor_goal = CursorGoal::ScreenCol {
+                    screen_col: target.screen_col,
+                    display_col: self.current_cursor_display_col(),
+                };
                 self.ensure_wrapped_cursor_segment_visible(delta);
             }
             return;
@@ -8989,8 +9020,7 @@ impl Editor {
             .saturating_add_signed(delta)
             .min(self.last_navigable_line());
         self.reveal_cursor_destination(target_line);
-        self.move_to_display_col_on_current_line(display_col);
-        self.refresh_cursor_goal();
+        self.apply_cursor_goal_to_current_line();
     }
 
     fn recompute_window_cursor_goals(&mut self) {
@@ -9017,6 +9047,8 @@ impl Editor {
             action,
             Action::MoveUp
                 | Action::MoveDown
+                | Action::MoveScreenLineUp
+                | Action::MoveScreenLineDown
                 | Action::PageUp
                 | Action::PageDown
                 | Action::MoveToLineEnd

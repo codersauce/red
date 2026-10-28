@@ -578,6 +578,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn returned_wrapped_link_survives_screen_line_down_and_up() {
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("target.rs");
+        std::fs::write(&target, "first\nsecond\nthird\n").unwrap();
+        let source = format!("{}[read](target.rs:2)\n", "word ".repeat(28));
+        let mut editor = editor(vec![document(&directory.path().join("index.md"), &source)]);
+        cursor_at(&mut editor, "read");
+        let origin = editor.current_jump_entry();
+        follow(&mut editor).await;
+        assert_eq!(editor.current_buffer().file.as_deref(), target.to_str());
+        assert_eq!(editor.buffer_line(), 1);
+        key(&mut editor, KeyCode::Char('o'), KeyModifiers::CONTROL).await;
+        assert_eq!(editor.current_jump_entry(), origin);
+
+        for character in "gjgk".chars() {
+            key(&mut editor, KeyCode::Char(character), KeyModifiers::NONE).await;
+        }
+        assert_eq!(editor.current_jump_entry(), origin);
+        follow(&mut editor).await;
+        assert_eq!(editor.current_buffer().file.as_deref(), target.to_str());
+        assert_eq!(editor.buffer_line(), 1);
+    }
+
+    #[tokio::test]
     async fn follows_document_relative_encoded_file_and_heading() {
         let directory = tempfile::tempdir().unwrap();
         let target = directory.path().join("café #notes.md");

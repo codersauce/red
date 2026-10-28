@@ -608,6 +608,69 @@ async fn test_wrap_uses_skipcol_for_deep_wrapped_cursor() {
 }
 
 #[tokio::test]
+async fn screen_line_motion_keeps_column_across_short_wrapped_and_blank_rows() {
+    let content = "abcdefghijklmn\n\nopqrstuvwxyz";
+    let config = Config {
+        wrap: Some(true),
+        ..Default::default()
+    };
+    let mut harness =
+        EditorHarness::with_config_and_size(Buffer::new(None, content.to_string()), config, 10, 8);
+    harness.execute_action(Action::MoveTo(10, 1)).await.unwrap();
+
+    for (action, expected) in [
+        (Action::MoveScreenLineDown, (13, 0)),
+        (Action::MoveScreenLineDown, (0, 1)),
+        (Action::MoveScreenLineDown, (4, 2)),
+        (Action::MoveScreenLineUp, (0, 1)),
+        (Action::MoveScreenLineUp, (13, 0)),
+        (Action::MoveScreenLineUp, (10, 0)),
+    ] {
+        harness.execute_action(action).await.unwrap();
+        assert_eq!(harness.cursor_position(), expected);
+    }
+
+    harness
+        .execute_action(Action::MoveScreenLineDown)
+        .await
+        .unwrap();
+    harness.execute_action(Action::MoveLeft).await.unwrap();
+    harness
+        .execute_action(Action::MoveScreenLineUp)
+        .await
+        .unwrap();
+    harness.assert_cursor_at(6, 0);
+    harness.assert_buffer_contents(content);
+}
+
+#[tokio::test]
+async fn nowrap_screen_line_motion_keeps_column_across_short_lines() {
+    let config = Config {
+        wrap: Some(false),
+        ..Default::default()
+    };
+    let mut harness = EditorHarness::with_config(
+        Buffer::new(None, "abcdefgh\nx\n\nijklmnop".to_string()),
+        config,
+    );
+    harness.execute_action(Action::MoveTo(6, 1)).await.unwrap();
+    for expected in [(0, 1), (0, 2), (6, 3)] {
+        harness
+            .execute_action(Action::MoveScreenLineDown)
+            .await
+            .unwrap();
+        assert_eq!(harness.cursor_position(), expected);
+    }
+    for expected in [(0, 2), (0, 1), (6, 0)] {
+        harness
+            .execute_action(Action::MoveScreenLineUp)
+            .await
+            .unwrap();
+        assert_eq!(harness.cursor_position(), expected);
+    }
+}
+
+#[tokio::test]
 async fn test_nowrap_screen_line_motion_preserves_viewport_until_scroll_margin() {
     for scrolloff in [0, 3] {
         let config = || Config {
