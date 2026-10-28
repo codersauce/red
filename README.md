@@ -259,6 +259,15 @@ including nested formatting, reference links, and URL/email autolinks. Markdown
 delimiters remain visible in both Normal and Insert mode, so navigation and
 editing use the original source positions.
 
+List markers and task checkboxes retain their source characters and indentation.
+Ordered-list numbers are emphasized separately from their punctuation, and checked
+tasks highlight the `x` or `X` without dimming the item text. In Normal mode, press
+`gT` anywhere on a task's first source line, or choose **Toggle task** in the command
+palette, to switch between `[ ]` and `[x]`. Nested tasks and tasks in block quotes
+work too; code examples are left alone. Each toggle preserves the cursor and is
+one undo step. The action is `ToggleMarkdownTask` for custom keybindings and is
+available for Markdown documents up to 2 MiB.
+
 In Normal mode, press `gx` on a Markdown link's label or destination, or choose
 **Follow link** in the command palette. Web links open in your browser and email
 links in your mail app. Local files open in Red relative to the Markdown file's

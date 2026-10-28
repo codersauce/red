@@ -52,6 +52,7 @@ mod keyboard_shortcuts;
 mod learning;
 mod lsp_coordinator;
 mod markdown_links;
+mod markdown_lists;
 mod markdown_tables;
 mod mouse;
 mod multi_cursor;
@@ -2886,6 +2887,8 @@ pub enum Action {
     FollowLinkInSplit,
     /// Releases the current Markdown pane's destination without closing it.
     ClearLinkDestination,
+    /// Toggles the Markdown task marker on the current source line.
+    ToggleMarkdownTask,
     MoveToNextWord,
     MoveToPreviousWord,
     MoveToNextBigWord,
@@ -22525,6 +22528,9 @@ impl Editor {
                     self.notify_change(runtime).await?;
                 }
                 self.render(buffer)?;
+            }
+            Action::ToggleMarkdownTask => {
+                self.execute_toggle_markdown_task(buffer, runtime).await?;
             }
             Action::ToggleCommentRange(range) => {
                 let start_line = range.start.line.min(self.last_navigable_line());

@@ -29,6 +29,7 @@ use crate::{
 };
 
 mod markdown_inline;
+mod markdown_lists;
 
 #[derive(Clone, Copy)]
 struct BundledLanguageDefinition {
@@ -1432,7 +1433,10 @@ impl Highlighter {
                                     &self.theme,
                                 );
                             }
-                            let captured = StyleInfo { start, end, style };
+                            let mut captured = StyleInfo { start, end, style };
+                            if language_id == "markdown" {
+                                markdown_lists::refine_capture(capture_name, code, &mut captured);
+                            }
                             if capture_refines_equal_range(capture_name) {
                                 refinement_colors.push(captured);
                             } else {
@@ -1514,6 +1518,11 @@ impl Highlighter {
 }
 
 fn capture_style(theme: &Theme, language_id: &str, scope: &str) -> Option<Style> {
+    if language_id == "markdown" {
+        if let Some(style) = markdown_lists::capture_style(theme, scope) {
+            return Some(style);
+        }
+    }
     if language_id == "markdown_inline"
         || (language_id == "markdown" && scope == "markup.underline.link.markdown")
     {
@@ -2803,6 +2812,18 @@ const MARKDOWN_HIGHLIGHT_QUERY: &str = r#"
   (list_marker_dot)
   (list_marker_parenthesis)
 ] @punctuation.definition.list.begin.markdown
+
+[
+  (list_marker_dot)
+  (list_marker_parenthesis)
+] @constant.numeric.list.markdown
+
+[
+  (task_list_marker_checked)
+  (task_list_marker_unchecked)
+] @punctuation.definition.task.markdown
+
+(task_list_marker_checked) @markup.list.checked.markdown
 
 [
   (indented_code_block)

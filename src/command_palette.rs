@@ -1167,6 +1167,15 @@ fn builtin_commands() -> Vec<BuiltinCommand> {
             Action::FollowLink,
         ),
         builtin(
+            "editor.toggle_markdown_task",
+            "Toggle task",
+            "Editing",
+            "Check or uncheck the Markdown task on the current line",
+            None,
+            &["markdown", "list", "checkbox", "todo"],
+            Action::ToggleMarkdownTask,
+        ),
+        builtin(
             "editor.follow_link_in_split",
             "Open link in split",
             "Navigation",
@@ -1576,6 +1585,7 @@ fn action_label(action: &Action) -> String {
         Action::FilePicker => "Find file".to_string(),
         Action::GoToDefinition => "Go to definition".to_string(),
         Action::FollowLink => "Follow link".to_string(),
+        Action::ToggleMarkdownTask => "Toggle task".to_string(),
         Action::FollowLinkInSplit => "Open link in split".to_string(),
         Action::ClearLinkDestination => "Clear link destination".to_string(),
         Action::FormatDocument => "Format document".to_string(),

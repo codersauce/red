@@ -70,6 +70,8 @@ Supported cursor shapes are `default`, `blinking_block`, `steady_block`, `blinki
 
 Every editor mode has its own key table under `[keys.<mode>]` [@defaults]. A binding can be an action string, a list of actions, a nested chord table, or a plugin command such as `{ PluginCommand = "BufferPicker" }` [@defaults]. The default normal-mode map includes Vim-style motion and editing keys, command/search entry through `:` and `/`, file and command pickers through `Ctrl-p`, `Ctrl-Shift-p`, and `Alt-x`, keyboard-shortcut help through `F1`, and plugin commands for buffers, project search, theme browser, Git, LSP symbols, and the agent [@defaults].
 
+In Markdown buffers, `gT` invokes `ToggleMarkdownTask` to check or uncheck the task on the current source line. The command palette exposes the same action as **Toggle task**. Custom keymaps can bind `ToggleMarkdownTask` to another key; toggling is available in Normal mode and records one undo step [@defaults] [@editor].
+
 The default Space and `Ctrl-w` prefixes are dense command neighborhoods. Space opens buffer, plugin listing, project search, theme, LSP, Git, hunk, statusline, code-action, rename, and agent workflows; `Ctrl-w` owns window focus, movement, splits, closing, balancing, maximizing, and only-window behavior [@defaults].
 
 ## Plugins, Plugin Config, And Permissions
