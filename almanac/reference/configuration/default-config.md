@@ -32,6 +32,7 @@ The top-level schema accepts keys for editor behavior, keymaps, theme, cursor, p
 | `mouse_scroll_lines` | `3` | Terminal mouse-wheel scroll amount [@defaults]. |
 | `scrolloff` | `3` | Minimum visible lines above and below the cursor when possible [@defaults]. |
 | `wrap` | `true` | Wrap long lines at the window edge [@defaults]. |
+| `markdown_link_split_focus` | `"source"` | Keep focus in the Markdown source when opening a link in its remembered split; use `"target"` to focus the destination. Applies on restart [@defaults] [@config]. |
 | `wrap_window_navigation` | `true` | Wrap `Ctrl-w h/j/k/l` focus across the opposite editor edge [@defaults] [@config]. |
 | `relative_line_numbers` | `false` | Show the cursor line as an absolute line number and other visible lines as distances from it [@defaults] [@config]. |
 | `breakindent` | `true` | Indent wrapped continuation rows to leading whitespace, keeping at least 20 text columns [@defaults]. |

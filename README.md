@@ -269,6 +269,20 @@ Source links such as `src/main.rs:42:3` or `src/main.rs#L42` also work. Use
 links in rendered tables follow the same rules; missing targets leave you in
 place. Link navigation is available for Markdown documents up to 2 MiB.
 
+Press `Ctrl-w x`, or choose **Open link in split**, to keep the Markdown document
+visible while opening a local link in a split to its right. That source pane
+remembers the destination: later `gx` or `Ctrl-w x` opens reuse it. A `[links → N]`
+indicator in the source's filename identifies the destination pane number.
+Focus stays in the source by default; set `markdown_link_split_focus = "target"`
+in your config and restart Red to focus the opened file instead.
+
+The destination has its own `Ctrl-o`/`Ctrl-i` history. Changing files there keeps
+it assigned, and unsaved edits remain in their buffers. **Clear link destination**
+in the command palette releases it without closing the pane. Closing either pane
+or changing the source document also clears the association; ordinary `gx` then
+opens in the current pane again. Associations are independent for each source pane
+and last only for the current session. Web and email links still open externally.
+
 Add new highlighting, exact filenames, comment syntax, indentation, and language
 servers through a unified `[languages.<id>]` configuration or an installable
 language pack. Native Tree-sitter grammars require explicit digest-bound trust;

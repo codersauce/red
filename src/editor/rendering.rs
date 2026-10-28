@@ -3920,6 +3920,11 @@ impl Editor {
                 " [CONFLICT]"
             });
         }
+        if let Some(destination) = self.markdown_link_destination() {
+            if let Some(index) = self.window_manager.window_index(destination) {
+                filename.push_str(&format!(" [links → {}]", index + 1));
+            }
+        }
         let diagnostics = configured(StatuslineSection::Diagnostics)
             .then(|| self.statusline_diagnostic_counts(buffer_index))
             .flatten();

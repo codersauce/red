@@ -8,7 +8,13 @@ use pulldown_cmark::{BrokenLink, Event, LinkType, Options, Parser, Tag, TagEnd};
 use unicode_segmentation::UnicodeSegmentation as _;
 
 use super::{render_buffer::RenderBuffer, Action, Editor, Mode, Runtime};
-use crate::{buffer::Buffer, plugin, utils::normalized_file_path};
+use crate::{
+    buffer::{Buffer, BufferId},
+    config::MarkdownLinkSplitFocus,
+    plugin,
+    utils::normalized_file_path,
+    window::{JumpList, WindowId},
+};
 
 /// Bound synchronous parsing and retained indexes, as with table projections.
 const MAX_DOCUMENT_BYTES: usize = 2 * 1024 * 1024;
@@ -226,11 +232,53 @@ fn decode_component(value: &str) -> anyhow::Result<String> {
 }
 
 struct PreparedLink {
-    action: Action,
+    destination: PreparedDestination,
     new_buffer: Option<Buffer>,
 }
 
+enum PreparedDestination {
+    External(String),
+    Local {
+        buffer_id: BufferId,
+        /// Grapheme column and zero-based line; absent for a bare file link.
+        position: Option<(usize, usize)>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum LinkOpening {
+    Default,
+    Split,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(super) struct LinkDestination {
+    source_buffer: BufferId,
+    window: WindowId,
+}
+
 impl Editor {
+    /// Drop routes when their source document or either pane no longer exists.
+    pub(super) fn reconcile_markdown_link_destinations(&mut self) {
+        self.markdown_link_destinations
+            .retain(|source, destination| {
+                self.window_manager.window(destination.window).is_some()
+                    && self.window_manager.window(*source).is_some_and(|window| {
+                        self.buffer_manager
+                            .get(window.buffer_index)
+                            .is_some_and(|buffer| buffer.id() == destination.source_buffer)
+                    })
+            });
+    }
+
+    pub(super) fn markdown_link_destination(&self) -> Option<WindowId> {
+        let source = self.window_manager.active_window()?;
+        let destination = self.markdown_link_destinations.get(&source.id)?;
+        (self.current_buffer().id() == destination.source_buffer
+            && self.window_manager.window(destination.window).is_some())
+        .then_some(destination.window)
+    }
+
     fn markdown_link_index(&self, buffer: &Buffer) -> anyhow::Result<Arc<LinkIndex>> {
         if buffer.byte_len() > MAX_DOCUMENT_BYTES {
             bail!("Markdown link navigation supports documents up to 2 MiB");
@@ -305,7 +353,7 @@ impl Editor {
             Target::Local { path, position } => (path, position),
             Target::External(url) => {
                 return Ok(PreparedLink {
-                    action: Action::OpenExternalUrl(url),
+                    destination: PreparedDestination::External(url),
                     new_buffer: None,
                 });
             }
@@ -317,7 +365,10 @@ impl Editor {
                 crate::unicode_utils::byte_to_grapheme(&text, byte_column)
             });
             return Ok(PreparedLink {
-                action: Action::MoveTo(column, line + 1),
+                destination: PreparedDestination::Local {
+                    buffer_id: document.id(),
+                    position: Some((column, line)),
+                },
                 new_buffer: None,
             });
         }
@@ -349,29 +400,48 @@ impl Editor {
                 .with_context(|| format!("Cannot read linked file: {}", path.display()))?;
             new_buffer.insert(Buffer::new(Some(path_string.clone()), contents))
         };
-        let action = if position == Position::Start {
-            Action::OpenFile(path_string)
+        let position = if position == Position::Start {
+            None
         } else {
             let (line, column) = self.markdown_link_position(destination, &position)?;
-            Action::OpenLocation(
-                plugin::PluginLocation {
-                    path: path_string,
-                    line,
-                    column,
-                    column_encoding: plugin::LocationColumnEncoding::Utf8Byte,
-                },
-                plugin::OpenLocationTarget::Current,
-            )
+            let column = destination.get(line).map_or(0, |text| {
+                crate::unicode_utils::byte_to_grapheme(&text, column)
+            });
+            Some((column, line))
         };
-        Ok(PreparedLink { action, new_buffer })
+        Ok(PreparedLink {
+            destination: PreparedDestination::Local {
+                buffer_id: destination.id(),
+                position,
+            },
+            new_buffer,
+        })
     }
 
     pub(super) async fn follow_markdown_link(
         &mut self,
+        opening: LinkOpening,
         screen: &mut RenderBuffer,
         runtime: &mut Runtime,
     ) -> anyhow::Result<()> {
         let prepared = self.prepare_markdown_link()?;
+        let (buffer_id, position) = match prepared.destination {
+            PreparedDestination::Local {
+                buffer_id,
+                position,
+            } => (buffer_id, position),
+            PreparedDestination::External(url) => {
+                self.execute_with_tracking(&Action::OpenExternalUrl(url), screen, runtime, false)
+                    .await?;
+                return Ok(());
+            }
+        };
+        let source = self
+            .window_manager
+            .active_stable_window_id()
+            .ok_or_else(|| anyhow!("No source pane for Markdown link"))?;
+        let source_buffer = self.current_buffer().id();
+        let destination = self.markdown_link_destination();
         let opened = prepared.new_buffer.map(|buffer| {
             let file = buffer.file.clone();
             let index = self.buffer_manager.len();
@@ -381,9 +451,54 @@ impl Editor {
             }
             (file, index)
         });
-        // FollowLink records the one logical jump; nested open/move actions do not.
-        self.execute_with_tracking(&prepared.action, screen, runtime, false)
-            .await?;
+
+        let routed = destination.is_some() || opening == LinkOpening::Split;
+        let previous = if let Some(destination) = destination {
+            let index = self
+                .window_manager
+                .window_index(destination)
+                .expect("validated Markdown destination must exist");
+            self.set_active_window(index);
+            Some(self.current_jump_entry())
+        } else if routed {
+            let index = self.buffer_manager.active_index();
+            if !self.update_window_layout(|windows| windows.split_vertical(index)) {
+                if opened.is_some() {
+                    self.buffer_manager.pop_buffer();
+                }
+                bail!("Cannot create a link destination split");
+            }
+            *self.active_jump_list_mut() = JumpList::default();
+            None
+        } else {
+            None
+        };
+
+        let result = self
+            .open_prepared_local_link(buffer_id, position, screen, runtime)
+            .await;
+        if result.is_ok() && routed {
+            if let Some(previous) = previous {
+                self.save_to_history(previous);
+            }
+            let window = self
+                .window_manager
+                .active_stable_window_id()
+                .expect("opening a link retains the destination pane");
+            self.markdown_link_destinations.insert(
+                source,
+                LinkDestination {
+                    source_buffer,
+                    window,
+                },
+            );
+        }
+        if routed && self.config.markdown_link_split_focus == MarkdownLinkSplitFocus::Source {
+            if let Some(index) = self.window_manager.window_index(source) {
+                self.set_active_window(index);
+            }
+        }
+        result?;
         if let Some((Some(file), index)) = opened {
             self.plugin_registry
                 .notify(
@@ -393,6 +508,31 @@ impl Editor {
                 )
                 .await?;
         }
+        self.render(screen)?;
+        Ok(())
+    }
+
+    async fn open_prepared_local_link(
+        &mut self,
+        buffer_id: BufferId,
+        position: Option<(usize, usize)>,
+        screen: &mut RenderBuffer,
+        runtime: &mut Runtime,
+    ) -> anyhow::Result<()> {
+        // Select the prepared buffer even for same-document anchors in another pane.
+        if self.current_buffer().id() != buffer_id {
+            self.execute_with_tracking(
+                &Action::OpenBufferById(buffer_id.as_u64()),
+                screen,
+                runtime,
+                false,
+            )
+            .await?;
+        }
+        if let Some((column, line)) = position {
+            self.execute_with_tracking(&Action::MoveTo(column, line + 1), screen, runtime, false)
+                .await?;
+        }
         Ok(())
     }
 }
@@ -400,7 +540,10 @@ impl Editor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{config::Config, theme::Theme, unicode_utils::char_to_grapheme};
+    use crate::{
+        config::Config, test_utils::EditorTestExt as _, theme::Theme,
+        unicode_utils::char_to_grapheme,
+    };
     use crossterm::event::{Event as TerminalEvent, KeyCode, KeyEvent, KeyModifiers};
 
     fn editor(buffers: Vec<Buffer>) -> Editor {
@@ -441,6 +584,338 @@ mod tests {
     async fn follow(editor: &mut Editor) {
         key(editor, KeyCode::Char('g'), KeyModifiers::NONE).await;
         key(editor, KeyCode::Char('x'), KeyModifiers::NONE).await;
+    }
+
+    async fn follow_in_split(editor: &mut Editor) {
+        key(editor, KeyCode::Char('w'), KeyModifiers::CONTROL).await;
+        key(editor, KeyCode::Char('x'), KeyModifiers::NONE).await;
+    }
+
+    fn activate(editor: &mut Editor, window: WindowId) {
+        editor.set_active_window(editor.window_manager.window_index(window).unwrap());
+    }
+
+    #[tokio::test]
+    async fn split_reuse_preserves_source_and_records_only_target_history_in_both_focus_modes() {
+        for focus in [
+            MarkdownLinkSplitFocus::Source,
+            MarkdownLinkSplitFocus::Target,
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            std::fs::write(directory.path().join("target.rs"), "first\nsecond\nthird\n").unwrap();
+            let mut editor = editor(vec![document(
+                &directory.path().join("report.md"),
+                "[first](target.rs:2)\n[second](target.rs:3)\n",
+            )]);
+            editor.config.markdown_link_split_focus = focus;
+            let source = editor.window_manager.active_stable_window_id().unwrap();
+            cursor_at(&mut editor, "first");
+            let origin = editor.current_jump_entry();
+            editor.push_history_entry(origin.clone());
+            follow_in_split(&mut editor).await;
+            let target = editor.markdown_link_destinations[&source].window;
+            assert_eq!(editor.window_manager.window_count(), 2);
+            assert_eq!(
+                editor.window_manager.active_stable_window_id(),
+                Some(if focus == MarkdownLinkSplitFocus::Source {
+                    source
+                } else {
+                    target
+                })
+            );
+            activate(&mut editor, target);
+            assert_eq!(editor.buffer_line(), 1);
+            assert!(editor.active_jump_list().entries.is_empty());
+            activate(&mut editor, source);
+            assert_eq!(editor.current_jump_entry(), origin);
+            cursor_at(&mut editor, "second");
+            let origin = editor.current_jump_entry();
+            follow(&mut editor).await;
+            assert_eq!(
+                editor.window_manager.active_stable_window_id(),
+                Some(if focus == MarkdownLinkSplitFocus::Source {
+                    source
+                } else {
+                    target
+                })
+            );
+            activate(&mut editor, target);
+            assert_eq!(editor.buffer_line(), 2);
+            assert_eq!(editor.active_jump_list().entries.len(), 1);
+            key(&mut editor, KeyCode::Char('o'), KeyModifiers::CONTROL).await;
+            assert_eq!(editor.buffer_line(), 1);
+            key(&mut editor, KeyCode::Char('i'), KeyModifiers::CONTROL).await;
+            assert_eq!(editor.buffer_line(), 2);
+            activate(&mut editor, source);
+            assert_eq!(editor.current_jump_entry(), origin);
+            assert_eq!(editor.active_jump_list().entries.len(), 1);
+            follow_in_split(&mut editor).await;
+            assert_eq!(editor.window_manager.window_count(), 2);
+        }
+    }
+
+    #[tokio::test]
+    async fn split_handles_same_document_anchors_and_table_links_without_changing_source() {
+        let text = "Name | Value\n--- | ---\n[**Read**](#destination) | é\n\n# Destination\n";
+        let mut editor = editor(vec![document(Path::new("/tmp/red-split-table.md"), text)]);
+        cursor_at(&mut editor, "Read");
+        let origin = editor.current_jump_entry();
+        follow_in_split(&mut editor).await;
+        let target = editor.markdown_link_destination().unwrap();
+        assert_eq!(editor.current_jump_entry(), origin);
+        assert_eq!(editor.current_buffer().contents(), text);
+        assert!(!editor.current_buffer().is_dirty());
+        activate(&mut editor, target);
+        assert_eq!(editor.current_buffer().id(), origin.buffer_id);
+        assert_eq!(editor.buffer_line(), 4);
+    }
+
+    #[tokio::test]
+    async fn failed_split_links_do_not_change_layout_focus_or_history() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("target.md"), "# Existing\n").unwrap();
+        let mut editor = editor(vec![document(
+            &directory.path().join("report.md"),
+            "[missing](absent.md)\n[heading](target.md#absent)\n[valid](target.md)\n",
+        )]);
+        for needle in ["missing", "heading"] {
+            cursor_at(&mut editor, needle);
+            let origin = editor.current_jump_entry();
+            follow_in_split(&mut editor).await;
+            assert_eq!(editor.current_jump_entry(), origin);
+            assert_eq!(editor.window_manager.window_count(), 1);
+            assert_eq!(editor.buffer_manager.len(), 1);
+            assert!(editor.markdown_link_destinations.is_empty());
+            assert!(editor.active_jump_list().entries.is_empty());
+        }
+        cursor_at(&mut editor, "valid");
+        follow_in_split(&mut editor).await;
+        let target = editor.markdown_link_destination().unwrap();
+        cursor_at(&mut editor, "missing");
+        follow(&mut editor).await;
+        assert_eq!(editor.markdown_link_destination(), Some(target));
+        assert_eq!(editor.window_manager.window_count(), 2);
+        assert!(editor
+            .window_manager
+            .window(target)
+            .unwrap()
+            .jump_list
+            .entries
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn destination_edits_and_manual_buffer_changes_keep_route_and_unsaved_contents() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut editor = editor(vec![
+            document(
+                &directory.path().join("report.md"),
+                "[one](one.rs)\n[two](two.rs)\n",
+            ),
+            document(&directory.path().join("one.rs"), "one\n"),
+            document(&directory.path().join("two.rs"), "two\n"),
+        ]);
+        let source = editor.window_manager.active_stable_window_id().unwrap();
+        cursor_at(&mut editor, "one");
+        follow_in_split(&mut editor).await;
+        let target = editor.markdown_link_destination().unwrap();
+        activate(&mut editor, target);
+        editor
+            .test_execute_action(Action::InsertCharAtCursorPos('X'))
+            .await
+            .unwrap();
+        let edited_id = editor.current_buffer().id();
+        assert!(editor.current_buffer().is_dirty());
+        activate(&mut editor, source);
+        cursor_at(&mut editor, "two");
+        follow(&mut editor).await;
+        activate(&mut editor, target);
+        key(&mut editor, KeyCode::Char('o'), KeyModifiers::CONTROL).await;
+        assert_eq!(editor.current_buffer().id(), edited_id);
+        assert_eq!(editor.current_buffer().contents(), "Xone\n");
+        editor
+            .test_execute_action(Action::OpenBufferById(
+                editor.buffer_manager[2].id().as_u64(),
+            ))
+            .await
+            .unwrap();
+        activate(&mut editor, source);
+        assert_eq!(editor.markdown_link_destination(), Some(target));
+        cursor_at(&mut editor, "one");
+        follow(&mut editor).await;
+        activate(&mut editor, target);
+        assert_eq!(editor.current_buffer().contents(), "Xone\n");
+    }
+
+    #[tokio::test]
+    async fn routes_survive_reordering_but_clear_on_source_change_explicit_clear_and_closure() {
+        let mut editor = editor(vec![
+            document(Path::new("/tmp/report.md"), "[jump](#heading)\n# Heading\n"),
+            document(Path::new("/tmp/other.md"), "other\n"),
+        ]);
+        let source = editor.window_manager.active_stable_window_id().unwrap();
+        let source_buffer = editor.current_buffer().id();
+        cursor_at(&mut editor, "jump");
+        follow_in_split(&mut editor).await;
+        let target = editor.markdown_link_destination().unwrap();
+        editor
+            .test_execute_action(Action::MoveWindowToRight)
+            .await
+            .unwrap();
+        assert_eq!(editor.markdown_link_destination(), Some(target));
+        follow(&mut editor).await;
+        editor
+            .test_execute_action(Action::ClearLinkDestination)
+            .await
+            .unwrap();
+        assert!(editor.markdown_link_destination().is_none());
+        assert_eq!(editor.window_manager.window_count(), 2);
+        follow_in_split(&mut editor).await;
+        let target = editor.markdown_link_destination().unwrap();
+        editor
+            .test_execute_action(Action::OpenBufferById(
+                editor.buffer_manager[1].id().as_u64(),
+            ))
+            .await
+            .unwrap();
+        editor
+            .test_execute_action(Action::OpenBufferById(source_buffer.as_u64()))
+            .await
+            .unwrap();
+        assert!(editor.markdown_link_destination().is_none());
+        cursor_at(&mut editor, "jump");
+        follow_in_split(&mut editor).await;
+        let current_target = editor.markdown_link_destination().unwrap();
+        assert_ne!(current_target, target);
+        activate(&mut editor, current_target);
+        editor
+            .test_execute_action(Action::CloseWindow)
+            .await
+            .unwrap();
+        activate(&mut editor, source);
+        assert!(editor.markdown_link_destination().is_none());
+        let count = editor.window_manager.window_count();
+        follow(&mut editor).await;
+        assert_eq!(editor.window_manager.window_count(), count);
+        assert_eq!(editor.buffer_line(), 1);
+    }
+
+    #[tokio::test]
+    async fn two_panes_of_one_document_keep_independent_destinations() {
+        let mut editor = editor(vec![document(
+            Path::new("/tmp/report.md"),
+            "[one](#one)\n[two](#two)\n# One\n# Two\n",
+        )]);
+        let first = editor.window_manager.active_stable_window_id().unwrap();
+        editor
+            .test_execute_action(Action::SplitHorizontal)
+            .await
+            .unwrap();
+        let second = editor.window_manager.active_stable_window_id().unwrap();
+        cursor_at(&mut editor, "two");
+        follow_in_split(&mut editor).await;
+        let second_target = editor.markdown_link_destination().unwrap();
+        activate(&mut editor, first);
+        cursor_at(&mut editor, "one");
+        follow_in_split(&mut editor).await;
+        let first_target = editor.markdown_link_destination().unwrap();
+        assert_ne!(first_target, second_target);
+        assert_eq!(editor.window_manager.window_count(), 4);
+        assert_eq!(editor.markdown_link_destinations.len(), 2);
+        activate(&mut editor, first_target);
+        assert_eq!(editor.buffer_line(), 2);
+        activate(&mut editor, second_target);
+        assert_eq!(editor.buffer_line(), 3);
+        activate(&mut editor, second);
+        assert_eq!(editor.markdown_link_destination(), Some(second_target));
+    }
+
+    #[tokio::test]
+    async fn nested_routes_take_one_hop_and_source_replacement_releases_outgoing_route() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut editor = editor(vec![
+            document(
+                &directory.path().join("a.md"),
+                "[read](b.md)\n[replace](c.md)\n",
+            ),
+            document(&directory.path().join("b.md"), "[next](c.md)\n"),
+            document(&directory.path().join("c.md"), "# End\n"),
+        ]);
+        let a = editor.window_manager.active_stable_window_id().unwrap();
+        cursor_at(&mut editor, "read");
+        follow_in_split(&mut editor).await;
+        let b = editor.markdown_link_destination().unwrap();
+        activate(&mut editor, b);
+        cursor_at(&mut editor, "next");
+        follow_in_split(&mut editor).await;
+        let c = editor.markdown_link_destination().unwrap();
+        activate(&mut editor, a);
+        follow(&mut editor).await;
+        assert_eq!(editor.window_manager.window_count(), 3);
+        assert_eq!(editor.window_manager.window(b).unwrap().buffer_index, 1);
+        assert_eq!(editor.markdown_link_destinations[&b].window, c);
+        cursor_at(&mut editor, "replace");
+        follow(&mut editor).await;
+        assert_eq!(editor.window_manager.window(b).unwrap().buffer_index, 2);
+        assert!(!editor.markdown_link_destinations.contains_key(&b));
+        assert_eq!(editor.markdown_link_destination(), Some(b));
+    }
+
+    #[tokio::test]
+    async fn restored_layout_keeps_panes_but_forgets_link_routes() {
+        let mut editor = editor(vec![document(
+            Path::new("/tmp/report.md"),
+            "[jump](#heading)\n# Heading\n",
+        )]);
+        cursor_at(&mut editor, "jump");
+        follow_in_split(&mut editor).await;
+        let snapshot = editor.window_manager.snapshot();
+        let buffers = HashMap::from([(0, 0)]);
+        editor.window_manager =
+            crate::window::WindowManager::from_snapshot(&snapshot, (80, 25), &buffers).unwrap();
+        editor.sync_with_window();
+        assert_eq!(editor.window_manager.window_count(), 2);
+        assert!(editor.markdown_link_destinations.is_empty());
+        follow(&mut editor).await;
+        assert_eq!(editor.buffer_line(), 1);
+        assert_eq!(editor.window_manager.window_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn buffer_reindexing_preserves_routes_and_source_closure_removes_them() {
+        let mut editor = editor(vec![
+            document(Path::new("/tmp/unused.txt"), "unused\n"),
+            document(Path::new("/tmp/report.md"), "[jump](#heading)\n# Heading\n"),
+        ]);
+        let unused = editor.window_manager.active_stable_window_id().unwrap();
+        editor
+            .test_execute_action(Action::SplitHorizontal)
+            .await
+            .unwrap();
+        editor
+            .test_execute_action(Action::OpenBufferById(
+                editor.buffer_manager[1].id().as_u64(),
+            ))
+            .await
+            .unwrap();
+        let source = editor.window_manager.active_stable_window_id().unwrap();
+        cursor_at(&mut editor, "jump");
+        follow_in_split(&mut editor).await;
+        let target = editor.markdown_link_destination().unwrap();
+        activate(&mut editor, unused);
+        editor
+            .test_execute_action(Action::DeleteBuffer(false))
+            .await
+            .unwrap();
+        activate(&mut editor, source);
+        assert_eq!(editor.markdown_link_destination(), Some(target));
+        follow(&mut editor).await;
+        editor
+            .test_execute_action(Action::CloseWindow)
+            .await
+            .unwrap();
+        assert!(editor.markdown_link_destinations.is_empty());
+        assert!(editor.window_manager.window(target).is_some());
     }
 
     #[test]
@@ -715,7 +1190,9 @@ mod tests {
         ] {
             cursor_at(&mut editor, needle);
             let prepared = editor.prepare_markdown_link().unwrap();
-            assert_eq!(prepared.action, Action::OpenExternalUrl(url.into()));
+            assert!(
+                matches!(prepared.destination, PreparedDestination::External(actual) if actual == url)
+            );
             assert!(prepared.new_buffer.is_none());
             assert!(editor.active_jump_list().entries.is_empty());
         }

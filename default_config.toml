@@ -26,6 +26,10 @@ wrap = true
 # presentation in the current split without changing the file.
 markdown_tables = true
 
+# Keep focus in the Markdown source when a link opens in its remembered split.
+# Set to "target" to focus the destination. Config changes apply on restart.
+markdown_link_split_focus = "source"
+
 # Wrap Ctrl-w h/j/k/l focus across the opposite editor edge.
 wrap_window_navigation = true
 
@@ -453,6 +457,7 @@ Esc = { EnterMode = "Normal" }
 "m" = "MoveToNextCall"
 
 [keys.normal."Ctrl-w"]
+"x" = "FollowLinkInSplit"
 "a" = { PluginCommand = "AgentOpen" }
 "h" = "MoveWindowLeft"
 "H" = "MoveWindowToLeft"

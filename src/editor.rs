@@ -2882,6 +2882,10 @@ pub enum Action {
     OpenExternalUrl(String),
     /// Follows the Markdown link at the source cursor without requiring an LSP.
     FollowLink,
+    /// Opens a Markdown link in a dedicated, reusable destination split.
+    FollowLinkInSplit,
+    /// Releases the current Markdown pane's destination without closing it.
+    ClearLinkDestination,
     MoveToNextWord,
     MoveToPreviousWord,
     MoveToNextBigWord,
@@ -3737,6 +3741,7 @@ pub struct Editor {
     layout_cache: std::cell::RefCell<HashMap<LayoutCacheKey, std::sync::Arc<DisplayLayout>>>,
     markdown_table_cache: RefCell<HashMap<BufferId, markdown_tables::CachedTables>>,
     markdown_link_cache: RefCell<HashMap<BufferId, markdown_links::CachedLinks>>,
+    markdown_link_destinations: HashMap<WindowId, markdown_links::LinkDestination>,
 
     /// Window manager handling splits and layout
     window_manager: WindowManager,
@@ -5876,6 +5881,7 @@ impl Editor {
             layout_cache: std::cell::RefCell::new(HashMap::new()),
             markdown_table_cache: RefCell::new(HashMap::new()),
             markdown_link_cache: RefCell::new(HashMap::new()),
+            markdown_link_destinations: HashMap::new(),
             window_manager,
             stdout,
             keyboard_protocol: crate::keyboard::KeyboardProtocol::default(),
@@ -6369,6 +6375,7 @@ impl Editor {
             self.cursor_goal = window.cursor_goal;
             self.vx = window.vx;
         }
+        self.reconcile_markdown_link_destinations();
     }
 
     /// Synchronizes the active window with the editor's state
@@ -6384,6 +6391,7 @@ impl Editor {
             window.cursor_goal = self.cursor_goal;
             window.vx = self.vx;
         }
+        self.reconcile_markdown_link_destinations();
     }
 
     #[cfg(test)]
@@ -23728,11 +23736,27 @@ impl Editor {
                 self.execute_with_tracking(&Action::MoveTo(*x, *y), buffer, runtime, false)
                     .await?;
             }
-            Action::FollowLink => {
-                if let Err(error) = self.follow_markdown_link(buffer, runtime).await {
+            Action::FollowLink | Action::FollowLinkInSplit => {
+                self.sync_to_window();
+                let opening = if matches!(action, Action::FollowLinkInSplit) {
+                    markdown_links::LinkOpening::Split
+                } else {
+                    markdown_links::LinkOpening::Default
+                };
+                // Routed opens own the destination's history, even when focus moves there.
+                add_to_history &= opening == markdown_links::LinkOpening::Default
+                    && self.markdown_link_destination().is_none();
+                if let Err(error) = self.follow_markdown_link(opening, buffer, runtime).await {
+                    add_to_history = false;
                     self.set_legacy_message(Some(error.to_string()));
                     self.render(buffer)?;
                 }
+            }
+            Action::ClearLinkDestination => {
+                if let Some(source) = self.window_manager.active_stable_window_id() {
+                    self.markdown_link_destinations.remove(&source);
+                }
+                self.render(buffer)?;
             }
             Action::OpenExternalUrl(url) => {
                 let lowercase = url.to_ascii_lowercase();
