@@ -10977,6 +10977,7 @@ impl Editor {
 
     async fn run_interactive(&mut self, runtime: &mut Runtime) -> anyhow::Result<()> {
         let interactive_startup = perf::PerfSpan::start("startup:interactive");
+        crate::terminal_output::enable_theme_color();
         terminal::enable_raw_mode()?;
         self.terminal_active = true;
         self.stdout

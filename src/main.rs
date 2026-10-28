@@ -824,6 +824,7 @@ async fn attach_session(session: &str) -> anyhow::Result<()> {
             red::headless::connect_session(&Config::path("run"), session, None, size).await?;
         let mut rows = Vec::new();
         terminal::enable_raw_mode()?;
+        red::terminal_output::enable_theme_color();
         let mut terminal_guard = DetachedTerminalGuard::default();
         let mut output = std::io::BufWriter::with_capacity(1 << 20, stdout());
         let mut clipboard = SessionClipboard::new(&client.clipboard_config);
