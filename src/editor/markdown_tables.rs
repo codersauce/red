@@ -751,6 +751,11 @@ impl SourceColumns {
         Self(columns)
     }
 
+    fn grapheme_count(&self) -> usize {
+        // One entry per source grapheme, followed by the end-of-line sentinel.
+        self.0.len() - 1
+    }
+
     fn at(&self, byte: usize) -> usize {
         self.0[self
             .0
@@ -935,10 +940,20 @@ fn project_row(
         }
     }
     let count = projected.len();
+    let source_graphemes = source_columns.grapheme_count();
     projected
         .into_iter()
         .enumerate()
-        .map(|(index, projection)| projected_segment(row.line, &row.text, projection, index, count))
+        .map(|(index, projection)| {
+            projected_segment(
+                row.line,
+                &row.text,
+                source_graphemes,
+                projection,
+                index,
+                count,
+            )
+        })
         .collect()
 }
 
@@ -1017,12 +1032,13 @@ fn project_delimiter(
         source: end..end + 1,
         column: column.saturating_sub(2),
     });
-    projected_segment(line, text, projected, 0, 1)
+    projected_segment(line, text, source_columns.grapheme_count(), projected, 0, 1)
 }
 
 fn projected_segment(
     line: usize,
     text: &str,
+    source_graphemes: usize,
     projection: ProjectedRow,
     index: usize,
     count: usize,
@@ -1045,7 +1061,7 @@ fn projected_segment(
         start_col,
         end_col,
         start_grapheme: 0,
-        end_grapheme: text.graphemes(true).count(),
+        end_grapheme: source_graphemes,
         start_byte: 0,
         end_byte: text.len(),
         start_grapheme_col: 0,
@@ -1288,6 +1304,44 @@ mod tests {
                     glyph.text
                 );
             }
+        }
+    }
+
+    #[test]
+    fn long_wrapped_unicode_rows_preserve_source_ranges_after_resizing() {
+        let source_line = format!("| {} | tail |", "e\u{301} 界🙂 ".repeat(1024));
+        let source = format!("| Value | Note |\n| --- | --- |\n{source_line}\n");
+        let tables = MarkdownTables::parse(&source);
+        let source_graphemes = source_line.graphemes(true).count();
+        let last_emoji = source_line.rfind('🙂').unwrap();
+        let source_column = display_width(&source_line[..last_emoji]);
+
+        for width in [24, 80, 40] {
+            let layout = tables.layout(width, 4, true, false);
+            let rows = &layout.lines[&2].rows;
+            assert!(
+                rows.len() > 32,
+                "expected many wrapped rows at width {width}"
+            );
+            for row in rows {
+                assert_eq!(
+                    (row.start_grapheme, row.end_grapheme),
+                    (0, source_graphemes),
+                    "source grapheme range at width {width}, row {}",
+                    row.row
+                );
+                assert_eq!((row.start_byte, row.end_byte), (0, source_line.len()));
+            }
+
+            let mut matching = rows
+                .iter()
+                .filter(|row| row.contains_cursor_col(source_column));
+            let row = matching
+                .next()
+                .expect("the last emoji has a source mapping");
+            assert!(matching.next().is_none(), "source mapping must be unique");
+            let screen_column = row.screen_col_for_display_col(source_column, width);
+            assert_eq!(row.display_col_for_screen_col(screen_column), source_column);
         }
     }
 
