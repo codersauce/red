@@ -354,6 +354,10 @@ async fn run_editor_inner(args: Args) -> anyhow::Result<()> {
     editor.enable_agent_continuity(Config::path("agent/conversations"));
     editor.enable_update_checks(Config::path("cache/updates"));
     editor.set_session_store(session_store);
+    if let Some(path) = args.agent_watch.as_deref() {
+        let directory = (path != ".").then(|| PathBuf::from(path));
+        editor.begin_agent_watch(directory)?;
+    }
 
     if let Some(session) = &args.core_session {
         #[cfg(unix)]

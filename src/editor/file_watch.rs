@@ -501,7 +501,7 @@ impl Editor {
         Ok(())
     }
 
-    async fn reload_changed_file(
+    pub(super) async fn reload_changed_file(
         &mut self,
         index: usize,
         runtime: &mut Runtime,

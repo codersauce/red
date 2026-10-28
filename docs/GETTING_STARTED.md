@@ -508,6 +508,28 @@ configuration.
 See the [agent workflow and safety contract](AGENT_WORKFLOW.md) for the full
 interaction model, commands, path boundaries, and failure behavior.
 
+### Watch an external agent
+
+`:agent-watch` follows a Claude Code, Codex CLI, or Gemini CLI session that is
+already working in this project. Red opens the file the agent reads or edits,
+jumps to the changed lines, and tints them. The mode is read-only. `q` returns
+to normal editing.
+
+```shell
+red --agent-watch
+red --agent-watch=/path/to/project
+```
+
+```text
+:agent-watch
+:agent-watch stop
+```
+
+`f` pauses follow so you can scroll, and `esc` follows again. `1`–`9` pins one
+agent when several are active. This is not Red's own Codex agent and it does
+not use `[agent] follow_tool_calls`. See [Agent watch](AGENT_WATCH.md) for the
+session files, keys, and limits.
+
 ## Configuration
 
 Red layers your configuration over embedded defaults:
@@ -613,6 +635,8 @@ red --version               # print the installed version
 red --runtime-files         # list visible plugins/themes and their sources
 red --eject <asset>         # copy a bundled plugin/theme into your config dir
 red --agent-check           # report Codex integration prerequisites
+red --agent-watch           # follow Claude Code, Codex, or Gemini CLI
+red --agent-watch=DIR       # follow agents in another directory
 ```
 
 Use `red --help` for the complete generated command-line reference.

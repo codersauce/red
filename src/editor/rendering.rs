@@ -33,7 +33,7 @@ use crate::{
     notification::{NotificationCounts, NotificationState, Severity},
     plugin::{rpc::RpcStatuslineSide, DecorationAnchor},
     splash,
-    theme::{SelectionForegroundPriority, Style, SurfacePalette, Theme},
+    theme::{DiffPalette, SelectionForegroundPriority, Style, SurfacePalette, Theme},
     ui::IconCatalog,
     undo::{TextPosition, TextRange},
     unicode_utils::{
@@ -2970,6 +2970,7 @@ impl Editor {
         }
 
         self.render_search_highlights_in_window(buffer, window)?;
+        self.render_agent_watch_highlight(buffer, window)?;
         self.render_matching_brackets_in_window(buffer, window, None);
 
         let multi_cursor_ranges = self
@@ -3173,6 +3174,54 @@ impl Editor {
                 cell.style = self.theme.matched_bracket_style(&cell.style);
             }
         }
+    }
+
+    fn render_agent_watch_highlight(
+        &mut self,
+        buffer: &mut RenderBuffer,
+        window: &crate::window::Window,
+    ) -> anyhow::Result<()> {
+        let Some(highlight) = self.agent_watch_highlight() else {
+            return Ok(());
+        };
+        let Some(file) = self
+            .buffer_manager
+            .get(window.buffer_index)
+            .and_then(|buffer| buffer.file.clone())
+        else {
+            return Ok(());
+        };
+        if !crate::utils::same_file_path(Path::new(&file), &highlight.path) {
+            return Ok(());
+        }
+        let Some(bg) = agent_watch_line_color(&self.theme, highlight.kind) else {
+            return Ok(());
+        };
+        let layout = self.layout_for_window(window);
+        let height = self.window_content_height(window);
+        let gutter = self.gutter_width_for_window(window);
+        let start_x = window.position.x + gutter + 1;
+        let end_x = window
+            .position
+            .x
+            .saturating_add(window.inner_width())
+            .saturating_sub(1);
+        if end_x < start_x {
+            return Ok(());
+        }
+        for segment in layout.rows.iter().filter(|segment| {
+            (highlight.start_line..=highlight.end_line).contains(&segment.line)
+                && segment.row < height
+        }) {
+            let term_y = self.window_to_terminal_y(window, segment.row);
+            buffer.set_bg_for_range(
+                Point::new(start_x, term_y),
+                Point::new(end_x, term_y),
+                &bg,
+                &self.theme,
+            );
+        }
+        Ok(())
     }
 
     fn render_search_highlights_in_window(
@@ -3853,7 +3902,9 @@ impl Editor {
             .then(|| statusline_relative_path(file_path.as_deref(), &workspace_root))
             .flatten();
         let context = StatuslineContext {
-            mode: if self.pane_resize_mode.is_some() {
+            mode: if let Some(mode) = self.agent_watch_mode_name() {
+                mode
+            } else if self.pane_resize_mode.is_some() {
                 "RESIZE".to_string()
             } else if let Some(multi_cursor) = self.multi_cursor_status_label() {
                 multi_cursor
@@ -4186,6 +4237,8 @@ impl Editor {
                         Some(record.severity),
                         display_width(&prefix) + display_width(&source),
                     )
+                } else if let Some(activity) = self.agent_watch_status_line() {
+                    (activity, None, 0)
                 } else {
                     (String::new(), None, 0)
                 };
@@ -4450,6 +4503,14 @@ impl Editor {
 
     fn update_gutter_width(&mut self) {
         self.vx = self.gutter_width() + 1;
+    }
+}
+
+fn agent_watch_line_color(theme: &Theme, kind: crate::agent_watch::TouchKind) -> Option<Color> {
+    let palette = DiffPalette::new(theme);
+    match kind {
+        crate::agent_watch::TouchKind::Edit => palette.added.bg,
+        crate::agent_watch::TouchKind::Read => palette.hunk.bg.or(palette.added.bg),
     }
 }
 
