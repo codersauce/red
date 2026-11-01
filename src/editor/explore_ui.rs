@@ -9,9 +9,9 @@ use crate::color::{ensure_minimum_contrast, Color};
 use crate::explore::{sidebar_columns, DimZone, Hit, Jump, SyncInput, View, ViewDef, ViewRef};
 use crate::highlighter::LanguageRegistry;
 use crate::theme::{Style, SurfacePalette, Theme, MINIMUM_SELECTION_TEXT_CONTRAST};
+use crate::ui::{BorderStyle, Component, Dialog};
 use crate::unicode_utils::{
     char_to_grapheme, display_width, trim_line_ending, truncate_display_width,
-    truncate_display_width_with_marker, TruncationSide,
 };
 
 use super::{Action, Editor, RenderBuffer, Runtime};
@@ -64,10 +64,9 @@ impl Editor {
                     self.explore.enabled = !self.explore.enabled;
                     if !self.explore.enabled {
                         self.explore.clear_follow();
-                        self.explore.help = false;
                     }
                     if self.explore.enabled {
-                        "Code explore on. Space e ? lists keys. Double-click a name to follow it."
+                        "Code explore on. Space e ? opens keyboard shortcuts. Double-click a name to follow it."
                             .to_string()
                     } else {
                         "Code explore off.".to_string()
@@ -75,12 +74,11 @@ impl Editor {
                 }
                 "on" => {
                     self.explore.enabled = true;
-                    "Code explore on. Space e ? lists keys.".to_string()
+                    "Code explore on. Space e ? opens keyboard shortcuts.".to_string()
                 }
                 "off" | "close" => {
                     self.explore.enabled = false;
                     self.explore.clear_follow();
-                    self.explore.help = false;
                     "Code explore off.".to_string()
                 }
                 "skeleton" | "skel" => {
@@ -122,12 +120,8 @@ impl Editor {
                 "pr" => self.explore_pr(None),
                 "help" | "?" => {
                     self.explore.enabled = true;
-                    self.explore.help = !self.explore.help;
-                    if self.explore.help {
-                        "Key list is in the sidebar.".to_string()
-                    } else {
-                        "Key list closed.".to_string()
-                    }
+                    self.open_explore_shortcuts(Some(runtime));
+                    "Keyboard shortcuts.".to_string()
                 }
                 _ => "usage: explore [on|off|skeleton|follow|def|type|back|forward|next|prev|index|pr [base]|help]".to_string(),
             }
@@ -153,7 +147,7 @@ impl Editor {
         let mut hits = Vec::new();
         self.paint_explore_source(buffer, window, &view, &palette);
         if let Some(rect) = self.explore_sidebar_rect(window) {
-            hits.extend(paint_sidebar(buffer, rect, &view, &palette, ascii));
+            hits.extend(paint_sidebar(buffer, rect, &view, &palette, &self.theme));
         }
         if self.explore_chrome_rows(window) == 1 {
             let y = window.position.y + window.inner_height() - 1;
@@ -163,8 +157,8 @@ impl Editor {
                 y,
                 window.inner_width(),
                 &view,
-                &palette,
                 ascii,
+                &self.theme,
             ));
         }
         self.explore.set_hits(hits);
@@ -564,15 +558,14 @@ fn paint_badge(
     palette: &Palette,
     theme: &Theme,
 ) {
-    let text = format!(" ×{count}");
+    let text = format!(" {count}");
     let width = display_width(&text);
     if line_width + width > content_width {
         return;
     }
     let style = Style {
-        fg: Some(palette.accent),
+        fg: theme.statusline_style.inner_style.fg.or(Some(palette.fg)),
         bg: theme.style.bg,
-        bold: true,
         ..Style::default()
     };
     buffer.set_text(origin_x + line_width, y, &text, &style);
@@ -589,17 +582,12 @@ struct Palette {
     fg: Color,
     muted: Color,
     heading: Color,
-    accent: Color,
     border: Color,
     sidebar_bg: Color,
-    title_bg: Color,
-    title_fg: Color,
     selected_bg: Color,
     selected_fg: Color,
     follow_bg: Color,
     follow_fg: Color,
-    crumb_bg: Color,
-    warn: Color,
 }
 
 impl Palette {
@@ -627,32 +615,20 @@ impl Palette {
             &["descriptionForeground", "editorLineNumber.foreground"],
             fg,
         ));
-        let accent = pick(
-            &[
-                "textLink.foreground",
-                "editorInfo.foreground",
-                "focusBorder",
-            ],
-            fg,
+        let border = pick(
+            &["sideBar.border"],
+            theme
+                .ui_style
+                .popup_border
+                .fg
+                .unwrap_or(pick(&["focusBorder"], muted)),
         );
-        let border = theme
-            .ui_style
-            .popup_border
-            .fg
-            .unwrap_or(pick(&["sideBar.border", "focusBorder"], muted));
-        let title_bg = pick(
-            &["sideBarSectionHeader.background", "statusBar.background"],
-            theme.ui_style.popup_title.bg.unwrap_or(sidebar_bg),
-        );
-        let title_fg = pick(
-            &["sideBarSectionHeader.foreground", "statusBar.foreground"],
-            theme.ui_style.popup_title.fg.unwrap_or(fg),
-        );
+        let heading = pick(&["sideBarTitle.foreground", "sideBar.foreground"], fg);
         let selected_bg = theme
             .ui_style
             .picker_selected_item
             .bg
-            .unwrap_or(pick(&["list.activeSelectionBackground"], title_bg));
+            .unwrap_or(pick(&["list.activeSelectionBackground"], sidebar_bg));
         let selected_fg = theme
             .ui_style
             .picker_selected_item
@@ -670,11 +646,6 @@ impl Palette {
             .and_then(|style| style.fg)
             .or_else(|| theme.find_match_style.as_ref().and_then(|style| style.fg))
             .unwrap_or(selected_fg);
-        let crumb_bg = pick(&["statusBar.background"], title_bg);
-        let warn = pick(
-            &["editorWarning.foreground", "list.warningForeground"],
-            accent,
-        );
         let roles = SurfacePalette::new(
             theme,
             &Style {
@@ -685,28 +656,21 @@ impl Palette {
         );
         let fg = roles.primary.fg.unwrap_or(fg);
         let muted = roles.muted.fg.unwrap_or(muted);
-        let accent = roles.accent.fg.unwrap_or(accent);
-        let heading = ensure_minimum_contrast(accent, sidebar_bg, MINIMUM_SELECTION_TEXT_CONTRAST);
+        let heading = ensure_minimum_contrast(heading, sidebar_bg, MINIMUM_SELECTION_TEXT_CONTRAST);
         let selected_fg =
             ensure_minimum_contrast(selected_fg, selected_bg, MINIMUM_SELECTION_TEXT_CONTRAST);
-        let title_fg = ensure_minimum_contrast(title_fg, title_bg, MINIMUM_SELECTION_TEXT_CONTRAST);
         let follow_fg =
             ensure_minimum_contrast(follow_fg, follow_bg, MINIMUM_SELECTION_TEXT_CONTRAST);
         Self {
             fg,
             muted,
             heading,
-            accent,
             border,
             sidebar_bg,
-            title_bg,
-            title_fg,
             selected_bg,
             selected_fg,
             follow_bg,
             follow_fg,
-            crumb_bg,
-            warn,
         }
     }
 }
@@ -716,7 +680,6 @@ enum Tone {
     Body,
     Muted,
     Heading,
-    Accent,
     Selected,
 }
 
@@ -724,7 +687,6 @@ struct Row {
     text: String,
     tone: Tone,
     jump: Option<Jump>,
-    hints: Vec<(String, String)>,
 }
 
 fn paint_sidebar(
@@ -732,68 +694,59 @@ fn paint_sidebar(
     rect: Rect,
     view: &View,
     palette: &Palette,
-    ascii: bool,
+    theme: &Theme,
 ) -> Vec<Hit> {
-    let style = |tone: &Tone| row_style(tone, palette);
-    fill_rect(buffer, &rect, ' ', &style(&Tone::Body));
-    let inner_w = rect.width.saturating_sub(2);
-    let content_w = inner_w.saturating_sub(1);
-    if rect.width < 8 || rect.height < 4 || content_w == 0 {
+    if rect.width < 8 || rect.height < 4 {
         return Vec::new();
     }
-    let rows = sidebar_rows(view, content_w, rect.height);
+    let surface = Style {
+        fg: Some(palette.fg),
+        bg: Some(palette.sidebar_bg),
+        ..Style::default()
+    };
+    let border = Style {
+        fg: Some(palette.border),
+        bg: Some(palette.sidebar_bg),
+        ..Style::default()
+    };
+    let title = Style {
+        fg: Some(palette.heading),
+        bg: Some(palette.sidebar_bg),
+        bold: true,
+        ..Style::default()
+    };
+    let inner_w = rect.width.saturating_sub(2);
+    let inner_h = rect.height.saturating_sub(2);
+    let content_w = inner_w.saturating_sub(2);
+    if inner_w == 0 || inner_h == 0 || content_w == 0 {
+        return Vec::new();
+    }
+    let dialog = Dialog::new(
+        Some("explore".to_string()),
+        rect.x,
+        rect.y,
+        inner_w,
+        inner_h,
+        &surface,
+        BorderStyle::Single,
+        theme,
+    )
+    .with_border_draw_style(&border)
+    .with_title_style(&title)
+    .with_left_aligned_title();
+    if dialog.draw(buffer).is_err() {
+        return Vec::new();
+    }
+    let rows = sidebar_rows(view, content_w, inner_h);
     let mut hits = Vec::new();
     for (index, row) in rows.iter().enumerate() {
-        if index >= rect.height {
-            break;
-        }
-        let y = rect.y + index;
-        let tone = if index == 0 { Tone::Heading } else { row.tone };
-        let background = if index == 0 {
-            palette.title_bg
-        } else {
-            match &row.tone {
-                Tone::Selected => palette.selected_bg,
-                _ => palette.sidebar_bg,
-            }
-        };
-        let mut line_style = style(&tone);
-        line_style.bg = Some(background);
-        if index == 0 {
-            line_style.fg = Some(palette.title_fg);
-            line_style.bold = true;
-        }
-        let shown = if row.hints.is_empty() {
-            row.text.clone()
-        } else {
-            String::new()
-        };
-        let text = format!(
-            "{border}{body}{border}",
-            border = if ascii { "|" } else { "│" },
-            body = pad(&format!(" {shown}"), inner_w)
-        );
-        buffer.set_text(
-            rect.x,
-            y,
-            &truncate_display_width(&text, rect.width),
-            &line_style,
-        );
-        if !row.hints.is_empty() {
-            paint_key_hints(buffer, rect.x + 2, y, content_w, &row.hints, palette);
-        }
-        if let Some(cell) = cell_mut(buffer, rect.x, y) {
-            cell.style.fg = Some(palette.border);
-        }
-        if rect.width > 1 {
-            if let Some(cell) = cell_mut(buffer, rect.x + rect.width - 1, y) {
-                cell.style.fg = Some(palette.border);
-            }
-        }
+        let y = rect.y + 1 + index;
+        let line_style = row_style(&row.tone, palette);
+        buffer.set_text(rect.x + 2, y, &pad(&row.text, content_w), &line_style);
         if let Some(jump) = &row.jump {
             hits.push(Hit {
                 x0: rect.x + 1,
-                x1: rect.x + rect.width - 1,
+                x1: rect.x + rect.width.saturating_sub(1),
                 y,
                 jump: jump.clone(),
             });
@@ -807,7 +760,6 @@ fn row_style(tone: &Tone, palette: &Palette) -> Style {
         Tone::Body => palette.fg,
         Tone::Muted => palette.muted,
         Tone::Heading => palette.heading,
-        Tone::Accent => palette.accent,
         Tone::Selected => palette.selected_fg,
     };
     let bg = match tone {
@@ -817,47 +769,15 @@ fn row_style(tone: &Tone, palette: &Palette) -> Style {
     Style {
         fg: Some(fg),
         bg: Some(bg),
-        bold: matches!(tone, Tone::Heading | Tone::Accent | Tone::Selected),
+        bold: matches!(tone, Tone::Heading | Tone::Selected),
         ..Style::default()
     }
 }
 
 fn sidebar_rows(view: &View, width: usize, height: usize) -> Vec<Row> {
-    let mut rows = Vec::new();
-    let mut title = String::from("explore");
-    if view.skeleton {
-        title.push_str("  Dim");
-    }
-    if view.pr_mode {
-        title.push_str("  Review");
-    }
-    rows.push(Row {
-        text: clip(&title, width),
-        tone: Tone::Heading,
-        jump: None,
-        hints: Vec::new(),
-    });
-    let footer = footer_rows(width);
-    let note = if view.help {
-        Vec::new()
-    } else {
-        note_rows(view, width)
-    };
-    let reserved = 1 + 1 + footer.len() + note.len();
-    let body_height = height.saturating_sub(reserved);
-    let mut body = if view.help {
-        help_rows(width)
-    } else {
-        body_rows(view, width)
-    };
-    body.truncate(body_height);
-    rows.extend(body);
-    rows.extend(note);
+    let mut rows = body_rows(view, width);
     rows.push(blank());
-    rows.extend(footer);
-    while rows.len() < height {
-        rows.push(blank());
-    }
+    rows.extend(note_rows(view, width));
     rows.truncate(height);
     rows
 }
@@ -895,13 +815,13 @@ fn body_rows(view: &View, width: usize) -> Vec<Row> {
         rows.push(muted(&view.cursor_syntax, width));
     }
     if view.in_function_count > 0 {
-        rows.push(accent(
+        rows.push(body(
             &format!("{} in this function", view.in_function_count),
             width,
         ));
     }
     if let Some(following) = &view.following {
-        rows.push(accent(
+        rows.push(body(
             &format!("Following {following} ({})", view.follow_spans.len()),
             width,
         ));
@@ -949,16 +869,14 @@ fn definition_rows(def: &ViewDef, width: usize) -> Vec<Row> {
             text: clip(&def.label, width),
             tone: Tone::Body,
             jump: Some(jump.clone()),
-            hints: Vec::new(),
         },
         Row {
             text: clip(
-                &format!("{file}:{}  {}  ×{}", def.line + 1, def.kind, def.refs),
+                &format!("{file}:{}  {}  {}", def.line + 1, def.kind, def.refs),
                 width,
             ),
-            tone: Tone::Accent,
+            tone: Tone::Muted,
             jump: Some(jump),
-            hints: Vec::new(),
         },
         muted(&def.signature, width),
     ]
@@ -982,7 +900,6 @@ fn reference_row(reference: &ViewRef, width: usize) -> Row {
             line: reference.line,
             column: reference.column,
         }),
-        hints: Vec::new(),
     }
 }
 
@@ -996,93 +913,24 @@ fn note_rows(view: &View, width: usize) -> Vec<Row> {
     rows
 }
 
-fn footer_rows(width: usize) -> Vec<Row> {
-    vec![
-        key_row(width, &[("e f", "follow"), ("e s", "dim")]),
-        key_row(width, &[("e d", "definition"), ("e t", "type")]),
-        key_row(width, &[("e b", "back"), ("e ?", "keys")]),
-    ]
-}
-
-fn key_row(width: usize, pairs: &[(&str, &str)]) -> Row {
-    Row {
-        text: String::new(),
-        tone: Tone::Muted,
-        jump: None,
-        hints: pairs
-            .iter()
-            .map(|(key, label)| ((*key).to_string(), (*label).to_string()))
-            .filter(|(key, _)| display_width(&format!("[{key}]")) <= width)
-            .collect(),
-    }
-}
-
-fn help_rows(width: usize) -> Vec<Row> {
-    let mut rows = vec![heading("Keys")];
-    for (key, label) in [
-        ("e e", "open or close"),
-        ("Space E", "same"),
-        ("e f", "follow this name"),
-        ("e s", "dim all but calls"),
-        ("e d", "go to definition"),
-        ("e t", "go to written type"),
-        ("e j", "next match"),
-        ("e k", "previous match"),
-        ("e b", "trail back"),
-        ("e n", "trail forward"),
-        ("e r", "re-read this file"),
-        ("e R", "index the project"),
-        ("e p", "index this review"),
-        ("e ?", "key list"),
-        ("e q", "close"),
-    ] {
-        rows.push(key_row(width, &[(key, label)]));
-    }
-    rows.push(muted("Double-click follows too.", width));
-    rows.push(muted(":explore runs the same commands.", width));
-    rows.push(blank());
-    rows.extend(
-        [
-            "Dim keeps the signature, calls into this project or this review, and library calls that touch the system. Other lines fade.",
-            "Matches share a spelling. SCIP files are left unread. gd still asks the language server.",
-        ]
-        .into_iter()
-        .flat_map(|line| wrap_muted(line, width)),
-    );
-    rows
-}
-
 fn paint_breadcrumb(
     buffer: &mut RenderBuffer,
     x: usize,
     y: usize,
     width: usize,
     view: &View,
-    palette: &Palette,
     ascii: bool,
+    theme: &Theme,
 ) -> Vec<Hit> {
-    let style = Style {
-        fg: Some(palette.fg),
-        bg: Some(palette.crumb_bg),
-        ..Style::default()
-    };
-    buffer.fill_rect(
-        x,
-        y,
-        width,
-        1,
-        ' ',
-        &style,
-        &Theme {
-            style: Style {
-                bg: Some(palette.crumb_bg),
-                ..Style::default()
-            },
-            ..Theme::default()
+    let style = theme.statusline_style.inner_style.clone();
+    let fill_theme = Theme {
+        style: Style {
+            bg: style.bg,
+            ..Style::default()
         },
-    );
-    // fill_rect blends against the passed theme background. The cells are
-    // already the crumb color, so a direct write is enough for the text.
+        ..Theme::default()
+    };
+    buffer.fill_rect(x, y, width, 1, ' ', &style, &fill_theme);
     let gap = if ascii { " > " } else { " › " };
     let mut hits = Vec::new();
     let mut text = String::from(" ");
@@ -1121,39 +969,35 @@ fn paint_breadcrumb(
             }
         }
     }
-    let mut pills = String::new();
+    let mut tail = Vec::new();
+    if !view.pr_summary.is_empty() {
+        tail.push((format!(" {} ", view.pr_summary), style.clone()));
+    }
     if view.skeleton {
-        pills.push_str(" dim");
+        tail.push((
+            " DIM ".to_string(),
+            theme.statusline_style.outer_style.clone(),
+        ));
     }
     if view.pr_mode {
-        pills.push_str(" review");
+        tail.push((
+            " REVIEW ".to_string(),
+            theme.statusline_style.outer_style.clone(),
+        ));
     }
-    if !view.pr_summary.is_empty() {
-        pills.push(' ');
-        pills.push_str(&view.pr_summary);
-    }
-    let pill_w = display_width(&pills);
-    let room = width.saturating_sub(pill_w + 1);
+    let tail_w = tail
+        .iter()
+        .map(|(label, _)| display_width(label))
+        .sum::<usize>();
+    let room = width.saturating_sub(tail_w);
     let shown = clip(&text, room);
-    let current = Style {
-        fg: Some(palette.heading),
-        bg: Some(palette.crumb_bg),
-        bold: true,
-        ..Style::default()
-    };
-    buffer.set_text(x, y, &pad(&shown, room), &current);
-    if pill_w > 0 && pill_w < width {
-        let pill_style = Style {
-            fg: Some(if view.pr_mode {
-                palette.warn
-            } else {
-                palette.accent
-            }),
-            bg: Some(palette.crumb_bg),
-            bold: true,
-            ..Style::default()
-        };
-        buffer.set_text(x + width - pill_w, y, &pills, &pill_style);
+    buffer.set_text(x, y, &pad(&shown, room), &style);
+    if tail_w > 0 && tail_w < width {
+        let mut cursor = x + width - tail_w;
+        for (label, label_style) in &tail {
+            buffer.set_text(cursor, y, label, label_style);
+            cursor += display_width(label);
+        }
     }
     hits
 }
@@ -1163,7 +1007,6 @@ fn heading(text: &str) -> Row {
         text: text.to_string(),
         tone: Tone::Heading,
         jump: None,
-        hints: Vec::new(),
     }
 }
 
@@ -1172,7 +1015,6 @@ fn body(text: &str, width: usize) -> Row {
         text: clip(text, width),
         tone: Tone::Body,
         jump: None,
-        hints: Vec::new(),
     }
 }
 
@@ -1181,16 +1023,6 @@ fn muted(text: &str, width: usize) -> Row {
         text: clip(text, width),
         tone: Tone::Muted,
         jump: None,
-        hints: Vec::new(),
-    }
-}
-
-fn accent(text: &str, width: usize) -> Row {
-    Row {
-        text: clip(text, width),
-        tone: Tone::Accent,
-        jump: None,
-        hints: Vec::new(),
     }
 }
 
@@ -1199,12 +1031,11 @@ fn blank() -> Row {
         text: String::new(),
         tone: Tone::Body,
         jump: None,
-        hints: Vec::new(),
     }
 }
 
 fn clip(text: &str, width: usize) -> String {
-    truncate_display_width_with_marker(text, width, "…", TruncationSide::Right)
+    truncate_display_width(text, width)
 }
 
 fn plain_role(role: &str) -> &str {
@@ -1214,58 +1045,6 @@ fn plain_role(role: &str) -> &str {
         "type" => "type",
         "field" => "field",
         _ => "name",
-    }
-}
-
-fn paint_key_hints(
-    buffer: &mut RenderBuffer,
-    x: usize,
-    y: usize,
-    width: usize,
-    hints: &[(String, String)],
-    palette: &Palette,
-) {
-    let cap_bg = if palette.title_bg != palette.sidebar_bg {
-        palette.title_bg
-    } else if palette.selected_bg != palette.sidebar_bg {
-        mix(palette.sidebar_bg, palette.selected_bg, 0.72)
-    } else {
-        mix(palette.sidebar_bg, palette.fg, 0.16)
-    };
-    let cap_fg = ensure_minimum_contrast(palette.accent, cap_bg, MINIMUM_SELECTION_TEXT_CONTRAST);
-    let cap_style = Style {
-        fg: Some(cap_fg),
-        bg: Some(cap_bg),
-        bold: true,
-        ..Style::default()
-    };
-    let label_style = Style {
-        fg: Some(palette.muted),
-        bg: Some(palette.sidebar_bg),
-        ..Style::default()
-    };
-    let gap = " · ";
-    let mut cursor = 0usize;
-    for (key, label) in hints {
-        let cap = format!("[{key}]");
-        let cap_w = display_width(&cap);
-        let separator = if cursor == 0 { 0 } else { display_width(gap) };
-        if cursor + separator + cap_w + 1 > width {
-            break;
-        }
-        if separator > 0 {
-            buffer.set_text(x + cursor, y, gap, &label_style);
-            cursor += separator;
-        }
-        buffer.set_text(x + cursor, y, &cap, &cap_style);
-        cursor += cap_w + 1;
-        let room = width.saturating_sub(cursor);
-        if room == 0 {
-            break;
-        }
-        let shown = clip(label, room);
-        buffer.set_text(x + cursor, y, &shown, &label_style);
-        cursor += display_width(&shown);
     }
 }
 
@@ -1349,17 +1128,6 @@ fn pad(text: &str, width: usize) -> String {
     padded
 }
 
-fn fill_rect(buffer: &mut RenderBuffer, rect: &Rect, ch: char, style: &Style) {
-    let theme = Theme {
-        style: Style {
-            bg: style.bg,
-            ..Style::default()
-        },
-        ..Theme::default()
-    };
-    buffer.fill_rect(rect.x, rect.y, rect.width, rect.height, ch, style, &theme);
-}
-
 fn cell_mut(
     buffer: &mut RenderBuffer,
     x: usize,
@@ -1402,28 +1170,23 @@ fn review(owned: bool) -> bool {
         let text = screen_text(&screen);
         write_frame(&screen, "explore-sidebar.html");
         assert!(text.contains("explore"), "{text}");
-        assert!(
-            text.contains("let template") || text.contains("template…"),
-            "{text}"
-        );
-        assert!(
-            text.contains('…'),
-            "a clipped match keeps an ellipsis: {text}"
-        );
+        assert!(text.contains("let template"), "{text}");
         assert!(text.contains("Definition"), "{text}");
         assert!(!text.contains("DEFINITION"), "{text}");
         assert!(!text.contains("binding"), "{text}");
         assert!(text.contains("variable") || text.contains("name"), "{text}");
-        assert!(text.contains("[e f]"), "follow is a keycap: {text}");
         assert!(
-            text.contains(" · "),
-            "hints are separated like the action bar: {text}"
+            !text.contains('['),
+            "explore draws no bracketed keys: {text}"
         );
         assert!(
             text.contains("Same spelling") || text.contains("language server"),
             "{text}"
         );
-        assert!(footer_sits_under_matches(&text), "{text}");
+        assert!(
+            text.contains("┌") && text.contains("explore"),
+            "the title sits in the side panel frame: {text}"
+        );
     }
 
     #[test]
@@ -1457,26 +1220,22 @@ fn review(owned: bool) -> bool {
         );
         let text = screen_text(&screen);
         write_frame(&screen, "explore-skeleton.html");
-        assert!(text.contains("Dim") || text.contains("dim"), "{text}");
-        editor.explore.help = true;
+        assert!(text.contains("DIM"), "{text}");
+        assert!(!text.contains("×"), "counts are plain numbers: {text}");
+        editor.config =
+            crate::config::Config::load_user_toml("", std::path::Path::new("config.toml"), &[])
+                .unwrap()
+                .config;
+        editor.open_explore_shortcuts(None);
         editor.render(&mut screen).unwrap();
         let help = screen_text(&screen);
         write_frame(&screen, "explore-help.html");
-        assert!(help.contains("[e ?]"), "{help}");
-        assert!(help.contains("dim all but calls"), "{help}");
-        assert!(help.contains("language server"), "{help}");
+        assert!(help.contains("Keyboard shortcuts"), "{help}");
+        assert!(help.contains("Explore"), "{help}");
+        assert!(help.contains("Space e f"), "{help}");
+        assert!(help.contains("Space e ?"), "{help}");
+        assert!(!help.contains("[e "), "{help}");
         assert!(!help.contains("LSP"), "{help}");
-    }
-
-    fn footer_sits_under_matches(text: &str) -> bool {
-        let lines: Vec<&str> = text.lines().collect();
-        let Some(matches) = lines.iter().position(|line| line.contains("Matches")) else {
-            return false;
-        };
-        let Some(footer) = lines.iter().position(|line| line.contains("[e f]")) else {
-            return false;
-        };
-        footer > matches && footer - matches < 12
     }
 
     fn write_frame(buffer: &RenderBuffer, name: &str) {

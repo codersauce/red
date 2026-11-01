@@ -82,7 +82,6 @@ pub struct View {
     pub pr_summary: String,
     pub index_summary: String,
     pub index_note: String,
-    pub help: bool,
     pub badges: Vec<(usize, usize)>,
     pub dim: Option<DimZone>,
     pub file_key: String,
@@ -108,7 +107,6 @@ struct OpenFile {
 pub struct Session {
     pub enabled: bool,
     pub skeleton: bool,
-    pub help: bool,
     pub pr_mode: bool,
     follow: Option<FollowLock>,
     trail: Vec<Jump>,
@@ -271,7 +269,6 @@ impl Session {
             pr_summary: self.index.pr_summary.clone(),
             index_summary: self.index.summary(),
             index_note: self.index.note(),
-            help: self.help,
             badges,
             dim,
             file_key,

@@ -1608,7 +1608,7 @@ fn action_label(action: &Action) -> String {
             "index" => "Index the project".to_string(),
             "refresh" => "Re-read this file".to_string(),
             "pr" => "Index this review".to_string(),
-            "help" => "Key list".to_string(),
+            "help" => "Keyboard shortcuts".to_string(),
             "close" => "Close".to_string(),
             other => format!("Code explore {other}"),
         },
@@ -2421,7 +2421,7 @@ mod tests {
             ("f", "Follow this name"),
             ("s", "Dim all but calls"),
             ("d", "Go to definition"),
-            ("?", "Key list"),
+            ("?", "Keyboard shortcuts"),
         ] {
             assert!(
                 explore_hints

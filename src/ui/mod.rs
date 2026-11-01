@@ -52,7 +52,7 @@ pub use confirmation::{
 pub(crate) use copilot_signin::{CopilotSignInDialog, CopilotSignInModel, CopilotSignInPhase};
 use crossterm::event::{Event, KeyCode, MouseEvent, MouseEventKind};
 pub use diagnostic_info::DiagnosticInfo;
-use dialog::Dialog;
+pub(crate) use dialog::{BorderStyle, Dialog};
 pub use file_picker::FilePicker;
 pub(crate) use file_picker::FilePickerCache;
 pub use geometry::OverlayLayout;

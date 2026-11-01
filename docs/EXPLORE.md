@@ -1,6 +1,6 @@
 # Code explore
 
-The sidebar follows `docs/DESIGN.md`: theme colors, a footer that sits under the content, an ellipsis when a line does not fit, and keycaps with the key on the section-header color.
+The sidebar follows `docs/DESIGN.md`: `sideBar` colors, a `Dialog` frame with the title in the border, `sideBarTitle.foreground` headings, and status-line mode names.
 
 Code explore is a reading mode. It keeps the editor you already use and adds a
 sidebar, dimming, and a review trail so a function is easier to follow. It does
@@ -8,7 +8,8 @@ not send the buffer to a model and it does not ask you a question.
 
 Turn it on with `Space e e`, `Space E`, or `:explore`. The sidebar opens on the
 right when the window is wide enough, and a one-line trail sits above the
-status line. `Space e ?` lists the keys in the sidebar.
+status line. `Space e ?` opens Keyboard shortcuts scoped to the explore
+bindings. Which-key, after `Space e`, shows only the next key.
 
 `Space` is the same leader as the rest of Red. After `Space`, `e` is the
 explore group, and the which-key popup names it "Explore". `Ctrl-\` still
@@ -27,9 +28,10 @@ The sidebar follows the cursor.
 - **Matches** lists occurrences of that name in the current function first,
   then other indexed files. These are shared spellings, not type-checked cross
   references.
-- A `×N` count sits just after a function, struct, enum, trait, or type
-  definition when the line is short enough to leave room. `N` is the number of
-  name matches in the index.
+- A plain count sits just after a function, struct, enum, trait, or type
+  definition when the line is short enough to leave room. The number is the
+  name matches in the index, in the status-line color. Dim and review show as
+  `DIM` and `REVIEW` on the trail row, in the same prominent style as `NORMAL`.
 
 ## Keys
 
@@ -47,7 +49,7 @@ The sidebar follows the cursor.
 | `Space e r` | Re-read the current file |
 | `Space e R` | Index source files in the repo (capped) |
 | `Space e p` | Index only this PR's changed files, or turn that scope off |
-| `Space e ?` | Show or hide the key list |
+| `Space e ?` | Open Keyboard shortcuts for these bindings |
 | `gd` | Unchanged. This still asks the language server |
 
 `:explore` accepts the same verbs: `on`, `off`, `skeleton`, `follow`, `def`,
@@ -105,7 +107,7 @@ deterministic.
 
 Tree-sitter reads the languages Red already ships grammars for, including Rust,
 TypeScript, TSX, JavaScript, JSX, Lua, Bash, Fish, PowerShell, JSON, TOML, and
-YAML. A buffer with no grammar still gets the trail and the key list. Husk uses
+YAML. A buffer with no grammar still gets the trail. Husk uses
 Red's own highlighter rather than a tree-sitter grammar, so explore does not
 pretend to parse it.
 

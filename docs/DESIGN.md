@@ -14,23 +14,26 @@ it covers only as much of the file as the content needs (`src/ui/dialog.rs`,
 `src/ui/picker.rs`, `src/ui/keymap_hints.rs`, `src/ui/hover_info.rs`).
 
 Side panels sit beside the text, not on top of it. Plugin trees
-(`src/plugin/tree.rs`) and the explore sidebar start at the top of the panel
-and stack downward. Content starts one cell inside the frame. Section headings
-are short and stacked with a single blank row between groups.
+(`src/plugin/tree.rs`, `src/plugin/panel.rs`) fill their column with
+`sideBar.background` and stack rows from the top. A framed panel uses
+`Dialog`: the title sits in the top border, the way `popup_title` does, and
+the body is inset by the frame. Do not draw a private rail, title bar, or
+palette when `Dialog` or the plugin panel styles already cover it.
 
-Do not pin a footer to the bottom of a tall panel and leave a dead band above
-it. The footer sits under the last line of content. Leftover rows are empty
-panel background after the footer.
+Section headings are short and stacked with a single blank row between groups.
+Empty rows after the content stay panel background.
 
 ## Spacing
 
 - One cell of padding inside a border.
 - One blank row between sections.
-- One cell between a key and its label, matching the action bar
+- One cell between a key and its label. Which-key uses `KEY_GAP` in
+  `src/ui/keymap_hints.rs`. The action bar uses the same one-cell gap
   (`src/ui/action_bar.rs`).
-- Three cells between paired hints on the same row. Keymap hints use a blank
-  gap (`COLUMN_GAP` in `src/ui/keymap_hints.rs`). The action bar uses the same
-  width as ` · `.
+- Which-key columns are separated by three blank cells (`COLUMN_GAP`).
+- The action bar separates a key/label pair from the next pair with the
+  three-cell string ` · ` (space, middot, space). That is a separator, not a
+  blank column gap.
 - Do not pad a short label out to the full width with extra words.
 
 ## Borders
@@ -38,16 +41,16 @@ panel background after the footer.
 Dialogs and pickers use a single-line frame: `┌ ┐ └ ┘ ─ │`. Rounded corners
 exist on `BorderStyle::Rounded` and are used by welcome, what's new, signature
 help, and the status-line layout. Pickers, keymap hints, and the agent
-composer use `BorderStyle::Single`. When `window_borders_ascii` is set, use
-`+ - |` instead of box drawing.
+composer use `BorderStyle::Single`. When `window_borders_ascii` is set, window
+splits use `+ - |`. Dialogs and which-key keep the box-drawing frame.
 
 The frame uses `theme.ui_style.popup_border` for popups and
-`theme.ui_style.dialog_border` for dialogs. Do not invent a third border
-color. The title sits in the top border, in `popup_title` or `dialog_title`,
-and is bold.
+`theme.ui_style.dialog_border` for dialogs. A side panel uses
+`sideBar.border` for the same `Dialog` frame. The title is bold, in the top
+border, using `popup_title` or `dialog_title` on a popup and
+`sideBarTitle.foreground` on a side panel.
 
 Plugin trees draw ancestry with `│`, `├`, and `└` in the indent-guide color.
-A side panel uses the same single-line vertical rules for its frame.
 
 ## Color
 
@@ -65,24 +68,30 @@ its background.
   `sideBarTitle.foreground`, `sideBarSectionHeader.background`,
   `sideBarSectionHeader.foreground`.
 - Lists and focus: `list.activeSelectionBackground`,
-  `list.activeSelectionForeground`, `focusBorder`, `textLink.foreground`.
+  `list.activeSelectionForeground`, `focusBorder`.
+- Links and which-key labels: `textLink.foreground`,
+  `markup.underline.link`, `peekViewResult.fileForeground`.
 - Search and follow: `editor.findMatchBackground`,
   `editor.findMatchHighlightBackground`.
 - Status and warnings: `statusBar.background`, `statusBar.foreground`,
-  `editorWarning.foreground`.
+  `statusline_style`, `editorWarning.foreground`.
 
 Do not hard-code a palette for a feature. If a key is missing, fall back
 through the role's existing chain, then `theme.ui_style`, then `theme.style`.
-A one-off gold or navy that ignores the user's theme is a bug.
 
 The selected row uses `picker_selected_item` or
 `list.activeSelectionBackground` / `list.activeSelectionForeground`. Follow
-highlights use the find-match styles. The selected row keeps enough contrast
-to read the whole label.
+highlights use the find-match styles.
 
-Section headings inside a side panel use the accent (`textLink.foreground`,
-then `editorInfo.foreground`, then `focusBorder`), checked against the panel
-background. A heading that falls back to the body color looks washed out.
+A side-panel heading uses `sideBarTitle.foreground`, bold, the same treatment
+as a plugin tree root (`src/plugin/tree.rs`). Do not recolor those headings
+with `textLink.foreground`. Link color belongs to links and which-key labels.
+
+Mode indicators use the status line. The mode name is uppercase (`NORMAL`,
+`INSERT`) in `statusline_style.outer_style`. A feature mode on a status-like
+row uses that same prominent style (`DIM`, `REVIEW`). Counts are plain
+numbers, the way search matches render `3/12` and diagnostics render a marker
+plus a number. Do not invent a `×N` prefix or a colored pill for either.
 
 ## Glyphs
 
@@ -99,29 +108,29 @@ every word. A section heading does not need one.
 
 Every new icon has an ASCII fallback, and a Unicode fallback where the status
 line already has one. Choose the glyph from the user's icon style and from
-`window_borders_ascii`.
+`window_borders_ascii` when the surface already consults that flag.
 
-## Key hints
+## Keys
 
-Two existing surfaces already split the key from the action:
+Red has one notation for a chord: space-separated key names, the same strings
+the shortcut catalog stores. Examples: `Space e f`, `Space E`, `Ctrl-w h`,
+`Alt-p`, `Esc`, `F1`. No brackets, no chips, and no second spelling of the
+same chord.
 
-- Keymap hints (`src/ui/keymap_hints.rs`) put the key first, in
-  `peekViewResult.lineForeground` or muted, and the action one cell later, in
-  the link color (`markup.underline.link`, or
-  `peekViewResult.fileForeground`). A group that continues ends with ` …`.
-- The action bar (`src/ui/action_bar.rs`) draws the key bold in the secondary
-  role and the label in muted. Pairs are separated by ` · `.
+Three surfaces already show keys, and they do not overlap:
 
-A hint that lives in a panel footer has no card around it, so color alone
-reads as loose text. Draw it as a keycap: the key in brackets, bold, on a
-chip. Prefer `sideBarSectionHeader.background` when that color differs from
-the panel. When it does not, tint the chip toward
-`list.activeSelectionBackground` so the key is still a separate object. The
-action stays in muted on the panel background. Separate pairs with ` · `,
-the same separator the action bar uses. Write the key as the user presses it
-(`e f`, `Space E`, `gd`), not as an internal action name. Truncate a label
-with `…` rather than running it into the next key. Drop a pair that does not
-fit before drawing a broken bracket.
+- Which-key (`src/ui/keymap_hints.rs`) shows only the next key in each row
+  (`f`, `s`, `d`). The pending prefix is the popup title (`Space e · keymaps`)
+  and the command line. A group that continues ends with ` …`.
+- Keyboard shortcuts (`:keys`, `F1`, `Alt+/`, `src/ui/keyboard_shortcuts.rs`)
+  shows the full chord in bold, then the action. The command palette shows
+  the same full chord.
+- The action bar (`src/ui/action_bar.rs`) is the footer hint. The key is bold
+  in the secondary role and the label is muted. Pairs are separated by ` · `.
+
+A panel does not grow its own key renderer. `Space e ?` opens Keyboard
+shortcuts scoped to the explore bindings. Any other footer hint goes through
+`ActionBar`.
 
 ## Words
 
@@ -134,9 +143,8 @@ definition". Plugin empty and loading lines do the same: "No themes found",
   server" rather than "LSP" on a first-view label. `gd` can stay, because it
   is the key.
 - Section headings are short title case ("Inside", "Matches"), in the same
-  voice as picker titles. The mode pill (`NORMAL`, `INSERT`) is the exception
-  that stays uppercase, because it names the editor mode.
-- A mode pill on a reading surface says the effect: "Dim", "Review".
+  voice as picker titles. The mode name (`NORMAL`, `DIM`) stays uppercase,
+  because it is a status-line mode.
 - Empty states say what is missing and what to do: "No name under the cursor."
   "No matches for this name."
 - Loading and partial results name the scope: "6 changed files indexed." Do
@@ -144,10 +152,15 @@ definition". Plugin empty and loading lines do the same: "No themes found",
 
 ## Truncation
 
-Clip on a grapheme boundary with `truncate_display_width_with_marker` and a
-`…` marker (`src/unicode_utils.rs`). Never cut a token in the middle and leave
-the row looking finished. Paths keep the file name when the directory does
-not fit. A count such as `×7` stays visible; shorten the title before the
+Clip on a grapheme boundary. Dialog titles, which-key, the action bar, plugin
+panels, and keyboard shortcuts use `truncate_display_width` and stop at the
+edge (`src/unicode_utils.rs`). They do not add an ellipsis. A surface that
+already ellipsizes, such as a picker path, keeps `…` through
+`truncate_display_width_with_marker`. Match the surface you are extending.
+Do not add a third clipping rule, and do not ellipsize every row by default.
+
+Paths keep the file name when the directory does not fit. A count stays
+visible when the row is a title-plus-count; shorten the title before the
 count. Wrap a note on word boundaries before clipping a single word.
 
 ## Inconsistencies this pass does not pretend away
@@ -156,8 +169,10 @@ count. Wrap a note on word boundaries before clipping a single word.
   Pickers and the status line are Nerd Font glyphs with ASCII fallbacks.
 - Plugin tree icons are Nerd Font only. They do not consult
   `PickerIconStyle`, so an ASCII icon setting still draws ``.
-- Some cards use a single border and some use a rounded one.
-- The action bar truncates with `truncate_display_width` and no ellipsis.
-  New surfaces use `…`.
+- Some cards use a single border and some use a rounded one. Which-key and
+  pickers ignore `window_borders_ascii`; window splits honor it.
+- Keyboard shortcuts draws its scope toggle as `[This context]` and
+  `[All Red keys]`. That is a control label, not a key chord. Key chords
+  stay unbracketed.
 - A few command-line messages still say "LSP" where a sidebar should say
   "language server".
