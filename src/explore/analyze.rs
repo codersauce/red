@@ -642,11 +642,11 @@ pub fn human_kind(kind: &str) -> String {
             "function"
         }
         "function_signature_item" => "signature",
-        "impl_item" => "impl",
+        "impl_item" => "implementation",
         "struct_item" | "class_declaration" => "struct",
         "enum_item" => "enum",
         "trait_item" | "interface_declaration" => "trait",
-        "let_declaration" | "lexical_declaration" | "variable_declarator" => "binding",
+        "let_declaration" | "lexical_declaration" | "variable_declarator" => "variable",
         "const_item" => "const",
         "if_expression" | "if_statement" => "if",
         "match_expression" | "switch_statement" => "match",
@@ -850,14 +850,18 @@ fn review(owned: bool) -> bool {
             .name_at(template.span.start_line, template.span.start_col)
             .expect("name");
         assert_eq!(name.name, "template");
-        assert!(analysis
-            .definitions
-            .iter()
-            .any(|def| def.name == "LaunchSpec"));
-        assert!(analysis
-            .definitions
-            .iter()
-            .any(|def| { def.name == "review" && def.return_type.as_deref() == Some("bool") }));
+        assert!(
+            analysis
+                .definitions
+                .iter()
+                .any(|def| def.name == "LaunchSpec")
+        );
+        assert!(
+            analysis
+                .definitions
+                .iter()
+                .any(|def| { def.name == "review" && def.return_type.as_deref() == Some("bool") })
+        );
     }
 
     #[test]

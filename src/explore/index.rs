@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use super::analyze::{analyze, Analysis, Role};
+use super::analyze::{Analysis, Role, analyze};
 use crate::highlighter::LanguageRegistry;
 
 pub const MAX_SCAN_FILES: usize = 400;
@@ -69,20 +69,18 @@ impl Index {
         let cap = if self.truncated { " · capped" } else { "" };
         match &self.pr_files {
             Some(changed) => format!(
-                "PR · {} changed · {} indexed{cap}",
+                "Review · {} changed · {} files{cap}",
                 changed.len(),
                 self.files.len()
             ),
-            None => format!("{} indexed{cap}", self.files.len()),
+            None => format!("{} files{cap}", self.files.len()),
         }
     }
 
     pub fn note(&self) -> String {
-        let mut note = String::from(
-            "tree-sitter names, not types. SCIP protobuf is not loaded. gd still uses LSP.",
-        );
+        let mut note = String::from("Same spelling. gd asks the language server.");
         if self.scip_present {
-            note = format!("index.scip is on disk. {note}");
+            note = format!("A SCIP file is here and not loaded. {note}");
         }
         if !self.message.is_empty() {
             note = format!("{} {note}", self.message);
@@ -501,9 +499,11 @@ mod tests {
         index.pr_files = Some(BTreeSet::from(["/repo/changed.rs".to_string()]));
         assert!(index.defined_in_scope("audit"));
         assert!(!index.defined_in_scope("elsewhere"));
-        assert!(index
-            .best_definition("elsewhere", "/repo/changed.rs")
-            .is_some());
+        assert!(
+            index
+                .best_definition("elsewhere", "/repo/changed.rs")
+                .is_some()
+        );
     }
 
     #[test]
@@ -539,12 +539,14 @@ mod tests {
         let stats = index.scan_pr(root, &registry, Some("HEAD")).unwrap();
         assert!(stats.files >= 1, "{}", stats.message);
         assert!(index.best_definition("extra", "").is_some());
-        assert!(index
-            .pr_files
-            .as_ref()
-            .unwrap()
-            .iter()
-            .all(|path| path.ends_with("kept.rs")));
+        assert!(
+            index
+                .pr_files
+                .as_ref()
+                .unwrap()
+                .iter()
+                .all(|path| path.ends_with("kept.rs"))
+        );
         assert!(!index.pr_summary.is_empty() || index.pr_base.as_deref() == Some("HEAD"));
     }
 }

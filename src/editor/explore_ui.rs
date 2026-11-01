@@ -5,12 +5,13 @@ use std::path::Path;
 
 use unicode_segmentation::UnicodeSegmentation as _;
 
-use crate::color::Color;
-use crate::explore::{sidebar_columns, DimZone, Hit, Jump, SyncInput, View, ViewDef, ViewRef};
+use crate::color::{Color, ensure_minimum_contrast};
+use crate::explore::{DimZone, Hit, Jump, SyncInput, View, ViewDef, ViewRef, sidebar_columns};
 use crate::highlighter::LanguageRegistry;
-use crate::theme::{Style, Theme};
+use crate::theme::{MINIMUM_SELECTION_TEXT_CONTRAST, Style, SurfacePalette, Theme};
 use crate::unicode_utils::{
-    char_to_grapheme, display_width, trim_line_ending, truncate_display_width,
+    TruncationSide, char_to_grapheme, display_width, trim_line_ending, truncate_display_width,
+    truncate_display_width_with_marker,
 };
 
 use super::{Action, Editor, RenderBuffer, Runtime};
@@ -76,9 +77,9 @@ impl Editor {
                     self.explore.enabled = true;
                     self.explore.skeleton = !self.explore.skeleton;
                     if self.explore.skeleton {
-                        "Skeleton on. Repo calls and syscall wrappers stay bright.".to_string()
+                        "Dim on. Calls into this project, and library calls that touch the system, stay bright.".to_string()
                     } else {
-                        "Skeleton off.".to_string()
+                        "Dim off.".to_string()
                     }
                 }
                 "follow" => {
@@ -339,7 +340,7 @@ impl Editor {
         self.ingest_open_buffers(&registry);
         match result {
             Ok(stats) => {
-                let scope = if pr { "PR" } else { "repo" };
+                let scope = if pr { "review" } else { "project" };
                 format!(
                     "Indexed {} {scope} files{}. {}",
                     stats.files,
@@ -354,7 +355,7 @@ impl Editor {
     fn explore_pr(&mut self, base: Option<&str>) -> String {
         if self.explore.pr_mode && base.is_none() {
             self.explore.clear_pr();
-            return "PR scope off. Skeleton uses every indexed definition.".to_string();
+            return "Review scope off. Dim uses every indexed definition.".to_string();
         }
         self.explore.enabled = true;
         self.explore_scan(true, base)
@@ -592,170 +593,112 @@ struct Palette {
 
 impl Palette {
     fn from_theme(theme: &Theme) -> Self {
-        let bg = theme.style.bg.unwrap_or(Color::Rgb {
-            r: 12,
-            g: 14,
-            b: 18,
+        let editor_bg = theme.style.bg.unwrap_or_default();
+        let editor_fg = theme.style.fg.unwrap_or(Color::Rgb {
+            r: 255,
+            g: 255,
+            b: 255,
         });
-        let fg = theme.style.fg.unwrap_or(Color::Rgb {
-            r: 230,
-            g: 232,
-            b: 235,
-        });
-        if bg.is_light() {
-            Self {
-                fg: Color::Rgb {
-                    r: 28,
-                    g: 32,
-                    b: 38,
-                },
-                muted: Color::Rgb {
-                    r: 90,
-                    g: 96,
-                    b: 108,
-                },
-                heading: Color::Rgb {
-                    r: 140,
-                    g: 72,
-                    b: 10,
-                },
-                accent: Color::Rgb {
-                    r: 12,
-                    g: 110,
-                    b: 78,
-                },
-                border: Color::Rgb {
-                    r: 176,
-                    g: 164,
-                    b: 140,
-                },
-                sidebar_bg: mix(
-                    bg,
-                    Color::Rgb {
-                        r: 244,
-                        g: 240,
-                        b: 230,
-                    },
-                    0.72,
-                ),
-                title_bg: Color::Rgb {
-                    r: 42,
-                    g: 48,
-                    b: 64,
-                },
-                title_fg: Color::Rgb {
-                    r: 255,
-                    g: 236,
-                    b: 210,
-                },
-                selected_bg: Color::Rgb {
-                    r: 255,
-                    g: 214,
-                    b: 150,
-                },
-                selected_fg: Color::Rgb {
-                    r: 32,
-                    g: 24,
-                    b: 12,
-                },
-                follow_bg: Color::Rgb {
-                    r: 255,
-                    g: 196,
-                    b: 96,
-                },
-                follow_fg: Color::Rgb { r: 32, g: 22, b: 8 },
-                crumb_bg: mix(
-                    bg,
-                    Color::Rgb {
-                        r: 232,
-                        g: 226,
-                        b: 210,
-                    },
-                    0.8,
-                ),
-                warn: Color::Rgb {
-                    r: 150,
-                    g: 40,
-                    b: 40,
-                },
-            }
-        } else {
-            Self {
-                fg,
-                muted: Color::Rgb {
-                    r: 148,
-                    g: 158,
-                    b: 172,
-                },
-                heading: Color::Rgb {
-                    r: 255,
-                    g: 196,
-                    b: 120,
-                },
-                accent: Color::Rgb {
-                    r: 126,
-                    g: 214,
-                    b: 168,
-                },
-                border: Color::Rgb {
-                    r: 78,
-                    g: 96,
-                    b: 120,
-                },
-                sidebar_bg: mix(
-                    bg,
-                    Color::Rgb {
-                        r: 16,
-                        g: 20,
-                        b: 30,
-                    },
-                    0.65,
-                ),
-                title_bg: Color::Rgb {
-                    r: 28,
-                    g: 36,
-                    b: 52,
-                },
-                title_fg: Color::Rgb {
-                    r: 255,
-                    g: 224,
-                    b: 180,
-                },
-                selected_bg: Color::Rgb {
-                    r: 58,
-                    g: 74,
-                    b: 104,
-                },
-                selected_fg: Color::Rgb {
-                    r: 244,
-                    g: 246,
-                    b: 250,
-                },
-                follow_bg: Color::Rgb {
-                    r: 112,
-                    g: 78,
-                    b: 24,
-                },
-                follow_fg: Color::Rgb {
-                    r: 255,
-                    g: 236,
-                    b: 200,
-                },
-                crumb_bg: mix(
-                    bg,
-                    Color::Rgb {
-                        r: 22,
-                        g: 28,
-                        b: 40,
-                    },
-                    0.7,
-                ),
-                warn: Color::Rgb {
-                    r: 255,
-                    g: 140,
-                    b: 150,
-                },
-            }
+        let pick = |keys: &[&str], fallback: Color| {
+            keys.iter()
+                .find_map(|key| theme.colors.get(*key).copied())
+                .unwrap_or(fallback)
+        };
+        let sidebar_bg = pick(
+            &["sideBar.background", "editor.background"],
+            theme.ui_style.popup.bg.unwrap_or(editor_bg),
+        );
+        let fg = pick(
+            &["sideBar.foreground", "editor.foreground"],
+            theme.ui_style.popup.fg.unwrap_or(editor_fg),
+        );
+        let muted = theme.ui_style.muted.fg.unwrap_or(pick(
+            &["descriptionForeground", "editorLineNumber.foreground"],
+            fg,
+        ));
+        let heading = theme.ui_style.popup_title.fg.unwrap_or(pick(
+            &["textLink.foreground", "sideBarTitle.foreground"],
+            fg,
+        ));
+        let accent = pick(
+            &[
+                "textLink.foreground",
+                "editorInfo.foreground",
+                "focusBorder",
+            ],
+            heading,
+        );
+        let border = theme
+            .ui_style
+            .popup_border
+            .fg
+            .unwrap_or(pick(&["sideBar.border", "focusBorder"], muted));
+        let title_bg = pick(
+            &["sideBarSectionHeader.background", "statusBar.background"],
+            theme.ui_style.popup_title.bg.unwrap_or(sidebar_bg),
+        );
+        let title_fg = pick(
+            &["sideBarSectionHeader.foreground", "statusBar.foreground"],
+            theme.ui_style.popup_title.fg.unwrap_or(fg),
+        );
+        let selected_bg = theme
+            .ui_style
+            .picker_selected_item
+            .bg
+            .unwrap_or(pick(&["list.activeSelectionBackground"], title_bg));
+        let selected_fg = theme
+            .ui_style
+            .picker_selected_item
+            .fg
+            .unwrap_or(pick(&["list.activeSelectionForeground"], fg));
+        let follow_bg = theme
+            .find_match_highlight_style
+            .as_ref()
+            .and_then(|style| style.bg)
+            .or_else(|| theme.find_match_style.as_ref().and_then(|style| style.bg))
+            .unwrap_or(selected_bg);
+        let follow_fg = theme
+            .find_match_highlight_style
+            .as_ref()
+            .and_then(|style| style.fg)
+            .or_else(|| theme.find_match_style.as_ref().and_then(|style| style.fg))
+            .unwrap_or(selected_fg);
+        let crumb_bg = pick(&["statusBar.background"], title_bg);
+        let warn = pick(
+            &["editorWarning.foreground", "list.warningForeground"],
+            accent,
+        );
+        let roles = SurfacePalette::new(
+            theme,
+            &Style {
+                fg: Some(fg),
+                bg: Some(sidebar_bg),
+                ..Style::default()
+            },
+        );
+        let fg = roles.primary.fg.unwrap_or(fg);
+        let muted = roles.muted.fg.unwrap_or(muted);
+        let accent = roles.accent.fg.unwrap_or(accent);
+        let selected_fg =
+            ensure_minimum_contrast(selected_fg, selected_bg, MINIMUM_SELECTION_TEXT_CONTRAST);
+        let title_fg = ensure_minimum_contrast(title_fg, title_bg, MINIMUM_SELECTION_TEXT_CONTRAST);
+        let follow_fg =
+            ensure_minimum_contrast(follow_fg, follow_bg, MINIMUM_SELECTION_TEXT_CONTRAST);
+        Self {
+            fg,
+            muted,
+            heading,
+            accent,
+            border,
+            sidebar_bg,
+            title_bg,
+            title_fg,
+            selected_bg,
+            selected_fg,
+            follow_bg,
+            follow_fg,
+            crumb_bg,
+            warn,
         }
     }
 }
@@ -773,6 +716,7 @@ struct Row {
     text: String,
     tone: Tone,
     jump: Option<Jump>,
+    hints: Vec<(String, String)>,
 }
 
 fn paint_sidebar(
@@ -785,10 +729,11 @@ fn paint_sidebar(
     let style = |tone: &Tone| row_style(tone, palette);
     fill_rect(buffer, &rect, ' ', &style(&Tone::Body));
     let inner_w = rect.width.saturating_sub(2);
-    if rect.width < 8 || rect.height < 4 || inner_w == 0 {
+    let content_w = inner_w.saturating_sub(1);
+    if rect.width < 8 || rect.height < 4 || content_w == 0 {
         return Vec::new();
     }
-    let rows = sidebar_rows(view, inner_w, rect.height);
+    let rows = sidebar_rows(view, content_w, rect.height);
     let mut hits = Vec::new();
     for (index, row) in rows.iter().enumerate() {
         if index >= rect.height {
@@ -810,10 +755,15 @@ fn paint_sidebar(
             line_style.fg = Some(palette.title_fg);
             line_style.bold = true;
         }
+        let shown = if row.hints.is_empty() {
+            row.text.clone()
+        } else {
+            String::new()
+        };
         let text = format!(
             "{border}{body}{border}",
             border = if ascii { "|" } else { "│" },
-            body = pad(&format!(" {}", row.text.trim_start()), inner_w)
+            body = pad(&format!(" {shown}"), inner_w)
         );
         buffer.set_text(
             rect.x,
@@ -821,6 +771,9 @@ fn paint_sidebar(
             &truncate_display_width(&text, rect.width),
             &line_style,
         );
+        if !row.hints.is_empty() {
+            paint_key_hints(buffer, rect.x + 2, y, content_w, &row.hints, palette);
+        }
         if let Some(cell) = cell_mut(buffer, rect.x, y) {
             cell.style.fg = Some(palette.border);
         }
@@ -863,17 +816,18 @@ fn row_style(tone: &Tone, palette: &Palette) -> Style {
 
 fn sidebar_rows(view: &View, width: usize, height: usize) -> Vec<Row> {
     let mut rows = Vec::new();
-    let mut title = String::from(" explore");
+    let mut title = String::from("explore");
     if view.skeleton {
-        title.push_str("  SKEL");
+        title.push_str("  Dim");
     }
     if view.pr_mode {
-        title.push_str("  PR");
+        title.push_str("  Review");
     }
     rows.push(Row {
-        text: truncate_display_width(&title, width),
+        text: clip(&title, width),
         tone: Tone::Heading,
         jump: None,
+        hints: Vec::new(),
     });
     let footer = footer_rows(width);
     let note = if view.help {
@@ -881,7 +835,7 @@ fn sidebar_rows(view: &View, width: usize, height: usize) -> Vec<Row> {
     } else {
         note_rows(view, width)
     };
-    let reserved = 1 + footer.len() + note.len();
+    let reserved = 1 + 1 + footer.len() + note.len();
     let body_height = height.saturating_sub(reserved);
     let mut body = if view.help {
         help_rows(width)
@@ -890,15 +844,12 @@ fn sidebar_rows(view: &View, width: usize, height: usize) -> Vec<Row> {
     };
     body.truncate(body_height);
     rows.extend(body);
-    while rows.len() + footer.len() + note.len() < height {
-        rows.push(Row {
-            text: String::new(),
-            tone: Tone::Body,
-            jump: None,
-        });
-    }
     rows.extend(note);
+    rows.push(blank());
     rows.extend(footer);
+    while rows.len() < height {
+        rows.push(blank());
+    }
     rows.truncate(height);
     rows
 }
@@ -908,12 +859,12 @@ fn body_rows(view: &View, width: usize) -> Vec<Row> {
     if !view.note.is_empty() {
         rows.push(muted(&view.note, width));
     }
-    rows.push(heading("IN"));
+    rows.push(heading("Inside"));
     rows.push(body(
         &view
             .in_function
             .clone()
-            .unwrap_or_else(|| "top level".to_string()),
+            .unwrap_or_else(|| "top of the file".to_string()),
         width,
     ));
     rows.push(muted(
@@ -921,16 +872,16 @@ fn body_rows(view: &View, width: usize) -> Vec<Row> {
         width,
     ));
     rows.push(blank());
-    rows.push(heading("AT CURSOR"));
+    rows.push(heading("Here"));
     match &view.cursor_name {
         Some(name) => {
             let mut label = name.clone();
             if !view.cursor_role.is_empty() {
-                label = format!("{name}  {}", view.cursor_role);
+                label = format!("{name}  {}", plain_role(&view.cursor_role));
             }
             rows.push(body(&label, width));
         }
-        None => rows.push(muted("no name", width)),
+        None => rows.push(muted("No name under the cursor", width)),
     }
     if !view.cursor_syntax.is_empty() {
         rows.push(muted(&view.cursor_syntax, width));
@@ -943,31 +894,31 @@ fn body_rows(view: &View, width: usize) -> Vec<Row> {
     }
     if let Some(following) = &view.following {
         rows.push(accent(
-            &format!("following {following} · {}", view.follow_spans.len()),
+            &format!("Following {following} ({})", view.follow_spans.len()),
             width,
         ));
     }
     rows.push(blank());
-    rows.push(heading("DEFINITION"));
+    rows.push(heading("Definition"));
     if let Some(def) = &view.definition {
         rows.extend(definition_rows(def, width));
     } else {
-        rows.push(muted("not in the local index", width));
+        rows.push(muted("No definition in this index", width));
     }
     rows.push(blank());
     rows.push(heading(&format!(
-        "REFERENCES  {}",
+        "Matches  {}",
         view.references.len().min(40)
     )));
     if view.references.is_empty() {
-        rows.push(muted("none for this name", width));
+        rows.push(muted("No matches for this name", width));
     }
     for reference in view.references.iter().take(8) {
         rows.push(reference_row(reference, width));
     }
     if view.references.len() > 8 {
         rows.push(muted(
-            &format!("+{} more  \\j next", view.references.len() - 8),
+            &format!("+{} more", view.references.len() - 8),
             width,
         ));
     }
@@ -987,17 +938,19 @@ fn definition_rows(def: &ViewDef, width: usize) -> Vec<Row> {
         .unwrap_or(def.file.as_str());
     vec![
         Row {
-            text: truncate_display_width(&def.label, width),
+            text: clip(&def.label, width),
             tone: Tone::Body,
             jump: Some(jump.clone()),
+            hints: Vec::new(),
         },
         Row {
-            text: truncate_display_width(
+            text: clip(
                 &format!("{file}:{}  {}  ×{}", def.line + 1, def.kind, def.refs),
                 width,
             ),
             tone: Tone::Accent,
             jump: Some(jump),
+            hints: Vec::new(),
         },
         muted(&def.signature, width),
     ]
@@ -1006,7 +959,7 @@ fn definition_rows(def: &ViewDef, width: usize) -> Vec<Row> {
 fn reference_row(reference: &ViewRef, width: usize) -> Row {
     let marker = if reference.current { "▸" } else { " " };
     Row {
-        text: truncate_display_width(
+        text: clip(
             &format!("{marker}{:>4} {}", reference.line + 1, reference.detail),
             width,
         ),
@@ -1021,66 +974,74 @@ fn reference_row(reference: &ViewRef, width: usize) -> Row {
             line: reference.line,
             column: reference.column,
         }),
+        hints: Vec::new(),
     }
 }
 
 fn note_rows(view: &View, width: usize) -> Vec<Row> {
-    let mut rows = vec![muted(&view.index_summary, width)];
+    let mut rows = Vec::new();
+    rows.extend(wrap_muted(&view.index_summary, width));
     if view.pr_mode && !view.pr_summary.is_empty() {
-        rows.push(muted(&view.pr_summary, width));
+        rows.extend(wrap_muted(&view.pr_summary, width));
     }
-    rows.push(muted("names, not types · gd = LSP", width));
+    rows.extend(wrap_muted(&view.index_note, width));
     rows
 }
 
 fn footer_rows(width: usize) -> Vec<Row> {
     vec![
-        muted("\\f follow   \\s skeleton", width),
-        muted("\\d def      \\t type", width),
-        muted("\\b back     \\? keys", width),
+        key_row(width, &[("\\f", "follow"), ("\\s", "dim")]),
+        key_row(width, &[("\\d", "definition"), ("\\t", "type")]),
+        key_row(width, &[("\\b", "back"), ("\\?", "keys")]),
     ]
 }
 
+fn key_row(width: usize, pairs: &[(&str, &str)]) -> Row {
+    Row {
+        text: String::new(),
+        tone: Tone::Muted,
+        jump: None,
+        hints: pairs
+            .iter()
+            .map(|(key, label)| ((*key).to_string(), (*label).to_string()))
+            .filter(|(key, _)| display_width(&format!("[{key}]")) <= width)
+            .collect(),
+    }
+}
+
 fn help_rows(width: usize) -> Vec<Row> {
-    [
-        "KEYS",
-        "\\ e     toggle explore",
-        "space E  same",
-        "\\ f     follow this name",
-        "\\ *     follow this name",
-        "double-click follows too",
-        "\\ s     skeleton dimming",
-        "\\ d     definition",
-        "\\ t     type, then back",
-        "\\ j/k   next/prev ref",
-        "\\ b/n   trail back/forward",
-        "\\ r     re-read this file",
-        "\\ R     index the repo",
-        "\\ p     PR changed files",
-        "\\ q     close explore",
-        ":explore same commands",
-        "",
-        "Skeleton keeps calls into",
-        "this repo, or this PR, and",
-        "stdlib wrappers of syscalls.",
-        "Everything else in the",
-        "function fades.",
-        "",
-        "The index is tree-sitter.",
-        "SCIP files are not loaded.",
-        "gd still asks the LSP.",
-    ]
-    .into_iter()
-    .map(|line| {
-        if line == "KEYS" {
-            heading(line)
-        } else if line.is_empty() {
-            blank()
-        } else {
-            muted(line, width)
-        }
-    })
-    .collect()
+    let mut rows = vec![heading("Keys")];
+    for (key, label) in [
+        ("\\e", "open or close"),
+        ("space E", "same"),
+        ("\\f", "follow this name"),
+        ("\\*", "follow this name"),
+        ("\\s", "dim other lines"),
+        ("\\d", "go to definition"),
+        ("\\t", "go to written type"),
+        ("\\j", "next match"),
+        ("\\k", "previous match"),
+        ("\\b", "trail back"),
+        ("\\n", "trail forward"),
+        ("\\r", "re-read this file"),
+        ("\\R", "index the project"),
+        ("\\p", "index this review"),
+        ("\\q", "close"),
+    ] {
+        rows.push(key_row(width, &[(key, label)]));
+    }
+    rows.push(muted("Double-click follows too.", width));
+    rows.push(muted(":explore runs the same commands.", width));
+    rows.push(blank());
+    rows.extend(
+        [
+            "Dim keeps the signature, calls into this project or this review, and library calls that touch the system. Other lines fade.",
+            "Matches share a spelling. SCIP files are left unread. gd still asks the language server.",
+        ]
+        .into_iter()
+        .flat_map(|line| wrap_muted(line, width)),
+    );
+    rows
 }
 
 fn paint_breadcrumb(
@@ -1154,10 +1115,10 @@ fn paint_breadcrumb(
     }
     let mut pills = String::new();
     if view.skeleton {
-        pills.push_str(" skel");
+        pills.push_str(" dim");
     }
     if view.pr_mode {
-        pills.push_str(" pr");
+        pills.push_str(" review");
     }
     if !view.pr_summary.is_empty() {
         pills.push(' ');
@@ -1165,7 +1126,7 @@ fn paint_breadcrumb(
     }
     let pill_w = display_width(&pills);
     let room = width.saturating_sub(pill_w + 1);
-    let shown = truncate_display_width(&text, room);
+    let shown = clip(&text, room);
     let current = Style {
         fg: Some(palette.heading),
         bg: Some(palette.crumb_bg),
@@ -1194,30 +1155,34 @@ fn heading(text: &str) -> Row {
         text: text.to_string(),
         tone: Tone::Heading,
         jump: None,
+        hints: Vec::new(),
     }
 }
 
 fn body(text: &str, width: usize) -> Row {
     Row {
-        text: truncate_display_width(text, width),
+        text: clip(text, width),
         tone: Tone::Body,
         jump: None,
+        hints: Vec::new(),
     }
 }
 
 fn muted(text: &str, width: usize) -> Row {
     Row {
-        text: truncate_display_width(text, width),
+        text: clip(text, width),
         tone: Tone::Muted,
         jump: None,
+        hints: Vec::new(),
     }
 }
 
 fn accent(text: &str, width: usize) -> Row {
     Row {
-        text: truncate_display_width(text, width),
+        text: clip(text, width),
         tone: Tone::Accent,
         jump: None,
+        hints: Vec::new(),
     }
 }
 
@@ -1226,6 +1191,146 @@ fn blank() -> Row {
         text: String::new(),
         tone: Tone::Body,
         jump: None,
+        hints: Vec::new(),
+    }
+}
+
+fn clip(text: &str, width: usize) -> String {
+    truncate_display_width_with_marker(text, width, "…", TruncationSide::Right)
+}
+
+fn plain_role(role: &str) -> &str {
+    match role {
+        "definition" => "definition",
+        "call" => "call",
+        "type" => "type",
+        "field" => "field",
+        _ => "name",
+    }
+}
+
+fn paint_key_hints(
+    buffer: &mut RenderBuffer,
+    x: usize,
+    y: usize,
+    width: usize,
+    hints: &[(String, String)],
+    palette: &Palette,
+) {
+    let cap_bg = if palette.title_bg != palette.sidebar_bg {
+        palette.title_bg
+    } else if palette.selected_bg != palette.sidebar_bg {
+        mix(palette.sidebar_bg, palette.selected_bg, 0.72)
+    } else {
+        mix(palette.sidebar_bg, palette.fg, 0.16)
+    };
+    let cap_fg = ensure_minimum_contrast(palette.accent, cap_bg, MINIMUM_SELECTION_TEXT_CONTRAST);
+    let cap_style = Style {
+        fg: Some(cap_fg),
+        bg: Some(cap_bg),
+        bold: true,
+        ..Style::default()
+    };
+    let label_style = Style {
+        fg: Some(palette.muted),
+        bg: Some(palette.sidebar_bg),
+        ..Style::default()
+    };
+    let gap = " · ";
+    let mut cursor = 0usize;
+    for (key, label) in hints {
+        let cap = format!("[{key}]");
+        let cap_w = display_width(&cap);
+        let separator = if cursor == 0 { 0 } else { display_width(gap) };
+        if cursor + separator + cap_w + 1 > width {
+            break;
+        }
+        if separator > 0 {
+            buffer.set_text(x + cursor, y, gap, &label_style);
+            cursor += separator;
+        }
+        buffer.set_text(x + cursor, y, &cap, &cap_style);
+        cursor += cap_w + 1;
+        let room = width.saturating_sub(cursor);
+        if room == 0 {
+            break;
+        }
+        let shown = clip(label, room);
+        buffer.set_text(x + cursor, y, &shown, &label_style);
+        cursor += display_width(&shown);
+    }
+}
+
+fn wrap_muted(text: &str, width: usize) -> Vec<Row> {
+    if text.is_empty() {
+        return Vec::new();
+    }
+    wrap_lines(text, width)
+        .into_iter()
+        .map(|line| muted(&line, width))
+        .collect()
+}
+
+fn wrap_lines(text: &str, width: usize) -> Vec<String> {
+    if width == 0 {
+        return vec![clip(text, width)];
+    }
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    let mut current_w = 0usize;
+    for word in text.split_whitespace() {
+        let word_w = display_width(word);
+        if word_w > width {
+            if !current.is_empty() {
+                lines.push(std::mem::take(&mut current));
+                current_w = 0;
+            }
+            lines.push(clip(word, width));
+            continue;
+        }
+        let extra = usize::from(!current.is_empty());
+        if current_w + extra + word_w > width && !current.is_empty() {
+            lines.push(std::mem::take(&mut current));
+            current_w = 0;
+        }
+        if !current.is_empty() {
+            current.push(' ');
+            current_w += 1;
+        }
+        current.push_str(word);
+        current_w += word_w;
+    }
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    lines
+}
+
+fn mix(from: Color, to: Color, amount: f32) -> Color {
+    let (ar, ag, ab) = channels(from);
+    let (br, bg, bb) = channels(to);
+    let amount = amount.clamp(0.0, 1.0);
+    let mix_channel = |left: u8, right: u8| -> u8 {
+        (f32::from(left) * (1.0 - amount) + f32::from(right) * amount).round() as u8
+    };
+    Color::Rgb {
+        r: mix_channel(ar, br),
+        g: mix_channel(ag, bg),
+        b: mix_channel(ab, bb),
+    }
+}
+
+fn channels(color: Color) -> (u8, u8, u8) {
+    match color {
+        Color::Rgb { r, g, b } => (r, g, b),
+        Color::Rgba { r, g, b, a } => {
+            let amount = f32::from(a) / 255.0;
+            (
+                (f32::from(r) * amount) as u8,
+                (f32::from(g) * amount) as u8,
+                (f32::from(b) * amount) as u8,
+            )
+        }
     }
 }
 
@@ -1256,34 +1361,6 @@ fn cell_mut(
         return None;
     }
     buffer.cells.get_mut(y * buffer.width + x)
-}
-
-fn mix(from: Color, to: Color, amount: f32) -> Color {
-    let (ar, ag, ab) = channels(from);
-    let (br, bg, bb) = channels(to);
-    let amount = amount.clamp(0.0, 1.0);
-    let mix_channel = |left: u8, right: u8| -> u8 {
-        (f32::from(left) * (1.0 - amount) + f32::from(right) * amount).round() as u8
-    };
-    Color::Rgb {
-        r: mix_channel(ar, br),
-        g: mix_channel(ag, bg),
-        b: mix_channel(ab, bb),
-    }
-}
-
-fn channels(color: Color) -> (u8, u8, u8) {
-    match color {
-        Color::Rgb { r, g, b } => (r, g, b),
-        Color::Rgba { r, g, b, a } => {
-            let amount = f32::from(a) / 255.0;
-            (
-                (f32::from(r) * amount) as u8,
-                (f32::from(g) * amount) as u8,
-                (f32::from(b) * amount) as u8,
-            )
-        }
-    }
 }
 
 #[cfg(test)]
@@ -1317,13 +1394,28 @@ fn review(owned: bool) -> bool {
         let text = screen_text(&screen);
         write_frame(&screen, "explore-sidebar.html");
         assert!(text.contains("explore"), "{text}");
-        assert!(text.contains("let template"), "{text}");
-        assert!(text.contains("review") || text.contains("IN"), "{text}");
         assert!(
-            text.contains("REFERENCES") || text.contains("AT CURSOR"),
+            text.contains("let template") || text.contains("template…"),
             "{text}"
         );
-        assert!(text.contains("follow"), "{text}");
+        assert!(
+            text.contains('…'),
+            "a clipped match keeps an ellipsis: {text}"
+        );
+        assert!(text.contains("Definition"), "{text}");
+        assert!(!text.contains("DEFINITION"), "{text}");
+        assert!(!text.contains("binding"), "{text}");
+        assert!(text.contains("variable") || text.contains("name"), "{text}");
+        assert!(text.contains("[\u{5c}f]"), "follow is a keycap: {text}");
+        assert!(
+            text.contains(" · "),
+            "hints are separated like the action bar: {text}"
+        );
+        assert!(
+            text.contains("Same spelling") || text.contains("language server"),
+            "{text}"
+        );
+        assert!(footer_sits_under_matches(&text), "{text}");
     }
 
     #[test]
@@ -1357,10 +1449,25 @@ fn review(owned: bool) -> bool {
         );
         let text = screen_text(&screen);
         write_frame(&screen, "explore-skeleton.html");
-        assert!(text.contains("SKEL") || text.contains("skel"), "{text}");
+        assert!(text.contains("Dim") || text.contains("dim"), "{text}");
         editor.explore.help = true;
         editor.render(&mut screen).unwrap();
+        let help = screen_text(&screen);
         write_frame(&screen, "explore-help.html");
+        assert!(help.contains("[\u{5c}?]"), "{help}");
+        assert!(help.contains("language server"), "{help}");
+        assert!(!help.contains("LSP"), "{help}");
+    }
+
+    fn footer_sits_under_matches(text: &str) -> bool {
+        let lines: Vec<&str> = text.lines().collect();
+        let Some(matches) = lines.iter().position(|line| line.contains("Matches")) else {
+            return false;
+        };
+        let Some(footer) = lines.iter().position(|line| line.contains("[\u{5c}f]")) else {
+            return false;
+        };
+        footer > matches && footer - matches < 12
     }
 
     fn write_frame(buffer: &RenderBuffer, name: &str) {
@@ -1371,7 +1478,7 @@ fn review(owned: bool) -> bool {
         let path = std::path::Path::new(&dir).join(name);
         let mut html = String::from(
             "<!doctype html><meta charset=\"utf-8\"><title>explore</title>\
-<style>html,body{margin:0;background:#07090d}pre{margin:0;padding:18px 16px 20px;font-family:'JetBrains Mono','DejaVu Sans Mono',monospace;font-size:15px;line-height:1.35;white-space:pre}</style><pre>",
+<style>html,body{margin:0;background:#07090d}pre{margin:0;padding:18px 16px 20px;font-family:'JetBrainsMono Nerd Font','JetBrainsMono NF','JetBrains Mono','DejaVu Sans Mono',monospace;font-size:15px;line-height:1.35;white-space:pre}</style><pre>",
         );
         for y in 0..buffer.height {
             let mut x = 0;

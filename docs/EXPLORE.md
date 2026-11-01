@@ -1,5 +1,7 @@
 # Code explore
 
+The sidebar follows `docs/DESIGN.md`: theme colors, a footer that sits under the content, an ellipsis when a line does not fit, and keycaps with the key on the section-header color.
+
 Code explore is a reading mode. It keeps the editor you already use and adds a
 sidebar, dimming, and a review trail so a function is easier to follow. It does
 not send the buffer to a model and it does not ask you a question.
@@ -15,12 +17,12 @@ line. `?` inside the `\` chord (`\?`) lists the keys in the sidebar.
 The sidebar follows the cursor.
 
 - **In** is the function that encloses the cursor.
-- **At cursor** is the name under the cursor, what kind of name it is, and the
-  syntax node around it (a call, a binding, a match, and so on).
+- **Here** is the name under the cursor, what kind of name it is, and the
+  syntax node around it (a call, a variable, a match, and so on).
 - **Definition** is the matching name in the local index, or the `let` / parameter
-  binding in this function.
-- **References** lists occurrences of that name in the current function first,
-  then other indexed files. These are name matches, not type-checked cross
+  in this function.
+- **Matches** lists occurrences of that name in the current function first,
+  then other indexed files. These are shared spellings, not type-checked cross
   references.
 - A `×N` count sits just after a function, struct, enum, trait, or type
   definition when the line is short enough to leave room. `N` is the number of
@@ -34,7 +36,7 @@ The sidebar follows the cursor.
 | `\q`, `:explore off` | Close it |
 | `\f`, `\*` | Follow the name under the cursor through this function |
 | double-click | Same follow, only while explore is on |
-| `\s` | Skeleton dimming |
+| `\s` | Dim other lines in this function |
 | `\d` | Jump to the definition in the index |
 | `\t` | Jump to the explicit type, when one is written down |
 | `\j` / `\k` | Next / previous reference |

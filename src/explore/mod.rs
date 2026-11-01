@@ -10,8 +10,8 @@ mod index;
 
 use std::path::{Path, PathBuf};
 
-pub use analyze::{last_type_name, Analysis, Role, Span};
-pub use index::{language_id_from_path, normalize_path, repo_root, Index, ScanStats};
+pub use analyze::{Analysis, Role, Span, last_type_name};
+pub use index::{Index, ScanStats, language_id_from_path, normalize_path, repo_root};
 
 use crate::highlighter::LanguageRegistry;
 use analyze::{human_kind, is_syscall_wrapper};
@@ -510,7 +510,7 @@ fn resolve_definition(
     }) {
         let signature = match binding.type_name.as_deref() {
             Some(type_name) => format!("type {type_name}"),
-            None => "local binding".to_string(),
+            None => "local name".to_string(),
         };
         return Some(view_def(
             &binding.name,
@@ -786,7 +786,7 @@ fn other() {
         assert!(view.follow_spans.len() < 5);
         assert_eq!(view.in_function.as_deref(), Some("review"));
         assert!(
-            view.cursor_syntax.contains("binding")
+            view.cursor_syntax.contains("variable")
                 || view.cursor_role == "name"
                 || !view.cursor_syntax.is_empty()
         );
