@@ -313,17 +313,29 @@ impl Editor {
             let from = self.cursor_crumb();
             self.explore.record_jump(from, jump.clone());
         }
-        if !jump.file.is_empty()
-            && !jump.file.starts_with("buffer:")
-            && crate::explore::normalize_path(&jump.file) != self.explore_file_key()
-        {
-            self.execute_with_tracking(
-                &Action::OpenFile(jump.file.clone()),
-                buffer,
-                runtime,
-                false,
-            )
-            .await?;
+        if !jump.file.is_empty() && jump.file != self.explore_file_key() {
+            if let Some(id) = jump.file.strip_prefix("buffer:") {
+                let Ok(id) = id.parse::<u64>() else {
+                    return Ok(format!("{label} is no longer an open buffer"));
+                };
+                let open = self
+                    .buffer_manager
+                    .iter()
+                    .any(|buffer| buffer.id().as_u64() == id);
+                if !open {
+                    return Ok(format!("buffer {id} is no longer open"));
+                }
+                self.execute_with_tracking(&Action::OpenBufferById(id), buffer, runtime, false)
+                    .await?;
+            } else if crate::explore::normalize_path(&jump.file) != self.explore_file_key() {
+                self.execute_with_tracking(
+                    &Action::OpenFile(jump.file.clone()),
+                    buffer,
+                    runtime,
+                    false,
+                )
+                .await?;
+            }
         }
         let line_text = self.current_buffer().get(jump.line).unwrap_or_default();
         let column = char_to_grapheme(trim_line_ending(&line_text), jump.column);
@@ -1513,6 +1525,63 @@ fn review(owned: bool) -> bool {
             .iter()
             .map(|cell| cell.text.as_str())
             .collect()
+    }
+
+    #[tokio::test]
+    async fn trail_back_activates_the_unnamed_source_buffer() {
+        let config = Config::default();
+        let lsp = Box::new(LspManager::new(config.lsp.clone()));
+        let unnamed = crate::buffer::Buffer::new(None, "let value = 1;\nvalue\n".to_string());
+        let unnamed_id = unnamed.id().as_u64();
+        let named =
+            crate::buffer::Buffer::new(Some("other.rs".into()), "fn other() {}\n".to_string());
+        let mut editor = Editor::with_size(
+            lsp,
+            80,
+            24,
+            config,
+            crate::theme::Theme::default(),
+            vec![named, unnamed],
+        )
+        .unwrap();
+        editor.test_disable_terminal_output();
+        let mut screen = RenderBuffer::new(80, 24, &editor.theme.style);
+        let mut runtime = crate::plugin::Runtime::new();
+        let message = editor
+            .explore_go(
+                crate::explore::Jump {
+                    label: "value".into(),
+                    file: format!("buffer:{unnamed_id}"),
+                    line: 1,
+                    column: 0,
+                },
+                false,
+                &mut screen,
+                &mut runtime,
+            )
+            .await
+            .unwrap();
+        assert!(message.starts_with('→'), "{message}");
+        assert_eq!(editor.current_buffer().id().as_u64(), unnamed_id);
+        assert_eq!(editor.buffer_line(), 1);
+
+        let message = editor
+            .explore_go(
+                crate::explore::Jump {
+                    label: "gone".into(),
+                    file: "buffer:999999".into(),
+                    line: 0,
+                    column: 0,
+                },
+                false,
+                &mut screen,
+                &mut runtime,
+            )
+            .await
+            .unwrap();
+        assert_eq!(message, "buffer 999999 is no longer open");
+        assert_eq!(editor.current_buffer().id().as_u64(), unnamed_id);
+        assert_eq!(editor.buffer_line(), 1);
     }
 
     fn screen_text(buffer: &RenderBuffer) -> String {

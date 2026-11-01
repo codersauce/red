@@ -242,7 +242,7 @@ impl Session {
             }
         }
         let (following, follow_spans) = follow_spans(self.follow.as_ref(), analysis, &file_key);
-        let dim = skeleton_zone(self.skeleton, analysis, function, &self.index);
+        let dim = skeleton_zone(self.skeleton, analysis, function, &self.index, &file_key);
         let badges = badges(analysis, &self.index, &file_key);
         View {
             language: analysis
@@ -385,13 +385,29 @@ impl Session {
         let symbol = view.cursor_name.clone().unwrap_or_default();
         if self.xref_name.as_deref() != Some(symbol.as_str()) {
             self.xref_name = Some(symbol);
-            self.xref_at = 0;
-        } else if forward {
-            self.xref_at = (self.xref_at + 1) % view.references.len();
-        } else {
-            self.xref_at = (self.xref_at + view.references.len() - 1) % view.references.len();
         }
-        let reference = &view.references[self.xref_at];
+        // The sidebar lists the current function first. Stepping uses file
+        // order so entering another function does not renumber the matches.
+        let order = navigation_order(&view.references);
+        let current = order
+            .iter()
+            .enumerate()
+            .filter(|(_, &index)| {
+                let reference = &view.references[index];
+                reference.file == view.file_key
+                    && reference.line == line
+                    && reference.column <= column
+            })
+            .max_by_key(|(_, &index)| view.references[index].column)
+            .map(|(position, _)| position);
+        let next = match current {
+            Some(position) if forward => (position + 1) % order.len(),
+            Some(position) => (position + order.len() - 1) % order.len(),
+            None if forward => 0,
+            None => order.len() - 1,
+        };
+        self.xref_at = next;
+        let reference = &view.references[order[next]];
         Ok(Jump {
             label: reference.label.clone(),
             file: reference.file.clone(),
@@ -594,11 +610,27 @@ fn follow_spans(
     (Some(follow.name.clone()), spans)
 }
 
+fn navigation_order(references: &[ViewRef]) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..references.len()).collect();
+    order.sort_by(|&left, &right| {
+        let left = &references[left];
+        let right = &references[right];
+        (&left.file, left.line, left.column).cmp(&(&right.file, right.line, right.column))
+    });
+    order.dedup_by(|&mut left, &mut right| {
+        let left = &references[left];
+        let right = &references[right];
+        left.file == right.file && left.line == right.line && left.column == right.column
+    });
+    order
+}
+
 fn skeleton_zone(
     enabled: bool,
     analysis: Option<&Analysis>,
     function: Option<&analyze::FunctionScope>,
     index: &Index,
+    file_key: &str,
 ) -> Option<DimZone> {
     if !enabled {
         return None;
@@ -606,12 +638,14 @@ fn skeleton_zone(
     let analysis = analysis?;
     let function = function?;
     let mut keep = vec![function.signature];
+    let file_is_in_scope = index.file_in_scope(file_key);
     for call in &function.calls {
-        let repo = index.defined_in_scope(&call.name)
-            || analysis
+        let local = file_is_in_scope
+            && analysis
                 .definitions
                 .iter()
                 .any(|def| def.name == call.name && def.kind == "fn");
+        let repo = index.defined_in_scope(&call.name) || local;
         if call.syscall || repo || is_syscall_wrapper(&call.path, &call.name, call.is_macro) {
             keep.push(call.call);
         }
@@ -893,5 +927,92 @@ fn other() {
             .find(|(line, _)| *line == helper_line)
             .unwrap();
         assert!(badge.1 >= 2, "helper refs: {}", badge.1);
+    }
+
+    #[test]
+    fn next_match_visits_every_occurrence_across_functions() {
+        let source = r#"
+fn alpha() {
+    let marker = 1;
+    marker
+}
+fn beta() {
+    let marker = 2;
+    marker
+}
+"#;
+        let (mut session, _) = session_with(source);
+        let mut positions = session
+            .open
+            .as_ref()
+            .unwrap()
+            .analysis
+            .names
+            .iter()
+            .filter(|name| name.name == "marker")
+            .map(|name| (name.span.start_line, name.span.start_col))
+            .collect::<Vec<_>>();
+        positions.sort();
+        positions.dedup();
+        assert!(positions.len() >= 4, "{positions:?}");
+        let (mut line, mut column) = positions[0];
+        let mut seen = Vec::new();
+        for _ in 0..positions.len() {
+            let jump = session.step_reference(line, column, true).unwrap();
+            seen.push((jump.line, jump.column));
+            line = jump.line;
+            column = jump.column;
+        }
+        let mut sorted = seen.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(sorted, positions, "visited {seen:?}");
+        assert_eq!(seen.last().copied(), Some(positions[0]));
+    }
+
+    #[test]
+    fn review_scope_dims_helpers_outside_the_changed_files() {
+        let (mut session, _) = session_with(SOURCE);
+        session.skeleton = true;
+        session.index.pr_files = Some(std::collections::BTreeSet::from(["/repo/other.rs".into()]));
+        let (helper, read, line) = call_spans(&session);
+        let dim = session.view(line, 4).dim.expect("dim zone inside review");
+        assert!(
+            !dim.keep.iter().any(|span| span.contains_span(helper)),
+            "an unchanged file's helper must dim under review scope"
+        );
+        assert!(dim.keep.iter().any(|span| span.contains_span(read)));
+    }
+
+    #[test]
+    fn review_scope_keeps_helpers_in_a_changed_file() {
+        let (mut session, _) = session_with(SOURCE);
+        session.skeleton = true;
+        session.index.pr_files = Some(std::collections::BTreeSet::from(["/repo/review.rs".into()]));
+        let (helper, _, line) = call_spans(&session);
+        let dim = session.view(line, 4).dim.expect("dim zone inside review");
+        assert!(dim.keep.iter().any(|span| span.contains_span(helper)));
+    }
+
+    fn call_spans(session: &Session) -> (Span, Span, usize) {
+        let analysis = &session.open.as_ref().unwrap().analysis;
+        let review = analysis
+            .functions
+            .iter()
+            .find(|function| function.name == "review")
+            .unwrap();
+        let helper = review
+            .calls
+            .iter()
+            .find(|call| call.name == "helper")
+            .unwrap()
+            .call;
+        let read = review
+            .calls
+            .iter()
+            .find(|call| call.name == "read_to_string")
+            .unwrap()
+            .call;
+        (helper, read, review.span.start_line + 1)
     }
 }
