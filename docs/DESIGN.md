@@ -77,6 +77,38 @@ A list panel title is an optional first row, bold, in the surface style
 A text panel uses that same bold first row and draws a `─` underneath it.
 None of these put the title in a border.
 
+A grouped sidebar, such as explore, uses three levels and keeps the title on
+the window's top row, level with the window bar. The window bar stops at the
+sidebar column so that row belongs to the panel.
+
+1. Panel title. Title case (`Explore`, `Agent`, `Project Search Results`),
+   not uppercase and not a bare lowercase word. One leading space, then an
+   icon when the surface has one. Explore uses the Neo-tree root icon ``,
+   or `>` when icons are not Nerd Font. Bold. Foreground is
+   `sideBarSectionHeader.foreground`, then `sideBarTitle.foreground`.
+   Background is `sideBarSectionHeader.background`, then `sideBar.background`.
+   Do not paint this row with `list.activeSelectionBackground`. That color is
+   the current match. One blank row sits under the title.
+2. Section headers (`Inside`, `Here`, `Definition`, `Matches`). Bold, no
+   icon, one blank row above each. Foreground is `sideBar.foreground`, the
+   same color as the content, so the bold weight is what marks the level.
+   `sideBarTitle.foreground` is the wrong choice here: in Tokyo Night it is
+   dimmer than the content and inverts the hierarchy. A section count is
+   right-aligned on that same row in the muted color (`Matches` on the left,
+   `3` on the right).
+3. Content and notes. Names and match lines are `sideBar.foreground` at
+   regular weight. The current match keeps
+   `list.activeSelectionBackground`. Metadata (`rust · review.rs`,
+   `variable`, `3 in this function`, `review.rs:8  let  3`, `type LaunchSpec`)
+   is muted: `descriptionForeground`, then `editorLineNumber.foreground`.
+   A reference count stays inline beside its kind. The trailing note
+   (`1 file`, `Same spelling. gd asks the language server.`) is the same
+   muted style, after one blank row.
+
+`sideBarSectionHeader.*` is present in many themes and is only for that title
+band. Section headers do not borrow it, because its background often matches
+`sideBar.background` and its foreground is not a reliable step above the body.
+
 ## Background
 
 `sideBar.background` and `sideBar.foreground` apply when the panel sets that

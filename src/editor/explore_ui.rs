@@ -146,7 +146,14 @@ impl Editor {
         let mut hits = Vec::new();
         self.paint_explore_source(buffer, window, &view, &palette);
         if let Some(rect) = self.explore_sidebar_rect(window) {
-            hits.extend(paint_sidebar(buffer, rect, &view, &palette, ascii));
+            hits.extend(paint_sidebar(
+                buffer,
+                rect,
+                &view,
+                &palette,
+                ascii,
+                explore_title_icon(self.config.picker.icons.style),
+            ));
         }
         if self.explore_chrome_rows(window) == 1 {
             let y = window.position.y + window.inner_height() - 1;
@@ -400,13 +407,15 @@ impl Editor {
         if width == 0 {
             return None;
         }
-        let height = self.window_content_height(window);
-        if height == 0 {
+        let height = window
+            .inner_height()
+            .saturating_sub(self.explore_chrome_rows(window));
+        if height < 4 {
             return None;
         }
         Some(Rect {
             x: window.position.x + window.inner_width() - width,
-            y: window.position.y + self.window_content_top(window),
+            y: window.position.y,
             width,
             height,
         })
@@ -580,7 +589,8 @@ struct Rect {
 struct Palette {
     fg: Color,
     muted: Color,
-    heading: Color,
+    title_fg: Color,
+    title_bg: Color,
     border: Color,
     editor_bg: Color,
     sidebar_bg: Color,
@@ -623,7 +633,18 @@ impl Palette {
             ],
             muted,
         );
-        let heading = pick(&["sideBarTitle.foreground", "sideBar.foreground"], fg);
+        let title_fg = pick(
+            &[
+                "sideBarSectionHeader.foreground",
+                "sideBarTitle.foreground",
+                "sideBar.foreground",
+            ],
+            fg,
+        );
+        let title_bg = pick(
+            &["sideBarSectionHeader.background", "sideBar.background"],
+            sidebar_bg,
+        );
         let selected_bg = theme
             .ui_style
             .picker_selected_item
@@ -656,7 +677,7 @@ impl Palette {
         );
         let fg = roles.primary.fg.unwrap_or(fg);
         let muted = roles.muted.fg.unwrap_or(muted);
-        let heading = ensure_minimum_contrast(heading, sidebar_bg, MINIMUM_SELECTION_TEXT_CONTRAST);
+        let title_fg = ensure_minimum_contrast(title_fg, title_bg, MINIMUM_SELECTION_TEXT_CONTRAST);
         let selected_fg =
             ensure_minimum_contrast(selected_fg, selected_bg, MINIMUM_SELECTION_TEXT_CONTRAST);
         let follow_fg =
@@ -664,7 +685,8 @@ impl Palette {
         Self {
             fg,
             muted,
-            heading,
+            title_fg,
+            title_bg,
             border,
             editor_bg,
             sidebar_bg,
@@ -688,6 +710,14 @@ struct Row {
     text: String,
     tone: Tone,
     jump: Option<Jump>,
+    right: Option<String>,
+}
+
+fn explore_title_icon(style: crate::config::PickerIconStyle) -> &'static str {
+    match style {
+        crate::config::PickerIconStyle::NerdFont => "",
+        _ => ">",
+    }
 }
 
 fn paint_sidebar(
@@ -696,6 +726,7 @@ fn paint_sidebar(
     view: &View,
     palette: &Palette,
     ascii: bool,
+    icon: &str,
 ) -> Vec<Hit> {
     if rect.width < 8 || rect.height < 4 {
         return Vec::new();
@@ -716,8 +747,8 @@ fn paint_sidebar(
         ..Style::default()
     };
     let title = Style {
-        fg: Some(palette.heading),
-        bg: Some(palette.sidebar_bg),
+        fg: Some(palette.title_fg),
+        bg: Some(palette.title_bg),
         bold: true,
         ..Style::default()
     };
@@ -729,14 +760,17 @@ fn paint_sidebar(
         buffer.set_text(body_x, y, &blank, &surface);
         buffer.set_text(rect.x, y, rail, &divider);
     }
-    buffer.set_text(body_x, rect.y, &pad(" explore", body_w), &title);
-    let rows = sidebar_rows(view, content_w, rect.height.saturating_sub(1));
+    let title_text = if icon.is_empty() {
+        " Explore".to_string()
+    } else {
+        format!(" {icon} Explore")
+    };
+    buffer.set_text(body_x, rect.y, &pad(&title_text, body_w), &title);
+    let rows = sidebar_rows(view, content_w, rect.height.saturating_sub(2));
     let mut hits = Vec::new();
     for (index, row) in rows.iter().enumerate() {
-        let y = rect.y + 1 + index;
-        let line_style = row_style(&row.tone, palette);
-        let shown = format!(" {}", row.text);
-        buffer.set_text(body_x, y, &pad(&shown, body_w), &line_style);
+        let y = rect.y + 2 + index;
+        paint_sidebar_row(buffer, body_x, y, body_w, row, palette);
         if let Some(jump) = &row.jump {
             hits.push(Hit {
                 x0: body_x,
@@ -749,11 +783,36 @@ fn paint_sidebar(
     hits
 }
 
+fn paint_sidebar_row(
+    buffer: &mut RenderBuffer,
+    x: usize,
+    y: usize,
+    width: usize,
+    row: &Row,
+    palette: &Palette,
+) {
+    let line_style = row_style(&row.tone, palette);
+    let Some(right) = row.right.as_deref() else {
+        buffer.set_text(x, y, &pad(&format!(" {}", row.text), width), &line_style);
+        return;
+    };
+    let right_w = display_width(right);
+    let left_room = width.saturating_sub(right_w);
+    buffer.set_text(
+        x,
+        y,
+        &pad(&format!(" {}", row.text), left_room),
+        &line_style,
+    );
+    if right_w > 0 && right_w < width {
+        buffer.set_text(x + left_room, y, right, &row_style(&Tone::Muted, palette));
+    }
+}
+
 fn row_style(tone: &Tone, palette: &Palette) -> Style {
     let fg = match tone {
-        Tone::Body => palette.fg,
+        Tone::Body | Tone::Heading => palette.fg,
         Tone::Muted => palette.muted,
-        Tone::Heading => palette.heading,
         Tone::Selected => palette.selected_fg,
     };
     let bg = match tone {
@@ -828,10 +887,7 @@ fn body_rows(view: &View, width: usize) -> Vec<Row> {
         rows.push(muted("No definition in this index", width));
     }
     rows.push(blank());
-    rows.push(heading(&format!(
-        "Matches  {}",
-        view.references.len().min(40)
-    )));
+    rows.push(heading_count("Matches", view.references.len().min(40)));
     if view.references.is_empty() {
         rows.push(muted("No matches for this name", width));
     }
@@ -859,42 +915,38 @@ fn definition_rows(def: &ViewDef, width: usize) -> Vec<Row> {
         .and_then(|name| name.to_str())
         .unwrap_or(def.file.as_str());
     vec![
-        Row {
-            text: clip(&def.label, width),
-            tone: Tone::Body,
-            jump: Some(jump.clone()),
-        },
-        Row {
-            text: clip(
+        row(clip(&def.label, width), Tone::Body, Some(jump.clone())),
+        row(
+            clip(
                 &format!("{file}:{}  {}  {}", def.line + 1, def.kind, def.refs),
                 width,
             ),
-            tone: Tone::Muted,
-            jump: Some(jump),
-        },
+            Tone::Muted,
+            Some(jump),
+        ),
         muted(&def.signature, width),
     ]
 }
 
 fn reference_row(reference: &ViewRef, width: usize) -> Row {
     let marker = if reference.current { "▸" } else { " " };
-    Row {
-        text: clip(
+    row(
+        clip(
             &format!("{marker}{:>4} {}", reference.line + 1, reference.detail),
             width,
         ),
-        tone: if reference.current {
+        if reference.current {
             Tone::Selected
         } else {
             Tone::Body
         },
-        jump: Some(Jump {
+        Some(Jump {
             label: reference.label.clone(),
             file: reference.file.clone(),
             line: reference.line,
             column: reference.column,
         }),
-    }
+    )
 }
 
 fn note_rows(view: &View, width: usize) -> Vec<Row> {
@@ -996,36 +1048,36 @@ fn paint_breadcrumb(
     hits
 }
 
-fn heading(text: &str) -> Row {
+fn row(text: String, tone: Tone, jump: Option<Jump>) -> Row {
     Row {
-        text: text.to_string(),
-        tone: Tone::Heading,
-        jump: None,
+        text,
+        tone,
+        jump,
+        right: None,
+    }
+}
+
+fn heading(text: &str) -> Row {
+    row(text.to_string(), Tone::Heading, None)
+}
+
+fn heading_count(text: &str, count: usize) -> Row {
+    Row {
+        right: Some(count.to_string()),
+        ..heading(text)
     }
 }
 
 fn body(text: &str, width: usize) -> Row {
-    Row {
-        text: clip(text, width),
-        tone: Tone::Body,
-        jump: None,
-    }
+    row(clip(text, width), Tone::Body, None)
 }
 
 fn muted(text: &str, width: usize) -> Row {
-    Row {
-        text: clip(text, width),
-        tone: Tone::Muted,
-        jump: None,
-    }
+    row(clip(text, width), Tone::Muted, None)
 }
 
 fn blank() -> Row {
-    Row {
-        text: String::new(),
-        tone: Tone::Body,
-        jump: None,
-    }
+    row(String::new(), Tone::Body, None)
 }
 
 fn clip(text: &str, width: usize) -> String {
@@ -1163,7 +1215,12 @@ fn review(owned: bool) -> bool {
         editor.render(&mut screen).unwrap();
         let text = screen_text(&screen);
         write_frame(&screen, "explore-sidebar.html");
-        assert!(text.contains("explore"), "{text}");
+        assert!(text.contains("Explore"), "{text}");
+        assert!(
+            screen_text_row(&screen, 0).contains("Explore"),
+            "the title shares the top row: {}",
+            screen_text_row(&screen, 0)
+        );
         assert!(text.contains("let template"), "{text}");
         assert!(text.contains("Definition"), "{text}");
         assert!(!text.contains("DEFINITION"), "{text}");
@@ -1182,6 +1239,65 @@ fn review(owned: bool) -> bool {
             !text.contains('┌') && !text.contains('└'),
             "explore has no dialog frame: {text}"
         );
+        assert!(
+            text.contains("let  ") || text.contains("let 3") || text.contains("let  3"),
+            "the definition count stays beside the kind: {text}"
+        );
+    }
+
+    #[test]
+    fn title_stays_on_the_top_row_when_a_window_bar_is_present() {
+        let mut editor = editor_with(SOURCE);
+        editor.explore.enabled = true;
+        let window_id = editor
+            .window_manager
+            .active_stable_window_id()
+            .expect("active window");
+        editor
+            .window_bar_manager
+            .create("test-bar".into(), crate::plugin::WindowBarConfig::default());
+        editor.window_bar_manager.update(
+            "test-bar",
+            window_id,
+            vec![crate::plugin::WindowBarSegment {
+                id: Some("chrome".into()),
+                text: "X".repeat(400),
+                style: crate::plugin::WindowBarStyle::default(),
+                tooltip: None,
+                action: None,
+            }],
+        );
+        let mut screen = RenderBuffer::new(120, 36, &editor.theme.style);
+        editor.render(&mut screen).unwrap();
+        let top = screen_text_row(&screen, 0);
+        let divider = top.find('│').expect("divider");
+        assert!(top[..divider].contains('X'), "{top}");
+        assert!(top[divider..].contains("Explore"), "{top}");
+        assert!(!top[divider..].contains('X'), "{top}");
+    }
+
+    #[test]
+    fn mocha_and_ascii_keep_the_title_and_a_single_divider() {
+        let mut editor = editor_with(SOURCE);
+        editor.theme = crate::theme::parse_vscode_theme("themes/mocha.json").unwrap();
+        editor.config.window_borders_ascii = true;
+        editor.config.picker.icons.style = crate::config::PickerIconStyle::Ascii;
+        editor.explore.enabled = true;
+        let mut screen = RenderBuffer::new(120, 36, &editor.theme.style);
+        editor.render(&mut screen).unwrap();
+        let top = screen_text_row(&screen, 0);
+        assert!(top.contains('|'), "{top}");
+        assert!(top.contains("> Explore"), "{top}");
+        assert!(!top.contains('│') && !top.contains('┌'), "{top}");
+        let title_bg = editor
+            .theme
+            .colors
+            .get("sideBarSectionHeader.background")
+            .copied();
+        let explore_at = top.find("Explore").expect("title");
+        let cell = &screen.cells[explore_at];
+        assert_eq!(cell.style.bg, title_bg);
+        assert!(cell.style.bold);
     }
 
     #[test]
@@ -1329,6 +1445,14 @@ fn review(owned: bool) -> bool {
         editor.test_disable_terminal_output();
         editor.splash_dismissed = true;
         editor
+    }
+
+    fn screen_text_row(buffer: &RenderBuffer, y: usize) -> String {
+        let start = y * buffer.width;
+        buffer.cells[start..start + buffer.width]
+            .iter()
+            .map(|cell| cell.text.as_str())
+            .collect()
     }
 
     fn screen_text(buffer: &RenderBuffer) -> String {

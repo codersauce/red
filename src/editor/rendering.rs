@@ -2403,21 +2403,24 @@ impl Editor {
             self.render_directory_header(buffer, window, directory);
             return;
         }
-        let Some(rendered) = self
-            .window_bar_manager
-            .render(window.id, window.inner_width())
-        else {
+        let bar_width = window
+            .inner_width()
+            .saturating_sub(self.explore_sidebar_columns(window));
+        if bar_width == 0 {
+            return;
+        }
+        let Some(rendered) = self.window_bar_manager.render(window.id, bar_width) else {
             return;
         };
 
         let mut base_style = rendered.style.resolve(&self.theme);
         base_style.fg = base_style.fg.or(self.theme.style.fg);
         base_style.bg = base_style.bg.or(self.theme.style.bg);
-        let blank = " ".repeat(window.inner_width());
+        let blank = " ".repeat(bar_width);
         buffer.set_text(window.position.x, window.position.y, &blank, &base_style);
 
         let mut x = window.position.x;
-        let end = window.position.x + window.inner_width();
+        let end = window.position.x + bar_width;
         for segment in rendered.segments {
             if x >= end {
                 break;
@@ -2436,7 +2439,9 @@ impl Editor {
         window: &crate::window::Window,
         directory: &crate::buffer::directory::Directory,
     ) {
-        let width = window.inner_width();
+        let width = window
+            .inner_width()
+            .saturating_sub(self.explore_sidebar_columns(window));
         let height = self.window_content_top(window);
         if height == 0 || width == 0 {
             return;

@@ -1,6 +1,6 @@
 # Code explore
 
-The sidebar follows `docs/DESIGN.md`: a `sideBar` column, one `│` on the editor edge, a plain `explore` title row, `sideBarTitle.foreground` headings, and status-line mode names.
+The sidebar follows `docs/DESIGN.md`: a `sideBar` column from the top row, one `│` on the editor edge, and three levels. `Explore` is the title, bold, with the Neo-tree root icon. `Inside`, `Here`, `Definition`, and `Matches` are bold section headers in the content color, with one blank row above each. Names are regular weight. Notes and the definition count stay muted and inline. `DIM` and `REVIEW` stay on the trail row.
 
 Code explore is a reading mode. It keeps the editor you already use and adds a
 sidebar, dimming, and a review trail so a function is easier to follow. It does
@@ -18,7 +18,7 @@ detaches a session. `Space e` used to open the error list; that list is now
 
 ## What you can see
 
-The sidebar follows the cursor.
+The sidebar follows the cursor. `Explore` shares the top row with the file name.
 
 - **In** is the function that encloses the cursor.
 - **Here** is the name under the cursor, what kind of name it is, and the
