@@ -850,18 +850,14 @@ fn review(owned: bool) -> bool {
             .name_at(template.span.start_line, template.span.start_col)
             .expect("name");
         assert_eq!(name.name, "template");
-        assert!(
-            analysis
-                .definitions
-                .iter()
-                .any(|def| def.name == "LaunchSpec")
-        );
-        assert!(
-            analysis
-                .definitions
-                .iter()
-                .any(|def| { def.name == "review" && def.return_type.as_deref() == Some("bool") })
-        );
+        assert!(analysis
+            .definitions
+            .iter()
+            .any(|def| def.name == "LaunchSpec"));
+        assert!(analysis
+            .definitions
+            .iter()
+            .any(|def| { def.name == "review" && def.return_type.as_deref() == Some("bool") }));
     }
 
     #[test]

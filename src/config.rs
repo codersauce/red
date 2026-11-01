@@ -4718,8 +4718,17 @@ groups = [["\\bif\\b", "\\belse\\b", "\\bendif\\b"]]
             Some(&KeyAction::Single(Action::OpenDiagnosticsPicker))
         );
         assert_eq!(
-            leader.get("e"),
+            leader.get("D"),
             Some(&KeyAction::Single(Action::OpenErrorDiagnosticsPicker))
+        );
+        let Some(KeyAction::Nested(explore)) = leader.get("e") else {
+            panic!("expected a Space e explore mapping");
+        };
+        assert_eq!(
+            explore.get("f"),
+            Some(&KeyAction::Single(Action::ExploreCommand(
+                "follow".to_string()
+            )))
         );
         assert_eq!(
             leader.get("f"),

@@ -5,13 +5,13 @@ use std::path::Path;
 
 use unicode_segmentation::UnicodeSegmentation as _;
 
-use crate::color::{Color, ensure_minimum_contrast};
-use crate::explore::{DimZone, Hit, Jump, SyncInput, View, ViewDef, ViewRef, sidebar_columns};
+use crate::color::{ensure_minimum_contrast, Color};
+use crate::explore::{sidebar_columns, DimZone, Hit, Jump, SyncInput, View, ViewDef, ViewRef};
 use crate::highlighter::LanguageRegistry;
-use crate::theme::{MINIMUM_SELECTION_TEXT_CONTRAST, Style, SurfacePalette, Theme};
+use crate::theme::{Style, SurfacePalette, Theme, MINIMUM_SELECTION_TEXT_CONTRAST};
 use crate::unicode_utils::{
-    TruncationSide, char_to_grapheme, display_width, trim_line_ending, truncate_display_width,
-    truncate_display_width_with_marker,
+    char_to_grapheme, display_width, trim_line_ending, truncate_display_width,
+    truncate_display_width_with_marker, TruncationSide,
 };
 
 use super::{Action, Editor, RenderBuffer, Runtime};
@@ -57,7 +57,7 @@ impl Editor {
                         self.explore.help = false;
                     }
                     if self.explore.enabled {
-                        "Code explore on. \\? lists keys. Double-click a name to follow it."
+                        "Code explore on. Space e ? lists keys. Double-click a name to follow it."
                             .to_string()
                     } else {
                         "Code explore off.".to_string()
@@ -65,7 +65,7 @@ impl Editor {
                 }
                 "on" => {
                     self.explore.enabled = true;
-                    "Code explore on. \\? lists keys.".to_string()
+                    "Code explore on. Space e ? lists keys.".to_string()
                 }
                 "off" | "close" => {
                     self.explore.enabled = false;
@@ -342,8 +342,9 @@ impl Editor {
             Ok(stats) => {
                 let scope = if pr { "review" } else { "project" };
                 format!(
-                    "Indexed {} {scope} files{}. {}",
+                    "Indexed {} {scope} {}{}. {}",
                     stats.files,
+                    if stats.files == 1 { "file" } else { "files" },
                     if stats.truncated { " (capped)" } else { "" },
                     stats.message
                 )
@@ -616,17 +617,13 @@ impl Palette {
             &["descriptionForeground", "editorLineNumber.foreground"],
             fg,
         ));
-        let heading = theme.ui_style.popup_title.fg.unwrap_or(pick(
-            &["textLink.foreground", "sideBarTitle.foreground"],
-            fg,
-        ));
         let accent = pick(
             &[
                 "textLink.foreground",
                 "editorInfo.foreground",
                 "focusBorder",
             ],
-            heading,
+            fg,
         );
         let border = theme
             .ui_style
@@ -679,6 +676,7 @@ impl Palette {
         let fg = roles.primary.fg.unwrap_or(fg);
         let muted = roles.muted.fg.unwrap_or(muted);
         let accent = roles.accent.fg.unwrap_or(accent);
+        let heading = ensure_minimum_contrast(accent, sidebar_bg, MINIMUM_SELECTION_TEXT_CONTRAST);
         let selected_fg =
             ensure_minimum_contrast(selected_fg, selected_bg, MINIMUM_SELECTION_TEXT_CONTRAST);
         let title_fg = ensure_minimum_contrast(title_fg, title_bg, MINIMUM_SELECTION_TEXT_CONTRAST);
@@ -990,9 +988,9 @@ fn note_rows(view: &View, width: usize) -> Vec<Row> {
 
 fn footer_rows(width: usize) -> Vec<Row> {
     vec![
-        key_row(width, &[("\\f", "follow"), ("\\s", "dim")]),
-        key_row(width, &[("\\d", "definition"), ("\\t", "type")]),
-        key_row(width, &[("\\b", "back"), ("\\?", "keys")]),
+        key_row(width, &[("e f", "follow"), ("e s", "dim")]),
+        key_row(width, &[("e d", "definition"), ("e t", "type")]),
+        key_row(width, &[("e b", "back"), ("e ?", "keys")]),
     ]
 }
 
@@ -1012,21 +1010,21 @@ fn key_row(width: usize, pairs: &[(&str, &str)]) -> Row {
 fn help_rows(width: usize) -> Vec<Row> {
     let mut rows = vec![heading("Keys")];
     for (key, label) in [
-        ("\\e", "open or close"),
-        ("space E", "same"),
-        ("\\f", "follow this name"),
-        ("\\*", "follow this name"),
-        ("\\s", "dim other lines"),
-        ("\\d", "go to definition"),
-        ("\\t", "go to written type"),
-        ("\\j", "next match"),
-        ("\\k", "previous match"),
-        ("\\b", "trail back"),
-        ("\\n", "trail forward"),
-        ("\\r", "re-read this file"),
-        ("\\R", "index the project"),
-        ("\\p", "index this review"),
-        ("\\q", "close"),
+        ("e e", "open or close"),
+        ("Space E", "same"),
+        ("e f", "follow this name"),
+        ("e s", "dim all but calls"),
+        ("e d", "go to definition"),
+        ("e t", "go to written type"),
+        ("e j", "next match"),
+        ("e k", "previous match"),
+        ("e b", "trail back"),
+        ("e n", "trail forward"),
+        ("e r", "re-read this file"),
+        ("e R", "index the project"),
+        ("e p", "index this review"),
+        ("e ?", "key list"),
+        ("e q", "close"),
     ] {
         rows.push(key_row(width, &[(key, label)]));
     }
@@ -1406,7 +1404,7 @@ fn review(owned: bool) -> bool {
         assert!(!text.contains("DEFINITION"), "{text}");
         assert!(!text.contains("binding"), "{text}");
         assert!(text.contains("variable") || text.contains("name"), "{text}");
-        assert!(text.contains("[\u{5c}f]"), "follow is a keycap: {text}");
+        assert!(text.contains("[e f]"), "follow is a keycap: {text}");
         assert!(
             text.contains(" · "),
             "hints are separated like the action bar: {text}"
@@ -1454,7 +1452,8 @@ fn review(owned: bool) -> bool {
         editor.render(&mut screen).unwrap();
         let help = screen_text(&screen);
         write_frame(&screen, "explore-help.html");
-        assert!(help.contains("[\u{5c}?]"), "{help}");
+        assert!(help.contains("[e ?]"), "{help}");
+        assert!(help.contains("dim all but calls"), "{help}");
         assert!(help.contains("language server"), "{help}");
         assert!(!help.contains("LSP"), "{help}");
     }
@@ -1464,7 +1463,7 @@ fn review(owned: bool) -> bool {
         let Some(matches) = lines.iter().position(|line| line.contains("Matches")) else {
             return false;
         };
-        let Some(footer) = lines.iter().position(|line| line.contains("[\u{5c}f]")) else {
+        let Some(footer) = lines.iter().position(|line| line.contains("[e f]")) else {
             return false;
         };
         footer > matches && footer - matches < 12

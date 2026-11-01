@@ -23832,7 +23832,8 @@ impl Editor {
             }
             Action::ExploreCommand(command) => {
                 add_to_history = false;
-                self.execute_explore_command(command, buffer, runtime).await?;
+                self.execute_explore_command(command, buffer, runtime)
+                    .await?;
             }
             Action::GoToDefinition => {
                 if let Some(file) = self.current_buffer().file.clone() {

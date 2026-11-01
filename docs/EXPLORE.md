@@ -6,11 +6,14 @@ Code explore is a reading mode. It keeps the editor you already use and adds a
 sidebar, dimming, and a review trail so a function is easier to follow. It does
 not send the buffer to a model and it does not ask you a question.
 
-Turn it on with `Space E`, `\e`, or `:explore`. The sidebar opens on the right
-when the window is wide enough, and a one-line trail sits above the status
-line. `?` inside the `\` chord (`\?`) lists the keys in the sidebar.
+Turn it on with `Space e e`, `Space E`, or `:explore`. The sidebar opens on the
+right when the window is wide enough, and a one-line trail sits above the
+status line. `Space e ?` lists the keys in the sidebar.
 
-`Ctrl-\` still detaches a session. The explore chord is a bare `\`.
+`Space` is the same leader as the rest of Red. After `Space`, `e` is the
+explore group, and the which-key popup names it "Explore". `Ctrl-\` still
+detaches a session. `Space e` used to open the error list; that list is now
+`Space D`.
 
 ## What you can see
 
@@ -32,19 +35,19 @@ The sidebar follows the cursor.
 
 | Key | Action |
 | --- | --- |
-| `Space E`, `\e`, `:explore` | Toggle explore |
-| `\q`, `:explore off` | Close it |
-| `\f`, `\*` | Follow the name under the cursor through this function |
+| `Space e e`, `Space E`, `:explore` | Toggle explore |
+| `Space e q`, `:explore off` | Close it |
+| `Space e f`, `Space e *` | Follow the name under the cursor through this function |
 | double-click | Same follow, only while explore is on |
-| `\s` | Dim other lines in this function |
-| `\d` | Jump to the definition in the index |
-| `\t` | Jump to the explicit type, when one is written down |
-| `\j` / `\k` | Next / previous reference |
-| `\b` / `\n` | Review trail back / forward |
-| `\r` | Re-read the current file |
-| `\R` | Index source files in the repo (capped) |
-| `\p` | Index only this PR's changed files, or turn that scope off |
-| `\?` | Show or hide the key list |
+| `Space e s` | Dim everything in this function except project calls and system-touching library calls |
+| `Space e d` | Jump to the definition in the index |
+| `Space e t` | Jump to the explicit type, when one is written down |
+| `Space e j` / `Space e k` | Next / previous match |
+| `Space e b` / `Space e n` | Review trail back / forward |
+| `Space e r` | Re-read the current file |
+| `Space e R` | Index source files in the repo (capped) |
+| `Space e p` | Index only this PR's changed files, or turn that scope off |
+| `Space e ?` | Show or hide the key list |
 | `gd` | Unchanged. This still asks the language server |
 
 `:explore` accepts the same verbs: `on`, `off`, `skeleton`, `follow`, `def`,
@@ -58,7 +61,7 @@ While explore is off, double-click still selects a word.
 
 ## Skeleton
 
-`\s` fades the current function except:
+`Space e s` fades tokens in the current function except:
 
 - the signature
 - calls whose name is defined in the indexed repo
@@ -66,7 +69,7 @@ While explore is off, double-click still selects a word.
   `std::process`, `std::net`, `File::open`, `Command::new`, `println!`, and
   similar)
 
-Nested functions stay readable. With PR scope on (`\p`), "defined in the repo"
+Nested functions stay readable. With PR scope on (`Space e p`), "defined in the repo"
 narrows to definitions in the changed files. Syscall wrappers stay bright
 either way.
 
@@ -75,12 +78,12 @@ either way.
 Opening explore reads the current buffer immediately. It does not walk the
 repository until you ask.
 
-- `\r` reparses the file you are editing. That is the fast path while you move
+- `Space e r` reparses the file you are editing. That is the fast path while you move
   through a change.
-- `\R` walks the git repo (respecting `.gitignore`) and parses up to 400 source
+- `Space e R` walks the git repo (respecting `.gitignore`) and parses up to 400 source
   files with Red's tree-sitter grammars. A later edit reparses only the open
   buffer.
-- `\p` asks git for the changed files against `origin/main`, `main`, `master`,
+- `Space e p` asks git for the changed files against `origin/main`, `main`, `master`,
   or a base you pass (`:explore pr origin/main`), then indexes those files
   only. The sidebar shows the PR file count and a `+added −removed` summary
   when `git diff --numstat` can provide one.

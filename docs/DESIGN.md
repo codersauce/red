@@ -80,6 +80,10 @@ The selected row uses `picker_selected_item` or
 highlights use the find-match styles. The selected row keeps enough contrast
 to read the whole label.
 
+Section headings inside a side panel use the accent (`textLink.foreground`,
+then `editorInfo.foreground`, then `focusBorder`), checked against the panel
+background. A heading that falls back to the body color looks washed out.
+
 ## Glyphs
 
 Nerd Font icons are the default (`PickerIconStyle::NerdFont`) for pickers,
@@ -115,7 +119,7 @@ the panel. When it does not, tint the chip toward
 `list.activeSelectionBackground` so the key is still a separate object. The
 action stays in muted on the panel background. Separate pairs with ` · `,
 the same separator the action bar uses. Write the key as the user presses it
-(`[\f]`, `[space E]`, `gd`), not as an internal action name. Truncate a label
+(`e f`, `Space E`, `gd`), not as an internal action name. Truncate a label
 with `…` rather than running it into the next key. Drop a pair that does not
 fit before drawing a broken bracket.
 

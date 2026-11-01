@@ -1596,20 +1596,20 @@ fn action_label(action: &Action) -> String {
         Action::FilePicker => "Find file".to_string(),
         Action::GoToDefinition => "Go to definition".to_string(),
         Action::ExploreCommand(command) => match command.as_str() {
-            "toggle" => "Toggle code explore".to_string(),
-            "skeleton" => "Toggle skeleton dimming".to_string(),
-            "follow" => "Follow symbol in this function".to_string(),
-            "definition" => "Jump to the explored definition".to_string(),
-            "type" => "Jump to the explicit type".to_string(),
-            "back" => "Review trail back".to_string(),
-            "forward" => "Review trail forward".to_string(),
-            "next" => "Next name match".to_string(),
-            "prev" => "Previous name match".to_string(),
-            "index" => "Index the repository".to_string(),
+            "toggle" => "Open or close".to_string(),
+            "skeleton" => "Dim all but calls".to_string(),
+            "follow" => "Follow this name".to_string(),
+            "definition" => "Go to definition".to_string(),
+            "type" => "Go to written type".to_string(),
+            "back" => "Trail back".to_string(),
+            "forward" => "Trail forward".to_string(),
+            "next" => "Next match".to_string(),
+            "prev" => "Previous match".to_string(),
+            "index" => "Index the project".to_string(),
             "refresh" => "Re-read this file".to_string(),
-            "pr" => "Index this pull request".to_string(),
-            "help" => "Code explore keys".to_string(),
-            "close" => "Close code explore".to_string(),
+            "pr" => "Index this review".to_string(),
+            "help" => "Key list".to_string(),
+            "close" => "Close".to_string(),
             other => format!("Code explore {other}"),
         },
         Action::FollowLink => "Follow link".to_string(),
@@ -1676,7 +1676,7 @@ fn group_label(prefix: &[String], key: &str) -> String {
     let prefix = prefix.join(" ");
     match (prefix.as_str(), display_key(key)) {
         ("Space", "h") => "Git hunks".to_string(),
-        ("", "\\") => "Code explore".to_string(),
+        ("Space", "e") => "Explore".to_string(),
         ("Space", "c") => "Commit message".to_string(),
         (_, "Ctrl-w") => "Windows".to_string(),
         (_, "g") => "Go to".to_string(),
@@ -1914,7 +1914,7 @@ mod tests {
             .find(|entry| entry.id == "lsp.errors")
             .unwrap();
         assert_eq!(errors.action, Action::OpenErrorDiagnosticsPicker);
-        assert_eq!(errors.shortcuts, ["Space e"]);
+        assert_eq!(errors.shortcuts, ["Space D"]);
 
         let save = entries
             .iter()
@@ -2411,7 +2411,28 @@ mod tests {
             .any(|hint| { hint.key == "d" && hint.label == "Diagnostics" && !hint.is_group }));
         assert!(hints
             .iter()
-            .any(|hint| hint.key == "e" && hint.label == "Errors" && !hint.is_group));
+            .any(|hint| hint.key == "e" && hint.label == "Explore" && hint.is_group));
+        let Some(KeyAction::Nested(explore)) = leader.get("e") else {
+            panic!("expected the explore group");
+        };
+        let explore_hints = keymap_hints(&["Space".to_string(), "e".to_string()], explore);
+        for (key, label) in [
+            ("e", "Open or close"),
+            ("f", "Follow this name"),
+            ("s", "Dim all but calls"),
+            ("d", "Go to definition"),
+            ("?", "Key list"),
+        ] {
+            assert!(
+                explore_hints
+                    .iter()
+                    .any(|hint| hint.key == key && hint.label == label && !hint.is_group),
+                "missing {key} {label}: {explore_hints:?}"
+            );
+        }
+        assert!(hints
+            .iter()
+            .any(|hint| hint.key == "D" && hint.label == "Errors" && !hint.is_group));
     }
 
     #[test]

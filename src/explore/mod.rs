@@ -10,8 +10,8 @@ mod index;
 
 use std::path::{Path, PathBuf};
 
-pub use analyze::{Analysis, Role, Span, last_type_name};
-pub use index::{Index, ScanStats, language_id_from_path, normalize_path, repo_root};
+pub use analyze::{last_type_name, Analysis, Role, Span};
+pub use index::{language_id_from_path, normalize_path, repo_root, Index, ScanStats};
 
 use crate::highlighter::LanguageRegistry;
 use analyze::{human_kind, is_syscall_wrapper};
