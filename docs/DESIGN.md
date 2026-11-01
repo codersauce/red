@@ -13,19 +13,23 @@ is a bordered card, usually anchored near the cursor or the lower right, and
 it covers only as much of the file as the content needs (`src/ui/dialog.rs`,
 `src/ui/picker.rs`, `src/ui/keymap_hints.rs`, `src/ui/hover_info.rs`).
 
-Side panels sit beside the text, not on top of it. Plugin trees
-(`src/plugin/tree.rs`, `src/plugin/panel.rs`) fill their column with
-`sideBar.background` and stack rows from the top. A framed panel uses
-`Dialog`: the title sits in the top border, the way `popup_title` does, and
-the body is inset by the frame. Do not draw a private rail, title bar, or
-palette when `Dialog` or the plugin panel styles already cover it.
+Side panels sit beside the text, not on top of it. A docked panel is a
+filled column (`src/plugin/panel.rs`). Neo-tree fills that column with
+`sideBar.background` and stacks rows from the top. A panel that does not set
+a surface, such as the agent pane, uses `editor.background`. `Dialog`, with
+the title in the top border, is for popups, pickers, and which-key. Do not
+wrap a docked column in a dialog frame.
 
 Section headings are short and stacked with a single blank row between groups.
 Empty rows after the content stay panel background.
 
 ## Spacing
 
-- One cell of padding inside a border.
+- Dialogs and pickers keep one cell of padding inside the border.
+- A list or tree row has no frame inset. It starts at the column edge with one
+  leading space, the way a Neo-tree row does (`src/plugin/tree.rs`).
+- A text panel insets one cell on each side when the pane is at least 3
+  columns wide (`TextPanelContentMetrics` in `src/plugin/panel.rs`).
 - One blank row between sections.
 - One cell between a key and its label. Which-key uses `KEY_GAP` in
   `src/ui/keymap_hints.rs`. The action bar uses the same one-cell gap
@@ -45,12 +49,46 @@ composer use `BorderStyle::Single`. When `window_borders_ascii` is set, window
 splits use `+ - |`. Dialogs and which-key keep the box-drawing frame.
 
 The frame uses `theme.ui_style.popup_border` for popups and
-`theme.ui_style.dialog_border` for dialogs. A side panel uses
-`sideBar.border` for the same `Dialog` frame. The title is bold, in the top
-border, using `popup_title` or `dialog_title` on a popup and
-`sideBarTitle.foreground` on a side panel.
+`theme.ui_style.dialog_border` for dialogs. The title of a popup is bold, in
+the top border, using `popup_title` or `dialog_title`.
+
+A docked side panel does not draw a box. Its separator is one `│` (or `|`
+when `window_borders_ascii` is set) on the editor side of the column: just to
+the right of a left panel, just to the left of a right panel
+(`render_panel_separator` in `src/plugin/panel.rs`). Neo-tree colors that
+glyph with `sideBar.border`, then `panel.border`, then
+`editorLineNumber.foreground`, on `editor.background`. A text panel always
+draws the glyph. A row panel with no border spec draws a space until the
+divider is dragged. Dragging recolors it with `sash.hoverBorder`, then
+`panelTitle.activeBorder`, then `focusBorder`
+(`Theme::active_divider_style`).
+
+Window splits are a separate chrome. They use `│ ─ ┌ ┐` junctions, or
+`+ - |` when `window_borders_ascii` is set (`src/editor/rendering.rs`).
 
 Plugin trees draw ancestry with `│`, `├`, and `└` in the indent-guide color.
+Those guides sit inside the column. They are not the panel divider.
+
+## Title
+
+A list panel title is an optional first row, bold, in the surface style
+(`src/plugin/panel.rs`). A tree puts its name in the root row, bold, in
+`sideBarTitle.foreground`, after one leading space (`src/plugin/tree.rs`).
+A text panel uses that same bold first row and draws a `─` underneath it.
+None of these put the title in a border.
+
+## Background
+
+`sideBar.background` and `sideBar.foreground` apply when the panel sets that
+surface, as Neo-tree and explore do. A panel that leaves the surface unset
+keeps `editor.background`. The agent conversation pane is that second case.
+
+## Focus
+
+The selected row uses `list.activeSelectionBackground` and
+`list.activeSelectionForeground`. The highlight stays after `Esc` returns
+focus to the editor. The divider color changes while the divider is dragged.
+Keyboard focus does not draw a second frame around the column.
 
 ## Color
 

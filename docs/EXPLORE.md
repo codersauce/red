@@ -1,6 +1,6 @@
 # Code explore
 
-The sidebar follows `docs/DESIGN.md`: `sideBar` colors, a `Dialog` frame with the title in the border, `sideBarTitle.foreground` headings, and status-line mode names.
+The sidebar follows `docs/DESIGN.md`: a `sideBar` column, one `│` on the editor edge, a plain `explore` title row, `sideBarTitle.foreground` headings, and status-line mode names.
 
 Code explore is a reading mode. It keeps the editor you already use and adds a
 sidebar, dimming, and a review trail so a function is easier to follow. It does

@@ -9,7 +9,6 @@ use crate::color::{ensure_minimum_contrast, Color};
 use crate::explore::{sidebar_columns, DimZone, Hit, Jump, SyncInput, View, ViewDef, ViewRef};
 use crate::highlighter::LanguageRegistry;
 use crate::theme::{Style, SurfacePalette, Theme, MINIMUM_SELECTION_TEXT_CONTRAST};
-use crate::ui::{BorderStyle, Component, Dialog};
 use crate::unicode_utils::{
     char_to_grapheme, display_width, trim_line_ending, truncate_display_width,
 };
@@ -147,7 +146,7 @@ impl Editor {
         let mut hits = Vec::new();
         self.paint_explore_source(buffer, window, &view, &palette);
         if let Some(rect) = self.explore_sidebar_rect(window) {
-            hits.extend(paint_sidebar(buffer, rect, &view, &palette, &self.theme));
+            hits.extend(paint_sidebar(buffer, rect, &view, &palette, ascii));
         }
         if self.explore_chrome_rows(window) == 1 {
             let y = window.position.y + window.inner_height() - 1;
@@ -583,6 +582,7 @@ struct Palette {
     muted: Color,
     heading: Color,
     border: Color,
+    editor_bg: Color,
     sidebar_bg: Color,
     selected_bg: Color,
     selected_fg: Color,
@@ -616,12 +616,12 @@ impl Palette {
             fg,
         ));
         let border = pick(
-            &["sideBar.border"],
-            theme
-                .ui_style
-                .popup_border
-                .fg
-                .unwrap_or(pick(&["focusBorder"], muted)),
+            &[
+                "sideBar.border",
+                "panel.border",
+                "editorLineNumber.foreground",
+            ],
+            muted,
         );
         let heading = pick(&["sideBarTitle.foreground", "sideBar.foreground"], fg);
         let selected_bg = theme
@@ -666,6 +666,7 @@ impl Palette {
             muted,
             heading,
             border,
+            editor_bg,
             sidebar_bg,
             selected_bg,
             selected_fg,
@@ -694,9 +695,14 @@ fn paint_sidebar(
     rect: Rect,
     view: &View,
     palette: &Palette,
-    theme: &Theme,
+    ascii: bool,
 ) -> Vec<Hit> {
     if rect.width < 8 || rect.height < 4 {
+        return Vec::new();
+    }
+    let body_w = rect.width.saturating_sub(1);
+    let content_w = body_w.saturating_sub(1);
+    if body_w == 0 || content_w == 0 {
         return Vec::new();
     }
     let surface = Style {
@@ -704,9 +710,9 @@ fn paint_sidebar(
         bg: Some(palette.sidebar_bg),
         ..Style::default()
     };
-    let border = Style {
+    let divider = Style {
         fg: Some(palette.border),
-        bg: Some(palette.sidebar_bg),
+        bg: Some(palette.editor_bg),
         ..Style::default()
     };
     let title = Style {
@@ -715,38 +721,26 @@ fn paint_sidebar(
         bold: true,
         ..Style::default()
     };
-    let inner_w = rect.width.saturating_sub(2);
-    let inner_h = rect.height.saturating_sub(2);
-    let content_w = inner_w.saturating_sub(2);
-    if inner_w == 0 || inner_h == 0 || content_w == 0 {
-        return Vec::new();
+    let body_x = rect.x + 1;
+    let blank = " ".repeat(body_w);
+    let rail = if ascii { "|" } else { "│" };
+    for row in 0..rect.height {
+        let y = rect.y + row;
+        buffer.set_text(body_x, y, &blank, &surface);
+        buffer.set_text(rect.x, y, rail, &divider);
     }
-    let dialog = Dialog::new(
-        Some("explore".to_string()),
-        rect.x,
-        rect.y,
-        inner_w,
-        inner_h,
-        &surface,
-        BorderStyle::Single,
-        theme,
-    )
-    .with_border_draw_style(&border)
-    .with_title_style(&title)
-    .with_left_aligned_title();
-    if dialog.draw(buffer).is_err() {
-        return Vec::new();
-    }
-    let rows = sidebar_rows(view, content_w, inner_h);
+    buffer.set_text(body_x, rect.y, &pad(" explore", body_w), &title);
+    let rows = sidebar_rows(view, content_w, rect.height.saturating_sub(1));
     let mut hits = Vec::new();
     for (index, row) in rows.iter().enumerate() {
         let y = rect.y + 1 + index;
         let line_style = row_style(&row.tone, palette);
-        buffer.set_text(rect.x + 2, y, &pad(&row.text, content_w), &line_style);
+        let shown = format!(" {}", row.text);
+        buffer.set_text(body_x, y, &pad(&shown, body_w), &line_style);
         if let Some(jump) = &row.jump {
             hits.push(Hit {
-                x0: rect.x + 1,
-                x1: rect.x + rect.width.saturating_sub(1),
+                x0: body_x,
+                x1: rect.x + rect.width,
                 y,
                 jump: jump.clone(),
             });
@@ -1183,9 +1177,10 @@ fn review(owned: bool) -> bool {
             text.contains("Same spelling") || text.contains("language server"),
             "{text}"
         );
+        assert!(text.contains('│'), "the editor edge is one divider: {text}");
         assert!(
-            text.contains("┌") && text.contains("explore"),
-            "the title sits in the side panel frame: {text}"
+            !text.contains('┌') && !text.contains('└'),
+            "explore has no dialog frame: {text}"
         );
     }
 
