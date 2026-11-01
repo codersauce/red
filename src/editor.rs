@@ -36,6 +36,7 @@ mod diagnostics_picker;
 mod display_layout;
 mod edit_batch;
 mod edit_history;
+mod explore_ui;
 mod file_watch;
 mod inline_actions;
 mod inline_agent_outcomes;
@@ -3016,6 +3017,8 @@ pub enum Action {
 
     GoToLine(usize),
     GoToDefinition,
+    /// Code-reading command. The string is a small verb such as `toggle` or `follow`.
+    ExploreCommand(String),
 
     JumpBack,
     JumpForward,
@@ -3752,6 +3755,9 @@ pub struct Editor {
     /// Full-document structural queries, independent from viewport highlighting.
     syntax_textobjects: SyntaxTextObjectService,
     syntax_indentation: crate::syntax_indent::SyntaxIndentation,
+
+    /// Reading tools: symbol follow, skeleton dimming, and the context sidebar.
+    explore: crate::explore::Session,
 
     /// Cached syntax highlight spans per buffer for the most recently parsed
     /// viewport-plus-margin slice.
@@ -5940,6 +5946,7 @@ impl Editor {
             highlighter,
             syntax_textobjects,
             syntax_indentation,
+            explore: crate::explore::Session::default(),
             highlight_cache: HashMap::new(),
             bracket_match_cache: None,
             layout_cache: std::cell::RefCell::new(HashMap::new()),
@@ -7619,11 +7626,15 @@ impl Editor {
         window
             .inner_height()
             .saturating_sub(self.window_content_top(window))
+            .saturating_sub(self.explore_chrome_rows(window))
     }
 
     fn window_content_width(&self, window: &crate::window::Window) -> usize {
         let gutter_width = self.gutter_width_for_window(window);
-        window.inner_width().saturating_sub(gutter_width + 1)
+        window
+            .inner_width()
+            .saturating_sub(gutter_width + 1)
+            .saturating_sub(self.explore_sidebar_columns(window))
     }
 
     fn layout_for_window(&self, window: &crate::window::Window) -> std::sync::Arc<DisplayLayout> {
@@ -18674,6 +18685,15 @@ impl Editor {
         if cmd == "update" {
             return vec![Action::UpdateRed];
         }
+        if cmd == "explore" || cmd.starts_with("explore ") {
+            let argument = cmd.strip_prefix("explore").unwrap_or_default().trim();
+            let command = if argument.is_empty() {
+                "toggle".to_string()
+            } else {
+                argument.to_string()
+            };
+            return vec![Action::ExploreCommand(command)];
+        }
         if cmd == "learn" {
             return vec![Action::OpenLearn];
         }
@@ -23809,6 +23829,10 @@ impl Editor {
             Action::GoToLine(line) => {
                 self.go_to_line(*line, buffer, runtime, GoToLinePosition::Center)
                     .await?
+            }
+            Action::ExploreCommand(command) => {
+                add_to_history = false;
+                self.execute_explore_command(command, buffer, runtime).await?;
             }
             Action::GoToDefinition => {
                 if let Some(file) = self.current_buffer().file.clone() {

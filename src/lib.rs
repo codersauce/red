@@ -32,6 +32,7 @@ pub mod copilot;
 pub mod dispatcher;
 pub mod editing;
 pub mod editor;
+pub mod explore;
 pub mod formatter;
 pub mod headless;
 pub mod highlighter;

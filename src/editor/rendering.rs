@@ -1814,6 +1814,9 @@ impl Editor {
             self.request_motion_render(super::MotionRender::Cursor);
             return Ok(());
         }
+        if self.explore.enabled {
+            return self.render_motion_frame(buffer);
+        }
         let _span = super::perf::PerfSpan::start("render:motion_delta");
         self.update_gutter_width();
         self.fix_cursor_pos();
@@ -2318,6 +2321,7 @@ impl Editor {
             // Render overlays within window bounds
             self.render_overlays_in_window(buffer, &window)?;
             self.render_inline_prediction_in_window(buffer, &window)?;
+            self.paint_explore_chrome(buffer, &window)?;
         }
 
         Ok(())
