@@ -105,6 +105,12 @@ sidebar column so that row belongs to the panel.
    (`1 file`, `Same spelling. gd asks the language server.`) is the same
    muted style, after one blank row.
 
+The row above the status line is the cursor's location, not a history of
+jumps: enclosing function, kind, then name, with empty and repeated segments
+left out. A trail counter such as `2/2` sits at the right in the muted color
+only while the trail has entries. `DIM` and `REVIEW` stay on that row in the
+status-line mode style.
+
 `sideBarSectionHeader.*` is present in many themes and is only for that title
 band. Section headers do not borrow it, because its background often matches
 `sideBar.background` and its foreground is not a reliable step above the body.

@@ -7,8 +7,13 @@ sidebar, dimming, and a review trail so a function is easier to follow. It does
 not send the buffer to a model and it does not ask you a question.
 
 Turn it on with `Space e e`, `Space E`, or `:explore`. The sidebar opens on the
-right when the window is wide enough, and a one-line trail sits above the
-status line. `Space e ?` opens Keyboard shortcuts scoped to the explore
+right when the window is wide enough. The row above the status line is
+where the cursor is now: the enclosing function when there is one, the kind,
+then the name, joined by ` › `. On `let template` inside `review` that is
+`review › variable › template`. On `struct LaunchSpec;` it is
+`struct › LaunchSpec`. A repeated word is dropped, and the word `explore` is
+not used as a stand-in. After a jump the same row stays on the cursor, and
+the right end shows the trail position, such as `2/2`. `Space e ?` opens Keyboard shortcuts scoped to the explore
 bindings. Which-key, after `Space e`, shows only the next key.
 
 `Space` is the same leader as the rest of Red. After `Space`, `e` is the
@@ -31,7 +36,7 @@ The sidebar follows the cursor. `Explore` shares the top row with the file name.
 - A plain count sits just after a function, struct, enum, trait, or type
   definition when the line is short enough to leave room. The number is the
   name matches in the index, in the status-line color. Dim and review show as
-  `DIM` and `REVIEW` on the trail row, in the same prominent style as `NORMAL`.
+  `DIM` and `REVIEW` on the location row, in the same prominent style as `NORMAL`.
 
 ## Keys
 
@@ -56,8 +61,10 @@ The sidebar follows the cursor. `Explore` shares the top row with the file name.
 `type`, `back`, `forward`, `next`, `prev`, `index`, `refresh`, `pr`, `pr origin/main`,
 and `help`.
 
-Click a reference, definition, or trail crumb to jump there. Jumps are recorded
-on the trail so you can walk back.
+Click a reference or definition to jump there. Jumps are recorded on the trail
+so `Space e b` and `Space e n` can walk back. The bottom row does not list
+those jumps. It keeps showing the cursor, and adds `1/2` style counter while
+the trail has entries.
 
 While explore is off, double-click still selects a word.
 

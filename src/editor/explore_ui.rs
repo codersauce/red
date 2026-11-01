@@ -978,42 +978,12 @@ fn paint_breadcrumb(
     };
     buffer.fill_rect(x, y, width, 1, ' ', &style, &fill_theme);
     let gap = if ascii { " > " } else { " › " };
-    let mut hits = Vec::new();
     let mut text = String::from(" ");
-    if view.trail.is_empty() {
-        if let Some(function) = &view.in_function {
-            text.push_str(function);
-        } else {
-            text.push_str("explore");
-        }
-        if !view.cursor_syntax.is_empty() {
+    for (index, segment) in location_segments(view).iter().enumerate() {
+        if index > 0 {
             text.push_str(gap);
-            text.push_str(&view.cursor_syntax);
         }
-        if let Some(name) = &view.cursor_name {
-            text.push_str(gap);
-            text.push_str(name);
-        }
-    } else {
-        let mut cursor = 1usize;
-        for (index, crumb) in view.trail.iter().enumerate() {
-            if index > 0 {
-                text.push_str(gap);
-                cursor += display_width(gap);
-            }
-            let start = cursor;
-            text.push_str(&crumb.label);
-            cursor += display_width(&crumb.label);
-            hits.push(Hit {
-                x0: x + start,
-                x1: x + cursor,
-                y,
-                jump: crumb.clone(),
-            });
-            if cursor > width.saturating_sub(16) {
-                break;
-            }
-        }
+        text.push_str(segment);
     }
     let mut tail = Vec::new();
     if !view.pr_summary.is_empty() {
@@ -1031,6 +1001,19 @@ fn paint_breadcrumb(
             theme.statusline_style.outer_style.clone(),
         ));
     }
+    if !view.trail.is_empty() {
+        let counter = format!(" {}/{} ", view.trail_at + 1, view.trail.len());
+        let mut counter_style = theme.ui_style.muted.clone();
+        counter_style.bg = style.bg.or(counter_style.bg);
+        counter_style.fg = theme
+            .colors
+            .get("descriptionForeground")
+            .or_else(|| theme.colors.get("editorLineNumber.foreground"))
+            .copied()
+            .or(counter_style.fg)
+            .or(style.fg);
+        tail.push((counter, counter_style));
+    }
     let tail_w = tail
         .iter()
         .map(|(label, _)| display_width(label))
@@ -1045,7 +1028,28 @@ fn paint_breadcrumb(
             cursor += display_width(label);
         }
     }
-    hits
+    Vec::new()
+}
+
+fn location_segments(view: &View) -> Vec<String> {
+    let mut segments = Vec::new();
+    if let Some(function) = &view.in_function {
+        push_distinct(&mut segments, function);
+    }
+    if !view.cursor_syntax.is_empty() {
+        push_distinct(&mut segments, &view.cursor_syntax);
+    }
+    if let Some(name) = &view.cursor_name {
+        push_distinct(&mut segments, name);
+    }
+    segments
+}
+
+fn push_distinct(segments: &mut Vec<String>, next: &str) {
+    if next.is_empty() || segments.last().is_some_and(|previous| previous == next) {
+        return;
+    }
+    segments.push(next.to_string());
 }
 
 fn row(text: String, tone: Tone, jump: Option<Jump>) -> Row {
@@ -1298,6 +1302,62 @@ fn review(owned: bool) -> bool {
         let cell = &screen.cells[explore_at];
         assert_eq!(cell.style.bg, title_bg);
         assert!(cell.style.bold);
+    }
+
+    #[test]
+    fn location_row_follows_the_cursor_and_counts_the_trail() {
+        let mut editor = editor_with(SOURCE);
+        editor.explore.enabled = true;
+        let mut screen = RenderBuffer::new(120, 36, &editor.theme.style);
+
+        place(&mut editor, 3, "template");
+        editor.render(&mut screen).unwrap();
+        let inside = screen_text(&screen);
+        assert!(inside.contains("review › variable › template"), "{inside}");
+        assert!(!inside.contains("1/1"), "{inside}");
+
+        place(&mut editor, 0, "LaunchSpec");
+        editor.render(&mut screen).unwrap();
+        let top = screen_text(&screen);
+        assert!(top.contains("struct › LaunchSpec"), "{top}");
+        assert!(top.contains("top of the file"), "{top}");
+        assert!(!top.contains("explore ›"), "{top}");
+        assert!(!top.contains("1/1"), "{top}");
+
+        place(&mut editor, 3, "LaunchSpec");
+        editor.sync_explore_buffer();
+        let from = editor.cursor_crumb();
+        let position = editor.cursor_text_position();
+        let to = editor
+            .explore
+            .definition_jump(position.line, position.character)
+            .expect("definition");
+        editor.explore.record_jump(from, to.clone());
+        editor.cy = to.line;
+        editor.cx = to.column;
+        editor.sync_to_window();
+        editor.render(&mut screen).unwrap();
+        let jumped = screen_text(&screen);
+        assert!(jumped.contains("struct › LaunchSpec"), "{jumped}");
+        assert!(jumped.contains("2/2"), "{jumped}");
+        assert!(!jumped.contains("LaunchSpec › LaunchSpec"), "{jumped}");
+        assert!(jumped.contains("top of the file"), "{jumped}");
+
+        let back = editor.explore.back().expect("trail back");
+        editor.cy = back.line;
+        editor.cx = back.column;
+        editor.sync_to_window();
+        editor.render(&mut screen).unwrap();
+        let returned = screen_text(&screen);
+        assert!(returned.contains("1/2"), "{returned}");
+        assert!(returned.contains("review ›"), "{returned}");
+    }
+
+    fn place(editor: &mut Editor, line: usize, needle: &str) {
+        let text = editor.current_buffer().get(line).unwrap_or_default();
+        editor.cy = line;
+        editor.cx = text.find(needle).unwrap_or(0);
+        editor.sync_to_window();
     }
 
     #[test]
