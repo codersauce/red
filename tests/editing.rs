@@ -9998,7 +9998,9 @@ async fn focused_agent_panel_keeps_global_leader_until_the_composer_is_focused()
         panic!("expected Space to start the leader sequence from the conversation, got {action:?}");
     };
     assert_eq!(leader.len(), 8);
-    for global in ["A", "?", "d", "e", "m", "N", "P", "s"] {
+    // Space e is the explore group and stays with the buffer. The error list,
+    // which used to be Space e, is Space D and remains available from a panel.
+    for global in ["A", "?", "d", "D", "m", "N", "P", "s"] {
         assert!(
             leader.contains_key(global),
             "global leader branch {global:?} must remain available"

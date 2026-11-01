@@ -22145,126 +22145,37 @@ impl Editor {
     }
 
     #[allow(clippy::double_must_use)]
-    #[async_recursion::async_recursion]
-    async fn execute_action_inner(
+    fn execute_action_inner<'a>(
+        &'a mut self,
+        action: &'a Action,
+        buffer: &'a mut RenderBuffer,
+        runtime: &'a mut Runtime,
+        tracking: bool,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<bool>> + Send + 'a>>
+    {
+        let fut = self.execute_action_inner_body(action, buffer, runtime, tracking);
+        Box::pin(fut)
+    }
+
+    #[allow(clippy::double_must_use)]
+    /// Match arms that run before ex commands.
+    ///
+    /// `Ok(None)` leaves the action for the later group. `Ok(Some((true, quit)))`
+    /// returns immediately. `Ok(Some((false, _)))` means the action ran and the
+    /// shared tail should run.
+    ///
+    /// A shell command re-enters this dispatcher. In a debug build the whole
+    /// match keeps one stack frame, and two of those frames no longer fit in
+    /// the 2 MiB test stack. These arms stay in their own frame.
+    #[inline(never)]
+    async fn dispatch_actions_before_commands(
         &mut self,
         action: &Action,
         buffer: &mut RenderBuffer,
         runtime: &mut Runtime,
         tracking: bool,
-    ) -> anyhow::Result<bool> {
-        // log!("Action: {action:?}");
-        self.half_page_keeps_screen_row = false;
-        self.set_legacy_message(None);
-        if self.intercept_learn_action(action, buffer, runtime)? {
-            return Ok(false);
-        }
-        if self.current_buffer().directory.is_some()
-            && matches!(
-                action,
-                Action::Save
-                    | Action::ForceSave
-                    | Action::SaveAs(_)
-                    | Action::ForceSaveAs(_)
-                    | Action::SetBufferName(_)
-                    | Action::EnterMode(Mode::Insert)
-                    | Action::SetSyntax(_)
-            )
-        {
-            self.set_legacy_message(Some("Directory buffers are read-only".to_string()));
-            self.render(buffer)?;
-            return Ok(false);
-        }
-        if matches!(
-            action,
-            Action::Save | Action::ForceSave | Action::SaveAs(_) | Action::ForceSaveAs(_)
-        ) && self
-            .tutorial_controller
-            .as_ref()
-            .is_some_and(|tutorial| tutorial.practice_buffer_id == self.current_buffer().id())
-        {
-            self.last_error = Some("the Red tutorial practice buffer cannot be saved".to_string());
-            self.render(buffer)?;
-            return Ok(false);
-        }
-        let sensitive_action = matches!(
-            action,
-            Action::NotifyPlugin(_, _, _) | Action::RunShell(_) | Action::RunShellFilter { .. }
-        ) || matches!(
-            action,
-            Action::CopilotFinishSignIn(_)
-                | Action::CopilotEnableAndSignIn
-                | Action::CopilotCopySignInCode(_)
-                | Action::CopilotRetrySignIn
-                | Action::CopilotDismissSignIn
-                | Action::CopilotRespond { .. }
-        ) || matches!(action, Action::SubmitInlineAssist(_))
-            || matches!(action, Action::StageInlineAssistHandoff { .. })
-            || matches!(action, Action::NotifyPlugins(method, _) if method.starts_with("composer:"));
-        if !sensitive_action {
-            self.actions.push(action.clone());
-        }
-        // The action history is only read back by visual-block replication,
-        // which records absolute indices in `pending_select_action`. Trim the
-        // front when nothing is recording so the history can't grow without
-        // bound over a long session.
-        const MAX_ACTION_HISTORY: usize = 1024;
-        if self.pending_select_action.is_none() && self.actions.len() > MAX_ACTION_HISTORY {
-            let excess = self.actions.len() - MAX_ACTION_HISTORY / 2;
-            self.actions.drain(..excess);
-        }
-
-        let mut add_to_history = tracking;
-        if matches!(
-            action,
-            Action::SplitHorizontal
-                | Action::SplitVertical
-                | Action::SplitHorizontalNewBuffer
-                | Action::SplitVerticalNewBuffer
-                | Action::SplitHorizontalWithFile(_)
-                | Action::SplitVerticalWithFile(_)
-                | Action::CloseWindow
-                | Action::NextWindow
-                | Action::PreviousWindow
-                | Action::MoveWindowUp
-                | Action::MoveWindowDown
-                | Action::MoveWindowLeft
-                | Action::MoveWindowRight
-                | Action::MoveWindowToLeft
-                | Action::MoveWindowToBottom
-                | Action::MoveWindowToTop
-                | Action::MoveWindowToRight
-                | Action::EnterPaneResizeMode
-                | Action::ResizeWindowUp(_)
-                | Action::ResizeWindowDown(_)
-                | Action::ResizeWindowLeft(_)
-                | Action::ResizeWindowRight(_)
-                | Action::BalanceWindows
-                | Action::ResetPanelLayout(_)
-                | Action::MaximizeWindow
-                | Action::OnlyWindow
-        ) && self.clear_pane_zoom()
-        {
-            self.invalidate_terminal_render_state(buffer);
-            self.render(buffer)?;
-        }
-        let action_buffer_id = self.current_buffer().id();
-        let signature_snapshot = self.signature_snapshot();
-        let action_buffer_revision = self.current_buffer().revision();
-        self.lsp_coordinator
-            .ensure_notified_revision(action_buffer_id, action_buffer_revision);
-        let event_snapshot_before_action = self.event_snapshot();
-        let action_cause = Self::action_cause(action);
-        let jump_entry_before_action = self.jump_origin_for_action(action);
-        let picker_handle_before_action = self
-            .current_dialog
-            .as_ref()
-            .and_then(|dialog| dialog.picker_handle());
-        let composer_handle_before_action = self
-            .current_dialog
-            .as_ref()
-            .and_then(|dialog| dialog.composer_handle());
-
+        add_to_history: &mut bool,
+    ) -> anyhow::Result<Option<(bool, bool)>> {
         match action {
             Action::MousePress {
                 column,
@@ -22288,25 +22199,25 @@ impl Editor {
                     .get(&self.current_buffer().id())
                     .and_then(|commands| commands.cancel.clone());
                 if let Some(command) = scratch_command {
-                    add_to_history = false;
+                    *add_to_history = false;
                     self.execute_plugin_command(buffer, runtime, &command)
                         .await?;
                 } else {
                     if *force {
-                        return Ok(true);
+                        return Ok(Some((true, true)));
                     }
                     if self.defer_quit_for_pending_save() {
-                        return Ok(false);
+                        return Ok(Some((true, false)));
                     }
                     let modified_buffers = self.modified_buffers();
                     if modified_buffers.is_empty() {
-                        return Ok(true);
+                        return Ok(Some((true, true)));
                     }
                     self.set_legacy_message(Some(format!(
                         "The following buffers have unwritten changes: {}",
                         modified_buffers.join(", ")
                     )));
-                    return Ok(false);
+                    return Ok(Some((true, false)));
                 }
             }
             Action::MoveUp => {
@@ -22392,14 +22303,14 @@ impl Editor {
             Action::RepeatCharSearch(count) => {
                 let Some((kind, target)) = self.last_character_motion else {
                     self.set_legacy_message(Some("no previous character search".to_string()));
-                    return Ok(false);
+                    return Ok(Some((true, false)));
                 };
                 self.move_to_forward_character(target, *count, kind, buffer)?;
             }
             Action::RepeatCharSearchOpposite(count) => {
                 let Some((kind, target)) = self.last_character_motion else {
                     self.set_legacy_message(Some("no previous character search".to_string()));
-                    return Ok(false);
+                    return Ok(Some((true, false)));
                 };
                 let kind = match kind {
                     ForwardCharacterMotion::Find => ForwardCharacterMotion::FindBackward,
@@ -22438,7 +22349,7 @@ impl Editor {
             }
             Action::MoveToViewportTop(count) | Action::MoveToViewportBottom(count) => {
                 let Some(window) = self.active_window_with_editor_view() else {
-                    return Ok(false);
+                    return Ok(Some((true, false)));
                 };
                 let layout = self.layout_for_window(&window);
                 let mut visible_lines = Vec::new();
@@ -22461,7 +22372,7 @@ impl Editor {
             }
             Action::MoveToViewportMiddle => {
                 let Some(window) = self.active_window_with_editor_view() else {
-                    return Ok(false);
+                    return Ok(Some((true, false)));
                 };
                 let layout = self.layout_for_window(&window);
                 let middle = layout.screen_height().saturating_sub(1) / 2;
@@ -22527,7 +22438,7 @@ impl Editor {
                 self.render_motion_frame(buffer)?;
             }
             Action::EnterSearch(direction) => {
-                add_to_history = false;
+                *add_to_history = false;
                 self.selection = None;
                 self.pending_visual_text_object_scope = None;
                 self.pending_operator = None;
@@ -22536,7 +22447,7 @@ impl Editor {
                 self.render(buffer)?;
             }
             Action::RestoreLastVisualSelection => {
-                add_to_history = false;
+                *add_to_history = false;
                 if self.restore_last_visual_selection() {
                     self.render(buffer)?;
                 } else {
@@ -22583,11 +22494,11 @@ impl Editor {
             | Action::ViewInlineAssistAnswer
             | Action::EscalateInlineAssist
             | Action::StageInlineAssistHandoff { .. } => {
-                add_to_history = tracking && Self::records_jump(action);
+                *add_to_history = tracking && Self::records_jump(action);
                 if let std::ops::ControlFlow::Break(quit) =
                     self.execute_inline_action(action, buffer, runtime).await?
                 {
-                    return Ok(quit);
+                    return Ok(Some((true, quit)));
                 }
             }
             Action::OpenAgentAnnotation(id) => {
@@ -22595,15 +22506,15 @@ impl Editor {
                     .await?;
             }
             Action::EnterMode(new_mode) => {
-                add_to_history = false;
+                *add_to_history = false;
                 if self.execute_enter_mode(*new_mode, buffer, runtime).await? {
-                    return Ok(false);
+                    return Ok(Some((true, false)));
                 }
             }
             Action::InsertCharAtCursorPos(c) => {
                 if self.insert_at_multi_cursors(&c.to_string()) {
                     self.publish_multi_cursor_edit(buffer, runtime).await?;
-                    return Ok(false);
+                    return Ok(Some((true, false)));
                 }
                 let completion_dialog_open = self
                     .current_dialog
@@ -23203,7 +23114,7 @@ impl Editor {
                 self.advance_semantic_change_past_history(revision);
             }
             Action::SelectPreviousUndoBranch => {
-                add_to_history = false;
+                *add_to_history = false;
                 let message = self
                     .current_buffer_mut()
                     .undo_history
@@ -23216,7 +23127,7 @@ impl Editor {
                 self.draw_commandline(buffer);
             }
             Action::SelectNextUndoBranch => {
-                add_to_history = false;
+                *add_to_history = false;
                 let message = self
                     .current_buffer_mut()
                     .undo_history
@@ -23229,7 +23140,7 @@ impl Editor {
                 self.draw_commandline(buffer);
             }
             Action::AgentUnsavedEditChoice(choice) => {
-                add_to_history = false;
+                *add_to_history = false;
                 Box::pin(self.resolve_agent_edit_decision(*choice, buffer, runtime)).await?;
             }
             Action::RevertTransaction(transaction_id) => {
@@ -23237,20 +23148,20 @@ impl Editor {
                 Box::pin(self.revert_transaction(transaction_id, buffer, runtime)).await?;
             }
             Action::RepeatLastChange => {
-                add_to_history = false;
+                *add_to_history = false;
                 self.replay_last_semantic_change(buffer, runtime).await?;
             }
             Action::PlayMacro(register) => {
-                add_to_history = false;
+                *add_to_history = false;
                 self.play_macro(*register, buffer, runtime).await?;
             }
             Action::SetMark(mark) => {
-                add_to_history = false;
+                *add_to_history = false;
                 self.set_named_mark(*mark);
             }
             Action::JumpToMark { mark, linewise } => {
                 if *mark == '\'' {
-                    add_to_history = false;
+                    *add_to_history = false;
                     if let Some(entry) = self.active_jump_list().previous_context.clone() {
                         self.remember_previous_context(self.current_jump_entry());
                         self.jump_to_entry(&entry, buffer, runtime).await?;
@@ -23271,7 +23182,7 @@ impl Editor {
                     };
                     let Some(mut anchor) = anchor else {
                         self.set_legacy_message(Some(format!("mark {mark} is not set")));
-                        return Ok(false);
+                        return Ok(Some((true, false)));
                     };
 
                     if let Some(index) = self
@@ -23290,13 +23201,13 @@ impl Editor {
                             self.set_legacy_message(Some(format!(
                                 "marked buffer for {mark} disappeared"
                             )));
-                            return Ok(false);
+                            return Ok(Some((true, false)));
                         };
                         if !Path::new(&file).exists() {
                             self.set_legacy_message(Some(format!(
                                 "marked file for {mark} disappeared"
                             )));
-                            return Ok(false);
+                            return Ok(Some((true, false)));
                         }
                         self.execute_with_tracking(
                             &Action::OpenFile(file),
@@ -23313,7 +23224,7 @@ impl Editor {
                         self.set_legacy_message(Some(format!(
                             "marked buffer for {mark} disappeared"
                         )));
-                        return Ok(false);
+                        return Ok(Some((true, false)));
                     }
 
                     let mut position = anchor.fallback;
@@ -23333,7 +23244,7 @@ impl Editor {
                     Err(error) => {
                         self.set_legacy_message(Some(error.to_string()));
                         self.render(buffer)?;
-                        return Ok(false);
+                        return Ok(Some((true, false)));
                     }
                 };
                 if substitutions.is_empty() && command.suppress_errors {
@@ -23352,12 +23263,12 @@ impl Editor {
                 }
             }
             Action::ConfirmSubstitute(decision) => {
-                add_to_history = false;
+                *add_to_history = false;
                 let Some(mut confirmation) = self.substitute_confirmation.take() else {
                     self.set_legacy_message(Some(
                         "no substitute confirmation is active".to_string(),
                     ));
-                    return Ok(false);
+                    return Ok(Some((true, false)));
                 };
                 match decision {
                     SubstituteDecision::Yes | SubstituteDecision::Last => {
@@ -23399,22 +23310,22 @@ impl Editor {
                 }
             }
             Action::SetMacroRegister { register, keys } => {
-                add_to_history = false;
+                *add_to_history = false;
                 let Some(register) = normalize_macro_register(*register) else {
                     self.set_legacy_message(Some(
                         "macro register must be a letter or digit".to_string(),
                     ));
-                    return Ok(false);
+                    return Ok(Some((true, false)));
                 };
                 if let Err(error) = Self::macro_events_from_notation(keys) {
                     self.set_legacy_message(Some(error.to_string()));
-                    return Ok(false);
+                    return Ok(Some((true, false)));
                 }
                 self.set_register(register, Content::charwise(keys.clone()));
                 self.draw_commandline(buffer);
             }
             Action::PrintRegisters => {
-                add_to_history = false;
+                *add_to_history = false;
                 let mut registers = self
                     .registers
                     .iter()
@@ -23583,14 +23494,14 @@ impl Editor {
             Action::DeletePreviousChar => {
                 if self.delete_before_multi_cursors() {
                     self.publish_multi_cursor_edit(buffer, runtime).await?;
-                    return Ok(false);
+                    return Ok(Some((true, false)));
                 }
                 let completion_dialog_open = self
                     .current_dialog
                     .as_ref()
                     .is_some_and(|dialog| dialog.allows_event_passthrough());
                 if self.cx == 0 && self.buffer_line() == 0 {
-                    return Ok(false);
+                    return Ok(Some((true, false)));
                 }
 
                 let started_transaction = !self.transaction_active();
@@ -23670,7 +23581,7 @@ impl Editor {
                 }
             }
             Action::DumpHistory => {
-                add_to_history = false;
+                *add_to_history = false;
                 self.clean_jump_list();
                 let (entries, index) = {
                     let list = self.active_jump_list();
@@ -23701,15 +23612,15 @@ impl Editor {
                 log!("");
             }
             Action::DumpBuffer => {
-                add_to_history = false;
+                *add_to_history = false;
                 log!("{buffer}", buffer = buffer.dump(false));
             }
             Action::DumpDiagnostics => {
-                add_to_history = false;
+                *add_to_history = false;
                 log!("{diagnostics:#?}", diagnostics = self.diagnostics);
             }
             Action::DumpCapabilities => {
-                add_to_history = false;
+                *add_to_history = false;
                 log!(
                     "client: {}",
                     serde_json::to_string_pretty(&get_client_capabilities("workspace-uri"))?
@@ -23720,11 +23631,11 @@ impl Editor {
                 );
             }
             Action::DoPing => {
-                add_to_history = false;
+                *add_to_history = false;
                 self.lsp.workspace_symbol("").await?;
             }
             Action::ViewLogs => {
-                add_to_history = false;
+                *add_to_history = false;
                 if let Some(log_file) = self.config.log_file.clone() {
                     let path = match normalized_file_path(&log_file) {
                         Ok(path) => path,
@@ -23733,7 +23644,7 @@ impl Editor {
                                 "Failed to open log file: {}",
                                 e
                             )));
-                            return Ok(false);
+                            return Ok(Some((true, false)));
                         }
                     };
                     let log_file = path.to_string_lossy().into_owned();
@@ -23745,7 +23656,7 @@ impl Editor {
                                     "Failed to open log file: {}",
                                     e
                                 )));
-                                return Ok(false);
+                                return Ok(Some((true, false)));
                             }
                         };
                         self.set_current_buffer(buffer, index).await?;
@@ -23766,9 +23677,146 @@ impl Editor {
             | Action::PluginManagerInstall(..)
             | Action::PluginManagerAction(..)
             | Action::PluginManagerFinished { .. } => {
-                add_to_history = false;
+                *add_to_history = false;
                 self.execute_package_action(action, buffer, runtime).await?;
             }
+            _ => return Ok(None),
+        }
+        Ok(Some((false, false)))
+    }
+
+    async fn execute_action_inner_body(
+        &mut self,
+        action: &Action,
+        buffer: &mut RenderBuffer,
+        runtime: &mut Runtime,
+        tracking: bool,
+    ) -> anyhow::Result<bool> {
+        // log!("Action: {action:?}");
+        self.half_page_keeps_screen_row = false;
+        self.set_legacy_message(None);
+        if self.intercept_learn_action(action, buffer, runtime)? {
+            return Ok(false);
+        }
+        if self.current_buffer().directory.is_some()
+            && matches!(
+                action,
+                Action::Save
+                    | Action::ForceSave
+                    | Action::SaveAs(_)
+                    | Action::ForceSaveAs(_)
+                    | Action::SetBufferName(_)
+                    | Action::EnterMode(Mode::Insert)
+                    | Action::SetSyntax(_)
+            )
+        {
+            self.set_legacy_message(Some("Directory buffers are read-only".to_string()));
+            self.render(buffer)?;
+            return Ok(false);
+        }
+        if matches!(
+            action,
+            Action::Save | Action::ForceSave | Action::SaveAs(_) | Action::ForceSaveAs(_)
+        ) && self
+            .tutorial_controller
+            .as_ref()
+            .is_some_and(|tutorial| tutorial.practice_buffer_id == self.current_buffer().id())
+        {
+            self.last_error = Some("the Red tutorial practice buffer cannot be saved".to_string());
+            self.render(buffer)?;
+            return Ok(false);
+        }
+        let sensitive_action = matches!(
+            action,
+            Action::NotifyPlugin(_, _, _) | Action::RunShell(_) | Action::RunShellFilter { .. }
+        ) || matches!(
+            action,
+            Action::CopilotFinishSignIn(_)
+                | Action::CopilotEnableAndSignIn
+                | Action::CopilotCopySignInCode(_)
+                | Action::CopilotRetrySignIn
+                | Action::CopilotDismissSignIn
+                | Action::CopilotRespond { .. }
+        ) || matches!(action, Action::SubmitInlineAssist(_))
+            || matches!(action, Action::StageInlineAssistHandoff { .. })
+            || matches!(action, Action::NotifyPlugins(method, _) if method.starts_with("composer:"));
+        if !sensitive_action {
+            self.actions.push(action.clone());
+        }
+        // The action history is only read back by visual-block replication,
+        // which records absolute indices in `pending_select_action`. Trim the
+        // front when nothing is recording so the history can't grow without
+        // bound over a long session.
+        const MAX_ACTION_HISTORY: usize = 1024;
+        if self.pending_select_action.is_none() && self.actions.len() > MAX_ACTION_HISTORY {
+            let excess = self.actions.len() - MAX_ACTION_HISTORY / 2;
+            self.actions.drain(..excess);
+        }
+
+        let mut add_to_history = tracking;
+        if matches!(
+            action,
+            Action::SplitHorizontal
+                | Action::SplitVertical
+                | Action::SplitHorizontalNewBuffer
+                | Action::SplitVerticalNewBuffer
+                | Action::SplitHorizontalWithFile(_)
+                | Action::SplitVerticalWithFile(_)
+                | Action::CloseWindow
+                | Action::NextWindow
+                | Action::PreviousWindow
+                | Action::MoveWindowUp
+                | Action::MoveWindowDown
+                | Action::MoveWindowLeft
+                | Action::MoveWindowRight
+                | Action::MoveWindowToLeft
+                | Action::MoveWindowToBottom
+                | Action::MoveWindowToTop
+                | Action::MoveWindowToRight
+                | Action::EnterPaneResizeMode
+                | Action::ResizeWindowUp(_)
+                | Action::ResizeWindowDown(_)
+                | Action::ResizeWindowLeft(_)
+                | Action::ResizeWindowRight(_)
+                | Action::BalanceWindows
+                | Action::ResetPanelLayout(_)
+                | Action::MaximizeWindow
+                | Action::OnlyWindow
+        ) && self.clear_pane_zoom()
+        {
+            self.invalidate_terminal_render_state(buffer);
+            self.render(buffer)?;
+        }
+        let action_buffer_id = self.current_buffer().id();
+        let signature_snapshot = self.signature_snapshot();
+        let action_buffer_revision = self.current_buffer().revision();
+        self.lsp_coordinator
+            .ensure_notified_revision(action_buffer_id, action_buffer_revision);
+        let event_snapshot_before_action = self.event_snapshot();
+        let action_cause = Self::action_cause(action);
+        let jump_entry_before_action = self.jump_origin_for_action(action);
+        let picker_handle_before_action = self
+            .current_dialog
+            .as_ref()
+            .and_then(|dialog| dialog.picker_handle());
+        let composer_handle_before_action = self
+            .current_dialog
+            .as_ref()
+            .and_then(|dialog| dialog.composer_handle());
+
+        match self
+            .dispatch_actions_before_commands(
+                action,
+                buffer,
+                runtime,
+                tracking,
+                &mut add_to_history,
+            )
+            .await?
+        {
+            Some((true, quit)) => return Ok(quit),
+            Some((false, _)) => {}
+            None => match action {
             Action::Command(cmd) => {
                 if Self::is_shell_ex_command(cmd) {
                     log!("Handling command: [shell command]");
@@ -26085,6 +26133,8 @@ impl Editor {
                     self.render(buffer)?;
                 }
             }
+                _ => {}
+        }
         }
 
         if let Some(generated) = self.generated_indent {
