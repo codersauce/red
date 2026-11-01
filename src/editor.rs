@@ -23832,8 +23832,8 @@ impl Editor {
             }
             Action::ExploreCommand(command) => {
                 add_to_history = false;
-                self.execute_explore_command(command, buffer, runtime)
-                    .await?;
+                // Box the future so it is not stored in execute's state machine.
+                self.explore_command(command, buffer, runtime).await?;
             }
             Action::GoToDefinition => {
                 if let Some(file) = self.current_buffer().file.clone() {

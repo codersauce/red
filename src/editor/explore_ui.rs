@@ -39,6 +39,16 @@ impl Editor {
         explore_chrome_rows(self, window)
     }
 
+    #[inline(never)]
+    pub(super) fn explore_command<'a>(
+        &'a mut self,
+        command: &'a str,
+        buffer: &'a mut RenderBuffer,
+        runtime: &'a mut Runtime,
+    ) -> futures::future::BoxFuture<'a, anyhow::Result<()>> {
+        Box::pin(self.execute_explore_command(command, buffer, runtime))
+    }
+
     pub(crate) async fn execute_explore_command(
         &mut self,
         command: &str,
