@@ -261,6 +261,78 @@ async fn running_codex_process_survives_disconnect_and_reattach() {
     server_result.unwrap();
 }
 
+async fn shell_command_client(directory: &Path, gate: &Path, marker: &Path) {
+    let mut first = connect_session(directory, "shell-work", None, (100, 24))
+        .await
+        .unwrap();
+    first
+        .input(InputEvent::Key {
+            code: KeyCode::Character(':'),
+            modifiers: Vec::new(),
+            key_kind: red::headless::KeyKind::Press,
+        })
+        .await
+        .unwrap();
+    first
+        .input(InputEvent::Paste {
+            text: format!(
+                "!sh -c 'while test -f \"{}\"; do sleep 0.01; done; printf completed > \"{}\"'",
+                gate.display(),
+                marker.display()
+            ),
+        })
+        .await
+        .unwrap();
+
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        first.input(InputEvent::Key {
+            code: KeyCode::Enter,
+            modifiers: Vec::new(),
+            key_kind: red::headless::KeyKind::Press,
+        }),
+    )
+    .await
+    .expect("launching a shell command blocked its detach IPC response")
+    .unwrap();
+    drop(first);
+    std::fs::remove_file(gate).unwrap();
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !marker.exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("shell command did not continue after disconnect");
+    assert_eq!(std::fs::read_to_string(marker).unwrap(), "completed");
+
+    let mut second = connect_session(directory, "shell-work", None, (100, 24))
+        .await
+        .unwrap();
+    let mut found_completion = second
+        .initial_render
+        .lines
+        .iter()
+        .any(|line| line.text.contains("Shell finished"));
+    for _ in 0..25 {
+        if found_completion {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        found_completion = second
+            .heartbeat()
+            .await
+            .unwrap()
+            .lines
+            .iter()
+            .any(|line| line.text.contains("Shell finished"));
+    }
+    assert!(found_completion, "reattach did not expose shell completion");
+    stop_session(directory, "shell-work").await.unwrap();
+    drop(second);
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn shell_command_survives_disconnect_without_blocking_detach_ipc() {
     let directory = tempfile::tempdir().unwrap();
@@ -280,79 +352,10 @@ async fn shell_command_survives_disconnect_without_blocking_detach_ipc() {
     let core = DetachedEditorCore::new(editor).await.unwrap();
     let session = bind_session(directory.path(), "shell-work").unwrap();
 
-    let server = serve_editor_session(&session, core);
-    let client = async {
-        let mut first = connect_session(directory.path(), "shell-work", None, (100, 24))
-            .await
-            .unwrap();
-        first
-            .input(InputEvent::Key {
-                code: KeyCode::Character(':'),
-                modifiers: Vec::new(),
-                key_kind: red::headless::KeyKind::Press,
-            })
-            .await
-            .unwrap();
-        first
-            .input(InputEvent::Paste {
-                text: format!(
-                    "!sh -c 'while test -f \"{}\"; do sleep 0.01; done; printf completed > \"{}\"'",
-                    gate.display(),
-                    marker.display()
-                ),
-            })
-            .await
-            .unwrap();
-
-        tokio::time::timeout(
-            Duration::from_secs(1),
-            first.input(InputEvent::Key {
-                code: KeyCode::Enter,
-                modifiers: Vec::new(),
-                key_kind: red::headless::KeyKind::Press,
-            }),
-        )
-        .await
-        .expect("launching a shell command blocked its detach IPC response")
-        .unwrap();
-        drop(first);
-        std::fs::remove_file(&gate).unwrap();
-
-        tokio::time::timeout(Duration::from_secs(5), async {
-            while !marker.exists() {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("shell command did not continue after disconnect");
-        assert_eq!(std::fs::read_to_string(&marker).unwrap(), "completed");
-
-        let mut second = connect_session(directory.path(), "shell-work", None, (100, 24))
-            .await
-            .unwrap();
-        let mut found_completion = second
-            .initial_render
-            .lines
-            .iter()
-            .any(|line| line.text.contains("Shell finished"));
-        for _ in 0..25 {
-            if found_completion {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-            found_completion = second
-                .heartbeat()
-                .await
-                .unwrap()
-                .lines
-                .iter()
-                .any(|line| line.text.contains("Shell finished"));
-        }
-        assert!(found_completion, "reattach did not expose shell completion");
-        stop_session(directory.path(), "shell-work").await.unwrap();
-        drop(second);
-    };
-
+    // The client future is large. Keeping it on this function's stack next to
+    // the editor's command executor overflows the 2MB test thread.
+    let server = Box::pin(serve_editor_session(&session, core));
+    let client = Box::pin(shell_command_client(directory.path(), &gate, &marker));
     let (server_result, ()) = tokio::join!(server, client);
     server_result.unwrap();
 }
