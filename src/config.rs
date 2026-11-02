@@ -255,6 +255,12 @@ pub struct Config {
     /// width of the visible text. Defaults to on. The cursor line is shown raw
     /// while editing or when the cursor enters a concealed span.
     pub markdown_conceal: Option<bool>,
+    /// How standalone Markdown images are drawn. Defaults to automatic detection.
+    #[serde(default)]
+    pub markdown_images: MarkdownImagesMode,
+    /// Maximum screen rows reserved for one inline Markdown image.
+    #[serde(default = "default_markdown_image_max_height")]
+    pub markdown_image_max_height: usize,
     /// Focus after opening a Markdown link in its remembered split.
     #[serde(default)]
     pub markdown_link_split_focus: MarkdownLinkSplitFocus,
@@ -692,6 +698,29 @@ pub enum PickerInputPosition {
     /// Place input after results.
     #[default]
     Bottom,
+}
+
+/// Terminal rendering used for standalone Markdown images.
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum MarkdownImagesMode {
+    /// Query the terminal, then fall back to half-blocks and a text placeholder.
+    #[default]
+    Auto,
+    /// Kitty graphics protocol, including Ghostty and WezTerm.
+    Kitty,
+    /// iTerm2 inline images protocol, including VS Code's terminal.
+    Iterm2,
+    /// Sixel, including foot, mlterm, and recent Windows Terminal.
+    Sixel,
+    /// Unicode upper-half-block cells in truecolor.
+    Halfblocks,
+    /// Do not draw pixels. Show a one-line placeholder away from the cursor.
+    Off,
+}
+
+fn default_markdown_image_max_height() -> usize {
+    16
 }
 
 /// Which pane retains focus when a Markdown link opens in its destination.
@@ -2125,6 +2154,8 @@ fn known_top_level_field(field: &str) -> bool {
             | "wrap"
             | "markdown_tables"
             | "markdown_conceal"
+            | "markdown_images"
+            | "markdown_image_max_height"
             | "markdown_link_split_focus"
             | "wrap_window_navigation"
             | "relative_line_numbers"
@@ -4748,6 +4779,30 @@ groups = [["\\bif\\b", "\\belse\\b", "\\bendif\\b"]]
         assert_eq!(config.key_hints, KeyHintsConfig::default());
         assert!(config.key_hints.enabled);
         assert_eq!(config.key_hints.delay_ms, 250);
+    }
+
+    #[test]
+    fn markdown_images_mode_loads_defaults_and_recovers_invalid_user_values() {
+        let path = Path::new("config.toml");
+        for (source, expected, diagnostics) in [
+            ("", MarkdownImagesMode::Auto, 0),
+            (
+                "markdown_images = 'halfblocks'",
+                MarkdownImagesMode::Halfblocks,
+                0,
+            ),
+            ("markdown_images = 'off'", MarkdownImagesMode::Off, 0),
+            ("markdown_images = 'nope'", MarkdownImagesMode::Auto, 1),
+        ] {
+            let loaded = Config::load_user_toml(source, path, &[]).unwrap();
+            assert_eq!(loaded.config.markdown_images, expected);
+            assert_eq!(loaded.diagnostics.len(), diagnostics);
+        }
+        let defaults = Config::load_user_toml("", path, &[]).unwrap();
+        assert_eq!(defaults.config.markdown_image_max_height, 16);
+        let loaded = Config::load_user_toml("markdown_image_max_height = 9", path, &[]).unwrap();
+        assert_eq!(loaded.config.markdown_image_max_height, 9);
+        assert_eq!(loaded.config.markdown_images, MarkdownImagesMode::Auto);
     }
 
     #[test]

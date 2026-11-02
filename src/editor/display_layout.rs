@@ -160,6 +160,53 @@ fn break_indent_width(line: &str, width: usize, options: BreakIndentOptions) -> 
     )
 }
 
+/// One screen row of a Markdown image block.
+///
+/// `index` is the row within the image. `start_col` on the segment repeats
+/// that index so viewport scrolling can skip rows with `skipcol`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct ImageSpan {
+    pub index: u16,
+    pub rows: u16,
+    pub cols: u16,
+    pub placeholder: bool,
+}
+
+/// Builds the screen rows reserved for one inline image.
+pub(super) fn image_line_segments(
+    line: usize,
+    rows: u16,
+    cols: u16,
+    placeholder: bool,
+) -> Vec<LineSegment> {
+    (0..rows)
+        .map(|index| LineSegment {
+            line,
+            row: usize::from(index),
+            start_col: usize::from(index),
+            end_col: usize::from(index),
+            start_grapheme: 0,
+            end_grapheme: 0,
+            start_byte: 0,
+            end_byte: 0,
+            start_grapheme_col: 0,
+            source_offset: 0,
+            first_segment: index == 0,
+            last_segment: index + 1 == rows,
+            visual_offset: 0,
+            concealed: Vec::new(),
+            projection: None,
+            projection_left: 0,
+            image: Some(ImageSpan {
+                index,
+                rows,
+                cols,
+                placeholder,
+            }),
+        })
+        .collect()
+}
+
 /// Byte ranges of one source line that occupy no screen cells.
 ///
 /// Ranges are relative to the line without its line ending. They are sorted,
@@ -275,10 +322,15 @@ pub struct LineSegment {
     /// A table row maps disjoint cell ranges instead of one linear source slice.
     pub(super) projection: Option<std::sync::Arc<super::markdown_tables::ProjectedRow>>,
     pub(super) projection_left: usize,
+    /// Set when this row is part of an inline Markdown image.
+    pub(super) image: Option<ImageSpan>,
 }
 
 impl LineSegment {
     pub fn contains_display_col(&self, col: usize) -> bool {
+        if self.image.is_some() {
+            return col == 0;
+        }
         if let Some(projection) = &self.projection {
             return projection.contains(col);
         }
@@ -292,6 +344,9 @@ impl LineSegment {
     /// Includes the insertion caret after the final character, but keeps
     /// boundaries between wrapped segments exclusive on the preceding row.
     pub fn contains_cursor_col(&self, col: usize) -> bool {
+        if let Some(image) = self.image {
+            return image.index == 0 && col == 0;
+        }
         if self.projection.is_some() {
             return self.contains_display_col(col);
         }
@@ -299,6 +354,9 @@ impl LineSegment {
     }
 
     pub fn screen_col_for_display_col(&self, col: usize, width: usize) -> usize {
+        if self.image.is_some() {
+            return 0;
+        }
         if let Some(projection) = &self.projection {
             return projection
                 .column_for_source(col)
@@ -311,6 +369,9 @@ impl LineSegment {
     }
 
     pub fn display_col_for_screen_col(&self, col: usize) -> usize {
+        if self.image.is_some() {
+            return 0;
+        }
         if let Some(projection) = &self.projection {
             return projection.source_for_column(col + self.projection_left);
         }
@@ -682,9 +743,10 @@ pub struct LayoutConfig {
 }
 
 pub fn layout_lines(lines: &[String], line_count: usize, config: LayoutConfig) -> DisplayLayout {
-    layout_lines_with_tables(lines, line_count, config, None, None, None, None)
+    layout_lines_with_tables(lines, line_count, config, None, None, None, None, None)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn layout_lines_with_tables(
     lines: &[String],
     line_count: usize,
@@ -693,6 +755,7 @@ pub(super) fn layout_lines_with_tables(
     reveal: Option<&Range<usize>>,
     concealments: Option<&LineConcealments>,
     conceal_reveal: Option<&Range<usize>>,
+    images: Option<&super::markdown_images::ImageLayout>,
 ) -> DisplayLayout {
     if config.content_width == 0 || config.height == 0 {
         return DisplayLayout::default();
@@ -720,7 +783,13 @@ pub(super) fn layout_lines_with_tables(
             0
         };
         let segments =
-            if let Some(table) = tables.and_then(|tables| tables.line(line_index, reveal)) {
+            if let Some(image_rows) = images.and_then(|images| images.rendered(line_index)) {
+                image_rows
+                    .iter()
+                    .filter(|segment| line_skipcol == 0 || segment.start_col >= line_skipcol)
+                    .cloned()
+                    .collect()
+            } else if let Some(table) = tables.and_then(|tables| tables.line(line_index, reveal)) {
                 table
                     .rows
                     .iter()
@@ -733,7 +802,8 @@ pub(super) fn layout_lines_with_tables(
                     .collect()
             } else if config.wrap {
                 let show_source = reveal.is_some_and(|range| range.contains(&line_index))
-                    || conceal_reveal.is_some_and(|range| range.contains(&line_index));
+                    || conceal_reveal.is_some_and(|range| range.contains(&line_index))
+                    || images.is_some_and(|images| images.raw_lines.contains(&line_index));
                 let concealment = if show_source {
                     Concealment::default()
                 } else {
@@ -882,6 +952,7 @@ fn wrap_line_segments_with_limit(
                     last_segment: false,
                     visual_offset: if first_segment { 0 } else { indent },
                     concealed: ranges,
+                    image: None,
                 });
                 if segments.len() == max_segments {
                     return segments;
@@ -927,6 +998,7 @@ fn wrap_line_segments_with_limit(
             last_segment: true,
             visual_offset: if first_segment { 0 } else { indent },
             concealed: concealed_ranges,
+            image: None,
         });
     }
 
@@ -976,6 +1048,7 @@ fn wrap_line_segments_with_limit(
             last_segment: start_col == line_width,
             visual_offset: if first_segment { 0 } else { indent },
             concealed: Vec::new(),
+            image: None,
         });
     }
 
@@ -1040,6 +1113,7 @@ pub(super) fn nowrap_line_segment(
         last_segment: end_byte == line.len(),
         visual_offset: 0,
         concealed: Vec::new(),
+        image: None,
     }]
 }
 

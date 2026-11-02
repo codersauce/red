@@ -52,6 +52,7 @@ mod keyboard_shortcuts;
 mod learning;
 mod lsp_coordinator;
 mod markdown_conceal;
+mod markdown_images;
 mod markdown_links;
 mod markdown_lists;
 mod markdown_tables;
@@ -135,7 +136,7 @@ use crate::{
     comment::CommentSyntax,
     config::{
         Config, ConfigDiagnostic, ConfigDiagnosticSource, ConfigRecovery, FormattingProvider,
-        KeyAction, LanguageFormatterConfig, PickerIconStyle, StatuslineConfig,
+        KeyAction, LanguageFormatterConfig, MarkdownImagesMode, PickerIconStyle, StatuslineConfig,
     },
     dispatcher::Dispatcher,
     editing::{
@@ -993,6 +994,9 @@ struct RenderedViewport {
     markdown_reveal: Option<(usize, usize)>,
     markdown_conceal: bool,
     markdown_conceal_reveal: Option<(usize, usize)>,
+    markdown_images: MarkdownImagesMode,
+    markdown_image_reveal: Option<(usize, usize)>,
+    markdown_image_epoch: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3445,6 +3449,10 @@ struct LayoutCacheKey {
     markdown_reveal: Option<std::ops::Range<usize>>,
     markdown_conceal: bool,
     markdown_conceal_reveal: Option<std::ops::Range<usize>>,
+    markdown_images: MarkdownImagesMode,
+    markdown_image_reveal: Option<std::ops::Range<usize>>,
+    markdown_image_epoch: u64,
+    markdown_image_max_rows: usize,
     markdown_ascii: bool,
 }
 
@@ -3750,6 +3758,7 @@ pub struct Editor {
     layout_cache: std::cell::RefCell<HashMap<LayoutCacheKey, std::sync::Arc<DisplayLayout>>>,
     markdown_table_cache: RefCell<HashMap<BufferId, markdown_tables::CachedTables>>,
     markdown_conceal_cache: RefCell<HashMap<BufferId, markdown_conceal::CachedConcealment>>,
+    markdown_images: RefCell<markdown_images::ImageRuntime>,
     markdown_link_cache: RefCell<HashMap<BufferId, markdown_links::CachedLinks>>,
     markdown_link_destinations: HashMap<WindowId, markdown_links::LinkDestination>,
 
@@ -5891,6 +5900,7 @@ impl Editor {
             layout_cache: std::cell::RefCell::new(HashMap::new()),
             markdown_table_cache: RefCell::new(HashMap::new()),
             markdown_conceal_cache: RefCell::new(HashMap::new()),
+            markdown_images: RefCell::new(markdown_images::ImageRuntime::new()),
             markdown_link_cache: RefCell::new(HashMap::new()),
             markdown_link_destinations: HashMap::new(),
             window_manager,
@@ -6442,6 +6452,11 @@ impl Editor {
             markdown_conceal_reveal: self
                 .markdown_conceal_reveal(window)
                 .map(|range| (range.start, range.end)),
+            markdown_images: self.config.markdown_images,
+            markdown_image_reveal: self
+                .markdown_image_source_reveal(window)
+                .map(|range| (range.start, range.end)),
+            markdown_image_epoch: self.markdown_image_epoch(),
         })
     }
 
@@ -7580,6 +7595,7 @@ impl Editor {
         let prediction = self
             .visible_inline_suggestion()
             .filter(|suggestion| window.active && suggestion.snapshot.buffer_id == buffer.id());
+        let images = self.prepare_markdown_images(window);
         let key = LayoutCacheKey {
             inline_selection: self.inline_comment_selection(window.id, buffer.id()),
             buffer_index: window.buffer_index,
@@ -7599,6 +7615,10 @@ impl Editor {
             markdown_reveal: self.markdown_reveal_range(window),
             markdown_conceal: self.markdown_conceal_enabled(window),
             markdown_conceal_reveal: self.markdown_conceal_reveal(window),
+            markdown_images: self.config.markdown_images,
+            markdown_image_reveal: self.markdown_image_source_reveal(window),
+            markdown_image_epoch: self.markdown_image_epoch(),
+            markdown_image_max_rows: self.markdown_image_max_rows(),
             markdown_ascii: self.config.window_borders_ascii,
         };
         if let Some(layout) = self.layout_cache.borrow().get(&key) {
@@ -7638,6 +7658,7 @@ impl Editor {
             key.markdown_reveal.as_ref(),
             concealments.as_deref(),
             key.markdown_conceal_reveal.as_ref(),
+            images.as_ref(),
         )
         .with_inline_comments(
             &comments,
@@ -8521,6 +8542,9 @@ impl Editor {
         line_index: usize,
         width: usize,
     ) -> Vec<self::display_layout::LineSegment> {
+        if let Some(segments) = self.markdown_image_line_segments(line_index, width) {
+            return segments;
+        }
         if let Some(segments) = self.markdown_line_segments(line_index, width) {
             return segments;
         }
@@ -8604,7 +8628,7 @@ impl Editor {
     fn clamp_cursor_to_scrolled_viewport(&mut self) {
         if !self.wrap
             && !self.has_inline_comments(self.current_buffer().id())
-            && !self.active_has_markdown_tables()
+            && !(self.active_has_markdown_tables() || self.active_has_markdown_images())
         {
             return;
         }
@@ -8652,7 +8676,7 @@ impl Editor {
     fn scroll_wrapped_viewport_down_one_screen_line(&mut self) -> bool {
         if !self.wrap
             && !self.has_inline_comments(self.current_buffer().id())
-            && !self.active_has_markdown_tables()
+            && !(self.active_has_markdown_tables() || self.active_has_markdown_images())
         {
             return false;
         }
@@ -8672,12 +8696,12 @@ impl Editor {
     fn scroll_wrapped_viewport_up_one_screen_line(&mut self) -> bool {
         if !self.wrap
             && !self.has_inline_comments(self.current_buffer().id())
-            && !self.active_has_markdown_tables()
+            && !(self.active_has_markdown_tables() || self.active_has_markdown_images())
         {
             return false;
         }
 
-        if !self.wrap && !self.active_has_markdown_tables() {
+        if !self.wrap && !(self.active_has_markdown_tables() || self.active_has_markdown_images()) {
             let Some(previous_line) = self.vtop.checked_sub(1) else {
                 return false;
             };
@@ -8736,7 +8760,7 @@ impl Editor {
 
         if !self.wrap
             && !self.has_inline_comments(self.current_buffer().id())
-            && !self.active_has_markdown_tables()
+            && !(self.active_has_markdown_tables() || self.active_has_markdown_images())
         {
             let scrolloff = self
                 .config
@@ -9380,7 +9404,7 @@ impl Editor {
     fn check_bounds(&mut self) -> bool {
         let old_position = (self.cx, self.cy, self.vtop);
         let has_comments = self.has_inline_comments(self.current_buffer().id())
-            || self.active_has_markdown_tables();
+            || (self.active_has_markdown_tables() || self.active_has_markdown_images());
         let last_line = if self.is_insert() {
             self.current_buffer().len()
         } else {
@@ -11113,6 +11137,7 @@ impl Editor {
         let interactive_startup = perf::PerfSpan::start("startup:interactive");
         terminal::enable_raw_mode()?;
         self.terminal_active = true;
+        self.probe_terminal_graphics();
         self.stdout
             .execute(event::EnableMouseCapture)?
             .execute(event::EnableFocusChange)?
@@ -11597,6 +11622,10 @@ impl Editor {
         runtime: &mut Runtime,
     ) -> anyhow::Result<()> {
         let _span = perf::PerfSpan::start("editor:background");
+        if self.poll_markdown_images() {
+            self.force_full_redraw = true;
+            self.render(buffer)?;
+        }
         self.plugin_registry.poll_rpc_lifecycle(runtime).await;
         for event in std::mem::take(&mut self.pending_panel_events) {
             let topic = format!("panel:event:{}", event.panel_id);
@@ -21270,6 +21299,11 @@ impl Editor {
             return Ok(());
         }
         let _restore = perf::PerfSpan::start("shutdown:restore_terminal");
+        let shutdown_images = self.markdown_image_shutdown_sequence();
+        if !shutdown_images.is_empty() {
+            let _ = std::io::Write::write_all(&mut self.stdout, shutdown_images.as_bytes());
+            let _ = self.stdout.flush();
+        }
         let keyboard_result = std::mem::take(&mut self.keyboard_protocol).stop(&mut self.stdout);
         let output_result = Self::restore_terminal_output(&mut self.stdout);
         let raw_mode_result = terminal::disable_raw_mode();
@@ -23922,7 +23956,7 @@ impl Editor {
             }
             Action::ScrollUp => {
                 let scroll_lines = self.config.mouse_scroll_lines.unwrap_or(3);
-                if self.active_has_markdown_tables() {
+                if self.active_has_markdown_tables() || self.active_has_markdown_images() {
                     self.scroll_markdown_viewport(false, scroll_lines);
                     self.sync_to_window();
                     self.render_motion_frame(buffer)?;
@@ -23948,7 +23982,7 @@ impl Editor {
             }
             Action::ScrollDown => {
                 let scroll_lines = self.config.mouse_scroll_lines.unwrap_or(3);
-                if self.active_has_markdown_tables() {
+                if self.active_has_markdown_tables() || self.active_has_markdown_images() {
                     self.scroll_markdown_viewport(true, scroll_lines);
                     self.sync_to_window();
                     self.render_motion_frame(buffer)?;
@@ -31596,7 +31630,13 @@ impl Editor {
         let line = line.trim_end_matches('\n');
         let display_col = grapheme_to_column_with_tabs(line, self.cx, self.active_tab_width());
 
-        if self.active_has_markdown_tables() {
+        // Image scrolling stores the visible image row in skipcol. Showing the
+        // source again must not treat that row index as a horizontal offset.
+        if self.image_line_is_raw(buffer_line) {
+            self.skipcol = 0;
+        }
+
+        if self.active_has_markdown_tables() || self.active_has_markdown_images() {
             self.ensure_markdown_cursor_visible(buffer_line, display_col, width);
             return;
         }
