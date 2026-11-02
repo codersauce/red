@@ -280,6 +280,31 @@ impl super::Editor {
             .then_some(line..line + 1)
     }
 
+    pub(super) fn toggle_markdown_conceal(&mut self) {
+        let enabled = self
+            .window_manager
+            .active_window()
+            .map(|window| {
+                window
+                    .markdown_conceal
+                    .unwrap_or(self.config.markdown_conceal.unwrap_or(true))
+            })
+            .unwrap_or(true);
+        if let Some(window) = self.window_manager.active_window_mut() {
+            window.markdown_conceal = Some(!enabled);
+        }
+        self.vleft = 0;
+        self.skipcol = 0;
+        self.set_legacy_message(Some(
+            if enabled {
+                "Markdown conceal disabled"
+            } else {
+                "Markdown conceal enabled"
+            }
+            .to_string(),
+        ));
+    }
+
     pub(super) fn concealment_for_line(&self, line: usize) -> Concealment {
         let Some(window) = self.active_window_with_editor_view() else {
             return Concealment::default();
@@ -554,5 +579,57 @@ mod tests {
         let mut rust = markdown_editor("lib.rs", source, 80, 12);
         let rendered = flat(&screen(&mut rust));
         assert!(rendered.contains("https://example.com/a"), "{rendered}");
+    }
+
+    #[test]
+    fn search_highlight_follows_visible_columns_on_other_lines() {
+        let source = "cursor line\nSee [docs](https://example.com) tail\n";
+        let mut editor = markdown_editor("notes.md", source, 80, 12);
+        let highlight = crate::color::Color::Rgb {
+            r: 20,
+            g: 40,
+            b: 60,
+        };
+        let marked = Style {
+            bg: Some(highlight),
+            ..Style::default()
+        };
+        editor.theme.find_match_style = Some(marked.clone());
+        editor.theme.find_match_highlight_style = Some(marked);
+        editor.search_term = "tail".to_string();
+        let line = "See [docs](https://example.com) tail";
+        let tail = line.find("tail").unwrap();
+        let tail_col = crate::unicode_utils::display_width(&line[..tail]);
+        let window = editor.active_window_with_editor_view().unwrap();
+        let segment = editor
+            .layout_for_window(&window)
+            .rows
+            .iter()
+            .find(|segment| segment.line == 1)
+            .unwrap()
+            .clone();
+        let spans = segment.visible_screen_spans(tail_col, tail_col + 4);
+        assert_eq!(
+            spans,
+            vec![(segment.visual_offset + 9, segment.visual_offset + 13)]
+        );
+        assert_ne!(spans[0].0, tail_col);
+
+        let mut frame = RenderBuffer::new(80, 12, &Style::default());
+        editor.render(&mut frame).unwrap();
+        let row = segment.row;
+        let term_y = editor.window_to_terminal_y(&window, row);
+        let origin =
+            editor.window_to_terminal_x(&window, editor.gutter_width_for_window(&window) + 1);
+        let highlighted: String = (spans[0].0..spans[0].1)
+            .map(|local| {
+                let cell = &frame.cells[term_y * frame.width + origin + local];
+                assert_eq!(cell.style.bg, Some(highlight), "{local}: {}", cell.text);
+                cell.text.clone()
+            })
+            .collect();
+        assert_eq!(highlighted, "tail");
+        let raw = &frame.cells[term_y * frame.width + origin + tail_col];
+        assert_ne!(raw.style.bg, Some(highlight));
     }
 }

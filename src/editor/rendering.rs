@@ -3411,33 +3411,33 @@ impl Editor {
                             }
                             continue;
                         }
-                        let start = start_col.max(segment.start_col);
-                        let end = end_col.min(segment.end_col);
-                        if end <= start {
-                            continue;
-                        }
-
-                        let local_start =
-                            segment.visual_offset + start.saturating_sub(segment.start_col);
-                        if local_start >= content_width {
-                            continue;
-                        }
-                        let local_end = (segment.visual_offset
-                            + end.saturating_sub(segment.start_col))
-                        .min(content_width);
                         let terminal_y = self.window_to_terminal_y(window, segment.row);
-                        buffer.set_bg_for_range(
-                            Point::new(
-                                self.window_to_terminal_x(window, content_start + local_start),
-                                terminal_y,
-                            ),
-                            Point::new(
-                                self.window_to_terminal_x(window, content_start + local_end - 1),
-                                terminal_y,
-                            ),
-                            &bg,
-                            &self.theme,
-                        );
+                        for (local_start, local_end) in
+                            segment.visible_screen_spans(start_col, end_col)
+                        {
+                            if local_start >= content_width {
+                                continue;
+                            }
+                            let local_end = local_end.min(content_width);
+                            if local_end <= local_start {
+                                continue;
+                            }
+                            buffer.set_bg_for_range(
+                                Point::new(
+                                    self.window_to_terminal_x(window, content_start + local_start),
+                                    terminal_y,
+                                ),
+                                Point::new(
+                                    self.window_to_terminal_x(
+                                        window,
+                                        content_start + local_end - 1,
+                                    ),
+                                    terminal_y,
+                                ),
+                                &bg,
+                                &self.theme,
+                            );
+                        }
                     }
                 } else {
                     let points = self
@@ -3503,21 +3503,17 @@ impl Editor {
                 }
                 continue;
             }
-            let start = start_col.max(segment.start_col);
-            let end = end_col.min(segment.end_col);
-            if end <= start {
-                continue;
-            }
-
-            for col in start..end {
-                let local_x = segment.visual_offset + col.saturating_sub(segment.start_col);
-                if local_x >= content_width {
+            for (local_start, local_end) in segment.visible_screen_spans(start_col, end_col) {
+                if local_start >= content_width {
                     continue;
                 }
-                points.push(Point::new(
-                    self.window_to_terminal_x(window, content_start + local_x),
-                    self.window_to_terminal_y(window, segment.row),
-                ));
+                let local_end = local_end.min(content_width);
+                for local_x in local_start..local_end {
+                    points.push(Point::new(
+                        self.window_to_terminal_x(window, content_start + local_x),
+                        self.window_to_terminal_y(window, segment.row),
+                    ));
+                }
             }
         }
 

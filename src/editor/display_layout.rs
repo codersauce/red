@@ -351,6 +351,44 @@ impl LineSegment {
         )
     }
 
+    /// Screen spans, including break-indent, for a source display-column range.
+    /// Concealed columns are omitted so highlights land on the visible text.
+    pub(super) fn visible_screen_spans(
+        &self,
+        start_col: usize,
+        end_col: usize,
+    ) -> Vec<(usize, usize)> {
+        let start = start_col.max(self.start_col);
+        let end = end_col.min(self.end_col);
+        if end <= start {
+            return Vec::new();
+        }
+        if self.concealed.is_empty() {
+            return vec![(
+                self.visual_offset + start - self.start_col,
+                self.visual_offset + end - self.start_col,
+            )];
+        }
+        let mut spans = Vec::new();
+        let mut column = start;
+        while column < end {
+            if let Some(hidden) = self.concealed.iter().find(|range| range.contains(&column)) {
+                column = hidden.end;
+                continue;
+            }
+            let run_start = column;
+            while column < end && !self.concealed.iter().any(|range| range.contains(&column)) {
+                column += 1;
+            }
+            let local_start = self.visual_offset + self.visible_columns_before(run_start);
+            let local_end = self.visual_offset + self.visible_columns_before(column);
+            if local_end > local_start {
+                spans.push((local_start, local_end));
+            }
+        }
+        spans
+    }
+
     /// First source column of this row that is actually drawn.
     /// Falls back to `start_col` when the row is entirely concealed.
     pub(super) fn first_visible_source_col(&self) -> usize {

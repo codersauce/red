@@ -24037,28 +24037,9 @@ impl Editor {
                 self.render(buffer)?;
             }
             Action::ToggleMarkdownConceal => {
-                let enabled = self
-                    .window_manager
-                    .active_window()
-                    .map(|window| {
-                        window
-                            .markdown_conceal
-                            .unwrap_or(self.config.markdown_conceal.unwrap_or(true))
-                    })
-                    .unwrap_or(true);
-                if let Some(window) = self.window_manager.active_window_mut() {
-                    window.markdown_conceal = Some(!enabled);
-                }
-                self.vleft = 0;
-                self.skipcol = 0;
-                self.set_legacy_message(Some(
-                    if enabled {
-                        "Markdown conceal disabled"
-                    } else {
-                        "Markdown conceal enabled"
-                    }
-                    .to_string(),
-                ));
+                // Keep this arm tiny. `execute_action_inner` is already near the
+                // 2MB test-thread stack limit when a command re-enters it.
+                self.toggle_markdown_conceal();
                 self.render(buffer)?;
             }
             Action::SetWrap(wrap) => {
