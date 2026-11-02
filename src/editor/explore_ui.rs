@@ -7,13 +7,39 @@ use unicode_segmentation::UnicodeSegmentation as _;
 
 use crate::color::{ensure_minimum_contrast, Color};
 use crate::explore::{sidebar_columns, DimZone, Hit, Jump, SyncInput, View, ViewDef, ViewRef};
-use crate::highlighter::LanguageRegistry;
 use crate::theme::{Style, SurfacePalette, Theme, MINIMUM_SELECTION_TEXT_CONTRAST};
 use crate::unicode_utils::{
     char_to_grapheme, display_width, trim_line_ending, truncate_display_width,
 };
 
 use super::{Action, Editor, RenderBuffer, Runtime};
+
+pub(super) struct ExploreIndexRun {
+    receiver: std::sync::mpsc::Receiver<crate::explore::IndexEvent>,
+    notification: crate::notification::NotificationId,
+    review: bool,
+}
+
+pub(super) struct ExploreBufferParse {
+    key: String,
+    revision: u64,
+    receiver: std::sync::mpsc::Receiver<crate::explore::ParsedBuffer>,
+}
+
+struct ExploreIndexPoll {
+    review: bool,
+    notification: crate::notification::NotificationId,
+    progress: Option<(usize, usize)>,
+    ready: Option<(Box<crate::explore::Index>, crate::explore::ScanStats)>,
+    failed: Option<String>,
+}
+
+pub(super) struct ExploreBufferSnapshot {
+    key: String,
+    revision: u64,
+    language: Option<String>,
+    source: String,
+}
 
 pub(crate) fn explore_sidebar_columns(editor: &Editor, window: &crate::window::Window) -> usize {
     if !editor.explore.enabled || !window.active {
@@ -110,7 +136,7 @@ impl Editor {
                 "forward" => self.explore_trail(true, buffer, runtime).await?,
                 "next" => self.explore_step_reference(true, buffer, runtime).await?,
                 "prev" | "previous" => self.explore_step_reference(false, buffer, runtime).await?,
-                "index" | "scan" => self.explore_scan(false, None),
+                "index" | "scan" => self.start_explore_index(false, None),
                 "refresh" => {
                     self.explore.invalidate();
                     self.sync_explore_buffer();
@@ -193,11 +219,25 @@ impl Editor {
         }
         let key = self.explore_file_key();
         let revision = self.current_buffer().revision();
-        if self.explore.is_current(&key, revision) {
+        if self.explore.is_current(&key, revision) || self.buffer_parse_covers(&key, revision) {
+            return;
+        }
+        let bytes = self.current_buffer().byte_len();
+        if bytes > crate::explore::MAX_SOURCE_BYTES {
+            self.explore.install_analysis(
+                key,
+                revision,
+                0,
+                crate::explore::Analysis::empty("file is too large for the explore parse"),
+            );
             return;
         }
         let source = self.current_buffer().contents();
         let language = self.current_language_id();
+        if bytes > crate::explore::INLINE_PARSE_BYTES {
+            self.queue_buffer_parse(key, revision, language, source);
+            return;
+        }
         let registry = self.highlighter.registry();
         self.explore.sync(SyncInput {
             key: &key,
@@ -349,39 +389,225 @@ impl Editor {
         Ok(format!("→ {label}"))
     }
 
-    fn explore_scan(&mut self, pr: bool, base: Option<&str>) -> String {
+    fn start_explore_index(&mut self, review: bool, base: Option<&str>) -> String {
+        if self.explore_index.is_some() {
+            return "An index is already running.".to_string();
+        }
         let Some(root) = self.explore_root() else {
             return "No directory to index.".to_string();
         };
-        let registry = self.highlighter.registry();
-        let result = if pr {
-            self.explore.scan_pr(&root, &registry, base)
-        } else {
-            Ok(self.explore.scan_workspace(&root, &registry))
-        };
-        self.ingest_open_buffers(&registry);
-        match result {
-            Ok(stats) => {
-                let scope = if pr { "review" } else { "project" };
-                format!(
-                    "Indexed {} {scope} {}{}. {}",
-                    stats.files,
-                    if stats.files == 1 { "file" } else { "files" },
-                    if stats.truncated { " (capped)" } else { "" },
-                    stats.message
-                )
+        let registry = self.highlighter.registry().as_ref().clone();
+        let receiver =
+            crate::explore::spawn_index(root, registry, review, base.map(str::to_string));
+        let label = if review { "review" } else { "project" };
+        let notification = self.notifications.begin_progress(
+            crate::notification::NotificationSource::Editor,
+            "explore-index",
+            crate::notification::MessageContent::new(format!("Indexing {label}")),
+            crate::notification::ProgressPriority::UserInitiated,
+            crate::notification::NotificationTime::now(),
+        );
+        match notification {
+            Ok(notification) => {
+                self.explore_index = Some(ExploreIndexRun {
+                    receiver,
+                    notification,
+                    review,
+                });
+                format!("Indexing {label}.")
             }
-            Err(error) => error,
+            Err(_) => "An index is already running.".to_string(),
         }
     }
 
     fn explore_pr(&mut self, base: Option<&str>) -> String {
+        if self.explore_index.is_some() {
+            return "An index is already running.".to_string();
+        }
         if self.explore.pr_mode && base.is_none() {
             self.explore.clear_pr();
             return "Review scope off. Dim uses every indexed definition.".to_string();
         }
         self.explore.enabled = true;
-        self.explore_scan(true, base)
+        self.start_explore_index(true, base)
+    }
+
+    pub(super) fn service_explore_background(&mut self) -> bool {
+        let mut render = self.poll_explore_index();
+        render |= self.poll_buffer_parse();
+        render
+    }
+
+    fn poll_explore_index(&mut self) -> bool {
+        let Some(ExploreIndexPoll {
+            review,
+            notification,
+            progress,
+            ready,
+            failed,
+        }) = self.drain_explore_index()
+        else {
+            return false;
+        };
+        if let Some((done, total)) = progress {
+            let label = if review { "review" } else { "project" };
+            let text = format!("Indexing {label} · {done}/{total}");
+            let percentage =
+                (total > 0).then(|| ((done.saturating_mul(100)) / total).min(100) as u8);
+            let _ = self.notifications.update_progress(
+                notification,
+                crate::notification::MessageContent::new(text.clone()),
+                percentage,
+                crate::notification::NotificationTime::now(),
+            );
+            self.set_quiet_message(Some(text));
+        }
+        if let Some((index, stats)) = ready {
+            self.explore.index = *index;
+            self.explore.pr_mode = review;
+            self.ingest_open_buffers();
+            let summary = Self::index_summary(review, &stats);
+            let _ = self.notifications.finish_progress(
+                notification,
+                crate::notification::ProgressOutcome::Succeeded,
+                crate::notification::MessageContent::new(summary.clone()),
+                crate::notification::NotificationTime::now(),
+            );
+            self.set_quiet_message(Some(summary));
+            self.explore_index = None;
+            return true;
+        }
+        if let Some(message) = failed {
+            let _ = self.notifications.finish_progress(
+                notification,
+                crate::notification::ProgressOutcome::Failed,
+                crate::notification::MessageContent::new(message.clone()),
+                crate::notification::NotificationTime::now(),
+            );
+            self.set_quiet_message(Some(message));
+            self.explore_index = None;
+            return true;
+        }
+        progress.is_some()
+    }
+
+    fn drain_explore_index(&self) -> Option<ExploreIndexPoll> {
+        let run = self.explore_index.as_ref()?;
+        let mut progress = None;
+        let mut ready = None;
+        let mut failed = None;
+        loop {
+            match run.receiver.try_recv() {
+                Ok(crate::explore::IndexEvent::Progress { done, total }) => {
+                    progress = Some((done, total));
+                }
+                Ok(crate::explore::IndexEvent::Ready { index, stats }) => {
+                    ready = Some((index, stats));
+                    break;
+                }
+                Ok(crate::explore::IndexEvent::Failed { message }) => {
+                    failed = Some(message);
+                    break;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    failed = Some("Index stopped before it finished.".to_string());
+                    break;
+                }
+            }
+        }
+        if progress.is_none() && ready.is_none() && failed.is_none() {
+            return None;
+        }
+        Some(ExploreIndexPoll {
+            review: run.review,
+            notification: run.notification,
+            progress,
+            ready,
+            failed,
+        })
+    }
+
+    fn poll_buffer_parse(&mut self) -> bool {
+        let parsed = {
+            let Some(run) = &self.explore_buffer_parse else {
+                return false;
+            };
+            match run.receiver.try_recv() {
+                Ok(parsed) => Some(parsed),
+                Err(std::sync::mpsc::TryRecvError::Empty) => return false,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => None,
+            }
+        };
+        self.explore_buffer_parse = None;
+        let mut render = false;
+        if let Some(parsed) = parsed {
+            let current = self.explore_file_key();
+            let revision = self.current_buffer().revision();
+            if parsed.key == current && parsed.revision == revision {
+                self.explore.install_analysis(
+                    parsed.key,
+                    parsed.revision,
+                    parsed.hash,
+                    parsed.analysis,
+                );
+                render = true;
+            }
+        }
+        self.kick_buffer_parse();
+        render
+    }
+
+    fn buffer_parse_covers(&self, key: &str, revision: u64) -> bool {
+        self.explore_buffer_parse
+            .as_ref()
+            .is_some_and(|parse| parse.key == key && parse.revision == revision)
+            || self
+                .explore_buffer_parse_next
+                .as_ref()
+                .is_some_and(|parse| parse.key == key && parse.revision == revision)
+    }
+
+    fn queue_buffer_parse(
+        &mut self,
+        key: String,
+        revision: u64,
+        language: Option<String>,
+        source: String,
+    ) {
+        self.explore_buffer_parse_next = Some(ExploreBufferSnapshot {
+            key,
+            revision,
+            language,
+            source,
+        });
+        if self.explore_buffer_parse.is_none() {
+            self.kick_buffer_parse();
+        }
+    }
+
+    fn kick_buffer_parse(&mut self) {
+        if self.explore_buffer_parse.is_some() {
+            return;
+        }
+        let Some(snapshot) = self.explore_buffer_parse_next.take() else {
+            return;
+        };
+        let registry = self.highlighter.registry().as_ref().clone();
+        let key = snapshot.key.clone();
+        let revision = snapshot.revision;
+        let receiver = crate::explore::spawn_buffer_parse(
+            snapshot.key,
+            snapshot.revision,
+            snapshot.language,
+            snapshot.source,
+            registry,
+        );
+        self.explore_buffer_parse = Some(ExploreBufferParse {
+            key,
+            revision,
+            receiver,
+        });
     }
 
     fn explore_root(&self) -> Option<std::path::PathBuf> {
@@ -392,7 +618,18 @@ impl Editor {
         self.explore.root_for(&key)
     }
 
-    fn ingest_open_buffers(&mut self, registry: &LanguageRegistry) {
+    fn index_summary(review: bool, stats: &crate::explore::ScanStats) -> String {
+        let scope = if review { "review" } else { "project" };
+        format!(
+            "Indexed {} {scope} {}{}. {}",
+            stats.files,
+            if stats.files == 1 { "file" } else { "files" },
+            if stats.truncated { " (capped)" } else { "" },
+            stats.message
+        )
+    }
+
+    fn ingest_open_buffers(&mut self) {
         let opened = self
             .buffer_manager
             .iter()
@@ -400,17 +637,22 @@ impl Editor {
                 let file = buffer.file.clone()?;
                 Some((
                     crate::explore::normalize_path(&file),
+                    buffer.byte_len(),
                     buffer.contents(),
                     file,
                 ))
             })
             .collect::<Vec<_>>();
-        for (key, source, file) in opened {
+        let registry = self.highlighter.registry();
+        for (key, bytes, source, file) in opened {
+            if bytes > crate::explore::INLINE_PARSE_BYTES {
+                continue;
+            }
             let Some(language) = self.highlighter.language_id_for_file(Some(&file)) else {
                 continue;
             };
             self.explore
-                .ingest_source(&key, &source, language, registry);
+                .ingest_source(&key, &source, language, &registry);
         }
     }
 
@@ -1582,6 +1824,130 @@ fn review(owned: bool) -> bool {
         assert_eq!(message, "buffer 999999 is no longer open");
         assert_eq!(editor.current_buffer().id().as_u64(), unnamed_id);
         assert_eq!(editor.buffer_line(), 1);
+    }
+
+    #[tokio::test]
+    async fn project_index_lets_the_editor_take_input_while_it_runs() {
+        use std::sync::{Arc, Barrier};
+        use std::time::{Duration, Instant};
+
+        let directory = tempfile::tempdir().unwrap();
+        let body = "fn item() { let value = 1; value }\n".repeat(4_000);
+        for index in 0..6 {
+            std::fs::write(directory.path().join(format!("file{index}.rs")), &body).unwrap();
+        }
+        let config = Config::default();
+        let lsp = Box::new(LspManager::new(config.lsp.clone()));
+        let buffer = crate::buffer::Buffer::new(
+            Some(directory.path().join("file0.rs").display().to_string()),
+            "fn cursor() {\n    let value = 1;\n}\n".into(),
+        );
+        let mut editor = Editor::with_size(
+            lsp,
+            80,
+            24,
+            config,
+            crate::theme::Theme::default(),
+            vec![buffer],
+        )
+        .unwrap();
+        editor.test_disable_terminal_output();
+        let mut screen = RenderBuffer::new(80, 24, &editor.theme.style);
+        let mut runtime = crate::plugin::Runtime::new();
+        let barrier = Arc::new(Barrier::new(2));
+        crate::explore::set_index_pause_for_test(Some(barrier.clone()));
+        struct ClearPause;
+        impl Drop for ClearPause {
+            fn drop(&mut self) {
+                crate::explore::set_index_pause_for_test(None);
+            }
+        }
+        let _clear = ClearPause;
+
+        let started = Instant::now();
+        editor
+            .execute_explore_command("index", &mut screen, &mut runtime)
+            .await
+            .unwrap();
+        let blocked = started.elapsed();
+        assert!(
+            blocked < Duration::from_millis(200),
+            "index command blocked the editor for {blocked:?}"
+        );
+        assert_eq!(editor.last_error.as_deref(), Some("Indexing project."));
+        editor
+            .execute_explore_command("index", &mut screen, &mut runtime)
+            .await
+            .unwrap();
+        assert_eq!(
+            editor.last_error.as_deref(),
+            Some("An index is already running.")
+        );
+        editor
+            .execute(&Action::MoveDown, &mut screen, &mut runtime)
+            .await
+            .unwrap();
+        assert_eq!(editor.buffer_line(), 1);
+        editor.explore.enabled = false;
+        editor.explore.invalidate();
+        editor
+            .execute(&Action::DeleteBuffer(true), &mut screen, &mut runtime)
+            .await
+            .unwrap();
+        barrier.wait();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while editor.explore_index.is_some() {
+            assert!(Instant::now() < deadline, "index did not finish");
+            editor.service_explore_background();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(editor.explore.index.file_count() >= 6);
+        editor
+            .execute(&Action::MoveDown, &mut screen, &mut runtime)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn large_buffer_reparse_does_not_block_the_next_edit() {
+        use std::time::{Duration, Instant};
+
+        let line = "fn item() { let value = 1; value }\n";
+        let source = line.repeat((crate::explore::INLINE_PARSE_BYTES / line.len()) + 40);
+        let mut editor = editor_with(&source);
+        editor.explore.enabled = true;
+        let key = editor.explore_file_key();
+        let revision = editor.current_buffer().revision();
+        let started = Instant::now();
+        editor.sync_explore_buffer();
+        let blocked = started.elapsed();
+        assert!(
+            blocked < Duration::from_millis(100),
+            "reparse blocked the editor for {blocked:?}"
+        );
+        assert!(!editor.explore.is_current(&key, revision));
+        editor
+            .execute(
+                &Action::MoveDown,
+                &mut RenderBuffer::new(120, 36, &editor.theme.style),
+                &mut crate::plugin::Runtime::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(editor.buffer_line(), 1);
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !editor.explore.is_current(&key, revision) {
+            assert!(
+                Instant::now() < deadline,
+                "background reparse did not finish"
+            );
+            editor.service_explore_background();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            editor.explore.view(0, 3).in_function.as_deref(),
+            Some("item")
+        );
     }
 
     fn screen_text(buffer: &RenderBuffer) -> String {

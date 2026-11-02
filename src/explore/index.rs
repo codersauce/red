@@ -208,11 +208,20 @@ impl Index {
     }
 
     pub fn scan_workspace(&mut self, root: &Path, registry: &LanguageRegistry) -> ScanStats {
+        self.scan_workspace_with(root, registry, &mut |_, _| {})
+    }
+
+    pub fn scan_workspace_with(
+        &mut self,
+        root: &Path,
+        registry: &LanguageRegistry,
+        progress: &mut dyn FnMut(usize, usize),
+    ) -> ScanStats {
         self.clear_files();
         self.pr_files = None;
         self.pr_base = None;
         self.pr_summary.clear();
-        self.scan_paths(root, registry, None)
+        self.scan_paths(root, registry, None, progress)
     }
 
     pub fn scan_pr(
@@ -220,6 +229,16 @@ impl Index {
         root: &Path,
         registry: &LanguageRegistry,
         base: Option<&str>,
+    ) -> Result<ScanStats, String> {
+        self.scan_pr_with(root, registry, base, &mut |_, _| {})
+    }
+
+    pub fn scan_pr_with(
+        &mut self,
+        root: &Path,
+        registry: &LanguageRegistry,
+        base: Option<&str>,
+        progress: &mut dyn FnMut(usize, usize),
     ) -> Result<ScanStats, String> {
         let base = resolve_base(root, base);
         let changed = changed_files(root, &base)?;
@@ -232,7 +251,7 @@ impl Index {
                 .map(|path| normalize_path(&path.to_string_lossy()))
                 .collect(),
         );
-        let stats = self.scan_paths(root, registry, Some(&changed));
+        let stats = self.scan_paths(root, registry, Some(&changed), progress);
         Ok(stats)
     }
 
@@ -241,6 +260,7 @@ impl Index {
         root: &Path,
         registry: &LanguageRegistry,
         only: Option<&[PathBuf]>,
+        progress: &mut dyn FnMut(usize, usize),
     ) -> ScanStats {
         self.root = Some(root.to_path_buf());
         self.scip_present = scip_present(root);
@@ -255,7 +275,10 @@ impl Index {
         if paths.len() > MAX_SCAN_FILES {
             self.truncated = true;
         }
-        for path in paths.into_iter().take(MAX_SCAN_FILES) {
+        let total = paths.len().min(MAX_SCAN_FILES);
+        progress(0, total);
+        for (done, path) in paths.into_iter().take(MAX_SCAN_FILES).enumerate() {
+            progress(done + 1, total);
             if !path.is_file() {
                 skipped += 1;
                 continue;

@@ -10,7 +10,7 @@ mod index;
 
 use std::path::{Path, PathBuf};
 
-pub use analyze::{last_type_name, Analysis, Role, Span};
+pub use analyze::{last_type_name, Analysis, Role, Span, INLINE_PARSE_BYTES, MAX_SOURCE_BYTES};
 pub use index::{language_id_from_path, normalize_path, repo_root, Index, ScanStats};
 
 use crate::highlighter::LanguageRegistry;
@@ -452,6 +452,17 @@ impl Session {
         })
     }
 
+    pub fn install_analysis(&mut self, key: String, revision: u64, hash: u64, analysis: Analysis) {
+        if analysis.language.is_some() {
+            self.index.upsert(&key, hash, &analysis);
+        }
+        self.open = Some(OpenFile {
+            key,
+            revision,
+            analysis,
+        });
+    }
+
     pub fn scan_workspace(&mut self, root: &Path, registry: &LanguageRegistry) -> ScanStats {
         self.pr_mode = false;
         self.index.scan_workspace(root, registry)
@@ -471,6 +482,100 @@ impl Session {
         let path = Path::new(file);
         repo_root(path).or_else(|| path.parent().map(Path::to_path_buf))
     }
+}
+
+pub(crate) enum IndexEvent {
+    Progress { done: usize, total: usize },
+    Ready { index: Box<Index>, stats: ScanStats },
+    Failed { message: String },
+}
+
+pub(crate) struct ParsedBuffer {
+    pub key: String,
+    pub revision: u64,
+    pub hash: u64,
+    pub analysis: Analysis,
+}
+
+#[cfg(test)]
+static INDEX_PAUSE: std::sync::Mutex<Option<std::sync::Arc<std::sync::Barrier>>> =
+    std::sync::Mutex::new(None);
+
+/// Test hook. The index thread waits on this barrier before it reads files.
+#[cfg(test)]
+pub(crate) fn set_index_pause_for_test(barrier: Option<std::sync::Arc<std::sync::Barrier>>) {
+    *INDEX_PAUSE.lock().unwrap() = barrier;
+}
+
+pub(crate) fn spawn_index(
+    root: PathBuf,
+    registry: LanguageRegistry,
+    review: bool,
+    base: Option<String>,
+) -> std::sync::mpsc::Receiver<IndexEvent> {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::Builder::new()
+        .name("explore-index".into())
+        .spawn(move || run_index(root, registry, review, base, sender))
+        .ok();
+    receiver
+}
+
+fn run_index(
+    root: PathBuf,
+    registry: LanguageRegistry,
+    review: bool,
+    base: Option<String>,
+    sender: std::sync::mpsc::Sender<IndexEvent>,
+) {
+    #[cfg(test)]
+    if let Some(barrier) = INDEX_PAUSE.lock().unwrap().clone() {
+        barrier.wait();
+    }
+    let mut index = Index::default();
+    let mut report = |done, total| {
+        let _ = sender.send(IndexEvent::Progress { done, total });
+    };
+    let outcome = if review {
+        index.scan_pr_with(&root, &registry, base.as_deref(), &mut report)
+    } else {
+        Ok(index.scan_workspace_with(&root, &registry, &mut report))
+    };
+    let event = match outcome {
+        Ok(stats) => IndexEvent::Ready {
+            index: Box::new(index),
+            stats,
+        },
+        Err(message) => IndexEvent::Failed { message },
+    };
+    let _ = sender.send(event);
+}
+
+pub(crate) fn spawn_buffer_parse(
+    key: String,
+    revision: u64,
+    language: Option<String>,
+    source: String,
+    registry: LanguageRegistry,
+) -> std::sync::mpsc::Receiver<ParsedBuffer> {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::Builder::new()
+        .name("explore-buffer".into())
+        .spawn(move || {
+            let hash = index::hash_text(&source);
+            let analysis = match language.as_deref() {
+                Some(language) => analyze::analyze(&registry, language, &source),
+                None => Analysis::empty("no language detected for this buffer"),
+            };
+            let _ = sender.send(ParsedBuffer {
+                key,
+                revision,
+                hash,
+                analysis,
+            });
+        })
+        .ok();
+    receiver
 }
 
 fn analyze_source(registry: &LanguageRegistry, language: &str, source: &str) -> Analysis {

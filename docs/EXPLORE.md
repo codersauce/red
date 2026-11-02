@@ -90,12 +90,15 @@ repository until you ask.
 - `Space e r` reparses the file you are editing. That is the fast path while you move
   through a change.
 - `Space e R` walks the git repo (respecting `.gitignore`) and parses up to 400 source
-  files with Red's tree-sitter grammars. A later edit reparses only the open
-  buffer.
+  files with Red's tree-sitter grammars. The walk runs off the editor thread.
+  The status line counts files as they are read, then shows the summary. A
+  second index command while one is running does not start another. A later
+  edit reparses only the open buffer. A large buffer is parsed in the
+  background so typing is not stuck on tree-sitter.
 - `Space e p` asks git for the changed files against `origin/main`, `main`, `master`,
   or a base you pass (`:explore pr origin/main`), then indexes those files
-  only. The sidebar shows the PR file count and a `+added −removed` summary
-  when `git diff --numstat` can provide one.
+  only, also in the background. The sidebar shows the PR file count and a
+  `+added −removed` summary when `git diff --numstat` can provide one.
 
 The index is a map from name to file and line. It does not know which `template`
 you meant when two exist. The sidebar says so.

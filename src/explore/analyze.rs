@@ -191,7 +191,10 @@ impl Analysis {
     }
 }
 
-const MAX_SOURCE_BYTES: usize = 1_500_000;
+pub const MAX_SOURCE_BYTES: usize = 1_500_000;
+/// Parses at or below this size stay on the editor thread. Larger buffers are
+/// parsed in the background so a keystroke does not wait on tree-sitter.
+pub const INLINE_PARSE_BYTES: usize = 48 * 1024;
 
 pub fn analyze(registry: &LanguageRegistry, language_id: &str, source: &str) -> Analysis {
     if source.len() > MAX_SOURCE_BYTES {
