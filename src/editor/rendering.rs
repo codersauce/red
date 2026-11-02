@@ -1298,7 +1298,7 @@ fn render_source_segment(
         }
     };
     let text = &line[segment.start_byte..segment.end_byte];
-    if text.bytes().all(|byte| (b' '..=b'~').contains(&byte)) {
+    if segment.concealed.is_empty() && text.bytes().all(|byte| (b' '..=b'~').contains(&byte)) {
         let skipped = segment
             .start_col
             .saturating_sub(segment.start_grapheme_col)
@@ -1353,12 +1353,12 @@ fn render_source_segment(
         } else {
             display_width(grapheme)
         };
-        if grapheme_col < segment.start_col {
+        if grapheme_col < segment.start_col || segment.hides_source_column(grapheme_col) {
             grapheme_col += width;
             byte_offset += grapheme.len();
             continue;
         }
-        let local_x = segment.visual_offset + grapheme_col.saturating_sub(segment.start_col);
+        let local_x = segment.visual_offset + segment.visible_columns_before(grapheme_col);
         if local_x >= geometry.width {
             break;
         }
@@ -1375,6 +1375,9 @@ fn render_source_segment(
                 .iter()
                 .position(|byte| !matches!(byte, b' '..=b'~'))
                 .unwrap_or(limit);
+            if let Some(hidden_at) = segment.next_concealed_column_after(grapheme_col) {
+                length = length.min(hidden_at.saturating_sub(grapheme_col)).max(1);
+            }
             // An ASCII base may become part of the following non-ASCII
             // grapheme, such as e plus an accent or a keycap sequence.
             if length < remaining.len()
@@ -5015,6 +5018,7 @@ mod tests {
             first_segment,
             last_segment: true,
             visual_offset: 0,
+            concealed: Vec::new(),
         }
     }
 

@@ -26,6 +26,12 @@ wrap = true
 # presentation in the current split without changing the file.
 markdown_tables = true
 
+# Hide inline Markdown markers while wrapping: link URLs and brackets, emphasis
+# markers, image markup, and code-span backticks take no cells. `:markdown-conceal`
+# toggles this in the current split. Insert, visual, search, and a cursor inside
+# concealed syntax show that line's raw text. Tables keep their own grid.
+markdown_conceal = true
+
 # Keep focus in the Markdown source when a link opens in its remembered split.
 # Set to "target" to focus the destination. Config changes apply on restart.
 markdown_link_split_focus = "source"

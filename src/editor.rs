@@ -51,6 +51,7 @@ mod inline_notifications;
 mod keyboard_shortcuts;
 mod learning;
 mod lsp_coordinator;
+mod markdown_conceal;
 mod markdown_links;
 mod markdown_lists;
 mod markdown_tables;
@@ -195,8 +196,7 @@ use crate::{
 };
 
 use self::display_layout::{
-    leading_whitespace_display_width, wrap_line_segments, BreakIndentOptions, DisplayLayout,
-    LayoutConfig,
+    leading_whitespace_display_width, BreakIndentOptions, DisplayLayout, LayoutConfig,
 };
 
 thread_local! {
@@ -991,6 +991,8 @@ struct RenderedViewport {
     gutter_width: usize,
     markdown_tables: bool,
     markdown_reveal: Option<(usize, usize)>,
+    markdown_conceal: bool,
+    markdown_conceal_reveal: Option<(usize, usize)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2929,6 +2931,8 @@ pub enum Action {
     ToggleWrap,
     SetWrap(bool),
     ToggleMarkdownTables,
+    /// Shows or hides inline Markdown syntax when measuring wrapped lines.
+    ToggleMarkdownConceal,
     SetRelativeLineNumbers(bool),
 
     DeletePreviousChar,
@@ -3439,6 +3443,8 @@ struct LayoutCacheKey {
     inline_prediction: Option<u64>,
     markdown_tables: bool,
     markdown_reveal: Option<std::ops::Range<usize>>,
+    markdown_conceal: bool,
+    markdown_conceal_reveal: Option<std::ops::Range<usize>>,
     markdown_ascii: bool,
 }
 
@@ -3743,6 +3749,7 @@ pub struct Editor {
     /// Memoized display layout, shared by the many per-frame layout queries.
     layout_cache: std::cell::RefCell<HashMap<LayoutCacheKey, std::sync::Arc<DisplayLayout>>>,
     markdown_table_cache: RefCell<HashMap<BufferId, markdown_tables::CachedTables>>,
+    markdown_conceal_cache: RefCell<HashMap<BufferId, markdown_conceal::CachedConcealment>>,
     markdown_link_cache: RefCell<HashMap<BufferId, markdown_links::CachedLinks>>,
     markdown_link_destinations: HashMap<WindowId, markdown_links::LinkDestination>,
 
@@ -5883,6 +5890,7 @@ impl Editor {
             bracket_match_cache: None,
             layout_cache: std::cell::RefCell::new(HashMap::new()),
             markdown_table_cache: RefCell::new(HashMap::new()),
+            markdown_conceal_cache: RefCell::new(HashMap::new()),
             markdown_link_cache: RefCell::new(HashMap::new()),
             markdown_link_destinations: HashMap::new(),
             window_manager,
@@ -6429,6 +6437,10 @@ impl Editor {
             markdown_tables: self.markdown_tables_enabled(window),
             markdown_reveal: self
                 .markdown_reveal_range(window)
+                .map(|range| (range.start, range.end)),
+            markdown_conceal: self.markdown_conceal_enabled(window),
+            markdown_conceal_reveal: self
+                .markdown_conceal_reveal(window)
                 .map(|range| (range.start, range.end)),
         })
     }
@@ -7585,6 +7597,8 @@ impl Editor {
             inline_prediction: prediction.map(|suggestion| suggestion.snapshot.generation),
             markdown_tables: self.markdown_tables_enabled(window),
             markdown_reveal: self.markdown_reveal_range(window),
+            markdown_conceal: self.markdown_conceal_enabled(window),
+            markdown_conceal_reveal: self.markdown_conceal_reveal(window),
             markdown_ascii: self.config.window_borders_ascii,
         };
         if let Some(layout) = self.layout_cache.borrow().get(&key) {
@@ -7615,12 +7629,15 @@ impl Editor {
             break_indent,
         };
         let tables = self.markdown_table_layout(window);
+        let concealments = self.markdown_line_concealments(window);
         let mut layout = display_layout::layout_lines_with_tables(
             &lines,
             line_count,
             layout_config,
             tables.as_deref(),
             key.markdown_reveal.as_ref(),
+            concealments.as_deref(),
+            key.markdown_conceal_reveal.as_ref(),
         )
         .with_inline_comments(
             &comments,
@@ -8489,15 +8506,14 @@ impl Editor {
         }
     }
 
-    fn current_screen_segment_bounds(&self) -> Option<(usize, usize)> {
+    fn current_screen_segment(&self) -> Option<self::display_layout::LineSegment> {
         let line_index = self.buffer_line();
         let line = self.current_line_contents()?;
         let line = trim_line_ending(&line);
         let display_col = grapheme_to_column_with_tabs(line, self.cx, self.active_tab_width());
         let window = self.window_manager.active_window()?;
         let layout = self.layout_for_window(window);
-        let segment = layout.segment_for_cursor(line_index, display_col)?;
-        Some((segment.start_col, segment.end_col))
+        layout.segment_for_cursor(line_index, display_col).cloned()
     }
 
     fn wrapped_line_segments_for_width(
@@ -8520,12 +8536,20 @@ impl Editor {
                 self.active_tab_width(),
             );
         }
-        wrap_line_segments(
-            trim_line_ending(&line),
+        let line = trim_line_ending(&line);
+        let break_indent =
+            self.break_indent_options_for_buffer_index(self.buffer_manager.active_index());
+        let concealment = self.concealment_for_line(line_index);
+        if concealment.is_empty() {
+            return display_layout::wrap_line_segments(line, line_index, width, 0, break_indent);
+        }
+        display_layout::wrap_concealed_line_segments(
+            line,
             line_index,
             width,
             0,
-            self.break_indent_options_for_buffer_index(self.buffer_manager.active_index()),
+            break_indent,
+            &concealment,
         )
     }
 
@@ -8873,13 +8897,16 @@ impl Editor {
             return Some(unchanged);
         }
         let target_position = |target: &self::display_layout::LineSegment| {
+            let mapped = target.display_col_for_screen_col(screen_col);
             let display_col = if target.projection.is_some() {
-                target.display_col_for_screen_col(screen_col)
+                mapped
             } else {
-                target
-                    .start_col
-                    .saturating_add(screen_col.saturating_sub(target.visual_offset))
-                    .min(target.end_col.saturating_sub(1))
+                let limit = if target.concealed.is_empty() {
+                    target.end_col.saturating_sub(1)
+                } else {
+                    target.last_visible_source_col()
+                };
+                mapped.min(limit)
             };
             ScreenLineTarget {
                 line: target.line,
@@ -8955,8 +8982,8 @@ impl Editor {
             return;
         }
 
-        if let Some((start_col, _)) = self.current_screen_segment_bounds() {
-            self.move_to_display_col_on_current_line(start_col);
+        if let Some(segment) = self.current_screen_segment() {
+            self.move_to_display_col_on_current_line(segment.first_visible_source_col());
         }
     }
 
@@ -8966,8 +8993,8 @@ impl Editor {
             return;
         }
 
-        if let Some((_, end_col)) = self.current_screen_segment_bounds() {
-            self.move_to_display_col_on_current_line(end_col.saturating_sub(1));
+        if let Some(segment) = self.current_screen_segment() {
+            self.move_to_display_col_on_current_line(segment.last_visible_source_col());
         }
     }
 
@@ -8983,7 +9010,7 @@ impl Editor {
             return;
         }
 
-        let Some((start_col, end_col)) = self.current_screen_segment_bounds() else {
+        let Some(segment) = self.current_screen_segment() else {
             return;
         };
         let Some(line) = self.current_line_contents() else {
@@ -8995,10 +9022,13 @@ impl Editor {
             .enumerate()
             .find_map(|(index, grapheme)| {
                 let col = grapheme_to_column_with_tabs(line, index, self.active_tab_width());
-                (col >= start_col && col < end_col && !grapheme.chars().all(char::is_whitespace))
-                    .then_some(col)
+                (col >= segment.start_col
+                    && col < segment.end_col
+                    && !segment.hides_source_column(col)
+                    && !grapheme.chars().all(char::is_whitespace))
+                .then_some(col)
             })
-            .unwrap_or(start_col);
+            .unwrap_or_else(|| segment.first_visible_source_col());
         self.move_to_display_col_on_current_line(target);
     }
 
@@ -18727,6 +18757,9 @@ impl Editor {
             if cmd == "markdown-tables" {
                 actions.push(Action::ToggleMarkdownTables);
             }
+            if cmd == "markdown-conceal" {
+                actions.push(Action::ToggleMarkdownConceal);
+            }
 
             if cmd == "statusline" {
                 actions.push(Action::OpenStatuslineManager);
@@ -24001,6 +24034,31 @@ impl Editor {
                 }
                 self.vleft = 0;
                 self.skipcol = 0;
+                self.render(buffer)?;
+            }
+            Action::ToggleMarkdownConceal => {
+                let enabled = self
+                    .window_manager
+                    .active_window()
+                    .map(|window| {
+                        window
+                            .markdown_conceal
+                            .unwrap_or(self.config.markdown_conceal.unwrap_or(true))
+                    })
+                    .unwrap_or(true);
+                if let Some(window) = self.window_manager.active_window_mut() {
+                    window.markdown_conceal = Some(!enabled);
+                }
+                self.vleft = 0;
+                self.skipcol = 0;
+                self.set_legacy_message(Some(
+                    if enabled {
+                        "Markdown conceal disabled"
+                    } else {
+                        "Markdown conceal enabled"
+                    }
+                    .to_string(),
+                ));
                 self.render(buffer)?;
             }
             Action::SetWrap(wrap) => {

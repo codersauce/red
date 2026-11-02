@@ -251,6 +251,10 @@ pub struct Config {
     pub wrap: Option<bool>,
     /// Render tables in Markdown buffers, revealing source while editing. Defaults to on.
     pub markdown_tables: Option<bool>,
+    /// Hide inline Markdown syntax when wrapping, so links and emphasis use the
+    /// width of the visible text. Defaults to on. The cursor line is shown raw
+    /// while editing or when the cursor enters a concealed span.
+    pub markdown_conceal: Option<bool>,
     /// Focus after opening a Markdown link in its remembered split.
     #[serde(default)]
     pub markdown_link_split_focus: MarkdownLinkSplitFocus,
@@ -2120,6 +2124,7 @@ fn known_top_level_field(field: &str) -> bool {
             | "scrolloff"
             | "wrap"
             | "markdown_tables"
+            | "markdown_conceal"
             | "markdown_link_split_focus"
             | "wrap_window_navigation"
             | "relative_line_numbers"
