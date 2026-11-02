@@ -1298,7 +1298,7 @@ fn render_source_segment(
         }
     };
     let text = &line[segment.start_byte..segment.end_byte];
-    if text.bytes().all(|byte| (b' '..=b'~').contains(&byte)) {
+    if segment.concealed.is_empty() && text.bytes().all(|byte| (b' '..=b'~').contains(&byte)) {
         let skipped = segment
             .start_col
             .saturating_sub(segment.start_grapheme_col)
@@ -1353,12 +1353,12 @@ fn render_source_segment(
         } else {
             display_width(grapheme)
         };
-        if grapheme_col < segment.start_col {
+        if grapheme_col < segment.start_col || segment.hides_source_column(grapheme_col) {
             grapheme_col += width;
             byte_offset += grapheme.len();
             continue;
         }
-        let local_x = segment.visual_offset + grapheme_col.saturating_sub(segment.start_col);
+        let local_x = segment.visual_offset + segment.visible_columns_before(grapheme_col);
         if local_x >= geometry.width {
             break;
         }
@@ -1375,6 +1375,9 @@ fn render_source_segment(
                 .iter()
                 .position(|byte| !matches!(byte, b' '..=b'~'))
                 .unwrap_or(limit);
+            if let Some(hidden_at) = segment.next_concealed_column_after(grapheme_col) {
+                length = length.min(hidden_at.saturating_sub(grapheme_col)).max(1);
+            }
             // An ASCII base may become part of the following non-ASCII
             // grapheme, such as e plus an accent or a keycap sequence.
             if length < remaining.len()
@@ -3408,33 +3411,33 @@ impl Editor {
                             }
                             continue;
                         }
-                        let start = start_col.max(segment.start_col);
-                        let end = end_col.min(segment.end_col);
-                        if end <= start {
-                            continue;
-                        }
-
-                        let local_start =
-                            segment.visual_offset + start.saturating_sub(segment.start_col);
-                        if local_start >= content_width {
-                            continue;
-                        }
-                        let local_end = (segment.visual_offset
-                            + end.saturating_sub(segment.start_col))
-                        .min(content_width);
                         let terminal_y = self.window_to_terminal_y(window, segment.row);
-                        buffer.set_bg_for_range(
-                            Point::new(
-                                self.window_to_terminal_x(window, content_start + local_start),
-                                terminal_y,
-                            ),
-                            Point::new(
-                                self.window_to_terminal_x(window, content_start + local_end - 1),
-                                terminal_y,
-                            ),
-                            &bg,
-                            &self.theme,
-                        );
+                        for (local_start, local_end) in
+                            segment.visible_screen_spans(start_col, end_col)
+                        {
+                            if local_start >= content_width {
+                                continue;
+                            }
+                            let local_end = local_end.min(content_width);
+                            if local_end <= local_start {
+                                continue;
+                            }
+                            buffer.set_bg_for_range(
+                                Point::new(
+                                    self.window_to_terminal_x(window, content_start + local_start),
+                                    terminal_y,
+                                ),
+                                Point::new(
+                                    self.window_to_terminal_x(
+                                        window,
+                                        content_start + local_end - 1,
+                                    ),
+                                    terminal_y,
+                                ),
+                                &bg,
+                                &self.theme,
+                            );
+                        }
                     }
                 } else {
                     let points = self
@@ -3500,21 +3503,17 @@ impl Editor {
                 }
                 continue;
             }
-            let start = start_col.max(segment.start_col);
-            let end = end_col.min(segment.end_col);
-            if end <= start {
-                continue;
-            }
-
-            for col in start..end {
-                let local_x = segment.visual_offset + col.saturating_sub(segment.start_col);
-                if local_x >= content_width {
+            for (local_start, local_end) in segment.visible_screen_spans(start_col, end_col) {
+                if local_start >= content_width {
                     continue;
                 }
-                points.push(Point::new(
-                    self.window_to_terminal_x(window, content_start + local_x),
-                    self.window_to_terminal_y(window, segment.row),
-                ));
+                let local_end = local_end.min(content_width);
+                for local_x in local_start..local_end {
+                    points.push(Point::new(
+                        self.window_to_terminal_x(window, content_start + local_x),
+                        self.window_to_terminal_y(window, segment.row),
+                    ));
+                }
             }
         }
 
@@ -5015,6 +5014,7 @@ mod tests {
             first_segment,
             last_segment: true,
             visual_offset: 0,
+            concealed: Vec::new(),
         }
     }
 

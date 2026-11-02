@@ -2744,3 +2744,42 @@ async fn closing_bracket_operator_motion_warns_without_editing() {
     harness.assert_buffer_contents(contents);
     assert_eq!(harness.last_error(), Some("No more functions to move to"));
 }
+
+#[tokio::test]
+async fn conceal_aware_wrap_moves_by_visible_screen_lines() {
+    let url = "https://example.com/docs/conceal/aware/wrapping/path";
+    let source = format!("alpha bravo [guide]({url}) charlie delta echo foxtrot golf hotel\n");
+    let mut harness = EditorHarness::with_config_and_size(
+        Buffer::new(Some("notes.md".into()), source.clone()),
+        default_key_config(),
+        36,
+        14,
+    );
+    let shown = (0..10)
+        .map(|row| harness.render_row(row).unwrap())
+        .collect::<String>()
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .collect::<String>();
+    assert!(shown.contains("guide"), "{shown}");
+    assert!(!shown.contains("example.com"), "{shown}");
+
+    type_normal_keys(&mut harness, "gj").await;
+    assert_eq!(harness.cursor_position().1, 0);
+    assert!(harness.cursor_position().0 > 0);
+    type_normal_keys(&mut harness, "gk").await;
+    harness.assert_cursor_at(0, 0);
+
+    harness
+        .execute_action(Action::Command("markdown-conceal".into()))
+        .await
+        .unwrap();
+    let raw = (0..10)
+        .map(|row| harness.render_row(row).unwrap())
+        .collect::<String>()
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .collect::<String>();
+    assert!(raw.contains("example.com"), "{raw}");
+    harness.assert_buffer_contents(&source);
+}

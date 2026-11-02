@@ -162,6 +162,8 @@ pub struct Window {
     pub wrap: bool,
     /// Window-local override for rendered Markdown tables.
     pub(crate) markdown_tables: Option<bool>,
+    /// Window-local override for inline Markdown concealment.
+    pub(crate) markdown_conceal: Option<bool>,
 
     /// Cursor x position (column) within the buffer
     pub cx: usize,
@@ -221,6 +223,7 @@ impl Window {
             skipcol: 0,
             wrap: true,
             markdown_tables: None,
+            markdown_conceal: None,
             cx: 0,
             cy: 0,
             cursor_goal: CursorGoal::default(),
@@ -2662,6 +2665,7 @@ impl WindowManager {
                     new_window.active = false;
                     new_window.wrap = window.wrap;
                     new_window.markdown_tables = window.markdown_tables;
+                    new_window.markdown_conceal = window.markdown_conceal;
                     new_window.jump_list = window.jump_list.clone();
 
                     let mut old_window = window.clone();

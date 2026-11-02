@@ -1057,7 +1057,13 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let target = directory.path().join("target.rs");
         std::fs::write(&target, "first\nsecond\nthird\n").unwrap();
-        let source = format!("{}[read](target.rs:2)\n", "word ".repeat(28));
+        // Trailing visible words give gj a screen row after the label. The
+        // concealed destination no longer occupies wrap rows of its own.
+        let source = format!(
+            "{}[read](target.rs:2) {}\n",
+            "word ".repeat(28),
+            "tail ".repeat(24)
+        );
         let mut editor = editor(vec![document(&directory.path().join("index.md"), &source)]);
         cursor_at(&mut editor, "read");
         let origin = editor.current_jump_entry();

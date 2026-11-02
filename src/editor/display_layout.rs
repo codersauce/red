@@ -2,13 +2,15 @@
 //!
 //! Layout consumes grapheme boundaries and terminal-cell widths to build an immutable
 //! [`DisplayLayout`] for one viewport configuration. It owns wrapping, horizontal
-//! offsets, continuation indentation, and the conversions used by vertical screen-line
-//! motion. It does not paint styles or mutate window state.
+//! offsets, continuation indentation, concealed spans, and the conversions used by
+//! vertical screen-line motion. It does not paint styles or mutate window state.
 //!
 //! Callers must include every layout-affecting input in their cache key. Reusing a
-//! layout across a buffer revision, viewport width, wrap mode, or indentation change
-//! would produce incorrect cursor and hit-test positions even when the underlying text
-//! looks similar.
+//! layout across a buffer revision, viewport width, wrap mode, indentation, or
+//! concealment change would produce incorrect cursor and hit-test positions even when
+//! the underlying text looks similar.
+
+use std::ops::Range;
 
 use unicode_segmentation::UnicodeSegmentation as _;
 
@@ -158,6 +160,93 @@ fn break_indent_width(line: &str, width: usize, options: BreakIndentOptions) -> 
     )
 }
 
+/// Byte ranges of one source line that occupy no screen cells.
+///
+/// Ranges are relative to the line without its line ending. They are sorted,
+/// non-overlapping, and half-open. Wrapping and screen columns skip them, while
+/// source columns stay addressable so a cursor can still enter the hidden text.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(super) struct Concealment {
+    hidden_bytes: Vec<Range<usize>>,
+}
+
+impl Concealment {
+    pub(super) fn new(mut hidden_bytes: Vec<Range<usize>>) -> Self {
+        hidden_bytes.retain(|range| range.start < range.end);
+        hidden_bytes.sort_by_key(|range| (range.start, range.end));
+        let mut merged: Vec<Range<usize>> = Vec::new();
+        for range in hidden_bytes {
+            if let Some(last) = merged.last_mut() {
+                if range.start <= last.end {
+                    last.end = last.end.max(range.end);
+                    continue;
+                }
+            }
+            merged.push(range);
+        }
+        Self {
+            hidden_bytes: merged,
+        }
+    }
+
+    pub(super) fn is_empty(&self) -> bool {
+        self.hidden_bytes.is_empty()
+    }
+
+    pub(super) fn hides_byte(&self, byte: usize) -> bool {
+        let index = self.hidden_bytes.partition_point(|range| range.end <= byte);
+        self.hidden_bytes
+            .get(index)
+            .is_some_and(|range| range.contains(&byte))
+    }
+
+    pub(super) fn hides_span(&self, start: usize, len: usize) -> bool {
+        if len == 0 {
+            return false;
+        }
+        let end = start + len;
+        let index = self
+            .hidden_bytes
+            .partition_point(|range| range.end <= start);
+        self.hidden_bytes
+            .get(index)
+            .is_some_and(|range| start < range.end && range.start < end)
+    }
+}
+
+/// Per-buffer-line concealment, indexed by buffer line.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(super) struct LineConcealments {
+    lines: Vec<Concealment>,
+}
+
+impl LineConcealments {
+    pub(super) fn new(lines: Vec<Concealment>) -> Self {
+        Self { lines }
+    }
+
+    pub(super) fn line(&self, index: usize) -> Concealment {
+        self.lines.get(index).cloned().unwrap_or_default()
+    }
+}
+
+fn visible_columns_between(concealed: &[Range<usize>], from: usize, to: usize) -> usize {
+    if to <= from {
+        return 0;
+    }
+    let mut hidden = 0;
+    for range in concealed {
+        if range.end <= from {
+            continue;
+        }
+        if range.start >= to {
+            break;
+        }
+        hidden += range.end.min(to).saturating_sub(range.start.max(from));
+    }
+    (to - from).saturating_sub(hidden)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LineSegment {
     pub line: usize,
@@ -180,6 +269,9 @@ pub struct LineSegment {
     /// segments; on wrapped continuations it aligns the text with the
     /// line's indentation (vim's 'breakindent').
     pub visual_offset: usize,
+    /// Source display columns drawn with zero width. Empty for ordinary text.
+    /// Ranges are half-open, sorted, and non-overlapping.
+    pub(super) concealed: Vec<Range<usize>>,
     /// A table row maps disjoint cell ranges instead of one linear source slice.
     pub(super) projection: Option<std::sync::Arc<super::markdown_tables::ProjectedRow>>,
     pub(super) projection_left: usize,
@@ -213,14 +305,133 @@ impl LineSegment {
                 .saturating_sub(self.projection_left)
                 .min(width.saturating_sub(1));
         }
-        (self.visual_offset + col.saturating_sub(self.start_col)).min(width.saturating_sub(1))
+        let visible =
+            visible_columns_between(&self.concealed, self.start_col, col.max(self.start_col));
+        (self.visual_offset + visible).min(width.saturating_sub(1))
     }
 
     pub fn display_col_for_screen_col(&self, col: usize) -> usize {
         if let Some(projection) = &self.projection {
             return projection.source_for_column(col + self.projection_left);
         }
-        self.start_col + col.saturating_sub(self.visual_offset)
+        let target = col.saturating_sub(self.visual_offset);
+        if self.concealed.is_empty() {
+            return self.start_col + target;
+        }
+        let mut source = self.start_col;
+        let mut visual = 0usize;
+        for range in &self.concealed {
+            if range.start <= source {
+                source = source.max(range.end);
+                continue;
+            }
+            let gap = range.start.saturating_sub(source);
+            if target < visual + gap {
+                return source + (target - visual);
+            }
+            visual += gap;
+            source = range.end;
+        }
+        let trailing = self.end_col.saturating_sub(source);
+        if target < visual + trailing {
+            return source + (target - visual);
+        }
+        self.last_visible_source_col()
+    }
+
+    pub(super) fn hides_source_column(&self, column: usize) -> bool {
+        self.concealed.iter().any(|range| range.contains(&column))
+    }
+
+    pub(super) fn visible_columns_before(&self, source_col: usize) -> usize {
+        visible_columns_between(
+            &self.concealed,
+            self.start_col,
+            source_col.max(self.start_col),
+        )
+    }
+
+    /// Screen spans, including break-indent, for a source display-column range.
+    /// Concealed columns are omitted so highlights land on the visible text.
+    pub(super) fn visible_screen_spans(
+        &self,
+        start_col: usize,
+        end_col: usize,
+    ) -> Vec<(usize, usize)> {
+        let start = start_col.max(self.start_col);
+        let end = end_col.min(self.end_col);
+        if end <= start {
+            return Vec::new();
+        }
+        if self.concealed.is_empty() {
+            return vec![(
+                self.visual_offset + start - self.start_col,
+                self.visual_offset + end - self.start_col,
+            )];
+        }
+        let mut spans = Vec::new();
+        let mut column = start;
+        while column < end {
+            if let Some(hidden) = self.concealed.iter().find(|range| range.contains(&column)) {
+                column = hidden.end;
+                continue;
+            }
+            let run_start = column;
+            while column < end && !self.concealed.iter().any(|range| range.contains(&column)) {
+                column += 1;
+            }
+            let local_start = self.visual_offset + self.visible_columns_before(run_start);
+            let local_end = self.visual_offset + self.visible_columns_before(column);
+            if local_end > local_start {
+                spans.push((local_start, local_end));
+            }
+        }
+        spans
+    }
+
+    /// First source column of this row that is actually drawn.
+    /// Falls back to `start_col` when the row is entirely concealed.
+    pub(super) fn first_visible_source_col(&self) -> usize {
+        let mut column = self.start_col;
+        for range in &self.concealed {
+            if range.end <= column {
+                continue;
+            }
+            if range.start > column {
+                return column;
+            }
+            column = range.end;
+        }
+        if column < self.end_col {
+            column
+        } else {
+            self.start_col
+        }
+    }
+
+    /// Inclusive source column of the last drawn cell on this row.
+    pub(super) fn last_visible_source_col(&self) -> usize {
+        let mut end = self.end_col;
+        for range in self.concealed.iter().rev() {
+            if range.end < end {
+                break;
+            }
+            if range.start < end {
+                end = range.start;
+            }
+        }
+        if end > self.start_col {
+            end - 1
+        } else {
+            self.start_col
+        }
+    }
+
+    pub(super) fn next_concealed_column_after(&self, column: usize) -> Option<usize> {
+        self.concealed
+            .iter()
+            .map(|range| range.start)
+            .find(|start| *start > column)
     }
 }
 
@@ -471,7 +682,7 @@ pub struct LayoutConfig {
 }
 
 pub fn layout_lines(lines: &[String], line_count: usize, config: LayoutConfig) -> DisplayLayout {
-    layout_lines_with_tables(lines, line_count, config, None, None)
+    layout_lines_with_tables(lines, line_count, config, None, None, None, None)
 }
 
 pub(super) fn layout_lines_with_tables(
@@ -479,7 +690,9 @@ pub(super) fn layout_lines_with_tables(
     line_count: usize,
     config: LayoutConfig,
     tables: Option<&super::markdown_tables::TableLayout>,
-    reveal: Option<&std::ops::Range<usize>>,
+    reveal: Option<&Range<usize>>,
+    concealments: Option<&LineConcealments>,
+    conceal_reveal: Option<&Range<usize>>,
 ) -> DisplayLayout {
     if config.content_width == 0 || config.height == 0 {
         return DisplayLayout::default();
@@ -519,6 +732,15 @@ pub(super) fn layout_lines_with_tables(
                     })
                     .collect()
             } else if config.wrap {
+                let show_source = reveal.is_some_and(|range| range.contains(&line_index))
+                    || conceal_reveal.is_some_and(|range| range.contains(&line_index));
+                let concealment = if show_source {
+                    Concealment::default()
+                } else {
+                    concealments
+                        .map(|concealments| concealments.line(line_index))
+                        .unwrap_or_default()
+                };
                 wrap_line_segments_with_limit(
                     line,
                     line_index,
@@ -526,6 +748,7 @@ pub(super) fn layout_lines_with_tables(
                     line_skipcol,
                     config.break_indent,
                     config.height - row,
+                    &concealment,
                 )
             } else {
                 nowrap_line_segment(
@@ -556,6 +779,25 @@ pub(super) fn layout_lines_with_tables(
     }
 }
 
+pub(super) fn wrap_concealed_line_segments(
+    line: &str,
+    line_index: usize,
+    width: usize,
+    skipcol: usize,
+    break_indent: BreakIndentOptions,
+    concealment: &Concealment,
+) -> Vec<LineSegment> {
+    wrap_line_segments_with_limit(
+        line,
+        line_index,
+        width,
+        skipcol,
+        break_indent,
+        usize::MAX,
+        concealment,
+    )
+}
+
 pub fn wrap_line_segments(
     line: &str,
     line_index: usize,
@@ -563,7 +805,15 @@ pub fn wrap_line_segments(
     skipcol: usize,
     break_indent: BreakIndentOptions,
 ) -> Vec<LineSegment> {
-    wrap_line_segments_with_limit(line, line_index, width, skipcol, break_indent, usize::MAX)
+    wrap_line_segments_with_limit(
+        line,
+        line_index,
+        width,
+        skipcol,
+        break_indent,
+        usize::MAX,
+        &Concealment::default(),
+    )
 }
 
 fn wrap_line_segments_with_limit(
@@ -573,6 +823,7 @@ fn wrap_line_segments_with_limit(
     skipcol: usize,
     break_indent: BreakIndentOptions,
     max_segments: usize,
+    concealment: &Concealment,
 ) -> Vec<LineSegment> {
     let mut segments = Vec::new();
     if width == 0 || max_segments == 0 {
@@ -588,7 +839,10 @@ fn wrap_line_segments_with_limit(
     let mut start_grapheme = 0;
     let mut start_byte = 0;
     let mut col = 0;
+    let mut visual_col = 0;
+    let mut segment_visual = 0;
     let mut grapheme_count = 0;
+    let mut concealed_ranges = Vec::new();
 
     for (grapheme_index, (byte_offset, grapheme)) in line.grapheme_indices(true).enumerate() {
         let first_segment = start_col == 0;
@@ -597,14 +851,19 @@ fn wrap_line_segments_with_limit(
         } else {
             continuation_width
         };
-        let grapheme_width = if grapheme == "\t" {
+        let raw_width = if grapheme == "\t" {
             tab_width - (col % tab_width)
         } else {
             display_width(grapheme)
         };
+        let hidden = concealment.hides_span(byte_offset, grapheme.len());
+        let visual_width = if hidden { 0 } else { raw_width };
+        let occupied = visual_col - segment_visual;
 
-        if col > start_col && col + grapheme_width > start_col + segment_width {
+        // Concealed syntax has no cells, so it never opens a new screen row.
+        if visual_width > 0 && occupied > 0 && occupied + visual_width > segment_width {
             let end_col = col;
+            let ranges = std::mem::take(&mut concealed_ranges);
             if end_col > skipcol {
                 segments.push(LineSegment {
                     line: line_index,
@@ -622,6 +881,7 @@ fn wrap_line_segments_with_limit(
                     first_segment,
                     last_segment: false,
                     visual_offset: if first_segment { 0 } else { indent },
+                    concealed: ranges,
                 });
                 if segments.len() == max_segments {
                     return segments;
@@ -629,11 +889,21 @@ fn wrap_line_segments_with_limit(
             }
 
             start_col = end_col;
+            segment_visual = visual_col;
             start_grapheme = grapheme_index;
             start_byte = byte_offset;
         }
 
-        col += grapheme_width;
+        if hidden && raw_width > 0 {
+            if let Some(last) = concealed_ranges.last_mut().filter(|range| range.end == col) {
+                last.end = col + raw_width;
+            } else {
+                concealed_ranges.push(col..col + raw_width);
+            }
+        }
+
+        col += raw_width;
+        visual_col += visual_width;
         grapheme_count = grapheme_index + 1;
     }
 
@@ -656,6 +926,7 @@ fn wrap_line_segments_with_limit(
             first_segment,
             last_segment: true,
             visual_offset: if first_segment { 0 } else { indent },
+            concealed: concealed_ranges,
         });
     }
 
@@ -704,6 +975,7 @@ fn wrap_line_segments_with_limit(
             first_segment,
             last_segment: start_col == line_width,
             visual_offset: if first_segment { 0 } else { indent },
+            concealed: Vec::new(),
         });
     }
 
@@ -767,6 +1039,7 @@ pub(super) fn nowrap_line_segment(
         first_segment: true,
         last_segment: end_byte == line.len(),
         visual_offset: 0,
+        concealed: Vec::new(),
     }]
 }
 
@@ -853,8 +1126,15 @@ mod tests {
         assert!(segments[1].contains_cursor_col(6));
         assert!(!segments[1].contains_cursor_col(7));
 
-        let clipped =
-            wrap_line_segments_with_limit("abcdef", 0, 3, 0, BreakIndentOptions::disabled(), 1);
+        let clipped = wrap_line_segments_with_limit(
+            "abcdef",
+            0,
+            3,
+            0,
+            BreakIndentOptions::disabled(),
+            1,
+            &Concealment::default(),
+        );
         assert_eq!(clipped.len(), 1);
         assert!(!clipped[0].contains_cursor_col(3));
 
@@ -1180,5 +1460,84 @@ mod tests {
         assert_eq!(layout.row(0).map(|segment| segment.line), Some(0));
         assert_eq!(layout.row(2).map(|segment| segment.line), Some(2));
         assert!(layout.row(3).is_none());
+    }
+
+    #[test]
+    fn concealed_spans_wrap_and_map_cursors_by_visible_cells() {
+        let line = "See [docs](https://example.com/very/long/path) now please";
+        let label = line.find("docs").unwrap();
+        let after = line.find(" now").unwrap();
+        let hidden = Concealment::new(vec![line.find('[').unwrap()..label, label + 4..after]);
+        let raw = wrap_line_segments(line, 0, 12, 0, BreakIndentOptions::disabled());
+        let wrapped = wrap_line_segments_with_limit(
+            line,
+            0,
+            12,
+            0,
+            BreakIndentOptions::disabled(),
+            usize::MAX,
+            &hidden,
+        );
+
+        assert!(wrapped.len() < raw.len());
+        assert_eq!(wrapped.len(), 2);
+        for segment in &wrapped {
+            let visible =
+                visible_columns_between(&segment.concealed, segment.start_col, segment.end_col);
+            assert!(visible <= 12, "visible width {visible}");
+            assert!(visible > 0);
+        }
+        let url = line.find("https").unwrap();
+        let segment = wrapped
+            .iter()
+            .find(|segment| segment.contains_cursor_col(url))
+            .unwrap();
+        assert!(segment.hides_source_column(url));
+        assert_eq!(
+            segment.screen_col_for_display_col(url, 12),
+            segment.screen_col_for_display_col(after, 12)
+        );
+        assert_eq!(segment.display_col_for_screen_col(8), after);
+        assert_eq!(segment.first_visible_source_col(), 0);
+        assert_eq!(segment.last_visible_source_col(), after + 3);
+        for column in 0..8 {
+            let source = segment.display_col_for_screen_col(column);
+            assert!(!segment.hides_source_column(source), "{column} -> {source}");
+            assert_eq!(segment.screen_col_for_display_col(source, 12), column);
+        }
+    }
+
+    #[test]
+    fn concealed_unicode_keeps_its_visible_width_and_source_bytes() {
+        let line = "See [文档](https://example.com/path) end";
+        let label = line.find("文档").unwrap();
+        let after = line.find(" end").unwrap();
+        let hidden = Concealment::new(vec![
+            line.find('[').unwrap()..label,
+            label + "文档".len()..after,
+        ]);
+        let wrapped = wrap_line_segments_with_limit(
+            line,
+            0,
+            10,
+            0,
+            BreakIndentOptions::disabled(),
+            usize::MAX,
+            &hidden,
+        );
+        // "See 文档 end" is 3 + 1 + 4 + 1 + 3 = 12 visible columns, so it wraps once.
+        assert_eq!(wrapped.len(), 2);
+        let url_col = display_width(&line[..line.find("https").unwrap()]);
+        let after_col = display_width(&line[..after]);
+        let segment = wrapped
+            .iter()
+            .find(|segment| segment.contains_cursor_col(url_col))
+            .unwrap();
+        assert_eq!(
+            segment.screen_col_for_display_col(url_col, 10),
+            segment.screen_col_for_display_col(after_col, 10)
+        );
+        assert_eq!(segment.display_col_for_screen_col(8), after_col);
+        assert_eq!(&line[label..label + "文档".len()], "文档");
     }
 }
