@@ -746,8 +746,9 @@ pub fn layout_lines(lines: &[String], line_count: usize, config: LayoutConfig) -
     layout_lines_with_tables(lines, line_count, config, None, None, None, None, None)
 }
 
-/// The declaration replaces the image's first row while the cursor is on it.
-/// The remaining image rows stay, so the block keeps the same height.
+/// The declaration takes the image rows its text occupies. A wrapped source
+/// uses one image row per text row, so the block stays the same height until
+/// the text is taller than the picture.
 fn image_rows_with_declaration(
     line: &str,
     line_index: usize,
@@ -757,26 +758,30 @@ fn image_rows_with_declaration(
     config: LayoutConfig,
 ) -> Vec<LineSegment> {
     let mut segments = Vec::new();
-    if show_declaration && line_skipcol == 0 {
-        // Real text rows only. Image rows stay below them and are not wrap rows.
-        if config.wrap {
-            segments.extend(wrap_line_segments(
+    let text_rows = if show_declaration && line_skipcol == 0 {
+        let text = if config.wrap {
+            wrap_line_segments(
                 line,
                 line_index,
                 config.content_width,
                 0,
                 config.break_indent,
-            ));
+            )
         } else {
-            segments.extend(nowrap_line_segment(
+            nowrap_line_segment(
                 line,
                 line_index,
                 config.content_width,
                 config.vleft,
                 config.break_indent.tab_width,
-            ));
-        }
-    }
+            )
+        };
+        let count = text.len();
+        segments.extend(text);
+        count
+    } else {
+        0
+    };
     segments.extend(
         image_rows
             .iter()
@@ -785,7 +790,7 @@ fn image_rows_with_declaration(
                     .image
                     .map(|span| usize::from(span.index))
                     .unwrap_or(0);
-                if show_declaration && index == 0 {
+                if index < text_rows {
                     return false;
                 }
                 line_skipcol == 0 || segment.start_col >= line_skipcol

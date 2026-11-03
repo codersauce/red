@@ -2989,7 +2989,9 @@ mod tests {
         config.clipboard.enabled = false;
         config.scrolloff = Some(0);
         config.markdown_images = MarkdownImagesMode::Halfblocks;
-        let source = format!("hello\n![swatch]({})\nafter\n", path.display());
+        // A relative name stays one row on every OS. An absolute macOS temp
+        // path is long enough to wrap the declaration and shift the next line.
+        let source = "hello\n![swatch](swatch.png)\nafter\n".to_string();
         let lsp = Box::new(crate::lsp::LspManager::new(config.lsp.clone()));
         let mut editor = crate::editor::Editor::with_size(
             lsp,
@@ -3842,6 +3844,53 @@ mod tests {
         assert_eq!(
             hidden.rows.last().unwrap().row,
             revealed.rows.last().unwrap().row
+        );
+
+        let long = vec![
+            "![swatch](/var/folders/cx/long-temp-name/swatch.png)\n".to_string(),
+            "after\n".to_string(),
+        ];
+        let narrow = LayoutConfig {
+            content_width: 20,
+            ..config
+        };
+        let long_plan = ImageLayout {
+            rows: BTreeMap::from([(0, image_line_segments(0, 6, 10, false))]),
+            raw_lines: BTreeSet::new(),
+        };
+        let mut revealed_long_plan = ImageLayout {
+            rows: long_plan.rows.clone(),
+            raw_lines: long_plan.raw_lines.clone(),
+        };
+        revealed_long_plan.raw_lines.insert(0);
+        let hidden_long =
+            layout_lines_with_tables(&long, 2, narrow, None, None, None, None, Some(&long_plan));
+        let revealed_long = layout_lines_with_tables(
+            &long,
+            2,
+            narrow,
+            None,
+            None,
+            None,
+            None,
+            Some(&revealed_long_plan),
+        );
+        assert_eq!(hidden_long.rows.len(), revealed_long.rows.len());
+        assert!(revealed_long.rows[0].image.is_none());
+        assert!(revealed_long.rows[1].image.is_none());
+        let text_rows = revealed_long
+            .rows
+            .iter()
+            .take_while(|row| row.line == 0 && row.image.is_none())
+            .count();
+        assert!(text_rows >= 2, "a long path wraps inside the block");
+        assert_eq!(
+            revealed_long.rows[text_rows].image.unwrap().index,
+            u16::try_from(text_rows).unwrap()
+        );
+        assert_eq!(
+            hidden_long.rows.last().unwrap().row,
+            revealed_long.rows.last().unwrap().row
         );
     }
 
